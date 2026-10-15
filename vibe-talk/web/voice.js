@@ -19745,11 +19745,12 @@ function answeredThread(message) {
 //
 // AN ANSWER OF ALL THAT IS NOT FOLDED STILL PLACES WHAT IT CARRIES (`placeFromAnswer`). A newest page
 // of All is not folded over one sent after it, nor once the stream has delivered anything since it was
-// sent, nor once the store has gained or lost a message since by any other way (`heldAsSent`) — the
-// reader's own send, acknowledged, or a message Main's poll brought — which as the newest page of All
-// it would take out as deleted, or put back; a delta is not folded once All's cover has moved on from
-// where it began, nor once the stream has removed a message since it was sent, which it may carry and
-// would put back (`noteLiveRemoval`); a late answer is not used once something newer has replaced it.
+// sent; a delta is not folded once All's cover has moved on from where it began, nor once the stream
+// has removed a message since it was sent, which it may carry and would put back (`noteLiveRemoval`);
+// neither once the store has gained, lost or replaced a message since by any other way (`heldAsSent`)
+// — the reader's own send, acknowledged, a message Main's poll brought, or an edit it brought — which
+// the answer would take out as deleted, put back, or undo with its older copy; a late answer is not
+// used once something newer has replaced it.
 // And behind a bridge that streams its answer by editing it, every placing read is out while an edit
 // arrives. Thrown away whole, each was asked again, and the answer stayed on Main until the channel
 // went quiet; marked as having answered without being folded, a reply that a page of All sent before
@@ -19852,11 +19853,11 @@ function queuePlaceUnplaced() {
 }
 
 /**
- * @typedef {AbandonedRead & {sent: string | null, seen: number, number: number, held: Set<string>,
+ * @typedef {AbandonedRead & {sent: string | null, seen: number, number: number, held: Map<string, any>,
  *   removals: number}} PlacingRead A placing read: the position in All it continues, or null for All's
- *   newest page, `unplacedArrivals` and `timelineAnswersAsked` when it was sent, the ids of the
- *   messages the store held then (`heldAsSent`), and `liveRemovalsSeen` for its channel then. Its `key`
- *   is the view on screen in the left column, whose poll waits for it once it is given up on.
+ *   newest page, `unplacedArrivals` and `timelineAnswersAsked` when it was sent, the store's copies of
+ *   the messages it held then (`heldAsSent`), and `liveRemovalsSeen` for its channel then. Its `key` is
+ *   the view on screen in the left column, whose poll waits for it once it is given up on.
  */
 
 /**
@@ -19887,7 +19888,7 @@ async function placeUnplaced() {
       /** @type {PlacingRead} */
       const read = { key, channel, canon, sent, seen: unplacedArrivals, sentAt: Date.now(),
         live: liveEventsSeen.get(channel) || 0, news: liveNewsSeen.get(channel) || 0, number: 0,
-        held: heldIds(canon), removals: liveRemovalsSeen.get(channel) || 0 };
+        held: heldNow(canon), removals: liveRemovalsSeen.get(channel) || 0 };
       const path = `${base}${sent ? `&after=${encodeURIComponent(sent)}` : ""}&reason=place`;
       /** @type {VibeTalk.TimelineResponse} */
       let payload;
@@ -19937,12 +19938,15 @@ async function placeUnplaced() {
  * it is the older and this page is folded over it; a newest page that lands after the stream has
  * delivered anything since it was sent, which as the newest page of All would take that message out
  * of the store as deleted upstream, and for which false is answered, to ask again for what arrived
- * since; and a newest page that lands when the store no longer holds the messages it held when the
- * page was sent (`heldAsSent`). The store gains a message by other ways than the stream — the
- * reader's own send, acknowledged; a message the stream missed, brought by Main's poll; a read of a
- * thread — and the page, sent before, would take that one out as deleted too (`#310
- * stale-live-read-flicker`); and one taken out since, it would put back. Not folded, the answer is
- * still not thrown away (`placeFromAnswer`), and that never takes a message out of the store.
+ * since; and either, when the store no longer holds what it held when the read was sent
+ * (`heldAsSent`). The store gains a message by other ways than the stream — the reader's own send,
+ * acknowledged; a message the stream missed, brought by Main's poll; a read of a thread — and a newest
+ * page, sent before, would take that one out as deleted too (`#310 stale-live-read-flicker`); one
+ * taken out since, it would put back; and a copy replaced since — an edit Main's read brought while
+ * the answer was out — either answer would undo with its older copy, until the next read to carry the
+ * message: for a newest page of Main, never, once a message is a thread reply. Not folded, the answer
+ * is still not thrown away (`placeFromAnswer`), and that never takes a message out of the store, nor
+ * gives one anything but a thread record.
  *
  * @param {VibeTalk.TimelineResponse} payload
  * @param {PlacingRead} read
@@ -19954,10 +19958,11 @@ function landPlacingRead(payload, read) {
   const delta = Boolean(read.sent && payload.delta);
   const quiet = (liveEventsSeen.get(channel) || 0) === read.live;
   const unremoved = (liveRemovalsSeen.get(channel) || 0) === read.removals;
+  const unchanged = heldAsSent(canon, read.held);
   let folded = false;
   if (delta) {
-    folded = unremoved && !payload.delta.more && foldTimelineDelta(payload, read.sent, "flat", null);
-  } else if (quiet && heldAsSent(canon, read.held) && !newerPage(canon, "flat", read.number)) {
+    folded = unremoved && unchanged && !payload.delta.more && foldTimelineDelta(payload, read.sent, "flat", null);
+  } else if (quiet && unchanged && !newerPage(canon, "flat", read.number)) {
     foldTimelinePage(payload, false, "flat", null);
     folded = true;
   }
@@ -20014,15 +20019,29 @@ function heldIds(canon) {
 }
 
 /**
- * Whether store `canon` holds the messages it held when a read was sent, `held` being their ids
- * (`heldIds`): none added since, and none taken out. A copy replaced since — an edit, a thread record —
- * is still the same message. `#308 live-reply-in-main`.
+ * The store's copy of each message store `canon` holds now, by id: what a placing read sent now is
+ * folded over only if the store still holds it when the read lands (`heldAsSent`).
  *
  * @param {any} canon
- * @param {Set<string>} held
+ * @returns {Map<string, any>}
+ */
+function heldNow(canon) {
+  return new Map(canon.messages.map((message) => [String(message.id), message]));
+}
+
+/**
+ * Whether store `canon` holds what it held when a read was sent, `held` being its copies then
+ * (`heldNow`): no message added since, none taken out, and none replaced. A read that brings a copy
+ * word for word keeps the store's (`mergeIntoCanon`, `foldTimelineDelta`); one that brings an edit, a
+ * thread record or a count replaces it, and the read sent before is older than that copy, which it
+ * would undo. `#308 live-reply-in-main`.
+ *
+ * @param {any} canon
+ * @param {Map<string, any>} held
  */
 function heldAsSent(canon, held) {
-  return canon.messages.length === held.size && canon.messages.every((message) => held.has(String(message.id)));
+  return canon.messages.length === held.size &&
+    canon.messages.every((message) => held.get(String(message.id)) === message);
 }
 
 /**

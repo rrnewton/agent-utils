@@ -58250,8 +58250,8 @@ function brokenScriptEach(...patches) {
   }, SCRIPT);
 }
 
-/** A negative control: a placing page of All folded whatever the store has gained or lost since it was sent. */
-const FOLD_OVER_ANY_STORE = ["quiet && heldAsSent(canon, read.held) && ", "quiet && "];
+/** A negative control: a placing read of All folded whatever the store has gained, lost or replaced since it was sent. */
+const FOLD_OVER_ANY_STORE = ["  const unchanged = heldAsSent(canon, read.held);\n", "  const unchanged = true;\n"];
 /** A negative control: a read of All for Main's counts speaking for every message held when it lands. */
 const COUNTS_SPEAK_FOR_ALL = ["    answersFor: heldIds(channelCanon) };", "    answersFor: null };"];
 
@@ -58895,8 +58895,8 @@ for (const change of ["removed", "edited"]) {
       for (let i = 0; i < 3; i += 1) await page.settle();
       assert.equal(held.length, 1, "fixture: no read of All was made to place the reply");
       // Removed or edited upstream once the placing page was taken; the reader opens All, whose own page
-      // says so. An edit leaves the store holding the same messages (`heldAsSent`), so only the order
-      // the two pages were sent in tells which is the newer.
+      // says so. The store then no longer holds what it held when the placing page was sent
+      // (`heldAsSent`), and apart from that, the order the two pages were sent in tells which is newer.
       if (change === "removed") server.remove("202");
       else server.edit("202", { content: "a reply in the first discussion, edited" });
       page.setClock(page.clock() + 5000);
@@ -58925,51 +58925,67 @@ for (const change of ["removed", "edited"]) {
       assert.ok(savedMessage(page, "202").content.endsWith("edited"), "the placing page, the older, undid an edit made upstream");
     }
 
-    // THE CONTROL: with nothing to say which was sent first, the older page is folded over the newer:
-    // for a reply removed, only if also folded whatever the store has lost since it was sent (review
-    // round 4).
+    // THE CONTROL: with nothing to say which was sent first, the older page is folded over the newer,
+    // if also folded whatever the store has lost or replaced since it was sent (review rounds 4 and 5).
     const unordered = ["    cover.fullSent = sentNumberOf(payload);\n", ""];
-    const control = await run(change === "removed" ? brokenScriptEach(unordered, FOLD_OVER_ANY_STORE) : brokenScript(...unordered));
+    const control = await run(brokenScriptEach(unordered, FOLD_OVER_ANY_STORE));
     assert.ok(change === "removed" ? shownIds(control.page).includes("202") : !savedMessage(control.page, "202").content.endsWith("edited"),
       "the older page was not folded anyway, so this test cannot see it");
   });
 }
 
 test("`#308 live-reply-in-main`: a read of All for Main's counts sent after a placing page, and landing after it, is folded over it", async () => {
+  const edited = "a reply in the first discussion, edited";
   const run = async (script) => {
-    const { page, server, held, quietReply } = await heldAllReads(script);
-    page.setClock(page.clock() + TIMELINE_RECONCILE_MS + 60000);
-    // The bridge's answer, pushed with no thread record before its root's count has moved on: Main's
-    // read behind it finds nothing outrunning the store, and only the placing read goes.
-    const first = page.messages.find((m) => m.id === "201").thread;
-    const pushed = message({ id: "300", content: "the bridge's answer" });
-    server.post({ ...pushed, thread: { ...first, is_root: false, reply_count: 2 } });
+    const { page, server, held } = await heldAllReads(script);
+    // All brought up to date by what changed in it, a minute inside its reconcile window: the interval
+    // for Main's counts runs from that read, and All's last newest page stays as old as it was.
+    page.setClock(page.clock() + TIMELINE_RECONCILE_MS - 60000);
+    await pickThread(page, "flat");
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    await pollOnce(page);
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    await pickThread(page, "main");
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    // Past All's reconcile window, within the interval: the bridge's answer, pushed with no thread
+    // record, moves its root's count past what the store holds, and only the placing read goes.
+    page.setClock(page.clock() + 120000);
+    const from = page.timelineCalls.length;
+    const { pushed } = bridgeReply(page, server);
     await deliver(page, page.stream(), sseMessage(pushed));
     for (let i = 0; i < 3; i += 1) await page.settle();
     assert.deepStrictEqual([held.place.length, held.counts.length], [1, 0], "fixture: not the placing read alone");
-    // Then a reply the stream never delivers: the poll's read of Main asks All for its counts.
-    quietReply();
+    assert.deepStrictEqual(readsSince(page, from).filter(([, , reason]) => reason === "place"), [["flat", false, "place"]],
+      "fixture: the placing read is not All's newest page");
+    // A reply in that discussion edited upstream, which no read of Main carries: a copy of its own, so
+    // the placing page already taken keeps the text it was taken with. Past the interval, the poll's
+    // read of Main brings nothing, and asks All for its counts.
+    const reply = page.messages.findIndex((m) => m.id === "202");
+    page.messages[reply] = { ...page.messages[reply] };
+    server.edit("202", { content: edited });
+    page.setClock(page.clock() + COUNTS_ALL_READ_MS);
     await pollOnce(page);
     for (let i = 0; i < 3; i += 1) await page.settle();
     assert.equal(held.counts.length, 1, "fixture: All was not read for Main's counts");
-    // The placing page, sent first, lands first; then the read for the counts, the newer.
+    // The placing page, sent first, lands first, over the store as it was when it was sent; then the
+    // read for the counts, the newer.
     page.setClock(page.clock() + 5000);
     held.place[0]();
     for (let i = 0; i < 3; i += 1) await page.settle();
-    assert.equal(savedMessage(page, "250"), null, "fixture: the placing page carried the quiet reply");
+    assert.notEqual(savedMessage(page, "202").content, edited, "fixture: the placing page carried the edit");
     page.setClock(page.clock() + 5000);
     held.counts[0]();
     for (let i = 0; i < 3; i += 1) await page.settle();
     return { page };
   };
   const { page } = await run(SCRIPT);
-  assert.ok(savedMessage(page, "250"), "the read for Main's counts was not folded, and the reply it carried is not held");
+  assert.equal(savedMessage(page, "202").content, edited, "the read for Main's counts was not folded, and the edit it carried is not held");
 
   // THE CONTROL, as round 2 did: the placing page taken as the newer because it LANDED after the read
   // for the counts was sent.
   const control = await run(brokenScript("    if (!newerPage(channelCanon, \"flat\", number)) {",
     "    if (!(channelCanon.views.get(viewKey(\"flat\")) && channelCanon.views.get(viewKey(\"flat\")).fullAt > now)) {"));
-  assert.equal(savedMessage(control.page, "250"), null, "the read for the counts was folded anyway, so this test cannot see it");
+  assert.notEqual(savedMessage(control.page, "202").content, edited, "the read for the counts was folded anyway, so this test cannot see it");
 });
 
 for (const mode of ["delta", "newest"]) {
@@ -59308,12 +59324,85 @@ for (const placing of ["newest", "delta"]) {
       const unplaced = await run(brokenScript("  if (channelCanon.channel === String(channel)) forgetUnplaced(channelCanon, String(id));\n", ""));
       assert.ok(inThread(unplaced), "the reply stayed gone anyway, so this test cannot see it");
       if (placing === "delta") {
-        // And a placing delta folded whatever the stream removed since it was sent: it brings the reply
-        // back itself.
-        const folded = await run(brokenScript("  const unremoved = (liveRemovalsSeen.get(channel) || 0) === read.removals;\n",
-          "  const unremoved = true;\n"));
+        // And a placing delta folded whatever the stream removed since it was sent brings the reply back
+        // itself: landing first, as it is; landing after Main's read took the reply out, only if also
+        // folded whatever the store has lost since (`heldAsSent`).
+        const unremoved = ["  const unremoved = (liveRemovalsSeen.get(channel) || 0) === read.removals;\n",
+          "  const unremoved = true;\n"];
+        const folded = await run(landsFirst === "placing" ? brokenScript(...unremoved) : brokenScriptEach(unremoved, FOLD_OVER_ANY_STORE));
         assert.ok(inThread(folded), "the placing delta left the reply gone anyway, so this test cannot see it");
       }
     });
   }
+}
+
+// And a placing read sent before an edit that Main's read brought while it was out was folded over the
+// store's newer copy, and undid the edit until the next read to carry the message: never, for a
+// newest page of Main, once that message has been placed in a thread. A placing read is now folded
+// only over the store's copies as they were when it was sent (`heldAsSent`).
+
+for (const placing of ["newest", "delta"]) {
+  test(`\`#308 live-reply-in-main\`: a placing ${placing === "newest" ? "page" : "delta"} of All does not undo an edit Main's poll brought while it was out`, async () => {
+    const edited = "first thread root, edited while the placing read was out";
+    const run = async (script) => {
+      const { page, server } = await forwardPage({}, (p) => { p.servePlacing = true; }, script);
+      if (placing === "delta") {
+        // All read once, and recently: the placing read asks what changed in All since.
+        await pickThread(page, "flat");
+        for (let i = 0; i < 3; i += 1) await page.settle();
+        await pickThread(page, "main");
+        for (let i = 0; i < 3; i += 1) await page.settle();
+      } else {
+        page.setClock(page.clock() + TIMELINE_RECONCILE_MS + 60000);
+      }
+      const serve = page.timeline;
+      /** @type {Array<() => void>} */
+      const held = [];
+      page.timeline = (path, options) => {
+        if (!/reason=place/.test(path)) return serve(path, options);
+        // Answered as the server had it when asked: `server.edit` changes the messages an answer not yet
+        // read out would carry.
+        const answer = Promise.resolve(serve(path, options)).then(async (response) => {
+          const body = await response.text();
+          return { ...response, text: async () => body };
+        });
+        return new Promise((resolve) => held.push(() => resolve(answer)));
+      };
+      const from = page.timelineCalls.length;
+      // The bridge's reply moves its root's count on, so a delta of All carries the root too.
+      const { first, pushed } = bridgeReply(page, server);
+      await deliver(page, page.stream(), sseMessage(pushed));
+      for (let i = 0; i < 3; i += 1) await page.settle();
+      assert.deepStrictEqual(readsSince(page, from).filter(([, , reason]) => reason === "place"), [["flat", placing === "delta", "place"]],
+        `fixture: not one placing read of the kind meant: ${JSON.stringify(readsSince(page, from))}`);
+      // The root edited upstream once the placing read was taken, and brought by Main's poll: the stream
+      // says nothing of it.
+      server.edit("201", { content: edited });
+      page.setClock(page.clock() + DISCORD_POLL_MS);
+      await pollOnce(page);
+      for (let i = 0; i < 3; i += 1) await page.settle();
+      assert.equal(savedMessage(page, "201").content, edited, "fixture: Main's poll did not bring the edit");
+      held[0]();
+      for (let i = 0; i < 3; i += 1) await page.settle();
+      // And two polls after, which bring nothing more of the root.
+      for (let poll = 0; poll < 2; poll += 1) {
+        page.setClock(page.clock() + DISCORD_POLL_MS);
+        await pollOnce(page);
+        for (let i = 0; i < 3; i += 1) await page.settle();
+      }
+      return { page, first, held };
+    };
+    const { page, first, held } = await run(SCRIPT);
+    assert.equal(savedMessage(page, "201").content, edited, "the placing read undid an edit made after it was sent");
+    assert.ok(bodyOf(rowOf(page, "201")).text().includes(edited), "Main shows the root as it was before the edit");
+    assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "the reply was left on Main");
+    const kept = savedMessage(page, "300");
+    assert.ok(kept && kept.thread && kept.thread.id === first.id, `the reply is not held in its thread: ${JSON.stringify(kept)}`);
+    assert.equal(held.length, 1, "the placing read was asked again");
+
+    // THE CONTROL, as round 4 did: folded whatever the store has replaced since it was sent, the
+    // placing read puts back the root as it was before the edit.
+    const control = await run(brokenScript(...FOLD_OVER_ANY_STORE));
+    assert.equal(savedMessage(control.page, "201").content, "first thread root", "the edit survived anyway, so this test cannot see it");
+  });
 }
