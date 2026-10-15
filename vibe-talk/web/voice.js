@@ -239,6 +239,14 @@ let statusTimer = null;
 // `#241 voice-composer` gave the call's message box the same room, so the same holds on the call's
 // view: a long turn arriving folded brings up "Expand all", the room grows by the chip, and a
 // reader following the call would otherwise be left a chip short of the foot and stop following.
+//
+// `#280 scroll-stability`. THE LISTS KEEP THEIR ROOM WHILE THEIR SCREEN IS HIDDEN. The chips go with the
+// main screen and are measured at nothing, and a room of nothing written where the lists read it took that
+// room out of them on every other screen. Chromium laid the list out without it as the main screen came
+// back, and only then were the chips measured again: a reader 40px up All with Summarise and Expand all up
+// was within the slack of the foot of a list 36px short, and was taken to the foot as the room came back.
+// So #screen-main holds the room as last measured on it, which the lists and their boxes read, and changes
+// it only while it is shown; the status pill, which stands on every screen, reads the measure as it is.
 if (typeof window.ResizeObserver === "function") {
   new window.ResizeObserver(([entry]) => {
     const height = entry.contentRect.height;
@@ -249,9 +257,10 @@ if (typeof window.ResizeObserver === "function") {
     // `#243 filter-keeps-selection`: nor one whose message a filter change holds in place. `#241 voice-composer`:
     // the call's transcript follows too, not only the channel.
     const pinned = !landed && currentScreen === "main" && followsNewest(area);
-    el("frame-body").style.setProperty(
-      "--scroll-tools-clearance", height > 0 ? `calc(${height}px + 0.5rem)` : "0px"
-    );
+    const room = height > 0 ? `calc(${height}px + 0.5rem)` : "0px";
+    el("frame-body").style.setProperty("--scroll-tools-clearance", room);
+    const screen = leftEl("screen-main");
+    if (!screen.hidden) screen.style.setProperty("--scroll-tools-clearance", room);
     if (landed) placeEntryLanding(entryLanding.row, entryLanding.first);
     if (pinned) area.scrollTop = area.scrollHeight;
     // The room the channel's box keeps for them is above it, so it moved with them.
