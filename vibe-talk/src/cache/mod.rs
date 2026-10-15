@@ -1444,7 +1444,10 @@ impl MessageCache {
     /// a channel was written to the file or recorded as left out ([`MessageCache::mark_suspect`]):
     /// when the file now open was opened in this process. A change made before then, while the
     /// server was down or the cache off, never reached the file, so the feed vouches for nothing
-    /// seen before it.
+    /// seen before it. An erase of a whole channel forgets, with its rows, the changes the feed
+    /// delivered for it, and so records a drop of the channel once it is carried out
+    /// ([`MessageCache::last_drop_ms`]): nothing of the channel seen by then is vouched for until a
+    /// read begun afterwards has seen it again.
     #[must_use]
     pub fn fed_since_ms(&self) -> i64 {
         self.shared.opened_ms.load(Ordering::SeqCst)
