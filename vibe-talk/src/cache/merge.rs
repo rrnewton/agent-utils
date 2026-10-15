@@ -32,10 +32,18 @@
 //!    listing does), so a copy there is held whatever a later listing lacked; but it is never
 //!    vouched for unless the latest read of the scope's newest end listed it
 //!    ([`super::shadow`]), and the listing that later settles its stretch takes it out.
-//! 5. **Snippets never overwrite listing text.** A bridge falls back to a short snippet when a live
-//!    event has no body, so a pushed update that is a strict prefix of the held text (a trailing
-//!    `…` ignored) changes nothing, and a pushed create of an unknown id is held as partial until
-//!    any listing replaces it.
+//! 5. **A pushed text may be a snippet.** A bridge falls back to a short snippet when a live event
+//!    has no body, and nothing in a push says which it sent, so whatever text a push brings is held
+//!    as partial (possibly a snippet): a pushed creation of an unknown id, and a pushed edit that
+//!    replaces the held text, whether that text was a read's or a push's. Only a read proves it
+//!    whole: one that brings the same text, whenever it began, or one that began after the push,
+//!    whatever text it brings (rule 2). A read that began no later than the push, with other text,
+//!    changes nothing: it may be of the version before an edit the push brought. And a snippet
+//!    never overwrites text a read brought: a pushed edit that is a strict prefix of it (a trailing
+//!    `…` ignored) changes nothing. Such a prefix may as well be the whole of an edit that cut the
+//!    end off, or a snippet of one that changed what follows it, so the writer records the push,
+//!    like every pushed edit whose text it does not take, as a change the file lacks
+//!    ([`super::writer`]).
 
 /// How an incoming copy reached the cache.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,7 +77,7 @@ pub struct Held<'a> {
     pub observed_ms: i64,
     /// Provider edit time, when known.
     pub edited_ms: Option<i64>,
-    /// Whether a push set it, and it may be a snippet.
+    /// Whether a push set it, so that it may be a snippet, and no read has proven it whole since.
     pub partial: bool,
 }
 
@@ -101,7 +109,7 @@ pub struct Offered<'a> {
 pub enum Verdict {
     /// Keep the held content as it is.
     Keep,
-    /// Same text, now confirmed by a listing: keep it, and it is no longer partial.
+    /// Same text, now confirmed by a read: keep it, and it is no longer partial.
     Confirm,
     /// Take the offered content, marked partial or not.
     Replace {
@@ -125,18 +133,17 @@ pub fn edit_order(held: &Held<'_>, offered: &Offered<'_>) -> Option<std::cmp::Or
 /// Rules 2 and 5 for a message the cache already holds.
 #[must_use]
 pub fn content_verdict(held: &Held<'_>, offered: &Offered<'_>) -> Verdict {
-    let listing = offered.arrival == Arrival::Listing;
+    let pushed = offered.arrival.is_push();
     if held.content_hash == offered.content_hash {
-        return if held.partial && listing && !offered.partial {
+        // A read that brings the text a push brought proves it whole, whenever the read began.
+        return if held.partial && !pushed && !offered.partial {
             Verdict::Confirm
         } else {
             Verdict::Keep
         };
     }
     // A snippet never overwrites text a read brought.
-    if offered.arrival.is_push()
-        && !held.partial
-        && (offered.partial || is_snippet_of(offered.content, held.content))
+    if pushed && !held.partial && (offered.partial || is_snippet_of(offered.content, held.content))
     {
         return Verdict::Keep;
     }
@@ -145,15 +152,12 @@ pub fn content_verdict(held: &Held<'_>, offered: &Offered<'_>) -> Verdict {
     if order == Some(std::cmp::Ordering::Less) {
         return Verdict::Keep;
     }
-    // Any listing replaces what a push may have cut short.
-    if held.partial && listing {
-        return Verdict::Replace { partial: false };
-    }
     let newer_observation = offered.observed_ms > held.observed_ms;
     let newer_edit = order == Some(std::cmp::Ordering::Greater);
     if newer_observation || newer_edit {
+        // What a push brings may be a snippet, whatever it replaces; a read's copy is whole.
         Verdict::Replace {
-            partial: offered.arrival.is_push() && offered.partial,
+            partial: pushed || offered.partial,
         }
     } else {
         Verdict::Keep
@@ -161,8 +165,8 @@ pub fn content_verdict(held: &Held<'_>, offered: &Offered<'_>) -> Verdict {
 }
 
 /// Whether a message the cache does not hold yet is stored as partial. Every push of an unknown
-/// id is, until the bridge says which pushes carry whole bodies: it may be a snippet, and the
-/// next listing will replace it.
+/// id is, as every text a push brings is (rule 5), until a provider says which pushes carry whole
+/// bodies: it may be a snippet, and only a read proves it whole.
 #[must_use]
 pub fn new_row_partial(arrival: Arrival, offered_partial: bool) -> bool {
     arrival.is_push() || offered_partial
@@ -333,7 +337,9 @@ mod tests {
             );
             assert_eq!(
                 content_verdict(&h, &offered(None, false, arrival)),
-                Verdict::Replace { partial: false },
+                Verdict::Replace {
+                    partial: arrival.is_push()
+                },
                 "{arrival:?}: no edit time from a path that cannot say; the later observation wins"
             );
         }
@@ -362,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pushed_snippet_never_overwrites_listing_text_and_a_listing_replaces_a_partial() {
+    fn a_pushed_snippet_never_overwrites_listing_text_and_only_a_read_proves_a_pushed_text_whole() {
         let text = "The full body of a long message";
         for snippet in [
             "The full body",
@@ -376,7 +382,8 @@ mod tests {
                 "{snippet:?}"
             );
         }
-        // A real edit pushed later still lands.
+        // A real edit pushed later still lands, but as possibly a snippet: it may be the start of
+        // an edit that changed the start.
         assert_eq!(
             run(
                 text,
@@ -386,17 +393,43 @@ mod tests {
                 20,
                 Arrival::PushUpdate
             ),
-            Verdict::Replace { partial: false }
+            Verdict::Replace { partial: true }
         );
-        // A partial row is replaced by any listing, even one that started earlier.
+        // So does a pushed edit of a partial row: a push never proves a text whole.
+        for arrival in [Arrival::PushUpdate, Arrival::PushCreate] {
+            assert_eq!(
+                run("The full", 30, true, "The fuller", 40, arrival),
+                Verdict::Replace { partial: true },
+                "{arrival:?}"
+            );
+        }
+        for arrival in [Arrival::Listing, Arrival::Rows] {
+            // A read begun after the push replaces it, whatever text it brings...
+            assert_eq!(
+                run("The full", 30, true, text, 35, arrival),
+                Verdict::Replace { partial: false },
+                "{arrival:?}"
+            );
+            // ...one begun no later, with other text, changes nothing: it may be of the version
+            // before an edit the push brought...
+            for at in [5, 30] {
+                assert_eq!(
+                    run("The full", 30, true, text, at, arrival),
+                    Verdict::Keep,
+                    "{arrival:?} at {at}"
+                );
+            }
+            // ...and one that carries the same text confirms it, whenever it began.
+            assert_eq!(
+                run(text, 30, true, text, 5, arrival),
+                Verdict::Confirm,
+                "{arrival:?}"
+            );
+        }
+        // A push of the same text confirms nothing.
         assert_eq!(
-            run("The full", 30, true, text, 5, Arrival::Listing),
-            Verdict::Replace { partial: false }
-        );
-        // ...and confirmed by one that carries the same text.
-        assert_eq!(
-            run(text, 30, true, text, 5, Arrival::Listing),
-            Verdict::Confirm
+            run(text, 30, true, text, 40, Arrival::PushUpdate),
+            Verdict::Keep
         );
         assert!(new_row_partial(Arrival::PushCreate, false));
         assert!(new_row_partial(Arrival::PushUpdate, false));

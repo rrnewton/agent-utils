@@ -1323,7 +1323,9 @@ impl Writer<'_> {
     /// another process held too long, a constraint one row broke): whatever it said, an edit, a
     /// deletion or a creation, the file lacks it, exactly as if a full queue had dropped it. So it
     /// is recorded as a drop: in memory at once, where every read judges by it, and in the file by
-    /// a step of its own as soon as the file takes writes again ([`Writer::drops_step`]).
+    /// a step of its own as soon as the file takes writes again ([`Writer::drops_step`]). So is any
+    /// other change the file does not take though it may lack it: an offer for a channel off the
+    /// list, one an erase made stale, a pushed edit whose text it keeps out.
     fn lost(&mut self, chan: &ChanKey) {
         let now = self.now();
         lock(&self.shared.drops)
@@ -1985,6 +1987,15 @@ impl Writer<'_> {
             partial: offered_partial,
         };
         let verdict = merge::content_verdict(&held_copy, &offered_copy);
+        // A pushed edit whose text the file does not take: rule 5's snippet of the held text,
+        // which may as well be the whole of an edit that cut the end off; a copy of an earlier
+        // version by its edit time; or one seen no later than the read that brought the held text
+        // (the same millisecond, say). Whichever it was, the feed delivered a change the file may
+        // lack, so it is recorded as left out: nothing of the channel seen before now is vouched
+        // for, by the feed or by a claim, until a read begun after it has seen it again.
+        if arrival == Arrival::PushUpdate && hash != held.content_hash && verdict == Verdict::Keep {
+            self.lost(chan);
+        }
         // A copy of an earlier version than the one held (rule 2's edit times), however late it
         // was seen: it changes nothing of the message but what only ever accumulates.
         let earlier_version =

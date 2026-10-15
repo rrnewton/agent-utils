@@ -3769,6 +3769,17 @@ polled provider's feed told it (`live_poll_seconds`): the poller publishes new m
 else, and the server refuses an adapter's push for a channel it polls, so no deletion or edit ever
 arrives that way; only reads prove what such a channel still holds.
 
+A pushed text may be cut short. A bridge sends the start of a message rather than the whole of it
+when its live event carries no body, and nothing in the push says which it sent. So whatever text a
+push brings, a new message's or an edit's, is held as possibly cut short, and is never counted as
+one the cache would answer with until a read has brought the whole text: one that brings the same
+text, whenever it began, or one that began after the push. A read that began no later than the
+push and brings other text changes nothing, since it may be from before the edit. A pushed edit
+that is only the start of the text a read brought does not replace it; but it may as well be the
+whole of an edit that cut the end off, so the channel is then in doubt, as after a change left out.
+So it is whenever a pushed edit is not taken: one older, by its edit time, than the text held, or
+one seen no later than the read that brought that text.
+
 ### Whose reads fill it
 
 * **A read-scope token never fills it.** The read token is the one pasted into a voice agent. No
@@ -3856,7 +3867,9 @@ starts:
   * `content_differs`.
 
 With a table but no file open, an ask counts as `off`. With no table, nothing is counted. An ask
-the cache would never answer, such as Slack's Flat view, is not counted at all.
+the cache would never answer, such as Slack's Flat view, is not counted at all. An answer that
+would hold a message only as a push brought it, possibly cut short, counts as a `gap` until a read
+brings that message whole.
 
 A Slack window upstream carries thread replies (`#307 slack-reply-live`), and the cache answers a
 window from the channel's own messages. Where it would have served one, the replies upstream

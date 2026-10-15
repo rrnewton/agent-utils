@@ -17,11 +17,11 @@
 //!
 //! | Consumer | Would serve when |
 //! |---|---|
-//! | `messages`, `digest`, `todo`, `bankruptcy`, `speech`: the callers of `ops::messages` | the scope's coverage is contiguous from the head down to `limit` rows, the band is vouched for (the stretch served at or above the head's settled top, which no claim holds, lies wholly in what the latest read of the scope's newest end listed, from where its listing began up; every row served there was listed by that read, whatever else has seen it since; and none lies above the head), the latest read of the scope's newest end began at most [`FRESH_UNFED_MS`] before the ask ([`FRESH_LIVE_FED_MS`] when a live producer feeds the channel), and so was every claim under the window below the settled top (edits and deletions reflected as of then), unless the channel's feed carries edits and deletions, an adapter pushes them (not the live poller, which publishes creations alone), and they have reached the file since that claim was read, nothing served is in doubt (see below), and the barrier passed |
-//! | `message_by_id`, `summary` | the message is held and not in doubt (an offer dropped for its channel since it was seen may have been its edit or deletion, whatever its feed carries), and the barrier passed, and: on a bridge, whose feed carries deletions, the coverage of its home scope was revalidated within [`REVALIDATED_BRIDGE_MS`], or the channel is fed by an adapter's pushes (the live poller publishes creations alone) and the message was seen, or that coverage revalidated, since the feed's changes have reached the file: since this process's file could take them and the route list first reached it (a deletion made before then, while the server was down or the list unknown, reached nothing; a channel put back on the list, or added to it, is in doubt until read again, since nothing of it reached the file while it was off); on Slack and Discord, whose feeds carry only additions, within [`REVALIDATED_ADDITIONS_ONLY_MS`], and otherwise it would take one existence check upstream first (`needs_existence_check`) |
-//! | `page` | the span asked for lies inside complete coverage (up to the page's last row, when it is full), the band is vouched for as for `messages`, no row of it is in doubt, and the barrier passed; an open-ended page needs a fresh head, not in doubt, as well |
-//! | `count` | complete coverage spans `[since, head − 120 s]` (so never on Slack, whose coverage is never complete), the band is vouched for as for `messages`, the head and the claims counted are as fresh as for `messages`, nothing counted is in doubt, and the barrier passed |
-//! | `timeline_fallback` | coverage holds `limit` rows down from the head, the band is vouched for as for `messages` (so a row pushed or posted above the head is never served), nothing served is in doubt, and the barrier passed: what a newest page answered from the cache would be, were upstream to fail. Slack's Flat view never |
+//! | `messages`, `digest`, `todo`, `bankruptcy`, `speech`: the callers of `ops::messages` | the scope's coverage is contiguous from the head down to `limit` rows, the band is vouched for (the stretch served at or above the head's settled top, which no claim holds, lies wholly in what the latest read of the scope's newest end listed, from where its listing began up; every row served there was listed by that read, whatever else has seen it since; and none lies above the head), the latest read of the scope's newest end began at most [`FRESH_UNFED_MS`] before the ask ([`FRESH_LIVE_FED_MS`] when a live producer feeds the channel), and so was every claim under the window below the settled top (edits and deletions reflected as of then), unless the channel's feed carries edits and deletions, an adapter pushes them (not the live poller, which publishes creations alone), and they have reached the file since that claim was read, nothing served is in doubt (see below) or held only as a push brought it (see `gap`), and the barrier passed |
+//! | `message_by_id`, `summary` | the message is held whole (not as a push brought it: see `gap`) and not in doubt (an offer dropped for its channel since it was seen may have been its edit or deletion, whatever its feed carries), and the barrier passed, and: on a bridge, whose feed carries deletions, the coverage of its home scope was revalidated within [`REVALIDATED_BRIDGE_MS`], or the channel is fed by an adapter's pushes (the live poller publishes creations alone) and the message was seen, or that coverage revalidated, since the feed's changes have reached the file: since this process's file could take them and the route list first reached it (a deletion made before then, while the server was down or the list unknown, reached nothing; a channel put back on the list, or added to it, is in doubt until read again, since nothing of it reached the file while it was off); on Slack and Discord, whose feeds carry only additions, within [`REVALIDATED_ADDITIONS_ONLY_MS`], and otherwise it would take one existence check upstream first (`needs_existence_check`) |
+//! | `page` | the span asked for lies inside complete coverage (up to the page's last row, when it is full), the band is vouched for as for `messages`, no row of it is in doubt or held only as a push brought it, and the barrier passed; an open-ended page needs a fresh head, not in doubt, as well |
+//! | `count` | complete coverage spans `[since, head − 120 s]` (so never on Slack, whose coverage is never complete), the band is vouched for as for `messages`, the head and the claims counted are as fresh as for `messages`, nothing counted is in doubt or held only as a push brought it (the comparison checks the text too), and the barrier passed |
+//! | `timeline_fallback` | coverage holds `limit` rows down from the head, the band is vouched for as for `messages` (so a row pushed or posted above the head is never served), nothing served is in doubt or held only as a push brought it, and the barrier passed: what a newest page answered from the cache would be, were upstream to fail. Slack's Flat view never |
 //!
 //! # What a miss says
 //!
@@ -41,7 +41,9 @@
 //!   saw: a thread's listing says nothing of Main, nor a two-row page of the rows below it;
 //! - `gap`: the cache does not hold what would be served: no head, a hole in the coverage, a stretch
 //!   of the unsettled band below where the latest read of the scope's newest end began listing, a
-//!   row in the band that read did not list, a row above the head, or not the message;
+//!   row in the band that read did not list, a row above the head, or not the message; or it holds
+//!   a row's text only as a push brought it, which may be a snippet (a bridge sends one when its
+//!   live event has no body), no read having proven it whole since (merge rule 5);
 //! - `incomplete`: covered, but by reads that may have left a message out (Slack's);
 //! - `stale_head`: what the cache holds was confirmed too long ago: the head, the claims under a
 //!   window or a count, or the coverage of a message's home scope on a bridge;
@@ -389,11 +391,14 @@ pub struct Facts {
     /// Whether a live producer feeds the channel: its provider is polled, or adapters push.
     pub live_fed: bool,
     /// Since when every change the live feed offered for the channel reached the file or was
-    /// recorded as left out: from when this process's file could take offers and the route list
-    /// first reached it ([`super::MessageCache::fed_since_ms`]). A live feed vouches for nothing
-    /// seen before it. `None` when not known, or when nothing feeding the channel ever delivers a
-    /// deletion or an edit (its provider is polled: the poller publishes creations alone, and the
-    /// ingest route refuses an adapter's pushes for it): then for nothing.
+    /// recorded as left out (a pushed edit whose text the file keeps out among them): from when
+    /// this process's file could take offers and the route list first reached it
+    /// ([`super::MessageCache::fed_since_ms`]). A live feed vouches for nothing seen before it,
+    /// and for nothing but that a message exists and its text is unchanged: never that a text a
+    /// push brought, which may be a snippet, is whole. `None` when not known, or when nothing
+    /// feeding the channel ever delivers a deletion or an edit (its provider is polled: the poller
+    /// publishes creations alone, and the ingest route refuses an adapter's pushes for it): then
+    /// for nothing.
     pub fed_since_ms: Option<i64>,
     /// The latest local time an offer for the channel was dropped in this process, if one was.
     /// The rule takes the later of this and the file's [`View::dropped_ms`].
@@ -516,6 +521,12 @@ fn trusted(row: &CachedMessage, dropped: Option<i64>) -> bool {
     dropped.is_none_or(|dropped| row.observed_ms > dropped)
 }
 
+/// Whether the cache holds a row's text whole: no push brought it since a read last proved it
+/// (merge rule 5). A text a push brought may be a snippet, and is never handed back as the message.
+fn whole(row: &CachedMessage) -> bool {
+    !row.content_partial
+}
+
 /// Whether the scope's head is trusted after the latest drop: a read of the scope's newest end
 /// began after it, and would have listed a creation the drop left out. No head is not a doubt.
 fn head_trusted(view: &View, dropped: Option<i64>) -> bool {
@@ -566,7 +577,9 @@ fn current(full_ms: Option<i64>, facts: &Facts) -> bool {
 /// adapter's pushes: [`Facts::fed_since_ms`] is `None` for a polled channel), and the feed's
 /// current run (from when the file could take offers in this process and the route list first
 /// reached it) began no later than `at_ms`. A change made before the run began (while the server
-/// was down, say) reached nothing, and no drop records it.
+/// was down, say) reached nothing, and no drop records it. One the feed delivered and the file did
+/// not take (an edit whose text it kept out, say) is a drop, which each rule checks apart
+/// ([`trusted`]).
 fn fed_since(at_ms: i64, facts: &Facts) -> bool {
     facts.feed == Feed::Deletions
         && facts.live_fed
@@ -623,6 +636,9 @@ fn newest(view: &View, limit: usize, facts: &Facts, needs_fresh: bool) -> Result
     if !head_trusted(view, dropped) || !window.iter().all(|row| trusted(row, dropped)) {
         return Err(Miss::Suspect);
     }
+    if !window.iter().all(whole) {
+        return Err(Miss::Gap);
+    }
     let head = view.head.ok_or(Miss::Gap)?;
     // A window of fewer rows than asked is the whole scope only from its very start, which no
     // coverage reaches: it is clipped at the age limit.
@@ -649,15 +665,18 @@ fn newest(view: &View, limit: usize, facts: &Facts, needs_fresh: bool) -> Result
     Ok(Decision::Serve)
 }
 
-/// One message: held, seen since the channel's latest drop, and its home scope revalidated recently
-/// enough for its provider's feed. A live feed that carries deletions vouches for a message only
-/// when nothing it offered since the message was seen was dropped, and only when it has been
-/// running since the message was seen, or its home scope revalidated: a deletion made before then
-/// reached nothing.
+/// One message: held whole, seen since the channel's latest drop, and its home scope revalidated
+/// recently enough for its provider's feed. A live feed that carries deletions vouches for a
+/// message only when nothing it offered since the message was seen was dropped, and only when it
+/// has been running since the message was seen, or its home scope revalidated: a deletion made
+/// before then reached nothing.
 fn message(view: &View, facts: &Facts) -> Result<Decision, Miss> {
     let row = view.rows.first().ok_or(Miss::Gap)?;
     if !trusted(row, dropped(view, facts)) {
         return Err(Miss::Suspect);
+    }
+    if !whole(row) {
+        return Err(Miss::Gap);
     }
     let revalidated = view
         .coverage
@@ -699,6 +718,9 @@ fn page(
     {
         return Err(Miss::Suspect);
     }
+    if !view.rows.iter().all(whole) {
+        return Err(Miss::Gap);
+    }
     let end = if full {
         view.rows[limit].created_ms.saturating_add(1)
     } else if let Some(until) = until {
@@ -725,6 +747,9 @@ fn count(view: &View, since: i64, facts: &Facts) -> Result<Decision, Miss> {
     let dropped = dropped(view, facts);
     if !head_trusted(view, dropped) || !view.rows.iter().all(|row| trusted(row, dropped)) {
         return Err(Miss::Suspect);
+    }
+    if !view.rows.iter().all(whole) {
+        return Err(Miss::Gap);
     }
     let head = view.head.ok_or(Miss::Gap)?;
     let cover = coverage::covers(&view.coverage, since, head.settled_top()).ok_or(Miss::Gap)?;

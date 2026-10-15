@@ -1461,8 +1461,16 @@ impl MessageCache {
     /// whatever the feed delivered for it while it was off the list was refused. And an erase of
     /// a whole channel forgets, with its rows, the changes the feed delivered for it, and so
     /// records a drop of the channel once it is carried out ([`MessageCache::last_drop_ms`]), as
-    /// does a change such an erase discards on its way to the file. Either way nothing of the
-    /// channel seen by then is vouched for until a read begun afterwards has seen it again.
+    /// does a change such an erase discards on its way to the file. So does a pushed edit whose
+    /// text the file keeps out (merge rule 5's snippet of the text a read brought, which may as
+    /// well be the whole of an edit that cut the end off; a copy of an earlier version by its edit
+    /// time; or one seen no later than the read that brought the text held). Either way nothing
+    /// of the channel seen by then is vouched for until a read begun afterwards has seen it again.
+    ///
+    /// The feed vouches for what it could have contradicted, and no more: that a message exists
+    /// and its text has not changed since. It never makes a text whole. Whatever text a push
+    /// brought may be a snippet, and is never served until a read proves it whole (merge rule 5,
+    /// and [`shadow`]'s `gap`).
     #[must_use]
     pub fn fed_since_ms(&self) -> i64 {
         self.shared.fed_since_ms.load(Ordering::SeqCst)

@@ -1042,7 +1042,7 @@ fn a_complete_deltas_deletions_remove_ghosts_but_not_what_was_seen_after_it_star
 }
 
 #[test]
-fn a_pushed_snippet_never_overwrites_listing_text_and_a_listing_replaces_a_partial() {
+fn a_pushed_snippet_never_overwrites_listing_text_and_a_later_listing_replaces_a_partial() {
     let fx = Fixture::new("cache-snippet");
     let full = Message {
         content: "The whole body of a long message about the release".to_owned(),
@@ -1062,8 +1062,14 @@ fn a_pushed_snippet_never_overwrites_listing_text_and_a_listing_replaces_a_parti
     };
     push(&fx, unknown, false, T0 + 300);
     assert!(held(&fx, "m2").expect("held").content_partial);
-    // ...and any listing replaces it, even one that started earlier.
+    // ...which a listing that started earlier leaves as it is: it may be of a version before an
+    // edit the push brought...
     fx.list(vec![m(2)], T0 + 250, None);
+    let kept = held(&fx, "m2").expect("held");
+    assert!(kept.content_partial);
+    assert_eq!(kept.message.content, "The start of");
+    // ...and one that started later replaces.
+    fx.list(vec![m(2)], T0 + 350, None);
     let replaced = held(&fx, "m2").expect("held");
     assert!(!replaced.content_partial);
     assert_eq!(replaced.message.content, m(2).content);

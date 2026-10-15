@@ -36,6 +36,17 @@
 //! - **A change a whole erase discards**: one on its way to the file when an erase of its whole
 //!   channel moved the channel's epoch is recorded as left out, whether or not the file held a row
 //!   of the channel for the erase to record a drop on.
+//!
+//! And what the fourth review of the fix found:
+//!
+//! - **A pushed edit the file keeps out**: rule 5 keeps the text a read brought over a pushed edit
+//!   that is a strict prefix of it, taking it for a bridge's snippet, but it may as well be the
+//!   whole of an edit that cut the end off; and rule 2 keeps it over a pushed edit seen in the same
+//!   millisecond as that read. Either way the file may lack a change the feed delivered, so it is
+//!   recorded as left out, and the feed never vouches for the text the edit took away.
+//! - **A pushed text taken for whole**: whatever text a push brings may be a snippet, and is never
+//!   served as the message until a read proves it whole; a pushed edit never makes a pushed text
+//!   whole, and a read that began no later than the push never replaces it.
 
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
@@ -1580,15 +1591,16 @@ fn change_dropped_by_an_erase(prior: bool, how: Option<WholeErase>, edit: bool) 
     )
 }
 
-/// The control: with no erase, the queued deletion lands, and its tombstone holds the older copy
-/// back. (An edit of a message the file does not hold is stored partial, and any listing replaces a
-/// partial row, an older one too: #297's remaining item, the review's probe
-/// `rv3_nb_a_pushed_edit_of_an_unheld_message_is_never_undone_by_an_older_copy`.)
+/// The control: with no erase, the queued change lands, and holds the older copy back: a
+/// deletion's tombstone, and an edit's text, held as possibly a snippet, which a read that began
+/// before the push never replaces (merge rule 5; this edit was #297's remaining item (h)).
 #[test]
-fn control_a_queued_deletion_with_no_erase_lands_and_holds_an_older_copy_back() {
+fn control_a_queued_change_with_no_erase_lands_and_holds_an_older_copy_back() {
     let mut vouched = Vec::new();
     for prior in [false, true] {
-        vouched.extend(change_dropped_by_an_erase(prior, None, false));
+        for edit in [false, true] {
+            vouched.extend(change_dropped_by_an_erase(prior, None, edit));
+        }
     }
     assert!(vouched.is_empty(), "{vouched:#?}");
 }
@@ -1614,4 +1626,354 @@ fn a_change_a_whole_erase_drops_for_a_channel_with_no_row_is_never_undone() {
         vouched.is_empty(),
         "a change a whole erase dropped is undone and vouched for: {vouched:#?}"
     );
+}
+
+// ---- the fourth review of the fix: what a push says of a message's text ------------------------
+
+/// A change of message `msg`, its text now `text`, pushed at `at`: an edit with `update`, a
+/// creation without.
+fn push_text(
+    cache: &MessageCache,
+    chan: &ChanKey,
+    msg: Message,
+    text: &str,
+    update: bool,
+    at: i64,
+) {
+    let changed = Message {
+        content: text.to_owned(),
+        ..msg
+    };
+    let stamp = cache.stamp(chan);
+    cache.offer(
+        chan.clone(),
+        stamp,
+        Observation::Push {
+            push: Push::Upsert {
+                message: Box::new(Incoming::new(changed, Scope::Flat)),
+                update,
+                partial: false,
+            },
+            observed_ms: at,
+        },
+    );
+    assert!(cache.quiesce_blocking(WAIT));
+}
+
+/// What the cache would decide for `id` by id on a live-fed bridge, asked at `asked_ms`, the text
+/// it holds, and whether it holds that text as possibly a snippet.
+fn decide_id(
+    cache: &MessageCache,
+    chan: &ChanKey,
+    id: &str,
+    asked_ms: i64,
+) -> (shadow::Decision, Option<String>, Option<bool>) {
+    let ask = shadow::Ask::Message {
+        consumer: shadow::Consumer::MessageById,
+        id: MessageId(id.to_owned()),
+    };
+    let query = shadow::query(&ask, observe::Shape::Bridge, true).expect("a query");
+    let view = cache.shadow_view(chan, &query).served().expect("served");
+    let facts = shadow::Facts {
+        asked_ms,
+        live_fed: true,
+        fed_since_ms: Some(cache.fed_since_ms()),
+        dropped_ms: cache.last_drop_ms(chan),
+        barrier: true,
+        feed: shadow::Feed::Deletions,
+    };
+    let row = view.rows.first();
+    (
+        shadow::decide(&ask, &view, &facts),
+        row.map(|r| r.message.content.clone()),
+        row.map(|r| r.content_partial),
+    )
+}
+
+/// The adapter pushes an edit of m3 whose text the file does not take. Rule 5 takes a pushed text
+/// that is a strict prefix of the text a read brought for a bridge's snippet, and keeps the text it
+/// holds. But that prefix may as well be the whole of an edit that cut the end off ("body number 3"
+/// to "body number"), or a snippet of an edit that changed the end ("body num…" for "body
+/// numeral"): the file then lacks a change the feed delivered, and must record it as left out, or
+/// the feed (and, within the day, the claim of the read that brought the old text) vouches for text
+/// the edit took away. Asked 5 s on, and a day and an hour on. (The review's probe
+/// `p1_a_pushed_edit_that_shortens_the_text_is_never_vouched_for_as_the_old_text`.)
+#[test]
+fn a_pushed_edit_the_file_does_not_take_is_never_vouched_for_as_the_text_it_replaced() {
+    let mut failures = Vec::new();
+    for (label, new_text) in [
+        ("an edit that cut the end off", "body number"),
+        ("a snippet of an edit that changed the end", "body num…"),
+    ] {
+        let dir = crate::testing::TempDir::new("cache-pushed-prefix");
+        let first = T0 + 8 * STEP + SEC;
+        let clock = Arc::new(ManualClock(AtomicI64::new(first)));
+        let (cache, chan) = bridge_with_flat(&dir, &clock, first);
+        let at = first + 10 * SEC;
+        clock.set(at);
+        push_text(&cache, &chan, m(3), new_text, true, at);
+        let (_, kept, _) = decide_id(&cache, &chan, "m3", at + 1);
+        assert_eq!(
+            kept.as_deref(),
+            Some("body number 3"),
+            "{label}: rule 5 keeps the text a read brought"
+        );
+        for asked in [at + 5 * SEC, first + 25 * HOUR] {
+            clock.set(asked);
+            let (decision, content, _) = decide_id(&cache, &chan, "m3", asked);
+            if decision == shadow::Decision::Serve && content.as_deref() != Some(new_text) {
+                failures.push(format!(
+                    "{label}, asked {} s on: {decision:?} {content:?}, the feed having delivered \
+                     {new_text:?} (drop {:?})",
+                    (asked - first) / SEC,
+                    cache.last_drop_ms(&chan)
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// The same edit, cutting the end off m3, and two hours on a read of the newest end lists m6 to m8
+/// alone, its listing starting above m3. m3 rests on the first read's claim, which the feed keeps
+/// current; a window of 8 must not hand back the text the edit took away. (The review's probe
+/// `p1w_a_window_never_hands_back_text_a_pushed_shortening_edit_took_away`.)
+#[test]
+fn a_window_never_hands_back_text_a_pushed_edit_the_file_did_not_take_took_away() {
+    let dir = crate::testing::TempDir::new("cache-pushed-prefix-window");
+    let first = T0 + 8 * STEP + SEC;
+    let clock = Arc::new(ManualClock(AtomicI64::new(first)));
+    let (cache, chan) = bridge_with_flat(&dir, &clock, first);
+    let at = first + 10 * SEC;
+    clock.set(at);
+    push_text(&cache, &chan, m(3), "body number", true, at);
+    let later = first + 2 * HOUR;
+    clock.set(later);
+    let top = Observation::Listing(Listing {
+        scope: Scope::Flat,
+        rows: (6..=8).map(|n| Incoming::new(m(n), Scope::Flat)).collect(),
+        observed_ms: later,
+        proof: Some(newest_proof(ListStart::At(T0 + 6 * STEP))),
+    });
+    let stamp = cache.stamp(&chan);
+    cache.offer(chan.clone(), stamp, top);
+    assert!(cache.quiesce_blocking(WAIT));
+    let asked = later + 5 * SEC;
+    clock.set(asked);
+    let ask = window(8);
+    let query = shadow::query(&ask, observe::Shape::Bridge, true).expect("a query");
+    let view = cache.shadow_view(&chan, &query).served().expect("served");
+    let facts = shadow::Facts {
+        asked_ms: asked,
+        live_fed: true,
+        fed_since_ms: Some(cache.fed_since_ms()),
+        dropped_ms: cache.last_drop_ms(&chan),
+        barrier: true,
+        feed: shadow::Feed::Deletions,
+    };
+    let decision = shadow::decide(&ask, &view, &facts);
+    let m3 = view
+        .rows
+        .iter()
+        .find(|r| r.message.id.0 == "m3")
+        .map(|r| r.message.content.clone());
+    assert!(
+        !(decision == shadow::Decision::Serve && m3.as_deref() == Some("body number 3")),
+        "a window {decision:?} hands back m3 as {m3:?}"
+    );
+}
+
+/// A read begins at `at` and lands with m3 as `FIRST EDIT`; an adapter's edit of m3 to `EDITED`,
+/// received in the same millisecond, lands after it. Rule 2 takes a copy over the held one only
+/// when it was seen later, so the file keeps the read's text: the edit must then be recorded as
+/// left out, never lost while the feed vouches for the text it replaced. #297's remaining item (f),
+/// the review's probe `rv2_c_a_pushed_edit_tied_with_the_read_that_brought_the_old_text_is_not_lost`.
+#[test]
+fn a_pushed_edit_tied_with_the_read_that_brought_the_old_text_is_never_lost() {
+    let dir = crate::testing::TempDir::new("cache-pushed-edit-tie");
+    let first = T0 + 8 * STEP + SEC;
+    let clock = Arc::new(ManualClock(AtomicI64::new(first)));
+    let (cache, chan) = bridge_with_flat(&dir, &clock, first);
+    let at = first + 10 * SEC;
+    clock.set(at);
+    let read_stamp = cache.stamp(&chan);
+    let push_stamp = cache.stamp(&chan);
+    let read = Observation::Listing(Listing {
+        scope: Scope::Flat,
+        rows: (1..=8)
+            .map(|n| {
+                let mut row = m(n);
+                if n == 3 {
+                    row.content = "FIRST EDIT".to_owned();
+                }
+                Incoming::new(row, Scope::Flat)
+            })
+            .collect(),
+        observed_ms: at,
+        proof: Some(newest_proof(ListStart::At(T0 + STEP))),
+    });
+    cache.offer(chan.clone(), read_stamp, read);
+    let edited = Message {
+        content: "EDITED".to_owned(),
+        ..m(3)
+    };
+    cache.offer(
+        chan.clone(),
+        push_stamp,
+        Observation::Push {
+            push: Push::Upsert {
+                message: Box::new(Incoming::new(edited, Scope::Flat)),
+                update: true,
+                partial: false,
+            },
+            observed_ms: at,
+        },
+    );
+    assert!(cache.quiesce_blocking(WAIT));
+    let mut vouched = Vec::new();
+    for asked in [at + 5 * SEC, first + 25 * HOUR] {
+        clock.set(asked);
+        let (decision, content, _) = decide_id(&cache, &chan, "m3", asked);
+        if vouches_for_undone_change(decision, content.as_deref(), true) {
+            vouched.push(format!(
+                "asked {} s on: {decision:?} {content:?}",
+                (asked - first) / SEC
+            ));
+        }
+    }
+    assert!(vouched.is_empty(), "the old text vouched for: {vouched:#?}");
+}
+
+/// A text a push brought may be a snippet (a bridge falls back to one when its live event has no
+/// body), and the cache holds it as possibly one. It must never count it as the whole message: a
+/// pushed creation of a message it did not hold (`the full…`); one followed by a pushed edit, which
+/// may be a snippet too (`the fuller…`); and a pushed edit of a message a read brought, whose text
+/// is no prefix of the old (`Body…`, a snippet of an edit that changed the start). Asked 5 s on,
+/// and a day and an hour on, where only the feed could vouch. (The review's probes
+/// `p2_a_partial_pushed_creation_is_never_served_as_the_whole_message` and
+/// `p2b_a_pushed_update_never_makes_a_pushed_snippet_whole`.)
+#[test]
+fn a_text_a_push_brought_is_never_served_as_the_whole_message() {
+    let mut failures = Vec::new();
+    for case in [
+        "a pushed creation",
+        "a pushed creation and a pushed edit",
+        "a pushed edit",
+    ] {
+        let dir = crate::testing::TempDir::new("cache-pushed-snippet");
+        let first = T0 + 8 * STEP + SEC;
+        let clock = Arc::new(ManualClock(AtomicI64::new(first)));
+        let (cache, chan) = bridge_with_flat(&dir, &clock, first);
+        let at = first + 10 * SEC;
+        clock.set(at);
+        let nine = message("m9", "ada", "the whole of message nine", T0 + 9 * STEP);
+        let (id, text) = match case {
+            "a pushed creation" => {
+                push_text(&cache, &chan, nine, "the full…", false, at);
+                ("m9", "the full…")
+            }
+            "a pushed creation and a pushed edit" => {
+                push_text(&cache, &chan, nine.clone(), "the full…", false, at);
+                clock.set(at + SEC);
+                push_text(&cache, &chan, nine, "the fuller…", true, at + SEC);
+                ("m9", "the fuller…")
+            }
+            _ => {
+                push_text(&cache, &chan, m(3), "Body…", true, at);
+                ("m3", "Body…")
+            }
+        };
+        for asked in [at + 5 * SEC, first + 25 * HOUR] {
+            clock.set(asked);
+            let (decision, content, partial) = decide_id(&cache, &chan, id, asked);
+            assert_eq!(
+                content.as_deref(),
+                Some(text),
+                "{case}: the pushed text is held"
+            );
+            if partial != Some(true) || decision == shadow::Decision::Serve {
+                failures.push(format!(
+                    "{case}, asked {} s on: {decision:?} {content:?} partial {partial:?}",
+                    (asked - first) / SEC
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// What proves a pushed text whole is a read: one that brings the same text, whenever it began (a
+/// lookup by id here, begun before the push), or one begun after the push, whatever text it
+/// brings. The message is then vouched for again.
+#[test]
+fn a_read_proves_a_pushed_text_whole() {
+    for case in ["the same text, read earlier", "a listing begun later"] {
+        let dir = crate::testing::TempDir::new("cache-pushed-proven");
+        let first = T0 + 8 * STEP + SEC;
+        let clock = Arc::new(ManualClock(AtomicI64::new(first)));
+        let (cache, chan) = bridge_with_flat(&dir, &clock, first);
+        let at = first + 10 * SEC;
+        clock.set(at);
+        let whole = "the whole of message nine";
+        let nine = message("m9", "ada", whole, T0 + 9 * STEP);
+        let pushed = if case == "a listing begun later" {
+            "the whole…"
+        } else {
+            whole
+        };
+        push_text(&cache, &chan, nine.clone(), pushed, false, at);
+        assert_eq!(decide_id(&cache, &chan, "m9", at + 1).2, Some(true));
+        let observation = if case == "a listing begun later" {
+            clock.set(at + 20 * SEC);
+            Observation::Listing(Listing {
+                scope: Scope::Flat,
+                rows: (1..=8)
+                    .map(m)
+                    .chain([nine])
+                    .map(|row| Incoming::new(row, Scope::Flat))
+                    .collect(),
+                observed_ms: at + 20 * SEC,
+                proof: Some(newest_proof(ListStart::At(T0 + STEP))),
+            })
+        } else {
+            clock.set(at + 20 * SEC);
+            Observation::Rows {
+                rows: vec![Incoming::new(nine, Scope::Flat)],
+                scope: None,
+                observed_ms: at - 5 * SEC,
+            }
+        };
+        let stamp = cache.stamp(&chan);
+        cache.offer(chan.clone(), stamp, observation);
+        assert!(cache.quiesce_blocking(WAIT));
+        let asked = at + 30 * SEC;
+        clock.set(asked);
+        assert_eq!(
+            decide_id(&cache, &chan, "m9", asked),
+            (shadow::Decision::Serve, Some(whole.to_owned()), Some(false)),
+            "{case}"
+        );
+    }
+}
+
+/// No erase at all: a pushed edit of m3, a message the file does not hold yet (held as possibly a
+/// snippet), and then a read lands the bridge's copy dated before the edit. That copy must not
+/// replace the edit's text: it may be of the version before the edit. #297's remaining item (h),
+/// the review's probe `rv3_nb_a_pushed_edit_of_an_unheld_message_is_never_undone_by_an_older_copy`.
+#[test]
+fn a_pushed_edit_of_an_unheld_message_is_never_undone_by_an_older_copy() {
+    let dir = crate::testing::TempDir::new("cache-unheld-edit");
+    let first = T0 + 8 * STEP + SEC;
+    let clock = Arc::new(ManualClock(AtomicI64::new(first)));
+    let chan = ChanKey::new("p", "C1");
+    let cache = fixtures::open(&dir, &clock, Limits::default());
+    cache.retain_only(routes_of(std::slice::from_ref(&chan)));
+    assert!(cache.quiesce_blocking(WAIT));
+    let at = first + 20 * SEC;
+    clock.set(at);
+    push_text(&cache, &chan, m(3), "EDITED", true, at);
+    clock.set(first + 40 * SEC);
+    read_dated(&cache, &chan, first + 15 * SEC, true);
+    let vouched = undone_when_asked(&cache, &chan, &clock, first, true, "an unheld edit");
+    assert!(vouched.is_empty(), "{vouched:#?}");
 }
