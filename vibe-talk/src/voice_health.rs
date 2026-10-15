@@ -20,15 +20,23 @@
 //!
 //! **How a call ended** (`#268 voice-call-drops`) is the second record here, [`EndReport`]: one
 //! line per call that opened, naming who or what ended it, on the same terms — closed, bounded by
-//! its own [`LogBudget`], and free of anything said.
+//! its own [`LogBudget`], and free of anything said in the call. `#330 voice-long-turn-drop` gave it
+//! one field of words: the voice SERVICE's own close reason or error, capped at
+//! [`MAX_CLOSE_REASON_CHARS`] with control characters refused, and quoted in the line — never the
+//! owner's speech or the agent's.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-/// The largest request body this route reads. A valid report is under 200 bytes.
-pub const MAX_BODY_BYTES: usize = 512;
+/// The largest request body either route reads. A health report is under 200 bytes; a call-end
+/// record with its longest close reason, every character of it escaped, is under 1000.
+pub const MAX_BODY_BYTES: usize = 1_024;
+
+/// The longest close reason a call-end record carries, in characters: a WebSocket close frame's
+/// reason is at most 123 bytes, and an `error` frame's words are cut to the same order.
+pub const MAX_CLOSE_REASON_CHARS: usize = 123;
 
 /// The most lines this route writes per [`BUDGET_WINDOW`], across every caller. Well above what
 /// honest pages produce — seven lines per call at most — and far below a flood.
@@ -77,6 +85,9 @@ pub enum Cause {
     ErrorFrame,
     /// Audible audio or assistant text arrived after an unresponsive report.
     Recovered,
+    /// A turn completed having carried audible audio and no assistant text: the service answered,
+    /// and its words never arrived. Not an unresponsive state. `#330 voice-long-turn-drop`.
+    AudioWithoutText,
 }
 
 impl Cause {
@@ -87,6 +98,7 @@ impl Cause {
             Self::NoReply => "no_reply",
             Self::ErrorFrame => "error_frame",
             Self::Recovered => "recovered",
+            Self::AudioWithoutText => "audio_without_text",
         }
     }
 }
@@ -137,10 +149,17 @@ impl HealthReport {
         Ok(())
     }
 
-    /// Whether this report ends an episode rather than starting one.
+    /// Whether this report is good news, logged at info: a recovery, or a turn that was heard —
+    /// only its text did not arrive.
     #[must_use]
     pub fn is_recovery(&self) -> bool {
         self.cause == Cause::Recovered
+    }
+
+    /// Whether this report is about the transcript rather than the service answering at all.
+    #[must_use]
+    pub fn is_missing_text(&self) -> bool {
+        self.cause == Cause::AudioWithoutText
     }
 
     /// The single log line: enum names and integers, and nothing anybody said.
@@ -157,6 +176,46 @@ impl HealthReport {
             self.audio_ms,
             self.peak,
         )
+    }
+}
+
+/// Wire protocols a call-end record is defined for: every one the page speaks. `#330
+/// voice-long-turn-drop`: a call on the hosted vendor's protocol that ended mid-answer left no line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub enum CallProtocol {
+    /// The deployment-managed WebSocket protocol.
+    #[serde(rename = "vibe-talk-v1")]
+    VibeTalkV1,
+    /// The hosted conversational vendor's own protocol.
+    #[serde(rename = "elevenlabs")]
+    Hosted,
+}
+
+impl CallProtocol {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::VibeTalkV1 => "vibe-talk-v1",
+            Self::Hosted => "elevenlabs",
+        }
+    }
+}
+
+/// Whether the page was in sight when its call ended. `#330 voice-long-turn-drop`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Visibility {
+    /// On screen.
+    Visible,
+    /// In the background: another app in front, the phone locked.
+    Hidden,
+}
+
+impl Visibility {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Visible => "visible",
+            Self::Hidden => "hidden",
+        }
     }
 }
 
@@ -193,17 +252,23 @@ impl EndedBy {
 }
 
 /// One page's record of how a call that opened ended: `POST /api/v1/voice-end`. The field set IS
-/// the allowlist, as for [`HealthReport`]: closed enums, a flag and integers, and nothing anybody
-/// said.
+/// the allowlist, as for [`HealthReport`]: closed enums, a flag and integers, and one capped line of
+/// the voice service's own words — nothing said in the call.
 ///
 /// `#268 voice-call-drops`. Calls ended on their own, and the only record of why was the voice
 /// bridge's log, which saw the page say goodbye and could not see what made it. One line per call
 /// here tells a hang-up from a drop from the service ending the call.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+///
+/// `#330 voice-long-turn-drop`. A long answer was cut and the call ended, and this line could not say
+/// why: it now carries the service's reason, and what decides between the candidates — whether the
+/// page had just sent a text turn, an `audio_end` or an `interrupt` (a bridge may take the last two
+/// for a cut), whether it was in sight, and how much of the answer was still waiting to be played.
+/// The new fields are optional, so a page that predates them still records its calls.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EndReport {
     /// Wire protocol of the call.
-    pub protocol: Protocol,
+    pub protocol: CallProtocol,
     /// Whether the call was typed.
     pub chat: bool,
     /// Who or what ended it.
@@ -216,6 +281,25 @@ pub struct EndReport {
     pub since_open_ms: u32,
     /// Completed turns in the call: an ordinal, not an id.
     pub turns: u32,
+    /// Whether the page was in sight at the end.
+    #[serde(default)]
+    pub visibility: Option<Visibility>,
+    /// Milliseconds of the assistant's audio still queued to play at the end.
+    #[serde(default)]
+    pub queued_audio_ms: Option<u32>,
+    /// Milliseconds before the end that the page last sent a text turn; absent when it sent none.
+    #[serde(default)]
+    pub last_text_ms: Option<u32>,
+    /// Milliseconds before the end that the page last sent `audio_end`; absent when it sent none.
+    #[serde(default)]
+    pub last_audio_end_ms: Option<u32>,
+    /// Milliseconds before the end that the page last sent `interrupt`; absent when it sent none.
+    #[serde(default)]
+    pub last_interrupt_ms: Option<u32>,
+    /// The voice service's own words: its close reason, or its `error`. At most
+    /// [`MAX_CLOSE_REASON_CHARS`], with no control characters.
+    #[serde(default)]
+    pub close_reason: Option<String>,
 }
 
 impl EndReport {
@@ -236,6 +320,28 @@ impl EndReport {
         {
             return Err("close_code is not a WebSocket close code (1000-4999)".to_owned());
         }
+        if self.queued_audio_ms.is_some_and(|ms| ms > MAX_AUDIO_MS) {
+            return Err(format!("queued_audio_ms is longer than {MAX_AUDIO_MS} ms"));
+        }
+        for (name, ago) in [
+            ("last_text_ms", self.last_text_ms),
+            ("last_audio_end_ms", self.last_audio_end_ms),
+            ("last_interrupt_ms", self.last_interrupt_ms),
+        ] {
+            if ago.is_some_and(|ms| ms > MAX_SINCE_OPEN_MS) {
+                return Err(format!("{name} is longer than {MAX_SINCE_OPEN_MS} ms"));
+            }
+        }
+        if let Some(reason) = &self.close_reason {
+            if reason.chars().count() > MAX_CLOSE_REASON_CHARS {
+                return Err(format!(
+                    "close_reason is longer than {MAX_CLOSE_REASON_CHARS} characters"
+                ));
+            }
+            if reason.chars().any(char::is_control) {
+                return Err("close_reason carries a control character".to_owned());
+            }
+        }
         Ok(())
     }
 
@@ -245,11 +351,15 @@ impl EndReport {
         self.ended_by == EndedBy::HangUp
     }
 
-    /// The single log line: enum names and integers, and nothing anybody said.
+    /// The single log line: enum names and integers, `-` for what was not sent, and the service's
+    /// reason last and quoted, its quotes and backslashes escaped, so it cannot pass for a field.
     #[must_use]
     pub fn log_fields(&self) -> String {
+        let number = |value: Option<u32>| value.map_or_else(|| "-".to_owned(), |n| n.to_string());
         format!(
-            "protocol={} chat={} ended_by={} close_code={} since_open_ms={} turns={}",
+            "protocol={} chat={} ended_by={} close_code={} since_open_ms={} turns={} visibility={} \
+             queued_audio_ms={} last_text_ms={} last_audio_end_ms={} last_interrupt_ms={} \
+             close_reason={}",
             self.protocol.as_str(),
             self.chat,
             self.ended_by.as_str(),
@@ -257,6 +367,14 @@ impl EndReport {
                 .map_or_else(|| "-".to_owned(), |code| code.to_string()),
             self.since_open_ms,
             self.turns,
+            self.visibility.map_or("-", Visibility::as_str),
+            number(self.queued_audio_ms),
+            number(self.last_text_ms),
+            number(self.last_audio_end_ms),
+            number(self.last_interrupt_ms),
+            self.close_reason
+                .as_deref()
+                .map_or_else(|| "-".to_owned(), |reason| format!("{reason:?}")),
         )
     }
 }
@@ -365,6 +483,7 @@ mod tests {
             Cause::NoReply,
             Cause::ErrorFrame,
             Cause::Recovered,
+            Cause::AudioWithoutText,
         ] {
             let wire = serde_json::to_value(cause).expect("serializes");
             assert_eq!(wire, cause.as_str());
@@ -400,6 +519,87 @@ mod tests {
             assert!(absurd.validate().is_err(), "{absurd:?}");
         }
         report(Cause::NoReply).validate().expect("valid");
+    }
+
+    fn end() -> EndReport {
+        EndReport {
+            protocol: CallProtocol::VibeTalkV1,
+            chat: false,
+            ended_by: EndedBy::ServerClosed,
+            close_code: Some(1011),
+            since_open_ms: 95_000,
+            turns: 4,
+            visibility: Some(Visibility::Visible),
+            queued_audio_ms: Some(41_000),
+            last_text_ms: Some(2_000),
+            last_audio_end_ms: Some(1_900),
+            last_interrupt_ms: None,
+            close_reason: Some("interrupt boundary timed out; reconnect".to_owned()),
+        }
+    }
+
+    #[test]
+    fn a_call_end_line_says_what_decides_who_ended_it_and_quotes_only_the_services_reason() {
+        // `#330 voice-long-turn-drop`.
+        assert_eq!(
+            end().log_fields(),
+            "protocol=vibe-talk-v1 chat=false ended_by=server_closed close_code=1011 \
+             since_open_ms=95000 turns=4 visibility=visible queued_audio_ms=41000 \
+             last_text_ms=2000 last_audio_end_ms=1900 last_interrupt_ms=- \
+             close_reason=\"interrupt boundary timed out; reconnect\""
+        );
+        // A reason that tries to look like more fields stays inside its quotes.
+        let forged = EndReport {
+            close_reason: Some("x\" ended_by=hang_up".to_owned()),
+            ..end()
+        };
+        assert!(
+            forged
+                .log_fields()
+                .ends_with(r#"close_reason="x\" ended_by=hang_up""#),
+            "{}",
+            forged.log_fields()
+        );
+        // The hosted protocol is recorded too, by its wire name.
+        let hosted: EndReport = serde_json::from_value(serde_json::json!({
+            "protocol": "elevenlabs", "chat": false, "ended_by": "hang_up",
+            "since_open_ms": 1000, "turns": 1,
+        }))
+        .expect("an older page's record, on the hosted protocol, still reads");
+        assert!(hosted.log_fields().starts_with("protocol=elevenlabs "));
+        assert!(hosted.log_fields().ends_with("close_reason=-"));
+    }
+
+    #[test]
+    fn a_call_end_record_refuses_a_long_or_control_laden_reason_and_absurd_offsets() {
+        end().validate().expect("valid");
+        for absurd in [
+            EndReport {
+                close_reason: Some("x".repeat(MAX_CLOSE_REASON_CHARS + 1)),
+                ..end()
+            },
+            EndReport {
+                close_reason: Some("line one\nline two".to_owned()),
+                ..end()
+            },
+            EndReport {
+                queued_audio_ms: Some(MAX_AUDIO_MS + 1),
+                ..end()
+            },
+            EndReport {
+                last_text_ms: Some(MAX_SINCE_OPEN_MS + 1),
+                ..end()
+            },
+        ] {
+            assert!(absurd.validate().is_err(), "{absurd:?}");
+        }
+        // Counted in characters, not bytes: a reason in another script is not cut shorter.
+        EndReport {
+            close_reason: Some("é".repeat(MAX_CLOSE_REASON_CHARS)),
+            ..end()
+        }
+        .validate()
+        .expect("123 characters of two bytes each is still 123 characters");
     }
 
     #[test]
