@@ -10,10 +10,15 @@
 //! ([`crate::model::Message::mentions`]), and the page draws the chip as `@Ada Lovelace`, speech
 //! says "Ada Lovelace", and a model is shown the name beside the mention. The name comes from the
 //! `users.info` cache every author's name already goes through, so a person who has written in the
-//! channel costs nothing, and a legacy `<@U0123|ada>` names its person by its own label. The
-//! people nobody has looked up yet are looked up as authors are, at most
-//! [`MENTION_LOOKUPS_MAX`] of them for one read, best effort; a mention whose name is not known
-//! is drawn as its id and said as "a mention", as before.
+//! channel costs nothing. The people nobody has looked up yet are looked up as authors are, at
+//! most [`MENTION_LOOKUPS_MAX`] of them for one read, best effort; a mention whose name is not
+//! known is drawn as its id and said as "a mention", as before.
+//!
+//! A legacy `<@U0123|label>` is named the same way, and its label is never taken for the name: it
+//! is text whoever wrote the message chose, not a name the user cache holds, so
+//! `<@U0123|The Owner>` would otherwise put "The Owner" on the chip, in speech and before the
+//! voice agent for whoever `U0123` really is — and only when that person had not also written on
+//! the page, so the name would hang on what else was read.
 //!
 //! A channel mention Slack sends without a name, `<#C0123>` or `<#C0123|>`, is named the same
 //! way, from `conversations.info`, at most [`CHANNEL_LOOKUPS_MAX`] channels for one read, each
@@ -68,19 +73,18 @@ fn tokens(text: &str) -> impl Iterator<Item = &str> {
 }
 
 /// The people a Slack text mentions, `<@U…>` or a legacy `<@U…|label>`, each once, in the order
-/// first mentioned, with the label a legacy mention carries.
-pub(super) fn user_mentions(text: &str) -> Vec<(&str, Option<&str>)> {
+/// first mentioned. A legacy mention's label is dropped: the sender wrote it, so it names nobody.
+pub(super) fn user_mentions(text: &str) -> Vec<&str> {
     let mut seen = HashSet::new();
     tokens(text)
         .filter_map(|token| {
-            let (target, label) = match token.split_once('|') {
-                Some((target, label)) => (target, Some(label.trim()).filter(|l| !l.is_empty())),
-                None => (token, None),
-            };
+            let target = token
+                .split_once('|')
+                .map_or(token, |(target, _label)| target);
             let id = target.strip_prefix('@')?;
-            super::ids::is_user_id(id).then_some((id, label))
+            super::ids::is_user_id(id).then_some(id)
         })
-        .filter(|(id, _)| seen.insert(*id))
+        .filter(|id| seen.insert(*id))
         .collect()
 }
 
@@ -119,20 +123,17 @@ pub fn clean_name(name: &str) -> Option<String> {
     (!bounded.is_empty()).then_some(bounded)
 }
 
-/// Who each user mention of `text` names, from a legacy mention's own label or from `resolved`,
-/// in the order first mentioned. A mention named by neither is left out: it is drawn as its id.
+/// Who each user mention of `text` names, from `resolved` — the user cache and this read's
+/// lookups — in the order first mentioned. A mention `resolved` does not name is left out, and so
+/// drawn as its id, whatever label a legacy mention carries.
 pub(super) fn names_for(
     text: &str,
     resolved: &HashMap<String, (String, bool)>,
 ) -> Vec<MentionName> {
     user_mentions(text)
         .into_iter()
-        .filter_map(|(id, label)| {
-            let name = resolved
-                .get(id)
-                .map(|(name, _)| name.as_str())
-                .or(label.map(|label| label.trim_start_matches('@')))
-                .and_then(clean_name)?;
+        .filter_map(|id| {
+            let name = resolved.get(id).and_then(|(name, _)| clean_name(name))?;
             Some(MentionName {
                 id: id.to_owned(),
                 name,
@@ -143,7 +144,8 @@ pub(super) fn names_for(
 
 impl HttpSlackClient {
     /// The people the user mentions of `raws` name who still need looking up, besides `authors`:
-    /// every one already in the name cache, and at most [`MENTION_LOOKUPS_MAX`] who are not.
+    /// every one already in the name cache, and at most [`MENTION_LOOKUPS_MAX`] who are not. A
+    /// legacy mention's person is among them like any other: its label is no name.
     pub(super) fn mentions_to_look_up<'r>(
         &self,
         raws: &'r [Raw],
@@ -154,8 +156,8 @@ impl HttpSlackClient {
         let mut fresh = Vec::new();
         for raw in raws {
             let text = raw.value.get("text").and_then(Value::as_str).unwrap_or("");
-            for (id, label) in user_mentions(text) {
-                if label.is_some() || !seen.insert(id) {
+            for id in user_mentions(text) {
+                if !seen.insert(id) {
                     continue;
                 }
                 if self.knows_user(id) {
@@ -276,15 +278,15 @@ mod tests {
     #[test]
     fn the_people_a_text_mentions_are_read_once_each_in_order() {
         assert_eq!(
-            user_mentions("<@U0ADA0001> and <@W0GRACE01|grace>, <@U0ADA0001> again"),
-            [("U0ADA0001", None), ("W0GRACE01", Some("grace"))]
+            user_mentions("<@U0ADA0001> and <@W0GRACE01|grace>, <@U0ADA0001|ada> again"),
+            ["U0ADA0001", "W0GRACE01"]
         );
         // Not a person: a channel, a group, a link, a bot's B id, an unclosed bracket, text.
         assert!(user_mentions(
             "<#C0123ABCD|general> <!subteam^S01|@ops> <https://x.test|x> <@B0123> <@U01 a < b"
         )
         .is_empty());
-        assert_eq!(user_mentions("<@U01|>"), [("U01", None)]);
+        assert_eq!(user_mentions("<@U01|>"), ["U01"]);
     }
 
     #[test]
@@ -310,15 +312,16 @@ mod tests {
     }
 
     #[test]
-    fn a_mention_is_named_by_the_cache_then_by_its_own_label_and_otherwise_not_at_all() {
+    fn a_mention_is_named_by_the_cache_and_never_by_its_own_label() {
         let resolved: HashMap<String, (String, bool)> = [
             ("U0ADA0001".to_owned(), ("Ada Lovelace".to_owned(), false)),
             ("U0GRACE01".to_owned(), ("Grace Hopper".to_owned(), false)),
         ]
         .into();
+        // Grace's label names someone else, and Alan's is all that would name him: neither is used.
         assert_eq!(
             names_for(
-                "<@U0ADA0001> <@U0GRACE01|grace> <@W0ALAN001|@alan> <@U0GHOST01>",
+                "<@U0ADA0001> <@U0GRACE01|The Owner> <@W0ALAN001|@alan> <@U0GHOST01>",
                 &resolved
             ),
             [
@@ -329,10 +332,6 @@ mod tests {
                 MentionName {
                     id: "U0GRACE01".to_owned(),
                     name: "Grace Hopper".to_owned()
-                },
-                MentionName {
-                    id: "W0ALAN001".to_owned(),
-                    name: "alan".to_owned()
                 },
             ]
         );

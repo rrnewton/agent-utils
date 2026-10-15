@@ -1179,7 +1179,9 @@ drawn as the person's name, `@Ada Lovelace`, said as "Ada Lovelace" rather than 
 shown to the voice agent beside the mention as `(mentions: <@U…> is Ada Lovelace)`. The name comes
 from `users.info`, through the same cache as authors' names (an hour, a failure five minutes);
 a read looks up at most 25 people not already known, best effort, and a later read names the
-rest. A mention nobody can name is drawn as its id and said as "a mention", as before. A channel
+rest. A mention nobody can name is drawn as its id and said as "a mention", as before. A legacy
+`<@U…|label>` is named the same way: its label is text the sender chose, not a name from the
+user cache, so it is never shown, said or given to the voice agent as the name. A channel
 mention Slack sends without its name, `<#C…>` or `<#C…|>`, is named from `conversations.info`
 (at most ten channels a read, remembered for an hour) and shown as `#name`; a user group's
 mention carries its handle and is shown as `@ops`. A pin keeps the text it was pinned with, and
