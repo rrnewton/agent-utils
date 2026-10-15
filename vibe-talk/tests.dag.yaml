@@ -377,7 +377,8 @@ steps:
   # the foot of Main, All or the call's view with Send tappable, or with the card they saw alone where it
   # stood (`#280`); and at 393x852, All with Summarise and Expand all up, a reader 40 or 60px above its
   # foot back from Settings on their row, or with the opened card where it stood, and one at the foot at it
-  # (`#280`).
+  # (`#280`); and at 393x852 and 1280x800, with no card, a reader 30 to 60px up Main, All or the call's view
+  # back from Settings offered no jump and nothing grown under them, one 150px up offered it still (`#207`).
   # Measured on 2026-10-13: about 235s wall and 45s CPU on a loaded host, with a draft arriving under the
   # thread list; its wall limit goes from 300s to 420s for that headroom, and its CPU limit stays 200s.
   # Measured on 2026-10-14: about 330s wall on a loaded host with the box's room and the opened draft
@@ -386,15 +387,16 @@ steps:
   # from 480s to 540s for that headroom, and its CPU limit stays 200s. The last gate ran it in 366s; the
   # card going from a reader who saw only it adds about 108s alone at the three phones, so its wall limit
   # goes from 540s to 660s for that headroom, and its CPU limit stays 200s. The last gate ran it in 476s;
-  # the trips to Settings and back add about 50s alone at the two phones, and the chips' room about 20s
-  # at 393x852, so its wall limit goes from 660s to 750s for that headroom, and its CPU limit stays 200s.
+  # the trips to Settings and back add about 50s alone at the two phones, the chips' room about 20s at
+  # 393x852 and the jump back from Settings about 30s at 393x852 and 1280x800, so its wall limit goes from
+  # 660s to 780s for that headroom, and its CPU limit stays 200s.
   - group: check
     job: approval-card-browser
-    desc: the send card's place, thumb reach, hold, docked layout and frozen card, the recap line of a new call, and the channel's list held still as the card comes and goes, in current Chromium at 393x852, 360x780, 375x667, 667x375 and 375x330, beside a reply open in a column at 1280x800, and docked under the thread list through the view keys, arriving there, and back from it with the channel's reader where they were, at 393x852 and 1280x800, the cards' reader kept across two columns and back at 1280x800, the channel's reader kept at its foot as the box takes back its room after Send at 393x852 and 1280x800, a reader of a draft opened by More kept on it at 393x852 and through two columns and back at 1280x800, and a reader who saw only that card at the foot once it goes, there or from under the thread list, at 393x852, 360x780 and 375x667, and back from Settings where they were at 393x852 and 375x667, the chips' room kept for them at 393x852
+    desc: the send card's place, thumb reach, hold, docked layout and frozen card, the recap line of a new call, and the channel's list held still as the card comes and goes, in current Chromium at 393x852, 360x780, 375x667, 667x375 and 375x330, beside a reply open in a column at 1280x800, and docked under the thread list through the view keys, arriving there, and back from it with the channel's reader where they were, at 393x852 and 1280x800, the cards' reader kept across two columns and back at 1280x800, the channel's reader kept at its foot as the box takes back its room after Send at 393x852 and 1280x800, a reader of a draft opened by More kept on it at 393x852 and through two columns and back at 1280x800, and a reader who saw only that card at the foot once it goes, there or from under the thread list, at 393x852, 360x780 and 375x667, and back from Settings where they were at 393x852 and 375x667, the chips' room kept for them at 393x852, and the jump decided on the list as it is laid out at 393x852 and 1280x800
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/approval_card_browser.py
     jobs_flag: ""
-    timeout: 750
+    timeout: 780
     cpu_timeout: 200
     hint:
       resources: {browser: 1}

@@ -29867,6 +29867,59 @@ test("`#280 scroll-stability`: BACK FROM SETTINGS the chips' room is in the list
   assert.deepStrictEqual(unheld, { ...real, up50: false });
 });
 
+test("`#207 scrollback-jump` x `#280 scroll-stability`: BACK FROM SETTINGS the jump is decided on the list as it is laid out, once the header Settings kept has collapsed — a reader 40px above the foot is not offered it, one far up still is", async () => {
+  // From review, in Chromium: a reader 30 or 40px above the foot at a desk, or 60px on a phone, went to
+  // Settings and came back offered the jump, the list 36 to 40px longer under them for the jump's own room.
+  // showScreen decided the jump as the main screen was shown, before `renderControlBar` collapsed the header
+  // that Settings' title and Back had kept up: the list's window was 54px short at the desk, and a reader 40px
+  // up read as 94px up, past SCROLLBACK_PX. Once offered, the jump stays until the reader is within the slack
+  // of the foot. The fixture lays out no header, so the test gives the list's window the header's 54px
+  // whenever #topbar is up, and keeps the list's place while it is hidden (`clampedAsShownLikeChromium`).
+  const HEADER = 54;
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    await signIn(page);
+    await showDiscord(page, tallChannel());
+    const area = page.el("scroll-area");
+    const topbar = page.el("topbar");
+    let base = area.clientHeight;
+    Object.defineProperty(area, "clientHeight", {
+      configurable: true,
+      get: () => base - (topbar.hidden ? 0 : HEADER),
+      set: (value) => {
+        base = Number(value) || 0;
+      },
+    });
+    clampedAsShownLikeChromium(page, area);
+    assert.equal(topbar.hidden, true, "the premise: the main screen has no header");
+    const gap = () => area.scrollHeight - area.scrollTop - area.clientHeight;
+    const result = {};
+    for (const up of [0, 40, 150]) {
+      for (const how of ["back", "esc"]) {
+        // From the foot, as a thumb comes up the list: the jump is not up below SCROLLBACK_PX.
+        await scrollToGap(page, 0);
+        await scrollToGap(page, up);
+        const before = `${gap()} ${rowOnScreen(page)} ${jumpShown(page)}`;
+        assert.equal(jumpShown(page), up > SCROLLBACK_PX, `the premise: the jump as a reader ${up}px up has it`);
+        await page.el("open-settings").click();
+        await page.settle();
+        assert.equal(topbar.hidden, false, "the premise: Settings has its header, its title and Back");
+        if (how === "back") await page.el("close-settings").click();
+        else await press(page, focused(page), "Escape");
+        await page.settle();
+        result[`up${up}${how}`] = page.screen() === "main" && `${gap()} ${rowOnScreen(page)} ${jumpShown(page)}` === before;
+      }
+    }
+    return result;
+  };
+  const real = await run(SCRIPT);
+  assert.deepStrictEqual(real, { up0back: true, up0esc: true, up40back: true, up40esc: true, up150back: true, up150esc: true });
+  // THE CONTROL: the jump decided as the screen is shown, under the header still up. The reader 40px up is
+  // offered it, and only they are.
+  const early = await run(brokenScript("  if (!main) renderJumpNewest();\n", "  renderJumpNewest();\n"));
+  assert.deepStrictEqual(early, { ...real, up40back: false, up40esc: false });
+});
+
 test("a thread opened from All is a filter of what All holds, with no request, and Back restores All", async () => {
   const page = await threadPage();
   page.el("channel-view-flat").click();
