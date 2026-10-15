@@ -4064,8 +4064,8 @@ own adapter-only token; every other route uses the read/write tokens described a
 | GET | `/api/v1/voice-session` | **write** | open a browser-ready session through the configured conversational voice provider |
 | GET | `/api/v1/voice-agent` | read | the versioned voice-agent prompt and which MCP tools this credential may call — see "Conversational voice providers" |
 | POST | `/api/v1/voice-timing` | **write** | one call's content-free startup phase offsets, logged as `voice_startup` |
-| POST | `/api/v1/voice-health` | **write** | a content-free "the voice service is not responding" record, logged as `voice_unresponsive` or `voice_recovered` — see "When the voice service stops answering" |
-| POST | `/api/v1/voice-end` | **write** | how a call that opened ended — `hang_up`, `error_frame`, `server_closed`, `connection_lost` or `suspended` — as one content-free line, `voice_call_ended` — see "How a call ended" |
+| POST | `/api/v1/voice-health` | **write** | a content-free "the voice service is not responding" record, logged as `voice_unresponsive` or `voice_recovered`, or that a turn was heard with no text, `voice_text_missing` — see "When the voice service stops answering" |
+| POST | `/api/v1/voice-end` | **write** | how a call that opened ended, on either protocol — `hang_up`, `error_frame`, `server_closed`, `connection_lost` or `suspended` — with the voice service's own capped reason, as one line, `voice_call_ended` — see "How a call ended" |
 | GET | `/api/v1/signed-url` | **write** | compatibility endpoint that mints an ElevenLabs signed URL |
 | GET | `/api/v1/channels/{id}/messages?limit=` | read | full scrollback, oldest first; an optional `as_of` when the provider served a copy it could not bring up to date (`#208 persistent-cache`) |
 | GET | `/api/v1/channels/{id}/messages/{message_id}?thread_id=` | read | one message in full; `thread_id` names the thread a reply is in, and without it a reply is still found in the thread this server knows it to be in — from the reads it holds, a pin or the bookmark — at the cost of one read of that thread (`#319 slack-reply-by-id`) |
@@ -4862,6 +4862,33 @@ repeat of text already held changes nothing — and stores that row once, when t
 The same words in a later turn are a new row. A frame without `turn` cannot be matched and is
 treated as its own turn.
 
+**What a server should do for a long answer** (`#330 voice-long-turn-drop`). A long spoken answer
+was lost — no text on screen, then the call ended midway — and every mechanism found that could
+do that sits partly in the server. The page no longer sends `audio_end` into an answer still being
+spoken, keeps whatever text of a cut turn arrived (marked "(cut off)"), says when a turn played
+audio with no text, and records the server's close reason. A `vibe-talk-v1` server should, in turn:
+
+* **Cut only on `interrupt`.** An `audio_end` while an assistant turn is still running closes the
+  microphone segment after that turn; it is not a request to stop the answer. Older pages sent one
+  into a long answer to deliver a relayed message.
+* **Never discard what was spoken.** On an interrupt, an `error` or a close, send the assistant's
+  words up to the cut as a final `transcript` before the interrupted `turn_complete` or the `error`,
+  and drop only the PCM. A bounded wait for the backend to confirm a cut may end the session, but
+  not before that text has gone.
+* **Fall back to the model's text.** When the backend yields audio for a turn and no transcript of
+  it, send the text the model generated instead; the page otherwise shows "spoken reply — no text
+  received" and reports `audio_without_text`.
+* **Never drop text or control frames for audio.** When the outbound queue is full, give
+  `transcript`, `turn_complete` and `error` priority over PCM, or slow the audio; do not end the
+  call because audio could not be queued.
+* **Do not time out a client still listening.** An answer generated faster than it is played can
+  take a minute to hear; an idle timer that starts at the turn's end can close the session while the
+  listener is still hearing it. Count idleness from when playback could have ended, or let the
+  client's microphone audio refresh it.
+* **Say why the session ended**, in the close frame's reason or an `error` frame — the page records
+  it as `close_reason` — and log every session end on one line with the reason, the turn, the time
+  since it opened and the last frame the client sent.
+
 ### Repeatable live spoken-read acceptance
 
 `scripts/voice-read-acceptance.py` is the provider-neutral live check for
@@ -5015,6 +5042,7 @@ by text alone. The page reports each of these, once per call:
 | `silent_turns` | two consecutive turns are silent. One is not enough: turn detection may close an empty turn for background noise, and a response that only calls a tool may say nothing before the answer follows. Any turn that was heard ends the run, including one the listener interrupted or one that carried an `error` |
 | `no_reply` | 15 seconds after the greeting was promised, or after a typed prompt, with no audible PCM, no assistant text and no `turn_complete`. A typed call does not wait for its greeting, so there the greeting is judged as an ordinary turn and is not timed. A prompt typed while a greeting's audio or text is already arriving is held until that greeting's `turn_complete`. Meanwhile the bound restarts with each further piece of the greeting, so it measures the greeting going quiet without completing. Known limitation: a prompt sent before any of the greeting arrives, including one queued before `session_started`, cannot be told apart from it. The greeting's first text disarms that prompt's bound, and the greeting's `turn_complete` is taken as the prompt's |
 | `error_frame` | the server sent `error`; the page already shows it in red and now also logs it, without its text. It is the verdict on the turn it arrives in, before or after that turn's audio: the next `turn_complete` is not counted as silent, and the no-reply bound is disarmed, so one failure is logged once. An `error` carries no turn number, so an `error` sent between turns spares the next turn instead |
+| `audio_without_text` | a turn completes having carried audible audio and no assistant text: the service answered, and its words never arrived (`#330 voice-long-turn-drop`). Its row says "spoken reply — no text received" where the text would have been, "(cut off)" after it when the turn was cut, and the record keeps that line as the page's note, never as the assistant's words. Heard, so not the unresponsive state: the status line stays `live`, and the server logs it at WARN as `voice_text_missing` |
 
 The status line then turns to the `unresponsive` state with "The voice service is not responding."
 That notice does not dismiss itself while the condition holds, and nothing is torn down, because
@@ -5030,12 +5058,12 @@ once per reported episode. The body is a closed record, for example
 "silent_turns":2,"audio_ms":1000,"peak":0}`. Every field is required. `audio_ms` and `peak` describe
 the last silent turn, so "no audio arrived" (`audio_ms=0`) and "silent audio arrived" (`audio_ms>0`,
 `peak` under 256) can be told apart without capturing a call. An unknown field, `cause` or
-`protocol` is refused with 400 `invalid_health`, not echoed. A body over 512 bytes gets 413. Past 30
+`protocol` is refused with 400 `invalid_health`, not echoed. A body over 1,024 bytes gets 413. Past 30
 records a minute across all callers the route answers 429 `voice_health_throttled` and writes
 nothing for them except one `voice_health_throttled max_lines=30 window_s=60` line per minute, so
 one page cannot flood the log with records. (The access log still notes every request, as it does
 for every route.) It logs one line of names and numbers only, WARN for a report and INFO for a
-recovery:
+recovery (`voice_text_missing` for `audio_without_text`, at WARN, the rest as below):
 `voice_unresponsive protocol=vibe-talk-v1 chat=false cause=silent_turns since_open_ms=21400 turns=3
 silent_turns=2 audio_ms=1000 peak=0`.
 
@@ -5071,13 +5099,30 @@ minute later), and in the transcript's seam:
 Each call that opened is recorded once, when it ends, to `POST /api/v1/voice-end`, for example
 `{"protocol":"vibe-talk-v1","chat":false,"ended_by":"connection_lost","close_code":1006,
 "since_open_ms":22000,"turns":2}`. `close_code` is the code the browser reported, 1000–4999, and is
-absent when the page closed the socket itself; every other field is required. Anything else — a
-free-text reason, an unknown `ended_by`, a code out of range — is refused with 400 `invalid_end`
-and logs nothing. It has its own budget of 30 records a minute (429 `voice_end_throttled` past it,
-announced by one `voice_end_throttled` line a minute), so it cannot crowd out the health record. It
-logs one line of names and numbers, INFO for a hang-up and WARN for anything else:
-`voice_call_ended protocol=vibe-talk-v1 chat=false ended_by=connection_lost close_code=1006
-since_open_ms=22000 turns=2`. A start that never opened is the startup record's (above), not this.
+absent when the page closed the socket itself.
+
+`#330 voice-long-turn-drop`. A long spoken answer was cut and the call ended, and this record could
+not say why — nor did a call on the hosted vendor's protocol leave one at all. Now every call that
+opened is recorded, on either protocol (`"protocol":"elevenlabs"` for the hosted one), and the
+record carries what decides between the candidates, each optional so that an older page's record
+still reads:
+
+| Field | What it says |
+|---|---|
+| `visibility` | `visible` or `hidden`: whether the page was in sight at the end |
+| `queued_audio_ms` | how much of the assistant's audio was still waiting to be played |
+| `last_text_ms`, `last_audio_end_ms`, `last_interrupt_ms` | how long before the end the page last sent a text turn, an `audio_end` and an `interrupt` — a bridge may take either of the last two for a cut — and absent for one it never sent. A hang-up's own goodbye is not counted |
+| `close_reason` | the voice SERVICE's own words — its close reason, or its `error` — with the token taken out, folded onto one line and cut to 120 characters; never anything said in the call. The server refuses one over 123 characters or carrying a control character |
+
+Anything else — an unknown field or `ended_by`, a code out of range, an offset over a day, queued
+audio over an hour — is refused with 400 `invalid_end` and logs nothing. It has its own budget of 30
+records a minute (429 `voice_end_throttled` past it, announced by one `voice_end_throttled` line a
+minute), so it cannot crowd out the health record. It logs one line, INFO for a hang-up and WARN for
+anything else, `-` for each field not sent and the service's reason last, quoted, so it cannot pass
+for a field: `voice_call_ended protocol=vibe-talk-v1 chat=false ended_by=server_closed
+close_code=1011 since_open_ms=95000 turns=4 visibility=visible queued_audio_ms=41000
+last_text_ms=2000 last_audio_end_ms=1900 last_interrupt_ms=- close_reason="interrupt boundary timed
+out; reconnect"`. A start that never opened is the startup record's (above), not this.
 
 A socket the page has finished with no longer speaks for any call. Its close can arrive seconds
 after the page's `quit` — a server that waits out an interrupt before closing takes that long — and
@@ -5107,6 +5152,36 @@ waits out the rest of it too. A turn that sends nothing for 8 seconds without co
 completing — a trickle of hypotheses of background speech, a bridge that never sends the turn's
 `turn_complete` — 30 seconds after the hold began however often its frames came
 (`SPOKEN_TURN_HOLD_CAP_MS`). The connection details say which let it go.
+
+**Who wants it said decides whether it may cut an answer** (`#330 voice-long-turn-drop`). The owner
+asked for a summary of the night's messages; after a short filler line the agent spoke a long
+answer that never appeared as text, and the call ended midway. The likeliest cause was this page's:
+a relayed channel message, held 30 seconds behind the answer by the cap above, then went out as an
+`audio_end`, which a bridge takes for an interrupt — dropping the rest of the answer's audio and
+its text, and closing the call when the backend is slow to confirm the cut. An answer longer than
+30 seconds is ordinary, so:
+
+* **A relayed message, or the page's own word on a yes, never cuts an answer.** It waits for the
+  answer's `turn_complete` and then for its audio to finish playing, plus 600 ms
+  (`ANSWER_PLAYED_GRACE_MS`) for the owner to answer the answer first. The cap does not end that
+  wait while the answer is still arriving; only a turn that has gone quiet — nothing for 8 seconds
+  and nothing left to play, a stalled turn rather than an answer — is let go.
+* **A message the owner types while the assistant is speaking cuts the answer at once**, with the
+  protocol's own `interrupt`, never a silent `audio_end`: playback stops, late audio of the cut turn
+  is not played, the transcript draws an **answer cut off** line, the status line says "You cut the
+  answer short to send your message.", and the message goes once the interrupted turn's
+  `turn_complete` has come and the segment has closed. Typed during the owner's own spoken turn,
+  nothing is cut: it waits as before.
+* **A cut answer keeps its words.** Whatever of it had arrived stays on screen and in the record
+  with "(cut off)" after it — cut by the reader's message, by a `turn_complete` that says
+  `interrupted`, or by the call ending under it.
+* **An answer is written down as it is said.** A spoken turn is stored when it ends, so a phone
+  that killed the installed app mid-answer took the answer with it. Every turn still being said is
+  now copied to the device's storage every 3 seconds (`UNSETTLED_SAVE_MS`) and at once when the
+  page is hidden or unloaded; a turn that ends takes its copy away. The next time the app opens, a
+  copy whose page has not rewritten it for 15 seconds (`UNSETTLED_ABANDONED_MS`) is filed in the
+  conversation it was said in, marked "(cut off — the app closed before this turn ended)", before
+  the record is read back. One page never files another live page's copy, nor its own.
 
 ## Signed conversation URLs
 

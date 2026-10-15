@@ -650,11 +650,14 @@ async fn a_call_end_record_is_one_line_and_says_who_ended_the_call() {
         .collect();
     assert_eq!(lines.len(), 2, "expected one line per call: {lines:?}");
     assert!(lines[0].contains("WARN"), "{}", lines[0]);
+    // A record from a page that predates `#330 voice-long-turn-drop` still makes a whole line, with
+    // `-` for each field it did not send.
     assert_eq!(
         lines[0].split("voice_call_ended ").nth(1),
         Some(
             "protocol=vibe-talk-v1 chat=false ended_by=connection_lost close_code=1006 \
-             since_open_ms=22000 turns=2"
+             since_open_ms=22000 turns=2 visibility=- queued_audio_ms=- last_text_ms=- \
+             last_audio_end_ms=- last_interrupt_ms=- close_reason=-"
         )
     );
     assert!(lines[1].contains("INFO"), "{}", lines[1]);
@@ -662,7 +665,56 @@ async fn a_call_end_record_is_one_line_and_says_who_ended_the_call() {
         lines[1].split("voice_call_ended ").nth(1),
         Some(
             "protocol=vibe-talk-v1 chat=false ended_by=hang_up close_code=- since_open_ms=95000 \
-             turns=7"
+             turns=7 visibility=- queued_audio_ms=- last_text_ms=- last_audio_end_ms=- \
+             last_interrupt_ms=- close_reason=-"
+        )
+    );
+}
+
+/// `#330 voice-long-turn-drop`. The line says who ended a call cut mid-answer: the service's own
+/// reason, quoted, and how long before the end the page last sent each frame a bridge may take for
+/// a cut, whether it was in sight, and how much answer was still to play.
+#[tokio::test]
+async fn a_call_end_line_carries_the_services_reason_quoted_and_the_last_frames_sent() {
+    let capture = LogCapture::info_only();
+    let harness = harness();
+    let record = json!({
+        "protocol": "elevenlabs",
+        "chat": false,
+        "ended_by": "server_closed",
+        "close_code": 1011,
+        "since_open_ms": 95_000,
+        "turns": 4,
+        "visibility": "hidden",
+        "queued_audio_ms": 41_000,
+        "last_text_ms": 2_000,
+        "last_audio_end_ms": 1_900,
+        "close_reason": "interrupt boundary timed out; reconnect",
+    });
+    assert_eq!(
+        call(
+            &harness,
+            "POST",
+            "/api/v1/voice-end",
+            Some(WRITE_TOKEN),
+            Some(record)
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let text = capture.text();
+    let line = text
+        .lines()
+        .find(|l| l.contains("voice_call_ended "))
+        .expect("the call's end was logged");
+    assert!(line.contains("WARN"), "{line}");
+    assert_eq!(
+        line.split("voice_call_ended ").nth(1),
+        Some(
+            "protocol=elevenlabs chat=false ended_by=server_closed close_code=1011 \
+             since_open_ms=95000 turns=4 visibility=hidden queued_audio_ms=41000 \
+             last_text_ms=2000 last_audio_end_ms=1900 last_interrupt_ms=- \
+             close_reason=\"interrupt boundary timed out; reconnect\""
         )
     );
 }

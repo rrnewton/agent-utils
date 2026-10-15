@@ -335,6 +335,8 @@ async fn a_health_report_is_accepted_from_the_write_token_only() {
         "no_reply",
         "error_frame",
         "recovered",
+        // `#330 voice-long-turn-drop`.
+        "audio_without_text",
     ] {
         let mut report = silent_report();
         report["cause"] = cause.into();
@@ -490,6 +492,99 @@ async fn a_call_end_record_is_accepted_from_the_write_token_only_for_every_docum
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
+/// `#330 voice-long-turn-drop`. The record a page sends now: for the hosted protocol as well, with
+/// the service's own reason and what decides who ended the call.
+fn full_end_report() -> Value {
+    json!({
+        "protocol": "vibe-talk-v1",
+        "chat": false,
+        "ended_by": "server_closed",
+        "close_code": 1011,
+        "since_open_ms": 95_000,
+        "turns": 4,
+        "visibility": "visible",
+        "queued_audio_ms": 41_000,
+        "last_text_ms": 2_000,
+        "last_audio_end_ms": 1_900,
+        "last_interrupt_ms": 30_000,
+        "close_reason": "interrupt boundary timed out; reconnect",
+    })
+}
+
+#[tokio::test]
+async fn a_call_end_record_carries_the_services_reason_and_what_decides_who_ended_it() {
+    let router = app();
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/api/v1/voice-end",
+        Some(WRITE_TOKEN),
+        Some(full_end_report()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let mut hosted = full_end_report();
+    hosted["protocol"] = "elevenlabs".into();
+    hosted["visibility"] = "hidden".into();
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/api/v1/voice-end",
+        Some(WRITE_TOKEN),
+        Some(hosted),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "a call on the hosted protocol is recorded too: {body}"
+    );
+    let with = |key: &str, value: Value| {
+        let mut report = full_end_report();
+        report[key] = value;
+        report
+    };
+    for (why, report) in [
+        (
+            "a reason longer than a close frame can carry",
+            with(
+                "close_reason",
+                json!("x".repeat(vibe_talk::voice_health::MAX_CLOSE_REASON_CHARS + 1)),
+            ),
+        ),
+        (
+            "a reason with a line break could forge a second log line",
+            with(
+                "close_reason",
+                json!("ok\nvoice_call_ended ended_by=hang_up"),
+            ),
+        ),
+        (
+            "an unknown visibility is refused, not echoed",
+            with("visibility", json!("minimized")),
+        ),
+        (
+            "more queued audio than an hour is not a measurement",
+            with("queued_audio_ms", json!(3_600_001)),
+        ),
+        (
+            "an offset longer than a day is not a measurement",
+            with("last_audio_end_ms", json!(86_400_001)),
+        ),
+    ] {
+        let (status, body) = send(
+            &router,
+            "POST",
+            "/api/v1/voice-end",
+            Some(WRITE_TOKEN),
+            Some(report),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{why}: {body}");
+        assert_eq!(body["error"], "invalid_end", "{why}");
+    }
 }
 
 #[tokio::test]

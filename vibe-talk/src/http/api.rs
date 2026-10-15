@@ -1250,6 +1250,9 @@ pub async fn voice_health(
     }
     if report.is_recovery() {
         tracing::info!("voice_recovered {}", report.log_fields());
+    } else if report.is_missing_text() {
+        // `#330 voice-long-turn-drop`. Heard, so not unresponsive: its words never arrived as text.
+        tracing::warn!("voice_text_missing {}", report.log_fields());
     } else {
         tracing::warn!("voice_unresponsive {}", report.log_fields());
     }
@@ -1261,7 +1264,9 @@ pub async fn voice_health(
 ///
 /// Closed like the health record (see [`crate::voice_health::EndReport`]), logged and not stored,
 /// one line per call: `voice_call_ended`, at info when the reader hung up and at warn when anything
-/// else ended the call. Bounded by its own [`crate::voice_health::LogBudget`].
+/// else ended the call. Bounded by its own [`crate::voice_health::LogBudget`]. For every protocol the
+/// page speaks, with the voice service's own close reason and what decides who ended the call
+/// (`#330 voice-long-turn-drop`).
 pub async fn voice_end(
     State(state): State<AppState>,
     _scope: WriteScope,
