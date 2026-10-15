@@ -10431,7 +10431,10 @@ function showPostProposal(proposal) {
     postWatch.hold = null;
     postWatch.changed = false;
     postWatch.unfolded = false;
+    // Asked BEFORE the card goes, which is what changes the answer. `#280 scroll-stability`.
+    const alone = cardAloneOnScreen();
     placePostCard();
+    if (alone) inColumn(columns.main, scrollToNewest);
     if (hadFocus) parkFocusOffCard();
     renderJumpNewest();
     return;
@@ -10503,6 +10506,40 @@ function showPostProposal(proposal) {
  */
 function cardsAtFootUnderCard() {
   return threadListOnScreen() && columns.side.mode === "list" && !cardsOpening && atBottom(leftEl("side-scroll"));
+}
+
+/**
+ * Whether the reader sees nothing of the list on screen but the send card at its foot, and perhaps the
+ * box under it: the card stands across the list's top edge. Asked BEFORE the card goes. `#269
+ * approval-card-inline` x `#280 scroll-stability`.
+ *
+ * A long draft opened by More stands taller than a phone's list — in Chromium 907px in a list 739px tall
+ * at 393x852 — so a reader near its foot sees the card, Send on screen and tappable, and no row. The card
+ * is the list's next message, and that reader is where it is: once it goes, its place is the list's
+ * foot, so they are put on the newest line, and follow the list as a reader at its foot does. Nothing
+ * else puts them there. Chromium's own scroll anchoring holds the box under the card where it stood as
+ * the card goes, and so leaves the reader exactly as far above the foot as they were. Readers 30 to 80px
+ * up Main or All, and 30 to 100px up the call's view, past the slack and with the box on screen, were
+ * left there: the box took back its room a second later with them held on their row (`holdDraftRoom`),
+ * the jump came with its room, and they ended 132 to 210px above the foot, offered the jump, no longer
+ * following, at 393x852, 360x780 and 375x667. With anchoring turned off (`overflow-anchor: none`), as in
+ * a browser that has none, the list's clamp took every one of them to the foot. On the call's view the
+ * frozen card is drawn just above the card first (`placeInConversation`), and Chromium's anchoring keeps
+ * the card where it stood through that too; a browser without it moves the card down under the reader,
+ * and the clamp takes them to the foot once it goes.
+ *
+ * Only there: a reader who can see a row is on that row, which the card going below it does not move,
+ * unless the list grown shorter is clamped to its foot under them. Never under the thread list, where the
+ * card is docked: Main's list behind the cards has its own keeper (`cardMovedUnderLists`), and the place
+ * the way back puts back is read as the list comes (`keepReaderPlace`).
+ */
+function cardAloneOnScreen() {
+  const card = leftEl("post-confirm");
+  const place = card.getAttribute("data-place");
+  if (currentScreen !== "main" || card.hidden || (place !== "channel" && place !== "voice")) return false;
+  const top = leftEl("scroll-area").getBoundingClientRect().top;
+  const box = card.getBoundingClientRect();
+  return box.top <= top + 0.5 && box.bottom > top;
 }
 
 /** Take the cards to their foot again, above the card docked under them. */
@@ -18359,6 +18396,13 @@ function channelCard() {
  *
  * ...or, where their screen showed only the send card, on the card, at the height it stood at, where it
  * ends this list too (`readerPlace`). `#269 approval-card-inline` x `#280 scroll-stability`.
+ *
+ * ...or, where that card has gone since, Send tapped or the draft settled elsewhere, on the newest line,
+ * the place the card left at the foot, as it is for a reader who saw only the card as it went
+ * (`cardAloneOnScreen`). The card goes from the dock under the thread list too, the reader's place read
+ * as the list came up: in Chromium at 393x852, the long draft opened by More, Cmd+3 from 40 or 60px up
+ * Main, the draft settled elsewhere or sent from the dock, and then Esc or Cmd+1 left them 182 or 202px
+ * above the foot, and Cmd+2 353px above All's foot, offered the jump and no longer following the list.
  */
 function keepReaderPlace(place) {
   if (place.pinned) {
@@ -18378,6 +18422,10 @@ function keepReaderPlace(place) {
   if (card) {
     el("scroll-area").scrollTop += card.getBoundingClientRect().top - place.card;
     renderJumpNewest();
+    return true;
+  }
+  if (typeof place.card === "number" && postWatch.shown === null) {
+    scrollToNewest();
     return true;
   }
   return false;

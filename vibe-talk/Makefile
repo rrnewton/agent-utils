@@ -203,8 +203,12 @@ send-order-browser:
 # where it stood through the thread list and back and across Main and All (`#280`); and at 1280x800,
 # the opened draft drawn taller in two columns' left column, a reader at the foot of Main or All at
 # the foot through Ctrl+4 and back with Send tappable, one up either on their row, and one near the
-# foot whom the change could not keep there on their row again on the way back. Pass
-# WEB_ROOT=dir for another copy of the page, SCREENSHOTS=dir to keep a PNG of each placement.
+# foot whom the change could not keep there on their row again on the way back; and at 393x852,
+# 360x780 and 375x667 a reader who saw only that draft's card, past the slack of the foot, at the foot
+# with no jump a second after Send or the draft settled elsewhere, in Main, All and the call's view, and
+# at 393x852 one who saw only it as the thread list docked it, on the way back once it had gone
+# (`#280`). Pass WEB_ROOT=dir for another copy of the page, SCREENSHOTS=dir to keep a PNG of each
+# placement.
 approval-card-browser:
 	python3 tests/approval_card_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
