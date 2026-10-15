@@ -85,9 +85,10 @@ pub struct Offered<'a> {
     /// Provider edit time, when reported.
     pub edited_ms: Option<i64>,
     /// Whether every copy of the message its provider gives reports its edits, so that a copy
-    /// without an edit time is of a message not edited when it was read: Slack's, and Discord's
-    /// own API. A bridge's copies may come by paths that cannot say (a pushed event), so its are
-    /// compared by edit time only where both copies carry one.
+    /// without an edit time is of a message not edited when it was read: the copies Slack's reads
+    /// and Discord's own API's give. A bridge's copies may come by paths that cannot say, and so
+    /// may a change an adapter pushes for any provider, so theirs are compared by edit time only
+    /// where both copies carry one.
     pub reports_edits: bool,
     /// How it arrived.
     pub arrival: Arrival,

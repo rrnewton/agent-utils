@@ -505,9 +505,15 @@ impl Fill {
         self.offer(observations);
     }
 
-    /// Offer one change from the live feed, observed when the fill began.
+    /// Offer one change from the live feed, observed when the fill began: the poller's, when the
+    /// fill was begun for it, and otherwise an adapter's ([`observe::PushedBy`]).
     pub fn offer_push(self, live: &LiveMessage) {
-        let observation = observe::pushed(self.shape, live, self.observed_ms);
+        let by = if self.grant.server_fill() == Some(ServerFill::Poller) {
+            observe::PushedBy::Poller
+        } else {
+            observe::PushedBy::Adapter
+        };
+        let observation = observe::pushed(self.shape, live, by, self.observed_ms);
         self.offer(vec![observation]);
     }
 
