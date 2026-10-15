@@ -1,12 +1,13 @@
 ---
 title: 'stale-live-read-flicker: a live message drawn in All vanishes for a few frames when an earlier live read lands after it'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-14T19:48:50.922088080+00:00
-updated_at: 2026-10-14T21:43:42.541909131+00:00
+updated_at: 2026-10-15T09:40:09.620126609+00:00
+closed_at: 2026-10-15T09:40:09.620126469+00:00
 ---
 
 # Description
