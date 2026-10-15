@@ -127,12 +127,22 @@ uncovered and wholly on screen. This lays it out on three phones and measures:
      the desk, and 60px up on the phone. One 150px up keeps the jump. Decided as the main screen was
      shown, under the header Settings kept (54px of it at the desk), the jump was offered to them, and its
      own room under the box then held it there.
+ 22. On a phone with a keyboard, a reader of a long draft opened by More presses "?" or Ctrl+/ for Help, and
+     while Help is up the draft is settled elsewhere, its Send is tapped where it is docked under Help, or a
+     short draft takes its place. Back by Esc, by Help's Back or by the browser's Back, a reader who was at
+     the foot of Main, All or the call's view, and one 40 or 100px up who saw only the card, is on the newest
+     line with no jump, the short draft's Send tappable, now and a second later, once the box has taken back
+     its room. The main screen was shown before Help's list, which held the focus, was hidden and before the
+     control pane was shown: Chromium laid the page out to blur that list, and the channel's list, short of
+     the card that had gone, was clamped to a window the pane's 66px too tall. The reader was left 58px above
+     the foot at 393x852, and 200px once the box took back its room, the jump offered.
 
 Runs: 393x852, 360x780 and 375x667, each with a one-row and a thirty-row transcript, with and
 without the first call's connection banner, and with a short and a 1,500-character draft, and points
 9, 10 and 18 once (point 18 with a reader 30 and 60px up each list, by Send and settled elsewhere, and
 five ways through the thread list, at 393x852, and one case of each list at the other two); point 19 at
-393x852, eleven trips, and four at 375x667; points 20 and 21 at 393x852; the docked card alone at 667x375
+393x852, eleven trips, and four at 375x667; point 22 at 393x852, ten trips, and four at 375x667; points 20
+and 21 at 393x852; the docked card alone at 667x375
 and 375x330; points 11 to 13, 15 and 16 at 393x852; and points 8, 11 to 15, 17 and 21 at 1280x800 with a
 mouse.
 
@@ -1233,6 +1243,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi
             if size in (PHONES[0], PHONES[2]):
                 listed += "; " + settings_trip_case(page, url, voice, api, size,
                                                     SETTINGS_TRIPS if size == PHONES[0] else SETTINGS_TRIPS_FEW)
+                listed += "; " + help_key_trip_case(page, url, voice, api, size,
+                                                    HELP_KEY_TRIPS if size == PHONES[0] else HELP_KEY_TRIPS_FEW)
             if size == PHONES[0]:
                 listed += "; " + chips_room_case(page, url, voice, api, size)
                 listed += "; " + jump_after_settings_case(page, url, voice, api, size, True, JUMP_TRIPS_PHONE)
@@ -2425,6 +2437,133 @@ def settings_trip_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, siz
     return (f"{where}: a reader at the foot of {', '.join(lists)} at it again, Send tappable, and one"
             f" {' and '.join(str(up) for up in ups)}px up who saw only the card with it where it stood, by the gear"
             " or Settings and Help, and Back or Esc")
+
+
+# Point 22's trips, (list, px up, the key for Help, what becomes of the draft while Help is up, the way back): at
+# the foot of each list, and 40 and 100px up Main and All, where a reader sees the opened card and no row. The
+# draft is settled elsewhere (the server's proposal goes to none, as after a spoken yes, another device or its
+# lapse), its Send is tapped where it is docked under Help, or a short draft takes its place. Help is left by
+# Esc, by its own Back tapped, or by the browser's Back.
+HELP_KEY_TRIPS: tuple[tuple[str, int, str, str, str], ...] = (
+    ("Main", 0, "?", "settle", "esc"), ("Main", 0, "?", "settle", "back"), ("Main", 0, "?", "settle", "browser"),
+    ("Main", 0, "Control+/", "settle", "esc"), ("Main", 40, "?", "settle", "esc"),
+    ("All", 0, "?", "tap", "back"), ("All", 100, "?", "settle", "browser"), ("All", 0, "?", "shorter", "esc"),
+    ("the call's view", 0, "?", "settle", "esc"), ("the call's view", 0, "?", "tap", "back"),
+)
+HELP_KEY_TRIPS_FEW: tuple[tuple[str, int, str, str, str], ...] = (
+    ("Main", 0, "?", "settle", "esc"), ("All", 0, "?", "settle", "browser"),
+    ("the call's view", 0, "?", "settle", "back"), ("Main", 0, "?", "shorter", "back"),
+)
+HELP_KEY_CHANGES = {"settle": "the draft settled elsewhere", "tap": "Send tapped under Help",
+                    "shorter": "a short draft in its place"}
+HELP_KEY_BACKS = {"esc": "Esc", "back": "Help's Back", "browser": "the browser's Back"}
+
+
+def help_key_trip_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: tuple[int, int],
+                       trips: tuple[tuple[str, int, str, str, str], ...]) -> str:
+    """Point 22, on a phone with a keyboard: a reader of a long draft opened by More presses "?" or Ctrl+/ for
+    Help, the draft goes from under Help or a short one takes its place, and the way back by Esc, Help's Back or
+    the browser's Back finds them on the newest line, with no jump, now and once the box has taken back its
+    room. The main screen was shown before Help's list, which held the focus, was hidden, and before the control
+    pane was shown: Chromium laid the page out to blur that list, and the channel's list, short of the card that
+    had gone, was clamped to a window the pane's height too tall."""
+    width, height = size
+    where = f"{width}x{height}, Help by its key and back"
+    api.threaded = True
+    api.older_threads = 14
+    try:
+        open_call(page, url, voice, api, 30, False)
+        api.deliver_posts = True
+        page.click("#view-switch")
+        page.wait_for_function("() => document.querySelectorAll('#discord-log > li[data-id]').length > 0",
+                               timeout=10_000)
+        page.wait_for_timeout(300)
+        serial = 220
+        for view, up, key, change, back in trips:
+            on_call = view == "the call's view"
+            if page.evaluate("() => document.getElementById('pane-discord').hidden") != on_call:
+                page.click("#view-switch")
+                page.wait_for_timeout(400)
+            if not on_call:
+                view_key(page, "Meta", 1 if view == "Main" else 2, None, None)
+            serial += 1
+            propose(page, api, serial, LONG_DRAFT)
+            page.wait_for_timeout(HOLD_MS + 200)
+            # Opened by More without taking the focus onto the card, as a finger leaves it.
+            page.evaluate("() => document.getElementById('post-confirm-more').click()")
+            page.wait_for_function("() => !document.getElementById('post-confirm').hasAttribute('data-folded')",
+                                   timeout=5000)
+            page.wait_for_timeout(300)
+            page.evaluate(UP_THE_LIST_JS, up)
+            # The keys on the list, as after the reader's own scroll.
+            page.evaluate("() => document.getElementById('scroll-area').focus({ preventScroll: true })")
+            page.wait_for_timeout(400)
+            before = page.evaluate(CARD_ALONE_JS)
+            if up == 0:
+                check(before["call"] is on_call and rect(before, "gap") <= 1 and before["sendHit"] is True and
+                      not before["folded"],
+                      f"{where}: the premise, a reader at the foot of {view}, Send tappable: {before}")
+            else:
+                check(before["call"] is on_call and not before["folded"] and before["row"] is False and
+                      rect(before, "height") > rect(before, "list") and rect(before, "card") < 0,
+                      f"{where}: the premise, a reader {up}px up {view} who sees the opened card and no row: {before}")
+            how = f"{key} for Help, {HELP_KEY_CHANGES[change]} and {HELP_KEY_BACKS[back]}"
+            page.keyboard.press(key)
+            page.wait_for_function("() => currentScreen === 'help'", timeout=5000)
+            page.wait_for_timeout(300)
+            docked = page.evaluate("() => { const c = document.getElementById('post-confirm');"
+                                   " return [c.parentElement.id, c.getAttribute('data-place'), c.hidden]; }")
+            check(docked == ["frame-body", "dock", False], f"{where}: the premise, the card docked under Help: {docked}")
+            if change == "settle":
+                api.settle()
+                page.locator("#post-confirm").wait_for(state="hidden", timeout=5000)
+            elif change == "tap":
+                page.tap("#post-confirm-send")
+                page.locator("#post-confirm").wait_for(state="hidden", timeout=5000)
+            else:
+                serial += 1
+                api.propose({"serial": serial, "handle": f"hAnDlE-browser-check-{serial:04d}",
+                             "channel_id": CHANNEL["id"], "channel_name": "lead team",
+                             "text": POST_PREFIX + SHORT_DRAFT, "prefix": POST_PREFIX, "reply_to": None,
+                             "expires_in_ms": 120_000})
+                page.wait_for_function(f"() => postWatch.shown !== null && postWatch.shown.serial === {serial}",
+                                       timeout=10_000)
+            page.wait_for_timeout(300)
+            if back == "esc":
+                page.keyboard.press("Escape")
+            elif back == "back":
+                page.tap("#close-help")
+            else:
+                page.go_back()
+            page.wait_for_function("() => currentScreen === 'main'", timeout=5000)
+            for when in ("", " a second later"):
+                page.wait_for_timeout(1400 if when else 400)
+                after = page.evaluate(CARD_ALONE_JS)
+                kept = rect(after, "gap") <= 1 and after["jump"] is None and (
+                    after["card"] is not None and after["sendHit"] is True if change == "shorter" else after["card"] is None)
+                check(kept, f"{where}: {how} left a reader {up}px up {view} {rect(after, 'gap'):.0f}px above the foot"
+                            f"{when}, the jump saying {after['jump']!r}, the card {'up' if after['card'] is not None else 'gone'}"
+                            f" and Send tappable {after['sendHit']}")
+            if change == "shorter":
+                api.settle()
+                page.locator("#post-confirm").wait_for(state="hidden", timeout=5000)
+                page.wait_for_timeout(1300)
+            page.evaluate("() => document.getElementById('scroll-area').focus()")
+        taps = sum(1 for *_, change, _ in trips if change == "tap")
+        check(len(api.commits) == taps, f"{where}: {len(api.commits)} commits, not one per tap ({taps})")
+        check(not api.cancels, f"{where}: a draft was withdrawn ({api.cancels})")
+    finally:
+        api.threaded = False
+        api.older_threads = 0
+        api.deliver_posts = False
+    lists = sorted({view for view, *_ in trips}, key=["Main", "All", "the call's view"].index)
+    ups = sorted({up for _, up, *_ in trips if up})
+    keys = sorted({key for _, _, key, _, _ in trips})
+    return (f"{where}: a reader at the foot of {', '.join(lists)}"
+            + (f", and one {' and '.join(str(up) for up in ups)}px up who saw only the card," if ups else "")
+            + f" on the newest line with no jump by {' and '.join(keys)},"
+            f" {', '.join(sorted({HELP_KEY_CHANGES[change] for *_, change, _ in trips}))},"
+            f" and {', '.join(sorted({HELP_KEY_BACKS[back] for *_, back in trips}))}")
 
 
 # Point 20: the chips over the foot of the list on screen, by id, and the room the lists keep for them.
