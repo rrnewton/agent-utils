@@ -3758,6 +3758,14 @@ when the bridge last saw the channel. Nothing would then hold the deleted messag
 back. So once the erase is carried out the channel is in doubt too, as after a change left out: no
 message of it seen by then is trusted until a read that began afterwards has seen it again.
 
+The same holds wherever the live feed reported a change the file never took. A channel off the list
+takes none: the server offers nothing for it, and refuses an adapter's push for it. So a channel put
+back on the list, or added to it, is in doubt from the moment it is listed, and so is one a change
+was on its way to the file for when an erase of the whole channel set the change aside, whether or
+not the file held anything of it yet. Before the list first reaches the cache after a start, and
+while an erased file is being replaced, nothing reaches the file at all, so nothing the live feed
+told the server before then is taken as proof that a held message is current.
+
 ### Whose reads fill it
 
 * **A read-scope token never fills it.** The read token is the one pasted into a voice agent. No

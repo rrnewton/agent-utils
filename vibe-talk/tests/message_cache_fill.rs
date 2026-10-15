@@ -3921,3 +3921,118 @@ async fn a_deleted_reply_the_cache_would_serve_from_a_known_thread_is_counted_as
         "the deleted reply the cache would have served is a counted difference: {counted:?}"
     );
 }
+
+/// A live-fed bridge (adapters push through `[ingest]`). The owner hides the read channel in
+/// Settings: a sweep erases it, and records a drop as it does. While it is hidden, a message is
+/// deleted upstream and the adapter pushes the deletion: the server refuses it, as it refuses any
+/// push for a channel it does not answer for, so the file never learns of it. The owner shows the
+/// channel again, and a write-scope read begun after that is answered from the copy the bridge
+/// took while the channel was hidden, before the deletion: the deleted message is back in the
+/// cache. Upstream no longer has it, and the shadow must not count the cache as one that would
+/// serve it, five seconds on or a day and an hour on. (The review's probe
+/// `r3_e2e_a_deletion_pushed_while_hidden_is_never_undone_by_a_copy_from_then`.)
+#[tokio::test]
+async fn a_deletion_pushed_while_the_channel_was_hidden_is_never_vouched_for_once_shown_again() {
+    let clock = ManualClock::at(T0 + HOUR);
+    let text = testing::config_toml().replace(
+        "[discord]",
+        "[discord]\nthread_api = \"bridge\"\napi_base = \"http://127.0.0.1:9/api\"\n\
+         recent_view = \"flat\"",
+    );
+    let text = format!("{text}\n[ingest]\ntoken = \"{INGEST_TOKEN}\"\n");
+    let (mut state, fake, _store) = testing::state_with_store_from_toml(&text);
+    let ids: Vec<MessageId> = (0..5)
+        .map(|n| {
+            fake.seed_at(
+                &id(READ_CHANNEL),
+                "Ada",
+                &format!("message {n}"),
+                T0 + n * MINUTE,
+            )
+        })
+        .collect();
+    let bridge = Arc::new(CopyKeepingBridge {
+        inner: Arc::new(TimelineChat::new(fake.clone())),
+        copy: std::sync::Mutex::new(None),
+    });
+    state.replace_chat(bridge.clone());
+    let dir = TempDir::new("cache-fill-hidden-deletion");
+    let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
+    let cache = state.message_cache.cache().expect("installed");
+    get(&state, &flat_page()).await;
+    assert_eq!(held(&cache), 5);
+
+    clock.advance(MINUTE);
+    state
+        .hidden_channels
+        .write()
+        .expect("hidden")
+        .insert(id(READ_CHANNEL));
+    state.refresh_routes();
+    assert!(cache.quiesce_blocking(WAIT));
+
+    clock.advance(MINUTE);
+    let copy = vibe_talk::chat::ChatClient::fetch_recent(fake.as_ref(), &id(READ_CHANNEL), 50)
+        .await
+        .expect("read");
+    let copied_at = clock.now();
+
+    clock.advance(10 * MINUTE);
+    let gone = ids[1].clone();
+    fake.delete(&gone);
+    assert_eq!(
+        ingest(&state, pushed_deletion("e1", &gone)).await,
+        StatusCode::NOT_FOUND,
+        "a push for a hidden channel is refused"
+    );
+
+    clock.advance(MINUTE);
+    state
+        .hidden_channels
+        .write()
+        .expect("hidden")
+        .remove(&id(READ_CHANNEL));
+    state.refresh_routes();
+    assert!(cache.quiesce_blocking(WAIT));
+
+    clock.advance(MINUTE);
+    *bridge.copy.lock().expect("copy") = Some((copy, vibe_talk::clock::iso_from_ms(copied_at)));
+    vibe_talk::ops::resolve(
+        &state,
+        vibe_talk::auth::Scope::Write,
+        READ_CHANNEL,
+        "message",
+        None,
+        None,
+    )
+    .await
+    .expect("resolved");
+    *bridge.copy.lock().expect("copy") = None;
+    assert!(cache.quiesce_blocking(WAIT));
+    assert!(
+        holds(&cache, &read_chan(), &gone),
+        "the copy from before the deletion brought the message back"
+    );
+
+    for (step, label) in [(5_000, "5 s"), (25 * HOUR, "25 h")] {
+        clock.advance(step);
+        let status = call_as(
+            &state,
+            &format!("/api/v1/channels/{READ_CHANNEL}/messages/{}", gone.as_str()),
+            testing::READ_TOKEN,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{label}: upstream deleted it"
+        );
+        let counted = shadow_of(&state, "message_by_id").await;
+        assert_eq!(
+            (counted.would_serve, counted.extra_rows),
+            (0, 0),
+            "{label}: the cache would serve a message deleted upstream, whose deletion the \
+             adapter pushed while the channel was hidden: {counted:?}"
+        );
+    }
+}

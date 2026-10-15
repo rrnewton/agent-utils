@@ -1081,10 +1081,13 @@ pub(crate) struct Shared {
     /// ended: the writer checkpoints the log itself when this is small, so that its own copy,
     /// and its sync, are cheap.
     pub(crate) log_backlog: AtomicI64,
-    /// Local time, by [`Shared::clock`], the file now open was opened in this process: since then,
-    /// every change the live feed offered for a channel was written or recorded as left out. What
-    /// happened before (while the server was down, or the cache off) never reached the file.
-    pub(crate) opened_ms: AtomicI64,
+    /// Local time, by [`Shared::clock`], since which every change the live feed offered for a
+    /// channel on the route list was written to the file now open or recorded as left out
+    /// ([`MessageCache::fed_since_ms`]): the later of when that file could first be offered
+    /// anything in this process and when the first route snapshot reached this cache. What
+    /// happened before (while the server was down, the cache off, the file being replaced, or the
+    /// list not yet known) never reached the file.
+    pub(crate) fed_since_ms: AtomicI64,
     /// Erases asked for and not yet applied, with the sequence number that applies them
     /// (`u64::MAX` when the writer could not be asked). An erase holds this lock from before its
     /// epochs move until its record is written ([`MessageCache::queue_erase`]).
@@ -1385,7 +1388,7 @@ impl MessageCache {
             search_text_current: AtomicBool::new(true),
             readers_in_use: AtomicUsize::new(0),
             log_backlog: AtomicI64::new(i64::MAX),
-            opened_ms: AtomicI64::new(i64::MAX),
+            fed_since_ms: AtomicI64::new(i64::MAX),
             erasing: Mutex::new(HashMap::new()),
             sweep: Mutex::new(None),
             erase_failed: Mutex::new(Refused::default()),
@@ -1395,6 +1398,10 @@ impl MessageCache {
             read_hook: Mutex::new(None),
         });
         let inner = open_inner(&path, &shared)?;
+        // Nothing can be offered before the handle exists; the first route snapshot moves this on.
+        shared
+            .fed_since_ms
+            .store(shared.clock.now_ms(), Ordering::SeqCst);
         Ok(Self {
             shared,
             inner: RwLock::new(Some(Arc::new(inner))),
@@ -1441,16 +1448,24 @@ impl MessageCache {
     }
 
     /// Since when, by [`MessageCache::now_ms`]'s clock, every change the live feed has offered for
-    /// a channel was written to the file or recorded as left out ([`MessageCache::mark_suspect`]):
-    /// when the file now open was opened in this process. A change made before then, while the
-    /// server was down or the cache off, never reached the file, so the feed vouches for nothing
-    /// seen before it. An erase of a whole channel forgets, with its rows, the changes the feed
-    /// delivered for it, and so records a drop of the channel once it is carried out
-    /// ([`MessageCache::last_drop_ms`]): nothing of the channel seen by then is vouched for until a
-    /// read begun afterwards has seen it again.
+    /// a channel on the route list was written to the file or recorded as left out
+    /// ([`MessageCache::mark_suspect`]): the later of when the file now open could first be offered
+    /// anything in this process (once it is installed: a file erased and replaced answers `Off`
+    /// until then) and when the first route snapshot reached this cache ([`Sink::install`] hands
+    /// one over at once, or arming does). A change made before then, while the server was down,
+    /// the cache off, or the server not yet answering for the channel, never reached the file, so
+    /// the feed vouches for nothing seen before it.
+    ///
+    /// A channel the route list names afresh later (put back on it, added to it, or now under
+    /// another provider key) is recorded as left out when it comes ([`MessageCache::retain_only`]):
+    /// whatever the feed delivered for it while it was off the list was refused. And an erase of
+    /// a whole channel forgets, with its rows, the changes the feed delivered for it, and so
+    /// records a drop of the channel once it is carried out ([`MessageCache::last_drop_ms`]), as
+    /// does a change such an erase discards on its way to the file. Either way nothing of the
+    /// channel seen by then is vouched for until a read begun afterwards has seen it again.
     #[must_use]
     pub fn fed_since_ms(&self) -> i64 {
-        self.shared.opened_ms.load(Ordering::SeqCst)
+        self.shared.fed_since_ms.load(Ordering::SeqCst)
     }
 
     /// Replace the route snapshot the writer gates on, and sweep every channel and provider not
@@ -1463,6 +1478,14 @@ impl MessageCache {
     /// sweep of a process has landed, no channel is readable at all. A sweep the file refuses
     /// still erases, once the file takes it, every channel it left out, even one a later snapshot
     /// names again, and blocks each until then ([`Refused::sweeps`]).
+    ///
+    /// The live feed's changes for a channel off the list reach nothing: the sink offers nothing
+    /// for it, and the ingest route refuses an adapter's pushes for it. So every channel this
+    /// snapshot names that the one before it did not (put back, added, or now under another
+    /// provider key) is recorded as left out, before any read can find it on the list
+    /// ([`MessageCache::mark_suspect`]): nothing of it seen by then is vouched for, by the feed or
+    /// by a claim, until a read begun afterwards has seen it again. The first snapshot instead
+    /// starts the feed's vouching window ([`MessageCache::fed_since_ms`]).
     pub fn retain_only(&self, routes: RouteSnapshot) {
         let routes = Arc::new(routes);
         let previous = self
@@ -1471,6 +1494,18 @@ impl MessageCache {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
+        match &previous {
+            None => {
+                self.shared
+                    .fed_since_ms
+                    .fetch_max(self.shared.clock.now_ms(), Ordering::SeqCst);
+            }
+            Some(previous) => {
+                for chan in routes.channels.iter().filter(|chan| !previous.allows(chan)) {
+                    self.mark_suspect(chan);
+                }
+            }
+        }
         let mut removed: HashSet<ChanKey> = lock(&self.shared.epochs.channels)
             .keys()
             .filter(|chan| !routes.allows(chan))
@@ -2051,6 +2086,11 @@ impl MessageCache {
         if reopen {
             let fresh = open_inner(&self.path, &self.shared)?;
             *self.inner.write().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(fresh));
+            // Only now can the fresh file be offered anything: until it was installed, every offer
+            // came back `Off`, recorded nowhere, and the feed vouches for nothing seen before.
+            self.shared
+                .fed_since_ms
+                .store(self.shared.clock.now_ms(), Ordering::SeqCst);
         }
         Ok(EraseReport {
             bytes,
@@ -2340,9 +2380,6 @@ impl Drop for MessageCache {
 /// Open the file at `path` for `shared`: create it `0600` if absent, recognise it, rebuild one of
 /// ours that cannot be used, start its writer, and open its readers.
 fn open_inner(path: &Path, shared: &Arc<Shared>) -> Result<Inner, CacheError> {
-    shared
-        .opened_ms
-        .store(shared.clock.now_ms(), Ordering::SeqCst);
     let mut rebuilt = false;
     let connection = loop {
         file::create_if_absent(path).map_err(CacheError::Filesystem)?;

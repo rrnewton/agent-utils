@@ -25,6 +25,17 @@
 //!   edits the live feed delivered for it. A read begun after it, its stamp current, may still
 //!   bring a copy its provider dated before them; the feed must not vouch for what that copy
 //!   brings back.
+//!
+//! And what the third review of the fix found:
+//!
+//! - **A change the file never took**: the live feed's changes for a channel off the route list
+//!   reach nothing, so a channel put back on the list, or added to it, is in doubt from when it is
+//!   listed; a change offered for a channel off the list, or before the first list came, is
+//!   recorded as left out; and the feed vouches for nothing seen before the first list reached the
+//!   cache, nor before an erased file was replaced.
+//! - **A change a whole erase discards**: one on its way to the file when an erase of its whole
+//!   channel moved the channel's epoch is recorded as left out, whether or not the file held a row
+//!   of the channel for the erase to record a drop on.
 
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
@@ -1172,5 +1183,435 @@ fn a_read_begun_after_a_whole_channel_erase_is_vouched_for_again() {
         shadow::decide(&ask, &view, &facts),
         shadow::Decision::Serve,
         "m1, listed by a read begun after the erase, is vouched for again"
+    );
+}
+
+/// A change of m3 the live feed delivers at `at`, under `stamp`: its deletion, or with `edit` an
+/// edit to `EDITED`.
+fn offer_change_of_m3(cache: &MessageCache, chan: &ChanKey, stamp: Stamp, at: i64, edit: bool) {
+    if edit {
+        let mut changed = m(3);
+        changed.content = "EDITED".to_owned();
+        cache.offer(
+            chan.clone(),
+            stamp,
+            Observation::Push {
+                push: Push::Upsert {
+                    message: Box::new(Incoming::new(changed, Scope::Flat)),
+                    update: true,
+                    partial: false,
+                },
+                observed_ms: at,
+            },
+        );
+    } else {
+        offer_deletion_of_m3(cache, chan, stamp, at);
+    }
+}
+
+/// Every way the cache would vouch for m3 as the feed's change left it undone, asked 50 seconds
+/// after `first`, while a proven copy's claim stands, and a day and an hour after, past
+/// [`shadow::REVALIDATED_BRIDGE_MS`], where only the feed could vouch. `what` names the case.
+fn undone_when_asked(
+    cache: &MessageCache,
+    chan: &ChanKey,
+    clock: &ManualClock,
+    first: i64,
+    edit: bool,
+    what: &str,
+) -> Vec<String> {
+    let mut vouched = Vec::new();
+    for asked in [first + 50 * SEC, first + 25 * HOUR] {
+        clock.set(asked);
+        let (decision, content) = decide_m3(cache, chan, asked);
+        if vouches_for_undone_change(decision, content.as_deref(), edit) {
+            vouched.push(format!(
+                "{what}, asked {} s on: {decision:?} {content:?}",
+                (asked - first) / SEC
+            ));
+        }
+    }
+    vouched
+}
+
+/// The routes naming exactly `chans`, of provider `p`.
+fn routes_of(chans: &[ChanKey]) -> RouteSnapshot {
+    RouteSnapshot::new(chans.to_vec(), ["p".to_owned()])
+}
+
+/// The owner takes C1 of a live-fed bridge off the list at `first` + 10 s (a sweep, which records a
+/// drop as it erases the channel) and puts it back at + 30 s. At + 20 s, while it is off the list,
+/// m3 is changed upstream, deleted or edited: the sink offers nothing for a channel off its list,
+/// and the ingest route refuses an adapter's push for it (`offered` false); or the change reaches
+/// the cache all the same (`offered` true), where nothing of the channel is written. A read begun
+/// at + 40 s lands the bridge's copy dated + 15 s: after the sweep's drop, before the change. The
+/// feed must not vouch for m3 as that copy has it, nor may the copy's claim. (The reviews' probes
+/// `r3_p1_off_list_change` and
+/// `rv3_f1_a_deletion_made_while_the_channel_was_off_the_list_is_never_vouched_for`.)
+#[test]
+fn a_change_made_while_the_channel_was_off_the_list_is_never_undone_by_a_copy_from_then() {
+    let mut vouched = Vec::new();
+    for edit in [false, true] {
+        for proven in [true, false] {
+            for offered in [false, true] {
+                let dir = crate::testing::TempDir::new("cache-off-the-list");
+                let first = T0 + 8 * STEP + SEC;
+                let clock = Arc::new(ManualClock(AtomicI64::new(first)));
+                let (cache, chan) = bridge_with_flat(&dir, &clock, first);
+                clock.set(first + 10 * SEC);
+                cache.retain_only(routes_of(&[]));
+                assert!(cache.quiesce_blocking(WAIT));
+                clock.set(first + 20 * SEC);
+                if offered {
+                    let stamp = cache.stamp(&chan);
+                    offer_change_of_m3(&cache, &chan, stamp, first + 20 * SEC, edit);
+                    assert!(cache.quiesce_blocking(WAIT));
+                }
+                clock.set(first + 30 * SEC);
+                cache.retain_only(routes_of(std::slice::from_ref(&chan)));
+                assert!(cache.quiesce_blocking(WAIT));
+                clock.set(first + 40 * SEC);
+                read_dated(&cache, &chan, first + 15 * SEC, proven);
+                vouched.extend(undone_when_asked(
+                    &cache,
+                    &chan,
+                    &clock,
+                    first,
+                    edit,
+                    &format!("edit {edit}, proven {proven}, offered {offered}"),
+                ));
+            }
+        }
+    }
+    assert!(
+        vouched.is_empty(),
+        "a change made while the channel was off the list is undone and vouched for: {vouched:#?}"
+    );
+}
+
+/// The same with no sweep at all: C1 is first put on the list at `first` + 20 s, the file having
+/// been opened, and C0 listed, at `first`. m3 was changed at + 10 s, before C1 was listed (offered
+/// to the cache or not); the bridge's copy is dated + 5 s. (The reviews' probes
+/// `r3_p2_unlisted_change` and
+/// `rv3_f1_a_channel_listed_after_the_file_opened_never_vouches_for_a_copy_from_before`.)
+#[test]
+fn a_channel_listed_after_the_file_opened_never_vouches_for_a_copy_from_before() {
+    let mut vouched = Vec::new();
+    for edit in [false, true] {
+        for proven in [true, false] {
+            for offered in [false, true] {
+                let dir = crate::testing::TempDir::new("cache-listed-late");
+                let first = T0 + 8 * STEP + SEC;
+                let clock = Arc::new(ManualClock(AtomicI64::new(first)));
+                let chan = ChanKey::new("p", "C1");
+                let other = ChanKey::new("p", "C0");
+                let cache = fixtures::open(&dir, &clock, Limits::default());
+                cache.retain_only(routes_of(std::slice::from_ref(&other)));
+                assert!(cache.quiesce_blocking(WAIT));
+                clock.set(first + 10 * SEC);
+                if offered {
+                    let stamp = cache.stamp(&chan);
+                    offer_change_of_m3(&cache, &chan, stamp, first + 10 * SEC, edit);
+                    assert!(cache.quiesce_blocking(WAIT));
+                }
+                clock.set(first + 20 * SEC);
+                cache.retain_only(routes_of(&[other, chan.clone()]));
+                assert!(cache.quiesce_blocking(WAIT));
+                clock.set(first + 30 * SEC);
+                read_dated(&cache, &chan, first + 5 * SEC, proven);
+                vouched.extend(undone_when_asked(
+                    &cache,
+                    &chan,
+                    &clock,
+                    first,
+                    edit,
+                    &format!("edit {edit}, proven {proven}, offered {offered}"),
+                ));
+            }
+        }
+    }
+    assert!(
+        vouched.is_empty(),
+        "a change made before the channel was listed is undone and vouched for: {vouched:#?}"
+    );
+}
+
+/// Before the first route snapshot (a server whose list is not yet known, or not yet armed), a
+/// change of m3 reaches the cache: a deletion of a message the file does not hold, or an edit.
+/// Nothing is written. The first snapshot, at `first` + 20 s, lists C1; a read begun at + 30 s
+/// lands the bridge's copy dated + 5 s, before the change. (The review's probe
+/// `r3_p2b_pre_first_sweep_deletion`.)
+#[test]
+fn a_change_offered_before_the_first_snapshot_is_never_undone_by_a_copy_from_before_it() {
+    let mut vouched = Vec::new();
+    for edit in [false, true] {
+        for proven in [true, false] {
+            let dir = crate::testing::TempDir::new("cache-before-first-sweep");
+            let first = T0 + 8 * STEP + SEC;
+            let clock = Arc::new(ManualClock(AtomicI64::new(first)));
+            let chan = ChanKey::new("p", "C1");
+            let cache = fixtures::open(&dir, &clock, Limits::default());
+            clock.set(first + 10 * SEC);
+            let stamp = cache.stamp(&chan);
+            offer_change_of_m3(&cache, &chan, stamp, first + 10 * SEC, edit);
+            assert!(cache.quiesce_blocking(WAIT));
+            clock.set(first + 20 * SEC);
+            cache.retain_only(routes_of(std::slice::from_ref(&chan)));
+            assert!(cache.quiesce_blocking(WAIT));
+            clock.set(first + 30 * SEC);
+            read_dated(&cache, &chan, first + 5 * SEC, proven);
+            vouched.extend(undone_when_asked(
+                &cache,
+                &chan,
+                &clock,
+                first,
+                edit,
+                &format!("edit {edit}, proven {proven}"),
+            ));
+        }
+    }
+    assert!(
+        vouched.is_empty(),
+        "a change offered before the first snapshot is undone and vouched for: {vouched:#?}"
+    );
+}
+
+/// Between the file's opening, at `first`, and the first route snapshot, at + 20 s, nothing the
+/// feed delivers reaches the cache at all: the sink offers nothing for a channel it does not yet
+/// know, and nothing before the cache is installed behind it. m3 deleted upstream at + 10 s leaves
+/// no trace, so the feed vouches for nothing seen before that snapshot: not for m3 in a copy dated
+/// + 5 s that claims nothing.
+#[test]
+fn the_feed_vouches_for_nothing_seen_before_the_first_route_snapshot() {
+    let dir = crate::testing::TempDir::new("cache-fed-from-first-snapshot");
+    let first = T0 + 8 * STEP + SEC;
+    let clock = Arc::new(ManualClock(AtomicI64::new(first)));
+    let chan = ChanKey::new("p", "C1");
+    let cache = fixtures::open(&dir, &clock, Limits::default());
+    clock.set(first + 20 * SEC);
+    cache.retain_only(routes_of(std::slice::from_ref(&chan)));
+    assert!(cache.quiesce_blocking(WAIT));
+    clock.set(first + 30 * SEC);
+    read_dated(&cache, &chan, first + 5 * SEC, false);
+    let vouched = undone_when_asked(&cache, &chan, &clock, first, false, "rows only");
+    assert!(
+        vouched.is_empty(),
+        "the feed vouches for a copy from before the route list reached the cache: {vouched:#?}"
+    );
+    assert_eq!(cache.fed_since_ms(), first + 20 * SEC);
+}
+
+/// A clock a test moves by hand that runs `hook`, once, at the first reading taken on `thread`
+/// after it is set, handing back the time from before the hook ran.
+struct HookClock {
+    now: Arc<AtomicI64>,
+    thread: std::thread::ThreadId,
+    hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl Clock for HookClock {
+    fn now_ms(&self) -> i64 {
+        let now = self.now.load(std::sync::atomic::Ordering::SeqCst);
+        if std::thread::current().id() == self.thread {
+            let hook = lock(&self.hook).take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        now
+    }
+}
+
+/// While an erased file is replaced, every offer comes back `Off`, recorded nowhere: the feed
+/// vouches for nothing seen before the fresh file was installed. m3 is deleted upstream at
+/// `first` + 10 s, while the fresh file is being opened, and its push is refused; the bridge's copy
+/// dated + 5 s, which claims nothing, must not then be vouched for.
+#[test]
+fn the_feed_vouches_for_nothing_seen_before_an_erased_file_was_replaced() {
+    let dir = crate::testing::TempDir::new("cache-fed-from-reopen");
+    let first = T0 + 8 * STEP + SEC;
+    let now = Arc::new(AtomicI64::new(first));
+    let clock = Arc::new(HookClock {
+        now: Arc::clone(&now),
+        thread: std::thread::current().id(),
+        hook: std::sync::Mutex::new(None),
+    });
+    let cache = Arc::new(
+        MessageCache::open(CacheOptions {
+            clock: Arc::clone(&clock) as Arc<dyn Clock>,
+            ..CacheOptions::new(dir.path().join("cache").join("c.sqlite3"))
+        })
+        .expect("the cache opens"),
+    );
+    let chan = ChanKey::new("p", "C1");
+    cache.retain_only(routes_of(std::slice::from_ref(&chan)));
+    assert!(cache.quiesce_blocking(WAIT));
+    let offered = Arc::new(std::sync::Mutex::new(None));
+    {
+        let (cache, chan, now, offered) = (
+            Arc::downgrade(&cache),
+            chan.clone(),
+            Arc::clone(&now),
+            Arc::clone(&offered),
+        );
+        *lock(&clock.hook) = Some(Box::new(move || {
+            let at = first + 10 * SEC;
+            now.store(at, std::sync::atomic::Ordering::SeqCst);
+            let cache = cache.upgrade().expect("the cache");
+            let stamp = cache.stamp(&chan);
+            *lock(&offered) = Some(cache.offer(
+                chan.clone(),
+                stamp,
+                Observation::Push {
+                    push: Push::Delete {
+                        id: MessageId("m3".to_owned()),
+                        created_ms: None,
+                    },
+                    observed_ms: at,
+                },
+            ));
+        }));
+    }
+    cache
+        .erase_file(true)
+        .expect("the file is erased and replaced");
+    assert!(
+        lock(&offered).is_some(),
+        "the deletion was pushed while the file was replaced"
+    );
+    assert!(cache.quiesce_blocking(WAIT));
+    now.store(first + 30 * SEC, std::sync::atomic::Ordering::SeqCst);
+    read_dated(&cache, &chan, first + 5 * SEC, false);
+    let mut vouched = Vec::new();
+    for asked in [first + 50 * SEC, first + 25 * HOUR] {
+        now.store(asked, std::sync::atomic::Ordering::SeqCst);
+        let (decision, content) = decide_m3(&cache, &chan, asked);
+        if vouches_for_undone_change(decision, content.as_deref(), false) {
+            vouched.push(format!(
+                "offer {:?}, asked {} s on: {decision:?} {content:?}",
+                lock(&offered),
+                (asked - first) / SEC
+            ));
+        }
+    }
+    assert!(
+        vouched.is_empty(),
+        "the feed vouches for a copy from before the fresh file could take offers: {vouched:#?}"
+    );
+}
+
+/// What a channel put back on the list leaves in doubt is lifted as on any drop: a read begun after
+/// it was put back vouches for what it lists.
+#[test]
+fn a_read_begun_after_a_channel_was_put_back_is_vouched_for_again() {
+    let dir = crate::testing::TempDir::new("cache-put-back-lifted");
+    let first = T0 + 8 * STEP + SEC;
+    let clock = Arc::new(ManualClock(AtomicI64::new(first)));
+    let (cache, chan) = bridge_with_flat(&dir, &clock, first);
+    clock.set(first + 10 * SEC);
+    cache.retain_only(routes_of(&[]));
+    assert!(cache.quiesce_blocking(WAIT));
+    clock.set(first + 30 * SEC);
+    cache.retain_only(routes_of(std::slice::from_ref(&chan)));
+    assert!(cache.quiesce_blocking(WAIT));
+    assert_eq!(cache.last_drop_ms(&chan), Some(first + 30 * SEC));
+    clock.set(first + 40 * SEC);
+    read_dated(&cache, &chan, first + 40 * SEC, true);
+    let asked = first + 50 * SEC;
+    clock.set(asked);
+    let (decision, content) = decide_m3(&cache, &chan, asked);
+    assert_eq!(
+        (decision, content.as_deref()),
+        (shadow::Decision::Serve, Some("body number 3")),
+        "m3, listed by a read begun after the channel was put back, is vouched for again"
+    );
+}
+
+/// A change of m3 the feed delivers at `first` + 20 s is queued while the writer is behind (held
+/// still here), and C1 is erased whole, as `how` erases it, before the writer reaches it (none for
+/// the control): the erase moves the channel's epoch, so the change is dropped unwritten. The file
+/// holds no row of C1 when the erase is carried out (`prior` false: nothing of C1 written yet;
+/// `prior` true: an earlier whole erase took its row, and nothing was written since), so the erase
+/// detaches nothing. A read begun at + 40 s lands the bridge's copy dated + 15 s, before the
+/// change. What the cache would then vouch for, as [`undone_when_asked`] reports it.
+fn change_dropped_by_an_erase(prior: bool, how: Option<WholeErase>, edit: bool) -> Vec<String> {
+    let dir = crate::testing::TempDir::new("cache-erase-drops-change");
+    let first = T0 + 8 * STEP + SEC;
+    let clock = Arc::new(ManualClock(AtomicI64::new(first)));
+    let chan = ChanKey::new("p", "C1");
+    let cache = fixtures::open(&dir, &clock, Limits::default());
+    cache.retain_only(routes_of(std::slice::from_ref(&chan)));
+    assert!(cache.quiesce_blocking(WAIT));
+    if prior {
+        read_dated(&cache, &chan, first, true);
+        clock.set(first + 10 * SEC);
+        cache.erase_channels(std::slice::from_ref(&chan));
+        assert!(cache.quiesce_blocking(WAIT));
+    }
+    let at = first + 20 * SEC;
+    clock.set(at);
+    let resume = cache.pause_writer();
+    let stamp = cache.stamp(&chan);
+    offer_change_of_m3(&cache, &chan, stamp, at, edit);
+    clock.set(at + 1);
+    match how {
+        Some(WholeErase::Channel) => cache.erase_channels(std::slice::from_ref(&chan)),
+        Some(WholeErase::Provider) => cache.erase_provider(&chan.provider_key),
+        Some(WholeErase::Sweep) => {
+            cache.retain_only(routes_of(&[]));
+            cache.retain_only(routes_of(std::slice::from_ref(&chan)));
+        }
+        None => {}
+    }
+    drop(resume);
+    assert!(cache.quiesce_blocking(WAIT));
+    if how.is_some() {
+        assert_eq!(cache.stats().ops_stale, 1, "the erase dropped the change");
+    }
+    clock.set(first + 40 * SEC);
+    read_dated(&cache, &chan, first + 15 * SEC, true);
+    undone_when_asked(
+        &cache,
+        &chan,
+        &clock,
+        first,
+        edit,
+        &format!("prior {prior}, {how:?}, edit {edit}"),
+    )
+}
+
+/// The control: with no erase, the queued deletion lands, and its tombstone holds the older copy
+/// back. (An edit of a message the file does not hold is stored partial, and any listing replaces a
+/// partial row, an older one too: #297's remaining item, the review's probe
+/// `rv3_nb_a_pushed_edit_of_an_unheld_message_is_never_undone_by_an_older_copy`.)
+#[test]
+fn control_a_queued_deletion_with_no_erase_lands_and_holds_an_older_copy_back() {
+    let mut vouched = Vec::new();
+    for prior in [false, true] {
+        vouched.extend(change_dropped_by_an_erase(prior, None, false));
+    }
+    assert!(vouched.is_empty(), "{vouched:#?}");
+}
+
+/// A whole-channel erase that finds no row of the channel records no drop of its own, yet the
+/// change it dropped unwritten was a deletion or an edit the file now lacks just the same: the
+/// observation that would have made the row, and its tombstone. It must be recorded as left out,
+/// or the feed vouches for m3 as the older copy has it. By every whole erase: a confirmed loss of
+/// access, a provider erase and a sweep. (The reviews' probes
+/// `r3_p3_stale_change_for_unheld_channel` and
+/// `rv3_f2_a_whole_erase_finding_no_row_never_lets_a_stale_deletion_be_undone`.)
+#[test]
+fn a_change_a_whole_erase_drops_for_a_channel_with_no_row_is_never_undone() {
+    let mut vouched = Vec::new();
+    for prior in [false, true] {
+        for how in WHOLE_ERASES {
+            for edit in [false, true] {
+                vouched.extend(change_dropped_by_an_erase(prior, Some(how), edit));
+            }
+        }
+    }
+    assert!(
+        vouched.is_empty(),
+        "a change a whole erase dropped is undone and vouched for: {vouched:#?}"
     );
 }
