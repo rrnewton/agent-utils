@@ -2096,6 +2096,7 @@ model provider or a real gateway.
 | Prepare bodies for speech | `speakable.enabled` | `VIBE_TALK_SPEAKABLE` | **on by default**; off relays exactly what was typed. Does not affect the time-zone conversion. A value that is neither `true` nor `false` refuses to start |
 | ElevenLabs API key | `elevenlabs.api_key` | `VIBE_TALK_ELEVENLABS_API_KEY` | **secret**, needed to mint signed URLs and for the ElevenLabs read-aloud backend |
 | Your own Discord user id | `discord.owner_user_id` | `VIBE_TALK_DISCORD_OWNER_USER_ID` | public; **cannot be derived** — see below. Without it, messages you type into Discord yourself are drawn as a third party |
+| Your coding agents' accounts | `discord.coding_agent_user_ids` | — | public; a list of account ids, at most 32. The channel view draws each as the coding agent and no other bot; unset, the one bot in a channel besides this server is guessed to be it. See [Who the coding agent is](#who-the-coding-agent-is) |
 | ElevenLabs voice id | `elevenlabs.voice_id` | `VIBE_TALK_ELEVENLABS_VOICE_ID` | public; **optional** — read-aloud borrows the configured agent's own voice when this is unset |
 | ElevenLabs API base | `elevenlabs.api_base` | `VIBE_TALK_ELEVENLABS_API_BASE` | `https://api.elevenlabs.io/v1` |
 | Storage path | `storage.path` | `VIBE_TALK_STORAGE_PATH` | absolute; unset means **no durable state** |
@@ -2168,7 +2169,8 @@ provider = "slack"
 
 Keys common to both kinds: `key` (1–32 lowercase letters, digits, or hyphens), `kind` (`discord`
 or `slack`), `name` (display name; defaults to `Discord` or `Slack`), `api_base`, `token`,
-`owner_user_id`, `request_timeout_seconds` (default `20`, range `1`–`120`), `live_poll_seconds`
+`owner_user_id`, `coding_agent_user_ids` (see [Who the coding agent is](#who-the-coding-agent-is)),
+`request_timeout_seconds` (default `20`, range `1`–`120`), `live_poll_seconds`
 (default `0`, off; at least `5`), `channel_registration`, and `max_post_chars` / `max_post_bytes`
 (the most one message may hold; see the configuration table). Discord-protocol providers also take
 `thread_api`, `upstream_read_marks` and `markup`, and with `thread_api = "bridge"` also `recent_view`,
@@ -7758,6 +7760,23 @@ else's.
 You can also set it without a restart: **Settings lists every account it has seen** and lets you
 say which is which. That is the faster fix, and it is per-browser; the configuration setting is for
 a deployment that would rather state it once.
+
+### Who the coding agent is
+
+`#323 slack-system-bots`. The channel view draws the coding agent's messages as the call
+transcript's other speaker, full width and without its name. Which account that is, in order:
+
+1. **Your choice in Settings**, which beats everything below, in every channel the account speaks in.
+2. **An account `coding_agent_user_ids` names** at the channel's provider (a `[[providers]]` entry,
+   or `[discord]`). Then no other bot is the coding agent.
+3. **Otherwise, on a Discord-protocol provider, the one bot in the channel besides this server**,
+   a guess that declines when there are two.
+
+A Slack provider makes **no guess**: a Slack workspace's channels carry system bots, such as the
+welcome bot a workspace move brings, Slackbot, and integrations, and the lone-bot guess drew a
+welcome bot as the coding agent, nameless and in its colours. In a Slack channel every bot not named
+is drawn as another bot, with its own name and `(bot)`, until the configuration or Settings names the
+coding agent. Slackbot is drawn as a bot although Slack's `users.info` says otherwise.
 
 ## Running the tests
 

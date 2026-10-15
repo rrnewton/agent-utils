@@ -770,11 +770,33 @@ pub struct ProviderConfig {
     /// makes with that in front of them, not a thing that happens because they upgraded. Refused
     /// below [`crate::live::MIN_POLL_SECONDS`].
     pub live_poll_seconds: u64,
+    /// The accounts the coding agents post as at this provider, `coding_agent_user_ids`, when the
+    /// operator has named them. `#323 slack-system-bots`.
+    ///
+    /// The page draws these as the coding agent and no other bot, so a system bot — a Slack
+    /// workspace's welcome bot, an integration — is drawn as another bot, with its own name and a
+    /// bot label. Unset, a Discord-protocol provider keeps the page's guess that the one bot in a
+    /// channel besides this server is the coding agent; a Slack provider makes no such guess (see
+    /// [`ProviderConfig::coding_agents_named_only`]). The reader's own choice in Settings beats
+    /// both. Public: an account id is on every message that account has sent.
+    pub coding_agent_user_ids: Vec<String>,
     /// How this provider is reached.
     pub kind: ProviderKind,
 }
 
 impl ProviderConfig {
+    /// Whether the page may take only an account named here, or by the reader in Settings, to be
+    /// the coding agent, rather than guessing that a channel's one other bot is. `#323
+    /// slack-system-bots`.
+    ///
+    /// True wherever `coding_agent_user_ids` names any account, and always for a Slack provider:
+    /// a Slack workspace's channels carry system and app bots (a welcome bot when the workspace
+    /// moves, integrations), so a lone bot there says nothing about who the coding agent is.
+    #[must_use]
+    pub fn coding_agents_named_only(&self) -> bool {
+        !self.coding_agent_user_ids.is_empty() || matches!(self.kind, ProviderKind::Slack(_))
+    }
+
     /// The namespace recorded beside a channel this provider registered.
     ///
     /// For a Discord-protocol provider it is the API base, exactly as single-provider deployments
@@ -1050,6 +1072,7 @@ struct FileDiscord {
     thread_api: Option<crate::threads::ThreadApi>,
     bot_token: Option<Secret>,
     owner_user_id: Option<String>,
+    coding_agent_user_ids: Option<Vec<String>>,
     api_base: Option<String>,
     request_timeout_seconds: Option<u64>,
     default_fetch_limit: Option<u16>,
@@ -1087,6 +1110,7 @@ struct FileProvider {
     api_base: Option<String>,
     token: Option<Secret>,
     owner_user_id: Option<String>,
+    coding_agent_user_ids: Option<Vec<String>>,
     request_timeout_seconds: Option<u64>,
     live_poll_seconds: Option<u64>,
     channel_registration: Option<bool>,
@@ -2393,6 +2417,50 @@ fn validate_display_name(field: &str, name: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// The most accounts `coding_agent_user_ids` may name. A deployment has a handful of agents; the
+/// bound keeps a mistyped list from riding on every client-config answer.
+pub const MAX_CODING_AGENT_IDS: usize = 32;
+
+/// The longest account id `coding_agent_user_ids` may hold, in bytes. Discord snowflakes and Slack
+/// member ids are a fraction of it.
+const MAX_ACCOUNT_ID_BYTES: usize = 64;
+
+/// Validate `coding_agent_user_ids`: each id trimmed, none empty, none with a space or a control
+/// character, none longer than [`MAX_ACCOUNT_ID_BYTES`], at most [`MAX_CODING_AGENT_IDS`] of them,
+/// each once. `#323 slack-system-bots`.
+fn coding_agent_ids(field: &str, ids: Option<Vec<String>>) -> Result<Vec<String>, ConfigError> {
+    let ids = ids.unwrap_or_default();
+    if ids.len() > MAX_CODING_AGENT_IDS {
+        return Err(ConfigError::Invalid {
+            field: field.to_owned(),
+            detail: format!(
+                "names {} accounts; at most {MAX_CODING_AGENT_IDS}",
+                ids.len()
+            ),
+        });
+    }
+    let mut kept: Vec<String> = Vec::with_capacity(ids.len());
+    for id in ids {
+        let id = id.trim().to_owned();
+        if id.is_empty()
+            || id.len() > MAX_ACCOUNT_ID_BYTES
+            || id.chars().any(|c| c.is_control() || c.is_whitespace())
+        {
+            return Err(ConfigError::Invalid {
+                field: field.to_owned(),
+                detail: format!(
+                    "{id:?} is not an account id: give each as the provider writes it, such as \
+                     U0123ABCD or a Discord snowflake, at most {MAX_ACCOUNT_ID_BYTES} bytes"
+                ),
+            });
+        }
+        if !kept.contains(&id) {
+            kept.push(id);
+        }
+    }
+    Ok(kept)
+}
+
 /// Read the shared limits from `[chat]`, or from `[discord]` where older files keep them.
 fn chat_limits(chat: &FileChat, discord: &FileDiscord) -> Result<ChatLimits, ConfigError> {
     fn pick<T: Copy>(
@@ -2471,6 +2539,7 @@ fn legacy_discord_provider<'e>(
         let configures_a_provider = file.provider_name.is_some()
             || file.thread_api.is_some()
             || file.owner_user_id.is_some()
+            || file.coding_agent_user_ids.is_some()
             || file.api_base.is_some()
             || file.request_timeout_seconds.is_some()
             || file.live_poll_seconds.is_some()
@@ -2526,6 +2595,8 @@ fn legacy_discord_provider<'e>(
         None => file.live_poll_seconds.unwrap_or(0),
     };
     validate_poll_seconds("discord.live_poll_seconds", live_poll_seconds)?;
+    let coding_agent_user_ids =
+        coding_agent_ids("discord.coding_agent_user_ids", file.coding_agent_user_ids)?;
 
     let discord = discord_protocol(
         "discord",
@@ -2557,6 +2628,7 @@ fn legacy_discord_provider<'e>(
         key: LEGACY_DISCORD_PROVIDER_KEY.to_owned(),
         name: provider_name,
         live_poll_seconds,
+        coding_agent_user_ids,
         kind: ProviderKind::Discord(discord),
     }))
 }
@@ -2844,6 +2916,8 @@ fn provider_entry<'e>(
     validate_request_timeout(&field("request_timeout_seconds"), request_timeout_seconds)?;
     let live_poll_seconds = entry.live_poll_seconds.unwrap_or(0);
     validate_poll_seconds(&field("live_poll_seconds"), live_poll_seconds)?;
+    let coding_agent_user_ids =
+        coding_agent_ids(&field("coding_agent_user_ids"), entry.coding_agent_user_ids)?;
     let refuse = |name: &str, kind: &str| ConfigError::Invalid {
         field: field(name),
         detail: format!("does not apply to a provider of kind {kind:?}"),
@@ -2978,6 +3052,7 @@ fn provider_entry<'e>(
         key,
         name,
         live_poll_seconds,
+        coding_agent_user_ids,
         kind,
     })
 }
@@ -3392,6 +3467,94 @@ provider = "slack"
         assert_eq!(cfg.channels[0].provider.as_deref(), Some("discord"));
         assert_eq!(cfg.channels[1].provider.as_deref(), Some("slack"));
         assert!(cfg.discord().is_some());
+    }
+
+    #[test]
+    fn coding_agents_are_named_per_provider_and_a_slack_provider_never_guesses() {
+        // `#323 slack-system-bots`.
+        let cfg = Config::from_toml_and_env(MULTI, &env(&[])).expect("valid");
+        let gchat = cfg.provider("gchat").expect("gchat");
+        let slack = cfg.provider("slack").expect("slack");
+        assert!(gchat.coding_agent_user_ids.is_empty());
+        assert!(
+            !gchat.coding_agents_named_only(),
+            "a Discord-protocol provider that names nobody keeps the guess"
+        );
+        assert!(slack.coding_agent_user_ids.is_empty());
+        assert!(
+            slack.coding_agents_named_only(),
+            "a Slack provider's channels carry system bots: no guess"
+        );
+
+        let named = MULTI
+            .replace(
+                "thread_api = \"off\"",
+                "thread_api = \"off\"\ncoding_agent_user_ids = [\"900000000000000001\"]",
+            )
+            .replace(
+                "live_poll_seconds = 15",
+                "live_poll_seconds = 15\ncoding_agent_user_ids = [\" U0AGENT001\", \"W0AGENT002 \", \"U0AGENT001\"]",
+            );
+        let cfg = Config::from_toml_and_env(&named, &env(&[])).expect("valid");
+        let gchat = cfg.provider("gchat").expect("gchat");
+        assert_eq!(gchat.coding_agent_user_ids, ["900000000000000001"]);
+        assert!(
+            gchat.coding_agents_named_only(),
+            "named agents end the guess"
+        );
+        assert_eq!(
+            cfg.provider("slack").expect("slack").coding_agent_user_ids,
+            ["U0AGENT001", "W0AGENT002"],
+            "trimmed, each once, in order"
+        );
+
+        let refused = |list: &str| {
+            let text = MULTI.replace(
+                "live_poll_seconds = 15",
+                &format!("live_poll_seconds = 15\ncoding_agent_user_ids = {list}"),
+            );
+            match Config::from_toml_and_env(&text, &env(&[])) {
+                Err(ConfigError::Invalid { field, .. }) => {
+                    assert_eq!(field, "providers.slack.coding_agent_user_ids", "{list}");
+                }
+                other => panic!("{list} was not refused: {other:?}"),
+            }
+        };
+        refused("[\"\"]");
+        refused("[\"U0 AGENT\"]");
+        refused("[\"U0\\nAGENT\"]");
+        refused(&format!("[\"{}\"]", "U".repeat(65)));
+        refused(&format!(
+            "[{}]",
+            (0..=MAX_CODING_AGENT_IDS)
+                .map(|n| format!("\"U{n:08}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    #[test]
+    fn the_legacy_discord_section_may_name_its_coding_agents() {
+        let text = crate::testing::config_toml().replace(
+            "[discord]\n",
+            "[discord]\ncoding_agent_user_ids = [\"20\"]\n",
+        );
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid");
+        let discord = cfg
+            .provider(LEGACY_DISCORD_PROVIDER_KEY)
+            .expect("the legacy provider");
+        assert_eq!(discord.coding_agent_user_ids, ["20"]);
+        assert!(discord.coding_agents_named_only());
+        // Beside other providers, a [discord] section with only this and no token configures a
+        // provider it cannot reach, and is refused as every such section is.
+        let orphan = MULTI.replace(
+            "[chat]",
+            "[discord]\ncoding_agent_user_ids = [\"20\"]\n\n[chat]",
+        );
+        assert!(matches!(
+            Config::from_toml_and_env(&orphan, &env(&[])),
+            Err(ConfigError::Invalid { field, .. }) if field == "discord.bot_token"
+        ));
     }
 
     #[test]

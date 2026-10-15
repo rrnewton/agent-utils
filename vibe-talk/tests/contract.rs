@@ -197,6 +197,13 @@ fn client_config(
         replay_enabled: full,
         self_author_id: full.then(|| "9".into()),
         owner_author_id: full.then(|| "7".into()),
+        // `#323 slack-system-bots`: both present in the full sample, both absent in the other.
+        coding_agent_ids: if full {
+            vec!["1000000000000000001".into()]
+        } else {
+            Vec::new()
+        },
+        coding_agents_named_only: full,
         live_poll_seconds: 5,
         live_delivery,
         channel_registration_supported: full,
@@ -222,6 +229,12 @@ fn client_config(
                 live_poll_seconds: 5,
                 self_author_id: full.then(|| "9".into()),
                 owner_author_id: full.then(|| "7".into()),
+                coding_agent_ids: if full {
+                    vec!["1000000000000000001".into()]
+                } else {
+                    Vec::new()
+                },
+                coding_agents_named_only: full,
             },
             ProviderDescription {
                 key: "slack".into(),
@@ -237,6 +250,9 @@ fn client_config(
                 live_poll_seconds: 30,
                 self_author_id: full.then(|| "U0SELF0001".into()),
                 owner_author_id: None,
+                // A Slack provider guesses no coding agent, named or not.
+                coding_agent_ids: Vec::new(),
+                coding_agents_named_only: true,
             },
         ],
         summaries_unavailable: (!full).then(|| "elevenlabs.api_key is not configured".into()),

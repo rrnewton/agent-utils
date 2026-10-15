@@ -757,8 +757,22 @@ pub async fn client_config(
             live_poll_seconds: entry.live_poll_seconds,
             self_author_id: entry.client.self_author_id(),
             owner_author_id: entry.client.owner_author_id(),
+            coding_agent_ids: state
+                .config
+                .provider(&entry.key)
+                .map(|provider| provider.coding_agent_user_ids.clone())
+                .unwrap_or_default(),
+            coding_agents_named_only: state
+                .config
+                .provider(&entry.key)
+                .is_some_and(crate::config::ProviderConfig::coding_agents_named_only),
         })
         .collect();
+    // With one provider, the deployment-wide fields are its own.
+    let default_provider = state
+        .config
+        .default_provider_key()
+        .and_then(|key| state.config.provider(key));
     let live_poll_seconds = state.config.live_poll_seconds();
     Ok(Json(ClientConfigResponse {
         chat_provider_name: state.chat.provider_name().to_owned(),
@@ -784,6 +798,11 @@ pub async fn client_config(
         replay_enabled: crate::replay::offered(&state.config.replay, &state.config.conversation),
         self_author_id: state.chat.self_author_id(),
         owner_author_id: state.chat.owner_author_id(),
+        coding_agent_ids: default_provider
+            .map(|provider| provider.coding_agent_user_ids.clone())
+            .unwrap_or_default(),
+        coding_agents_named_only: default_provider
+            .is_some_and(crate::config::ProviderConfig::coding_agents_named_only),
         providers,
         summaries_unavailable: state.summarizer.unavailable_reason(),
         token_scope: scope.into(),

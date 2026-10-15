@@ -95,6 +95,10 @@
         }
       ],
       "chat_provider_name": "Chat",
+      "coding_agent_ids": [
+        "1000000000000000001"
+      ],
+      "coding_agents_named_only": true,
       "conversational_voice": {
         "instance_id": "instance",
         "name": "voice",
@@ -125,6 +129,10 @@
         {
           "channel_discovery_supported": false,
           "channel_registration_supported": false,
+          "coding_agent_ids": [
+            "1000000000000000001"
+          ],
+          "coding_agents_named_only": true,
           "idempotent_posts_supported": true,
           "key": "discord",
           "live_delivery": "push",
@@ -139,6 +147,7 @@
         {
           "channel_discovery_supported": true,
           "channel_registration_supported": true,
+          "coding_agents_named_only": true,
           "key": "slack",
           "live_delivery": "poll",
           "live_poll_seconds": 30,
@@ -240,6 +249,7 @@
         {
           "channel_discovery_supported": false,
           "channel_registration_supported": false,
+          "coding_agents_named_only": true,
           "key": "slack",
           "live_delivery": "poll",
           "live_poll_seconds": 30,
@@ -318,6 +328,7 @@
         {
           "channel_discovery_supported": false,
           "channel_registration_supported": false,
+          "coding_agents_named_only": true,
           "key": "slack",
           "live_delivery": "poll",
           "live_poll_seconds": 30,

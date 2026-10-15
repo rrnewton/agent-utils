@@ -1871,11 +1871,18 @@
               <p class="hint">
                 The guesses, in the order they are tried: the account this bridge posts as is
                 <strong>you</strong> — your own replies and anything your voice bot says go out
-                through it, so they are your words even though a bot delivered them; a lone bot that
-                is not this bridge is the <strong>coding agent</strong>; everyone else is another
-                person or another bot. With two candidate bots the guess refuses rather than picking
-                one. The guess is made per channel, so a bot that only ever speaks somewhere else
-                cannot spoil the guess here.
+                through it, so they are your words even though a bot delivered them; a bot the
+                server's configuration names as a coding agent is the <strong>coding
+                agent</strong>; otherwise a lone bot that is not this bridge is the coding agent;
+                everyone else is another person or another bot. With two candidate bots the guess
+                refuses rather than picking one. The guess is made per channel, so a bot that only
+                ever speaks somewhere else cannot spoil the guess here.
+              </p>
+              <p class="hint">
+                The lone-bot guess is not made in a Slack channel, nor where the configuration names
+                its coding agents: Slack's channels carry system bots, such as a workspace's welcome
+                bot, which would otherwise be drawn as your coding agent. There every bot not named
+                is drawn as another bot, with its name and <em>(bot)</em>, until you choose here.
               </p>
               <p class="hint">
                 A <em>choice</em>, though, is about the account rather than the room: an account is

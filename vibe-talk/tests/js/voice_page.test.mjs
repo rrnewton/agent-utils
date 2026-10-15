@@ -1691,6 +1691,10 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         speech_prep_enabled: page.speechPrepEnabled,
         self_author_id: page.selfAuthorId,
         owner_author_id: page.ownerAuthorId,
+        // `#323 slack-system-bots`. Absent unless a test names coding agents or says only named
+        // accounts may be one, as the server omits both otherwise.
+        coding_agent_ids: page.codingAgentIds,
+        coding_agents_named_only: page.codingAgentsNamedOnly,
         // Absent unless a test describes providers, as an older single-provider server sends it.
         providers: page.providers,
         // Absent unless a test says the server cannot summarise at all.
@@ -1938,6 +1942,10 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     selfAuthorId: "1000000000000000009",
     /** The reader's OWN Discord account. Not derivable; configured or chosen in Settings. */
     ownerAuthorId: null,
+    /** The coding agents the configuration names. `#323 slack-system-bots`. */
+    codingAgentIds: undefined,
+    /** Whether only a named account may be drawn as the coding agent. `#323 slack-system-bots`. */
+    codingAgentsNamedOnly: undefined,
     replayStatus: 200,
     replayMaxTurns: 40,
     replayTransport: "contextual_update",
@@ -17068,6 +17076,99 @@ test("...and with TWO bots the guess refuses rather than picking one", async () 
 
   assert.equal(whoOf(page, 1), "bot", "it still claims to know which bot is the coding agent");
   assert.equal(whoOf(page, 3), "bot");
+});
+
+// `#323 slack-system-bots`. A Slack workspace's welcome bot, alone in a channel with the owner and
+// another person: the lone-bot guess drew it as the coding agent, nameless and in the agent's tile.
+function welcomed() {
+  return [
+    message({ id: "1000000000000000001", author: "Welcome bot", author_id: "B0WELCOME1", author_is_bot: true }),
+    message({ id: "1000000000000000002", author: "alice", author_id: "10", author_is_bot: false }),
+  ];
+}
+
+const authorLine = (li) => li.descendants().find((node) => node.hasClass("msg-author"));
+
+test("A SLACK SYSTEM BOT IS ANOTHER BOT, DRAWN WITH ITS NAME AND (bot), NEVER THE CODING AGENT", async () => {
+  const page = newPage();
+  page.codingAgentsNamedOnly = true;
+  await signIn(page);
+  await showDiscord(page, welcomed());
+
+  assert.equal(whoOf(page, 0), "bot", "the lone system bot was taken to be the coding agent");
+  const named = authorLine(row(page, 0));
+  assert.equal(named.hidden, false, "the system bot's name is hidden, as the coding agent's is");
+  assert.equal(named.textContent, "Welcome bot (bot)", "the system bot is not named and labelled");
+  assert.equal(whoOf(page, 1), "human");
+});
+
+test("...the control: where the server allows the guess, a lone bot is still the coding agent", async () => {
+  // Without it the test above passes on a page that never draws a coding agent at all.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, welcomed());
+
+  assert.equal(whoOf(page, 0), "coder", "the lone-bot guess is gone where nothing turned it off");
+  assert.equal(authorLine(row(page, 0)).hidden, true, "the coding agent's name is drawn twice");
+});
+
+test("A CONFIGURED CODING AGENT IS THE CODING AGENT BESIDE A SYSTEM BOT, AND SETTINGS STILL DECIDES", async () => {
+  const store = new Map();
+  const page = newPage(store);
+  page.codingAgentIds = ["20"];
+  page.codingAgentsNamedOnly = true;
+  await signIn(page);
+  await showDiscord(page, [
+    ...welcomed(),
+    message({ id: "1000000000000000003", author: "MyDiscordBot", author_id: "20", author_is_bot: true }),
+  ]);
+
+  assert.equal(whoOf(page, 0), "bot", "the system bot was drawn as a coding agent");
+  assert.equal(whoOf(page, 2), "coder", "the configured coding agent beside a second bot was not drawn as one");
+
+  // The reader's own choice beats the configuration, both ways.
+  await page.el("open-settings").click();
+  const choose = async (id, bucket) => {
+    const select = page.el("identity-list").descendants()
+      .find((node) => node.getAttribute("data-author-id") === id);
+    assert.ok(select, `Settings offers no row for ${id}`);
+    select.value = bucket;
+    await select.dispatch("change");
+  };
+  await choose("B0WELCOME1", "coder");
+  await choose("20", "bot");
+  assert.equal(whoOf(page, 0), "coder", "a choice in Settings did not beat the configuration");
+  assert.equal(whoOf(page, 2), "bot", "a choice in Settings did not beat the configuration");
+});
+
+test("EACH PROVIDER'S CHANNELS FOLLOW THEIR OWN PROVIDER'S CODING-AGENT RULE", async () => {
+  const page = newPage();
+  const team = { id: "C0194ABCDE", label: "team", writable: true, alias: null, added: false, provider: "slack" };
+  const space = { id: "1110000000000000301", label: "chat space", writable: true, alias: null, added: false, provider: "gchat" };
+  const describe = (key, name, more) => ({ key, name, threading_supported: false, live_delivery: "poll",
+    live_poll_seconds: 30, channel_registration_supported: false, channel_discovery_supported: false,
+    upstream_read_mark_supported: false, self_author_id: null, owner_author_id: null, ...more });
+  page.channels = [team, space];
+  page.providers = [describe("slack", "Slack", { coding_agents_named_only: true }), describe("gchat", "Google Chat", {})];
+  page.messages = welcomed();
+  // Each channel holds the same two messages, as its own.
+  page.channelPage = async (path) => {
+    const channel = String(path).includes(encodeURIComponent(space.id)) ? space : team;
+    return json(200, {
+      channel, messages: page.messages.map((m) => ({ ...m, channel_id: channel.id })), dismissed: [],
+    });
+  };
+  await signIn(page);
+  for (const [channel, lone] of [[team, "bot"], [space, "coder"], [team, "bot"]]) {
+    if (page.el("discord-channel").value !== channel.id) {
+      page.el("discord-channel").value = channel.id;
+      await page.el("discord-channel").dispatch("change");
+      await page.settle();
+    } else {
+      await showDiscord(page, page.messages);
+    }
+    assert.equal(whoOf(page, 0), lone, `${channel.label}: the lone bot followed another provider's rule`);
+  }
 });
 
 test("REPLYING TEACHES THE PAGE WHICH ACCOUNT IS ITS OWN, AND THAT ACCOUNT IS 'ME'", async () => {

@@ -233,6 +233,23 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#323 slack-system-bots` in the browser engine: a Slack welcome bot alone in a channel drawn as
+  # another bot, its name and "(bot)" on screen, set in and coloured as a colleague is, with no coding
+  # agent unless one is named; and a named coding agent drawn as the agent beside it.
+  - group: check
+    job: system-bots-browser
+    desc: Slack system bots drawn as bots, and a named coding agent as the agent, in current Chromium at a 412x915 Android viewport and a 1280x800 desk
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/system_bots_browser.py
+    jobs_flag: ""
+    timeout: 60
+    cpu_timeout: 30
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 4
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#242 rich-headers` in the browser engine: each headed row's tag, title and time drawn whole —
   # beside the time and the buttons where the list is wide enough, as the row's first line where it
   # is not — the words they restate hidden and every one of them in the header, a combined row's

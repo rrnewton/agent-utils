@@ -179,6 +179,25 @@ declare namespace VibeTalk {
      */
     chat_provider_name: string;
     /**
+     * The accounts the configuration names as the coding agents, `coding_agent_user_ids`.
+     * `#323 slack-system-bots`.
+     *
+     * The page draws each as the coding agent. Sent only when there are some; with several
+     * providers, each provider's own are in its [`ProviderDescription`] instead.
+     */
+    coding_agent_ids?: string[];
+    /**
+     * Whether only an account named in `coding_agent_ids`, or chosen by the reader in Settings,
+     * is drawn as the coding agent, rather than the one bot in a channel besides this server.
+     * `#323 slack-system-bots`.
+     *
+     * True when the configuration names any coding agent, and for a Slack provider, whose
+     * channels carry system bots (a workspace's welcome bot, integrations) that would otherwise be
+     * drawn as the coding agent, nameless and in its colours. Sent only when true: absent, from
+     * this server or an older one, means the page may guess.
+     */
+    coding_agents_named_only?: boolean;
+    /**
      * Selected conversational voice provider, named by its implementation.
      */
     conversational_voice: VoiceDescription;
@@ -977,6 +996,17 @@ declare namespace VibeTalk {
      * Whether this provider accepts pasted links and references when adding a channel.
      */
     channel_registration_supported: boolean;
+    /**
+     * The accounts the configuration names as this provider's coding agents. `#323
+     * slack-system-bots`. Sent only when there are some.
+     */
+    coding_agent_ids?: string[];
+    /**
+     * Whether only those, or an account the reader chose in Settings, are drawn as the coding
+     * agent in this provider's channels: see [`ClientConfigResponse::coding_agents_named_only`].
+     * Sent only when true.
+     */
+    coding_agents_named_only?: boolean;
     /**
      * Whether this provider posts a message sent again under the same key at most once. Sent
      * only when true.

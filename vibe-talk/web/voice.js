@@ -14459,6 +14459,8 @@ function saveCacheShell(config) {
     threading_supported: config.threading_supported === true,
     self_author_id: config.self_author_id || null,
     owner_author_id: config.owner_author_id || null,
+    coding_agent_ids: Array.isArray(config.coding_agent_ids) ? config.coding_agent_ids : [],
+    coding_agents_named_only: config.coding_agents_named_only === true,
     providers: Array.isArray(config.providers) ? config.providers : [],
   };
   const listed = new Set(channels.map((channel) => String(channel.id)));
@@ -15217,6 +15219,7 @@ function hydrateFromCache() {
   deploymentCapabilities.threading = threadingSupported;
   knownChannels = shell.channels;
   learnProviders(shell.providers);
+  deploymentCodingAgents = codingAgentsFrom(shell);
   if (shell.self_author_id) noteSelfAuthor(shell.self_author_id);
   ownerAuthorId = shell.owner_author_id || null;
   fillChannelSelect("discord-channel");
@@ -21512,6 +21515,34 @@ let ownerAuthorId = null;
 let providerSelfIds = new Set();
 let providerOwnerIds = new Set();
 
+/**
+ * The accounts the configuration names as the coding agents (`coding_agent_user_ids`), and whether
+ * only those — and the reader's own choices in Settings — may be drawn as the coding agent, for a
+ * deployment that describes no providers one by one. `#323 slack-system-bots`. A provider that is
+ * described carries its own (`codingAgentsOf`).
+ */
+let deploymentCodingAgents = { ids: new Set(), namedOnly: false };
+
+/**
+ * The coding agents a provider description, or client-config itself, names.
+ *
+ * @param {{ coding_agent_ids?: string[], coding_agents_named_only?: boolean } | null | undefined} described
+ * @returns {{ ids: Set<string>, namedOnly: boolean }}
+ */
+function codingAgentsFrom(described) {
+  const ids = described && Array.isArray(described.coding_agent_ids) ? described.coding_agent_ids : [];
+  return {
+    ids: new Set(ids.map(String)),
+    namedOnly: Boolean(described && described.coding_agents_named_only === true),
+  };
+}
+
+/** Who may be drawn as the coding agent in channel `channelId`: its provider's, else the deployment's. */
+function codingAgentsOf(channelId) {
+  const provider = providerOfChannel(channelId);
+  return provider ? codingAgentsFrom(provider) : deploymentCodingAgents;
+}
+
 /** Whether `id` is an account this server posts as. */
 function isSelfId(id) {
   return Boolean(id) && ((selfAuthorId && id === selfAuthorId) || providerSelfIds.has(id));
@@ -21607,6 +21638,10 @@ function messageChannel(message) {
  * is overridden by an explicit choice, and Settings shows what was guessed so a wrong one is
  * visible rather than merely wrong.
  *
+ * The coding agent is guessed only where the server allows it: an account the configuration names
+ * is the coding agent, and where the configuration names any, or the channel is Slack's, no other
+ * bot is guessed to be one (`#323 slack-system-bots`).
+ *
  * WHICH CHANNEL is an argument because the last guess is a census, and a census is only meaningful
  * about one conversation. Callers pass the channel they are drawing: the message list passes the
  * one it is showing, Settings passes the one its picker is on. They can legitimately differ, and
@@ -21630,7 +21665,20 @@ function bucketFor(authorId, isBot, channelId) {
     // 3. Not a bot, so a person. Which person is not something this page can know.
     return "human";
   }
-  // 4. A bot, and if it is the ONLY bot IN THIS CHANNEL that is not us then it is the coding agent
+  // 4. A bot the configuration names as a coding agent at this channel's provider
+  //    (`coding_agent_user_ids`). `#323 slack-system-bots`.
+  const agents = codingAgentsOf(channelId);
+  if (agents.ids.has(id)) {
+    return "coder";
+  }
+  // 5. Where only a named account may be the coding agent — the configuration names some, or the
+  //    provider is Slack, whose channels carry system bots (a workspace's welcome bot, an
+  //    integration) — every other bot is another bot, drawn with its own name and "(bot)". A
+  //    lone system bot was drawn as the coding agent: nameless, unlabelled, in the agent's colours.
+  if (agents.namedOnly) {
+    return "bot";
+  }
+  // 6. A bot, and if it is the ONLY bot IN THIS CHANNEL that is not us then it is the coding agent
   //    — the owner's own heuristic, and true of every channel this bridge is pointed at so far.
   //    With two or more it is a coin toss, so it stays "another bot" and Settings is where it gets
   //    decided. Scoped to the channel: a bot that has never spoken here says nothing about who the
@@ -37632,6 +37680,7 @@ function applyClientConfig(config) {
   threadingSupported = config.threading_supported === true;
   deploymentCapabilities.threading = threadingSupported;
   learnProviders(config.providers);
+  deploymentCodingAgents = codingAgentsFrom(config);
   // The selected backend owns its display name. An older server leaves it unspecified, so the
   // page stays neutral instead of guessing a platform from channel IDs or deployment details.
   chatProviderName =

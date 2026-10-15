@@ -45,6 +45,9 @@ const USER_FAILURE_TTL: Duration = Duration::from_secs(300);
 /// Most conversations remembered as having threads.
 const THREADED_MAX: usize = 1000;
 
+/// Slackbot's user id, the same in every workspace. `users.info` reports it with `is_bot: false`.
+const SLACKBOT_USER_ID: &str = "USLACKBOT";
+
 /// Message subtypes that are somebody's words. Every other subtype is a system event (a join, a
 /// topic change, a rename, …) and is omitted from reads.
 const KEPT_SUBTYPES: [&str; 4] = [
@@ -742,8 +745,11 @@ impl Raw {
             .own_name()
             .or_else(|| looked_up.map(|(name, _)| name.clone()))
             .unwrap_or_else(|| author_id.clone());
+        // Slackbot is Slack's own system bot, though `users.info` says `is_bot: false` of it; it
+        // is drawn as the bot it is. `#323 slack-system-bots`.
         let author_is_bot = self.str_field("bot_id").is_some()
             || self.str_field("subtype") == Some("bot_message")
+            || author_id == SLACKBOT_USER_ID
             || looked_up.is_some_and(|(_, is_bot)| *is_bot);
         // A message with no `thread_ts` is on the conversation's own timeline, and Slack lets any
         // such message head a thread: posting with `thread_ts` = its `ts` starts one. So it is

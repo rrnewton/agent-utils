@@ -188,6 +188,17 @@
           "description": "Source chat service's human-readable name, supplied by the selected backend.",
           "type": "string"
         },
+        "coding_agent_ids": {
+          "description": "The accounts the configuration names as the coding agents, `coding_agent_user_ids`.\n`#323 slack-system-bots`.\n\nThe page draws each as the coding agent. Sent only when there are some; with several\nproviders, each provider's own are in its [`ProviderDescription`] instead.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "coding_agents_named_only": {
+          "description": "Whether only an account named in `coding_agent_ids`, or chosen by the reader in Settings,\nis drawn as the coding agent, rather than the one bot in a channel besides this server.\n`#323 slack-system-bots`.\n\nTrue when the configuration names any coding agent, and for a Slack provider, whose\nchannels carry system bots (a workspace's welcome bot, integrations) that would otherwise be\ndrawn as the coding agent, nameless and in its colours. Sent only when true: absent, from\nthis server or an older one, means the page may guess.",
+          "type": "boolean"
+        },
         "conversational_voice": {
           "$ref": "#/$defs/VoiceDescription",
           "description": "Selected conversational voice provider, named by its implementation."
@@ -1073,6 +1084,17 @@
         },
         "channel_registration_supported": {
           "description": "Whether this provider accepts pasted links and references when adding a channel.",
+          "type": "boolean"
+        },
+        "coding_agent_ids": {
+          "description": "The accounts the configuration names as this provider's coding agents. `#323\nslack-system-bots`. Sent only when there are some.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "coding_agents_named_only": {
+          "description": "Whether only those, or an account the reader chose in Settings, are drawn as the coding\nagent in this provider's channels: see [`ClientConfigResponse::coding_agents_named_only`].\nSent only when true.",
           "type": "boolean"
         },
         "idempotent_posts_supported": {

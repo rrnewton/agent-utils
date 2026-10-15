@@ -85,6 +85,23 @@ pub struct ClientConfigResponse {
     /// draws both as the owner's own words, because they are: one typed into Discord, one dictated
     /// through this bridge.
     pub owner_author_id: Option<String>,
+    /// The accounts the configuration names as the coding agents, `coding_agent_user_ids`.
+    /// `#323 slack-system-bots`.
+    ///
+    /// The page draws each as the coding agent. Sent only when there are some; with several
+    /// providers, each provider's own are in its [`ProviderDescription`] instead.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coding_agent_ids: Vec<String>,
+    /// Whether only an account named in `coding_agent_ids`, or chosen by the reader in Settings,
+    /// is drawn as the coding agent, rather than the one bot in a channel besides this server.
+    /// `#323 slack-system-bots`.
+    ///
+    /// True when the configuration names any coding agent, and for a Slack provider, whose
+    /// channels carry system bots (a workspace's welcome bot, integrations) that would otherwise be
+    /// drawn as the coding agent, nameless and in its colours. Sent only when true: absent, from
+    /// this server or an older one, means the page may guess.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub coding_agents_named_only: bool,
     /// Seconds between live ingestion ticks, or `0` when live ingestion is OFF.
     ///
     /// The page needs this to tell the truth about its own channel view. With ingestion off the
@@ -745,6 +762,15 @@ pub struct ProviderDescription {
     pub self_author_id: Option<String>,
     /// The owner's own account at this provider, when configured.
     pub owner_author_id: Option<String>,
+    /// The accounts the configuration names as this provider's coding agents. `#323
+    /// slack-system-bots`. Sent only when there are some.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coding_agent_ids: Vec<String>,
+    /// Whether only those, or an account the reader chose in Settings, are drawn as the coding
+    /// agent in this provider's channels: see [`ClientConfigResponse::coding_agents_named_only`].
+    /// Sent only when true.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub coding_agents_named_only: bool,
 }
 
 /// How channel changes reach the live stream.
