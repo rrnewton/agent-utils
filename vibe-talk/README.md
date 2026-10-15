@@ -166,9 +166,13 @@ sliding on if it was right above that message. Its button then reads **Unarchive
 leaves it out, **Collapse read** folds it, and a thread's count of unread replies on Main stops
 counting it. Where the chat service lets vibe-talk move its own read marker — where the **⋯** menu
 offers **In** *the service* **only** — that marker is then moved through the message as well, as
-that item moves it: for the whole space, and never backward. The server does not ask the service
-again for a message it has already marked through, by a reply or by that item, nor for one before
-it, and the service's bridge keeps its own cursor forward too. The status line then says **Marked
+that item moves it: for the whole space, and never backward. It is moved only once that Done is
+saved: a message already drawn Done by a Done still on its way to the server (**Done**, **e** or a
+swipe just before the send went) waits for it, and is not marked in the service at all if that Done
+fails or is put back meanwhile, since the service's marker cannot be moved back (`#311
+sent-read-waits-for-done`). The server does not ask the service again for a message it has already
+marked through, by a reply or by that item, nor for one before it, and the service's bridge keeps
+its own cursor forward too. The status line then says **Marked
 read here and in** *the service*. Slack has no such marker for vibe-talk to move (its **Clear unread
 in Slack** setting is separate and unchanged), and nor does a bot on Discord itself.
 
@@ -188,7 +192,9 @@ the last Done. A reply that finishes sending after you have moved to another cha
 message Done on the server only, with no **Undo** here, and moves the service's marker where it can.
 `make -C vibe-talk reply-marks-read-browser` walks it in Chromium at 1280x800 in two columns: a Reply
 docked in each column, a later message in an answered thread's box marking nothing, and the first
-reply typed in a new thread on the right marking its root read in both columns.
+reply typed in a new thread on the right marking its root read in both columns. `make -C vibe-talk
+done-sync-browser` holds each Done on the server while a Reply is sent, and checks the service is
+asked nothing until the Done is saved, and nothing once it is refused.
 
 **A voice agent's reply follows the same rule.** Its `post_reply` with a reply target is a targeted
 reply; it has no thread box of its own to write in. Once it is posted — at once, with **Ask me

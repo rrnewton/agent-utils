@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""A Done reaches every view at once, in real Chromium.
+"""A Done reaches every view at once, and a send's mark in the chat service waits for its Done, in real Chromium.
 
 `#306 done-stale-across-views`. Found in review of #295 shift-e-read-collapse: a message marked Done in
 one view still showed as not Done in another view loaded earlier in the session, until some later read
-redrew it. The fake-DOM suite (tests/js/voice_page.test.mjs) pins each path with negative controls; this
-shows what only a browser engine can: what is painted, frame by frame, as a view is shown again.
+redrew it. `#311 sent-read-waits-for-done`: a send confirming while the Done of the message it answers
+was still being saved moved the chat service's read marker through it at once, so a Done that then
+failed left the message unread here and read in the service, whose marker cannot be moved back. The
+fake-DOM suite (tests/js/voice_page.test.mjs) pins each path with negative controls; this shows what
+only a browser engine can: what is painted, frame by frame, as a view is shown again, and what reaches
+the server, and when, while a write is really held on the wire.
 
-It serves the checked-out page and a small fake API from one loopback origin.
+It serves the checked-out page and small fake APIs from one loopback origin.
 
   On a 412x915 phone, by touch, over the channel of tests/view_switch_browser.py: opened in All, Main
   chosen, then reopened in Main with no saved rows, so Main is read for itself, and All chosen and read
@@ -14,8 +18,16 @@ It serves the checked-out page and a small fake API from one loopback origin.
   message in All -> Main chosen in the bar's picker: the message is drawn Done on every frame from the
   switch on, and no read is sent -> Undo in Main -> All chosen: drawn not Done on every frame, no read.
 
+  At 1280x800 in two columns, over the channel of tests/reply_marks_read_browser.py, whose provider can
+  move its read marker, every Done write held on the server until released: Done clicked on a Main
+  message, then Reply on it, typed and sent with Enter -> the reply posts, and nothing is asked of the
+  provider while the Done is held -> the Done refused -> still nothing asked, the message drawn unread,
+  the failure said. Then the same on another message with the Done saved -> the provider is asked once,
+  after the Done is saved, and the status line says it is marked in the chat service.
+
 No page error at any step. Pass --web-root DIR to run it against another copy of the page -- the page
-before this fix fails at the first switch -- and --screenshots DIR to keep a PNG of each stage.
+before these fixes fails at the first switch, and at the first held Done -- and --screenshots DIR to
+keep a PNG of each stage.
 """
 
 from __future__ import annotations
@@ -33,13 +45,24 @@ from urllib.parse import parse_qs, urlsplit
 
 import offline_cache_browser as fixture
 from offline_cache_browser import CACHE_KEY, TOKEN, Json, check, handler_for
+from reply_in_column_browser import open_columns, place_row, reply_button
+from reply_marks_read_browser import MarkerApi, drawn_read
+from two_column_browser import Desk
 from view_switch_browser import PHONE, SwitchApi
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType, Route
 
-# The message posted to the channel itself that the walk marks Done in All and finds in Main.
+WIDTH, HEIGHT = 1280, 800
+# The message posted to the channel itself that the phone walk marks Done in All and finds in Main.
 MARKED = "212"
+# The Main messages the desk walk answers: the first while its Done is refused, the second saved.
+REFUSED, SAVED = "203", "205"
+# Where a pressed row's top is put, below the top of its column's list, in px.
+ROW_OFFSET_PX = 90
+# How long a mark would take to reach the server, had one been asked: everything else here is
+# answered within a few milliseconds on loopback.
+QUIET_MS = 800
 
 
 class DoneApi(SwitchApi):
@@ -73,6 +96,45 @@ class DoneApi(SwitchApi):
     def is_done(self, message_id: str) -> bool:
         with self.lock:
             return message_id in self.dismissed
+
+
+class HeldDoneApi(MarkerApi):
+    """`reply_marks_read_browser.MarkerApi`, holding each Done write on the wire until the walk releases
+    it, then saving it or refusing it as the server's store would; "saved" goes into the writes when a
+    held Done is saved, so a mark's place after it is an observation."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = threading.Event()
+        self.refuse = False
+        self.held = 0
+
+    def post(self, path: str, body: Json) -> tuple[int, Json]:
+        if not path.endswith("/dismiss"):
+            return super().post(path, body)
+        with self.lock:
+            self.held += 1
+            self.writes.append("dismiss")
+        self.release.wait(20)
+        self.release.clear()
+        if self.refuse:
+            return 502, {"error": "store_error", "detail": "the store is read-only"}
+        ids = body.get("messages")
+        done = [str(one) for one in ids] if isinstance(ids, list) else []
+        with self.lock:
+            self.dismissed.update(done)
+            self.writes.append("saved")
+        return 200, {"dismissed": done}
+
+    def marked_after_saved(self, message_id: str) -> bool:
+        """Whether the provider's mark for `message_id` came after the last Done saved, and after no other."""
+        with self.lock:
+            writes = list(self.writes)
+            marks = [str(mark.get("message_id")) for mark in self.marks]
+        if marks.count(message_id) != 1:
+            return False
+        at = [index for index, write in enumerate(writes) if write == "upstream-read"][marks.index(message_id)]
+        return "saved" in writes[:at]
 
 
 # From now on, on every frame and on every change to the list: the view shown and how row `id` is drawn
@@ -126,10 +188,12 @@ def main() -> int:
         ) from error
     if args.screenshots:
         args.screenshots.mkdir(parents=True, exist_ok=True)
-    # The fake API's handler serves the page from this module attribute.
+    # The fake APIs' handler serves the page from this module attribute.
     fixture.WEB_ROOT = args.web_root.resolve()
     with sync_playwright() as playwright:
-        print(views_walk(playwright.chromium, args))
+        phone = views_walk(playwright.chromium, args)
+        desk = sends_walk(playwright.chromium, args)
+    print(f"{phone}; {desk}")
     return 0
 
 
@@ -253,6 +317,98 @@ def views_walk(chromium: BrowserType, args: argparse.Namespace) -> str:
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def sends_walk(chromium: BrowserType, args: argparse.Namespace) -> str:
+    """`#311`: a Reply sent while its message's Done is held asks the provider nothing until that Done is saved."""
+    api = HeldDoneApi()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api))
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-done-sends-") as profile:
+            context = chromium.launch_persistent_context(
+                profile, headless=True, executable_path=args.browser_executable,
+                viewport={"width": WIDTH, "height": HEIGHT}, color_scheme="dark",
+            )
+            version = context.browser.version if context.browser else "Chromium"
+            page = context.pages[0]
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            desk = Desk(page, args.screenshots, f"done-sends-{WIDTH}", WIDTH, HEIGHT)
+            page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
+            open_columns(desk)
+            held_send(desk, api, REFUSED, refuse=True)
+            page.click("#dismiss-error")
+            held_send(desk, api, SAVED, refuse=False)
+            check(not errors, f"the page threw: {errors}")
+            context.close()
+            return f"{version} at {WIDTH}x{HEIGHT}: " + "; ".join(desk.notes)
+    finally:
+        api.release.set()
+        api.stopping.set()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def held_send(desk: Desk, api: HeldDoneApi, message_id: str, refuse: bool) -> None:
+    """Done clicked on `message_id`, held; a Reply on it sent; the Done then refused or saved."""
+    page = desk.page
+    where = f"Reply while the Done of {message_id} is held, then {'refused' if refuse else 'saved'}"
+    api.refuse = refuse
+    place_row(desk, "left", message_id, top=ROW_OFFSET_PX)
+    desk.check(not drawn_read(desk, "left", message_id), f"{where}: the premise is an unread message")
+    held = api.held
+    page.locator(f"#discord-log > li[data-id='{message_id}'] .done-button").click()
+    desk.wait_for(f"() => document.querySelector(\"#discord-log > li[data-id='{message_id}']\").getAttribute('data-archived') === 'true'",
+                  f"{where}: the message was not drawn Done at once")
+    for _ in range(200):
+        if api.held > held:
+            break
+        page.wait_for_timeout(25)
+    desk.check(api.held == held + 1, f"{where}: the Done did not reach the server")
+    button = reply_button(desk, "left", message_id)
+    page.mouse.click(button["x"], button["y"])
+    desk.wait_for("() => document.querySelector('.reply-compose').parentElement.id === 'column-reply'",
+                  f"{where}: the box did not open in the column")
+    before = len(api.posted())
+    page.keyboard.type(f"answering {message_id} while its Done is saved")
+    page.keyboard.press("Enter")
+    for _ in range(200):
+        if len(api.posted()) > before:
+            break
+        page.wait_for_timeout(25)
+    posted = api.posted()
+    desk.check(len(posted) == before + 1 and posted[-1].get("reply_to") == message_id,
+               f"{where}: the reply did not post as a reply to {message_id}: {posted[before:]}")
+    page.wait_for_timeout(QUIET_MS)
+    desk.check(message_id not in api.marked(), f"{where}: the provider was asked while the Done was held: {api.marked()}")
+    desk.shot(f"{message_id}-held")
+    api.release.set()
+    if refuse:
+        desk.wait_for("() => !document.getElementById('error').hidden", f"{where}: the refused Done was not said")
+        desk.wait_for(f"() => document.querySelector(\"#discord-log > li[data-id='{message_id}']\").getAttribute('data-archived') === 'false'",
+                      f"{where}: the refused Done left the message drawn Done")
+        page.wait_for_timeout(QUIET_MS)
+        desk.check(message_id not in api.marked(), f"{where}: the provider was asked after the Done was refused: {api.marked()}")
+        desk.check(not page.evaluate("() => document.getElementById('status').textContent.startsWith('Marked read here and in')"),
+                   f"{where}: a refused Done was said as a read in the chat service")
+        desk.shot(f"{message_id}-refused")
+        desk.notes.append(f"{message_id}: the reply posted, nothing asked of the provider while its Done was held nor after it was refused")
+        return
+    for _ in range(200):
+        if message_id in api.marked():
+            break
+        page.wait_for_timeout(25)
+    desk.check(api.marked_after_saved(message_id), f"{where}: the provider was not asked once, after the Done was saved: {api.writes}")
+    desk.check(api.all_after_reply(), f"{where}: the mark was asked as the owner's own, not after a reply")
+    desk.wait_for("() => document.getElementById('status').textContent.startsWith('Marked read here and in Discord.')",
+                  f"{where}: the status line does not say the message is marked in the chat service")
+    desk.check(drawn_read(desk, "left", message_id), f"{where}: the message is not drawn read")
+    desk.shot(f"{message_id}-saved")
+    desk.notes.append(f"{message_id}: the reply posted, the provider asked once, only after its held Done was saved")
 
 
 if __name__ == "__main__":

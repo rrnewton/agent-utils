@@ -29129,13 +29129,16 @@ function noteDoneSaving(ids) {
  * Whether every one of `ids` is Done here with its Done saved: a Done of any of them still on its way
  * to the server waited for first (`doneSaving`), then the ids looked at again, since a Done that
  * failed has put them back, as has a put back (Undo, `e`) made meanwhile. `#295 shift-e-read-collapse`.
+ * `done` is that look: by default the column worked on once the wait is over; a confirmed send's
+ * (`markAnsweredDone`, `#311 sent-read-waits-for-done`) looks at what the page holds (`doneHeldHere`).
  *
  * @param {string[]} ids
+ * @param {() => boolean} [done]
  */
-async function doneSaved(ids) {
+async function doneSaved(ids, done = () => ids.every((id) => archivedIds.has(String(id)))) {
   for (;;) {
     const saving = [...new Set(ids.map((id) => doneSaving.get(String(id))).filter(Boolean))];
-    if (saving.length === 0) return ids.every((id) => archivedIds.has(String(id)));
+    if (saving.length === 0) return done();
     await Promise.all(saving);
   }
 }
@@ -31839,10 +31842,12 @@ function unseenColumnReply() {
 //   * A TARGETED REPLY — Reply, Quote reply, a row's Draft, in one column or docked in two — marks the
 //     message it answers, on Main or inside a thread. Only that message.
 //   * MARKING READ is what this page's own read action does for that message, and only once the send
-//     is confirmed (`markSentRead`): Done, as above; and, where the channel's provider lets the server
-//     move its own read marker (the "⋯" menu's "In <service> only"), that marker moved through the
-//     message, asked `after_reply` so the server never moves it back behind a message already marked
-//     and never asks twice for one (src/reply_read.rs). Never where that marker covers more than the
+//     is confirmed (`markSentRead`): Done, as above; and, once that Done is saved — one still on its
+//     way when the send confirmed waited for (`#311 sent-read-waits-for-done`) — and where the
+//     channel's provider lets the server move its own read marker (the "⋯" menu's "In <service>
+//     only"), that marker moved through the message, asked `after_reply` so the server never moves
+//     it back behind a message already marked and never asks twice for one (src/reply_read.rs). Nothing
+//     is asked after a Done that failed. Never where that marker covers more than the
 //     channel — one thread of a larger space, or a service that cannot say — since nobody pressed
 //     anything to clear messages this page never received. Shift+E's read (`#295
 //     shift-e-read-collapse`, `readAndCollapse`) is this same mark, through `markReadInService`.
@@ -31880,7 +31885,37 @@ function doneWhereNotDrawn(id) {
 }
 
 /**
+ * Whether message `id`, which a send just confirmed, is Done here: every message of the row standing
+ * for it, in the column drawing it (`answeredRow`, or `found` as that answered already), else, drawn in
+ * no column, by what the page holds (`doneWhereNotDrawn`).
+ *
+ * @param {string} id
+ * @param {{column: typeof activeColumn, row: HTMLElement} | null} [found]
+ */
+function answeredDone(id, found = answeredRow(id)) {
+  return inColumn(found ? found.column : columns.main, () => (found
+    ? idsOf(found.row).every((one) => archivedIds.has(one)) : doneWhereNotDrawn(id)));
+}
+
+/**
+ * Whether every one of `ids`, of the channel on screen, is Done by what the page holds: the channel's
+ * store where it keeps one, which a Done, a put back and a failed one taken back all move at once
+ * (`markHeldDone`, `settleHeldDone`), else the left column's set — never by a row having left a list,
+ * which a Done that failed does not always bring back. `#311 sent-read-waits-for-done`.
+ *
+ * @param {string[]} ids
+ */
+function doneHeldHere(ids) {
+  if (threadingSupported && channelCanon.channel === String(el("discord-channel").value)) {
+    return ids.every((id) => channelCanon.dismissed.has(String(id)));
+  }
+  return inColumn(columns.main, () => ids.every((id) => archivedIds.has(String(id))));
+}
+
+/**
  * Mark Done message `id` of `channel`, which a send just confirmed marks read. See the section note.
+ * Answers whether that Done is saved, which is when the chat service may be asked to mark it too
+ * (`markSentRead`); a Done that fails throws.
  *
  * Done in the column that draws it (mirrored into the other by `mirrorArchived`), on every message
  * of its row, since the Done button reads a row half Done as unread and would go on offering Done.
@@ -31889,25 +31924,34 @@ function doneWhereNotDrawn(id) {
  * would put back a message of this one. `#245 done-feedback`: the moment of the Done is drawn on the
  * row answered, the one found here, and on no row where no column draws it.
  *
+ * `#311 sent-read-waits-for-done`. A MESSAGE DONE ALREADY is not marked again, but it may be drawn Done
+ * by a Done still on its way to the server — `e`, the Done button, a swipe or Shift+E pressed just
+ * before the send confirmed — since a message is drawn Done the moment it is marked. That Done is
+ * waited for (`doneSaved`, as Shift+E waits for one, `#295 shift-e-read-collapse`) and the message
+ * looked at again by what the page holds (`doneHeldHere`): false once that Done has failed, or been put
+ * back meanwhile, and once the reader has gone to another channel, whose Done this page no longer
+ * holds (a set kept over the change can still name it while its write is on its way). The chat
+ * service's marker cannot be moved back, so nothing is asked of it for a Done this cannot say is saved.
+ *
  * @param {string} channel
  * @param {string} id
+ * @returns {Promise<boolean>}
  */
 async function markAnsweredDone(channel, id) {
   if (channel !== String(el("discord-channel").value)) {
     await queueInboxWrite(() => api(`/api/v1/channels/${encodeURIComponent(channel)}/dismiss`,
       { method: "POST", body: { messages: [id] } }));
-    return;
+    return true;
   }
   const found = answeredRow(id);
-  const marking = inColumn(found ? found.column : columns.main, () => {
-    const ids = found ? idsOf(found.row) : [id];
-    const done = found ? ids.every((one) => archivedIds.has(one)) : doneWhereNotDrawn(id);
-    return done ? null : toggleArchived(ids, found ? found.row : null);
-  });
-  if (marking === null) return;
-  await marking;
+  const ids = found ? idsOf(found.row) : [id];
+  if (answeredDone(id, found)) {
+    return doneSaved(ids, () => String(el("discord-channel").value) === channel && doneHeldHere(ids));
+  }
+  await inColumn(found ? found.column : columns.main, () => toggleArchived(ids, found ? found.row : null));
   // `#240 reading-bookmark`. Send said where the way back is, and the Done's own words took the line.
   if (bookmarkAnchor(channel)) setStatus("b goes back to your bookmark.");
+  return true;
 }
 
 /**
@@ -31977,10 +32021,9 @@ function serviceMarkNotAsked(outcome) {
 /**
  * The chat service's half of marking message `id` of `channel` read, asked after its Done here, so
  * the two marks are one act: by Shift+E (`readAndCollapse`) and by a confirmed send (`markSentRead`).
- * `#300 reply-marks-read`, `#295 shift-e-read-collapse`. Only Shift+E waits for that Done to be
- * saved (`doneSaved`). `markSentRead` does not yet: where the message is already drawn Done, by a
- * Done still on its way, it asks without waiting for that write, so a Done that then fails can leave
- * the service's marker moved (`#311 sent-read-waits-for-done`).
+ * `#300 reply-marks-read`, `#295 shift-e-read-collapse`. Both ask only once that Done is saved, a Done
+ * still on its way waited for (`doneSaved`), and ask nothing after one that failed: Shift+E
+ * (`readAndCollapse`), and a confirmed send since `#311 sent-read-waits-for-done` (`markAnsweredDone`).
  *
  * Where the channel's provider lets the server move its own read marker (what offers the "⋯" menu's
  * "In <service> only"), that marker moved through the message, asked `after_reply` so the server
@@ -32055,13 +32098,14 @@ function doneReadWords(mark, also = "") {
  * Mark read what `entry`, a send just confirmed, marks (`marksRead`): Done, and then the chat
  * service's own read marker moved through it where it can be (`markReadInService`). The second waits
  * for the first and is not asked when the Done failed, as "Mark read through here" goes. See the
- * section note. `#300 reply-marks-read`.
+ * section note. `#300 reply-marks-read`. `#311 sent-read-waits-for-done`: nor while a Done the message
+ * is drawn with already is still on its way, nor once that one has failed (`markAnsweredDone`).
  *
  * @param {{channel: string, marksRead: string}} entry
  */
 async function markSentRead(entry) {
   const id = String(entry.marksRead);
-  await markAnsweredDone(entry.channel, id);
+  if (!(await markAnsweredDone(entry.channel, id))) return;
   const mark = await markReadInService(entry.channel, id);
   // Nothing asked: the Done's own words already say it was not marked in the chat service.
   if (!mark.asked) return;

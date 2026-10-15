@@ -797,13 +797,16 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
-  # `#306 done-stale-across-views` in the browser engine, on a 412x915 phone by touch, with Main and All
-  # each read for itself: a Done tapped in All is drawn in Main, and an Undo in Main drawn in All, on
-  # every frame from the switch in the bar's picker on, with no read. Measured on 2026-10-14: about 4s
-  # wall.
+  # `#306 done-stale-across-views` and `#311 sent-read-waits-for-done` in the browser engine. On a 412x915
+  # phone by touch, with Main and All each read for itself: a Done tapped in All is drawn in Main, and an
+  # Undo in Main drawn in All, on every frame from the switch in the bar's picker on, with no read. At
+  # 1280x800 in two columns, every Done write held on the server: a Reply sent with Enter on a message
+  # whose Done is held asks the provider nothing while it is held, nor after it is refused, and once a
+  # held Done is saved asks it once, after the Done, said on the status line. Measured on 2026-10-14:
+  # about 7s wall.
   - group: check
     job: done-sync-browser
-    desc: a Done and an Undo drawn in a view held from earlier from its first frame, in current Chromium at 412x915
+    desc: a Done and an Undo drawn in a view held from earlier from its first frame, and a sent reply's provider mark waiting for a held Done, in current Chromium at 412x915 and 1280x800
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/done_sync_browser.py
     jobs_flag: ""
@@ -811,7 +814,7 @@ steps:
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
-      est_duration_s: 4
+      est_duration_s: 7
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 

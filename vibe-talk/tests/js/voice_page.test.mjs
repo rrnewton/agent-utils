@@ -21397,8 +21397,7 @@ test("SHIFT+E PRESSED WHILE A DONE IS STILL BEING SAVED asks the chat service on
       "without the wait no read was said, so this test cannot see it");
   }
   const unlooked = await readCollapseWhileSaving(failing, "Shift+E",
-    brokenScript("if (saving.length === 0) return ids.every((id) => archivedIds.has(String(id)));",
-      "if (saving.length === 0) return true;"));
+    brokenScript("if (saving.length === 0) return done();", "if (saving.length === 0) return true;"));
   assert.deepStrictEqual(unlooked.whileSaving, [], "the control waited no longer");
   assert.deepStrictEqual(unlooked.asked, ["3"],
     "waiting without looking again asked nothing after the failed Done, so this test cannot see it");
@@ -60395,3 +60394,148 @@ test("`#306 done-stale-across-views`: a thread's card on the right counts an Und
   assert.equal(listCardSays(control.page, one).count, "1 reply", "without the cards drawn again the card counted the Undo, so this test cannot see it");
 });
 
+// --- `#311 sent-read-waits-for-done` ------------------------------------------------------------
+//
+// Found in review of #295 shift-e-read-collapse. A confirmed send marks read what it answers: Done,
+// then the chat service's own read marker moved through it (`#300 reply-marks-read`). A message is
+// drawn Done the moment it is marked, before its write is even sent, so a send confirming while that
+// Done was still being saved took it for saved and asked the service at once; a Done that then failed
+// left the message unread here and read in the service, whose marker cannot be moved back. Shift+E
+// already waited (`doneSaved`, #295); a confirmed send now waits the same way.
+
+/** The line in `markAnsweredDone` that waits for a Done still on its way and looks again, for negative controls. */
+const SENT_WAITS = "    return doneSaved(ids, () => String(el(\"discord-channel\").value) === channel && doneHeldHere(ids));\n";
+
+/**
+ * Message 3 of `conversation` marked Done with its Done button, the write held on its way to the server;
+ * a Reply on it sent and confirmed meanwhile; then the Done answered `answer`, or saved where that is
+ * null. Answers the page, what was asked of the chat service while the Done was on its way, and the
+ * server's floor's asks of the service.
+ */
+async function replyWhileDoneSaving(answer, script = SCRIPT) {
+  const target = "1000000000000000003";
+  const page = newPage(new Map(), script);
+  page.upstreamReadMarkSupported = true;
+  const asked = serverFloor(page);
+  await signIn(page);
+  await showDiscord(page, conversation());
+  let release = () => {};
+  page.inboxWriteHook = async (kind) => (kind === "dismiss"
+    ? new Promise((resolve) => { release = () => resolve(answer); }) : null);
+  // Not waited for: the button's act ends with the Done's write, which is held.
+  const pressed = doneButton(rowWithId(page, target)).click();
+  await page.settle();
+  assert.deepStrictEqual(page.dismissCalls, [{ messages: [target] }], "the premise is the Done on its way");
+  assert.equal(rowWithId(page, target).getAttribute("data-archived"), "true", "the premise is the message drawn Done already");
+  await replyAndSend(page, target, "answering while the Done is saved");
+  assert.equal(page.repliesPosted.at(-1).body.reply_to, target, "the premise is the reply sent and confirmed");
+  await page.settle();
+  const whileSaving = [...page.upstreamReadCalls];
+  release();
+  await pressed.catch(() => {});
+  for (let i = 0; i < 3; i += 1) await page.settle();
+  return { page, target, whileSaving, asked };
+}
+
+test("`#311 sent-read-waits-for-done`: a send confirmed while its message's Done is being saved asks the chat service only once that Done is saved, and nothing after it failed", async () => {
+  const failing = json(502, { error: "store_error", detail: "the store is read-only" });
+  // Failed: nothing asked, before or after; the message unread here, and the failure said.
+  const failed = await replyWhileDoneSaving(failing);
+  assert.deepStrictEqual(failed.whileSaving, [], "the chat service was asked before the Done was saved");
+  assert.deepStrictEqual(failed.page.upstreamReadCalls, [], "the chat service was asked after the Done failed");
+  assert.deepStrictEqual(failed.asked, [], "the chat service's marker was moved for a Done that failed");
+  assert.equal(rowWithId(failed.page, failed.target).getAttribute("data-archived"), "false", "a Done that failed left the row Done");
+  assert.equal(failed.page.el("error").hidden, false, "a Done that failed said nothing");
+  assert.doesNotMatch(failed.page.el("status").textContent, /^Marked read here and in/, "a Done that failed was said as a read in the service");
+  // Saved: asked once it is, after it, as a reply's mark, and said; no second Done was written.
+  const saved = await replyWhileDoneSaving(null);
+  assert.deepStrictEqual(saved.whileSaving, [], "the chat service was asked before the Done was saved");
+  assert.deepStrictEqual(saved.page.dismissCalls, [{ messages: [saved.target] }], "the send wrote a second Done");
+  assert.deepStrictEqual(saved.page.upstreamReadCalls, [{ message_id: saved.target, after_reply: true }],
+    "the saved Done was not marked in the chat service as a reply's mark");
+  assert.deepStrictEqual(saved.asked, [saved.target]);
+  const dismissed = saved.page.requests.findIndex((one) => one.endsWith("/dismiss"));
+  const marked = saved.page.requests.findIndex((one) => one.endsWith("/upstream-read"));
+  assert.ok(dismissed >= 0 && marked > dismissed, "the chat service was asked before the Done was written");
+  assert.match(saved.page.el("status").textContent, /^Marked read here and in Discord\./, "the mark in the chat service was not said");
+  assert.equal(rowWithId(saved.page, saved.target).getAttribute("data-archived"), "true");
+  assert.equal(saved.page.el("error").hidden, true, `the mark put up the error banner: ${saved.page.el("error").textContent}`);
+
+  // A message whose Done was saved before the send confirmed is asked of the service with no wait.
+  const settled = newPage();
+  settled.upstreamReadMarkSupported = true;
+  await signIn(settled);
+  await showDiscord(settled, conversation());
+  await doneButton(rowWithId(settled, "1000000000000000003")).click();
+  await settled.settle();
+  await replyAndSend(settled, "1000000000000000003", "after the Done was saved");
+  assert.deepStrictEqual(settled.upstreamReadCalls, [{ message_id: "1000000000000000003", after_reply: true }],
+    "a message Done and saved before the send was not marked in the chat service");
+  assert.equal(settled.dismissCalls.length, 1, "the send wrote a second Done over a saved one");
+
+  // THE CONTROLS. Without the wait the send takes the Done on its way for a saved one: it asks the
+  // service at once, so the marker moves for a Done that then fails. Waiting without looking again asks
+  // it once that Done has failed.
+  const unwaited = await replyWhileDoneSaving(failing, brokenScript(SENT_WAITS, "    return true;\n"));
+  assert.deepStrictEqual(unwaited.whileSaving, [{ message_id: unwaited.target, after_reply: true }],
+    "without the wait the service was not asked before the Done was saved, so this test cannot see it");
+  assert.deepStrictEqual(unwaited.asked, [unwaited.target], "without the wait the service's marker did not move, so this test cannot see it");
+  const unlooked = await replyWhileDoneSaving(failing, brokenScript(SENT_WAITS, "    return doneSaved(ids, () => true);\n"));
+  assert.deepStrictEqual(unlooked.whileSaving, [], "the control waited no longer");
+  assert.deepStrictEqual(unlooked.asked, [unlooked.target],
+    "waiting without looking again asked nothing after the failed Done, so this test cannot see it");
+});
+
+test("`#311 sent-read-waits-for-done`: a Done put back while the send waits for it, or a channel left meanwhile, asks the chat service nothing", async () => {
+  const here = message({ id: "3100000000000000001", channel_id: CHANNEL.id, content: "answer me" });
+  const there = message({ id: "3100000000000000002", channel_id: OTHER_CHANNEL.id, content: "elsewhere" });
+  /** `here` marked Done, held on its way; a Reply on it sent; `meanwhile`; then the Done saved. */
+  const run = async (meanwhile, script = SCRIPT) => {
+    const page = newPage(new Map(), script);
+    page.upstreamReadMarkSupported = true;
+    page.channels = [{ ...CHANNEL }, { ...OTHER_CHANNEL }];
+    serveByChannel(page, { [CHANNEL.id]: [here], [OTHER_CHANNEL.id]: [there] });
+    await signIn(page);
+    await showDiscord(page, []);
+    const held = [];
+    page.inboxWriteHook = async (kind) => (kind === "dismiss" && held.length === 0
+      ? new Promise((resolve) => { held.push(() => resolve(null)); }) : null);
+    const pressed = doneButton(rowWithId(page, here.id)).click();
+    await page.settle();
+    assert.equal(held.length, 1, "the premise is the Done on its way");
+    await replyAndSend(page, here.id, "answering while the Done is saved");
+    assert.equal(page.repliesPosted.at(-1).body.reply_to, here.id, "the premise is the reply sent");
+    const acted = meanwhile(page);
+    await page.settle();
+    held[0]();
+    await pressed.catch(() => {});
+    await acted;
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    return page;
+  };
+  // Undo pressed while the Done is on its way: written once the Done is, and nothing read in the service.
+  const undo = (page) => page.el("undo-dismiss").click();
+  const undone = await run(undo);
+  assert.deepStrictEqual(undone.restoreCalls, [{ messages: [here.id] }], "the premise is the Undo written");
+  assert.equal(rowWithId(undone, here.id).getAttribute("data-archived"), "false");
+  assert.deepStrictEqual(undone.upstreamReadCalls, [], "a message put back before its Done was saved was read in the chat service");
+  // Another channel read meanwhile: the Done is saved, and nothing is asked for a channel the page has left.
+  const away = (page) => readChannel(page, OTHER_CHANNEL.id);
+  const left = await run(away);
+  assert.deepStrictEqual(shownIds(left), [there.id], "the premise is the other channel on screen");
+  assert.ok(left.dealtWith.has(here.id), "the premise is the Done saved");
+  assert.deepStrictEqual(left.upstreamReadCalls, [], "a channel left before the Done was saved was read in the chat service");
+  // THE CONTROLS. The Done waited for and not looked at again, both are asked of the service. Looked at
+  // again without asking whether the channel is still the one on screen, the channel left is: the set
+  // kept over the change still names the message, its Done having been on its way when the next
+  // channel's read landed.
+  const looked = brokenScript(SENT_WAITS, "    return doneSaved(ids, () => true);\n");
+  assert.equal((await run(undo, looked)).upstreamReadCalls.length, 1,
+    "without looking again the put back message was not asked, so this test cannot see it");
+  assert.equal((await run(away, looked)).upstreamReadCalls.length, 1,
+    "without looking again the channel left was not asked, so this test cannot see it");
+  const anywhere = brokenScript(SENT_WAITS, "    return doneSaved(ids, () => doneHeldHere(ids));\n");
+  assert.equal((await run(away, anywhere)).upstreamReadCalls.length, 1,
+    "without the channel looked at the channel left was not asked, so this test cannot see it");
+  assert.deepStrictEqual((await run(undo, anywhere)).upstreamReadCalls, [], "the channel's check is what keeps a put back unasked");
+});
