@@ -168,7 +168,12 @@ exact unregistered worktree and its complete Git identity, salvages authored and
 work without assigning an owner, task, or handoff, then fences and removes it. A present HANDOFF.md
 requires its exact SHA-256 after the coordinator reads it; that content is rechecked and copied
 beside the registry as `HANDOFF-OWNERLESS-RETIRED.*.md`, never into the salvage commit. Any other
-uncommitted handoff file refuses. `recover-ownerless-agent-cache` relocates only its one explicitly supported cache
+uncommitted handoff file refuses. A detached-HEAD worktree is accepted with `--detached` while a
+remote branch contains its HEAD. `recover-ownerless-agent-clone` retires an unregistered standalone
+clone (a directory with its own Git directories): every checkout inside must be clean, every ref,
+tag, stash entry and worktree HEAD must be reachable from the remote named for its Git directory or
+be pushed to `refs/rescue/<slot>-<date>[-N]` and read back, and no process may use it; the dry run
+prints the plan and an inventory digest that `--apply` requires. `recover-ownerless-agent-cache` relocates only its one explicitly supported cache
 tree outside the managed slot root; it is not an exemption for arbitrary directories.
 
 When a source repository moves, its rows report `repository-evidence-unavailable`.

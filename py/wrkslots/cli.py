@@ -34,6 +34,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import traceback
@@ -41,7 +42,7 @@ import unicodedata
 import urllib.parse
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Set as AbstractSet
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import IO, NoReturn, TextIO, TypedDict, TypeVar
 
 from wrkslots import __version__, imagecmd, sandbox, slotimage, yamlconfig
@@ -1202,7 +1203,9 @@ class OwnerlessAgentAuthorization:
     actor: ProcessIdentity
     repository: str
     head: str
-    branch: str
+    #: None for a detached HEAD, which is accepted only while a remote branch
+    #: contains it.
+    branch: str | None
     remote: str
     remote_url_sha256: str
     handoff_sha256: str | None
@@ -8853,6 +8856,8 @@ def _validate_journal_shape(
             )
     elif kind == "ownerless-agent-remove":
         _ownerless_agent_journal_inputs(dataclasses.replace(config, machine=machine), raw)
+    elif kind == _OWNERLESS_CLONE_KIND:
+        _ownerless_clone_journal_inputs(dataclasses.replace(config, machine=machine), raw)
     elif kind == "ownerless-agent-cache-relocate":
         _ownerless_agent_cache_journal_inputs(
             dataclasses.replace(config, machine=machine), raw
@@ -18687,8 +18692,15 @@ class _LiveUseObservation:
 
 
 def _lsof_slot_use(
-    executable: Path, slot_path: Path
+    executable: Path, slot_path: Path, *, strict_warnings: bool = False
 ) -> tuple[_LsofUseDiagnostic | None, bool, int]:
+    """Run lsof over ``slot_path``.
+
+    A warning lsof attributes to an unrelated path is normally tolerated;
+    ``strict_warnings`` makes any diagnostic at all make process use
+    indeterminate, for removals that destroy unreplicated Git state.
+    """
+
     lsof_command = [str(executable), "-nP", "-Fpcfn", "+D", str(slot_path)]
     what = f"lsof +D {slot_path}"
     seconds = _item_seconds_left(what)
@@ -18706,7 +18718,9 @@ def _lsof_slot_use(
         raise Refusal(
             f"process use is indeterminate because lsof failed: {exc}"
         ) from exc
-    if not _unrelated_lsof_warnings(completed.stderr, slot_path):
+    if (strict_warnings and completed.stderr.strip()) or not _unrelated_lsof_warnings(
+        completed.stderr, slot_path
+    ):
         raise Refusal(
             "process use is indeterminate because lsof reported: "
             f"{completed.stderr.strip().splitlines()[0]}"
@@ -18754,12 +18768,14 @@ def _assert_slot_unused(
     canonical_path: Path | None = None,
     after_fence: bool = False,
     before_image_fence: bool = False,
+    strict_lsof_warnings: bool = False,
 ) -> None:
     while True:
         observation = _observe_slot_use_once(
             slot_path,
             record,
             use_lsof=use_lsof,
+            strict_lsof_warnings=strict_lsof_warnings,
             ignore_invoking_ancestry=ignore_invoking_ancestry,
             census=census,
             fallback_census=fallback_census,
@@ -18800,6 +18816,7 @@ def _observe_slot_use_once(
     canonical_path: Path | None = None,
     after_fence: bool = False,
     before_image_fence: bool = False,
+    strict_lsof_warnings: bool = False,
 ) -> _LiveUseObservation | None:
     try:
         current_directory = Path.cwd().resolve(strict=True)
@@ -18864,7 +18881,12 @@ def _observe_slot_use_once(
     )
     direct_use_proven_absent = False
     if lsof is not None and use_lsof:
-        evidence, malformed_lsof, lsof_returncode = _lsof_slot_use(lsof, slot_path)
+        # Existing callers keep the exact two-argument call.
+        evidence, malformed_lsof, lsof_returncode = (
+            _lsof_slot_use(lsof, slot_path, strict_warnings=True)
+            if strict_lsof_warnings
+            else _lsof_slot_use(lsof, slot_path)
+        )
         if evidence is not None:
             refusal = Refusal(
                 f"live process {evidence.pid} uses slot {slot_path}"
@@ -20000,6 +20022,7 @@ def _salvage_candidate(
     ownerless_slot: str | None = None,
     ownerless_recorded_at: str | None = None,
     allow_shallow: bool = False,
+    detached_root: bool = False,
 ) -> _SalvageCandidate:
     """Return HEAD, status digest, durable commit candidate, and dirty state.
 
@@ -20021,7 +20044,10 @@ def _salvage_candidate(
             ownerless_slot=ownerless_slot,
             ownerless_recorded_at=ownerless_recorded_at,
             allow_shallow=allow_shallow,
+            detached_root=detached_root,
         )
+    if detached_root:
+        raise StateError("only an ownerless worktree may be salvaged with a detached root")
     path = path_override or _stored_path(config, checkout.path, "checkout path")
     _relative, repository = _stored_repository_path(config, checkout.repository)
     # Only a submodule candidate is detached; its repository is the source
@@ -20102,8 +20128,13 @@ def _salvage_candidate_uncached(
     ownerless_slot: str | None = None,
     ownerless_recorded_at: str | None = None,
     allow_shallow: bool = False,
+    detached_root: bool = False,
 ) -> _SalvageCandidate:
     """Return HEAD, status digest, durable commit candidate, and dirty state.
+
+    ``detached_root`` accepts the managed checkout itself on a detached HEAD
+    (an ownerless worktree whose HEAD a remote branch contains) instead of
+    comparing its branch; it is otherwise judged like any managed checkout.
 
     A temporary index captures tracked and ordinary untracked files outside the
     configured regenerable caches. Gitignored content is never uploaded. The
@@ -20133,6 +20164,8 @@ def _salvage_candidate_uncached(
                 f"cannot determine branch state for checkout {checkout.name}"
                 + _git_failure_detail(branch_result)
             )
+    elif detached_root:
+        _assert_detached_head(vcs, path)
     else:
         branch = vcs.branch(path)
         if branch != checkout.branch:
@@ -20914,6 +20947,7 @@ def _salvage_ownerless_worktree(
                 verify_repository_membership=not detached,
                 ownerless_slot=slot,
                 ownerless_recorded_at=authorization.recorded_at,
+                detached_root=not detached and authorization.branch is None,
             ),
         )
         for candidate, candidate_path, detached in candidates
@@ -42615,7 +42649,11 @@ def _ownerless_agent_authorization_from_obj(
         actor=actor,
         repository=_as_str(raw["repository"], "ownerless agent repository"),
         head=head,
-        branch=_validate_ref(_as_str(raw["branch"], "ownerless agent branch"), "branch"),
+        branch=(
+            None
+            if raw["branch"] is None
+            else _validate_ref(_as_str(raw["branch"], "ownerless agent branch"), "branch")
+        ),
         remote=_validate_remote(_as_str(raw["remote"], "ownerless agent remote")),
         remote_url_sha256=digest,
         handoff_sha256=handoff_digest,
@@ -42665,13 +42703,27 @@ def _ownerless_agent_checkout(
         name="worktree",
         path=path.relative_to(config.root).as_posix(),
         repository=authorization.repository,
-        branch=authorization.branch,
+        branch=authorization.branch or "",
         start_point=authorization.head,
         remote=authorization.remote,
         remote_url_sha256=authorization.remote_url_sha256,
         landed_ref=_landed_ref_for_remote(config, authorization.remote),
         head=authorization.head,
     )
+
+
+def _assert_detached_head(vcs: _GitVcs, path: Path) -> None:
+    result = vcs._run(path, ["symbolic-ref", "--quiet", "--short", "HEAD"], check=False)
+    if result.returncode == 0:
+        raise Refusal(
+            f"checkout {path} is on branch {result.stdout.strip()}, not detached; "
+            "name it with --branch"
+        )
+    if result.returncode != 1 or result.stdout or result.stderr:
+        raise Refusal(
+            f"cannot read the branch of checkout {path}: git symbolic-ref failed"
+            + _git_failure_detail(result)
+        )
 
 
 def _ownerless_agent_facts(
@@ -42711,13 +42763,26 @@ def _ownerless_agent_facts(
         )
     vcs = _GitVcs()
     head = vcs.verify_existing_worktree(repository, path)
-    branch = vcs.branch(path)
-    if head != authorization.head or branch != authorization.branch:
-        raise Refusal("ownerless agent worktree HEAD or branch changed")
+    if authorization.branch is None:
+        _assert_detached_head(vcs, path)
+        if head != authorization.head:
+            raise Refusal("ownerless agent worktree HEAD changed")
+    else:
+        branch = vcs.branch(path)
+        if head != authorization.head or branch != authorization.branch:
+            raise Refusal("ownerless agent worktree HEAD or branch changed")
     vcs.assert_ordinary_history(path)
     vcs.assert_ordinary_index(path)
     if vcs.remote_url_sha256(path, authorization.remote) != authorization.remote_url_sha256:
         raise Refusal("ownerless agent worktree remote changed")
+    if authorization.branch is None:
+        authority = vcs.remote_authority(path, authorization.remote)
+        if not vcs.remote_heads_containing(path, authorization.remote, head, authority):
+            raise Refusal(
+                f"ownerless agent worktree has a detached HEAD {head} that no branch of "
+                f"remote {authorization.remote} contains; push it or create a branch for "
+                "it first"
+            )
     checkout = _ownerless_agent_checkout(config, authorization, path, repository)
     # Salvage never stages a handoff, and only the bound root HANDOFF.md is
     # preserved beside the registry, so every other one must be moved first.
@@ -42893,6 +42958,7 @@ def _assert_ownerless_salvage_still_matches(
                 verify_repository_membership=not detached,
                 ownerless_slot=slot,
                 ownerless_recorded_at=authorization.recorded_at,
+                detached_root=not detached and authorization.branch is None,
             ),
         )
         for candidate, candidate_path, detached in candidates
@@ -43074,7 +43140,7 @@ def _cmd_recover_ownerless_agent_worktree(args: argparse.Namespace) -> int:
             actor=coordinator,
             repository=repository_relative,
             head=head,
-            branch=_validate_ref(args.branch, "branch"),
+            branch=None if args.detached else _validate_ref(args.branch, "branch"),
             remote=_validate_remote(args.remote),
             remote_url_sha256=digest,
             handoff_sha256=handoff_digest,
@@ -43084,7 +43150,8 @@ def _cmd_recover_ownerless_agent_worktree(args: argparse.Namespace) -> int:
             config, authorization, target, repository, expected_identity=True
         )
         if not args.apply:
-            print(f"WORKTREE path={target} outcome=planned detail=ownerless-agent")
+            detail = "ownerless-agent" if authorization.branch else "ownerless-agent-detached"
+            print(f"WORKTREE path={target} outcome=planned detail={detail}")
             return 0
         journal = {
             "schema": SCHEMA,
@@ -43107,6 +43174,2328 @@ def _cmd_recover_ownerless_agent_worktree(args: argparse.Namespace) -> int:
         after_states, after_archives = _validate_global_state(config)
         if _global_rows(after_states, after_archives) != before:
             raise StateError("ownerless agent recovery changed registered slot state")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Ownerless standalone clones (recover-ownerless-agent-clone)
+#
+# A leaked directory under the agent slot root can be a standalone clone, with
+# its own Git directory, rather than a linked worktree of a registered source
+# repository. Deleting it deletes every ref and object it holds, so the proof is
+# stricter than for a worktree: there is no dirty-tree salvage at all. Every
+# checkout inside it must be clean, every ref, HEAD and stash entry of every Git
+# directory inside it must be reachable from a remote the coordinator names, or
+# be pushed to refs/rescue/<slot>-<date>[-N] on that remote and read back, and
+# no process may use it. Anything the walk cannot classify refuses.
+# ---------------------------------------------------------------------------
+
+_OWNERLESS_CLONE_KIND = "ownerless-clone-remove"
+_OWNERLESS_CLONE_JOURNAL_REQUIRED = frozenset(
+    {
+        "schema",
+        "kind",
+        "machine",
+        "slot",
+        "phase",
+        "fenced",
+        "authorization",
+        "rescue",
+        "record",
+    }
+)
+_OWNERLESS_CLONE_AUTHORIZATION_REQUIRED = frozenset(
+    {
+        "path",
+        "identity",
+        "actor",
+        "remote_urls",
+        "inventory_sha256",
+        "handoff_sha256s",
+        "discard_ignored",
+        "recorded_at",
+    }
+)
+_OWNERLESS_CLONE_PHASES = frozenset(
+    {"prepared", "rescued", "fenced", "removing", "removed"}
+)
+_OWNERLESS_CLONE_RESCUE_ROOT = "refs/rescue"
+# How many example paths one refusal names before summarising the rest.
+_OWNERLESS_CLONE_EXAMPLES = 5
+_OWNERLESS_CLONE_PER_WORKTREE_REFS = ("refs/bisect/", "refs/worktree/", "refs/rewritten/")
+# A clone's own configuration must not be able to hide changes from the
+# cleanliness proof: an fsmonitor hook or a stale untracked cache can report a
+# modified or new file as clean.
+_OWNERLESS_CLONE_TREE_CONFIG: tuple[tuple[str, str], ...] = (
+    ("core.fsmonitor", "false"),
+    ("core.untrackedCache", "false"),
+    ("core.ignoreStat", "false"),
+    ("core.ignoreCase", "false"),
+    ("core.precomposeUnicode", "false"),
+    ("core.checkStat", "default"),
+    ("core.trustctime", "true"),
+    ("core.symlinks", "true"),
+)
+
+
+# The shape of a repository directory, checked entry by entry and by type.
+# Anything that does not fit refuses rather than being deleted unexamined.
+# refs/ is inventoried by for-each-ref (a stray file there is a broken ref and
+# refuses); logs/, info/, hooks/ and rr-cache/ are declared as not preserved;
+# a repository nested anywhere is found by the walk and inventoried itself.
+_GIT_DIR_FILES = frozenset(
+    {
+        "HEAD",
+        "ORIG_HEAD",
+        "FETCH_HEAD",
+        "AUTO_MERGE",
+        "COMMIT_EDITMSG",
+        "config",
+        "description",
+        "index",
+        "packed-refs",
+        "shallow",
+        "gc.log",
+    }
+)
+_GIT_DIR_FREE_FORM = frozenset({"refs", "logs", "info", "hooks", "rr-cache"})
+_GIT_DIR_EMPTY_ONLY = frozenset({"branches", "remotes", "lfs"})
+_WORKTREE_ADMIN_FILES = frozenset(
+    {
+        "HEAD",
+        "ORIG_HEAD",
+        "FETCH_HEAD",
+        "AUTO_MERGE",
+        "COMMIT_EDITMSG",
+        "commondir",
+        "gitdir",
+        "index",
+        "locked",
+        "config.worktree",
+    }
+)
+_OWNERLESS_CLONE_PACK_RE = re.compile(
+    r"pack-[0-9a-f]{40}(?:[0-9a-f]{24})?\.(?:pack|idx|rev|keep|promisor|mtimes|bitmap)"
+    r"|multi-pack-index(?:-[0-9a-f]{40}(?:[0-9a-f]{24})?\.(?:bitmap|rev))?"
+    r"|tmp_(?:pack|idx|rev)_[A-Za-z0-9]+"
+)
+_LOOSE_OBJECT_RE = re.compile(r"[0-9a-f]{38}(?:[0-9a-f]{24})?")
+
+
+def _ownerless_clone_unexpected_git_content(
+    git_dir: Path, root: Path, checkouts: AbstractSet[Path]
+) -> list[str]:
+    """Name every entry of ``git_dir`` that is not shaped like Git's own.
+
+    Every allowlisted name must also have the right type. The object store is
+    checked down to each file (a loose object must start with a zlib header);
+    each linked worktree's directory likewise; modules/ may hold only module
+    repositories (each judged as a Git directory of its own) and the
+    directories leading to them; branches/, remotes/ and lfs/ must be empty.
+    A top-level entry that is a walked checkout (a worktree kept inside the
+    Git directory) is judged as a checkout instead. Lock files refuse: a Git
+    operation may be running, or died holding state.
+    """
+
+    unexpected: list[str] = []
+
+    def note(path: Path) -> None:
+        unexpected.append(path.relative_to(root).as_posix())
+
+    def entries(directory: Path) -> list[os.DirEntry[str]]:
+        try:
+            with os.scandir(directory) as iterator:
+                return sorted(iterator, key=lambda entry: entry.name)
+        except OSError as exc:
+            raise Refusal(f"cannot read Git directory {directory}: {exc}") from exc
+
+    def regular(entry: os.DirEntry[str]) -> bool:
+        return entry.is_file(follow_symlinks=False)
+
+    def directory(entry: os.DirEntry[str]) -> bool:
+        return entry.is_dir(follow_symlinks=False)
+
+    def loose_object(path: Path) -> bool:
+        try:
+            with open(path, "rb") as handle:
+                header = handle.read(2)
+        except OSError:
+            return False
+        return len(header) == 2 and header[0] & 0x0F == 8 and (header[0] << 8 | header[1]) % 31 == 0
+
+    def check_objects(objects: Path) -> None:
+        for entry in entries(objects):
+            name, path = entry.name, Path(entry.path)
+            if re.fullmatch(r"[0-9a-f]{2}", name) and directory(entry):
+                for loose in entries(path):
+                    if not (
+                        regular(loose)
+                        and (
+                            (_LOOSE_OBJECT_RE.fullmatch(loose.name) and loose_object(Path(loose.path)))
+                            or loose.name.startswith("tmp_obj_")
+                        )
+                    ):
+                        note(Path(loose.path))
+            elif name == "pack" and directory(entry):
+                for pack in entries(path):
+                    if not (regular(pack) and _OWNERLESS_CLONE_PACK_RE.fullmatch(pack.name)):
+                        note(Path(pack.path))
+            elif name == "info" and directory(entry):
+                for info in entries(path):
+                    if info.name in {"alternates", "packs", "http-alternates", "commit-graph"}:
+                        if not regular(info):
+                            note(Path(info.path))
+                    elif info.name == "commit-graphs" and directory(info):
+                        for graph in entries(Path(info.path)):
+                            if not (
+                                regular(graph)
+                                and (
+                                    graph.name == "commit-graph-chain"
+                                    or re.fullmatch(r"graph-[0-9a-f]{40}(?:[0-9a-f]{24})?\.graph", graph.name)
+                                )
+                            ):
+                                note(Path(graph.path))
+                    else:
+                        note(Path(info.path))
+            elif name in {"commit-graph", "multi-pack-index"} and regular(entry):
+                continue
+            elif re.fullmatch(r"tmp_(?:obj|pack|idx|graph)_[A-Za-z0-9]+", name) and regular(entry):
+                continue
+            else:
+                note(path)
+
+    def check_modules(modules: Path) -> None:
+        for entry in entries(modules):
+            path = Path(entry.path)
+            if not directory(entry):
+                note(path)
+                continue
+            try:
+                with os.scandir(path) as iterator:
+                    inner = {child.name: child for child in iterator}
+            except OSError as exc:
+                raise Refusal(f"cannot read Git directory {path}: {exc}") from exc
+            if _is_structural_git_dir(path, inner):
+                continue  # a module repository; the walk judges it on its own
+            check_modules(path)
+
+    for entry in entries(git_dir):
+        name, path = entry.name, Path(entry.path)
+        if path.resolve() in checkouts:
+            continue
+        if name in _GIT_DIR_FILES:
+            if not regular(entry):
+                note(path)
+        elif name in _GIT_DIR_FREE_FORM:
+            if not directory(entry):
+                note(path)
+        elif name in _GIT_DIR_EMPTY_ONLY:
+            if not directory(entry) or entries(path):
+                note(path)
+        elif name == "objects":
+            if directory(entry):
+                check_objects(path)
+            else:
+                note(path)
+        elif name == "modules":
+            if directory(entry):
+                check_modules(path)
+            else:
+                note(path)
+        elif name == "worktrees":
+            if not directory(entry):
+                note(path)
+                continue
+            for admin in entries(path):
+                if not directory(admin):
+                    note(Path(admin.path))
+                    continue
+                for item in entries(Path(admin.path)):
+                    if item.name in _WORKTREE_ADMIN_FILES:
+                        if not regular(item):
+                            note(Path(item.path))
+                    elif item.name in {"logs", "refs"}:
+                        if not directory(item):
+                            note(Path(item.path))
+                    else:
+                        note(Path(item.path))
+        elif name == "fsmonitor--daemon.ipc" and not (regular(entry) or directory(entry)):
+            continue
+        else:
+            note(path)
+    return unexpected
+
+
+@dataclasses.dataclass(frozen=True)
+class OwnerlessCloneAuthorization:
+    """Exact facts authorizing removal of one unregistered standalone clone."""
+
+    path: str
+    identity: tuple[int, int, int]
+    actor: ProcessIdentity
+    #: (Git directory key, remote URL) pairs, sorted by key.
+    remote_urls: tuple[tuple[str, str], ...]
+    inventory_sha256: str
+    handoff_sha256s: tuple[str, ...]
+    discard_ignored: bool
+    recorded_at: str
+
+
+@dataclasses.dataclass(frozen=True)
+class _CloneTip:
+    """One object a ref, HEAD, stash entry, or worktree HEAD keeps alive."""
+
+    label: str
+    object: str
+    object_type: str
+
+
+@dataclasses.dataclass(frozen=True)
+class _CloneRepository:
+    """One Git directory inside the clone and everything it keeps alive."""
+
+    key: str
+    git_dir: Path
+    checkouts: tuple[str, ...]
+    configured_remotes: tuple[tuple[str, str], ...]
+    tips: tuple[_CloneTip, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class _CloneWalk:
+    checkout_roots: tuple[Path, ...]
+    git_dirs: tuple[Path, ...]
+    handoff_files: tuple[Path, ...]
+    unversioned: tuple[str, ...]
+    fingerprint: str
+    #: For each checkout root, every non-directory entry whose nearest
+    #: enclosing checkout it is, relative to that root (its own .git excluded).
+    files_by_checkout: Mapping[Path, tuple[str, ...]] = dataclasses.field(
+        default_factory=dict
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class _CloneInventory:
+    root: Path
+    repositories: tuple[_CloneRepository, ...]
+    #: (location, SHA-256) for every handoff found: "slot:<relative path>" or
+    #: "control:<sidecar file name>".
+    handoffs: tuple[tuple[str, str], ...]
+    blockers: tuple[str, ...]
+    #: (relative path, size) of every file a tracked .gitignore hides outside
+    #: the cache globs; removal deletes them only with --discard-ignored.
+    ignored: tuple[tuple[str, int], ...]
+    fingerprint: str
+    digest: str
+
+
+def _ownerless_clone_examples(values: Sequence[str]) -> str:
+    # A name need not be UTF-8; escape it so a refusal can always be printed.
+    values = [
+        os.fsencode(value).decode("utf-8", "backslashreplace") for value in values
+    ]
+    shown = ", ".join(values[:_OWNERLESS_CLONE_EXAMPLES])
+    hidden = len(values) - _OWNERLESS_CLONE_EXAMPLES
+    return shown + (f" and {hidden} more" if hidden > 0 else "")
+
+
+def _is_structural_git_dir(directory: Path, entries: Mapping[str, os.DirEntry[str]]) -> bool:
+    """Git's own test for a repository directory: HEAD, objects/ and refs/."""
+
+    head = entries.get("HEAD")
+    objects = entries.get("objects")
+    refs = entries.get("refs")
+    try:
+        return (
+            head is not None
+            and head.is_file(follow_symlinks=False)
+            and objects is not None
+            and objects.is_dir(follow_symlinks=False)
+            and refs is not None
+            and refs.is_dir(follow_symlinks=False)
+        )
+    except OSError as exc:
+        raise Refusal(f"cannot classify directory {directory}: {exc}") from exc
+
+
+def _ownerless_clone_walk(root: Path) -> _CloneWalk:
+    """Classify every entry below ``root`` without following links or crossing mounts.
+
+    Returns every checkout root (a directory holding ``.git``), every
+    Git directory (Git's structural test, wherever it appears, including
+    ``.git/modules/*`` and bare repositories), every regular file whose name
+    starts with HANDOFF outside checkouts and Git directories, every other
+    entry outside both a
+    checkout and a Git directory (unversioned content that removal would lose),
+    and a fingerprint of the whole tree except object stores. Object stores are
+    skipped: an added object cannot lose data unless a ref changes, and refs
+    are inside the fingerprint.
+    """
+
+    try:
+        root_metadata = os.lstat(root)
+    except OSError as exc:
+        raise Refusal(f"cannot inspect ownerless clone {root}: {exc}") from exc
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        raise Refusal(f"ownerless clone is not a directory: {root}")
+    device = root_metadata.st_dev
+    fingerprint = hashlib.sha256()
+    checkout_roots: list[Path] = []
+    git_dirs: list[Path] = []
+    handoffs: list[Path] = []
+    unversioned: list[str] = []
+    files_by_checkout: dict[Path, list[str]] = {}
+    # (directory, nearest enclosing checkout root, inside a Git directory)
+    pending: list[tuple[Path, Path | None, bool]] = [(root, None, False)]
+    while pending:
+        directory, owner, in_git = pending.pop()
+        try:
+            with os.scandir(directory) as iterator:
+                entries = {entry.name: entry for entry in iterator}
+        except OSError as exc:
+            raise Refusal(f"cannot read ownerless clone directory {directory}: {exc}") from exc
+        is_git_dir = _is_structural_git_dir(directory, entries)
+        if is_git_dir:
+            git_dirs.append(directory)
+        dot_git = entries.get(".git")
+        is_checkout = False
+        # A working tree can sit inside a Git directory (a bare repository
+        # with worktrees, or `git worktree add .git/wt`); it is a checkout,
+        # and what lies below it is working-tree content, not Git internals.
+        if dot_git is not None and not is_git_dir:
+            if dot_git.is_symlink():
+                raise Refusal(f"ownerless clone contains a symlinked .git: {dot_git.path}")
+            is_checkout = True
+            checkout_roots.append(directory)
+            files_by_checkout.setdefault(directory, [])
+        child_owner = directory if is_checkout else owner
+        child_checkout = child_owner is not None
+        child_git = (in_git and not is_checkout) or is_git_dir
+        for name in sorted(entries):
+            entry = entries[name]
+            path = Path(entry.path)
+            relative = path.relative_to(root).as_posix()
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise Refusal(f"cannot inspect ownerless clone entry {path}: {exc}") from exc
+            if stat.S_ISDIR(metadata.st_mode):
+                if metadata.st_dev != device:
+                    raise Refusal(f"ownerless clone crosses a mount point: {path}")
+                if is_git_dir and name == "objects":
+                    continue
+                fingerprint.update(
+                    f"d\0{relative}\0{metadata.st_ino}\0{metadata.st_mtime_ns}\n".encode(
+                        "utf-8", "surrogateescape"
+                    )
+                )
+                # A directory named .git inside a checkout is that checkout's
+                # Git directory; it is classified when it is visited.
+                pending.append((path, child_owner, child_git or name == ".git"))
+                continue
+            fingerprint.update(
+                (
+                    f"f\0{relative}\0{stat.S_IFMT(metadata.st_mode)}\0{metadata.st_ino}\0"
+                    f"{metadata.st_size}\0{metadata.st_mtime_ns}\n"
+                ).encode("utf-8", "surrogateescape")
+            )
+            if child_git:
+                continue
+            if child_owner is not None:
+                # Content inside a checkout is judged by Git, and every entry
+                # must be one Git reports (see _ownerless_clone_unclaimed).
+                if not (is_checkout and name == ".git"):
+                    files_by_checkout[child_owner].append(
+                        path.relative_to(child_owner).as_posix()
+                    )
+                continue
+            if name.startswith("HANDOFF") and stat.S_ISREG(metadata.st_mode):
+                handoffs.append(path)
+                continue
+            unversioned.append(relative)
+    return _CloneWalk(
+        checkout_roots=tuple(sorted(checkout_roots)),
+        git_dirs=tuple(sorted(git_dirs)),
+        handoff_files=tuple(sorted(handoffs)),
+        unversioned=tuple(sorted(unversioned)),
+        fingerprint=fingerprint.hexdigest(),
+        files_by_checkout={key: tuple(value) for key, value in files_by_checkout.items()},
+    )
+
+
+def _ownerless_clone_git_env(git_dir: Path) -> dict[str, str]:
+    # An explicit GIT_DIR stops Git discovering an enclosing repository.
+    return {"GIT_DIR": str(git_dir), "GIT_OPTIONAL_LOCKS": "0"}
+
+
+def _ownerless_clone_object_types(
+    vcs: _GitVcs, git_dir: Path, objects: Sequence[str]
+) -> dict[str, str]:
+    if not objects:
+        return {}
+    result = vcs._run(
+        git_dir,
+        ["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+        input_text="".join(f"{value}\n" for value in objects),
+        env_overrides=_ownerless_clone_git_env(git_dir),
+    )
+    types: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and SHA_RE.fullmatch(parts[0]):
+            types[parts[0]] = parts[1]
+    missing = [value for value in objects if value not in types]
+    if missing:
+        raise Refusal(
+            f"Git directory {git_dir} names missing objects: "
+            f"{_ownerless_clone_examples(sorted(set(missing)))}"
+        )
+    return types
+
+
+def _ownerless_clone_worktrees(
+    vcs: _GitVcs, git_dir: Path
+) -> list[dict[str, str]]:
+    result = vcs._run(
+        git_dir,
+        ["worktree", "list", "--porcelain", "-z"],
+        env_overrides=_ownerless_clone_git_env(git_dir),
+    )
+    records: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    for field in result.stdout.split("\0"):
+        if not field:
+            if current:
+                records.append(current)
+                current = {}
+            continue
+        name, _separator, value = field.partition(" ")
+        current[name] = value
+    if current:
+        records.append(current)
+    return records
+
+
+def _ownerless_clone_checkout_blockers(
+    vcs: _GitVcs,
+    root: Path,
+    checkout: Path,
+    nested_roots: AbstractSet[str],
+    cache_globs: Sequence[str],
+) -> tuple[list[str], list[str], list[tuple[str, int]]]:
+    """Return why ``checkout`` is not clean, its handoffs, and its gitignored files.
+
+    Paths are relative to ``root``. An untracked path inside another
+    repository nested below ``checkout`` is that repository's to judge. An
+    untracked or ignored file whose name starts with HANDOFF is returned as a
+    handoff, which must be read, rather than as dirt.
+
+    A gitignored file outside ``cache_globs`` is dirt unless the pattern that
+    ignores it comes from a .gitignore file the checkout tracks: patterns in
+    .git/info/exclude or an excludes file are local, uncommitted settings, so
+    a file they hide is ordinary untracked work. Files ignored by a tracked
+    .gitignore are returned, with their sizes, for the caller to list.
+    """
+
+    relative = checkout.relative_to(root).as_posix()
+    operations = vcs.operation_paths(checkout)
+    if operations:
+        return [f"checkout {relative} has an unfinished Git operation at {operations[0]}"], [], []
+    try:
+        vcs.assert_ordinary_index(checkout)
+    except Refusal as exc:
+        return [f"checkout {relative}: {exc}"], [], []
+    pathspecs = ["."]
+    for pattern in cache_globs:
+        pathspecs.append(f":(exclude,glob){pattern}")
+        pathspecs.append(f":(exclude,glob){pattern}/**")
+    result = vcs._run(
+        checkout,
+        [
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+            "--",
+            *pathspecs,
+        ],
+        env_overrides={"GIT_OPTIONAL_LOCKS": "0"},
+        config=_OWNERLESS_CLONE_TREE_CONFIG,
+    )
+
+    def nested_owner(path: str) -> bool:
+        parts = PurePosixPath(path.rstrip("/")).parts
+        for length in range(1, len(parts) + 1):
+            prefix = PurePosixPath(relative, *parts[:length]).as_posix()
+            if prefix in nested_roots:
+                return True
+        return False
+
+    fields = result.stdout.split("\0")
+    dirty: list[str] = []
+    handoffs: list[str] = []
+    index = 0
+    while index < len(fields):
+        field = fields[index]
+        index += 1
+        if not field:
+            continue
+        kind = field[0]
+        if kind == "?":
+            untracked = field[2:]
+            if nested_owner(untracked):
+                continue
+            if PurePosixPath(untracked).name.startswith("HANDOFF") and not untracked.endswith("/"):
+                handoffs.append(PurePosixPath(relative, untracked).as_posix())
+                continue
+            dirty.append(untracked)
+        elif kind == "2":
+            # A rename record is followed by its original path.
+            index += 1
+            dirty.append(field.split(" ", 9)[-1])
+        elif kind == "1":
+            dirty.append(field.split(" ", 8)[-1])
+        elif kind == "u":
+            dirty.append(field.split(" ", 10)[-1])
+        elif kind == "#":
+            continue
+        else:
+            dirty.append(field)
+    listing = vcs._run(
+        checkout,
+        ["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--", *pathspecs],
+        env_overrides={"GIT_OPTIONAL_LOCKS": "0"},
+        config=_OWNERLESS_CLONE_TREE_CONFIG,
+    )
+    ignored_paths = [
+        path for path in listing.stdout.split("\0") if path and not nested_owner(path)
+    ]
+    declared: list[tuple[str, int]] = []
+    if ignored_paths:
+        verdicts = vcs._run(
+            checkout,
+            ["check-ignore", "-v", "-z", "--stdin"],
+            input_text="".join(f"{path}\0" for path in ignored_paths),
+            env_overrides={"GIT_OPTIONAL_LOCKS": "0"},
+            check=False,
+            config=_OWNERLESS_CLONE_TREE_CONFIG,
+        )
+        if verdicts.returncode not in (0, 1) or verdicts.stderr.strip():
+            raise Refusal(
+                f"cannot classify ignored files in checkout {relative}"
+                + _git_failure_detail(verdicts)
+            )
+        fields = verdicts.stdout.split("\0")
+        sources: dict[str, str] = {}
+        for offset in range(0, len(fields) - 3, 4):
+            source, _line, _pattern, path = fields[offset : offset + 4]
+            sources[path] = source
+        # An absolute source (an excludes file) lies outside the checkout and is
+        # never a tracked .gitignore.
+        candidates = sorted(
+            {source for source in sources.values() if source and not source.startswith("/")}
+        )
+        tracked: set[str] = set()
+        if candidates:
+            listed = vcs._run(
+                checkout,
+                ["ls-files", "-z", "--", *(f":(literal){value}" for value in candidates)],
+                env_overrides={"GIT_OPTIONAL_LOCKS": "0"},
+            )
+            tracked = {value for value in listed.stdout.split("\0") if value}
+        for path in ignored_paths:
+            location = PurePosixPath(relative, path).as_posix()
+            if PurePosixPath(path).name.startswith("HANDOFF"):
+                handoffs.append(location)
+                continue
+            ignore_source = sources.get(path)
+            if ignore_source is None or ignore_source not in tracked:
+                dirty.append(f"{path} (ignored only by {ignore_source or 'an unknown rule'})")
+                continue
+            try:
+                size = os.lstat(checkout / path).st_size
+            except OSError as exc:
+                raise Refusal(f"cannot inspect ignored file {location}: {exc}") from exc
+            declared.append((location, size))
+    # The ident attribute rewrites $Id$ on checkout and back on comparison, so
+    # an edit of the same length inside the marker reads as clean.
+    tracked_listing = vcs._run(
+        checkout,
+        ["ls-files", "-z"],
+        env_overrides={"GIT_OPTIONAL_LOCKS": "0"},
+        config=_OWNERLESS_CLONE_TREE_CONFIG,
+    ).stdout
+    if tracked_listing:
+        attributes = vcs._run(
+            checkout,
+            ["check-attr", "-z", "--stdin", "ident"],
+            input_text=tracked_listing,
+            env_overrides={"GIT_OPTIONAL_LOCKS": "0"},
+        ).stdout.split("\0")
+        marked = [
+            attributes[offset]
+            for offset in range(0, len(attributes) - 2, 3)
+            if attributes[offset + 2] not in {"unspecified", "unset"}
+        ]
+        if marked:
+            dirty.append(
+                f"{len(marked)} file(s) with the ident attribute, whose edits can read as "
+                f"clean: {_ownerless_clone_examples(marked)}"
+            )
+    if dirty:
+        return [
+            f"checkout {relative} has {len(dirty)} uncommitted or untracked path(s): "
+            f"{_ownerless_clone_examples(dirty)}"
+        ], handoffs, declared
+    return [], handoffs, declared
+
+
+def _ownerless_clone_unclaimed(
+    vcs: _GitVcs, checkout: Path, files: Sequence[str]
+) -> list[str]:
+    """Return walked entries of ``checkout`` that Git does not report at all.
+
+    Status and the ignored listing describe only what Git sees. A file inside
+    a gitlink directory with no .git, or one a repository setting hides from
+    every listing, is invisible to both and would be deleted unexamined. Every
+    entry must be tracked or lie in (or be) an untracked path Git lists.
+    """
+
+    listing = vcs._run(
+        checkout,
+        ["ls-files", "-z", "--cached", "--others", "--directory"],
+        env_overrides={"GIT_OPTIONAL_LOCKS": "0"},
+        config=_OWNERLESS_CLONE_TREE_CONFIG,
+    )
+    exact: set[str] = set()
+    directories: set[str] = set()
+    for value in listing.stdout.split("\0"):
+        if not value:
+            continue
+        if value.endswith("/"):
+            directories.add(value.rstrip("/"))
+        else:
+            exact.add(value)
+    unclaimed: list[str] = []
+    for relative in files:
+        if relative in exact:
+            continue
+        parts = relative.split("/")
+        if any("/".join(parts[:length]) in directories for length in range(1, len(parts))):
+            continue
+        unclaimed.append(relative)
+    return unclaimed
+
+
+def _ownerless_clone_sidecar_handoffs(config: Config, slot: str) -> list[Path]:
+    """Return every wrkslots handoff sidecar written for ``slot`` on any machine."""
+
+    found: list[Path] = []
+    pattern = re.compile(r"HANDOFF\.(\d+)\.(.+)\.json")
+    for path in sorted(config.control.glob("HANDOFF.*.json")):
+        match = pattern.fullmatch(path.name)
+        if match is None:
+            continue
+        rest = match.group(2)
+        machine_length = int(match.group(1))
+        remainder = rest[machine_length + 1 :]
+        slot_length, _separator, tail = remainder.partition(".")
+        if not slot_length.isdigit():
+            continue
+        if tail[: int(slot_length)] == slot and tail[int(slot_length) : int(slot_length) + 1] == ".":
+            found.append(path)
+    return found
+
+
+def _ownerless_clone_inventory(config: Config, target: Path) -> _CloneInventory:
+    """Read every Git fact removal of ``target`` depends on, without changing it."""
+
+    slot = target.name
+    root = target
+    vcs = _GitVcs()
+    walk = _ownerless_clone_walk(root)
+    blockers: list[str] = []
+    if walk.unversioned:
+        blockers.append(
+            f"{len(walk.unversioned)} entr(y/ies) lie outside every checkout and Git "
+            f"directory and would be lost: {_ownerless_clone_examples(list(walk.unversioned))}"
+        )
+    real_root = root.resolve(strict=True)
+
+    def inside(path: Path) -> bool:
+        return _path_is_within(path, real_root)
+
+    def key_of(path: Path) -> str:
+        return path.relative_to(real_root).as_posix() or "."
+
+    repositories: dict[Path, list[Path]] = {}
+    for git_dir in walk.git_dirs:
+        repositories.setdefault(git_dir.resolve(strict=True), [])
+    nested_roots = {key_of(checkout.resolve(strict=True)) for checkout in walk.checkout_roots}
+    nested_roots.update(key_of(git_dir.resolve(strict=True)) for git_dir in walk.git_dirs)
+    for checkout in walk.checkout_roots:
+        resolved = checkout.resolve(strict=True)
+        top = vcs.repository_root(checkout).resolve(strict=True)
+        if top != resolved:
+            raise Refusal(
+                f"checkout {key_of(resolved)} is not its own Git worktree root "
+                f"(Git reports {top}); preserve the clone and inspect it"
+            )
+        common = vcs.common_directory(checkout).resolve(strict=True)
+        if not inside(common):
+            raise Refusal(
+                f"checkout {key_of(resolved)} belongs to a Git directory outside the clone "
+                f"({common}); removing it would leave that repository's registration and "
+                "per-worktree state behind. Retire it with recover-ownerless-agent-worktree "
+                "or move it out first"
+            )
+        repositories.setdefault(common, []).append(resolved)
+
+    clone_repositories: list[_CloneRepository] = []
+    checkout_handoffs: list[str] = []
+    ignored: list[tuple[str, int]] = []
+    for git_dir in sorted(repositories, key=key_of):
+        key = key_of(git_dir)
+        env = _ownerless_clone_git_env(git_dir)
+        for name in ("info/grafts", "shallow"):
+            if (git_dir / name).exists() or (git_dir / name).is_symlink():
+                raise Refusal(
+                    f"Git directory {key} uses {name}; its history cannot prove what "
+                    "a remote holds"
+                )
+        listing = vcs._run(
+            git_dir,
+            ["for-each-ref", "--format=%(objectname) %(objecttype) %(refname)"],
+            env_overrides=env,
+        )
+        if listing.stderr.strip():
+            raise Refusal(
+                f"Git reported a problem listing refs in {key}: "
+                f"{listing.stderr.strip().splitlines()[0]}"
+            )
+        tips: list[_CloneTip] = []
+        ref_names: set[str] = set()
+        for line in listing.stdout.splitlines():
+            parts = line.split(" ", 2)
+            if len(parts) != 3 or not SHA_RE.fullmatch(parts[0]):
+                raise Refusal(f"Git returned a malformed ref listing in {key}: {line!r}")
+            if parts[2].startswith("refs/replace/"):
+                raise Refusal(f"Git directory {key} contains replacement ref {parts[2]}")
+            ref_names.add(parts[2])
+            tips.append(_CloneTip(parts[2], parts[0], parts[1]))
+        extra: list[tuple[str, str]] = []
+        head = vcs._run(
+            git_dir, ["rev-parse", "-q", "--verify", "HEAD"], env_overrides=env, check=False
+        )
+        if head.returncode == 0 and SHA_RE.fullmatch(head.stdout.strip()):
+            extra.append(("HEAD", head.stdout.strip()))
+        elif head.returncode != 1 or head.stdout.strip() or head.stderr.strip():
+            raise Refusal(f"cannot read HEAD of Git directory {key}" + _git_failure_detail(head))
+        orig_head = vcs._run(
+            git_dir, ["rev-parse", "-q", "--verify", "ORIG_HEAD"], env_overrides=env, check=False
+        )
+        if orig_head.returncode == 0 and SHA_RE.fullmatch(orig_head.stdout.strip()):
+            extra.append(("ORIG_HEAD", orig_head.stdout.strip()))
+        if "refs/stash" in ref_names:
+            stash = vcs._run(
+                git_dir,
+                ["log", "-g", "--no-abbrev", "--format=%H", "refs/stash", "--"],
+                env_overrides=env,
+            )
+            for number, value in enumerate(stash.stdout.split()):
+                if not SHA_RE.fullmatch(value):
+                    raise Refusal(f"Git returned a malformed stash entry in {key}: {value!r}")
+                extra.append((f"refs/stash@{{{number}}}", value))
+        checkouts = sorted(repositories[git_dir])
+        registered: set[Path] = set()
+        for record in _ownerless_clone_worktrees(vcs, git_dir):
+            raw_path = record.get("worktree")
+            if raw_path is None:
+                raise Refusal(f"Git returned a worktree record without a path for {key}")
+            path = Path(raw_path)
+            if "bare" in record:
+                continue
+            exists = path.exists() or path.is_symlink()
+            resolved = path.resolve() if exists else path
+            label = key_of(resolved) if inside(resolved) else str(path)
+            if exists and not inside(resolved):
+                raise Refusal(
+                    f"Git directory {key} has worktree {path} outside the clone; removing "
+                    "the clone would break it. Retire or move that worktree first"
+                )
+            if exists:
+                registered.add(resolved)
+            value = record.get("HEAD", "")
+            if SHA_RE.fullmatch(value) and value != "0" * 40:
+                extra.append((f"worktree:{label}:HEAD", value))
+        unwalked = sorted(
+            path
+            for path in registered
+            if inside(path) and path not in set(checkouts) and path != git_dir
+        )
+        if unwalked:
+            raise Refusal(
+                f"Git directory {key} registers worktree(s) inside the clone that the walk "
+                f"did not find as checkouts: {_ownerless_clone_examples([key_of(p) for p in unwalked])}; "
+                "preserve the clone and inspect it"
+            )
+        unregistered = [checkout for checkout in checkouts if checkout not in registered]
+        if unregistered:
+            raise Refusal(
+                f"checkout(s) {_ownerless_clone_examples([key_of(c) for c in unregistered])} "
+                f"use Git directory {key}, which does not list them as worktrees; preserve "
+                "the clone and inspect it"
+            )
+        # The index of a Git directory whose main working tree is absent (or
+        # that is bare) is not covered by any status: anything staged there
+        # exists nowhere else.
+        main_records = _ownerless_clone_worktrees(vcs, git_dir)[:1]
+        main_present = bool(main_records) and "bare" not in main_records[0] and (
+            Path(main_records[0].get("worktree", "")).resolve() in set(checkouts)
+        )
+        if (git_dir / "index").exists() and not main_present:
+            if head.returncode == 0:
+                staged = vcs._run(
+                    git_dir,
+                    ["diff-index", "--cached", "--quiet", "HEAD", "--"],
+                    env_overrides=env,
+                    check=False,
+                    config=_OWNERLESS_CLONE_TREE_CONFIG,
+                )
+                if staged.returncode != 0:
+                    blockers.append(
+                        f"Git directory {key} has no working tree but its index holds "
+                        "staged changes"
+                    )
+            else:
+                entries = vcs._run(git_dir, ["ls-files", "-z"], env_overrides=env)
+                if entries.stdout:
+                    blockers.append(
+                        f"Git directory {key} has no commit but its index holds staged files"
+                    )
+        unexpected = _ownerless_clone_unexpected_git_content(
+            git_dir,
+            real_root,
+            {checkout.resolve(strict=True) for checkout in walk.checkout_roots},
+        )
+        if unexpected:
+            blockers.append(
+                f"Git directory {key} holds {len(unexpected)} entr(y/ies) that are not Git's "
+                f"own and would be deleted unexamined: {_ownerless_clone_examples(unexpected)}"
+            )
+        filters = vcs._run(
+            git_dir,
+            ["config", "--get-regexp", r"^filter\..*\.(clean|process)$"],
+            env_overrides=env,
+            check=False,
+        )
+        if filters.stdout.strip():
+            blockers.append(
+                f"Git directory {key} configures a content filter "
+                f"({filters.stdout.split()[0]}), which can make an edited file look clean"
+            )
+        lfs = git_dir / "lfs" / "objects"
+        if lfs.is_dir() and any(lfs.iterdir()):
+            blockers.append(
+                f"Git directory {key} holds Git LFS objects, which this command cannot "
+                "prove the remote holds"
+            )
+        # Every linked worktree's own Git directory, whether or not its
+        # working tree still exists: its HEAD, its per-worktree refs, and for a
+        # missing working tree, anything staged in its index.
+        admin_root = git_dir / "worktrees"
+        admins = (
+            sorted(path for path in admin_root.iterdir() if path.is_dir() and not path.is_symlink())
+            if admin_root.is_dir()
+            else []
+        )
+        for admin in admins:
+            admin_label = f"worktree-admin:{key_of(admin)}"
+            admin_env = {"GIT_DIR": str(admin), "GIT_OPTIONAL_LOCKS": "0"}
+            # Every ref this worktree sees; a stray file under its refs/ is a
+            # broken ref, which Git reports and which refuses.
+            per_worktree = vcs._run(
+                git_dir,
+                ["for-each-ref", "--format=%(objectname) %(objecttype) %(refname)"],
+                env_overrides=admin_env,
+            )
+            if per_worktree.stderr.strip():
+                raise Refusal(
+                    f"Git reported a problem listing refs of worktree {key_of(admin)}: "
+                    f"{per_worktree.stderr.strip().splitlines()[0]}"
+                )
+            for line in per_worktree.stdout.splitlines():
+                parts = line.split(" ", 2)
+                if len(parts) != 3 or not SHA_RE.fullmatch(parts[0]):
+                    raise Refusal(f"Git returned a malformed ref listing in {key}: {line!r}")
+                if parts[2].startswith(_OWNERLESS_CLONE_PER_WORKTREE_REFS):
+                    tips.append(_CloneTip(f"{admin_label}:{parts[2]}", parts[0], parts[1]))
+            admin_filters = vcs._run(
+                git_dir,
+                ["config", "--get-regexp", r"^filter\..*\.(clean|process)$"],
+                env_overrides=admin_env,
+                check=False,
+            )
+            if admin_filters.stdout.strip():
+                blockers.append(
+                    f"worktree {key_of(admin)} configures a content filter "
+                    f"({admin_filters.stdout.split()[0]}), which can make an edited file look clean"
+                )
+            admin_head = vcs._run(
+                git_dir, ["rev-parse", "-q", "--verify", "HEAD"], env_overrides=admin_env, check=False
+            )
+            if admin_head.returncode == 0 and SHA_RE.fullmatch(admin_head.stdout.strip()):
+                extra.append((f"{admin_label}:HEAD", admin_head.stdout.strip()))
+            admin_orig = vcs._run(
+                git_dir,
+                ["rev-parse", "-q", "--verify", "ORIG_HEAD"],
+                env_overrides=admin_env,
+                check=False,
+            )
+            if admin_orig.returncode == 0 and SHA_RE.fullmatch(admin_orig.stdout.strip()):
+                extra.append((f"{admin_label}:ORIG_HEAD", admin_orig.stdout.strip()))
+            gitdir_file = admin / "gitdir"
+            try:
+                worktree_path = Path(
+                    gitdir_file.read_text(encoding="utf-8", errors="surrogateescape").strip()
+                ).parent
+            except OSError:
+                worktree_path = None
+            if (
+                (worktree_path is None or not (worktree_path.exists() or worktree_path.is_symlink()))
+                and (admin / "index").exists()
+                and admin_head.returncode == 0
+            ):
+                staged = vcs._run(
+                    git_dir,
+                    ["diff-index", "--cached", "--quiet", "HEAD", "--"],
+                    env_overrides=admin_env,
+                    check=False,
+                    config=_OWNERLESS_CLONE_TREE_CONFIG,
+                )
+                if staged.returncode != 0:
+                    blockers.append(
+                        f"worktree {worktree_path or admin.name} of {key} is missing but its "
+                        "index holds staged changes"
+                    )
+        for checkout in checkouts:
+            unclaimed = _ownerless_clone_unclaimed(
+                vcs, checkout, walk.files_by_checkout.get(checkout, ())
+            )
+            if unclaimed:
+                blockers.append(
+                    f"checkout {key_of(checkout)} has {len(unclaimed)} entr(y/ies) Git does not "
+                    f"report (for example inside a gitlink directory without .git): "
+                    f"{_ownerless_clone_examples(unclaimed)}"
+                )
+            try:
+                _assert_cache_policy_untracked_path(
+                    config, key_of(checkout), checkout, vcs, config.cache_globs
+                )
+            except Refusal as exc:
+                blockers.append(str(exc))
+            checkout_blockers, found_handoffs, found_ignored = _ownerless_clone_checkout_blockers(
+                vcs,
+                real_root,
+                checkout,
+                nested_roots - {key_of(checkout)},
+                config.cache_globs,
+            )
+            blockers.extend(checkout_blockers)
+            checkout_handoffs.extend(found_handoffs)
+            ignored.extend(found_ignored)
+        types = _ownerless_clone_object_types(
+            vcs, git_dir, sorted({value for _label, value in extra})
+        )
+        tips.extend(_CloneTip(label, value, types[value]) for label, value in extra)
+        remotes = vcs._run(
+            git_dir,
+            ["config", "--get-regexp", r"^remote\..*\.url$"],
+            env_overrides=env,
+            check=False,
+        )
+        configured = tuple(
+            sorted(
+                (name.removeprefix("remote.").removesuffix(".url"), url)
+                for line in remotes.stdout.splitlines()
+                for name, _sep, url in (line.partition(" "),)
+            )
+        )
+        clone_repositories.append(
+            _CloneRepository(
+                key=key,
+                git_dir=git_dir,
+                checkouts=tuple(key_of(checkout) for checkout in checkouts),
+                configured_remotes=configured,
+                tips=tuple(sorted(set(tips), key=lambda tip: (tip.label, tip.object))),
+            )
+        )
+
+    handoffs: list[tuple[str, str]] = []
+    in_tree = {path.relative_to(root).as_posix() for path in walk.handoff_files}
+    in_tree.update(checkout_handoffs)
+    for relative_handoff in sorted(in_tree):
+        digest, _size = _sha256_regular_file(
+            root / relative_handoff, "ownerless clone handoff"
+        )
+        handoffs.append((f"slot:{relative_handoff}", digest))
+    for path in _ownerless_clone_sidecar_handoffs(config, slot):
+        digest, _size = _sha256_regular_file(path, "ownerless clone handoff sidecar")
+        handoffs.append((f"control:{path.name}", digest))
+    canonical = json.dumps(
+        {
+            "repositories": [
+                {
+                    "key": repository.key,
+                    "checkouts": list(repository.checkouts),
+                    "tips": [
+                        [tip.label, tip.object, tip.object_type] for tip in repository.tips
+                    ],
+                }
+                for repository in clone_repositories
+            ],
+            "handoffs": [list(value) for value in handoffs],
+            "blockers": blockers,
+            "ignored": [list(value) for value in sorted(ignored)],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return _CloneInventory(
+        root=root,
+        repositories=tuple(clone_repositories),
+        handoffs=tuple(handoffs),
+        blockers=tuple(blockers),
+        ignored=tuple(sorted(ignored)),
+        fingerprint=walk.fingerprint,
+        digest=hashlib.sha256(canonical.encode("utf-8", "surrogateescape")).hexdigest(),
+    )
+
+
+def _ownerless_clone_remote_urls(values: Sequence[str] | None) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for raw in values or ():
+        key, separator, url = raw.partition("=")
+        if not separator or not key or not url:
+            raise Refusal(f"--remote-url must be KEY=URL, got {raw!r}")
+        if key in result:
+            raise Refusal(f"duplicate --remote-url for Git directory {key!r}")
+        if url.startswith("-"):
+            raise Refusal(f"remote URL cannot begin with '-': {url!r}")
+        _refuse_control_characters(url, "remote URL")
+        result[key] = url
+    return result
+
+
+def _assert_ownerless_clone_url(config: Config, target: Path, key: str, url: str) -> None:
+    """Refuse a local remote that is not durable storage independent of ``target``.
+
+    A local remote is accepted only outside every managed slot root (another
+    slot is as disposable as this one), and only when its Git directory and
+    every object directory it borrows from through alternates also lie outside
+    them and outside ``target``: a remote whose refs name objects stored in the
+    clone would report everything reachable and then lose it.
+    """
+
+    candidate = _local_remote_url_path(target, url)
+    if candidate is None:
+        return
+    if not _local_remote_url_is_absolute(url):
+        raise Refusal(
+            f"--remote-url {key}={url} is a relative local path; name the remote absolutely"
+        )
+    forbidden = [target.resolve()] + [
+        root.resolve() for root in _slot_roots(config).values() if root.exists()
+    ]
+
+    def assert_outside(path: Path, what: str) -> None:
+        resolved = path.resolve()
+        for root in forbidden:
+            if _path_is_within(resolved, root):
+                place = "the clone being removed" if root == forbidden[0] else f"slot root {root}"
+                raise Refusal(
+                    f"--remote-url {key}={url}: {what} {resolved} lies inside {place}; a "
+                    "rescue there is not durable"
+                )
+
+    assert_outside(candidate, "the remote")
+    try:
+        candidate = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise Refusal(f"--remote-url {key}={url} is not an existing path: {exc}") from exc
+    vcs = _GitVcs()
+    result = vcs._run(
+        candidate,
+        ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        env_overrides={"GIT_CEILING_DIRECTORIES": str(candidate.parent)},
+        check=False,
+    )
+    lines = result.stdout.splitlines()
+    if result.returncode != 0 or len(lines) != 1:
+        raise Refusal(
+            f"--remote-url {key}={url} is not a Git repository" + _git_failure_detail(result)
+        )
+    common = Path(lines[0])
+    assert_outside(common, "its Git directory")
+    # Reachability is judged in the clone's object store against the tips the
+    # remote advertises, which proves the remote holds the history only if
+    # the remote's history is complete.
+    if (common / "shallow").exists() or (common / "shallow").is_symlink():
+        raise Refusal(f"--remote-url {key}={url} is a shallow repository; it cannot hold the history")
+    partial = vcs._run(
+        common,
+        ["config", "--get-regexp", r"^(extensions\.partialclone|remote\..*\.promisor)$"],
+        env_overrides={"GIT_DIR": str(common)},
+        check=False,
+    )
+    if partial.stdout.strip():
+        raise Refusal(
+            f"--remote-url {key}={url} is a partial clone ({partial.stdout.split()[0]}); it "
+            "may lack objects its refs reach"
+        )
+    pending = [common / "objects"]
+    seen: set[Path] = set()
+    while pending:
+        objects = pending.pop().resolve()
+        if objects in seen:
+            continue
+        seen.add(objects)
+        if len(seen) > 64:
+            raise Refusal(f"--remote-url {key}={url} has an alternates chain longer than 64")
+        assert_outside(objects, "an object directory it uses")
+        alternates = objects / "info" / "alternates"
+        if not alternates.exists():
+            continue
+        try:
+            text = alternates.read_text(encoding="utf-8", errors="surrogateescape")
+        except OSError as exc:
+            raise Refusal(f"cannot read alternates file {alternates}: {exc}") from exc
+        for line in text.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                lender = Path(line)
+                pending.append(lender if lender.is_absolute() else objects / lender)
+
+
+def _assert_ownerless_clone_not_an_alternate(config: Config, target: Path) -> None:
+    """Refuse when a repository near the slot root borrows objects from ``target``.
+
+    Git's alternates let a repository read objects from another one's store, so
+    deleting the lender corrupts the borrower. This checks the places a slot,
+    validation checkout, or source repository keeps its alternates file, to a
+    bounded depth; it cannot search the host.
+    """
+
+    real_target = target.resolve()
+    roots = {*_slot_roots(config).values(), config.root}
+    patterns = (
+        "objects/info/alternates",
+        ".git/objects/info/alternates",
+        "*/objects/info/alternates",
+        "*/*/objects/info/alternates",
+        "*/.git/objects/info/alternates",
+        "*/*/.git/objects/info/alternates",
+        "*/*/*/.git/objects/info/alternates",
+        "*/*/*/*/.git/objects/info/alternates",
+        "*/.git/modules/*/objects/info/alternates",
+        "*/*/.git/modules/*/objects/info/alternates",
+        "*/.git/modules/*/modules/*/objects/info/alternates",
+        "*/*/.git/modules/*/modules/*/objects/info/alternates",
+    )
+    for base in roots:
+        for pattern in patterns:
+            for alternates in base.glob(pattern):
+                if _path_is_within(alternates.resolve(), real_target):
+                    continue
+                try:
+                    text = alternates.read_text(encoding="utf-8", errors="surrogateescape")
+                except OSError as exc:
+                    raise Refusal(f"cannot read alternates file {alternates}: {exc}") from exc
+                objects = alternates.parent.parent
+                for line in text.splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    lender = Path(line)
+                    if not lender.is_absolute():
+                        lender = objects / lender
+                    if _path_is_within(lender.resolve(), real_target):
+                        raise Refusal(
+                            f"{alternates} borrows objects from {lender} inside the clone; "
+                            "removing the clone would corrupt that repository"
+                        )
+
+
+def _assert_ownerless_clone_registry(
+    config: Config,
+    target: Path,
+    states: Sequence[ActiveState],
+    archives: Sequence[ArchiveState],
+) -> None:
+    _assert_ownerless_agent_no_registry_collision(config, target, states, archives)
+    if _load_hold_snapshot(config, target.name) is not None:
+        raise Refusal(f"slot name {target.name} is held; unhold it before removal")
+    real_target = target.resolve()
+    for state in states:
+        for record in state.slots:
+            for checkout in record.checkouts:
+                try:
+                    _stored, repository = _stored_repository_path(config, checkout.repository)
+                except Refusal:
+                    continue
+                if _path_is_within(repository.resolve(), real_target):
+                    raise Refusal(
+                        f"registered slot {record.slot} uses source repository {repository} "
+                        "inside the clone"
+                    )
+
+
+def _ownerless_clone_facts(
+    config: Config,
+    target: Path,
+    remote_urls: Mapping[str, str],
+    handoff_digests: AbstractSet[str],
+    *,
+    discard_ignored: bool,
+    check_processes: bool = True,
+) -> _CloneInventory:
+    """Every check removal needs, in order of cost; return the inventory."""
+
+    if target.is_symlink() or not target.is_dir():
+        raise Refusal(f"ownerless clone is absent or unsafe: {target}")
+    _ensure_no_mount_components(target.parent, target, "ownerless clone")
+    _assert_no_mountinfo_crossing(target, target, "ownerless clone")
+    inventory = _ownerless_clone_inventory(config, target)
+    if inventory.blockers:
+        raise Refusal(
+            "ownerless clone is not clean: " + "; ".join(inventory.blockers)
+        )
+    _assert_ownerless_clone_handoffs_read(inventory, handoff_digests)
+    _assert_ownerless_clone_urls_cover(config, target, inventory, remote_urls)
+    _assert_ownerless_clone_ignored(inventory, discard_ignored)
+    _assert_ownerless_clone_not_an_alternate(config, target)
+    if check_processes:
+        _assert_slot_unused(target, strict_lsof_warnings=True)
+        _assert_unregistered_path_systemd_unrelated(target)
+    return inventory
+
+
+def _assert_ownerless_clone_ignored(inventory: _CloneInventory, discard_ignored: bool) -> None:
+    if inventory.ignored and not discard_ignored:
+        total = sum(size for _path, size in inventory.ignored)
+        raise Refusal(
+            f"{len(inventory.ignored)} gitignored file(s), {total} bytes, outside cache_globs "
+            "would be deleted: "
+            f"{_ownerless_clone_examples([path for path, _size in inventory.ignored])}; "
+            "review them in the dry run and rerun with --discard-ignored"
+        )
+
+
+def _assert_ownerless_clone_handoffs_read(
+    inventory: _CloneInventory, handoff_digests: AbstractSet[str]
+) -> None:
+    unread = [
+        f"{location} (sha256 {digest})"
+        for location, digest in inventory.handoffs
+        if digest not in handoff_digests
+    ]
+    if unread:
+        raise Refusal(
+            "ownerless clone has unread handoff(s): "
+            f"{_ownerless_clone_examples(unread)}; read each and rerun with "
+            "--handoff-sha256 for every digest"
+        )
+
+
+def _assert_ownerless_clone_urls_cover(
+    config: Config, target: Path, inventory: _CloneInventory, remote_urls: Mapping[str, str]
+) -> None:
+    keys = {repository.key for repository in inventory.repositories}
+    missing = sorted(keys - set(remote_urls))
+    unknown = sorted(set(remote_urls) - keys)
+    if unknown:
+        raise Refusal(
+            f"--remote-url names Git director(y/ies) not in the clone: {', '.join(unknown)}"
+        )
+    if missing:
+        described = []
+        for repository in inventory.repositories:
+            if repository.key in missing:
+                configured = ", ".join(
+                    f"{name}={url}" for name, url in repository.configured_remotes
+                ) or "none"
+                described.append(f"{repository.key} (configured remotes: {configured})")
+        raise Refusal(
+            "every Git directory in the clone needs --remote-url KEY=URL naming the "
+            f"remote its work must be reachable from; missing: {'; '.join(described)}"
+        )
+    for key, url in remote_urls.items():
+        _assert_ownerless_clone_url(config, target, key, url)
+
+
+def _ownerless_clone_listing(
+    vcs: _GitVcs, git_dir: Path, url: str, cache: dict[str, dict[str, str]]
+) -> dict[str, str]:
+    if url not in cache:
+        with vcs._isolated_repository(git_dir / "objects") as (isolated, env):
+            cache[url] = vcs._ls_remote_inventory(isolated, url, env_overrides=env)
+    return cache[url]
+
+
+def _ownerless_clone_unreachable(
+    vcs: _GitVcs,
+    repository: _CloneRepository,
+    advertised: Mapping[str, str],
+) -> list[_CloneTip]:
+    """Return the tips (one per object) no ref advertised by the remote keeps alive.
+
+    A commit tip is kept alive when some advertised tip present locally reaches
+    it. An advertised tip absent locally is not consulted, so the answer can be
+    "unreachable" for a commit the remote does hold; that costs one redundant
+    rescue ref, never a lost commit. Annotated tags, trees and blobs are kept
+    alive only when the remote advertises that exact object.
+    """
+
+    advertised_objects = set(advertised.values())
+    with vcs._isolated_repository(repository.git_dir / "objects") as (isolated, env):
+        peel_inputs = sorted(advertised_objects) + sorted(
+            {tip.object for tip in repository.tips if tip.object_type == "commit"}
+        )
+        peeled: dict[str, str] = {}
+        if peel_inputs:
+            result = vcs._run(
+                isolated,
+                ["cat-file", "--batch-check=%(objectname)"],
+                input_text="".join(f"{value}^{{commit}}\n" for value in peel_inputs),
+                env_overrides=env,
+            )
+            lines = result.stdout.splitlines()
+            if len(lines) != len(peel_inputs):
+                raise Refusal("Git returned an incomplete object listing")
+            for value, line in zip(peel_inputs, lines):
+                if SHA_RE.fullmatch(line.strip()):
+                    peeled[value] = line.strip()
+        positives = sorted(
+            {
+                peeled[tip.object]
+                for tip in repository.tips
+                if tip.object_type == "commit" and tip.object in peeled
+            }
+        )
+        missing = [
+            tip.label
+            for tip in repository.tips
+            if tip.object_type == "commit" and tip.object not in peeled
+        ]
+        if missing:
+            raise Refusal(
+                f"Git directory {repository.key} cannot read commit(s) for "
+                f"{_ownerless_clone_examples(missing)}"
+            )
+        negatives = sorted({peeled[value] for value in advertised_objects if value in peeled})
+        if positives and not negatives:
+            raise Refusal(
+                f"remote for Git directory {repository.key} advertises no commit this "
+                "directory holds; it is probably the wrong repository. Check --remote-url "
+                "before anything is pushed there"
+            )
+        unreached: set[str] = set()
+        if positives:
+            listing = vcs._run(
+                isolated,
+                ["rev-list", "--stdin"],
+                input_text="".join(f"{value}\n" for value in positives)
+                + "--not\n"
+                + "".join(f"{value}\n" for value in negatives),
+                env_overrides=env,
+            )
+            unreached = set(listing.stdout.split())
+    result_tips: dict[str, _CloneTip] = {}
+    for tip in repository.tips:
+        if tip.object_type == "commit":
+            kept = tip.object not in unreached
+        else:
+            kept = tip.object in advertised_objects
+        if not kept and tip.object not in result_tips:
+            result_tips[tip.object] = tip
+    return [result_tips[value] for value in sorted(result_tips)]
+
+
+def _ownerless_clone_rescue_name(slot: str, date: str, number: int) -> str:
+    suffix = "" if number == 1 else f"-{number}"
+    return _validate_full_ref(
+        f"{_OWNERLESS_CLONE_RESCUE_ROOT}/{slot}-{date}{suffix}", "rescue ref"
+    )
+
+
+def _ownerless_clone_plan(
+    vcs: _GitVcs,
+    slot: str,
+    date: str,
+    inventory: _CloneInventory,
+    remote_urls: Mapping[str, str],
+) -> tuple[
+    list[tuple[_CloneRepository, str, list[tuple[_CloneTip, str, list[str]]]]],
+    dict[str, dict[str, str]],
+]:
+    """Return, per Git directory, each unreachable object and its rescue ref name.
+
+    Names are ``refs/rescue/<slot>-<date>`` and then ``-2``, ``-3``... in
+    order, counted per remote URL across the whole clone, skipping every name
+    (and every name prefix) the remote already advertises.
+    """
+
+    listings: dict[str, dict[str, str]] = {}
+    taken: dict[str, set[str]] = {}
+    counters: dict[str, int] = {}
+    plan: list[tuple[_CloneRepository, str, list[tuple[_CloneTip, str, list[str]]]]] = []
+    for repository in inventory.repositories:
+        url = remote_urls[repository.key]
+        advertised = _ownerless_clone_listing(vcs, repository.git_dir, url, listings)
+        names = taken.setdefault(url, set(advertised))
+        unreachable = _ownerless_clone_unreachable(vcs, repository, advertised)
+        entries: list[tuple[_CloneTip, str, list[str]]] = []
+        for tip in unreachable:
+            number = counters.get(url, 0)
+            while True:
+                number += 1
+                name = _ownerless_clone_rescue_name(slot, date, number)
+                if name in names or any(existing.startswith(name + "/") for existing in names):
+                    continue
+                break
+            counters[url] = number
+            names.add(name)
+            labels = sorted(
+                other.label for other in repository.tips if other.object == tip.object
+            )
+            entries.append((tip, name, labels))
+        plan.append((repository, url, entries))
+    return plan, listings
+
+
+def _ownerless_clone_push(
+    vcs: _GitVcs,
+    repository: _CloneRepository,
+    url: str,
+    assignments: Sequence[tuple[str, str]],
+) -> None:
+    """Create each rescue ref atomically, refusing to replace any ref, and read them back."""
+
+    if not assignments:
+        return
+    with vcs._isolated_repository(repository.git_dir / "objects") as (isolated, env):
+        arguments = ["push", "--porcelain", "--atomic"]
+        arguments.extend(f"--force-with-lease={ref}:" for _value, ref in assignments)
+        arguments.extend(("--", url))
+        arguments.extend(f"{value}:{ref}" for value, ref in assignments)
+        vcs._run(isolated, arguments, env_overrides=env)
+        observed = vcs._ls_remote_inventory(
+            isolated,
+            url,
+            refs=tuple(ref for _value, ref in assignments),
+            env_overrides=env,
+        )
+    wrong = [
+        f"{ref} (expected {value}, remote reports {observed.get(ref) or 'no ref'})"
+        for value, ref in assignments
+        if observed.get(ref) != value
+    ]
+    if wrong:
+        raise Refusal(
+            f"rescue push to {url} was not read back intact: {_ownerless_clone_examples(wrong)}; "
+            "the clone is preserved"
+        )
+
+
+def _ownerless_clone_rescue(
+    vcs: _GitVcs,
+    slot: str,
+    inventory: _CloneInventory,
+    remote_urls: Mapping[str, str],
+    *,
+    before_push: Callable[[list[dict[str, object]]], None],
+) -> list[dict[str, object]]:
+    """Push every planned rescue ref; ``before_push`` journals the plan first.
+
+    Journaling the plan before the push keeps the name of every rescue ref a
+    crash might leave on the remote, so the archive record still says which
+    ref preserves which object after a resume finds the object reachable.
+    """
+
+    date = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d")
+    plan, _listings = _ownerless_clone_plan(vcs, slot, date, inventory, remote_urls)
+    receipts: list[dict[str, object]] = [
+        {
+            "repository": repository.key,
+            "url": url,
+            "object": tip.object,
+            "type": tip.object_type,
+            "ref": name,
+            "labels": labels,
+        }
+        for repository, url, entries in plan
+        for tip, name, labels in entries
+    ]
+    if receipts:
+        before_push(receipts)
+    for repository, url, entries in plan:
+        _ownerless_clone_push(
+            vcs, repository, url, [(tip.object, name) for tip, name, _labels in entries]
+        )
+    return receipts
+
+
+def _ownerless_clone_verified_receipts(
+    vcs: _GitVcs,
+    inventory: _CloneInventory,
+    receipts: Sequence[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    """Keep each receipt whose ref the remote now advertises at its object, once."""
+
+    git_dirs = {repository.key: repository.git_dir for repository in inventory.repositories}
+    listings: dict[str, dict[str, str]] = {}
+    kept: dict[tuple[str, str], dict[str, object]] = {}
+    for receipt in receipts:
+        key = _as_str(receipt.get("repository"), "rescue receipt repository")
+        url = _as_str(receipt.get("url"), "rescue receipt URL")
+        ref = _as_str(receipt.get("ref"), "rescue receipt ref")
+        value = _as_str(receipt.get("object"), "rescue receipt object")
+        if key not in git_dirs:
+            raise StateError(f"rescue receipt names unknown Git directory {key}")
+        advertised = _ownerless_clone_listing(vcs, git_dirs[key], url, listings)
+        if advertised.get(ref) == value:
+            kept[(url, ref)] = dict(receipt)
+    return list(kept.values())
+
+
+def _ownerless_clone_keepers(
+    vcs: _GitVcs,
+    inventory: _CloneInventory,
+    remote_urls: Mapping[str, str],
+) -> dict[tuple[str, str], str]:
+    """Say, per (Git directory, object), when only rescue or salvage refs keep it alive.
+
+    The value is "kept-by:<ref>" when a refs/rescue/* or refs/salvage/* ref
+    the remote advertises names that exact object, otherwise
+    "reachable-only-via-rescue-or-salvage-refs". Objects that ordinary refs
+    keep alive are absent.
+    """
+
+    keepers: dict[tuple[str, str], str] = {}
+    listings: dict[str, dict[str, str]] = {}
+    for repository in inventory.repositories:
+        url = remote_urls[repository.key]
+        advertised = _ownerless_clone_listing(vcs, repository.git_dir, url, listings)
+        transient = {
+            ref: value
+            for ref, value in advertised.items()
+            if ref.startswith(f"{_OWNERLESS_CLONE_RESCUE_ROOT}/")
+            or ref.startswith(f"{SALVAGE_REF_ROOT}/")
+        }
+        if not transient:
+            continue
+        durable = {ref: value for ref, value in advertised.items() if ref not in transient}
+        try:
+            unreached = {
+                tip.object for tip in _ownerless_clone_unreachable(vcs, repository, durable)
+            }
+        except Refusal:
+            # No ordinary ref shares history with this Git directory.
+            unreached = {tip.object for tip in repository.tips}
+        exact: dict[str, str] = {}
+        for ref, value in sorted(transient.items()):
+            exact.setdefault(value, ref)
+        for value in unreached:
+            keepers[(repository.key, value)] = (
+                f"kept-by:{exact[value]}"
+                if value in exact
+                else "reachable-only-via-rescue-or-salvage-refs"
+            )
+    return keepers
+
+
+def _ownerless_clone_record(
+    inventory: _CloneInventory,
+    remote_urls: Mapping[str, str],
+    receipts: Sequence[Mapping[str, object]],
+    keepers: Mapping[tuple[str, str], str] | None = None,
+) -> dict[str, object]:
+    """The archive record: every ref the clone held and how it survives."""
+
+    rescued = {
+        (str(receipt["repository"]), str(receipt["object"])): str(receipt["ref"])
+        for receipt in receipts
+    }
+    for key, value in (keepers or {}).items():
+        rescued.setdefault(key, value)
+    return {
+        "repositories": [
+            {
+                "key": repository.key,
+                "url": remote_urls[repository.key],
+                "checkouts": list(repository.checkouts),
+                "tips": [
+                    {
+                        "label": tip.label,
+                        "object": tip.object,
+                        "type": tip.object_type,
+                        "survives_as": rescued.get(
+                            (repository.key, tip.object), "reachable-from-remote"
+                        ),
+                    }
+                    for tip in repository.tips
+                ],
+            }
+            for repository in inventory.repositories
+        ],
+        "handoffs": [
+            {"location": location, "sha256": digest} for location, digest in inventory.handoffs
+        ],
+    }
+
+
+def _ownerless_clone_handoff_copy(
+    config: Config, authorization: OwnerlessCloneAuthorization, location: str, digest: str
+) -> Path:
+    key = hashlib.sha256(
+        f"{config.machine}\0{authorization.path}\0{authorization.recorded_at}\0{location}".encode(
+            "utf-8", "surrogateescape"
+        )
+    ).hexdigest()[:16]
+    return config.control / f"HANDOFF-OWNERLESS-CLONE-RETIRED.{key}.{digest}.md"
+
+
+def _preserve_ownerless_clone_handoffs(
+    config: Config,
+    authorization: OwnerlessCloneAuthorization,
+    inventory: _CloneInventory,
+) -> list[str]:
+    """Copy every in-tree handoff beside the registry and read each copy back."""
+
+    copies: list[str] = []
+    for location, digest in inventory.handoffs:
+        if not location.startswith("slot:"):
+            continue
+        source = inventory.root / location.removeprefix("slot:")
+        copy = _ownerless_clone_handoff_copy(config, authorization, location, digest)
+        if not copy.exists() and not copy.is_symlink():
+            contents = _read_bounded_regular_file(
+                source, "ownerless clone handoff", HANDOFF_BYTES_LIMIT
+            )
+            if hashlib.sha256(contents).hexdigest() != digest:
+                raise Refusal(f"ownerless clone handoff {source} changed after it was read")
+            _atomic_write_bytes(copy, contents)
+        preserved = _read_bounded_regular_file(
+            copy, "preserved ownerless clone handoff", HANDOFF_BYTES_LIMIT
+        )
+        if hashlib.sha256(preserved).hexdigest() != digest:
+            raise StateError(f"preserved ownerless clone handoff changed: {copy}")
+        copies.append(str(copy))
+    return copies
+
+
+def _ownerless_clone_authorization_to_obj(
+    value: OwnerlessCloneAuthorization,
+) -> dict[str, object]:
+    return {
+        "path": value.path,
+        "identity": list(value.identity),
+        "actor": _identity_to_obj(value.actor),
+        "remote_urls": {key: url for key, url in value.remote_urls},
+        "inventory_sha256": value.inventory_sha256,
+        "handoff_sha256s": list(value.handoff_sha256s),
+        "discard_ignored": value.discard_ignored,
+        "recorded_at": value.recorded_at,
+    }
+
+
+def _ownerless_clone_authorization_from_obj(value: object) -> OwnerlessCloneAuthorization:
+    raw = _as_mapping(value, "ownerless clone authorization")
+    _exact_keys(
+        raw, _OWNERLESS_CLONE_AUTHORIZATION_REQUIRED, set(), "ownerless clone authorization"
+    )
+    identity = tuple(
+        _as_int(item, "ownerless clone directory identity")
+        for item in _as_list(raw["identity"], "ownerless clone directory identity")
+    )
+    if len(identity) != 3:
+        raise StateError("ownerless clone directory identity must have three fields")
+    actor = _identity_from_obj(raw["actor"], "ownerless clone recovery actor")
+    if actor is None:
+        raise StateError("ownerless clone recovery has no actor")
+    urls = _as_mapping(raw["remote_urls"], "ownerless clone remote URLs")
+    remote_urls = tuple(
+        sorted(
+            (str(key), _as_str(url, "ownerless clone remote URL")) for key, url in urls.items()
+        )
+    )
+    digest = _as_str(raw["inventory_sha256"], "ownerless clone inventory digest")
+    handoffs = tuple(
+        _as_str(item, "ownerless clone handoff digest")
+        for item in _as_list(raw["handoff_sha256s"], "ownerless clone handoff digests")
+    )
+    if not DIGEST_RE.fullmatch(digest) or not all(DIGEST_RE.fullmatch(h) for h in handoffs):
+        raise StateError("ownerless clone digests are invalid")
+    recorded_at = _as_str(raw["recorded_at"], "ownerless clone recorded_at")
+    _parse_timestamp(recorded_at, "ownerless clone recorded_at")
+    if not isinstance(raw["discard_ignored"], bool):
+        raise StateError("ownerless clone discard_ignored must be boolean")
+    return OwnerlessCloneAuthorization(
+        path=_as_str(raw["path"], "ownerless clone path"),
+        identity=(identity[0], identity[1], identity[2]),
+        actor=actor,
+        remote_urls=remote_urls,
+        inventory_sha256=digest,
+        handoff_sha256s=handoffs,
+        discard_ignored=raw["discard_ignored"],
+        recorded_at=recorded_at,
+    )
+
+
+def _ownerless_clone_journal_inputs(
+    config: Config, raw: Mapping[str, object]
+) -> tuple[OwnerlessCloneAuthorization, Path, Path, Path | None, str]:
+    _exact_keys(raw, _OWNERLESS_CLONE_JOURNAL_REQUIRED, set(), "ownerless clone journal")
+    if (
+        _as_int(raw["schema"], "ownerless clone journal.schema") != SCHEMA
+        or raw["kind"] != _OWNERLESS_CLONE_KIND
+        or raw["machine"] != config.machine
+    ):
+        raise StateError("ownerless clone journal identity is invalid")
+    authorization = _ownerless_clone_authorization_from_obj(raw["authorization"])
+    _relative, target = _ownerless_agent_target(config, authorization.path)
+    if raw["slot"] != target.name:
+        raise StateError("ownerless clone journal slot differs from its path")
+    _relative, fenced = _relative_inside(
+        config.root, _as_str(raw["fenced"], "ownerless clone fenced path"), "fenced path"
+    )
+    prefix = f".{target.name}.ownerless-clone."
+    if fenced.parent != target.parent or not re.fullmatch(
+        rf"{re.escape(prefix)}[0-9a-f]{{32}}", fenced.name
+    ):
+        raise StateError("ownerless clone fenced path does not match its target")
+    phase = _as_str(raw["phase"], "ownerless clone journal.phase")
+    if phase not in _OWNERLESS_CLONE_PHASES:
+        raise StateError(f"unknown ownerless clone phase {phase!r}")
+    for index, value in enumerate(_as_list(raw["rescue"], "ownerless clone journal.rescue")):
+        _as_mapping(value, f"ownerless clone journal.rescue[{index}]")
+    if raw["record"] is not None:
+        _as_mapping(raw["record"], "ownerless clone journal.record")
+    target_present = target.exists() or target.is_symlink()
+    fenced_present = fenced.exists() or fenced.is_symlink()
+    if target_present and fenced_present:
+        raise Refusal("canonical and fenced ownerless clone paths both exist")
+    active = target if target_present else fenced if fenced_present else None
+    if phase == "removed" and active is not None:
+        raise Refusal("ownerless clone reappeared after removal was recorded")
+    if active is not None and (
+        active.is_symlink()
+        or not active.is_dir()
+        or _open_directory_identity(active, "ownerless clone") != authorization.identity
+    ):
+        raise Refusal("ownerless clone identity changed; preserve it")
+    return authorization, target, fenced, active, phase
+
+
+def _remove_ownerless_clone_tree(fenced: Path) -> None:
+    """Delete the fenced tree; a read-only directory is made writable once, then retried."""
+
+    _assert_no_mountinfo_crossing(fenced, fenced, "fenced ownerless clone")
+    retried: set[str] = set()
+
+    def handle(function: Callable[[str], object], path: str, error: BaseException) -> None:
+        parent = os.path.dirname(path)
+        if (
+            isinstance(error, PermissionError)
+            and path not in retried
+            and _path_is_within(Path(parent), fenced)
+        ):
+            retried.add(path)
+            try:
+                os.chmod(parent, stat.S_IMODE(os.lstat(parent).st_mode) | stat.S_IRWXU)
+                function(path)
+                return
+            except OSError as retry_error:
+                error = retry_error
+        raise Refusal(f"cannot remove fenced ownerless clone entry {path}: {error}")
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(fenced, onexc=handle)
+    else:
+        shutil.rmtree(
+            fenced,
+            onerror=lambda function, path, info: handle(function, path, info[1]),
+        )
+    _fsync_directory(fenced.parent)
+
+
+def _recover_ownerless_clone(
+    config: Config,
+    path: Path,
+    raw: Mapping[str, object],
+    coordinator: ProcessIdentity,
+) -> None:
+    """Resume or finish one ownerless clone removal.
+
+    A refusal before removal begins, with the clone back at its own path,
+    retires the journal (recording what was pushed) so the registry is not
+    blocked by a removal that will not happen; nothing was deleted, and a rescue
+    ref already pushed is only an extra copy.
+    """
+
+    journal = dict(raw)
+    try:
+        _recover_ownerless_clone_steps(config, path, journal, coordinator)
+    except Refusal as exc:
+        if journal.get("phase") not in {"prepared", "rescued"}:
+            raise
+        _relative, target = _ownerless_agent_target(
+            config,
+            _as_str(
+                _as_mapping(journal["authorization"], "authorization")["path"],
+                "ownerless clone path",
+            ),
+        )
+        _relative, fenced = _relative_inside(
+            config.root, _as_str(journal["fenced"], "fenced path"), "fenced path"
+        )
+        if not target.is_dir() or fenced.exists() or fenced.is_symlink():
+            raise
+        _write_event_file(
+            config,
+            config.machine,
+            "ownerless-agent-clone-abandoned",
+            {
+                "slot": journal["slot"],
+                "authorization": journal["authorization"],
+                # Planned rescue refs; each was pushed only if the push succeeded.
+                "planned_rescue": journal["rescue"],
+                "refusal": str(exc),
+                "recovery_actor": _identity_to_obj(coordinator),
+            },
+        )
+        _clear_journal(config, journal)
+        raise Refusal(
+            f"{exc}. Nothing was removed and the removal journal was retired; run the dry "
+            "run again before another --apply"
+        ) from exc
+
+
+def _recover_ownerless_clone_steps(
+    config: Config,
+    path: Path,
+    journal: dict[str, object],
+    coordinator: ProcessIdentity,
+) -> None:
+    raw: Mapping[str, object] = dict(journal)
+    if path != _journal_path(config):
+        raise StateError("ownerless clone journal filename is invalid")
+    _assert_caller_process(coordinator, "coordinator")
+    authorization, target, fenced, active, phase = _ownerless_clone_journal_inputs(config, raw)
+    if authorization.actor.host_id != _host_id():
+        raise Refusal("ownerless clone journal belongs to another host identity")
+    remote_urls = dict(authorization.remote_urls)
+    handoffs = set(authorization.handoff_sha256s)
+    receipts = [dict(_as_mapping(value, "rescue receipt")) for value in _as_list(raw["rescue"], "rescue")]
+    vcs = _GitVcs()
+    if phase in {"prepared", "rescued", "fenced"}:
+        if active is None:
+            raise Refusal(
+                "ownerless clone is absent before removal was recorded; inspect the slot "
+                "root and the journal before doing anything else"
+            )
+        if active == fenced:
+            # Interrupted between the fence and the start of removal. Nested
+            # worktree links name the canonical path, so restore it and prove
+            # everything again before fencing anew.
+            _rename_slot_path(config, fenced, target)
+            _fsync_directory(target.parent)
+            active = target
+            journal["phase"] = "rescued" if receipts else "prepared"
+            _write_journal(config, journal)
+        states, archives = _validate_global_state(config)
+        _assert_ownerless_clone_registry(config, target, states, archives)
+        inventory = _ownerless_clone_facts(
+            config,
+            target,
+            remote_urls,
+            handoffs,
+            discard_ignored=authorization.discard_ignored,
+        )
+        if inventory.digest != authorization.inventory_sha256:
+            raise Refusal(
+                "ownerless clone changed since its inventory was authorized "
+                f"(now {inventory.digest}); it is preserved. Rerun the dry run"
+            )
+        def journal_plan(planned: list[dict[str, object]]) -> None:
+            journal["rescue"] = [*receipts, *planned]
+            _write_journal(config, journal)
+            _interrupt_for_test("after-ownerless-clone-rescue-plan")
+
+        receipts.extend(
+            _ownerless_clone_rescue(
+                vcs, target.name, inventory, remote_urls, before_push=journal_plan
+            )
+        )
+        receipts = _ownerless_clone_verified_receipts(vcs, inventory, receipts)
+        journal["rescue"] = receipts
+        journal["record"] = _ownerless_clone_record(inventory, remote_urls, receipts)
+        journal["phase"] = "rescued"
+        _write_journal(config, journal)
+        _interrupt_for_test("after-ownerless-clone-rescue")
+        # The proof removal rests on: with fresh listings, nothing is unreachable.
+        plan, _listings = _ownerless_clone_plan(
+            vcs, target.name, "00000000", inventory, remote_urls
+        )
+        remaining = [
+            f"{repository.key}:{tip.label}"
+            for repository, _url, entries in plan
+            for tip, _name, _labels in entries
+        ]
+        if remaining:
+            raise Refusal(
+                "after the rescue push the remote still does not hold: "
+                f"{_ownerless_clone_examples(remaining)}; the clone is preserved"
+            )
+        journal["record"] = _ownerless_clone_record(
+            inventory,
+            remote_urls,
+            receipts,
+            _ownerless_clone_keepers(vcs, inventory, remote_urls),
+        )
+        _write_journal(config, journal)
+        final = _ownerless_clone_inventory(config, target)
+        if final.digest != authorization.inventory_sha256 or final.blockers:
+            raise Refusal("ownerless clone changed during rescue; it is preserved")
+        _preserve_ownerless_clone_handoffs(config, authorization, final)
+        _rename_slot_path(config, target, fenced)
+        _fsync_directory(target.parent)
+        if _open_directory_identity(fenced, "fenced ownerless clone") != authorization.identity:
+            _rename_slot_path(config, fenced, target)
+            _fsync_directory(target.parent)
+            raise Refusal("ownerless clone identity changed during fencing")
+        journal["phase"] = "fenced"
+        _write_journal(config, journal)
+        _interrupt_for_test("after-ownerless-clone-fence")
+        # The census comes first: once no process holds a reference into the
+        # renamed tree, none can gain one (the fence name is unguessable), so
+        # the walk that follows sees the content that will be deleted.
+        try:
+            _assert_slot_unused(fenced, strict_lsof_warnings=True)
+            _assert_unregistered_path_systemd_unrelated(target)
+            _assert_unregistered_path_systemd_unrelated(fenced)
+            if _ownerless_clone_walk(fenced).fingerprint != final.fingerprint:
+                raise Refusal(
+                    "ownerless clone content changed while it was being fenced; it was "
+                    "restored to its path and preserved"
+                )
+        except Refusal:
+            _rename_slot_path(config, fenced, target)
+            _fsync_directory(target.parent)
+            journal["phase"] = "rescued"
+            _write_journal(config, journal)
+            raise
+        journal["phase"] = "removing"
+        _write_journal(config, journal)
+        _interrupt_for_test("after-ownerless-clone-removing")
+        phase = "removing"
+        active = fenced
+    if phase == "removing":
+        if active is not None:
+            if active != fenced:
+                raise Refusal(
+                    "ownerless clone is back at its canonical path after removal began; "
+                    "preserve it and inspect"
+                )
+            _remove_ownerless_clone_tree(fenced)
+        journal["phase"] = "removed"
+        _write_journal(config, journal)
+    if target.exists() or target.is_symlink() or fenced.exists() or fenced.is_symlink():
+        raise Refusal("ownerless clone still exists after removal")
+    record = _as_mapping(journal["record"], "ownerless clone record")
+    copies = []
+    for value in _as_list(record["handoffs"], "ownerless clone record handoffs"):
+        item = _as_mapping(value, "ownerless clone record handoff")
+        location = _as_str(item["location"], "ownerless clone handoff location")
+        if location.startswith("slot:"):
+            copies.append(
+                str(
+                    _ownerless_clone_handoff_copy(
+                        config,
+                        authorization,
+                        location,
+                        _as_str(item["sha256"], "ownerless clone handoff digest"),
+                    )
+                )
+            )
+    _write_event_file(
+        config,
+        config.machine,
+        "ownerless-agent-clone-removed",
+        {
+            "slot": raw["slot"],
+            "authorization": _ownerless_clone_authorization_to_obj(authorization),
+            "rescue": receipts,
+            "record": journal["record"],
+            "handoffs_preserved": copies,
+            "recovery_actor": _identity_to_obj(coordinator),
+        },
+    )
+    _clear_journal(config, journal)
+    print(
+        f"recovered ownerless agent clone={target} rescued_refs={len(receipts)}"
+    )
+    for receipt in receipts:
+        print(
+            f"RESCUED repository={receipt['repository']} ref={receipt['ref']} "
+            f"object={receipt['object']} labels={','.join(str(label) for label in _as_list(receipt['labels'], 'rescue labels'))}"
+        )
+
+
+def _ownerless_clone_dry_run(
+    config: Config,
+    raw_path: str,
+    remote_urls: Mapping[str, str],
+    handoff_digests: AbstractSet[str],
+    discard_ignored: bool,
+) -> int:
+    states, archives = _validate_global_state(config)
+    relative, target = _ownerless_agent_target(config, raw_path)
+    _assert_ownerless_clone_registry(config, target, states, archives)
+    if target.is_symlink() or not target.is_dir():
+        raise Refusal(f"ownerless clone is absent or unsafe: {target}")
+    _ensure_no_mount_components(target.parent, target, "ownerless clone")
+    _assert_no_mountinfo_crossing(target, target, "ownerless clone")
+    inventory = _ownerless_clone_inventory(config, target)
+    print(
+        f"CLONE path={target} inventory_sha256={inventory.digest} "
+        f"repositories={len(inventory.repositories)}"
+    )
+    problems: list[str] = list(inventory.blockers)
+    for location, digest in inventory.handoffs:
+        state = "read" if digest in handoff_digests else "UNREAD"
+        print(f"HANDOFF {location} sha256={digest} {state}")
+    try:
+        _assert_ownerless_clone_handoffs_read(inventory, handoff_digests)
+    except Refusal as exc:
+        problems.append(str(exc))
+    try:
+        _assert_ownerless_clone_urls_cover(config, target, inventory, remote_urls)
+    except Refusal as exc:
+        problems.append(str(exc))
+    if inventory.ignored:
+        total = sum(size for _path, size in inventory.ignored)
+        print(
+            f"IGNORED files={len(inventory.ignored)} bytes={total} (hidden by tracked "
+            ".gitignore files, outside cache_globs; deleted only with --discard-ignored)"
+        )
+        for path, size in inventory.ignored[:50]:
+            print(f"  IGNORED {path} bytes={size}")
+        if len(inventory.ignored) > 50:
+            print(f"  IGNORED ... and {len(inventory.ignored) - 50} more")
+    try:
+        _assert_ownerless_clone_ignored(inventory, discard_ignored)
+    except Refusal as exc:
+        problems.append(str(exc))
+    vcs = _GitVcs()
+    date = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d")
+    total_tips = 0
+    total_rescue = 0
+    covered = {
+        key: url
+        for key, url in remote_urls.items()
+        if any(repository.key == key for repository in inventory.repositories)
+    }
+    planned: dict[str, list[tuple[_CloneTip, str, list[str]]]] = {}
+    if set(covered) == {repository.key for repository in inventory.repositories}:
+        plan, _listings = _ownerless_clone_plan(vcs, target.name, date, inventory, covered)
+        planned = {repository.key: entries for repository, _url, entries in plan}
+    for repository in inventory.repositories:
+        configured = ",".join(f"{name}={url}" for name, url in repository.configured_remotes)
+        entries = planned.get(repository.key)
+        rescue_by_object = (
+            {tip.object: name for tip, name, _labels in entries} if entries is not None else {}
+        )
+        print(
+            f"REPOSITORY key={repository.key} url={remote_urls.get(repository.key, 'MISSING')} "
+            f"checkouts={len(repository.checkouts)} tips={len(repository.tips)} "
+            f"configured_remotes={configured or 'none'}"
+        )
+        for tip in repository.tips:
+            total_tips += 1
+            if entries is None:
+                state = "unchecked"
+            elif tip.object in rescue_by_object:
+                state = f"rescue->{rescue_by_object[tip.object]}"
+            else:
+                state = "reachable"
+            print(f"  TIP {tip.label} {tip.object} {tip.object_type} {state}")
+        if entries is not None:
+            total_rescue += len(entries)
+    try:
+        _assert_ownerless_clone_not_an_alternate(config, target)
+        _assert_slot_unused(target, strict_lsof_warnings=True)
+        _assert_unregistered_path_systemd_unrelated(target)
+    except Refusal as exc:
+        problems.append(str(exc))
+    print(
+        "NOTE repositories that borrow objects from the clone through alternates are "
+        "searched for only in the slot roots and the project root, to a bounded depth"
+    )
+    for repository in inventory.repositories:
+        hooks = repository.git_dir / "hooks"
+        custom = (
+            sorted(
+                path.name
+                for path in hooks.iterdir()
+                if path.is_file() and not path.name.endswith(".sample")
+            )
+            if hooks.is_dir()
+            else []
+        )
+        if custom:
+            print(
+                f"NOTE Git directory {repository.key} has hooks that will be deleted: "
+                f"{', '.join(custom)}"
+            )
+    print(
+        f"SUMMARY tips={total_tips} rescue_objects={total_rescue} "
+        f"(rescue ref names are predicted for {date} UTC) blockers={len(problems)}"
+    )
+    if problems:
+        for problem in problems:
+            print(f"BLOCKED {problem}")
+        raise Refusal(
+            f"ownerless clone {relative} cannot be retired yet: {problems[0]}"
+        )
+    url_args = " ".join(
+        f"--remote-url {shlex.quote(f'{key}={url}')}" for key, url in sorted(remote_urls.items())
+    )
+    handoff_args = "".join(
+        f" --handoff-sha256 {digest}" for digest in sorted({d for _l, d in inventory.handoffs})
+    ) + (" --discard-ignored" if inventory.ignored else "")
+    print(f"CLONE path={target} outcome=planned detail=ownerless-clone")
+    print(
+        f"NEXT wrkslots recover-ownerless-agent-clone {shlex.quote(relative)} {url_args}"
+        f"{handoff_args} --inventory-sha256 {inventory.digest} --apply "
+        "--coordinator-authorized --coordinator-pid PID"
+    )
+    return 0
+
+
+def _cmd_recover_ownerless_agent_clone(args: argparse.Namespace) -> int:
+    try:
+        return _cmd_recover_ownerless_agent_clone_checked(args)
+    except UnicodeError as exc:
+        raise Refusal(
+            f"a path or ref in the clone is not valid UTF-8 ({exc}); nothing was removed. "
+            "Inspect and rename it first"
+        ) from exc
+
+
+def _cmd_recover_ownerless_agent_clone_checked(args: argparse.Namespace) -> int:
+    config = _load_config(args.project_root, args.machine)
+    if config.machine != _short_hostname():
+        raise Refusal("ownerless clone recovery must run on the clone's machine")
+    remote_urls = _ownerless_clone_remote_urls(args.remote_urls)
+    handoff_digests = set(args.handoff_sha256s or ())
+    for digest in handoff_digests:
+        if not DIGEST_RE.fullmatch(digest):
+            raise Refusal("--handoff-sha256 must be one lowercase SHA-256 digest")
+    if not args.apply:
+        # A dry run reads; another operation's journal does not stop it, but
+        # --apply will refuse while any journal is outstanding, so say so.
+        own = _journal_path(config)
+        if own.exists() or own.is_symlink():
+            raw = _as_mapping(_read_json(own, "recovery journal"), "recovery journal")
+            if raw.get("kind") == _OWNERLESS_CLONE_KIND:
+                authorization, target, _f, _a, phase = _ownerless_clone_journal_inputs(
+                    config, raw
+                )
+                if authorization.path == _ownerless_agent_target(config, args.path)[0]:
+                    print(f"CLONE path={target} outcome=planned detail=resume phase={phase}")
+                    return 0
+        for journal_path in _outstanding_journals(config):
+            print(
+                f"NOTE an interrupted mutation is recorded in {journal_path}; --apply "
+                "refuses until it is recovered"
+            )
+        return _ownerless_clone_dry_run(
+            config, args.path, remote_urls, handoff_digests, args.discard_ignored
+        )
+    _require_coordinator_authorized(args, "ownerless agent clone recovery")
+    if args.coordinator_pid is None:
+        raise Refusal("--apply requires --coordinator-pid")
+    coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
+    with _mutation_locks(config, args.wait_lock):
+        _refuse_partial_state(config)
+        journals = _outstanding_journals(config)
+        if journals:
+            path, raw = _load_journal(config)
+            if raw.get("kind") != _OWNERLESS_CLONE_KIND:
+                raise Refusal(f"another interrupted mutation is recorded in {path}")
+            authorization, _target, _fenced, _active, _phase = (
+                _ownerless_clone_journal_inputs(config, raw)
+            )
+            if authorization.path != _ownerless_agent_target(config, args.path)[0]:
+                raise Refusal("requested ownerless path differs from the interrupted recovery")
+            _recover_ownerless_clone(config, path, raw, coordinator)
+            return 0
+        if args.inventory_sha256 is None or not DIGEST_RE.fullmatch(args.inventory_sha256):
+            raise Refusal(
+                "--apply requires --inventory-sha256 with the digest a dry run printed, so "
+                "the clone removed is exactly the clone reviewed"
+            )
+        states, archives = _validate_global_state(config)
+        relative, target = _ownerless_agent_target(config, args.path)
+        _assert_ownerless_clone_registry(config, target, states, archives)
+        identity = _open_directory_identity(target, "ownerless clone")
+        inventory = _ownerless_clone_facts(
+            config, target, remote_urls, handoff_digests, discard_ignored=args.discard_ignored
+        )
+        if inventory.digest != args.inventory_sha256:
+            raise Refusal(
+                f"ownerless clone inventory is now {inventory.digest}, not the reviewed "
+                f"{args.inventory_sha256}; rerun the dry run and review it again"
+            )
+        # Reach every remote, and refuse an unrelated one, before journaling.
+        _ownerless_clone_plan(_GitVcs(), target.name, "00000000", inventory, remote_urls)
+        if _open_directory_identity(target, "ownerless clone") != identity:
+            raise Refusal("ownerless clone identity changed during inspection")
+        authorization = OwnerlessCloneAuthorization(
+            path=relative,
+            identity=identity,
+            actor=coordinator,
+            remote_urls=tuple(sorted(remote_urls.items())),
+            inventory_sha256=inventory.digest,
+            handoff_sha256s=tuple(sorted({digest for _l, digest in inventory.handoffs})),
+            discard_ignored=bool(args.discard_ignored),
+            recorded_at=_utc_now(),
+        )
+        journal: dict[str, object] = {
+            "schema": SCHEMA,
+            "kind": _OWNERLESS_CLONE_KIND,
+            "machine": config.machine,
+            "slot": target.name,
+            "phase": "prepared",
+            "fenced": (
+                target.with_name(f".{target.name}.ownerless-clone.{uuid.uuid4().hex}")
+                .relative_to(config.root)
+                .as_posix()
+            ),
+            "authorization": _ownerless_clone_authorization_to_obj(authorization),
+            "rescue": [],
+            "record": None,
+        }
+        _write_journal(config, journal)
+        _interrupt_for_test("after-ownerless-clone-journal")
+        before = _global_rows(states, archives)
+        _recover_ownerless_clone(config, _journal_path(config), journal, coordinator)
+        after_states, after_archives = _validate_global_state(config)
+        if _global_rows(after_states, after_archives) != before:
+            raise StateError("ownerless clone recovery changed registered slot state")
     return 0
 
 
@@ -52836,6 +55225,12 @@ def _cmd_recover(
                     "--retry-running-hook and --abort-create apply only to create journals"
                 )
             _recover_ownerless_agent(config, path, raw, coordinator)
+        elif kind == _OWNERLESS_CLONE_KIND:
+            if args.retry_running_hook or args.abort_create:
+                raise Refusal(
+                    "--retry-running-hook and --abort-create apply only to create journals"
+                )
+            _recover_ownerless_clone(config, path, raw, coordinator)
         elif kind == "ownerless-agent-cache-relocate":
             if args.retry_running_hook or args.abort_create:
                 raise Refusal(
@@ -52893,6 +55288,7 @@ def _cmd_recover(
             "legacy-validate-remove",
             "ownerless-validate-remove",
             "ownerless-agent-remove",
+            _OWNERLESS_CLONE_KIND,
             "ownerless-agent-cache-relocate",
         }:
             if after != before:
@@ -54578,7 +56974,20 @@ usage or audit gate unknown, 3 fail-closed refusal.
     recover_ownerless_agent.add_argument("path", metavar="PATH")
     recover_ownerless_agent.add_argument("--repository", required=True, metavar="PATH")
     recover_ownerless_agent.add_argument("--head", required=True, metavar="SHA")
-    recover_ownerless_agent.add_argument("--branch", required=True, metavar="BRANCH")
+    ownerless_branch = recover_ownerless_agent.add_mutually_exclusive_group(required=True)
+    ownerless_branch.add_argument(
+        "--branch",
+        metavar="BRANCH",
+        help="the branch the worktree has checked out",
+    )
+    ownerless_branch.add_argument(
+        "--detached",
+        action="store_true",
+        help=(
+            "the worktree has a detached HEAD; accepted only while HEAD is contained in "
+            "a branch of the remote, checked again before every destructive boundary"
+        ),
+    )
     recover_ownerless_agent.add_argument("--remote", required=True, metavar="REMOTE")
     recover_ownerless_agent.add_argument(
         "--remote-url-sha256", required=True, metavar="SHA256"
@@ -54601,6 +57010,111 @@ usage or audit gate unknown, 3 fail-closed refusal.
     recover_ownerless_agent.set_defaults(
         handler=_cmd_recover_ownerless_agent_worktree
     )
+
+    recover_ownerless_clone = subparsers.add_parser(
+        "recover-ownerless-agent-clone",
+        help="rescue every unpushed ref of one unregistered standalone clone, then remove it",
+        description="\n\n".join(
+            textwrap.fill(paragraph, width=96)
+            for paragraph in (
+                "Retire one exact direct child of the managed agent directory that no row "
+                "claims and that holds its own Git directories: a standalone clone, a "
+                "directory of several checkouts, or a bare repository.",
+                "Nothing is salvaged from a dirty tree: every checkout inside must be clean, "
+                "nothing may lie outside a checkout, and no process may use the directory "
+                "(any lsof diagnostic counts as use). Every ref, HEAD, stash entry and "
+                "worktree HEAD of every Git directory inside must be reachable from the "
+                "remote named for that directory; each one that is not is first pushed to "
+                "refs/rescue/<slot>-<UTC date>[-N] there and read back. The directory is then "
+                "fenced, rechecked and deleted, and an ownerless-agent-clone-removed event "
+                "records every ref and how it survives.",
+                "The default is a read-only dry run. It prints every Git directory, every "
+                "ref and whether it is reachable or would be rescued, every blocker, the "
+                "inventory digest, and the exact --apply command. --apply needs that digest "
+                "and refuses if anything changed since.",
+                "A file hidden only by .git/info/exclude or an excludes file counts as "
+                "untracked work. Files a tracked .gitignore hides outside cache_globs are "
+                "listed and deleted only with --discard-ignored. A local --remote-url must lie "
+                "outside every slot root and must not borrow objects from the clone.",
+                "Not preserved: Git reflogs other than refs/stash, objects no ref names, a Git "
+                "directory's config, logs/, info/, hooks/, rr-cache/ and message files "
+                "(including those of linked worktrees), untracked files under cache_globs, and, "
+                "with --discard-ignored, the listed gitignored files. Any other entry inside a "
+                "Git directory that is not shaped like Git's own refuses.",
+            )
+        ),
+        epilog=(
+            "example:\n"
+            "  wrkslots recover-ownerless-agent-clone worktrees/slots/old-clone \\\n"
+            "    --remote-url .git=https://github.com/example/product\n"
+            "  wrkslots recover-ownerless-agent-clone worktrees/slots/old-clone \\\n"
+            "    --remote-url .git=https://github.com/example/product \\\n"
+            "    --inventory-sha256 DIGEST --apply --coordinator-authorized \\\n"
+            "    --coordinator-pid \"$COORDINATOR_PID\""
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    recover_ownerless_clone.add_argument(
+        "path",
+        metavar="PATH",
+        help="the directory, relative to the project root, e.g. worktrees/slots/old-clone",
+    )
+    recover_ownerless_clone.add_argument(
+        "--remote-url",
+        dest="remote_urls",
+        action="append",
+        metavar="KEY=URL",
+        help=(
+            "repeatable; for each Git directory inside the clone, keyed by its path "
+            "relative to the clone (.git for the clone's own, .git/modules/NAME for a "
+            "submodule, sub/.git for a nested clone), the remote its refs must be reachable "
+            "from and where rescue refs are pushed. The dry run lists every key and its "
+            "configured remotes. A local path must be absolute and outside the clone"
+        ),
+    )
+    recover_ownerless_clone.add_argument(
+        "--handoff-sha256",
+        dest="handoff_sha256s",
+        action="append",
+        metavar="SHA256",
+        help=(
+            "repeatable; the digest of each handoff (any HANDOFF* file outside a checkout "
+            "or untracked or ignored inside one, and any wrkslots handoff sidecar for this "
+            "slot name) after the coordinator has read it. In-tree handoffs are copied "
+            "beside the registry as HANDOFF-OWNERLESS-CLONE-RETIRED.*.md before removal"
+        ),
+    )
+    recover_ownerless_clone.add_argument(
+        "--discard-ignored",
+        action="store_true",
+        help=(
+            "allow deleting files a tracked .gitignore hides outside cache_globs; the dry "
+            "run lists them. Files hidden only by .git/info/exclude or an excludes file "
+            "always count as untracked work and refuse"
+        ),
+    )
+    recover_ownerless_clone.add_argument(
+        "--inventory-sha256",
+        metavar="SHA256",
+        help="required with --apply: the inventory digest the dry run printed",
+    )
+    recover_ownerless_clone.add_argument(
+        "--apply",
+        action="store_true",
+        help="push rescue refs, fence and delete; without it nothing is changed",
+    )
+    recover_ownerless_clone.add_argument(
+        "--coordinator-authorized",
+        action="store_true",
+        help="required with --apply: the coordinator performs this removal",
+    )
+    recover_ownerless_clone.add_argument(
+        "--coordinator-pid",
+        type=int,
+        metavar="PID",
+        help="required with --apply: the coordinator process recorded in the journal",
+    )
+    recover_ownerless_clone.set_defaults(handler=_cmd_recover_ownerless_agent_clone)
 
     recover_ownerless_cache = subparsers.add_parser(
         "recover-ownerless-agent-cache",

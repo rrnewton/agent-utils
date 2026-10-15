@@ -283,20 +283,32 @@ steps:
       preferred_inner_jobs: 1
       rss_baseline_bytes: 134217728
 
+  # Two shards: one process measured 626 s on 2026-10-15 (763 tests), past the
+  # 600 s bound, once the ownerless-clone suite was added.
   - group: wrkslots
-    job: test
-    desc: wrkslots non-lifecycle Python tests
-    cmd: python3 scripts/run_component_tests.py --component wrkslots -- -q
+    job: shard-0
+    desc: wrkslots non-lifecycle Python tests, shard 1 of 2
+    cmd: python3 scripts/run_component_tests.py --component wrkslots --shard 0/2 -- -q
     jobs_flag: ""
-    labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, component-wrkslots]
+    labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 600
     cpu_timeout: 1200
-    hint:
+    hint: &wrkslots_test_hint
       resources: {lifecycle-io: 1}
-      est_duration_s: 150
+      est_duration_s: 330
       classification: latency-bound
       preferred_inner_jobs: 2
       rss_baseline_bytes: 1610612736
+
+  - group: wrkslots
+    job: shard-1
+    desc: wrkslots non-lifecycle Python tests, shard 2 of 2
+    cmd: python3 scripts/run_component_tests.py --component wrkslots --shard 1/2 -- -q
+    jobs_flag: ""
+    labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
+    timeout: 600
+    cpu_timeout: 1200
+    hint: *wrkslots_test_hint
 
   - group: wrkviz
     job: shard-0

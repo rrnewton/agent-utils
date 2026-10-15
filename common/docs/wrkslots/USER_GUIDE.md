@@ -1501,6 +1501,11 @@ wrkslots recover-ownerless-agent-worktree worktrees/slots/example \
   --remote-url-sha256 SHA256 [--handoff-sha256 SHA256]
 ```
 
+A worktree with a detached HEAD takes `--detached` instead of `--branch`. It is accepted only while
+a branch of the recorded remote contains HEAD; that is checked against a fresh listing of the remote
+before every destructive boundary, and a HEAD no remote branch contains refuses. Everything else is
+judged as for a worktree on a branch.
+
 Repeat with `--apply --coordinator-authorized --coordinator-pid "$COORDINATOR_PID"` only after the
 plan agrees. The worktree must be one direct child of the managed agent root. A HANDOFF.md requires
 the exact digest supplied after the coordinator reads it; the command rechecks it before every
@@ -1510,6 +1515,100 @@ an ACTIVE/archive identity collision refuses. Tracked and ordinary untracked fil
 configured cache paths, and initialized nested repositories are committed to verified salvage refs
 before the exact inode is fenced and removed. Any later participant can resume the journal with
 ordinary `recover`.
+
+### Ownerless standalone clones
+
+A leaked directory may hold its own Git directory instead of being a linked worktree of a source
+repository: a standalone clone, a directory holding several checkouts, or a bare repository.
+`recover-ownerless-agent-worktree` refuses those because the repository is inside the removal
+target. Deleting such a directory deletes every ref and object in it, so its proof is stricter and
+nothing is salvaged from a dirty tree:
+
+- every checkout inside (the clone's own, nested clones, submodules and linked worktrees) must have a
+  clean index and working tree, with no unfinished Git operation and no assume-unchanged or
+  skip-worktree entries; an untracked nested repository is judged on its own. A file hidden only
+  by `.git/info/exclude` or an excludes file counts as untracked, because those are local settings;
+  a file hidden by a tracked `.gitignore` outside `cache_globs` is listed by the dry run and is
+  deleted only with `--discard-ignored`. A linked worktree whose directory is gone still has its
+  HEAD and per-worktree refs inventoried, and anything staged in its index refuses, as does
+  anything staged in the index of a Git directory with no working tree. Status runs with the
+  clone's `core.fsmonitor`, `core.untrackedCache`, `core.ignoreStat` and `core.ignoreCase` (among
+  others) overridden, so its own configuration cannot hide a change. Every file the walk finds in
+  a checkout must also be one Git reports, tracked or untracked; a file Git cannot see, such as one
+  inside a gitlink directory without `.git`, refuses. Worktrees kept inside a Git directory (a bare
+  repository with worktrees) are checkouts like any other, and every worktree a Git directory
+  registers inside the clone must be found as one. A tracked file under `cache_globs` refuses, as
+  it does for every other removal. Inside each Git directory, every entry must be shaped like
+  Git's own, by name and type: an unknown top-level entry, anything in the object store that is not
+  a loose object (with a zlib header), pack-family file, commit-graph or index, anything under
+  `modules/` that is not a module repository, a non-empty `branches/`, `remotes/` or `lfs/`, a lock
+  file, and an unknown entry of a linked worktree's directory refuse, as do a configured content
+  filter (in the repository's or a linked worktree's configuration)
+ (`filter.*.clean` or `filter.*.process`, which can make an edited file look clean);
+- nothing may lie outside a checkout or Git directory, except a handoff;
+- no Git directory may use grafts, shallow history or replacement refs, and no worktree a Git
+  directory inside registers may exist outside the directory;
+- no process may use the directory. lsof diagnostics that the worktree commands attribute to
+  unrelated paths count as indeterminate here and refuse;
+- every handoff (a `HANDOFF*` file outside a checkout, untracked or ignored inside one, or a
+  wrkslots handoff sidecar for the slot name) must be read and its SHA-256 supplied;
+- every ref (every namespace, including `refs/remotes/*`), HEAD, `ORIG_HEAD`, `refs/stash` entry,
+  worktree HEAD and per-worktree ref of every Git directory inside must be reachable from the remote named
+  for that Git directory. A commit counts as reachable when a commit the remote advertises reaches
+  it; an annotated tag, tree or blob only when the remote advertises that exact object. Each object
+  that is not reachable is pushed, in one atomic push per Git directory that refuses to replace any
+  ref, to `refs/rescue/<slot>-<UTC date>`, then `-2`, `-3` and so on, skipping names the remote
+  already has, and every ref is read back before anything is fenced.
+
+Each Git directory is keyed by its path relative to the directory: `.git` for a clone,
+`.git/modules/NAME` for a submodule, `sub/.git` for a nested clone. Name the remote for each one
+with `--remote-url KEY=URL`. The configured `origin` is not trusted: a leaked clone's `origin` is
+often another leaked slot. A remote that advertises no commit the Git directory holds refuses, so a
+mistyped URL cannot receive a whole history. A local remote must be an absolute path outside every
+managed slot root (another slot is not durable storage), must not be shallow or a partial clone,
+and its Git directory and every object directory it borrows through alternates must lie outside
+the clone and the slot roots; a remote that stored its objects in the clone, or lacked the history
+its refs name, would report everything reachable and lose it. Repositories
+that borrow objects from the clone through alternates are searched for, to a bounded depth, in
+the slot roots and the project root; one found refuses.
+
+```sh
+wrkslots recover-ownerless-agent-clone worktrees/slots/old-clone \
+  --remote-url .git=https://github.com/example/product [--handoff-sha256 SHA256 ...]
+```
+
+The dry run changes nothing. It prints every Git directory with its configured remotes, every ref
+with `reachable` or the rescue ref it would get, every handoff, every blocker, an inventory digest,
+and the exact apply command. Apply repeats every check, refuses unless the inventory still has the
+reviewed digest, and is journaled:
+
+```sh
+wrkslots recover-ownerless-agent-clone worktrees/slots/old-clone \
+  --remote-url .git=https://github.com/example/product \
+  --inventory-sha256 DIGEST --apply --coordinator-authorized --coordinator-pid "$COORDINATOR_PID"
+```
+
+After the rescue push it lists the remote again and requires that nothing is unreachable, copies
+each in-tree handoff beside the registry as `HANDOFF-OWNERLESS-CLONE-RETIRED.*.md`, renames the
+directory to a fence, compares a fingerprint of the whole tree (object stores aside) with the one
+taken before the rename, repeats the process census, and only then deletes it. A failed check after
+the rename restores the directory to its path. The `ownerless-agent-clone-removed` event is the
+archive record: every ref with its object and `reachable-from-remote`, the rescue ref this run
+pushed for it, `kept-by:<ref>` when only an existing `refs/rescue/*` or `refs/salvage/*` ref names
+it, or `reachable-only-via-rescue-or-salvage-refs`. Apply runs the process census and lists every remote before it writes its journal. A
+refusal after that, while the directory is still (or again) at its own path, retires the journal
+with an `ownerless-agent-clone-abandoned` event naming any rescue ref already pushed, so a removal
+that will not happen does not block other mutations; run the dry run again before another apply. A
+run that dies resumes with the same command or with `recover`; one that died after the fence but
+before deletion began moves the directory back and proves everything again. A dry run is not
+stopped by another operation's journal, but notes it, because apply refuses while any journal is
+outstanding.
+
+Not preserved: reflogs other than `refs/stash`, objects no ref names, a Git directory's `config`,
+`logs/`, `info/`, `hooks/` (the dry run names custom hooks), `rr-cache/` and message files
+(including those of linked worktrees), untracked files under `cache_globs`, and, with
+`--discard-ignored`, the gitignored files the dry run listed. Tracked files with the `ident`
+attribute refuse, because an edit inside `$Id$` can read as clean.
 
 The `worktrees/slots/ignored` path is not an agent worktree. Only when it contains the command's
 one exact supported cache hierarchy can it be relocated intact outside the managed slot root:
