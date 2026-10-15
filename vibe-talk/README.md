@@ -298,6 +298,13 @@ since a read that placed the thread stays **1 new**, so Done through a list cann
 nothing has brought; so does an unread reply cut from the device's copy (below). Only replies the
 page cannot place at all — read long ago or new, it cannot tell — are taken as you say.
 
+**Done is the message's, in every view.** A message marked Done, or put back, in Main, All, a thread,
+the Pinned list or either column is drawn so at once in every other view the page holds: Main or All
+loaded earlier in the session, a thread opened before, the right column's thread while two columns are
+put away or show their cards, and the cards' counts of unread replies. Nothing is read for it. A Done or
+an Undo the server refuses is taken back in all of them. `#306 done-stale-across-views`; `make -C
+vibe-talk done-sync-browser` checks it in Chromium on a phone, frame by frame as the view is chosen.
+
 Known limits of the counts (`#222 unread-replies`):
 - A reply the page never held that is marked Done on another device still counts as new on its
   message until a read of All or of the thread brings it: Main's refresh names Done replies by id,

@@ -797,6 +797,24 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#306 done-stale-across-views` in the browser engine, on a 412x915 phone by touch, with Main and All
+  # each read for itself: a Done tapped in All is drawn in Main, and an Undo in Main drawn in All, on
+  # every frame from the switch in the bar's picker on, with no read. Measured on 2026-10-14: about 4s
+  # wall.
+  - group: check
+    job: done-sync-browser
+    desc: a Done and an Undo drawn in a view held from earlier from its first frame, in current Chromium at 412x915
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/done_sync_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 4
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#252 thread-button-state` in the browser engine, at 412x915 by touch and 1280x800 with a mouse: on
   # Main, in the dark scheme and the light, a new message's Thread tag -- the thread Google Chat names
   # for every message, which nobody has answered -- is drawn exactly as Reply beside it (border, ink,

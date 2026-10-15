@@ -42063,10 +42063,11 @@ test("...and a landing left to the read behind held rows is paid by that read wh
 });
 
 test("...but not a landing made on an earlier visit, when the thread comes back with nothing unread", async () => {
-  // A thread the page holds comes back with the rows it was left with, at the scroll position it was
-  // left at: the very row and position the first visit's landing was made with. Read meanwhile in All,
-  // none of those rows is unread now, so this visit lands nowhere, and the read behind them, landing
-  // late, is not held to the first visit's landing — which would open a row nobody opened.
+  // A thread the page holds comes back at the scroll position it was left at, the position the first
+  // visit's landing was made with. Read meanwhile in All, none of its rows is unread now, so this visit
+  // lands nowhere, and the read behind them, landing late, is not held to the first visit's landing —
+  // which would open a row nobody opened. (Since `#306 done-stale-across-views` the rows are drawn
+  // again as the thread comes back, with the Done made in All; before, they came back as they were left.)
   const run = async (script) => {
     const page = newPage(new Map(), script);
     const messages = runThread(page, { tail: [...RUN_TAIL, ["agent", true], ["own", true]] });
@@ -42085,20 +42086,27 @@ test("...but not a landing made on an earlier visit, when the thread comes back 
     }
     await pickThread(page, `thread:${RUN_THREAD}`);
     await page.settle();
-    assert.equal(rowWithId(page, runId(500)), answer, "the thread did not come back with its rows; this proves nothing");
-    assert.ok(atTheHead(page, answer), "the thread did not come back where it was left; this proves nothing");
+    // Where it was left. Since `#306 done-stale-across-views` its rows are drawn again as it comes back,
+    // what was marked Done in All being Done in its copy too, which retires the row the first visit
+    // landed on as well.
+    const back = rowWithId(page, runId(500));
+    assert.ok(atTheHead(page, back), "the thread did not come back where it was left; this proves nothing");
+    const doneOnReturn = back.getAttribute("data-archived");
     hold.release();
     await entering;
     await page.settle();
     await page.settle();
     assert.deepStrictEqual(rowIds(rowWithId(page, runId(500))), [runId(12), runId(500)],
       "the read did not join 12 to the answer's row; this proves nothing");
-    return rowWithId(page, runId(500)).getAttribute("data-collapsed");
+    return { collapsed: rowWithId(page, runId(500)).getAttribute("data-collapsed"), doneOnReturn };
   };
-  assert.equal(await run(SCRIPT), "true", "the first visit's landing opened the row the read drew under message 12");
-  // Negative control: the landing left standing when the view changes.
-  assert.equal(await run(brokenScript("  entryLanding = null;\n  if (view === \"thread\")", "  if (view === \"thread\")")), "false",
-    "the first visit's landing did not hold without the reset; the control proves nothing");
+  assert.deepStrictEqual(await run(SCRIPT), { collapsed: "true", doneOnReturn: "true" },
+    "the first visit's landing opened the row the read drew under message 12, or the thread came back without the Done made in All");
+  // Negative control: the landing left standing when the view changes, and the thread's rows come back
+  // as they were left, the very row the landing was made on among them.
+  const control = brokenScriptEach(["  entryLanding = null;\n  if (view === \"thread\")", "  if (view === \"thread\")"],
+    ["if (held.readMode !== readMode || rowsMissDone()) renderCachedTimeline();", "if (held.readMode !== readMode) renderCachedTimeline();"]);
+  assert.equal((await run(control)).collapsed, "false", "the first visit's landing did not hold without the reset; the control proves nothing");
 });
 
 test("...and held rows with nothing unread whose read fails leave the reader on the newest line, through the next poll", async () => {
@@ -60179,3 +60187,211 @@ test("`#208 persistent-cache`: a help entry hidden with its feature never holds 
   await cached.el("fold-help").click();
   assert.deepStrictEqual(openHelp(cached), HELP_SLUGS);
 });
+
+// --- `#306 done-stale-across-views` -------------------------------------------------------------
+//
+// Found in review of #295 shift-e-read-collapse: a message marked Done in Main still showed as not
+// Done in All, loaded earlier in the session, until some later read redrew it. Every view the page
+// holds keeps a copy of which messages are Done for when it is shown again, and only the list the Done
+// was made in, and the right column while it showed a thread, were told. A Done or an Undo now reaches
+// every held view's copy at once — Main, All, a thread, the right column put away, and the cards'
+// unread counts — with no read.
+
+/** The line in `dismissMessages` that brings the views held into line, taken out for a negative control. */
+const DONE_FOLLOWS = ["  followDoneEverywhere(requested);\n  // Before the redraw", "  // Before the redraw"];
+/** ...the same in `restoreMessages`. */
+const UNDO_FOLLOWS = ["  followDoneEverywhere(restored);\n  if (lastDismissal", "  if (lastDismissal"];
+/** The check that draws a held view's rows again as it is shown, where they say otherwise than its copy. */
+const HELD_REDRAWS = ["if (held.readMode !== readMode || rowsMissDone()) renderCachedTimeline();",
+  "if (held.readMode !== readMode) renderCachedTimeline();"];
+
+/**
+ * The channel of `threadData` opened in All, then Main read for itself as its poll reads it, so that
+ * Main and All each keep their own copy of what is Done, as they do after any read of Main. Answers the
+ * page and the timeline reads made so far.
+ */
+async function mainAndAllHeld(script = SCRIPT, arrange = null) {
+  const page = newPage(new Map(), script);
+  const data = threadData();
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  if (arrange) arrange(page);
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await pickThread(page, "main");
+  await reReadChannel(page);
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"]);
+  return { page, reads: page.timelineCalls.length };
+}
+
+const doneDrawn = (page, id) => channelRow(page, id).getAttribute("data-archived");
+
+test("`#306 done-stale-across-views`: a Done in Main is drawn in All, held from earlier, as All is shown, with no read; an Undo in All is drawn in Main", async () => {
+  const run = async (script = SCRIPT) => {
+    const { page, reads } = await mainAndAllHeld(script);
+    await doneButton(channelRow(page, "201")).click();
+    await page.settle();
+    assert.equal(doneDrawn(page, "201"), "true", "the premise is 201 marked Done in Main");
+    await pickThread(page, "flat");
+    return { page, reads };
+  };
+  /** A Done on 203 in All, whose write saves the snapshot from All's copy; answers whether that kept 201 Done. */
+  const laterSave = async (page) => {
+    await doneButton(channelRow(page, "203")).click();
+    await page.settle();
+    return savedScopes(page)[scopeKey(CHANNEL.id)].dismissed.includes("201");
+  };
+  const { page, reads } = await run();
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"]);
+  assert.equal(doneDrawn(page, "201"), "true", "the message marked Done in Main shows as not Done in All");
+  assert.equal(doneButton(channelRow(page, "201")).text(), "Unarchive", "All's Done button still offers Done");
+  assert.deepStrictEqual(page.timelineCalls.slice(reads), [], "All waited on a read to draw the Done");
+
+  // Undo, from All: put back in All, and in Main as Main is shown again.
+  await page.el("undo-dismiss").click();
+  await page.settle();
+  assert.deepStrictEqual(page.restoreCalls, [{ messages: ["201"] }]);
+  assert.equal(doneDrawn(page, "201"), "false", "the premise is 201 put back in All");
+  await pickThread(page, "main");
+  assert.equal(doneDrawn(page, "201"), "false", "the message put back in All still shows as Done in Main");
+  assert.equal(doneButton(channelRow(page, "201")).text(), "Done");
+  assert.deepStrictEqual(page.timelineCalls.slice(reads), [], "Main waited on a read to draw the Undo");
+
+  // A view shown again with nothing changed in it keeps its very rows: the check redraws nothing then.
+  const drawn = [...page.el("discord-log").children];
+  await pickThread(page, "flat");
+  await pickThread(page, "main");
+  assert.ok(page.el("discord-log").children.every((li, at) => li === drawn[at]), "a held view nothing changed was drawn again");
+
+  // Done in Main once more, and a later write from All, which saves the snapshot from All's copy: the
+  // Done is kept, there and in Main.
+  await doneButton(channelRow(page, "201")).click();
+  await page.settle();
+  await pickThread(page, "flat");
+  assert.ok(await laterSave(page), "a write from All saved the snapshot without the Done made in Main");
+  await pickThread(page, "main");
+  assert.equal(doneDrawn(page, "201"), "true", "a write from All took the Done made in Main out of Main");
+
+  // THE CONTROLS. Without the views held brought into line, All shows the Done made in Main as not Done,
+  // and the next write from All saves that stale copy as the store's, so the Done goes from every view.
+  // With them brought into line but not drawn again as they are shown, All's rows show what they showed
+  // when they were left. Without an Undo reaching them, Main shows the message put back as Done.
+  const unfollowed = await run(brokenScript(...DONE_FOLLOWS));
+  assert.equal(doneDrawn(unfollowed.page, "201"), "false", "without the views held brought into line All showed the Done, so this test cannot see it");
+  assert.equal(await laterSave(unfollowed.page), false,
+    "the stale copy did not reach the snapshot, so this test's claim about it is untested");
+  const undrawn = await run(brokenScript(...HELD_REDRAWS));
+  assert.equal(doneDrawn(undrawn.page, "201"), "false", "without the redraw as All is shown All showed the Done, so this test cannot see it");
+  const unundone = await run(brokenScript(...UNDO_FOLLOWS));
+  await unundone.page.el("undo-dismiss").click();
+  await unundone.page.settle();
+  await pickThread(unundone.page, "main");
+  assert.equal(doneDrawn(unundone.page, "201"), "true", "without the Undo reaching the views held Main showed it, so this test cannot see it");
+});
+
+test("`#306 done-stale-across-views`: a Done or an Undo the server refuses is taken back in every view held, as All is shown", async () => {
+  const refuse = (kind) => (page) => {
+    page.inboxWriteHook = async (asked) => (asked === kind ? json(502, { error: "store_error", detail: "the store is read-only" }) : null);
+  };
+  const run = async (kind, script = SCRIPT) => {
+    const { page } = await mainAndAllHeld(script);
+    if (kind === "restore") {
+      await doneButton(channelRow(page, "201")).click();
+      await page.settle();
+    }
+    refuse(kind)(page);
+    await doneButton(channelRow(page, "201")).click();
+    await page.settle();
+    assert.equal(page.el("error").hidden, false, `the premise is a ${kind} refused, and said`);
+    await pickThread(page, "flat");
+    return page;
+  };
+  // A Done refused in Main: 201 is not Done in All either. An Undo refused: it is Done in All still.
+  assert.equal(doneDrawn(await run("dismiss"), "201"), "false", "a Done the server refused shows in All as made");
+  assert.equal(doneDrawn(await run("restore"), "201"), "true", "an Undo the server refused shows in All as made");
+  // THE CONTROLS: without the failure taken back in the views held, each shows in All as made.
+  const done = await run("dismiss", brokenScript("    followDoneEverywhere(requested);\n    renderTodoControls();",
+    "    renderTodoControls();"));
+  assert.equal(doneDrawn(done, "201"), "true", "without the take-back reaching the views held the refused Done did not show, so this test cannot see it");
+  const undo = await run("restore", brokenScript("    followDoneEverywhere(restored);\n    renderTodoControls();",
+    "    renderTodoControls();"));
+  assert.equal(doneDrawn(undo, "201"), "false", "without the take-back reaching the views held the refused Undo did not show, so this test cannot see it");
+});
+
+/** The channel of `threadData` in All, read once: `threadPage`, on `script`. */
+async function threadPageOn(script) {
+  const page = newPage(new Map(), script);
+  const data = threadData();
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  return page;
+}
+
+test("`#306 done-stale-across-views`: the right column's thread, put away with two columns, shows a Done made meanwhile in one column as two columns come back", async () => {
+  const run = async (script = SCRIPT) => {
+    const page = await threadPageOn(script);
+    await pickThread(page, "main");
+    await pickThread(page, "thread:spaces/A/threads/one & two");
+    await twoColumns(page);
+    assert.deepStrictEqual(sideIds(page), ["201", "202"], "the premise is the thread on the right");
+    assert.equal(sideRow(page, "202").getAttribute("data-archived"), "false");
+    await page.el("column-toggle").click();
+    await page.settle();
+    assert.equal(page.el("thread-select").value, "thread:spaces/A/threads/one & two", "the premise is the thread in one column");
+    const reads = page.timelineCalls.length;
+    await doneButton(channelRow(page, "202")).click();
+    await page.settle();
+    assert.equal(doneDrawn(page, "202"), "true", "the premise is the reply marked Done in one column");
+    await page.el("column-toggle").click();
+    await page.settle();
+    assert.deepStrictEqual(sideIds(page), ["201", "202"], "two columns did not come back to the thread");
+    return { page, reads };
+  };
+  const { page, reads } = await run();
+  assert.equal(sideRow(page, "202").getAttribute("data-archived"), "true", "the right column shows the reply marked Done meanwhile as not Done");
+  assert.deepStrictEqual(page.timelineCalls.slice(reads).filter((call) => viewOf(call) === "thread"), [],
+    "the right column waited on a read of the thread to draw the Done");
+  // And the right column's copy holds it, so a Done read there says so: its button offers Unarchive.
+  assert.equal(doneButton(sideRow(page, "202")).text(), "Unarchive");
+
+  // THE CONTROLS. Without the right column's copy brought into line while it is put away, or without its
+  // rows drawn again as it comes back, the reply shows there as not Done.
+  const unfollowed = await run(brokenScript(
+    "  if (!sideShowing() && activeColumn !== columns.side && columns.side.state !== null) {", "  if (false) {"));
+  assert.equal(unfollowed.page.el("side-log").children.find((li) => li.getAttribute("data-id") === "202").getAttribute("data-archived"),
+    "false", "without the right column's copy brought into line it showed the Done, so this test cannot see it");
+  const undrawn = await run(brokenScript("      if (rowsMissDone()) renderCachedTimeline();\n      return undefined;",
+    "      return undefined;"));
+  assert.equal(undrawn.page.el("side-log").children.find((li) => li.getAttribute("data-id") === "202").getAttribute("data-archived"),
+    "false", "without the redraw as two columns come back it showed the Done, so this test cannot see it");
+});
+
+test("`#306 done-stale-across-views`: a thread's card on the right counts an Undo made with its thread closed at once, with no read", async () => {
+  const one = "spaces/A/threads/one & two";
+  const run = async (script = SCRIPT) => {
+    const { page } = await twoColumnServer(null, script);
+    assert.equal(listCardSays(page, one).count, "1 reply · 1 unread", "the premise is a card counting its unread reply");
+    await threadBadge(channelRow(page, "201")).click();
+    await page.settle();
+    assert.deepStrictEqual(sideIds(page), ["201", "202"]);
+    await doneButton(sideRow(page, "202")).click();
+    await page.settle();
+    await page.el("side-close").click();
+    await page.settle();
+    assert.equal(listCardSays(page, one).count, "1 reply", "the premise is the card counting the reply Done");
+    const reads = page.timelineCalls.length;
+    await page.el("undo-dismiss").click();
+    await page.settle();
+    assert.deepStrictEqual(page.restoreCalls, [{ messages: ["202"] }], "the premise is the Undo put back on the server");
+    return { page, reads };
+  };
+  const { page, reads } = await run();
+  assert.equal(listCardSays(page, one).count, "1 reply · 1 unread", "the card does not count the reply the Undo put back");
+  assert.deepStrictEqual(page.timelineCalls.slice(reads), [], "the card waited on a read to count the Undo");
+  // THE CONTROL: without the cards drawn again after the Undo, the card says nothing unread.
+  const control = await run(brokenScript("    });\n  }\n  if (sideColumnUp()) renderSideColumn();\n}", "    });\n  }\n}"));
+  assert.equal(listCardSays(control.page, one).count, "1 reply", "without the cards drawn again the card counted the Undo, so this test cannot see it");
+});
+

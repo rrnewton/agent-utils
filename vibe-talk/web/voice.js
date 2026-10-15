@@ -16440,8 +16440,10 @@ async function changeChannelView(view, threadId = null, summary = null, origin =
     if (keepPlace) keepReaderPlace(place);
     catchUpHeldView();
     // What was read, dealt with or answered elsewhere since the held rows were drawn: in a thread
-    // just left, above all, whose replies Main's chips count (`#222 unread-replies`).
-    if (held.readMode !== readMode) renderCachedTimeline();
+    // just left, above all, whose replies Main's chips count (`#222 unread-replies`). A message marked
+    // Done, or put back, in another view meanwhile is in this view's copy already, not yet on its
+    // rows (`#306 done-stale-across-views`).
+    if (held.readMode !== readMode || rowsMissDone()) renderCachedTimeline();
     else syncUnreadReplies();
     renderChannelFreshness();
     // A thread read behind its held rows for replies they lack is entered at its newest, where those
@@ -29174,6 +29176,8 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
   // `#229 desktop-two-column`. Done is the message's, so the other column shows it Done as well.
   const column = activeColumn;
   const mirrored = mirrorArchived(requested, true);
+  // ...and every view held out of sight, and the cards on screen. `#306 done-stale-across-views`.
+  followDoneEverywhere(requested);
   // Before the redraw, so the line moves with the row it was over; and in the other column, whose own
   // redraw (`mirrorArchived`) came before it, or never came, when it draws none of these messages.
   const move = bump ? stageBookmark(bump.channel, bump.to) : null;
@@ -29214,6 +29218,8 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
       mirrorArchived(mirrored.filter((id) => !kept.has(id)), false);
       guardQuietly(refreshAfterInboxChange)();
     });
+    // ...and in every view held, from the store the lines above took it back in. `#306`.
+    followDoneEverywhere(requested);
     renderTodoControls();
     if (landed.length > 0) error.landed = landed.length;
     throw error;
@@ -29273,6 +29279,8 @@ async function restoreMessages(ids) {
   // `#229 desktop-two-column`. Put back in the other column as well.
   const column = activeColumn;
   const mirrored = mirrorArchived(restored, false);
+  // ...and every view held out of sight, and the cards on screen. `#306 done-stale-across-views`.
+  followDoneEverywhere(restored);
   if (lastDismissal !== null) {
     const left = lastDismissal.messages.filter((id) => !restored.includes(id));
     lastDismissal = left.length === 0 ? null : { ...lastDismissal, messages: left };
@@ -29315,6 +29323,8 @@ async function restoreMessages(ids) {
       mirrorArchived(mirrored.filter((id) => !kept.has(id)), true);
       guardQuietly(refreshAfterInboxChange)();
     });
+    // ...and in every view held, from the store the lines above took it back in. `#306`.
+    followDoneEverywhere(restored);
     renderTodoControls();
     if (landed.length > 0) error.landed = landed.length;
     throw error;
@@ -29348,6 +29358,75 @@ function mirrorArchived(ids, done) {
     else syncUnreadReplies();
   });
   return changed;
+}
+
+// --- one read state in every view the page holds -------------------------------------------------
+//
+// `#306 done-stale-across-views`. Found in review of #295 shift-e-read-collapse: a message marked
+// Done in Main still showed as not Done in All, loaded earlier in the session, for seconds, until
+// some later read redrew it. Each view keeps its own copy of which messages are Done (`archivedIds`)
+// for when it is shown again — a view left in a column (`channelContexts`), and the right column's
+// thread while two columns are put away or show their cards — and only the list the Done was made in,
+// and the other column while it shows a thread (`mirrorArchived`), were told. Worse, a stale copy put
+// back was later written over the store (`syncCanonDismissed`), so the Done could go out of every view.
+//
+// So a Done or an Undo here, and a failed one taken back, brings every copy into line with the store
+// at once (`followDoneEverywhere`), which `markHeldDone` and `settleHeldDone` have already moved; the
+// cards on screen, which count unread replies from the store, are drawn again then; and a view whose
+// rows were drawn before is drawn again as it is shown, where they say otherwise (`rowsMissDone`).
+// No read is asked for any of it.
+
+/**
+ * Every copy of the read state of `ids` that the page holds out of sight, into line with the store's
+ * (`channelCanon.dismissed`), after a Done, a put back, or a failed one taken back: the views held in
+ * either column, and the right column's own while it does not show a thread. Each copy is replaced
+ * rather than changed in place, since one may be the very set a list on screen is drawn from. Then
+ * the cards on screen, drawn from the store, are drawn again. `#306 done-stale-across-views`.
+ *
+ * @param {string[]} ids
+ */
+function followDoneEverywhere(ids) {
+  if (!threadingSupported || channelCanon.channel !== String(el("discord-channel").value)) return;
+  const named = ids.map(String);
+  /** @param {Set<string>} copy */
+  const caughtUp = (copy) => {
+    const moved = named.filter((id) => copy.has(id) !== channelCanon.dismissed.has(id));
+    if (moved.length === 0) return copy;
+    const next = new Set(copy);
+    for (const id of moved) {
+      if (channelCanon.dismissed.has(id)) next.add(id);
+      else next.delete(id);
+    }
+    return next;
+  };
+  for (const held of channelContexts.values()) held.dismissed = caughtUp(held.dismissed);
+  if (!sideShowing() && activeColumn !== columns.side && columns.side.state !== null) {
+    inColumn(columns.side, () => {
+      archivedIds = caughtUp(archivedIds);
+    });
+  }
+  if (sideColumnUp()) renderSideColumn();
+}
+
+/**
+ * Whether the rows drawn in the column being worked on show a message's read state other than its own
+ * copy (`archivedIds`) says: a row drawn Done, or not, against it, or under Hide read a message drawn,
+ * or left out, against it. Rows held while a Done or an Undo was made in another view keep the look
+ * they had; their copy was brought into line at once (`followDoneEverywhere`), and this says they are
+ * to be drawn again as they are shown. `#306 done-stale-across-views`.
+ */
+function rowsMissDone() {
+  if (!threadingSupported || channelView === "threads") return false;
+  const rows = [...el("discord-log").children];
+  if (rows.some((row) => {
+    const ids = idsOf(row);
+    return ids.length > 0 && (row.getAttribute("data-archived") === "true") !== ids.every((id) => archivedIds.has(id));
+  })) return true;
+  if (!hidingRead()) return false;
+  const keeps = readFilterKeeps();
+  const wanted = new Set(timelineMessages.filter(keeps).map((message) => String(message.id)));
+  const drawn = new Set(rows.flatMap(idsOf));
+  return wanted.size !== drawn.size || [...wanted].some((id) => !drawn.has(id));
 }
 
 /** Put back exactly what the last dismissal cleared, and the bookmark where that moved it from. */
@@ -34365,7 +34444,12 @@ function selectSideThread(id, summary = null) {
   columns.side.mode = "thread";
   renderSideMode();
   const opened = inColumn(columns.side, () => {
-    if (was === "thread" && channelView === "thread" && String(selectedThreadId) === thread) return undefined;
+    if (was === "thread" && channelView === "thread" && String(selectedThreadId) === thread) {
+      // Shown again as it was put away, two columns coming back to it: drawn again where a Done or an
+      // Undo made meanwhile in one column left its rows behind its copy. `#306 done-stale-across-views`.
+      if (rowsMissDone()) renderCachedTimeline();
+      return undefined;
+    }
     return changeChannelView("thread", thread, known);
   });
   flyThreadCard(leftEl("side-thread-card"), from, leftEl("side-pane"));
