@@ -66978,9 +66978,9 @@ test("`#208 persistent-cache`: a help entry hidden with its feature never holds 
 // unread counts — with no read.
 
 /** The line in `dismissMessages` that brings the views held into line, taken out for a negative control. */
-const DONE_FOLLOWS = ["  followDoneEverywhere(requested, column);\n  // Before the redraw", "  // Before the redraw"];
+const DONE_FOLLOWS = ["    followDoneEverywhere(requested, column);\n    // Before the redraw", "    // Before the redraw"];
 /** ...the same in `restoreMessages`. */
-const UNDO_FOLLOWS = ["  followDoneEverywhere(restored, column);\n  if (lastDismissal", "  if (lastDismissal"];
+const UNDO_FOLLOWS = ["    followDoneEverywhere(restored, column);\n    if (lastDismissal", "    if (lastDismissal"];
 /** The check that draws a held view's rows again as it is shown, where they say otherwise than its copy. */
 const HELD_REDRAWS = ["if (held.readMode !== readMode || rowsMissDone()) renderCachedTimeline();",
   "if (held.readMode !== readMode) renderCachedTimeline();"];
@@ -67810,6 +67810,402 @@ test("`#311 sent-read-waits-for-done`: under Hide read without threads a reply t
   assert.deepStrictEqual(offListFailed.whileSaving, [], "the control waited no longer");
   assert.deepStrictEqual(offListFailed.asked, [target],
     "looking again by the list asked nothing after the failed Done, so this test cannot see it");
+});
+
+// --- `#326 refused-undo-restores-done` ----------------------------------------------------------
+//
+// Found in the final reviews of #306 done-stale-across-views and #311 sent-read-waits-for-done. A Done
+// pressed, then Undo while the Done is still being saved: the Undo's write waits behind the Done's. Each
+// refusal took back exactly what its own act had changed, so with both refused the Undo's took the
+// message back to Done — a Done the server had refused as well. Every view drew it Done, the next write
+// saved it into the device's snapshot, and a Reply on it wrote no Done and asked the chat service, whose
+// marker cannot be moved back, to mark it read. A refusal now takes a message back to what the server
+// holds for it, by this page's writes: the last of them it saved, or what it held before the first.
+
+/** The refusal every test of this section answers a write with. */
+const STORE_REFUSES = () => json(502, { error: "store_error", detail: "the store is read-only" });
+
+/** The line in `settleInboxWrite` that leaves a refused write's take-back out where the server holds what it made, for negative controls. */
+const REFUSAL_KEEPS_SERVER = ["      else if (write.server === done) stands.add(id);\n", ""];
+/** ...and the one that leaves it out while a later write of the message is on its way. */
+const REFUSAL_KEEPS_LATER = ["      if (write.writes > 0) stands.add(id);\n      else if", "      if"];
+
+/** The lines that bring the Undo chip up to date as a Done is saved whatever it offers since, for a negative control. */
+const CHIP_FOLLOWS_ANY = ["  if (offered()) {\n    const still = new Set(lastDismissal.messages);\n", "  {\n    const still = new Set(requested);\n"];
+
+/**
+ * Root 201 of `threadData`, Main and All held, the chat service's marker supported, marked Done in Main
+ * with its Done button, its write held on its way; Undo pressed meanwhile, from the chip, its write queued
+ * behind; with `again`, Done pressed on it once more from its row, queued behind that; then the writes
+ * answered in turn by `answers` (null for saved). Answers the page and the server's floor's asks of the
+ * chat service.
+ */
+async function doneThenUndo(answers, script = SCRIPT, again = false) {
+  let asked = null;
+  const { page } = await mainAndAllHeld(script, (fresh) => { fresh.upstreamReadMarkSupported = true; asked = serverFloor(fresh); });
+  const later = answers.slice(1);
+  let release = null;
+  page.inboxWriteHook = async (kind) => {
+    if (kind === "dismiss" && release === null) return new Promise((resolve) => { release = () => resolve(answers[0]); });
+    return later.length > 0 ? later.shift() : null;
+  };
+  // Not waited for: the button's act ends with its write, which is held.
+  const acts = [doneButton(channelRow(page, "201")).click()];
+  await page.settle();
+  assert.ok(release, "the premise is the Done on its way");
+  assert.equal(doneDrawn(page, "201"), "true", "the premise is the Done drawn at once");
+  acts.push(page.el("undo-dismiss").click());
+  await page.settle();
+  assert.equal(doneDrawn(page, "201"), "false", "the premise is the Undo drawn at once");
+  if (again) {
+    acts.push(doneButton(channelRow(page, "201")).click());
+    await page.settle();
+    assert.equal(doneDrawn(page, "201"), "true", "the premise is the second Done drawn at once");
+  }
+  assert.deepStrictEqual(page.restoreCalls, [], "the premise is the Undo waiting behind the Done");
+  release();
+  for (const act of acts) await act.catch(() => {});
+  for (let i = 0; i < 4; i += 1) await page.settle();
+  assert.deepStrictEqual(page.restoreCalls, [{ messages: ["201"] }], "the premise is the Undo written after the Done");
+  assert.equal(page.dismissCalls.length, again ? 2 : 1, "the premise is each Done written once");
+  assert.equal(page.el("error").hidden, answers.every((answer) => answer === null), "the premise is each refusal said");
+  page.inboxWriteHook = null;
+  return { page, asked };
+}
+
+/** Every order of `count` writes each refused or saved, and its name: "refuse/save" and so on. */
+const answerOrders = (count) => Array.from({ length: 2 ** count }, (_, n) => {
+  const answers = Array.from({ length: count }, (__, at) => ((n >> (count - 1 - at)) & 1 ? null : STORE_REFUSES()));
+  return [answers, answers.map((answer) => (answer ? "refuse" : "save")).join("/")];
+});
+
+test("`#326 refused-undo-restores-done`: a Done and the Undo pressed while it was saved, each refused or saved, leave root 201 as the server holds it in every view, in the snapshot and for a Reply", async () => {
+  for (const [answers, says] of answerOrders(2)) {
+    const { page, asked } = await doneThenUndo(answers);
+    const held = page.dealtWith.has("201");
+    assert.equal(held, answers[0] === null && answers[1] !== null, `${says}: the premise is the server's Done for 201`);
+    assert.equal(doneDrawn(page, "201"), String(held), `${says}: Main draws 201 otherwise than the server holds it`);
+    assert.equal(doneButton(channelRow(page, "201")).text(), held ? "Unarchive" : "Done", `${says}: Main's button offers the wrong act`);
+    // Undo was pressed: the chip offers to put back nothing, whichever answer came last.
+    assert.equal(page.el("undo-dismiss").hidden, true, `${says}: the Undo chip came back after Undo was pressed`);
+    await pickThread(page, "flat");
+    assert.equal(doneDrawn(page, "201"), String(held), `${says}: All draws 201 otherwise than the server holds it`);
+    await pickThread(page, "main");
+    // A later write, which saves the snapshot from the page's copy.
+    await doneButton(channelRow(page, "203")).click();
+    await page.settle();
+    assert.equal(savedDone(page, "201"), held, `${says}: a later write saved 201 into the snapshot otherwise than the server holds it`);
+    // A Reply on 201: a Done written first where the server holds none, and only then the chat service asked.
+    const before = page.dismissCalls.length;
+    await replyAndSend(page, "201", "on it");
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    assert.equal(page.repliesPosted.at(-1).body.reply_to, "201", `${says}: the premise is the reply sent and confirmed`);
+    assert.deepStrictEqual(page.dismissCalls.slice(before), held ? [] : [{ messages: ["201"] }],
+      `${says}: the reply's Done was written otherwise than the server's Done says`);
+    assert.equal(page.dealtWith.has("201"), true, `${says}: the reply left 201 without a Done on the server`);
+    const dismissed = page.requests.map((one, at) => (one.endsWith("/dismiss") ? at : -1)).filter((at) => at >= 0).at(-1);
+    const marked = page.requests.findIndex((one) => one.endsWith("/upstream-read"));
+    assert.ok(marked > dismissed, `${says}: the chat service was asked before 201's Done was on the server`);
+    assert.deepStrictEqual(asked, ["201"], `${says}: the chat service's marker was not moved once, for 201`);
+  }
+
+  // THE CONTROLS. A refusal taking back what its own act changed, whatever the server holds: refused
+  // twice, the Undo's take-back draws 201 Done, saves it, and the Reply writes no Done and asks the
+  // service for a message the server holds none for.
+  const { page, asked } = await doneThenUndo([STORE_REFUSES(), STORE_REFUSES()], brokenScript(...REFUSAL_KEEPS_SERVER));
+  assert.equal(page.dealtWith.has("201"), false);
+  assert.equal(doneDrawn(page, "201"), "true", "without the server's state kept the Undo's refusal took 201 back to not Done, so this test cannot see it");
+  await doneButton(channelRow(page, "203")).click();
+  await page.settle();
+  assert.equal(savedDone(page, "201"), true, "without the server's state kept the snapshot left 201 out, so this test's claim about it is untested");
+  const before = page.dismissCalls.length;
+  await replyAndSend(page, "201", "on it");
+  for (let i = 0; i < 3; i += 1) await page.settle();
+  assert.deepStrictEqual(page.dismissCalls.slice(before), [], "without the server's state kept the reply wrote a Done, so this test cannot see it");
+  assert.deepStrictEqual(asked, ["201"], "without the server's state kept the chat service was not asked, so this test cannot see it");
+  assert.equal(page.dealtWith.has("201"), false);
+  // The Done's answer bringing the chip up to date whatever it offers since: saved twice, it offers to
+  // put back 201, which is back already.
+  const chip = await doneThenUndo([null, null], brokenScript(...CHIP_FOLLOWS_ANY));
+  assert.equal(chip.page.el("undo-dismiss").hidden, false, "without the chip's own check it stayed away, so this test cannot see it");
+});
+
+test("`#326 refused-undo-restores-done`: a Done, its Undo and a Done again, pressed while the first was saved, each refused or saved, leave root 201 as the server holds it", async () => {
+  for (const [answers, says] of answerOrders(3)) {
+    const { page } = await doneThenUndo(answers, SCRIPT, true);
+    const held = page.dealtWith.has("201");
+    // The last write the server saved decides it; none saved, it holds none.
+    const last = [true, false, true].filter((_, at) => answers[at] === null).at(-1);
+    assert.equal(held, last === true, `${says}: the premise is the server's Done for 201`);
+    assert.equal(doneDrawn(page, "201"), String(held), `${says}: Main draws 201 otherwise than the server holds it`);
+    await pickThread(page, "flat");
+    assert.equal(doneDrawn(page, "201"), String(held), `${says}: All draws 201 otherwise than the server holds it`);
+    await doneButton(channelRow(page, "203")).click();
+    await page.settle();
+    assert.equal(savedDone(page, "201"), held, `${says}: a later write saved 201 into the snapshot otherwise than the server holds it`);
+  }
+  // THE CONTROLS. Without a later write's act left standing, the first Done's refusal takes 201 back to
+  // not Done under the second Done, whose saving then draws nothing; without the server's state kept,
+  // the second Done's refusal takes it back to not Done over the first one saved.
+  const unlater = await doneThenUndo([STORE_REFUSES(), STORE_REFUSES(), null], brokenScript(...REFUSAL_KEEPS_LATER), true);
+  assert.equal(unlater.page.dealtWith.has("201"), true);
+  assert.equal(doneDrawn(unlater.page, "201"), "false",
+    "without the later write's act left standing 201 was drawn Done, so this test cannot see it");
+  const unkept = await doneThenUndo([null, STORE_REFUSES(), STORE_REFUSES()], brokenScript(...REFUSAL_KEEPS_SERVER), true);
+  assert.equal(unkept.page.dealtWith.has("201"), true);
+  assert.equal(doneDrawn(unkept.page, "201"), "false", "without the server's state kept 201 was drawn Done, so this test cannot see it");
+});
+
+// A Done or an Undo that fails in the page before its write is queued — a slip in drawing it, no write
+// at all — used to leave everything noted before it as it was: the act drawn and held here with no write
+// on its way, a wait on it (`doneSaved`) that never ended, and the ledger counting a write still on its
+// way, so every later refusal of that message took nothing back. A plain `finally` that only ended the
+// wait would have been worse: a send looking again would have found the Done held, and asked the chat
+// service to mark a message read whose Done was never sent. It is taken back as a refusal is.
+
+/** web/voice.js `script` with a slip just before `line`: an exception no write caused, the `nth` time it is reached. */
+function slipBefore(script, line, nth = 1) {
+  assert.ok(script.includes(line), `the slip goes before ${JSON.stringify(line)}, which web/voice.js no longer contains`);
+  return script.replace(line,
+    `if ((globalThis.slipReached = (globalThis.slipReached || 0) + 1) === ${nth}) throw new Error("a slip in the page");\n${line}`);
+}
+
+/** The last line a Done draws before its write is queued, and the same for an Undo. */
+const BEFORE_DONE_WRITE = "    setStatus(`Saving ${requested.length} local change";
+const BEFORE_UNDO_WRITE = "    setStatus(`Restoring ${restored.length} message";
+/** The line after an Undo's notes, before its `try`: a slip there is one nothing takes back, as before. */
+const UNDO_OUTSIDE_TRY = "  // `#229 desktop-two-column`. Put back in the other column as well.\n";
+/**
+ * A Done's `catch` letting a slip through untouched, as when the lines before the write were outside the
+ * `try`, and its `finally` ending the wait on it (`saved`) or, as then, not: for negative controls.
+ */
+const DONE_CATCH = "  } catch (error) {\n    // Only what the server did not take is taken back: the batches before the one that failed are\n";
+const DONE_SLIP_UNTAKEN = [DONE_CATCH, `${DONE_CATCH}    if (error.message === "a slip in the page") throw error;\n`];
+const DONE_SAVED = "    saved();\n  }\n  settleInboxWrite(requested, true, new Set(requested));\n";
+const DONE_SLIP_UNSAVED = [DONE_SAVED, DONE_SAVED.replace("    saved();", "    if (globalThis.slipReached !== 1) saved();")];
+/** The ledger settled for a slip too, in each act's `catch`: for negative controls, left out for a slip only. */
+const DONE_SLIP_SETTLES = ["    const stands = settleInboxWrite(requested, true, kept, sent);\n",
+  "    const stands = error.message === \"a slip in the page\" ? new Set() : settleInboxWrite(requested, true, kept, sent);\n"];
+const UNDO_SLIP_SETTLES = ["    const stands = settled ? new Set() : settleInboxWrite(restored, false, kept, sent);\n",
+  "    const stands = settled || error.message === \"a slip in the page\" ? new Set() : settleInboxWrite(restored, false, kept, sent);\n"];
+/** ...and settled as if the server had refused it, a write made before it still on its way. */
+const DONE_SLIP_REFUSED = ["settleInboxWrite(requested, true, kept, sent)", "settleInboxWrite(requested, true, kept, true)"];
+const UNDO_SLIP_REFUSED = ["settleInboxWrite(restored, false, kept, sent)", "settleInboxWrite(restored, false, kept, true)"];
+
+/**
+ * Root 201 of `threadData`, Main and All held, the chat service's marker supported, marked Done in Main
+ * with its Done button on `script`, which slips before the write is queued. Answers the page and the
+ * server's floor's asks of the chat service.
+ */
+async function slippedDone(script) {
+  let asked = null;
+  const { page } = await mainAndAllHeld(script, (fresh) => { fresh.upstreamReadMarkSupported = true; asked = serverFloor(fresh); });
+  await doneButton(channelRow(page, "201")).click().catch(() => {});
+  for (let i = 0; i < 3; i += 1) await page.settle();
+  assert.deepStrictEqual(page.dismissCalls, [], "the premise is a Done whose write was never sent");
+  return { page, asked };
+}
+
+/** A Reply on 201, sent and confirmed. Answers the Done writes made from then on. */
+async function replyOn201(page) {
+  const before = page.dismissCalls.length;
+  await replyAndSend(page, "201", "on it");
+  for (let i = 0; i < 3; i += 1) await page.settle();
+  assert.equal(page.repliesPosted.at(-1).body.reply_to, "201", "the premise is the reply sent and confirmed");
+  return page.dismissCalls.slice(before);
+}
+
+test("`#326 refused-undo-restores-done`: a Done that fails in the page before its write is sent is taken back as a refused one: in every view, a later refusal taken back too, and a Reply writes its own Done before the chat service is asked", async () => {
+  const { page, asked } = await slippedDone(slipBefore(SCRIPT, BEFORE_DONE_WRITE));
+  assert.equal(page.el("error").hidden, false, "the slip was not said");
+  assert.equal(doneDrawn(page, "201"), "false", "Main draws a Done whose write was never sent");
+  assert.equal(doneButton(channelRow(page, "201")).text(), "Done", "Main's button offers to put back a Done never sent");
+  await pickThread(page, "flat");
+  assert.equal(doneDrawn(page, "201"), "false", "All draws a Done whose write was never sent");
+  await pickThread(page, "main");
+  // A Done of it again, refused: taken back, with no other write of it on its way.
+  page.inboxWriteHook = async (kind) => (kind === "dismiss" ? STORE_REFUSES() : null);
+  await doneButton(channelRow(page, "201")).click().catch(() => {});
+  for (let i = 0; i < 3; i += 1) await page.settle();
+  page.inboxWriteHook = null;
+  assert.deepStrictEqual(page.dismissCalls, [{ messages: ["201"] }], "the premise is the second Done written, and refused");
+  assert.equal(doneDrawn(page, "201"), "false", "a refused Done after the slip stayed drawn: the slipped write is still counted on its way");
+  // A Reply on it: its own Done written first, and only then the chat service asked, once.
+  assert.deepStrictEqual(await replyOn201(page), [{ messages: ["201"] }], "the reply wrote no Done of its own");
+  assert.equal(page.dealtWith.has("201"), true);
+  const dismissed = page.requests.map((one, at) => (one.endsWith("/dismiss") ? at : -1)).filter((at) => at >= 0).at(-1);
+  assert.ok(page.requests.findIndex((one) => one.endsWith("/upstream-read")) > dismissed,
+    "the chat service was asked before 201's Done was on the server");
+  assert.deepStrictEqual(asked, ["201"], "the chat service's marker was not moved once, for 201");
+
+  // THE CONTROLS. A slip nothing takes back, as when the lines before the write were outside the `try`:
+  // 201 stays drawn Done with no write sent, and the Reply's wait for that Done never ends, so it neither
+  // writes a Done nor asks the chat service.
+  const loose = await slippedDone(slipBefore(brokenScriptEach(DONE_SLIP_UNTAKEN, DONE_SLIP_UNSAVED), BEFORE_DONE_WRITE));
+  assert.equal(doneDrawn(loose.page, "201"), "true", "a slip nothing takes back was taken back, so this test cannot see one left");
+  assert.deepStrictEqual(await replyOn201(loose.page), [], "with the slip left the reply wrote a Done, so this test cannot see its wait");
+  assert.deepStrictEqual(loose.asked, [], "with the slip left the reply's wait ended, so this test cannot see it hang");
+  // The wait ended by a plain `finally`, the Done not taken back: the Reply finds 201 held Done, writes
+  // nothing, and asks the chat service to mark a message whose Done was never sent.
+  const ended = await slippedDone(slipBefore(brokenScript(...DONE_SLIP_UNTAKEN), BEFORE_DONE_WRITE));
+  assert.deepStrictEqual(await replyOn201(ended.page), [], "with the wait ended the reply wrote a Done, so this test cannot see it");
+  assert.deepStrictEqual(ended.asked, ["201"], "with the wait ended and the Done kept the service was not asked, so this test cannot see the marker moved");
+  assert.equal(ended.page.dealtWith.has("201"), false);
+  // The ledger not settled for the slip: the second Done's refusal finds a write of 201 still on its way,
+  // and takes nothing back.
+  const counted = await slippedDone(slipBefore(brokenScript(...DONE_SLIP_SETTLES), BEFORE_DONE_WRITE));
+  assert.equal(doneDrawn(counted.page, "201"), "false", "the premise is the slip taken back");
+  counted.page.inboxWriteHook = async (kind) => (kind === "dismiss" ? STORE_REFUSES() : null);
+  await doneButton(channelRow(counted.page, "201")).click().catch(() => {});
+  for (let i = 0; i < 3; i += 1) await counted.page.settle();
+  assert.equal(doneDrawn(counted.page, "201"), "true", "with the ledger left counting the slip the refusal was taken back, so this test cannot see it");
+});
+
+/** Root 201 of `threadData`, Main and All held, marked Done and saved, then Undo pressed from the chip on `script`, which slips before its write. */
+async function slippedUndo(script) {
+  const { page } = await mainAndAllHeld(script);
+  await doneButton(channelRow(page, "201")).click();
+  await page.settle();
+  assert.deepStrictEqual(page.dismissCalls, [{ messages: ["201"] }], "the premise is a Done saved, to undo");
+  await page.el("undo-dismiss").click().catch(() => {});
+  for (let i = 0; i < 3; i += 1) await page.settle();
+  assert.deepStrictEqual(page.restoreCalls, [], "the premise is an Undo whose write was never sent");
+  return page;
+}
+
+test("`#326 refused-undo-restores-done`: an Undo that fails in the page before its write is sent is taken back as a refused one: Done in every view, as the server holds it, and a later refusal taken back too", async () => {
+  const page = await slippedUndo(slipBefore(SCRIPT, BEFORE_UNDO_WRITE));
+  assert.equal(page.el("error").hidden, false, "the slip was not said");
+  assert.equal(doneDrawn(page, "201"), "true", "Main draws 201 put back by an Undo never sent");
+  await pickThread(page, "flat");
+  assert.equal(doneDrawn(page, "201"), "true", "All draws 201 put back by an Undo never sent");
+  await pickThread(page, "main");
+  assert.equal(doneDrawn(page, "201"), "true", "Main draws 201 put back by an Undo never sent, once shown again");
+  // Put back from its row, refused: Done again, with no other write of it on its way.
+  page.inboxWriteHook = async (kind) => (kind === "restore" ? STORE_REFUSES() : null);
+  await doneButton(channelRow(page, "201")).click().catch(() => {});
+  for (let i = 0; i < 3; i += 1) await page.settle();
+  page.inboxWriteHook = null;
+  assert.deepStrictEqual(page.restoreCalls, [{ messages: ["201"] }], "the premise is the put back written, and refused");
+  assert.equal(doneDrawn(page, "201"), "true", "a refused put back after the slip stayed drawn: the slipped write is still counted on its way");
+  await doneButton(channelRow(page, "203")).click();
+  await page.settle();
+  assert.equal(savedDone(page, "201"), true, "a later write saved 201 into the snapshot otherwise than the server holds it");
+
+  // THE CONTROLS. A slip outside the `try`: 201 put back in the page's copy while the server holds its
+  // Done, and drawn so once Main is shown again. The ledger not settled for the slip: the put back's
+  // refusal finds a write of 201 still on its way, and leaves it drawn put back.
+  const loose = await slippedUndo(slipBefore(SCRIPT, UNDO_OUTSIDE_TRY));
+  await pickThread(loose, "flat");
+  await pickThread(loose, "main");
+  assert.equal(doneDrawn(loose, "201"), "false", "a slip outside the `try` was taken back, so this test cannot see one left");
+  const counted = await slippedUndo(slipBefore(brokenScript(...UNDO_SLIP_SETTLES), BEFORE_UNDO_WRITE));
+  assert.equal(doneDrawn(counted, "201"), "true", "the premise is the slip taken back");
+  counted.inboxWriteHook = async (kind) => (kind === "restore" ? STORE_REFUSES() : null);
+  await doneButton(channelRow(counted, "201")).click().catch(() => {});
+  for (let i = 0; i < 3; i += 1) await counted.settle();
+  assert.equal(doneDrawn(counted, "201"), "false", "with the ledger left counting the slip the refusal was taken back, so this test cannot see it");
+});
+
+test("`#326 refused-undo-restores-done`: a Done or an Undo that fails in the page while an earlier write of the message is still on its way takes back exactly what it changed, and that write's answer decides", async () => {
+  /**
+   * Root 201 of `threadData`, Main and All held, on `script`. With `kind` "restore", its Done held on its
+   * way and Undo pressed meanwhile from the chip; with "dismiss", its Done saved, then its put back from
+   * the row held on its way and Done pressed again from the row; the second act slipping before its
+   * write. Then the held write answered `answer` (null for saved). Answers the page and how 201 was drawn
+   * just after the slip.
+   */
+  const run = async (kind, answer, script) => {
+    const { page } = await mainAndAllHeld(script);
+    const earlier = kind === "restore" ? "dismiss" : "restore";
+    if (kind === "dismiss") {
+      await doneButton(channelRow(page, "201")).click();
+      await page.settle();
+    }
+    let release = null;
+    page.inboxWriteHook = async (asked) => (asked === earlier && release === null
+      ? new Promise((resolve) => { release = () => resolve(answer); }) : null);
+    const first = doneButton(channelRow(page, "201")).click();
+    await page.settle();
+    assert.ok(release, `the premise is the ${earlier} on its way`);
+    assert.equal(doneDrawn(page, "201"), String(earlier === "dismiss"), `the premise is the ${earlier} drawn at once`);
+    await (kind === "restore" ? page.el("undo-dismiss") : doneButton(channelRow(page, "201"))).click().catch(() => {});
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    assert.equal(page.el("error").hidden, false, "the premise is the slip said");
+    const afterSlip = doneDrawn(page, "201");
+    release();
+    await first.catch(() => {});
+    for (let i = 0; i < 4; i += 1) await page.settle();
+    page.inboxWriteHook = null;
+    assert.deepStrictEqual(kind === "restore" ? page.restoreCalls : page.dismissCalls.slice(1), [],
+      `the premise is the ${kind} never written`);
+    return { page, afterSlip };
+  };
+  for (const kind of ["restore", "dismiss"]) {
+    const line = kind === "restore" ? BEFORE_UNDO_WRITE : BEFORE_DONE_WRITE;
+    // The Done saved first reaches its line too.
+    const nth = kind === "restore" ? 1 : 2;
+    for (const answer of [null, STORE_REFUSES()]) {
+      const says = `the ${kind} slipped, the earlier write ${answer === null ? "saved" : "refused"}`;
+      const { page, afterSlip } = await run(kind, answer, slipBefore(SCRIPT, line, nth));
+      assert.equal(afterSlip, String(kind === "restore"), `${says}: the slip left its own act drawn over the earlier write's`);
+      const held = page.dealtWith.has("201");
+      assert.equal(doneDrawn(page, "201"), String(held), `${says}: Main draws 201 otherwise than the server holds it`);
+      await pickThread(page, "flat");
+      assert.equal(doneDrawn(page, "201"), String(held), `${says}: All draws 201 otherwise than the server holds it`);
+      await doneButton(channelRow(page, "203")).click();
+      await page.settle();
+      assert.equal(savedDone(page, "201"), held, `${says}: a later write saved 201 into the snapshot otherwise than the server holds it`);
+    }
+  }
+  // THE CONTROLS: a slip settled as if the server had refused it finds the earlier write still on its way,
+  // so takes nothing back, and its own act stays drawn once that write is saved.
+  const undo = await run("restore", null, slipBefore(brokenScript(...UNDO_SLIP_REFUSED), BEFORE_UNDO_WRITE));
+  assert.equal(undo.page.dealtWith.has("201"), true);
+  assert.equal(doneDrawn(undo.page, "201"), "false", "the slipped Undo settled as refused was taken back, so this test cannot see it");
+  const done = await run("dismiss", null, slipBefore(brokenScript(...DONE_SLIP_REFUSED), BEFORE_DONE_WRITE, 2));
+  assert.equal(done.page.dealtWith.has("201"), false);
+  assert.equal(doneDrawn(done.page, "201"), "true", "the slipped Done settled as refused was taken back, so this test cannot see it");
+});
+
+test("`#326 refused-undo-restores-done`: a put back from its row that the server refuses leaves the Undo chip offering a Done made while it was on its way", async () => {
+  const run = async (script = SCRIPT) => {
+    const { page } = await mainAndAllHeld(script);
+    await doneButton(channelRow(page, "201")).click();
+    await page.settle();
+    // 201 put back from its row, its write held: the chip offered 201 alone, so it goes.
+    let release = null;
+    page.inboxWriteHook = async (kind) => (kind === "restore" && release === null
+      ? new Promise((resolve) => { release = () => resolve(STORE_REFUSES()); }) : null);
+    const putBack = doneButton(channelRow(page, "201")).click();
+    await page.settle();
+    assert.ok(release, "the premise is the put back on its way");
+    assert.equal(page.el("undo-dismiss").hidden, true, "the premise is the chip gone with 201 put back");
+    // A Done on 203 meanwhile, its write queued behind: the chip offers it.
+    const done = doneButton(channelRow(page, "203")).click();
+    await page.settle();
+    assert.equal(page.el("undo-dismiss").hidden, false, "the premise is the chip offering the Done on 203");
+    release();
+    await putBack.catch(() => {});
+    await done;
+    for (let i = 0; i < 4; i += 1) await page.settle();
+    page.inboxWriteHook = null;
+    assert.equal(page.el("error").hidden, false, "the premise is the put back refused, and said");
+    assert.equal(doneDrawn(page, "201"), "true", "the premise is 201 Done again, as the server holds it");
+    assert.equal(page.el("undo-dismiss").hidden, false, "the chip went with the refusal");
+    await page.el("undo-dismiss").click();
+    await page.settle();
+    return page;
+  };
+  const page = await run();
+  assert.deepStrictEqual(page.restoreCalls.at(-1), { messages: ["203"] }, "the chip's Undo put back another message than the Done made last");
+  assert.equal(doneDrawn(page, "203"), "false");
+  assert.equal(doneDrawn(page, "201"), "true");
+  // THE CONTROL: the refusal bringing the chip back to what it offered before the put back, whatever it
+  // offers since: it offers 201 again, and the Done on 203 has no Undo.
+  const control = await run(brokenScript("    if (lastDismissal === offer) {", "    if (true) {"));
+  assert.deepStrictEqual(control.restoreCalls.at(-1), { messages: ["201"] },
+    "without the chip's own check the Undo put back 203, so this test cannot see it");
 });
 
 // --- `#315 removed-reply-target`: a reply to a message removed upstream -----------------------------

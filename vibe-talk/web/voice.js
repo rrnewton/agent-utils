@@ -35122,6 +35122,85 @@ function queueInboxWrite(task) {
   return run;
 }
 
+// --- what a refused Done or put back takes back --------------------------------------------------
+//
+// `#326 refused-undo-restores-done`. Found in the final reviews of #306 done-stale-across-views and
+// #311 sent-read-waits-for-done. A Done pressed, then Undo while the Done was still being saved: the
+// Undo's write waits behind the Done's (`queueInboxWrite`). Each refusal took back exactly what its own
+// act had changed, so with both refused, the Undo's took the message back to Done — a Done the server
+// had refused as well. Every view drew it Done while the server held none, the next write saved it into
+// the device's snapshot, and a Reply on it wrote no Done and asked the chat service, whose marker cannot
+// be moved back, to mark it read after_reply.
+//
+// So a refused write takes a message back to what the SERVER holds for it by this page's writes: the
+// last of them it saved, or, none saved, what the page held before the first. Writes settle in the order
+// they were made, so that is known by the time each is answered. Refused while a later write of the
+// message is still on its way, it takes nothing back: that later act is what is drawn, and its own
+// answer settles it. A refused Undo of a refused Done leaves the message not Done; a refused Done
+// pressed again over a refused Undo of a saved one leaves it Done.
+
+/**
+ * By message id, how many of this page's Done and put-back writes naming it are on their way (`writes`),
+ * and whether the server holds it Done by them (`server`): by the last of them it saved, or as the page
+ * held it before the first (`noteInboxWrite`). `#326 refused-undo-restores-done`.
+ *
+ * @type {Map<string, {writes: number, server: boolean}>}
+ */
+const inboxWritesOnTheWay = new Map();
+
+/**
+ * Note a Done or a put back of `ids` as on its way (`inboxWritesOnTheWay`). Called as the act is made,
+ * before it changes anything here: a message no write is on its way for already is held by the server
+ * as the page holds it now (`doneHeldHere`).
+ *
+ * @param {string[]} ids
+ */
+function noteInboxWrite(ids) {
+  for (const id of ids) {
+    const write = inboxWritesOnTheWay.get(id) || { writes: 0, server: doneHeldHere([id]) };
+    write.writes += 1;
+    inboxWritesOnTheWay.set(id, write);
+  }
+}
+
+/**
+ * The write of `ids`, a Done when `done` or else a put back, has been answered; `saved`, the ids the
+ * server took. Answers the refused ids whose take-back is left out (`#326 refused-undo-restores-done`):
+ * each one a later write is on its way for, whose act is what is drawn, and each one the server holds as
+ * this write would have made it — a put back of a Done the server refused as well, or a Done over a put
+ * back it refused of one it had saved.
+ *
+ * `sent` false: the write was never queued — a slip in the page before it (`dismissMessages`,
+ * `restoreMessages`) — so it is only no longer on its way, and nothing is left out. The server never
+ * heard of it, and it settles out of the order writes are answered in: one made before it may still be
+ * on its way, and decides what the server holds. Its act takes back exactly what it changed.
+ *
+ * @param {string[]} ids
+ * @param {boolean} done
+ * @param {Set<string>} saved
+ * @param {boolean} [sent]
+ * @returns {Set<string>}
+ */
+function settleInboxWrite(ids, done, saved, sent = true) {
+  /** @type {Set<string>} */
+  const stands = new Set();
+  for (const id of ids) {
+    const write = inboxWritesOnTheWay.get(id);
+    if (!write) continue;
+    write.writes -= 1;
+    if (!sent) {
+      // Never written: no answer to learn from, and nothing of it to keep.
+    } else if (saved.has(id)) {
+      write.server = done;
+    } else {
+      if (write.writes > 0) stands.add(id);
+      else if (write.server === done) stands.add(id);
+    }
+    if (write.writes === 0) inboxWritesOnTheWay.delete(id);
+  }
+  return stands;
+}
+
 /**
  * `#295 shift-e-read-collapse`. The Done of each message still on its way to the server, by message
  * id: settled, saved or not, once its write has settled and what a failure takes back is taken back.
@@ -35193,29 +35272,55 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
   const previousDismissal = lastDismissal;
   // `#245 done-feedback`. Named now, while the row is still drawn; see `dismissalName`.
   const name = dismissalName(requested);
-  lastDismissal = { channel, messages: requested, bump, name };
+  // This Done's own offer of Undo, marked as its own (`act`), which a put back of some of its messages
+  // from their rows keeps. `#326 refused-undo-restores-done`: once the write is answered the chip is
+  // changed only while it still offers this Done — not once the reader has pressed Undo, or made another
+  // Done, while it was being saved, when it came back offering to put back a message already back.
+  const act = Symbol("done");
+  lastDismissal = { channel, messages: requested, bump, name, act };
+  const offered = () => lastDismissal !== null && lastDismissal.act === act;
+  // Before anything here changes, so that what the server holds is known if it refuses (`#326`).
+  noteInboxWrite(requested);
   for (const id of requested) {
     archivedIds.add(id);
   }
   // Done here from now on, and saved only once the write below is (`doneSaved`).
   const saved = noteDoneSaving(requested);
-  const held = markHeldDone(requested, true, doneSettlesHere());
   // `#229 desktop-two-column`. Done is the message's, so the other column shows it Done as well.
   const column = activeColumn;
-  const mirrored = mirrorArchived(requested, true);
-  // ...and every view held out of sight, and the cards on screen. `#306 done-stale-across-views`.
-  followDoneEverywhere(requested, column);
-  // Before the redraw, so the line moves with the row it was over; and in the other column, whose own
-  // redraw (`mirrorArchived`) came before it, or never came, when it draws none of these messages.
-  const move = bump ? stageBookmark(bump.channel, bump.to) : null;
-  if (move) inOtherColumn(renderScrollTools);
-  await refreshAfterInboxChange();
-  renderTodoControls();
-  setStatus(`Saving ${requested.length} local change${requested.length === 1 ? "" : "s"}…`);
+  // What the lines in the `try` change, for a refusal to take back. `#326 refused-undo-restores-done`:
+  // from the notes above on, everything is in the `try`, so a slip in drawing the Done before its write
+  // is queued takes back exactly what the Done changed, the ledger told no write went (`sent`), and only
+  // then is the wait on it ended. Left out, it left the message Done here with no write on its way, a
+  // wait on it (`doneSaved`) that never ended, and the ledger counting a write still on its way, so every
+  // later refusal of that message took nothing back. Nor is a plain `finally` enough: the Done still drawn
+  // and in the store, a send looking again once the wait ends would find it Done, and ask the chat
+  // service, whose marker cannot be moved back.
+  /** @type {HeldDoneMark | null} */
+  let held = null;
+  /** @type {string[]} */
+  let mirrored = [];
+  /** The bookmark's move, staged with the Done. */
+  /** @type {ReturnType<typeof stageBookmark> | null} */
+  let move = null;
+  /** Whether the Done's write was queued, and the move's behind it (`settleInboxWrite`). */
+  let sent = false;
   let payload;
   /** The ids of the batches the server has taken, when there are several. */
   const landed = [];
   try {
+    held = markHeldDone(requested, true, doneSettlesHere());
+    mirrored = mirrorArchived(requested, true);
+    // ...and every view held out of sight, and the cards on screen. `#306 done-stale-across-views`.
+    followDoneEverywhere(requested, column);
+    // Before the redraw, so the line moves with the row it was over; and in the other column, whose own
+    // redraw (`mirrorArchived`) came before it, or never came, when it draws none of these messages.
+    const staged = bump ? stageBookmark(bump.channel, bump.to) : null;
+    move = staged;
+    if (staged) inOtherColumn(renderScrollTools);
+    await refreshAfterInboxChange();
+    renderTodoControls();
+    setStatus(`Saving ${requested.length} local change${requested.length === 1 ? "" : "s"}…`);
     const writing = queueInboxWrite(async () => {
       const route = `/api/v1/channels/${encodeURIComponent(channel)}/dismiss`;
       if (!body.messages || body.messages.length <= DISMISS_BATCH) {
@@ -35225,9 +35330,10 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
       // may carry, so it goes in batches, and the undo covers all of them.
       return { messages: await writeInBatches(route, body.messages.map(String), landed) };
     });
+    sent = true;
     // Queued straight behind the Done, and sent only once it is saved.
-    if (move) {
-      guardQuietly(() => sendBookmark(move, { conditional: true, after: writing.then(() => true, () => false) }))();
+    if (staged) {
+      guardQuietly(() => sendBookmark(staged, { conditional: true, after: writing.then(() => true, () => false) }))();
     }
     payload = await writing;
   } catch (error) {
@@ -35235,14 +35341,23 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
     // Done there, so they stay Done here, and are what Undo puts back. The bookmark's move, sent only
     // after the whole write, is taken back, which leaves the line above them all.
     const kept = new Set(landed);
-    const failed = requested.filter((id) => !kept.has(id));
-    if (landed.length > 0) settleHeldDone(heldDonePart(held, landed), true);
-    settleHeldDone(landed.length > 0 ? heldDonePart(held, failed) : held, false);
-    lastDismissal = landed.length > 0 ? { channel, messages: landed.slice(), bump: null } : previousDismissal;
+    // `#326 refused-undo-restores-done`: nor what the server holds Done all the same, by an earlier
+    // write of this page that it saved, nor what a later act of the reader's, still on its way, drew.
+    const stands = settleInboxWrite(requested, true, kept, sent);
+    const back = new Set(requested.filter((id) => !kept.has(id) && !stands.has(id)));
+    const standing = requested.filter((id) => !back.has(id));
+    if (held) {
+      if (standing.length > 0) settleHeldDone(heldDonePart(held, standing), true);
+      settleHeldDone(standing.length > 0 ? heldDonePart(held, [...back]) : held, false);
+    }
+    // A move staged before a slip that came ahead of the write: taken back as a refused Done's is.
+    const unsent = sent ? null : move;
+    if (unsent) guardQuietly(() => sendBookmark(unsent, { conditional: true, after: Promise.resolve(false) }))();
+    if (offered()) lastDismissal = landed.length > 0 ? { channel, messages: landed.slice(), bump: null } : previousDismissal;
     // Taken back in the column it was made in, and in the other. `#229 desktop-two-column`.
     inColumn(column, () => {
-      for (const id of added) if (!kept.has(id)) archivedIds.delete(id);
-      mirrorArchived(mirrored.filter((id) => !kept.has(id)), false);
+      for (const id of added) if (back.has(id)) archivedIds.delete(id);
+      mirrorArchived(mirrored.filter((id) => back.has(id)), false);
       guardQuietly(refreshAfterInboxChange)();
     });
     // ...and in every view held, from the store the lines above took it back in; in the left column
@@ -35258,9 +35373,14 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
     // back. It runs after the lines below, which leave the Done as it is.
     saved();
   }
-  settleHeldDone(held, true);
+  settleInboxWrite(requested, true, new Set(requested));
+  if (held) settleHeldDone(held, true);
   const stored = (payload.messages || requested).map(String);
-  lastDismissal = { channel, messages: stored, bump, name };
+  // What the server stored, less what was put back from its row meanwhile.
+  if (offered()) {
+    const still = new Set(lastDismissal.messages);
+    lastDismissal = { channel, messages: stored.filter((id) => still.has(id) || !requested.includes(id)), bump, name, act };
+  }
   const count = stored.length;
   setStatus(
     `${count} message${count === 1 ? "" : "s"} marked as dealt with here — not in the source chat service.`
@@ -35299,34 +35419,54 @@ async function restoreMessages(ids) {
   const restored = ids.map(String);
   const removed = restored.filter((id) => archivedIds.has(id));
   const previousDismissal = lastDismissal;
+  // Before anything here changes, so that what the server holds is known if it refuses (`#326
+  // refused-undo-restores-done`).
+  noteInboxWrite(restored);
   for (const id of restored) {
     archivedIds.delete(id);
   }
-  // `#245 done-feedback`. Unread again, so no longer being drawn as just marked Done: the Undo chip
-  // and z (`undoDismissal`) and the row's own button (`toggleArchived`) all come through here.
-  unflashIds(restored);
-  const held = markHeldDone(restored, false);
   // `#229 desktop-two-column`. Put back in the other column as well.
   const column = activeColumn;
-  const mirrored = mirrorArchived(restored, false);
-  // ...and every view held out of sight, and the cards on screen. `#306 done-stale-across-views`.
-  followDoneEverywhere(restored, column);
-  if (lastDismissal !== null) {
-    const left = lastDismissal.messages.filter((id) => !restored.includes(id));
-    lastDismissal = left.length === 0 ? null : { ...lastDismissal, messages: left };
-  }
-  await refreshAfterInboxChange();
-  renderTodoControls();
-  setStatus(`Restoring ${restored.length} message${restored.length === 1 ? "" : "s"}…`);
+  // What the lines in the `try` change, for a refusal to take back: from the notes above on, a slip
+  // before the write is queued takes back exactly what the put back changed, the ledger told no write
+  // went (`sent`), as in `dismissMessages` (`#326 refused-undo-restores-done`).
+  /** @type {HeldDoneMark | null} */
+  let held = null;
+  /** @type {string[]} */
+  let mirrored = [];
+  // The Undo chip's offer once this has taken its messages out of it. `#326 refused-undo-restores-done`:
+  // a refusal changes the chip back only while it still offers that — not once a Done made while this
+  // was on its way offers its own, which it used to take away, offering this one's again.
+  let offer = lastDismissal;
+  /** Whether the write was queued: a slip before it takes back exactly what this changed. */
+  let sent = false;
   let settled = false;
   /** The ids of the batches the server has taken. */
   const landed = [];
   try {
+    // `#245 done-feedback`. Unread again, so no longer being drawn as just marked Done: the Undo chip
+    // and z (`undoDismissal`) and the row's own button (`toggleArchived`) all come through here.
+    unflashIds(restored);
+    held = markHeldDone(restored, false);
+    mirrored = mirrorArchived(restored, false);
+    // ...and every view held out of sight, and the cards on screen. `#306 done-stale-across-views`.
+    followDoneEverywhere(restored, column);
+    if (lastDismissal !== null) {
+      const left = lastDismissal.messages.filter((id) => !restored.includes(id));
+      lastDismissal = left.length === 0 ? null : { ...lastDismissal, messages: left };
+    }
+    offer = lastDismissal;
+    await refreshAfterInboxChange();
+    renderTodoControls();
+    setStatus(`Restoring ${restored.length} message${restored.length === 1 ? "" : "s"}…`);
     // In batches the server accepts, as the dismissal that made them went: the undo of a long Done
     // through here names more ids than one request may carry. `#240 reading-bookmark`.
-    await queueInboxWrite(() => writeInBatches(`/api/v1/channels/${encodeURIComponent(channel)}/restore`,
+    const writing = queueInboxWrite(() => writeInBatches(`/api/v1/channels/${encodeURIComponent(channel)}/restore`,
       restored, landed));
+    sent = true;
+    await writing;
     // Settled before the read below, which then speaks for these messages.
+    settleInboxWrite(restored, false, new Set(restored));
     settleHeldDone(held, true);
     settled = true;
     if (todoMode && !threadingSupported) {
@@ -35337,20 +35477,23 @@ async function restoreMessages(ids) {
     // are back there, so they stay back here, and are no longer the last dismissal's. A read of the
     // to-do list that failed after every batch landed takes nothing back.
     const kept = new Set(landed);
-    const failed = restored.filter((id) => !kept.has(id));
-    if (!settled) {
-      if (landed.length > 0) settleHeldDone(heldDonePart(held, landed), true);
-      settleHeldDone(landed.length > 0 ? heldDonePart(held, failed) : held, false);
+    // `#326 refused-undo-restores-done`: nor what the server holds put back all the same — a Done this
+    // put back, refused itself — nor what a later act of the reader's, still on its way, drew.
+    const stands = settled ? new Set() : settleInboxWrite(restored, false, kept, sent);
+    const back = new Set(restored.filter((id) => !kept.has(id) && !stands.has(id)));
+    if (!settled && held) {
+      const standing = restored.filter((id) => !back.has(id));
+      if (standing.length > 0) settleHeldDone(heldDonePart(held, standing), true);
+      settleHeldDone(standing.length > 0 ? heldDonePart(held, [...back]) : held, false);
     }
-    if (previousDismissal === null) {
-      lastDismissal = null;
-    } else {
-      const left = previousDismissal.messages.filter((id) => !kept.has(id));
-      lastDismissal = left.length === 0 ? null : { ...previousDismissal, messages: left };
+    // Unless the chip has changed since: a Done made meanwhile offers its own Undo, which stands.
+    if (lastDismissal === offer) {
+      const left = previousDismissal === null ? [] : previousDismissal.messages.filter((id) => !kept.has(id));
+      lastDismissal = previousDismissal === null || left.length === 0 ? null : { ...previousDismissal, messages: left };
     }
     inColumn(column, () => {
-      for (const id of removed) if (!kept.has(id)) archivedIds.add(id);
-      mirrorArchived(mirrored.filter((id) => !kept.has(id)), true);
+      for (const id of removed) if (back.has(id)) archivedIds.add(id);
+      mirrorArchived(mirrored.filter((id) => back.has(id)), true);
       guardQuietly(refreshAfterInboxChange)();
     });
     // ...and in every view held, from the store the lines above took it back in; in the left column

@@ -324,7 +324,15 @@ put away or show their cards, and the cards' counts of unread replies. Nothing i
 an Undo the server refuses is taken back in all of them, both columns included whatever the right one
 did while it was on its way: its thread closed or opened again, or two columns put away or brought
 back. `#306 done-stale-across-views`; `make -C vibe-talk done-sync-browser` checks it in Chromium on a
-phone, frame by frame as the view is chosen.
+phone, frame by frame as the view is chosen. A refusal takes the message back to what the server holds
+for it by this page's writes (a Done made on another device meanwhile is not seen until a read), which
+is not always how it was before the act refused: **Undo** pressed while a Done is still being saved,
+both refused, leaves the message not Done, and a Reply on it then writes its Done before the chat
+service is asked anything (`#326 refused-undo-restores-done`). A refusal that arrives while a later
+**Done** or **Undo** of the same message is still on its way leaves that later act drawn, and the
+**Undo** chip, once pressed, does not come back when the Done it took back is saved, nor does a refused
+Undo take away the chip of a Done made while it was on its way. A Done or an Undo that fails in the
+page before its write is sent takes back exactly what it changed, and no wait on it is left hanging.
 
 Known limits of the counts (`#222 unread-replies`):
 - A reply the page never held that is marked Done on another device still counts as new on its
