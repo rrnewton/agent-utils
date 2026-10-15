@@ -14606,9 +14606,10 @@ function inTimeOrder(items, field) {
 /**
  * Fold one page into the store. A NEWEST page is the truth for its view from its oldest row up, so
  * a row of that view it does not carry there was deleted upstream and goes; an older page only
- * adds. Rows another view holds are untouched either way.
+ * adds. Rows another view holds are untouched either way. `page` is every row the page carries, where
+ * it reaches back to, when `arriving` is only the rows the store takes of it (`pageFold`).
  */
-function mergeIntoCanon(field, arriving, older, hasMore, belongs) {
+function mergeIntoCanon(field, arriving, older, hasMore, belongs, page = arriving) {
   const timeField = field === "threads" ? "updated_at" : "timestamp";
   // A message the store holds word for word keeps the store's object, the one the rows on screen
   // were drawn from, as a delta's does (`foldTimelineDelta`). `#229 desktop-two-column`: a thread's
@@ -14622,7 +14623,7 @@ function mergeIntoCanon(field, arriving, older, hasMore, belongs) {
     });
   }
   const incoming = new Set(arriving.map((item) => String(item.id)));
-  const edge = arriving.length ? timeOf(arriving[0], timeField) : NaN;
+  const edge = page.length ? timeOf(page[0], timeField) : NaN;
   const kept = channelCanon[field].filter((item) => !incoming.has(String(item.id)) &&
     (older || !belongs(item) || (hasMore && Number.isFinite(edge) && timeOf(item, timeField) < edge)));
   channelCanon[field] = inTimeOrder(older ? [...arriving, ...kept] : [...kept, ...arriving], timeField);
@@ -14670,18 +14671,18 @@ function coverView(arriving, older, hasMore, notice, view = channelView, thread 
 }
 
 /**
- * Fold a page read for a view — the current one by default — into the store. `answersFor`, when
- * given, is the ids of the messages the store held when a newest page was sent (`heldIds`): it speaks
- * only for those, and keeps every message the store has gained since, which it was sent too early to
- * carry (`readAllForCounts`, `#308 live-reply-in-main`).
+ * Fold a page read for a view — the current one by default — into the store. Never a message removed
+ * upstream after the read was sent; and `held`, when given, is the store's copies as a late read was
+ * sent (`heldNow`): it is folded only over the copies the store still holds as they were (`pageFold`,
+ * `#316 late-counts-resurrect`).
  *
  * @param {any} payload
  * @param {boolean} older
  * @param {string} [view]
  * @param {string | null} [thread]
- * @param {Set<string> | null} [answersFor]
+ * @param {Map<string, any> | null} [held]
  */
-function foldTimelinePage(payload, older, view = channelView, thread = selectedThreadId, answersFor = null) {
+function foldTimelinePage(payload, older, view = channelView, thread = selectedThreadId, held = null) {
   const channel = String(el("discord-channel").value);
   if (channelCanon.channel !== channel) loadCanon(channel);
   const hasMore = payload.has_more === true;
@@ -14691,13 +14692,15 @@ function foldTimelinePage(payload, older, view = channelView, thread = selectedT
   // A channel that is one thread has no other thread to show beside it. `#229 desktop-two-column`.
   if (channelCanon.scope !== scopeWas) Promise.resolve().then(renderColumns);
   const before = view === "threads" ? new Map() : heldCopies(payload.messages || []);
+  const fold = pageFold(channelCanon, payload, held);
+  const taken = view === "threads" ? [] : (payload.messages || []).filter(fold.takes);
   if (view === "threads") {
     mergeIntoCanon("threads", payload.threads || [], older, hasMore, () => true);
   } else {
     const inPage = view === "flat" ? allPageAnswersFor(payload.messages || [], Boolean(payload.notice))
       : (message) => inView(message, view, thread);
-    const belongs = answersFor ? (message) => answersFor.has(String(message.id)) && inPage(message) : inPage;
-    mergeIntoCanon("messages", payload.messages || [], older, hasMore, belongs);
+    mergeIntoCanon("messages", taken, older, hasMore, (message) => fold.answers(message) && inPage(message),
+      payload.messages || []);
   }
   if (payload.thread) upsertThreadSummary(payload.thread);
   if (view !== "thread") channelCanon.hasThreads = payload.has_threads === true;
@@ -14711,15 +14714,64 @@ function foldTimelinePage(payload, older, view = channelView, thread = selectedT
     const asOf = staleAsOf(payload);
     if (asOf !== null) cover.at = asOf;
   }
-  // A page is the server's own answer for every message on it, thread record or none.
-  for (const message of payload.messages || []) channelCanon.unplaced.delete(String(message.id));
+  // A page is the server's own answer for every message on it, thread record or none...
+  for (const message of taken) channelCanon.unplaced.delete(String(message.id));
   believeCarried(channelCanon, payload);
   for (const summary of [...(payload.threads || []), payload.thread]) {
     if (summary && summary.root) channelCanon.unplaced.delete(String(summary.root.id));
   }
+  // ...and one it did not take the copy of still says where it is, if the stream left that unplaced.
+  if (view !== "threads" && taken.length < (payload.messages || []).length) {
+    placeFromPage(payload, channelCanon, sentNumberOf(payload), held);
+  }
   // ...and read state too, and what it says of the replies the store lacks. `#222 unread-replies`.
   foldReadState(payload, view);
   noteReplyGaps(payload, view, older, false, before);
+}
+
+/**
+ * What a page of a view, `payload`, may fold into store `canon` (`foldTimelinePage`): the messages it
+ * `takes` its copy of, and those it `answers` for — takes out as deleted where it does not carry them.
+ * `#316 late-counts-resurrect`.
+ *
+ * NEVER A MESSAGE REMOVED UPSTREAM AFTER IT WAS SENT (`removedSince`). It is older than the removal:
+ * it takes no copy of the message, and does not take it out either, which the read behind the
+ * removal does. The read of All for Main's counts, sent before a removal and landing after Main's
+ * read had taken the message out, brought it back onto Main until the next full read.
+ *
+ * AND WITH `held` — the store's copies as the read was sent (`heldNow`) — ONLY OVER THE COPIES THE
+ * STORE STILL HOLDS AS THEY WERE: the check a placing read is folded by (`heldAsSent`), message by
+ * message (`heldUnchanged`). It takes its copy of a message held unchanged since, and of one the store
+ * has not held at all — unless that is on the main channel and a newest page of Main sent after it has
+ * landed, which speaks for it and did not leave it in the store, as an answer of All that is not folded
+ * puts back nothing such a page took out (`placeFromPage`). It answers only for the messages held
+ * unchanged. A copy replaced since — an edit Main's read brought, a thread record, a count — is newer
+ * than the page, which put back the text from before the edit; a message taken out since it would put
+ * back; and one gained since it was sent too early to speak for, and took out as deleted (`#310
+ * stale-live-read-flicker`). Of what it does not take, a message the stream left unplaced still takes
+ * its thread record (`placeFromPage`), and the counts, which come of the replies it brings that the
+ * store never held, are what such a read is for.
+ *
+ * @param {any} canon
+ * @param {VibeTalk.TimelineResponse} payload
+ * @param {Map<string, any> | null} held
+ */
+function pageFold(canon, payload, held) {
+  const number = sentNumberOf(payload);
+  const unchanged = held ? heldUnchanged(canon, held) : null;
+  const holds = held ? heldIds(canon) : null;
+  return {
+    /** @param {any} message */
+    takes: (message) => {
+      const id = String(message.id);
+      if (removedSince(canon, id, number)) return false;
+      if (!held || !unchanged || !holds) return true;
+      if (held.has(id)) return unchanged.has(id);
+      return !holds.has(id) && (answeredThread(message) !== null || !newerPage(canon, "main", number));
+    },
+    /** @param {any} message */
+    answers: (message) => !removedSince(canon, String(message.id), number) && (!unchanged || unchanged.has(String(message.id))),
+  };
 }
 
 /**
@@ -14837,7 +14889,9 @@ function foldTimelineDelta(payload, sent, view = channelView, thread = selectedT
       archivedIds.delete(id);
     }
   }
-  const arriving = payload.messages || [];
+  // Never a message removed upstream after it was sent (`removedSince`, `#316 late-counts-resurrect`).
+  const number = sentNumberOf(payload);
+  const arriving = (payload.messages || []).filter((message) => !removedSince(channelCanon, String(message.id), number));
   const before = heldCopies(arriving);
   const fresh = arriving.filter((message) => !sameMessage(before.get(String(message.id)), message));
   if (fresh.length) {
@@ -18434,8 +18488,9 @@ function outrunningThreads() {
 /**
  * Read All's newest page behind Main, for Main's counts, when they call for it and it is due: see
  * above. Folded as a read of All landing behind Main is (`foldLateTimelinePage`), which brings Main's
- * rows and chips up to date from it, and saves it with the device's copy — speaking only for the
- * messages the store held when it was sent (`foldTimelinePage`).
+ * rows and chips up to date from it, and saves it with the device's copy — only over the copies the
+ * store still holds as they were when it was sent, and never bringing back a message removed upstream
+ * since (`pageFold`, `#316 late-counts-resurrect`).
  */
 async function readAllForCounts(channel) {
   if (!threadingSupported || !channel || String(el("discord-channel").value) !== channel || channelView !== "main" ||
@@ -18449,11 +18504,12 @@ async function readAllForCounts(channel) {
   if (![...outrun].some(([id, count]) => !(saw && (saw.get(id) || 0) >= count))) return;
   countsAllReadAt.set(channel, now);
   countsAllReadInFlight = channel;
-  // What the page can speak for: the messages held as it is sent. One the store gains while it is out
+  // What the page can speak for: the store's copies as it is sent. One the store gains while it is out
   // — a reply the stream delivers, placed by a delta of All while this page is still on its way, or the
-  // reader's own send — is newer than the page, which would take it out as deleted (`#310`).
+  // reader's own send — is newer than the page, which would take it out as deleted (`#310`); one it
+  // replaces — an edit Main's read brings — the page would undo; one it loses, the page would put back.
   const read = { context: JSON.stringify([channel, "flat", null]), channel, view: "flat", thread: null, canon: channelCanon,
-    answersFor: heldIds(channelCanon) };
+    held: heldNow(channelCanon) };
   const seen = unplacedArrivals;
   try {
     const payload = await within(CHANNEL_READ_TIMEOUT_MS, (signal) => readTimeline(
@@ -18470,7 +18526,7 @@ async function readAllForCounts(channel) {
     // is folded over it.
     if (!newerPage(channelCanon, "flat", number)) {
       foldLateTimelinePage(payload, read);
-    } else if (current && placeFromPage(payload, read.canon, number)) {
+    } else if (current && placeFromPage(payload, read.canon, number, read.held)) {
       // Not folded, it still says where each message the stream left unplaced that it carries is.
       followPlacement();
     }
@@ -19307,7 +19363,7 @@ async function loadTimeline(options) {
  * the view it was read for, so the store keeps it — the same store, for the same channel and
  * token: a cleared screen or another channel is a new store, and the page is dropped. Without
  * this, a switch during the cold-start refresh would leave that view "saved" until the poll.
- * `read.answersFor`, when the read gives it, is what the page speaks for (`foldTimelinePage`).
+ * `read.held`, when the read gives it, is the store's copies as it was sent (`pageFold`).
  */
 function foldLateTimelinePage(payload, read) {
   if (!threadingSupported || channelCanon !== read.canon || read.canon.channel !== read.channel ||
@@ -19317,7 +19373,7 @@ function foldLateTimelinePage(payload, read) {
     inColumn(read.column, () => foldLateTimelinePage(payload, read));
     return;
   }
-  foldTimelinePage(payload, false, read.view, read.thread, read.answersFor || null);
+  foldTimelinePage(payload, false, read.view, read.thread, read.held || null);
   channelCanon.views.get(viewKey(read.view, read.thread)).landedHidden = true;
   if (read.context === channelContextKey()) {
     // Back on the view it was read for: that view is current now, not only on its next showing.
@@ -19842,8 +19898,8 @@ function answeredThread(message) {
 // removal from the stream, or a delta's deletions, says the message is gone, and it is no longer left
 // unplaced (`forgetUnplaced`). A reply removed while the placing read was out used to come back in its
 // thread from that read's answer, counted as unread. And the read of All for Main's counts, which is
-// folded for what it brings, speaks only for the messages the store held when it was sent
-// (`readAllForCounts`).
+// folded for what it brings, is folded only over the store's copies as they were when it was sent,
+// and never brings back a message removed upstream since (`pageFold`, `#316 late-counts-resurrect`).
 //
 // NOR WHILE A READ OF THE CHANNEL THE PAGE GAVE UP ON MAY STILL BE ANSWERED (`remote-ops-audit` W7).
 // The server is still reading for it, and behind a bridge that read is a scan of the space: a read
@@ -19942,6 +19998,20 @@ function believeCarried(canon, payload) {
     const at = canon.removed.get(String(message.id));
     if (at !== undefined && number > at) canon.removed.delete(String(message.id));
   }
+}
+
+/**
+ * Whether message `id` was removed upstream (`noteRemoved`) after the read numbered `number`
+ * (`sentNumberOf`) was sent: that read is older than the removal, and never brings the message back.
+ * `#316 late-counts-resurrect`.
+ *
+ * @param {any} canon
+ * @param {string} id
+ * @param {number} number
+ */
+function removedSince(canon, id, number) {
+  const at = canon.removed.get(id);
+  return at !== undefined && at >= number;
 }
 
 /** Whether message `id` of the selected channel is removed upstream, as far as this page knows (`noteRemoved`). */
@@ -20116,7 +20186,7 @@ function landPlacingRead(payload, read) {
 function placeFromAnswer(payload, read) {
   const { canon, channel } = read;
   if (channelCanon !== canon || canon.channel !== channel || String(el("discord-channel").value) !== channel) return;
-  const placed = placeFromPage(payload, canon, read.number);
+  const placed = placeFromPage(payload, canon, read.number, read.held);
   if (!(read.sent && payload.delta && payload.delta.more)) answerUnplaced(canon, read.seen);
   if (placed) followPlacement();
 }
@@ -20166,6 +20236,24 @@ function heldAsSent(canon, held) {
 }
 
 /**
+ * The same check, message by message: the ids store `canon` still holds as the copies `held` recorded
+ * when a read was sent (`heldNow`), neither taken out since nor replaced. What a late page of a view
+ * is folded over (`pageFold`). `#316 late-counts-resurrect`.
+ *
+ * @param {any} canon
+ * @param {Map<string, any>} held
+ * @returns {Set<string>}
+ */
+function heldUnchanged(canon, held) {
+  /** @type {Set<string>} */
+  const unchanged = new Set();
+  for (const message of canon.messages) {
+    if (held.get(String(message.id)) === message) unchanged.add(String(message.id));
+  }
+  return unchanged;
+}
+
+/**
  * What `payload`, an answer of All that is not folded, says of the messages the stream left unplaced in
  * store `canon`: see "an answer of All that is not folded" above. Each it carries is placed — the store's
  * copy takes the thread record the answer's copy has, and nothing else of it, and one the answer carries
@@ -20173,12 +20261,19 @@ function heldAsSent(canon, held) {
  * carries it, unless a newest page sent after the answer (`number`, `sentNumberOf`) that speaks for it
  * has landed. True when it placed any.
  *
+ * `held`, the store's copies as the read was sent (`heldNow`): a message whose copy the store still
+ * holds as it was then takes the answer's whole copy, which is the newer (`#316 late-counts-resurrect`).
+ * A bridge that streams its answer by editing it, while the placing page was out, used to have its
+ * reply placed in its thread with the text it was first pushed with, until the next read of that
+ * thread or of All. A copy replaced since is newer than the answer, and takes only the record.
+ *
  * @param {VibeTalk.TimelineResponse} payload
  * @param {any} canon
  * @param {number} number
+ * @param {Map<string, any> | null} [held]
  * @returns {boolean}
  */
-function placeFromPage(payload, canon, number) {
+function placeFromPage(payload, canon, number, held = null) {
   /** @type {Map<string, any>} by id, the answer's copies of the messages left unplaced */
   const carried = new Map();
   for (const message of payload.messages || []) {
@@ -20188,14 +20283,15 @@ function placeFromPage(payload, canon, number) {
   }
   if (carried.size === 0) return false;
   let placed = false;
-  canon.messages = canon.messages.map((held) => {
-    const id = String(held.id);
+  canon.messages = canon.messages.map((stored) => {
+    const id = String(stored.id);
     const copy = carried.get(id);
-    if (!copy) return held;
+    if (!copy) return stored;
     carried.delete(id);
     canon.unplaced.delete(id);
     placed = true;
-    return threadOf(copy) ? { ...held, thread: copy.thread } : held;
+    if (held && held.get(id) === stored) return copy;
+    return threadOf(copy) ? { ...stored, thread: copy.thread } : stored;
   });
   // One the store no longer holds was taken out by a newest page that does not speak for it — one of
   // Main, which carries no thread reply, or one sent before it arrived — or by one sent after this

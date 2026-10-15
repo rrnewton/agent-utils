@@ -288,7 +288,12 @@ one saved on the device; only for news — a message already seen at the same co
 read does not ask again; and never while the page is hidden. A read that fails waits out the same
 five minutes. Discord's own threads never ask, having no exact counts. On a Slack channel where agents
 keep answering while you sit on Main, that is a read about every five minutes: some 130 of Slack's
-calls an hour on top of Main's own refresh.
+calls an hour on top of Main's own refresh. Behind a slow chat service that read can land after
+Main's own reads have moved on, so it changes only what the page still holds as it held it when
+the read was sent (`#316 late-counts-resurrect`): it never brings back a message removed upstream
+since, nor puts back the text from before an edit Main's read has brought, nor takes away a message
+that arrived while it was out. It still brings the replies the page did not hold, which is what the
+counts need.
 
 **Slack's All brings the replies of at most ten threads per page**, the ten most recently active
 among its messages, and says so in its notice. A thread past those ten is on the page with its count
@@ -4430,8 +4435,10 @@ A message pushed WITHOUT a thread record is not known to be anywhere. The page d
 where most such messages belong, and once the read behind it is done reads All to place it
 (`reason=place`), after any read of the channel the page gave up on has been answered. A thread reply
 pushed that way shows on Main until that read lands, which behind a slow chat service can be more than
-a minute (`#308 live-reply-in-main`). So an adapter that can say where a message is should say so in
-every create and update, not only in its reads.
+a minute (`#308 live-reply-in-main`). A bridge that streams its answer by editing it while that read
+is out has it placed with the text the read found, not the text it was first pushed with (`#316
+late-counts-resurrect`). So an adapter that can say where a message is should say so in every create
+and update, not only in its reads.
 
 Updates use `kind: "update"` with the complete current message. Deletes use
 `{"event_id":"…","historical":false,"kind":"delete","channel_id":"123","message_id":"9001"}`.
