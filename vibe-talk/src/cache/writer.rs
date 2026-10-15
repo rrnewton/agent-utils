@@ -15,8 +15,9 @@
 //! - **Control operations** (an erase, a sweep, maintenance) run alone, after the batch before
 //!   them has committed and been published, and are published themselves as soon as their own
 //!   short transaction commits. An erase detaches the channel's rows from its name (no read can
-//!   reach them from then on) and leaves deleting them to background steps. An erase the file
-//!   refuses is owed: what it covers stays blocked, and a background step tries it again after a
+//!   reach them from then on) and leaves deleting them to background steps; once it has committed,
+//!   the channel is recorded as a drop, since it forgot the deletions and edits the live feed
+//!   delivered for it ([`Writer::forget_feed`]). An erase the file refuses is owed: what it covers stays blocked, and a background step tries it again after a
 //!   backoff until the file takes it. A refused sweep still erases every channel it left out,
 //!   even one a later route snapshot names again.
 //! - **Background work runs in steps** of about [`STEP`], one transaction each, alternating with
@@ -204,6 +205,7 @@ pub(crate) fn run(
                 pace_rebuild: Pace::new(),
                 since_merge: 0,
                 events: Vec::new(),
+                detached: Vec::new(),
             };
             writer.start();
             let _ = started.send(());
@@ -634,6 +636,9 @@ struct Writer<'c> {
     /// What the transaction under way has done that the store must follow: sent when it commits
     /// ([`Writer::announce`]), dropped when it rolls back.
     events: Vec<WriterEvent>,
+    /// The channels the transaction under way has erased whole ([`Writer::detach`]): each recorded
+    /// as a drop when it commits ([`Writer::forget_feed`]), and forgotten when it rolls back.
+    detached: Vec<ChanKey>,
 }
 
 /// How long one kind of step works before it writes its index entries out, which takes a time
@@ -1153,21 +1158,46 @@ impl Writer<'_> {
         work: impl FnOnce(&mut Self) -> rusqlite::Result<T>,
     ) -> rusqlite::Result<T> {
         self.events.clear();
+        self.detached.clear();
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         match work(self) {
             Ok(value) => {
                 if let Err(error) = self.conn.execute_batch("COMMIT") {
                     self.events.clear();
+                    self.detached.clear();
                     return Err(error);
                 }
                 self.announce();
+                self.forget_feed();
                 Ok(value)
             }
             Err(error) => {
                 let _ = self.conn.execute_batch("ROLLBACK");
                 self.events.clear();
+                self.detached.clear();
                 Err(error)
             }
+        }
+    }
+
+    /// The channels the transaction that has just committed erased whole. Each forgot, with its
+    /// rows, the tombstones of the deletions the live feed delivered for it and the edits it
+    /// delivered; and a read begun after the erase, its stamp current, may still bring a copy its
+    /// provider dated before them (a bridge's copy it could not bring up to date, which the fill
+    /// dates then). Landing in a channel that no longer remembers the change, that copy would bring
+    /// back a deleted message, or text edited away, and the feed would vouch for it for as long as
+    /// the process runs: the feed vouches for nothing since the file was opened only because every
+    /// change since then reached the file, or was recorded as left out.
+    ///
+    /// So each is recorded as a drop, now, after every observation the erase forgot ([`Writer::lost`]),
+    /// and the channel's next row takes it when it is made ([`Writer::intern`]): no row observed by
+    /// then, nor any head listed by then, is vouched for until a read begun after the erase has seen
+    /// it again. Recorded once the erase has committed, never inside it: in its transaction the drop
+    /// would be written to the row about to be renamed, which a file that refuses the erase refuses
+    /// too, and the drop would then be owed for ever.
+    fn forget_feed(&mut self) {
+        for chan in std::mem::take(&mut self.detached) {
+            self.lost(&chan);
         }
     }
 
@@ -2191,7 +2221,8 @@ impl Writer<'_> {
     /// out of every reader's reach ([`ERASED_PROVIDER`]), and its rows are deleted by later
     /// steps; one that holds none is deleted outright, its tombstones, coverage and heads with
     /// it. A channel the file never held costs nothing. Each one the file named is announced as
-    /// erased, so the store can forget its summaries.
+    /// erased, so the store can forget its summaries, and is recorded as a drop once the erase has
+    /// committed, since it forgot what the live feed delivered for it ([`Writer::forget_feed`]).
     fn detach(&mut self, chans: &[ChanKey]) -> rusqlite::Result<()> {
         for chan in chans {
             let Some(id) = self.find_chan(chan)? else {
@@ -2200,6 +2231,7 @@ impl Writer<'_> {
             self.events.push(WriterEvent::ChannelErased {
                 channel_id: ChannelId(chan.channel_id.clone()),
             });
+            self.detached.push(chan.clone());
             let holds: bool = self.conn.query_row(
                 "SELECT EXISTS (SELECT 1 FROM message WHERE chan = ?1)",
                 [id],

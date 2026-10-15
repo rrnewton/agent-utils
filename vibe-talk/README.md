@@ -3816,6 +3816,14 @@ back keeps its rows, and one whose access was lost keeps them until the refusal 
 erase is heard again. Either way nothing the live feed told the server before that start is taken as
 proof that a held message is current.
 
+An erase of a whole channel, however it comes (its access lost, its provider erased, or the channel
+taken off the list and put back), takes with the channel's messages the tombstones of the deletions
+the live feed had reported, and the edits it had reported. A read that began after the erase may
+still bring a copy older than one of them: a bridge's copy it could not bring up to date is dated
+when the bridge last saw the channel. Nothing would then hold the deleted message, or the old text,
+back. So once the erase is carried out the channel is in doubt too, as after a change left out: no
+message of it seen by then is trusted until a read that began afterwards has seen it again.
+
 ### Whose reads fill it
 
 * **A read-scope token never fills it.** The read token is the one pasted into a voice agent. No

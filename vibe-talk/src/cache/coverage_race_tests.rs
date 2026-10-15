@@ -17,6 +17,14 @@
 //! - **A refused sweep**: a sweep the file refused has dropped what was on its way for the
 //!   channels it left out, so it must erase them when it is carried out, even one put back on the
 //!   list since; and an erase carried out late must not let a read begun before it land after it.
+//!
+//! And what the second review of the fix found:
+//!
+//! - **A copy dated before a whole-channel erase**: an erase of a whole channel (a confirmed loss
+//!   of access, a provider erase, a sweep, at once or carried out late) forgets the deletions and
+//!   edits the live feed delivered for it. A read begun after it, its stamp current, may still
+//!   bring a copy its provider dated before them; the feed must not vouch for what that copy
+//!   brings back.
 
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
@@ -845,5 +853,324 @@ fn a_read_begun_before_a_refused_erase_was_carried_out_never_lands_after_it() {
     assert!(
         !(decision == shadow::Decision::Serve && content.is_some()),
         "a message deleted upstream would be served by id: {content:?}"
+    );
+}
+
+/// How a whole channel is erased: each detaches its rows, its tombstones and its coverage with it.
+#[derive(Clone, Copy, Debug)]
+enum WholeErase {
+    /// Access to the channel confirmed lost ([`MessageCache::erase_channels`]).
+    Channel,
+    /// The provider's credential refused for good ([`MessageCache::erase_provider`]).
+    Provider,
+    /// The owner takes the channel off the list in Settings and puts it back: a sweep.
+    Sweep,
+}
+
+const WHOLE_ERASES: [WholeErase; 3] =
+    [WholeErase::Channel, WholeErase::Provider, WholeErase::Sweep];
+
+/// Erase `chan` whole, as `how` does, and wait until the writer has carried it out.
+fn erase_whole(cache: &MessageCache, chan: &ChanKey, how: WholeErase) {
+    match how {
+        WholeErase::Channel => cache.erase_channels(std::slice::from_ref(chan)),
+        WholeErase::Provider => cache.erase_provider(&chan.provider_key),
+        WholeErase::Sweep => {
+            cache.retain_only(RouteSnapshot::new(
+                Vec::<ChanKey>::new(),
+                [chan.provider_key.clone()],
+            ));
+            assert!(cache.quiesce_blocking(WAIT));
+            cache.retain_only(RouteSnapshot::new(
+                [chan.clone()],
+                [chan.provider_key.clone()],
+            ));
+        }
+    }
+    assert!(cache.quiesce_blocking(WAIT));
+}
+
+/// A read of `chan`'s Flat list, m1 to m8 as first read, begun now under a stamp taken now, whose
+/// provider dated its copy `as_of`: a bridge's copy it could not bring up to date, which the fill
+/// dates then though the read began later (`Fill::observed`). `proven`: whether it proves the
+/// newest stretch, or vouches for nothing but the rows.
+fn read_dated(cache: &MessageCache, chan: &ChanKey, as_of: i64, proven: bool) {
+    let rows = (1..=8).map(|n| Incoming::new(m(n), Scope::Flat)).collect();
+    let observation = if proven {
+        Observation::Listing(Listing {
+            scope: Scope::Flat,
+            rows,
+            observed_ms: as_of,
+            proof: Some(newest_proof(ListStart::At(T0 + STEP))),
+        })
+    } else {
+        Observation::Rows {
+            rows,
+            scope: Some(Scope::Flat),
+            observed_ms: as_of,
+        }
+    };
+    let stamp = cache.stamp(chan);
+    cache.offer(chan.clone(), stamp, observation);
+    assert!(cache.quiesce_blocking(WAIT));
+}
+
+/// The feed of a live-fed bridge delivers a change of m3 at `first` + 10 s, and the file records
+/// it: its deletion (a tombstone), or with `edit` an edit to `EDITED`. At `first` + 20 s the whole
+/// channel is erased as `how` erases it (none for the control), the change with its rows. At
+/// `first` + 30 s a read begins, its stamp current, and lands with its provider's copy dated
+/// `first` + 5 s, before the change. The cache and the channel, the clock at `first` + 30 s.
+fn change_erase_then_older_copy(
+    dir: &crate::testing::TempDir,
+    clock: &Arc<ManualClock>,
+    first: i64,
+    how: Option<WholeErase>,
+    edit: bool,
+    proven: bool,
+) -> (MessageCache, ChanKey) {
+    let (cache, chan) = bridge_with_flat(dir, clock, first);
+    let changed_at = first + 10 * SEC;
+    clock.set(changed_at);
+    let stamp = cache.stamp(&chan);
+    if edit {
+        let mut changed = m(3);
+        changed.content = "EDITED".to_owned();
+        cache.offer(
+            chan.clone(),
+            stamp,
+            Observation::Push {
+                push: Push::Upsert {
+                    message: Box::new(Incoming::new(changed, Scope::Flat)),
+                    update: true,
+                    partial: false,
+                },
+                observed_ms: changed_at,
+            },
+        );
+    } else {
+        offer_deletion_of_m3(&cache, &chan, stamp, changed_at);
+    }
+    assert!(cache.quiesce_blocking(WAIT));
+    let held = decide_m3(&cache, &chan, changed_at + 1).1;
+    let expected = edit.then(|| "EDITED".to_owned());
+    assert_eq!(held, expected, "the feed's change landed");
+    if let Some(how) = how {
+        clock.set(first + 20 * SEC);
+        erase_whole(&cache, &chan, how);
+    }
+    clock.set(first + 30 * SEC);
+    read_dated(&cache, &chan, first + 5 * SEC, proven);
+    (cache, chan)
+}
+
+/// Whether the cache would vouch, by id, for m3 as the feed's change left it: deleted (no text),
+/// or with `edit` holding `EDITED`. A decision that serves anything else vouches for a change the
+/// feed delivered being undone.
+fn vouches_for_undone_change(
+    decision: shadow::Decision,
+    content: Option<&str>,
+    edit: bool,
+) -> bool {
+    decision == shadow::Decision::Serve
+        && if edit {
+            content != Some("EDITED")
+        } else {
+            content.is_some()
+        }
+}
+
+/// The control: with no erase, the deletion's tombstone holds the older copy of m3 back, and the
+/// edit's later observation keeps its text.
+#[test]
+fn control_an_older_copy_with_no_erase_never_undoes_the_feeds_change() {
+    for edit in [false, true] {
+        let dir = crate::testing::TempDir::new("cache-older-copy-control");
+        let first = T0 + 8 * STEP + SEC;
+        let clock = Arc::new(ManualClock(AtomicI64::new(first)));
+        let (cache, chan) = change_erase_then_older_copy(&dir, &clock, first, None, edit, true);
+        let asked = first + 40 * SEC;
+        clock.set(asked);
+        let (decision, content) = decide_m3(&cache, &chan, asked);
+        assert!(
+            !vouches_for_undone_change(decision, content.as_deref(), edit),
+            "edit {edit}: {decision:?} {content:?}"
+        );
+    }
+}
+
+/// A whole-channel erase detaches the tombstone of a deletion the live feed delivered. A read begun
+/// after the erase, its stamp current, but answered from a bridge's copy dated before the deletion,
+/// lands in a channel that no longer remembers it: the deleted m3 comes back, with nothing to hold
+/// it. The feed must not vouch for it: not ten seconds on, while the read's own claim would, nor a
+/// day and an hour on, past [`shadow::REVALIDATED_BRIDGE_MS`], where only the feed could, for as
+/// long as the process runs. By every erase that detaches a channel: a confirmed loss of access, a
+/// provider erase, and a sweep (the channel taken off the list and put back). (The reviews'
+/// probes `rv2_a_channel_erase_then_a_bridge_copy_dated_before_a_deletion_never_vouches_for_it`,
+/// `rv2_d_a_channel_swept_and_put_back_then_a_bridge_copy_dated_before_a_deletion_never_vouches_for_it`,
+/// `rv2_a_snapshot_older_than_a_channel_erase_never_brings_back_a_deleted_message` and
+/// `rv2_a_snapshot_older_than_a_sweep_never_brings_back_a_deleted_message`.)
+#[test]
+fn a_copy_dated_before_a_whole_channel_erase_never_brings_back_a_deletion_the_feed_delivered() {
+    let mut vouched = Vec::new();
+    for how in WHOLE_ERASES {
+        let dir = crate::testing::TempDir::new("cache-older-copy-deleted");
+        let first = T0 + 8 * STEP + SEC;
+        let clock = Arc::new(ManualClock(AtomicI64::new(first)));
+        let (cache, chan) =
+            change_erase_then_older_copy(&dir, &clock, first, Some(how), false, true);
+        for asked in [first + 40 * SEC, first + 25 * HOUR] {
+            clock.set(asked);
+            let (decision, content) = decide_m3(&cache, &chan, asked);
+            if vouches_for_undone_change(decision, content.as_deref(), false) {
+                vouched.push(format!(
+                    "{how:?}, asked {} s on: {decision:?} {content:?}",
+                    (asked - first) / SEC
+                ));
+            }
+        }
+    }
+    assert!(
+        vouched.is_empty(),
+        "a message deleted upstream, its deletion delivered by the feed, is vouched for: {vouched:#?}"
+    );
+}
+
+/// The same for an edit the feed delivered: the copy from before it brings the old text back, and
+/// the old text must never be vouched for. (The review's probe
+/// `rv2_b_channel_erase_then_a_bridge_copy_dated_before_an_edit_never_vouches_for_the_old_text`.)
+#[test]
+fn a_copy_dated_before_a_whole_channel_erase_never_brings_back_text_the_feed_edited_away() {
+    let mut vouched = Vec::new();
+    for how in WHOLE_ERASES {
+        let dir = crate::testing::TempDir::new("cache-older-copy-edited");
+        let first = T0 + 8 * STEP + SEC;
+        let clock = Arc::new(ManualClock(AtomicI64::new(first)));
+        let (cache, chan) =
+            change_erase_then_older_copy(&dir, &clock, first, Some(how), true, true);
+        for asked in [first + 40 * SEC, first + 25 * HOUR] {
+            clock.set(asked);
+            let (decision, content) = decide_m3(&cache, &chan, asked);
+            if vouches_for_undone_change(decision, content.as_deref(), true) {
+                vouched.push(format!(
+                    "{how:?}, asked {} s on: {decision:?} {content:?}",
+                    (asked - first) / SEC
+                ));
+            }
+        }
+    }
+    assert!(
+        vouched.is_empty(),
+        "text edited away is vouched for: {vouched:#?}"
+    );
+}
+
+/// The feed's own promise, with no claim beside it: the older copy proves nothing, so only the
+/// feed's vouching window could vouch for it. That window runs from the file's opening, and a
+/// whole-channel erase forgets what the feed delivered since: it must not vouch for a copy dated
+/// before the erase. (The review's probe
+/// `rv2_fed_since_vouches_for_a_copy_dated_before_a_channel_erase_forgot_its_deletion`.)
+#[test]
+fn the_feed_alone_never_vouches_for_a_copy_dated_before_a_whole_channel_erase() {
+    let mut vouched = Vec::new();
+    for how in WHOLE_ERASES {
+        for edit in [false, true] {
+            let dir = crate::testing::TempDir::new("cache-older-copy-fed");
+            let first = T0 + 8 * STEP + SEC;
+            let clock = Arc::new(ManualClock(AtomicI64::new(first)));
+            let (cache, chan) =
+                change_erase_then_older_copy(&dir, &clock, first, Some(how), edit, false);
+            let asked = first + 40 * SEC;
+            clock.set(asked);
+            let (decision, content) = decide_m3(&cache, &chan, asked);
+            if vouches_for_undone_change(decision, content.as_deref(), edit) {
+                vouched.push(format!("{how:?}, edit {edit}: {decision:?} {content:?}"));
+            }
+        }
+    }
+    assert!(
+        vouched.is_empty(),
+        "the feed vouches for a copy dated before the erase: {vouched:#?}"
+    );
+}
+
+/// The erase of a channel the file refused, carried out later, forgets the deletion the feed
+/// delivered before it as surely: a copy dated before it, read after it, must not bring m3 back
+/// for the feed to vouch for.
+#[test]
+fn a_copy_dated_before_an_erase_carried_out_late_never_brings_back_a_deletion_the_feed_delivered() {
+    let dir = crate::testing::TempDir::new("cache-older-copy-owed");
+    let first = T0 + 8 * STEP + SEC;
+    let clock = Arc::new(ManualClock(AtomicI64::new(first)));
+    let (cache, chan) = bridge_with_flat(&dir, &clock, first);
+    clock.set(first + 10 * SEC);
+    let stamp = cache.stamp(&chan);
+    offer_deletion_of_m3(&cache, &chan, stamp, first + 10 * SEC);
+    assert!(cache.quiesce_blocking(WAIT));
+    let (release, locker) = super::tests::hold_write_lock(&cache);
+    let applied = cache.stats().ops_applied;
+    clock.set(first + 20 * SEC);
+    cache.erase_channels(std::slice::from_ref(&chan));
+    wait_applied(&cache, applied, 1, "the erase was never tried");
+    release.send(()).expect("release");
+    locker.join().expect("locker");
+    let held = served_again(&cache, &chan, "the refused erase was never carried out");
+    assert!(held.is_empty(), "the channel was erased: {held:?}");
+    clock.set(first + 30 * SEC);
+    read_dated(&cache, &chan, first + 5 * SEC, true);
+    for asked in [first + 40 * SEC, first + 25 * HOUR] {
+        clock.set(asked);
+        let (decision, content) = decide_m3(&cache, &chan, asked);
+        assert!(
+            !vouches_for_undone_change(decision, content.as_deref(), false),
+            "asked {} s on: {decision:?} {content:?}",
+            (asked - first) / SEC
+        );
+    }
+}
+
+/// What a whole-channel erase leaves in doubt is lifted as on any drop: a read that began after it
+/// vouches for what it lists, and its listing takes out the older copy's m3, which it did not list.
+#[test]
+fn a_read_begun_after_a_whole_channel_erase_is_vouched_for_again() {
+    let dir = crate::testing::TempDir::new("cache-older-copy-lifted");
+    let first = T0 + 8 * STEP + SEC;
+    let clock = Arc::new(ManualClock(AtomicI64::new(first)));
+    let (cache, chan) =
+        change_erase_then_older_copy(&dir, &clock, first, Some(WholeErase::Channel), false, true);
+    clock.set(first + 40 * SEC);
+    let flat = Observation::Listing(Listing {
+        scope: Scope::Flat,
+        rows: (1..=8)
+            .filter(|&n| n != 3)
+            .map(|n| Incoming::new(m(n), Scope::Flat))
+            .collect(),
+        observed_ms: first + 40 * SEC,
+        proof: Some(newest_proof(ListStart::At(T0 + STEP))),
+    });
+    let stamp = cache.stamp(&chan);
+    cache.offer(chan.clone(), stamp, flat);
+    assert!(cache.quiesce_blocking(WAIT));
+    let asked = first + 50 * SEC;
+    clock.set(asked);
+    let (decision, content) = decide_m3(&cache, &chan, asked);
+    assert_eq!(content, None, "the read took m3 out: {decision:?}");
+    let ask = shadow::Ask::Message {
+        consumer: shadow::Consumer::MessageById,
+        id: m(1).id,
+    };
+    let query = shadow::query(&ask, observe::Shape::Bridge, true).expect("a query");
+    let view = cache.shadow_view(&chan, &query).served().expect("served");
+    let facts = shadow::Facts {
+        asked_ms: asked,
+        live_fed: true,
+        fed_since_ms: Some(cache.fed_since_ms()),
+        dropped_ms: cache.last_drop_ms(&chan),
+        barrier: true,
+        feed: shadow::Feed::Deletions,
+    };
+    assert_eq!(
+        shadow::decide(&ask, &view, &facts),
+        shadow::Decision::Serve,
+        "m1, listed by a read begun after the erase, is vouched for again"
     );
 }
