@@ -1542,7 +1542,9 @@ nothing is salvaged from a dirty tree:
   Git's own, by name and type: an unknown top-level entry, anything in the object store that is not
   a loose object (with a zlib header), pack-family file, commit-graph or index, anything under
   `modules/` that is not a module repository, a non-empty `branches/`, `remotes/` or `lfs/`, a lock
-  file, and an unknown entry of a linked worktree's directory refuse, as do a configured content
+  file, a ref file Git silently skips (a dot-file or `*.lock` under `refs/`, which is what a ref
+  update killed partway leaves, or a ref outside the per-worktree namespaces in a linked worktree's
+  `refs/`), and an unknown entry of a linked worktree's directory refuse, as do a configured content
   filter (in the repository's or a linked worktree's configuration)
  (`filter.*.clean` or `filter.*.process`, which can make an edited file look clean);
 - nothing may lie outside a checkout or Git directory, except a handoff;

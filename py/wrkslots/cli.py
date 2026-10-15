@@ -43240,8 +43240,8 @@ _OWNERLESS_CLONE_TREE_CONFIG: tuple[tuple[str, str], ...] = (
 
 # The shape of a repository directory, checked entry by entry and by type.
 # Anything that does not fit refuses rather than being deleted unexamined.
-# refs/ is inventoried by for-each-ref (a stray file there is a broken ref and
-# refuses); logs/, info/, hooks/ and rr-cache/ are declared as not preserved;
+# refs/ is inventoried by for-each-ref, and walked for the files Git skips
+# (dot-files and *.lock), which refuse; logs/, info/, hooks/ and rr-cache/ are declared as not preserved;
 # a repository nested anywhere is found by the walk and inventoried itself.
 _GIT_DIR_FILES = frozenset(
     {
@@ -43256,6 +43256,7 @@ _GIT_DIR_FILES = frozenset(
         "packed-refs",
         "shallow",
         "gc.log",
+        "config.worktree",
     }
 )
 _GIT_DIR_FREE_FORM = frozenset({"refs", "logs", "info", "hooks", "rr-cache"})
@@ -43331,8 +43332,7 @@ def _ownerless_clone_unexpected_git_content(
                     if not (
                         regular(loose)
                         and (
-                            (_LOOSE_OBJECT_RE.fullmatch(loose.name) and loose_object(Path(loose.path)))
-                            or loose.name.startswith("tmp_obj_")
+                            _LOOSE_OBJECT_RE.fullmatch(loose.name) and loose_object(Path(loose.path))
                         )
                     ):
                         note(Path(loose.path))
@@ -43357,12 +43357,36 @@ def _ownerless_clone_unexpected_git_content(
                                 note(Path(graph.path))
                     else:
                         note(Path(info.path))
-            elif name in {"commit-graph", "multi-pack-index"} and regular(entry):
-                continue
-            elif re.fullmatch(r"tmp_(?:obj|pack|idx|graph)_[A-Za-z0-9]+", name) and regular(entry):
-                continue
             else:
                 note(path)
+
+    def check_refs(refs: Path, allowed: tuple[str, ...] | None) -> None:
+        """Refuse what Git's ref store silently skips, so it cannot hide a commit.
+
+        Git ignores a ref file whose name starts with "." or ends with
+        ".lock" (a ref update killed partway leaves exactly that), so
+        for-each-ref neither lists nor warns about it. In a linked
+        worktree's refs/, Git reads only the per-worktree namespaces in
+        ``allowed``; anything else there is never read either.
+        """
+
+        pending = [refs]
+        while pending:
+            current = pending.pop()
+            for item in entries(current):
+                item_path = Path(item.path)
+                relative = "refs/" + item_path.relative_to(refs).as_posix()
+                if item.name.startswith(".") or item.name.endswith(".lock"):
+                    note(item_path)
+                elif allowed is not None and not any(
+                    relative.startswith(prefix) or prefix.startswith(relative + "/")
+                    for prefix in allowed
+                ):
+                    note(item_path)
+                elif directory(item):
+                    pending.append(item_path)
+                elif not regular(item):
+                    note(item_path)
 
     def check_modules(modules: Path) -> None:
         for entry in entries(modules):
@@ -43389,6 +43413,8 @@ def _ownerless_clone_unexpected_git_content(
         elif name in _GIT_DIR_FREE_FORM:
             if not directory(entry):
                 note(path)
+            elif name == "refs":
+                check_refs(path, None)
         elif name in _GIT_DIR_EMPTY_ONLY:
             if not directory(entry) or entries(path):
                 note(path)
@@ -43416,6 +43442,15 @@ def _ownerless_clone_unexpected_git_content(
                             note(Path(item.path))
                     elif item.name in {"logs", "refs"}:
                         if not directory(item):
+                            note(Path(item.path))
+                        elif item.name == "refs":
+                            check_refs(Path(item.path), _OWNERLESS_CLONE_PER_WORKTREE_REFS)
+                    elif item.name == "modules":
+                        # Submodules initialised in a linked worktree keep
+                        # their repositories here.
+                        if directory(item):
+                            check_modules(Path(item.path))
+                        else:
                             note(Path(item.path))
                     else:
                         note(Path(item.path))
@@ -44010,6 +44045,24 @@ def _ownerless_clone_inventory(config: Config, target: Path) -> _CloneInventory:
                 extra.append((f"refs/stash@{{{number}}}", value))
         checkouts = sorted(repositories[git_dir])
         registered: set[Path] = set()
+        # A submodule's Git directory names its working tree in core.worktree;
+        # Git's worktree listing reports the Git directory itself instead.
+        configured_worktree = vcs._run(
+            git_dir, ["config", "--get", "core.worktree"], env_overrides=env, check=False
+        ).stdout.strip()
+        main_worktree: Path | None = None
+        if configured_worktree:
+            candidate = Path(configured_worktree)
+            if not candidate.is_absolute():
+                candidate = git_dir / candidate
+            if candidate.exists():
+                main_worktree = candidate.resolve()
+                if not inside(main_worktree):
+                    raise Refusal(
+                        f"Git directory {key} has its working tree {main_worktree} outside "
+                        "the clone; removing the clone would break it"
+                    )
+                registered.add(main_worktree)
         for record in _ownerless_clone_worktrees(vcs, git_dir):
             raw_path = record.get("worktree")
             if raw_path is None:
@@ -44052,8 +44105,10 @@ def _ownerless_clone_inventory(config: Config, target: Path) -> _CloneInventory:
         # that is bare) is not covered by any status: anything staged there
         # exists nowhere else.
         main_records = _ownerless_clone_worktrees(vcs, git_dir)[:1]
-        main_present = bool(main_records) and "bare" not in main_records[0] and (
-            Path(main_records[0].get("worktree", "")).resolve() in set(checkouts)
+        main_present = (main_worktree is not None and main_worktree in set(checkouts)) or (
+            bool(main_records)
+            and "bare" not in main_records[0]
+            and Path(main_records[0].get("worktree", "")).resolve() in set(checkouts)
         )
         if (git_dir / "index").exists() and not main_present:
             if head.returncode == 0:
@@ -45390,8 +45445,9 @@ def _cmd_recover_ownerless_agent_clone(args: argparse.Namespace) -> int:
         return _cmd_recover_ownerless_agent_clone_checked(args)
     except UnicodeError as exc:
         raise Refusal(
-            f"a path or ref in the clone is not valid UTF-8 ({exc}); nothing was removed. "
-            "Inspect and rename it first"
+            f"a path or ref in the clone is not valid UTF-8 ({exc}); the command stopped. "
+            "Check its output above for whether removal had begun, then inspect and rename "
+            "the path"
         ) from exc
 
 

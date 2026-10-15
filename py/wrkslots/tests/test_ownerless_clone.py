@@ -1111,3 +1111,107 @@ def test_refuses_a_filter_in_a_linked_worktree_config_and_the_ident_attribute(
     git(clone / "wt", "config", "--worktree", "--unset", "filter.keep.clean")
     (clone / ".git" / "info" / "attributes").write_text("*.txt ident\n", encoding="utf-8")
     assert_refused_and_preserved(project, clone, remote, capsys, "ident attribute")
+
+
+def test_refuses_ref_files_git_silently_skips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, remote, clone = make_clone(tmp_path)
+    git(clone, "switch", "-q", "-c", "agent/work")
+    commit(clone, "work.txt")
+    git(clone, "switch", "-q", "main")
+    git(clone, "reflog", "expire", "--expire=now", "--all")
+    heads = clone / ".git" / "refs" / "heads" / "agent"
+    # What a ref update killed partway leaves: the only name is a lock file.
+    (heads / "work").rename(heads / "work.lock")
+    allow_test_host(monkeypatch)
+    assert_refused_and_preserved(project, clone, remote, capsys, "refs/heads/agent/work.lock")
+    (heads / "work.lock").unlink()
+    (clone / ".git" / "refs" / "heads" / ".notes.md").write_text("only copy\n", encoding="utf-8")
+    assert_refused_and_preserved(project, clone, remote, capsys, "refs/heads/.notes.md")
+
+
+def test_refuses_a_ref_a_linked_worktree_never_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, remote, clone = make_clone(tmp_path)
+    (clone / ".git" / "info" / "exclude").write_text("wt/\n", encoding="utf-8")
+    git(clone, "worktree", "add", "-q", "--detach", str(clone / "wt"))
+    tip = commit(clone / "wt", "feature.txt")
+    git(clone / "wt", "checkout", "-q", "--detach", "HEAD~1")
+    git(clone, "reflog", "expire", "--expire=now", "--all")
+    stray = clone / ".git" / "worktrees" / "wt" / "refs" / "heads" / "feature"
+    stray.parent.mkdir(parents=True)
+    stray.write_text(f"{tip}\n", encoding="utf-8")
+    allow_test_host(monkeypatch)
+    assert_refused_and_preserved(project, clone, remote, capsys, "worktrees/wt/refs/heads")
+
+
+def test_a_clone_with_an_initialised_submodule_and_worktree_config_is_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, remote, clone = make_clone(tmp_path)
+    sub_remote = tmp_path / "sub.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(sub_remote)], check=True)
+    sub_source = tmp_path / "sub-source"
+    subprocess.run(["git", "clone", "-q", str(sub_remote), str(sub_source)], check=True,
+                   capture_output=True)
+    git(sub_source, "config", "user.name", "x")
+    git(sub_source, "config", "user.email", "x@example.invalid")
+    commit(sub_source, "s.txt")
+    git(sub_source, "push", "-q", "origin", "HEAD:refs/heads/main")
+    git(clone, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub_remote), "subm")
+    git(clone, "commit", "-q", "-m", "add submodule")
+    git(clone, "push", "-q", "origin", "main")
+    git(clone, "config", "extensions.worktreeConfig", "true")
+    git(clone, "config", "--worktree", "core.sparseCheckout", "false")
+    assert (clone / ".git" / "config.worktree").is_file()
+    allow_test_host(monkeypatch)
+    digest, output = dry_run_digest(
+        project, clone, remote, capsys, "--remote-url", f".git/modules/subm={sub_remote}"
+    )
+    assert "REPOSITORY key=.git/modules/subm" in output and "checkouts=1" in output
+    assert (
+        run_clone(
+            project,
+            clone,
+            remote,
+            "--remote-url",
+            f".git/modules/subm={sub_remote}",
+            apply=True,
+            digest=digest,
+        )
+        == 0
+    )
+    assert not clone.exists()
+
+
+def test_a_submodule_initialised_in_a_linked_worktree_is_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, remote, clone = make_clone(tmp_path)
+    sub_remote = tmp_path / "sub.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(sub_remote)], check=True)
+    sub_source = tmp_path / "sub-source"
+    subprocess.run(["git", "clone", "-q", str(sub_remote), str(sub_source)], check=True,
+                   capture_output=True)
+    git(sub_source, "config", "user.name", "x")
+    git(sub_source, "config", "user.email", "x@example.invalid")
+    commit(sub_source, "s.txt")
+    git(sub_source, "push", "-q", "origin", "HEAD:refs/heads/main")
+    git(clone, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub_remote), "subm")
+    git(clone, "commit", "-q", "-m", "add submodule")
+    git(clone, "push", "-q", "origin", "main")
+    (clone / ".git" / "info" / "exclude").write_text("wt/\n", encoding="utf-8")
+    git(clone, "worktree", "add", "-q", "--detach", str(clone / "wt"))
+    git(clone / "wt", "-c", "protocol.file.allow=always", "submodule", "update", "--init", "-q")
+    keys = sorted(
+        path.relative_to(clone).as_posix() for path in (clone / ".git").rglob("modules/subm")
+    )
+    assert len(keys) == 2
+    extra: list[str] = []
+    for key in keys:
+        extra += ["--remote-url", f"{key}={sub_remote}"]
+    allow_test_host(monkeypatch)
+    digest, output = dry_run_digest(project, clone, remote, capsys, *extra)
+    assert "blockers=0" in output
