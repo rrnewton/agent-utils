@@ -1,12 +1,13 @@
 ---
 title: 'slack-emoji-shortcodes: show standard Slack emoji shortcodes as emoji'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-15T06:03:00.407145513+00:00
-updated_at: 2026-10-15T06:03:00.407145513+00:00
+updated_at: 2026-10-15T06:59:46.604354059+00:00
+closed_at: 2026-10-15T06:59:46.604353919+00:00
 ---
 
 # Description
