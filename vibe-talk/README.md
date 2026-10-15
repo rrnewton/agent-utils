@@ -3638,8 +3638,8 @@ It is **not encrypted**. Anyone who can read this account's files can read it, a
 ### Turning it on for a host
 
 **Enabling it only fills the file and measures what it would have served:** nothing is answered
-from it in this build. The races that would have let it claim more than it holds were closed in
-#297 cache-coverage-races.
+from it in this build. #297 cache-coverage-races closed the races found so far that would have let
+it claim more than it holds, and lists the ones a build that answers from it must still settle.
 
 1. **Deploy this build first, without the table, and let it run.** A build from before
    `summary-keep` refuses to start with a `[message_cache]` table at all (an unknown section). The
@@ -3807,9 +3807,14 @@ writes again, at the latest as the server stops. A record the file still cannot 
 with the process.
 
 An erase the file refuses the same way is not given up: what it covers is not read from the cache,
-and the server tries the erase again, a second or more apart, until the file takes it. That is in
-memory only: a server stopped before then, with the file still refusing, starts again with the rows
-it could not erase, until the refusal that asked for the erase is heard again.
+and the server tries the erase again, a second or more apart, until the file takes it. A channel
+taken off the list is erased then even if it was put back in the meantime: changes on their way to
+the file for it when it was taken off were set aside, and what the file holds of it can no longer be
+trusted. That is in memory only: a server stopped before then, with the file still refusing, starts
+again with the rows it could not erase. A channel still off the list is swept at that start; one put
+back keeps its rows, and one whose access was lost keeps them until the refusal that asked for the
+erase is heard again. Either way nothing the live feed told the server before that start is taken as
+proof that a held message is current.
 
 ### Whose reads fill it
 
