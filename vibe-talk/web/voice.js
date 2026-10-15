@@ -15002,8 +15002,16 @@ function deltaSideState(thread) {
  * case behind Main — they never were. Not a `replayed` copy: the stream replays what it had before it
  * attached, and a read since may have counted it already. Not a root's count of none, which needs
  * nothing: the reply is all its thread's replies, and is held.
+ *
+ * `read`, given only for the copy a reply's read of All brought of a message the stream left unplaced
+ * (`placeReplyTarget`), is where that read was sent (`sentNumberOf`). The copy stands there
+ * (`copyOrder`), and says what the read found, not the message as it was posted (`postedCopies`).
+ * `#316 late-counts-resurrect`: taken for the stream's copy, built on its bare one, it let the read of
+ * All for Main's counts, sent before the reply's read and landing after it, take its own older copy
+ * over it. A bridge's finished answer, which the reply's read had brought, went back to the text it
+ * was pushed with, saved, and shown in its thread or in All until a read of either landed.
  */
-function foldLiveMessage(message, live = false, replayed = false) {
+function foldLiveMessage(message, live = false, replayed = false, read = null) {
   const channel = String(el("discord-channel").value);
   if (channelCanon.channel !== channel) loadCanon(channel);
   const id = String(message.id);
@@ -15022,12 +15030,14 @@ function foldLiveMessage(message, live = false, replayed = false) {
   }
   channelCanon.messages = inTimeOrder(
     [...channelCanon.messages.filter((candidate) => String(candidate.id) !== id), kept], "timestamp");
-  // Where it stands in the order of reads (`copyOrder`, `#310 stale-live-read-flicker`): a message the
-  // store did not hold is newer than every read sent before it arrived, and one it held is as new as the
-  // store's copy was (`copyBuiltOn`). Either says the message as it was posted (`postedCopies`).
-  if (!held) orderCopy(kept, orderNow());
+  // Where it stands in the order of reads (`copyOrder`, `#310 stale-live-read-flicker`): a copy a read
+  // brought (`read`) where that read was sent. A message the store did not hold is newer than every read
+  // sent before it arrived, and one it held is as new as the store's copy was (`copyBuiltOn`). Either
+  // says the message as it was posted (`postedCopies`).
+  if (read !== null) copyOrder.set(kept, read);
+  else if (!held) orderCopy(kept, orderNow());
   else if (held !== kept) buildCopyOn(kept, held);
-  if (held !== kept) postedCopies.add(kept);
+  if (read === null && held !== kept) postedCopies.add(kept);
   if (!live || threadOf(kept)) channelCanon.unplaced.delete(id);
   else if (!held) {
     channelCanon.unplaced.add(id);
@@ -20010,17 +20020,18 @@ async function placeReplyTarget(entry) {
   refuseRemoved();
   const held = current() ? heldMessage(id) : null;
   if (held && !channelCanon.unplaced.has(id)) return answeredThread(held);
-  const payload = await apiDecoded(
-    "TimelineResponse",
+  const payload = await readTimeline(
     `/api/v1/channels/${encodeURIComponent(entry.channel)}/timeline?view=flat&limit=${DISCORD_PAGE_LIMIT}` +
       "&reason=reply-place"
   );
   const messages = payload.messages || [];
   if (current()) {
     // What the read says about every message the stream left unplaced, not only this one. The
-    // page itself is not folded: the view on screen is the next read's to redraw.
+    // page itself is not folded: the view on screen is the next read's to redraw. Each copy it gives
+    // stands where the read was sent (`copyOrder`), so no read sent before it undoes it.
+    const number = sentNumberOf(payload);
     for (const message of messages) {
-      if (channelCanon.unplaced.has(String(message.id))) foldLiveMessage(message);
+      if (channelCanon.unplaced.has(String(message.id))) foldLiveMessage(message, false, false, number);
     }
     saveChannelScope();
   }

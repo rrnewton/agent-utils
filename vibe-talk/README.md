@@ -4438,7 +4438,9 @@ where most such messages belong, and once the read behind it is done reads All t
 pushed that way shows on Main until that read lands, which behind a slow chat service can be more than
 a minute (`#308 live-reply-in-main`). A bridge that streams its answer by editing it while that read
 is out has it placed with the text the read found, not the text it was first pushed with (`#316
-late-counts-resurrect`). So an adapter that can say where a message is should say so in every create
+late-counts-resurrect`). The same holds when a reply to the message is what places it
+(`reason=reply-place`): a read of All sent before that one and landing after it does not put the
+pushed text back. So an adapter that can say where a message is should say so in every create
 and update, not only in its reads.
 
 Updates use `kind: "update"` with the complete current message. Deletes use
