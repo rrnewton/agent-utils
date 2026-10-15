@@ -4352,6 +4352,17 @@ def _lock_path(subject: Path) -> Path:
     return subject.with_name(f"{subject.name}.lock")
 
 
+# The lock files this thread holds a flock on, counted per path. A thread that holds the
+# registry lock must not wait for it again through a second descriptor (that waits for
+# itself), so a reader checks this before it takes the lock on its own.
+_HELD_LOCKS = threading.local()
+
+
+def _holds_lock(subject: Path) -> bool:
+    held: dict[Path, int] = getattr(_HELD_LOCKS, "paths", {})
+    return held.get(_lock_path(subject), 0) > 0
+
+
 @contextlib.contextmanager
 def _locked(subject: Path, *, exclusive: bool, wait_seconds: float) -> Iterator[None]:
     path = _lock_path(subject)
@@ -4386,7 +4397,15 @@ def _locked(subject: Path, *, exclusive: bool, wait_seconds: float) -> Iterator[
                         f"state lock is busy for {subject}; retry after the current command exits"
                     ) from exc
                 time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
-        yield
+        held: dict[Path, int] = getattr(_HELD_LOCKS, "paths", None) or {}
+        _HELD_LOCKS.paths = held
+        held[path] = held.get(path, 0) + 1
+        try:
+            yield
+        finally:
+            held[path] -= 1
+            if not held[path]:
+                del held[path]
     finally:
         try:
             fcntl.flock(fd, fcntl.LOCK_UN)
@@ -8138,7 +8157,53 @@ def _load_all_archives(
     return archives
 
 
+class _RegistryOverlap(StateError):
+    """A slot read as both active and archived."""
+
+
+# How long a reader that holds no registry lock, and read a slot as both active and
+# archived, waits for the registry lock before it reports that overlap.
+_OVERLAP_REREAD_LOCK_WAIT_SECONDS = 60.0
+
+
 def _validate_global_state(
+    config: Config,
+    *,
+    require_repository: bool = True,
+) -> tuple[list[ActiveState], list[ArchiveState]]:
+    """Load and validate every machine's ACTIVE and ARCHIVED state.
+
+    A mutation that retires a row writes its archive entry before it deletes the
+    ACTIVE row, and both happen under the exclusive registry lock. A
+    recover-absent-validate-rows batch spends its second liveness check between
+    the two (11 s for the batch on 2026-10-15). A caller holding that lock never
+    sees the gap, but some read paths hold no lock (the ownerless-clone dry run,
+    classify-create-journals, clean-caches and others). Such a reader refused with
+    "is active on ... and archived on ..." while the batch for
+    validate-fresh-383e7d19f719-518722-53ff9b4a was mid-flight. So a reader that
+    sees an overlap without holding the lock takes the shared lock, which waits for
+    the writer to finish, and reads again; only an overlap that survives that read
+    is reported. A thread that already holds the lock reports the overlap at once,
+    as before, and so does a reader that cannot take the lock.
+    """
+    try:
+        return _validate_global_state_once(config, require_repository=require_repository)
+    except _RegistryOverlap as overlap:
+        subject = config.control / "ACTIVE"
+        if _holds_lock(subject):
+            raise
+        first = overlap
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(
+                _locked(subject, exclusive=False, wait_seconds=_OVERLAP_REREAD_LOCK_WAIT_SECONDS)
+            )
+        except Refusal:
+            raise first from None
+        return _validate_global_state_once(config, require_repository=require_repository)
+
+
+def _validate_global_state_once(
     config: Config,
     *,
     require_repository: bool = True,
@@ -8152,7 +8217,7 @@ def _validate_global_state(
         for record in archive.records:
             slot = _as_str(record.get("slot"), "archive slot")
             if slot in active_slots:
-                raise StateError(
+                raise _RegistryOverlap(
                     f"slot {slot!r} is active on {active_slots[slot]} and archived on {archive.machine}"
                 )
     return states, archives

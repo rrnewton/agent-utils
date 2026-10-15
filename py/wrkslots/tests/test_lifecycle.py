@@ -45220,6 +45220,122 @@ def classify_validate(project: Path, slot: str) -> int:
     )
 
 
+def test_a_lockless_reader_waits_out_an_absent_batch_between_its_archive_and_active_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Production 2026-10-15: a reader holding no lock read
+    validate-fresh-383e7d19f719-518722-53ff9b4a as active and archived during the
+    11 s an absent-row batch spent in its second liveness check, and refused."""
+    project, repository, _remote = make_project(tmp_path)
+    made = create(project, slot="gone-a", agent="validate-a", branch=None, slot_type="validate")
+    assert made.returncode == 0, made.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    record = mark_recorded_owner_dead(project, "gone-a")
+    make_validate_row_absent(project, repository, record)
+    input_path = write_absent_validate_input(project, [record])
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    overlaps: list[str] = []
+    real_once = wrkslots._validate_global_state_once
+
+    def counting_once(
+        config_arg: wrkslots.Config, *, require_repository: bool = True
+    ) -> tuple[list[wrkslots.ActiveState], list[wrkslots.ArchiveState]]:
+        try:
+            return real_once(config_arg, require_repository=require_repository)
+        except wrkslots._RegistryOverlap:
+            overlaps.append(threading.current_thread().name)
+            raise
+
+    monkeypatch.setattr(wrkslots, "_validate_global_state_once", counting_once)
+    result: dict[str, object] = {}
+
+    def lockless_reader() -> None:
+        try:
+            states, _archives = wrkslots._validate_global_state(config)
+            result["slots"] = [row.slot for state in states for row in state.slots]
+        except Exception as exc:  # reported by the assertions below
+            result["error"] = exc
+
+    reader = threading.Thread(target=lockless_reader, name="lockless-reader")
+    real_safe = wrkslots._assert_absent_validate_rows_safe
+
+    def read_inside_the_gap(
+        config_arg: wrkslots.Config, rows: Sequence[wrkslots.ActiveRecord]
+    ) -> None:
+        archived = {entry.get("slot") for entry in wrkslots._load_archive(config_arg).records}
+        if any(row.slot in archived for row in rows) and reader.ident is None:
+            # The archive is durable and the ACTIVE row is still there: start the
+            # reader and keep the gap open until it has read the overlap.
+            reader.start()
+            deadline = time.monotonic() + 20
+            while "lockless-reader" not in overlaps:
+                assert time.monotonic() < deadline, result
+                time.sleep(0.01)
+            time.sleep(0.2)
+            assert result == {}, "the reader finished while the batch held the lock"
+        real_safe(config_arg, rows)
+
+    monkeypatch.setattr(wrkslots, "_assert_absent_validate_rows_safe", read_inside_the_gap)
+    assert run_absent_validate_recovery(project, input_path, apply=True) == 0
+    reader.join(30)
+    assert not reader.is_alive()
+    assert "error" not in result, result
+    assert result["slots"] == []
+    assert overlaps == ["lockless-reader"]
+
+
+def test_an_overlap_that_survives_the_locked_reread_or_a_lock_holder_reports_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _input_path, _config = _absent_batch_refused_after_its_archives(
+        tmp_path, monkeypatch
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    reads: list[bool] = []
+    real_once = wrkslots._validate_global_state_once
+
+    def recording_once(
+        config_arg: wrkslots.Config, *, require_repository: bool = True
+    ) -> tuple[list[wrkslots.ActiveState], list[wrkslots.ArchiveState]]:
+        reads.append(wrkslots._holds_lock(config_arg.control / "ACTIVE"))
+        return real_once(config_arg, require_repository=require_repository)
+
+    monkeypatch.setattr(wrkslots, "_validate_global_state_once", recording_once)
+    # The refused batch's overlap is real state: the locked reread sees it too.
+    with pytest.raises(wrkslots.StateError, match="is active on testhost and archived on"):
+        wrkslots._validate_global_state(config)
+    assert reads == [False, True]
+    assert not wrkslots._holds_lock(config.control / "ACTIVE")
+    # A thread that holds the registry lock reports it at once, without a second read.
+    reads.clear()
+    with wrkslots._mutation_locks(config, 1.0):
+        with pytest.raises(wrkslots.StateError, match="is active on testhost and archived on"):
+            wrkslots._validate_global_state(config)
+    assert reads == [True]
+    # So does a reader that cannot take the lock in time.
+    reads.clear()
+    monkeypatch.setattr(wrkslots, "_OVERLAP_REREAD_LOCK_WAIT_SECONDS", 0.2)
+    holder_ready = threading.Event()
+    release = threading.Event()
+
+    def hold_the_lock() -> None:
+        with wrkslots._mutation_locks(config, 1.0):
+            holder_ready.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=hold_the_lock)
+    holder.start()
+    try:
+        assert holder_ready.wait(10)
+        with pytest.raises(wrkslots.StateError, match="is active on testhost and archived on"):
+            wrkslots._validate_global_state(config)
+    finally:
+        release.set()
+        holder.join(10)
+    assert reads == [False]
+
+
 def test_create_and_classification_proceed_beside_an_interrupted_absent_validate_batch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
