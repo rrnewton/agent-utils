@@ -1,12 +1,13 @@
 ---
 title: 'removed-reply-target: a reply to a message removed upstream goes to the main channel'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-15T05:48:32.156222900+00:00
-updated_at: 2026-10-15T05:48:32.156222900+00:00
+updated_at: 2026-10-15T06:11:03.720091254+00:00
+closed_at: 2026-10-15T06:11:03.720091103+00:00
 ---
 
 # Description
