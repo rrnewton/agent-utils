@@ -1,12 +1,13 @@
 ---
 title: 'sent-read-waits-for-done: a confirmed send asks the chat service only after its Done is saved'
-status: open
+status: closed
 priority: 3
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-14T23:02:09.699471316+00:00
-updated_at: 2026-10-14T23:02:09.699471316+00:00
+updated_at: 2026-10-15T06:45:14.426323317+00:00
+closed_at: 2026-10-15T06:45:14.426323187+00:00
 ---
 
 # Description
