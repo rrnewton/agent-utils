@@ -64617,10 +64617,14 @@ const LONG_CARD_DRAFT = "The release notes for this week, as agreed: the runner 
  * browser gives it: while the card is docked on the main screen it takes its `offsetHeight`, `docked` px
  * to begin with, from the foot of both columns' lists. `settled()` is a browser's next layout: a list
  * grown shorter than its place is clamped to its foot, the sizes are reported, and what was waiting runs.
+ * `arrange` is handed the page before it loads, as `newPage`'s is (a session history, `enableHistory`).
  */
-async function draftOverThreads(script, docked, { proposed = true } = {}) {
+async function draftOverThreads(script, docked, { proposed = true, arrange = null } = {}) {
   const data = manyThreads(16);
-  const page = newPage(new Map(), script, (p) => p.enableResizeObserver());
+  const page = newPage(new Map(), script, (p) => {
+    p.enableResizeObserver();
+    if (arrange) arrange(p);
+  });
   page.threadingSupported = true;
   page.threads = data.threads;
   page.messages = data.messages;
@@ -65989,6 +65993,206 @@ test("`#269 approval-card-inline` x `#280 scroll-stability`: BACK FROM SETTINGS,
   // only the card alike, on every way back.
   const late = await run(brokenScript('  if (name === "main" && previous !== "main") postCardBackToMain();\n', ""));
   assert.deepStrictEqual(late, every(() => false));
+});
+
+// `#269 approval-card-inline` x `#280 scroll-stability`, from the final review. A trip to Help opened by its key,
+// "?" or Ctrl+/, still moved a reader who had not moved, on a narrow screen with a keyboard, when the long draft
+// opened by More was settled elsewhere, sent from under Help or replaced while Help was up. In Chromium at
+// 393x852 a reader at the foot of Main came back 58px above it, by Esc, by Help's Back or by the browser's Back,
+// and 200px above it with the jump offered once the box took back its room. showScreen showed the main screen
+// and only then hid Help's list, which held the focus after the key, and Help's Back, which held it after a
+// click, and only after that showed the control pane. Chromium blurs a control hidden while it holds the focus
+// on the spot, and lays the page out to do it, so the list was laid out there for the first time since it was
+// hidden: its reader's place came back clamped to a window 66px taller than its own. With the card still up
+// the list was no shorter than the reader's place and nothing stayed moved; with the card gone it was shorter,
+// and the clamp stood. Settings' Back and Esc let go of the focus before anything is shown, and never did this.
+
+/**
+ * A browser's own handling of a list on a screen hidden and shown again, exact about WHEN the list is laid out
+ * (`clampedAsShownLikeChromium` lays it out as the screen is shown). Its place is kept while the screen is
+ * hidden, and put back clamped to the list and its window as they stand the first time the page is laid out
+ * after the screen is shown: the page reading or moving the list, or Chromium blurring a control the page hides
+ * while the focus is in it, which Chromium does on the spot and lays the page out first to do. And the list's
+ * window is `pane` px taller while #control-pane is hidden, the pane's row giving its room to the body.
+ */
+function laidOutLikeChromium(page, main, pane) {
+  const screen = page.el("screen-main");
+  const controls = page.el("control-pane");
+  const position = Object.getOwnPropertyDescriptor(FakeElement.prototype, "scrollTop");
+  const room = Object.getOwnPropertyDescriptor(main, "clientHeight") ||
+    Object.getOwnPropertyDescriptor(FakeElement.prototype, "clientHeight");
+  let hidden = screen.hidden;
+  let due = false;
+  const layout = () => {
+    if (!due) return;
+    due = false;
+    position.set.call(main, position.get.call(main));
+  };
+  Object.defineProperty(main, "clientHeight", {
+    configurable: true,
+    get: () => {
+      layout();
+      return room.get.call(main) + (controls.hidden ? pane : 0);
+    },
+    set: (value) => room.set.call(main, value),
+  });
+  Object.defineProperty(main, "scrollTop", {
+    configurable: true,
+    get: () => {
+      layout();
+      return position.get.call(main);
+    },
+    set: (value) => {
+      if (hidden) return;
+      layout();
+      position.set.call(main, value);
+    },
+  });
+  Object.defineProperty(screen, "hidden", {
+    configurable: true,
+    get: () => hidden,
+    set: (value) => {
+      if (hidden && !value) due = true;
+      hidden = Boolean(value);
+    },
+  });
+  // Everything else showScreen hides, any of which may hold the focus as it does.
+  for (const id of ["screen-signin", "screen-settings", "screen-reply", "screen-help", "close-settings", "close-reply",
+    "close-help"]) {
+    const node = page.el(id);
+    let off = node.hidden;
+    Object.defineProperty(node, "hidden", {
+      configurable: true,
+      get: () => off,
+      set: (value) => {
+        off = Boolean(value);
+        if (off && nodeWithinFixture(node, FakeElement.focused)) {
+          layout();
+          FakeElement.focused = null;
+        }
+      },
+    });
+  }
+}
+
+test("`#269 approval-card-inline` x `#280 scroll-stability`: BACK FROM HELP OPENED BY ITS KEY, a reader of a long draft opened by More who did not move is on the newest line — at the foot of Main, of All or of the call's view, or seeing only the card — when the draft is settled elsewhere, sent from under Help or replaced by a short one while Help is up, by Esc, by Help's Back and by the browser's Back, and still there with no jump once the box takes back its room; though Chromium lays the page out as it blurs a control hidden with the focus in it", async () => {
+  // Thirty lines of words in the fixture's layout: as More lays a long draft out, taller than the list.
+  const TALL_DRAFT = "The release notes for this week, as agreed, with every target named. ".repeat(18);
+  const SHORT_DRAFT = "on it, back in ten";
+  // What the control pane's row gives the list on a 393x852 phone in Chromium while the pane is hidden.
+  const PANE = 66;
+  const HELP = [["?", "Esc"], ["?", "Back"], ["?", "Browser"]];
+  // Main's reader at its foot by the other key too.
+  const SLASH = [["Ctrl+/", "Esc"], ["Ctrl+/", "Back"], ["Ctrl+/", "Browser"]];
+  // Settings by the gear and its Back, which lets go of the focus before anything is shown.
+  const GEAR = [["gear", "Back"]];
+  const readers = [["Main", 0], ["Main", 40], ["Main", 150], ["All", 0], ["All", 40], ["All", 150], ["Call", 0]];
+  const changes = ["Elsewhere", "Sent", "Shorter"];
+  const tripsOf = (view, up) => [...HELP, ...(view === "Main" && up === 0 ? SLASH : []), ...(up === 0 ? GEAR : [])];
+  const run = async (script) => {
+    const { page, card, main, settled } = await draftOverThreads(script, 60, { arrange: (p) => p.enableHistory() });
+    laidOutLikeChromium(page, main, PANE);
+    const roomy = () => page.el("screen-main").hasAttribute("data-draft");
+    page.el("channel-composer").height = () => (roomy() ? CHANNEL_BOX.draft : CHANNEL_BOX.whole);
+    page.el("voice-composer").height = () => (roomy() ? VOICE_BOX.draft : VOICE_BOX.whole);
+    const onCall = () => page.tab() === "voice";
+    const picker = page.el("thread-select");
+    const gap = () => main.scrollHeight - main.scrollTop - main.clientHeight;
+    const sendShown = () => {
+      const box = page.el("post-confirm-send").getBoundingClientRect();
+      return !card.hidden && box.height > 0 && box.top >= 0 && box.bottom <= main.clientHeight;
+    };
+    // A click takes the focus, in Chromium, before the control it lands on acts.
+    const tap = async (id) => {
+      page.el(id).focus();
+      await page.el(id).click();
+    };
+    let serial = 80;
+    const draft = async (text) => {
+      serial += 1;
+      page.propose(proposal({ serial, handle: `hAnDlE-helpkey-${String(serial).padStart(8, "0")}`, text }));
+      await page.settle();
+    };
+    const toView = async (view) => {
+      if ((view === "Call") !== onCall()) await page.el("view-switch").click();
+      await settled();
+      if (view !== "Call" && picker.value !== (view === "Main" ? "main" : "flat")) {
+        await press(page, focused(page) || main, view === "Main" ? "1" : "2", { metaKey: true });
+        await settled();
+      }
+    };
+    const result = {};
+    for (const [view, up] of readers) {
+      for (const change of changes) {
+        for (const [key, back] of tripsOf(view, up)) {
+          const where = `${view} ${up}px up, ${change}, ${key} and ${back}`;
+          await toView(view);
+          if (card.hidden || page.el("post-confirm-text").textContent !== TALL_DRAFT) {
+            await draft(TALL_DRAFT);
+            page.expireTimers(2000);
+            await settled();
+          }
+          if (card.hasAttribute("data-folded")) await page.el("post-confirm-more").click();
+          await settled();
+          assert.ok(!card.hidden && !card.hasAttribute("data-folded") &&
+            card.parentNode === page.el(onCall() ? "pane-voice" : "pane-discord") &&
+            card.outerHeight() > main.clientHeight + 100 && !page.el("post-confirm-send").disabled,
+          `the premise: the draft opened by More is the list's next message, taller than the list, Send ready (${where})`);
+          main.scrollTop = main.scrollHeight - main.clientHeight - up;
+          await main.dispatch("scroll");
+          await settled();
+          assert.ok(gap() === up && (up === 0 ? sendShown() : rowOnScreen(page) === null && card.getBoundingClientRect().top < 0),
+            `the premise: the reader ${up === 0 ? "at the foot, Send on screen" : `${up}px up sees the card and no row`} (${where})`);
+          if (key === "gear") await tap("open-settings");
+          else await press(page, focused(page) || main, key === "?" ? "?" : "/", key === "?" ? { shiftKey: true } : { ctrlKey: true });
+          await settled();
+          const away = key === "gear" ? "settings" : "help";
+          assert.ok(page.screen() === away && card.parentNode === page.el("frame-body") && !card.hidden,
+            `the premise: ${away} is up, the card docked under it (${where})`);
+          if (change === "Elsewhere") page.settleProposal("committed");
+          else if (change === "Sent") await page.el("post-confirm-send").click();
+          else await draft(SHORT_DRAFT);
+          await page.settle();
+          await settled();
+          assert.ok(change === "Shorter" ? !card.hidden && page.el("post-confirm-text").textContent === SHORT_DRAFT : card.hidden,
+            `the premise: the draft is ${change === "Shorter" ? "replaced by a short one" : "gone"} while ${away} is up (${where})`);
+          if (back === "Esc") await press(page, focused(page), "Escape");
+          else if (back === "Back") await tap(key === "gear" ? "close-settings" : "close-help");
+          else await page.browserBack();
+          await settled();
+          assert.equal(page.screen(), "main", `the premise: the main screen is back (${where})`);
+          // The short draft: its reader at the foot with its Send on screen, and then it goes too.
+          const now = change === "Shorter" ? gap() <= BOTTOM_SLACK_PX && sendShown() : gap() === 0;
+          if (change === "Shorter") {
+            page.settleProposal("committed");
+            await page.settle();
+            await settled();
+          }
+          assert.ok(card.hidden && roomy(), `the premise: the card is gone and its room kept a moment (${where})`);
+          assert.equal(page.expireTimers(1000), 1, `the premise: the room is taken back a second after the card goes (${where})`);
+          await settled();
+          assert.ok(!roomy(), `the premise: the box has its room again (${where})`);
+          result[`${view}${up}${change}${key}${back}`] = now && gap() === 0 && !jumpShown(page);
+        }
+      }
+    }
+    result.untouched = page.proposalCancels.length === 0 &&
+      page.proposalCommits.length === readers.reduce((sum, [view, up]) => sum + tripsOf(view, up).length, 0);
+    return result;
+  };
+  const cases = readers.flatMap(([view, up]) => changes.flatMap((change) =>
+    tripsOf(view, up).map(([key, back]) => [`${view}${up}${change}${key}${back}`, key])));
+  const every = (value) => ({ ...Object.fromEntries(cases.map(([name, key]) => [name, value(key)])), untouched: true });
+  assert.deepStrictEqual(await run(SCRIPT), every(() => true));
+
+  // THE CONTROL. The main screen shown before what holds the focus is hidden and before the control pane is,
+  // as before this: every trip to Help moves its reader, whatever went from under Help and whichever way back.
+  // A trip by the gear and Settings' Back is kept even so, since Settings lets go of the focus before anything
+  // is shown and nothing lays the list out before the pane is back: the model clamps where Chromium lays out.
+  const first = await run(brokenScript(
+    "    if (screen !== name) el(`screen-${screen}`).hidden = true;\n",
+    "    el(`screen-${screen}`).hidden = screen !== name;\n"));
+  assert.deepStrictEqual(first, every((key) => key === "gear"));
 });
 
 // --- `#303 voice-post-prefix` with `#269 approval-card-inline` and `#270 voice-transcript-markers` --
