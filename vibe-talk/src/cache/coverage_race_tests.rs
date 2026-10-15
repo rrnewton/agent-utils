@@ -14,6 +14,9 @@
 //!
 //! - **An adapter's edit with no edit time**: the edit times that keep an older copy out must not
 //!   throw away an edit an adapter pushes, for any provider, with no edit time.
+//! - **A refused sweep**: a sweep the file refused has dropped what was on its way for the
+//!   channels it left out, so it must erase them when it is carried out, even one put back on the
+//!   list since; and an erase carried out late must not let a read begun before it land after it.
 
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
@@ -705,4 +708,142 @@ fn an_adapters_pushed_edit_without_an_edit_time_is_never_thrown_away() {
             }
         }
     }
+}
+
+/// Wait, for at most [`WAIT`], until the writer has applied `count` more operations than
+/// `applied`.
+fn wait_applied(cache: &MessageCache, applied: u64, count: u64, what: &str) {
+    let started = std::time::Instant::now();
+    while cache.stats().ops_applied < applied + count {
+        assert!(started.elapsed() < WAIT, "{what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Wait, for at most [`WAIT`], until `chan`'s Flat list is served again, and hand it back.
+fn served_again(cache: &MessageCache, chan: &ChanKey, what: &str) -> Vec<String> {
+    let started = std::time::Instant::now();
+    loop {
+        match cache.newest(chan, &Scope::Flat, 100) {
+            Read::Served(rows) => return rows.into_iter().map(|r| r.message.id.0).collect(),
+            Read::Blocked => {}
+            other => panic!("{other:?}"),
+        }
+        assert!(started.elapsed() < WAIT, "{what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A pushed deletion of m3, seen at `observed_ms`, offered under `stamp`.
+fn offer_deletion_of_m3(cache: &MessageCache, chan: &ChanKey, stamp: Stamp, observed_ms: i64) {
+    cache.offer(
+        chan.clone(),
+        stamp,
+        Observation::Push {
+            push: Push::Delete {
+                id: MessageId("m3".to_owned()),
+                created_ms: None,
+            },
+            observed_ms,
+        },
+    );
+}
+
+/// A sweep the file refuses (another program holding its lock past the writer's busy timeout, as
+/// a full disk would) has already moved the epochs of the channels it leaves out, so what was on
+/// its way to the file for them from before it, a pushed deletion included, is dropped unwritten.
+/// A live-fed bridge's channel leaves the list and comes back before the file takes writes again:
+/// the refused sweep must still erase it, and keep it blocked until then, whatever the snapshots
+/// after it say. A third snapshot naming it, as the second did, would otherwise count it as routed
+/// throughout. Kept and served, the channel would hold the deleted m3 for the feed to vouch for.
+/// (The review's probe
+/// `review_probe_a_channel_readded_after_a_refused_sweep_never_vouches_for_a_dropped_deletion`,
+/// and a third snapshot.)
+#[test]
+fn a_channel_put_back_after_a_refused_sweep_is_still_erased_and_never_vouches_for_a_lost_deletion()
+{
+    let dir = crate::testing::TempDir::new("cache-refused-sweep");
+    let first = T0 + 8 * STEP + 1_000;
+    let clock = Arc::new(ManualClock(AtomicI64::new(first)));
+    let (cache, chan) = bridge_with_flat(&dir, &clock, first);
+    clock.set(first + 10_000);
+    // A pushed deletion of m3 is received and stamped.
+    let stamp = cache.stamp(&chan);
+    let without = RouteSnapshot::new(Vec::<ChanKey>::new(), [chan.provider_key.clone()]);
+    let with = RouteSnapshot::new([chan.clone()], [chan.provider_key.clone()]);
+    // The file refuses writes for a while, and the writer is behind: the channel leaves the list,
+    // and comes back, before it gets to either sweep.
+    let (release, locker) = super::tests::hold_write_lock(&cache);
+    let applied = cache.stats().ops_applied;
+    let resume = cache.pause_writer();
+    cache.retain_only(without);
+    cache.retain_only(with.clone());
+    drop(resume);
+    wait_applied(&cache, applied, 3, "the sweeps were never tried");
+    // A third snapshot names the channel again, as the one before it did.
+    cache.retain_only(with);
+    wait_applied(&cache, applied, 4, "the third sweep was never tried");
+    assert_eq!(
+        cache.newest(&chan, &Scope::Flat, 100),
+        Read::Blocked,
+        "a channel a refused sweep left out is served before that sweep's erase of it"
+    );
+    release.send(()).expect("release");
+    locker.join().expect("locker");
+    // The deletion lands now, under its stamp from before the sweep.
+    offer_deletion_of_m3(&cache, &chan, stamp, first + 10_000);
+    let held = served_again(&cache, &chan, "the refused sweep was never carried out");
+    assert!(held.is_empty(), "the channel was erased: {held:?}");
+    clock.set(first + 20_000);
+    let (decision, content) = decide_m3(&cache, &chan, first + 20_000);
+    assert_eq!(content, None, "a deleted message kept: {decision:?}");
+    assert_ne!(decision, shadow::Decision::Serve);
+}
+
+/// An erase of a channel the file refused is carried out later, and detaches with the channel's
+/// rows the tombstones of deletions written since it was asked for. A read begun before then, but
+/// after the erase was asked for, must not land after it: in a channel that no longer remembers
+/// the deletion, it would bring the deleted message back for the feed to vouch for.
+#[test]
+fn a_read_begun_before_a_refused_erase_was_carried_out_never_lands_after_it() {
+    let dir = crate::testing::TempDir::new("cache-refused-erase-read");
+    let first = T0 + 8 * STEP + 1_000;
+    let clock = Arc::new(ManualClock(AtomicI64::new(first)));
+    let (cache, chan) = bridge_with_flat(&dir, &clock, first);
+    let (release, locker) = super::tests::hold_write_lock(&cache);
+    let applied = cache.stats().ops_applied;
+    clock.set(first + 5_000);
+    cache.erase_channels(std::slice::from_ref(&chan));
+    // A read of the channel's Flat list begins after the erase was asked for.
+    let read_began = first + 10_000;
+    clock.set(read_began);
+    let read_stamp = cache.stamp(&chan);
+    wait_applied(&cache, applied, 1, "the erase was never tried");
+    // Held still once the erase and its first retry are refused, so that what follows lands
+    // before the next retry.
+    let resume = cache.pause_writer();
+    release.send(()).expect("release");
+    locker.join().expect("locker");
+    // m3 is deleted upstream after the read began, and the deletion is written.
+    clock.set(first + 20_000);
+    let stamp = cache.stamp(&chan);
+    offer_deletion_of_m3(&cache, &chan, stamp, first + 20_000);
+    drop(resume);
+    let held = served_again(&cache, &chan, "the refused erase was never carried out");
+    assert!(held.is_empty(), "the channel was erased: {held:?}");
+    // The read lands now, with m3 as it was when it began.
+    let flat = Observation::Listing(Listing {
+        scope: Scope::Flat,
+        rows: (1..=8).map(|n| Incoming::new(m(n), Scope::Flat)).collect(),
+        observed_ms: read_began,
+        proof: Some(newest_proof(ListStart::At(T0 + STEP))),
+    });
+    cache.offer(chan.clone(), read_stamp, flat);
+    assert!(cache.quiesce_blocking(WAIT));
+    clock.set(first + 30_000);
+    let (decision, content) = decide_m3(&cache, &chan, first + 30_000);
+    assert!(
+        !(decision == shadow::Decision::Serve && content.is_some()),
+        "a message deleted upstream would be served by id: {content:?}"
+    );
 }

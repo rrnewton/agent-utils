@@ -17,7 +17,8 @@
 //!   short transaction commits. An erase detaches the channel's rows from its name (no read can
 //!   reach them from then on) and leaves deleting them to background steps. An erase the file
 //!   refuses is owed: what it covers stays blocked, and a background step tries it again after a
-//!   backoff until the file takes it.
+//!   backoff until the file takes it. A refused sweep still erases every channel it left out,
+//!   even one a later route snapshot names again.
 //! - **Background work runs in steps** of about [`STEP`], one transaction each, alternating with
 //!   the queue so that neither starves the other: the rows of erased channels, expired
 //!   tombstones, the age and revalidation pass, eviction, rebuilding `search_text`, compacting the
@@ -67,8 +68,8 @@ use super::schema::sqlite_code;
 use super::structure;
 use super::{
     file, lock, CacheError, ChanKey, Currency, DropRecord, Envelope, Erasing, Incoming, ListEnd,
-    ListStart, Listing, Maintenance, Observation, Op, Push, RouteSnapshot, Scope, Shared, Stamp,
-    Stats, ThreadRecord, WriterEvent, BATCH, DELETE_CHUNK, REVALIDATE_WITHIN_MS, STEP,
+    ListStart, Listing, Maintenance, Observation, Op, Push, Refused, RouteSnapshot, Scope, Shared,
+    Stamp, Stats, ThreadRecord, WriterEvent, BATCH, DELETE_CHUNK, REVALIDATE_WITHIN_MS, STEP,
     TOMBSTONE_KEEP_MS,
 };
 use crate::model::{ChannelId, MessageId};
@@ -560,20 +561,11 @@ enum Owed {
         chan: ChanKey,
         scope_key: String,
     },
-    /// A sweep to the route snapshot, owed as of the latest snapshot.
-    Sweep,
-}
-
-impl Owed {
-    /// What it keeps blocked while it is owed.
-    fn blocks(&self) -> Vec<Erasing> {
-        match self {
-            Self::Channels(chans) => chans.iter().cloned().map(Erasing::Channel).collect(),
-            Self::Provider(key) => vec![Erasing::Provider(key.clone())],
-            Self::Scope { chan, .. } => vec![Erasing::Channel(chan.clone())],
-            Self::Sweep => vec![Erasing::Sweep],
-        }
-    }
+    /// The sweeps to these route snapshots. Each moved the epochs of the channels it left out
+    /// before the file refused it, so what was on its way to the file for them from before was
+    /// dropped unwritten; and so each such channel is erased when the sweep is carried out,
+    /// whatever the latest snapshot says of it. Carried out with a sweep to the latest snapshot.
+    Sweep(Vec<Arc<RouteSnapshot>>),
 }
 
 /// One kind of background step.
@@ -960,13 +952,17 @@ impl Writer<'_> {
                 self.report("scope erase", result);
             }
             Op::RetainOnly { routes } => {
-                let result = self.transaction(|w| w.retain_only(&routes));
-                if result.is_ok() && self.work.owed.contains(&Owed::Sweep) {
-                    // A sweep to the latest snapshot is every sweep owed.
-                    self.work.owed.retain(|owed| *owed != Owed::Sweep);
-                    self.owed_blocks();
+                // Every sweep the file refused before is carried out with this one.
+                let refused = self.refused_sweeps();
+                let result = self.transaction(|w| w.retain_only(Some(&*routes), &refused));
+                match &result {
+                    Ok(()) => self
+                        .work
+                        .owed
+                        .retain(|owed| !matches!(owed, Owed::Sweep(_))),
+                    Err(_) => self.owe_sweep(routes),
                 }
-                self.owe_if_failed(&result, Owed::Sweep);
+                self.owed_blocks();
                 self.report("sweep", result);
             }
             Op::SetAccount {
@@ -1033,17 +1029,62 @@ impl Writer<'_> {
         }
     }
 
+    /// A sweep to `routes` the file refused: owed, with every sweep refused before it.
+    fn owe_sweep(&mut self, routes: Arc<RouteSnapshot>) {
+        let owed = self.work.owed.iter_mut().find_map(|owed| match owed {
+            Owed::Sweep(snapshots) => Some(snapshots),
+            _ => None,
+        });
+        match owed {
+            Some(snapshots) if snapshots.contains(&routes) => {}
+            Some(snapshots) => snapshots.push(routes),
+            None => self.work.owed.push(Owed::Sweep(vec![routes])),
+        }
+    }
+
+    /// The route snapshots of the sweeps the file refused, still owed.
+    fn refused_sweeps(&self) -> Vec<Arc<RouteSnapshot>> {
+        self.work
+            .owed
+            .iter()
+            .filter_map(|owed| match owed {
+                Owed::Sweep(snapshots) => Some(snapshots.iter().cloned()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
     /// Block exactly what the erases still owed cover: every failure is one of them, and nothing
     /// else writes [`Shared::erase_failed`] but a file erase, which clears it.
     fn owed_blocks(&self) {
-        let blocked: HashSet<Erasing> = self.work.owed.iter().flat_map(Owed::blocks).collect();
-        *lock(&self.shared.erase_failed) = blocked;
+        let mut refused = Refused::default();
+        for owed in &self.work.owed {
+            match owed {
+                Owed::Channels(chans) => refused
+                    .erasing
+                    .extend(chans.iter().cloned().map(Erasing::Channel)),
+                Owed::Provider(key) => {
+                    refused.erasing.insert(Erasing::Provider(key.clone()));
+                }
+                Owed::Scope { chan, .. } => {
+                    refused.erasing.insert(Erasing::Channel(chan.clone()));
+                }
+                Owed::Sweep(snapshots) => refused.sweeps.extend(snapshots.iter().cloned()),
+            }
+        }
+        *lock(&self.shared.erase_failed) = refused;
     }
 
     /// Carry out the erases the file refused, in the order they were asked for, as far as the file
     /// takes them. What one that succeeds covers is served again; one that fails, and every one
-    /// after it, stays owed, and the step is tried again after the backoff. A sweep is to the
-    /// latest route snapshot.
+    /// after it, stays owed, and the step is tried again after the backoff. A refused sweep erases
+    /// what it left out and what the latest route snapshot leaves out.
+    ///
+    /// The erase of a channel or a provider moves its epoch again as it is carried out: what it
+    /// detaches includes the tombstones of deletions written since it was asked for, so a read
+    /// begun before then must not land after it, in a channel that no longer remembers them. (A
+    /// sweep moves the epochs of what it erases anyway, and a scope erase leaves tombstones.)
     fn owed_step(&mut self) -> rusqlite::Result<()> {
         let owed = std::mem::take(&mut self.work.owed);
         let mut left = Vec::new();
@@ -1054,22 +1095,27 @@ impl Writer<'_> {
                 continue;
             }
             let result = match &erase {
-                Owed::Channels(chans) => self.transaction(|w| w.detach(chans)),
-                Owed::Provider(key) => self.transaction(|w| w.erase_provider(key)),
+                Owed::Channels(chans) => self.transaction(|w| {
+                    for chan in chans {
+                        w.shared.epochs.bump_channel(chan);
+                    }
+                    w.detach(chans)
+                }),
+                Owed::Provider(key) => self.transaction(|w| {
+                    w.shared.epochs.bump_provider(key);
+                    w.erase_provider(key)
+                }),
                 Owed::Scope { chan, scope_key } => {
                     self.transaction(|w| w.erase_scope(chan, scope_key))
                 }
-                Owed::Sweep => {
-                    let routes = self
+                Owed::Sweep(snapshots) => {
+                    let latest = self
                         .shared
                         .routes
                         .read()
                         .unwrap_or_else(PoisonError::into_inner)
                         .clone();
-                    match routes {
-                        Some(routes) => self.transaction(|w| w.retain_only(&routes)),
-                        None => Ok(()),
-                    }
+                    self.transaction(|w| w.retain_only(latest.as_deref(), snapshots))
                 }
             };
             if let Err(error) = result {
@@ -2313,12 +2359,22 @@ impl Writer<'_> {
         Ok(())
     }
 
-    fn retain_only(&mut self, routes: &RouteSnapshot) -> rusqlite::Result<()> {
+    /// Sweep the file to `routes`, when given, and carry out the sweeps to `refused` the file
+    /// refused before: erase every channel any of them leaves out, and the account of every
+    /// provider `routes` does not configure.
+    fn retain_only(
+        &mut self,
+        routes: Option<&RouteSnapshot>,
+        refused: &[Arc<RouteSnapshot>],
+    ) -> rusqlite::Result<()> {
         let doomed: Vec<ChanKey> = self
             .channels()?
             .into_iter()
             .map(|(_, chan)| chan)
-            .filter(|chan| !routes.allows(chan))
+            .filter(|chan| {
+                routes.is_some_and(|routes| !routes.allows(chan))
+                    || refused.iter().any(|routes| !routes.allows(chan))
+            })
             .collect();
         // Including channels this process never stamped: a fill that started before the sweep,
         // for a channel added back afterwards, is from before the erase.
@@ -2326,6 +2382,9 @@ impl Writer<'_> {
             self.shared.epochs.bump_channel(chan);
         }
         self.detach(&doomed)?;
+        let Some(routes) = routes else {
+            return Ok(());
+        };
         let accounts: Vec<String> = {
             let mut statement = self.conn.prepare("SELECT provider_key FROM account")?;
             let keys = statement

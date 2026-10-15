@@ -1095,7 +1095,7 @@ pub(crate) struct Shared {
     /// Erases the writer could not carry out. What they cover stays blocked until a later try
     /// carries them out, or the file is erased: a cache that cannot forget a channel must not serve
     /// it either. Written by the writer alone, from the erases it still owes.
-    pub(crate) erase_failed: Mutex<HashSet<Erasing>>,
+    pub(crate) erase_failed: Mutex<Refused>,
     /// What may not be served while access to it is in doubt: see [`MessageCache::block_channel`].
     pub(crate) blocks: Mutex<Blocks>,
     /// Where the writer sends its [`WriterEvent`]s, once something has subscribed. Bounded, and
@@ -1131,8 +1131,30 @@ pub(crate) struct Blocks {
 pub(crate) enum Erasing {
     Channel(ChanKey),
     Provider(String),
-    /// A sweep to the route snapshot.
-    Sweep,
+}
+
+/// What the erases the file refused cover, each blocked until the writer carries it out
+/// ([`Shared::erase_failed`]).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Refused {
+    /// The channels and providers erased, a scope erase blocking its whole channel.
+    pub(crate) erasing: HashSet<Erasing>,
+    /// The route snapshots of the sweeps refused: every channel one of them leaves out. Such a
+    /// channel's epoch has moved, so what was on its way to the file for it from before the sweep
+    /// was dropped unwritten, and it stays blocked until the sweep's erase of it is carried out,
+    /// whatever a later snapshot says of it.
+    pub(crate) sweeps: Vec<Arc<RouteSnapshot>>,
+}
+
+impl Refused {
+    /// Whether `chan` is among what they cover.
+    fn covers(&self, chan: &ChanKey) -> bool {
+        self.erasing.contains(&Erasing::Channel(chan.clone()))
+            || self
+                .erasing
+                .contains(&Erasing::Provider(chan.provider_key.clone()))
+            || self.sweeps.iter().any(|routes| !routes.allows(chan))
+    }
 }
 
 /// A sweep waiting to be applied.
@@ -1366,7 +1388,7 @@ impl MessageCache {
             opened_ms: AtomicI64::new(i64::MAX),
             erasing: Mutex::new(HashMap::new()),
             sweep: Mutex::new(None),
-            erase_failed: Mutex::new(HashSet::new()),
+            erase_failed: Mutex::new(Refused::default()),
             blocks: Mutex::new(Blocks::default()),
             events: Mutex::new(None),
             #[cfg(test)]
@@ -1435,7 +1457,9 @@ impl MessageCache {
     /// for it is dropped. Until the writer has applied the sweep, a channel is readable only if it
     /// was routed before it too: one removed and added back before the sweep lands still has rows
     /// the sweep is about to erase, and they must not be served in between. Before the first
-    /// sweep of a process has landed, no channel is readable at all.
+    /// sweep of a process has landed, no channel is readable at all. A sweep the file refuses
+    /// still erases, once the file takes it, every channel it left out, even one a later snapshot
+    /// names again, and blocks each until then ([`Refused::sweeps`]).
     pub fn retain_only(&self, routes: RouteSnapshot) {
         let routes = Arc::new(routes);
         let previous = self
@@ -1780,7 +1804,7 @@ impl MessageCache {
     /// Whether an erase of `provider_key` is waiting to be applied, or failed.
     fn provider_erasing(&self, provider_key: &str) -> bool {
         let key = Erasing::Provider(provider_key.to_owned());
-        if lock(&self.shared.erase_failed).contains(&key) {
+        if lock(&self.shared.erase_failed).erasing.contains(&key) {
             return true;
         }
         let applied = self.shared.seq.applied();
@@ -1791,8 +1815,8 @@ impl MessageCache {
 
     /// Whether reads of a channel are blocked: it is off the route snapshot (or there is none
     /// yet); a sweep that may erase it is pending; an erase of it or its provider has been asked
-    /// for and not yet applied; or one failed; or access to it is in doubt, or its provider is
-    /// suspended.
+    /// for and not yet applied; or one the file refused, a sweep that left it out included, is
+    /// still owed; or access to it is in doubt, or its provider is suspended.
     fn blocked(&self, chan: &ChanKey) -> bool {
         {
             let blocks = lock(&self.shared.blocks);
@@ -1811,18 +1835,16 @@ impl MessageCache {
             return true;
         }
         let applied = self.shared.seq.applied();
-        let failed = lock(&self.shared.erase_failed).clone();
-        let channel = Erasing::Channel(chan.clone());
-        let provider = Erasing::Provider(chan.provider_key.clone());
-        if failed.contains(&channel) || failed.contains(&provider) {
+        if lock(&self.shared.erase_failed).covers(chan) {
             return true;
         }
-        let sweep_failed = failed.contains(&Erasing::Sweep);
         if let Some(sweep) = lock(&self.shared.sweep).as_ref() {
-            if (sweep.seq > applied || sweep_failed) && !sweep.stable.contains(chan) {
+            if sweep.seq > applied && !sweep.stable.contains(chan) {
                 return true;
             }
         }
+        let channel = Erasing::Channel(chan.clone());
+        let provider = Erasing::Provider(chan.provider_key.clone());
         let mut pending = lock(&self.shared.erasing);
         pending.retain(|_, seq| *seq > applied);
         pending.contains_key(&channel) || pending.contains_key(&provider)
@@ -2019,7 +2041,7 @@ impl MessageCache {
         // Nothing in the old file can be served any more, and a fresh one holds nothing: what
         // was waiting to be erased, or could not be, is moot.
         lock(&self.shared.erasing).clear();
-        lock(&self.shared.erase_failed).clear();
+        *lock(&self.shared.erase_failed) = Refused::default();
         if let Some(sweep) = lock(&self.shared.sweep).as_mut() {
             sweep.seq = 0;
         }
