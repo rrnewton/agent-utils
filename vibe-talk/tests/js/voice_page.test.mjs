@@ -64344,8 +64344,8 @@ test("`#277 reply-in-column` with `#269 approval-card-inline`: a reply open at t
 
   // THE CONTROL: the card not told when a reply opens in a column. The walk above sees it.
   const control = await draftInTwoColumns(brokenScript(
-    "  renderReplyingMarks();\n  markCardBesideReply();\n  placeToolsOverReply();\n  if (!from",
-    "  renderReplyingMarks();\n  placeToolsOverReply();\n  if (!from"));
+    "  replyDocked = true;\n  renderReplyingMarks();\n  markCardBesideReply();\n",
+    "  replyDocked = true;\n  renderReplyingMarks();\n"));
   await replyButton(rowWithId(control, "200")).click();
   await control.settle();
   assert.equal(control.el("post-confirm").hasAttribute("data-beside-reply"), false,
