@@ -526,6 +526,12 @@ const session = {
   echoCancellation: false,
   // How many times the provider said this socket's session started; a second is a replacement.
   sessionStarts: 0,
+  // `#331 resume-on-websocket`. On `vibe-talk-v1`, the record fetched for this call and not yet
+  // offered: it goes at the first `session_started`, and only to a session that lists `replay`.
+  pendingResume: null,
+  // ...and what the bridge said to it: null, `waiting`, `accepted` or `refused`.
+  /** @type {string | null} */
+  recapAck: null,
 };
 
 // Recording is FIRE-AND-FORGET and gives up after the first failure.
@@ -6165,8 +6171,11 @@ function noteConversationEnded(cause = "ended") {
 // of the conversation above: on its surface, a chip — "412-word recap sent", "no recap sent", "recap
 // unsupported" — and inside the disclosure, below the sentence saying how the call before ended
 // (`#268 voice-call-drops`, unchanged), a sentence of its own about the recap. Neither overwrites the
-// other, so each keeps its own budget. "Sent", never "recapped" or "heard": neither transport
-// acknowledges a recap, so sent is all this page knows.
+// other, so each keeps its own budget. "Sent", never "recapped" or "heard": the hosted service
+// acknowledges nothing, so sent is all this page knows there. `#331 resume-on-websocket`: a
+// `vibe-talk-v1` bridge does answer its `replay` frame, and the live line under the call
+// (`renderCallRecap`) says "Caught the agent up" once it has; the seam, which a reload draws from the
+// stored marker, keeps "sent".
 //
 // The same seam comes back after a reload: the first record of each conversation is a
 // `conversation_start` marker holding its recap and how the call before it ended, written lazily — just
@@ -6187,6 +6196,10 @@ const RECAP_DETAILS = {
   unsupported:
     "Nothing was recapped: this server's voice service has no way to take a recap, so the agent " +
     "below remembers nothing above.",
+  // `#331 resume-on-websocket`. The bridge took the frame and answered that it would not use it.
+  refused:
+    "Nothing was recapped: the voice service refused the recap it was sent, so the agent below " +
+    "remembers nothing above.",
   empty:
     "No recap was sent: the conversation above held nothing said aloud to replay, so the agent " +
     "below starts from nothing.",
@@ -6204,8 +6217,13 @@ const RECAP_DETAILS = {
 /** The biggest number a stored marker may hold, as the server checks it. */
 const MARKER_NUMBER_MAX = 1000000;
 
-/** Whether the operator turned replay on where the voice backend cannot carry it, from client-config. */
-let replayUnavailable = false;
+/**
+ * Why replay is off although the operator turned it on, from client-config: `bridge_declined` or
+ * `bridge_unconfirmed` (`#331 resume-on-websocket`), or null when that is not why. Any word counts,
+ * so a reason this page does not know yet still marks a new conversation "recap unsupported".
+ * @type {string | null}
+ */
+let replayUnavailable = null;
 
 /** How the last call on this page ended, as `noteConversationEnded` saw it; null after a load. */
 let lastEndCause = null;
@@ -6220,8 +6238,11 @@ const startMarkers = new Map();
  * `words` is null when the server's replay did not say how many words it held — an older one —
  * which is a recap whose size nobody can state, never a recap of none.
  *
+ * On `vibe-talk-v1` a payload with no transport is a session that did not list `replay`
+ * (`#331 resume-on-websocket`): it was sent nothing because it could take nothing.
+ *
  * @param {any} resume what `fetchResume` answered, null for nothing
- * @param {"contextual_update" | "client_data" | null} transport how it went, null when it did not
+ * @param {"contextual_update" | "client_data" | "replay_frame" | null} transport how it went, null when it did not
  * @returns {{state: "sent", words: number | null, lines: number, dropped: number, transport: string} | {state: "none", why: string, dropped: number}}
  */
 function recapFor(resume, transport) {
@@ -6236,8 +6257,7 @@ function recapFor(resume, transport) {
       transport,
     };
   }
-  const wanted = resumeLast.attempted || (resumeAllowed && resumeWanted());
-  if (replayUnavailable || (session.protocol === "vibe-talk-v1" && (resume || wanted))) {
+  if (replayUnavailable || (resume && session.protocol === "vibe-talk-v1")) {
     return { state: "none", why: "unsupported", dropped: 0 };
   }
   if (resumeLast.failed) return { state: "none", why: "failed", dropped: 0 };
@@ -6262,7 +6282,8 @@ function recapChip(recap) {
     const words = recapWords(recap);
     return words === null ? "recap sent" : `${words.toLocaleString("en-US")}-word recap sent`;
   }
-  return recap.why === "unsupported" ? "recap unsupported" : "no recap sent";
+  if (recap.why === "unsupported") return "recap unsupported";
+  return recap.why === "refused" ? "recap refused" : "no recap sent";
 }
 
 /** The recap sentence for `recap`, or null for none. */
@@ -6387,6 +6408,131 @@ function drawBoundary(cause, endsId) {
 function noteCallRecap(recap) {
   session.recap = recap;
   settleBoundary(recap);
+  renderCallRecap();
+}
+
+// --- what the call in progress was given --------------------------------------------------------
+//
+// `#331 resume-on-websocket`. The owner: a visible indicator when a call starts, of how much earlier
+// conversation the agent was given or why it started fresh. The seam above the call says it too, but
+// a seam exists only where something is above it and says it in a chip; this line is under the call,
+// in words, for as long as the call lasts, and the seam keeps the fact afterwards.
+
+/** Why a call started fresh, per recap `why`, as the end of "Started fresh: …". */
+const CALL_FRESH = {
+  empty: "nothing was said aloud earlier",
+  too_long: "the earlier conversation was too long to send",
+  failed: "the earlier conversation could not be read",
+  refused: "the voice service refused the recap",
+  replaced_session: "the voice service replaced the session",
+};
+
+/**
+ * The line under a call for `recap`, given whether the voice service acknowledged it (`ack`).
+ * Words from the server's own count of what its replay held; "the earlier conversation" where an
+ * older server's replay named none.
+ *
+ * @param {any} recap
+ * @param {string | null} ack `accepted` once a `vibe-talk-v1` bridge has said it took the record
+ */
+function callRecapLine(recap, ack) {
+  if (recap.state === "sent") {
+    const words = recapWords(recap);
+    const amount = words === null
+      ? "the earlier conversation"
+      : `${words.toLocaleString("en-US")} word${words === 1 ? "" : "s"} from earlier`;
+    const older = recap.dropped > 0
+      ? `; ${recap.dropped} older line${recap.dropped === 1 ? "" : "s"} did not fit`
+      : "";
+    return `${ack === "accepted" ? "Caught the agent up with" : "Sent the agent"} ${amount}${older}`;
+  }
+  return `Started fresh: ${CALL_FRESH[recap.why] || freshBecause(recap.why)}`;
+}
+
+/** Why a call started fresh when it was resuming that was off or unsupported: the server's reason. */
+function freshBecause(why) {
+  if (replayUnavailable === "bridge_declined") return "the voice service does not take a recap";
+  if (replayUnavailable === "bridge_unconfirmed") return "the voice service has not said it takes a recap";
+  if (replayUnavailable || why === "unsupported") return "this voice session takes no recap";
+  if (!resumeAllowed) return "resuming is off on this server";
+  if (!resumeWanted()) return "resuming is off";
+  return "there was no earlier conversation to resume";
+}
+
+/** Draw the line under the call: shown while a call has a settled recap, hidden otherwise. */
+function renderCallRecap() {
+  const line = el("call-recap");
+  const said = session.socket && session.recap ? callRecapLine(session.recap, session.recapAck) : "";
+  if (line.textContent === said && line.hidden === !said) return;
+  const pinned = atBottom(leftEl("scroll-area"));
+  line.textContent = said;
+  line.hidden = !said;
+  if (said) {
+    line.setAttribute("data-recap", session.recap.state === "sent" ? (session.recapAck || "sent") : "fresh");
+  } else {
+    line.removeAttribute("data-recap");
+  }
+  followIfPinned(pinned);
+}
+
+/**
+ * `#331 resume-on-websocket`. The record of the conversation above, handed to a `vibe-talk-v1` call
+ * as the first frame after its first `session_started` — and only to a session that lists `replay`
+ * in `capabilities`. A bridge that predates the frame answers it with `error`, which ends the
+ * session, so a session that does not list it is sent nothing, and the line under the call says so.
+ *
+ * @param {VibeTalk.VibeTalkV1ServerFrame} message the `session_started`
+ */
+function offerReplayAtSessionStart(message) {
+  const resume = session.pendingResume;
+  if (!resume || message.type !== "session_started") return;
+  session.pendingResume = null;
+  const listed = Array.isArray(message.capabilities) && message.capabilities.includes("replay");
+  if (listed) {
+    const count = (value) => Math.min(MARKER_NUMBER_MAX, Math.max(0, Math.round(Number(value) || 0)));
+    sendVibeTalkFrame({
+      type: "replay",
+      text: String(resume.text),
+      lines: count(resume.included),
+      dropped: count(resume.dropped),
+      words: count(resume.words),
+    });
+    session.recapAck = "waiting";
+    noteCallRecap(recapFor(resume, "replay_frame"));
+  } else {
+    resumeLast = { ...resumeLast, armed: false, unsupported: true };
+    addDetail("this voice session does not list replay, so it was sent no recap");
+    noteCallRecap(recapFor(resume, null));
+    renderResumeState();
+  }
+  expectStartMarker(session.conversationId, session.recap, lastEndCause);
+}
+
+/**
+ * The bridge's answer to the `replay` frame: taken, or refused with its reason. Exactly one per
+ * frame; one nobody is waiting for says nothing.
+ *
+ * @param {VibeTalk.VibeTalkV1ServerFrame} message the `replay_ack`
+ */
+function noteReplayAck(message) {
+  if (message.type !== "replay_ack" || session.recapAck !== "waiting") return;
+  if (message.accepted === true) {
+    session.recapAck = "accepted";
+    resumeLast = { ...resumeLast, acked: true };
+    addDetail("the voice service took the recap");
+    renderCallRecap();
+  } else {
+    session.recapAck = "refused";
+    const reason = typeof message.reason === "string" && message.reason.trim() ? message.reason.trim() : "no reason given";
+    addDetail(`the voice service refused the recap: ${reason}`);
+    resumeLast = { ...resumeLast, armed: false, refused: true };
+    const recap = { state: "none", why: "refused", dropped: 0 };
+    noteCallRecap(recap);
+    // The conversation's start marker, while it still waits to be filed, says so as well.
+    const start = startMarkers.get(session.conversationId);
+    if (start) start.recap = recap;
+  }
+  renderResumeState();
 }
 
 /** The conversation `conversationId` has begun: its first record is preceded by its start marker. */
@@ -6413,6 +6559,8 @@ function noteConversationNamed(previous) {
   const recap = { state: "none", why: "replaced_session", dropped: 0 };
   session.recap = recap;
   setSeamRecap(drawBoundary("replaced", previous), boundaryFor(recap, "replaced"));
+  // `#331 resume-on-websocket`. The line under the call is about the session now running.
+  renderCallRecap();
   expectStartMarker(session.conversationId, recap, null);
 }
 
@@ -14658,6 +14806,8 @@ async function openConversation(options) {
   // was filed in the last one, and a turn recorded before then went there too.
   session.recordedAny = false;
   session.recap = null;
+  session.recapAck = null;
+  session.pendingResume = null;
   session.conversationId = null;
   // Fetched HERE, before the socket exists, so a slow or failing store delays the call rather than
   // racing `onopen` — a payload that arrived after the agent had already spoken would be a
@@ -14758,10 +14908,17 @@ async function openConversation(options) {
       conversationOpen = true;
       startPostWatch();
       session.conversationId = conversationIdFrom(null);
-      // `#270 voice-transcript-markers`. What this call was handed of the conversation above — on
-      // this protocol, never a recap — on the line above it, and in its first record.
-      noteCallRecap(recapFor(resume, null));
-      expectStartMarker(session.conversationId, session.recap, lastEndCause);
+      if (resume) {
+        // `#331 resume-on-websocket`. The record goes at `session_started`, and only to a session
+        // that lists `replay`, so what this call was handed is settled there
+        // (`offerReplayAtSessionStart`).
+        session.pendingResume = resume;
+      } else {
+        // `#270 voice-transcript-markers`. What this call was handed of the conversation above —
+        // nothing, and why — on the line above it, and in its first record.
+        noteCallRecap(recapFor(null, null));
+        expectStartMarker(session.conversationId, session.recap, lastEndCause);
+      }
       setState("live");
       setStatus("Opening the voice session…");
       renderControls();
@@ -15556,6 +15713,9 @@ function handleVibeTalk(message) {
       session.lastCompletedTurn = null;
       addDetail(`voice session ${message.session_id || "started"}`);
       session.v1Ready = true;
+      // `#331 resume-on-websocket`. Before anything else this call sends: the record of the
+      // conversation above, when this session lists `replay`.
+      offerReplayAtSessionStart(message);
       if (session.chat) {
         // A typed call does not wait for a promised greeting: the protocol does not say whether a
         // server greets a client that never sends `audio_start`, nor which turn number a greeting
@@ -15655,6 +15815,11 @@ function handleVibeTalk(message) {
           { stay: true }
         );
       }
+      break;
+    }
+    case "replay_ack": {
+      // `#331 resume-on-websocket`. Not a turn: nothing about it opens or ends one.
+      noteReplayAck(message);
       break;
     }
     case "turn_complete": {
@@ -15869,6 +16034,13 @@ function teardown() {
   session.playEndMs = 0;
   session.echoCancellation = false;
   session.sessionStarts = 0;
+  // `#331 resume-on-websocket`. A record still waiting for a `session_started` that never came was
+  // never sent: Settings must not say the call was resumed.
+  if (session.pendingResume) {
+    session.pendingResume = null;
+    resumeLast = { ...resumeLast, armed: false, unsent: true };
+    renderResumeState();
+  }
   // Chat is a property of ONE conversation, decided when its socket opened. Carrying it into the
   // next one would mean the big control silently started a typed conversation because the previous
   // one was typed, which is the sort of stickiness the placement rules of this page keep removing.
@@ -15964,6 +16136,8 @@ let hasSuspended = false;
 
 function renderControls() {
   syncScreenWakeLock();
+  // `#331 resume-on-websocket`. The line under the call goes with the call.
+  renderCallRecap();
   const talk = el("talk");
   const label = el("talk-label");
   const note = el("talk-note");
@@ -38653,8 +38827,22 @@ let resumeConversationId = null;
  * too long to replay, not an empty one. Saying "there was nothing to replay" about it asserts
  * something false about what was said earlier, which is the exact class of lie this feature is
  * written against; it just happens to be a lie about the past rather than about the present.
+ *
+ * `#331 resume-on-websocket` adds what a `vibe-talk-v1` bridge did with it, each of which takes
+ * `armed` back: `unsupported`, the call's session did not list `replay` and was sent nothing;
+ * `refused`, it took the frame and answered that it would not use it; `unsent`, the call ended
+ * before its session started. `acked` is the one that keeps it: the bridge said it took the record.
+ * And `words`, the server's count of what the record held, null where it named none.
  */
-let resumeLast = { attempted: false, armed: false, dropped: 0, failed: false };
+let resumeLast = blankResumeLast();
+
+/** What the last attempt did, before it has done anything. */
+function blankResumeLast() {
+  return {
+    attempted: false, armed: false, dropped: 0, failed: false, words: null,
+    acked: false, refused: false, unsupported: false, unsent: false,
+  };
+}
 
 const resumeWanted = () => localStorage.getItem(RESUME_KEY) === "on";
 
@@ -38685,6 +38873,16 @@ function resumeNote() {
   if (resumeLast.failed) {
     return "the agent starts fresh — the earlier conversation could not be read";
   }
+  // `#331 resume-on-websocket`. The voice service would not take the last one.
+  if (resumeLast.refused || resumeLast.unsupported) {
+    return "the agent starts fresh — the voice service took no recap";
+  }
+  // A call that ended before its session started was sent nothing, and the next one will be.
+  if (resumeLast.unsent) {
+    return resumeLast.dropped > 0
+      ? "the earlier conversation is replayed in part"
+      : "the earlier conversation is replayed";
+  }
   if (resumeLast.attempted && !resumeLast.armed) {
     return resumeLast.dropped > 0
       ? "the agent starts fresh — the earlier conversation was too long to replay"
@@ -38711,15 +38909,35 @@ function renderResumeState() {
   if (!state) {
     return;
   }
+  renderResumeSwitch();
   const lines = (count) => (count === 1 ? "1 earlier line" : `${count} earlier lines`);
-  if (!resumeAllowed) {
+  // `#331 resume-on-websocket`. How much the last call was given, in the server's own count.
+  const words = typeof resumeLast.words === "number" && resumeLast.words > 0
+    ? `${resumeLast.words.toLocaleString("en-US")} word${resumeLast.words === 1 ? "" : "s"}`
+    : null;
+  if (!resumeAllowed && replayUnavailable) {
+    // `#331 resume-on-websocket`. Turned on by the operator, and not possible here: the reason is
+    // beside the switch.
+    state.textContent = "Resuming is unavailable on this server: every call starts fresh.";
+  } else if (!resumeAllowed) {
     state.textContent = "Resuming is OFF on this server: every call starts fresh.";
   } else if (!resumeWanted()) {
     state.textContent = "Resuming is off: a new call starts fresh.";
   } else if (resumeLast.failed) {
     state.textContent = "The last call could NOT be resumed: the record would not load.";
+  } else if (resumeLast.refused) {
+    state.textContent = "The last call was NOT resumed: the voice service refused the recap.";
+  } else if (resumeLast.unsupported) {
+    state.textContent = "The last call was NOT resumed: its voice session took no recap.";
+  } else if (resumeLast.unsent) {
+    state.textContent = "The last call ended before it could be told what was already said.";
   } else if (resumeLast.armed && resumeLast.dropped > 0) {
-    state.textContent = `The last call was resumed IN PART: ${lines(resumeLast.dropped)} did not fit.`;
+    state.textContent = `The last call was resumed IN PART: ${words ? `${words}; ` : ""}` +
+      `${lines(resumeLast.dropped)} did not fit.`;
+  } else if (resumeLast.armed && words) {
+    state.textContent = resumeLast.acked
+      ? `The last call was resumed: the agent took ${words} from earlier.`
+      : `The last call was resumed: it was sent ${words} from earlier.`;
   } else if (resumeLast.armed) {
     state.textContent = "The last call was resumed.";
   } else if (resumeLast.attempted && resumeLast.dropped > 0) {
@@ -38736,6 +38954,37 @@ function renderResumeState() {
     state.textContent = "Resuming is on: the next call will be told what was already said.";
   }
   renderControls();
+}
+
+/**
+ * Resuming's switch: live only where this server can resume, and otherwise disabled, unticked, with
+ * its reason beside it. `#331 resume-on-websocket`: the owner found it a live checkbox on a server
+ * that could not resume — a control that did nothing — with only the line above to say so.
+ *
+ * Unticked while disabled, so it never shows a choice that is not in force; the choice itself is
+ * kept, and comes back where the server can act on it.
+ */
+function renderResumeSwitch() {
+  const toggle = el("resume-toggle");
+  const why = el("resume-unavailable");
+  toggle.disabled = !resumeAllowed;
+  toggle.checked = resumeAllowed && resumeWanted();
+  why.hidden = resumeAllowed;
+  why.textContent = resumeAllowed ? "" : resumeUnavailableReason();
+}
+
+/** Why this server cannot resume, as the line beside the disabled switch says it. */
+function resumeUnavailableReason() {
+  switch (replayUnavailable) {
+    case null:
+      return "Unavailable: resuming is turned off in this server's configuration.";
+    case "bridge_declined":
+      return "Unavailable: this server's voice service does not take a recap.";
+    case "bridge_unconfirmed":
+      return "Unavailable: this server's voice service has not said it takes a recap.";
+    default:
+      return "Unavailable: this server's voice service cannot take a recap.";
+  }
 }
 
 /**
@@ -38773,7 +39022,7 @@ function renderSpeechPrepState(enabled) {
  * caller does not branch on why; the SCREEN does, off `resumeLast`.
  */
 async function fetchResume() {
-  resumeLast = { attempted: false, armed: false, dropped: 0, failed: false };
+  resumeLast = blankResumeLast();
   if (!resumeAllowed || !resumeWanted() || !resumeConversationId) {
     renderResumeState();
     return null;
@@ -38785,7 +39034,7 @@ async function fetchResume() {
       `/api/v1/conversations/${encodeURIComponent(resumeConversationId)}/replay`
     );
   } catch (error) {
-    resumeLast = { attempted: true, armed: false, dropped: 0, failed: true };
+    resumeLast = { ...blankResumeLast(), attempted: true, failed: true };
     // The connection details, not the error panel: a lost reconstruction must not look like a
     // broken call, and the call is about to open perfectly well.
     addDetail(`the earlier conversation could not be replayed: ${error.message}`);
@@ -38800,19 +39049,19 @@ async function fetchResume() {
     // separates "the earlier conversation was empty" from "the budget dropped all of it". The
     // screen says opposite things about those two and only one of them can be true.
     resumeLast = {
+      ...blankResumeLast(),
       attempted: true,
-      armed: false,
       dropped: Number((payload && payload.dropped) || 0),
-      failed: false,
     };
     renderResumeState();
     return null;
   }
   resumeLast = {
+    ...blankResumeLast(),
     attempted: true,
     armed: true,
     dropped: Number(payload.dropped) || 0,
-    failed: false,
+    words: typeof payload.words === "number" ? payload.words : null,
   };
   renderResumeState();
   return payload;
@@ -41163,9 +41412,10 @@ function applyClientConfig(config) {
   // `#270 voice-transcript-markers`. Records, `records=1` and the send memory's cursor go only to a
   // server that says it takes them.
   transcriptRecordsSupported = config.transcript_records_supported === true;
-  // ...and whether replay is on where the voice backend cannot carry it, which each new
-  // conversation's line says ("recap unsupported") rather than saying nothing.
-  replayUnavailable = config.replay_unavailable === "backend";
+  // ...and why replay is off where the operator turned it on, which each new conversation's line
+  // says ("recap unsupported") rather than saying nothing, and Resuming's disabled switch says
+  // beside it (`#331 resume-on-websocket`).
+  replayUnavailable = typeof config.replay_unavailable === "string" ? config.replay_unavailable : null;
   renderResumeState();
   renderSpeechPrepState(config.speech_prep_enabled);
   applyNoiseRules(config.noise_rules);
@@ -41363,6 +41613,12 @@ renderLiveState();
 // itself.
 el("resume-toggle").checked = resumeWanted();
 el("resume-toggle").addEventListener("change", () => {
+  // `#331 resume-on-websocket`. Disabled where this server cannot resume, so nothing can change it
+  // there; and were something to, the choice is not taken from a switch that is not in force.
+  if (!resumeAllowed) {
+    renderResumeState();
+    return;
+  }
   const on = el("resume-toggle").checked;
   persistResume(on);
   // Deliberately NOT clearing `resumeLast`: everything the screen says about resuming is already

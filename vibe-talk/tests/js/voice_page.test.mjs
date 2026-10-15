@@ -35704,7 +35704,8 @@ test("`#270 voice-transcript-markers`: the line above a call says what recap it 
 test("`#270 voice-transcript-markers`: a backend that cannot take a recap says 'recap unsupported', and resuming off says nothing", async () => {
   const stored = SEAM_DETAILS_STORED();
   for (const [what, arrange, chip, recap] of [
-    ["replay on, vibe-talk-v1", (page) => { page.replayUnavailable = "backend"; page.replayEnabled = false; }, "recap unsupported",
+    // `#331 resume-on-websocket`: a bridge that answered the server's hello without `replay`.
+    ["replay on, vibe-talk-v1", (page) => { page.replayUnavailable = "bridge_declined"; page.replayEnabled = false; }, "recap unsupported",
       "Nothing was recapped: this server's voice service has no way to take a recap, so the agent below remembers nothing above."],
     ["resuming off", () => {}, null, null],
   ]) {
@@ -36009,6 +36010,8 @@ test("`#270 voice-transcript-markers`: the recap chip is at most three words and
     { state: "sent", words: 99999, lines: 1, dropped: 0, transport: "contextual_update" },
     { state: "none", why: "unsupported", dropped: 0 },
     { state: "none", why: "too_long", dropped: 3 },
+    // `#331 resume-on-websocket`.
+    { state: "none", why: "refused", dropped: 0 },
   ]) {
     const said = chip(recap);
     assert.ok(said.length <= 24 && said.split(/\s+/).length <= 3, `"${said}"`);
@@ -36017,7 +36020,7 @@ test("`#270 voice-transcript-markers`: the recap chip is at most three words and
   assert.equal(chip({ state: "none", why: "off", dropped: 0 }), null);
   const table = sourceStringTable("RECAP_DETAILS");
   assert.deepEqual(Object.keys(table).sort(),
-    ["client_data", "dropped", "empty", "failed", "replaced_session", "sent", "too_long", "unsupported"]);
+    ["client_data", "dropped", "empty", "failed", "refused", "replaced_session", "sent", "too_long", "unsupported"]);
   for (const [state, text] of Object.entries(table)) {
     const spent = words(text);
     assert.ok(spent >= SEAM_DETAIL_MIN_WORDS && spent <= SEAM_DETAIL_MAX_WORDS, `${state}: ${spent} words: "${text}"`);
@@ -57545,6 +57548,51 @@ const STATE_LINES = [
     (await startTalking(page)).close();
     await page.settle();
   }],
+  // `#331 resume-on-websocket`: what a `vibe-talk-v1` bridge did with the record, and the reason
+  // beside a disabled switch, which is its own line.
+  ["resumed, and the bridge took it", "resume-state", async (page) => {
+    await withEarlierConversation(page, { resume: true });
+    const socket = await startV1Call(page, ["replay"]);
+    socket.onmessage({ data: JSON.stringify({ type: "replay_ack", accepted: true }) });
+    socket.close();
+    await page.settle();
+  }],
+  ["the bridge refused it", "resume-state", async (page) => {
+    await withEarlierConversation(page, { resume: true });
+    const socket = await startV1Call(page, ["replay"]);
+    socket.onmessage({ data: JSON.stringify({ type: "replay_ack", accepted: false }) });
+    socket.close();
+    await page.settle();
+  }],
+  ["its session took no recap", "resume-state", async (page) => {
+    await withEarlierConversation(page, { resume: true });
+    (await startV1Call(page, undefined)).close();
+    await page.settle();
+  }],
+  ["ended before its session started", "resume-state", async (page) => {
+    await withEarlierConversation(page, { resume: true });
+    (await startV1Call(page, ["replay"], { started: false })).close();
+    await page.settle();
+  }],
+  ["resuming unavailable on the server", "resume-state", async (page) => {
+    page.replayEnabled = false;
+    page.replayUnavailable = "bridge_unconfirmed";
+    await signIn(page);
+  }],
+  ["switch: off on the server", "resume-unavailable", async (page) => {
+    page.replayEnabled = false;
+    await signIn(page);
+  }],
+  ["switch: the bridge declined", "resume-unavailable", async (page) => {
+    page.replayEnabled = false;
+    page.replayUnavailable = "bridge_declined";
+    await signIn(page);
+  }],
+  ["switch: the bridge has not answered", "resume-unavailable", async (page) => {
+    page.replayEnabled = false;
+    page.replayUnavailable = "bridge_unconfirmed";
+    await signIn(page);
+  }],
   ["live off on the server", "live-state", async (page) => {
     page.livePollSeconds = 0;
     page.liveDelivery = "off";
@@ -66633,4 +66681,283 @@ test("`#303 voice-post-prefix`: a tagged draft freezes into a card showing what 
   assert.ok(card, "the direct send left no frozen card");
   assert.match(wordsOf(card), /sent without asking/);
   assert.equal(card.children.find((kid) => kid.className === "body").textContent, `${DEFAULT_POST_PREFIX}rebase onto main`);
+});
+
+// --- `#331 resume-on-websocket` ------------------------------------------------------------------
+//
+// Three things the owner asked for. Where the server cannot resume, Resuming's switch is DISABLED
+// with its reason beside it, never a live control that does nothing. A call says, as it starts, how
+// much earlier conversation the agent was given, or why it started fresh — under the call and in
+// Settings. And the `vibe-talk-v1` backend can resume: the server's record goes in a `replay` frame,
+// first, to a session that lists `replay` in its `session_started`, and the bridge's `replay_ack`
+// decides whether the call was caught up or refused.
+
+/**
+ * A `vibe-talk-v1` mint, as a server on the websocket backend answers one. A declaration, not a
+ * `const`: the state-line budget above reaches it, and may run before this line is evaluated.
+ */
+async function v1Minted() {
+  return json(200, {
+    websocket_url: "wss://example.invalid/private-voice",
+    protocol: "vibe-talk-v1",
+    provider: "Voice bridge",
+    input_sample_rate: 24000,
+    output_sample_rate: 24000,
+  });
+}
+
+/**
+ * Start a `vibe-talk-v1` call on a signed-in page, and — unless `started` is false — have its
+ * session start listing `capabilities` (none when undefined). Returns the socket.
+ */
+async function startV1Call(page, capabilities, { started = true } = {}) {
+  page.setFetch(v1Minted);
+  await page.el("talk").click();
+  await page.settle();
+  const socket = page.sockets.at(-1);
+  socket.onopen();
+  if (started) {
+    socket.onmessage({ data: JSON.stringify({
+      type: "session_started", greeting: false, ...(capabilities ? { capabilities } : {}),
+    }) });
+  }
+  await page.settle();
+  return socket;
+}
+
+const replayFrames = (socket) => framesSent(socket).filter((frame) => frame.type === "replay");
+const callRecap = (page) => (page.el("call-recap").hidden ? null : page.el("call-recap").textContent);
+
+test("`#331 resume-on-websocket`: a session that lists replay is sent the server's record FIRST, and the call is caught up once the bridge says it took it", async () => {
+  const page = newPage();
+  page.transcriptRecordsSupported = true;
+  await withEarlierConversation(page, { resume: true });
+  assert.equal(callRecap(page), null, "the line under a call showed with no call");
+  const socket = await startV1Call(page, ["replay"]);
+
+  const frames = framesSent(socket);
+  assert.equal(frames[0] && frames[0].type, "replay",
+    `the record was not the first frame after session_started: ${frames.map((frame) => frame.type)}`);
+  assert.ok(frames.findIndex((frame) => frame.type === "audio_start") > 0, "the microphone opened before the record went");
+  assert.equal(replayFrames(socket).length, 1, "the record went twice");
+  const [replay] = replayFrames(socket);
+  assert.ok(replay.text.startsWith(REPLAY_PREAMBLE), "the frame does not carry the server's reconstruction");
+  assert.match(replay.text, /the mac runner stalled mid-deploy/);
+  assert.deepEqual([replay.lines, replay.dropped, replay.words], [2, 0, 11]);
+
+  // Sent, and not yet taken: the line says only what is known.
+  assert.equal(callRecap(page), "Sent the agent 11 words from earlier");
+  socket.onmessage({ data: JSON.stringify({ type: "replay_ack", accepted: true }) });
+  await page.settle();
+  assert.equal(callRecap(page), "Caught the agent up with 11 words from earlier");
+  assert.equal(page.el("call-recap").getAttribute("data-recap"), "accepted");
+  // Settings, and the line above the call, say it too.
+  assert.equal(page.el("resume-state").textContent, "The last call was resumed: the agent took 11 words from earlier.");
+  assert.equal(seamChip(boundaryLines(page).at(-1)), "11-word recap sent");
+
+  // The conversation's start marker records how it went.
+  speech(socket, "user", 1, "is it back now", true);
+  turnDone(socket, 1);
+  await watchTurns(page);
+  const started = [...page.storedTurns.entries()].find(([id]) => id !== "conv_earlier");
+  assert.ok(started, "the call filed nothing");
+  assert.deepEqual(started[1][0].detail, {
+    kind: "conversation_start",
+    recap: { state: "sent", words: 11, lines: 2, dropped: 0, transport: "replay_frame" },
+  });
+
+  // The line goes with the call; Settings keeps what the call got.
+  await page.el("hang-up").click();
+  await page.settle();
+  assert.equal(callRecap(page), null, "the line under the call outlived it");
+  assert.match(page.el("resume-state").textContent, /took 11 words from earlier/);
+});
+
+test("`#331 resume-on-websocket`: a session that does not list replay is sent nothing, and the call says it started fresh (negative control: one that ignores the list)", async () => {
+  const page = newPage();
+  await withEarlierConversation(page, { resume: true });
+  const socket = await startV1Call(page, undefined);
+  assert.deepEqual(replayFrames(socket), [], "a session that did not list replay was sent the record");
+  assert.equal(callRecap(page), "Started fresh: this voice session takes no recap");
+  assert.equal(page.el("call-recap").getAttribute("data-recap"), "fresh");
+  assert.equal(seamChip(boundaryLines(page).at(-1)), "recap unsupported");
+  assert.equal(page.el("resume-state").textContent, "The last call was NOT resumed: its voice session took no recap.");
+  // A word it does not list is not `replay`.
+  const other = newPage();
+  await withEarlierConversation(other, { resume: true });
+  assert.deepEqual(replayFrames(await startV1Call(other, ["replays", "Replay"])), []);
+
+  // The negative control: a page that sends the record whatever the session lists.
+  const careless = newPage(new Map(), brokenScript(
+    'const listed = Array.isArray(message.capabilities) && message.capabilities.includes("replay");',
+    "const listed = true;"));
+  await withEarlierConversation(careless, { resume: true });
+  assert.equal(replayFrames(await startV1Call(careless, undefined)).length, 1,
+    "the negative control sent nothing either, so the check above proves nothing");
+});
+
+test("`#331 resume-on-websocket`: a bridge that refuses the record: the call, Settings and the line above all say so, and a late yes changes nothing", async () => {
+  const page = newPage();
+  page.transcriptRecordsSupported = true;
+  await withEarlierConversation(page, { resume: true });
+  const socket = await startV1Call(page, ["replay"]);
+  socket.onmessage({ data: JSON.stringify({ type: "replay_ack", accepted: false, reason: "too long for this model" }) });
+  await page.settle();
+  assert.equal(callRecap(page), "Started fresh: the voice service refused the recap");
+  assert.equal(page.el("resume-state").textContent, "The last call was NOT resumed: the voice service refused the recap.");
+  assert.equal(seamChip(boundaryLines(page).at(-1)), "recap refused");
+  socket.onmessage({ data: JSON.stringify({ type: "replay_ack", accepted: true }) });
+  await page.settle();
+  assert.equal(callRecap(page), "Started fresh: the voice service refused the recap", "a second answer was believed");
+  speech(socket, "user", 1, "hello again", true);
+  turnDone(socket, 1);
+  await watchTurns(page);
+  const started = [...page.storedTurns.entries()].find(([id]) => id !== "conv_earlier");
+  assert.deepEqual(started[1][0].detail.recap, { state: "none", why: "refused", dropped: 0 },
+    "the start marker kept saying the recap was sent");
+  await page.el("hang-up").click();
+  await page.settle();
+  assert.equal(page.el("talk-note").textContent, "the agent starts fresh — the voice service took no recap");
+});
+
+test("`#331 resume-on-websocket`: a call that ends before its session starts was not resumed, and Settings does not say it was", async () => {
+  const page = newPage();
+  await withEarlierConversation(page, { resume: true });
+  const socket = await startV1Call(page, ["replay"], { started: false });
+  assert.equal(callRecap(page), null, "the line claimed a recap before the session could take one");
+  socket.close();
+  await page.settle();
+  assert.deepEqual(replayFrames(socket), []);
+  assert.equal(page.el("resume-state").textContent, "The last call ended before it could be told what was already said.");
+  assert.doesNotMatch(page.el("resume-state").textContent, /was resumed/);
+});
+
+test("`#331 resume-on-websocket`: on the hosted backend the call says what it was SENT, in the server's words, and how much did not fit", async () => {
+  const page = newPage();
+  page.replayWords = 412;
+  await withEarlierConversation(page, { resume: true });
+  await startTalking(page);
+  assert.equal(callRecap(page), "Sent the agent 412 words from earlier",
+    "nothing acknowledges a recap there, so 'caught up' would claim more than is known");
+  assert.equal(page.el("resume-state").textContent, "The last call was resumed: it was sent 412 words from earlier.");
+
+  const partial = newPage();
+  partial.replayMaxTurns = 1;
+  await withEarlierConversation(partial, { resume: true });
+  await startTalking(partial);
+  assert.equal(callRecap(partial), "Sent the agent 5 words from earlier; 1 older line did not fit");
+  assert.equal(partial.el("resume-state").textContent, "The last call was resumed IN PART: 5 words; 1 earlier line did not fit.");
+});
+
+test("`#331 resume-on-websocket`: a call that starts fresh says why, for every reason", async () => {
+  for (const [what, arrange, expected] of [
+    ["resuming off here", (page) => withEarlierConversation(page, { resume: false }), "Started fresh: resuming is off"],
+    ["resuming off on the server", async (page) => {
+      page.replayEnabled = false;
+      await withEarlierConversation(page, { resume: true });
+    }, "Started fresh: resuming is off on this server"],
+    ["a bridge that declined", async (page) => {
+      page.replayEnabled = false;
+      page.replayUnavailable = "bridge_declined";
+      await withEarlierConversation(page, { resume: true });
+    }, "Started fresh: the voice service does not take a recap"],
+    ["a bridge that has not answered", async (page) => {
+      page.replayEnabled = false;
+      page.replayUnavailable = "bridge_unconfirmed";
+      await withEarlierConversation(page, { resume: true });
+    }, "Started fresh: the voice service has not said it takes a recap"],
+    ["the record would not load", async (page) => {
+      page.replayStatus = 503;
+      await withEarlierConversation(page, { resume: true });
+    }, "Started fresh: the earlier conversation could not be read"],
+    ["every line over the budget", async (page) => {
+      page.replayMaxTurns = 0;
+      await withEarlierConversation(page, { resume: true });
+    }, "Started fresh: the earlier conversation was too long to send"],
+    ["nothing said aloud", async (page) => {
+      page.storedTurns.set("conv_empty", [{ speaker: "note", text: "the call ended", at_ms: 1 }]);
+      await signIn(page);
+      await page.settle();
+      await page.el("resume-toggle").setChecked(true);
+    }, "Started fresh: nothing was said aloud earlier"],
+    ["nothing earlier at all", async (page) => {
+      await signIn(page);
+      await page.el("resume-toggle").setChecked(true);
+    }, "Started fresh: there was no earlier conversation to resume"],
+  ]) {
+    const page = newPage();
+    await arrange(page);
+    await startTalking(page);
+    assert.equal(callRecap(page), expected, what);
+  }
+});
+
+test("`#331 resume-on-websocket`: where the server cannot resume, the switch is disabled and unticked with its reason beside it (negative control: a live switch)", async () => {
+  const reasons = [
+    ["off on the server", () => {}, "Unavailable: resuming is turned off in this server's configuration."],
+    ["a bridge that declined", (page) => { page.replayUnavailable = "bridge_declined"; },
+      "Unavailable: this server's voice service does not take a recap."],
+    ["a bridge that has not answered", (page) => { page.replayUnavailable = "bridge_unconfirmed"; },
+      "Unavailable: this server's voice service has not said it takes a recap."],
+  ];
+  for (const [what, arrange, reason] of reasons) {
+    const store = new Map([["vibe-talk.voice.resume", "on"]]);
+    const page = newPage(store);
+    page.replayEnabled = false;
+    arrange(page);
+    await signIn(page);
+    await page.settle();
+    const toggle = page.el("resume-toggle");
+    assert.equal(toggle.disabled, true, `${what}: the switch is live on a server that cannot resume`);
+    assert.equal(toggle.checked, false, `${what}: a disabled switch shows a choice that is not in force`);
+    assert.equal(page.el("resume-unavailable").hidden, false, `${what}: no reason beside the switch`);
+    assert.equal(page.el("resume-unavailable").textContent, reason, what);
+    // The line above names the state; only the operator's own switch is "OFF".
+    assert.equal(page.el("resume-state").textContent, page.replayUnavailable
+      ? "Resuming is unavailable on this server: every call starts fresh."
+      : "Resuming is OFF on this server: every call starts fresh.", what);
+    // Nothing can change it there, and the owner's choice is kept for a server that can.
+    await toggle.setChecked(false);
+    assert.equal(store.get("vibe-talk.voice.resume"), "on", `${what}: a disabled switch changed the choice`);
+  }
+  // The markup: disabled until client-config says otherwise, and described by its reason.
+  assert.match(settingsGroup("Resuming"), /<input id="resume-toggle" type="checkbox" aria-describedby="resume-unavailable" disabled \/>/);
+
+  // Where it can, the switch is live, shows the kept choice, and has no reason beside it.
+  const live = newPage(new Map([["vibe-talk.voice.resume", "on"]]));
+  await signIn(live);
+  await live.settle();
+  assert.equal(live.el("resume-toggle").disabled, false);
+  assert.equal(live.el("resume-toggle").checked, true);
+  assert.equal(live.el("resume-unavailable").hidden, true);
+
+  // The negative control: a page that never disables it.
+  const careless = newPage(new Map(), brokenScript("toggle.disabled = !resumeAllowed;", "toggle.disabled = false;"));
+  careless.replayEnabled = false;
+  await signIn(careless);
+  await careless.settle();
+  assert.equal(careless.el("resume-toggle").disabled, false,
+    "the negative control disabled the switch anyway, so the check above proves nothing");
+});
+
+test("`#331 resume-on-websocket`: Help says the switch can be disabled and why, and what the line under a call means", () => {
+  const block = helpEntry("resuming");
+  assert.match(block, /does not take a recap/, "the bridge's reason is not explained");
+  assert.match(block, /has not said it takes a recap/);
+  assert.match(block, /Caught the agent up/, "the line under a call is not explained");
+  assert.match(block, /Started fresh/);
+});
+
+test("`#331 resume-on-websocket`: the line under a call heads the call's box, outside the transcript, and gives way to a send card", () => {
+  const code = HTML.replace(/<!--[\s\S]*?-->/g, " ");
+  // Not between the transcript, a send card and the box (`#269 approval-card-inline`): inside the box.
+  assert.match(code, /<ol id="transcript" class="messages"><\/ol>/);
+  assert.match(code, /<div id="voice-composer">\s*<p id="call-recap" class="call-recap" role="status" hidden><\/p>\s*<textarea id="compose-text"/);
+  assert.match(cssBlock("#screen-main[data-draft] #call-recap"), /display: none/, "the line stands between a card and the box");
+  const rule = cssBlock("#call-recap");
+  assert.match(rule, /font-size:/, "the line has no size of its own");
+  assert.match(rule, /text-align: center/);
+  assert.match(cssBlock('#call-recap[data-recap="accepted"]'), /color:/, "a recap the agent took does not look different");
+  // ...and the reason beside a disabled switch is drawn as a note under it, not as a bare hint.
+  assert.match(cssBlock(".toggle-why"), /padding-left:|margin-left:/, "the reason does not stand under the switch's words");
 });

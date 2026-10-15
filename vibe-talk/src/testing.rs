@@ -256,6 +256,9 @@ fn state_pieces_with(
     let message_cache = Arc::new(crate::cache::Sink::off());
     let live = Arc::new(crate::live::LiveHub::new());
     live.attach_cache(Arc::clone(&message_cache));
+    // `#331 resume-on-websocket`. Nothing asked yet: a test that needs the bridge's answer asks for
+    // it (`BridgeHello::ask`), so the moment it arrives is the test's, not a background task's.
+    let voice_bridge = Arc::new(crate::voice_bridge::BridgeHello::for_config(&config));
     let state = AppState {
         config: Arc::new(config),
         chat: providers.clone(),
@@ -280,6 +283,7 @@ fn state_pieces_with(
         read_ahead: Arc::new(crate::read_ahead::ReadAhead::new()),
         recent_view_shadow: Arc::new(crate::recent_view::Shadow::new()),
         agent_override: Arc::new(crate::voice_prompt::OverrideAnswers::new()),
+        voice_bridge,
         message_cache,
         // Numbered from one, so a test can name the sends it makes; a server numbers from its clock.
         post_gate: Arc::new(crate::post_gate::PostGate::with_ttl_and_numbering(
@@ -1582,5 +1586,163 @@ impl LogCapture {
             .filter(|line| line.contains(crate::access::TARGET))
             .map(str::to_owned)
             .collect()
+    }
+}
+
+/// A loopback `vibe-talk-v1` bridge, for tests: the bridge a deployment puts behind
+/// `conversation.websocket_url`, reduced to the part of the protocol `#331 resume-on-websocket`
+/// is about. It starts a session on every connection, lists `replay` in that `session_started`
+/// when it is built to take one, answers each `replay` frame with exactly one `replay_ack` —
+/// accepted, or refused with a reason when it does not take a replay — and ends the session on
+/// `quit`. Its frames are the contract's own types, so it speaks what the page validates.
+///
+/// It keeps every JSON frame each session was sent, in order, so a test can hold what a client
+/// said to it: this server's hello says `quit` and nothing else, and a call that resumes says
+/// `replay` before anything.
+#[derive(Debug)]
+pub struct FakeVoiceBridge {
+    url: String,
+    sessions: Arc<Mutex<Vec<Vec<serde_json::Value>>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl FakeVoiceBridge {
+    /// Listen on a loopback port. `takes_replay` decides whether its sessions list `replay`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no loopback port can be bound, which leaves the test nothing to run against.
+    pub async fn start(takes_replay: bool) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port for the fake bridge");
+        let url = format!(
+            "ws://{}/voice",
+            listener.local_addr().expect("the fake bridge's address")
+        );
+        let sessions = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&sessions);
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(serve_fake_bridge_session(
+                    stream,
+                    takes_replay,
+                    Arc::clone(&kept),
+                ));
+            }
+        });
+        Self {
+            url,
+            sessions,
+            task,
+        }
+    }
+
+    /// Where it listens, as `ws://127.0.0.1:PORT/voice`.
+    #[must_use]
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Every session so far, each as the JSON frames it was sent, in order.
+    #[must_use]
+    pub fn sessions(&self) -> Vec<Vec<serde_json::Value>> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The `text` of every `replay` frame any session was sent, in order.
+    #[must_use]
+    pub fn replays(&self) -> Vec<String> {
+        self.sessions()
+            .iter()
+            .flatten()
+            .filter(|frame| frame["type"] == "replay")
+            .filter_map(|frame| frame["text"].as_str().map(str::to_owned))
+            .collect()
+    }
+}
+
+impl Drop for FakeVoiceBridge {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// One session on the fake bridge: announce it, then answer `replay` and `quit` until it ends.
+async fn serve_fake_bridge_session(
+    stream: tokio::net::TcpStream,
+    takes_replay: bool,
+    sessions: Arc<Mutex<Vec<Vec<serde_json::Value>>>>,
+) {
+    use futures_util::{SinkExt as _, StreamExt as _};
+    use tokio_tungstenite::tungstenite::Message;
+
+    use crate::contract::{VibeTalkV1ClientFrame, VibeTalkV1ServerFrame};
+
+    let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
+        return;
+    };
+    let index = {
+        let mut all = sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        all.push(Vec::new());
+        all.len() - 1
+    };
+    let frame = |frame: &VibeTalkV1ServerFrame| {
+        Message::Text(serde_json::to_string(frame).unwrap_or_default().into())
+    };
+    let started = VibeTalkV1ServerFrame::SessionStarted {
+        greeting: Some(false),
+        session_id: Some(format!("fake-{}", index + 1)),
+        capabilities: if takes_replay {
+            vec![crate::voice_bridge::REPLAY.to_owned()]
+        } else {
+            Vec::new()
+        },
+    };
+    if socket.send(frame(&started)).await.is_err() {
+        return;
+    }
+    while let Some(Ok(message)) = socket.next().await {
+        let raw = match message {
+            Message::Text(raw) => raw,
+            Message::Close(_) => break,
+            _ => continue,
+        };
+        let value: serde_json::Value = serde_json::from_str(raw.as_ref()).unwrap_or_default();
+        if let Some(kept) = sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(index)
+        {
+            kept.push(value.clone());
+        }
+        match serde_json::from_value::<VibeTalkV1ClientFrame>(value) {
+            Ok(VibeTalkV1ClientFrame::Replay { .. }) => {
+                let ack = if takes_replay {
+                    VibeTalkV1ServerFrame::ReplayAck {
+                        accepted: true,
+                        reason: None,
+                    }
+                } else {
+                    VibeTalkV1ServerFrame::ReplayAck {
+                        accepted: false,
+                        reason: Some("this bridge does not take a replay".to_owned()),
+                    }
+                };
+                if socket.send(frame(&ack)).await.is_err() {
+                    break;
+                }
+            }
+            Ok(VibeTalkV1ClientFrame::Quit) => {
+                let _ = socket.close(None).await;
+                break;
+            }
+            _ => {}
+        }
     }
 }

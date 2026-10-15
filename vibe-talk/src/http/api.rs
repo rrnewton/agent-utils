@@ -796,6 +796,9 @@ pub async fn client_config(
         Some(lifecycle) if scope >= Scope::Write => lifecycle.status(&state.message_cache).await,
         _ => None,
     };
+    // `#331 resume-on-websocket`. What a `vibe-talk-v1` bridge last said about taking a recap; an
+    // old answer is asked again in the background, never waited for here.
+    let bridge = crate::replay::bridge_support(&state);
     Ok(Json(ClientConfigResponse {
         app_name: Some(state.config.app_name.clone()),
         chat_provider_name: state.chat.provider_name().to_owned(),
@@ -818,10 +821,15 @@ pub async fn client_config(
         replies_in_thread: state.chat.replies_in_thread(),
         idempotent_posts_supported: state.chat.supports_idempotent_posts(),
         speech_prep_enabled: state.config.speakable.enabled,
-        replay_enabled: crate::replay::offered(&state.config.replay, &state.config.conversation),
+        replay_enabled: crate::replay::offered(
+            &state.config.replay,
+            &state.config.conversation,
+            bridge,
+        ),
         replay_unavailable: crate::replay::unavailable(
             &state.config.replay,
             &state.config.conversation,
+            bridge,
         ),
         transcript_records_supported: true,
         self_author_id: state.chat.self_author_id(),
@@ -3026,7 +3034,8 @@ pub struct ReplayResponse {
     pub words: usize,
     /// The budget that produced it.
     pub policy: crate::replay::ReplayPolicy,
-    /// How the page should hand `text` to the vendor.
+    /// How the page should hand `text` to the hosted vendor. A `vibe-talk-v1` call sends it in the
+    /// protocol's `replay` frame instead, whatever this says (`#331 resume-on-websocket`).
     pub transport: crate::replay::Transport,
     /// Whether the operator has turned resuming on at all.
     ///

@@ -670,7 +670,9 @@ public `vibe-talk-v1` WebSocket protocol can set `backend = "conversation"`; the
 message as a text turn, collects the agent's 24 kHz PCM response, and returns WAV audio. When a
 server-audio backend is available, the channel bar offers an instant device/agent selector.
 `read_aloud.websocket_url` may name a server-only route to that same agent when the browser-facing
-conversation URL goes through a different ingress.
+conversation URL goes through a different ingress. It is also where this server asks the bridge
+whether it takes a recap (`#331 resume-on-websocket`; see [Resuming on the websocket
+backend](#resuming-on-the-websocket-backend)), whatever `read_aloud.backend` is.
 
 The page plays a prepared read **as it arrives**. It fetches the audio itself and schedules the
 PCM on a Web Audio context, because an `<audio src>` element buffers a streamed WAV by bytes —
@@ -2219,7 +2221,7 @@ model provider or a real gateway.
 | Agent conversation idle close | `summaries.socket_idle_seconds` | — | default `30` |
 | Agent turn deadline | `summaries.reply_timeout_seconds` | — | one turn, and one opening handshake, default `30`, minimum 1 |
 | Thread-naming read budget | `summaries.thread_naming_interval_seconds` | — | seconds between two reads of a channel's threads to name them, default `30`, `0` to `3600` (`0`: not spaced, still one at a time); not part of the summary cache key — see [Thread names](#thread-names) |
-| Resuming | `replay.enabled` | `VIBE_TALK_REPLAY_ENABLED` | **off by default**; on, every new call re-sends earlier conversation content to the vendor. Only the ElevenLabs backend can carry it: with `conversation.backend = "websocket"` the page is told replay is off, and the server warns at startup |
+| Resuming | `replay.enabled` | `VIBE_TALK_REPLAY_ENABLED` | **off by default**; on, every new call re-sends earlier conversation content to the vendor. The ElevenLabs backend always carries it; with `conversation.backend = "websocket"` it is offered only once the bridge lists `replay` in its `session_started`, which this server asks it at startup — until then the page is told replay is off and Settings disables the switch, saying why. See [Resuming on the websocket backend](#resuming-on-the-websocket-backend) |
 | Replay budget | `replay.max_chars` / `replay.max_turns` | `VIBE_TALK_REPLAY_MAX_CHARS` / `_TURNS` | default `6000` / `40`; oldest dropped first; `0` is refused, not "unlimited" |
 | Replay transport | `replay.transport` | `VIBE_TALK_REPLAY_TRANSPORT` | `contextual_update` (default) or `client_data` |
 | Config file path | — | `VIBE_TALK_CONFIG` | or `--config` |
@@ -4383,13 +4385,34 @@ record ends with — reads "new conversation" with a chip beside the label:
 | a recap | "412-word recap sent" ("recap sent" when the server's replay does not say how many words, as one from before this does not) | how many words went, and how many older lines did not fit; on the start request, that the agent's own settings may ignore it |
 | nothing, though resuming is on | "no recap sent" | why: nothing said aloud to replay, not even the last line fitting the budget, the page unable to read the record, or a replacement voice session |
 | nothing, because the backend cannot take one | "recap unsupported" | the voice service has no way to take a recap, so the agent remembers nothing above |
+| a recap the voice service refused | "recap refused" | the voice service refused the recap it was sent (`#331`: a bridge's `replay_ack` with `accepted: false`) |
 | resuming is off | none | none |
 
-"Sent" and not "recapped": neither transport acknowledges a recap, so sent is all the page knows.
-The sentence the line already had, saying how the call before ended (`#268 voice-call-drops`), stays
-as it was, beside its own; it takes the resuming wording only when a recap really went. On the
-`vibe-talk-v1` backend, which has no way to carry a recap, a server with `replay.enabled` on says
-"recap unsupported" on every new call rather than nothing.
+"Sent" and not "recapped": the hosted service acknowledges nothing, and the chip is drawn from the
+stored marker after a reload, so sent is all it says. The sentence the line already had, saying how
+the call before ended (`#268 voice-call-drops`), stays as it was, beside its own; it takes the
+resuming wording only when a recap really went. On the `vibe-talk-v1` backend, a server with
+`replay.enabled` on whose bridge has not said it takes a recap says "recap unsupported" on every new
+call rather than nothing, and so does a call whose own session did not list `replay`.
+
+**The line under a call says what it was given** (`#331 resume-on-websocket`). From the moment the
+call's recap is settled until it ends, a line at the head of the call's message box, under the
+turns, says in words what the agent was handed — "Sent the agent 412 words from earlier", with "; 3
+older lines did not fit" when the budget dropped some — and, on a bridge that answered its `replay`
+frame, "Caught the agent up with 412 words from earlier" once it did. It gives way while a send card
+is up, so nothing stands between the card and the box. A call that was given nothing says "Started fresh:" and why:
+resuming is off (here or on the server), the voice service does not take a recap or has not said it
+does, this call's session took none or refused it, nothing was said aloud earlier, the record would
+not load or was too long to send, or there was no earlier conversation to resume. The words are the
+server's own count of what its replay held. Settings' Resuming line says the same of the last call,
+with the count: "The last call was resumed: the agent took 412 words from earlier."
+
+**Where this server cannot resume, the switch is disabled.** With `replay.enabled` off, or a bridge
+that has not said it takes a recap, "Tell a new call what was already said" is drawn disabled and
+unticked — never a live control that does nothing — with its reason directly under it: "Unavailable:
+resuming is turned off in this server's configuration", "…this server's voice service does not take
+a recap", or "…has not said it takes a recap". The owner's own choice is kept, and comes back where
+the server can act on it.
 
 The same line comes back after a reload. On a server that keeps records, a conversation's first
 record is a `conversation_start` marker holding the recap its call was sent and how the call before
@@ -4436,14 +4459,47 @@ the budget like any other, the channel's name is neutralized like the words, and
 what each opening means. The page's markers — a conversation's start, a draft that was not sent —
 are never replayed.
 
-Where the voice backend cannot carry a recap at all — `conversation.backend = "websocket"` —
-client-config says `replay_unavailable: "backend"` as well as `replay_enabled: false`, so the page
-says "recap unsupported" on the new conversation's seam rather than nothing (above).
+Where the voice backend cannot take a recap — a `conversation.backend = "websocket"` bridge that
+answered this server's hello without `replay`, or has not answered one — client-config says
+`replay_unavailable: "bridge_declined"` or `"bridge_unconfirmed"` as well as `replay_enabled: false`,
+so the page disables the switch with that reason and says "recap unsupported" on the new
+conversation's seam rather than nothing (above).
+
+### Resuming on the websocket backend
+
+`#331 resume-on-websocket`. A deployment-managed `vibe-talk-v1` bridge can resume too: the page
+hands the new call the same reconstruction the hosted backend is sent, in a `replay` frame, and the
+bridge feeds it to its model. The frame and its answer are in the protocol (see [Conversational
+voice providers](#conversational-voice-providers)); what matters here is when it is offered.
+
+* **Only a bridge that says so is sent one.** A bridge lists `replay` in its `session_started`
+  `capabilities` when it takes the frame. A bridge that predates the frame would answer it with
+  `error`, which ends the session, so nothing else is a yes.
+* **This server asks before any call.** With `replay.enabled` on and the websocket backend, it opens
+  one session on the bridge at startup, reads `session_started`, and ends it with `quit` — no audio,
+  no prompt, no recap. It dials `read_aloud.websocket_url` when that is set, and otherwise
+  `conversation.websocket_url` when it is an absolute `ws://` or `wss://` URL; a path is the page's
+  own host, which the server cannot dial, so a deployment whose page uses `/ws?…` sets
+  `read_aloud.websocket_url` to its loopback route to the same bridge. Until the bridge answers with
+  `replay`, client-config reports replay off, with `bridge_unconfirmed` (no answer: not asked yet,
+  no address, refused, silent) or `bridge_declined` (it answered without `replay`), and the startup
+  log says which. An answer is kept for thirty minutes and a failure for one; a page loading
+  client-config after that has it asked again in the background.
+* **Each call checks its own session too.** The page sends `replay` only to a session whose
+  `session_started` lists it, as the first frame after it, so a bridge that changed since the ask
+  costs a call that says "this voice session takes no recap" — never a frame sent into a session
+  that cannot take it. A `replay_ack` with `accepted: true` turns "Sent the agent …" into "Caught the
+  agent up with …"; `accepted: false` makes the call "Started fresh: the voice service refused the
+  recap", and its seam "recap refused".
+
+The privacy note below applies unchanged: on this backend the earlier conversation goes to the
+bridge, and on to whatever model it uses.
 
 ### Privacy
 
-**Every new call re-sends earlier conversation content to ElevenLabs**, including Discord text
-written by other people that the agent read out. That is why it is off by default, why the
+**Every new call re-sends earlier conversation content to the voice vendor** — ElevenLabs, or the
+bridge and its model on the websocket backend — including Discord text written by other people that
+the agent read out. That is why it is off by default, why the
 Settings screen says it in those words, and why it deserves an explicit decision if any of that
 content is sensitive.
 
@@ -4915,6 +4971,43 @@ the page shows it immediately and replaces it in place as it improves. The page 
 repeat of text already held changes nothing — and stores that row once, when the turn completes.
 The same words in a later turn are a new row. A frame without `turn` cannot be matched and is
 treated as its own turn.
+
+**Capabilities, and the replay frame** (`#331 resume-on-websocket`). `session_started` may carry
+`"capabilities": ["replay"]`: the optional client frames this server accepts, by `type`. Absent or
+empty means none, and a client ignores a word it does not know. A client never sends an optional
+frame to a session that did not list it, because a server that predates one answers it with
+`error`, which ends the session. vibe-talk asks a bridge for this list before any call — one
+session, read `session_started`, send `quit`, nothing else — and offers the owner Resuming only
+when the list holds `replay`.
+
+`replay` is the one optional frame so far. To a session that listed it, a client resuming an
+earlier conversation sends, as its **first frame after `session_started`** and before `audio_start`
+or any `prompt`, at most once per session:
+
+```json
+{"type":"replay","text":"You are resuming an earlier voice conversation with this same user. …","lines":12,"dropped":3,"words":412}
+```
+
+`text` is the whole payload, exactly as `GET /api/v1/conversations/{id}/replay` renders it for every
+backend (the hosted one gets the same text as a `contextual_update`): a preamble telling the agent
+it is resuming, not to answer or read back what follows, and — when lines were dropped — that the
+record is incomplete; then the record, one `you:`, `agent:` or `sent to …:` line per turn, oldest
+first, fenced as untrusted text because it quotes channel messages. It is already inside the
+server's `replay.max_chars` and `replay.max_turns`. `lines`, `dropped` and `words` describe it, for
+logs. A bridge should give `text` to its model as context — a system or context message, not a user
+turn — before the agent says anything, and a bridge that greets should wait for the client's first
+frame before it does, since a resuming client sends this one at once.
+
+The server answers every `replay` with exactly one
+`{"type":"replay_ack","accepted":true}` once the record is in the model's context, or
+`{"type":"replay_ack","accepted":false,"reason":"…"}` when this session will not use it (too long for
+its model, a mode that keeps no context). `replay_ack` is not a turn: no `turn_complete` follows it,
+and it opens none. The page says "Caught the agent up with 412 words from earlier" on an accepted
+one and "Started fresh: the voice service refused the recap" on a refusal; with no answer it keeps
+saying it sent them. A bridge that does not take the frame simply does not list it.
+
+`vibe_talk::testing::FakeVoiceBridge` is a loopback bridge that does all of this, for either answer,
+and `tests/replay_bridge.rs` holds the server and the frame to it.
 
 ### Repeatable live spoken-read acceptance
 
@@ -8583,6 +8676,7 @@ src/untrusted.rs      the data-not-instructions boundary
 src/ops.rs            the operations both front doors share: allowlist, fetch, transform
 src/live.rs           bounded polling and adapter push, per-channel fan-out, replay, and SSE bodies
 src/replay.rs         rebuilding continuity across a hang-up: the preamble, the budget, the fence
+src/voice_bridge.rs   what a vibe-talk-v1 bridge says it accepts: the hello that offers resuming
 src/probe.rs          the startup channel reachability probe and its failure taxonomy
 src/diagnostics.rs    those same checks on demand, structured, redacted, and time-bounded
 src/upstream_profile.rs  how long each provider operation and Slack Web API call takes, and how
@@ -8716,6 +8810,11 @@ Beyond the security list above:
   switch are all tested — but no billed run has yet confirmed that ElevenLabs puts the payload in
   context for the first agent turn. `scripts/run.sh --smoke-agent --replay-check` is the check;
   it has never been run against a live agent. That is why `replay.enabled` defaults to false.
+* **No real bridge has taken a `replay` frame yet.** `#331 resume-on-websocket` defines the frame,
+  the hello that offers it and the acknowledgement, and holds this server and the page to them
+  against `FakeVoiceBridge`; a deployment's bridge must still implement them, and until it lists
+  `replay` its owner sees Resuming disabled with "has not said it takes a recap" or "does not take a
+  recap".
 * **The replay budget is a guess.** 6000 characters and 40 turns were chosen, not measured. The
   payload is billed per call.
 * **A contextual update reaches the agent only while the app is open.** The conversation socket
