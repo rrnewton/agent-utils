@@ -1611,6 +1611,20 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   // draws two columns at all, and so whether the view picker offers them. `#281 view-keys`.
   elements.get("column-toggle").getClientRects = () =>
     (page.wideDesk && !elements.get("column-toggle").hidden ? [{ top: 0, bottom: 0 }] : []);
+  // `#314 reply-focus-flake`. The reply's box: none under anything hidden, and in a column's place for a
+  // reply only while the same desktop block draws two columns — the left one's while #screen-main carries
+  // `data-columns="two"`, the right one's while #side-column has a box. A window narrowed under a reply
+  // open in a column stops drawing it before the page has decided anything (`page.wideDesk` set, its
+  // resize event not yet fired), which is what a test of that moment asks here.
+  elements.get("reply-compose").getClientRects = () => {
+    const box = elements.get("reply-compose");
+    for (let at = box; at; at = at.parentNode) if (at.hidden) return [];
+    const screen = elements.get("screen-main");
+    const drawn = box.parentNode === elements.get("column-reply")
+      ? page.wideDesk && screen.getAttribute("data-columns") === "two"
+      : box.parentNode !== elements.get("side-reply") || elements.get("side-column").getClientRects().length > 0;
+    return drawn ? [{ top: 0, bottom: 0 }] : [];
+  };
   const page = {
     elements,
     el: (id) => {
@@ -2486,6 +2500,21 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     // With frames (`enableAnimationFrames`), the page decides the columns at the next one.
     if (page.frames) await page.nextFrame();
     await page.settle();
+  };
+  /**
+   * `#314 reply-focus-flake`. The focus leaves whatever has it for nothing: the document's `activeElement`
+   * falls back to nothing, and `focusout`, saying no element took it, goes to the element and to each one
+   * around it, as it bubbles in a browser. Chromium does this to a field it has stopped drawing, in a
+   * task of its own once it has laid the page out without it — before the page's next frame, on a slow
+   * one — and to a field the reader clicks away from onto something that takes no focus.
+   */
+  page.loseFocus = async () => {
+    const from = FakeElement.focused;
+    if (!from) return;
+    FakeElement.focused = null;
+    const event = { type: "focusout", target: from, relatedTarget: null };
+    for (let at = from; at; at = at.parentNode) await at.dispatch("focusout", event);
+    await page.documentEvent("focusout", event);
   };
   /**
    * `#225 enter-to-send`. The platform the browser reports, as `navigator.platform` gives it. Set
@@ -56453,6 +56482,96 @@ test("`#277 reply-in-column`: two columns going while a reply is open hand it to
   await page.el("view-switch").click();
   await page.settle();
   assert.equal(replyBoxAt(page), "screen", "the call's view kept a reply open in a column");
+});
+
+// `#314 reply-focus-flake`. tests/reply_in_column_browser.py failed now and then on a loaded host with "the
+// box lost the focus on the way to the reply screen". The page decides one column or two at the frame after
+// a resize, and Chromium, once it has laid the narrower window out without the column, takes the focus off
+// the box it no longer draws in a task of its own — on a slow frame, before the page's. The hand-off then
+// saw no focus in the box (`leaveColumns`). That browser check holds the page's frames back to make the
+// order certain; here it is the order of the steps.
+
+/** A reply open in `column` of two columns, on `row`, with words in its box and the focus. */
+async function replyTypedInColumn(page, column, row) {
+  await replyButton(row(page)).click();
+  assert.equal(replyBoxAt(page), column, `${column}: the premise is a reply open in the column`);
+  await page.el("reply-text").setValue("halfway through a sentence");
+  assert.equal(focused(page), page.el("reply-text"), `${column}: the premise is the focus in the box`);
+}
+
+/** The window narrowed with the reader typing, the browser taking the focus off the box before the page's frame. */
+async function narrowedUnderSlowFrame(page, column) {
+  page.wideDesk = false;
+  assert.equal(page.el("reply-compose").getClientRects().length, 0, `${column}: the premise is a box no longer drawn`);
+  await page.loseFocus();
+  assert.equal(focused(page), null, `${column}: the premise is the focus taken off the box`);
+  await page.setDesk(false);
+}
+
+const REPLY_COLUMNS_ROWS = [["left", (page) => rowWithId(page, "200")], ["right", (page) => sideRow(page, "202")]];
+
+test("`#314 reply-focus-flake`: a window narrowed under a reply open in a column gives the reply screen the box with the focus in it, even where the browser took the focus off it before the page's frame; a box the reader left for nothing is not given it back", async () => {
+  for (const [column, row] of REPLY_COLUMNS_ROWS) {
+    // A quick frame: the box still has the focus when the page hands the reply on.
+    const { page: quick } = await replyColumnsPage();
+    await replyTypedInColumn(quick, column, row);
+    await quick.setDesk(false);
+    assert.equal(quick.screen(), "reply", `${column}: the premise is the reply screen`);
+    assert.equal(focused(quick), quick.el("reply-text"), `${column}, quick frame: ${focusName(quick)} has the focus, not the box`);
+
+    // A slow one: the browser has taken it already.
+    const { page } = await replyColumnsPage();
+    await replyTypedInColumn(page, column, row);
+    await narrowedUnderSlowFrame(page, column);
+    assert.equal(page.screen(), "reply", `${column}: one column did not hand the reply to the reply screen`);
+    assert.equal(replyBoxAt(page), "screen");
+    assert.equal(page.el("reply-text").value, "halfway through a sentence", `${column}: the words did not go with the reply`);
+    assert.equal(focused(page), page.el("reply-text"), `${column}, slow frame: ${focusName(page)} has the focus, not the box`);
+
+    // The reader's own leaving is theirs: a click away from the box onto what takes no focus, the box still
+    // drawn, and then the window narrowed. The reply screen's list has the keys, as for any reader not typing.
+    await page.el("reply-cancel").click();
+    await page.setDesk(true);
+    assert.ok(inTwoColumns(page), `${column}: the premise is two columns again`);
+    await replyTypedInColumn(page, column, row);
+    assert.ok(page.el("reply-compose").getClientRects().length > 0, `${column}: the premise is a box drawn in its column`);
+    await page.loseFocus();
+    await page.setDesk(false);
+    assert.equal(page.screen(), "reply");
+    assert.equal(focused(page), page.el("reply-scroll"),
+      `${column}: a box the reader had left took the focus back on the reply screen (${focusName(page)} has it)`);
+  }
+
+  // Taken by the browser, but the window wide again before the page's frame, and the reader then on the
+  // column's list and off it onto nothing: what took the focus since is where they went, and a later
+  // narrowing does not take them back to the box.
+  const movedOn = async (script) => {
+    const { page } = await replyColumnsPage(script);
+    await replyTypedInColumn(page, "right", REPLY_COLUMNS_ROWS[1][1]);
+    page.wideDesk = false;
+    await page.loseFocus();
+    await page.setDesk(true);
+    assert.equal(replyBoxAt(page), "right", "the premise is the reply still open in its column");
+    page.el("side-scroll").focus();
+    await page.documentEvent("focusin", { type: "focusin", target: page.el("side-scroll"), relatedTarget: null });
+    await page.loseFocus();
+    await page.setDesk(false);
+    assert.equal(page.screen(), "reply");
+    return focused(page) === page.el("reply-text");
+  };
+  assert.equal(await movedOn(SCRIPT), false, "the box took back a focus the reader had given the column's list since");
+
+  // THE CONTROLS: the hand-off deciding from where the focus is alone, as it did; and the browser's taking
+  // never forgotten. The walk above sees each.
+  const { page: control } = await replyColumnsPage(brokenScript(
+    "(nodeWithin(el(\"reply-compose\"), document.activeElement) || (replyFocusTaken && focusLost()))",
+    "nodeWithin(el(\"reply-compose\"), document.activeElement)"));
+  await replyTypedInColumn(control, "right", REPLY_COLUMNS_ROWS[1][1]);
+  await narrowedUnderSlowFrame(control, "right");
+  assert.equal(control.screen(), "reply");
+  assert.notEqual(focused(control), control.el("reply-text"), "the control kept the focus in the box, so this test cannot see it lost");
+  assert.equal(await movedOn(brokenScript('document.addEventListener("focusin", () => {\n  replyFocusTaken = false;\n});', "")), true,
+    "the control that never forgets gave the list the focus too, so this test cannot see a focus taken back");
 });
 
 /**

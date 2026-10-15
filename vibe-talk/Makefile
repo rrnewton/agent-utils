@@ -367,7 +367,9 @@ reply-continuity-browser:
 # columns staying where they were to the pixel and the message answered edged and unmoved; Escape, Cancel,
 # Send and Enter put the box back and the column where it was, the keys on its list, a sent reply posted
 # where the reply screen posts it; a message low in a column moves up only as far as shows it over the
-# box; a window narrowed to one column hands an open reply to the reply screen with its words; `#281
+# box; a window narrowed to one column hands an open reply to the reply screen with its words, and
+# `#314 reply-focus-flake` with the focus in its box even where the page's frame comes after the browser
+# has taken the focus off it (the page's frames held back, in each column); `#281
 # view-keys`: real Ctrl+4 in an open reply leaves it, and Ctrl+2 and Ctrl+3 show All and the thread list
 # with the reply put down, its words kept; and one column is the reply screen, as it was. Pass
 # WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each

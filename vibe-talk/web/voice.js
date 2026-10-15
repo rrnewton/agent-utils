@@ -30629,6 +30629,12 @@ let replyFromTop = null;
  * reply-in-column`; see `dockReply`.
  */
 let replyDocked = false;
+/**
+ * Whether the browser took the focus off the box of a reply open in a column because it stopped drawing
+ * that column, so that the reader was typing in it as far as the page is concerned. `#314
+ * reply-focus-flake`; see `noteReplyFocusLeaving`.
+ */
+let replyFocusTaken = false;
 /** The row's messages the reply on screen answers the first of, for the reply screen it may move to. */
 let replyMessages = /** @type {Array<object>} */ ([]);
 
@@ -31296,9 +31302,12 @@ function dockReply(from) {
  */
 function undockReply() {
   if (!replyDocked) return;
+  // Not open in a column from here on, before the box moves: Chromium takes the focus off a box as it
+  // leaves the column, and that is not the column going (`noteReplyFocusLeaving`).
+  replyDocked = false;
+  replyFocusTaken = false;
   el("screen-reply").append(el("reply-compose"));
   for (const id of ["column-reply", "side-reply"]) leftEl(id).hidden = true;
-  replyDocked = false;
   renderReplyingMarks();
   placeToolsOverReply();
   scheduleBackSync();
@@ -31345,6 +31354,31 @@ function moveReplyToScreen(typing) {
   replyFromTop = null;
   placeReplyMessage(null);
   if (typing) el("reply-text").focus({ preventScroll: true });
+}
+
+/**
+ * The reply's box, or something in it, has lost the focus. `#314 reply-focus-flake`.
+ *
+ * A WINDOW NARROWED UNDER A REPLY OPEN IN A COLUMN CAN TAKE THE FOCUS OFF ITS BOX BEFORE THE PAGE HANDS IT
+ * ON. The page decides one column or two at the frame after a resize (`renderColumns`), and hands the reply
+ * to the reply screen then, with the focus if the box had it (`leaveColumns`). But Chromium, once it has
+ * laid the narrower window out without the column — web/voice.css draws neither column's place for a reply
+ * outside the desk's block — takes the focus off the box it no longer draws, in a task of its own, which a
+ * slow frame lets come first. The hand-off then found the focus nowhere and gave the keys to the reply
+ * screen's list: the reader, mid-sentence, was out of the box. tests/reply_in_column_browser.py met it now
+ * and then on a loaded host; a reader would on a busy machine.
+ *
+ * So it is noted here: the focus leaving the box for nothing while the box is open in a column that is no
+ * longer drawn is the browser's doing, and the hand-off gives it back while nothing else has taken it. Left
+ * for another element, or for nothing while the box is still drawn (a click on what takes no focus, another
+ * window), it was the reader's, and is not.
+ *
+ * @param {FocusEvent} event
+ */
+function noteReplyFocusLeaving(event) {
+  const box = el("reply-compose");
+  replyFocusTaken = replyDocked && !(event && event.relatedTarget) &&
+    typeof box.getClientRects === "function" && box.getClientRects().length === 0;
 }
 
 /**
@@ -32934,7 +32968,8 @@ function leaveColumns(next = "one") {
   // it, and given to the reply screen once the layout that follows is drawn: what this returns, which
   // `moveLayout` runs then — over one column, or over the thread list (`#281 view-keys`).
   const replying = replyDocked;
-  const typing = replying && nodeWithin(el("reply-compose"), document.activeElement);
+  // `#314 reply-focus-flake`. Or had it until the browser took it, the column no longer drawn.
+  const typing = replying && (nodeWithin(el("reply-compose"), document.activeElement) || (replyFocusTaken && focusLost()));
   if (replying) undockReply();
   // `#262 search-load-older`. The right column's walk for the search ends: its list is put aside, held.
   endSearchWalk(columns.side);
@@ -38530,6 +38565,12 @@ el("reply-context-more").addEventListener("click", guardQuietly(loadEarlierReply
 // only on the way out — a way out that is not a control (the browser's own back, a reload) would
 // otherwise lose it.
 el("reply-text").addEventListener("input", rememberDraft);
+// `#314 reply-focus-flake`. The focus a narrowed window takes off a reply open in a column, for the hand-off;
+// forgotten once anything has the focus again, which is where the reader went.
+el("reply-compose").addEventListener("focusout", noteReplyFocusLeaving);
+document.addEventListener("focusin", () => {
+  replyFocusTaken = false;
+});
 // `#277 reply-in-column`. A reply open in a column changes height without the window changing — the box
 // dragged taller, a failed send's line, the new-thread choice — and the chips standing on it go with it.
 if (typeof window.ResizeObserver === "function") {

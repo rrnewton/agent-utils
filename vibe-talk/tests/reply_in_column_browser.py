@@ -28,7 +28,10 @@ Then a message low in the left column, which the box would cover: the column mov
 shows it above the box and its chips, never taking its top under the column's, and Cancel puts it back
 to the pixel. Then the box dragged far taller than the window: it stops at a quarter of the window, and
 the list over it keeps its height. Then a reply open in the right column when the window is narrowed to
-one column: the reply screen takes it, words and all.
+one column: the reply screen takes it, words and all. Then the same in each column with the page's frames
+held back behind the browser's (`#314 reply-focus-flake`), which lays the narrower window out and takes the
+focus off the box it no longer draws before the page hands the reply on, as a loaded host does by chance:
+the box on the reply screen has the focus all the same.
 
 Then the service refusing a reply sent from each column, as a chat service that is down does: the
 column still goes back to where it was, and the failure is ON SCREEN — the status line, a polite live
@@ -87,6 +90,9 @@ REFUSALS: tuple[tuple[str, tuple[str, tuple[int, Json]], str], ...] = (
     ("left", ("205", (503, {"error": "upstream_unavailable", "detail": "chat service down"})), "Reply unconfirmed"),
     ("right", ("208", (422, {"error": "chat_error", "detail": "Google Chat returned HTTP 400"})), "Reply not sent"),
 )
+# The rows a reply is opened on before the window is narrowed under a slow frame (`slow_frame_run`): one
+# of Main's on the left, one of the runner's replies on the right, neither holding a draft.
+SLOW_FRAME_ROWS = (("left", "207"), ("right", "206"))
 # Where a pressed row's top is put, below the top of its column's list, in px.
 ROW_OFFSET_PX = 90
 # The words a drag selects in a message, from its first character.
@@ -297,6 +303,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace) -> str:
             low_run(desk)
             tall_box_run(desk)
             narrowed_run(desk)
+            for column, message_id in SLOW_FRAME_ROWS:
+                slow_frame_run(desk, column, message_id)
             for column, refusal, said in REFUSALS:
                 refused_run(desk, api, column, refusal, said)
             view_keys_run(desk)
@@ -703,6 +711,94 @@ def narrowed_run(desk: Desk) -> None:
                   " && document.getElementById('thread-select').value === 'columns'",
                   "narrowed: two columns did not come back")
     desk.notes.append("narrowed to 900px, the reply open on the right moved to the reply screen with its words")
+
+
+# `#314 reply-focus-flake`. The page's own frames held back, each run this long after the browser's: the
+# browser lays the narrowed window out without the column, and takes the focus off the box it no longer
+# draws, before the page's frame that hands the reply to the reply screen. A loaded host does that now and
+# then by chance (the narrowed step above failed so about one run in ten under contention); this does it
+# every time.
+HELD_FRAME_MS = 250
+
+# Hold the page's frames, and note what happens to the box's focus before the first of them runs: a
+# `focusout` then is the browser's alone, since the page hands the reply on only in a frame.
+HOLD_FRAMES_JS = """(ms) => {
+    const held = {original: window.requestAnimationFrame, waiting: 0, ran: false, dropped: null};
+    const box = document.getElementById('reply-compose');
+    held.note = (event) => {
+        if (held.ran || held.dropped) return;
+        held.dropped = {to: event.relatedTarget ? event.relatedTarget.id || event.relatedTarget.tagName : null,
+                        in: box.parentElement ? box.parentElement.id : ''};
+    };
+    box.addEventListener('focusout', held.note);
+    const frame = held.original.bind(window);
+    window.requestAnimationFrame = (callback) => frame(() => {
+        held.waiting += 1;
+        setTimeout(() => {
+            held.waiting -= 1;
+            held.ran = true;
+            callback(performance.now());
+        }, ms);
+    });
+    window.__heldFrames = held;
+}"""
+
+# The page's frames as they were, the focus no longer watched.
+RELEASE_FRAMES_JS = """() => {
+    const held = window.__heldFrames;
+    window.requestAnimationFrame = held.original;
+    document.getElementById('reply-compose').removeEventListener('focusout', held.note);
+}"""
+
+
+def slow_frame_run(desk: Desk, column: str, message_id: str) -> None:
+    """A window narrowed under a reply open in `column`, the page's frame later than the browser's own
+    layout: the reply screen takes the reply with the focus in its box, as it does on a quick frame."""
+    page = desk.page
+    where = f"slow frame {column}"
+    mount = "column-reply" if column == "left" else "side-reply"
+    desk.wait_for(f"() => !!document.querySelector(\"#{list_of(column)} > li[data-id='{message_id}']\")",
+                  f"{where}: the column does not show {message_id}")
+    place_row(desk, column, message_id, top=ROW_OFFSET_PX)
+    button = reply_button(desk, column, message_id)
+    page.mouse.click(button["x"], button["y"])
+    desk.wait_for(f"() => document.querySelector('.reply-compose').parentElement.id === '{mount}'",
+                  f"{where}: the box did not open in the column")
+    page.keyboard.type("halfway through a sentence")
+    desk.settled()
+    page.evaluate(HOLD_FRAMES_JS, HELD_FRAME_MS)
+    page.set_viewport_size({"width": 900, "height": HEIGHT})
+    desk.wait_for("() => document.getElementById('screen-reply').getClientRects().length > 0"
+                  " && document.querySelector('.reply-compose').parentElement.id === 'screen-reply'",
+                  f"{where}: one column did not hand the reply to the reply screen")
+    found = page.evaluate("""() => ({
+        held: window.__heldFrames.ran, dropped: window.__heldFrames.dropped,
+        focus: document.activeElement ? document.activeElement.id || document.activeElement.tagName : '',
+        value: document.getElementById('reply-text').value,
+    })""")
+    assert isinstance(found, dict)
+    # The premise: the page's frame came after the browser had taken the focus off the box, still in its
+    # column. Without it this step is the narrowed step again, and proves nothing about a slow frame.
+    dropped = found["dropped"]
+    desk.check(found["held"] is True and isinstance(dropped, dict) and dropped["to"] is None and dropped["in"] == mount,
+               f"{where}: the browser had not taken the focus off the box before the page's frame ({dropped}), "
+               "so this proves nothing")
+    desk.check(found["value"] == "halfway through a sentence", f"{where}: the reply screen has {found['value']!r}, not the words written")
+    desk.check(found["focus"] == "reply-text", f"{where}: the box lost the focus on the way to the reply screen, to {found['focus']!r}")
+    desk.shot(f"slow-frame-{column}")
+    page.evaluate(RELEASE_FRAMES_JS)
+    desk.wait_for("() => window.__heldFrames.waiting === 0", f"{where}: the page's held frames did not run")
+    # Emptied before Cancel, so that no draft is kept for the steps after this one to open.
+    page.keyboard.press("Control+A")
+    page.keyboard.press("Backspace")
+    page.click("#reply-cancel")
+    page.set_viewport_size({"width": WIDTH, "height": HEIGHT})
+    desk.wait_for("() => document.getElementById('side-column').getClientRects().length > 0"
+                  " && document.getElementById('thread-select').value === 'columns'",
+                  f"{where}: two columns did not come back")
+    desk.settled()
+    desk.notes.append(f"narrowed with the page's frame {HELD_FRAME_MS}ms behind the browser's, which had taken the "
+                      f"focus off the box, the reply open on the {column} moved to the reply screen, the box keeping the focus")
 
 
 # The view keys' state: the picker, the layout, where the reply's box is and what it holds, and the keys.
