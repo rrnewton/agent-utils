@@ -1,12 +1,13 @@
 ---
 title: 'slack-mention-names: draw and speak a Slack mention as the person''s name'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-15T06:03:00.396811676+00:00
-updated_at: 2026-10-15T06:03:00.396811676+00:00
+updated_at: 2026-10-15T08:30:13.494302134+00:00
+closed_at: 2026-10-15T08:30:13.494301974+00:00
 ---
 
 # Description
