@@ -15,6 +15,7 @@ use crate::threads::MessageThread;
 /// A plain message with a creation time in milliseconds.
 pub(crate) fn message(id: &str, author: &str, content: &str, created_ms: i64) -> Message {
     Message {
+        edited_timestamp: None,
         thread: None,
         id: MessageId(id.to_owned()),
         channel_id: ChannelId("C1".to_owned()),

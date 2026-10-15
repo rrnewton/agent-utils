@@ -43,6 +43,7 @@ const THREAD: &str = "opaque/thread-T";
 fn thread_message(id: &str, n: i64, content: &str) -> Message {
     let at = BASE_MS + n * MINUTE_MS;
     Message {
+        edited_timestamp: None,
         id: MessageId(id.to_owned()),
         channel_id: ChannelId(READ_CHANNEL.to_owned()),
         author: "grace".to_owned(),

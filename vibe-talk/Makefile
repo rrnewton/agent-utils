@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser system-bots-browser rich-headers-browser read-aloud-browser post-confirm-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser reply-continuity-browser reply-in-column-browser reply-marks-read-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser thread-card-header-browser all-thread-strip-browser scroll-stability-browser copy-message-browser fold-steps-browser back-gesture-browser
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser system-bots-browser edited-mark-browser rich-headers-browser read-aloud-browser post-confirm-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser reply-continuity-browser reply-in-column-browser reply-marks-read-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser thread-card-header-browser all-thread-strip-browser scroll-stability-browser copy-message-browser fold-steps-browser back-gesture-browser
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -133,6 +133,12 @@ reactions-browser:
 # it, at a phone and a desk, dark and light. Pass SCREENSHOTS=dir to keep PNGs.
 system-bots-browser:
 	python3 tests/system_bots_browser.py $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
+
+# `#320 slack-edited-mark` in a real Chromium: the "(edited)" after an edited row's time, on one line
+# inside the meta line, after the time, clear of the row's buttons, in the time's ink and size, at two
+# phone widths and a desk, in both schemes. Pass SCREENSHOTS=dir to keep one PNG per size and scheme.
+edited-mark-browser:
+	python3 tests/edited_mark_browser.py $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#242 rich-headers` in a real Chromium: each agent's tag, title and time drawn whole in the row's
 # header where it fits and as its first line where it does not, the words they restate hidden and

@@ -861,11 +861,78 @@ fn a_copy_that_named_no_mention_never_erases_names_a_read_found() {
 }
 
 #[test]
+fn an_edit_time_is_kept_and_only_ever_moves_later() {
+    // `#320 slack-edited-mark`. A copy that cannot see edits never takes the mark away, and one read
+    // before the last edit never moves it back.
+    let fx = Fixture::new("cache-edited");
+    let edited = |at: &str, content: &str| Message {
+        content: content.to_owned(),
+        edited_timestamp: Some(at.to_owned()),
+        ..m(1)
+    };
+    fx.list(vec![m(1)], T0 + 100, None);
+    assert_eq!(
+        held(&fx, "m1").expect("held").message.edited_timestamp,
+        None
+    );
+    fx.list(
+        vec![edited("2026-10-14T10:05:00.000000Z", "fixed")],
+        T0 + 200,
+        None,
+    );
+    let first = held(&fx, "m1").expect("held").message;
+    assert_eq!(first.content, "fixed");
+    assert_eq!(
+        first.edited_timestamp.as_deref(),
+        Some("2026-10-14T10:05:00.000000Z")
+    );
+    // A live copy with the same words and no edit time.
+    push(
+        &fx,
+        Message {
+            content: "fixed".to_owned(),
+            ..m(1)
+        },
+        true,
+        T0 + 300,
+    );
+    assert_eq!(
+        held(&fx, "m1")
+            .expect("held")
+            .message
+            .edited_timestamp
+            .as_deref(),
+        Some("2026-10-14T10:05:00.000000Z"),
+        "a copy that cannot see edits took the mark away"
+    );
+    // A later edit moves it on; an earlier one, read late, does not move it back.
+    fx.list(
+        vec![edited("2026-10-14T10:09:30.000100Z", "fixed twice")],
+        T0 + 400,
+        None,
+    );
+    fx.list(
+        vec![edited("2026-10-14T10:05:00.000000Z", "fixed twice")],
+        T0 + 500,
+        None,
+    );
+    assert_eq!(
+        held(&fx, "m1")
+            .expect("held")
+            .message
+            .edited_timestamp
+            .as_deref(),
+        Some("2026-10-14T10:09:30.000100Z")
+    );
+}
+
+#[test]
 fn a_message_reads_back_exactly_as_the_client_produced_it_minus_derived_fields() {
     let fx = Fixture::new("cache-roundtrip");
     let mut original = reply("r9", "m1", "hello **there**", T0 + 7);
     original.reply_to = Some(mid("m1"));
     original.author_is_bot = true;
+    original.edited_timestamp = Some("2026-10-14T10:05:00.000000Z".to_owned());
     original.reactions = Some(vec![Reaction {
         emoji: "party".to_owned(),
         custom: true,

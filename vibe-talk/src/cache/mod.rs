@@ -437,6 +437,7 @@ impl Observation {
                 + m.channel_id.0.len()
                 + m.timestamp.len()
                 + m.spoken_time.len()
+                + m.edited_timestamp.as_ref().map_or(0, String::len)
                 + m.spoken_content.len()
                 + m.content_html.len()
                 + m.reply_to.as_ref().map_or(0, |r| r.0.len())

@@ -250,6 +250,23 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#320 slack-edited-mark` in the browser engine: the "(edited)" after an edited row's time, on one
+  # line inside the meta line and after the time, clear of the row's buttons and uncovered, in the
+  # time's ink and size, at two phone widths and a desk, in the dark and light schemes.
+  - group: check
+    job: edited-mark-browser
+    desc: the edited mark laid out in current Chromium at 412x915 and 360x800 Android viewports and a 1280x800 desk
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/edited_mark_browser.py
+    jobs_flag: ""
+    timeout: 60
+    cpu_timeout: 30
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 5
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#242 rich-headers` in the browser engine: each headed row's tag, title and time drawn whole —
   # beside the time and the buttons where the list is wide enough, as the row's first line where it
   # is not — the words they restate hidden and every one of them in the header, a combined row's

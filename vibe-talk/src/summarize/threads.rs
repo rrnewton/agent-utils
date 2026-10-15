@@ -1736,6 +1736,7 @@ mod tests {
     #[test]
     fn a_thread_prompt_fences_every_message_and_keeps_the_root_and_the_newest() {
         let message = |id: &str, content: &str| Message {
+            edited_timestamp: None,
             thread: None,
             id: MessageId(id.to_owned()),
             channel_id: ChannelId("c".to_owned()),

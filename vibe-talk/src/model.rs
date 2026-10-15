@@ -171,6 +171,19 @@ pub struct Message {
     /// than to a blank.
     #[serde(default)]
     pub spoken_time: String,
+    /// When the message was last edited, ISO-8601, as the provider reports it. `#320
+    /// slack-edited-mark`.
+    ///
+    /// Set from the provider's own record of an edit: Slack's `edited.ts`, Discord's
+    /// `edited_timestamp`, or a bridge that passes either through. ABSENT IS "NO EDIT REPORTED":
+    /// the message was never edited, or it came from a provider or by a path that cannot say —
+    /// the two look the same, so an absent field is drawn as every message was before edits were
+    /// carried, with no mark, and a copy without it never takes away one a read brought.
+    ///
+    /// For the page, which marks an edited message, and for a model that is asked: it is never
+    /// read aloud. Exact, like [`Message::timestamp`], and never rounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edited_timestamp: Option<String>,
     /// The message this one is a reply to, when it is one.
     ///
     /// Discord records a reply on the REPLYING message, as `message_reference.message_id`, and
@@ -433,6 +446,26 @@ impl Message {
     }
 }
 
+/// The later of two copies' edit times, as [`Message::edited_timestamp`] holds them. `#320
+/// slack-edited-mark`.
+///
+/// A message once edited stays edited, so a copy that cannot see edits — a live echo, a provider
+/// that does not report them — or one read before the last edit never takes the mark away or moves
+/// it back. Compared as instants, and as text when either does not read as one.
+#[must_use]
+pub fn later_edit(a: Option<String>, b: Option<String>) -> Option<String> {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            let a_is_later = match (crate::clock::instant_ms(&a), crate::clock::instant_ms(&b)) {
+                (Some(x), Some(y)) => x >= y,
+                _ => a >= b,
+            };
+            Some(if a_is_later { a } else { b })
+        }
+        (a, b) => a.or(b),
+    }
+}
+
 /// Sort a batch of messages oldest-first, by snowflake where possible.
 ///
 /// Messages whose id does not parse keep their relative order and sort after the parseable ones,
@@ -505,6 +538,7 @@ mod tests {
 
     fn msg(id: &str) -> Message {
         Message {
+            edited_timestamp: None,
             thread: None,
             id: MessageId(id.to_owned()),
             channel_id: ChannelId("c".to_owned()),
@@ -562,6 +596,47 @@ mod tests {
             let back: Message = serde_json::from_value(value.clone()).expect("round trips");
             assert_eq!(serde_json::to_value(&back).expect("serializes"), value);
         }
+    }
+
+    #[test]
+    fn an_edit_time_is_absent_on_the_wire_until_one_is_reported() {
+        // `#320 slack-edited-mark`.
+        let mut message = msg("7");
+        let plain = serde_json::to_value(&message).expect("serializes");
+        assert!(plain.get("edited_timestamp").is_none(), "{plain}");
+        message.edited_timestamp = Some("2026-10-14T10:05:00.000100Z".to_owned());
+        let edited = serde_json::to_value(&message).expect("serializes");
+        assert_eq!(
+            edited["edited_timestamp"],
+            serde_json::json!("2026-10-14T10:05:00.000100Z")
+        );
+        for value in [plain, edited] {
+            let back: Message = serde_json::from_value(value.clone()).expect("round trips");
+            assert_eq!(serde_json::to_value(&back).expect("serializes"), value);
+        }
+    }
+
+    #[test]
+    fn the_later_edit_wins_and_none_never_erases_one() {
+        let at = |text: &str| Some(text.to_owned());
+        assert_eq!(later_edit(None, None), None);
+        assert_eq!(
+            later_edit(None, at("2026-10-14T10:05:00Z")),
+            at("2026-10-14T10:05:00Z")
+        );
+        assert_eq!(
+            later_edit(at("2026-10-14T10:05:00Z"), None),
+            at("2026-10-14T10:05:00Z")
+        );
+        // As instants, so a zone offset is not compared as text.
+        assert_eq!(
+            later_edit(at("2026-10-14T06:09:00-04:00"), at("2026-10-14T10:05:00Z")),
+            at("2026-10-14T06:09:00-04:00")
+        );
+        assert_eq!(
+            later_edit(at("2026-10-14T10:05:00Z"), at("2026-10-14T06:09:00-04:00")),
+            at("2026-10-14T06:09:00-04:00")
+        );
     }
 
     #[test]

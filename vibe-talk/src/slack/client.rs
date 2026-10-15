@@ -573,10 +573,11 @@ impl HttpSlackClient {
     ///
     /// Order is preserved. A message with no author of any kind is omitted, with a warning. Every
     /// read of a message passes through here, so each carries the reactions Slack reported on it,
-    /// marked where the owner is among those who reacted (`#312 slack-reactions`), and who each of
-    /// its mentions names (`#318 slack-mention-names`): the people are looked up with the
-    /// authors, at most [`super::mentions::MENTION_LOOKUPS_MAX`] of them not already known, and
-    /// the channels a mention gives no name are named from `conversations.info`.
+    /// marked where the owner is among those who reacted (`#312 slack-reactions`), when it was
+    /// last edited (`#320 slack-edited-mark`), and who each of its mentions names
+    /// (`#318 slack-mention-names`): the people are looked up with the authors, at most
+    /// [`super::mentions::MENTION_LOOKUPS_MAX`] of them not already known, and the channels a
+    /// mention gives no name are named from `conversations.info`.
     pub(super) async fn messages(&self, channel: &ChannelId, raws: &[Raw]) -> Vec<Message> {
         let mut wanted: Vec<&str> = raws.iter().filter_map(Raw::lookup_needed).collect();
         wanted.sort_unstable();
@@ -691,6 +692,16 @@ impl Raw {
         self.str_field("latest_reply").and_then(ids::ts_micros)
     }
 
+    /// When this message was last edited, from Slack's `edited: {user, ts}`, when it was and the
+    /// `ts` reads as one. `#320 slack-edited-mark`.
+    pub fn edited_micros(&self) -> Option<i64> {
+        self.value
+            .get("edited")
+            .and_then(|edited| edited.get("ts"))
+            .and_then(Value::as_str)
+            .and_then(ids::ts_micros)
+    }
+
     fn author_id(&self) -> Option<&str> {
         self.str_field("user")
             .or_else(|| self.str_field("bot_id"))
@@ -777,6 +788,8 @@ impl Raw {
             timestamp: rfc3339(self.micros),
             // Left EMPTY: this layer holds no configuration, and `crate::ops` is the one filler.
             spoken_time: String::new(),
+            // Slack's `edited.ts`, on an edited message only. `#320 slack-edited-mark`.
+            edited_timestamp: self.edited_micros().map(rfc3339),
             // Slack has no reply pointer; a reply is thread membership, carried in `thread`.
             reply_to: None,
             // The words, then a line for each file the message shares: a post that is only a file

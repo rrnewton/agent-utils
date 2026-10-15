@@ -420,6 +420,7 @@
         "channel_id": "100",
         "content": "[build-bot] Status, 15:05Z. hello",
         "content_html": "<p><em>hello</em></p>\n",
+        "edited_timestamp": "2026-09-25T12:04:30.000100Z",
         "heading": {
           "cut": 28,
           "tag": "build-bot",
@@ -483,6 +484,7 @@
       "channel_id": "100",
       "content": "[build-bot] Status, 15:05Z. hello",
       "content_html": "<p><em>hello</em></p>\n",
+      "edited_timestamp": "2026-09-25T12:04:30.000100Z",
       "heading": {
         "cut": 28,
         "tag": "build-bot",
@@ -562,6 +564,7 @@
           "channel_id": "100",
           "content": "[build-bot] Status, 15:05Z. hello",
           "content_html": "<p><em>hello</em></p>\n",
+          "edited_timestamp": "2026-09-25T12:04:30.000100Z",
           "heading": {
             "cut": 28,
             "tag": "build-bot",
@@ -832,6 +835,7 @@
           "channel_id": "100",
           "content": "[build-bot] Status, 15:05Z. hello",
           "content_html": "<p><em>hello</em></p>\n",
+          "edited_timestamp": "2026-09-25T12:04:30.000100Z",
           "heading": {
             "cut": 28,
             "tag": "build-bot",
@@ -948,6 +952,7 @@
           "channel_id": "100",
           "content": "[build-bot] Status, 15:05Z. hello",
           "content_html": "<p><em>hello</em></p>\n",
+          "edited_timestamp": "2026-09-25T12:04:30.000100Z",
           "heading": {
             "cut": 28,
             "tag": "build-bot",
@@ -1113,6 +1118,7 @@
           "channel_id": "100",
           "content": "[build-bot] Status, 15:05Z. hello",
           "content_html": "<p><em>hello</em></p>\n",
+          "edited_timestamp": "2026-09-25T12:04:30.000100Z",
           "heading": {
             "cut": 28,
             "tag": "build-bot",

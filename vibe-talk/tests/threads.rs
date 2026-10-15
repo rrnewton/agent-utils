@@ -18,6 +18,7 @@ const THREAD: &str = "opaque/thread-A";
 
 fn message(id: &str, content: &str, thread: bool) -> Message {
     Message {
+        edited_timestamp: None,
         id: MessageId(id.to_owned()),
         channel_id: ChannelId(WRITE_CHANNEL.to_owned()),
         author: "Reader".to_owned(),

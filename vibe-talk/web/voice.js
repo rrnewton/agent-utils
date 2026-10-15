@@ -1753,6 +1753,17 @@ const dayTitle = (at, shown) => `${dayLabel(at)}, ${shown}`;
 /** The classes of the time elements `timeNode` makes, and so the only ones `freshenDayTitle` touches. */
 const DAY_TITLED = new Set(["msg-time", "at"]);
 
+/** The class of a row's edited mark, whose title `freshenDayTitle` words as an edit. `#320 slack-edited-mark`. */
+const EDITED_MARK = "edited-mark";
+
+/**
+ * What hovering an edited mark says: when the message was last edited, in the words its time's own
+ * title uses — "Edited Yesterday, Oct 11, Sun, 5:25 PM".
+ *
+ * @param {Date} at
+ */
+const editedTitle = (at) => `Edited ${dayTitle(at, shortTimeFormat().format(at))}`;
+
 /**
  * A message's time, as the element that shows it: `<time datetime>` holding the text `shown`, its
  * day in the title, which the browser draws as its own tooltip on hover. A phone has no hover, and
@@ -1790,10 +1801,11 @@ function timeNode(className, at, shown) {
 function freshenDayTitle(event) {
   const node = /** @type {Element | null} */ (event ? event.target : null);
   if (!node || typeof node.getAttribute !== "function" || String(node.tagName).toLowerCase() !== "time") return;
-  if (!DAY_TITLED.has(String(node.className))) return;
+  const kind = String(node.className);
+  if (!DAY_TITLED.has(kind) && kind !== EDITED_MARK) return;
   const at = new Date(String(node.getAttribute("datetime") || ""));
   if (Number.isNaN(at.getTime())) return;
-  const title = dayTitle(at, String(node.textContent));
+  const title = kind === EDITED_MARK ? editedTitle(at) : dayTitle(at, String(node.textContent));
   if (node.getAttribute("title") !== title) node.setAttribute("title", title);
 }
 
@@ -14896,6 +14908,11 @@ function foldLiveMessage(message, live = false, replayed = false) {
   if (held && Array.isArray(held.reactions) && !Array.isArray(kept.reactions)) {
     kept = { ...kept, reactions: held.reactions };
   }
+  // `#320 slack-edited-mark`. Nor does a copy that does not say when the message was edited take the
+  // mark away: an edit is never undone, and the stream's copy may come by a path that cannot see it.
+  if (held && held.edited_timestamp && !kept.edited_timestamp) {
+    kept = { ...kept, edited_timestamp: held.edited_timestamp };
+  }
   channelCanon.messages = inTimeOrder(
     [...channelCanon.messages.filter((candidate) => String(candidate.id) !== id), kept], "timestamp");
   if (!live || threadOf(kept)) channelCanon.unplaced.delete(id);
@@ -24316,6 +24333,11 @@ function toggleMessageDetails(li, messages) {
     : String(message.author || "");
   const when = document.createElement("div");
   when.textContent = fullLocalTime(message);
+  // `#320 slack-edited-mark`. When it was last edited, which a phone cannot hover the mark to learn.
+  const edited = rowEdited(messages);
+  const editedLine = document.createElement("div");
+  editedLine.className = "msg-edited";
+  editedLine.textContent = edited === null ? "" : edited.at === null ? "Edited" : `Edited ${fullLocalAt(edited.at)}`;
   const id = document.createElement("div");
   id.className = "msg-id";
   // EVERY id, on a row that is showing more than one message. This sheet is the answer to "does
@@ -24336,7 +24358,7 @@ function toggleMessageDetails(li, messages) {
     const open = childByClass(li, "msg-details");
     if (open) li.removeChild(open);
   }));
-  details.append(who, when, id, mark);
+  details.append(who, when, ...(edited === null ? [] : [editedLine]), id, mark);
   li.append(details);
 }
 
@@ -25811,6 +25833,15 @@ function fullLocalTime(message) {
   if (at === null) {
     return String(message.spoken_time || "unknown");
   }
+  return fullLocalAt(at);
+}
+
+/**
+ * `at` as the details sheet says an instant: "Yesterday, Oct 11, Sun, 05:25 PM PDT".
+ *
+ * @param {Date} at
+ */
+function fullLocalAt(at) {
   // Explicit components, NOT `timeStyle`. ECMA-402 forbids combining that with an individual field
   // such as `timeZoneName`, and a browser answers that with a TypeError rather than by ignoring the
   // option — so the sheet would have thrown instead of opening.
@@ -26064,7 +26095,9 @@ function channelRowFrame(messages) {
   pinChip.className = "pin-chip";
   pinChip.hidden = true;
   pinChip.textContent = "Pinned";
-  meta.append(author, stamp, pinChip);
+  // `#320 slack-edited-mark`. "(edited)" after the time, when the provider says the message changed.
+  const edited = editedMark(messages);
+  meta.append(author, stamp, ...(edited ? [edited] : []), pinChip);
   const body = document.createElement("div");
   body.className = "body";
   // THE COMBINED BODY, and it is the only thing the reader sees of the grouping: each part as the
@@ -26092,6 +26125,69 @@ function channelRowFrame(messages) {
   if (reactions) li.append(reactions);
   return { li, meta, body, content: combinedContent(messages), text, reactions };
 }
+
+// --- edited messages ------------------------------------------------------------------------------
+//
+// `#320 slack-edited-mark`. A message its author changed after sending it says so, as Slack and
+// Discord both mark one: "(edited)" in the row's meta line, straight after the time and in the time's
+// own muted ink and size, because it is a fact about the message and not part of what it says.
+//
+//   * ONLY WHERE THE PROVIDER SAYS SO. `edited_timestamp` is the provider's own record of the last
+//     edit — Slack's `edited.ts`, Discord's `edited_timestamp` — and absent is "not reported", which
+//     is drawn as every message was before edits were carried: with no mark.
+//   * WHEN, ON HOVER AND IN THE DETAILS SHEET. Its tooltip is the time of the last edit in the words
+//     the time's own tooltip uses, worded again at hover by `freshenDayTitle` so a page left open
+//     overnight does not say "Today" the morning after; a phone, which has no hover, reads it in the
+//     sheet a press-and-hold opens (`toggleMessageDetails`).
+//   * A COMBINED ROW IS EDITED WHEN ANY OF ITS MESSAGES IS, and its mark says the latest edit.
+//   * NOT READ ALOUD, NOT SEARCHED. The voice reads the message's words; "edited" is not one of them.
+//     A screen reader meets it as the word it is, after the time.
+//   * A LIVE COPY NEVER TAKES IT AWAY. A copy from the stream that does not say when the message was
+//     edited keeps the edit time the store held (`foldLiveMessage`), as it keeps the reactions.
+
+/**
+ * When a row's messages were last edited: the latest edit among them, `at` null when none of the edits
+ * says a time a Date can read; or null when none of them was edited.
+ *
+ * @param {Array<object>} messages
+ * @returns {{at: Date | null} | null}
+ */
+function rowEdited(messages) {
+  let edited = null;
+  for (const message of messages) {
+    const raw = message && message.edited_timestamp ? String(message.edited_timestamp) : "";
+    if (!raw) continue;
+    const at = new Date(raw);
+    const readable = Number.isNaN(at.getTime()) ? null : at;
+    if (edited === null) edited = { at: readable };
+    else if (readable && (edited.at === null || readable.getTime() > edited.at.getTime())) edited.at = readable;
+  }
+  return edited;
+}
+
+/**
+ * The mark after a row's time, or null when none of its messages was edited: a `<time>` holding the
+ * last edit, titled with it, or a plain span when no edit says a readable time. Text only.
+ *
+ * @param {Array<object>} messages
+ */
+function editedMark(messages) {
+  const edited = rowEdited(messages);
+  if (edited === null) return null;
+  const mark = document.createElement(edited.at === null ? "span" : "time");
+  mark.className = EDITED_MARK;
+  mark.textContent = "(edited)";
+  if (edited.at !== null) {
+    mark.setAttribute("datetime", edited.at.toISOString());
+    mark.setAttribute("title", editedTitle(edited.at));
+  } else {
+    mark.setAttribute("title", "Edited");
+  }
+  return mark;
+}
+
+/** What the redraw keys hold of a message's edit, so a row that becomes edited is drawn again. */
+const editedDrawn = (message) => (message && message.edited_timestamp ? String(message.edited_timestamp) : null);
 
 // --- reactions ------------------------------------------------------------------------------------
 //
@@ -29518,7 +29614,7 @@ function syncPinnedList() {
   // tag confirmed by a later read brings a heading to a message whose text has not changed.
   const drawn = JSON.stringify([combineMessages, channelCanon.scope, threadingSupported,
     ...messages.map((m) => [m.id, m.timestamp, m.content, renderedHtmlOf(m), m.author, threadOf(m), isNoise(m),
-      keptByPin.has(m), reactionsDrawn(m), m.heading || null])]);
+      keptByPin.has(m), reactionsDrawn(m), m.heading || null, editedDrawn(m)])]);
   if (drawn === pinnedListDrawn) return;
   pinnedListDrawn = drawn;
   drawingPinnedRows = true;
@@ -31737,7 +31833,8 @@ function renderReplyContext() {
   const shown = earlier.slice(Math.max(0, earlier.length - replyContext.shown));
   // The heading as well as the body, as the Pinned list keys it (`#242 rich-headers`).
   const drawn = JSON.stringify(shown.map((message) =>
-    [String(message.id), message.content, renderedHtmlOf(message), reactionsDrawn(message), message.heading || null]));
+    [String(message.id), message.content, renderedHtmlOf(message), reactionsDrawn(message), message.heading || null,
+      editedDrawn(message)]));
   if (drawn !== replyContext.drawn) {
     list.replaceChildren(...glom(shown).map(replyContextRow));
     replyContext.drawn = drawn;

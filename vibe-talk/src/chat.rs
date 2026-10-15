@@ -2255,6 +2255,7 @@ mod lookup_tests {
 
     fn reply(id: &str) -> Message {
         Message {
+            edited_timestamp: None,
             id: MessageId(id.to_owned()),
             channel_id: ChannelId("42".to_owned()),
             author: "grace".to_owned(),
@@ -2587,6 +2588,7 @@ mod threads_tests {
 
     fn message(id: &str, timestamp: &str) -> Message {
         Message {
+            edited_timestamp: None,
             thread: None,
             id: MessageId(id.to_owned()),
             channel_id: ChannelId("c".to_owned()),

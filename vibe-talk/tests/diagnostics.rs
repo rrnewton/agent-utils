@@ -401,6 +401,7 @@ async fn a_channel_whose_messages_come_back_blank_warns_about_the_message_conten
             _after: Option<&MessageId>,
         ) -> Result<Vec<Message>, ChatError> {
             Ok(vec![Message {
+                edited_timestamp: None,
                 thread: None,
                 id: MessageId("1".to_owned()),
                 channel_id: channel.clone(),

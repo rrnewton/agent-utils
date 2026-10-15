@@ -234,11 +234,19 @@ impl Entry for Message {
     // A copy that cannot see reactions keys by its id alone, as every message did before. The
     // owner's own reaction is part of the tally (`#312 slack-reactions`): the owner taking one
     // back as somebody else adds it leaves the count alone and changes the chip.
+    //
+    // A message changes when it is edited, too (`#320 slack-edited-mark`): the same message at a
+    // later edit time is new, so an edit inside the overlap reaches the page with the next delta,
+    // and a message read again with no edit time keys exactly as it always did.
     fn key(&self) -> String {
-        let Some(reactions) = &self.reactions else {
-            return self.id.0.clone();
+        let id = match &self.edited_timestamp {
+            Some(edited) => format!("{}~{edited}", self.id.0),
+            None => self.id.0.clone(),
         };
-        let mut key = format!("{}#", self.id.0);
+        let Some(reactions) = &self.reactions else {
+            return id;
+        };
+        let mut key = format!("{id}#");
         for reaction in reactions {
             key.push_str(&format!(
                 "{}\u{1f}{}\u{1f}{}{}\u{1e}",
@@ -555,6 +563,7 @@ mod tests {
 
     fn message(id: &str, at: &str) -> Message {
         Message {
+            edited_timestamp: None,
             id: MessageId(id.to_owned()),
             channel_id: channel(),
             author: "Reader".to_owned(),
@@ -1063,5 +1072,28 @@ mod tests {
         owners.reactions.as_mut().expect("reactions")[0].owner_reacted = true;
         assert_ne!(theirs.key(), owners.key());
         assert_eq!(theirs.key(), theirs.clone().key(), "a key is stable");
+    }
+
+    #[test]
+    fn an_edit_is_a_change_and_no_edit_keys_as_before() {
+        // `#320 slack-edited-mark`. A message read with no edit time keys exactly as it did before
+        // edits were carried, reactions or not; one edited, and edited again, is new each time.
+        let plain = message("1", "2026-10-04T07:00:00Z");
+        let mut edited = plain.clone();
+        edited.edited_timestamp = Some("2026-10-04T07:01:00Z".to_owned());
+        let mut again = plain.clone();
+        again.edited_timestamp = Some("2026-10-04T07:02:00Z".to_owned());
+        assert_eq!(plain.key(), "1");
+        assert_ne!(edited.key(), plain.key());
+        assert_ne!(again.key(), edited.key());
+        let reacted_plain = reacted("1", "2026-10-04T07:00:00Z", &[("👀", 1)]);
+        let mut reacted_edited = reacted_plain.clone();
+        reacted_edited.edited_timestamp = edited.edited_timestamp.clone();
+        assert!(
+            reacted_plain.key().starts_with("1#"),
+            "{}",
+            reacted_plain.key()
+        );
+        assert_ne!(reacted_edited.key(), reacted_plain.key());
     }
 }

@@ -50,6 +50,10 @@
 //! emoji's name, with the count and whether the owner's own `owner_user_id` is among those who
 //! reacted. A message Slack lists without them is "not reported". Nothing here adds or removes one.
 //!
+//! An edited message carries `edited: {user, ts}` in the same answers, read as the message's
+//! `edited_timestamp` (`#320 slack-edited-mark`, `Raw::edited_micros`); one without it, or whose
+//! `ts` is not one, has none.
+//!
 //! # What it does not do
 //!
 //! There is no Events API or Socket Mode connection: new messages arrive through the server's

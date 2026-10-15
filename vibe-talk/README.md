@@ -329,6 +329,14 @@ yours if you reacted to any of them. Reactions reach the page with the next read
 the message by a refresh. Discord, Slack and a compatible bridge report them; see
 [Slack](#slack) for what the Slack backend reads.
 
+**An edited message says so.** `#320 slack-edited-mark`. Where the chat service reports that a
+message was changed after it was sent — Slack and Discord both do, and a bridge that passes their
+edit time through — the row shows **(edited)** after its time, in the time's own muted ink. Hovering
+it says when the last edit was; on a phone, press and hold the message and its details say it. A
+post combined from several messages is marked if any of them was edited. The mark is never read
+aloud and a search does not match it; the voice agent is told a message was edited, so it can say so
+when you ask. A service that does not report edits shows no mark, as before.
+
 **An agent's own heading moves into the header.** Agents posting through one shared account often
 open a message with who they are, a title and a time — `[build-bot coordinator] Backup check, 10:52
 PM ET. All shards are synced.` That first line is drawn in the row's header instead: the tag in quiet
@@ -1224,6 +1232,14 @@ replies included, and on the messages and replies the live poll delivers. No sco
 
 A compatible bridge passes `reactions` through as Slack sends it. One that omits the field shows no
 reactions, exactly as before reactions were read.
+
+**Edits.** `#320 slack-edited-mark`. Slack marks an edited message with `edited: {user, ts}` in
+the same `conversations.history` and `conversations.replies` answers, so reading it costs no call: the
+app shows **(edited)** after the message's time, with the edit's time in its tooltip, in every view
+and on what the live poll delivers. An edit reaches the page as a reaction does, with the next read
+of its message (see **When they show** above): an edit to a reply shows at once in its thread and can
+take up to the fifteen minutes under [Limits](#limits) to show in All. A bridge that leaves `edited`
+off shows no mark.
 
 **Files.** `#313 slack-file-posts`. A message that shares files shows a line for each, after its
 own words when it has any: a paperclip, the file's name, linked to the file's page in Slack, and its

@@ -78,6 +78,7 @@ impl Thread {
             )
         };
         Message {
+            edited_timestamp: None,
             thread: None,
             id: MessageId(id),
             channel_id: channel.clone(),

@@ -573,6 +573,13 @@
           "description": "The body as the page draws it: `content` rendered from Markdown and SANITIZED, by\n[`crate::render`]. `#217 markdown-blocks`.\n\nA third field for the same body, and it answers a third question: not what was written\n(`content`, which a copy keeps and the speech path falls back to) nor what a voice should\nsay (`spoken_content`), but what the reader should SEE — lists with bullets, paragraphs with\nspace between them, a link that is a link. HTML the server's sanitizer has already cut to a\nsmall allowlist, so the page inserts it as it stands and builds no markup of its own from\nchannel text.\n\nEMPTY means \"draw `content` as plain paragraphs\", by the convention `spoken_content`\nfollows: it is what a message carries before anything renders it — on every path toward a\nmodel, which has no use for HTML — and what it carries when rendering changed nothing,\nwhich is most chat. Filled only on the routes the page reads.",
           "type": "string"
         },
+        "edited_timestamp": {
+          "description": "When the message was last edited, ISO-8601, as the provider reports it. `#320\nslack-edited-mark`.\n\nSet from the provider's own record of an edit: Slack's `edited.ts`, Discord's\n`edited_timestamp`, or a bridge that passes either through. ABSENT IS \"NO EDIT REPORTED\":\nthe message was never edited, or it came from a provider or by a path that cannot say —\nthe two look the same, so an absent field is drawn as every message was before edits were\ncarried, with no mark, and a copy without it never takes away one a read brought.\n\nFor the page, which marks an edited message, and for a model that is asked: it is never\nread aloud. Exact, like [`Message::timestamp`], and never rounded.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "heading": {
           "anyOf": [
             {

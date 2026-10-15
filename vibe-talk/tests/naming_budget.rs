@@ -76,6 +76,7 @@ fn thread_id(channel: &str, n: usize) -> String {
 
 fn message(channel: &str, id: &str, content: &str) -> Message {
     Message {
+        edited_timestamp: None,
         thread: None,
         id: MessageId(id.to_owned()),
         channel_id: ChannelId(channel.to_owned()),

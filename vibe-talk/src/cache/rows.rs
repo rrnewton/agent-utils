@@ -142,6 +142,10 @@ pub(crate) struct Extra {
     /// Who the message's mentions name, as [`Message::mentions`]. `#318 slack-mention-names`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) mentions: Vec<MentionName>,
+    /// When the provider says the message was last edited, as [`Message::edited_timestamp`].
+    /// `#320 slack-edited-mark`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) edited_timestamp: Option<String>,
 }
 
 /// Provider creation time, derived as `ops::message_ms` derives it: the id's own time first (a
@@ -199,6 +203,7 @@ pub(crate) fn reconstruct(
         author_is_bot,
         timestamp: extra.timestamp,
         spoken_time: String::new(),
+        edited_timestamp: extra.edited_timestamp,
         reply_to: reply_to.map(MessageId),
         content,
         spoken_content: String::new(),

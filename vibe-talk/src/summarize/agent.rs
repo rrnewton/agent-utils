@@ -617,6 +617,7 @@ mod tests {
 
     fn message(content: &str) -> Message {
         Message {
+            edited_timestamp: None,
             thread: None,
             id: MessageId("1".to_owned()),
             channel_id: crate::model::ChannelId("100".to_owned()),

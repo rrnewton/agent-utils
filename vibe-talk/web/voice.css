@@ -3627,6 +3627,18 @@ a.search-hit-link {
   --pin-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8.5 3.5h7'/%3E%3Cpath d='M10 3.5v6L7 13.5h10l-3-4v-6z' fill='black'/%3E%3Cpath d='M12 13.5v7'/%3E%3C/svg%3E");
 }
 
+/*
+ * `#320 slack-edited-mark`. "(edited)" after a row's time, when the provider says the message was
+ * changed after it was sent. In the time's own muted ink and size, which it takes from the meta line,
+ * so it reads as a fact about the message and not as words of it; kept whole when the meta line wraps
+ * on a narrow phone. A label, not a control: its tooltip says when, and nothing happens on a tap.
+ */
+.edited-mark {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  cursor: default;
+}
+
 /* `left: auto` because a reply already draws its veil on this same pseudo-element with `inset: 0`,
    and with both sides set and a width the box is overconstrained and the right one is dropped: the
    gold edge landed on a pinned reply's LEFT side, against its arrow. */

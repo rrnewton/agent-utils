@@ -1027,6 +1027,7 @@ mod tests {
                 _after: Option<&crate::model::MessageId>,
             ) -> Result<Vec<crate::model::Message>, ChatError> {
                 Ok(vec![crate::model::Message {
+                    edited_timestamp: None,
                     thread: None,
                     id: crate::model::MessageId("1".to_owned()),
                     channel_id: channel.clone(),

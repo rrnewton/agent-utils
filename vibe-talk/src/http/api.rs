@@ -439,6 +439,7 @@ pub async fn ingest_event(
             message_id,
         } => {
             let tombstone = Message {
+                edited_timestamp: None,
                 thread: None,
                 id: message_id,
                 channel_id: channel_id.clone(),

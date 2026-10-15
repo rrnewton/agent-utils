@@ -862,6 +862,14 @@ pub fn parse_message(value: &serde_json::Value) -> Result<Message, ChatError> {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
         timestamp: field("timestamp")?,
+        // Discord's `edited_timestamp`, null on a message never edited, which the Google Chat bridge
+        // may send too. `#320 slack-edited-mark`.
+        edited_timestamp: value
+            .get("edited_timestamp")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|at| !at.is_empty())
+            .map(str::to_owned),
         // Left EMPTY on purpose. This layer holds no configuration and therefore does not know the
         // operator's zone; `crate::ops::stamp` is the single place that fills it in. See
         // `crate::model::Message::spoken_time`.
@@ -2964,6 +2972,37 @@ mod tests {
         let message = parse_message(&value).expect("attachment-only messages still parse");
         assert_eq!(message.content, "");
         assert!(!message.author_is_bot);
+    }
+
+    #[test]
+    fn an_edit_time_is_read_as_discord_and_the_bridge_send_it() {
+        // `#320 slack-edited-mark`: `edited_timestamp`, null on a message never edited.
+        let with = |edited: serde_json::Value| {
+            parse_message(&serde_json::json!({
+                "id": "5", "channel_id": "123", "timestamp": "2026-10-14T10:00:00.000000+00:00",
+                "content": "fixed", "edited_timestamp": edited,
+                "author": { "id": "500000000000000005", "username": "u" }
+            }))
+            .expect("parses")
+            .edited_timestamp
+        };
+        assert_eq!(
+            with(serde_json::json!("2026-10-14T10:05:00.123000+00:00")).as_deref(),
+            Some("2026-10-14T10:05:00.123000+00:00")
+        );
+        assert_eq!(with(serde_json::Value::Null), None);
+        assert_eq!(with(serde_json::json!("")), None);
+        assert_eq!(
+            with(serde_json::json!(17)),
+            None,
+            "not a time is not an edit"
+        );
+        let never = parse_message(&serde_json::json!({
+            "id": "5", "channel_id": "123", "timestamp": "t",
+            "author": { "id": "500000000000000005", "username": "u" }
+        }))
+        .expect("parses");
+        assert_eq!(never.edited_timestamp, None);
     }
 
     fn reacted(reactions: serde_json::Value) -> Message {

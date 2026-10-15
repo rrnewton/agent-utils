@@ -653,6 +653,7 @@ mod tests {
 
     fn message(id: &str, thread: Option<&str>) -> Message {
         Message {
+            edited_timestamp: None,
             id: MessageId(id.to_owned()),
             channel_id: ChannelId("1".to_owned()),
             author: "Reader".to_owned(),

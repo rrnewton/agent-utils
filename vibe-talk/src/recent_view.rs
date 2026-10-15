@@ -601,6 +601,7 @@ mod tests {
 
     fn message(n: u64, text: &str) -> Message {
         Message {
+            edited_timestamp: None,
             thread: None,
             id: MessageId(n.to_string()),
             channel_id: ChannelId("1".to_owned()),

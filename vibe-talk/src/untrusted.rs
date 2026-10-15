@@ -71,6 +71,10 @@ pub fn fenced(body: &str) -> String {
 /// happens exactly once, in [`crate::ops`], because this is one of four render sites and a
 /// formatter copied into each of them would drift three ways. Both time fields are shown, and the
 /// spoken one comes first and is labelled, so a model reading top to bottom reads the right one.
+///
+/// An edited message says `edited` after them, and no time: the model can answer whether a message
+/// was edited when asked, and has no second instant to say aloud in the wrong zone. `#320
+/// slack-edited-mark`.
 #[must_use]
 pub fn render_for_model(messages: &[Message]) -> String {
     let mut body = String::new();
@@ -80,10 +84,15 @@ pub fn render_for_model(messages: &[Message]) -> String {
         // attached to the thing being replied to, so there is nothing to search for and nothing
         // to guess. See `crate::model::Message::author_id`.
         body.push_str(&format!(
-            "[{} | {} | exact {} | {} {}] {}{}\n",
+            "[{} | {} | exact {}{} | {} {}] {}{}\n",
             message.id.as_str(),
             message.spoken(),
             message.timestamp,
+            if message.edited_timestamp.is_some() {
+                " | edited"
+            } else {
+                ""
+            },
             neutralize(&message.author),
             neutralize(&message.author_id.mention()),
             neutralize(&message.content),
@@ -121,6 +130,7 @@ mod tests {
 
     fn message(author: &str, content: &str) -> Message {
         Message {
+            edited_timestamp: None,
             thread: None,
             id: MessageId("1000000000000000001".to_owned()),
             channel_id: ChannelId("c".to_owned()),
@@ -248,6 +258,21 @@ mod tests {
             spoken_at < exact_at,
             "the speakable field must come first, or a model reading in order says the wrong one"
         );
+    }
+
+    #[test]
+    fn an_edited_message_says_so_without_a_second_instant() {
+        // `#320 slack-edited-mark`: whether, for a model asked; never when, which it could only
+        // say in the zone it was written in.
+        let mut edited = message("codex-eng", "green, typo fixed");
+        edited.edited_timestamp = Some("2026-08-18T12:05:00+00:00".to_owned());
+        let rendered = render_for_model(&[edited, message("codex-eng", "unedited")]);
+        assert!(
+            rendered.contains("exact 2026-08-18T12:00:00+00:00 | edited | codex-eng"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("12:05"), "{rendered}");
+        assert_eq!(rendered.matches("| edited").count(), 1, "{rendered}");
     }
 
     #[test]

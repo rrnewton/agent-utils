@@ -379,6 +379,7 @@ impl FakeDiscord {
             .or_insert_with(|| UserId(next_author.to_string()))
             .clone();
         state.messages.push(Message {
+            edited_timestamp: None,
             thread: None,
             id: id.clone(),
             channel_id: channel.clone(),

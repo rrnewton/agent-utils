@@ -713,12 +713,15 @@ fn apply(held: &mut Held, live: &LiveMessage, applying: Applying) {
 /// The message a live edit leaves behind: the edit, keeping what an echo cannot see.
 ///
 /// A live copy carries no reactions and may carry no thread; neither absence means "removed", so
-/// the held copy's survive. See [`Message::reactions`].
+/// the held copy's survive. See [`Message::reactions`]. Nor does a copy without an edit time take
+/// the held one's away (`#320 slack-edited-mark`, [`crate::model::later_edit`]).
 fn merged(held: &Message, edit: &Message) -> Message {
     let mut next = edit.clone();
     if next.reactions.is_none() {
         next.reactions.clone_from(&held.reactions);
     }
+    next.edited_timestamp =
+        crate::model::later_edit(next.edited_timestamp.take(), held.edited_timestamp.clone());
     if next.thread.is_none() {
         next.thread.clone_from(&held.thread);
     }
@@ -1082,6 +1085,7 @@ mod tests {
 
     fn message(id: u64, text: &str) -> Message {
         Message {
+            edited_timestamp: None,
             thread: None,
             id: MessageId(id.to_string()),
             channel_id: ChannelId("1".to_owned()),

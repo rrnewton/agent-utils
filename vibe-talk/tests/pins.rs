@@ -32,6 +32,7 @@ struct OneMessage;
 
 fn message(id: &str) -> Message {
     Message {
+        edited_timestamp: None,
         thread: None,
         id: MessageId(id.to_owned()),
         channel_id: ChannelId(READ_CHANNEL.to_owned()),

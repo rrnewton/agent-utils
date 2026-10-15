@@ -2191,6 +2191,7 @@ mod tests {
 
     fn message(channel: &ChannelId, id: u64, content: &str) -> Message {
         Message {
+            edited_timestamp: None,
             thread: None,
             id: MessageId(id.to_string()),
             channel_id: channel.clone(),

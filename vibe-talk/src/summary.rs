@@ -187,6 +187,7 @@ mod tests {
 
     fn message(content: &str) -> Message {
         Message {
+            edited_timestamp: None,
             thread: None,
             id: MessageId("1000000000000000001".to_owned()),
             channel_id: ChannelId("c".to_owned()),

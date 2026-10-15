@@ -82,6 +82,7 @@ fn message(
         content.push_str(RARE);
     }
     Message {
+        edited_timestamp: None,
         thread: thread.map(|t| MessageThread {
             id: format!("t{t}"),
             root_message_id: None,

@@ -41247,6 +41247,165 @@ test("a pinned message shows its reactions in the Pinned list, and redraws when 
     "the Pinned list kept the reactions it was first drawn with");
 });
 
+// --- edited messages (#320 slack-edited-mark) ------------------------------------------------------
+//
+// A message its author changed after sending it says "(edited)" after its time, where the provider
+// says so — Slack's `edited.ts`, Discord's `edited_timestamp` — as `edited_timestamp`. When, on hover
+// and in the details sheet; never in the body, the search or the voice.
+
+/** A row's edited mark, or undefined when it has none. */
+const editedMarkOf = (li) => {
+  const meta = li.children.find((node) => node.className === "meta");
+  return meta ? meta.children.find((node) => node.className === "edited-mark") : undefined;
+};
+
+test("an edited message says (edited) straight after its time; one not edited, or not reported, does not", async () => {
+  await inZone("America/New_York", async () => {
+    const page = newPage();
+    await signIn(page);
+    const sent = localAt(2026, 8, 19, 9, 10);
+    const changed = localAt(2026, 8, 19, 9, 42);
+    const rows = await showDiscord(page, [
+      message({ id: "100", content: "deploy at noon, typo fixed", timestamp: sent.toISOString(),
+        edited_timestamp: changed.toISOString() }),
+      message({ id: "101", content: "never touched", timestamp: localAt(2026, 8, 19, 9, 50).toISOString() }),
+      message({ id: "102", content: "an older server's copy", timestamp: localAt(2026, 8, 19, 9, 55).toISOString(),
+        edited_timestamp: null }),
+    ]);
+    const mark = editedMarkOf(rows[0]);
+    assert.ok(mark, "the edited message has no mark");
+    assert.equal(mark.tagName, "time", "the mark does not say which instant the edit was");
+    assert.equal(mark.textContent, "(edited)");
+    assert.equal(mark.getAttribute("datetime"), changed.toISOString());
+    assert.equal(mark.getAttribute("title"), `Edited Today, Aug 19, Wed, ${shownTime(changed)}`);
+    const order = rows[0].children.find((node) => node.className === "meta").children.map((node) => node.className);
+    assert.equal(order.indexOf("edited-mark"), order.indexOf("msg-time") + 1, `the mark is not after the time: ${order}`);
+    // The negative controls: never edited, and an edit time that is not there.
+    assert.equal(editedMarkOf(rows[1]), undefined, "a message never edited is marked");
+    assert.equal(editedMarkOf(rows[2]), undefined, "an edit time of null is marked");
+    // Not part of what the message says: not in its body, and not a match for a search.
+    assert.ok(!rows[0].children.find((node) => node.className === "body").text().includes("edited"));
+    await search(page, "edited");
+    await page.settle();
+    assert.ok(rows.every((li) => li.hasClass("search-hidden")), "the mark made a row match a search");
+  });
+});
+
+test("an edit's tooltip says its day again at hover, and the details sheet says when for a phone", async () => {
+  await inZone("America/New_York", async () => {
+    const page = newPage();
+    await signIn(page);
+    const changed = localAt(2026, 8, 19, 9, 42);
+    const rows = await showDiscord(page, [
+      message({ id: "100", content: "deploy at noon", timestamp: localAt(2026, 8, 19, 9, 10).toISOString(),
+        edited_timestamp: changed.toISOString() }),
+      message({ id: "101", content: "never touched", timestamp: localAt(2026, 8, 19, 9, 50).toISOString() }),
+    ]);
+    const mark = editedMarkOf(rows[0]);
+    page.setClock(localAt(2026, 8, 20, 0, 5).getTime());
+    await page.documentEvent("pointerover", { target: mark });
+    assert.equal(mark.getAttribute("title"), `Edited Yesterday, Aug 19, Wed, ${shownTime(changed)}`,
+      "a page left open past midnight still called the edit Today");
+    assert.equal(mark.textContent, "(edited)", "the hover changed the mark's words");
+    await hold(page, rows[0]);
+    const sheet = rows[0].descendants().find((node) => node.className === "msg-details");
+    const line = sheet.children.find((node) => node.className === "msg-edited");
+    assert.ok(line, "the details sheet does not say when the message was edited");
+    assert.match(line.textContent, /^Edited Yesterday, Aug 19, Wed, /);
+    await hold(page, rows[1]);
+    const plain = rows[1].descendants().find((node) => node.className === "msg-details");
+    assert.ok(plain, "the unedited row's details did not open");
+    assert.equal(plain.children.find((node) => node.className === "msg-edited"), undefined,
+      "an unedited message's details say it was edited");
+  });
+});
+
+test("an edit with no readable time is still marked, and a combined row says its latest edit", async () => {
+  const page = newPage();
+  await signIn(page);
+  const first = splitPost(
+    { edited_timestamp: "2026-08-19T04:35:00.000Z" },
+    { edited_timestamp: "2026-08-19T04:40:30.000Z" }
+  );
+  const rows = await showDiscord(page, [...first,
+    message({ id: "3000000000000000001", content: "fixed", edited_timestamp: "sometime" })]);
+  assert.equal(rows.length, 2, "the fixture did not produce one combined row and one more");
+  assert.equal(editedMarkOf(rows[0]).getAttribute("datetime"), "2026-08-19T04:40:30.000Z",
+    "a combined row's mark is not its latest edit");
+  assert.equal(rows[0].descendants().filter((node) => node.className === "edited-mark").length, 1);
+  const vague = editedMarkOf(rows[1]);
+  assert.equal(vague.tagName, "span", "an edit with no readable time claimed an instant");
+  assert.equal(vague.textContent, "(edited)");
+  assert.equal(vague.getAttribute("title"), "Edited");
+  assert.equal(vague.getAttribute("datetime"), null);
+});
+
+test("a live copy that does not say when a message was edited keeps the mark a read brought", async () => {
+  const page = await reactedThreadPage();
+  const read = page.messages.find((m) => m.id === "200");
+  page.messages = page.messages.map((m) => (m.id === "200" ? { ...m, edited_timestamp: "2026-08-19T04:45:00.000Z" } : m));
+  await pollOnce(page);
+  assert.ok(editedMarkOf(rowOf(page, "200")), "a read that brought the edit drew no mark");
+  page.timeline = errorResponse(502, "chat_error", "history read timed out");
+  await deliver(page, page.stream(), sseMessage({ ...read, content: "main channel announcement, edited again" }));
+  await page.settle();
+  const kept = savedScopes(page)[scopeKey(CHANNEL.id)].messages.find((m) => m.id === "200");
+  assert.equal(kept.content, "main channel announcement, edited again", "the echo was not folded into the store");
+  assert.equal(kept.edited_timestamp, "2026-08-19T04:45:00.000Z", "the store's copy lost the edit");
+  // Drawn from what the device kept, with the service unreachable: the echo's words, and the mark.
+  const again = reloadWith(page.storage, [], (p) => {
+    p.threadingSupported = true;
+    p.threads = [];
+    p.timeline = errorResponse(502, "chat_error", "history read timed out");
+  });
+  await reopenedChannel(again);
+  const row = rowOf(again, "200");
+  assert.match(row.children.find((node) => node.className === "body").text(), /edited again/,
+    "the reopened row is not the echo's, so its mark proves nothing");
+  assert.ok(editedMarkOf(row), "the live echo took the mark away");
+});
+
+test("negative control: without the rule, the live echo does take the edit from the store", async () => {
+  const page = await reactedThreadPage(brokenScript(
+    "if (held && held.edited_timestamp && !kept.edited_timestamp) {", "if (false) {"));
+  const read = page.messages.find((m) => m.id === "200");
+  page.messages = page.messages.map((m) => (m.id === "200" ? { ...m, edited_timestamp: "2026-08-19T04:45:00.000Z" } : m));
+  await pollOnce(page);
+  page.timeline = errorResponse(502, "chat_error", "history read timed out");
+  await deliver(page, page.stream(), sseMessage({ ...read, content: "main channel announcement, edited again" }));
+  await page.settle();
+  const kept = savedScopes(page)[scopeKey(CHANNEL.id)].messages.find((m) => m.id === "200");
+  assert.equal(kept.edited_timestamp, undefined, "the control did not take the rule away, so it proves nothing");
+});
+
+test("a pinned message that is edited later is redrawn in the Pinned list with its mark", async () => {
+  const page = newPage();
+  const data = threadData();
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  page.pinned.set(String(data.messages[0].id), storedPin(data.messages[0], 1));
+  page.servePinsRevision = true;
+  page.pinsRevision = 7;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await showPinned(page);
+  const pinnedRow = () => page.el("pinned-log").children.find((li) => li.getAttribute("data-id") === String(data.messages[0].id));
+  assert.equal(editedMarkOf(pinnedRow()), undefined, "the fixture's pin is already marked");
+  page.messages = page.messages.map((m) => (m.id === data.messages[0].id
+    ? { ...m, edited_timestamp: "2026-08-19T04:45:00.000Z" } : m));
+  await pollOnce(page);
+  assert.ok(editedMarkOf(pinnedRow()), "the Pinned list kept the row it drew before the edit");
+});
+
+test("the edited mark is drawn in the time's ink, kept whole, and has no hover", () => {
+  const mark = cssBlock(".edited-mark");
+  assert.match(mark, /white-space: nowrap/);
+  assert.match(mark, /flex: 0 0 auto/);
+  assert.doesNotMatch(mark, /color:/, "the mark has an ink of its own rather than the time's");
+  assert.doesNotMatch(mark, /cursor: pointer/);
+  assert.doesNotMatch(CSS_CODE, /\.edited-mark:hover/);
+});
+
 // --- `#221 read-modes` ---------------------------------------------------------------------------
 //
 // The owner, 2026-10-08: entering a thread to read the agent's answer landed on it folded. "I would

@@ -570,6 +570,20 @@ declare namespace VibeTalk {
      */
     content_html?: string;
     /**
+     * When the message was last edited, ISO-8601, as the provider reports it. `#320
+     * slack-edited-mark`.
+     *
+     * Set from the provider's own record of an edit: Slack's `edited.ts`, Discord's
+     * `edited_timestamp`, or a bridge that passes either through. ABSENT IS "NO EDIT REPORTED":
+     * the message was never edited, or it came from a provider or by a path that cannot say —
+     * the two look the same, so an absent field is drawn as every message was before edits were
+     * carried, with no mark, and a copy without it never takes away one a read brought.
+     *
+     * For the page, which marks an edited message, and for a model that is asked: it is never
+     * read aloud. Exact, like [`Message::timestamp`], and never rounded.
+     */
+    edited_timestamp?: string | null;
+    /**
      * The tag, time and title the message's first line states, for the page to show in the row's
      * header. `#242 rich-headers`; see [`crate::heading`].
      *

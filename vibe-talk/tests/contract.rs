@@ -72,6 +72,7 @@ fn message(id: &str) -> Message {
         author_is_bot: false,
         timestamp: "2026-09-25T12:00:00+00:00".into(),
         spoken_time: String::new(),
+        edited_timestamp: None,
         reply_to: None,
         content: "hello".into(),
         spoken_content: String::new(),
@@ -93,6 +94,9 @@ fn threaded_message(id: &str) -> Message {
             reply_count_exact: true,
         }),
         spoken_time: "noon".into(),
+        // `#320 slack-edited-mark`: edited here, not on the plain sample, so the generated
+        // validators are proven against both.
+        edited_timestamp: Some("2026-09-25T12:04:30.000100Z".into()),
         reply_to: Some(MessageId("200".into())),
         spoken_content: "hello, spoken".into(),
         // `#196 auto-read-noise`: present on one sample and absent on the other, so the

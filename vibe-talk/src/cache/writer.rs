@@ -1263,6 +1263,7 @@ impl Writer<'_> {
                     thread: message.thread.clone(),
                     reactions: message.reactions.clone(),
                     mentions: message.mentions.clone(),
+                    edited_timestamp: message.edited_timestamp.clone(),
                 })
                 .unwrap_or_else(|_| "{}".to_owned());
                 let search_text = self.search_text(&chan.provider_key, message);
@@ -1393,6 +1394,11 @@ impl Writer<'_> {
                 } else {
                     message.mentions.clone()
                 },
+                // Nor does one that cannot see edits take away the mark. `#320 slack-edited-mark`.
+                edited_timestamp: crate::model::later_edit(
+                    message.edited_timestamp.clone(),
+                    held_extra.edited_timestamp,
+                ),
             })
             .unwrap_or(held.extra.clone());
         }

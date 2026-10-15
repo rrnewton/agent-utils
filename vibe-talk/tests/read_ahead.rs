@@ -42,6 +42,7 @@ const LOOKUP: Duration = Duration::from_millis(100);
 
 fn message(id: &str, thread: Option<&str>) -> Message {
     Message {
+        edited_timestamp: None,
         id: MessageId(id.to_owned()),
         channel_id: ChannelId(READ_CHANNEL.to_owned()),
         author: "Reader".to_owned(),
