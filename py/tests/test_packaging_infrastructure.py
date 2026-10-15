@@ -879,9 +879,11 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # The two lockless-reader cases of 5258942d (a reader that waits out an
     # absent batch between its archive and its ACTIVE delete, and an overlap
     # that survives the locked reread or that a lock holder reports) are mapped.
-    assert len(all_tests) == 1960
+    # The batch maps-filter ceiling case of 8eb8de0f (four selected trees fit
+    # where one allowance would not) is mapped.
+    assert len(all_tests) == 1961
     assert len(ordinary) == 336
-    assert len(mapped) == 1624
+    assert len(mapped) == 1625
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
