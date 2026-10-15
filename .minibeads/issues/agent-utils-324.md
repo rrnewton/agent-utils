@@ -1,12 +1,13 @@
 ---
 title: 'live-pill-covers-row: the live pill covers the top row on a phone'
-status: open
+status: closed
 priority: 3
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-15T06:03:00.417442984+00:00
-updated_at: 2026-10-15T06:03:00.417442984+00:00
+updated_at: 2026-10-15T08:54:04.828397342+00:00
+closed_at: 2026-10-15T08:54:04.828397202+00:00
 ---
 
 # Description
