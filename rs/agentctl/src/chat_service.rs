@@ -70,6 +70,12 @@ const OUTPUT_RETRY_MAX: Duration = Duration::from_secs(60);
 // matched, as `RouteCache::saturated_by` describes, and while the agent works by Herdr's report
 // or by its screen, as `TurnEvidence` describes.
 const SATURATED_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// How often `chat run` reads the pane itself while a reply alias keeps an output pattern matched
+/// but nothing can add a reply soon: the agent is idle by Herdr's report and by its screen,
+/// every open request has stored a reply, and the output subscription works. See
+/// `saturated_poll_interval`. It equals the period of the record scan, which wakes the loop and
+/// looks Herdr's status up anyway, and `idle_poll_at` puts the read at that wake.
+pub const IDLE_SATURATED_POLL_INTERVAL: Duration = DELIVERY_RETRY_INTERVAL;
 const PROVIDER_RETRY_MIN: Duration = Duration::from_secs(1);
 const PROVIDER_RETRY_MAX: Duration = Duration::from_secs(60);
 // Already reported reply IDs one recovery-scan log line names before it counts the rest.
@@ -169,6 +175,10 @@ pub struct ServiceOptions {
     pub reconciliation_interval: Duration,
     /// When `chat run` tries again to type prompts and reports them as stalled.
     pub timing: DeliveryTiming,
+    /// How often `chat run` reads the pane while a closing line keeps an output pattern matched
+    /// but the agent is idle and every open request has stored a reply: normally
+    /// [`IDLE_SATURATED_POLL_INTERVAL`].
+    pub idle_poll_interval: Duration,
 }
 
 /// When `chat run` tries again to type the prompts of requests it has admitted, and when it
@@ -2018,11 +2028,54 @@ fn refresh_matched_route(
 }
 
 /// When to read the pane again because `text` shows a closing line that keeps an output pattern
-/// matched, as `RouteCache::saturated_by` describes; `None` when it shows none.
-fn next_saturated_poll(routes: &RouteCache, text: &str) -> Option<Instant> {
-    routes
-        .saturated_by(text)
-        .then(|| Instant::now() + SATURATED_POLL_INTERVAL)
+/// matched, as `RouteCache::saturated_by` describes, `interval` from now; `None` when it shows
+/// none. `interval` comes from `saturated_poll_interval`.
+fn next_saturated_poll(routes: &RouteCache, text: &str, interval: Duration) -> Option<Instant> {
+    routes.saturated_by(text).then(|| Instant::now() + interval)
+}
+
+/// When the backstop read that `next_saturated_poll` set for `at`, `interval` after a read, should
+/// come: at the next scan of the request records, `next_scan`, which wakes the loop and looks
+/// Herdr's status up anyway, so the read costs no wake of its own; but no sooner than
+/// `SATURATED_POLL_INTERVAL` from now and no later than `at`. A poll at the shorter interval is
+/// left as it is.
+fn idle_poll_at(at: Instant, interval: Duration, next_scan: Instant) -> Instant {
+    if interval <= SATURATED_POLL_INTERVAL {
+        return at;
+    }
+    let soonest = Instant::now() + SATURATED_POLL_INTERVAL;
+    next_scan.clamp(soonest, at.max(soonest))
+}
+
+/// How long after a read that shows such a closing line the loop reads the pane again.
+///
+/// The read exists because a later reply under a matched pattern raises no output event. A reply
+/// is written by a turn, so while the agent works the loop reads every `SATURATED_POLL_INTERVAL`.
+/// When nothing can add a reply soon, it reads only every `idle`, as a backstop:
+///
+/// - the agent is not working, neither by Herdr's last report nor by the screens the loop has
+///   read since, so a reply needs a new turn, and Herdr raises an event for the change of status
+///   to `working` that starts the faster reads again;
+/// - every open request has stored a reply, so none is still waiting for its first one, whose
+///   pattern the closing line of another request's reply can keep matched as well;
+/// - the output subscription works (`subscribed`), since without it no event reports a turn
+///   starting.
+///
+/// The backstop catches a reply written in a turn that Herdr's status rules report as idle, which
+/// can happen in a Claude Code pane, and that the bridge did not start: such a reply under a
+/// matched pattern is read within `idle` rather than `SATURATED_POLL_INTERVAL`, and is lost if it
+/// leaves a screen-only pane's screen before then.
+fn saturated_poll_interval(
+    routes: &RouteCache,
+    turn: &TurnEvidence,
+    subscribed: bool,
+    idle: Duration,
+) -> Duration {
+    if subscribed && !turn.working() && routes.all_answered() {
+        idle.max(SATURATED_POLL_INTERVAL)
+    } else {
+        SATURATED_POLL_INTERVAL
+    }
 }
 
 /// Capture the replies of each open request whose current reply ID has a closing line in
@@ -2097,6 +2150,8 @@ struct RouteCache {
     by_nonce: BTreeMap<String, String>,
     /// The reply aliases of open and closed requests, like `by_nonce`.
     by_alias: BTreeMap<String, String>,
+    /// The keys of open requests that have stored no reply yet.
+    unanswered: BTreeSet<String>,
 }
 
 impl RouteCache {
@@ -2111,6 +2166,7 @@ impl RouteCache {
                     key: route.key,
                     nonce: route.nonce,
                     current_identifier: Some(route.identifier),
+                    answered: route.answered,
                 })
                 .collect(),
         )
@@ -2122,12 +2178,16 @@ impl RouteCache {
             by_key: BTreeMap::new(),
             by_nonce: BTreeMap::new(),
             by_alias: BTreeMap::new(),
+            unanswered: BTreeSet::new(),
         };
         for entry in entries {
             if let Some(identifier) = entry.current_identifier.as_ref() {
                 result
                     .by_identifier
                     .insert(identifier.clone(), entry.key.clone());
+                if !entry.answered {
+                    result.unanswered.insert(entry.key.clone());
+                }
             }
             if let Some(alias) = entry.alias {
                 result.by_alias.insert(alias, entry.key.clone());
@@ -2147,7 +2207,11 @@ impl RouteCache {
         if let Some((_, Some(identifier))) = previous.as_ref() {
             self.by_identifier.remove(identifier);
         }
+        self.unanswered.remove(key);
         if let Some(route) = route {
+            if !route.answered {
+                self.unanswered.insert(route.key.clone());
+            }
             self.by_nonce.insert(route.nonce.clone(), route.key.clone());
             if chat_runtime::parse_reply_alias(&route.identifier).is_some() {
                 self.by_alias
@@ -2203,6 +2267,13 @@ impl RouteCache {
     /// Whether some open request has a current reply ID, so that a reply could be stored.
     fn has_current(&self) -> bool {
         !self.by_identifier.is_empty()
+    }
+
+    /// Whether every open request has stored at least one reply. A request this cache last read
+    /// before its first reply was stored counts as unanswered until it is read again, which
+    /// errs toward the faster reads.
+    fn all_answered(&self) -> bool {
+        self.unanswered.is_empty()
     }
 
     /// The current reply IDs of open requests whose closing line `text` shows, each once, in
@@ -3791,7 +3862,12 @@ fn owner_loop<A: ManagedApi + ?Sized>(
     // prompts that no pass has tried yet since the service started.
     let mut watch = DeliveryWatch::new(options.timing);
     watch.scan(state, &queue_reader, &mut routes);
-    let mut poll_at = next_saturated_poll(&routes, &initial);
+    // No output subscription works yet, so the first poll comes after the shorter interval.
+    let mut poll_at = next_saturated_poll(
+        &routes,
+        &initial,
+        saturated_poll_interval(&routes, &turn, false, options.idle_poll_interval),
+    );
     // Consecutive failed reads of the saturated poll, which logs the first and the recovery.
     let mut poll_failures = 0_u64;
     // Consecutive failed lookups of Herdr's status after a wait that ended with no event, which
@@ -3801,6 +3877,20 @@ fn owner_loop<A: ManagedApi + ?Sized>(
     let mut lookup_retry_at: Option<Instant> = None;
 
     let mut stream: Option<PaneEventStream> = None;
+    // When to read the pane again after a read that showed `$text`: see `next_saturated_poll`
+    // and `saturated_poll_interval`.
+    macro_rules! saturated_poll {
+        ($text:expr) => {{
+            let interval = saturated_poll_interval(
+                &routes,
+                &turn,
+                stream.is_some(),
+                options.idle_poll_interval,
+            );
+            next_saturated_poll(&routes, $text, interval)
+                .map(|at| idle_poll_at(at, interval, watch.next_scan))
+        }};
+    }
     let mut subscribed_patterns = Vec::new();
     let mut output_retry_at = Instant::now();
     let mut output_retry_delay = Duration::from_secs(1);
@@ -3851,7 +3941,8 @@ fn owner_loop<A: ManagedApi + ?Sized>(
         }
         if poll_at.is_some_and(|at| Instant::now() >= at) {
             // This read runs every `SATURATED_POLL_INTERVAL` for as long as the pane shows the
-            // closing line, or the agent works while some request has a current reply ID, and at
+            // closing line, or only every idle backstop while `saturated_poll_interval` allows,
+            // or the agent works while some request has a current reply ID, and at
             // once before each rescan and each pass that handles queued request keys and after a
             // settle the pane has already left, so it saves no snapshot, which would cost a file
             // write and two fsyncs each time, and a failed read is tried again at the next
@@ -3881,7 +3972,7 @@ fn owner_loop<A: ManagedApi + ?Sized>(
                     enqueue_report_backlog(&mut direct_keys, &report, overflowed);
                     notes.log(&report);
                     turn.report(&report);
-                    poll_at = next_saturated_poll(&routes, &snapshot);
+                    poll_at = saturated_poll!(&snapshot);
                 }
                 Err(error) if stop.is_stopped() => return Err(error.into()),
                 Err(error) => {
@@ -3983,7 +4074,7 @@ fn owner_loop<A: ManagedApi + ?Sized>(
             notes.log(&check.report);
             turn.report(&check.report);
             if let Some(snapshot) = &check.snapshot {
-                poll_at = next_saturated_poll(&routes, snapshot);
+                poll_at = saturated_poll!(snapshot);
             }
         }
 
@@ -4021,7 +4112,7 @@ fn owner_loop<A: ManagedApi + ?Sized>(
                 enqueue_report_backlog(&mut direct_keys, &report, overflowed);
                 notes.log(&report);
                 turn.report(&report);
-                poll_at = next_saturated_poll(&routes, &snapshot);
+                poll_at = saturated_poll!(&snapshot);
             }
             let report = recover_pass(state, manager, options.delivery, &mut routes, &mut control)?;
             enqueue_report_backlog(&mut direct_keys, &report, overflowed);
@@ -4073,9 +4164,19 @@ fn owner_loop<A: ManagedApi + ?Sized>(
         // closing line keeps its pattern matched. So while the agent works, by Herdr's report or
         // by its screen, and some request has a current reply ID, the pane is read every
         // interval. A request stays open until `chat close`, so with outbound replies on, that is
-        // in practice whenever the agent works.
-        if turn.working() && poll_at.is_none() && routes.has_current() {
-            poll_at = Some(Instant::now() + SATURATED_POLL_INTERVAL);
+        // in practice whenever the agent works. A poll set to the idle backstop is brought
+        // forward as soon as the reasons for it no longer hold: the agent works, a request
+        // waits for its first reply, or the subscription is gone.
+        let soon = Instant::now() + SATURATED_POLL_INTERVAL;
+        let backstop_lapsed = poll_at.is_some_and(|at| at > soon)
+            && saturated_poll_interval(
+                &routes,
+                &turn,
+                stream.is_some(),
+                options.idle_poll_interval,
+            ) <= SATURATED_POLL_INTERVAL;
+        if backstop_lapsed || (turn.working() && poll_at.is_none() && routes.has_current()) {
+            poll_at = Some(soon);
         }
 
         if let Some(active) = stream.as_mut() {
@@ -4177,7 +4278,7 @@ fn owner_loop<A: ManagedApi + ?Sized>(
                                 turn.report(&report);
                                 // This capture covers only the event's own reply ID, so an event
                                 // never puts off a poll that is already due for the others.
-                                poll_at = poll_at.or_else(|| next_saturated_poll(&routes, &text));
+                                poll_at = poll_at.or_else(|| saturated_poll!(&text));
                             }
                             PaneEvent::Settled { status }
                                 if info.status == status
@@ -4204,7 +4305,7 @@ fn owner_loop<A: ManagedApi + ?Sized>(
                                 enqueue_report_backlog(&mut direct_keys, &report, overflowed);
                                 notes.log(&report);
                                 turn.report(&report);
-                                poll_at = next_saturated_poll(&routes, &snapshot);
+                                poll_at = saturated_poll!(&snapshot);
                                 let recovery = recover_pass(
                                     state,
                                     manager,
@@ -4254,7 +4355,7 @@ fn owner_loop<A: ManagedApi + ?Sized>(
                         enqueue_report_backlog(&mut direct_keys, &report, overflowed);
                         notes.log(&report);
                         turn.report(&report);
-                        poll_at = next_saturated_poll(&routes, &snapshot);
+                        poll_at = saturated_poll!(&snapshot);
                     }
                 }
                 Err(error) => {
@@ -7762,16 +7863,19 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 key: first_key,
                 nonce: "AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
                 identifier: "AAAAAAAAAAAAAAAAAAAAAA_2".to_owned(),
+                answered: false,
             },
             ReplyRoute {
                 key: second_key.clone(),
                 nonce: "BBBBBBBBBBBBBBBBBBBBBB".to_owned(),
                 identifier: "BBBBBBBBBBBBBBBBBBBBBB_1".to_owned(),
+                answered: false,
             },
             ReplyRoute {
                 key: third_key.clone(),
                 nonce: "CCCCCCCCCCCCCCCCCCCCCC".to_owned(),
                 identifier: "CCCCCCCCCCCCCCCCCCCCCC_1".to_owned(),
+                answered: false,
             },
         ]);
         let old = "  </CHAT_REPLY_AAAAAAAAAAAAAAAAAAAAAA_1>";
@@ -7809,6 +7913,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 key: second_key.clone(),
                 nonce: "BBBBBBBBBBBBBBBBBBBBBB".to_owned(),
                 identifier: "BBBBBBBBBBBBBBBBBBBBBB_2".to_owned(),
+                answered: false,
             }),
         );
         let next_patterns = routes.patterns().expect("advanced patterns");
@@ -7844,11 +7949,13 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 key: first_key.clone(),
                 nonce: "AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
                 identifier: "AAAAAAAAAAAAAAAAAAAAAA_1".to_owned(),
+                answered: false,
             },
             ReplyRoute {
                 key: second_key,
                 nonce: "BBBBBBBBBBBBBBBBBBBBBB".to_owned(),
                 identifier: "BBBBBBBBBBBBBBBBBBBBBB_7".to_owned(),
+                answered: false,
             },
         ]);
         let patterns = routes.patterns().expect("route patterns");
@@ -7866,6 +7973,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 key: key.clone(),
                 nonce: "AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
                 identifier: "AAAAAAAAAAAAAAAAAAAAAA_2".to_owned(),
+                answered: false,
             }),
         );
         assert_eq!(routes.key("AAAAAAAAAAAAAAAAAAAAAA_1"), None);
@@ -7883,6 +7991,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 key: "c".repeat(64),
                 nonce: "CCCCCCCCCCCCCCCCCCCCCC".to_owned(),
                 identifier: "CCCCCCCCCCCCCCCCCCCCCC_1".to_owned(),
+                answered: false,
             }),
         );
         assert_ne!(
@@ -7917,6 +8026,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 key: format!("{index:064x}"),
                 nonce: format!("{index:022x}"),
                 identifier: format!("{index:022x}_999999"),
+                answered: false,
             })
             .collect::<Vec<_>>();
         let cache = RouteCache::new(routes);
@@ -7954,6 +8064,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
             key: "a".repeat(64),
             nonce: "AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
             identifier: "AAAAAAAAAAAAAAAAAAAAAA_.*".to_owned(),
+            answered: false,
         }]);
         assert!(invalid.patterns().is_err());
         let over_budget = RouteCache::new(
@@ -7962,6 +8073,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                     key: format!("{index:064x}"),
                     nonce: format!("{index:022x}"),
                     identifier: format!("{index:022x}_999999"),
+                    answered: false,
                 })
                 .collect(),
         );
@@ -8117,7 +8229,15 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
             "herdr raises no event for a second closing line under the same alias"
         );
         assert!(routes.saturated_by(&first) && routes.saturated_by(&second));
-        assert!(next_saturated_poll(&routes, &second).is_some());
+        assert!(next_saturated_poll(&routes, &second, SATURATED_POLL_INTERVAL).is_some());
+        // Until its first reply is stored, the request keeps the poll at the shorter interval
+        // even while the agent is idle and the output subscription works.
+        let idle = TurnEvidence::default();
+        assert!(!routes.all_answered());
+        assert_eq!(
+            saturated_poll_interval(&routes, &idle, true, IDLE_SATURATED_POLL_INTERVAL),
+            SATURATED_POLL_INTERVAL
+        );
 
         let client = HerdrClient::with_executable("direct", Path::new("/missing/herdr"))
             .expect("construct client");
@@ -8144,7 +8264,34 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
         assert_eq!(report.captured, [(key.clone(), vec![1])]);
         // The alias stays the same after a reply, so its pattern and the saturation do too.
         assert_eq!(routes.patterns().expect("patterns"), patterns);
-        assert!(next_saturated_poll(&routes, &second).is_some());
+        assert!(next_saturated_poll(&routes, &second, SATURATED_POLL_INTERVAL).is_some());
+        // Now every open request has a reply, so an idle agent with a working subscription is
+        // read only on the idle backstop; a working agent, or a lost subscription, keeps the
+        // shorter interval.
+        assert!(routes.all_answered());
+        assert_eq!(
+            saturated_poll_interval(&routes, &idle, true, IDLE_SATURATED_POLL_INTERVAL),
+            IDLE_SATURATED_POLL_INTERVAL
+        );
+        assert_eq!(
+            saturated_poll_interval(&routes, &idle, false, IDLE_SATURATED_POLL_INTERVAL),
+            SATURATED_POLL_INTERVAL
+        );
+        let mut working = TurnEvidence::default();
+        working.status("working");
+        assert_eq!(
+            saturated_poll_interval(&routes, &working, true, IDLE_SATURATED_POLL_INTERVAL),
+            SATURATED_POLL_INTERVAL
+        );
+        let mut running = TurnEvidence::default();
+        running.report(&CycleReport {
+            prompt_typed: true,
+            ..CycleReport::default()
+        });
+        assert_eq!(
+            saturated_poll_interval(&routes, &running, true, IDLE_SATURATED_POLL_INTERVAL),
+            SATURATED_POLL_INTERVAL
+        );
         let poll = |routes: &mut RouteCache, control: &mut PassControl<'_>| {
             capture_visible_current(
                 &state,
@@ -8174,13 +8321,14 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
             key: "b".repeat(64),
             nonce: "BBBBBBBBBBBBBBBBBBBBBB".to_owned(),
             identifier: long_id.to_owned(),
+            answered: false,
         }]);
         let legacy_text = format!("<CHAT_REPLY_{long_id}>\nanswer\n</CHAT_REPLY_{long_id}>\n");
-        assert!(next_saturated_poll(&legacy, &legacy_text).is_none());
+        assert!(next_saturated_poll(&legacy, &legacy_text, SATURATED_POLL_INTERVAL).is_none());
         // Once the request closes, its alias no longer holds the poll.
         state.close_replies(&key).expect("close replies");
         routes.replace(&key, None);
-        assert!(next_saturated_poll(&routes, &second).is_none());
+        assert!(next_saturated_poll(&routes, &second, SATURATED_POLL_INTERVAL).is_none());
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -8829,6 +8977,7 @@ arrive after it; chat provider worker panicked"
             nonce: "AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
             alias: None,
             current_identifier: Some("AAAAAAAAAAAAAAAAAAAAAA_2".to_owned()),
+            answered: true,
         }]);
         routes.replace(&key, None);
         assert_eq!(
@@ -10411,6 +10560,22 @@ esac
             .remove(0)
     }
 
+    thread_local! {
+        /// The idle backstop the owner loops that a test on this thread runs use: see
+        /// [`with_idle_poll_interval`].
+        static TEST_IDLE_POLL_INTERVAL: Cell<Duration> =
+            const { Cell::new(IDLE_SATURATED_POLL_INTERVAL) };
+    }
+
+    /// Run `body` with `interval` as the `idle_poll_interval` of every owner loop it runs on this
+    /// thread, instead of `IDLE_SATURATED_POLL_INTERVAL`, so that a test need not wait a minute.
+    fn with_idle_poll_interval<T>(interval: Duration, body: impl FnOnce() -> T) -> T {
+        let previous = TEST_IDLE_POLL_INTERVAL.with(|cell| cell.replace(interval));
+        let result = body();
+        TEST_IDLE_POLL_INTERVAL.with(|cell| cell.set(previous));
+        result
+    }
+
     /// Run the owner loop for `state`'s agent until the fixture's fake Herdr client has served
     /// `reads` pane reads, let it run on briefly so a further read is recorded too, stop it, and
     /// return the source of every read it made.
@@ -10658,6 +10823,7 @@ esac
                     delivery,
                     reconciliation_interval,
                     timing,
+                    idle_poll_interval: TEST_IDLE_POLL_INTERVAL.with(Cell::get),
                 },
                 &stop,
                 &cancellation,
@@ -10919,25 +11085,48 @@ esac
         }
     }
 
+    // These three keep Herdr's status `idle` and every request answered once its first reply is
+    // stored, which puts the loop on its idle backstop, so they set that backstop to the shorter
+    // interval: what they pin is the saturated poll itself. The policy that lengthens it while
+    // the agent is idle is pinned by the tests after them.
     #[test]
     fn the_owner_loop_reads_each_further_reply_under_one_alias_on_the_saturated_poll() {
-        further_replies_under_one_alias_on_the_saturated_poll(false, SCREEN_ONLY);
+        with_idle_poll_interval(SATURATED_POLL_INTERVAL, || {
+            further_replies_under_one_alias_on_the_saturated_poll(false, SCREEN_ONLY, false);
+        });
     }
 
     #[test]
     fn after_an_output_event_the_owner_loop_reads_further_replies_on_the_saturated_poll() {
-        further_replies_under_one_alias_on_the_saturated_poll(true, SCREEN_ONLY);
+        with_idle_poll_interval(SATURATED_POLL_INTERVAL, || {
+            further_replies_under_one_alias_on_the_saturated_poll(true, SCREEN_ONLY, false);
+        });
     }
 
     #[test]
     fn the_saturated_poll_reads_a_pane_with_scrollback_as_the_other_reads_of_the_owner_loop_do() {
-        further_replies_under_one_alias_on_the_saturated_poll(
-            false,
-            crate::client::PaneScroll {
-                max_offset_from_bottom: 120,
-                ..SCREEN_ONLY
-            },
+        with_idle_poll_interval(SATURATED_POLL_INTERVAL, || {
+            further_replies_under_one_alias_on_the_saturated_poll(
+                false,
+                crate::client::PaneScroll {
+                    max_offset_from_bottom: 120,
+                    ..SCREEN_ONLY
+                },
+                false,
+            );
+        });
+    }
+
+    #[test]
+    fn while_the_agent_works_further_replies_are_read_every_interval_despite_the_idle_backstop() {
+        // The production backstop of ten seconds applies only while the agent is idle. Herdr
+        // reports this agent working throughout, so the loop reads every
+        // `SATURATED_POLL_INTERVAL` and stores all three replies within the bound below.
+        assert_eq!(
+            TEST_IDLE_POLL_INTERVAL.with(Cell::get),
+            IDLE_SATURATED_POLL_INTERVAL
         );
+        further_replies_under_one_alias_on_the_saturated_poll(false, SCREEN_ONLY, true);
     }
 
     /// Herdr raises an output event only when a pattern starts to match, so once a request's
@@ -10956,6 +11145,7 @@ esac
     fn further_replies_under_one_alias_on_the_saturated_poll(
         first_from_event: bool,
         scroll: crate::client::PaneScroll,
+        working: bool,
     ) {
         let fixture = crate::subagents::tests::Fixture::new();
         fixture.start(None);
@@ -10983,6 +11173,9 @@ esac
         };
         let initial = usize::from(!first_from_event);
         show(initial);
+        if working {
+            *fixture.client.status.lock().expect("status") = Some("working".to_owned());
+        }
         let read_sources = &fixture.client.read_sources;
         read_sources.lock().expect("read sources").clear();
         let events: fn(&str) -> Vec<Value> = if first_from_event {
@@ -11041,6 +11234,12 @@ esac
             reads >= answers.len() && reads as u128 <= 2 + intervals,
             "{reads} reads in {elapsed:?}"
         );
+        // And at least once per interval: the two further replies came within about two
+        // intervals each, well before two idle backstops (2 x 10 s) could have read them.
+        assert!(
+            elapsed < SATURATED_POLL_INTERVAL * 2 * answers.len() as u32,
+            "the further replies took {elapsed:?}"
+        );
         let source = if scroll.max_offset_from_bottom == 0 {
             "visible"
         } else {
@@ -11049,6 +11248,156 @@ esac
         assert!(sources.iter().all(|read| read == source), "{sources:?}");
         drop(herdr.release);
         herdr.server.join().expect("herdr stand-in");
+    }
+
+    /// Whether the Herdr stand-in of
+    /// [`an_idle_backstop_is_cut_short_once_the_agent_starts_working`] reports the agent working.
+    static REPORT_WORKING: AtomicBool = AtomicBool::new(false);
+
+    /// The owner loop of [`idle_backstop_case`]: `first answer` is on the screen and stored at
+    /// startup, so every open request has a reply. Once the loop has made its first saturated
+    /// poll, its second read, and half a second has passed without another, `second answer`
+    /// appears under the same reply ID, which raises no output event; `on_show` runs then. Returns how long after it appeared it was stored, and
+    /// how many pane reads the loop made in between, counting the one that stored it.
+    fn idle_backstop_case(
+        backstop: Duration,
+        events: fn(&str) -> Vec<Value>,
+        on_show: impl Fn(&crate::subagents::tests::Fixture) + Send + Sync,
+    ) -> (Duration, usize) {
+        with_idle_poll_interval(backstop, || {
+            let fixture = crate::subagents::tests::Fixture::new();
+            fixture.start(None);
+            let (_, state) = worker_bridge_state(&fixture, true);
+            let (key, prompt) = delivered_worker_request(&state);
+            assert!(
+                prompt.contains("Include the line <CHAT_REPLY_001> at the beginning"),
+                "{prompt}"
+            );
+            let screen = |answers: &[&str]| {
+                answers
+                    .iter()
+                    .map(|answer| format!("<CHAT_REPLY_001>\n{answer}\n</CHAT_REPLY_001>\n"))
+                    .collect::<String>()
+            };
+            *fixture.client.screen.lock().expect("screen") = Some(screen(&["first answer"]));
+            let stored = || {
+                state.inspect_request(&key).expect("inspect request")["replies"]
+                    .as_array()
+                    .expect("replies")
+                    .len()
+            };
+            let read_sources = &fixture.client.read_sources;
+            read_sources.lock().expect("read sources").clear();
+            let herdr = owner_loop_herdr_every(
+                &fixture.root,
+                "herdr",
+                events,
+                Some(Duration::from_millis(300)),
+            );
+            let mut last_reads = (0, Instant::now());
+            let mut shown: Option<(Instant, usize)> = None;
+            let mut done: Option<(Instant, usize)> = None;
+            run_owner_loop_until(
+                &fixture,
+                &state,
+                &herdr,
+                Duration::from_secs(3_600),
+                Duration::from_secs(60),
+                || {
+                    let reads = read_sources.lock().expect("read sources").len();
+                    if reads != last_reads.0 {
+                        last_reads = (reads, Instant::now());
+                    }
+                    // The startup read and the first saturated poll have both been made, and the
+                    // loop has had time to set its next poll after the second.
+                    if shown.is_none()
+                        && reads >= 2
+                        && last_reads.1.elapsed() >= Duration::from_millis(500)
+                    {
+                        assert_eq!(stored(), 1, "the first reply is stored at startup");
+                        *fixture.client.screen.lock().expect("screen") =
+                            Some(screen(&["first answer", "second answer"]));
+                        on_show(&fixture);
+                        shown = Some((Instant::now(), reads));
+                    }
+                    if shown.is_some() && done.is_none() && stored() == 2 {
+                        done = Some((Instant::now(), reads));
+                    }
+                    done.is_some()
+                },
+            );
+            drop(herdr.release);
+            herdr.server.join().expect("herdr stand-in");
+            let (shown_at, reads_at_show) = shown.expect("the second reply was shown");
+            let (stored_at, reads_at_store) = done.expect("the second reply was stored");
+            (stored_at - shown_at, reads_at_store - reads_at_show)
+        })
+    }
+
+    #[test]
+    fn an_idle_agent_whose_requests_are_answered_is_read_only_on_the_idle_backstop() {
+        // Herdr reports the agent idle, its screen shows no running turn, the subscription
+        // works, and the request has stored its first reply: nothing but a new turn can add a
+        // reply, so after its first saturated poll the loop reads the pane only on the idle
+        // backstop. The second reply appears half a second after that poll; no read comes
+        // `SATURATED_POLL_INTERVAL` later, and the backstop read, one read in all, stores it.
+        let backstop = Duration::from_secs(6);
+        let (waited, reads) = idle_backstop_case(backstop, |_| Vec::new(), |_| {});
+        assert_eq!(reads, 1, "only the backstop read came: waited {waited:?}");
+        assert!(
+            waited >= Duration::from_secs(3) && waited <= backstop + Duration::from_secs(2),
+            "{waited:?}"
+        );
+    }
+
+    #[test]
+    fn an_idle_backstop_read_comes_with_the_next_record_scan() {
+        let now = Instant::now();
+        let idle = IDLE_SATURATED_POLL_INTERVAL;
+        let at = now + idle;
+        // A scan due within the backstop takes the read along.
+        let scan = now + Duration::from_secs(4);
+        assert_eq!(idle_poll_at(at, idle, scan), scan);
+        // Never sooner than the shorter interval, nor later than the backstop.
+        let soon = idle_poll_at(at, idle, now);
+        assert!(
+            soon >= now + SATURATED_POLL_INTERVAL && soon < now + idle,
+            "{soon:?}"
+        );
+        assert_eq!(idle_poll_at(at, idle, now + Duration::from_secs(3_600)), at);
+        // A poll at the shorter interval is left alone.
+        let fast = now + SATURATED_POLL_INTERVAL;
+        assert_eq!(idle_poll_at(fast, SATURATED_POLL_INTERVAL, scan), fast);
+    }
+
+    #[test]
+    fn an_idle_backstop_is_cut_short_once_the_agent_starts_working() {
+        // As above, but with a backstop of a minute, and when the second reply appears Herdr
+        // reports the agent working, raising its status event. The loop goes back to reading
+        // every `SATURATED_POLL_INTERVAL` at once rather than waiting out the backstop.
+        REPORT_WORKING.store(false, AtomicOrdering::SeqCst);
+        let (waited, _) = idle_backstop_case(
+            Duration::from_secs(60),
+            |pane| {
+                if REPORT_WORKING.load(AtomicOrdering::SeqCst) {
+                    vec![json!({
+                        "event": "pane.agent_status_changed",
+                        "data": {"pane_id": pane, "agent_status": "working"},
+                    })]
+                } else {
+                    Vec::new()
+                }
+            },
+            |fixture| {
+                *fixture.client.status.lock().expect("status") = Some("working".to_owned());
+                REPORT_WORKING.store(true, AtomicOrdering::SeqCst);
+            },
+        );
+        REPORT_WORKING.store(false, AtomicOrdering::SeqCst);
+        assert!(
+            waited <= SATURATED_POLL_INTERVAL * 3,
+            "the backstop was not cut short: {waited:?}"
+        );
     }
 
     #[test]
@@ -12177,6 +12526,7 @@ esac
                     delivery: DrainOptions::default(),
                     reconciliation_interval: Duration::from_secs(1),
                     timing: DeliveryTiming::default(),
+                    idle_poll_interval: IDLE_SATURATED_POLL_INTERVAL,
                 },
             )
             .expect("tick");
@@ -12199,6 +12549,7 @@ esac
             delivery: DrainOptions::default(),
             reconciliation_interval: Duration::from_secs(1),
             timing: DeliveryTiming::default(),
+            idle_poll_interval: IDLE_SATURATED_POLL_INTERVAL,
         }
     }
 

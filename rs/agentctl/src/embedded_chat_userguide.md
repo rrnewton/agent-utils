@@ -740,6 +740,23 @@ output the agent received keeps them going too, although it is never posted. A
 read that fails is logged once and retried every 2 seconds, and its first
 success after that is logged as well.
 
+These reads slow to once every 10 seconds, made at the scan of the request
+records that wakes the service every 10 seconds anyway, while nothing can add a
+reply soon: the service does not count the agent as working, as described
+below, every open request has stored at least one reply, and the output
+subscription works. A reply is written by a turn, and herdr reports the agent's
+change of status to `working` with an event, after which the reads come every 2
+seconds again; a prompt the service types counts as the start of a turn too.
+The slower reads are a backstop for a turn that herdr's status rules report as
+idle, which can happen in a Claude Code pane, and that the service did not
+start, such as one the owner typed into the pane: a reply such a turn writes
+under a short ID whose closing line is already in view is stored within about
+10 seconds rather than 2, and is lost, neither posted nor reported, if it
+leaves the screen of a pane whose reads see only the screen before then. While
+some open request has stored no reply yet, the reads stay at every 2 seconds,
+because the closing line of another request's reply can keep the pattern of
+its ID matched too.
+
 A turn can also write a reply block and then push it off the screen with more
 output before it ends. If another line keeps the pattern matched without
 starting the reads above, such as a closing line under a long reply ID inside a

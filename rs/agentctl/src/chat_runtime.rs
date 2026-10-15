@@ -3939,6 +3939,8 @@ pub struct ReplyRoute {
     /// Exact reply identifier expected for the request: its reply alias, or its next
     /// `<nonce>_<ordinal>` when it has none.
     pub identifier: String,
+    /// Whether the request has stored at least one reply.
+    pub answered: bool,
 }
 
 /// One retained nonce route, including closed routes that must remain stale rather than unknown.
@@ -3953,6 +3955,9 @@ pub struct ReplyRouteEntry {
     /// Exact identifier while capture is open, as `ReplyRoute::identifier` describes; absent
     /// after explicit closure.
     pub current_identifier: Option<String>,
+    /// Whether the request has stored at least one reply, as `ReplyRoute::answered` says. A
+    /// closed or retired route reports `false`; only open routes use it.
+    pub answered: bool,
 }
 
 /// One bounded result of durably admitting an upstream acknowledgement unit.
@@ -7380,21 +7385,19 @@ and the replies captured for them. The provider's own thread is the complete rec
             .iter()
             .map(|(record, _)| {
                 let alias = alias_by_key.get(&record.key).cloned();
+                let next_ordinal = next_by_nonce
+                    .get(&record.reply_nonce)
+                    .copied()
+                    .unwrap_or(record.next_reply_ordinal);
                 ReplyRouteEntry {
                     key: record.key.clone(),
                     nonce: record.reply_nonce.clone(),
                     current_identifier: (!record.reply_closed).then(|| {
-                        alias.clone().unwrap_or_else(|| {
-                            format!(
-                                "{}_{}",
-                                record.reply_nonce,
-                                next_by_nonce
-                                    .get(&record.reply_nonce)
-                                    .copied()
-                                    .unwrap_or(record.next_reply_ordinal)
-                            )
-                        })
+                        alias
+                            .clone()
+                            .unwrap_or_else(|| format!("{}_{next_ordinal}", record.reply_nonce))
                     }),
+                    answered: !record.reply_closed && next_ordinal > 1,
                     alias,
                 }
             })
@@ -7403,6 +7406,7 @@ and the replies captured for them. The provider's own thread is the complete rec
             key: retired.request_key.clone(),
             nonce: retired.reply_nonce.clone(),
             current_identifier: None,
+            answered: false,
             alias: alias_by_key.get(&retired.request_key).cloned(),
         }));
         Ok(SnapshotCapture {
@@ -8062,6 +8066,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             .filter(|(record, _)| !record.reply_closed)
             .map(|(record, _)| ReplyRoute {
                 identifier: current_reply_id(&record, aliases.get(record.key.as_str()).copied()),
+                answered: record.reply_count > 0,
                 key: record.key,
                 nonce: record.reply_nonce,
             })
@@ -8094,6 +8099,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                 ReplyRouteEntry {
                     current_identifier: (!record.reply_closed)
                         .then(|| current_reply_id(&record, alias)),
+                    answered: !record.reply_closed && record.reply_count > 0,
                     alias: alias.map(format_reply_alias),
                     key: record.key,
                     nonce: record.reply_nonce,
@@ -8109,6 +8115,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                 key: retired.request_key,
                 nonce: retired.reply_nonce,
                 current_identifier: None,
+                answered: false,
             }
         }));
         Ok(entries)
@@ -8152,6 +8159,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             .and_then(|aliases| aliases.alias_of(key));
         Ok(Some(ReplyRoute {
             identifier: current_reply_id(&record, alias),
+            answered: record.reply_count > 0,
             key: record.key,
             nonce: record.reply_nonce,
         }))

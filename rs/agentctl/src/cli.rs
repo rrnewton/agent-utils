@@ -918,6 +918,7 @@ impl ChatOperate {
             },
             reconciliation_interval: Duration::from_secs_f64(self.reconcile_interval),
             timing: crate::chat_service::DeliveryTiming::default(),
+            idle_poll_interval: crate::chat_service::IDLE_SATURATED_POLL_INTERVAL,
         }
     }
 }
