@@ -234,19 +234,6 @@ fn directory_name(name: &str) -> String {
     }
 }
 
-/// `mpdm-ada--grace--alan-1` as `Group: ada, grace, alan`; anything else unchanged.
-fn group_name(name: &str) -> String {
-    name.strip_prefix("mpdm-")
-        .and_then(|rest| rest.rsplit_once('-').map(|(members, _)| members))
-        .map(|members| {
-            format!(
-                "Group: {}",
-                members.split("--").collect::<Vec<_>>().join(", ")
-            )
-        })
-        .unwrap_or_else(|| name.to_owned())
-}
-
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DirectoryCursor {
@@ -1523,7 +1510,8 @@ impl HttpSlackClient {
             };
             format!("DM: {person}")
         } else if flag("is_mpim") {
-            group_name(name.unwrap_or(id))
+            // By the people in it, not by its handles. `#317 slack-group-dm-names`.
+            self.group_name(id, name).await
         } else {
             format!("#{}", name.unwrap_or(id))
         };

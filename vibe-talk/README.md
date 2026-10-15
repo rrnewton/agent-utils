@@ -1101,6 +1101,16 @@ link, and the channel browser.
    as **User Token Scopes** only to [clear unread in Slack](#clearing-unread-in-slack).
 3. **Install to Workspace** and copy the token.
 
+**Group DMs are named by the people in them.** The channel browser lists a group DM as
+`Group: Ada Lovelace, Grace Hopper`: its members' display names, leaving out you (`owner_user_id`)
+and the account the token posts as, read with `conversations.members` and `users.info` and
+remembered for an hour. Adding it from the browser keeps that name, so the channel picker, the
+channel's header and speech say it too, and searching the browser for a person's name finds the
+group DMs they are in. A member whose name cannot be read is shown by their member id; when no
+member can be named, as without `users:read`, the group DM keeps the handles Slack names it by,
+`Group: ada, grace, alan`. A group DM added before this keeps the name it was added with;
+**Rename** in Settings changes it. (`#317 slack-group-dm-names`)
+
 **Bot or user token.** A bot token (`xoxb-…`) posts as the app and reads only conversations the
 app has been added to: `/invite @your-app` in each channel, and direct messages only with the
 app itself. A user token (`xoxp-…`) reads what you can read and posts **as you**; set
@@ -1418,6 +1428,7 @@ is what one push does at Slack:
 | `users.info` | `user` |
 | `users.conversations` | `types`, `limit`, `cursor`, `exclude_archived` |
 | `conversations.mark` | `channel`, `ts`; called only with `upstream_clear` on, and answering `{ok:true}` |
+| `conversations.members` | `channel`, `limit`, `cursor`; called by the channel browser for each group DM, to name it by its members; a bridge without it leaves group DMs named by their handles |
 
 A bridge may cap any page below the `limit` asked for, as long as `has_more` and
 `response_metadata.next_cursor` say so.

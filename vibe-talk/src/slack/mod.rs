@@ -20,6 +20,7 @@
 //! | `chat.postMessage` | every post, in a conversation or in a thread |
 //! | `users.info` | an author's display name when the message does not carry one |
 //! | `users.conversations` | the channel browser |
+//! | `conversations.members` | a group DM's members, to name it by them in the channel browser (`slack/groups.rs`) |
 //! | `conversations.mark` | clearing unread in Slack, only with `upstream_clear` on (`slack/clear.rs`) |
 //!
 //! Every call is a form-encoded `POST {api_base}/{method}` with `Authorization: Bearer <token>`.
@@ -61,6 +62,7 @@
 mod clear;
 mod client;
 mod files;
+mod groups;
 mod history;
 pub mod ids;
 mod live;

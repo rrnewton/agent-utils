@@ -2,7 +2,7 @@
 //!
 //! Deterministic data, a configurable page cap (real servers may answer with fewer messages than
 //! asked for), per-method call counters, injectable `ok:false` errors and a one-shot 429. It
-//! implements exactly the eight methods the client is allowed to call and answers
+//! implements exactly the nine methods the client is allowed to call and answers
 //! `unknown_method` for anything else, so a test fails if the client strays outside the subset.
 //!
 //! `conversations.mark` behaves as Slack's does: it moves the read cursor wherever it is told,
@@ -29,7 +29,7 @@ pub const SELF_USER: &str = "UBOTSELF1";
 pub const BASE_SECS: i64 = 1_700_000_000;
 
 /// The methods the fake implements, which are the only ones the client may use.
-pub const METHODS: [&str; 8] = [
+pub const METHODS: [&str; 9] = [
     "auth.test",
     "conversations.info",
     "conversations.history",
@@ -38,6 +38,7 @@ pub const METHODS: [&str; 8] = [
     "users.info",
     "users.conversations",
     "conversations.mark",
+    "conversations.members",
 ];
 
 /// Everything the fake knows and records.
@@ -53,6 +54,9 @@ pub struct FakeState {
     pub users: HashMap<String, Value>,
     /// What `users.conversations` lists, in order.
     pub memberships: Vec<Value>,
+    /// `conversations.members` answers by conversation id, in order. A conversation with none here
+    /// answers `channel_not_found`. `#317 slack-group-dm-names`.
+    pub members: HashMap<String, Vec<String>>,
     /// Calls per method.
     pub calls: HashMap<String, usize>,
     /// Every request: method and decoded form parameters.
@@ -622,6 +626,13 @@ fn handle(shared: &Mutex<FakeState>, uri: &Uri, headers: &HeaderMap, body: &[u8]
                 None => err("user_not_found"),
             }
         }
+        "conversations.members" => match state.members.get(&channel) {
+            Some(members) => {
+                let list = members.iter().map(|member| json!(member)).collect();
+                ok(page(list, "members", &params, cap))
+            }
+            None => err("channel_not_found"),
+        },
         "users.conversations" => {
             assert_eq!(
                 params.get("types").map(String::as_str),

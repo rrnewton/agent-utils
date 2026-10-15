@@ -104,6 +104,9 @@ struct CachedUser {
     at: Instant,
 }
 
+/// What is remembered of each group DM's members, by conversation id. `#317 slack-group-dm-names`.
+pub(super) type GroupMembers = Mutex<HashMap<String, (Option<Vec<String>>, Instant)>>;
+
 /// A live Slack client.
 #[derive(Debug)]
 pub struct HttpSlackClient {
@@ -120,6 +123,10 @@ pub struct HttpSlackClient {
     /// The account this client posts as, learned from `auth.test` or from its first post.
     self_user_id: Mutex<Option<String>>,
     users: Mutex<HashMap<String, CachedUser>>,
+    /// Each group DM's member ids, or `None` where Slack would not list them, and when that was
+    /// learned, so the channel browser names it by its members without asking again. `#317
+    /// slack-group-dm-names`; see `super::groups`.
+    pub(super) group_members: GroupMembers,
     /// Conversations in which a thread root has been seen, so `has_threads` does not flicker
     /// between pages that happen to contain none.
     threaded: Mutex<HashSet<String>>,
@@ -191,6 +198,7 @@ impl HttpSlackClient {
             upstream_clear: config.upstream_clear,
             self_user_id: Mutex::new(None),
             users: Mutex::new(HashMap::new()),
+            group_members: GroupMembers::default(),
             threaded: Mutex::new(HashSet::new()),
             proven: Mutex::new(HashMap::new()),
             flat_memory: Mutex::default(),
@@ -419,6 +427,19 @@ impl HttpSlackClient {
         if slot.is_none() && !id.is_empty() {
             *slot = Some(id.to_owned());
         }
+    }
+
+    /// The owner's own Slack user id, when configured.
+    pub(super) fn owner_id(&self) -> Option<String> {
+        self.owner_user_id.clone()
+    }
+
+    /// The account this client posts as, once known.
+    pub(super) fn self_id(&self) -> Option<String> {
+        self.self_user_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Note that `conversation` has threads.
@@ -774,10 +795,7 @@ impl ChatClient for HttpSlackClient {
     }
 
     fn self_author_id(&self) -> Option<String> {
-        self.self_user_id
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.self_id()
     }
 
     fn owner_author_id(&self) -> Option<String> {

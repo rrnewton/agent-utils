@@ -144,6 +144,18 @@ pub fn is_conversation_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
 }
 
+/// Whether `id` has the shape of a Slack user id: `U` or `W`, then upper-case letters and digits.
+/// Bots have user ids of the same shape.
+#[must_use]
+pub fn is_user_id(id: &str) -> bool {
+    id.len() >= 2
+        && id.len() <= 32
+        && matches!(id.as_bytes()[0], b'U' | b'W')
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
 /// Whether `id` has the shape of a Slack workspace or enterprise id: `T` or `E` and alphanumerics.
 fn is_team_id(id: &str) -> bool {
     id.len() >= 2
