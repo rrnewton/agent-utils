@@ -99,11 +99,21 @@ uncovered and wholly on screen. This lays it out on three phones and measures:
      40px up All, on a reply Main lacks, is at Main's foot in two columns and on the same row again
      after Ctrl+2; one 40px up Main in two columns is at its foot in one, the card shorter there,
      and on the same row again after Ctrl+4.
+ 18. On the phone, a reader near the foot of a long draft opened by More sees the card, Send on screen
+     and tappable, and no row, past the slack of the foot and with the box under the card on screen.
+     Send tapped, or the draft settled elsewhere, leaves them at the foot with no jump a second later,
+     once the box has taken back its room (`#280 scroll-stability`), in Main, in All and on the call's
+     view. Chromium's own scroll anchoring holds the box under the card where it stood as the card
+     goes, which left them as far above the foot as they were, and then the room and the jump's
+     further: 182px for one 40px up. So is one who saw only the card as Meta+3 docked it under the
+     thread list, once it has gone from there, on the way back by Esc, Meta+1 or Meta+2.
 
 Runs: 393x852, 360x780 and 375x667, each with a one-row and a thirty-row transcript, with and
 without the first call's connection banner, and with a short and a 1,500-character draft, and points
-9 and 10 once; the docked card alone at 667x375 and 375x330; points 11 to 13, 15 and 16 at 393x852;
-and points 8, 11 to 15 and 17 at 1280x800 with a mouse.
+9, 10 and 18 once (point 18 with a reader 30 and 60px up each list, by Send and settled elsewhere, and
+five ways through the thread list, at 393x852, and one case of each list at the other two); the docked
+card alone at 667x375 and 375x330; points 11 to 13, 15 and 16 at 393x852; and points 8, 11 to 15 and 17
+at 1280x800 with a mouse.
 
 It serves the checked-out assets and a small fake API from one loopback origin and routes the voice
 WebSocket to a Playwright mock playing the deployed `vibe-talk-v1` protocol (and, for point 9, the
@@ -1197,6 +1207,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi
                 listed += "; " + thread_list_arrival_case(page, url, voice, api, size, True)
                 listed += "; " + room_back_case(page, url, voice, api, size, True)
                 listed += "; " + opened_card_case(page, url, voice, api, size)
+            listed += "; " + card_alone_case(page, url, voice, api, size,
+                                             CARD_ALONE_CASES if size == PHONES[0] else CARD_ALONE_FEW)
             check(not errors, f"{width}x{height}: the page threw: {errors}")
         finally:
             context.close()
@@ -2138,6 +2150,145 @@ def two_columns_opened_case(page: Page, url: str, voice: FakeVoice, api: FakeApi
     return (f"{where}: a reader at the foot of Main and of All at the left column's foot by {mod}+4, Send tappable,"
             f" and at it again by {mod}+1 and {mod}+2; one 400px up either on their row; one 40px up All on their"
             f" row again by {mod}+4 and {mod}+2, and one 40px up Main in two columns by {mod}+1 and {mod}+4")
+
+
+# Point 18: the list on screen, the channel's or the call's, and the reader against it: how far above its foot
+# they are, whether any of its rows is on screen, the card's top and height against the list, whether a tap at
+# Send's centre lands on Send, and what the jump says.
+CARD_ALONE_JS = """() => {
+  const area = document.getElementById('scroll-area');
+  const top = area.getBoundingClientRect().top;
+  const bottom = top + area.clientHeight;
+  const call = document.getElementById('pane-discord').hidden;
+  const rows = call ? [...document.getElementById('transcript').children]
+    : [...document.querySelectorAll('#discord-log > li[data-id]')];
+  const row = rows.some((li) => {
+    if (!li.getClientRects().length) return false;
+    const b = li.getBoundingClientRect();
+    return b.bottom > top && b.top < bottom;
+  });
+  const card = document.getElementById('post-confirm');
+  const send = document.getElementById('post-confirm-send');
+  const r = send.getBoundingClientRect();
+  let hit = false;
+  if (!card.hidden && r.height > 0 && r.top >= -0.5 && r.bottom <= innerHeight + 0.5) {
+    const n = document.elementFromPoint((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+    hit = Boolean(n && (n === send || send.contains(n)));
+  }
+  const box = card.getBoundingClientRect();
+  const jump = document.getElementById('jump-newest');
+  return { call, gap: area.scrollHeight - area.scrollTop - area.clientHeight, row, list: area.clientHeight,
+           card: card.hidden ? null : box.top - top, height: card.hidden ? null : box.height,
+           folded: card.hasAttribute('data-folded'), sendHit: hit,
+           jump: jump.hidden ? null : document.getElementById('jump-newest-label').textContent };
+}"""
+
+# Point 18's cases, (list, how the card goes, px up, the way back from the thread list or None): every list, both
+# ways and two heights, at 393x852, with the card going from the list, and through the thread list the card going
+# from under its cards and each way back; and one of each list at the two other phones. Each reader is past the
+# slack of the foot and has the box under the card on screen, where Chromium's anchoring holds it, in the list
+# and as the card goes to the dock; further up than SCROLLBACK_PX, 64px, the jump comes with its room and takes
+# the box off screen. Through the thread list from Main, Main is left behind the cards where that anchoring left
+# it, and the place the way back holds is the card. From All, Main stood at its foot behind the cards in these
+# runs, and the way back reached the foot before the place was put back as well: those two are kept as cases the
+# change must not break.
+CARD_ALONE_CASES: tuple[tuple[str, str, int, str | None], ...] = (
+    *((view, how, up, None) for view in ("Main", "All", "the call's view") for how in ("tap", "settle")
+      for up in (30, 60)),
+    ("Main", "settle", 40, "Escape"), ("Main", "tap", 60, "1"), ("Main", "settle", 40, "2"),
+    ("All", "tap", 40, "1"), ("All", "settle", 60, "Escape"),
+)
+CARD_ALONE_FEW: tuple[tuple[str, str, int, str | None], ...] = (
+    ("Main", "tap", 40, None), ("All", "settle", 60, None), ("the call's view", "tap", 50, None),
+)
+# web/voice.js's BOTTOM_SLACK_PX: a reader this near the foot is at it, and followed.
+FOOT_SLACK_PX = 24
+
+
+def card_alone_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: tuple[int, int],
+                    cases: tuple[tuple[str, str, int, str | None], ...]) -> str:
+    """Point 18, on the phone: a reader who sees only a long draft opened by More, Send on screen, past the slack
+    of the foot, is at the foot with no jump a second after Send is tapped or the draft is settled elsewhere — in
+    Main, in All and on the call's view — though Chromium's own scroll anchoring holds the box under the card
+    where it stood as the card goes; and so is one who saw only the card as Cmd+3 docked it under the thread
+    list, on the way back by Esc, Cmd+1 or Cmd+2 once it has gone from there."""
+    width, height = size
+    where = f"{width}x{height}, the card going from a reader who saw only it"
+    api.threaded = True
+    api.older_threads = 14
+    try:
+        open_call(page, url, voice, api, 30, False)
+        api.deliver_posts = True
+        page.click("#view-switch")
+        page.wait_for_function("() => document.querySelectorAll('#discord-log > li[data-id]').length > 0",
+                               timeout=10_000)
+        page.wait_for_timeout(300)
+        serial = 180
+        for view, how, up, back in cases:
+            on_call = view == "the call's view"
+            if page.evaluate("() => document.getElementById('pane-discord').hidden") != on_call:
+                page.click("#view-switch")
+                page.wait_for_timeout(400)
+            if not on_call:
+                view_key(page, "Meta", 1 if view == "Main" else 2, None, None)
+            serial += 1
+            propose(page, api, serial, LONG_DRAFT)
+            # Send is held a moment after a card appears; a draft settled elsewhere need not wait for it.
+            page.wait_for_timeout(HOLD_MS + 200 if how == "tap" else 300)
+            # Opened by More without taking the focus onto the card, as a finger leaves it.
+            page.evaluate("() => document.getElementById('post-confirm-more').click()")
+            page.wait_for_function("() => !document.getElementById('post-confirm').hasAttribute('data-folded')",
+                                   timeout=5000)
+            page.wait_for_timeout(300)
+            page.evaluate(UP_THE_LIST_JS, up)
+            page.wait_for_timeout(400)
+            before = page.evaluate(CARD_ALONE_JS)
+            check(before["call"] is on_call and not before["folded"] and rect(before, "height") > rect(before, "list")
+                  and before["row"] is False and rect(before, "card") < 0 and before["sendHit"] is True and
+                  rect(before, "gap") > FOOT_SLACK_PX,
+                  f"{where}: the premise, a reader {up}px up {view} who sees the opened card, Send tappable, and no"
+                  f" row, past the slack of the foot: {before}")
+            route = ""
+            if back is not None:
+                view_key(page, "Meta", 3, None, "list")
+                route = f" after Meta+3, and {'Esc' if back == 'Escape' else f'Meta+{back}'} once it had gone,"
+            if how == "tap":
+                page.tap("#post-confirm-send")
+            else:
+                api.settle()
+            page.locator("#post-confirm").wait_for(state="hidden", timeout=5000)
+            gone = time.monotonic()
+            if back is not None:
+                page.wait_for_timeout(200)
+                leave_thread_list(page, "Meta", back)
+                picked = page.evaluate(PICKED_VIEW_JS)
+                to = view if back == "Escape" else ("Main" if back == "1" else "All")
+                check(picked == ("main" if to == "Main" else "flat"),
+                      f"{where}: the premise, {back} left the thread list for {to}, not {picked}")
+                # The way back puts the card's place back on the main screen, and the room a second after that.
+                gone = time.monotonic()
+            page.wait_for_timeout(max(0, int(1800 - (time.monotonic() - gone) * 1000)))
+            check(page.evaluate(ROOM_JS)["room"] is False, f"{where}: the premise, the box has its room back")
+            after = page.evaluate(CARD_ALONE_JS)
+            check(rect(after, "gap") <= 1 and after["jump"] is None,
+                  f"{where}: {'Send tapped' if how == 'tap' else 'the draft settled elsewhere'}{route} left a reader"
+                  f" who saw only the card {rect(before, 'gap'):.0f}px up {view} {rect(after, 'gap'):.0f}px above the"
+                  f" foot a second after the card went (the jump says {after['jump']!r})")
+            # The focus back on the list, so that the next card's Send is tapped as the others were.
+            page.evaluate("() => document.getElementById('scroll-area').focus()")
+        taps = sum(1 for _, how, _, _ in cases if how == "tap")
+        check(len(api.commits) == taps, f"{where}: {len(api.commits)} commits, not one per tap ({taps})")
+        check(not api.cancels, f"{where}: a draft was withdrawn ({api.cancels})")
+    finally:
+        api.threaded = False
+        api.older_threads = 0
+        api.deliver_posts = False
+    ups = sorted({up for _, _, up, _ in cases})
+    listed = any(back is not None for _, _, _, back in cases)
+    return (f"{where}: readers {', '.join(str(up) for up in ups)}px up Main, All and the call's view, who saw only"
+            " the card, at the foot with no jump a second after Send and after the draft was settled elsewhere"
+            + ("; and those who saw only it as Meta+3 docked it, on the way back by Esc, Meta+1 and Meta+2 once it"
+               " had gone from under the cards" if listed else ""))
 
 
 def walk_desk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi) -> str:
