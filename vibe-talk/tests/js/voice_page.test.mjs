@@ -61331,6 +61331,251 @@ test("`#269 approval-card-inline` x `#280 scroll-stability`: A READER WHOSE SCRE
   assert.deepStrictEqual(always, { ...real, byRow: false });
 });
 
+// `#269 approval-card-inline` x `#280 scroll-stability`, from review's fifth round. A reader near the foot of a
+// long draft opened by More sees the card, Send on screen, and no row. They tap Send, or the draft is settled
+// somewhere else, and the card goes. Chromium's own scroll anchoring then held the box under the card where it
+// stood, and that left a reader 30 to 80px up Main or All, or to 100px up the call's view, exactly as far above
+// the foot as they had been, past the slack. A second later the box took back its room with them held on their
+// row, and the jump came with its room. They ended 132 to 210px above the foot, offered the jump, no longer
+// following the list. This fixture has no scroll anchoring, and its clamp alone takes every such reader to the
+// foot, as a browser with none does. So the test lays Chromium's anchoring on, as far as these readers meet it.
+
+/** web/voice.css's box at the foot of the call's transcript in Chromium at 393x852: whole, and one line under
+ * a draft. */
+const VOICE_BOX = { whole: 206, draft: 96 };
+
+/**
+ * Chromium's scroll anchoring, as far as a reader at the foot of a list that ends in the send card meets it.
+ * The first row of the list on screen is the anchor. With no row on screen, the box under the card is the
+ * anchor while any of it is on screen. A change made through the returned function keeps the anchor where it
+ * stood, and then the list is clamped, as a browser clamps it.
+ */
+function anchoredLikeChromium(main, rows, box) {
+  const onScreen = (node) => {
+    const r = node.getBoundingClientRect();
+    return r.height > 0 && r.bottom > 0 && r.top < main.clientHeight;
+  };
+  return (mutate) => {
+    const anchor = rows().find(onScreen) || (onScreen(box()) ? box() : null);
+    const before = anchor ? anchor.getBoundingClientRect().top : 0;
+    mutate();
+    main.scrollTop += anchor ? anchor.getBoundingClientRect().top - before : 0;
+  };
+}
+
+/**
+ * Make every change the send card makes to the list it ends through `anchored`: its going, its moves into the
+ * dock under the thread list and back, and the frozen card the call's view draws just above it as a tap sends.
+ */
+function anchorCardChanges(page, card, anchored) {
+  let hidden = card.hidden;
+  Object.defineProperty(card, "hidden", {
+    configurable: true,
+    get: () => hidden,
+    set: (value) => {
+      if (Boolean(value) !== hidden) anchored(() => { hidden = Boolean(value); });
+    },
+  });
+  const transcript = page.el("transcript");
+  const append = transcript.append.bind(transcript);
+  transcript.append = (...kids) => anchored(() => append(...kids));
+  for (const id of ["frame-body", "pane-discord", "pane-voice"]) {
+    const parent = page.el(id);
+    const insert = parent.insertBefore.bind(parent);
+    parent.insertBefore = (node, ref) => (node === card ? anchored(() => insert(node, ref)) : insert(node, ref));
+  }
+}
+
+test("`#269 approval-card-inline` x `#280 scroll-stability`: A READER WHO SEES ONLY THE SEND CARD AS IT GOES, a long draft opened by More, is on the newest line, and still there with no jump once the box takes back its room — Send tapped and the draft settled elsewhere, in Main, in All and on the call's view — though the browser's anchoring holds the box under the card where it stood; and a reader up the list is on their row", async () => {
+  // Thirty lines of words in the fixture's layout: as More lays a long draft out, taller than the list.
+  const TALL_DRAFT = "The release notes for this week, as agreed, with every target named. ".repeat(18);
+  const run = async (script, { anchoring = true } = {}) => {
+    const { page, card, main, settled } = await draftOverThreads(script, 60);
+    const roomy = () => page.el("screen-main").hasAttribute("data-draft");
+    page.el("channel-composer").height = () => (roomy() ? CHANNEL_BOX.draft : CHANNEL_BOX.whole);
+    page.el("voice-composer").height = () => (roomy() ? VOICE_BOX.draft : VOICE_BOX.whole);
+    const onCall = () => page.tab() === "voice";
+    const anchored = anchoring
+      ? anchoredLikeChromium(main,
+        () => page.el(onCall() ? "transcript" : "discord-log").children.filter((li) => !li.hidden),
+        () => page.el(onCall() ? "voice-composer" : "channel-composer"))
+      : (mutate) => {
+        mutate();
+        main.scrollTop = main.scrollTop;
+      };
+    anchorCardChanges(page, card, anchored);
+    const picker = page.el("thread-select");
+    const gap = () => main.scrollHeight - main.scrollTop - main.clientHeight;
+    const rowSeen = () => {
+      const row = page.el(onCall() ? "transcript" : "discord-log").children
+        .find((li) => !li.hidden && li.getBoundingClientRect().bottom > 0 && li.getBoundingClientRect().top < main.clientHeight);
+      return row ? `${row.getAttribute("data-id") || row.className}@${row.getBoundingClientRect().top}` : null;
+    };
+    const toView = async (view) => {
+      if (view === "call") {
+        if (!onCall()) await page.el("view-switch").click();
+      } else {
+        if (onCall()) await page.el("view-switch").click();
+        if (picker.value !== (view === "1" ? "main" : "flat")) await press(page, focused(page) || main, view, { metaKey: true });
+      }
+      await settled();
+    };
+    let serial = 70;
+    const result = {};
+    for (const view of ["1", "2", "call"]) {
+      for (const how of ["Tap", "Elsewhere"]) {
+        for (const up of [40, 80, "row"]) {
+          await toView(view);
+          if (card.hidden || page.el("post-confirm-text").textContent !== TALL_DRAFT) {
+            serial += 1;
+            page.propose(proposal({ serial, handle: `hAnDlE-alone-${String(serial).padStart(8, "0")}`, text: TALL_DRAFT }));
+            await page.settle();
+            page.expireTimers(2000);
+            await settled();
+          }
+          if (card.hasAttribute("data-folded")) await page.el("post-confirm-more").click();
+          await settled();
+          const where = `${view === "call" ? "the call's view" : view === "1" ? "Main" : "All"}, ${how}, ${up}`;
+          assert.ok(!card.hidden && !card.hasAttribute("data-folded") && card.parentNode === page.el(onCall() ? "pane-voice" : "pane-discord") &&
+            card.outerHeight() > main.clientHeight + 100 && roomy() && !page.el("post-confirm-send").disabled,
+          `the premise: the draft opened by More is the list's next message, taller than the list, Send ready (${where})`);
+          // `row`: further up than the card is tall, so that the card's going leaves them where they were.
+          main.scrollTop = main.scrollHeight - main.clientHeight - (up === "row" ? card.outerHeight() + 100 : up);
+          await main.dispatch("scroll");
+          await settled();
+          const before = rowSeen();
+          const send = page.el("post-confirm-send").getBoundingClientRect();
+          assert.ok(up === "row"
+            ? before !== null
+            : gap() === up && up > BOTTOM_SLACK_PX && before === null && card.getBoundingClientRect().top < 0 &&
+              send.top >= 0 && send.bottom <= main.clientHeight,
+          `the premise: the reader ${up === "row" ? "sees a row" : `${up}px up sees the card, Send on screen, and no row`} (${where}, ${before})`);
+          if (how === "Tap") await page.el("post-confirm-send").click();
+          else page.settleProposal("committed");
+          await page.settle();
+          await settled();
+          assert.ok(card.hidden && roomy(), `the premise: the card is gone and its room kept a moment (${where})`);
+          const gone = up === "row" ? rowSeen() === before : gap() === 0;
+          assert.equal(page.expireTimers(1000), 1, `the premise: the room is taken back a second after the card goes (${where})`);
+          await settled();
+          assert.ok(!roomy(), `the premise: the box has its room again (${where})`);
+          result[`${view === "call" ? "Call" : view === "1" ? "Main" : "All"}${how}${up}`] =
+            gone && (up === "row" ? rowSeen() === before : gap() === 0 && !jumpShown(page));
+        }
+      }
+    }
+    result.sent = page.proposalCommits.length === 9 && page.proposalCancels.length === 0;
+    return result;
+  };
+  const every = (value) => ({
+    ...Object.fromEntries(["Main", "All", "Call"].flatMap((view) => ["Tap", "Elsewhere"].flatMap((how) =>
+      [40, 80, "row"].map((up) => [`${view}${how}${up}`, typeof value === "function" ? value(up) : value])))),
+    sent: true,
+  });
+  assert.deepStrictEqual(await run(SCRIPT), every(true));
+
+  // THE CONTROLS. The card's going with nothing to put the reader who saw only it on the newest line: the
+  // anchoring leaves each of them as far above the foot as they were, and the room coming back leaves them
+  // further. The reader up the list is not moved.
+  const SENT_AWAY = "    if (alone) inColumn(columns.main, scrollToNewest);\n";
+  const unplaced = brokenScript(SENT_AWAY, "");
+  assert.deepStrictEqual(await run(unplaced), every((up) => up === "row"));
+  // ...which a browser with no anchoring hides: its clamp takes each of them to the foot. The defect is the
+  // anchoring's, and the test sees it only with the anchoring laid on.
+  assert.deepStrictEqual(await run(unplaced, { anchoring: false }), every(true));
+  // Every reader of a list the card ends taken to the newest line as it goes, whatever they could see: the
+  // reader up the list is moved off their row.
+  const always = await run(brokenScript("  return box.top <= top + 0.5 && box.bottom > top;\n", "  return true;\n"));
+  assert.deepStrictEqual(always, every((up) => up !== "row"));
+});
+
+// ...and from the dock under the thread list. The place a trip through the list puts back is read as the list
+// comes up (`listHeldPlace`), and for a reader who saw only the card it is the card. Gone from under the cards
+// by the way back, Send tapped there or the draft settled elsewhere, it put nobody anywhere: in Chromium Esc or
+// Cmd+1 left a reader who had been 40 or 60px up Main 182 or 202px above its foot, and Cmd+2 353px above All's,
+// offered the jump and no longer following.
+
+test("`#269 approval-card-inline` x `#280 scroll-stability`: A READER WHO SAW ONLY THE SEND CARD AS THE THREAD LIST CAME, a long draft opened by More, is on the newest line on the way back by Esc, Cmd-1 and Cmd-2 once the card has gone from under the cards — Send tapped there, or the draft settled elsewhere — and still there with no jump once the box takes back its room", async () => {
+  const TALL_DRAFT = "The release notes for this week, as agreed, with every target named. ".repeat(18);
+  const run = async (script) => {
+    const { page, card, main, side, settled } = await draftOverThreads(script, 60);
+    const roomy = () => page.el("screen-main").hasAttribute("data-draft");
+    page.el("channel-composer").height = () => (roomy() ? CHANNEL_BOX.draft : CHANNEL_BOX.whole);
+    // The card leaving the foot of Main or All for the dock: Chromium's anchoring holds the box under it where
+    // it stood, and the reader as far above the foot as they were.
+    anchorCardChanges(page, card, anchoredLikeChromium(main,
+      () => page.el("discord-log").children.filter((li) => !li.hidden), () => page.el("channel-composer")));
+    const picker = page.el("thread-select");
+    const layout = () => page.el("screen-main").getAttribute("data-columns");
+    const gap = () => main.scrollHeight - main.scrollTop - main.clientHeight;
+    const key = async (name) => {
+      await press(page, focused(page) || (layout() === "list" ? side : main), name, name === "Escape" ? {} : { metaKey: true });
+      await settled();
+    };
+    let serial = 90;
+    const result = {};
+    for (const view of ["1", "2"]) {
+      for (const how of ["Tap", "Elsewhere"]) {
+        for (const back of ["Escape", "1", "2"]) {
+          if (layout() !== null || picker.value !== (view === "1" ? "main" : "flat")) await key(view);
+          if (card.hidden || page.el("post-confirm-text").textContent !== TALL_DRAFT) {
+            serial += 1;
+            page.propose(proposal({ serial, handle: `hAnDlE-listed-${String(serial).padStart(8, "0")}`, text: TALL_DRAFT }));
+            await page.settle();
+            page.expireTimers(2000);
+            await settled();
+          }
+          if (card.hasAttribute("data-folded")) await page.el("post-confirm-more").click();
+          await settled();
+          const where = `${view === "1" ? "Main" : "All"}, ${how}, back by ${back}`;
+          main.scrollTop = main.scrollHeight - main.clientHeight - 40;
+          await main.dispatch("scroll");
+          await settled();
+          assert.ok(!card.hidden && card.parentNode === page.el("pane-discord") && card.outerHeight() > main.clientHeight + 100 &&
+            gap() === 40 && rowOnScreen(page) === null && card.getBoundingClientRect().top < 0,
+          `the premise: the reader 40px up sees the opened card and no row (${where}, ${rowOnScreen(page)})`);
+          await key("3");
+          assert.ok(layout() === "list" && !card.hidden && card.parentNode === page.el("frame-body") &&
+            !page.el("post-confirm-send").disabled, `the premise: Cmd-3 docks the card under the cards, Send ready (${where})`);
+          if (how === "Tap") await page.el("post-confirm-send").click();
+          else page.settleProposal("committed");
+          await page.settle();
+          await settled();
+          assert.ok(card.hidden && roomy() && layout() === "list", `the premise: the card is gone from under the cards (${where})`);
+          await key(back);
+          const to = back === "Escape" ? view : back;
+          assert.ok(layout() === null && picker.value === (to === "1" ? "main" : "flat"),
+            `the premise: ${back} left the list for ${to === "1" ? "Main" : "All"} within the second (${where})`);
+          const kept = gap() === 0;
+          assert.equal(page.expireTimers(1000), 1, `the premise: the room is taken back a second after the card goes (${where})`);
+          await settled();
+          assert.ok(!roomy(), `the premise: the box has its room again (${where})`);
+          result[`${view === "1" ? "Main" : "All"}${how}${back}`] = kept && gap() === 0 && !jumpShown(page);
+        }
+      }
+    }
+    result.sent = page.proposalCommits.length === 6 && page.proposalCancels.length === 0;
+    return result;
+  };
+  const every = (value) => ({
+    ...Object.fromEntries(["Main", "All"].flatMap((view) => ["Tap", "Elsewhere"].flatMap((how) =>
+      ["Escape", "1", "2"].map((back) => [`${view}${how}${back}`, typeof value === "function" ? value(view, how, back) : value])))),
+    sent: true,
+  });
+  assert.deepStrictEqual(await run(SCRIPT), every(true));
+
+  // THE CONTROL. The place read on a card that has since gone put back nowhere: the reader who came from Main
+  // is where the card's going to the dock left Main behind the cards, as far above its foot as they were, and
+  // not on its newest line. From All, the list draws Main behind its cards on
+  // the rows All's reader could see once the card had gone to the dock, which here are All's newest replies
+  // over a root Main ends on, so Main is at its foot behind the list and the way back finds the foot without
+  // the place; in Chromium Main stood up its list there, and point 18 of tests/approval_card_browser.py takes
+  // a reader from All that way.
+  const unplaced = await run(brokenScript(
+    '  if (typeof place.card === "number" && postWatch.shown === null) {\n', "  if (false) {\n"));
+  assert.deepStrictEqual(unplaced, every((view) => view === "All"));
+});
+
 // `#269 approval-card-inline` x `#280 scroll-stability`, from review of the rebase onto #304 back-gesture-in-app.
 // Two columns draw the left column at half the window's width, and the send card at the foot of its list
 // with it: a long draft opened by More was 519px tall in All at 1280x800 in Chromium and 580px beside a
