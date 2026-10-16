@@ -240,6 +240,48 @@ The checkpoint-only command continues to refuse message-bearing boundaries.
 An older host that cannot read an exact-boundary audit fails closed; keep the
 matching host available through retry and confirmation.
 
+A different problem has no gap at all: on reconnect the provider offers, at the
+saved inclusive cursor, a batch whose content differs from the saved boundary.
+A provider that can resume at that cursor only as a synthetic checkpoint does
+this whenever the saved boundary also carried a message. `chat run` refuses the
+batch without acknowledging it, journals the refusal in
+`boundary-mismatch.json`, and stops the provider instead of reconnecting:
+every reconnect would be offered the same batch. While the file names the
+current boundary, every start refuses before subscribing. `chat status`
+reports it as `boundary_mismatch`, sets `healthy: false`, and names the
+recovery in `boundary_mismatch_recovery`.
+
+When the offered batch is a checkpoint only and every saved boundary message
+is already a stored request, replacing the boundary with that checkpoint loses
+nothing. Accept it with the service stopped:
+
+```sh
+agentctl chat accept-checkpoint-boundary \
+  --bridge-state /home/me/.local/state/agentctl/project-chat \
+  --keep-cursor "$CURRENT_CURSOR" \
+  --expected-checkpoint-sha256 "$CHECKPOINT_SHA256" \
+  --expected-configuration-sha256 "$CONFIGURATION_SHA256"
+```
+
+It refuses unless the runner lease is free, both digests match, the cursor is
+the current one, no admission transaction or unresolved gap remains, and the
+boundary's provider commit is confirmed by its receipt. Each saved boundary
+message must be a retained request with the same content that is acknowledged
+(or has acknowledgements disabled) and was delivered or replied to, or a
+retired request with the same content. A message excluded by a runtime prefix
+filter has no request, so its boundary is refused. A journaled refusal whose
+offered batch carried messages is refused too.
+
+Acceptance writes one audit under `boundary-acceptances/` (the reviewed
+checkpoint and receipt, the configuration digest, the journaled refusal, and
+each message's request evidence; at most 64 records) and removes
+`boundary-mismatch.json`. It changes no checkpoint, receipt, request, or reply
+bytes, and status reports `boundary_checkpoint_accepted: true`. The next
+generation may admit exactly one checkpoint at the kept cursor in place of the
+saved boundary; anything else there is refused and journaled again. Once that
+checkpoint is admitted, the audit names an earlier boundary and authorizes
+nothing more, and delivery resumes after the cursor.
+
 For a bounded local work recovery pass while the daemon is stopped (`tick` does
 not repair provider gaps):
 

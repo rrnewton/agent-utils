@@ -136,6 +136,14 @@ const MAX_GAP_DIAGNOSTIC_BYTES: usize = 64 * 1_024;
 const MAX_GAP_RETRY_EVIDENCE_BYTES: usize = 64 * 1_024;
 const MAX_GAP_RETRY_BYTES: usize = 512 * 1_024;
 const MAX_GAP_RETRIES: usize = 64;
+// A provider offered different content at the current inclusive cursor: see `BoundaryMismatch`.
+const BOUNDARY_MISMATCH_FILE: &str = "boundary-mismatch.json";
+const MAX_BOUNDARY_MISMATCH_BYTES: usize = 16 * 1_024;
+// Operator acceptances of a checkpoint-only replacement boundary: see
+// `BoundaryAcceptanceRecord`.
+const BOUNDARY_ACCEPTANCE_DIRECTORY: &str = "boundary-acceptances";
+const MAX_BOUNDARY_ACCEPTANCE_BYTES: usize = 512 * 1_024;
+const MAX_BOUNDARY_ACCEPTANCES: usize = 64;
 const MAX_ADMISSION_INTENT_BYTES: usize = 1_024 * 1_024;
 /// Stable read-only JSON schema emitted by `agentctl chat inspect`.
 pub const REQUEST_INSPECTION_SCHEMA: &str = "agentctl-chat-request-inspection/v1";
@@ -408,6 +416,10 @@ pub enum ChatRuntimeError {
     Subscription(SubscriptionError),
     /// A provider declared an unrecoverable stream gap that must not be acknowledged.
     UnresolvedGap(String),
+    /// A provider offered different content at the current inclusive cursor. The refusal is
+    /// journaled in `boundary-mismatch.json`, and automatic reconnect is refused until an
+    /// operator recovers the state.
+    BoundaryMismatch(String),
 }
 
 impl ChatRuntimeError {
@@ -426,6 +438,9 @@ impl fmt::Display for ChatRuntimeError {
             Self::Subscription(error) => fmt::Display::fmt(error, formatter),
             Self::UnresolvedGap(detail) => {
                 write!(formatter, "provider stream has an unresolved gap: {detail}")
+            }
+            Self::BoundaryMismatch(detail) => {
+                write!(formatter, "provider replaced the saved boundary: {detail}")
             }
         }
     }
@@ -1152,6 +1167,203 @@ fn checkpoint_only_fingerprint(cursor: &str) -> Result<String> {
 
 fn bytes_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+/// A refused inclusive replay: the provider offered a batch at the current cursor whose content
+/// differs from the saved boundary. `admit_batch` writes it before refusing, and
+/// `subscribe_request` refuses every later reconnect while it still names the current boundary,
+/// so a deterministic refusal is not retried. `accept-checkpoint-boundary` is the operator path
+/// when the offered batch is a checkpoint and every saved boundary message is a stored request.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoundaryMismatch {
+    version: u32,
+    cursor: String,
+    host_batch_sequence: u64,
+    saved_batch_fingerprint: String,
+    saved_event_count: u32,
+    saved_message_count: u32,
+    offered_batch_fingerprint: String,
+    offered_event_count: u32,
+    offered_checkpoint_only: bool,
+    provider_sequence: u64,
+    delivery_id: String,
+    observed_at_millis: u64,
+}
+
+impl BoundaryMismatch {
+    fn validate(&self) -> Result<()> {
+        if self.version != STATE_VERSION
+            || self.host_batch_sequence == 0
+            || self.provider_sequence == 0
+            || self.delivery_id.is_empty()
+            || self.delivery_id.len() > chat_subscription::MAX_TOKEN_BYTES
+            || !valid_key(&self.saved_batch_fingerprint)
+            || !valid_key(&self.offered_batch_fingerprint)
+            || self.saved_batch_fingerprint == self.offered_batch_fingerprint
+        {
+            return Err(ChatRuntimeError::invalid(
+                "boundary mismatch diagnostic is inconsistent or outside protocol bounds",
+            ));
+        }
+        ProviderCursor::new(self.cursor.clone())
+            .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Whether this refusal still describes the checkpoint's current boundary.
+    fn names(&self, checkpoint: &Checkpoint) -> bool {
+        checkpoint.cursor.as_deref() == Some(self.cursor.as_str())
+            && checkpoint.host_batch_sequence == self.host_batch_sequence
+            && checkpoint.boundary_batch_fingerprint.as_deref()
+                == Some(self.saved_batch_fingerprint.as_str())
+    }
+
+    fn recovery(&self) -> String {
+        if self.offered_checkpoint_only {
+            format!(
+                "stop the service, review `agentctl chat status`, then run `agentctl chat \
+                 accept-checkpoint-boundary --bridge-state DIR --keep-cursor {} \
+                 --expected-checkpoint-sha256 SHA256 --expected-configuration-sha256 SHA256`; it \
+                 accepts the checkpoint only when every saved boundary message is a stored \
+                 request",
+                self.cursor
+            )
+        } else {
+            "the provider offered message content that differs from the saved boundary; no \
+             automatic or operator replacement is safe, so compare the provider's history with \
+             the saved requests before choosing a recovery"
+                .to_owned()
+        }
+    }
+
+    fn detail(&self) -> String {
+        format!(
+            "cursor {} holds a saved {}-event batch with {} message(s) (host batch {}), but the \
+             provider offered a different {}-event batch{} in sequence {} delivery {:?}; \
+             automatic reconnect is refused; recovery: {}",
+            self.cursor,
+            self.saved_event_count,
+            self.saved_message_count,
+            self.host_batch_sequence,
+            self.offered_event_count,
+            if self.offered_checkpoint_only {
+                " (a checkpoint only)"
+            } else {
+                ""
+            },
+            self.provider_sequence,
+            self.delivery_id,
+            self.recovery()
+        )
+    }
+}
+
+/// Input pins for `accept-checkpoint-boundary`.
+pub struct CheckpointBoundaryAcceptance<'a> {
+    /// SHA256 of the exact durable checkpoint document reviewed by the operator.
+    pub expected_checkpoint_sha256: &'a str,
+    /// SHA256 of the exact configuration naming the reviewed plugin and channels.
+    pub expected_configuration_sha256: &'a str,
+    /// The current opaque cursor; the command refuses any other.
+    pub keep_cursor: &'a str,
+}
+
+/// Why one saved boundary message is safe to drop from the replay boundary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoundaryAcceptanceMessage {
+    request_key: String,
+    message_fingerprint: String,
+    /// `request` (a retained request record) or `retired` (a retired request guard).
+    stored_as: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ack_phase: Option<String>,
+    replies_captured: u32,
+}
+
+/// The audited operator acceptance of one checkpoint-only batch at the current cursor in place
+/// of a saved boundary whose messages are all stored requests. It names one exact boundary (host
+/// batch sequence, cursor, fingerprint, event count, message guards) and the configuration, so it
+/// authorizes nothing once that boundary is replaced or the configuration changes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoundaryAcceptanceRecord {
+    version: u32,
+    cursor: String,
+    host_batch_sequence: u64,
+    saved_batch_fingerprint: String,
+    saved_event_count: u32,
+    replacement_batch_fingerprint: String,
+    messages: Vec<BoundaryAcceptanceMessage>,
+    checkpoint_json: String,
+    checkpoint_sha256: String,
+    committed_receipt_json: String,
+    configuration_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mismatch_json: Option<String>,
+    accepted_at_millis: u64,
+}
+
+impl BoundaryAcceptanceRecord {
+    fn validate(&self) -> Result<Checkpoint> {
+        if self.version != STATE_VERSION
+            || self.host_batch_sequence == 0
+            || self.accepted_at_millis == 0
+            || !valid_key(&self.saved_batch_fingerprint)
+            || !valid_key(&self.replacement_batch_fingerprint)
+            || !valid_key(&self.configuration_sha256)
+            || self.saved_batch_fingerprint == self.replacement_batch_fingerprint
+            || self.checkpoint_json.len() > 1 << 20
+            || self.committed_receipt_json.len() > MAX_COMMIT_RECEIPT_BYTES
+            || self
+                .mismatch_json
+                .as_ref()
+                .is_some_and(|json| json.len() > MAX_BOUNDARY_MISMATCH_BYTES)
+            || bytes_sha256(self.checkpoint_json.as_bytes()) != self.checkpoint_sha256
+            || checkpoint_only_fingerprint(&self.cursor)? != self.replacement_batch_fingerprint
+        {
+            return Err(ChatRuntimeError::invalid(
+                "invalid checkpoint boundary acceptance audit",
+            ));
+        }
+        let checkpoint: Checkpoint = decode_document(self.checkpoint_json.as_bytes())?;
+        validate_checkpoint(&checkpoint)?;
+        let receipt: CommitReceipt = decode_document(self.committed_receipt_json.as_bytes())?;
+        receipt.validate()?;
+        let guards = self
+            .messages
+            .iter()
+            .map(|message| BoundaryMessageGuard {
+                request_key: message.request_key.clone(),
+                message_fingerprint: message.message_fingerprint.clone(),
+            })
+            .collect::<Vec<_>>();
+        if checkpoint.cursor.as_deref() != Some(self.cursor.as_str())
+            || checkpoint.host_batch_sequence != self.host_batch_sequence
+            || checkpoint.boundary_batch_fingerprint.as_deref()
+                != Some(self.saved_batch_fingerprint.as_str())
+            || checkpoint.boundary_event_count != self.saved_event_count
+            || checkpoint.boundary_messages != guards
+            || checkpoint.reconciliation_required
+            || receipt.phase != CommitReceiptPhase::Committed
+            || receipt.host_batch_sequence != self.host_batch_sequence
+            || receipt.cursor != self.cursor
+            || receipt.event_count != self.saved_event_count
+            || receipt.batch_fingerprint != self.saved_batch_fingerprint
+            || self
+                .messages
+                .iter()
+                .any(|message| !matches!(message.stored_as.as_str(), "request" | "retired"))
+        {
+            return Err(ChatRuntimeError::invalid(
+                "checkpoint boundary acceptance audit does not describe one committed boundary",
+            ));
+        }
+        Ok(checkpoint)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -4886,7 +5098,322 @@ impl BridgeState {
                 )));
             }
         }
+        if let Some(mismatch) = self.boundary_mismatch()? {
+            if mismatch.names(&checkpoint) {
+                return Err(ChatRuntimeError::BoundaryMismatch(mismatch.detail()));
+            }
+        }
         self.config.subscribe_request(checkpoint.cursor.as_deref())
+    }
+
+    /// The journaled boundary refusal, if any; it may name an earlier boundary.
+    fn boundary_mismatch(&self) -> Result<Option<BoundaryMismatch>> {
+        match read_document::<BoundaryMismatch>(
+            &self.root.join(BOUNDARY_MISMATCH_FILE),
+            MAX_BOUNDARY_MISMATCH_BYTES,
+        ) {
+            Ok(mismatch) => {
+                mismatch.validate()?;
+                Ok(Some(mismatch))
+            }
+            Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Accept one checkpoint-only batch at the current cursor in place of the saved boundary.
+    ///
+    /// Some providers can resume at an inclusive cursor only as a synthetic checkpoint, which
+    /// cannot reproduce a saved boundary that carried messages. That replacement loses nothing
+    /// exactly when every saved boundary message is already a stored request. This verifies that
+    /// with the runner stopped, under the state lock, against operator-reviewed SHA256 pins of
+    /// the checkpoint and configuration; it then writes one audit under `boundary-acceptances/`
+    /// and removes `boundary-mismatch.json`. Admission later accepts only a batch consisting of
+    /// exactly one checkpoint at this cursor, and only while the checkpoint still names this
+    /// boundary. Request, reply, checkpoint, and receipt bytes do not change here.
+    pub fn accept_checkpoint_boundary(
+        &self,
+        request: &CheckpointBoundaryAcceptance<'_>,
+    ) -> Result<Value> {
+        for digest in [
+            request.expected_checkpoint_sha256,
+            request.expected_configuration_sha256,
+        ] {
+            if !valid_key(digest) {
+                return Err(ChatRuntimeError::invalid(
+                    "boundary acceptance requires lowercase SHA256 pins",
+                ));
+            }
+        }
+        let runner = open_existing_private_state_lock(&self.root.join(".run.lock"))?;
+        runner.try_lock_exclusive().map_err(|error| {
+            ChatRuntimeError::invalid(format!(
+                "boundary acceptance requires a stopped runner: {error}"
+            ))
+        })?;
+        let _runner = RunnerLease { file: runner };
+        let state_lock = open_existing_private_state_lock(&self.root.join(".state.lock"))?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let checkpoint_bytes = read_artifact_bytes(&self.root.join("checkpoint.json"), 1 << 20)?;
+        let configuration_bytes = read_artifact_bytes(&self.root.join("bridge.json"), 1 << 20)?;
+        if bytes_sha256(&checkpoint_bytes) != request.expected_checkpoint_sha256
+            || bytes_sha256(&configuration_bytes) != request.expected_configuration_sha256
+        {
+            return Err(ChatRuntimeError::invalid(
+                "boundary acceptance inputs differ from the reviewed SHA256 pins",
+            ));
+        }
+        self.verify_gap_retry_configuration(&configuration_bytes)?;
+        if !path_is_absent(&self.admission_path())? {
+            return Err(ChatRuntimeError::invalid(
+                "boundary acceptance refuses an unfinished admission transaction",
+            ));
+        }
+        let checkpoint: Checkpoint = decode_document(&checkpoint_bytes)?;
+        validate_checkpoint(&checkpoint)?;
+        let cursor = checkpoint.cursor.clone().ok_or_else(|| {
+            ChatRuntimeError::invalid("boundary acceptance requires an existing cursor")
+        })?;
+        if cursor != request.keep_cursor {
+            return Err(ChatRuntimeError::invalid(
+                "boundary acceptance must name the current cursor; it cannot select another",
+            ));
+        }
+        if checkpoint.reconciliation_required
+            || self
+                .gap_diagnostic()?
+                .is_some_and(|gap| gap.phase == GapPhase::Unresolved)
+        {
+            return Err(ChatRuntimeError::invalid(
+                "boundary acceptance refuses a state with an unresolved gap; use the gap retry commands",
+            ));
+        }
+        let saved_fingerprint = checkpoint
+            .boundary_batch_fingerprint
+            .clone()
+            .filter(|_| checkpoint.host_batch_sequence > 0 && checkpoint.boundary_event_count > 0)
+            .ok_or_else(|| {
+                ChatRuntimeError::invalid(
+                    "boundary acceptance requires a retained boundary at the current cursor",
+                )
+            })?;
+        let replacement = checkpoint_only_fingerprint(&cursor)?;
+        if saved_fingerprint == replacement {
+            return Err(ChatRuntimeError::invalid(
+                "the saved boundary is already a checkpoint; there is nothing to accept",
+            ));
+        }
+        let receipt_bytes = read_artifact_bytes(
+            &self.commit_receipt_path(checkpoint.host_batch_sequence),
+            MAX_COMMIT_RECEIPT_BYTES,
+        )?;
+        let receipt: CommitReceipt = decode_document(&receipt_bytes)?;
+        receipt.validate()?;
+        if !checkpoint.boundary_ever_committed
+            || receipt.phase != CommitReceiptPhase::Committed
+            || receipt.host_batch_sequence != checkpoint.host_batch_sequence
+            || receipt.cursor != cursor
+            || receipt.event_count != checkpoint.boundary_event_count
+            || receipt.batch_fingerprint != saved_fingerprint
+        {
+            return Err(ChatRuntimeError::invalid(
+                "boundary acceptance requires the provider-committed boundary and its matching receipt",
+            ));
+        }
+        let mut messages = Vec::with_capacity(checkpoint.boundary_messages.len());
+        for guard in &checkpoint.boundary_messages {
+            let refuse = |reason: &str| {
+                ChatRuntimeError::invalid(format!(
+                    "saved boundary message {} {reason}; accepting a checkpoint in its place could lose it",
+                    guard.request_key
+                ))
+            };
+            if fs::symlink_metadata(self.request_path(&guard.request_key)).is_ok() {
+                let record = self.read_request(&guard.request_key)?;
+                if saved_message_fingerprint(&record.message)? != guard.message_fingerprint {
+                    return Err(refuse("names different content than its stored request"));
+                }
+                if !matches!(record.ack_phase, AckPhase::Acked | AckPhase::Disabled) {
+                    return Err(refuse("is stored but not yet acknowledged"));
+                }
+                if record.phase != RequestPhase::Delivered && record.reply_count == 0 {
+                    return Err(refuse("is stored but neither delivered nor replied to"));
+                }
+                messages.push(BoundaryAcceptanceMessage {
+                    request_key: guard.request_key.clone(),
+                    message_fingerprint: guard.message_fingerprint.clone(),
+                    stored_as: "request".to_owned(),
+                    phase: Some(request_phase_name(&record.phase).to_owned()),
+                    ack_phase: Some(
+                        match record.ack_phase {
+                            AckPhase::Disabled => "disabled",
+                            AckPhase::Pending => "pending",
+                            AckPhase::Sending => "sending",
+                            AckPhase::Acked => "acked",
+                        }
+                        .to_owned(),
+                    ),
+                    replies_captured: record.reply_count,
+                });
+            } else if let Some(retired) = self.retired_key(&guard.request_key)? {
+                if retired.message_fingerprint != guard.message_fingerprint {
+                    return Err(refuse("names different content than its retired request"));
+                }
+                messages.push(BoundaryAcceptanceMessage {
+                    request_key: guard.request_key.clone(),
+                    message_fingerprint: guard.message_fingerprint.clone(),
+                    stored_as: "retired".to_owned(),
+                    phase: None,
+                    ack_phase: None,
+                    replies_captured: 0,
+                });
+            } else {
+                return Err(refuse("is not a stored request"));
+            }
+        }
+        let mismatch = self.boundary_mismatch()?;
+        if let Some(mismatch) = mismatch.as_ref() {
+            if mismatch.names(&checkpoint) && !mismatch.offered_checkpoint_only {
+                return Err(ChatRuntimeError::invalid(
+                    "the journaled refusal offered messages, not a checkpoint; boundary acceptance does not apply",
+                ));
+            }
+        }
+        let mismatch_json = mismatch
+            .as_ref()
+            .filter(|mismatch| mismatch.names(&checkpoint))
+            .map(serde_json::to_string)
+            .transpose()?;
+        let as_text = |bytes| {
+            String::from_utf8(bytes).map_err(|_| {
+                ChatRuntimeError::invalid("boundary acceptance input is not UTF-8 JSON")
+            })
+        };
+        let record = BoundaryAcceptanceRecord {
+            version: STATE_VERSION,
+            cursor: cursor.clone(),
+            host_batch_sequence: checkpoint.host_batch_sequence,
+            saved_batch_fingerprint: saved_fingerprint.clone(),
+            saved_event_count: checkpoint.boundary_event_count,
+            replacement_batch_fingerprint: replacement,
+            messages,
+            checkpoint_json: as_text(checkpoint_bytes)?,
+            checkpoint_sha256: request.expected_checkpoint_sha256.to_owned(),
+            committed_receipt_json: as_text(receipt_bytes)?,
+            configuration_sha256: request.expected_configuration_sha256.to_owned(),
+            mismatch_json,
+            accepted_at_millis: unix_millis(),
+        };
+        record.validate()?;
+        if encoded_document_bytes(&record)? > MAX_BOUNDARY_ACCEPTANCE_BYTES {
+            return Err(ChatRuntimeError::invalid(
+                "boundary acceptance audit exceeds its byte bound",
+            ));
+        }
+        let path = self.boundary_acceptance_path(&checkpoint)?;
+        let summary = |record: &BoundaryAcceptanceRecord, already: bool| {
+            json!({
+                "accepted": true,
+                "already_accepted": already,
+                "cursor": record.cursor,
+                "host_batch_sequence": record.host_batch_sequence,
+                "saved_event_count": record.saved_event_count,
+                "stored_messages": record.messages,
+                "audit": path,
+                "next": "start the service; the provider's checkpoint at this cursor is admitted once, and delivery resumes after it",
+            })
+        };
+        let directory = self.root.join(BOUNDARY_ACCEPTANCE_DIRECTORY);
+        if !path_is_absent(&path)? {
+            let existing = self
+                .active_boundary_acceptance(&checkpoint)?
+                .ok_or_else(|| {
+                    ChatRuntimeError::invalid("boundary acceptance audit disappeared")
+                })?;
+            if existing.configuration_sha256 != record.configuration_sha256
+                || existing.messages != record.messages
+                || existing.checkpoint_sha256 != record.checkpoint_sha256
+            {
+                return Err(ChatRuntimeError::invalid(
+                    "this boundary already has a different acceptance",
+                ));
+            }
+            remove_if_exists(&self.root.join(BOUNDARY_MISMATCH_FILE))?;
+            agent::sync_directory(&self.root)?;
+            return Ok(summary(&existing, true));
+        }
+        if !path_is_absent(&directory)? {
+            agent::validate_private_directory(&directory, "boundary acceptance directory", false)?;
+            if fs::read_dir(&directory)?.count() >= MAX_BOUNDARY_ACCEPTANCES {
+                return Err(ChatRuntimeError::invalid(
+                    "boundary acceptance audit history is full",
+                ));
+            }
+        } else {
+            agent::create_private_directory(
+                &directory,
+                "boundary acceptance directory",
+                false,
+                true,
+            )?;
+            agent::sync_directory(&self.root)?;
+        }
+        // The audit is the acceptance; the refusal it answers is removed only after it is durable.
+        write_document(&path, &record)?;
+        remove_if_exists(&self.root.join(BOUNDARY_MISMATCH_FILE))?;
+        agent::sync_directory(&self.root)?;
+        Ok(summary(&record, false))
+    }
+
+    fn boundary_acceptance_path(&self, checkpoint: &Checkpoint) -> Result<PathBuf> {
+        let fingerprint = checkpoint
+            .boundary_batch_fingerprint
+            .as_deref()
+            .filter(|fingerprint| valid_key(fingerprint))
+            .ok_or_else(|| ChatRuntimeError::invalid("boundary acceptance needs a boundary"))?;
+        Ok(self.root.join(BOUNDARY_ACCEPTANCE_DIRECTORY).join(format!(
+            "{:020}-{fingerprint}.json",
+            checkpoint.host_batch_sequence
+        )))
+    }
+
+    /// The operator acceptance that names exactly the checkpoint's current boundary, if any.
+    fn active_boundary_acceptance(
+        &self,
+        checkpoint: &Checkpoint,
+    ) -> Result<Option<BoundaryAcceptanceRecord>> {
+        if checkpoint.host_batch_sequence == 0 || checkpoint.boundary_batch_fingerprint.is_none() {
+            return Ok(None);
+        }
+        let directory = self.root.join(BOUNDARY_ACCEPTANCE_DIRECTORY);
+        if path_is_absent(&directory)? {
+            return Ok(None);
+        }
+        agent::validate_private_directory(&directory, "boundary acceptance directory", false)?;
+        let record: BoundaryAcceptanceRecord = match read_document(
+            &self.boundary_acceptance_path(checkpoint)?,
+            MAX_BOUNDARY_ACCEPTANCE_BYTES,
+        ) {
+            Ok(record) => record,
+            Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(None)
+            }
+            Err(error) => return Err(error),
+        };
+        let accepted = record.validate()?;
+        let configuration = read_artifact_bytes(&self.root.join("bridge.json"), 1 << 20)?;
+        if accepted.cursor != checkpoint.cursor
+            || accepted.host_batch_sequence != checkpoint.host_batch_sequence
+            || accepted.boundary_batch_fingerprint != checkpoint.boundary_batch_fingerprint
+            || accepted.boundary_event_count != checkpoint.boundary_event_count
+            || accepted.boundary_messages != checkpoint.boundary_messages
+            || checkpoint.reconciliation_required
+            || bytes_sha256(&configuration) != record.configuration_sha256
+        {
+            return Ok(None);
+        }
+        self.verify_gap_retry_configuration(&configuration)?;
+        Ok(Some(record))
     }
 
     /// Approve one checkpoint-only replay, preserving the unresolved gap until provider commit.
@@ -5318,6 +5845,7 @@ impl BridgeState {
             Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
+        let mut accepted_boundary_replacement = false;
         if checkpoint.cursor.as_deref() == Some(batch.cursor().as_str())
             && checkpoint.host_batch_sequence > 0
         {
@@ -5327,9 +5855,36 @@ impl BridgeState {
                 )
             })?;
             if previous.batch_fingerprint != batch_fingerprint {
-                return Err(ChatRuntimeError::invalid(
-                    "provider reused the current inclusive cursor for different batch content",
-                ));
+                let checkpoint_only = batch.events() == [CommittableEvent::Checkpoint];
+                if checkpoint_only
+                    && restore_guard.is_none()
+                    && Some(previous.batch_fingerprint.as_str())
+                        == checkpoint.boundary_batch_fingerprint.as_deref()
+                    && self.active_boundary_acceptance(&checkpoint)?.is_some()
+                {
+                    accepted_boundary_replacement = true;
+                } else {
+                    // The same offer recurs on every reconnect, so journal it and stop.
+                    let mismatch = BoundaryMismatch {
+                        version: STATE_VERSION,
+                        cursor: batch.cursor().as_str().to_owned(),
+                        host_batch_sequence: checkpoint.host_batch_sequence,
+                        saved_batch_fingerprint: previous.batch_fingerprint.clone(),
+                        saved_event_count: previous.event_count,
+                        saved_message_count: u32::try_from(checkpoint.boundary_messages.len())
+                            .unwrap_or(u32::MAX),
+                        offered_batch_fingerprint: batch_fingerprint.clone(),
+                        offered_event_count: u32::try_from(batch.events().len())
+                            .unwrap_or(u32::MAX),
+                        offered_checkpoint_only: checkpoint_only,
+                        provider_sequence: batch.sequence().get(),
+                        delivery_id: batch.delivery_id().as_str().to_owned(),
+                        observed_at_millis: unix_millis(),
+                    };
+                    mismatch.validate()?;
+                    write_document(&self.root.join(BOUNDARY_MISMATCH_FILE), &mismatch)?;
+                    return Err(ChatRuntimeError::BoundaryMismatch(mismatch.detail()));
+                }
             }
         }
         let host_batch_sequence = checkpoint
@@ -5430,7 +5985,8 @@ impl BridgeState {
             })
             .collect::<Result<Vec<_>>>()?;
         if checkpoint.cursor.as_deref() == Some(batch.cursor().as_str()) {
-            if checkpoint.boundary_batch_fingerprint.is_some()
+            if !accepted_boundary_replacement
+                && checkpoint.boundary_batch_fingerprint.is_some()
                 && (checkpoint.boundary_batch_fingerprint.as_deref()
                     != Some(batch_fingerprint.as_str())
                     || usize::try_from(checkpoint.boundary_event_count).ok()
@@ -5646,6 +6202,10 @@ impl BridgeState {
         let latest_commit_confirmed = commit_receipt
             .as_ref()
             .is_some_and(|receipt| receipt.phase == CommitReceiptPhase::Committed);
+        let boundary_mismatch = self
+            .boundary_mismatch()?
+            .filter(|mismatch| mismatch.names(&checkpoint));
+        let boundary_acceptance = self.active_boundary_acceptance(&checkpoint)?;
         let mut phases = Map::new();
         phases.insert("pending".to_owned(), Value::from(0));
         phases.insert("submitting".to_owned(), Value::from(0));
@@ -5767,14 +6327,18 @@ impl BridgeState {
             "committed_batches": checkpoint.committed_batches,
             "runtime_evidence": {
                 "configuration_initialized": true,
-                "connected_now": if unresolved_gap { Value::Bool(false) } else { Value::Null },
-                "healthy": !unresolved_gap,
+                "connected_now": if unresolved_gap || boundary_mismatch.is_some() { Value::Bool(false) } else { Value::Null },
+                "healthy": !unresolved_gap && boundary_mismatch.is_none(),
                 "durable_batch_verified": latest_commit_confirmed && !unresolved_gap,
                 "latest_commit_receipt": commit_receipt,
                 "basis": if gap_retry.is_some() {
                     "operator approved an identical checkpoint retry; provider commit has not resolved the gap"
                 } else if unresolved_gap {
                     "the provider declared a gap; no commit was sent and automatic reconnect is refused"
+                } else if boundary_mismatch.is_some() {
+                    "the provider offered different content at the current cursor; no commit was sent and automatic reconnect is refused"
+                } else if boundary_acceptance.is_some() {
+                    "operator accepted a checkpoint in place of the saved boundary; the provider has not yet committed it"
                 } else {
                     "provider-free durable status; use the service manager for current process liveness"
                 },
@@ -5783,6 +6347,9 @@ impl BridgeState {
             "unresolved_gap": gap,
             "gap_retry_approved": gap_retry.is_some(),
             "gap_retry_evidence_sha256": gap_retry.as_ref().map(|retry| &retry.evidence_sha256),
+            "boundary_mismatch": boundary_mismatch,
+            "boundary_mismatch_recovery": boundary_mismatch.as_ref().map(BoundaryMismatch::recovery),
+            "boundary_checkpoint_accepted": boundary_acceptance.is_some(),
             "reply_count": checkpoint.reply_count,
             "reply_bytes": checkpoint.reply_bytes,
             "retired_route_count": checkpoint.retired_route_count,
@@ -16127,6 +16694,213 @@ mod tests {
         assert_eq!(fs::read(state.request_path(&key)).unwrap(), before);
         assert!(!state.read_checkpoint().unwrap().reconciliation_required);
         fs::remove_dir_all(&state.root).unwrap();
+    }
+
+    /// A committed boundary at `cursor-safe` holding one owner message and a checkpoint, as a
+    /// provider whose acknowledgement arrives with the message leaves it. `stored` decides
+    /// whether the message's request is acknowledged and delivered before the test.
+    fn message_boundary_fixture(name: &str, stored: bool) -> BridgeState {
+        let root = temporary(name);
+        let state = BridgeState::initialize(&root, config())
+            .expect("initialize")
+            .with_ignored_text_prefixes(vec!["[notice]".to_owned()])
+            .expect("fixture prefix");
+        drop(state.acquire_runner_lease().expect("stopped runner"));
+        let admission = state.admit_batch(&indexed_delivery(1, 1)).expect("admit");
+        state.confirm_batch_commit(&admission).expect("commit");
+        let admission = state
+            .admit_batch(&boundary_delivery_at(2, 7, "cursor-safe", "request 7"))
+            .expect("admit boundary");
+        state
+            .confirm_batch_commit(&admission)
+            .expect("commit boundary");
+        if stored {
+            let key = &admission.new_request_keys[0];
+            let mut record = state.read_request(key).expect("request");
+            record.phase = RequestPhase::Delivered;
+            record.delivery_started_at_millis = Some(record.admitted_at_millis);
+            record.delivered_at_millis = Some(record.admitted_at_millis);
+            record.ack_phase = AckPhase::Acked;
+            record.reaction_id = Some("reaction-7".to_owned());
+            record.reaction_already_present = Some(false);
+            let mut checkpoint = state.read_checkpoint().expect("checkpoint");
+            state
+                .write_request_accounted(&record, &mut checkpoint)
+                .expect("save acknowledged request");
+            state
+                .persist_checkpoint(&mut checkpoint)
+                .expect("account acknowledged request");
+        }
+        state
+    }
+
+    fn accept_boundary(state: &BridgeState, cursor: &str) -> Result<Value> {
+        let pin = |name| bytes_sha256(&fs::read(state.root.join(name)).expect("pin input"));
+        let checkpoint = pin("checkpoint.json");
+        let configuration = pin("bridge.json");
+        state.accept_checkpoint_boundary(&CheckpointBoundaryAcceptance {
+            expected_checkpoint_sha256: &checkpoint,
+            expected_configuration_sha256: &configuration,
+            keep_cursor: cursor,
+        })
+    }
+
+    #[test]
+    fn checkpoint_replacing_a_stored_message_boundary_is_journaled_then_accepted_once() {
+        let state = message_boundary_fixture("boundary-accept", true);
+        let saved = state.read_checkpoint().expect("checkpoint");
+        let boundary_key = saved.boundary_messages[0].request_key.clone();
+        // The provider can resume at the saved cursor only as a checkpoint: refuse, journal the
+        // refusal, and refuse every later reconnect before it reaches the provider.
+        assert!(matches!(
+            state.admit_batch(&checkpoint_delivery(3, "cursor-safe")),
+            Err(ChatRuntimeError::BoundaryMismatch(detail))
+                if detail.contains("accept-checkpoint-boundary")
+        ));
+        assert_eq!(state.read_checkpoint().expect("unchanged"), saved);
+        assert!(state.root.join(BOUNDARY_MISMATCH_FILE).exists());
+        assert!(matches!(
+            state.subscribe_request(),
+            Err(ChatRuntimeError::BoundaryMismatch(_))
+        ));
+        let status = state.status().expect("status");
+        assert_eq!(status["runtime_evidence"]["healthy"], false);
+        assert_eq!(status["boundary_mismatch"]["offered_checkpoint_only"], true);
+        assert!(status["boundary_mismatch_recovery"]
+            .as_str()
+            .is_some_and(|text| text.contains("accept-checkpoint-boundary")));
+
+        let accepted = accept_boundary(&state, "cursor-safe").expect("accept");
+        assert_eq!(accepted["accepted"], true);
+        assert_eq!(accepted["stored_messages"][0]["request_key"], boundary_key);
+        assert!(!state.root.join(BOUNDARY_MISMATCH_FILE).exists());
+        let audited = fixture_files(&state.root);
+        assert_eq!(
+            accept_boundary(&state, "cursor-safe").expect("idempotent")["already_accepted"],
+            true
+        );
+        assert_eq!(fixture_files(&state.root), audited);
+        let status = state.status().expect("status");
+        assert_eq!(status["runtime_evidence"]["healthy"], true);
+        assert_eq!(status["boundary_checkpoint_accepted"], true);
+
+        // Acceptance covers exactly one checkpoint, never different messages at the cursor.
+        let reopened = BridgeState::open(&state.root).expect("reopen");
+        reopened.subscribe_request().expect("reconnect allowed");
+        let changed = boundary_delivery_at(4, 8, "cursor-safe", "request 8");
+        assert!(matches!(
+            reopened.admit_batch(&changed),
+            Err(ChatRuntimeError::BoundaryMismatch(_))
+        ));
+        assert!(reopened.subscribe_request().is_err());
+        // The journaled refusal offered messages, so the operator command no longer applies.
+        assert!(accept_boundary(&reopened, "cursor-safe").is_err());
+        fs::remove_file(reopened.root.join(BOUNDARY_MISMATCH_FILE)).expect("clear fixture refusal");
+
+        let admission = reopened
+            .admit_batch(&checkpoint_delivery(5, "cursor-safe"))
+            .expect("accepted checkpoint");
+        assert!(admission.new_request_keys.is_empty());
+        reopened
+            .confirm_batch_commit(&admission)
+            .expect("provider commit");
+        let checkpoint = reopened.read_checkpoint().expect("checkpoint");
+        assert_eq!(checkpoint.cursor.as_deref(), Some("cursor-safe"));
+        assert_eq!(
+            checkpoint.boundary_batch_fingerprint.as_deref(),
+            Some(checkpoint_only_fingerprint("cursor-safe").unwrap().as_str())
+        );
+        assert!(checkpoint.boundary_messages.is_empty());
+        assert_eq!(checkpoint.request_count, saved.request_count);
+        reopened.read_request(&boundary_key).expect("request kept");
+        assert_eq!(
+            reopened.status().unwrap()["boundary_checkpoint_accepted"],
+            false
+        );
+        // The same checkpoint again is now an exact replay, and delivery resumes after it.
+        reopened
+            .admit_batch(&checkpoint_delivery(6, "cursor-safe"))
+            .expect("exact checkpoint replay");
+        let next = reopened
+            .admit_batch(&indexed_delivery_at(7, 9, "cursor-next", "request 9"))
+            .expect("next message");
+        assert_eq!(next.new_request_keys.len(), 1);
+        fs::remove_dir_all(&state.root).expect("cleanup");
+    }
+
+    #[test]
+    fn checkpoint_boundary_acceptance_refuses_a_message_that_is_not_a_stored_request() {
+        // Admitted but not acknowledged or replied to.
+        let state = message_boundary_fixture("boundary-accept-unacked", false);
+        let before = fixture_files(&state.root);
+        assert!(accept_boundary(&state, "cursor-safe")
+            .unwrap_err()
+            .to_string()
+            .contains("not yet acknowledged"));
+        assert_eq!(fixture_files(&state.root), before);
+        assert!(matches!(
+            state.admit_batch(&checkpoint_delivery(3, "cursor-safe")),
+            Err(ChatRuntimeError::BoundaryMismatch(_))
+        ));
+        fs::remove_dir_all(&state.root).expect("cleanup");
+
+        // An ignored message has no request at all.
+        let root = temporary("boundary-accept-ignored");
+        let state = BridgeState::initialize(&root, config())
+            .expect("initialize")
+            .with_ignored_text_prefixes(vec!["[notice]".to_owned()])
+            .expect("fixture prefix");
+        drop(state.acquire_runner_lease().expect("stopped runner"));
+        let admission = state
+            .admit_batch(&boundary_delivery_at(
+                1,
+                3,
+                "cursor-safe",
+                "[notice] status",
+            ))
+            .expect("admit");
+        assert!(admission.new_request_keys.is_empty());
+        state.confirm_batch_commit(&admission).expect("commit");
+        let before = fixture_files(&state.root);
+        assert!(accept_boundary(&state, "cursor-safe")
+            .unwrap_err()
+            .to_string()
+            .contains("is not a stored request"));
+        assert_eq!(fixture_files(&state.root), before);
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn checkpoint_boundary_acceptance_refuses_another_cursor_changed_pins_and_a_live_runner() {
+        let state = message_boundary_fixture("boundary-accept-pins", true);
+        let before = fixture_files(&state.root);
+        assert!(accept_boundary(&state, "cursor-other")
+            .unwrap_err()
+            .to_string()
+            .contains("current cursor"));
+        assert!(accept_boundary(&state, "cursor-1").is_err());
+        let configuration = bytes_sha256(&fs::read(state.root.join("bridge.json")).unwrap());
+        assert!(state
+            .accept_checkpoint_boundary(&CheckpointBoundaryAcceptance {
+                expected_checkpoint_sha256: &"0".repeat(64),
+                expected_configuration_sha256: &configuration,
+                keep_cursor: "cursor-safe",
+            })
+            .is_err());
+        let lease = state.acquire_runner_lease().expect("live runner");
+        assert!(accept_boundary(&state, "cursor-safe")
+            .unwrap_err()
+            .to_string()
+            .contains("stopped runner"));
+        drop(lease);
+        assert_eq!(fixture_files(&state.root), before);
+        // Without an acceptance, a checkpoint at another cursor is ordinary progress, and the
+        // stored boundary's checkpoint replacement stays refused.
+        assert!(matches!(
+            state.admit_batch(&checkpoint_delivery(3, "cursor-safe")),
+            Err(ChatRuntimeError::BoundaryMismatch(_))
+        ));
+        fs::remove_dir_all(&state.root).expect("cleanup");
     }
 
     #[test]

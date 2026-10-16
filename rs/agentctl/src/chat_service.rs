@@ -334,6 +334,15 @@ pub fn retry_boundary_gap(
     Ok(BridgeState::inspect(state_root)?.approve_boundary_gap_retry(request)?)
 }
 
+/// Accept a checkpoint-only batch at the current cursor in place of a saved boundary whose
+/// messages are all stored requests, without provider or coordinator access.
+pub fn accept_checkpoint_boundary(
+    state_root: &Path,
+    request: &chat_runtime::CheckpointBoundaryAcceptance<'_>,
+) -> Result<Value, ChatServiceError> {
+    Ok(BridgeState::inspect(state_root)?.accept_checkpoint_boundary(request)?)
+}
+
 /// Inspect one exact active retained request without writes or external service access.
 pub fn inspect_request(state_root: &Path, key: &str) -> Result<Value, ChatServiceError> {
     Ok(BridgeState::inspect(state_root)?.inspect_request(key)?)
@@ -3551,10 +3560,9 @@ where
         inner: backend,
         receive_tracker: Arc::clone(&receive_tracker),
     };
-    let request = state.subscribe_request().map_err(|error| match error {
-        ChatRuntimeError::UnresolvedGap(detail) => ProviderGenerationError::Fatal(detail),
-        other => ProviderGenerationError::Retryable(other.to_string()),
-    })?;
+    let request = state
+        .subscribe_request()
+        .map_err(classify_subscribe_request_failure)?;
     if stop.is_stopped() {
         cancel_provider_generation(
             cancellation,
@@ -3596,6 +3604,17 @@ where
                 })?;
                 return Err(ProviderGenerationError::Fatal(detail));
             }
+            // A different batch at the current cursor recurs on every reconnect; retrying it
+            // only opens more provider subscriptions. The refusal is journaled; stop.
+            Err(error @ ChatRuntimeError::BoundaryMismatch(_)) => {
+                let detail = error.to_string();
+                cancel_provider(cancellation).map_err(|error| {
+                    ProviderGenerationError::Fatal(format!(
+                        "{detail}; provider cancellation cleanup failed: {error}"
+                    ))
+                })?;
+                return Err(ProviderGenerationError::Fatal(detail));
+            }
             Err(error) => {
                 return Err(classify_provider_receive_failure(
                     stop,
@@ -3621,6 +3640,18 @@ where
                 );
             }
         }
+    }
+}
+
+/// A journaled refusal (an unresolved gap or a replaced boundary) ends the provider worker: it
+/// would refuse the same way on every reconnect. Anything else is retried.
+fn classify_subscribe_request_failure(error: ChatRuntimeError) -> ProviderGenerationError {
+    match error {
+        ChatRuntimeError::UnresolvedGap(detail) => ProviderGenerationError::Fatal(detail),
+        error @ ChatRuntimeError::BoundaryMismatch(_) => {
+            ProviderGenerationError::Fatal(error.to_string())
+        }
+        other => ProviderGenerationError::Retryable(other.to_string()),
     }
 }
 
@@ -10316,6 +10347,25 @@ esac
             configured_outbound_join_timeout(&no_outbound),
             Duration::ZERO
         );
+    }
+
+    #[test]
+    fn journaled_subscribe_refusals_end_the_provider_worker_instead_of_reconnecting() {
+        assert!(matches!(
+            classify_subscribe_request_failure(ChatRuntimeError::BoundaryMismatch(
+                "cursor 7 holds a saved 2-event batch".to_owned()
+            )),
+            ProviderGenerationError::Fatal(detail)
+                if detail.contains("provider replaced the saved boundary")
+        ));
+        assert!(matches!(
+            classify_subscribe_request_failure(ChatRuntimeError::UnresolvedGap("gap".to_owned())),
+            ProviderGenerationError::Fatal(_)
+        ));
+        assert!(matches!(
+            classify_subscribe_request_failure(ChatRuntimeError::Invalid("busy".to_owned())),
+            ProviderGenerationError::Retryable(_)
+        ));
     }
 
     #[test]

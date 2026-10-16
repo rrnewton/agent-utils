@@ -663,6 +663,11 @@ enum ChatCommand {
         after_help = "Example: agentctl chat retry-boundary-gap --bridge-state /home/me/chat-state --expected-gap-sha256 <SHA256> --expected-checkpoint-sha256 <SHA256> --expected-configuration-sha256 <SHA256> --keep-cursor <CURSOR> --evidence-file /home/me/private/evidence.json --evidence-sha256 <SHA256>\n\nThis preserves the cursor and unresolved gap. Recovery requires a newer exact provider commit; changed message payloads or a replacement checkpoint are refused."
     )]
     RetryBoundaryGap(ChatRetryGap),
+    /// Accept a provider checkpoint in place of a saved boundary whose messages are all stored
+    #[command(
+        after_help = "Example: agentctl chat accept-checkpoint-boundary --bridge-state /home/me/chat-state --keep-cursor <CURSOR> --expected-checkpoint-sha256 <SHA256> --expected-configuration-sha256 <SHA256>\n\nUse it when `chat status` reports a boundary_mismatch whose offered batch is a checkpoint only: the provider can resume at the saved inclusive cursor only as a checkpoint, while the saved boundary there also carried messages. The command refuses unless the service is stopped, the pins match, the cursor is the current one, no gap is unresolved, the boundary's provider commit is confirmed, and every saved boundary message is a stored request that is acknowledged and was delivered or replied to (or a retired request). It writes one audit under boundary-acceptances/ and removes boundary-mismatch.json; start the service afterwards. The cursor never moves backwards or skips: the provider's checkpoint at this cursor is admitted once and delivery resumes after it."
+    )]
+    AcceptCheckpointBoundary(ChatAcceptCheckpointBoundary),
     /// Inspect one exact active retained request without writes or external access
     Inspect(ChatInspect),
     /// Print one thread's retained messages as quoted text, oldest first, without writes
@@ -780,6 +785,21 @@ struct ChatRetryGap {
     /// SHA256 of the exact reviewed evidence file bytes
     #[arg(long, value_name = "SHA256")]
     evidence_sha256: String,
+}
+
+#[derive(Args)]
+struct ChatAcceptCheckpointBoundary {
+    #[command(flatten)]
+    state: ChatState,
+    /// SHA256 of the reviewed checkpoint.json bytes
+    #[arg(long, value_name = "SHA256")]
+    expected_checkpoint_sha256: String,
+    /// SHA256 of the reviewed bridge.json configuration bytes
+    #[arg(long, value_name = "SHA256")]
+    expected_configuration_sha256: String,
+    /// Exact current opaque cursor; this command cannot select another
+    #[arg(long, value_name = "CURSOR")]
+    keep_cursor: String,
 }
 
 #[derive(Args)]
@@ -1780,6 +1800,19 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             write_json(&result).map_err(Failure::Output)?;
             Ok(0)
         }
+        ChatCommand::AcceptCheckpointBoundary(value) => {
+            let result = crate::chat_service::accept_checkpoint_boundary(
+                &value.state.bridge_state,
+                &crate::chat_runtime::CheckpointBoundaryAcceptance {
+                    expected_checkpoint_sha256: &value.expected_checkpoint_sha256,
+                    expected_configuration_sha256: &value.expected_configuration_sha256,
+                    keep_cursor: &value.keep_cursor,
+                },
+            )
+            .map_err(Failure::Chat)?;
+            write_json(&result).map_err(Failure::Output)?;
+            Ok(0)
+        }
         ChatCommand::Inspect(value) => {
             let result =
                 crate::chat_service::inspect_request(&value.state.bridge_state, &value.request)
@@ -2468,6 +2501,50 @@ mod tests {
             assert!(help.contains(option), "{option}");
         }
         assert!(help.contains("newer exact provider commit"));
+        let accept = Cli::try_parse_from([
+            "agentctl",
+            "chat",
+            "accept-checkpoint-boundary",
+            "--bridge-state",
+            "/tmp/chat-state",
+            "--keep-cursor",
+            "cursor-safe",
+            "--expected-checkpoint-sha256",
+            &"b".repeat(64),
+            "--expected-configuration-sha256",
+            &"c".repeat(64),
+        ])
+        .expect("parse checkpoint boundary acceptance");
+        assert!(matches!(
+            accept.command,
+            Some(Commands::Chat(Chat {
+                command: ChatCommand::AcceptCheckpointBoundary(_),
+            }))
+        ));
+        assert!(Cli::try_parse_from([
+            "agentctl",
+            "chat",
+            "accept-checkpoint-boundary",
+            "--bridge-state",
+            "/tmp/chat-state",
+            "--keep-cursor",
+            "cursor-safe",
+        ])
+        .is_err());
+        let help =
+            Cli::try_parse_from(["agentctl", "chat", "accept-checkpoint-boundary", "--help"])
+                .err()
+                .expect("acceptance help")
+                .to_string();
+        for option in [
+            "--bridge-state",
+            "--keep-cursor",
+            "--expected-checkpoint-sha256",
+            "--expected-configuration-sha256",
+        ] {
+            assert!(help.contains(option), "{option}");
+        }
+        assert!(help.contains("every saved boundary message is a stored request"));
         let inspect = Cli::try_parse_from([
             "agentctl",
             "chat",
