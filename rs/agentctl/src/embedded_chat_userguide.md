@@ -1645,18 +1645,48 @@ the reminder only if the agent is still idle since the same moment, which
 catches a turn the agent started on its own, as when the owner types into the
 pane.
 
+Last, right before the reminder is composed, the service reads the end (up to
+8 MiB) of the transcript of the Claude Code session that answer named: the
+file `<session ID>.jsonl` in any project directory under `projects` in the
+session process's `CLAUDE_CONFIG_DIR`, or else under `~/.claude/projects`, the
+file `agentctl inbox watch` reads. A request whose reply ID heads a complete
+reply block in the agent's ordinary text there, an opening marker line, at
+least one nonblank line and the closing marker line, each alone on its line and
+outside code fences, is left out of the reminder and never reminded, and the
+service logs that once. Such a reply was printed though no read of the pane has
+shown it, as when a full-screen Claude Code pane's view is scrolled away from
+its end, and the service sends it once the pane shows it; a reminder saying no
+reply arrived would make the agent send it a second time. Thinking and tool
+calls are not ordinary text. A transcript that cannot be found or read leaves
+the reminder as it was, and the service logs the problem.
+
 The reminder is one prompt. For one request it reads:
 
 ```text
-Chat reply reminder: the chat bridge has received no reply from you to the chat request with reply ID 001 (sent to you 3m ago). A reply written only in your thinking is not delivered: the bridge reads only the ordinary text you print. If you meant to reply, print the reply as ordinary text between two marker lines: an opening line made of the literal prefix `<CHAT_REPLY_`, the reply ID and `>`, and a closing line made of `</CHAT_REPLY_`, the same ID and `>`, each alone on its line and outside code fences. If the request's prompt printed an `agentctl chat reply` command, you can instead write the reply to a file and send it with that command. If a request needs no reply, you answered it another way, or you are still working on it, ignore this reminder; the bridge sends it only once for each request.
+Chat reply reminder: the chat bridge has received no reply from you to the chat request with reply ID 001 (sent to you 3m ago). A reply written only in your thinking is not delivered: the bridge reads only the ordinary text you print. If you meant to reply, print the reply as ordinary text between two marker lines: an opening line made of the literal prefix `<CHAT_REPLY_`, the reply ID and `>`, and a closing line made of `</CHAT_REPLY_`, the same ID and `>`, each alone on its line and outside code fences. Before you send anything, check whether the bridge already holds a reply: one you printed shortly before this reminder can still be captured just after it was typed. Run this command for each request; a reply it lists reached the bridge, so do not send that reply again:
+001: /path/to/agentctl chat sent --bridge-state /path/to/state --request 4f0c…
+If the request's prompt printed an `agentctl chat reply` command, you can instead write the reply to a file and send it with that command. If a request needs no reply, you answered it another way, or you are still working on it, ignore this reminder; the bridge sends it only once for each request.
 ```
 
 It names up to 32 reply IDs, newest first, each with how long ago its prompt
 was typed, and counts the rest, whom it reminds too. It spells the marker lines
-out in parts, so no row of it is a marker however the terminal wraps it. With
-`--offer-reply-command`, it prints instead, on a line of its own for each
-request it names, the exact `agentctl chat reply` command that request's
-prompt offered, unless that would make the reminder longer than 16 KiB.
+out in parts, so no row of it is a marker however the terminal wraps it. For
+each request it names it prints, on a line of its own, the exact
+`agentctl chat sent --request` command that lists the replies the bridge holds
+for that request, with the full key, so the agent can tell a reply the bridge
+captured after the reminder was typed from one it never received before
+sending anything again; when a command cannot be printed safely, it names the
+command in general terms instead. With `--offer-reply-command`, it also prints,
+on a line of its own for each request it names, the exact `agentctl chat reply`
+command that request's prompt offered, after the check, unless that would make
+the reminder longer than 16 KiB.
+
+The service log records each reply as it arrives, with the reply ID its
+request is known by: `chat reply N of request KEY (reply ID ID) was captured
+from the coordinator's pane` for a block a capture stored, and ``chat reply for
+request KEY was stored by `agentctl chat reply`; sending it`` for one the reply
+command stored. Together with the reminder lines, the log shows whether a reply
+arrived before or after a reminder.
 
 The requests are recorded as reminded in `reply-reminders.json` in the state
 directory before the reminder is queued, together with the reminder itself

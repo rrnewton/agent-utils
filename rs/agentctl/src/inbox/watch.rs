@@ -455,6 +455,20 @@ impl ClaudeSession {
     pub(crate) fn status(&self) -> Option<&str> {
         self.status.as_deref()
     }
+
+    /// The session's ID, which names its transcript `<project>/<session>.jsonl`.
+    pub(crate) fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    /// The process ID of the session's Claude Code process, as a decimal string.
+    pub(crate) fn pid(&self) -> Option<String> {
+        match &self.pid {
+            Some(serde_json::Value::String(pid)) => Some(pid.clone()),
+            Some(serde_json::Value::Number(pid)) => Some(pid.to_string()),
+            _ => None,
+        }
+    }
 }
 
 /// Run a query command in its own process group with a deadline and return its stdout. On the
@@ -566,16 +580,23 @@ fn query_cancellable(
 
 /// `HERDR_PANE_ID` of a process, read from `<proc_root>/<pid>/environ`.
 fn pane_of_process(proc_root: &Path, pid: &str) -> Option<String> {
+    environment_value(proc_root, pid, "HERDR_PANE_ID")
+}
+
+/// The value of the environment variable `name` of a process, read from
+/// `<proc_root>/<pid>/environ`.
+pub(crate) fn environment_value(proc_root: &Path, pid: &str, name: &str) -> Option<String> {
     let environ = fs::read(proc_root.join(pid).join("environ")).ok()?;
+    let prefix = format!("{name}=");
     environ.split(|byte| *byte == 0).find_map(|entry| {
         entry
-            .strip_prefix(b"HERDR_PANE_ID=")
+            .strip_prefix(prefix.as_bytes())
             .map(|value| String::from_utf8_lossy(value).into_owned())
     })
 }
 
 /// `<projects>/<any project>/<session>.jsonl`, if it exists.
-fn transcript_of_session(projects: &Path, session: &str) -> Option<PathBuf> {
+pub(crate) fn transcript_of_session(projects: &Path, session: &str) -> Option<PathBuf> {
     fs::read_dir(projects)
         .ok()?
         .flatten()

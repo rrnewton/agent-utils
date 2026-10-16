@@ -6832,6 +6832,21 @@ at the end of your turn instead."
         (neutral_capture_syntax(&command) == command).then_some(command)
     }
 
+    /// The exact `chat sent` command that lists the replies this state holds for request `key`,
+    /// or `None` when a word of it cannot be printed safely on one line, as for
+    /// [`Self::thread_history_command`]. A reply reminder prints it so the coordinator can tell a
+    /// reply the bridge captured from one it never received before sending anything again.
+    fn sent_command(&self, key: &str) -> Option<String> {
+        let root = std::path::absolute(&self.root).ok()?;
+        let command = format!(
+            "{} chat sent --bridge-state {} --request {}",
+            history_program(env::current_exe()),
+            shell_word(root.to_str()?)?,
+            shell_word(key)?,
+        );
+        (neutral_capture_syntax(&command) == command).then_some(command)
+    }
+
     /// The exact `chat reply` command for this state, request and reply ID, run by `executable`,
     /// with `PATH_TO_YOUR_REPLY` in place of the reply file, or `None` when no file is at the
     /// executable's path, a word of it cannot be printed safely on one line, or the command holds

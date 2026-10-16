@@ -2034,6 +2034,8 @@ with other text, so the oldest were not read",
         .into_iter()
         .map(|(key, _)| key)
         .collect::<Vec<_>>();
+    let fresh = RouteCache::from_entries(route_entries);
+    log_captured(control, &fresh, &report.captured);
     report.merge(process_keys(
         state,
         manager,
@@ -2041,7 +2043,7 @@ with other text, so the oldest were not read",
         &captured_keys,
         control,
     )?);
-    *routes = RouteCache::from_entries(route_entries);
+    *routes = fresh;
     Ok(report)
 }
 
@@ -2096,6 +2098,7 @@ fn capture_direct<A: ManagedApi + ?Sized>(
     }
     if !capture.ordinals.is_empty() {
         report.captured.push((key.clone(), capture.ordinals));
+        log_captured(control, routes, &report.captured);
         report.merge(process_keys(
             state,
             manager,
@@ -2106,6 +2109,31 @@ fn capture_direct<A: ManagedApi + ?Sized>(
     }
     routes.replace(&key, state.next_reply_route(&key)?);
     Ok(report)
+}
+
+/// Log each reply a capture of the coordinator's pane stored, by its request and the reply ID
+/// `routes` knows the request by, so the service log shows a reply arriving as well as any
+/// reminder sent for its request (#260 reminder-capture-race).
+fn log_captured(control: &PassControl<'_>, routes: &RouteCache, captured: &[(String, Vec<u32>)]) {
+    for line in captured_lines(routes, captured) {
+        control.log(line);
+    }
+}
+
+/// The lines [`log_captured`] writes.
+fn captured_lines(routes: &RouteCache, captured: &[(String, Vec<u32>)]) -> Vec<String> {
+    captured
+        .iter()
+        .flat_map(|(key, ordinals)| {
+            ordinals.iter().map(move |ordinal| {
+                format!(
+                    "agentctl: chat reply {ordinal} of request {key} (reply ID {}) was captured \
+from the coordinator's pane",
+                    routes.reply_id_of(key, *ordinal)
+                )
+            })
+        })
+        .collect()
 }
 
 /// The open requests whose prompt has not reached the coordinator, or may not have, as the queue
@@ -2392,6 +2420,18 @@ impl RouteCache {
             self.by_nonce.get(identifier.rsplit_once('_')?.0)?
         };
         Some((key.as_str(), self.is_open(key)))
+    }
+
+    /// The reply ID a log line names the reply numbered `ordinal` of request `key` by: the
+    /// request's reply alias, or else `<nonce>_<ordinal>`, or `?` when this cache does not know
+    /// the request.
+    fn reply_id_of(&self, key: &str, ordinal: u32) -> String {
+        if let Some((alias, _)) = self.by_alias.iter().find(|(_, owner)| *owner == key) {
+            return alias.clone();
+        }
+        self.by_key
+            .get(key)
+            .map_or_else(|| "?".to_owned(), |(nonce, _)| format!("{nonce}_{ordinal}"))
     }
 
     fn is_open(&self, key: &str) -> bool {
@@ -4728,6 +4768,12 @@ fn take_reply_wakes(
             break;
         };
         if state.has_unsent_reply(&key) {
+            // The reply itself was stored by `agentctl chat reply`, in its own process, so only
+            // this line puts its arrival in the service log (#260 reminder-capture-race).
+            service_log(format_args!(
+                "agentctl: chat reply for request {key} was stored by `agentctl chat reply`; \
+sending it"
+            ));
             keys.push(key);
         }
     }
@@ -15417,6 +15463,8 @@ printf '{"version":1,"id":"%s","action":"send","ok":true,"receipt":{"message_id"
         asked: Arc<AtomicU64>,
         script:
             Arc<Mutex<std::collections::VecDeque<Result<reply_reminders::ClaudeState, String>>>>,
+        /// The reply IDs whose blocks the session's transcript holds.
+        printed: Arc<Mutex<BTreeSet<String>>>,
     }
 
     impl reply_reminders::ClaudeIdleSource for FakeClaude {
@@ -15434,6 +15482,20 @@ printf '{"version":1,"id":"%s","action":"send","ok":true,"receipt":{"message_id"
             } else {
                 reply_reminders::ClaudeState::Busy("busy".to_owned())
             })
+        }
+
+        fn printed_replies(
+            &self,
+            _info: &crate::client::AgentPaneInfo,
+            reply_ids: &BTreeSet<String>,
+        ) -> Result<BTreeSet<String>, String> {
+            Ok(self
+                .printed
+                .lock()
+                .expect("printed")
+                .intersection(reply_ids)
+                .cloned()
+                .collect())
         }
     }
 
@@ -15482,6 +15544,7 @@ printf '{"version":1,"id":"%s","action":"send","ok":true,"receipt":{"message_id"
                 idle: Arc::clone(&idle),
                 asked: Arc::clone(&asked),
                 script: Arc::clone(&script),
+                printed: Arc::default(),
             }),
         );
         (fixture, state, reminders, idle, asked, script)
@@ -15942,6 +16005,158 @@ has been seen working and is idle again, or for 1s if it is not seen working"),
             .expect("candidates")
             .candidates
             .is_empty());
+    }
+
+    #[test]
+    fn each_captured_reply_is_logged_with_the_reply_id_its_request_is_known_by() {
+        // #260 reminder-capture-race: the service log shows a reply arriving, not only a
+        // reminder, under the alias a request's prompt gave, or else its long ID.
+        let aliased = "a".repeat(64);
+        let long = "b".repeat(64);
+        let nonce = "n".repeat(22);
+        let routes = RouteCache::from_entries(vec![
+            ReplyRouteEntry {
+                key: aliased.clone(),
+                nonce: "m".repeat(22),
+                current_identifier: Some("5002".to_owned()),
+                answered: false,
+                alias: Some("5002".to_owned()),
+            },
+            ReplyRouteEntry {
+                key: long.clone(),
+                nonce: nonce.clone(),
+                current_identifier: Some(format!("{nonce}_3")),
+                answered: true,
+                alias: None,
+            },
+        ]);
+        assert_eq!(
+            captured_lines(
+                &routes,
+                &[
+                    (aliased.clone(), vec![1, 2]),
+                    (long.clone(), vec![3]),
+                    ("c".repeat(64), vec![1]),
+                ]
+            ),
+            [
+                format!(
+                    "agentctl: chat reply 1 of request {aliased} (reply ID 5002) was captured from \
+the coordinator's pane"
+                ),
+                format!(
+                    "agentctl: chat reply 2 of request {aliased} (reply ID 5002) was captured from \
+the coordinator's pane"
+                ),
+                format!(
+                    "agentctl: chat reply 3 of request {long} (reply ID {nonce}_3) was captured \
+from the coordinator's pane"
+                ),
+                format!(
+                    "agentctl: chat reply 1 of request {} (reply ID ?) was captured from the \
+coordinator's pane",
+                    "c".repeat(64)
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_reply_the_transcript_holds_is_not_reported_missing_though_the_pane_does_not_show_it() {
+        // #260 reminder-capture-race: the coordinator printed its reply and went idle, but no
+        // read of the pane shows the block, as when its view is scrolled away from its end, so
+        // the read before the reminder stores nothing. The session's transcript holds the block
+        // when the reminder would be composed, so none is typed, the log says why, and no later
+        // check reminds that request either. Another request whose reply the transcript does not
+        // hold is still reminded.
+        let (fixture, state, _reminders, _idle, _asked) = reminding_worker(true);
+        let printed = Arc::new(Mutex::new(BTreeSet::from(["001".to_owned()])));
+        let mut reminders = ReplyReminders::with_source(
+            Duration::from_millis(100),
+            Box::new(FakeClaude {
+                idle: Arc::new(AtomicBool::new(true)),
+                asked: Arc::default(),
+                script: Arc::default(),
+                printed: Arc::clone(&printed),
+            }),
+        );
+        let said = Arc::clone(&reminders.said);
+        let (key, _) = delivered_worker_request(&state);
+        fixture.client.runs.lock().expect("runs").clear();
+        let mut turn = TurnEvidence::default();
+        reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
+        thread::sleep(Duration::from_millis(150));
+        let check = reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
+        assert!(check.snapshot.is_some(), "the read before a reminder ran");
+        assert!(check.report.captured.is_empty(), "the pane shows no reply");
+        assert!(reminders_typed(&fixture).is_empty());
+        let left_out = format!(
+            "agentctl: reply reminders: request {key} (reply ID 001) is not reminded: the \
+coordinator's Claude Code transcript holds a complete reply block under that ID that no read of \
+its pane has captured yet, as when the pane's view is scrolled away from its end; the bridge \
+sends that reply once the pane shows it"
+        );
+        assert_eq!(
+            said.lock()
+                .expect("log")
+                .iter()
+                .filter(|line| **line == left_out)
+                .count(),
+            1,
+            "{:#?}",
+            said.lock().expect("log")
+        );
+        let record = state
+            .update_reply_reminders(chat_runtime::unix_millis(), None, |_| (false, ()))
+            .expect("record")
+            .0;
+        assert!(!record.reminded(&key), "nothing was recorded as reminded");
+        assert_eq!(record.pending, None);
+
+        // Later checks neither remind it nor read the transcript for it again, though the
+        // transcript no longer shows the block: a transcript only grows.
+        printed.lock().expect("printed").clear();
+        for _ in 0..3 {
+            thread::sleep(Duration::from_millis(150));
+            reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
+        }
+        assert!(reminders_typed(&fixture).is_empty());
+
+        // A second request, which the transcript holds no reply to, is reminded alone.
+        let second = admitted_worker_message(&state, 2, "two");
+        chat_runtime::deliver_request_with(
+            &state,
+            &RecordingDelivery::default(),
+            &second,
+            DrainOptions::default(),
+        )
+        .expect("deliver the second request");
+        reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
+        thread::sleep(Duration::from_millis(150));
+        reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
+        let typed = reminders_typed(&fixture);
+        assert_eq!(typed.len(), 1, "{typed:#?}");
+        assert!(typed[0].contains("reply ID 002"), "{}", typed[0]);
+        assert!(!typed[0].contains("001"), "{}", typed[0]);
+        assert!(
+            typed[0].contains(" chat sent --bridge-state "),
+            "{}",
+            typed[0]
+        );
+        assert!(
+            typed[0].contains(&format!("--request {second}")),
+            "{}",
+            typed[0]
+        );
+        assert_eq!(
+            said.lock()
+                .expect("log")
+                .iter()
+                .filter(|line| **line == left_out)
+                .count(),
+            1,
+            "logged once"
+        );
     }
 
     #[test]

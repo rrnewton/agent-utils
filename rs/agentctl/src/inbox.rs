@@ -32,7 +32,7 @@ use sha2::{Digest as _, Sha256};
 
 mod watch;
 
-pub(crate) use watch::claude_sessions_by_pane;
+pub(crate) use watch::{claude_sessions_by_pane, environment_value, transcript_of_session};
 
 /// Most notices one coordinator's queue holds; further posts are refused as busy.
 pub(crate) const DEFAULT_MAX_LIVE: usize = 200;

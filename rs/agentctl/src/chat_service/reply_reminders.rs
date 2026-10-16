@@ -17,6 +17,13 @@
 //! Before reminding, the check reads the pane and captures it as a recovery scan does, so a reply
 //! on screen that no capture stored yet counts, and it reminds no one if that capture may have
 //! typed or left a prompt for the coordinator. Herdr and Claude Code are then asked once more.
+//! Last, right before the reminder is composed, it reads the transcript of the Claude Code session
+//! that answer named (`<projects>/<session>.jsonl`, the file `agentctl inbox watch` reads) and
+//! leaves out each request whose reply ID heads a complete reply block in the session's ordinary
+//! text: that reply was printed, though no read of the pane has shown it yet, as when the pane's
+//! view is scrolled away from its end, and a reminder saying no reply arrived would only make the
+//! coordinator send it a second time once the pane does show it (#260 reminder-capture-race). A
+//! transcript that cannot be found or read leaves the reminder as it was, and is logged.
 //! The reminder is recorded before it is queued and is typed only through the queue's normal
 //! checks, never into a working pane nor behind another prompt; one the queue does not type is
 //! taken back out of it. That holds off the next reminder until the coordinator has been seen
@@ -24,9 +31,12 @@
 //! retry delay has passed: twice the idle time after the first such reminder in a row, doubling
 //! with each after it, and at most `MAX_REPLY_REMINDER_RETRY`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::path::PathBuf;
+use std::fs;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::agent::DrainOptions;
@@ -65,6 +75,9 @@ const CLAUDE_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Claude Code is not asked again for one idle time, except right before a reminder, so a slow
 /// host does not spend most of each scan waiting for it.
 const CLAUDE_SLOW_ANSWER: Duration = Duration::from_secs(3);
+/// Most bytes at the end of a Claude Code transcript read for reply blocks before a reminder, as
+/// many as `agentctl inbox watch` reads for an agent's last message.
+const TRANSCRIPT_TAIL_BYTES: u64 = 8 * 1024 * 1024;
 
 /// How `chat run` reminds a Claude Code coordinator of the requests it has not answered.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -144,12 +157,164 @@ pub(crate) trait ClaudeIdleSource {
         info: &AgentPaneInfo,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<ClaudeState, String>;
+
+    /// The reply IDs among `reply_ids` that head a complete reply block in the transcript of the
+    /// Claude Code session that the last [`Self::state`] found in the pane `info` describes: see
+    /// [`printed_reply_ids`]. Empty for a source that keeps no transcript.
+    fn printed_replies(
+        &self,
+        info: &AgentPaneInfo,
+        reply_ids: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>, String> {
+        let _ = (info, reply_ids);
+        Ok(BTreeSet::new())
+    }
+}
+
+/// The Claude Code session the last question found in a pane.
+#[derive(Clone, Debug)]
+struct FoundSession {
+    pane_id: String,
+    session_id: String,
+    pid: String,
 }
 
 /// `claude agents --json`, joined to Herdr panes as `agentctl inbox watch` joins it.
 struct ClaudeAgents {
     claude: PathBuf,
     proc_root: PathBuf,
+    // The session the last answer named for the pane it was asked about, whose transcript
+    // `printed_replies` reads.
+    found: Mutex<Option<FoundSession>>,
+}
+
+impl ClaudeAgents {
+    fn new(claude: PathBuf, proc_root: PathBuf) -> Self {
+        Self {
+            claude,
+            proc_root,
+            found: Mutex::new(None),
+        }
+    }
+}
+
+/// Where the Claude Code process `pid` keeps its transcripts: `projects` in its
+/// `CLAUDE_CONFIG_DIR`, or else in `.claude` in its home directory, or else in `.claude` in this
+/// process's home directory, as `agentctl inbox watch` assumes.
+fn claude_projects(proc_root: &Path, pid: &str) -> PathBuf {
+    if let Some(directory) = crate::inbox::environment_value(proc_root, pid, "CLAUDE_CONFIG_DIR")
+        .filter(|directory| !directory.is_empty())
+    {
+        return PathBuf::from(directory).join("projects");
+    }
+    crate::inbox::environment_value(proc_root, pid, "HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .unwrap_or_default()
+        .join(".claude")
+        .join("projects")
+}
+
+/// The reply IDs among `reply_ids` that head a complete reply block in the ordinary text of the
+/// assistant messages in the last `TRANSCRIPT_TAIL_BYTES` of the Claude Code transcript at `path`:
+/// an opening marker line `<CHAT_REPLY_ID>` and, after at least one other nonblank line, the
+/// closing line `</CHAT_REPLY_ID>`, each alone on its line apart from surrounding blanks and
+/// outside code fences, in one message. Thinking and tool calls are not ordinary text. A line cut
+/// by the byte limit is skipped, since it does not parse.
+pub(crate) fn printed_reply_ids(
+    path: &Path,
+    reply_ids: &BTreeSet<String>,
+) -> io::Result<BTreeSet<String>> {
+    let mut found = BTreeSet::new();
+    if reply_ids.is_empty() {
+        return Ok(found);
+    }
+    let mut file = fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    let from = length.saturating_sub(TRANSCRIPT_TAIL_BYTES);
+    file.seek(SeekFrom::Start(from))?;
+    let mut bytes = Vec::new();
+    file.take(length - from).read_to_end(&mut bytes)?;
+    for line in bytes.split(|byte| *byte == b'\n') {
+        // Most lines name no marker, and are not parsed.
+        if !std::str::from_utf8(line).is_ok_and(|line| line.contains("CHAT_REPLY_")) {
+            continue;
+        }
+        let Ok(record) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        if record.get("type").and_then(serde_json::Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(content) = record
+            .pointer("/message/content")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for text in content
+            .iter()
+            .filter(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+        {
+            complete_blocks(text, reply_ids, &mut found);
+        }
+    }
+    Ok(found)
+}
+
+/// Add to `found` each of `reply_ids` that heads a complete reply block in `text`, as
+/// [`printed_reply_ids`] describes.
+fn complete_blocks(text: &str, reply_ids: &BTreeSet<String>, found: &mut BTreeSet<String>) {
+    let mut fence: Option<(char, usize)> = None;
+    // The reply ID of the block open at this line, and whether it has a nonblank line yet.
+    let mut open: Option<(&str, bool)> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        let run = |character: char| line.chars().take_while(|value| *value == character).count();
+        if let Some((character, length)) = fence {
+            if run(character) >= length && line.trim_start_matches(character).is_empty() {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some(character) = line
+            .chars()
+            .next()
+            .filter(|value| matches!(value, '`' | '~'))
+        {
+            let length = run(character);
+            let info = &line[length..];
+            if length >= 3 && !(character == '`' && info.contains('`')) {
+                fence = Some((character, length));
+                open = None;
+                continue;
+            }
+        }
+        if let Some(identifier) = line
+            .strip_prefix("<CHAT_REPLY_")
+            .and_then(|rest| rest.strip_suffix('>'))
+        {
+            open = reply_ids
+                .get(identifier)
+                .map(|identifier| (identifier.as_str(), false));
+        } else if let Some(identifier) = line
+            .strip_prefix("</CHAT_REPLY_")
+            .and_then(|rest| rest.strip_suffix('>'))
+        {
+            if let Some((opened, true)) = open {
+                if opened == identifier {
+                    found.insert(opened.to_owned());
+                }
+            }
+            open = None;
+        } else if !line.is_empty() {
+            if let Some((_, body)) = open.as_mut() {
+                *body = true;
+            }
+        }
+    }
 }
 
 impl ClaudeIdleSource for ClaudeAgents {
@@ -168,16 +333,53 @@ impl ClaudeIdleSource for ClaudeAgents {
             cancelled,
         )
         .map_err(|error| error.to_string())?;
-        Ok(
-            match sessions
-                .get(&info.pane_id)
-                .and_then(|session| session.status())
-            {
-                Some("idle") => ClaudeState::Idle,
-                Some(other) => ClaudeState::Busy(other.to_owned()),
-                None => ClaudeState::NoSession,
-            },
-        )
+        let session = sessions.get(&info.pane_id);
+        *self
+            .found
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = session.and_then(|session| {
+            Some(FoundSession {
+                pane_id: info.pane_id.clone(),
+                session_id: session.session_id()?.to_owned(),
+                pid: session.pid()?,
+            })
+        });
+        Ok(match session.and_then(|session| session.status()) {
+            Some("idle") => ClaudeState::Idle,
+            Some(other) => ClaudeState::Busy(other.to_owned()),
+            None => ClaudeState::NoSession,
+        })
+    }
+
+    fn printed_replies(
+        &self,
+        info: &AgentPaneInfo,
+        reply_ids: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>, String> {
+        let found = self
+            .found
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .filter(|found| found.pane_id == info.pane_id)
+            .ok_or_else(|| {
+                format!(
+                    "`{} agents --json` named no session ID and process for the pane {}",
+                    self.claude.display(),
+                    info.pane_id
+                )
+            })?;
+        let projects = claude_projects(&self.proc_root, &found.pid);
+        let path =
+            crate::inbox::transcript_of_session(&projects, &found.session_id).ok_or_else(|| {
+                format!(
+                    "no transcript {}.jsonl is in any project under {}",
+                    found.session_id,
+                    projects.display()
+                )
+            })?;
+        printed_reply_ids(&path, reply_ids)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))
     }
 }
 
@@ -291,6 +493,9 @@ pub(crate) struct ReplyReminders {
     waiting: Option<String>,
     // The reminder last logged as waiting in the queue, and why.
     stuck: Option<(String, String)>,
+    // The requests whose reply the coordinator's transcript showed, which are never reminded: a
+    // transcript only grows, so it is not read again for them.
+    printed: BTreeSet<String>,
     #[cfg(test)]
     pub(super) said: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
@@ -301,10 +506,10 @@ impl ReplyReminders {
     pub(super) fn new(settings: &ReplyReminderSettings) -> Self {
         Self::with_source(
             settings.idle,
-            Box::new(ClaudeAgents {
-                claude: settings.claude_bin.clone(),
-                proc_root: PathBuf::from("/proc"),
-            }),
+            Box::new(ClaudeAgents::new(
+                settings.claude_bin.clone(),
+                PathBuf::from("/proc"),
+            )),
         )
     }
 
@@ -321,6 +526,7 @@ impl ReplyReminders {
             problems: BTreeMap::new(),
             waiting: None,
             stuck: None,
+            printed: BTreeSet::new(),
             #[cfg(test)]
             said: std::sync::Arc::default(),
         }
@@ -591,7 +797,13 @@ seen working and is idle again, or for {}s if it is not seen working",
                 return Ok(check);
             }
         };
-        let eligible = candidates.eligible(&record, now);
+        // Only a request that can still be reminded needs to stay known as printed.
+        self.printed.retain(|key| candidates.retained.contains(key));
+        let eligible = candidates
+            .eligible(&record, now)
+            .into_iter()
+            .filter(|candidate| !self.printed.contains(&candidate.key))
+            .collect::<Vec<_>>();
         if eligible.is_empty() {
             // Nothing is left to remind, so nothing is held off either.
             self.period.end();
@@ -681,6 +893,13 @@ seen working and is idle again, or for {}s if it is not seen working",
         {
             return Ok(check);
         }
+        // Right before the reminder is composed, after the answer that named the session, the
+        // session's transcript shows whether the coordinator printed a reply that no read of the
+        // pane has shown yet.
+        let due = self.leave_out_printed(&info, due);
+        if due.is_empty() {
+            return Ok(check);
+        }
 
         let reminder = chat_runtime::compose_reminder(state, &due, now);
         let recorded = state.update_reply_reminders(now, Some(&candidates.retained), |record| {
@@ -735,6 +954,54 @@ seen working and is idle again, or for {}s if it is not seen working",
         check.report.prompt_typed |= outcome.may_have_typed();
         report_receipt_errors(&notes, &mut check.report);
         Ok(check)
+    }
+
+    /// `due` without each request whose reply ID heads a complete reply block in the transcript of
+    /// the Claude Code session in the pane `info` describes, each of which is logged and never
+    /// reminded. A transcript that cannot be found or read leaves `due` as it is, and is logged.
+    fn leave_out_printed(
+        &mut self,
+        info: &AgentPaneInfo,
+        due: Vec<ReminderCandidate>,
+    ) -> Vec<ReminderCandidate> {
+        let due = due
+            .into_iter()
+            .filter(|candidate| !self.printed.contains(&candidate.key))
+            .collect::<Vec<_>>();
+        if due.is_empty() {
+            return due;
+        }
+        let reply_ids = due
+            .iter()
+            .map(|candidate| candidate.reply_id.clone())
+            .collect::<BTreeSet<_>>();
+        let printed = match self.source.printed_replies(info, &reply_ids) {
+            Ok(printed) => {
+                self.worked("the read of the coordinator's Claude Code transcript");
+                printed
+            }
+            Err(error) => {
+                self.failed(
+                    "the read of the coordinator's Claude Code transcript",
+                    error,
+                );
+                return due;
+            }
+        };
+        let (left_out, kept): (Vec<_>, Vec<_>) = due
+            .into_iter()
+            .partition(|candidate| printed.contains(&candidate.reply_id));
+        for candidate in left_out {
+            self.say(format_args!(
+                "agentctl: reply reminders: request {} (reply ID {}) is not reminded: the \
+coordinator's Claude Code transcript holds a complete reply block under that ID that no read of \
+its pane has captured yet, as when the pane's view is scrolled away from its end; the bridge \
+sends that reply once the pane shows it",
+                candidate.key, candidate.reply_id
+            ));
+            self.printed.insert(candidate.key);
+        }
+        kept
     }
 
     /// Look the coordinator's pane up in Herdr, and note its status in `turn`. `None` when the
@@ -1032,7 +1299,7 @@ mod tests {
             )
             .expect("environ");
         }
-        let source = Box::new(ClaudeAgents { claude, proc_root });
+        let source = Box::new(ClaudeAgents::new(claude, proc_root));
         (directory, source)
     }
 
@@ -1049,6 +1316,125 @@ mod tests {
             terminal_id: None,
             tab_id: None,
         }
+    }
+
+    /// One transcript line: an assistant message whose content is `content`.
+    fn assistant(content: serde_json::Value) -> String {
+        serde_json::json!({"type": "assistant", "message": {"content": content}}).to_string()
+    }
+
+    #[test]
+    fn a_transcript_shows_a_reply_only_for_a_complete_block_in_ordinary_text() {
+        let directory = std::env::temp_dir().join(format!(
+            "agentctl-reply-reminder-transcript-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("fixture directory");
+        let path = directory.join("s.jsonl");
+        let text = |text: &str| serde_json::json!([{"type": "text", "text": text}]);
+        let lines = [
+            // Complete, with the bullet-free indentation a model sometimes adds.
+            assistant(text(
+                "Done.\n  <CHAT_REPLY_5002>\nThe answer.\n  </CHAT_REPLY_5002>  \n",
+            )),
+            // Only in thinking, or only in a tool call: not printed.
+            assistant(serde_json::json!([{"type": "thinking", "thinking":
+                "<CHAT_REPLY_5003>\nthought\n</CHAT_REPLY_5003>"}])),
+            assistant(serde_json::json!([{"type": "tool_use", "input": {"command":
+                "<CHAT_REPLY_5004>\nx\n</CHAT_REPLY_5004>"}}])),
+            // Inside a code fence, sharing a line with other text, unclosed, or empty.
+            assistant(text(
+                "```text\n<CHAT_REPLY_5005>\nquoted\n</CHAT_REPLY_5005>\n```",
+            )),
+            assistant(text(
+                "Reply under <CHAT_REPLY_5006> and </CHAT_REPLY_5006> later.",
+            )),
+            assistant(text("<CHAT_REPLY_5007>\nstarted")),
+            assistant(text("<CHAT_REPLY_5008>\n\n</CHAT_REPLY_5008>")),
+            // A user prompt that quotes a block is not the coordinator's output.
+            serde_json::json!({"type": "user", "message": {"content":
+                "<CHAT_REPLY_5009>\nquoted\n</CHAT_REPLY_5009>"}})
+            .to_string(),
+            // A closing line under another ID ends nothing, and a fence closed before the block
+            // does not hide it.
+            assistant(text("<CHAT_REPLY_5010>\nbody\n</CHAT_REPLY_5011>")),
+            assistant(text(
+                "```\ncode\n```\n<CHAT_REPLY_5012>\nbody\n</CHAT_REPLY_5012>",
+            )),
+            "{not json".to_owned(),
+        ];
+        fs::write(&path, lines.join("\n") + "\n").expect("transcript");
+        let asked = (5002..=5012)
+            .map(|id| id.to_string())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            printed_reply_ids(&path, &asked).expect("read"),
+            BTreeSet::from(["5002".to_owned(), "5012".to_owned()])
+        );
+        // Only the IDs asked about are reported.
+        assert_eq!(
+            printed_reply_ids(&path, &BTreeSet::from(["5003".to_owned()])).expect("read"),
+            BTreeSet::new()
+        );
+        // Only the end of a long transcript is read.
+        let mut long = assistant(text("<CHAT_REPLY_5002>\nold\n</CHAT_REPLY_5002>")) + "\n";
+        let filler = assistant(text(&"x".repeat(1_000))) + "\n";
+        let fillers = usize::try_from(TRANSCRIPT_TAIL_BYTES).expect("bytes") / filler.len() + 1;
+        long.push_str(&filler.repeat(fillers));
+        fs::write(&path, long).expect("long transcript");
+        assert_eq!(
+            printed_reply_ids(&path, &asked).expect("read"),
+            BTreeSet::new()
+        );
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn the_transcript_read_is_the_one_of_the_session_claude_code_last_named_in_the_pane() {
+        let (directory, _) = claude_fixture("transcript", "[]");
+        let claude = directory.join("claude");
+        let listing = r#"[{"pid":101,"sessionId":"s-1","status":"idle"}]"#;
+        fs::write(&claude, format!("#!/bin/sh\ncat <<'END'\n{listing}\nEND\n"))
+            .expect("write claude");
+        let config = directory.join("config");
+        let project = config.join("projects").join("-work-project");
+        fs::create_dir_all(&project).expect("project");
+        fs::write(
+            directory.join("proc").join("101").join("environ"),
+            format!(
+                "HOME=/home/x\0CLAUDE_CONFIG_DIR={}\0HERDR_PANE_ID=w:coordinator\0",
+                config.display()
+            ),
+        )
+        .expect("environ");
+        let source = ClaudeAgents::new(claude, directory.join("proc"));
+        let ids = BTreeSet::from(["5002".to_owned()]);
+        let coordinator = pane("claude", "w:coordinator");
+        let error = source
+            .printed_replies(&coordinator, &ids)
+            .expect_err("no session was named yet");
+        assert!(error.contains("named no session ID"), "{error}");
+        assert_eq!(source.state(&coordinator, &|| false), Ok(ClaudeState::Idle));
+        let error = source
+            .printed_replies(&coordinator, &ids)
+            .expect_err("the transcript does not exist yet");
+        assert!(error.contains("no transcript s-1.jsonl"), "{error}");
+        fs::write(
+            project.join("s-1.jsonl"),
+            assistant(serde_json::json!([{"type": "text",
+                "text": "<CHAT_REPLY_5002>\nanswer\n</CHAT_REPLY_5002>"}]))
+                + "\n",
+        )
+        .expect("transcript");
+        assert_eq!(source.printed_replies(&coordinator, &ids), Ok(ids.clone()));
+        // Another pane's question replaces the session it reads.
+        assert_eq!(
+            source.state(&pane("claude", "w:other"), &|| false),
+            Ok(ClaudeState::NoSession)
+        );
+        assert!(source.printed_replies(&coordinator, &ids).is_err());
+        fs::remove_dir_all(directory).expect("cleanup");
     }
 
     #[test]

@@ -350,11 +350,15 @@ then start again from that time",
     }
 
     /// The text of a reminder of `requests`, newest delivery first, at `now_millis`. It names up
-    /// to `MAX_REMINDER_LISTED_IDS` reply IDs and counts the rest. With `chat run
-    /// --offer-reply-command` it prints, for each request it names, the `agentctl chat reply`
-    /// command that request's prompt offered, unless that would make it longer than its bound;
-    /// otherwise it points to that command in general terms. It spells the marker lines out in
-    /// parts, so that no row of it forms a marker however the terminal wraps it.
+    /// to `MAX_REMINDER_LISTED_IDS` reply IDs and counts the rest. It tells the coordinator to
+    /// check what the bridge holds before it sends anything, printing for each request it names
+    /// the `agentctl chat sent --request` command that lists that request's replies, since a reply
+    /// printed shortly before the reminder can be captured just after it was typed (#260
+    /// reminder-capture-race). With `chat run --offer-reply-command` it also prints, for each
+    /// request it names, the `agentctl chat reply` command that request's prompt offered. A
+    /// command that cannot be printed, or a text longer than its bound, falls back to general
+    /// terms. It spells the marker lines out in parts, so that no row of it forms a marker
+    /// however the terminal wraps it.
     pub(crate) fn reminder_prompt(
         &self,
         requests: &[ReminderCandidate],
@@ -388,34 +392,63 @@ print. If you meant to reply, print the reply as ordinary text between two marke
 opening line made of the literal prefix `<CHAT_REPLY_`, the reply ID and `>`, and a closing line \
 made of `</CHAT_REPLY_`, the same ID and `>`, each alone on its line and outside code fences."
         );
+        let check_lead = "Before you send anything, check whether the bridge already holds a \
+reply: one you printed shortly before this reminder can still be captured just after it was typed.";
+        let general_check = format!(
+            "{check_lead} `agentctl chat sent --bridge-state DIR --request KEY` lists the replies the \
+bridge holds for a request; a reply it lists reached the bridge, so do not send that reply again."
+        );
         let close = "If a request needs no reply, you answered it another way, or you are still \
 working on it, ignore this reminder; the bridge sends it only once for each request.";
-        let generic = format!(
-            "{lead} If the request's prompt printed an `agentctl chat reply` command, you can \
-instead write the reply to a file and send it with that command. {close}"
-        );
-        if !self.offer_reply_command {
-            return generic;
-        }
-        let commands = named
-            .iter()
-            .map(|request| {
-                self.reply_command(env::current_exe(), &request.key, &request.reply_id)
-                    .map(|command| format!("{}: {command}", request.reply_id))
-            })
-            .collect::<Option<Vec<_>>>();
-        let Some(commands) = commands else {
-            return generic;
+        let listed_commands = |command: &dyn Fn(&ReminderCandidate) -> Option<String>| {
+            named
+                .iter()
+                .map(|request| command(request).map(|line| format!("{}: {line}", request.reply_id)))
+                .collect::<Option<Vec<_>>>()
+                .map(|lines| lines.join("\n"))
         };
+        let check = listed_commands(&|request| self.sent_command(&request.key)).map_or_else(
+            || general_check.clone(),
+            |lines| {
+                format!(
+                    "{check_lead} Run this command for each request; a reply it lists reached the \
+bridge, so do not send that reply again:\n{lines}\n"
+                )
+            },
+        );
+        let generic_with = |check: &str| {
+            let separator = if check.ends_with('\n') { "" } else { " " };
+            format!(
+                "{lead} {check}{separator}If the request's prompt printed an `agentctl chat reply` \
+command, you can instead write the reply to a file and send it with that command. {close}"
+            )
+        };
+        let bounded_generic = || {
+            let generic = generic_with(&check);
+            if generic.len() <= MAX_REPLY_REMINDER_PROMPT_BYTES {
+                generic
+            } else {
+                generic_with(&general_check)
+            }
+        };
+        if !self.offer_reply_command {
+            return bounded_generic();
+        }
+        let Some(commands) = listed_commands(&|request| {
+            self.reply_command(env::current_exe(), &request.key, &request.reply_id)
+        }) else {
+            return bounded_generic();
+        };
+        let separator = if check.ends_with('\n') { "" } else { " " };
         let offered = format!(
-            "{lead} You can instead write the reply to a file, without the two lines, and send \
-it with `agentctl chat reply`, putting the file's path in place of PATH_TO_YOUR_REPLY:\n{}\n{close}",
-            commands.join("\n")
+            "{lead} {check}{separator}Otherwise you can write the reply to a file, without the two \
+lines, and send it with `agentctl chat reply`, putting the file's path in place of \
+PATH_TO_YOUR_REPLY:\n{commands}\n{close}"
         );
         if offered.len() <= MAX_REPLY_REMINDER_PROMPT_BYTES {
             offered
         } else {
-            generic
+            bounded_generic()
         }
     }
 }
@@ -1176,6 +1209,20 @@ request with reply ID 001 (sent to you 3m ago)."
         );
         assert!(one.contains("`agentctl chat reply`"), "{one}");
         assert!(one.contains("only once for each request"), "{one}");
+        // It says to check what the bridge holds before sending anything, with the exact
+        // command for the request (#260 reminder-capture-race).
+        assert!(
+            one.contains(
+                "Before you send anything, check whether the bridge already holds a reply"
+            ),
+            "{one}"
+        );
+        let check = one
+            .lines()
+            .find(|line| line.starts_with("001: "))
+            .expect("the check command line");
+        assert!(check.contains(" chat sent --bridge-state "), "{check}");
+        assert!(check.ends_with(&format!("--request {:064x}", 1)), "{check}");
         // No row of it is a marker line, however the terminal wraps it, and it names no reply
         // ID after a marker prefix, which a capture would read as a block or an unknown ID.
         assert!(!one.contains("CHAT_REPLY_0"), "{one}");
@@ -1197,7 +1244,23 @@ request with reply ID 001 (sent to you 3m ago)."
             listed.contains("032 (sent to you 32m ago), and 8 more."),
             "{listed}"
         );
-        assert!(!listed.contains("033"), "{listed}");
+        // Only the named requests are listed, each with its check command.
+        let (head, commands) = listed
+            .split_once("so do not send that reply again:\n")
+            .expect("the check commands");
+        assert!(!head.contains("033"), "{listed}");
+        assert_eq!(
+            commands
+                .lines()
+                .take_while(|line| line.contains(" chat sent "))
+                .count(),
+            32,
+            "{listed}"
+        );
+        assert!(
+            !commands.lines().any(|line| line.starts_with("033: ")),
+            "{listed}"
+        );
 
         // With `chat run --offer-reply-command`, each named request's command is printed.
         let offering = state.clone().with_reply_command_offered(true);
@@ -1208,7 +1271,7 @@ request with reply ID 001 (sent to you 3m ago)."
         );
         let command = offered
             .lines()
-            .find(|line| line.starts_with("007: "))
+            .find(|line| line.starts_with("007: ") && line.contains(" chat reply "))
             .expect("the command line");
         assert!(command.contains(" chat reply --bridge-state "), "{command}");
         assert!(
@@ -1218,6 +1281,16 @@ request with reply ID 001 (sent to you 3m ago)."
         assert!(
             command.contains("--reply-id 007 --file PATH_TO_YOUR_REPLY"),
             "{command}"
+        );
+        // The check comes before the offer to send.
+        let check = offered
+            .find(" chat sent --bridge-state ")
+            .expect("the check command");
+        assert!(
+            check
+                < offered
+                    .find(" chat reply --bridge-state ")
+                    .expect("the reply command")
         );
         fs::remove_dir_all(root).expect("cleanup");
     }
