@@ -1,12 +1,13 @@
 ---
 title: 'settings-server-hostname: show the server host prominently at the top of Settings'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-17T11:21:32.735541303+00:00
-updated_at: 2026-10-17T11:21:32.735541303+00:00
+updated_at: 2026-10-17T11:39:56.066486463+00:00
+closed_at: 2026-10-17T11:39:56.066486333+00:00
 ---
 
 # Description

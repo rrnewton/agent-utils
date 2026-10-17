@@ -895,6 +895,14 @@
         -->
         <section id="screen-settings" class="screen" tabindex="-1" aria-label="Settings" hidden>
           <div class="settings-column">
+            <!-- `#342 settings-server-hostname`. Which server this is, FIRST and loud: the owner
+                 runs several and forgets which one a tab is talking to. Filled by
+                 `deploymentOrigin`'s sibling in web/voice.js from the address the page was
+                 opened at, port included, so two instances on one host still differ. -->
+            <section class="settings-section" id="settings-server" aria-labelledby="settings-server-title">
+              <h2 id="settings-server-title">Server</h2>
+              <p id="settings-server-host" class="settings-server-host"></p>
+            </section>
             <!--
               `#271 settings-groups`. A HANDFUL OF SECTIONS, each one card.
 
@@ -908,6 +916,7 @@
               each one sits and how loud its heading is changed.
 
               The sections, in order:
+                Server — which server this page is talking to (`#342 settings-server-hostname`).
                 Voice agent — what it may send, what it is told, what it hears and remembers.
                 Messages — how a channel's messages are marked, drawn and read out.
                 Channels — the one per-channel box.

@@ -700,6 +700,17 @@ a.search-hit-link {
   margin: 0.15rem 0 0.35rem;
 }
 
+/* `#342 settings-server-hostname`. The host is the loudest line on Settings: it is the answer to
+   "which server is this?", asked before any switch is touched. */
+#screen-settings .settings-server-host {
+  margin: 0.1rem 0 0.5rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 1.45rem;
+  font-weight: 700;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
 /* A group's own heading, inside a section: what a card's heading used to be, one step quieter. */
 #screen-settings .settings-group > .group-head > h3 {
   font-size: 0.92rem;

@@ -4980,6 +4980,18 @@ test("the sign-in screen is compact and names the server receiving the token", (
   assert.equal(page.el("settings-server-url").textContent, "https://vibe.example");
 });
 
+test("settings names its server host prominently, first", () => {
+  const settings = HTML.slice(HTML.indexOf('id="screen-settings"'));
+  const banner = settings.indexOf('id="settings-server-host"');
+  assert.ok(banner !== -1, "settings has no server host banner");
+  assert.ok(
+    banner < settings.indexOf('id="settings-voice-agent"'),
+    "the server host is not the first thing on the settings screen"
+  );
+  const page = newPage();
+  assert.equal(page.el("settings-server-host").textContent, "vibe.example");
+});
+
 test("a token the server accepts leads to the main interface", async () => {
   const page = newPage();
   await signIn(page);
@@ -57156,8 +57168,8 @@ const groupsIn = (title) => [...settingsSection(title).matchAll(/<h3>([^<]+)<\/h
 test("`#271 settings-groups`: Settings is a handful of sections, and every group is inside one", () => {
   assert.deepStrictEqual(
     SETTINGS_SECTIONS,
-    ["Voice agent", "Messages", "Channels", "Screen and keys", "Storage and connection"],
-    "the sections are not the five the screen is arranged around"
+    ["Server", "Voice agent", "Messages", "Channels", "Screen and keys", "Storage and connection"],
+    "the sections are not the six the screen is arranged around"
   );
   const settings = HTML.slice(HTML.indexOf('id="screen-settings"'), HTML.indexOf('id="screen-help"'));
   const groups = [...settings.matchAll(/<section class="settings-group"/g)].length;

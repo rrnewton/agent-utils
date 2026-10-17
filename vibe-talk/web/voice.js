@@ -211,6 +211,18 @@ for (const id of ["signin-server-url", "settings-server-url"]) {
   el(id).textContent = deploymentOrigin();
 }
 
+/** The host this page was opened at, port included: `#342 settings-server-hostname`. */
+function deploymentHost() {
+  const host = window.location && typeof window.location.host === "string"
+    ? window.location.host.trim()
+    : "";
+  if (host) return host;
+  const origin = deploymentOrigin().replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
+  return origin.split("/")[0] || deploymentOrigin();
+}
+
+el("settings-server-host").textContent = deploymentHost();
+
 // ONE status line. It used to be two — a word under the header and a sentence at the foot — which
 // is how the closed state managed to announce itself three times in three vocabularies. The
 // sentence is the line; the state is the dot beside it.
