@@ -45527,6 +45527,46 @@ def test_create_and_classification_proceed_beside_an_interrupted_absent_validate
     assert not (control_directory(project) / "ACTIVE.testhost.journal").exists()
 
 
+def test_doctor_reports_beside_an_interrupted_absent_validate_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, input_path, _config = _absent_batch_refused_after_its_archives(
+        tmp_path, monkeypatch
+    )
+    capsys.readouterr()
+
+    # The batch's two rows are active and archived at once; doctor still reports.
+    assert wrkslots.main(
+        ["--project-root", str(project), "doctor", "--all-machines", "--format", "json"]
+    ) == 0, capsys.readouterr().err
+    json.loads(capsys.readouterr().out)
+
+    assert run_absent_validate_recovery(project, input_path, apply=True) == 0
+
+
+def test_doctor_still_refuses_an_overlap_the_absent_validate_batch_does_not_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, _input_path, _config = _absent_batch_refused_after_its_archives(
+        tmp_path, monkeypatch
+    )
+    journal = control_directory(project) / "ACTIVE.testhost.journal"
+    raw = json.loads(journal.read_text())
+    raw["items"] = raw["items"][:1]
+    raw["cursor"] = 1
+    monkeypatch.setattr(
+        wrkslots,
+        "_load_journal",
+        lambda _config, *, selected_path=None: (journal, raw),
+    )
+    capsys.readouterr()
+
+    assert wrkslots.main(
+        ["--project-root", str(project), "doctor", "--all-machines", "--format", "json"]
+    ) != 0
+    assert "is active on testhost and archived on" in capsys.readouterr().err
+
+
 def test_a_slot_of_the_interrupted_absent_validate_batch_is_not_reused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

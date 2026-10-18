@@ -33031,8 +33031,17 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     with _locked(
         config.control / "ACTIVE", exclusive=False, wait_seconds=args.wait_lock
     ):
-        all_states, _archives = _validate_global_state(
-            config, require_repository=False
+        # Read beside an outstanding recover-absent-validate-rows batch, as
+        # status and create do: its rows are archived before they leave
+        # ACTIVE, and they stay in both until the batch finishes or is
+        # replayed. On 2026-10-18 one validate row was in both from 12:41:20
+        # to 12:45:29Z, the health tick's doctor ran in that window, and the
+        # whole report refused. Any overlap the batch does not name still
+        # refuses.
+        all_states, _archives, _absent_paths, _absent_slots = (
+            _validate_global_state_beside_absent_batch(
+                config, require_repository=False, announce=False
+            )
         )
         states = (
             all_states
