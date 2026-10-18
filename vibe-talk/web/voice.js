@@ -153,7 +153,7 @@ const ALL_CHANNELS = "*";
  *   | "channel-view-flat" | "channel-view-main" | "channel-view-threads" | "clear-alias"
  *   | "clear-backlog" | "clear-view" | "close-browse-channels" | "close-help" | "close-reply"
  *   | "close-settings" | "collapse-all" | "column-toggle" | "dismiss-banner"
- *   | "dismiss-error" | "dismiss-status" | "expand-all" | "fold-help" | "forget-conversations"
+ *   | "dismiss-error" | "dismiss-status" | "expand-all" | "fold-help" | "fold-auto-read" | "fold-canned-prompts" | "fold-combining" | "fold-connection" | "fold-control-bar" | "fold-dismissed" | "fold-identities" | "fold-instructions" | "fold-keyboard" | "fold-mark-own" | "fold-message-cache" | "fold-microphone" | "fold-provider" | "fold-reading-full" | "fold-reading-width" | "fold-relay" | "fold-resuming" | "fold-rich-headers" | "fold-sending" | "fold-settings-all" | "fold-settings-channels" | "fold-settings-messages" | "fold-settings-screen" | "fold-settings-storage" | "fold-settings-voice-agent" | "fold-storage" | "fold-text-size" | "fold-token" | "fold-typing" | "forget-conversations"
  *   | "forget-dismissed-sends" | "forget-token"
  *   | "dismissed-send-close" | "dismissed-send-copy" | "dismissed-send-restore"
  *   | "retry-start"
@@ -1253,6 +1253,86 @@ function closeSettings() {
   if (held && !focusLost() && typeof held.blur === "function") held.blur();
   showScreen(screenBeforeSettings);
 }
+
+// --- Settings, folded -----------------------------------------------------------------------------
+//
+// `#346 settings-collapsible`. The owner, 2026-10-18: "every top-level section collapsible, collapsed
+// by default; its H2 subsections collapsed too; find-in-page still finds hidden text". Each fold is a
+// button in a heading (`#fold-<slug>`) over a body (`#fold-<slug>-body`) that is `hidden="until-found"`
+// while folded, so the browser's find still searches it and opens it on a match, firing `beforematch`,
+// which is when the button is told. A section's fold and the groups' folds inside it are separate: a
+// section opens to its groups' headings, each folded, and a match inside a group opens both.
+//
+// FOLDED ON EVERY LOAD, the markup's state and this script's, and as the reader leaves them while the
+// page is open: going to Help and back, or out of Settings and in again, keeps what is open.
+
+/**
+ * Every fold on Settings, by slug: the five sections (`settings-<id>`) and every headed group in them.
+ * Declared in the markup like every id here; the page suite holds this list to it in both directions.
+ */
+const SETTINGS_FOLDS = [
+  "settings-voice-agent",
+  "sending",
+  "instructions",
+  "resuming",
+  "relay",
+  "reading-full",
+  "canned-prompts",
+  "microphone",
+  "provider",
+  "settings-messages",
+  "mark-own",
+  "auto-read",
+  "combining",
+  "rich-headers",
+  "identities",
+  "dismissed",
+  "settings-channels",
+  "settings-screen",
+  "text-size",
+  "reading-width",
+  "control-bar",
+  "typing",
+  "keyboard",
+  "settings-storage",
+  "storage",
+  "message-cache",
+  "token",
+  "connection",
+];
+
+/** Whether the fold `slug` is open. */
+const foldOpen = (slug) => el(`fold-${slug}`).getAttribute("aria-expanded") === "true";
+
+/**
+ * Open or fold `slug`: its body shown, or hidden until found, and its button saying which. The body's
+ * attribute is written rather than its `hidden` property, which a browser that knows `until-found`
+ * reads as the string and one that does not as plain hidden.
+ */
+function setFold(slug, open) {
+  const body = el(`fold-${slug}-body`);
+  if (open) body.removeAttribute("hidden");
+  else body.setAttribute("hidden", "until-found");
+  el(`fold-${slug}`).setAttribute("aria-expanded", open ? "true" : "false");
+  renderSettingsFoldAll();
+}
+
+/** Expand all while any fold is folded, Fold all once none is, as Help's button does (`#246`). */
+function renderSettingsFoldAll() {
+  el("fold-settings-all").textContent = SETTINGS_FOLDS.some((slug) => !foldOpen(slug)) ? "Expand all" : "Fold all";
+}
+
+for (const slug of SETTINGS_FOLDS) {
+  setFold(slug, false);
+  el(`fold-${slug}`).addEventListener("click", () => setFold(slug, !foldOpen(slug)));
+  // The browser's find (or a link to a text fragment) is opening the body: it removes `hidden`
+  // itself, and the button has to say so.
+  el(`fold-${slug}-body`).addEventListener("beforematch", () => setFold(slug, true));
+}
+el("fold-settings-all").addEventListener("click", () => {
+  const open = SETTINGS_FOLDS.some((slug) => !foldOpen(slug));
+  for (const slug of SETTINGS_FOLDS) setFold(slug, open);
+});
 
 /**
  * The settings groups that have an explanation, and the slug that names it.

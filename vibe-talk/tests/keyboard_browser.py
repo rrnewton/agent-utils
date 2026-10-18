@@ -681,6 +681,11 @@ def settings_keys(walk: Walk) -> None:
         check(opened["focus"] == "screen-settings", f"on Settings the focus is on {opened['focus']!r}")
         if chord != ",":
             check(walk.last_key()["prevented"] is True, f"{chord!r} was left to the browser")
+        # `#346 settings-collapsible`: folded, Settings is a few headings and has nothing to page
+        # through, so everything is opened (Expand all, clicked by the script so the focus stays on the
+        # screen) once, and stays open for the second chord.
+        walk.page.evaluate("() => { const all = document.getElementById('fold-settings-all'); "
+                           "if (all.textContent.trim() === 'Expand all') all.click(); }")
         paged = walk.key("PageDown", "screen-settings")
         check(number(paged, "top") > number(opened, "top") + number(opened, "height") * 0.5,
               f"PgDn on Settings did not scroll it: {opened['top']} -> {paged['top']}")
@@ -696,15 +701,21 @@ def settings_keys(walk: Walk) -> None:
 # `#332 settings-voice-agent-section`. The Tab stops from Resuming through Reading full messages in
 # channel view, as the page suite pins them in the markup (`SETTINGS_TAB_STOPS` there). `#347
 # settings-prose` took the ? from beside "Arriving messages during a call", now the group's title, and
-# made How messages are said a link under the reading picker.
-SETTINGS_TAB_STOPS = ["help-link-resuming", "resume-toggle", "help-link-live-messages", "relay-to-agent",
+# made How messages are said a link under the reading picker. `#346 settings-collapsible` made each
+# group's heading the button that folds it, a stop before its ?; the walk opens the three first.
+SETTINGS_TAB_STOPS = ["fold-resuming", "help-link-resuming", "resume-toggle", "fold-relay",
+                      "help-link-live-messages", "relay-to-agent", "fold-reading-full",
                       "settings-audio-source", "help-link-speech-prep"]
+SETTINGS_FOLDS_OPENED = ["fold-settings-voice-agent", "fold-resuming", "fold-relay", "fold-reading-full"]
 
 
 def settings_tab_order(walk: Walk) -> None:
     """Tab walks the three settings that read a message out in reading order, each ? first; Shift+Tab walks back."""
     opened = walk.key(",", "screen-settings")
     check(opened["screen"] == "settings", f'"," did not open Settings: {opened}')
+    for fold in SETTINGS_FOLDS_OPENED:
+        if walk.page.get_attribute(f"#{fold}", "aria-expanded") != "true":
+            walk.page.click(f"#{fold}")
     # A control the page has disabled is no Tab stop, and the server decides whether one is: the
     # walk expects the stops that are live on this page, in the pinned order.
     stops = [stop for stop in SETTINGS_TAB_STOPS
@@ -1424,6 +1435,8 @@ def picker_and_help_keys(walk: Walk) -> None:
     left_help = walk.key(",")
     check(left_help["screen"] == "main", f'"," on Help did not leave it: {left_help}')
     walk.page.click("#open-settings")
+    if walk.page.get_attribute("#fold-settings-screen", "aria-expanded") != "true":
+        walk.page.click("#fold-settings-screen")
     walk.page.click("#help-link-keyboard")
     walk.page.click("#close-help")
     again = walk.settled()

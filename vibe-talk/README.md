@@ -7251,6 +7251,33 @@ and is still one channel's census, so a bot that only speaks somewhere else cann
 `64-channel-settings-all` photographs the box on All channels, Clear unread Mixed across two
 channels, at 393x852, 1280x800 and 1920x1080.
 
+**Every section folds, and so does every group in it** (`#346 settings-collapsible`). The owner,
+2026-10-18: "every top-level section collapsible, collapsed by default; its H2 subsections collapsed
+too; find-in-page still finds hidden text". So Settings opens as the server's address, an **Expand
+all** button, and five section titles, each folded:
+
+- A section's title, and each group's heading inside it, is a button with a chevron (`aria-expanded`,
+  `aria-controls`) over the body it opens. A section opens to its groups' headings, each still
+  folded; a group's `?` stays on its heading's line, and Tab goes heading, `?`, controls.
+- A folded body is `hidden="until-found"`, not `display: none` (the page's `[hidden]` rule leaves that
+  value alone), so the browser's find still searches it, and on a match opens it and the section
+  around it, firing `beforematch`, which the page hears to turn the buttons. Chromium does this; a
+  browser without `until-found` treats the body as hidden, where the button still opens it but find
+  cannot reach it until it is open. Not `<details>`: a summary cannot hold the `?`, nor have one
+  beside it that Tab reaches between the heading and the controls.
+- Everything is folded on every load, and stays as the reader leaves it while the page is open
+  (through Help and back, or out of Settings and in). Expand all opens every fold and then reads
+  Fold all. The Server section does not fold: it is one line, the answer to "which server is
+  this?", which `#342 settings-server-hostname` put first.
+- `SETTINGS_FOLDS` in `web/voice.js` lists every fold, and the page suite holds it to the markup in
+  both directions, with negative controls for a fold out of find's reach, a group that does not
+  fold, and the old `[hidden]` rule.
+
+`68-settings-folded` photographs Settings folded, and `69-settings-find-opens` checks in Chromium
+that a search for words in a folded group (a link to a text fragment, the same search as the find
+bar, which automation cannot drive) opens that group and its section and nothing else, at 393x852,
+1280x800 and 1920x1080.
+
 **Two readouts are drawn as data** (`#348 settings-dynamic-lists`). The owner, 2026-10-18:
 *Recently dismissed* should be "a fixed-height, user-resizable, scrollable list styled as data (not a
 control), with shorter previews", a row opening "a pop-out with the full text and a copy button", and

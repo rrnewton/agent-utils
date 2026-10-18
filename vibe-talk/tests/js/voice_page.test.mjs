@@ -501,9 +501,11 @@ const literal = (text) => String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
  * A Settings heading of `level` — 2 for a section, 3 for a group inside one — as a regex source,
  * its words captured, or only the heading whose words are the source `text`. `#347 settings-prose`
  * gave a heading a `title`, its one-line description as a tooltip, so the tag is matched with
- * whatever attributes it carries.
+ * whatever attributes it carries; `#346 settings-collapsible` put its words in the button that folds
+ * it, which is matched around them.
  */
-const settingsHeading = (level, text = "([^<]+)") => `<h${level}\\b[^>]*>${text}</h${level}>`;
+const settingsHeading = (level, text = "([^<]+)") =>
+  `<h${level}\\b[^>]*>(?:<button class="fold-toggle"[^>]*>)?${text}(?:</button>)?</h${level}>`;
 
 /** The words of every Settings heading of `level` in `html`, in order. */
 const settingsHeadings = (html, level) => [...html.matchAll(new RegExp(settingsHeading(level), "g"))].map((m) => m[1]);
@@ -537,7 +539,7 @@ function settingsGroup(heading, html = HTML) {
  * so the closing tag is found by counting rather than by the first one met.
  */
 function settingsSection(title, html = HTML) {
-  const head = new RegExp(`<h2 id="(settings-[a-z-]+)-title"[^>]*>${literal(title)}</h2>`).exec(html);
+  const head = new RegExp(`<h2 id="(settings-[a-z-]+)-title"[^>]*>(?:<button class="fold-toggle"[^>]*>)?${literal(title)}(?:</button>)?</h2>`).exec(html);
   assert.ok(head, `web/voice.html has no settings section titled "${title}"`);
   const opens = html.indexOf(`<section class="settings-section" id="${head[1]}"`);
   assert.ok(opens > 0 && opens < head.index, `"${title}" does not head a settings section`);
@@ -17418,7 +17420,7 @@ test("`#332 settings-voice-agent-section`: the ? check finds a ? nothing wires (
   assert.deepStrictEqual(helpLinkProblems(back, SCRIPT_CODE),
     ['#help-link-speech-prep-relay opens "speech-prep" and nothing in web/voice.js wires it']);
   // ...and an entry taken out of the script's list, which leaves its own ? unwired.
-  const unlisted = SCRIPT_CODE.replace('  "combining",\n', "");
+  const unlisted = SCRIPT_CODE.replace(/(const HELP_TOPICS = \[[^\]]*?)  "combining",\n/, "$1");
   assert.notEqual(unlisted, SCRIPT_CODE, "the negative control changed nothing");
   assert.deepStrictEqual(helpLinkProblems(HTML, unlisted), ['#help-link-combining opens "combining" and nothing in web/voice.js wires it']);
 });
@@ -57518,7 +57520,7 @@ test("`#271 settings-groups`: the Messages section holds the message options, an
     ["Stored conversations", "Saved messages on this server", "Token", "Connection status"]);
   // The per-channel box is its own section, with its `?` beside the section's title.
   const channels = settingsSection("Channels");
-  assert.match(channels, /<h2 id="settings-channels-title"[^>]*>Channels<\/h2>\s*<button class="help-link" id="help-link-channel-alias"/);
+  assert.match(channels, /<h2 id="settings-channels-title"[^>]*>(?:<button class="fold-toggle"[^>]*>)?Channels(?:<\/button>)?<\/h2>\s*<button class="help-link" id="help-link-channel-alias"/);
   assert.match(channels, /<section class="settings-group" id="channel-settings"/);
 });
 
@@ -57526,7 +57528,8 @@ test("`#271 settings-groups`: the section is the card, and a group inside it is 
   const section = cssBlock(".settings-section");
   assert.match(section, /border:\s*1px solid var\(--edge\)/, "a section is not drawn as a card");
   assert.match(section, /background:\s*var\(--panel\)/);
-  const row = cssBlock(".settings-section > .settings-group");
+  // `#346 settings-collapsible`: the groups are in the section's fold body.
+  const row = cssBlock(".settings-section > .fold-body > .settings-group");
   assert.match(row, /border:\s*none/, "a group inside a section still draws a card of its own");
   assert.match(row, /border-top:\s*1px solid var\(--edge\)/, "nothing says where one group ends and the next begins");
   assert.match(row, /background:\s*none/);
@@ -57607,7 +57610,7 @@ test("`#332 settings-voice-agent-section`: the check refuses the Settings from b
   const before = HTML
     .replace(reading, "")
     .replace('<p id="speech-prep-state" class="hint"></p>', "")
-    .replace(/(<h2 id="settings-messages-title"[^>]*>Messages<\/h2>)/,
+    .replace(/(<h2 id="settings-messages-title"[^>]*>(?:<button class="fold-toggle"[^>]*>)?Messages(?:<\/button>)?<\/h2>)/,
       `$1${prose}${reading.replace(READING_GROUPS[2], "Message audio").replace(/<p class="help-text-row">[\s\S]*?<\/p>/, "")}`);
   assert.notEqual(before, HTML, "the negative control changed nothing");
   assert.deepStrictEqual(voiceAgentSectionProblems(before), [
@@ -57620,7 +57623,7 @@ test("`#332 settings-voice-agent-section`: the check refuses the Settings from b
     "How messages are said in Help does not say which arm this server is in",
   ]);
   // Each change alone is caught by name: the old name, kept in place.
-  const renamed = HTML.replace(new RegExp(`(<h3\\b[^>]*>)${READING_GROUPS[2]}</h3>`), "$1Message audio</h3>");
+  const renamed = HTML.replace(new RegExp(`(<h3\\b[^>]*>(?:<button class="fold-toggle"[^>]*>)?)${READING_GROUPS[2]}<`), "$1Message audio<");
   assert.deepStrictEqual(voiceAgentSectionProblems(renamed), [
     `Voice agent does not hold ${READING_GROUPS.join(", ")} together: Sending, Instructions, Resuming, Arriving messages during a call, Message audio, Canned prompts, Microphone, Provider`,
     'Settings still says "Message audio"',
@@ -57640,9 +57643,12 @@ test("`#332 settings-voice-agent-section`: the check refuses the Settings from b
     ["Reading full messages in channel view has no link to How messages are pre-processed for speech"]);
 });
 
-/** The Tab stops from Resuming through Reading full messages in channel view, in order. */
-const SETTINGS_TAB_STOPS = ["help-link-resuming", "resume-toggle", "help-link-live-messages", "relay-to-agent",
-  "settings-audio-source", "help-link-speech-prep"];
+/**
+ * The Tab stops from Resuming through Reading full messages in channel view, in order. `#346
+ * settings-collapsible` made each group's heading the button that folds it, a stop before its `?`.
+ */
+const SETTINGS_TAB_STOPS = ["fold-resuming", "help-link-resuming", "resume-toggle", "fold-relay", "help-link-live-messages",
+  "relay-to-agent", "fold-reading-full", "settings-audio-source", "help-link-speech-prep"];
 
 /**
  * Where the markup breaks `stops` as consecutive Tab stops on Settings, as sentences. The focus order
@@ -57677,7 +57683,7 @@ test("`#332 settings-voice-agent-section`: Tab goes through the three in the ord
   const above = HTML.replace(link, "").replace('<label for="settings-audio-source">', `${link}<label for="settings-audio-source">`);
   assert.notEqual(above, HTML, "the negative control changed nothing");
   assert.deepStrictEqual(tabStopProblems(above, SETTINGS_TAB_STOPS).map((problem) => problem.replace(/^(<[a-z]+ [^ ]+ [^ ]+ id="[^"]+")[^>]*>/, "$1>")), [
-    '<button class="help-link help-link-text" id="help-link-speech-prep"> stands between #relay-to-agent and #settings-audio-source',
+    '<button class="help-link help-link-text" id="help-link-speech-prep"> stands between #fold-reading-full and #settings-audio-source',
     "#help-link-speech-prep comes before #settings-audio-source",
   ]);
   // ...and Canned prompts put back between Arriving messages and the reading picker.
@@ -57686,7 +57692,7 @@ test("`#332 settings-voice-agent-section`: Tab goes through the three in the ord
     `${canned}<section class="settings-group" id="reading-full-group">`);
   const found = tabStopProblems(between, SETTINGS_TAB_STOPS);
   assert.equal(found.length, 1, found.join("; "));
-  assert.match(found[0], /^<button class="help-link" id="help-link-canned-prompts"[^>]*> stands between #relay-to-agent and #settings-audio-source$/);
+  assert.match(found[0], /^<button class="fold-toggle" id="fold-canned-prompts"[^>]*> stands between #relay-to-agent and #fold-reading-full$/);
 });
 
 /** The longest a state line under one of the three may be: two lines on a phone, one at a desk. */
@@ -57929,7 +57935,7 @@ function settingsProseProblems(html) {
     if (!named || !new RegExp(`<select id="relay-to-agent" aria-labelledby="${named}"`).test(relay)) {
       problems.push("the drop-down is not named by the title above it");
     }
-    if ([...relay.matchAll(/<button\b/g)].length !== 1 || !/data-help="live-messages"/.test(relay)) {
+    if ([...relay.matchAll(/<button\b(?! class="fold-toggle")/g)].length !== 1 || !/data-help="live-messages"/.test(relay)) {
       problems.push("Arriving messages during a call has some other button than its own ?");
     }
   }
@@ -57941,7 +57947,7 @@ function settingsProseProblems(html) {
     problems.push('Help does not call the list "Mark-read automatically"');
   }
   // Every ? says what its heading says, and the heading says it too.
-  for (const head of settings.matchAll(/<(h[23])\b([^>]*)>([^<]+)<\/\1>\s*<button class="help-link" id="([a-z-]+)"[^>]*>\?<\/button>/g)) {
+  for (const head of settings.matchAll(/<(h[23])\b([^>]*)>(?:<button class="fold-toggle"[^>]*>)?([^<]+)(?:<\/button>)?<\/\1>\s*<button class="help-link" id="([a-z-]+)"[^>]*>\?<\/button>/g)) {
     const [, , attributes, words, link] = head;
     const button = new RegExp(`<button class="help-link" id="${link}"[^>]*>`).exec(head[0])[0];
     const said = titleOf(attributes);
@@ -57954,7 +57960,7 @@ function settingsProseProblems(html) {
   for (const [heading, line] of [...MOVED_DESCRIPTIONS, ...MOVED_SECTION_DESCRIPTIONS]) {
     if (settings.includes(`<p class="hint">${line}</p>`)) problems.push(`"${line}" is still a line under ${heading}`);
     const level = MOVED_SECTION_DESCRIPTIONS.has(heading) ? 2 : 3;
-    const tag = new RegExp(`<h${level}\\b[^>]*>${literal(heading)}</h${level}>`).exec(settings);
+    const tag = new RegExp(settingsHeading(level, literal(heading))).exec(settings);
     if (!tag || titleOf(tag[0]) !== line) problems.push(`${heading}'s tooltip is not "${line}"`);
   }
   // How messages are said is a short link into Help; Car audio is gone, and what it meant is said.
@@ -57962,7 +57968,7 @@ function settingsProseProblems(html) {
     problems.push('there is no link "How messages are pre-processed for speech"');
   }
   if (/Car audio/.test(settings)) problems.push('"Car audio: use Agent audio." is still on Settings');
-  const reading = new RegExp(`<h3\\b[^>]*>Reading full messages in channel view</h3>`).exec(settings);
+  const reading = new RegExp(settingsHeading(3, "Reading full messages in channel view")).exec(settings);
   if (!reading || !/a car's speakers/.test(titleOf(reading[0]) || "")) {
     problems.push("nothing says which voice a car's speakers carry");
   }
@@ -57986,7 +57992,7 @@ test("`#347 settings-prose`: the check refuses each old thing put back, one at a
     ]],
     // The #332 group: Live messages, its label with a ? after it, and the line under the picker.
     ["the old group", HTML.replace(relay, relay
-      .replace(/(<h3\b[^>]*>)Arriving messages during a call<\/h3>/, "$1Live messages</h3>")
+      .replace(/(<h3\b[^>]*>(?:<button class="fold-toggle"[^>]*>)?)Arriving messages during a call</, "$1Live messages<")
       .replace('<select id="relay-to-agent" aria-labelledby="relay-to-agent-title">',
         '<div class="label-help"><label for="relay-to-agent">Arriving messages during a call</label>' +
         '<button class="help-link" id="help-link-speech-prep-relay" type="button" data-help="speech-prep">?</button></div>' +
@@ -57994,7 +58000,7 @@ test("`#347 settings-prose`: the check refuses each old thing put back, one at a
       'no group is titled "Arriving messages during a call"',
       `Arriving messages during a call's tooltip is not "${MOVED_DESCRIPTIONS.get("Arriving messages during a call")}"`,
     ]],
-    ["the old name", HTML.replace(/(<h3\b[^>]*>)Mark-read automatically<\/h3>/, "$1Read automatically</h3>"), [
+    ["the old name", HTML.replace(/(<h3\b[^>]*>(?:<button class="fold-toggle"[^>]*>)?)Mark-read automatically</, "$1Read automatically<"), [
       'the list is still called "Read automatically" on Settings',
     ]],
     ["a line back under its heading", HTML.replace(/(Show messages sent seconds apart as one\s*<\/label>)/,
@@ -58365,6 +58371,176 @@ test("`#348 settings-dynamic-lists`: Connection status puts each part of the det
   assert.equal(page.el("connection-detail").textContent, lines.join(" · "), "the banner and the readout say different things");
   assert.match(cssRules(CSS_CODE, ".connection-panel > .data-line").join("\n"), /white-space:\s*pre-line/,
     "the stylesheet draws the lines as one");
+});
+
+// --- `#346 settings-collapsible` ------------------------------------------------------------------
+//
+// The owner, 2026-10-18 ("settings complaints"): "every top-level section collapsible, collapsed by
+// default; its H2 subsections collapsed too; find-in-page still finds hidden text (use
+// <details>/hidden=until-found)".
+
+/** The folds web/voice.js declares, from its source. */
+const scriptFolds = (script) => [.../const SETTINGS_FOLDS = \[([\s\S]*?)\]/.exec(script)[1].matchAll(/"([a-z-]+)"/g)].map((m) => m[1]);
+
+/**
+ * What is wrong with Settings' folds against `#346`, as sentences; empty when nothing is. A function of
+ * the markup, the stylesheet and the script, so each negative control can hand it one of them broken.
+ */
+function foldProblems(html, css, script) {
+  const problems = [];
+  const code = html.replace(/<!--[\s\S]*?-->/g, " ");
+  const settings = code.slice(code.indexOf('id="screen-settings"'), code.indexOf('id="screen-help"'));
+  const folds = [];
+  // Every section but Server: its title is the button, and everything after the heading is the body.
+  for (const [, id] of settings.matchAll(/<section class="settings-section" id="settings-([a-z-]+)"/g)) {
+    const section = settingsSection(SETTINGS_SECTIONS[[...settings.matchAll(/<section class="settings-section" id="settings-([a-z-]+)"/g)].findIndex((m) => m[1] === id)], code);
+    if (id === "server") {
+      if (/fold-toggle|fold-body/.test(section)) problems.push("the Server section folds, hiding which server this is");
+      continue;
+    }
+    const slug = `settings-${id}`;
+    folds.push(slug);
+    const toggle = new RegExp(`<h2 id="settings-${id}-title"[^>]*><button class="fold-toggle" id="fold-${slug}" type="button" aria-expanded="false" aria-controls="fold-${slug}-body">[^<]+</button></h2>`);
+    if (!toggle.test(section)) problems.push(`${slug}'s title is not the button that folds it`);
+    const body = new RegExp(`</h2>(?:\\s*<button class="help-link"[^>]*>\\?</button>\\s*</div>)?\\s*<div class="fold-body" id="fold-${slug}-body" hidden="until-found">`);
+    if (!body.test(section)) problems.push(`${slug}'s body is not right under its title, hidden until found`);
+  }
+  // Every headed group: its heading is the button, its body under the heading's row.
+  for (const group of settings.matchAll(/<section class="settings-group"[^>]*>\s*<div class="group-head">\s*<h3\b[^>]*>([\s\S]*?)<\/h3>([\s\S]*?)<\/div>\s*([\s\S]{0,140})/g)) {
+    const button = /^<button class="fold-toggle" id="fold-([a-z-]+)" type="button" aria-expanded="false" aria-controls="fold-\1-body">[^<]+<\/button>$/.exec(group[1]);
+    if (!button) {
+      problems.push(`the group "${group[1].replace(/<[^>]+>/g, "")}" does not fold`);
+      continue;
+    }
+    folds.push(button[1]);
+    if (!new RegExp(`^<div class="fold-body" id="fold-${button[1]}-body" hidden="until-found">`).test(group[3])) {
+      problems.push(`${button[1]}'s body is not under its heading, hidden until found`);
+    }
+  }
+  // Folded is "until found", never plain hidden, or the browser's find cannot reach the words.
+  if (/<div class="fold-body"[^>]*\shidden(?!="until-found")/.test(settings)) problems.push("a fold is plainly hidden, out of find's reach");
+  if (/<details\b/.test(settings.replace(/<details id="voice-system-prompt-fold"/, ""))) problems.push("a fold is a <details>");
+  const hiddenRule = cssRules(css, "[hidden]").join("\n");
+  if (/display:\s*none/.test(hiddenRule)) problems.push("[hidden] takes hidden-until-found out of find as well");
+  if (!/display:\s*none\s*!important/.test(cssRules(css, '[hidden]:not([hidden="until-found"])').join("\n"))) {
+    problems.push("nothing hides an ordinary [hidden] any more");
+  }
+  if (cssRules(css, ".fold-body").some((rule) => /display:\s*none|visibility:\s*hidden/.test(rule))) {
+    problems.push("the stylesheet hides a fold's body itself");
+  }
+  // The script's list is the markup's, both ways.
+  const listed = scriptFolds(script);
+  const missing = folds.filter((slug) => !listed.includes(slug));
+  const extra = listed.filter((slug) => !folds.includes(slug));
+  if (missing.length) problems.push(`SETTINGS_FOLDS does not list ${missing.join(", ")}`);
+  if (extra.length) problems.push(`SETTINGS_FOLDS lists ${extra.join(", ")}, which the markup does not have`);
+  return problems;
+}
+
+test("`#346 settings-collapsible`: every section but Server and every group in them folds, hidden until found", () => {
+  assert.deepStrictEqual(foldProblems(HTML, CSS_CODE, SCRIPT_CODE), []);
+  assert.equal(scriptFolds(SCRIPT_CODE).length, 28, "a fold went missing from the list, or one was added unchecked");
+});
+
+test("`#346 settings-collapsible`: the check refuses a fold out of find's reach, an unfolding group, and a list that disagrees (negative controls)", () => {
+  const plain = HTML.replace('<div class="fold-body" id="fold-microphone-body" hidden="until-found">', '<div class="fold-body" id="fold-microphone-body" hidden>');
+  assert.deepStrictEqual(foldProblems(plain, CSS_CODE, SCRIPT_CODE), [
+    "microphone's body is not under its heading, hidden until found",
+    "a fold is plainly hidden, out of find's reach",
+  ]);
+  const oldCss = CSS_CODE.replace('[hidden]:not([hidden="until-found"]) {', "[hidden] {");
+  assert.notEqual(oldCss, CSS_CODE, "the negative control changed nothing");
+  assert.deepStrictEqual(foldProblems(HTML, oldCss, SCRIPT_CODE), [
+    "[hidden] takes hidden-until-found out of find as well",
+    "nothing hides an ordinary [hidden] any more",
+  ]);
+  const flat = HTML.replace(/<button class="fold-toggle" id="fold-typing"[^>]*>Typing<\/button>/, "Typing");
+  assert.deepStrictEqual(foldProblems(flat, CSS_CODE, SCRIPT_CODE), ['the group "Typing" does not fold', "SETTINGS_FOLDS lists typing, which the markup does not have"]);
+  const unlisted = SCRIPT_CODE.replace(/(const SETTINGS_FOLDS = \[[^\]]*?)  "token",\n/, "$1");
+  assert.notEqual(unlisted, SCRIPT_CODE, "the negative control changed nothing");
+  assert.deepStrictEqual(foldProblems(HTML, CSS_CODE, unlisted), ["SETTINGS_FOLDS does not list token"]);
+  const server = HTML.replace('<h2 id="settings-server-title">Server</h2>',
+    '<h2 id="settings-server-title"><button class="fold-toggle" id="fold-settings-server" type="button">Server</button></h2>');
+  assert.deepStrictEqual(foldProblems(server, CSS_CODE, SCRIPT_CODE), ["the Server section folds, hiding which server this is"]);
+});
+
+/** Whether the fold `slug` is open on `page`, by its button and its body, which must agree. */
+function settingsFoldState(page, slug) {
+  const said = page.el(`fold-${slug}`).getAttribute("aria-expanded");
+  const hidden = page.el(`fold-${slug}-body`).getAttribute("hidden");
+  assert.ok((said === "true" && hidden === null) || (said === "false" && hidden === "until-found"),
+    `fold-${slug} says ${said} over a body hidden as ${hidden}`);
+  return said === "true";
+}
+
+test("`#346 settings-collapsible`: everything is folded as the page loads; a title opens its section, a heading its group, and again folds it", async () => {
+  const page = newPage();
+  await signIn(page);
+  await page.el("open-settings").click();
+  for (const slug of scriptFolds(SCRIPT_CODE)) assert.equal(settingsFoldState(page, slug), false, `${slug} is open as the page loads`);
+  await page.el("fold-settings-voice-agent").click();
+  assert.equal(settingsFoldState(page, "settings-voice-agent"), true);
+  // The section opens to its groups' headings, each still folded.
+  assert.equal(settingsFoldState(page, "resuming"), false, "opening the section opened its groups too");
+  await page.el("fold-resuming").click();
+  assert.equal(settingsFoldState(page, "resuming"), true);
+  assert.equal(settingsFoldState(page, "relay"), false);
+  await page.el("fold-resuming").click();
+  assert.equal(settingsFoldState(page, "resuming"), false, "the heading did not fold its group again");
+  // What is open stays open while the page is: through Help and back, and out of Settings and in.
+  await page.el("fold-microphone").click();
+  await page.el("help-link-microphone").click();
+  await page.el("close-help").click();
+  await page.el("close-settings").click();
+  await page.el("open-settings").click();
+  assert.equal(settingsFoldState(page, "microphone"), true, "the group folded itself behind the reader's back");
+  assert.equal(settingsFoldState(page, "settings-voice-agent"), true);
+  // A reload folds everything again: folded by default.
+  const again = reloadWith(new Map(page.storage), []);
+  await signIn(again);
+  assert.equal(settingsFoldState(again, "microphone"), false, "a fold was remembered across a reload");
+});
+
+test("`#346 settings-collapsible`: the browser's find opening a fold is heard, and its button says it is open", async () => {
+  // A match in a folded group: the browser opens the group's body and the section's around it, firing
+  // `beforematch` on each, outermost last (measured in Chromium 149), and removes their `hidden` itself.
+  const page = newPage();
+  await signIn(page);
+  await page.el("open-settings").click();
+  for (const slug of ["microphone", "settings-voice-agent"]) {
+    page.el(`fold-${slug}-body`).removeAttribute("hidden");
+    await page.el(`fold-${slug}-body`).dispatch("beforematch");
+  }
+  assert.equal(settingsFoldState(page, "microphone"), true, "the group's button still says it is folded");
+  assert.equal(settingsFoldState(page, "settings-voice-agent"), true);
+  // The negative control: a page that does not listen leaves the buttons saying folded over open bodies,
+  // which `foldState` refuses.
+  const deaf = newPage(new Map(), brokenScript(
+    '  el(`fold-${slug}-body`).addEventListener("beforematch", () => setFold(slug, true));\n', ""));
+  await signIn(deaf);
+  await deaf.el("open-settings").click();
+  deaf.el("fold-microphone-body").removeAttribute("hidden");
+  await deaf.el("fold-microphone-body").dispatch("beforematch");
+  assert.throws(() => settingsFoldState(deaf, "microphone"), /says false over a body hidden as null/);
+});
+
+test("`#346 settings-collapsible`: Expand all opens every fold and then reads Fold all, which folds them all", async () => {
+  const page = newPage();
+  await signIn(page);
+  await page.el("open-settings").click();
+  const all = page.el("fold-settings-all");
+  assert.equal(all.textContent, "Expand all");
+  await page.el("fold-settings-messages").click();
+  assert.equal(all.textContent, "Expand all", "one fold open, and the button offers to fold");
+  await all.click();
+  for (const slug of scriptFolds(SCRIPT_CODE)) assert.equal(settingsFoldState(page, slug), true, `Expand all left ${slug} folded`);
+  assert.equal(all.textContent, "Fold all");
+  await page.el("fold-typing").click();
+  assert.equal(all.textContent, "Expand all", "with a fold folded the button still offers to fold");
+  await all.click();
+  await all.click();
+  for (const slug of scriptFolds(SCRIPT_CODE)) assert.equal(settingsFoldState(page, slug), false, `Fold all left ${slug} open`);
+  assert.equal(all.textContent, "Expand all");
 });
 
 // --- `#272 voice-agent-instructions` --------------------------------------------------------------

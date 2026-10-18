@@ -300,8 +300,12 @@ body {
   grid-column: 1;
 }
 
-/* `hidden` has to beat the layout modes below, all of which set `display`. */
-[hidden] {
+/* `hidden` has to beat the layout modes below, all of which set `display`.
+
+   `#346 settings-collapsible`. EXCEPT `hidden="until-found"`, a folded part of Settings: the browser
+   draws it as `content-visibility: hidden`, which keeps its words searchable, and `display: none`
+   here would take them out of find-in-page, which is the whole point of the attribute. */
+[hidden]:not([hidden="until-found"]) {
   display: none !important;
 }
 
@@ -683,7 +687,7 @@ a.search-hit-link {
   border-radius: 0.8rem;
 }
 
-.settings-section > .settings-group {
+.settings-section > .fold-body > .settings-group {
   margin: 0;
   padding: 0.55rem 0 0.7rem;
   background: none;
@@ -773,6 +777,72 @@ a.search-hit-link {
   align-items: center;
   justify-content: space-between;
   gap: 0.5rem;
+}
+
+/* `#346 settings-collapsible`. A heading that folds: the heading's words are a button as wide as the
+   row up to its `?`, a tap target, with a chevron in front that points right while it is folded and
+   down while it is open. It keeps the heading's own size and weight, so a section's title still reads
+   a size above a group's. */
+.group-head > :is(h2, h3) {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.fold-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 2.6rem;
+  margin: 0;
+  padding: 0.15rem 0;
+  background: none;
+  border: none;
+  border-radius: 0.3rem;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.fold-toggle::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 0.42rem;
+  height: 0.42rem;
+  margin-left: 0.1rem;
+  border-right: 2px solid var(--muted);
+  border-bottom: 2px solid var(--muted);
+  transform: rotate(-45deg);
+  transition: transform 0.12s ease-out;
+}
+
+.fold-toggle[aria-expanded="true"]::before {
+  transform: rotate(45deg);
+}
+
+.fold-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fold-toggle::before { transition: none; }
+}
+
+/* A fold's body draws no box of its own: folded, `content-visibility: hidden` leaves a box of nothing,
+   and open, its groups are the section's rows as they always were. */
+.fold-body {
+  margin: 0;
+  padding: 0;
+}
+
+/* Expand all, at the head of the sections it opens and folds. */
+.settings-fold-all {
+  margin: 0 0 0.75rem;
 }
 
 /* `#347 settings-prose`. A heading whose one-line description is its tooltip says so to a mouse. */

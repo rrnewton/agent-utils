@@ -924,6 +924,28 @@
               <p id="settings-server-host" class="settings-server-host"></p>
             </section>
             <!--
+              `#346 settings-collapsible`. The owner, 2026-10-18: "every top-level section collapsible,
+              collapsed by default; its H2 subsections collapsed too; find-in-page still finds hidden
+              text (use <details>/hidden=until-found)".
+
+              So each section's title, and each group's heading inside it, is a BUTTON (`.fold-toggle`,
+              `aria-expanded`, `aria-controls`) over the body it opens, and the body is
+              `hidden="until-found"`: folded, and still searched by the browser's find, which opens it
+              (and the section around it) on a match and fires `beforematch`, which the script hears
+              to say so on the button. Not <details>: a group's `?` stands on its heading's line, and
+              a <summary> cannot hold a button, nor have one beside it that Tab reaches between the
+              heading and the controls. A browser without `until-found` treats the body as plainly
+              hidden: the button still opens it, and find cannot reach it until it is open.
+
+              Every fold starts folded, on every load (`SETTINGS_FOLDS` in web/voice.js), and stays as
+              the reader leaves it while the page is open. The Server section does not fold: it is one
+              line, the answer to "which server is this?", which `#342 settings-server-hostname` put
+              first and loud. Expand all opens every fold, and then folds them all.
+            -->
+            <p class="settings-fold-all">
+              <button id="fold-settings-all" class="secondary" type="button">Expand all</button>
+            </p>
+            <!--
               `#271 settings-groups`. A HANDFUL OF SECTIONS, each one card.
 
               The owner, 2026-10-13: "organize the settings page a little more logically so it
@@ -957,885 +979,934 @@
               the one warning that is the whole decision (Clear unread's).
             -->
             <section class="settings-section" id="settings-voice-agent" aria-labelledby="settings-voice-agent-title">
-              <h2 id="settings-voice-agent-title" title="What the agent may send and is told, what it hears, and how messages are read out.">Voice agent</h2>
-
-              <section class="settings-group">
-                <div class="group-head">
-                  <h3 title="Whether the voice agent reads a message back and waits for your yes before it sends.">Sending</h3>
-                  <button class="help-link" id="help-link-voice-send" type="button" data-help="voice-send" aria-label="About asking before the voice agent sends" title="Whether the voice agent reads a message back and waits for your yes before it sends.">?</button>
-                </div>
-                <!--
-                  `#271 settings-groups`. FIRST in the Voice agent section, under a heading that says
-                  what it is about. It used to be a card called "Voice" near the foot of the screen,
-                  and the owner, looking for the way to let the agent send without approval, did not
-                  find it there.
-
-                  `#264 voice-send-approval`. The SERVER's setting, not this browser's: it decides
-                  what the agent's post_reply does and which prompt the server hands the agent, for
-                  every device and every voice provider. So it is drawn from client-config and redrawn
-                  from what the PUT answers, as the noise rules are, never from the click alone.
-
-                  ON by default. Each state has one honest line in `#voice-ask-before-send-state`,
-                  written by `renderVoiceSendSetting` in web/voice.js: what the agent does, and — for
-                  off — what that exposes. Hidden as a whole, editor and all, when the server does not
-                  report the setting, which is an older server that always asks.
-
-                  `#voice-send-untick` is the way to send without asking, said where the owner looked
-                  for it; hidden once the box is unticked, when it would describe the other state.
-
-                  `#voice-send-hosted` is the warning that the switch does not reach everything. The
-                  server obeys it at once, but a hosted agent's own send rules are in its prompt,
-                  and its tool approval for post_reply is in its provider's console. The prompt
-                  follows the switch only when the provider lets this page replace it
-                  (`#272 voice-agent-instructions`); the approval never does. Shown unless a bridge
-                  fetches the prompt as each call opens, and worded by `renderVoiceSendHosted` from
-                  what the last call's agent was given. Served with the wording for not knowing.
-                -->
-                <div id="voice-send-editor" hidden>
-                  <label class="toggle">
-                    <input id="voice-ask-before-send" type="checkbox" checked />
-                    Ask me before the voice agent sends
-                  </label>
-                  <p id="voice-send-untick" class="hint">Untick it to let the agent send as soon as you ask, with no read-back.</p>
-                  <p id="voice-send-hosted" class="hint" hidden>The server changes at once. The agent's own instructions follow at its next call only if its provider lets this page replace its prompt; if not, paste the new prompt into the provider's console by hand. Change post_reply's approval there to match, either way.</p>
-                </div>
-                <p id="voice-ask-before-send-state" class="hint" aria-live="polite"></p>
-                <!--
-                  `#303 voice-post-prefix`. The tag the SERVER puts before every message the voice
-                  agent posts — "(Voice-agent relayed, from user) " until the owner saves his own —
-                  so a reader can tell a relayed message from one he typed. Kept in the server's
-                  store beside his instructions for the agent, shared by every device and every
-                  call, so it is drawn from client-config and redrawn from what the PUT or DELETE
-                  answered, never from the box alone.
-
-                  Save sends the box as typed; an empty box is saved as empty, which turns the tag
-                  off and is not the same as never having saved one. Reset to default forgets his
-                  own and puts the default back. The line under the buttons, written by
-                  `renderVoicePostPrefix` in web/voice.js, says which is in force. Hidden as a whole
-                  when the server does not report it, which is an older server that tags nothing.
-                -->
-                <div id="voice-post-prefix-editor" hidden>
-                  <label for="voice-post-prefix">Prefix on messages the agent posts</label>
-                  <input
-                    id="voice-post-prefix"
-                    type="text"
-                    autocomplete="off"
-                    spellcheck="false"
-                    aria-describedby="voice-post-prefix-help voice-post-prefix-state"
-                  />
-                  <p id="voice-post-prefix-help" class="hint">Put in front of every message the voice agent posts, and in its read-back, but never on what you type. Empty turns it off.</p>
-                  <div class="channel-actions">
-                    <button id="save-voice-post-prefix" class="secondary" type="button" disabled>Save</button>
-                    <button id="reset-voice-post-prefix" class="secondary" type="button">Reset to default</button>
+              <h2 id="settings-voice-agent-title" title="What the agent may send and is told, what it hears, and how messages are read out."><button class="fold-toggle" id="fold-settings-voice-agent" type="button" aria-expanded="false" aria-controls="fold-settings-voice-agent-body">Voice agent</button></h2>
+              <div class="fold-body" id="fold-settings-voice-agent-body" hidden="until-found">
+                <section class="settings-group">
+                  <div class="group-head">
+                    <h3 title="Whether the voice agent reads a message back and waits for your yes before it sends."><button class="fold-toggle" id="fold-sending" type="button" aria-expanded="false" aria-controls="fold-sending-body">Sending</button></h3>
+                    <button class="help-link" id="help-link-voice-send" type="button" data-help="voice-send" aria-label="About asking before the voice agent sends" title="Whether the voice agent reads a message back and waits for your yes before it sends.">?</button>
                   </div>
-                  <p id="voice-post-prefix-state" class="hint" aria-live="polite"></p>
-                </div>
-              </section>
+                  <div class="fold-body" id="fold-sending-body" hidden="until-found">
+                    <!--
+                      `#271 settings-groups`. FIRST in the Voice agent section, under a heading that says
+                      what it is about. It used to be a card called "Voice" near the foot of the screen,
+                      and the owner, looking for the way to let the agent send without approval, did not
+                      find it there.
 
-              <!--
-                `#272 voice-agent-instructions`. The owner's own words for the agent: "a section for
-                additional instructions that the user can fill in" and "a collapse section to
-                actually edit the system prompt". The SERVER's, like the switch above — kept in its
-                store, shared by every device, and put into the prompt when a call opens — so both
-                boxes are drawn from client-config and redrawn from what the PUT stored.
+                      `#264 voice-send-approval`. The SERVER's setting, not this browser's: it decides
+                      what the agent's post_reply does and which prompt the server hands the agent, for
+                      every device and every voice provider. So it is drawn from client-config and redrawn
+                      from what the PUT answers, as the noise rules are, never from the click alone.
 
-                Each box has its own Save, because each is a write to the server that a half-typed
-                text must not make. The system prompt is FOLDED: it is long, it is changed rarely,
-                and the instructions box is what the owner reaches for. What the agent may do —
-                read, send, or ask first — is not in either box; the server adds it after them from
-                the token and the switch above, which the line inside the fold says.
+                      ON by default. Each state has one honest line in `#voice-ask-before-send-state`,
+                      written by `renderVoiceSendSetting` in web/voice.js: what the agent does, and — for
+                      off — what that exposes. Hidden as a whole, editor and all, when the server does not
+                      report the setting, which is an older server that always asks.
 
-                `#voice-prompt-state` says how the words reach this deployment's agent and, after a
-                call, what that call was actually given. Written by `renderVoicePrompt` in
-                web/voice.js. Hidden as a whole, editor and all, when the server does not report
-                the setting, which is an older server.
-              -->
-              <section class="settings-group" id="voice-instructions-group">
-                <div class="group-head">
-                  <h3 title="Your own words for the voice agent, and its system prompt, kept on this server for every call.">Instructions</h3>
-                  <button class="help-link" id="help-link-voice-instructions" type="button" data-help="voice-instructions" aria-label="About the voice agent's instructions" title="Your own words for the voice agent, and its system prompt, kept on this server for every call.">?</button>
-                </div>
-                <div id="voice-prompt-editor" hidden>
-                  <label for="voice-instructions">Additional instructions</label>
-                  <textarea
-                    id="voice-instructions"
-                    rows="4"
-                    placeholder="For example: call me Sam, and keep answers short."
-                    aria-describedby="voice-instructions-state"
-                  ></textarea>
-                  <div class="channel-actions">
-                    <button id="save-voice-instructions" class="secondary" type="button" disabled>Save</button>
-                  </div>
-                  <p id="voice-instructions-state" class="hint" aria-live="polite"></p>
-                  <details id="voice-system-prompt-fold" class="settings-fold">
-                    <summary>Edit the system prompt</summary>
-                    <p class="hint">What the agent may do, read or send, is added after it from your token and the switch above.</p>
-                    <textarea
-                      id="voice-system-prompt"
-                      rows="12"
-                      spellcheck="false"
-                      aria-label="System prompt"
-                      aria-describedby="voice-system-prompt-state"
-                    ></textarea>
-                    <div class="channel-actions">
-                      <button id="save-voice-system-prompt" class="secondary" type="button" disabled>Save</button>
-                      <button id="restore-voice-system-prompt" class="secondary" type="button">Restore the shipped prompt</button>
+                      `#voice-send-untick` is the way to send without asking, said where the owner looked
+                      for it; hidden once the box is unticked, when it would describe the other state.
+
+                      `#voice-send-hosted` is the warning that the switch does not reach everything. The
+                      server obeys it at once, but a hosted agent's own send rules are in its prompt,
+                      and its tool approval for post_reply is in its provider's console. The prompt
+                      follows the switch only when the provider lets this page replace it
+                      (`#272 voice-agent-instructions`); the approval never does. Shown unless a bridge
+                      fetches the prompt as each call opens, and worded by `renderVoiceSendHosted` from
+                      what the last call's agent was given. Served with the wording for not knowing.
+                    -->
+                    <div id="voice-send-editor" hidden>
+                      <label class="toggle">
+                        <input id="voice-ask-before-send" type="checkbox" checked />
+                        Ask me before the voice agent sends
+                      </label>
+                      <p id="voice-send-untick" class="hint">Untick it to let the agent send as soon as you ask, with no read-back.</p>
+                      <p id="voice-send-hosted" class="hint" hidden>The server changes at once. The agent's own instructions follow at its next call only if its provider lets this page replace its prompt; if not, paste the new prompt into the provider's console by hand. Change post_reply's approval there to match, either way.</p>
                     </div>
-                    <p id="voice-system-prompt-state" class="hint" aria-live="polite"></p>
-                  </details>
-                </div>
-                <p id="voice-prompt-state" class="hint" aria-live="polite"></p>
-              </section>
+                    <p id="voice-ask-before-send-state" class="hint" aria-live="polite"></p>
+                    <!--
+                      `#303 voice-post-prefix`. The tag the SERVER puts before every message the voice
+                      agent posts — "(Voice-agent relayed, from user) " until the owner saves his own —
+                      so a reader can tell a relayed message from one he typed. Kept in the server's
+                      store beside his instructions for the agent, shared by every device and every
+                      call, so it is drawn from client-config and redrawn from what the PUT or DELETE
+                      answered, never from the box alone.
 
-              <section class="settings-group">
-                <div class="group-head">
-                  <h3 title="Off by default: it re-sends earlier conversation content to the voice vendor.">Resuming</h3>
-                  <button class="help-link" id="help-link-resuming" type="button" data-help="resuming" aria-label="About resuming" title="Off by default: it re-sends earlier conversation content to the voice vendor.">?</button>
-                </div>
+                      Save sends the box as typed; an empty box is saved as empty, which turns the tag
+                      off and is not the same as never having saved one. Reset to default forgets his
+                      own and puts the default back. The line under the buttons, written by
+                      `renderVoicePostPrefix` in web/voice.js, says which is in force. Hidden as a whole
+                      when the server does not report it, which is an older server that tags nothing.
+                    -->
+                    <div id="voice-post-prefix-editor" hidden>
+                      <label for="voice-post-prefix">Prefix on messages the agent posts</label>
+                      <input
+                        id="voice-post-prefix"
+                        type="text"
+                        autocomplete="off"
+                        spellcheck="false"
+                        aria-describedby="voice-post-prefix-help voice-post-prefix-state"
+                      />
+                      <p id="voice-post-prefix-help" class="hint">Put in front of every message the voice agent posts, and in its read-back, but never on what you type. Empty turns it off.</p>
+                      <div class="channel-actions">
+                        <button id="save-voice-post-prefix" class="secondary" type="button" disabled>Save</button>
+                        <button id="reset-voice-post-prefix" class="secondary" type="button">Reset to default</button>
+                      </div>
+                      <p id="voice-post-prefix-state" class="hint" aria-live="polite"></p>
+                    </div>
+                  </div>
+                </section>
+
                 <!--
-                  `#46 conversation-replay`. FOUR states, and the screen must be able to say each of
-                  them: off on the server, off here, resumed, and resumed IN PART. A single "resuming"
-                  light would be the feature claiming a continuity it does not have, which is the one
-                  failure this whole thing is arranged around.
+                  `#272 voice-agent-instructions`. The owner's own words for the agent: "a section for
+                  additional instructions that the user can fill in" and "a collapse section to
+                  actually edit the system prompt". The SERVER's, like the switch above — kept in its
+                  store, shared by every device, and put into the prompt when a call opens — so both
+                  boxes are drawn from client-config and redrawn from what the PUT stored.
 
-                  `#332 settings-voice-agent-section`. Each state is ONE SHORT LINE (`renderResumeState`
-                  in web/voice.js, held to a budget by the page suite): which state, and the number
-                  that matters. Why a state happens and what would change it is in the `?`'s entry.
+                  Each box has its own Save, because each is a write to the server that a half-typed
+                  text must not make. The system prompt is FOLDED: it is long, it is changed rarely,
+                  and the instructions box is what the owner reaches for. What the agent may do —
+                  read, send, or ask first — is not in either box; the server adds it after them from
+                  the token and the switch above, which the line inside the fold says.
+
+                  `#voice-prompt-state` says how the words reach this deployment's agent and, after a
+                  call, what that call was actually given. Written by `renderVoicePrompt` in
+                  web/voice.js. Hidden as a whole, editor and all, when the server does not report
+                  the setting, which is an older server.
                 -->
-                <p id="resume-state" class="hint" aria-live="polite"></p>
+                <section class="settings-group" id="voice-instructions-group">
+                  <div class="group-head">
+                    <h3 title="Your own words for the voice agent, and its system prompt, kept on this server for every call."><button class="fold-toggle" id="fold-instructions" type="button" aria-expanded="false" aria-controls="fold-instructions-body">Instructions</button></h3>
+                    <button class="help-link" id="help-link-voice-instructions" type="button" data-help="voice-instructions" aria-label="About the voice agent's instructions" title="Your own words for the voice agent, and its system prompt, kept on this server for every call.">?</button>
+                  </div>
+                  <div class="fold-body" id="fold-instructions-body" hidden="until-found">
+                    <div id="voice-prompt-editor" hidden>
+                      <label for="voice-instructions">Additional instructions</label>
+                      <textarea
+                        id="voice-instructions"
+                        rows="4"
+                        placeholder="For example: call me Sam, and keep answers short."
+                        aria-describedby="voice-instructions-state"
+                      ></textarea>
+                      <div class="channel-actions">
+                        <button id="save-voice-instructions" class="secondary" type="button" disabled>Save</button>
+                      </div>
+                      <p id="voice-instructions-state" class="hint" aria-live="polite"></p>
+                      <details id="voice-system-prompt-fold" class="settings-fold">
+                        <summary>Edit the system prompt</summary>
+                        <p class="hint">What the agent may do, read or send, is added after it from your token and the switch above.</p>
+                        <textarea
+                          id="voice-system-prompt"
+                          rows="12"
+                          spellcheck="false"
+                          aria-label="System prompt"
+                          aria-describedby="voice-system-prompt-state"
+                        ></textarea>
+                        <div class="channel-actions">
+                          <button id="save-voice-system-prompt" class="secondary" type="button" disabled>Save</button>
+                          <button id="restore-voice-system-prompt" class="secondary" type="button">Restore the shipped prompt</button>
+                        </div>
+                        <p id="voice-system-prompt-state" class="hint" aria-live="polite"></p>
+                      </details>
+                    </div>
+                    <p id="voice-prompt-state" class="hint" aria-live="polite"></p>
+                  </div>
+                </section>
+
+                <section class="settings-group">
+                  <div class="group-head">
+                    <h3 title="Off by default: it re-sends earlier conversation content to the voice vendor."><button class="fold-toggle" id="fold-resuming" type="button" aria-expanded="false" aria-controls="fold-resuming-body">Resuming</button></h3>
+                    <button class="help-link" id="help-link-resuming" type="button" data-help="resuming" aria-label="About resuming" title="Off by default: it re-sends earlier conversation content to the voice vendor.">?</button>
+                  </div>
+                  <div class="fold-body" id="fold-resuming-body" hidden="until-found">
+                    <!--
+                      `#46 conversation-replay`. FOUR states, and the screen must be able to say each of
+                      them: off on the server, off here, resumed, and resumed IN PART. A single "resuming"
+                      light would be the feature claiming a continuity it does not have, which is the one
+                      failure this whole thing is arranged around.
+
+                      `#332 settings-voice-agent-section`. Each state is ONE SHORT LINE (`renderResumeState`
+                      in web/voice.js, held to a budget by the page suite): which state, and the number
+                      that matters. Why a state happens and what would change it is in the `?`'s entry.
+                    -->
+                    <p id="resume-state" class="hint" aria-live="polite"></p>
+                    <!--
+                      `#331 resume-on-websocket`. Where this server cannot resume — the operator has
+                      replay off, or the voice bridge has not said it takes a recap — the switch is
+                      DISABLED and its reason stands right under it, read with it by a screen reader
+                      (`aria-describedby`): never a live control that does nothing. Shipped disabled, so
+                      it is live only once client-config says it may be (`renderResumeState`).
+                    -->
+                    <label class="toggle">
+                      <input id="resume-toggle" type="checkbox" aria-describedby="resume-unavailable" disabled />
+                      Tell a new call what was already said
+                    </label>
+                    <p id="resume-unavailable" class="toggle-why" hidden></p>
+                  </div>
+                </section>
+
                 <!--
-                  `#331 resume-on-websocket`. Where this server cannot resume — the operator has
-                  replay off, or the voice bridge has not said it takes a recap — the switch is
-                  DISABLED and its reason stands right under it, read with it by a screen reader
-                  (`aria-describedby`): never a live control that does nothing. Shipped disabled, so
-                  it is live only once client-config says it may be (`renderResumeState`).
+                  `#44 live-push`. Two separate facts, and the screen must not let them blur into one
+                  "live" light: whether the CHANNEL VIEW updates by itself, and whether an arriving
+                  message is spoken into a call in progress. The first costs nothing and is on whenever
+                  the server is ingesting; the second spends money and interrupts, and is off until it
+                  is asked for.
+
+                  `#347 settings-prose`. The owner, 2026-10-18: "Arriving messages during a call"
+                  becomes the title, "with only its drop-down". It was a group called Live messages
+                  whose first line said how this server delivers live updates — adapter push or polling,
+                  and whether this page is attached to the stream — which is how the server works, not
+                  a choice. That line is Connection status's now (`#live-state`, at the foot of the
+                  screen), and the label is the heading the picker is named by. Its `?` is still Live
+                  messages in Help, which says what each mode costs; How messages are said for the ear
+                  is the link under Reading full messages in channel view below.
+
+                  THREE options, not a checkbox, because "say something about it" and "read it out
+                  word for word" are different amounts of the reader's time and the vendor's money,
+                  and a two-state control forces the expensive one to stand in for both.
+
+                  No `selected` here on purpose: the live value is filled in by `renderReadNew` from
+                  the same key the bar button writes, so there is exactly one truth about the mode
+                  and not a markup default that disagrees with it after a reload.
                 -->
-                <label class="toggle">
-                  <input id="resume-toggle" type="checkbox" aria-describedby="resume-unavailable" disabled />
-                  Tell a new call what was already said
-                </label>
-                <p id="resume-unavailable" class="toggle-why" hidden></p>
-              </section>
+                <section class="settings-group" id="relay-group">
+                  <div class="group-head">
+                    <h3 id="relay-to-agent-title" title="Briefly, by default. Both speaking modes send channel text to the voice vendor and take conversation time."><button class="fold-toggle" id="fold-relay" type="button" aria-expanded="false" aria-controls="fold-relay-body">Arriving messages during a call</button></h3>
+                    <button class="help-link" id="help-link-live-messages" type="button" data-help="live-messages" aria-label="About arriving messages during a call" title="Briefly, by default. Both speaking modes send channel text to the voice vendor and take conversation time.">?</button>
+                  </div>
+                  <div class="fold-body" id="fold-relay-body" hidden="until-found">
+                    <select id="relay-to-agent" aria-labelledby="relay-to-agent-title">
+                      <option value="off">Don't tell the agent</option>
+                      <option value="gist">Say what each one says, briefly</option>
+                      <option value="full">Read them out in full</option>
+                    </select>
+                  </div>
+                </section>
 
-              <!--
-                `#44 live-push`. Two separate facts, and the screen must not let them blur into one
-                "live" light: whether the CHANNEL VIEW updates by itself, and whether an arriving
-                message is spoken into a call in progress. The first costs nothing and is on whenever
-                the server is ingesting; the second spends money and interrupts, and is off until it
-                is asked for.
+                <!--
+                  `#332 settings-voice-agent-section`. Which voice reads a whole message out when it is
+                  tapped in the channel view: the voice service's, or this device's own speech. It was
+                  a group called "Message audio" in Messages, and the owner asked for it here, beside
+                  the other two ways a message is read out — into a call as it arrives, and recapped
+                  to a new one — so it sits under those, named for what it does.
 
-                `#347 settings-prose`. The owner, 2026-10-18: "Arriving messages during a call"
-                becomes the title, "with only its drop-down". It was a group called Live messages
-                whose first line said how this server delivers live updates — adapter push or polling,
-                and whether this page is attached to the stream — which is how the server works, not
-                a choice. That line is Connection status's now (`#live-state`, at the foot of the
-                screen), and the label is the heading the picker is named by. Its `?` is still Live
-                messages in Help, which says what each mode costs; How messages are said for the ear
-                is the link under Reading full messages in channel view below.
+                  `#347 settings-prose`. "How messages are said" is a short link now, in the owner's
+                  words "How messages are pre-processed for speech", under the picker: the rewrite for
+                  the ear that both voices read, and that an arriving message is read out in too. It
+                  keeps the id `#help-link-speech-prep`, so HELP_TOPICS wires it as it wired the `?`.
+                  "Car audio: use Agent audio." meant nothing to the owner; what it meant — Agent audio
+                  plays as ordinary audio, so a car's speakers carry it — is the heading's tooltip.
+                  `#settings-audio-source` and `#settings-agent-audio` keep their ids; web/voice.js keeps
+                  the picker and the bar's switch in step (`setReadAudioSource`).
+                -->
+                <section class="settings-group" id="reading-full-group">
+                  <div class="group-head">
+                    <h3 title="Which voice reads a message you tap: Agent audio plays as ordinary audio, so a car's speakers carry it; Device voice is this device's own speech."><button class="fold-toggle" id="fold-reading-full" type="button" aria-expanded="false" aria-controls="fold-reading-full-body">Reading full messages in channel view</button></h3>
+                  </div>
+                  <div class="fold-body" id="fold-reading-full-body" hidden="until-found">
+                    <label for="settings-audio-source">Read messages with</label>
+                    <select id="settings-audio-source">
+                      <option id="settings-agent-audio" value="agent">Agent audio</option>
+                      <option value="device">Device voice</option>
+                    </select>
+                    <p class="help-text-row">
+                      <button class="help-link help-link-text" id="help-link-speech-prep" type="button" data-help="speech-prep" title="The rewrite for the ear that every message is read out in, by either voice.">How messages are pre-processed for speech</button>
+                    </p>
+                  </div>
+                </section>
 
-                THREE options, not a checkbox, because "say something about it" and "read it out
-                word for word" are different amounts of the reader's time and the vendor's money,
-                and a two-state control forces the expensive one to stand in for both.
+                <section class="settings-group">
+                  <div class="group-head">
+                    <h3 title="What the two prompt buttons send. Empty a field to restore its default."><button class="fold-toggle" id="fold-canned-prompts" type="button" aria-expanded="false" aria-controls="fold-canned-prompts-body">Canned prompts</button></h3>
+                    <button class="help-link" id="help-link-canned-prompts" type="button" data-help="canned-prompts" aria-label="About the canned prompts" title="What the two prompt buttons send. Empty a field to restore its default.">?</button>
+                  </div>
+                  <div class="fold-body" id="fold-canned-prompts-body" hidden="until-found">
+                    <label for="prompt-summary">Sumry</label>
+                    <textarea id="prompt-summary" rows="3"></textarea>
 
-                No `selected` here on purpose: the live value is filled in by `renderReadNew` from
-                the same key the bar button writes, so there is exactly one truth about the mode
-                and not a markup default that disagrees with it after a reload.
-              -->
-              <section class="settings-group" id="relay-group">
-                <div class="group-head">
-                  <h3 id="relay-to-agent-title" title="Briefly, by default. Both speaking modes send channel text to the voice vendor and take conversation time.">Arriving messages during a call</h3>
-                  <button class="help-link" id="help-link-live-messages" type="button" data-help="live-messages" aria-label="About arriving messages during a call" title="Briefly, by default. Both speaking modes send channel text to the voice vendor and take conversation time.">?</button>
-                </div>
-                <select id="relay-to-agent" aria-labelledby="relay-to-agent-title">
-                  <option value="off">Don't tell the agent</option>
-                  <option value="gist">Say what each one says, briefly</option>
-                  <option value="full">Read them out in full</option>
-                </select>
-              </section>
+                    <label for="prompt-blockers">Blockers — spends coding-agent work</label>
+                    <textarea id="prompt-blockers" rows="4"></textarea>
+                    <p id="prompt-state" class="hint" aria-live="polite"></p>
+                  </div>
+                </section>
 
-              <!--
-                `#332 settings-voice-agent-section`. Which voice reads a whole message out when it is
-                tapped in the channel view: the voice service's, or this device's own speech. It was
-                a group called "Message audio" in Messages, and the owner asked for it here, beside
-                the other two ways a message is read out — into a call as it arrives, and recapped
-                to a new one — so it sits under those, named for what it does.
+                <section class="settings-group">
+                  <div class="group-head">
+                    <h3 title="Applied to your next call, not the one in progress."><button class="fold-toggle" id="fold-microphone" type="button" aria-expanded="false" aria-controls="fold-microphone-body">Microphone</button></h3>
+                    <button class="help-link" id="help-link-microphone" type="button" data-help="microphone" aria-label="About the microphone settings" title="Applied to your next call, not the one in progress.">?</button>
+                  </div>
+                  <div class="fold-body" id="fold-microphone-body" hidden="until-found">
+                    <label class="toggle">
+                      <input id="mic-echo-cancellation" type="checkbox" checked />
+                      Echo cancellation
+                    </label>
+                    <label class="toggle">
+                      <input id="mic-noise-suppression" type="checkbox" checked />
+                      Noise suppression
+                    </label>
+                    <label class="toggle">
+                      <input id="mic-auto-gain" type="checkbox" checked />
+                      Automatic gain control
+                    </label>
+                    <p id="mic-settings-state" class="hint" aria-live="polite"></p>
+                  </div>
+                </section>
 
-                `#347 settings-prose`. "How messages are said" is a short link now, in the owner's
-                words "How messages are pre-processed for speech", under the picker: the rewrite for
-                the ear that both voices read, and that an arriving message is read out in too. It
-                keeps the id `#help-link-speech-prep`, so HELP_TOPICS wires it as it wired the `?`.
-                "Car audio: use Agent audio." meant nothing to the owner; what it meant — Agent audio
-                plays as ordinary audio, so a car's speakers carry it — is the heading's tooltip.
-                `#settings-audio-source` and `#settings-agent-audio` keep their ids; web/voice.js keeps
-                the picker and the bar's switch in step (`setReadAudioSource`).
-              -->
-              <section class="settings-group" id="reading-full-group">
-                <div class="group-head">
-                  <h3 title="Which voice reads a message you tap: Agent audio plays as ordinary audio, so a car's speakers carry it; Device voice is this device's own speech.">Reading full messages in channel view</h3>
-                </div>
-                <label for="settings-audio-source">Read messages with</label>
-                <select id="settings-audio-source">
-                  <option id="settings-agent-audio" value="agent">Agent audio</option>
-                  <option value="device">Device voice</option>
-                </select>
-                <p class="help-text-row">
-                  <button class="help-link help-link-text" id="help-link-speech-prep" type="button" data-help="speech-prep" title="The rewrite for the ear that every message is read out in, by either voice.">How messages are pre-processed for speech</button>
-                </p>
-              </section>
+                <!--
+                  The way OUT of this page to the thing that decides how the agent behaves.
 
-              <section class="settings-group">
-                <div class="group-head">
-                  <h3 title="What the two prompt buttons send. Empty a field to restore its default.">Canned prompts</h3>
-                  <button class="help-link" id="help-link-canned-prompts" type="button" data-help="canned-prompts" aria-label="About the canned prompts" title="What the two prompt buttons send. Empty a field to restore its default.">?</button>
-                </div>
+                  The voice, the tools and the first message all live in the vendor's own console, and
+                  none of them is editable here — this deployment supplies an agent id and connects to
+                  whatever that agent already is. So does the system prompt, unless the agent lets a
+                  client replace it (`#272 voice-agent-instructions`, Instructions above). Debugging
+                  "why did it say that" therefore usually ends on that page, and on a phone getting
+                  there meant finding the console, signing in, and picking the right agent out of a
+                  list by an id nobody remembers. One tap instead.
 
-                <label for="prompt-summary">Sumry</label>
-                <textarea id="prompt-summary" rows="3"></textarea>
-
-                <label for="prompt-blockers">Blockers — spends coding-agent work</label>
-                <textarea id="prompt-blockers" rows="4"></textarea>
-                <p id="prompt-state" class="hint" aria-live="polite"></p>
-              </section>
-
-              <section class="settings-group">
-                <div class="group-head">
-                  <h3 title="Applied to your next call, not the one in progress.">Microphone</h3>
-                  <button class="help-link" id="help-link-microphone" type="button" data-help="microphone" aria-label="About the microphone settings" title="Applied to your next call, not the one in progress.">?</button>
-                </div>
-
-                <label class="toggle">
-                  <input id="mic-echo-cancellation" type="checkbox" checked />
-                  Echo cancellation
-                </label>
-                <label class="toggle">
-                  <input id="mic-noise-suppression" type="checkbox" checked />
-                  Noise suppression
-                </label>
-                <label class="toggle">
-                  <input id="mic-auto-gain" type="checkbox" checked />
-                  Automatic gain control
-                </label>
-                <p id="mic-settings-state" class="hint" aria-live="polite"></p>
-              </section>
-
-              <!--
-                The way OUT of this page to the thing that decides how the agent behaves.
-
-                The voice, the tools and the first message all live in the vendor's own console, and
-                none of them is editable here — this deployment supplies an agent id and connects to
-                whatever that agent already is. So does the system prompt, unless the agent lets a
-                client replace it (`#272 voice-agent-instructions`, Instructions above). Debugging
-                "why did it say that" therefore usually ends on that page, and on a phone getting
-                there meant finding the console, signing in, and picking the right agent out of a
-                list by an id nobody remembers. One tap instead.
-
-                The id is printed BESIDE the link rather than only inside it. It is the durable half:
-                a console reorganises its own URLs whenever it likes, and when the deep link stops
-                landing the id is still what is needed to find the agent by hand.
-              -->
-              <section class="settings-group" id="agent-settings" hidden>
-                <div class="group-head">
-                  <h3>Provider</h3>
-                </div>
-                <p class="hint">
-                  Its voice and tools are configured at the vendor. Its prompt is too, unless it
-                  lets this page replace it; see Instructions above.
-                </p>
-                <p class="hint">
-                  <a id="agent-console-link" class="external-link" href="#" target="_blank" rel="noopener noreferrer">Open voice provider configuration</a>
-                </p>
-                <p class="hint">Provider id: <code id="agent-id" class="agent-id"></code></p>
-              </section>
+                  The id is printed BESIDE the link rather than only inside it. It is the durable half:
+                  a console reorganises its own URLs whenever it likes, and when the deep link stops
+                  landing the id is still what is needed to find the agent by hand.
+                -->
+                <section class="settings-group" id="agent-settings" hidden>
+                  <div class="group-head">
+                    <h3><button class="fold-toggle" id="fold-provider" type="button" aria-expanded="false" aria-controls="fold-provider-body">Provider</button></h3>
+                  </div>
+                  <div class="fold-body" id="fold-provider-body" hidden="until-found">
+                    <p class="hint">
+                      Its voice and tools are configured at the vendor. Its prompt is too, unless it
+                      lets this page replace it; see Instructions above.
+                    </p>
+                    <p class="hint">
+                      <a id="agent-console-link" class="external-link" href="#" target="_blank" rel="noopener noreferrer">Open voice provider configuration</a>
+                    </p>
+                    <p class="hint">Provider id: <code id="agent-id" class="agent-id"></code></p>
+                  </div>
+                </section>
+              </div>
             </section>
 
             <section class="settings-section" id="settings-messages" aria-labelledby="settings-messages-title">
-              <h2 id="settings-messages-title" title="How messages are marked and shown.">Messages</h2>
-
-              <section class="settings-group">
-                <div class="group-head">
-                  <h3 title="Greyed here, and kept out of the queue.">Your own messages</h3>
-                  <button class="help-link" id="help-link-mark-own" type="button" data-help="mark-own" aria-label="About marking your own messages read" title="Greyed here, and kept out of the queue.">?</button>
-                </div>
-                <!--
-                  ON by default, and deliberately: a message this bridge posted is one the owner
-                  dictated moments earlier. It is already read by the only definition that matters,
-                  and leaving it in the queue means the queue is partly a record of things he said.
-                -->
-                <label class="toggle">
-                  <input id="mark-own-read" type="checkbox" checked />
-                  Mark my own messages as read
-                </label>
-              </section>
-
-              <section class="settings-group">
-                <div class="group-head">
-                  <h3 title="A message whose whole text is one of these is marked read the moment it arrives.">Mark-read automatically</h3>
-                  <button class="help-link" id="help-link-auto-read" type="button" data-help="auto-read" aria-label="About marking messages read automatically" title="A message whose whole text is one of these is marked read the moment it arrives.">?</button>
-                </div>
-                <!--
-                  `#347 settings-prose`. "Mark-read automatically", the owner's name for it (2026-10-18,
-                  "he asked before"): what the list does is MARK a message read, and "Read
-                  automatically" read as though something read it out. Only the words changed; every
-                  id, and the server's list, are as they were.
-
-                  `#196 auto-read-noise`. The SERVER's list, not this browser's: it is kept in the
-                  store and shared by every device and by the voice agent, so it is edited here and
-                  read back from the answer rather than from what was typed. The sentence saying how
-                  a rule matches is the server's too — `#noise-matching` quotes it, the same rule
-                  `#alias-note` follows — because the matcher lives on the server and a second
-                  description here would be a second thing that can drift from it.
-
-                  Hidden as a whole when the server does not report the list, which is an older
-                  server or one whose store is failing; `#noise-state` then says so.
-                -->
-                <div id="noise-editor" hidden>
-                  <p id="noise-matching" class="hint"></p>
-                  <!-- Rows are built by `renderNoiseRules` in web/voice.js: the rule, and Remove. -->
-                  <ul id="noise-rule-list" class="noise-rules" aria-label="Messages marked read automatically"></ul>
-                  <p id="noise-count" class="hint" aria-live="polite"></p>
-                  <label for="noise-rule-new">Add a message</label>
-                  <input
-                    id="noise-rule-new"
-                    type="text"
-                    maxlength="200"
-                    autocomplete="off"
-                    enterkeyhint="done"
-                    placeholder="Working…"
-                    aria-describedby="noise-state"
-                  />
-                  <div class="channel-actions">
-                    <button id="add-noise-rule" class="secondary" type="button">Add</button>
+              <h2 id="settings-messages-title" title="How messages are marked and shown."><button class="fold-toggle" id="fold-settings-messages" type="button" aria-expanded="false" aria-controls="fold-settings-messages-body">Messages</button></h2>
+              <div class="fold-body" id="fold-settings-messages-body" hidden="until-found">
+                <section class="settings-group">
+                  <div class="group-head">
+                    <h3 title="Greyed here, and kept out of the queue."><button class="fold-toggle" id="fold-mark-own" type="button" aria-expanded="false" aria-controls="fold-mark-own-body">Your own messages</button></h3>
+                    <button class="help-link" id="help-link-mark-own" type="button" data-help="mark-own" aria-label="About marking your own messages read" title="Greyed here, and kept out of the queue.">?</button>
                   </div>
-                </div>
-                <p id="noise-state" class="hint" aria-live="polite"></p>
-              </section>
-
-              <section class="settings-group">
-                <div class="group-head">
-                  <h3 title="Same author, within five seconds. Turn it off to see the raw rows.">Combining messages</h3>
-                  <button class="help-link" id="help-link-combining" type="button" data-help="combining" aria-label="About combining messages" title="Same author, within five seconds. Turn it off to see the raw rows.">?</button>
-                </div>
-                <!--
-                  ON by default. An agent writing past Discord's length limit has its post split in
-                  two, and the second half continues mid-word a fraction of a second later. Drawn as
-                  two rows that is unreadable; drawn as one it is the message that was written.
-                  Display only — nothing here changes which messages exist.
-                -->
-                <label class="toggle">
-                  <input id="combine-messages" type="checkbox" checked />
-                  Show messages sent seconds apart as one
-                </label>
-              </section>
-
-              <section class="settings-group">
-                <div class="group-head">
-                  <h3 title="Turn it off to see each message's first line as it was written.">Rich headers</h3>
-                  <button class="help-link" id="help-link-rich-headers" type="button" data-help="rich-headers" aria-label="About rich headers" title="Turn it off to see each message's first line as it was written.">?</button>
-                </div>
-                <!--
-                  `#242 rich-headers`. ON by default. Agents posting through one shared account name
-                  themselves at the head of a message — "[build-bot] Status, 9:05 PM ET." — and that
-                  first line moves into the row's header: the tag, the title and the time. The
-                  server finds the pieces; this switch only decides whether the page shows them
-                  there or draws the line as written. Display only, and nothing is ever dropped:
-                  off, every row is exactly what it was before this existed.
-                -->
-                <label class="toggle">
-                  <input id="rich-headers" type="checkbox" checked />
-                  Show an agent's tag, title and time in the message header
-                </label>
-              </section>
-
-              <!--
-                WHO IS WHO: which account in the channel being read is you, which is the coding agent,
-                and which are other people and bots, as the channel view draws them.
-
-                `#349 channel-settings-all`. The owner, 2026-10-18: "drop the who-is-who part" from
-                the per-channel box, whose picker now offers All channels, which no list of speakers
-                can follow. It moved here, beside the other settings about how messages are drawn,
-                rather than going: it is the one way to name a coding agent where the server cannot
-                guess one (a Slack channel, or a deployment that names its agents), and the choices
-                already made are stored and keep applying either way.
-
-                It follows the channel the reader is READING (`#discord-channel`), which its first line
-                names. It used to follow the box's picker, and before that it listed every account
-                seen anywhere, which let a bot from another channel spoil the sole-other-bot guess;
-                the census is still per channel. A CHOICE is about the ACCOUNT, in every channel it
-                speaks in — see `renderIdentityRows` in web/voice.js.
-              -->
-              <section class="settings-group" id="identity-group">
-                <div class="group-head">
-                  <h3 title="Everyone who has spoken in the channel you are reading. Italic means guessed. A choice follows the account into every channel.">Who is who</h3>
-                  <button class="help-link" id="help-link-identities" type="button" data-help="identities" aria-label="About who is who in a channel" title="Everyone who has spoken in the channel you are reading. Italic means guessed. A choice follows the account into every channel.">?</button>
-                </div>
-                <!-- Rows are built by `renderIdentityRows` in web/voice.js, under a line naming the
-                     channel. Empty until that channel has been read, and it says so. -->
-                <div id="identity-list"></div>
-                <p id="identity-state" class="hint" aria-live="polite"></p>
-              </section>
-
-              <!--
-                `#193 compose-draft-loss`. A send dismissed from the outbox unsent is not gone at one
-                tap: it is kept here, on this device only, for a week (the newest ten), and Put back
-                returns it to its channel's outbox. web/voice.js writes the list and the line above it.
-
-                `#348 settings-dynamic-lists`. The owner, 2026-10-18: "a fixed-height, user-resizable,
-                scrollable list styled as data (not a control), with shorter previews; clicking one
-                opens a pop-out with the full text and a copy button". So the list is a data panel
-                (`.data-panel`, the dark readout Connection status is drawn in too) of a fixed height
-                the reader can drag taller, scrolling inside itself; each row is where it was going,
-                how long ago, and ONE line of its text, the rest cut off by the stylesheet rather than
-                by the script, so find-in-page and a screen reader still have all of it. A row is a
-                button that opens `#dismissed-send-popout`: the whole text, Copy, Put back (moved here
-                from the row, where a button on every line made the list a column of controls) and
-                Close. Escape and the back gesture close it, as they close a menu.
-              -->
-              <section class="settings-group" id="dismissed-group">
-                <div class="group-head">
-                  <h3 title="Messages you dismissed from the outbox unsent, kept on this device for a week in case you want one back.">Recently dismissed</h3>
-                </div>
-                <p id="dismissed-sends-state" class="hint" aria-live="polite"></p>
-                <ol id="dismissed-sends" class="dismissed-sends data-panel" aria-label="Recently dismissed messages" hidden></ol>
-                <button id="forget-dismissed-sends" class="secondary" type="button" hidden>Forget these now</button>
-                <div id="dismissed-send-popout" class="data-popout" role="dialog" aria-labelledby="dismissed-send-popout-meta" hidden>
-                  <p id="dismissed-send-popout-meta" class="dismissed-send-meta"></p>
-                  <div id="dismissed-send-popout-text" class="dismissed-send-full data-panel" tabindex="0" aria-label="The whole message"></div>
-                  <div class="channel-actions">
-                    <button id="dismissed-send-copy" class="secondary" type="button">Copy</button>
-                    <button id="dismissed-send-restore" class="secondary" type="button" title="Back in the outbox of its channel, where Edit, Retry and Dismiss are.">Put back</button>
-                    <button id="dismissed-send-close" class="secondary" type="button">Close</button>
+                  <div class="fold-body" id="fold-mark-own-body" hidden="until-found">
+                    <!--
+                      ON by default, and deliberately: a message this bridge posted is one the owner
+                      dictated moments earlier. It is already read by the only definition that matters,
+                      and leaving it in the queue means the queue is partly a record of things he said.
+                    -->
+                    <label class="toggle">
+                      <input id="mark-own-read" type="checkbox" checked />
+                      Mark my own messages as read
+                    </label>
                   </div>
-                  <p id="dismissed-send-popout-state" class="hint" aria-live="polite"></p>
-                </div>
-              </section>
+                </section>
 
-              <!--
-                `#332 settings-voice-agent-section`. "How messages are said" used to be a group here,
-                and it held no control: one paragraph saying which arm of the rewrite for the ear
-                this server is in. Information, not a setting, in the owner's words — so it is Help's
-                entry of that name now, line and all (`#speech-prep-state`), reached by a `?` beside
-                each setting it explains: Arriving messages during a call, and Reading full messages
-                in channel view, both in Voice agent.
-              -->
+                <section class="settings-group">
+                  <div class="group-head">
+                    <h3 title="A message whose whole text is one of these is marked read the moment it arrives."><button class="fold-toggle" id="fold-auto-read" type="button" aria-expanded="false" aria-controls="fold-auto-read-body">Mark-read automatically</button></h3>
+                    <button class="help-link" id="help-link-auto-read" type="button" data-help="auto-read" aria-label="About marking messages read automatically" title="A message whose whole text is one of these is marked read the moment it arrives.">?</button>
+                  </div>
+                  <div class="fold-body" id="fold-auto-read-body" hidden="until-found">
+                    <!--
+                      `#347 settings-prose`. "Mark-read automatically", the owner's name for it (2026-10-18,
+                      "he asked before"): what the list does is MARK a message read, and "Read
+                      automatically" read as though something read it out. Only the words changed; every
+                      id, and the server's list, are as they were.
+
+                      `#196 auto-read-noise`. The SERVER's list, not this browser's: it is kept in the
+                      store and shared by every device and by the voice agent, so it is edited here and
+                      read back from the answer rather than from what was typed. The sentence saying how
+                      a rule matches is the server's too — `#noise-matching` quotes it, the same rule
+                      `#alias-note` follows — because the matcher lives on the server and a second
+                      description here would be a second thing that can drift from it.
+
+                      Hidden as a whole when the server does not report the list, which is an older
+                      server or one whose store is failing; `#noise-state` then says so.
+                    -->
+                    <div id="noise-editor" hidden>
+                      <p id="noise-matching" class="hint"></p>
+                      <!-- Rows are built by `renderNoiseRules` in web/voice.js: the rule, and Remove. -->
+                      <ul id="noise-rule-list" class="noise-rules" aria-label="Messages marked read automatically"></ul>
+                      <p id="noise-count" class="hint" aria-live="polite"></p>
+                      <label for="noise-rule-new">Add a message</label>
+                      <input
+                        id="noise-rule-new"
+                        type="text"
+                        maxlength="200"
+                        autocomplete="off"
+                        enterkeyhint="done"
+                        placeholder="Working…"
+                        aria-describedby="noise-state"
+                      />
+                      <div class="channel-actions">
+                        <button id="add-noise-rule" class="secondary" type="button">Add</button>
+                      </div>
+                    </div>
+                    <p id="noise-state" class="hint" aria-live="polite"></p>
+                  </div>
+                </section>
+
+                <section class="settings-group">
+                  <div class="group-head">
+                    <h3 title="Same author, within five seconds. Turn it off to see the raw rows."><button class="fold-toggle" id="fold-combining" type="button" aria-expanded="false" aria-controls="fold-combining-body">Combining messages</button></h3>
+                    <button class="help-link" id="help-link-combining" type="button" data-help="combining" aria-label="About combining messages" title="Same author, within five seconds. Turn it off to see the raw rows.">?</button>
+                  </div>
+                  <div class="fold-body" id="fold-combining-body" hidden="until-found">
+                    <!--
+                      ON by default. An agent writing past Discord's length limit has its post split in
+                      two, and the second half continues mid-word a fraction of a second later. Drawn as
+                      two rows that is unreadable; drawn as one it is the message that was written.
+                      Display only — nothing here changes which messages exist.
+                    -->
+                    <label class="toggle">
+                      <input id="combine-messages" type="checkbox" checked />
+                      Show messages sent seconds apart as one
+                    </label>
+                  </div>
+                </section>
+
+                <section class="settings-group">
+                  <div class="group-head">
+                    <h3 title="Turn it off to see each message's first line as it was written."><button class="fold-toggle" id="fold-rich-headers" type="button" aria-expanded="false" aria-controls="fold-rich-headers-body">Rich headers</button></h3>
+                    <button class="help-link" id="help-link-rich-headers" type="button" data-help="rich-headers" aria-label="About rich headers" title="Turn it off to see each message's first line as it was written.">?</button>
+                  </div>
+                  <div class="fold-body" id="fold-rich-headers-body" hidden="until-found">
+                    <!--
+                      `#242 rich-headers`. ON by default. Agents posting through one shared account name
+                      themselves at the head of a message — "[build-bot] Status, 9:05 PM ET." — and that
+                      first line moves into the row's header: the tag, the title and the time. The
+                      server finds the pieces; this switch only decides whether the page shows them
+                      there or draws the line as written. Display only, and nothing is ever dropped:
+                      off, every row is exactly what it was before this existed.
+                    -->
+                    <label class="toggle">
+                      <input id="rich-headers" type="checkbox" checked />
+                      Show an agent's tag, title and time in the message header
+                    </label>
+                  </div>
+                </section>
+
+                <!--
+                  WHO IS WHO: which account in the channel being read is you, which is the coding agent,
+                  and which are other people and bots, as the channel view draws them.
+
+                  `#349 channel-settings-all`. The owner, 2026-10-18: "drop the who-is-who part" from
+                  the per-channel box, whose picker now offers All channels, which no list of speakers
+                  can follow. It moved here, beside the other settings about how messages are drawn,
+                  rather than going: it is the one way to name a coding agent where the server cannot
+                  guess one (a Slack channel, or a deployment that names its agents), and the choices
+                  already made are stored and keep applying either way.
+
+                  It follows the channel the reader is READING (`#discord-channel`), which its first line
+                  names. It used to follow the box's picker, and before that it listed every account
+                  seen anywhere, which let a bot from another channel spoil the sole-other-bot guess;
+                  the census is still per channel. A CHOICE is about the ACCOUNT, in every channel it
+                  speaks in — see `renderIdentityRows` in web/voice.js.
+                -->
+                <section class="settings-group" id="identity-group">
+                  <div class="group-head">
+                    <h3 title="Everyone who has spoken in the channel you are reading. Italic means guessed. A choice follows the account into every channel."><button class="fold-toggle" id="fold-identities" type="button" aria-expanded="false" aria-controls="fold-identities-body">Who is who</button></h3>
+                    <button class="help-link" id="help-link-identities" type="button" data-help="identities" aria-label="About who is who in a channel" title="Everyone who has spoken in the channel you are reading. Italic means guessed. A choice follows the account into every channel.">?</button>
+                  </div>
+                  <div class="fold-body" id="fold-identities-body" hidden="until-found">
+                    <!-- Rows are built by `renderIdentityRows` in web/voice.js, under a line naming the
+                         channel. Empty until that channel has been read, and it says so. -->
+                    <div id="identity-list"></div>
+                    <p id="identity-state" class="hint" aria-live="polite"></p>
+                  </div>
+                </section>
+
+                <!--
+                  `#193 compose-draft-loss`. A send dismissed from the outbox unsent is not gone at one
+                  tap: it is kept here, on this device only, for a week (the newest ten), and Put back
+                  returns it to its channel's outbox. web/voice.js writes the list and the line above it.
+
+                  `#348 settings-dynamic-lists`. The owner, 2026-10-18: "a fixed-height, user-resizable,
+                  scrollable list styled as data (not a control), with shorter previews; clicking one
+                  opens a pop-out with the full text and a copy button". So the list is a data panel
+                  (`.data-panel`, the dark readout Connection status is drawn in too) of a fixed height
+                  the reader can drag taller, scrolling inside itself; each row is where it was going,
+                  how long ago, and ONE line of its text, the rest cut off by the stylesheet rather than
+                  by the script, so find-in-page and a screen reader still have all of it. A row is a
+                  button that opens `#dismissed-send-popout`: the whole text, Copy, Put back (moved here
+                  from the row, where a button on every line made the list a column of controls) and
+                  Close. Escape and the back gesture close it, as they close a menu.
+                -->
+                <section class="settings-group" id="dismissed-group">
+                  <div class="group-head">
+                    <h3 title="Messages you dismissed from the outbox unsent, kept on this device for a week in case you want one back."><button class="fold-toggle" id="fold-dismissed" type="button" aria-expanded="false" aria-controls="fold-dismissed-body">Recently dismissed</button></h3>
+                  </div>
+                  <div class="fold-body" id="fold-dismissed-body" hidden="until-found">
+                    <p id="dismissed-sends-state" class="hint" aria-live="polite"></p>
+                    <ol id="dismissed-sends" class="dismissed-sends data-panel" aria-label="Recently dismissed messages" hidden></ol>
+                    <button id="forget-dismissed-sends" class="secondary" type="button" hidden>Forget these now</button>
+                    <div id="dismissed-send-popout" class="data-popout" role="dialog" aria-labelledby="dismissed-send-popout-meta" hidden>
+                      <p id="dismissed-send-popout-meta" class="dismissed-send-meta"></p>
+                      <div id="dismissed-send-popout-text" class="dismissed-send-full data-panel" tabindex="0" aria-label="The whole message"></div>
+                      <div class="channel-actions">
+                        <button id="dismissed-send-copy" class="secondary" type="button">Copy</button>
+                        <button id="dismissed-send-restore" class="secondary" type="button" title="Back in the outbox of its channel, where Edit, Retry and Dismiss are.">Put back</button>
+                        <button id="dismissed-send-close" class="secondary" type="button">Close</button>
+                      </div>
+                      <p id="dismissed-send-popout-state" class="hint" aria-live="polite"></p>
+                    </div>
+                  </div>
+                </section>
+
+                <!--
+                  `#332 settings-voice-agent-section`. "How messages are said" used to be a group here,
+                  and it held no control: one paragraph saying which arm of the rewrite for the ear
+                  this server is in. Information, not a setting, in the owner's words — so it is Help's
+                  entry of that name now, line and all (`#speech-prep-state`), reached by a `?` beside
+                  each setting it explains: Arriving messages during a call, and Reading full messages
+                  in channel view, both in Voice agent.
+                -->
+              </div>
             </section>
 
             <section class="settings-section" id="settings-channels" aria-labelledby="settings-channels-title">
               <div class="group-head">
-                <h2 id="settings-channels-title" title="One channel at a time, or all of them: your own name for one, taking it off the list, and clearing unread in its chat service.">Channels</h2>
+                <h2 id="settings-channels-title" title="One channel at a time, or all of them: your own name for one, taking it off the list, and clearing unread in its chat service."><button class="fold-toggle" id="fold-settings-channels" type="button" aria-expanded="false" aria-controls="fold-settings-channels-body">Channels</button></h2>
                 <button class="help-link" id="help-link-channel-alias" type="button" data-help="channel-alias" aria-label="About channels" title="One channel at a time, or all of them: your own name for one, taking it off the list, and clearing unread in its chat service.">?</button>
               </div>
-
-              <!--
-                `#39 channel-alias`. A name of the OWNER's own for a channel, so that addressing one
-                out loud is possible at all: a snowflake is unsayable and a configured label like
-                "build noise" is not what anyone says either. The three things it deliberately is
-                NOT are stated in Help, and they are the whole point of the feature.
-              -->
-              <!--
-                THE PER-CHANNEL SECTION, and the only one on this screen.
-                Everything else here is a setting about the app; everything in here is a setting about
-                ONE channel, and which one is chosen once at the top rather than separately by each
-                control. Before this the alias editor carried its own picker, which read as a quirk of
-                renaming rather than as the shape of the screen — and there was nowhere at all to put
-                a second per-channel control.
-              -->
-              <!--
-                THE PER-CHANNEL BOX, and the only one on this screen.
-                Everything else here is a setting about the app; everything in here is about ONE
-                channel, chosen once at the top rather than separately by each control.
-
-                IT IS SMALL WHEN IT IS DOING NOTHING. The first version laid every field out at once
-                — a rename box, an id box, a name box, a checkbox — and on a phone that is most of a
-                screen of text entry standing open for two acts that are each performed rarely. So
-                what is always visible is the picker, one line saying what this channel IS, and the
-                verbs. The fields belong to the verb and appear with it.
-              -->
-              <section class="settings-group" id="channel-settings" aria-labelledby="settings-channels-title">
-                <p class="hint">Chat service: <span id="chat-provider-settings">Chat</span></p>
-                <label for="settings-channel">Channel</label>
-                <select id="settings-channel" aria-describedby="channel-facts"></select>
-                <!-- What this channel IS: the name in force, and where it came from. -->
-                <p id="channel-facts" class="hint" aria-live="polite"></p>
-
+              <div class="fold-body" id="fold-settings-channels-body" hidden="until-found">
                 <!--
-                  `#349 channel-settings-all`. The picker's first choice is All channels, offered when
-                  there are two or more: the owner, 2026-10-18, "Clear unread can be set for all at
-                  once". With it chosen the line above says how many, Rename and Remove step aside
-                  (they name one channel), Add and Browse stay, and Clear unread below shows the
-                  channels' common mode, or Mixed, and Save sets it on every channel whose service can.
+                  `#39 channel-alias`. A name of the OWNER's own for a channel, so that addressing one
+                  out loud is possible at all: a snowflake is unsayable and a configured label like
+                  "build noise" is not what anyone says either. The three things it deliberately is
+                  NOT are stated in Help, and they are the whole point of the feature.
                 -->
-                <div class="channel-actions">
-                  <button id="rename-channel" class="secondary" type="button" aria-expanded="false" aria-controls="rename-fields">Rename</button>
+                <!--
+                  THE PER-CHANNEL SECTION, and the only one on this screen.
+                  Everything else here is a setting about the app; everything in here is a setting about
+                  ONE channel, and which one is chosen once at the top rather than separately by each
+                  control. Before this the alias editor carried its own picker, which read as a quirk of
+                  renaming rather than as the shape of the screen — and there was nowhere at all to put
+                  a second per-channel control.
+                -->
+                <!--
+                  THE PER-CHANNEL BOX, and the only one on this screen.
+                  Everything else here is a setting about the app; everything in here is about ONE
+                  channel, chosen once at the top rather than separately by each control.
+
+                  IT IS SMALL WHEN IT IS DOING NOTHING. The first version laid every field out at once
+                  — a rename box, an id box, a name box, a checkbox — and on a phone that is most of a
+                  screen of text entry standing open for two acts that are each performed rarely. So
+                  what is always visible is the picker, one line saying what this channel IS, and the
+                  verbs. The fields belong to the verb and appear with it.
+                -->
+                <section class="settings-group" id="channel-settings" aria-labelledby="settings-channels-title">
+                  <p class="hint">Chat service: <span id="chat-provider-settings">Chat</span></p>
+                  <label for="settings-channel">Channel</label>
+                  <select id="settings-channel" aria-describedby="channel-facts"></select>
+                  <!-- What this channel IS: the name in force, and where it came from. -->
+                  <p id="channel-facts" class="hint" aria-live="polite"></p>
+
                   <!--
-                    `#199 removable-config-channels`. Offered for EVERY channel on the list. One added
-                    here is forgotten. One from the configuration file is hidden instead, because the
-                    server never writes that file — it would otherwise come back on the next restart
-                    — and the hidden list below offers it back.
+                    `#349 channel-settings-all`. The picker's first choice is All channels, offered when
+                    there are two or more: the owner, 2026-10-18, "Clear unread can be set for all at
+                    once". With it chosen the line above says how many, Rename and Remove step aside
+                    (they name one channel), Add and Browse stay, and Clear unread below shows the
+                    channels' common mode, or Mixed, and Save sets it on every channel whose service can.
                   -->
-                  <button id="remove-channel" class="secondary" type="button" hidden>Remove</button>
-                  <button id="open-add-channel" class="secondary" type="button" aria-expanded="false" aria-controls="add-channel-fields">Add a channel</button>
-                  <!-- `#19 channel-browser`. Only offered when the server says the bridge can list its
-                       channels; otherwise pasting a link under "Add a channel" is the way in. -->
-                  <button id="open-browse-channels" class="secondary" type="button" aria-expanded="false" aria-controls="browse-channel-fields" hidden>Browse channels</button>
-                </div>
-                <p id="remove-channel-state" class="hint" aria-live="polite"></p>
-
-                <!--
-                  `#199 removable-config-channels`. Configured channels taken off the list, each with
-                  the one act that puts it back. Hidden while there are none. Rows are built by
-                  `renderHiddenChannels` in web/voice.js, in the directory's row shape: a name and a
-                  button.
-                -->
-                <div id="hidden-channels" hidden>
-                  <p class="hint">Hidden channels from this server's configuration:</p>
-                  <ul id="hidden-channel-list" class="channel-directory" aria-label="Hidden channels"></ul>
-                </div>
-
-                <div id="rename-fields" hidden>
-                  <label for="channel-alias">Call it</label>
-                  <input
-                    id="channel-alias"
-                    type="text"
-                    maxlength="60"
-                    autocomplete="off"
-                    aria-describedby="alias-state"
-                  />
-                  <p id="alias-state" class="hint" aria-live="polite"></p>
                   <div class="channel-actions">
-                    <button id="save-alias" class="secondary" type="button">Save</button>
-                    <button id="clear-alias" class="secondary" type="button">Use the configured label</button>
-                    <button id="cancel-rename" class="secondary" type="button">Cancel</button>
-                  </div>
-                  <!--
-                    The SERVER's own standing statement about what an alias is, quoted and never
-                    rewritten — the same rule `#inbox-note` follows. A second copy of a policy here
-                    would be a second thing that can drift from the one the server actually enforces.
-                  -->
-                  <p id="alias-note" class="hint"></p>
-                </div>
-
-                <div id="add-channel-fields" hidden>
-                  <p id="new-channel-help" class="hint">
-                    Enter the channel ID supplied by this deployment. The chat connector must
-                    already have access to the channel in the chat service.
-                  </p>
-                  <label id="new-channel-id-label" for="new-channel-id">Channel ID</label>
-                  <input
-                    id="new-channel-id"
-                    type="text"
-                    inputmode="numeric"
-                    maxlength="20"
-                    autocomplete="off"
-                    placeholder="17 to 20 digits"
-                    aria-describedby="add-channel-state"
-                  />
-                  <label for="new-channel-label">Call it</label>
-                  <input
-                    id="new-channel-label"
-                    type="text"
-                    maxlength="60"
-                    autocomplete="off"
-                    aria-describedby="add-channel-state"
-                  />
-                  <!--
-                    OFF BY DEFAULT, and it is the one control in here that widens what the bridge can
-                    SAY rather than what it can read. Left as a deliberate act rather than a
-                    convenience.
-                  -->
-                  <label id="new-channel-writable-row" class="row" for="new-channel-writable">
-                    <input id="new-channel-writable" type="checkbox" />
-                    <span>Let this app post here</span>
-                  </label>
-                  <div class="channel-actions">
-                    <button id="add-channel" class="secondary" type="button">Add</button>
-                    <button id="cancel-add-channel" class="secondary" type="button">Cancel</button>
-                  </div>
-                  <p id="add-channel-state" class="hint" aria-live="polite"></p>
-                </div>
-
-                <!--
-                  `#19 channel-browser`. The channels the bridge can see, searchable, one tap to add.
-                  Rows are built by `renderChannelDirectory` in web/voice.js; a channel this app
-                  already reads is marked and has no Add button, so it cannot be added twice.
-                -->
-                <div id="browse-channel-fields" hidden>
-                  <label for="channel-directory-search">Search channels</label>
-                  <input
-                    id="channel-directory-search"
-                    type="search"
-                    maxlength="100"
-                    autocomplete="off"
-                    enterkeyhint="search"
-                    placeholder="type part of a name"
-                    aria-describedby="channel-directory-state"
-                    aria-controls="channel-directory-list"
-                  />
-                  <p id="channel-directory-state" class="hint" aria-live="polite"></p>
-                  <ul id="channel-directory-list" class="channel-directory" aria-label="Channels you can add"></ul>
-                  <div class="channel-actions">
-                    <button id="channel-directory-more" class="secondary" type="button" hidden>Show more</button>
-                    <button id="channel-directory-retry" class="secondary" type="button" hidden>Try again</button>
-                    <button id="close-browse-channels" class="secondary" type="button">Done</button>
-                  </div>
-                </div>
-
-                <!--
-                  `#232 upstream-mark-read`. Clear this channel's unread state in its chat service's
-                  own app as vibe-talk receives each message, so that app's unread list keeps the
-                  people and vibe-talk keeps the agents. The SERVER does it, with no page open, so the
-                  choice is the server's own, read and written through /upstream-clear and never kept
-                  on this device. Shown only when the channel's service can do it, and only to a
-                  token that may change it. The warning is always on screen beside the choice, because
-                  what it does to the other app is the whole decision. Built by `renderUpstreamClear`
-                  in web/voice.js.
-                -->
-                <div id="upstream-clear" hidden>
-                  <hr class="settings-rule" />
-                  <label for="upstream-clear-mode">Clear unread in <span id="upstream-clear-provider">the chat service</span></label>
-                  <select id="upstream-clear-mode" aria-describedby="upstream-clear-warning upstream-clear-threads upstream-clear-state">
-                    <option value="off">Off</option>
-                    <option value="dry_run">Dry run: log only, mark nothing</option>
-                    <option value="on">On</option>
+                    <button id="rename-channel" class="secondary" type="button" aria-expanded="false" aria-controls="rename-fields">Rename</button>
                     <!--
-                      `#349 channel-settings-all`. What the choice shows when All channels is picked
-                      and the channels are not all set alike. Never a mode that can be saved:
-                      disabled, and offered only while it is true.
+                      `#199 removable-config-channels`. Offered for EVERY channel on the list. One added
+                      here is forgotten. One from the configuration file is hidden instead, because the
+                      server never writes that file — it would otherwise come back on the next restart
+                      — and the hidden list below offers it back.
                     -->
-                    <option id="upstream-clear-mixed" value="mixed" disabled hidden>Mixed</option>
-                  </select>
-                  <p id="upstream-clear-warning" class="hint">
-                    Marks EVERY message in <span id="upstream-clear-scope">this channel</span> read in
-                    <span id="upstream-clear-warning-provider">the chat service</span> as soon as
-                    vibe-talk receives it, including messages from people. The first message
-                    vibe-talk receives after it is on also marks everything already unread there
-                    read, people's messages too. vibe-talk's own unread and Done state are not changed.
-                  </p>
-                  <!--
-                    `#253 upstream-clear-polish`. Said plainly and on its own line, because it is the
-                    part that surprises: the service's read marker that can be moved covers the main
-                    conversation only, and nothing available can mark a thread read.
-                  -->
-                  <p id="upstream-clear-threads" class="hint">
-                    Thread replies stay unread in
-                    <span id="upstream-clear-threads-provider">the chat service</span>; only the main
-                    conversation is cleared.
-                  </p>
-                  <!--
-                    Save changes the mode. "Mark read now" (or "Try it now" in a dry run) is a one-shot
-                    act on the mode already saved: it pushes the newest message at once, and its
-                    progress and result go in the status line below. Shown only while the saved mode
-                    is on or a dry run and the choice above still matches it.
-                  -->
-                  <div class="channel-actions">
-                    <button id="upstream-clear-save" class="secondary" type="button" disabled>Save</button>
-                    <button id="upstream-clear-push" class="secondary" type="button" hidden>Mark read now</button>
+                    <button id="remove-channel" class="secondary" type="button" hidden>Remove</button>
+                    <button id="open-add-channel" class="secondary" type="button" aria-expanded="false" aria-controls="add-channel-fields">Add a channel</button>
+                    <!-- `#19 channel-browser`. Only offered when the server says the bridge can list its
+                         channels; otherwise pasting a link under "Add a channel" is the way in. -->
+                    <button id="open-browse-channels" class="secondary" type="button" aria-expanded="false" aria-controls="browse-channel-fields" hidden>Browse channels</button>
                   </div>
-                  <p id="upstream-clear-state" class="hint" aria-live="polite"></p>
-                </div>
-              </section>
+                  <p id="remove-channel-state" class="hint" aria-live="polite"></p>
+
+                  <!--
+                    `#199 removable-config-channels`. Configured channels taken off the list, each with
+                    the one act that puts it back. Hidden while there are none. Rows are built by
+                    `renderHiddenChannels` in web/voice.js, in the directory's row shape: a name and a
+                    button.
+                  -->
+                  <div id="hidden-channels" hidden>
+                    <p class="hint">Hidden channels from this server's configuration:</p>
+                    <ul id="hidden-channel-list" class="channel-directory" aria-label="Hidden channels"></ul>
+                  </div>
+
+                  <div id="rename-fields" hidden>
+                    <label for="channel-alias">Call it</label>
+                    <input
+                      id="channel-alias"
+                      type="text"
+                      maxlength="60"
+                      autocomplete="off"
+                      aria-describedby="alias-state"
+                    />
+                    <p id="alias-state" class="hint" aria-live="polite"></p>
+                    <div class="channel-actions">
+                      <button id="save-alias" class="secondary" type="button">Save</button>
+                      <button id="clear-alias" class="secondary" type="button">Use the configured label</button>
+                      <button id="cancel-rename" class="secondary" type="button">Cancel</button>
+                    </div>
+                    <!--
+                      The SERVER's own standing statement about what an alias is, quoted and never
+                      rewritten — the same rule `#inbox-note` follows. A second copy of a policy here
+                      would be a second thing that can drift from the one the server actually enforces.
+                    -->
+                    <p id="alias-note" class="hint"></p>
+                  </div>
+
+                  <div id="add-channel-fields" hidden>
+                    <p id="new-channel-help" class="hint">
+                      Enter the channel ID supplied by this deployment. The chat connector must
+                      already have access to the channel in the chat service.
+                    </p>
+                    <label id="new-channel-id-label" for="new-channel-id">Channel ID</label>
+                    <input
+                      id="new-channel-id"
+                      type="text"
+                      inputmode="numeric"
+                      maxlength="20"
+                      autocomplete="off"
+                      placeholder="17 to 20 digits"
+                      aria-describedby="add-channel-state"
+                    />
+                    <label for="new-channel-label">Call it</label>
+                    <input
+                      id="new-channel-label"
+                      type="text"
+                      maxlength="60"
+                      autocomplete="off"
+                      aria-describedby="add-channel-state"
+                    />
+                    <!--
+                      OFF BY DEFAULT, and it is the one control in here that widens what the bridge can
+                      SAY rather than what it can read. Left as a deliberate act rather than a
+                      convenience.
+                    -->
+                    <label id="new-channel-writable-row" class="row" for="new-channel-writable">
+                      <input id="new-channel-writable" type="checkbox" />
+                      <span>Let this app post here</span>
+                    </label>
+                    <div class="channel-actions">
+                      <button id="add-channel" class="secondary" type="button">Add</button>
+                      <button id="cancel-add-channel" class="secondary" type="button">Cancel</button>
+                    </div>
+                    <p id="add-channel-state" class="hint" aria-live="polite"></p>
+                  </div>
+
+                  <!--
+                    `#19 channel-browser`. The channels the bridge can see, searchable, one tap to add.
+                    Rows are built by `renderChannelDirectory` in web/voice.js; a channel this app
+                    already reads is marked and has no Add button, so it cannot be added twice.
+                  -->
+                  <div id="browse-channel-fields" hidden>
+                    <label for="channel-directory-search">Search channels</label>
+                    <input
+                      id="channel-directory-search"
+                      type="search"
+                      maxlength="100"
+                      autocomplete="off"
+                      enterkeyhint="search"
+                      placeholder="type part of a name"
+                      aria-describedby="channel-directory-state"
+                      aria-controls="channel-directory-list"
+                    />
+                    <p id="channel-directory-state" class="hint" aria-live="polite"></p>
+                    <ul id="channel-directory-list" class="channel-directory" aria-label="Channels you can add"></ul>
+                    <div class="channel-actions">
+                      <button id="channel-directory-more" class="secondary" type="button" hidden>Show more</button>
+                      <button id="channel-directory-retry" class="secondary" type="button" hidden>Try again</button>
+                      <button id="close-browse-channels" class="secondary" type="button">Done</button>
+                    </div>
+                  </div>
+
+                  <!--
+                    `#232 upstream-mark-read`. Clear this channel's unread state in its chat service's
+                    own app as vibe-talk receives each message, so that app's unread list keeps the
+                    people and vibe-talk keeps the agents. The SERVER does it, with no page open, so the
+                    choice is the server's own, read and written through /upstream-clear and never kept
+                    on this device. Shown only when the channel's service can do it, and only to a
+                    token that may change it. The warning is always on screen beside the choice, because
+                    what it does to the other app is the whole decision. Built by `renderUpstreamClear`
+                    in web/voice.js.
+                  -->
+                  <div id="upstream-clear" hidden>
+                    <hr class="settings-rule" />
+                    <label for="upstream-clear-mode">Clear unread in <span id="upstream-clear-provider">the chat service</span></label>
+                    <select id="upstream-clear-mode" aria-describedby="upstream-clear-warning upstream-clear-threads upstream-clear-state">
+                      <option value="off">Off</option>
+                      <option value="dry_run">Dry run: log only, mark nothing</option>
+                      <option value="on">On</option>
+                      <!--
+                        `#349 channel-settings-all`. What the choice shows when All channels is picked
+                        and the channels are not all set alike. Never a mode that can be saved:
+                        disabled, and offered only while it is true.
+                      -->
+                      <option id="upstream-clear-mixed" value="mixed" disabled hidden>Mixed</option>
+                    </select>
+                    <p id="upstream-clear-warning" class="hint">
+                      Marks EVERY message in <span id="upstream-clear-scope">this channel</span> read in
+                      <span id="upstream-clear-warning-provider">the chat service</span> as soon as
+                      vibe-talk receives it, including messages from people. The first message
+                      vibe-talk receives after it is on also marks everything already unread there
+                      read, people's messages too. vibe-talk's own unread and Done state are not changed.
+                    </p>
+                    <!--
+                      `#253 upstream-clear-polish`. Said plainly and on its own line, because it is the
+                      part that surprises: the service's read marker that can be moved covers the main
+                      conversation only, and nothing available can mark a thread read.
+                    -->
+                    <p id="upstream-clear-threads" class="hint">
+                      Thread replies stay unread in
+                      <span id="upstream-clear-threads-provider">the chat service</span>; only the main
+                      conversation is cleared.
+                    </p>
+                    <!--
+                      Save changes the mode. "Mark read now" (or "Try it now" in a dry run) is a one-shot
+                      act on the mode already saved: it pushes the newest message at once, and its
+                      progress and result go in the status line below. Shown only while the saved mode
+                      is on or a dry run and the choice above still matches it.
+                    -->
+                    <div class="channel-actions">
+                      <button id="upstream-clear-save" class="secondary" type="button" disabled>Save</button>
+                      <button id="upstream-clear-push" class="secondary" type="button" hidden>Mark read now</button>
+                    </div>
+                    <p id="upstream-clear-state" class="hint" aria-live="polite"></p>
+                  </div>
+                </section>
+              </div>
             </section>
 
             <section class="settings-section" id="settings-screen" aria-labelledby="settings-screen-title">
-              <h2 id="settings-screen-title">Screen and keys</h2>
+              <h2 id="settings-screen-title"><button class="fold-toggle" id="fold-settings-screen" type="button" aria-expanded="false" aria-controls="fold-settings-screen-body">Screen and keys</button></h2>
+              <div class="fold-body" id="fold-settings-screen-body" hidden="until-found">
+                <section class="settings-group">
+                  <div class="group-head">
+                    <h3><button class="fold-toggle" id="fold-text-size" type="button" aria-expanded="false" aria-controls="fold-text-size-body">Text size</button></h3>
+                  </div>
+                  <div class="fold-body" id="fold-text-size-body" hidden="until-found">
+                    <!--
+                      MESSAGE TEXT ONLY, not the whole interface. A reader asking for more words on a
+                      phone screen is not asking for a bigger Reply button, and scaling the row would
+                      scale its controls with it. Percent rather than points: it multiplies whatever the
+                      stylesheet's own size is, so the two lists stay in proportion.
 
-              <section class="settings-group">
-                <div class="group-head">
-                  <h3>Text size</h3>
-                </div>
-                <!--
-                  MESSAGE TEXT ONLY, not the whole interface. A reader asking for more words on a
-                  phone screen is not asking for a bigger Reply button, and scaling the row would
-                  scale its controls with it. Percent rather than points: it multiplies whatever the
-                  stylesheet's own size is, so the two lists stay in proportion.
+                      `#230 text-size-buttons`. A − and a + either side of the slider, one step of it
+                      each, for a thumb that cannot land a five-per-cent drag on a phone. They step by
+                      the slider's own step through the slider's own code (`stepMsgScale` in voice.js),
+                      and each is disabled at the end it moves towards.
+                    -->
+                    <div class="msg-scale-row">
+                      <button
+                        id="msg-scale-smaller"
+                        class="secondary step-button"
+                        type="button"
+                        aria-label="Smaller text"
+                        aria-controls="msg-scale"
+                        title="Smaller text"
+                      >−</button>
+                      <input
+                        id="msg-scale"
+                        type="range"
+                        min="80"
+                        max="150"
+                        step="5"
+                        aria-label="message text size, percent"
+                      />
+                      <button
+                        id="msg-scale-larger"
+                        class="secondary step-button"
+                        type="button"
+                        aria-label="Larger text"
+                        aria-controls="msg-scale"
+                        title="Larger text"
+                      >+</button>
+                    </div>
+                    <p id="msg-scale-state" class="hint" aria-live="polite"></p>
+                  </div>
+                </section>
 
-                  `#230 text-size-buttons`. A − and a + either side of the slider, one step of it
-                  each, for a thumb that cannot land a five-per-cent drag on a phone. They step by
-                  the slider's own step through the slider's own code (`stepMsgScale` in voice.js),
-                  and each is disabled at the end it moves towards.
-                -->
-                <div class="msg-scale-row">
-                  <button
-                    id="msg-scale-smaller"
-                    class="secondary step-button"
-                    type="button"
-                    aria-label="Smaller text"
-                    aria-controls="msg-scale"
-                    title="Smaller text"
-                  >−</button>
-                  <input
-                    id="msg-scale"
-                    type="range"
-                    min="80"
-                    max="150"
-                    step="5"
-                    aria-label="message text size, percent"
-                  />
-                  <button
-                    id="msg-scale-larger"
-                    class="secondary step-button"
-                    type="button"
-                    aria-label="Larger text"
-                    aria-controls="msg-scale"
-                    title="Larger text"
-                  >+</button>
-                </div>
-                <p id="msg-scale-state" class="hint" aria-live="polite"></p>
-              </section>
+                <section class="settings-group">
+                  <div class="group-head">
+                    <h3 title="How wide the column of messages is on a wide screen, in characters."><button class="fold-toggle" id="fold-reading-width" type="button" aria-expanded="false" aria-controls="fold-reading-width-body">Reading width</button></h3>
+                    <button class="help-link" id="help-link-reading-width" type="button" data-help="reading-width" aria-label="About the reading width" title="How wide the column of messages is on a wide screen, in characters.">?</button>
+                  </div>
+                  <div class="fold-body" id="fold-reading-width-body" hidden="until-found">
+                    <input
+                      id="reading-width"
+                      type="range"
+                      min="45"
+                      max="120"
+                      step="1"
+                      aria-label="reading width in characters"
+                    />
+                    <p id="reading-width-state" class="hint" aria-live="polite"></p>
+                  </div>
+                </section>
 
-              <section class="settings-group">
-                <div class="group-head">
-                  <h3 title="How wide the column of messages is on a wide screen, in characters.">Reading width</h3>
-                  <button class="help-link" id="help-link-reading-width" type="button" data-help="reading-width" aria-label="About the reading width" title="How wide the column of messages is on a wide screen, in characters.">?</button>
-                </div>
-                <input
-                  id="reading-width"
-                  type="range"
-                  min="45"
-                  max="120"
-                  step="1"
-                  aria-label="reading width in characters"
-                />
-                <p id="reading-width-state" class="hint" aria-live="polite"></p>
-              </section>
+                <section class="settings-group">
+                  <div class="group-head">
+                    <h3 title="Where the strip with the gear and the Voice/Channel switch sits: at the bottom, by your thumb, or at the top."><button class="fold-toggle" id="fold-control-bar" type="button" aria-expanded="false" aria-controls="fold-control-bar-body">Control bar</button></h3>
+                    <button class="help-link" id="help-link-control-bar" type="button" data-help="control-bar" aria-label="About the control bar" title="Where the strip with the gear and the Voice/Channel switch sits: at the bottom, by your thumb, or at the top.">?</button>
+                  </div>
+                  <div class="fold-body" id="fold-control-bar-body" hidden="until-found">
+                    <label for="bar-placement">Where the control bar sits</label>
+                    <select id="bar-placement" aria-describedby="bar-placement-state">
+                      <option value="bottom">Bottom — above the big buttons</option>
+                      <option value="top">Top — under the title</option>
+                    </select>
+                    <p id="bar-placement-state" class="hint" aria-live="polite"></p>
+                  </div>
+                </section>
 
-              <section class="settings-group">
-                <div class="group-head">
-                  <h3 title="Where the strip with the gear and the Voice/Channel switch sits: at the bottom, by your thumb, or at the top.">Control bar</h3>
-                  <button class="help-link" id="help-link-control-bar" type="button" data-help="control-bar" aria-label="About the control bar" title="Where the strip with the gear and the Voice/Channel switch sits: at the bottom, by your thumb, or at the top.">?</button>
-                </div>
-                <label for="bar-placement">Where the control bar sits</label>
-                <select id="bar-placement" aria-describedby="bar-placement-state">
-                  <option value="bottom">Bottom — above the big buttons</option>
-                  <option value="top">Top — under the title</option>
-                </select>
-                <p id="bar-placement-state" class="hint" aria-live="polite"></p>
-              </section>
+                <section class="settings-group">
+                  <div class="group-head">
+                    <h3><button class="fold-toggle" id="fold-typing" type="button" aria-expanded="false" aria-controls="fold-typing-body">Typing</button></h3>
+                  </div>
+                  <div class="fold-body" id="fold-typing-body" hidden="until-found">
+                    <!--
+                      `#225 enter-to-send`. One rule for every message box — the channel, a thread, a
+                      reply and the call — where each used to have its own. ON by default, which is what
+                      the channel's box always did. The hint under it is written by web/voice.js: with
+                      the switch off it names the key that sends instead, in the words on the reader's
+                      own keyboard (Cmd on an Apple one, Ctrl elsewhere), which the markup cannot know.
+                    -->
+                    <label class="toggle">
+                      <input id="enter-sends" type="checkbox" checked aria-describedby="enter-sends-hint" />
+                      Enter to send
+                    </label>
+                    <p id="enter-sends-hint" class="hint" aria-live="polite"></p>
+                  </div>
+                </section>
 
-              <section class="settings-group">
-                <div class="group-head">
-                  <h3>Typing</h3>
-                </div>
-                <!--
-                  `#225 enter-to-send`. One rule for every message box — the channel, a thread, a
-                  reply and the call — where each used to have its own. ON by default, which is what
-                  the channel's box always did. The hint under it is written by web/voice.js: with
-                  the switch off it names the key that sends instead, in the words on the reader's
-                  own keyboard (Cmd on an Apple one, Ctrl elsewhere), which the markup cannot know.
-                -->
-                <label class="toggle">
-                  <input id="enter-sends" type="checkbox" checked aria-describedby="enter-sends-hint" />
-                  Enter to send
-                </label>
-                <p id="enter-sends-hint" class="hint" aria-live="polite"></p>
-              </section>
-
-              <section class="settings-group">
-                <div class="group-head">
-                  <h3 title="The keys that type a character can be turned off; the ? lists every key.">Keyboard</h3>
-                  <button class="help-link" id="help-link-keyboard" type="button" data-help="keyboard" aria-label="Every keyboard shortcut" title="The keys that type a character can be turned off; the ? lists every key.">?</button>
-                </div>
-                <!--
-                  `#224 keyboard-shortcuts`. The keys that type a character — j, k, e, /, ? and the rest
-                  — can be turned off, which is what WCAG 2.1.4 asks of them; Escape, the arrows, Enter
-                  and the Ctrl or Cmd chords stay. ON by default. The line under it is written by
-                  web/voice.js, which names the chord's key as the reader's own keyboard names it. The
-                  `?` opens the list of every key, which `?` on the keyboard opens too.
-                -->
-                <label class="toggle">
-                  <input id="single-keys" type="checkbox" checked aria-describedby="single-keys-hint" />
-                  Single-key shortcuts
-                </label>
-                <p id="single-keys-hint" class="hint" aria-live="polite"></p>
-              </section>
+                <section class="settings-group">
+                  <div class="group-head">
+                    <h3 title="The keys that type a character can be turned off; the ? lists every key."><button class="fold-toggle" id="fold-keyboard" type="button" aria-expanded="false" aria-controls="fold-keyboard-body">Keyboard</button></h3>
+                    <button class="help-link" id="help-link-keyboard" type="button" data-help="keyboard" aria-label="Every keyboard shortcut" title="The keys that type a character can be turned off; the ? lists every key.">?</button>
+                  </div>
+                  <div class="fold-body" id="fold-keyboard-body" hidden="until-found">
+                    <!--
+                      `#224 keyboard-shortcuts`. The keys that type a character — j, k, e, /, ? and the rest
+                      — can be turned off, which is what WCAG 2.1.4 asks of them; Escape, the arrows, Enter
+                      and the Ctrl or Cmd chords stay. ON by default. The line under it is written by
+                      web/voice.js, which names the chord's key as the reader's own keyboard names it. The
+                      `?` opens the list of every key, which `?` on the keyboard opens too.
+                    -->
+                    <label class="toggle">
+                      <input id="single-keys" type="checkbox" checked aria-describedby="single-keys-hint" />
+                      Single-key shortcuts
+                    </label>
+                    <p id="single-keys-hint" class="hint" aria-live="polite"></p>
+                  </div>
+                </section>
+              </div>
             </section>
 
             <section class="settings-section" id="settings-storage" aria-labelledby="settings-storage-title">
-              <h2 id="settings-storage-title">Storage and connection</h2>
-
-              <section class="settings-group">
-                <div class="group-head">
-                  <h3 title="The transcript of each call, kept by this server so a reload does not lose it.">Stored conversations</h3>
-                  <button class="help-link" id="help-link-storage" type="button" data-help="storage" aria-label="About stored conversations" title="The transcript of each call, kept by this server so a reload does not lose it.">?</button>
-                </div>
-                <p id="storage-state" class="hint" aria-live="polite"></p>
-                <button id="forget-conversations" class="secondary" type="button">
-                  Forget stored conversations
-                </button>
-              </section>
-
-              <!--
-                `#208 persistent-cache`. The server's own copy of the channel messages it reads,
-                kept in a file of its own beside its store. The SERVER's, like the voice switch:
-                drawn from client-config's `message_cache` and redrawn from what each PUT or DELETE
-                answers, never from the click, so the box never says the file is kept or gone
-                when the server says otherwise.
-
-                HIDDEN as served, and it stays hidden unless client-config carries the status. A
-                server whose configuration has no [message_cache] table sends none, and no server
-                sends it to a read token, which cannot switch it. Its help entry is hidden with it,
-                so Help on such a server describes nothing it lacks.
-
-                Unticking turns saving off AND erases the file, and Erase empties it and carries
-                on, so both ask first, in `#message-cache-confirm`, and only its own button sends.
-                Turning it on sends at once: it erases nothing. Written by `renderServerCache` in
-                web/voice.js; a failed request is said in `#message-cache-state`.
-              -->
-              <section class="settings-group" id="message-cache-group" hidden>
-                <div class="group-head">
-                  <h3 title="The server's own copy of the channel messages it reads, kept for a limited time.">Saved messages on this server</h3>
-                  <button class="help-link" id="help-link-message-cache" type="button" data-help="message-cache" aria-label="About saved messages on this server" title="The server's own copy of the channel messages it reads, kept for a limited time.">?</button>
-                </div>
-                <label class="toggle">
-                  <input id="message-cache-enabled" type="checkbox" />
-                  Save the messages this server reads
-                </label>
-                <p id="message-cache-state" class="hint" aria-live="polite"></p>
-                <div id="message-cache-confirm" role="group" aria-labelledby="message-cache-confirm-text" hidden>
-                  <p id="message-cache-confirm-text"></p>
-                  <div class="channel-actions">
-                    <button id="message-cache-confirm-yes" class="secondary" type="button">Erase</button>
-                    <button id="message-cache-confirm-no" class="secondary" type="button">Keep them</button>
+              <h2 id="settings-storage-title"><button class="fold-toggle" id="fold-settings-storage" type="button" aria-expanded="false" aria-controls="fold-settings-storage-body">Storage and connection</button></h2>
+              <div class="fold-body" id="fold-settings-storage-body" hidden="until-found">
+                <section class="settings-group">
+                  <div class="group-head">
+                    <h3 title="The transcript of each call, kept by this server so a reload does not lose it."><button class="fold-toggle" id="fold-storage" type="button" aria-expanded="false" aria-controls="fold-storage-body">Stored conversations</button></h3>
+                    <button class="help-link" id="help-link-storage" type="button" data-help="storage" aria-label="About stored conversations" title="The transcript of each call, kept by this server so a reload does not lose it.">?</button>
                   </div>
-                </div>
-                <button id="message-cache-erase" class="secondary" type="button">Erase saved messages</button>
-              </section>
+                  <div class="fold-body" id="fold-storage-body" hidden="until-found">
+                    <p id="storage-state" class="hint" aria-live="polite"></p>
+                    <button id="forget-conversations" class="secondary" type="button">
+                      Forget stored conversations
+                    </button>
+                  </div>
+                </section>
 
-              <section class="settings-group">
-                <div class="group-head">
-                  <h3>Token</h3>
-                </div>
-                <p class="hint">Server: <code id="settings-server-url"></code></p>
-                <button id="forget-token" class="secondary" type="button">Forget token and sign out</button>
-              </section>
-
-              <!--
-                LAST, and that is the change. This is a READOUT, not a setting — it says what the
-                current conversation is and what the last close code was — and it was occupying the
-                first thing a reader sees on a screen they came to in order to change something.
-              -->
-              <section class="settings-group">
-                <div class="group-head">
-                  <h3 title="A readout: what the current call is connected to, how live updates reach this page, and why the last call closed.">Connection status</h3>
-                  <button class="help-link" id="help-link-connection" type="button" data-help="connection" aria-label="About the connection status" title="A readout: what the current call is connected to, how live updates reach this page, and why the last call closed.">?</button>
-                </div>
                 <!--
-                  `#348 settings-dynamic-lists`. A readout, so it is drawn as one: the dark, monospaced
-                  data panel Recently dismissed is drawn in, one fact to a line (`renderDetail` puts
-                  each part of the connection detail on its own line), and the live-updates line last.
+                  `#208 persistent-cache`. The server's own copy of the channel messages it reads,
+                  kept in a file of its own beside its store. The SERVER's, like the voice switch:
+                  drawn from client-config's `message_cache` and redrawn from what each PUT or DELETE
+                  answers, never from the click, so the box never says the file is kept or gone
+                  when the server says otherwise.
+
+                  HIDDEN as served, and it stays hidden unless client-config carries the status. A
+                  server whose configuration has no [message_cache] table sends none, and no server
+                  sends it to a read token, which cannot switch it. Its help entry is hidden with it,
+                  so Help on such a server describes nothing it lacks.
+
+                  Unticking turns saving off AND erases the file, and Erase empties it and carries
+                  on, so both ask first, in `#message-cache-confirm`, and only its own button sends.
+                  Turning it on sends at once: it erases nothing. Written by `renderServerCache` in
+                  web/voice.js; a failed request is said in `#message-cache-state`.
                 -->
-                <div id="connection-panel" class="data-panel connection-panel" role="group" aria-label="Connection status readout">
-                  <div id="settings-detail" class="data-line">no conversation yet</div>
-                  <!--
-                    `#347 settings-prose`. How live updates reach this page — the server polling the
-                    channel or a provider adapter pushing, and whether this page is attached to the
-                    server's stream — moved here from the head of Arriving messages during a call. The
-                    owner named it as the implementation detail to take out of the settings: it is a
-                    readout about how the server works, and this is the readout. Still one short line
-                    per state (`renderLiveState`), and the same element.
-                  -->
-                  <p id="live-state" class="data-line" aria-live="polite"></p>
-                </div>
-              </section>
+                <section class="settings-group" id="message-cache-group" hidden>
+                  <div class="group-head">
+                    <h3 title="The server's own copy of the channel messages it reads, kept for a limited time."><button class="fold-toggle" id="fold-message-cache" type="button" aria-expanded="false" aria-controls="fold-message-cache-body">Saved messages on this server</button></h3>
+                    <button class="help-link" id="help-link-message-cache" type="button" data-help="message-cache" aria-label="About saved messages on this server" title="The server's own copy of the channel messages it reads, kept for a limited time.">?</button>
+                  </div>
+                  <div class="fold-body" id="fold-message-cache-body" hidden="until-found">
+                    <label class="toggle">
+                      <input id="message-cache-enabled" type="checkbox" />
+                      Save the messages this server reads
+                    </label>
+                    <p id="message-cache-state" class="hint" aria-live="polite"></p>
+                    <div id="message-cache-confirm" role="group" aria-labelledby="message-cache-confirm-text" hidden>
+                      <p id="message-cache-confirm-text"></p>
+                      <div class="channel-actions">
+                        <button id="message-cache-confirm-yes" class="secondary" type="button">Erase</button>
+                        <button id="message-cache-confirm-no" class="secondary" type="button">Keep them</button>
+                      </div>
+                    </div>
+                    <button id="message-cache-erase" class="secondary" type="button">Erase saved messages</button>
+                  </div>
+                </section>
+
+                <section class="settings-group">
+                  <div class="group-head">
+                    <h3><button class="fold-toggle" id="fold-token" type="button" aria-expanded="false" aria-controls="fold-token-body">Token</button></h3>
+                  </div>
+                  <div class="fold-body" id="fold-token-body" hidden="until-found">
+                    <p class="hint">Server: <code id="settings-server-url"></code></p>
+                    <button id="forget-token" class="secondary" type="button">Forget token and sign out</button>
+                  </div>
+                </section>
+
+                <!--
+                  LAST, and that is the change. This is a READOUT, not a setting — it says what the
+                  current conversation is and what the last close code was — and it was occupying the
+                  first thing a reader sees on a screen they came to in order to change something.
+                -->
+                <section class="settings-group">
+                  <div class="group-head">
+                    <h3 title="A readout: what the current call is connected to, how live updates reach this page, and why the last call closed."><button class="fold-toggle" id="fold-connection" type="button" aria-expanded="false" aria-controls="fold-connection-body">Connection status</button></h3>
+                    <button class="help-link" id="help-link-connection" type="button" data-help="connection" aria-label="About the connection status" title="A readout: what the current call is connected to, how live updates reach this page, and why the last call closed.">?</button>
+                  </div>
+                  <div class="fold-body" id="fold-connection-body" hidden="until-found">
+                    <!--
+                      `#348 settings-dynamic-lists`. A readout, so it is drawn as one: the dark, monospaced
+                      data panel Recently dismissed is drawn in, one fact to a line (`renderDetail` puts
+                      each part of the connection detail on its own line), and the live-updates line last.
+                    -->
+                    <div id="connection-panel" class="data-panel connection-panel" role="group" aria-label="Connection status readout">
+                      <div id="settings-detail" class="data-line">no conversation yet</div>
+                      <!--
+                        `#347 settings-prose`. How live updates reach this page — the server polling the
+                        channel or a provider adapter pushing, and whether this page is attached to the
+                        server's stream — moved here from the head of Arriving messages during a call. The
+                        owner named it as the implementation detail to take out of the settings: it is a
+                        readout about how the server works, and this is the readout. Still one short line
+                        per state (`renderLiveState`), and the same element.
+                      -->
+                      <p id="live-state" class="data-line" aria-live="polite"></p>
+                    </div>
+                  </div>
+                </section>
+              </div>
             </section>
 
             <p class="hint">

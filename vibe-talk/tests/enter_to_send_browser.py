@@ -248,6 +248,9 @@ def main() -> int:
             platform = str(page.evaluate("() => navigator.platform"))
             chord = "Cmd+Enter" if platform.startswith(("Mac", "iPhone", "iPad", "iPod")) else "Ctrl+Enter"
             page.click("#open-settings")
+            # `#346 settings-collapsible`: Screen and keys, and Typing in it, are folded as Settings opens.
+            page.click("#fold-settings-screen")
+            page.click("#fold-typing")
             page.locator("#enter-sends").wait_for(state="visible", timeout=5000)
             check(page.is_checked("#enter-sends"), "Enter to send is not on by default")
             check(page.inner_text("#enter-sends-hint") == "Shift+Enter starts a new line.",

@@ -415,6 +415,11 @@ def shot_row(page: Page, args: argparse.Namespace, name: str, row_id: str) -> No
 
 def set_rich_headers(page: Page, on: bool) -> None:
     page.click("#open-settings")
+    # `#346 settings-collapsible`: open Messages and Rich headers in it, unless already open (the folds
+    # stay as they were left while the page is open).
+    for fold in ("fold-settings-messages", "fold-rich-headers"):
+        if page.get_attribute(f"#{fold}", "aria-expanded") != "true":
+            page.click(f"#{fold}")
     page.wait_for_selector("#rich-headers", state="visible", timeout=5_000)
     page.set_checked("#rich-headers", on)
     page.click("#close-settings")

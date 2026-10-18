@@ -1181,6 +1181,28 @@ def _act_clear_armed(driver: Driver) -> None:
     driver.settle(120)
 
 
+# `#346 settings-collapsible`. Every section of Settings and every group in them is folded as the page
+# loads, so a state about a setting opens the folds around it first, by their own buttons, outermost
+# first, as a reader taps them. Returns how many folds the element is inside.
+UNFOLD_JS = (
+    "(id) => { const node = document.getElementById(id); const bodies = []; "
+    "for (let n = node; n; n = n.parentElement) if (n.classList && n.classList.contains('fold-body')) bodies.unshift(n); "
+    "for (const body of bodies) { const toggle = document.querySelector(`[aria-controls=\"${body.id}\"]`); "
+    "if (toggle && toggle.getAttribute('aria-expanded') !== 'true') toggle.click(); } return bodies.length; }"
+)
+
+
+def _unfold(driver: Driver, *element_ids: str) -> None:
+    """Open the Settings folds around each of `element_ids`, and wait for the last to be drawn."""
+    for element_id in element_ids:
+        driver.page.evaluate(UNFOLD_JS, element_id)
+    # `checkVisibility`, not `__visible`: inside a body hidden until found an element still answers
+    # for its geometry (Chromium lays it out on asking) though nothing of it is drawn.
+    driver.page.wait_for_function(
+        "(id) => document.getElementById(id).checkVisibility()", arg=element_ids[-1], timeout=5_000
+    )
+
+
 def _act_settings(driver: Driver) -> None:
     driver.click("open-settings")
     driver.page.wait_for_function("() => window.__visible('close-settings')", timeout=5_000)
@@ -1448,7 +1470,8 @@ MEASURE_COLUMN = (
 def _act_desktop_column(driver: Driver, ch: str, into: str) -> float:
     """Land on the call screen, set the column to `ch` characters, and record what it measured."""
     driver.click("open-settings")
-    driver.page.wait_for_function("() => window.__visible('reading-width')", timeout=5_000)
+    driver.page.wait_for_function("() => window.__visible('close-settings')", timeout=5_000)
+    _unfold(driver, "reading-width")
     driver.js(SET_READING_WIDTH % ch)
     driver.click("close-settings")
     driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=5_000)
@@ -2320,6 +2343,7 @@ def _act_help_sections(driver: Driver) -> None:
     driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
     driver.click("open-settings")
     driver.page.wait_for_function("() => window.__visible('close-settings')", timeout=5_000)
+    _unfold(driver, "help-link-reading-width")
     driver.click("help-link-reading-width")
     driver.page.wait_for_function("() => window.__visible('close-help')", timeout=5_000)
     driver.settle(300)
@@ -2557,7 +2581,8 @@ def _act_control_bar_bottom(driver: Driver) -> None:
     in the header.
     """
     driver.click("open-settings")
-    driver.page.wait_for_function("() => window.__visible('bar-placement')", timeout=5_000)
+    driver.page.wait_for_function("() => window.__visible('close-settings')", timeout=5_000)
+    _unfold(driver, "bar-placement")
     driver.page.select_option("#bar-placement", "bottom")
     driver.click("close-settings")
     driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=5_000)
@@ -2946,6 +2971,7 @@ def _act_settings_text_size(driver: Driver) -> None:
     driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
     driver.click("open-settings")
     driver.page.wait_for_function("() => window.__visible('close-settings')", timeout=5_000)
+    _unfold(driver, "msg-scale")
     driver.js(
         "(() => { document.getElementById('msg-scale').closest('.settings-group')"
         ".scrollIntoView({ block: 'center' }); return true; })()"
@@ -3018,6 +3044,7 @@ def _act_recently_dismissed(driver: Driver) -> None:
     _act_send_dismissed(driver)
     driver.click("open-settings")
     driver.page.wait_for_function("() => window.__visible('close-settings')", timeout=5_000)
+    _unfold(driver, "dismissed-sends")
     driver.js(
         "(() => { document.getElementById('dismissed-sends').closest('.settings-group')"
         ".scrollIntoView({ block: 'center' }); return true; })()"
@@ -3071,6 +3098,7 @@ def _act_settings_dismissed_list(driver: Driver) -> None:
     driver.click("open-settings")
     driver.page.wait_for_function("() => window.__visible('close-settings')", timeout=5_000)
     driver.page.wait_for_function("() => document.querySelectorAll('#dismissed-sends > li').length === 6", timeout=5_000)
+    _unfold(driver, "dismissed-sends")
     driver.js(
         "(() => { if (window.__visible('status-line')) document.getElementById('dismiss-status').click(); "
         "document.getElementById('dismissed-sends').closest('.settings-group').scrollIntoView({ block: 'start' }); "
@@ -3099,6 +3127,7 @@ def _act_settings_connection_panel(driver: Driver) -> None:
     driver.page.wait_for_function("() => window.__text('talk-label') === 'Start a new call'", timeout=5_000)
     driver.click("open-settings")
     driver.page.wait_for_function("() => window.__visible('close-settings')", timeout=5_000)
+    _unfold(driver, "connection-panel")
     driver.js(
         "(() => { if (window.__visible('status-line')) document.getElementById('dismiss-status').click(); "
         "document.getElementById('connection-panel').closest('.settings-group').scrollIntoView({ block: 'center' }); "
@@ -3357,6 +3386,7 @@ def _act_settings_voice_agent(driver: Driver) -> None:
     driver.click("open-settings")
     driver.page.wait_for_function("() => window.__visible('close-settings')", timeout=5_000)
     driver.page.wait_for_function("() => (window.__text('resume-state') || '').length > 0", timeout=5_000)
+    _unfold(driver, "resume-toggle", "relay-to-agent", "settings-audio-source")
     driver.js(
         "(() => { document.getElementById('resume-toggle').closest('.settings-group')"
         ".scrollIntoView({ block: 'start' }); return true; })()"
@@ -3376,6 +3406,7 @@ def _act_settings_prose(driver: Driver) -> None:
     driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
     driver.click("open-settings")
     driver.page.wait_for_function("() => window.__visible('close-settings')", timeout=5_000)
+    _unfold(driver, "mark-own-read", "help-link-auto-read", "combine-messages")
     driver.js(
         "(() => { document.getElementById('settings-messages').scrollIntoView({ block: 'start' }); return true; })()"
     )
@@ -3437,6 +3468,7 @@ def _act_channel_settings_all(driver: Driver) -> None:
     driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
     driver.click("open-settings")
     driver.page.wait_for_function("() => window.__visible('close-settings')", timeout=5_000)
+    _unfold(driver, "settings-channel")
     driver.page.select_option("#settings-channel", "*")
     driver.page.wait_for_function(
         "() => /^Mixed:/.test(document.getElementById('upstream-clear-state').textContent || '')", timeout=10_000
@@ -3451,6 +3483,32 @@ def _after_channel_settings_all(driver: Driver) -> None:
     """Put the server's own client configuration and clear-unread answers back for every later state."""
     driver.page.unroute("**/api/v1/client-config", _all_channels_config)
     driver.page.unroute("**/api/v1/channels/*/upstream-clear", _all_channels_clear)
+
+
+def _act_settings_folded(driver: Driver) -> None:
+    """`#346 settings-collapsible`: Settings as it opens, every section folded to its title."""
+    driver.load(with_token=True)
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    driver.click("open-settings")
+    driver.page.wait_for_function("() => window.__visible('close-settings')", timeout=5_000)
+    driver.js("(() => { if (window.__visible('status-line')) document.getElementById('dismiss-status').click(); return true; })()")
+    driver.settle(300)
+
+
+def _act_settings_find_opens(driver: Driver) -> None:
+    """`#346 settings-collapsible`: a search for words in a folded group opens it, and its section.
+
+    Chromium's find bar cannot be driven under automation, but a link to a text fragment is the same
+    search through the same machinery: the browser finds the words in the folded group, opens its body
+    and the section's around it, and fires `beforematch` on each. So Settings is opened folded, and the
+    page then navigates to its own address with `#:~:text=Noise suppression`.
+    """
+    _act_settings_folded(driver)
+    driver.page.goto(f"{driver.base_url}/#:~:text=Noise%20suppression", wait_until="load")
+    driver.page.wait_for_function(
+        "() => document.getElementById('fold-microphone').getAttribute('aria-expanded') === 'true'", timeout=5_000
+    )
+    driver.settle(300)
 
 
 def _act_resume_unavailable(driver: Driver) -> None:
@@ -3471,6 +3529,7 @@ def _act_resume_unavailable(driver: Driver) -> None:
     driver.page.wait_for_function(
         "() => document.getElementById('resume-toggle').disabled === true", timeout=5_000
     )
+    _unfold(driver, "resume-toggle")
     driver.js(
         "(() => { document.getElementById('resume-toggle').closest('.settings-group')"
         ".scrollIntoView({ block: 'start' }); return true; })()"
@@ -6027,6 +6086,69 @@ SCENES: tuple[Scene, ...] = (
             ),
         ),
     ),
+    Scene(
+        name="68-settings-folded",
+        what="Settings as it opens: the server first, then every section folded to its title, and Expand all",
+        act=_act_settings_folded,
+        profiles=SETTINGS_PROFILES,
+        expect=(
+            ("the settings screen is up", "window.__visible('screen-settings')"),
+            (
+                # THE claim: collapsed by default, every section, its title a button that says so.
+                "every section but Server is folded to its title, and says so",
+                "(() => { const toggles = [...document.querySelectorAll('#screen-settings .settings-section > h2 > .fold-toggle, "
+                "#screen-settings .settings-section > .group-head > h2 > .fold-toggle')]; "
+                "return toggles.length === 5 && toggles.every((b) => b.getAttribute('aria-expanded') === 'false' "
+                "&& document.getElementById(b.getAttribute('aria-controls')).getAttribute('hidden') === 'until-found' "
+                "&& window.__visible(b.id)); })()",
+            ),
+            (
+                # `checkVisibility`: a control inside a body hidden until found still answers for its
+                # geometry when asked, though nothing of it is drawn; the bodies themselves are flat.
+                "no setting is drawn: the folded bodies take no room",
+                "['resume-toggle', 'mark-own-read', 'settings-channel', 'msg-scale', 'forget-token']"
+                ".every((id) => !document.getElementById(id).checkVisibility()) "
+                "&& [...document.querySelectorAll('#screen-settings .fold-body')].every((b) => b.getBoundingClientRect().height === 0)",
+            ),
+            (
+                "the server's address is still the first thing, and Expand all is offered",
+                "window.__visible('settings-server-host') && window.__visible('fold-settings-all') "
+                "&& document.getElementById('fold-settings-all').textContent.trim() === 'Expand all'",
+            ),
+            (
+                "each folded title is a tap target at least 40px tall, with its chevron",
+                "[...document.querySelectorAll('#screen-settings .fold-toggle')].filter((b) => window.__visible(b.id))"
+                ".every((b) => b.getBoundingClientRect().height >= 40 && getComputedStyle(b, '::before').content !== 'none')",
+            ),
+            (
+                "nothing on the settings screen is wider than it",
+                "(() => { const s = document.getElementById('screen-settings'); "
+                "return s.scrollWidth <= s.clientWidth + 1; })()",
+            ),
+        ),
+    ),
+    Scene(
+        name="69-settings-find-opens",
+        what="Settings after a search for 'Noise suppression': the folded Microphone group and its section opened by the browser",
+        act=_act_settings_find_opens,
+        profiles=SETTINGS_PROFILES,
+        expect=(
+            ("the settings screen is still up", "window.__visible('screen-settings')"),
+            (
+                # THE claim: find-in-page still finds hidden text, and opens what it is in.
+                "the browser opened the Microphone group and the Voice agent section, and both buttons say so",
+                "['fold-microphone', 'fold-settings-voice-agent'].every((id) => { const b = document.getElementById(id); "
+                "return b.getAttribute('aria-expanded') === 'true' "
+                "&& !document.getElementById(b.getAttribute('aria-controls')).hasAttribute('hidden'); })",
+            ),
+            (
+                "the switch the search was for is drawn, and nothing else was opened",
+                "window.__visible('mic-noise-suppression') && document.getElementById('mic-noise-suppression').checkVisibility() "
+                "&& document.getElementById('fold-resuming').getAttribute('aria-expanded') === 'false' "
+                "&& document.getElementById('fold-settings-messages').getAttribute('aria-expanded') === 'false'",
+            ),
+        ),
+    ),
     # LAST IN THE WALK, and not by accident: it empties the server's durable store on the way in,
     # so that the summary the state above cached is really regenerated and can really fail. Nothing
     # after it in this profile would miss what it deletes, and the next profile purges anyway.
@@ -6515,6 +6637,9 @@ def check_state_controls() -> list[str]:
         "65-settings-dismissed-list": SETTINGS_PROFILES,
         "66-settings-dismissed-popout": SETTINGS_PROFILES,
         "67-settings-connection-panel": SETTINGS_PROFILES,
+        # `#346 settings-collapsible`.
+        "68-settings-folded": SETTINGS_PROFILES,
+        "69-settings-find-opens": SETTINGS_PROFILES,
     }
     for name, wanted_profiles in restricted.items():
         scene = next((s for s in SCENES if s.name == name), None)
@@ -6733,6 +6858,11 @@ def check_state_controls() -> list[str]:
         "65-settings-dismissed-list": ("Math.max(...rgb) < 48", "s.resize === 'vertical'", "textOverflow"),
         "66-settings-dismissed-popout": ("t.length > 400", "dismissed-send-copy"),
         "67-settings-connection-panel": ("Math.max(...rgb) < 48", "split("),
+        # `#346 settings-collapsible`. Pinned to every section folded and hidden until found
+        # (`'until-found'`), to no setting drawn (`!window.__visible(id)`), and to the browser's search
+        # opening the group and its section (`fold-microphone`, `mic-noise-suppression`).
+        "68-settings-folded": ("'until-found'", "checkVisibility()"),
+        "69-settings-find-opens": ("fold-microphone", "mic-noise-suppression"),
     }
     for name, needles in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)
