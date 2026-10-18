@@ -881,21 +881,23 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # that survives the locked reread or that a lock holder reports) are mapped.
     # The batch maps-filter ceiling case of 8eb8de0f (four selected trees fit
     # where one allowance would not) is mapped.
-    # The 25 dead-owner archiving cases are mapped. remove
+    # The 32 dead-owner archiving cases are mapped. remove
     # --archive-drifted-checkouts: three drift kinds removed after a verified
-    # bundle, two commits that only worktree-private history reaches (the HEAD
-    # reflog, a refs/rewritten ref) kept, a published submodule kept local and
-    # a submodule's private branch refused, refusals for a live registered
-    # liveness answer, a live consenting owner, a live releasing owner, a
-    # bundle that cannot be made, and a checkout changed after archiving, one
-    # journal recovery and one receipt-parser case. remove
-    # --archive-nested-cache-repositories: a Cargo-style checkout, every
-    # commit object kept, two index-only contents kept, four refused
-    # unkeepable repositories, a failed bundle, one journal recovery and one
-    # evidence-parser case.
-    assert len(all_tests) == 1986
+    # bundle; three commits that only worktree-private history reaches (the
+    # HEAD reflog, a refs/rewritten ref, a reflog entry's old object) kept; two
+    # index states of the checkout kept; a published submodule, a submodule's
+    # private branch and a commit only a stale remote-tracking ref of the
+    # submodule names, all kept local; recovery refusing new submodule
+    # history; refusals for a live registered liveness answer, a live
+    # consenting owner, a live releasing owner, a bundle that cannot be made,
+    # and a checkout changed after archiving; one journal recovery and one
+    # receipt-parser case. remove --archive-nested-cache-repositories: a
+    # Cargo-style checkout, every commit object kept, three index-only or
+    # force-added states kept, five refused unkeepable repositories, a failed
+    # bundle, one journal recovery and one evidence-parser case.
+    assert len(all_tests) == 1993
     assert len(ordinary) == 336
-    assert len(mapped) == 1650
+    assert len(mapped) == 1657
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {

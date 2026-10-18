@@ -1068,18 +1068,23 @@ recorded) and the registered liveness command answers dead. A live owner, includ
 consented with a handoff, keeps the refusal; an owner that ran `wrkslots release` qualifies only
 once it has exited and the registered liveness command answers dead, and `recover` checks that
 again before it resumes such a removal. For each drifted checkout, removal makes the ordinary
-salvage commit of its found HEAD and its uncommitted and untracked non-ignored files. When the
-worktree's own HEAD reflog, per-worktree refs (`refs/worktree/`, `refs/bisect/`, `refs/rewritten/`)
-or their reflogs reach commits that no branch, tag or other shared ref outside `refs/remotes/`
-contains, which removing the worktree would leave unreachable, the tips of those commits become
-further parents of the salvage commit. Removal keeps the salvage commit, with the complete history
+salvage commit of its found HEAD and its uncommitted and untracked non-ignored files. Further
+parents keep what that commit alone would lose: a commit of exactly what the checkout's own index
+stages and a commit of its worktree read through a copy of that index (a file staged and then
+deleted, or force-added past `.gitignore` and edited), when either differs from HEAD and the
+salvage commit; and the tips of commits that only the worktree's own HEAD reflog, per-worktree refs
+(`refs/worktree/`, `refs/bisect/`, `refs/rewritten/`) or their reflogs reach, reading both object
+names of every reflog entry, and that no branch, tag or other shared ref outside `refs/remotes/`
+contains, since removing the worktree would leave them unreachable. Removal keeps the salvage commit, with the complete history
 it reaches, in a self-contained bundle under the control directory's
 `wrkslots-salvage/` (or `--salvage-archive-root`), read back by a fresh bare clone, the exact ref,
 and `git fsck --full --strict`. It never pushes and never asks a remote whether HEAD is published,
-because a changed remote URL may name a different repository; the checkout's submodules are not
-pushed either, and a submodule whose own repository holds commits on local refs, the stash or
-reflogs that neither its HEAD nor a remote-tracking ref contains refuses, because only its HEAD is
-kept. The salvage receipt, in the event log, the finish journal, and the archive row,
+because a changed remote URL may name a different repository. The checkout's submodules are not
+pushed either. A linked worktree's submodule repositories are deleted with it, so each submodule's
+salvage commit likewise keeps its index state and every commit that its own refs (remote-tracking
+refs included, which may be stale), stash and reflogs reach and that no ref of the source
+submodule repository contains; a submodule with any such state is kept in its own verified local
+bundle instead of being recorded as already published. Reftable ref storage refuses. The salvage receipt, in the event log, the finish journal, and the archive row,
 records `archive_reason: recorded-checkout-drift` and a `recorded_checkout_drift` object with the
 recorded and found branch (null when detached) and remote URL digests. Every later check, before
 the path fence, after it, and in `recover`, compares the checkout with that object instead of the

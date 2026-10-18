@@ -20325,18 +20325,26 @@ def _salvage_candidate(
     allow_shallow: bool = False,
     detached_root: bool = False,
     accept_drift: bool = False,
+    keep_private_state: bool = False,
 ) -> _SalvageCandidate:
     """Return HEAD, status digest, durable commit candidate, and dirty state.
 
     See _salvage_candidate_uncached. While an agent-slot removal runs
     (_SALVAGE_FACTS_MEMO), the facts of a clean checkout are derived once and
     returned again while _salvage_fingerprint shows the checkout unchanged.
-    ``accept_drift`` facts are never memoized, so they can never stand in for
-    a later call that still compares the recorded branch and remote.
+    ``accept_drift`` and ``keep_private_state`` facts are never memoized, so
+    they can never stand in for a later call that still compares the recorded
+    branch and remote, or that keeps only HEAD and the worktree.
     """
 
     memo = _SALVAGE_FACTS_MEMO.get()
-    if memo is None or record is None or ownerless_slot is not None or accept_drift:
+    if (
+        memo is None
+        or record is None
+        or ownerless_slot is not None
+        or accept_drift
+        or keep_private_state
+    ):
         return _salvage_candidate_uncached(
             config,
             record,
@@ -20350,6 +20358,7 @@ def _salvage_candidate(
             allow_shallow=allow_shallow,
             detached_root=detached_root,
             accept_drift=accept_drift,
+            keep_private_state=keep_private_state,
         )
     if detached_root:
         raise StateError("only an ownerless worktree may be salvaged with a detached root")
@@ -20421,44 +20430,85 @@ def _salvage_candidate(
     return facts
 
 
-def _worktree_private_orphan_tips(vcs: _GitVcs, path: Path, kept: str) -> tuple[str, ...]:
-    """Return the tips of commits that only ``path``'s private Git state reaches.
+def _assert_files_ref_storage(vcs: _GitVcs, path: Path) -> None:
+    """Refuse a repository whose refs and reflogs are not ordinary files."""
 
-    Removing a linked worktree deletes its private administrative directory:
-    its HEAD reflog and its per-worktree refs (_WORKTREE_PRIVATE_REF_PREFIXES:
-    refs/worktree/, refs/bisect/, refs/rewritten/) with their reflogs.  A
-    commit that only those reach (say one made on a detached HEAD before the
-    agent switched branches) is reachable from nothing afterwards.  This lists
-    the tips of such commits that neither ``kept`` nor any shared ref outside
-    refs/remotes/ reaches.
+    result = vcs._run(path, ["config", "--get", "extensions.refStorage"], check=False)
+    if result.returncode == 0 and result.stdout.strip().lower() not in ("", "files"):
+        raise Refusal(
+            f"checkout {path} keeps refs in {result.stdout.strip()!r} storage, whose "
+            "reflogs this salvage cannot read; preserve it"
+        )
+    if result.returncode not in (0, 1):
+        raise Refusal(
+            f"cannot read the ref storage of checkout {path}" + _git_failure_detail(result)
+        )
+
+
+def _reflog_files_under(directory: Path) -> list[Path]:
+    """List every reflog file at or below ``directory`` (none when it is absent)."""
+
+    if not os.path.lexists(directory):
+        return []
+    if directory.is_symlink():
+        raise Refusal(f"reflog path is a symbolic link: {directory}")
+    if directory.is_file():
+        return [directory]
+    found: list[Path] = []
+    for root, directories, files in os.walk(directory, followlinks=False):
+        for name in directories:
+            if (Path(root) / name).is_symlink():
+                raise Refusal(f"reflog directory is a symbolic link: {Path(root) / name}")
+        found.extend(Path(root) / name for name in sorted(files))
+    return sorted(found)
+
+
+def _reflog_endpoints(files: Sequence[Path]) -> set[str]:
+    """Return both object names of every entry in the reflog ``files``.
+
+    An entry's old object can be the only record of a commit once newer
+    entries are expired, so both are read, straight from the files.
     """
 
-    def reflog_entries(ref: str) -> set[str]:
-        listed = vcs._run(path, ["reflog", "show", "--format=%H", ref, "--"], check=False)
-        if listed.returncode != 0:
-            raise Refusal(
-                f"cannot read the {ref} reflog of checkout {path}"
-                + _git_failure_detail(listed)
-            )
-        return {line.strip() for line in listed.stdout.splitlines() if line.strip()}
+    endpoints: set[str] = set()
+    for file in files:
+        try:
+            contents = file.read_bytes()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise Refusal(f"cannot read reflog {file}: {exc}") from exc
+        for line in contents.splitlines():
+            if not line.strip():
+                continue
+            fields = line.split(b" ", 2)
+            if len(fields) < 3:
+                raise Refusal(f"reflog {file} has a malformed entry")
+            for raw in fields[:2]:
+                value = raw.decode("ascii", "replace")
+                if not SHA_RE.fullmatch(value):
+                    raise Refusal(f"reflog {file} names an object that is not a full name")
+                if set(value) != {"0"}:
+                    endpoints.add(value)
+    return endpoints
 
-    positives = reflog_entries("HEAD")
-    negatives = {kept}
-    private_refs: list[str] = []
-    for line in vcs._run(
-        path, ["for-each-ref", "--format=%(objectname) %(refname)"]
-    ).stdout.splitlines():
-        sha, _space, refname = line.partition(" ")
-        if refname.startswith(_WORKTREE_PRIVATE_REF_PREFIXES):
-            positives.add(sha)
-            private_refs.append(refname)
-        elif not refname.startswith("refs/remotes/"):
-            # A remote-tracking ref proves nothing for a drifted checkout (its
-            # remote may have changed) and a later prune can delete it.
-            negatives.add(sha)
-    for refname in private_refs:
-        if vcs._run(path, ["reflog", "exists", refname], check=False).returncode == 0:
-            positives |= reflog_entries(refname)
+
+def _git_path(vcs: _GitVcs, path: Path, name: str) -> Path:
+    return Path(
+        vcs._run(path, ["rev-parse", "--path-format=absolute", "--git-path", name]).stdout.strip()
+    )
+
+
+def _commit_tips(
+    vcs: _GitVcs,
+    path: Path,
+    positives: AbstractSet[str],
+    negatives: AbstractSet[str],
+    *,
+    env_overrides: Mapping[str, str] | None = None,
+) -> tuple[str, ...]:
+    """Return the tips of the commits ``positives`` reach and ``negatives`` do not."""
+
     if any(not SHA_RE.fullmatch(item) for item in positives | negatives):
         raise Refusal(f"checkout {path} lists a reflog entry or ref that is not a full object")
     if not positives:
@@ -20468,6 +20518,7 @@ def _worktree_private_orphan_tips(vcs: _GitVcs, path: Path, kept: str) -> tuple[
         ["rev-list", "--stdin"],
         input_text="".join(f"{item}\n" for item in sorted(positives))
         + "".join(f"^{item}\n" for item in sorted(negatives)),
+        env_overrides=env_overrides,
     ).stdout.split()
     if not orphans:
         return ()
@@ -20476,9 +20527,141 @@ def _worktree_private_orphan_tips(vcs: _GitVcs, path: Path, kept: str) -> tuple[
         path,
         ["rev-list", "--no-walk=unsorted", "--parents", "--stdin"],
         input_text="".join(f"{item}\n" for item in orphans),
+        env_overrides=env_overrides,
     ).stdout.splitlines():
         parents.update(line.split()[1:])
     return tuple(sorted(set(orphans) - parents))
+
+
+def _worktree_private_orphan_tips(vcs: _GitVcs, path: Path, kept: str) -> tuple[str, ...]:
+    """Return the tips of commits that only ``path``'s private Git state reaches.
+
+    Removing a linked worktree deletes its private administrative directory:
+    its HEAD reflog and its per-worktree refs (_WORKTREE_PRIVATE_REF_PREFIXES:
+    refs/worktree/, refs/bisect/, refs/rewritten/) with their reflogs.  A
+    commit that only those reach (say one made on a detached HEAD before the
+    agent switched branches) is reachable from nothing afterwards.  This lists
+    the tips of such commits, from both object names of every entry of those
+    reflogs and from those refs, that neither ``kept`` nor any shared ref
+    outside refs/remotes/ reaches.
+    """
+
+    _assert_files_ref_storage(vcs, path)
+    files = _reflog_files_under(_git_path(vcs, path, "logs/HEAD"))
+    for prefix in _WORKTREE_PRIVATE_REF_PREFIXES:
+        files.extend(_reflog_files_under(_git_path(vcs, path, f"logs/{prefix.rstrip('/')}")))
+    positives = _reflog_endpoints(files)
+    negatives = {kept}
+    for line in vcs._run(
+        path, ["for-each-ref", "--format=%(objectname) %(refname)"]
+    ).stdout.splitlines():
+        sha, _space, refname = line.partition(" ")
+        if refname.startswith(_WORKTREE_PRIVATE_REF_PREFIXES):
+            positives.add(sha)
+        elif not refname.startswith("refs/remotes/"):
+            # A remote-tracking ref proves nothing for a drifted checkout (its
+            # remote may have changed) and a later prune can delete it.
+            negatives.add(sha)
+    return _commit_tips(vcs, path, positives, negatives)
+
+
+def _submodule_private_tips(
+    vcs: _GitVcs, path: Path, kept: str, source: Path
+) -> tuple[str, ...]:
+    """Return the tips of commits that only a slot submodule's own repository holds.
+
+    A linked worktree's submodule repositories live in the worktree's own Git
+    directory, so removal deletes every ref, stash entry and reflog they hold,
+    remote-tracking refs included (those may also be stale).  This lists the
+    tips of the commits that any of them reaches (both object names of every
+    reflog entry) and that neither ``kept`` nor any ref of the source
+    submodule repository ``source``, which removal keeps, reaches.  Ancestry
+    is decided with the source's objects as an alternate, so every source
+    ref resolves.
+    """
+
+    _assert_files_ref_storage(vcs, path)
+    common = vcs.common_directory(path)
+    git_directory = Path(
+        vcs._run(path, ["rev-parse", "--absolute-git-dir"]).stdout.strip()
+    )
+    files = _reflog_files_under(common / "logs")
+    if git_directory != common:
+        files.extend(_reflog_files_under(git_directory / "logs"))
+    positives = _reflog_endpoints(files)
+    positives.update(
+        line.split(" ", 1)[0]
+        for line in vcs._run(path, ["for-each-ref", "--format=%(objectname) %(refname)"])
+        .stdout.splitlines()
+        if line
+    )
+    negatives = {kept}
+    negatives.update(
+        line.strip()
+        for line in vcs._run(source, ["for-each-ref", "--format=%(objectname)"])
+        .stdout.splitlines()
+        if line.strip()
+    )
+    source_objects = vcs.common_directory(source) / "objects"
+    return _commit_tips(
+        vcs,
+        path,
+        positives,
+        negatives,
+        env_overrides={"GIT_ALTERNATE_OBJECT_DIRECTORIES": str(source_objects)},
+    )
+
+
+def _index_state_trees(
+    vcs: _GitVcs, config: Config, checkout: Checkout, path: Path
+) -> tuple[str, ...]:
+    """Return the trees of a checkout's own index and of its worktree read through it.
+
+    Ordinary salvage reads the worktree into an index seeded from HEAD, so it
+    keeps neither what only the real index holds (a file staged and then
+    deleted or changed back) nor the worktree content of a file tracked only
+    in the real index (one force-added past .gitignore).  These two trees do:
+    the first is exactly what is staged, the second is a copy of the real
+    index updated from the worktree with the ordinary salvage pathspecs.
+    Copies are used, so the real index is never written.
+    """
+
+    index = _git_path(vcs, path, "index")
+    if not os.path.lexists(index):
+        return ()
+    if index.is_symlink() or not index.is_file():
+        raise Refusal(f"Git index of checkout {checkout.name} is unsafe: {index}")
+    pathspecs = _salvage_pathspecs(config, checkout.name)
+    with tempfile.TemporaryDirectory(prefix="wrkslots-index-state-") as temporary:
+        staged_copy = Path(temporary) / "staged"
+        worktree_copy = Path(temporary) / "worktree"
+        try:
+            shutil.copyfile(index, staged_copy, follow_symlinks=False)
+            shutil.copyfile(index, worktree_copy, follow_symlinks=False)
+        except OSError as exc:
+            raise Refusal(f"cannot copy the Git index of checkout {checkout.name}: {exc}") from exc
+        staged_tree = vcs._run(
+            path, ["write-tree"], env_overrides={"GIT_INDEX_FILE": str(staged_copy)}
+        ).stdout.strip()
+        env = {"GIT_INDEX_FILE": str(worktree_copy)}
+        vcs._run(path, ["add", "-u", "--", *pathspecs], env_overrides=env)
+        untracked = vcs._run(
+            path,
+            ["ls-files", "--others", "--exclude-standard", "-z", "--", *pathspecs],
+            env_overrides=env,
+        ).stdout
+        if untracked:
+            vcs._run(
+                path,
+                ["add", "--pathspec-from-file=-", "--pathspec-file-nul"],
+                input_text=untracked,
+                env_overrides={**env, "GIT_LITERAL_PATHSPECS": "1"},
+            )
+        worktree_tree = vcs._run(path, ["write-tree"], env_overrides=env).stdout.strip()
+    for tree in (staged_tree, worktree_tree):
+        if not SHA_RE.fullmatch(tree):
+            raise Refusal(f"index tree for checkout {checkout.name} is not a full Git object")
+    return staged_tree, worktree_tree
 
 
 def _salvage_candidate_uncached(
@@ -20495,15 +20678,22 @@ def _salvage_candidate_uncached(
     allow_shallow: bool = False,
     detached_root: bool = False,
     accept_drift: bool = False,
+    keep_private_state: bool = False,
 ) -> _SalvageCandidate:
     """See _salvage_candidate_facts.
 
-    For a drifted checkout (``accept_drift``), the salvage commit also gains,
-    as further parents, the tips of every commit only the worktree's private
-    HEAD reflog and refs reach (_worktree_private_orphan_tips), so the one
-    bundle of the salvage commit's complete history keeps them too.  It is
-    made with a fixed identity, date and message, so rechecks derive the same
-    commit while that private history is unchanged.
+    With ``keep_private_state`` (a drifted checkout and its submodules, see
+    _CheckoutDrift) the salvage commit also gains further parents, so the one
+    bundle of its complete history keeps them: a commit of exactly what the
+    real index stages and a commit of the worktree read through the real
+    index, when either tree differs from HEAD's and the salvage commit's
+    (_index_state_trees), and the tips of every commit that removal would
+    leave unreachable: for a checkout its worktree-private history
+    (_worktree_private_orphan_tips), for a submodule everything its own
+    repository holds beyond its source repository (_submodule_private_tips).
+    Every commit is made with a fixed identity, date and message, so rechecks
+    derive the same salvage commit while that state is unchanged, and any
+    change to it refuses.
     """
 
     facts = _salvage_candidate_facts(
@@ -20520,37 +20710,76 @@ def _salvage_candidate_uncached(
         detached_root=detached_root,
         accept_drift=accept_drift,
     )
-    if not accept_drift:
+    if not keep_private_state:
         return facts
     if record is None:
-        raise StateError("drifted checkout salvage requires its registry row")
+        raise StateError("private-state salvage requires its registry row")
     path = path_override or _stored_path(config, checkout.path, "checkout path")
-    tips = _worktree_private_orphan_tips(vcs, path, facts.commit)
-    if not tips:
+    identity = {
+        "GIT_AUTHOR_NAME": "wrkslots salvage",
+        "GIT_AUTHOR_EMAIL": "wrkslots@localhost",
+        "GIT_AUTHOR_DATE": record.heartbeat_at,
+        "GIT_COMMITTER_NAME": "wrkslots salvage",
+        "GIT_COMMITTER_EMAIL": "wrkslots@localhost",
+        "GIT_COMMITTER_DATE": record.heartbeat_at,
+    }
+
+    def commit_tree(tree: str, parents: Sequence[str], message: str) -> str:
+        commit = vcs._run(
+            path,
+            [
+                "commit-tree",
+                tree,
+                *itertools.chain.from_iterable(("-p", item) for item in parents),
+            ],
+            input_text=message,
+            env_overrides=identity,
+        ).stdout.strip()
+        if not SHA_RE.fullmatch(commit):
+            raise Refusal(
+                f"salvage commit for checkout {checkout.name} is not a full Git object"
+            )
+        return commit
+
+    head_tree = vcs._run(path, ["rev-parse", f"{facts.head}^{{tree}}"]).stdout.strip()
+    salvage_tree = vcs._run(path, ["rev-parse", f"{facts.commit}^{{tree}}"]).stdout.strip()
+    extra: list[str] = []
+    seen = {head_tree, salvage_tree}
+    for label, tree in zip(
+        ("index", "worktree-through-index"),
+        _index_state_trees(vcs, config, checkout, path),
+    ):
+        if tree in seen:
+            continue
+        seen.add(tree)
+        extra.append(
+            commit_tree(
+                tree,
+                [facts.head],
+                f"Salvage {record.slot}/{checkout.name} {label} after recorded owner "
+                f"exit\n\nsource-head: {facts.head}\n",
+            )
+        )
+    if allow_detached:
+        _relative, source = _stored_repository_path(config, checkout.repository)
+        tips = _submodule_private_tips(vcs, path, facts.commit, source)
+    else:
+        tips = _worktree_private_orphan_tips(vcs, path, facts.commit)
+    extra.extend(tip for tip in tips if tip not in extra)
+    if not extra:
         return facts
-    tree = vcs._run(path, ["rev-parse", f"{facts.commit}^{{tree}}"]).stdout.strip()
-    message = (
-        f"Salvage {record.slot}/{checkout.name} worktree-private history after "
-        "recorded owner exit\n\n"
-        f"source-head: {facts.head}\n"
-        + "".join(f"worktree-private-tip: {tip}\n" for tip in tips)
+    if facts.shallow is not None:
+        raise Refusal(
+            f"checkout {checkout.name} uses shallow history, so the index or private "
+            "history that removal would delete cannot be kept in a complete bundle"
+        )
+    commit = commit_tree(
+        salvage_tree,
+        [facts.commit, *extra],
+        f"Salvage {record.slot}/{checkout.name} private state after recorded owner "
+        f"exit\n\nsource-head: {facts.head}\n"
+        + "".join(f"kept: {item}\n" for item in extra),
     )
-    parents = [facts.commit, *tips]
-    commit = vcs._run(
-        path,
-        ["commit-tree", tree, *itertools.chain.from_iterable(("-p", item) for item in parents)],
-        input_text=message,
-        env_overrides={
-            "GIT_AUTHOR_NAME": "wrkslots salvage",
-            "GIT_AUTHOR_EMAIL": "wrkslots@localhost",
-            "GIT_AUTHOR_DATE": record.heartbeat_at,
-            "GIT_COMMITTER_NAME": "wrkslots salvage",
-            "GIT_COMMITTER_EMAIL": "wrkslots@localhost",
-            "GIT_COMMITTER_DATE": record.heartbeat_at,
-        },
-    ).stdout.strip()
-    if not SHA_RE.fullmatch(commit):
-        raise Refusal(f"salvage commit for checkout {checkout.name} is not a full Git object")
     return dataclasses.replace(facts, commit=commit, dirty=True)
 
 
@@ -21432,40 +21661,6 @@ def _salvage_one_checkout(
     }
 
 
-def _submodule_private_history_refusal(
-    vcs: _GitVcs, submodule: Checkout, path: Path, kept: str
-) -> Refusal | None:
-    """Refuse a drifted checkout's submodule whose repository holds more than its HEAD.
-
-    A linked worktree's submodule repositories live in the worktree's own Git
-    directory, so removal deletes their branches, stash and reflogs.  Ordinary
-    salvage keeps only the submodule's HEAD, so a submodule of a drifted
-    checkout must hold no commit that a local ref, the stash or a reflog
-    reaches and that neither ``kept`` (its HEAD or salvage commit) nor a
-    remote-tracking ref contains.
-    """
-
-    result = vcs._run(
-        path,
-        ["rev-list", "--count", "--all", "--reflog", "--not", "--remotes", kept],
-        check=False,
-    )
-    if result.returncode != 0:
-        return Refusal(
-            f"cannot inspect the private history of submodule {submodule.name}"
-            + _git_failure_detail(result)
-        )
-    count = int(result.stdout.strip() or "0")
-    if not count:
-        return None
-    return Refusal(
-        f"submodule {submodule.name} holds {count} commit(s) on local refs, the stash "
-        "or reflogs that neither its HEAD nor a remote-tracking ref contains; "
-        "--archive-drifted-checkouts keeps only a submodule's HEAD, so preserve the "
-        "slot. state: REFUSED -- no checkout was removed"
-    )
-
-
 def _drifted_checkout_refusal(
     checkout: Checkout, drift: _CheckoutDrift, reason: str
 ) -> Refusal:
@@ -21501,7 +21696,8 @@ def _salvage_agent_slot(
     whose branch or remote URL differs from its record, a detached HEAD
     included, is not refused: its found HEAD and uncommitted state are kept
     in a verified local bundle, never pushed (see _CheckoutDrift), and its
-    submodules are never pushed either. ``drift_refusal`` names why this
+    submodules are never pushed either; for both, the salvage commit also
+    keeps their index and private history (_salvage_candidate_uncached). ``drift_refusal`` names why this
     removal may not do that (its owner is not proven dead), and a drifted
     checkout then refuses with it. Without ``archive_drifted`` every drifted
     checkout refuses exactly as before.
@@ -21542,6 +21738,7 @@ def _salvage_agent_slot(
                 verify_repository_membership=not detached,
                 allow_shallow=detached,
                 accept_drift=drift is not None,
+                keep_private_state=never_push,
             ),
         )
         for checkout, path, detached, drift, never_push in candidates
@@ -21568,12 +21765,6 @@ def _salvage_agent_slot(
                 )
             )
             continue
-        if never_push:
-            # A submodule of a drifted checkout: its private history must be
-            # nothing more than what its salvage keeps.
-            refusal = _submodule_private_history_refusal(vcs, checkout, path, facts.commit)
-            if refusal is not None:
-                raise refusal
         receipts.append(
             _salvage_one_checkout(
                 config,
@@ -21756,7 +21947,7 @@ def _assert_salvage_still_matches(
             )
         targets.append((checkout, path, False, drift is not None))
         targets.extend(
-            (submodule, submodule_path, True, False)
+            (submodule, submodule_path, True, drift is not None)
             for submodule, submodule_path in _submodule_salvage_checkouts(
                 config, checkout, vcs, path_override=path
             )
@@ -21782,7 +21973,8 @@ def _assert_salvage_still_matches(
                 allow_detached=allow_detached,
                 verify_repository_membership=not allow_detached,
                 allow_shallow=allow_detached,
-                accept_drift=drifted,
+                accept_drift=drifted and not allow_detached,
+                keep_private_state=drifted,
             ),
         )
         for checkout, path, allow_detached, drifted in targets
@@ -30721,16 +30913,38 @@ def _salvage_nested_git_repository(
             "repository is shallow, so no bundle of it is self-contained; "
             "salvage refused"
         )
-    lfs_objects = dotgit / "lfs" / "objects"
     try:
-        holds_lfs = lfs_objects.is_dir() and any(lfs_objects.iterdir())
-    except OSError as exc:
-        raise refuse(f"cannot inspect .git/lfs/objects: {exc}") from exc
-    if holds_lfs or (os.path.lexists(lfs_objects) and not lfs_objects.is_dir()):
-        raise refuse(
-            "repository keeps Git LFS objects in .git/lfs/objects, which a Git "
-            "bundle does not carry; salvage refused"
+        lfs_entries = sorted(
+            name for name in os.listdir(dotgit) if name.lower().startswith("lfs")
         )
+    except OSError as exc:
+        raise refuse(f"cannot inspect .git for Git LFS storage: {exc}") from exc
+    if lfs_entries:
+        raise refuse(
+            f"repository has Git LFS storage (.git/{lfs_entries[0]}), whose objects a "
+            "Git bundle does not carry; salvage refused"
+        )
+    for config_name in ("config", "config.worktree"):
+        if not os.path.lexists(dotgit / config_name):
+            continue
+        names = output(
+            [
+                "config",
+                "--file",
+                str(dotgit / config_name),
+                "--null",
+                "--list",
+                "--name-only",
+            ]
+        )
+        lfs_keys = sorted(
+            key for key in names.split("\0") if key.lower().startswith("lfs.")
+        )
+        if lfs_keys:
+            raise refuse(
+                f"repository config sets {lfs_keys[0]}, so Git LFS objects may be kept "
+                "where a Git bundle does not reach; salvage refused"
+            )
     try:
         relative = display.relative_to(target.canonical_slot).as_posix()
     except ValueError:
@@ -30809,10 +31023,20 @@ def _salvage_nested_git_repository(
                     raise refuse("salvage index commit is not a full Git object")
         if worktree_changed:
             index_env = {**object_env, "GIT_INDEX_FILE": str(stage_root / "index")}
-            output(
-                ["read-tree", "--empty"] if head is None else ["read-tree", head],
-                extra_env=index_env,
-            )
+            if os.path.lexists(dotgit / "index"):
+                # Seeded from the real index, so a file tracked only there
+                # (force-added past .gitignore) is read from disk too.
+                try:
+                    shutil.copyfile(
+                        dotgit / "index", stage_root / "index", follow_symlinks=False
+                    )
+                except OSError as exc:
+                    raise refuse(f"cannot copy .git/index for salvage: {exc}") from exc
+            else:
+                output(
+                    ["read-tree", "--empty"] if head is None else ["read-tree", head],
+                    extra_env=index_env,
+                )
             # Every tracked change and untracked file that the repository's
             # own ignore rules do not ignore; .git/info/exclude rules were
             # refused before salvage and core.excludesFile is /dev/null.
@@ -30956,7 +31180,6 @@ def _salvage_nested_git_repository(
         "head": head,
         "salvage_commit": salvage_commit,
         "index_commit": index_commit,
-        "conditions": list(conditions),
         "refs_count": len(staged),
         "refs_sha256": key,
         "bundle": str(bundle.relative_to(archive_root)),
@@ -35130,6 +35353,7 @@ def _prefetch_remote_containment(
                 )
             )
             for candidate, candidate_path, detached, candidate_drifted in candidates:
+                keep_private_state = drifted
                 prepared.append(
                     (
                         candidate,
@@ -35144,6 +35368,7 @@ def _prefetch_remote_containment(
                             verify_repository_membership=not detached,
                             allow_shallow=detached,
                             accept_drift=candidate_drifted,
+                            keep_private_state=keep_private_state,
                         ),
                         candidate_drifted,
                         drifted,
@@ -56945,8 +57170,12 @@ _ARCHIVE_DRIFTED_CHECKOUTS_HELP = (
     "branch and remote had been recorded. Nothing is pushed and no remote is contacted "
     "for that checkout, and its submodules are never pushed either. Every later check "
     "compares the checkout with the drift recorded in its salvage receipt, so any "
-    "further change refuses. Gitignored files and the recorded branch ref are not "
-    "touched, as for any agent removal. An owner that is alive, or consented while "
+    "further change refuses. The salvage commit also keeps what the checkout's own "
+    "index stages, its worktree read through that index, and every commit that only "
+    "its worktree-private reflogs and refs reach, and for each submodule its index and "
+    "whatever its own repository holds beyond its source repository. Gitignored files "
+    "are not kept, and branch refs, the recorded one included, are left in the source "
+    "repository, as for any agent removal. An owner that is alive, or consented while "
     "alive, keeps the refusal; one that ran 'wrkslots release' qualifies only after "
     "it has exited and the registered liveness command answers dead, which recovery "
     "checks again (default: off, drift refuses)"
@@ -56962,7 +57191,7 @@ _ARCHIVE_NESTED_CACHE_REPOSITORIES_HELP = (
     "refs, full fsck), and judge it again before deletion. A repository that is "
     "structurally unsafe to judge (a .git file or symbolic link, alternates, linked "
     "worktrees, submodules, includes, filters, an operation in progress, hidden index "
-    "entries, local exclude rules, a shallow history, Git LFS objects) still refuses, "
+    "entries, local exclude rules, a shallow history, Git LFS storage) still refuses, "
     "and so does one whose bundle cannot be made or verified. Gitignored files are "
     "deleted with the cache as before (default: off, such a repository refuses)"
 )
