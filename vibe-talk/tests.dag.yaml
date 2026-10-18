@@ -510,6 +510,30 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#344 search-shortcut` in the browser engine, the keys pressed through CDP Input.dispatchKeyEvent at
+  # 1280x800: Ctrl+/ opens the search with its field focused and its default refused from the channel's
+  # message box holding a draft (the draft untouched, no slash typed, a bare "/" there still a slash),
+  # the reading-pace popover's slider (the popover closed), a ⋯ menu's item (the menu closed), the channel
+  # picker, a text field on Settings, Help, the right column's box in two columns, past a listener on the
+  # box that stops every key, the Reply screen (left, its draft kept) and the list with single keys off;
+  # Ctrl+Shift+? opens Help at the Keyboard entry; a German Ctrl+Shift+7 searches, an AltGr "/" does not,
+  # and a held chord searches once; then Cmd on an emulated Mac, Cmd+Shift+/ reported as "/" opening
+  # Help. Its own step rather than more of keyboard-browser, which is near its wall limit. Measured on
+  # 2026-10-18 outside dagrun on a host at load 18: about 11s wall.
+  - group: check
+    job: search-chord-browser
+    desc: the search's Ctrl+/ (Cmd+/) from a box, a popover, a menu, a picker, Settings, Help, two columns, Reply and with single keys off, and Help's Ctrl+?, pressed through CDP in current Chromium at 1280x800
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/search_chord_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 12
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#229 desktop-two-column` in the browser engine: the layout button draws Main and the right column
   # side by side inside the window at 1440x900 and 1280x800, neither under 440px, the view picker
   # saying so and the width handle gone; `#281 view-keys`: the thread list chosen from the picker is the

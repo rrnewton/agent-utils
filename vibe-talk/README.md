@@ -6817,6 +6817,11 @@ gives every application's Help menu Cmd+?, and Safari uses Cmd+/ for its status 
 take the chord before the page sees it. `?` alone and the Help link still open the list of keys, and
 `/` and the magnifying glass still open the search.
 
+`make -C vibe-talk search-chord-browser` presses these chords through CDP in a real Chromium at
+1280x800: from the message box with a draft, the pace popover, a ⋯ menu, the channel picker,
+Settings, Help, the right column, past a listener that stops the key, the Reply screen and with
+single keys off, then on an emulated Mac.
+
 `make -C vibe-talk keyboard-browser` presses these keys through CDP `Input.dispatchKeyEvent` in a
 real Chromium at 1280x800, so the browser's own default scrolling runs, and measures the list on
 screen after each one: on load, after a view switch, in the search, on Settings and in the message
