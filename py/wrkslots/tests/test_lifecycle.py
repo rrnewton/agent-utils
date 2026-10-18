@@ -55363,8 +55363,9 @@ def test_archive_drifted_checkouts_keeps_found_head_in_verified_bundle_then_remo
         assert git(repository, "rev-parse", "codex/other").stdout.strip() == head
 
 
+@pytest.mark.parametrize("root", ("head-reflog", "rewritten-ref"))
 def test_archive_drifted_checkouts_keeps_commits_only_the_worktree_reflog_reaches(
-    tmp_path: Path,
+    tmp_path: Path, root: str
 ) -> None:
     project, repository, _remote = make_project(tmp_path)
     assert create(project).returncode == 0
@@ -55377,8 +55378,16 @@ def test_archive_drifted_checkouts_keeps_commits_only_the_worktree_reflog_reache
     # removing the worktree deletes.
     git(tree, "checkout", "-q", "--detach")
     abandoned = commit_local(tree, "abandoned.txt", "abandoned\n", "detached work")
+    if root == "rewritten-ref":
+        # A per-worktree ref that removal deletes is then its only root.
+        git(tree, "update-ref", "refs/rewritten/label", abandoned)
     git(tree, "checkout", "-q", "-b", "codex/other", "codex/task")
     head = commit_local(tree, "drift.txt", "drift work\n", "unpushed drift")
+    if root == "rewritten-ref":
+        git(tree, "reflog", "expire", "--expire=now", "--expire-unreachable=now", "--all")
+        git(tree, "reflog", "expire", "--expire=now", "--expire-unreachable=now", "HEAD")
+        assert abandoned not in git(tree, "reflog", "show", "--format=%H", "HEAD").stdout
+        assert git(tree, "rev-parse", "refs/rewritten/label").stdout.strip() == abandoned
     assert git(repository, "branch", "--contains", abandoned).stdout.strip() == ""
     mark_owner_dead(project)
     set_liveness(project, "dead")
@@ -55719,7 +55728,9 @@ def test_archive_nested_cache_repositories_keeps_every_commit_object(
     assert git(remote, "rev-parse", "--verify", "-q", "refs/heads/side", check=False).returncode != 0
 
 
-@pytest.mark.parametrize("case", ("info-exclude", "rebase-in-progress", "shallow"))
+@pytest.mark.parametrize(
+    "case", ("info-exclude", "rebase-in-progress", "shallow", "lfs-objects")
+)
 def test_archive_nested_cache_repositories_still_refuses_what_it_cannot_keep(
     tmp_path: Path, case: str
 ) -> None:
@@ -55747,6 +55758,11 @@ def test_archive_nested_cache_repositories_still_refuses_what_it_cannot_keep(
             (clone / ".git" / "info").mkdir(exist_ok=True)
             (clone / ".git" / "info" / "exclude").write_text("secret\n", encoding="utf-8")
             expected = ".git/info/exclude ignores 'secret'"
+        elif case == "lfs-objects":
+            stored = clone / ".git" / "lfs" / "objects" / "ab" / "cd" / ("abcd" + "0" * 60)
+            stored.parent.mkdir(parents=True)
+            stored.write_bytes(b"large content only this repository has\n")
+            expected = "repository keeps Git LFS objects in .git/lfs/objects"
         else:
             git(clone, "-c", "sequence.editor=printf 'break\\n' >", "rebase", "-i", "HEAD")
             expected = "a rebase is in progress (.git/rebase-merge exists)"
@@ -55858,3 +55874,115 @@ def test_nested_git_evidence_parser_requires_complete_salvage_fields() -> None:
     with pytest.raises(wrkslots.StateError) as refused:
         wrkslots._nested_git_evidence_from_obj([partial], "test")
     assert "incomplete salvage bundle" in str(refused.value)
+
+
+@pytest.mark.parametrize("staged", ("staged-then-deleted", "staged-then-restored"))
+def test_archive_nested_cache_repositories_keeps_what_only_the_index_holds(
+    tmp_path: Path, staged: str
+) -> None:
+    project, repository, remote = make_project(tmp_path, cache_globs=("target",))
+    assert create(project).returncode == 0
+    tree = checkout(project)
+    commit_task(repository, tree, "codex/task")
+    clone = tree / "target" / "deps" / "work"
+    head = _nested_clone(remote, clone)
+    if staged == "staged-then-deleted":
+        (clone / "staged-only.txt").write_text("only in the index\n", encoding="utf-8")
+        git(clone, "add", "staged-only.txt")
+        (clone / "staged-only.txt").unlink()
+        path, content, status = "staged-only.txt", "only in the index\n", "AD"
+    else:
+        (clone / "seed.txt").write_text("staged edit\n", encoding="utf-8")
+        git(clone, "add", "seed.txt")
+        (clone / "seed.txt").write_text("seed\n", encoding="utf-8")
+        path, content, status = "seed.txt", "staged edit\n", "MM"
+    assert git(clone, "status", "--porcelain").stdout.startswith(status)
+    _prepare_removable_agent_slot(project)
+
+    removed = _remove_archiving(project, "--archive-nested-cache-repositories")
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+    item = wrkslots._as_mapping(_slot_removed_evidence(project)[0], "test evidence")
+    bundle = Path(wrkslots._as_str(item["salvage_bundle"], "test bundle"))
+    restored, refs = _unbundle(tmp_path, bundle, "restored-index.git")
+    index_commit = refs["refs/wrkslots-nested/index"]
+    assert git(restored, "rev-parse", f"{index_commit}^").stdout.strip() == head
+    assert git(restored, "show", f"{index_commit}:{path}").stdout == content
+    receipt = json.loads(
+        Path(wrkslots._as_str(item["salvage_receipt"], "test receipt")).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert receipt["index_commit"] == index_commit
+
+
+@pytest.mark.parametrize("submodule", ("published", "local-branch"))
+def test_archive_drifted_checkouts_keeps_submodules_local_and_refuses_their_private_history(
+    tmp_path: Path, submodule: str
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    add_recursive_submodules(tmp_path, project, repository)
+    assert create(project).returncode == 0
+    tree = checkout(project)
+    commit_task(repository, tree, "codex/task")
+    handed_off = finish(project)
+    assert handed_off.returncode == 0, handed_off.stderr
+    component = tree / "component"
+    component_remote = tmp_path / "component.git"
+    component_before = remote_refs(component_remote)
+    if submodule == "local-branch":
+        git(component, "config", "user.name", "Wrkslots Test")
+        git(component, "config", "user.email", "wrkslots@example.invalid")
+        component_head = git(component, "rev-parse", "HEAD").stdout.strip()
+        git(component, "checkout", "-q", "-b", "local-work")
+        commit_local(component, "local.txt", "submodule work\n", "submodule only")
+        git(component, "checkout", "-q", "--detach", component_head)
+    git(tree, "checkout", "-q", "-b", "codex/other")
+    head = commit_local(tree, "drift.txt", "drift work\n", "unpushed drift")
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    removed = _remove_archiving(project, "--archive-drifted-checkouts")
+
+    assert remote_refs(component_remote) == component_before
+    if submodule == "local-branch":
+        assert removed.returncode == 3, removed.stdout + removed.stderr
+        assert (
+            "submodule product/component holds 1 commit(s) on local refs, the stash or "
+            "reflogs that neither its HEAD nor a remote-tracking ref contains"
+        ) in removed.stderr
+        assert tree.is_dir()
+        assert git(component, "rev-parse", "--verify", "local-work").returncode == 0
+        assert git(tree, "rev-parse", "HEAD").stdout.strip() == head
+        assert len(active_slots(project)) == 1
+        return
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+    control = control_directory(project)
+    archive = json.loads((control / "ARCHIVED.testhost.json").read_text(encoding="utf-8"))
+    receipts = {item["checkout"]: item for item in archive["records"][0]["salvage"]}
+    assert receipts["product"]["archive_reason"] == "recorded-checkout-drift"
+    assert receipts["product/component"]["disposition"] == "already-published"
+    assert receipts["product/component/leaf"]["disposition"] == "already-published"
+
+
+def test_archive_drifted_checkouts_refuses_an_owner_that_released_but_is_alive(
+    tmp_path: Path,
+) -> None:
+    project, _digest = _owner_release_ready(tmp_path)
+    tree = checkout(project)
+    git(tree, "checkout", "-q", "-b", "codex/other")
+    head = commit_local(tree, "drift.txt", "drift work\n", "unpushed drift")
+    set_liveness(project, "alive")
+
+    refused = _remove_archiving(project, "--archive-drifted-checkouts")
+
+    assert refused.returncode == 3, refused.stdout + refused.stderr
+    assert (
+        "--archive-drifted-checkouts archives drift only when the recorded owner is "
+        "proven dead"
+    ) in refused.stderr
+    assert "the owner here is live and registered liveness says alive" in refused.stderr
+    assert git(tree, "rev-parse", "HEAD").stdout.strip() == head
+    assert len(active_slots(project)) == 1
