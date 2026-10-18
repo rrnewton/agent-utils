@@ -63,8 +63,31 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser], fo
     mount = actions.add_parser(
         "mount",
         help="mount every image-backed slot that is not mounted",
-        description="Mount all image-backed slots at their recorded locations (idempotent).",
+        description=(
+            "Mount all image-backed slots at their recorded locations (idempotent). A slot "
+            "that cannot be mounted does not stop the others: every slot that can be is "
+            "mounted, then each failure is listed and the command exits 3. An image that a "
+            "copy of an earlier mount in another mount namespace still holds is mounted "
+            "through that same loop device, never a second one; an image already attached "
+            "twice is refused. A mount point that holds exactly one file, the .git pointer "
+            "Git writes for this slot's own worktree registration (a repair that ran while "
+            "the image was unmounted leaves it), is cleared only with --coordinator-authorized, "
+            "and the removal is recorded in the event log."
+        ),
+        epilog="examples:\n  wrkslots image mount\n  wrkslots image mount --coordinator-authorized",
         formatter_class=formatter,
+    )
+    mount.add_argument(
+        "--coordinator-authorized",
+        action="store_true",
+        help=(
+            "remove a stray .git file from an unmounted slot's mount point when it is exactly "
+            "Git's own pointer to that slot's registered worktree (one regular file of at "
+            "most 4096 bytes reading 'gitdir: <admin>' for this checkout's administrative "
+            "directory, whose gitdir names this mount point), record that in the event log, "
+            "then mount the slot. Anything else in a mount point is never removed (default: "
+            "off, such a slot is reported and left unmounted)"
+        ),
     )
     mount.set_defaults(handler=_cmd_image_mount)
 
@@ -73,7 +96,11 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser], fo
         help="unmount one slot's images while nothing uses the slot",
         description=(
             "Unmount a slot's images after proving no process uses the slot. The next "
-            "wrkslots command mounts them again; use this before copying an image file."
+            "wrkslots command mounts them again; use this before copying an image file. "
+            "Copies of the mount in other mount namespaces are released too; if one is still "
+            "in use and keeps the image's loop device bound, the command says so and exits 3, "
+            "because the image file is then still open. An image attached to two loop devices "
+            "is refused."
         ),
         formatter_class=formatter,
     )
@@ -550,13 +577,140 @@ def _gib(value: object) -> str:
     return f"{value / GIB:.2f}G"
 
 
-def _cmd_image_mount(args: argparse.Namespace) -> int:
-    config = _config(args)
+#: Git's pointer file is one short line; anything larger is not one.
+_STRAY_POINTER_LIMIT = 4096
+
+
+def stray_worktree_pointer(
+    config: "cli.Config", record: "cli.ActiveRecord", image: slotimage.SlotImage
+) -> tuple[Path, str] | None:
+    """``(file, content)`` when an unmounted slot's mount point holds only Git's own pointer.
+
+    ``git worktree repair``, run in the main worktree while a flat image slot
+    was unmounted, writes ``.git`` into the empty mount point, which then
+    refuses the mount. That file is recognised only when it is exactly Git's
+    pointer to this slot's own registration: the mount point holds nothing
+    else; ``.git`` is a regular file the user owns, at most 4096 bytes, reading
+    ``gitdir: <admin>`` and a newline; ``<admin>`` is a linked-worktree
+    directory of the checkout's recorded repository; and ``<admin>/gitdir``
+    names exactly this mount point's ``.git``.
+    """
+
+    from wrkslots import cli
+
+    location = image.location
+    if slotimage.is_mounted(image.slot_image, location) or len(record.checkouts) != 1:
+        return None
     try:
-        actions = slotimage.ensure_all_mounted(config.control)
-    except slotimage.ImageError as exc:
-        raise _refuse(str(exc)) from exc
-    print("\n".join(actions) if actions else "all image-backed slots are mounted")
+        entries = sorted(os.listdir(location))
+    except OSError:
+        return None
+    if entries != [".git"]:
+        return None
+    pointer = location / ".git"
+    try:
+        info = os.lstat(pointer)
+        if (
+            not (info.st_mode & 0o170000 == 0o100000)
+            or info.st_uid != os.getuid()
+            or info.st_size > _STRAY_POINTER_LIMIT
+        ):
+            return None
+        content = pointer.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    if not content.startswith("gitdir: ") or not content.endswith("\n") or content.count("\n") != 1:
+        return None
+    admin = Path(content.removeprefix("gitdir: ").removesuffix("\n"))
+    checkout = record.checkouts[0]
+    try:
+        if cli._stored_path(config, checkout.path, "checkout path") != location:
+            return None
+        _relative, repository = cli._stored_repository_path(config, checkout.repository)
+        common = cli._GitVcs().common_directory(repository)
+    except (cli.Refusal, cli.StateError):
+        return None
+    if not admin.is_absolute() or admin.parent != common / "worktrees" or not admin.is_dir():
+        return None
+    try:
+        registered = (admin / "gitdir").read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    if registered.rstrip("\n") not in (str(pointer), os.path.realpath(pointer)):
+        return None
+    return pointer, content
+
+
+def _clear_stray_pointers(config: "cli.Config", authorized: bool) -> list[str]:
+    """Remove exact stray Git pointers (when authorized) and describe each one found."""
+
+    from wrkslots import cli
+
+    notes: list[str] = []
+    try:
+        state = cli._load_active(config)
+    except (cli.Refusal, cli.StateError):
+        return notes
+    for record in state.slots:
+        try:
+            image = slotimage.load(config.control, record.slot_type, record.slot)
+        except slotimage.ImageError:
+            continue
+        if image is None or image.phase != "ready":
+            continue
+        found = stray_worktree_pointer(config, record, image)
+        if found is None:
+            continue
+        pointer, content = found
+        if not authorized:
+            notes.append(
+                f"{record.slot_type}/{record.slot}: its mount point holds only Git's own pointer "
+                f"to its worktree registration ({pointer}: {content.strip()!r}); rerun "
+                "'wrkslots image mount --coordinator-authorized' to remove it and mount the slot"
+            )
+            continue
+        pointer.unlink()
+        cli._fsync_directory(pointer.parent)
+        state = cli._replace_record(state, record)
+        cli._write_active_state(
+            config,
+            state,
+            action="stray-git-pointer-removed",
+            slot=record.slot,
+            evidence={
+                "generation": record.generation,
+                "path": str(pointer),
+                "content": content,
+                "coordinator_authorized": True,
+                "actor": cli._identity_to_obj(cli._read_process_identity(os.getpid())),
+                "reason": (
+                    "the image was not mounted and its mount point held only Git's own pointer "
+                    "to this slot's worktree registration"
+                ),
+            },
+            require_repository=False,
+        )
+        print(f"removed stray Git pointer {pointer} (recorded in the event log)")
+    return notes
+
+
+def _cmd_image_mount(args: argparse.Namespace) -> int:
+    from wrkslots import cli
+
+    config = _config(args)
+    with cli._mutation_locks(config, args.wait_lock):
+        notes = _clear_stray_pointers(config, bool(getattr(args, "coordinator_authorized", False)))
+        try:
+            actions, failures = slotimage.ensure_all_mounted(config.control)
+        except slotimage.ImageError as exc:
+            raise _refuse(str(exc)) from exc
+        cli._refresh_owned_mounts(config)
+    print("\n".join(actions) if actions else "no image-backed slot needed mounting")
+    if failures:
+        raise _refuse(
+            f"{len(failures)} image-backed slot(s) could not be mounted; every other slot was: "
+            + "; ".join([*failures, *notes])
+        )
     return 0
 
 
@@ -568,10 +722,20 @@ def _cmd_image_unmount(args: argparse.Namespace) -> int:
     with cli._mutation_locks(config, args.wait_lock):
         cli._assert_slot_unused(image.location)
         try:
-            slotimage.unmount(image.state_image, image.state_mount)
-            slotimage.unmount(image.slot_image, image.location)
+            residual = [
+                *slotimage.unmount(image.state_image, image.state_mount),
+                *slotimage.unmount(image.slot_image, image.location),
+            ]
         except slotimage.ImageError as exc:
             raise _refuse(str(exc)) from exc
+        cli._refresh_owned_mounts(config)
+    if residual:
+        raise _refuse(
+            f"unmounted {args.slot_type}/{args.slot} on this host, but {', '.join(residual)} "
+            "still holds its image (a mount in another mount namespace that is still in use). "
+            "Do not copy or change the image file until that is released; the next wrkslots "
+            "command remounts the slot through the same device"
+        )
     print(f"unmounted {args.slot_type}/{args.slot}; the next wrkslots command remounts it")
     return 0
 

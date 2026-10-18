@@ -321,10 +321,12 @@ def test_slot_slices_nest_under_the_callers_slice(tmp_path: Path) -> None:
 
 
 def test_owned_mount_lines_are_excluded_from_use_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Owned lines are keyed by mount point and device (MAJOR:MINOR), never by a
+    # rendered source path, and only a whole-file-system mount (root "/") counts.
     line = "1 2 0:1 / /p/worktrees/slots/s1 rw - fuse.ext4 /p/slot.img rw"
     other = "3 2 0:2 / /p/worktrees/slots/s1/bind rw - ext4 /dev/sda1 rw"
     monkeypatch.setattr(
-        cli, "_OWNED_REPRESENTATION_MOUNTS", frozenset({(Path("/p/worktrees/slots/s1"), "/p/slot.img")})
+        cli, "_OWNED_REPRESENTATION_MOUNTS", frozenset({(Path("/p/worktrees/slots/s1"), "0:1")})
     )
     parsed = cli._parse_mountinfo_paths(f"{line}\n{other}\n", "test")
     assert [str(path) for path, _raw in parsed] == ["/", "/p/worktrees/slots/s1/bind", "/dev/sda1"]
@@ -746,10 +748,13 @@ def test_image_helper_refuses_paths_it_should_not_touch(tmp_path: Path) -> None:
         (("mount", str(image), "/usr"), "not a directory owned by the invoking user"),
         (("mount", str(image), str(tmp_path / "full")), "not empty"),
         (("mount", str(hard), str(target)), "singly linked"),
-        (("umount", "/usr"), "not the root of a loop-mounted slot image"),
-        (("umount", str(target)), "not the root of a loop-mounted slot image"),
-        (("trim", "/"), "not the root of a loop-mounted slot image"),
-        (("rmdir-lost-found", "/"), "not the root of a loop-mounted slot image"),
+        (("umount", str(image), "/usr"), "not the root of a loop-mounted slot image"),
+        (("umount", str(image), str(target)), "not the root of a loop-mounted slot image"),
+        (("trim", str(image), "/"), "not the root of a loop-mounted slot image"),
+        (("rmdir-lost-found", str(image), "/"), "not the root of a loop-mounted slot image"),
+        (("grow", str(image), "/"), "not the root of a loop-mounted slot image"),
+        (("umount", str(image), str(target), "--force"), "unknown umount option"),
+        (("umount", "/usr"), "usage: imagehelper.py"),  # the IMAGE argument is required
     ):
         result = run(*arguments)
         assert result.returncode != 0 and fragment in result.stderr, (arguments, result.stderr)
