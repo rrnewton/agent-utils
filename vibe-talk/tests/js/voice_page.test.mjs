@@ -58360,6 +58360,38 @@ test("`#348 settings-dynamic-lists`: Escape closes the pop-out before Settings, 
   assert.equal(blind.screen(), "main", "the negative control's Escape did not leave Settings, so the check above proves nothing");
 });
 
+test("`#348 settings-dynamic-lists` x `#346 settings-collapsible`: folding the group or section that holds the pop-out closes it", async () => {
+  for (const fold of ["dismissed", "settings-messages", "settings-all"]) {
+    const page = await dismissedPage("a message to read whole");
+    // Everything open, as a reader who opened the list to reach it has it.
+    await page.el("fold-settings-all").click();
+    await dismissedOpenerOf(dismissedItems(page)[0]).click();
+    assert.equal(page.el("dismissed-send-popout").hidden, false);
+    await page.el(`fold-${fold}`).click();
+    assert.equal(page.el("dismissed-send-popout").hidden, true, `folding ${fold} left the pop-out open out of sight`);
+    // ...so the next Escape is Settings', not spent on a pop-out nobody can see.
+    await press(page, page.el(`fold-${fold}`), "Escape");
+    assert.equal(page.screen(), "main", `after folding ${fold}, Escape closed something unseen first`);
+  }
+  // A fold elsewhere leaves it open.
+  const page = await dismissedPage("a message to read whole");
+  await page.el("fold-settings-all").click();
+  await dismissedOpenerOf(dismissedItems(page)[0]).click();
+  await page.el("fold-typing").click();
+  assert.equal(page.el("dismissed-send-popout").hidden, false, "folding another group closed the pop-out");
+  // The negative control: a page whose folds do not know the pop-out leaves it open behind the fold.
+  const blind = newPage(new Map(), brokenScript(
+    "    if (!foldOpen(slug) && FOLDS_HOLDING_DISMISSED.includes(slug)) closeDismissedSend(false);\n", ""));
+  await signIn(blind);
+  await showDiscord(blind, []);
+  await outgoingDismiss(await failedSend(blind, "another message")).click();
+  await blind.el("open-settings").click();
+  await blind.el("fold-settings-all").click();
+  await dismissedOpenerOf(dismissedItems(blind)[0]).click();
+  await blind.el("fold-dismissed").click();
+  assert.equal(blind.el("dismissed-send-popout").hidden, false, "the negative control closed it anyway, so the check above proves nothing");
+});
+
 test("`#348 settings-dynamic-lists`: Connection status puts each part of the detail on its own line; the banner keeps one", async () => {
   const page = newPage();
   await signIn(page);

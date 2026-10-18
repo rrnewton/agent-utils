@@ -1322,10 +1322,17 @@ function renderSettingsFoldAll() {
   el("fold-settings-all").textContent = SETTINGS_FOLDS.some((slug) => !foldOpen(slug)) ? "Expand all" : "Fold all";
 }
 
+/**
+ * The folds that hold the pop-out over Recently dismissed (`#348 settings-dynamic-lists`): folding one
+ * would leave it open out of sight, where Escape and Back would spend themselves closing it unseen.
+ */
+const FOLDS_HOLDING_DISMISSED = ["dismissed", "settings-messages"];
+
 for (const slug of SETTINGS_FOLDS) {
   setFold(slug, false);
   el(`fold-${slug}`).addEventListener("click", () => {
     setFold(slug, !foldOpen(slug));
+    if (!foldOpen(slug) && FOLDS_HOLDING_DISMISSED.includes(slug)) closeDismissedSend(false);
     // `#345 settings-multi-column`. In columns, a section opened or folded changes how they balance,
     // and can move to another column: the heading just pressed is brought back on screen, by as
     // little as it takes, so the reader does not lose what they opened.
@@ -1339,6 +1346,7 @@ for (const slug of SETTINGS_FOLDS) {
 el("fold-settings-all").addEventListener("click", () => {
   const open = SETTINGS_FOLDS.some((slug) => !foldOpen(slug));
   for (const slug of SETTINGS_FOLDS) setFold(slug, open);
+  if (!open) closeDismissedSend(false);
 });
 
 /**
