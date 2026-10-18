@@ -1,12 +1,13 @@
 ---
 title: 'settings-dynamic-lists: Recently dismissed and the connection status drawn as data, with a pop-out for a dismissed message'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-18T20:43:26.573707040+00:00
-updated_at: 2026-10-18T20:43:26.573707040+00:00
+updated_at: 2026-10-18T21:51:35.183263142+00:00
+closed_at: 2026-10-18T21:51:35.183262992+00:00
 ---
 
 # Description
