@@ -6556,12 +6556,49 @@ function noteConversationNamed(previous) {
     return;
   }
   if (!previous || previous === session.conversationId) return;
-  const recap = { state: "none", why: "replaced_session", dropped: 0 };
-  session.recap = recap;
+  const recap = noteSessionReplaced();
   setSeamRecap(drawBoundary("replaced", previous), boundaryFor(recap, "replaced"));
   // `#331 resume-on-websocket`. The line under the call is about the session now running.
   renderCallRecap();
   expectStartMarker(session.conversationId, recap, null);
+}
+
+/**
+ * `#331 resume-on-websocket`. The voice service replaced this call's session, and the session now
+ * running was sent no recap: whatever went, went to the one before it. The call holds that as its
+ * recap, an answer the old session still owed is nobody's, and Settings stops saying the last call
+ * was resumed, though the next call is offered the record as before. Answers the recap.
+ */
+function noteSessionReplaced() {
+  const recap = { state: "none", why: "replaced_session", dropped: 0 };
+  session.recap = recap;
+  session.recapAck = null;
+  if (resumeLast.armed) {
+    resumeLast = { ...resumeLast, replaced: true };
+    renderResumeState();
+  }
+  return recap;
+}
+
+/**
+ * `#331 resume-on-websocket`. A second `session_started` on a `vibe-talk-v1` socket: the bridge
+ * replaced the model session. The record goes once per call, as the first frame to the session it
+ * opened with, so the replacement is sent none, as on the hosted backend (`noteConversationNamed`).
+ * The conversation is still this call's, so no line is drawn between the two sessions: the line
+ * under the call says the session now running started fresh, and, while nothing has been said
+ * since a recap went, so do the line above the call and the conversation's start marker, as a
+ * refusal does (`noteReplayAck`). Once something has been said, those keep what its session was sent.
+ */
+function noteReplacedV1Session() {
+  const handed = session.recap;
+  const recap = noteSessionReplaced();
+  addDetail("the voice service replaced the session, and the new one was sent no recap");
+  if (handed && handed.state === "sent") {
+    settleBoundary(recap);
+    const start = startMarkers.get(session.conversationId);
+    if (start) start.recap = recap;
+  }
+  renderCallRecap();
 }
 
 /**
@@ -15714,8 +15751,12 @@ function handleVibeTalk(message) {
       addDetail(`voice session ${message.session_id || "started"}`);
       session.v1Ready = true;
       // `#331 resume-on-websocket`. Before anything else this call sends: the record of the
-      // conversation above, when this session lists `replay`.
-      offerReplayAtSessionStart(message);
+      // conversation above, when this session lists `replay`. A replacement session is sent none.
+      if (session.sessionStarts > 1) {
+        noteReplacedV1Session();
+      } else {
+        offerReplayAtSessionStart(message);
+      }
       if (session.chat) {
         // A typed call does not wait for a promised greeting: the protocol does not say whether a
         // server greets a client that never sends `audio_start`, nor which turn number a greeting
@@ -38832,7 +38873,9 @@ let resumeConversationId = null;
  * `armed` back: `unsupported`, the call's session did not list `replay` and was sent nothing;
  * `refused`, it took the frame and answered that it would not use it; `unsent`, the call ended
  * before its session started. `acked` is the one that keeps it: the bridge said it took the record.
- * And `words`, the server's count of what the record held, null where it named none.
+ * And `words`, the server's count of what the record held, null where it named none. `replaced`
+ * keeps `armed` too, since the record did go: the voice service then replaced the session that took
+ * it, and the one that finished the call was sent none (`noteSessionReplaced`).
  */
 let resumeLast = blankResumeLast();
 
@@ -38840,7 +38883,7 @@ let resumeLast = blankResumeLast();
 function blankResumeLast() {
   return {
     attempted: false, armed: false, dropped: 0, failed: false, words: null,
-    acked: false, refused: false, unsupported: false, unsent: false,
+    acked: false, refused: false, unsupported: false, unsent: false, replaced: false,
   };
 }
 
@@ -38931,6 +38974,8 @@ function renderResumeState() {
     state.textContent = "The last call was NOT resumed: its voice session took no recap.";
   } else if (resumeLast.unsent) {
     state.textContent = "The last call ended before it could be told what was already said.";
+  } else if (resumeLast.replaced) {
+    state.textContent = "The last call's voice session was replaced; the new one was sent no recap.";
   } else if (resumeLast.armed && resumeLast.dropped > 0) {
     state.textContent = `The last call was resumed IN PART: ${words ? `${words}; ` : ""}` +
       `${lines(resumeLast.dropped)} did not fit.`;
