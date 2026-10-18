@@ -155,6 +155,7 @@ const ALL_CHANNELS = "*";
  *   | "close-settings" | "collapse-all" | "column-toggle" | "dismiss-banner"
  *   | "dismiss-error" | "dismiss-status" | "expand-all" | "fold-help" | "forget-conversations"
  *   | "forget-dismissed-sends" | "forget-token"
+ *   | "dismissed-send-close" | "dismissed-send-copy" | "dismissed-send-restore"
  *   | "retry-start"
  *   | "hang-up"
  *   | "help-link-auto-read" | "help-link-canned-prompts" | "help-link-channel-alias"
@@ -806,6 +807,8 @@ function openMenus() {
   if (openRowMenu) open.push("menu:row");
   if (!el("speed-popover").hidden) open.push("menu:pace");
   if (promptsOpen) open.push("menu:prompts");
+  // `#348 settings-dynamic-lists`. The pop-out over Recently dismissed, on Settings.
+  if (!el("dismissed-send-popout").hidden) open.push("menu:dismissed");
   return open;
 }
 
@@ -832,6 +835,7 @@ function closeOpenMenu(name) {
     el("prompts-open").focus();
     return true;
   }
+  if (name === "menu:dismissed" && !el("dismissed-send-popout").hidden) return closeDismissedSend();
   return false;
 }
 
@@ -1185,6 +1189,8 @@ function showScreen(name) {
     if (readAloudPlayback === "browser") stopReading();
     disarmClear();
   }
+  // `#348 settings-dynamic-lists`. The pop-out over Recently dismissed is Settings', and goes with it.
+  if (name !== "settings") closeDismissedSend(false);
   // Help is reached FROM settings and returns TO it, so it must not become the thing settings
   // remembers to go back to — that would make the gear's way out lead into the document the
   // reader just left. `#85 voice-desktop-review`.
@@ -1478,6 +1484,12 @@ const CHANNEL_DRAFT_REFUSED = "This browser could not save the draft. Keep this 
  */
 let dismissedSends = [];
 /**
+ * `#348 settings-dynamic-lists`. The dismissed send the pop-out over Recently dismissed shows, and the row that opened it, which takes the focus back.
+ *
+ * @type {{id: string, opener: HTMLElement | null} | null}
+ */
+let dismissedPopout = null;
+/**
  * The dismissal the Undo chip takes back while it is up: the entry's id, its wait for an automatic
  * send if it had one, and the chip's timer.
  */
@@ -1580,7 +1592,9 @@ let bannerTimer = null;
 function renderDetail() {
   const text = redact(connectionDetail);
   el("connection-detail").textContent = text;
-  el("settings-detail").textContent = text;
+  // `#348 settings-dynamic-lists`. Settings draws it as a readout, one part to a line; the banner
+  // keeps the one line it has room for.
+  el("settings-detail").textContent = text.split(" · ").join("\n");
 }
 
 function showDetail(text) {
@@ -9504,6 +9518,8 @@ function onEscape(event, target) {
   if (closeRowMenuOnEscape(event)) return true;
   // The pace popover and the prompts tray, as the back gesture closes them (`#304 back-gesture-in-app`).
   if (closeOpenMenu("menu:pace") || closeOpenMenu("menu:prompts")) return true;
+  // `#348 settings-dynamic-lists`. The pop-out over Recently dismissed, before Settings itself.
+  if (closeOpenMenu("menu:dismissed")) return true;
   if (closeDetailsOn(target)) return true;
   if (searchOpen && currentScreen === "main") {
     setSearchOpen(false);
@@ -24432,29 +24448,41 @@ function loadDismissedSends() {
   }
 }
 
-/** Settings' Recently dismissed: each send's place, its age and its text, and Put back. */
+/** Where a dismissed send was going, and how long ago it was dismissed, as one line. */
+function dismissedSendMeta(held) {
+  const entry = held.entry;
+  const age = briefAge(held.at);
+  const when = age === "now" ? "just now" : `${age} ago`;
+  return [channelLabel(entry.channel), entry.replyTo ? "Reply" : entry.threadId ? "Thread" : "", `dismissed ${when}`]
+    .filter(Boolean).join(" · ");
+}
+
+/**
+ * Settings' Recently dismissed: each send's place, its age and the first line of its text.
+ *
+ * `#348 settings-dynamic-lists`. A data panel rather than a column of cards with a Put back on each:
+ * a row is one button, its two lines the place and age and the text, cut to one line by the stylesheet
+ * (the whole text is still in the row, for find-in-page and a screen reader), and it opens the pop-out
+ * where the whole message is, with Copy and Put back (`openDismissedSend`).
+ */
 function renderDismissedSends() {
   pruneDismissedSends();
   const items = dismissedSends.map((held) => {
     const entry = held.entry;
     const item = document.createElement("li");
     item.className = "dismissed-send";
-    const age = briefAge(held.at);
-    const when = age === "now" ? "just now" : `${age} ago`;
-    const where = [channelLabel(entry.channel), entry.replyTo ? "Reply" : entry.threadId ? "Thread" : "",
-      `dismissed ${when}`];
-    const restore = document.createElement("button");
-    restore.className = "secondary dismissed-send-restore";
-    restore.setAttribute("type", "button");
-    restore.textContent = "Put back";
-    restore.setAttribute("aria-label", `Put back “${sendSnippet(unsentText(entry))}”`);
-    restore.setAttribute("title", "Back in the outbox of its channel, where Edit, Retry and Dismiss are.");
-    restore.addEventListener("click", () => putBackDismissedSend(entry.id));
-    item.append(
-      styled("div", "dismissed-send-meta", where.filter(Boolean).join(" · ")),
-      styled("div", "dismissed-send-text", unsentText(entry)),
-      restore
+    const open = document.createElement("button");
+    open.className = "dismissed-send-open";
+    open.setAttribute("type", "button");
+    open.setAttribute("aria-haspopup", "dialog");
+    open.setAttribute("aria-controls", "dismissed-send-popout");
+    open.setAttribute("data-outgoing-id", String(entry.id));
+    open.addEventListener("click", () => openDismissedSend(entry.id, open));
+    open.append(
+      styled("span", "dismissed-send-meta", dismissedSendMeta(held)),
+      styled("span", "dismissed-send-text", unsentText(entry))
     );
+    item.append(open);
     return item;
   });
   el("dismissed-sends").replaceChildren(...items);
@@ -24462,10 +24490,60 @@ function renderDismissedSends() {
   el("forget-dismissed-sends").hidden = items.length === 0;
   el("dismissed-sends-state").textContent = items.length
     ? `Messages you dismissed from the outbox unsent, kept on this device for ${DISMISSED_SENDS_DAYS} days ` +
-      `(the newest ${DISMISSED_SENDS_LIMIT}). Put back returns one to the outbox of its channel.`
+      `(the newest ${DISMISSED_SENDS_LIMIT}). Open one to read it whole, copy it or put it back.`
     : `Nothing dismissed in the last ${DISMISSED_SENDS_DAYS} days. A message you dismiss from the ` +
       "outbox unsent is kept here that long, in case you want it back.";
+  // The pop-out is about one of them: gone from the list, it goes too.
+  if (dismissedPopout && !dismissedSends.some((held) => held.entry.id === dismissedPopout.id)) closeDismissedSend(false);
 }
+
+// --- the pop-out over Recently dismissed ----------------------------------------------------------
+//
+// `#348 settings-dynamic-lists`. One message, whole: where it was going and when it was dismissed, its
+// text as typed, Copy, Put back and Close. It is a menu to the keys and to the back gesture
+// (`openMenus`): Escape closes it first, and so does Back, before Settings. Leaving Settings closes it.
+
+/** Open the pop-out on the dismissed send `id`, from the row `opener`. */
+function openDismissedSend(id, opener) {
+  const held = dismissedSends.find((one) => one.entry.id === id);
+  if (!held) return;
+  dismissedPopout = { id, opener };
+  el("dismissed-send-popout-meta").textContent = dismissedSendMeta(held);
+  el("dismissed-send-popout-text").textContent = unsentText(held.entry);
+  el("dismissed-send-restore").setAttribute("aria-label", `Put back “${sendSnippet(unsentText(held.entry))}”`);
+  el("dismissed-send-popout-state").textContent = "";
+  const popout = el("dismissed-send-popout");
+  popout.hidden = false;
+  // Laid over its group, which may stand partly below the screen's edge: brought on screen whole.
+  if (typeof popout.scrollIntoView === "function") popout.scrollIntoView({ block: "nearest" });
+  el("dismissed-send-copy").focus({ preventScroll: true });
+  scheduleBackSync();
+}
+
+/** Close the pop-out, giving the focus back to the row that opened it when `refocus` and it is still there. */
+function closeDismissedSend(refocus = true) {
+  if (!dismissedPopout) return false;
+  const { opener } = dismissedPopout;
+  dismissedPopout = null;
+  el("dismissed-send-popout").hidden = true;
+  if (refocus && opener && opener.parentNode && typeof opener.focus === "function") opener.focus({ preventScroll: true });
+  scheduleBackSync();
+  return true;
+}
+
+el("dismissed-send-close").addEventListener("click", () => closeDismissedSend());
+el("dismissed-send-copy").addEventListener("click", async () => {
+  const held = dismissedPopout && dismissedSends.find((one) => one.entry.id === dismissedPopout?.id);
+  if (!held) return;
+  const copied = await writeClipboardText(unsentText(held.entry));
+  el("dismissed-send-popout-state").textContent = copied ? "Copied the whole message." : COPY_REFUSED;
+});
+el("dismissed-send-restore").addEventListener("click", () => {
+  if (!dismissedPopout) return;
+  const id = dismissedPopout.id;
+  closeDismissedSend(false);
+  putBackDismissedSend(id);
+});
 
 async function sendChannelMessage() {
   const key = activeComposerKey;

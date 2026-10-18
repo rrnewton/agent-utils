@@ -3025,6 +3025,88 @@ def _act_recently_dismissed(driver: Driver) -> None:
     driver.settle(300)
 
 
+# `#348 settings-dynamic-lists`: the sends dismissed for the list, oldest first, one of them long enough
+# that its row's one line is cut and its pop-out has to scroll on a phone.
+DISMISSED_LIST_TEXTS = (
+    "rerun the flaky shard before the release cut",
+    "the cache rebuild is done; the warm start is back under a minute",
+    "ask the runner owner whether arm64 can take the nightly as well",
+    "Long note for later, kept in case it is wanted. " + ("The integration shard was retried twice and "
+    "passed on the second attempt; the artifact upload waited on the cache for most of an hour, and "
+    "the release job should not be cut until the upload settles. ") * 4,
+    "ping me when the nightly is green",
+    "the arm64 runner is back; rerunning the release job now",
+)
+
+
+def _dismiss_sends(driver: Driver, texts: Iterable[str]) -> None:
+    """Send each of `texts` in the channel, have the chat service refuse it, and dismiss it unsent."""
+    driver.page.route("**/api/v1/channels/*/reply", _refuse_send)
+    try:
+        for text in texts:
+            driver.page.fill("#channel-compose-text", text)
+            driver.click("channel-send")
+            driver.page.wait_for_function(
+                "() => document.querySelector('#outgoing-log > li[data-send-state=\"failed\"]') !== null",
+                timeout=10_000,
+            )
+            driver.page.click("#outgoing-log > li[data-send-state='failed'] .outgoing-dismiss")
+            driver.page.wait_for_function(
+                "() => document.querySelector('#outgoing-log > li[data-send-state=\"failed\"]') === null",
+                timeout=5_000,
+            )
+    finally:
+        driver.page.unroute("**/api/v1/channels/*/reply", _refuse_send)
+
+
+def _act_settings_dismissed_list(driver: Driver) -> None:
+    """`#348 settings-dynamic-lists`: Settings' Recently dismissed as a data panel of six sends.
+
+    Six sends refused by the chat service and dismissed unsent (the reply route is this state's one
+    faked answer), then Settings with the group scrolled to the top: a dark, monospaced panel of a
+    fixed height, scrolling inside itself, each row where it was going, how long ago, and one line.
+    """
+    _act_open_channel(driver)
+    _dismiss_sends(driver, DISMISSED_LIST_TEXTS)
+    driver.click("open-settings")
+    driver.page.wait_for_function("() => window.__visible('close-settings')", timeout=5_000)
+    driver.page.wait_for_function("() => document.querySelectorAll('#dismissed-sends > li').length === 6", timeout=5_000)
+    driver.js(
+        "(() => { if (window.__visible('status-line')) document.getElementById('dismiss-status').click(); "
+        "document.getElementById('dismissed-sends').closest('.settings-group').scrollIntoView({ block: 'start' }); "
+        "return true; })()"
+    )
+    driver.settle(300)
+
+
+def _act_settings_dismissed_popout(driver: Driver) -> None:
+    """`#348 settings-dynamic-lists`: the long dismissed send opened in its pop-out, whole, with Copy."""
+    _act_settings_dismissed_list(driver)
+    driver.page.click("#dismissed-sends > li:nth-child(3) .dismissed-send-open")
+    driver.page.wait_for_function("() => window.__visible('dismissed-send-popout')", timeout=5_000)
+    driver.settle(300)
+
+
+def _act_settings_connection_panel(driver: Driver) -> None:
+    """`#348 settings-dynamic-lists`: Connection status after a call, as the dark readout, a fact a line."""
+    driver.load(with_token=True)
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    driver.click("talk")
+    driver.page.wait_for_function("() => window.__text('talk-label') === 'Listening'", timeout=10_000)
+    driver.js("window.__agentSays('Hello, I am listening.')")
+    driver.settle(200)
+    driver.click("hang-up")
+    driver.page.wait_for_function("() => window.__text('talk-label') === 'Start a new call'", timeout=5_000)
+    driver.click("open-settings")
+    driver.page.wait_for_function("() => window.__visible('close-settings')", timeout=5_000)
+    driver.js(
+        "(() => { if (window.__visible('status-line')) document.getElementById('dismiss-status').click(); "
+        "document.getElementById('connection-panel').closest('.settings-group').scrollIntoView({ block: 'center' }); "
+        "return true; })()"
+    )
+    driver.settle(300)
+
+
 # `#298 thread-card-header`. A channel WITH THREADS, for the one state whose subject is a thread opened
 # beside Main. The throwaway server's --fake-discord seeds a flat channel and offers no threads, so
 # this state answers two routes itself while it is walked, and nothing else: the client configuration,
@@ -5293,19 +5375,22 @@ SCENES: tuple[Scene, ...] = (
     ),
     Scene(
         name="51-recently-dismissed",
-        what="Settings, Recently dismissed: the send just dismissed, where it was going, and Put back",
+        what="Settings, Recently dismissed: the send just dismissed, where it was going, as a row that opens it",
         act=_act_recently_dismissed,
         profiles=("android-412", "laptop-1280"),
         expect=(
             ("the settings screen is up", "window.__visible('screen-settings')"),
             (
-                "the dismissed send is listed with its text, its age and Put back, on screen",
+                # `#348 settings-dynamic-lists`: the row is one button that opens the send's pop-out,
+                # where Put back is now; no button of its own in the row.
+                "the dismissed send is listed with its text and its age, as one row that opens it, on screen",
                 "(() => { const item = document.querySelector('#dismissed-sends > li'); "
                 "if (!item) return false; const b = item.getBoundingClientRect(); "
-                "const put = item.querySelector('.dismissed-send-restore'); "
+                "const open = item.querySelector('.dismissed-send-open'); "
                 "return /the arm64 runner is back/.test(item.textContent) "
-                "&& /dismissed just now/.test(item.textContent) && put !== null "
-                "&& put.getAttribute('aria-label') === 'Put back “the arm64 runner is back;…”' "
+                "&& /dismissed just now/.test(item.textContent) && open !== null "
+                "&& open.getAttribute('aria-haspopup') === 'dialog' "
+                "&& item.querySelector('.dismissed-send-restore') === null "
                 "&& b.top >= 0 && b.bottom <= innerHeight; })()",
             ),
             ("Forget these now is offered", "window.__visible('forget-dismissed-sends')"),
@@ -5835,6 +5920,113 @@ SCENES: tuple[Scene, ...] = (
             ),
         ),
     ),
+    Scene(
+        name="65-settings-dismissed-list",
+        what="Settings, Recently dismissed as a dark data panel: fixed height, resizable, scrolling, one line a row",
+        act=_act_settings_dismissed_list,
+        profiles=SETTINGS_PROFILES,
+        expect=(
+            ("the settings screen is up", "window.__visible('screen-settings')"),
+            (
+                # THE claim: drawn as data, a terminal's dark and monospaced panel, not a list of cards.
+                "the list is a dark, monospaced panel",
+                "(() => { const s = getComputedStyle(document.getElementById('dismissed-sends')); "
+                "const rgb = (s.backgroundColor.match(/[0-9.]+/g) || []).slice(0, 3).map(Number); "
+                "return rgb.length === 3 && Math.max(...rgb) < 48 && /mono/i.test(s.fontFamily); })()",
+            ),
+            (
+                "the list is of a fixed height, can be dragged taller, and scrolls inside itself",
+                "(() => { const l = document.getElementById('dismissed-sends'); const s = getComputedStyle(l); "
+                "const rem = parseFloat(getComputedStyle(document.documentElement).fontSize); "
+                "return Math.abs(l.getBoundingClientRect().height - 11 * rem) <= 2 && s.resize === 'vertical' "
+                "&& s.overflowY === 'auto' && l.scrollHeight > l.clientHeight; })()",
+            ),
+            (
+                # ...with shorter previews: each row's text one line, cut with an ellipsis.
+                "each row's text is one line",
+                "[...document.querySelectorAll('#dismissed-sends .dismissed-send-text')].every((e) => { "
+                "const line = parseFloat(getComputedStyle(e).lineHeight) || parseFloat(getComputedStyle(e).fontSize) * 1.5; "
+                "return e.getBoundingClientRect().height <= line + 1 && getComputedStyle(e).textOverflow === 'ellipsis'; })",
+            ),
+            (
+                "no row carries a button of its own besides the row",
+                "[...document.querySelectorAll('#dismissed-sends > li')].every((li) => li.querySelectorAll('button').length === 1)",
+            ),
+            (
+                "the list is on the screen",
+                "(() => { const b = document.getElementById('dismissed-sends').getBoundingClientRect(); "
+                "const s = document.getElementById('screen-settings').getBoundingClientRect(); "
+                "return b.top >= s.top - 1 && b.bottom <= s.bottom + 1; })()",
+            ),
+            (
+                "nothing on the settings screen is wider than it",
+                "(() => { const s = document.getElementById('screen-settings'); "
+                "return s.scrollWidth <= s.clientWidth + 1; })()",
+            ),
+        ),
+    ),
+    Scene(
+        name="66-settings-dismissed-popout",
+        what="Settings, a dismissed send opened in its pop-out: the whole text, Copy, Put back and Close",
+        act=_act_settings_dismissed_popout,
+        profiles=SETTINGS_PROFILES,
+        expect=(
+            ("the pop-out is up", "window.__visible('dismissed-send-popout')"),
+            (
+                # THE claim: the whole text, which the row cut to one line.
+                "the pop-out holds the whole long message",
+                "(() => { const t = document.getElementById('dismissed-send-popout-text').textContent; "
+                "return t.startsWith('Long note for later') && t.length > 400; })()",
+            ),
+            (
+                "Copy, Put back and Close are on screen, inside the window",
+                "['dismissed-send-copy', 'dismissed-send-restore', 'dismissed-send-close'].every((id) => { "
+                "const b = document.getElementById(id).getBoundingClientRect(); "
+                "return window.__visible(id) && b.top >= 0 && b.bottom <= innerHeight && b.left >= 0 && b.right <= innerWidth; })",
+            ),
+            (
+                "the pop-out is inside the window, and Copy has the focus",
+                "(() => { const b = document.getElementById('dismissed-send-popout').getBoundingClientRect(); "
+                "return b.top >= 0 && b.bottom <= innerHeight && b.left >= 0 && b.right <= innerWidth "
+                "&& document.activeElement === document.getElementById('dismissed-send-copy'); })()",
+            ),
+        ),
+    ),
+    Scene(
+        name="67-settings-connection-panel",
+        what="Settings, Connection status after a call: the dark readout, one fact to a line, and how live updates arrive",
+        act=_act_settings_connection_panel,
+        profiles=SETTINGS_PROFILES,
+        expect=(
+            ("the settings screen is up", "window.__visible('screen-settings')"),
+            (
+                "the readout is a dark, monospaced panel",
+                "(() => { const s = getComputedStyle(document.getElementById('connection-panel')); "
+                "const rgb = (s.backgroundColor.match(/[0-9.]+/g) || []).slice(0, 3).map(Number); "
+                "return rgb.length === 3 && Math.max(...rgb) < 48 && /mono/i.test(s.fontFamily); })()",
+            ),
+            (
+                # ...one fact to a line: the call's detail drawn on several lines, the live line after it.
+                "the call's detail is several lines, and the live-updates line is under it, in the panel",
+                "(() => { const d = document.getElementById('settings-detail'); const l = document.getElementById('live-state'); "
+                "const line = parseFloat(getComputedStyle(d).lineHeight) || parseFloat(getComputedStyle(d).fontSize) * 1.5; "
+                "return d.textContent.split('\\n').length >= 3 && d.getBoundingClientRect().height >= line * 3 - 1 "
+                "&& window.__visible('live-state') && l.getBoundingClientRect().top >= d.getBoundingClientRect().bottom - 1 "
+                "&& document.getElementById('connection-panel').contains(l); })()",
+            ),
+            (
+                "the panel is on the screen",
+                "(() => { const b = document.getElementById('connection-panel').getBoundingClientRect(); "
+                "const s = document.getElementById('screen-settings').getBoundingClientRect(); "
+                "return b.top >= s.top - 1 && b.bottom <= s.bottom + 1; })()",
+            ),
+            (
+                "nothing on the settings screen is wider than it",
+                "(() => { const s = document.getElementById('screen-settings'); "
+                "return s.scrollWidth <= s.clientWidth + 1; })()",
+            ),
+        ),
+    ),
     # LAST IN THE WALK, and not by accident: it empties the server's durable store on the way in,
     # so that the summary the state above cached is really regenerated and can really fail. Nothing
     # after it in this profile would miss what it deletes, and the next profile purges anyway.
@@ -6319,6 +6511,10 @@ def check_state_controls() -> list[str]:
         "63-settings-prose": SETTINGS_PROFILES,
         # `#349 channel-settings-all`.
         "64-channel-settings-all": SETTINGS_PROFILES,
+        # `#348 settings-dynamic-lists`.
+        "65-settings-dismissed-list": SETTINGS_PROFILES,
+        "66-settings-dismissed-popout": SETTINGS_PROFILES,
+        "67-settings-connection-panel": SETTINGS_PROFILES,
     }
     for name, wanted_profiles in restricted.items():
         scene = next((s for s in SCENES if s.name == name), None)
@@ -6530,6 +6726,13 @@ def check_state_controls() -> list[str]:
         # `#349 channel-settings-all`. Pinned to All channels being chosen (`s.value === '*'`), to Mixed
         # said in words (`Mixed: On in 1`), and to Who is who being out of the box (`settings-messages`).
         "64-channel-settings-all": ("s.value === '*'", "Mixed: On in 1", "settings-messages"),
+        # `#348 settings-dynamic-lists`. Pinned to the dark monospaced panel (`Math.max(...rgb) < 48`),
+        # to the fixed resizable scrolling list (`s.resize === 'vertical'`) and its one-line rows
+        # (`textOverflow`); to the pop-out's whole text (`t.length > 400`); and to the readout's
+        # fact-a-line detail (`split(`).
+        "65-settings-dismissed-list": ("Math.max(...rgb) < 48", "s.resize === 'vertical'", "textOverflow"),
+        "66-settings-dismissed-popout": ("t.length > 400", "dismissed-send-copy"),
+        "67-settings-connection-panel": ("Math.max(...rgb) < 48", "split("),
     }
     for name, needles in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)

@@ -423,8 +423,8 @@ A send that did not go through stays in the outbox with these actions:
   as a draft, Edit leaves the send in the outbox and says so.
 - **Dismiss** takes the send out of the outbox. For 15 seconds an **Undo dismiss** chip naming the
   message puts it back as it was. After that the message is still kept on this device for 7 days
-  (the newest 10) under **Settings → Recently dismissed**. **Put back** there returns it to
-  its channel's outbox, and **Forget these now** clears the list. If the browser cannot keep that
+  (the newest 10) under **Settings → Recently dismissed**. Tap one there to read it whole, copy it,
+  or **Put back** to return it to its channel's outbox; **Forget these now** clears the list. If the browser cannot keep that
   copy, the page says Undo works only until it is reloaded.
 
 A message with a saved reply draft shows **Draft**, with a pencil, just left of its Reply. This
@@ -7250,6 +7250,27 @@ in this browser and keep applying. It follows the channel being **read**, which 
 and is still one channel's census, so a bot that only speaks somewhere else cannot spoil the guess.
 `64-channel-settings-all` photographs the box on All channels, Clear unread Mixed across two
 channels, at 393x852, 1280x800 and 1920x1080.
+
+**Two readouts are drawn as data** (`#348 settings-dynamic-lists`). The owner, 2026-10-18:
+*Recently dismissed* should be "a fixed-height, user-resizable, scrollable list styled as data (not a
+control), with shorter previews", a row opening "a pop-out with the full text and a copy button", and
+the connection status should be drawn the same way, "a dark terminal-like panel". So both are a
+`.data-panel`: dark and monospaced in either colour scheme.
+
+- Recently dismissed is 11rem tall, scrolls inside itself, and can be dragged taller or shorter
+  (`resize: vertical`). A row is where the message was going and how long ago, and **one line** of
+  its text, cut with an ellipsis by the stylesheet; the whole text is still in the row, so find-in-page
+  and a screen reader have all of it.
+- A row is one button. It opens the pop-out: the whole message, **Copy** (the Clipboard API, falling
+  back to a hidden textarea, and saying so when neither works), **Put back** (moved here from the
+  row, where a button on every line made the list a column of controls) and **Close**. Escape and the
+  phone's back gesture close it before they close Settings, as they close a menu; leaving Settings
+  closes it; Close gives the focus back to the row. The list keeps its storage key and its limits.
+- Connection status puts each part of the connection detail on its own line, with how live updates
+  reach the page (`#347 settings-prose`) last; the banner after a call keeps its one line.
+
+`65-settings-dismissed-list`, `66-settings-dismissed-popout` and `67-settings-connection-panel`
+photograph them at 393x852, 1280x800 and 1920x1080.
 
 **Connection status moved to the end and gained a word.** It is a readout — what the conversation
 is, what audio format it negotiated, why the last one closed — and it was standing at the top of the

@@ -32776,7 +32776,17 @@ const outgoingActions = (row) =>
   row.descendants().filter((node) => node.tagName === "button").map((node) => node.textContent);
 const savedDismissed = (page) => JSON.parse(page.storage.get("vibe-talk.dismissed-sends") || "[]");
 const dismissedItems = (page) => page.el("dismissed-sends").children;
-const putBackOf = (item) => item.descendants().find((node) => node.hasClass("dismissed-send-restore"));
+/** The button that is a row of Recently dismissed, which opens its pop-out (`#348 settings-dynamic-lists`). */
+const dismissedOpenerOf = (item) => item.descendants().find((node) => node.hasClass("dismissed-send-open"));
+/**
+ * Put a dismissed send back as the reader does since `#348 settings-dynamic-lists`: open its row's
+ * pop-out, then its Put back. Returns that Put back button.
+ */
+async function putBackOf(page, item) {
+  await dismissedOpenerOf(item).click();
+  assert.equal(page.el("dismissed-send-popout").hidden, false, "the row did not open its pop-out");
+  return page.el("dismissed-send-restore");
+}
 const draftMarkerOf = (row) => row.descendants().find((node) => node.className === "draft-marker");
 const SEND_UNDO_MS = sourceConstant("SEND_UNDO_MS");
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -33113,7 +33123,9 @@ test("`#193 compose-draft-loss`: Dismiss is taken back by a chip that names the 
   assert.equal(page.el("dismissed-sends").hidden, false);
   assert.match(item.text(), /keep this in case I want it after all/);
   assert.match(item.text(), /dismissed just now/);
-  assert.equal(putBackOf(item).getAttribute("aria-label"), "Put back “keep this in case I want it…”");
+  await dismissedOpenerOf(item).click();
+  assert.equal(page.el("dismissed-send-restore").getAttribute("aria-label"), "Put back “keep this in case I want it…”");
+  await page.el("dismissed-send-close").click();
   assert.match(page.el("dismissed-sends-state").textContent, /kept on this device for 7 days/);
 
   // ...and after a reload, where no Undo is offered for a dismissal the page did not see.
@@ -33126,7 +33138,7 @@ test("`#193 compose-draft-loss`: Dismiss is taken back by a chip that names the 
   await again.el("open-settings").click();
   assert.match(dismissedItems(again)[0].text(), /^lead team · dismissed just now/);
   await again.el("close-settings").click();
-  await putBackOf(dismissedItems(again)[0]).click();
+  await (await putBackOf(again, dismissedItems(again)[0])).click();
   await again.settle();
   assert.equal(outgoingRows(again)[0].getAttribute("data-outgoing-id"), id);
   assert.equal(outgoingRows(again)[0].getAttribute("data-send-state"), "failed");
@@ -33185,7 +33197,7 @@ test("`#193 compose-draft-loss`: Undo puts back a send's wait to go again on its
   const later = await keyedChannel();
   await outgoingDismiss(await failedSend(later, "left to the reader", 502)).click();
   later.expireTimers(SEND_UNDO_MS);
-  await putBackOf(dismissedItems(later)[0]).click();
+  await (await putBackOf(later, dismissedItems(later)[0])).click();
   await later.settle();
   const put = outgoingRows(later)[0];
   assert.equal(put.getAttribute("data-send-state"), "unconfirmed");
@@ -39277,7 +39289,7 @@ test("`#277 send-order`: a message waiting its turn can be taken back with Edit 
 
   // Dismissed while it waited, it is kept as a message that was not sent, and goes only on Retry.
   page.expireTimers(SEND_UNDO_MS);
-  await putBackOf(dismissedItems(page)[0]).click();
+  await (await putBackOf(page, dismissedItems(page)[0])).click();
   await page.settle();
   const back = rowWith("C, to dismiss");
   assert.equal(back.getAttribute("data-send-state"), "failed");
@@ -39437,7 +39449,7 @@ test("`#277 send-order`: a send put back goes where it was written and holds wha
   await outgoingDismiss(waiting).click();
   page.expireTimers(SEND_UNDO_MS);
   await page.settle();
-  await putBackOf(dismissedItems(page).find((item) => item.text().includes("V, lost second"))).click();
+  await (await putBackOf(page, dismissedItems(page).find((item) => item.text().includes("V, lost second")))).click();
   await page.settle();
   const back = rowWith("V, lost second");
   assert.equal(back.getAttribute("data-send-state"), "unconfirmed");
@@ -57965,7 +57977,7 @@ test("`#347 settings-prose`: the check refuses each old thing put back, one at a
   const relay = `${settingsGroup("Arriving messages during a call")}</section>`;
   const cases = [
     // The live-updates line back at the head of the group, and named as it was.
-    ["the live line", HTML.replace(/\s*<p id="live-state" class="hint" aria-live="polite"><\/p>/, "")
+    ["the live line", HTML.replace(/\s*<p id="live-state" class="[^"]*" aria-live="polite"><\/p>/, "")
       .replace('<select id="relay-to-agent"', '<p id="live-state" class="hint" aria-live="polite"></p><select id="relay-to-agent"'), [
       "how live updates reach this page is not in Connection status",
       "how live updates reach this page is still in the Voice agent section",
@@ -58190,6 +58202,169 @@ test("`#349 channel-settings-all`: the Save check is not satisfied by a page tha
     "the negative control set every channel anyway");
   assert.equal(broken.el("upstream-clear-state").textContent.startsWith("Saved. On in all 2 channels."), false,
     "the negative control's status line reads as the real one's");
+});
+
+// --- `#348 settings-dynamic-lists` ----------------------------------------------------------------
+//
+// The owner, 2026-10-18 ("settings complaints"): "Recently dismissed" becomes a fixed-height,
+// user-resizable, scrollable list styled as data (not a control), with shorter previews; clicking one
+// opens a pop-out with the full text and a copy button. The connection-status list gets the same data
+// styling (for example a dark terminal-like panel).
+
+/**
+ * What is wrong with the two readouts against `#348`, as sentences; empty when nothing is. A function of
+ * the markup and the stylesheet, so each negative control can hand it the ones from before.
+ */
+function dataListProblems(html, css) {
+  const problems = [];
+  const code = html.replace(/<!--[\s\S]*?-->/g, " ");
+  const rule = (selector) => cssRules(css, selector).join("\n");
+  const panel = rule(".data-panel");
+  if (!/font-family:\s*ui-monospace/.test(panel) || !/background:\s*var\(--data-bg\)/.test(panel)) {
+    problems.push("there is no dark, monospaced data panel");
+  }
+  const bg = /--data-bg:\s*#([0-9a-f]{6})/i.exec(panel);
+  if (!bg || parseInt(bg[1].slice(0, 2), 16) > 0x30) problems.push("the data panel is not dark");
+  if (!/<ol id="dismissed-sends" class="dismissed-sends data-panel"/.test(code)) {
+    problems.push("Recently dismissed is not drawn as a data panel");
+  }
+  const list = rule(".dismissed-sends");
+  if (!/(?:^|\s)height:\s*\d/.test(list)) problems.push("Recently dismissed has no fixed height");
+  if (!/resize:\s*vertical/.test(list)) problems.push("Recently dismissed cannot be resized");
+  if (!/overflow:\s*auto/.test(list)) problems.push("Recently dismissed does not scroll inside itself");
+  const preview = rule(".dismissed-send-text");
+  if (!/white-space:\s*nowrap/.test(preview) || !/text-overflow:\s*ellipsis/.test(preview) || /line-clamp/.test(preview)) {
+    problems.push("a row's preview is not one line");
+  }
+  if (!/<div id="dismissed-send-popout"[^>]*role="dialog"[^>]*hidden>/.test(code) ||
+      !/<button id="dismissed-send-copy"[^>]*>Copy<\/button>/.test(code)) {
+    problems.push("there is no pop-out with a Copy button");
+  }
+  const connection = (/<div id="connection-panel" class="([^"]*)"[^>]*>([\s\S]*?)<\/div>\s*<\/section>/.exec(code) || []);
+  if (!/\bdata-panel\b/.test(connection[1] || "") || !/id="settings-detail"/.test(connection[2] || "") ||
+      !/id="live-state"/.test(connection[2] || "")) {
+    problems.push("Connection status is not drawn in the data panel");
+  }
+  return problems;
+}
+
+test("`#348 settings-dynamic-lists`: Recently dismissed and Connection status are dark data panels; the list is fixed, resizable and one line a row", () => {
+  assert.deepStrictEqual(dataListProblems(HTML, CSS_CODE), []);
+});
+
+test("`#348 settings-dynamic-lists`: the check refuses the readouts from before (negative controls)", () => {
+  // The list as it was: cards with three lines of text, no height, nothing to resize.
+  const oldCss = CSS_CODE
+    .replace(/\.dismissed-sends\s*\{[^}]*\}/, ".dismissed-sends { display: grid; gap: 0.5rem; list-style: none; }")
+    .replace(/\.dismissed-send-text\s*\{[^}]*\}/, ".dismissed-send-text { white-space: pre-wrap; -webkit-line-clamp: 3; line-clamp: 3; overflow: hidden; }");
+  assert.notEqual(oldCss, CSS_CODE, "the negative control changed nothing");
+  assert.deepStrictEqual(dataListProblems(HTML, oldCss), [
+    "Recently dismissed has no fixed height",
+    "Recently dismissed cannot be resized",
+    "Recently dismissed does not scroll inside itself",
+    "a row's preview is not one line",
+  ]);
+  // The markup as it was: a plain list, no pop-out, and the connection detail in an ordinary panel.
+  const oldHtml = HTML
+    .replace('class="dismissed-sends data-panel"', 'class="dismissed-sends"')
+    .replace(/<div id="dismissed-send-popout"[\s\S]*?<p id="dismissed-send-popout-state"[^>]*><\/p>\s*<\/div>/, "")
+    .replace('<div id="connection-panel" class="data-panel connection-panel"', '<div id="connection-panel" class="panel muted"');
+  assert.deepStrictEqual(dataListProblems(oldHtml, CSS_CODE), [
+    "Recently dismissed is not drawn as a data panel",
+    "there is no pop-out with a Copy button",
+    "Connection status is not drawn in the data panel",
+  ]);
+  // ...and a light panel is not a terminal's.
+  assert.deepStrictEqual(dataListProblems(HTML, CSS_CODE.replace(/--data-bg:\s*#[0-9a-f]{6}/i, "--data-bg: #f6f7f9")),
+    ["the data panel is not dark"]);
+});
+
+/** A page with one long send dismissed from the outbox, on Settings. */
+async function dismissedPage(text) {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, []);
+  const row = await failedSend(page, text);
+  await outgoingDismiss(row).click();
+  page.expireTimers(SEND_UNDO_MS);
+  await page.el("open-settings").click();
+  return page;
+}
+
+test("`#348 settings-dynamic-lists`: a row is one button, and it opens the whole message with Copy, Put back and Close", async () => {
+  const long = `first line of a long dismissed message\n${"and it goes on ".repeat(30)}to the very end`;
+  const page = await dismissedPage(long);
+  const item = dismissedItems(page)[0];
+  // The row: one button, no Put back of its own, the whole text still in it for find and a screen reader.
+  const buttons = item.descendants().filter((node) => node.tagName === "button");
+  assert.deepStrictEqual(buttons.map((node) => node.className), ["dismissed-send-open"], "the row is not one button");
+  assert.match(item.text(), /to the very end/, "the row holds only part of the text");
+  assert.equal(page.el("dismissed-send-popout").hidden, true, "the pop-out is up before anything was opened");
+  await dismissedOpenerOf(item).click();
+  assert.equal(page.el("dismissed-send-popout").hidden, false);
+  assert.equal(page.el("dismissed-send-popout-text").textContent, long, "the pop-out does not hold the whole message");
+  assert.match(page.el("dismissed-send-popout-meta").textContent, /^lead team · dismissed just now$/);
+  assert.equal(page.document.activeElement, page.el("dismissed-send-copy"), "the pop-out did not take the focus");
+  // Copy: the whole message, said so.
+  await page.el("dismissed-send-copy").click();
+  assert.equal(page.clipboard, long, "Copy did not put the whole message on the clipboard");
+  assert.equal(page.el("dismissed-send-popout-state").textContent, "Copied the whole message.");
+  // Every way of copying refused: said, never a silent no-op the reader mistakes for a copy.
+  page.clipboardRefuses = true;
+  page.execCopyRefuses = true;
+  page.clipboard = "something else";
+  await page.el("dismissed-send-copy").click();
+  assert.equal(page.clipboard, "something else");
+  assert.equal(page.el("dismissed-send-popout-state").textContent, sourceString("COPY_REFUSED"));
+  // Close: the focus back on the row that opened it.
+  await page.el("dismissed-send-close").click();
+  assert.equal(page.el("dismissed-send-popout").hidden, true);
+  assert.equal(page.document.activeElement, dismissedOpenerOf(dismissedItems(page)[0]), "the focus was not given back to the row");
+  // Put back, from the pop-out: back in the outbox, gone from the list, and the pop-out with it.
+  await dismissedOpenerOf(dismissedItems(page)[0]).click();
+  await page.el("dismissed-send-restore").click();
+  await page.settle();
+  assert.equal(page.el("dismissed-send-popout").hidden, true, "the pop-out outlived the message it showed");
+  assert.equal(dismissedItems(page).length, 0);
+  assert.deepEqual(savedDismissed(page), []);
+  assert.equal(savedOutgoing(page)[0].text, long, "Put back did not return it to the outbox");
+});
+
+test("`#348 settings-dynamic-lists`: Escape closes the pop-out before Settings, and leaving Settings closes it", async () => {
+  const page = await dismissedPage("a message to read whole");
+  await dismissedOpenerOf(dismissedItems(page)[0]).click();
+  await press(page, page.el("dismissed-send-copy"), "Escape");
+  assert.equal(page.el("dismissed-send-popout").hidden, true, "Escape left the pop-out up");
+  assert.equal(page.screen(), "settings", "Escape left Settings with the pop-out up");
+  await press(page, dismissedOpenerOf(dismissedItems(page)[0]), "Escape");
+  assert.equal(page.screen(), "main", "the next Escape did not leave Settings");
+  // Open, then leave Settings by its Back: the pop-out goes with Settings.
+  await page.el("open-settings").click();
+  await dismissedOpenerOf(dismissedItems(page)[0]).click();
+  await page.el("close-settings").click();
+  assert.equal(page.el("dismissed-send-popout").hidden, true, "the pop-out stayed up over the channel");
+  // The negative control: a page whose Escape does not know the pop-out leaves Settings at once.
+  const blind = newPage(new Map(), brokenScript('  if (closeOpenMenu("menu:dismissed")) return true;\n', ""));
+  await signIn(blind);
+  await showDiscord(blind, []);
+  await outgoingDismiss(await failedSend(blind, "another message")).click();
+  await blind.el("open-settings").click();
+  await dismissedOpenerOf(dismissedItems(blind)[0]).click();
+  await press(blind, blind.el("dismissed-send-copy"), "Escape");
+  assert.equal(blind.screen(), "main", "the negative control's Escape did not leave Settings, so the check above proves nothing");
+});
+
+test("`#348 settings-dynamic-lists`: Connection status puts each part of the detail on its own line; the banner keeps one", async () => {
+  const page = newPage();
+  await signIn(page);
+  (await startTalking(page)).close();
+  await page.settle();
+  const lines = page.el("settings-detail").textContent.split("\n");
+  assert.ok(lines.length >= 3, `the readout is not one fact to a line: ${JSON.stringify(lines)}`);
+  assert.ok(lines.every((line) => line.length > 0 && !line.includes(" · ")), `a line still holds two facts: ${JSON.stringify(lines)}`);
+  assert.equal(page.el("connection-detail").textContent, lines.join(" · "), "the banner and the readout say different things");
+  assert.match(cssRules(CSS_CODE, ".connection-panel > .data-line").join("\n"), /white-space:\s*pre-line/,
+    "the stylesheet draws the lines as one");
 });
 
 // --- `#272 voice-agent-instructions` --------------------------------------------------------------

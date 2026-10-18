@@ -1200,42 +1200,145 @@ a.search-hit-link {
   min-height: 2.5rem;
 }
 
-/* `#193 compose-draft-loss`. Settings' Recently dismissed: each unsent message dismissed from the
-   outbox, where it was going and how long ago, its first lines, and Put back. */
+/* `#348 settings-dynamic-lists`. A READOUT, drawn as one: the dark, monospaced panel of a terminal, in
+   both colour schemes, so a list of records or a connection's facts reads as data to look at and not as
+   a row of controls. Its own two colours, legible on each other whatever the page's scheme is. */
+.data-panel {
+  --data-bg: #0e1116;
+  --data-ink: #d3dae3;
+  --data-muted: #8b96a5;
+  --data-rule: #252b34;
+  background: var(--data-bg);
+  color: var(--data-ink);
+  border: 1px solid var(--data-rule);
+  border-radius: 0.45rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+/* `#193 compose-draft-loss`, drawn as data by `#348 settings-dynamic-lists`. Settings' Recently
+   dismissed: a panel of a fixed height that the reader can drag taller or shorter (`resize`), its rows
+   scrolling inside it; each row where the message was going and how long ago, and ONE line of its
+   text, cut off here and not by the script. */
 .dismissed-sends {
-  display: grid;
-  gap: 0.5rem;
-  margin: 0 0 0.5rem;
+  box-sizing: border-box;
+  height: 11rem;
+  min-height: 5.5rem;
+  max-height: 70vh;
+  resize: vertical;
+  overflow: auto;
+  overscroll-behavior: contain;
+  margin: 0.25rem 0 0.5rem;
   padding: 0;
   list-style: none;
 }
 
-.dismissed-send {
+.dismissed-send + .dismissed-send {
+  border-top: 1px solid var(--data-rule);
+}
+
+/* The row is one button, and must not look like one: no border, no fill, the panel's ink, full width. */
+.dismissed-send-open {
   display: grid;
-  gap: 0.3rem;
-  padding: 0.5rem 0.6rem;
-  border: 1px solid var(--edge);
-  border-radius: 0.4rem;
-  background: var(--panel);
+  gap: 0.1rem;
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 2.75rem;
+  padding: 0.35rem 0.6rem;
+  background: none;
+  border: none;
+  border-radius: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.dismissed-send-open:hover,
+.dismissed-send-open:focus-visible {
+  background: var(--data-rule);
+}
+
+.dismissed-send-open:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 .dismissed-send-meta {
-  color: var(--muted);
-  font-size: 0.78rem;
+  color: var(--data-muted, var(--muted));
+  font-size: 0.72rem;
 }
 
+/* The shorter preview: one line, an ellipsis where it is cut. */
 .dismissed-send-text {
+  display: block;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* The pop-out: one message whole, laid over its own group from the group's top edge and as wide as it,
+   scrolling inside itself when the message is long. Absolute, against the group (`#dismissed-group`),
+   and never fixed: nothing on this page escapes the box it is laid out in (`#226`). */
+#dismissed-group {
+  position: relative;
+}
+
+.data-popout {
+  position: absolute;
+  z-index: 5;
+  left: -0.3rem;
+  right: -0.3rem;
+  top: 0;
+  box-sizing: border-box;
+  max-height: min(36rem, 80dvh);
+  overflow: auto;
+  padding: 0.8rem 0.9rem 0.6rem;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 0.8rem;
+  /* The screen behind dimmed, so it reads as over the list rather than as part of it. A shadow, not an
+     element: it takes no tap, and Close, Escape or Back is how it goes. */
+  box-shadow: 0 0 0 100vmax rgb(0 0 0 / 0.45), 0 0.6rem 2rem rgb(0 0 0 / 0.45);
+}
+
+.data-popout > .dismissed-send-meta {
+  margin: 0 0 0.45rem;
+  color: var(--muted);
+}
+
+.dismissed-send-full {
+  max-height: 50dvh;
+  overflow: auto;
+  padding: 0.55rem 0.65rem;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 3;
-  line-clamp: 3;
-  overflow: hidden;
+  user-select: text;
+  -webkit-user-select: text;
 }
 
-.dismissed-send-restore {
-  justify-self: start;
+/* `#348 settings-dynamic-lists`. Connection status: the same panel, one fact to a line. */
+.connection-panel {
+  margin: 0.25rem 0 0.4rem;
+  padding: 0.55rem 0.7rem;
+}
+
+.connection-panel > .data-line {
+  margin: 0;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+
+.connection-panel > .data-line + .data-line {
+  margin-top: 0.35rem;
+  color: var(--data-muted);
+}
+
+.connection-panel > .data-line:empty {
+  display: none;
 }
 
 @keyframes outgoing-spin {
