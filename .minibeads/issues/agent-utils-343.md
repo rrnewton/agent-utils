@@ -1,12 +1,13 @@
 ---
 title: 'pwa-app-name: let each deployment name its installed app'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-18T12:40:57.758312447+00:00
-updated_at: 2026-10-18T12:40:57.758312447+00:00
+updated_at: 2026-10-18T12:53:54.333588123+00:00
+closed_at: 2026-10-18T12:53:54.333587913+00:00
 ---
 
 # Description
