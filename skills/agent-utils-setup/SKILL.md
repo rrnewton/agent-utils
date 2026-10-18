@@ -371,6 +371,12 @@ prompt was delivered. Expect these on the way, and handle them as described:
 - **A slot you own yourself** (created with your own PID as owner, with no agentctl agent behind
   it) cannot be proven dead by `bin/agent-liveness`, which finds no agentctl record and refuses.
   As its owner, write a handoff and release it, then `read-handoff` and `remove` as coordinator.
+  If that owner has already exited (an in-process subagent whose task returned, or a placeholder
+  hold name no process ever ran under), the coordinator that knows it stopped attests it once the
+  heartbeat has expired: `remove SLOT ... --coordinator-authorized --attest-agent-stopped AGENT
+  --attest-note TEXT`. This works only for the probe's `reason=no-agentctl-record` answer, so
+  `bin/agent-liveness` must be a copy of the current probe: copy it again after updating
+  agent-utils (an older copy also answers that for a missing registry).
 
 ## Phase 7: Hand off to the owner
 

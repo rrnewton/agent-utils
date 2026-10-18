@@ -15,7 +15,9 @@ recovery and migration paths.
 
 Initialize from the project root with the registered liveness command. Its exit status is part of
 the removal boundary: rc 0 means verified dead, rc 1 means alive, and rc 2 means unverifiable. A
-probe or occupancy scan failure is never evidence that a slot is clear.
+probe or occupancy scan failure is never evidence that a slot is clear. The one exact rc 2 line with
+`reason=no-agentctl-record` means the registry has never recorded the agent; only that answer lets a
+coordinator attest the agent stopped (see removal below).
 
 For a single repository whose slot directory must itself be the checkout root, use flat layout:
 
@@ -183,6 +185,21 @@ Only the recorded coordinator may run `remove`. Removal requires the recorded ha
 liveness rc 0, a dead owner process generation, and independent absence checks for cwd, executable,
 file descriptors, memory maps, mount references, and the recorded cgroup. rc 1, rc 2, a live or
 indeterminate owner, or any unreadable proof preserves every row and path. Holds also refuse removal.
+
+The single exception to rc 0 is an agent the liveness command has never recorded (an in-process
+subagent, a placeholder hold name): when its rc 2 line says `reason=no-agentctl-record`, the exact
+recorded owner generation is proven dead, and the heartbeat has expired, the coordinator that knows
+the agent stopped may say so for that one slot. It is recorded in the event log before salvage;
+every other check still runs, batches never accept it, and drift is not archived on it:
+
+```sh
+worktrees/wrkslots remove slot01 --coordinator-pid "$$" --expected-generation 1 \
+  --coordinator-authorized --attest-agent-stopped hold-slot01 \
+  --attest-note "placeholder hold name; no process ever ran under it"
+```
+
+A registered agent the command cannot verify (for example an active record that was never stopped)
+still refuses; stop it through its own registry first.
 
 Use `adopt` only to bind an unbound live owner from that owner's real process ancestry. It never
 replaces a bound historical owner. If an older owner never bound and is independently verified

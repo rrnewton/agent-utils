@@ -67,11 +67,18 @@ type, task and purpose, owner process identity, coordinator history, heartbeat t
    running `release` after `write-handoff`. See "Giving a slot back while the owner keeps running"
    below. The release replaces only the owner-exit, registered-liveness, and time-to-live
    conditions of `remove`; the handoff read, the process-use census, salvage, and holds still apply.
-8. Before removing an agent slot, `remove` publishes unpushed commits and tracked and ordinary
+8. An agent slot whose agent the registered running command has never recorded (a slot made for an
+   in-process subagent, or held under a placeholder name) cannot be reported dead by that command
+   once its owner has died. The coordinator may then attest that the agent stopped:
+   `remove SLOT --coordinator-authorized --attest-agent-stopped AGENT --attest-note TEXT`. See
+   "Removing a slot whose agent was never registered" below. The attestation replaces only the
+   command's "dead"; the owner must still be proven dead, the time-to-live expired, and every other
+   check still runs.
+9. Before removing an agent slot, `remove` publishes unpushed commits and tracked and ordinary
    untracked files outside configured regenerable cache paths to the recorded remote. It never
    uploads gitignored content. It records and rechecks the exact remote ref and commit before
    deletion. A validate slot skips this step.
-9. `recover` lets any later participant complete an interrupted create or removal from the durable
+10. `recover` lets any later participant complete an interrupted create or removal from the durable
    history. It is not tied to the participant that began the operation.
 
 Run `wrkslots quickstart` for copyable commands and `wrkslots COMMAND --help` for exact effects and
@@ -341,12 +348,20 @@ identity fields in the environment. Its exit status means:
   one non-empty line whose only `agent=` token is `agent=<the requested agent>` and whose only `rc=`
   token is `rc=1`. An uncaught Python exception also exits `1`, so any other output with status `1`,
   including a traceback, is treated as `2`;
-- `2`: the mechanism cannot determine the answer;
+- `2`: the mechanism cannot determine the answer. One exact form of `2` says more: standard output
+  and standard error together hold exactly one non-empty line whose only `agent=` token is the
+  requested agent, whose only `rc=` token is `rc=2`, and whose only `reason=` token is
+  `reason=no-agentctl-record`. That line means the command read its whole registry and no record
+  there has ever carried the name. Any command implementing this protocol may print it, not only
+  the agentctl example; print it only when that statement is true, and use another reason (the
+  example uses `reason=no-agentctl-registry`) when the registry itself cannot be read;
 - anything else: the check failed.
 
 Only `0` satisfies that reclaim condition. (`recover-absent-agent-row`, which acts only on a row
 whose storage is already gone, has one narrow exception for `1`, described under "Recover absent
-agent rows and ownerless agent worktrees".) The exact recorded process generation must independently
+agent rows and ownerless agent worktrees". `remove` accepts a coordinator's attestation in place of
+`0` only after the exact no-record line, described under "Removing a slot whose agent was never
+registered".) The exact recorded process generation must independently
 be dead, and the full process-use scan must find no cwd, executable, root, descriptor, mapping,
 cgroup, or mount use. If the liveness source is degraded or stale, return `2`; unknown ownership is
 not a free slot.
@@ -746,6 +761,57 @@ voids the release rather than being overridden by it. As with an owner-consented
 interrupted removal of a released slot whose owner is still alive must be finished by a `recover`
 from a version that has `release`; an older `recover` refuses and the journal blocks other mutations
 until a newer `recover` runs or the owner exits.
+
+## Removing a slot whose agent was never registered
+
+The registered running command can vouch only for agents its registry knows. A slot created for an
+in-process subagent, or held under a placeholder name, names an agent the command has never
+recorded. Once the slot's owner process has died, nothing can ever report that agent dead, so plain
+`remove` refuses forever, naming the agent and the rerun below. The coordinator that created the
+agent is the only party that knows it stopped, and it can say so for one slot:
+
+```sh
+wrkslots remove SLOT --coordinator-pid $$ --expected-generation N --coordinator-authorized \
+    --attest-agent-stopped AGENT --attest-note 'in-process subagent; its task returned at 10:02Z'
+```
+
+`remove` accepts the attestation in place of the command's "dead" only when all of these hold:
+
+- the running command answered with the exact no-record line (exit `2`, one line, the recorded
+  agent, `rc=2`, `reason=no-agentctl-record`; see "Time-to-live and process evidence"). Every other
+  answer keeps its meaning: an agent that is alive, an active record that was never stopped, an
+  incomplete rename, an occupied pane, a missing registry, extra output lines, or any other exit
+  status still refuses, and the refusal does not suggest attesting;
+- the slot records an owner process generation (not a missing or degenerate one), and that exact
+  generation is proven dead: its boot ended, its PID is gone, or the PID was reused. An owner that is
+  live, or whose state is indeterminate (for example a different machine identity), refuses;
+- the heartbeat time-to-live has expired;
+- `--coordinator-authorized`, `--attest-agent-stopped AGENT` naming exactly the slot's recorded
+  agent, and `--attest-note TEXT` (one line of at most 1024 characters saying how the coordinator
+  knows) are all given;
+- it is one explicit `remove` of an agent slot. `retire-pending`, `remove-agent-batch` and
+  validation removal do not accept the flags.
+
+Every other guard runs unchanged: holds, the handoff read, the uncommitted-handoff check, the
+process-use census, the owner-cgroup evidence, salvage before deletion, and the checks after the
+path fence. `--archive-drifted-checkouts` still needs the command's own "dead", so a drifted
+checkout must be restored first. When the command does answer "dead", the flags are not needed:
+the removal proceeds on that answer, says so, and records no attestation.
+
+The no-record answer speaks only for the registry the command reads, normally this project's. An
+agent registered in another registry looks unregistered here; the attestation is the coordinator's
+statement that covers that case, which is why it is recorded rather than inferred.
+
+The attestation is durable before anything is salvaged: an `active-state-recorded` event with action
+`unregistered-agent-stop-attested` carries the basis `coordinator-attested-unregistered-agent`, the
+generation, agent, owner identity and why it is dead, the actor, the heartbeat age, the command's
+exact line, and the note. `reclaim-started` records `registered_liveness: unverifiable`, and the
+reclaim evidence repeats the basis and the note. An interrupted attested removal resumes under
+`recover` only while that exact attestation is in the event log and the command still answers the
+no-record line (or "dead"); a later registration under the name refuses.
+
+A slot with no recorded owner whose agent was never registered is not covered: its owner cannot be
+proven dead, so it still needs the command's "dead".
 
 ## Remove a batch of agent slots
 
