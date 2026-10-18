@@ -4405,7 +4405,10 @@ resuming is off (here or on the server), the voice service does not take a recap
 does, this call's session took none or refused it, nothing was said aloud earlier, the record would
 not load or was too long to send, or there was no earlier conversation to resume. The words are the
 server's own count of what its replay held. Settings' Resuming line says the same of the last call,
-with the count: "The last call was resumed: the agent took 412 words from earlier."
+with the count: "The last call was resumed: the agent took 412 words from earlier." When the voice
+service replaces the session during a call, the session now running was sent no recap, so the line
+turns to "Started fresh: the voice service replaced the session" and Settings says the last call's
+voice session was replaced; the next call is offered the record as before.
 
 **Where this server cannot resume, the switch is disabled.** With `replay.enabled` off, or a bridge
 that has not said it takes a recap, "Tell a new call what was already said" is drawn disabled and
@@ -4491,6 +4494,13 @@ voice providers](#conversational-voice-providers)); what matters here is when it
   that cannot take it. A `replay_ack` with `accepted: true` turns "Sent the agent …" into "Caught the
   agent up with …"; `accepted: false` makes the call "Started fresh: the voice service refused the
   recap", and its seam "recap refused".
+* **A replacement session is sent none.** The record goes once per call, to the session the call
+  opened with. A second `session_started` on the same socket is a model session that never saw it,
+  whatever it lists: the page sends it nothing, the line under the call says "Started fresh: the
+  voice service replaced the session", and a `replay_ack` the old session still owed is ignored.
+  The conversation is still the call's, so no line is drawn between the two sessions. While nothing
+  has been said since the recap went, the seam above the call and its start marker turn to "no
+  recap sent" as well; after that they keep what the first session was sent.
 
 The privacy note below applies unchanged: on this backend the earlier conversation goes to the
 bridge, and on to whatever model it uses.
@@ -5004,7 +5014,9 @@ The server answers every `replay` with exactly one
 its model, a mode that keeps no context). `replay_ack` is not a turn: no `turn_complete` follows it,
 and it opens none. The page says "Caught the agent up with 412 words from earlier" on an accepted
 one and "Started fresh: the voice service refused the recap" on a refusal; with no answer it keeps
-saying it sent them. A bridge that does not take the frame simply does not list it.
+saying it sent them. A bridge that does not take the frame simply does not list it. The page sends
+`replay` only after a call's first `session_started`: a replacement session on the same socket is
+sent none, and the page says it started fresh.
 
 `vibe_talk::testing::FakeVoiceBridge` is a loopback bridge that does all of this, for either answer,
 and `tests/replay_bridge.rs` holds the server and the frame to it.

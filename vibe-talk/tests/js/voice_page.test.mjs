@@ -57574,6 +57574,10 @@ const STATE_LINES = [
     (await startV1Call(page, ["replay"], { started: false })).close();
     await page.settle();
   }],
+  ["its session was replaced", "resume-state", async (page) => {
+    (await replacedV1Call(page)).close();
+    await page.settle();
+  }],
   ["resuming unavailable on the server", "resume-state", async (page) => {
     page.replayEnabled = false;
     page.replayUnavailable = "bridge_unconfirmed";
@@ -66830,6 +66834,87 @@ test("`#331 resume-on-websocket`: a call that ends before its session starts was
   assert.deepEqual(replayFrames(socket), []);
   assert.equal(page.el("resume-state").textContent, "The last call ended before it could be told what was already said.");
   assert.doesNotMatch(page.el("resume-state").textContent, /was resumed/);
+});
+
+/**
+ * A `vibe-talk-v1` call that was sent the record, whose bridge then replaced the model session on
+ * the same socket: a second `session_started`, listing `replay`. With `acked`, the first session
+ * took the record first; with `said`, a turn went to it before the replacement. Returns the socket.
+ */
+async function replacedV1Call(page, { acked = true, said = false } = {}) {
+  page.transcriptRecordsSupported = true;
+  await withEarlierConversation(page, { resume: true });
+  const socket = await startV1Call(page, ["replay"]);
+  if (acked) {
+    socket.onmessage({ data: JSON.stringify({ type: "replay_ack", accepted: true }) });
+    await page.settle();
+  }
+  if (said) {
+    speech(socket, "user", 1, "is it back now", true);
+    turnDone(socket, 1);
+    await watchTurns(page);
+  }
+  socket.onmessage({ data: JSON.stringify({ type: "session_started", greeting: false, capabilities: ["replay"] }) });
+  await page.settle();
+  return socket;
+}
+
+const REPLACED_LINE = "Started fresh: the voice service replaced the session";
+const REPLACED_STATE = "The last call's voice session was replaced; the new one was sent no recap.";
+
+test("`#331 resume-on-websocket`: a replacement session on the same socket was sent no recap, and the call, Settings and the line above stop saying the agent has one (negative control: a page that takes it for the first)", async () => {
+  const page = newPage();
+  const socket = await replacedV1Call(page);
+  // The record goes once per call, to the session it opened with: the README's "no recap sent" for a
+  // replacement voice session.
+  assert.equal(replayFrames(socket).length, 1, "the replacement was sent the record as well");
+  assert.equal(callRecap(page), REPLACED_LINE, "the line kept saying the agent was caught up");
+  assert.equal(page.el("call-recap").getAttribute("data-recap"), "fresh");
+  assert.equal(page.el("resume-state").textContent, REPLACED_STATE);
+  // Nothing was said to the session that took it, so the line above the call is about this one.
+  const line = boundaryLines(page).at(-1);
+  assert.equal(seamChip(line), "no recap sent");
+  assert.match(seamRecapDetail(line), /^The voice service replaced this call's session/);
+  // ...and so is the conversation's start marker, filed with its first record: a reload agrees.
+  speech(socket, "user", 1, "are you there", true);
+  turnDone(socket, 1);
+  await watchTurns(page);
+  const started = [...page.storedTurns.entries()].find(([id]) => id !== "conv_earlier");
+  assert.ok(started, "the call filed nothing");
+  assert.deepEqual(started[1][0].detail.recap, { state: "none", why: "replaced_session", dropped: 0 },
+    "the start marker kept saying the recap was sent");
+  // The next call is offered the record as before: a replacement is not a bridge that takes none.
+  await page.el("hang-up").click();
+  await page.settle();
+  assert.equal(page.el("talk-note").textContent, "the earlier conversation is replayed");
+  assert.equal(page.el("resume-state").textContent, REPLACED_STATE, "Settings forgot the replacement at hang-up");
+
+  // An answer the replaced session still owed is nobody's: a refusal of the old record does not
+  // become this session's.
+  const waiting = newPage();
+  const owed = await replacedV1Call(waiting, { acked: false });
+  owed.onmessage({ data: JSON.stringify({ type: "replay_ack", accepted: false, reason: "too long" }) });
+  await waiting.settle();
+  assert.equal(callRecap(waiting), REPLACED_LINE, "the old session's answer was taken for the new one's");
+  assert.equal(seamChip(boundaryLines(waiting).at(-1)), "no recap sent");
+  assert.equal(waiting.el("resume-state").textContent, REPLACED_STATE);
+
+  // Turns went to the session that took it: the line above them, and their marker, keep what that
+  // session was sent; the line under the call is about the session now running.
+  const spoke = newPage();
+  await replacedV1Call(spoke, { said: true });
+  assert.equal(callRecap(spoke), REPLACED_LINE);
+  assert.equal(seamChip(boundaryLines(spoke).at(-1)), "11-word recap sent");
+  const filed = [...spoke.storedTurns.entries()].find(([id]) => id !== "conv_earlier");
+  assert.equal(filed[1][0].detail.recap.state, "sent");
+
+  // The negative control: a page that treats a replacement as the session the call opened with.
+  const careless = newPage(new Map(), brokenScript(
+    "        noteReplacedV1Session();\n", "        offerReplayAtSessionStart(message);\n"));
+  await replacedV1Call(careless);
+  assert.equal(callRecap(careless), "Caught the agent up with 11 words from earlier",
+    "the negative control changed the line too, so the check above proves nothing");
+  assert.equal(careless.el("resume-state").textContent, "The last call was resumed: the agent took 11 words from earlier.");
 });
 
 test("`#331 resume-on-websocket`: on the hosted backend the call says what it was SENT, in the server's words, and how much did not fit", async () => {
