@@ -4181,6 +4181,60 @@ async fn read_by_id_after(
     shadow_of(state, "message_by_id").await
 }
 
+/// An unpolled bridge fed by an adapter. A message read by id (rows only) is edited upstream so its
+/// new text is a strict prefix of the old ("message 2 and a tail" to "message 2"), and the adapter
+/// pushes the edit. The cache keeps the text it holds (rule 5 takes the prefix for a snippet), so
+/// it must never count that text as one it would serve, 5 s on or a day and an hour on. (The
+/// review's probe `r4_p1_e2e_a_pushed_edit_that_shortens_the_text_is_never_served_as_the_old_text`.)
+#[tokio::test]
+async fn a_pushed_edit_that_shortens_a_message_is_never_served_as_its_old_text() {
+    let clock = ManualClock::at(T0 + HOUR);
+    let AdapterFed {
+        state,
+        fake,
+        cache,
+        ids,
+        _store,
+        _dir,
+    } = adapter_fed_bridge(
+        "cache-fill-pushed-prefix",
+        |n| format!("message {n} and a tail"),
+        &clock,
+    )
+    .await;
+    let target = ids[2].clone();
+    get(
+        &state,
+        &format!(
+            "/api/v1/channels/{READ_CHANNEL}/messages/{}",
+            target.as_str()
+        ),
+    )
+    .await;
+    assert!(holds(&cache, &read_chan(), &target), "the lookup filled it");
+
+    clock.advance(MINUTE);
+    fake.edit(&target, "message 2");
+    let status = ingest(
+        &state,
+        pushed("e1", "update", &said(&fake, &target, "message 2")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(
+        cached(&cache, &read_chan(), &target).message.content,
+        "message 2 and a tail",
+        "rule 5 keeps the text a read brought"
+    );
+    for (step, label) in [(5_000, "5 s"), (25 * HOUR, "25 h")] {
+        let counted = read_by_id_after(&state, &clock, &target, step).await;
+        assert_eq!(
+            counted.content_differs, 0,
+            "{label}: the cache would serve text the adapter's pushed edit took away: {counted:?}"
+        );
+    }
+}
+
 /// An unpolled bridge fed by an adapter. A message is posted upstream with a long body, and the
 /// adapter pushes its creation with a snippet for a body, as a bridge does when its live event has
 /// none. The cache holds the snippet as possibly one, so it must never count it as the whole

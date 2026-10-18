@@ -1323,7 +1323,10 @@ impl Writer<'_> {
     /// another process held too long, a constraint one row broke): whatever it said, an edit, a
     /// deletion or a creation, the file lacks it, exactly as if a full queue had dropped it. So it
     /// is recorded as a drop: in memory at once, where every read judges by it, and in the file by
-    /// a step of its own as soon as the file takes writes again ([`Writer::drops_step`]).
+    /// a step of its own as soon as the file takes writes again ([`Writer::drops_step`]). So is any
+    /// other change the file does not take though it may lack it: an offer for a channel off the
+    /// list, one an erase made stale, a pushed edit whose text it keeps out or whose message is
+    /// past its cutoff.
     fn lost(&mut self, chan: &ChanKey) {
         let now = self.now();
         lock(&self.shared.drops)
@@ -1846,11 +1849,26 @@ impl Writer<'_> {
         let Some(created) = rows::created_ms(message) else {
             return Ok(Upserted::Written);
         };
+        let id = message.id.as_str();
         if created < cutoff {
             Stats::add(&self.shared.stats.rows_too_old, 1);
+            // A pushed edit of a message past the channel's cutoff that the file still holds, the
+            // hourly expiry not having taken it out yet: the row keeps the text the edit replaced
+            // until then, so the file lacks a change the feed delivered.
+            if arrival == Arrival::PushUpdate {
+                let held = self
+                    .hot
+                    .row_select
+                    .query_row(params![chan_id, id], Row::from_sql)
+                    .optional()?;
+                if held
+                    .is_some_and(|held| held.content_hash != rows::content_hash(&message.content))
+                {
+                    self.lost(chan);
+                }
+            }
             return Ok(Upserted::Written);
         }
-        let id = message.id.as_str();
         if let Some(deleted_ms) = self
             .hot
             .tomb_select
@@ -1985,23 +2003,52 @@ impl Writer<'_> {
             partial: offered_partial,
         };
         let verdict = merge::content_verdict(&held_copy, &offered_copy);
+        // A pushed edit whose text the file does not take: rule 5's snippet of the held text,
+        // which may as well be the whole of an edit that cut the end off; a copy of an earlier
+        // version by its edit time; or one seen no later than the read that brought the held text
+        // (the same millisecond, say). Whichever it was, the feed delivered a change the file may
+        // lack, so it is recorded as left out: nothing of the channel seen before now is vouched
+        // for, by the feed or by a claim, until a read begun after it has seen it again.
+        if arrival == Arrival::PushUpdate && hash != held.content_hash && verdict == Verdict::Keep {
+            self.lost(chan);
+        }
         // A copy of an earlier version than the one held (rule 2's edit times), however late it
         // was seen: it changes nothing of the message but what only ever accumulates.
         let earlier_version =
             merge::edit_order(&held_copy, &offered_copy) == Some(std::cmp::Ordering::Less);
+        // No push lifts the doubt a drop left on a row: it says nothing of whether the dropped
+        // change (its deletion, say) came before it, since an event retried, or delivered out of
+        // order, may come after the deletion that took the message out. Only a read begun after
+        // the drop vouches for the row again.
+        let in_doubt = dropped.is_some_and(|dropped| held.observed_ms <= dropped);
         let mut next = held.clone();
         match verdict {
             Verdict::Keep => {
                 // A later push of the same text says the message was there, as it is, then: a
                 // listing that started before it must not take its absence as a deletion, nor
                 // bring back text from before it. A re-listing changes nothing, so that listing
-                // an unchanged row again still writes nothing.
+                // an unchanged row again still writes nothing. But a row in doubt is not moved
+                // past the drop.
                 if arrival.is_push() && hash == held.content_hash && observed_ms > held.observed_ms
+                {
+                    next.observed_ms = match dropped {
+                        Some(dropped) if in_doubt => observed_ms.min(dropped),
+                        _ => observed_ms,
+                    };
+                }
+            }
+            Verdict::Confirm => {
+                next.content_partial = false;
+                // A text a push brought, its time the push's, proven whole by a read begun no
+                // later than a drop the push came after: the row takes the read's time, so that it
+                // stays in doubt. The text was there when that read began, so no read or listing
+                // begun since is of a version before it.
+                if dropped
+                    .is_some_and(|dropped| observed_ms <= dropped && dropped < held.observed_ms)
                 {
                     next.observed_ms = observed_ms;
                 }
             }
-            Verdict::Confirm => next.content_partial = false,
             Verdict::Replace { partial } => {
                 next.content.clone_from(&message.content);
                 hash.clone_into(&mut next.content_hash);

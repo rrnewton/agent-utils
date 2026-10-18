@@ -40,7 +40,10 @@
 //!    whatever text it brings (rule 2). A read that began no later than the push, with other text,
 //!    changes nothing: it may be of the version before an edit the push brought. And a snippet
 //!    never overwrites text a read brought: a pushed edit that is a strict prefix of it (a trailing
-//!    `…` ignored) changes nothing.
+//!    `…` ignored) changes nothing. Such a prefix may as well be the whole of an edit that cut the
+//!    end off, or a snippet of one that changed what follows it, so the writer records the push,
+//!    like every pushed edit whose text it does not take, as a change the file lacks
+//!    ([`super::writer`]).
 
 /// How an incoming copy reached the cache.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

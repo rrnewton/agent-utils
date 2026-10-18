@@ -391,13 +391,14 @@ pub struct Facts {
     /// Whether a live producer feeds the channel: its provider is polled, or adapters push.
     pub live_fed: bool,
     /// Since when every change the live feed offered for the channel reached the file or was
-    /// recorded as left out: from when this process's file could take offers and the route list
-    /// first reached it ([`super::MessageCache::fed_since_ms`]). A live feed vouches for nothing
-    /// seen before it, and for nothing but that a message exists and its text is unchanged: never
-    /// that a text a push brought, which may be a snippet, is whole. `None` when not known, or when
-    /// nothing feeding the channel ever delivers a deletion or an edit (its provider is polled: the
-    /// poller publishes creations alone, and the ingest route refuses an adapter's pushes for it):
-    /// then for nothing.
+    /// recorded as left out (a pushed edit whose text the file keeps out among them): from when
+    /// this process's file could take offers and the route list first reached it
+    /// ([`super::MessageCache::fed_since_ms`]). A live feed vouches for nothing seen before it,
+    /// and for nothing but that a message exists and its text is unchanged: never that a text a
+    /// push brought, which may be a snippet, is whole. `None` when not known, or when nothing
+    /// feeding the channel ever delivers a deletion or an edit (its provider is polled: the poller
+    /// publishes creations alone, and the ingest route refuses an adapter's pushes for it): then
+    /// for nothing.
     pub fed_since_ms: Option<i64>,
     /// The latest local time an offer for the channel was dropped in this process, if one was.
     /// The rule takes the later of this and the file's [`View::dropped_ms`].
@@ -576,7 +577,9 @@ fn current(full_ms: Option<i64>, facts: &Facts) -> bool {
 /// adapter's pushes: [`Facts::fed_since_ms`] is `None` for a polled channel), and the feed's
 /// current run (from when the file could take offers in this process and the route list first
 /// reached it) began no later than `at_ms`. A change made before the run began (while the server
-/// was down, say) reached nothing, and no drop records it.
+/// was down, say) reached nothing, and no drop records it. One the feed delivered and the file did
+/// not take (an edit whose text it kept out, say) is a drop, which each rule checks apart
+/// ([`trusted`]).
 fn fed_since(at_ms: i64, facts: &Facts) -> bool {
     facts.feed == Feed::Deletions
         && facts.live_fed

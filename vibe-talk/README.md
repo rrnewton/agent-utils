@@ -3841,7 +3841,17 @@ push brings, a new message's or an edit's, is held as possibly cut short, and is
 one the cache would answer with until a read has brought the whole text: one that brings the same
 text, whenever it began, or one that began after the push. A read that began no later than the
 push and brings other text changes nothing, since it may be from before the edit. A pushed edit
-that is only the start of the text a read brought does not replace it.
+that is only the start of the text a read brought does not replace it; but it may as well be the
+whole of an edit that cut the end off, so the channel is then in doubt, as after a change left out.
+So it is whenever a pushed edit is not taken: one older, by its edit time, than the text held, one
+seen no later than the read that brought that text, or one of a message past the channel's age
+limit, which the cache still holds, with its old text, until the hourly expiry takes it out.
+
+Nor does anything pushed lift a doubt. A push says nothing of whether the change left out came
+before it: an event sent again, or delivered out of order, can arrive after the deletion that took
+its message out. So a message in doubt stays in doubt, whatever the live feed brings for it, until a
+read that began afterwards has seen it. A read that began before the doubt arose does not vouch for
+it either, though it brings the very text a push brought since and so proves that text whole.
 
 ### Whose reads fill it
 
