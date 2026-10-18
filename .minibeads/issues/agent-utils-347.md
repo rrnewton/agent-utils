@@ -1,12 +1,13 @@
 ---
 title: 'settings-prose: no implementation prose on Settings; one-line descriptions become tooltips'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-18T20:43:26.571058928+00:00
-updated_at: 2026-10-18T20:43:26.571058928+00:00
+updated_at: 2026-10-18T21:14:53.046766186+00:00
+closed_at: 2026-10-18T21:14:53.046766025+00:00
 ---
 
 # Description
