@@ -124,8 +124,9 @@ const ALL_CHANNELS = "*";
 // controls.
 /**
  * @overload
- * @param {"api-token" | "channel-alias" | "channel-directory-search" | "combine-messages"
- *   | "enter-sends" | "mark-own-read" | "mic-auto-gain" | "mic-echo-cancellation"
+ * @param {"api-token" | "channel-alias" | "channel-compose-grow" | "channel-directory-search"
+ *   | "combine-messages" | "compose-grow" | "enter-sends" | "mark-own-read" | "mic-auto-gain"
+ *   | "mic-echo-cancellation" | "side-compose-grow"
  *   | "message-cache-enabled"
  *   | "mic-noise-suppression" | "msg-scale" | "new-channel-id" | "new-channel-label"
  *   | "new-channel-writable" | "noise-rule-new" | "read-speed-range" | "reading-width"
@@ -7496,6 +7497,8 @@ function rememberComposeDraft() {
   } catch (_error) {
     // Storage refused outright: the text is still in the field, which is all that can be kept.
   }
+  // `#340 composer-grow-box`. As typed, and as a send clears it.
+  fitGrowingBox(leftEl("compose-text"));
 }
 
 function storedComposeDraft() {
@@ -7649,19 +7652,174 @@ function deliverHeldTurn() {
  * dock. So this runs when the box takes the focus, and when the list shrinks while it has it.
  */
 function keepComposerInView() {
-  const area = leftEl("scroll-area");
-  const box = leftEl("voice-composer").getBoundingClientRect();
-  const top = box.top - area.getBoundingClientRect().top + area.scrollTop;
-  const bottom = top + box.height;
+  keepBoxInView(leftEl("voice-composer"), leftEl("scroll-area"));
+}
+
+/**
+ * Bring the whole of `box` into the view of `area`, the list it is in, as `keepComposerInView` says:
+ * the box whole, or its top where the list is shorter than it. `#340 composer-grow-box` made it any
+ * composer's, for a box growing under the reader's typing.
+ *
+ * @param {HTMLElement} box
+ * @param {HTMLElement} area
+ */
+function keepBoxInView(box, area) {
+  const rect = box.getBoundingClientRect();
+  const top = rect.top - area.getBoundingClientRect().top + area.scrollTop;
+  const bottom = top + rect.height;
   const view = area.clientHeight || 0;
   if (top >= area.scrollTop && bottom <= area.scrollTop + view) return;
-  area.scrollTop = box.height <= view ? bottom - view : top;
+  area.scrollTop = rect.height <= view ? bottom - view : top;
 }
 
 /** Whether the reader is writing in the call's box on the call's view, which is when it is kept in view. */
 function writingToAgent() {
   return currentScreen === "main" && currentView === "voice" &&
     document.activeElement === leftEl("compose-text");
+}
+
+// --- the box that grows -------------------------------------------------------------------------
+//
+// `#340 composer-grow-box`. The owner, on a desk: pasting a long message left the message box tiny,
+// while the room left of Send was empty. So that room holds a Grow checkbox, in each of the three
+// boxes the composers' shared rule draws (the call's, the channel's and the right column's), and
+// while it is ticked the box grows with what is typed or pasted, up to about 60% of the window, and
+// scrolls inside beyond that, so Send stays on screen.
+//
+//   * A DESK'S ALONE. web/voice.css draws the checkbox, and lets the box grow, in its desktop block
+//     only; this script never asks the window what it is (`growShown` asks the checkbox).
+//   * OFF BY DEFAULT, one choice for the three boxes, kept on this device. Absent means off, and the
+//     default is not written down as a choice.
+//   * THE BROWSER SIZES THE BOX where it can, by `field-sizing: content`. Where it cannot, the box is
+//     measured as it changes and its height written for the stylesheet to use (`fitGrowingBox`); the
+//     cap is the stylesheet's either way.
+//   * A SEND CARD WINS: while one is up, its box is one line beside Send, as `#269 approval-card-inline`
+//     made it, and the checkbox is not drawn. The right column's box, which no card touches, grows on.
+//   * NOT THE REPLY BOX, in this change: it has Cancel left of Send, and a cap of its own in a column.
+//   * SEND STAYS IN VIEW while the box grows under the reader's typing: its composer is brought into
+//     its list whole (`keepBoxInView`). Only for the box with the focus, so a draft put back into a box
+//     under a reader up the list moves nothing (`#280 scroll-stability`).
+
+const COMPOSER_GROW_KEY = "vibe-talk.voice.composer-grow";
+
+/** The boxes that grow, and their Grow checkboxes in the same order. All left-column ids: see `el`. */
+const COMPOSER_GROW_BOXES = ["compose-text", "channel-compose-text", "side-compose-text"];
+const COMPOSER_GROW_IDS = ["compose-grow", "channel-compose-grow", "side-compose-grow"];
+
+/** The height the stylesheet gives a growing box where the browser cannot size it (`fitGrowingBox`). */
+const COMPOSER_GROW_HEIGHT = "--composer-grow-height";
+
+/** Whether the browser sizes a field to its content itself. Chromium does; Firefox does not yet. */
+const FIELD_SIZING = Boolean(window.CSS && typeof window.CSS.supports === "function" &&
+  window.CSS.supports("field-sizing", "content"));
+
+/** Whether the boxes grow with their text: off unless the reader ticked Grow. See `storedComposerGrow`. */
+let composerGrow = false;
+
+/** What was stored. ABSENT MEANS OFF; a browser that refuses storage reads as nothing stored. */
+function storedComposerGrow() {
+  try {
+    return localStorage.getItem(COMPOSER_GROW_KEY) === "1";
+  } catch (_error) {
+    return false;
+  }
+}
+
+/** Grow ticked or unticked by the reader: kept, and drawn. */
+function applyComposerGrow(on) {
+  try {
+    localStorage.setItem(COMPOSER_GROW_KEY, on ? "1" : "0");
+  } catch (_error) {
+    // A browser that refuses storage still honours the choice for this session.
+  }
+  renderComposerGrow(on);
+}
+
+/**
+ * Draw the choice: `data-composer-grow` on #screen-main, which the stylesheet grows the boxes by, and
+ * every checkbox ticked or not, so the three say the one choice. Turned on, a height the reader dragged
+ * a box to is let go, or it would hold the box at that height as it grew.
+ */
+function renderComposerGrow(on) {
+  composerGrow = Boolean(on);
+  const screen = leftEl("screen-main");
+  if (composerGrow) screen.setAttribute("data-composer-grow", "");
+  else screen.removeAttribute("data-composer-grow");
+  for (const id of COMPOSER_GROW_IDS) /** @type {HTMLInputElement} */ (leftEl(id)).checked = composerGrow;
+  if (composerGrow) for (const id of COMPOSER_GROW_BOXES) leftEl(id).style.removeProperty("height");
+  fitGrowingBoxes();
+}
+
+/**
+ * Whether the composer `field` is in draws its Grow checkbox, which web/voice.css does on a desk and
+ * not under a send card: whether the box grows there at all.
+ *
+ * @param {HTMLElement} field
+ */
+function growShown(field) {
+  const box = leftEl(COMPOSER_GROW_IDS[COMPOSER_GROW_BOXES.indexOf(field.id)] || "");
+  return Boolean(box) && typeof box.getClientRects === "function" && box.getClientRects().length > 0;
+}
+
+/** The list `field` is in: the right column's for its box, else the left's. */
+const growingBoxList = (field) => leftEl(field.id === "side-compose-text" ? "side-scroll" : "scroll-area");
+
+/**
+ * Where the browser cannot size a box to its text, size it here: measured at its resting height and
+ * given the height its text takes, borders included (`box-sizing: border-box`), for the stylesheet to
+ * cap. Taken away while Grow is off. Left as it is while the box is not drawn growing (a phone, a send
+ * card, a pane not shown), where the stylesheet does not read it, and measured again once it is.
+ *
+ * The measure shrinks the box for a moment, and a list at its foot follows a box that shrinks: the
+ * list's place is put back after it, so a reader at the foot is not left above it by their own typing.
+ *
+ * @param {HTMLElement} field
+ */
+function fitGrowingBox(field) {
+  if (FIELD_SIZING) return;
+  if (!composerGrow) {
+    field.style.removeProperty(COMPOSER_GROW_HEIGHT);
+    return;
+  }
+  if (!growShown(field)) return;
+  const area = growingBoxList(field);
+  const place = area.scrollTop;
+  field.style.setProperty(COMPOSER_GROW_HEIGHT, "auto");
+  const style = typeof window.getComputedStyle === "function" ? window.getComputedStyle(field) : null;
+  const borders = style ? (parseFloat(style.borderTopWidth) || 0) + (parseFloat(style.borderBottomWidth) || 0) : 0;
+  field.style.setProperty(COMPOSER_GROW_HEIGHT, `${Math.ceil((Number(field.scrollHeight) || 0) + borders)}px`);
+  area.scrollTop = place;
+}
+
+/** `fitGrowingBox` for each of the three boxes. */
+function fitGrowingBoxes() {
+  for (const id of COMPOSER_GROW_BOXES) fitGrowingBox(leftEl(id));
+}
+
+/** Each growing box's height at its last report, by id, for `keepGrowingBoxInView`. */
+const growingHeights = new Map();
+
+/**
+ * A growing box changed size: with the reader typing in it, its whole composer brought into its list,
+ * Send included. A reader who was at the foot of the list before the box grew is kept at the foot, as
+ * the dock's growth keeps them (`#218 desktop-dock`), not merely shown the composer with the list's own
+ * room under it out of sight. Nothing moves for a box without the focus.
+ *
+ * @param {HTMLElement} field
+ */
+function keepGrowingBoxInView(field) {
+  const height = field.getBoundingClientRect().height;
+  const seen = growingHeights.get(field.id);
+  growingHeights.set(field.id, height);
+  if (!composerGrow || document.activeElement !== field || !growShown(field)) return;
+  const area = growingBoxList(field);
+  const grew = seen === undefined ? 0 : height - seen;
+  if (grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) {
+    area.scrollTop = area.scrollHeight;
+    return;
+  }
+  const composer = { "compose-text": "voice-composer", "channel-compose-text": "channel-composer" }[field.id] || "side-composer";
+  keepBoxInView(leftEl(composer), area);
 }
 
 // --- Enter, in every message box ----------------------------------------------------------------
@@ -19475,6 +19633,8 @@ function restoreChannelComposer() {
   el("channel-compose-text").disabled = false;
   el("channel-send").disabled = !channel || readOnly;
   renderChannelNavigation();
+  // `#340 composer-grow-box`. The draft put back is the box's height too.
+  fitGrowingBox(el("channel-compose-text"));
 }
 
 function rememberChannelContext() {
@@ -24461,6 +24621,7 @@ async function editOutgoingMessage(id) {
   inColumn(column, () => {
     const box = el("channel-compose-text");
     box.value = channelDrafts.get(key) || "";
+    fitGrowingBox(box);
     el("channel-compose-state").textContent = before && before.trim()
       ? "Your message is back, under the draft that was already here." : "";
     focusAtEnd(box);
@@ -24747,6 +24908,7 @@ async function sendChannelMessage() {
   // A failed outbox write leaves the previous durable draft available as a last resort.
   if (outgoingStorageOkay) saveChannelDrafts();
   el("channel-compose-text").value = "";
+  fitGrowingBox(el("channel-compose-text"));
   el("channel-compose-state").textContent = "";
   scrollToNewest();
   await completion;
@@ -43356,6 +43518,26 @@ applyMarkOwnRead(storedMarkOwnRead());
 applyCombineMessages(storedCombineMessages());
 applyRichHeaders(storedRichHeaders());
 applyEnterSends(storedEnterSends());
+// `#340 composer-grow-box`. Drawn as stored, and stored only once the reader ticks one: absent means off.
+renderComposerGrow(storedComposerGrow());
+for (const id of COMPOSER_GROW_IDS) {
+  leftEl(id).addEventListener("change", () => applyComposerGrow(/** @type {HTMLInputElement} */ (leftEl(id)).checked));
+}
+// The call's box is measured as it saves its draft (`rememberComposeDraft`); these two, as they are typed in.
+for (const id of ["channel-compose-text", "side-compose-text"]) {
+  leftEl(id).addEventListener("input", () => fitGrowingBox(leftEl(id)));
+}
+// Send kept in view as the box grows under the reader's typing. In the observer, not after it: a scroll
+// changes no size, so it cannot come round again as the loop a browser reports, and the list is where it
+// will be before the jump to the newest is decided again after the observer (`#207 scrollback-jump`). In
+// the right column a reader at the foot is kept there already (`#280 scroll-stability`), and this then
+// finds the composer in view and moves nothing.
+if (typeof window.ResizeObserver === "function") {
+  const growing = new window.ResizeObserver((entries) => {
+    for (const entry of entries) keepGrowingBoxInView(/** @type {HTMLElement} */ (entry.target));
+  });
+  for (const id of COMPOSER_GROW_BOXES) growing.observe(leftEl(id));
+}
 el("reading-width").addEventListener("input", () => readingWidthChanged(el("reading-width").value));
 el("msg-scale").addEventListener("input", () => msgScaleChanged(el("msg-scale").value));
 el("msg-scale-smaller").addEventListener("click", () => stepMsgScale(-1));
@@ -43724,6 +43906,8 @@ if (typeof window.addEventListener === "function") {
       renderColumns();
       // `#247 reply-continuity`. The reply screen's conversation was sized to the room it had.
       refitReplyMessage();
+      // `#340 composer-grow-box`. A window widened to a desk's draws a growing box, to be measured.
+      fitGrowingBoxes();
     };
     if (typeof requestAnimationFrame === "function") requestAnimationFrame(decide);
     else decide();
@@ -44089,6 +44273,9 @@ if (typeof window.ResizeObserver === "function") {
       // `#245 done-feedback`. The message box moves without a scroll too: the window, a view or
       // screen changing, the box itself resized.
       placeChipsOverComposer();
+      // `#340 composer-grow-box`. A box shown again, by a view, a screen or a send card going, is
+      // measured where the browser does not size it.
+      fitGrowingBoxes();
       // `#261 two-column-connectors`. A row folded or opened moves the roots below it with no scroll.
       scheduleColumnLinks();
     }, 0);

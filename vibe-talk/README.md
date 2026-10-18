@@ -6761,9 +6761,30 @@ page. One press is one send: the repeats of a held key never send, and where the
 they type no new lines either.
 
 The choice is stored on this device under `vibe-talk.voice.enter-sends`, like the page's other
-settings. Nothing is added to the boxes themselves, so a phone screen loses no space. Instead each
+settings. Nothing is added to the boxes for it, so a phone screen loses no space (a desk's box has
+the Grow checkbox beside Send, below, which a phone does not draw). Instead each
 box's `enterkeyhint` follows the switch, which is what the phone keyboard's return key shows: a send
 arrow when Enter sends, a return arrow when it starts a new line.
+
+### The message box can grow, on a desk
+
+`#340 composer-grow-box`. The owner, on a desk: pasting a long message left the message box tiny,
+while the room left of Send was empty. That room now holds a **Grow** checkbox, in the channel's box,
+the call's box and the right column's box. Ticked, the box grows with what you type or paste, up to
+about 60% of the window's height; beyond that it scrolls inside, so Send stays on screen. While you
+type in a growing box, its Send is kept in view in the list; a box that grows without the focus (a
+draft put back) moves nothing under you. An empty box rests at the height it always had.
+
+- **Off by default.** One choice for all three boxes, stored on this device under
+  `vibe-talk.voice.composer-grow` (`1` on, `0` off; absent means off and is not written down).
+- **Desktop only.** The checkbox is drawn, and the box grows, only in the desktop layout (a fine
+  pointer and a window at least 900px wide); a phone's box is unchanged.
+- **A send card wins.** While a send card is up, its one-line box beside Send stays as it was and
+  the checkbox is not drawn; the right column's box, which no card touches, still grows.
+- **Not the reply box** in this change: it has Cancel beside Send and its own cap in a column.
+- **How it grows.** CSS `field-sizing: content` where the browser has it (Chromium does). Where it
+  does not (Firefox today), the page measures the box as it changes and sets its height, capped by
+  the same rule.
 
 ### The keyboard: scrolling, search and Settings
 

@@ -457,6 +457,17 @@
                           placeholder="Message the agent…" aria-label="Message the agent"></textarea>
                 <button id="send-text" type="button"
                         title="Send this to the agent. With no call open it starts a typed conversation, which never opens the microphone.">Send</button>
+                <!--
+                  `#340 composer-grow-box`. The owner, on a desk: a long message pasted into the box
+                  leaves it tiny, while the room left of Send is empty. Ticked, the box grows with what
+                  is typed or pasted, up to about 60% of the window, and scrolls inside beyond that, so
+                  Send stays on screen. One choice for the three boxes, kept on this device. Drawn on a
+                  desk only (web/voice.css); a phone's box is as it was. AFTER Send in the markup, so
+                  Tab goes from the box to Send first; the stylesheet draws it left of Send, on its row.
+                -->
+                <label class="composer-grow" title="Let the box grow with what you type or paste, up to about 60% of the window">
+                  <input id="compose-grow" type="checkbox" /> Grow
+                </label>
               </div>
             </div>
 
@@ -562,6 +573,10 @@
                      goes in its placeholder, and names itself to a screen reader the same way. -->
                 <textarea id="channel-compose-text" rows="3" placeholder="Message the main channel…" aria-label="Message the main channel" aria-describedby="channel-compose-state"></textarea>
                 <button id="channel-send" type="button">Send</button>
+                <!-- `#340 composer-grow-box`: see #compose-grow. -->
+                <label class="composer-grow" title="Let the box grow with what you type or paste, up to about 60% of the window">
+                  <input id="channel-compose-grow" type="checkbox" /> Grow
+                </label>
                 <p id="channel-compose-state" class="hint" role="status" aria-live="polite"></p>
               </div>
             </div>
@@ -683,6 +698,10 @@
                 <div id="side-composer">
                   <textarea id="side-compose-text" rows="3" placeholder="Reply in this thread…" aria-label="Reply in this thread" aria-describedby="side-compose-state"></textarea>
                   <button id="side-send" type="button">Send</button>
+                  <!-- `#340 composer-grow-box`: see #compose-grow. -->
+                  <label class="composer-grow" title="Let the box grow with what you type or paste, up to about 60% of the window">
+                    <input id="side-compose-grow" type="checkbox" /> Grow
+                  </label>
                   <p id="side-compose-state" class="hint" role="status" aria-live="polite"></p>
                 </div>
               </div>

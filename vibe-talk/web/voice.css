@@ -1469,6 +1469,12 @@ a.search-hit-link {
   min-width: 5rem;
 }
 
+/* `#340 composer-grow-box`. The Grow choice beside Send is a desk's alone: a phone's box is as it was,
+   and has no row to spare for it. Drawn in the desktop block below. */
+.composer-grow {
+  display: none;
+}
+
 /* ------------------------------------------------------------------------ the reply screen -- */
 /*
  * `#51 reply-view`. One elastic part and a block under it: the conversation the message being
@@ -7349,6 +7355,70 @@ textarea {
   #width-grip:hover::before,
   #width-grip:focus-visible::before {
     background: var(--accent);
+  }
+
+  /* `#340 composer-grow-box`. The owner: a long message pasted into the box left it tiny, while the
+     room left of Send was empty. So that room holds a Grow checkbox, and the box grows with its text
+     while it is ticked (`data-composer-grow` on #screen-main, `applyComposerGrow`).
+
+     THE ROW. Two columns, the box, the state line and anything else across both, Send in the second
+     and the label in the first: `dense` puts the label on Send's row though it comes after Send in the
+     markup, which it does so that Tab goes from the box to Send first. Not while a send card is up:
+     the card's own rules give the box one line with Send beside it, and the label is not drawn. */
+  #screen-main:not([data-draft]) #voice-composer,
+  #screen-main:not([data-draft]) #channel-composer,
+  #side-composer {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-auto-flow: row dense;
+    align-items: center;
+  }
+
+  #screen-main:not([data-draft]) #compose-text,
+  #screen-main:not([data-draft]) #channel-compose-text,
+  #side-compose-text,
+  #screen-main:not([data-draft]) #channel-compose-state,
+  #side-compose-state {
+    grid-column: 1 / -1;
+  }
+
+  #screen-main:not([data-draft]) #send-text,
+  #screen-main:not([data-draft]) #channel-send,
+  #side-send {
+    grid-column: 2;
+  }
+
+  .composer-grow {
+    display: inline-flex;
+    grid-column: 1;
+    justify-self: start;
+    align-items: center;
+    gap: 0.35rem;
+    min-height: 24px;
+    font-size: 0.85rem;
+    color: var(--muted);
+    cursor: pointer;
+  }
+
+  #screen-main[data-draft] #voice-composer > .composer-grow,
+  #screen-main[data-draft] #channel-composer > .composer-grow {
+    display: none;
+  }
+
+  /* THE BOX GROWS with what is in it, `field-sizing: content` where the browser has it; where it does
+     not, web/voice.js measures the text and writes `--composer-grow-height` (`fitGrowingBox`). Up to
+     60% of the window, then it scrolls inside, so Send below it stays on screen. AT REST IT IS THE
+     HEIGHT IT ALWAYS WAS: a box sized by its text no longer takes its height from `rows="3"`, so its
+     least height is those three lines said in CSS, with the generic textarea rule's padding and border
+     (0.45rem and 1px, top and bottom); measured in Chromium, 86px either way. */
+  #screen-main[data-composer-grow]:not([data-draft]) #compose-text,
+  #screen-main[data-composer-grow]:not([data-draft]) #channel-compose-text,
+  #screen-main[data-composer-grow] #side-compose-text {
+    field-sizing: content;
+    height: var(--composer-grow-height, auto);
+    min-height: max(5rem, calc(3lh + 0.9rem + 2px));
+    max-height: 60vh;
+    overflow-y: auto;
+    resize: none;
   }
 }
 

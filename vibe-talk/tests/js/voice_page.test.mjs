@@ -3783,6 +3783,13 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
    * what a browser does after a layout that changed that element's size: every observer watching it
    * is told, and nothing else happens — in particular no scroll event, which is the point.
    */
+  /**
+   * `#340 composer-grow-box`. A browser that sizes a field to its text itself (`field-sizing: content`),
+   * as Chromium does. The page asks `CSS.supports` as it loads, so a test calls this from `arrange`.
+   */
+  page.supportFieldSizing = () => {
+    context.window.CSS = { supports: (property, value) => property === "field-sizing" && value === "content" };
+  };
   page.resizeObservers = [];
   page.enableResizeObserver = () => {
     context.window.ResizeObserver = class {
@@ -20579,6 +20586,175 @@ test("the field states its own layout rule: the size iOS will not zoom", () => {
   assert.doesNotMatch(CSS_CODE, /#text-entry|data-mode="text"/, "the Type toggle's styles outlived it");
 });
 
+// --- the box that grows (#340 composer-grow-box) -------------------------------------------------
+//
+// The owner, on a desk: pasting a long message left the message box tiny while the room left of Send
+// was empty. A Grow checkbox there, off by default, lets the box grow with its text up to 60% of the
+// window. This fixture lays nothing out, so what it checks is the markup, the rules and where each is,
+// the choice and where it is kept, the height written where the browser cannot size the box, and the
+// composer kept in view; tests/composer_grow_browser.py measures the box and Send in Chromium.
+
+const GROWING = [
+  { composer: "voice-composer", box: "compose-text", send: "send-text", grow: "compose-grow", state: null },
+  { composer: "channel-composer", box: "channel-compose-text", send: "channel-send", grow: "channel-compose-grow",
+    state: "channel-compose-state" },
+  { composer: "side-composer", box: "side-compose-text", send: "side-send", grow: "side-compose-grow",
+    state: "side-compose-state" },
+];
+
+/** The markup of one composer, `<div id="...">` to its closing tag (a composer holds no other div). */
+function composerMarkup(id) {
+  const at = HTML_CODE.indexOf(`<div id="${id}">`);
+  assert.ok(at >= 0, `web/voice.html has no #${id}`);
+  return HTML_CODE.slice(at, HTML_CODE.indexOf("</div>", at));
+}
+
+/** The selector the desktop block gives a part of a composer: scoped away from a send card where one can be up. */
+const growScoped = (composer, selector) => (composer === "side-composer" ? selector : `#screen-main:not([data-draft]) ${selector}`);
+
+test("`#340 composer-grow-box`: EACH COMPOSER HOLDS A Grow CHECKBOX AFTER Send, unticked, drawn on a desk alone, on Send's row", () => {
+  for (const { composer, box, send, grow, state } of GROWING) {
+    const markup = composerMarkup(composer);
+    const label = new RegExp(`<label class="composer-grow" title="[^"]*60%[^"]*">\\s*<input id="${grow}" type="checkbox" \\/> Grow\\s*<\\/label>`);
+    assert.match(markup, label, `#${composer} has no Grow checkbox`);
+    // After Send, so Tab goes from the box to Send first; before the state line.
+    const order = [box, send, grow, ...(state ? [state] : [])].map((id) => markup.indexOf(`id="${id}"`));
+    assert.ok(order.every((at, i) => at >= 0 && (i === 0 || at > order[i - 1])), `#${composer}'s parts are out of order: ${order}`);
+    // Every other part of the composer spans both columns of the desk's row, so `dense` cannot put Send
+    // beside it, above the box: whatever is added to a composer must say where it goes.
+    const ids = [...markup.matchAll(/\sid="([^"]+)"/g)].map((m) => m[1]).filter((id) => id !== composer);
+    for (const id of ids.filter((one) => one !== send && one !== grow)) {
+      assert.match(cssBlockIn(DESKTOP_QUERY, growScoped(composer, `#${id}`)), /grid-column:\s*1 \/ -1/,
+        `#${id} does not span both columns of #${composer} on a desk`);
+    }
+    assert.match(cssBlockIn(DESKTOP_QUERY, growScoped(composer, `#${send}`)), /grid-column:\s*2\b/);
+    const row = cssBlockIn(DESKTOP_QUERY, growScoped(composer, `#${composer}`));
+    assert.match(row, /grid-template-columns:\s*minmax\(0, 1fr\) auto/);
+    assert.match(row, /grid-auto-flow:\s*row dense/, `#${composer}: the label cannot come up beside Send`);
+  }
+  // A phone draws none of it; a desk draws it in the first column, left of Send.
+  assert.match(cssBlockOutside(DESKTOP_QUERY, ".composer-grow"), /display:\s*none/, "a phone draws the Grow checkbox");
+  const label = cssBlockIn(DESKTOP_QUERY, ".composer-grow");
+  assert.match(label, /display:\s*inline-flex/);
+  assert.match(label, /grid-column:\s*1\b/);
+  assert.match(label, /min-height:\s*24px/, "the Grow checkbox is a smaller target than WCAG 2.2's 24px");
+  // A send card's one-line box wins: no checkbox drawn under it.
+  for (const composer of ["voice-composer", "channel-composer"]) {
+    assert.match(cssBlockIn(DESKTOP_QUERY, `#screen-main[data-draft] #${composer} > .composer-grow`), /display:\s*none/,
+      `#${composer} draws Grow under a send card`);
+  }
+});
+
+test("`#340 composer-grow-box`: THE BOX GROWS by the browser's own field-sizing, up to 60% of the window and scrolling beyond, on a desk alone and not under a send card", () => {
+  for (const selector of [
+    "#screen-main[data-composer-grow]:not([data-draft]) #compose-text",
+    "#screen-main[data-composer-grow]:not([data-draft]) #channel-compose-text",
+    "#screen-main[data-composer-grow] #side-compose-text",
+  ]) {
+    const rule = cssBlockIn(DESKTOP_QUERY, selector);
+    assert.match(rule, /field-sizing:\s*content/, `${selector} does not size itself to its text`);
+    assert.match(rule, /height:\s*var\(--composer-grow-height, auto\)/, `${selector} ignores the height measured for it`);
+    assert.match(rule, /max-height:\s*60vh/, `${selector} is not capped at 60% of the window`);
+    assert.match(rule, /overflow-y:\s*auto/, `${selector} does not scroll beyond its cap`);
+    assert.equal(cssRulesElsewhere(DESKTOP_QUERY, selector), 0, `${selector} grows on a phone too`);
+  }
+  // The box at rest is as it was: the shared rule's height, and the call's box the channel's.
+  assert.match(cssBlock("#channel-compose-text"), /min-height:\s*5rem/);
+  assert.equal(cssBlock("#compose-text"), cssBlock("#channel-compose-text"));
+});
+
+test("`#340 composer-grow-box`: GROW IS OFF BY DEFAULT and not written down; ticked in one box it is ticked in all three, said on #screen-main and kept across a reload; storage that throws still honours it", async () => {
+  const store = new Map();
+  const page = newPage(store);
+  await signIn(page);
+  const screen = page.el("screen-main");
+  for (const { grow } of GROWING) assert.equal(page.el(grow).checked, false, `#${grow} is ticked on a fresh device`);
+  assert.equal(screen.hasAttribute("data-composer-grow"), false);
+  assert.equal(store.has("vibe-talk.voice.composer-grow"), false, "the default was written down as a choice");
+  await page.el("channel-compose-grow").setChecked(true);
+  for (const { grow } of GROWING) assert.equal(page.el(grow).checked, true, `#${grow} does not say the choice made in another box`);
+  assert.equal(screen.hasAttribute("data-composer-grow"), true, "ticking Grow did not tell the stylesheet");
+  assert.equal(store.get("vibe-talk.voice.composer-grow"), "1", "ticking Grow was not kept");
+  const again = newPage(store);
+  for (const { grow } of GROWING) assert.equal(again.el(grow).checked, true, `a reload unticked #${grow}`);
+  assert.equal(again.el("screen-main").hasAttribute("data-composer-grow"), true, "a reload let the boxes stop growing");
+  await again.el("side-compose-grow").setChecked(false);
+  assert.equal(store.get("vibe-talk.voice.composer-grow"), "0", "unticking Grow was not kept");
+  for (const { grow } of GROWING) assert.equal(again.el(grow).checked, false);
+  assert.equal(again.el("screen-main").hasAttribute("data-composer-grow"), false);
+  // A browser that throws on every write still grows the boxes for this visit.
+  const refusing = newPage();
+  refusing.storage.set = () => {
+    throw new Error("QuotaExceededError: the quota has been exceeded.");
+  };
+  await refusing.el("compose-grow").setChecked(true);
+  assert.equal(refusing.el("screen-main").hasAttribute("data-composer-grow"), true, "storage that throws lost the choice");
+  assert.equal(refusing.el("side-compose-grow").checked, true);
+});
+
+test("`#340 composer-grow-box`: WHERE THE BROWSER CANNOT SIZE THE BOX its height is measured and written, only on a desk, and taken away with Grow off; where it can, nothing is written", async () => {
+  const height = (page, id) => page.el(id).style.getPropertyValue("--composer-grow-height");
+  /** A page on a channel, Grow ticked, the channel's checkbox drawn (a desk) or not (a phone). */
+  const growPage = async (desk, arrange = null) => {
+    const page = newPage(new Map(), SCRIPT, arrange);
+    await signIn(page);
+    await showDiscord(page, tallChannel(10));
+    if (desk) page.el("channel-compose-grow").getClientRects = () => [{ top: 0, bottom: 24 }];
+    await page.el("channel-compose-grow").setChecked(true);
+    return page;
+  };
+  const desk = await growPage(true);
+  const box = desk.el("channel-compose-text");
+  await box.setValue("line\n".repeat(40));
+  assert.match(height(desk, "channel-compose-text"), /^\d+px$/, "a desk's growing box was given no height where the browser cannot size it");
+  // A send that clears the box measures it again; Grow off takes the height away.
+  box.style.setProperty("--composer-grow-height", "stale");
+  await desk.el("channel-send").click();
+  await desk.settle();
+  assert.match(height(desk, "channel-compose-text"), /^\d+px$/, "the box cleared by a send was not measured again");
+  await desk.el("channel-compose-grow").setChecked(false);
+  assert.equal(height(desk, "channel-compose-text"), "", "Grow off left the box at a measured height");
+  // A phone draws no checkbox, and its box is never measured.
+  const phone = await growPage(false);
+  await phone.el("channel-compose-text").setValue("line\n".repeat(40));
+  assert.equal(height(phone, "channel-compose-text"), "", "a phone's box was given a height");
+  // A browser with `field-sizing: content` sizes the box itself: nothing is written.
+  const sizing = await growPage(true, (p) => p.supportFieldSizing());
+  await sizing.el("channel-compose-text").setValue("line\n".repeat(40));
+  assert.equal(height(sizing, "channel-compose-text"), "", "a browser that sizes the box itself was given a height");
+});
+
+test("`#340 composer-grow-box`: SEND STAYS IN VIEW as the box grows under the reader's typing, and nothing moves for a box without the focus", async () => {
+  const page = newPage(new Map(), SCRIPT, (p) => p.enableResizeObserver());
+  await signIn(page);
+  await showDiscord(page, tallChannel(30));
+  page.el("channel-compose-grow").getClientRects = () => [{ top: 0, bottom: 24 }];
+  await page.el("channel-compose-grow").setChecked(true);
+  const area = page.el("scroll-area");
+  const box = page.el("channel-compose-text");
+  const composer = page.el("channel-composer");
+  const inView = () => {
+    const rect = composer.getBoundingClientRect();
+    return rect.top >= 0 && rect.bottom <= area.clientHeight;
+  };
+  // Without the focus: a box grown under a reader up the list moves nothing.
+  area.scrollTop = 0;
+  await area.dispatch("scroll");
+  assert.equal(inView(), false, "the premise: the composer is out of view at the head of the list");
+  page.resized(box);
+  assert.equal(area.scrollTop, 0, "a box grown without the focus moved the list");
+  // With it: the whole composer, Send included, brought into the list.
+  box.focus();
+  page.resized(box);
+  assert.ok(inView(), `the composer was left out of view as its box grew: ${JSON.stringify(composer.getBoundingClientRect())}`);
+  // Grow off: the box does not grow, and nothing here moves the list for it.
+  await page.el("channel-compose-grow").setChecked(false);
+  area.scrollTop = 0;
+  box.focus();
+  page.resized(box);
+  assert.equal(area.scrollTop, 0, "with Grow off a resize of the box moved the list");
+});
+
 // --- the keyboard (#224 keyboard-shortcuts) -------------------------------------------------------
 //
 // The owner, in the installed app on a Mac desk: PgUp, PgDn, Home and End did nothing, and he wanted
@@ -24597,6 +24773,13 @@ test("`#344 search-shortcut`: Ctrl+/ AND Cmd+/ OPEN THE SEARCH FROM ANYWHERE, wh
       }
       await opens(page, page.el(id), `on #${id}`);
     }
+    // `#340 composer-grow-box`. The Grow checkbox beside Send, which takes no typing: a bare "/" there
+    // searches as on any checkbox, and so does the chord.
+    page = await keyboardPage(platform);
+    await press(page, page.el("channel-compose-grow"), "/");
+    assert.ok(searchReady(page), `a bare "/" on the Grow checkbox left the focus on ${focusName(page)}`);
+    page = await keyboardPage(platform);
+    await opens(page, page.el("channel-compose-grow"), "on the Grow checkbox");
     // An open ⋯ menu, the focus on an item: closed first.
     page = await keyboardPage(platform);
     const row = page.el("discord-log").children[4];
