@@ -881,9 +881,18 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # that survives the locked reread or that a lock holder reports) are mapped.
     # The batch maps-filter ceiling case of 8eb8de0f (four selected trees fit
     # where one allowance would not) is mapped.
-    assert len(all_tests) == 1961
+    # The 18 dead-owner archiving cases (remove --archive-drifted-checkouts:
+    # three drift kinds removed after a verified bundle, a commit only the
+    # worktree's HEAD reflog reaches kept, refusals for a live
+    # registered liveness answer, a live consenting owner, a bundle that
+    # cannot be made, and a checkout changed after archiving, one journal
+    # recovery and one receipt-parser case; remove
+    # --archive-nested-cache-repositories: a Cargo-style checkout, every commit
+    # object kept, three refused unkeepable repositories, a failed bundle, one
+    # journal recovery and one evidence-parser case) are mapped.
+    assert len(all_tests) == 1979
     assert len(ordinary) == 336
-    assert len(mapped) == 1625
+    assert len(mapped) == 1643
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {

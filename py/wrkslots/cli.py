@@ -43,7 +43,7 @@ import urllib.parse
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Set as AbstractSet
 from pathlib import Path, PurePosixPath
-from typing import IO, NoReturn, TextIO, TypedDict, TypeVar
+from typing import IO, NoReturn, Protocol, TextIO, TypedDict, TypeVar
 
 from wrkslots import __version__, imagecmd, sandbox, slotimage, yamlconfig
 
@@ -247,6 +247,7 @@ _FINISH_JOURNAL_OPTIONAL = frozenset(
         "private_census_identity",
         "validation_removal_proof",
         "nested_git_evidence",
+        "archive_nested_cache_repositories",
     }
 )
 _LEGACY_VALIDATE_JOURNAL_REQUIRED = frozenset(
@@ -8845,6 +8846,14 @@ def _validate_journal_shape(
             raw["validate_complete"], bool
         ):
             raise StateError("finish journal.validate_complete must be boolean")
+        if "archive_nested_cache_repositories" in raw and (
+            raw["archive_nested_cache_repositories"] is not True
+            or record.slot_type != "agent"
+        ):
+            raise StateError(
+                "finish journal.archive_nested_cache_repositories must be true and "
+                "only for an agent slot"
+            )
         if "nested_git_evidence" in raw:
             _nested_git_evidence_from_obj(
                 raw["nested_git_evidence"], "finish journal.nested_git_evidence"
@@ -19805,8 +19814,14 @@ def _local_salvage_receipt_payload(
     facts: _SalvageCandidate,
     bundle_sha256: str,
     bundle_size: int,
+    *,
+    drift: _CheckoutDrift | None = None,
 ) -> dict[str, object]:
+    extra: dict[str, object] = (
+        {} if drift is None else {_CHECKOUT_DRIFT_RECEIPT_KEY: drift.to_obj()}
+    )
     return {
+        **extra,
         "schema": _LOCAL_SALVAGE_RECEIPT_SCHEMA,
         "kind": "wrkslots-local-salvage-archive",
         "machine": machine,
@@ -19913,12 +19928,18 @@ def _archive_salvage_locally(
     archive_root: Path,
     remote_failure: Refusal | None,
     vcs: _GitVcs,
+    *,
+    drift: _CheckoutDrift | None = None,
+    archive_reason: str | None = None,
 ) -> dict[str, object]:
     """Create and read back a self-contained bundle instead of a remote push.
 
     ``remote_failure`` is None when the remote is not in salvage_push_remotes,
     so nothing was pushed; otherwise it is the refused push, or the initial
     fetch's transport failure, so remote salvage did not complete.
+    ``archive_reason`` overrides the recorded reason (recorded-checkout-drift
+    for a drifted checkout and its submodules, which are never pushed), and
+    ``drift`` is recorded in both receipts (see _CheckoutDrift).
     """
     checked_root, bundle, receipt_path, archive_ref = _ensure_local_salvage_bundle(
         config, machine, slot, generation, checkout, path, facts, archive_root, vcs
@@ -19939,6 +19960,7 @@ def _archive_salvage_locally(
         facts,
         bundle_digest,
         bundle_size,
+        drift=drift,
     )
     if receipt_path.exists() or receipt_path.is_symlink():
         contents = _read_bounded_regular_file(
@@ -19965,11 +19987,20 @@ def _archive_salvage_locally(
             raise Refusal(f"local salvage archive receipt readback failed: {receipt_path}")
     receipt_sha256 = hashlib.sha256(contents).hexdigest()
     _interrupt_for_test("after-local-salvage-archive")
-    reason = (
-        f"remote {checkout.remote} is not in salvage_push_remotes"
-        if remote_failure is None
-        else "remote salvage did not complete"
-    )
+    if archive_reason is None:
+        archive_reason = (
+            "remote-not-allowed" if remote_failure is None else "remote-refused"
+        )
+    if archive_reason == _CHECKOUT_DRIFT_ARCHIVE_REASON:
+        reason = (
+            "the checkout differs from its recorded branch or remote"
+            if drift is not None
+            else "its superproject checkout differs from its recorded branch or remote"
+        ) + ", so nothing was pushed"
+    elif remote_failure is None:
+        reason = f"remote {checkout.remote} is not in salvage_push_remotes"
+    else:
+        reason = "remote salvage did not complete"
     print(
         f"WARNING: {reason} for checkout {checkout.name}; "
         f"using verified local archive {bundle}",
@@ -19992,10 +20023,13 @@ def _archive_salvage_locally(
         "archive_ref": archive_ref,
         "complete_history": True,
         "remote_failure": None if remote_failure is None else str(remote_failure),
-        "archive_reason": (
-            "remote-not-allowed" if remote_failure is None else "remote-refused"
-        ),
+        "archive_reason": archive_reason,
         "destination": str(bundle),
+        **(
+            {}
+            if drift is None
+            else {_CHECKOUT_DRIFT_RECEIPT_KEY: drift.to_obj()}
+        ),
     }
 
 
@@ -20057,6 +20091,7 @@ def _assert_local_salvage_receipt(
         facts,
         bundle_digest,
         bundle_size,
+        drift=_checkout_drift_from_receipt(salvage),
     )
     observed_receipt = _strict_json_object(
         receipt_contents, "local salvage archive receipt"
@@ -20289,16 +20324,19 @@ def _salvage_candidate(
     ownerless_recorded_at: str | None = None,
     allow_shallow: bool = False,
     detached_root: bool = False,
+    accept_drift: bool = False,
 ) -> _SalvageCandidate:
     """Return HEAD, status digest, durable commit candidate, and dirty state.
 
     See _salvage_candidate_uncached. While an agent-slot removal runs
     (_SALVAGE_FACTS_MEMO), the facts of a clean checkout are derived once and
     returned again while _salvage_fingerprint shows the checkout unchanged.
+    ``accept_drift`` facts are never memoized, so they can never stand in for
+    a later call that still compares the recorded branch and remote.
     """
 
     memo = _SALVAGE_FACTS_MEMO.get()
-    if memo is None or record is None or ownerless_slot is not None:
+    if memo is None or record is None or ownerless_slot is not None or accept_drift:
         return _salvage_candidate_uncached(
             config,
             record,
@@ -20311,6 +20349,7 @@ def _salvage_candidate(
             ownerless_recorded_at=ownerless_recorded_at,
             allow_shallow=allow_shallow,
             detached_root=detached_root,
+            accept_drift=accept_drift,
         )
     if detached_root:
         raise StateError("only an ownerless worktree may be salvaged with a detached root")
@@ -20382,6 +20421,53 @@ def _salvage_candidate(
     return facts
 
 
+def _worktree_private_orphan_tips(vcs: _GitVcs, path: Path, kept: str) -> tuple[str, ...]:
+    """Return the tips of commits that only ``path``'s private Git state reaches.
+
+    Removing a linked worktree deletes its private administrative directory:
+    its HEAD reflog and its refs/worktree/* and refs/bisect/* refs.  A commit
+    that only those reach (say one made on a detached HEAD before the agent
+    switched branches) is reachable from nothing afterwards.  This lists the
+    tips of such commits that neither ``kept`` nor any shared ref reaches.
+    """
+
+    reflog = vcs._run(path, ["reflog", "show", "--format=%H", "HEAD", "--"], check=False)
+    if reflog.returncode != 0:
+        raise Refusal(
+            f"cannot read the HEAD reflog of checkout {path}" + _git_failure_detail(reflog)
+        )
+    positives = {line.strip() for line in reflog.stdout.splitlines() if line.strip()}
+    negatives = {kept}
+    for line in vcs._run(
+        path, ["for-each-ref", "--format=%(objectname) %(refname)"]
+    ).stdout.splitlines():
+        sha, _space, refname = line.partition(" ")
+        if refname.startswith(("refs/worktree/", "refs/bisect/")):
+            positives.add(sha)
+        else:
+            negatives.add(sha)
+    if any(not SHA_RE.fullmatch(item) for item in positives | negatives):
+        raise Refusal(f"checkout {path} lists a reflog entry or ref that is not a full object")
+    if not positives:
+        return ()
+    orphans = vcs._run(
+        path,
+        ["rev-list", "--stdin"],
+        input_text="".join(f"{item}\n" for item in sorted(positives))
+        + "".join(f"^{item}\n" for item in sorted(negatives)),
+    ).stdout.split()
+    if not orphans:
+        return ()
+    parents: set[str] = set()
+    for line in vcs._run(
+        path,
+        ["rev-list", "--no-walk=unsorted", "--parents", "--stdin"],
+        input_text="".join(f"{item}\n" for item in orphans),
+    ).stdout.splitlines():
+        parents.update(line.split()[1:])
+    return tuple(sorted(set(orphans) - parents))
+
+
 def _salvage_candidate_uncached(
     config: Config,
     record: ActiveRecord | None,
@@ -20395,8 +20481,87 @@ def _salvage_candidate_uncached(
     ownerless_recorded_at: str | None = None,
     allow_shallow: bool = False,
     detached_root: bool = False,
+    accept_drift: bool = False,
+) -> _SalvageCandidate:
+    """See _salvage_candidate_facts.
+
+    For a drifted checkout (``accept_drift``), the salvage commit also gains,
+    as further parents, the tips of every commit only the worktree's private
+    HEAD reflog and refs reach (_worktree_private_orphan_tips), so the one
+    bundle of the salvage commit's complete history keeps them too.  It is
+    made with a fixed identity, date and message, so rechecks derive the same
+    commit while that private history is unchanged.
+    """
+
+    facts = _salvage_candidate_facts(
+        config,
+        record,
+        checkout,
+        vcs,
+        path_override=path_override,
+        allow_detached=allow_detached,
+        verify_repository_membership=verify_repository_membership,
+        ownerless_slot=ownerless_slot,
+        ownerless_recorded_at=ownerless_recorded_at,
+        allow_shallow=allow_shallow,
+        detached_root=detached_root,
+        accept_drift=accept_drift,
+    )
+    if not accept_drift:
+        return facts
+    if record is None:
+        raise StateError("drifted checkout salvage requires its registry row")
+    path = path_override or _stored_path(config, checkout.path, "checkout path")
+    tips = _worktree_private_orphan_tips(vcs, path, facts.commit)
+    if not tips:
+        return facts
+    tree = vcs._run(path, ["rev-parse", f"{facts.commit}^{{tree}}"]).stdout.strip()
+    message = (
+        f"Salvage {record.slot}/{checkout.name} worktree-private history after "
+        "recorded owner exit\n\n"
+        f"source-head: {facts.head}\n"
+        + "".join(f"worktree-private-tip: {tip}\n" for tip in tips)
+    )
+    parents = [facts.commit, *tips]
+    commit = vcs._run(
+        path,
+        ["commit-tree", tree, *itertools.chain.from_iterable(("-p", item) for item in parents)],
+        input_text=message,
+        env_overrides={
+            "GIT_AUTHOR_NAME": "wrkslots salvage",
+            "GIT_AUTHOR_EMAIL": "wrkslots@localhost",
+            "GIT_AUTHOR_DATE": record.heartbeat_at,
+            "GIT_COMMITTER_NAME": "wrkslots salvage",
+            "GIT_COMMITTER_EMAIL": "wrkslots@localhost",
+            "GIT_COMMITTER_DATE": record.heartbeat_at,
+        },
+    ).stdout.strip()
+    if not SHA_RE.fullmatch(commit):
+        raise Refusal(f"salvage commit for checkout {checkout.name} is not a full Git object")
+    return dataclasses.replace(facts, commit=commit, dirty=True)
+
+
+def _salvage_candidate_facts(
+    config: Config,
+    record: ActiveRecord | None,
+    checkout: Checkout,
+    vcs: _GitVcs,
+    *,
+    path_override: Path | None = None,
+    allow_detached: bool = False,
+    verify_repository_membership: bool = True,
+    ownerless_slot: str | None = None,
+    ownerless_recorded_at: str | None = None,
+    allow_shallow: bool = False,
+    detached_root: bool = False,
+    accept_drift: bool = False,
 ) -> _SalvageCandidate:
     """Return HEAD, status digest, durable commit candidate, and dirty state.
+
+    ``accept_drift`` skips only the comparison of the checkout's branch and
+    remote URL with the recorded ones (a detached HEAD included); every other
+    check runs. Its caller archives the result locally and never publishes it
+    (see _CheckoutDrift).
 
     ``detached_root`` accepts the managed checkout itself on a detached HEAD
     (an ownerless worktree whose HEAD a remote branch contains) instead of
@@ -20421,7 +20586,7 @@ def _salvage_candidate_uncached(
         if vcs.repository_root(path) != path.absolute():
             raise Refusal(f"nested repository is not rooted at its recorded path: {path}")
         head = vcs.head(path)
-    if allow_detached:
+    if allow_detached or accept_drift:
         branch_result = vcs._run(
             path, ["symbolic-ref", "--quiet", "--short", "HEAD"], check=False
         )
@@ -20455,7 +20620,7 @@ def _salvage_candidate_uncached(
         _cache_globs_for(config, checkout.name),
     )
     remote_authority = vcs.remote_authority(path, checkout.remote)
-    if remote_authority.sha256 != checkout.remote_url_sha256:
+    if not accept_drift and remote_authority.sha256 != checkout.remote_url_sha256:
         raise Refusal(
             f"checkout {checkout.name} remote {checkout.remote} URL changed; restore the "
             "recorded remote before reclaim so salvage cannot be sent elsewhere"
@@ -20965,6 +21130,151 @@ def _same_repository_remote(left: str, right: str) -> bool:
     return left_identity is not None and left_identity == _github_repository_identity(right)
 
 
+_CHECKOUT_DRIFT_RECEIPT_KEY = "recorded_checkout_drift"
+_CHECKOUT_DRIFT_ARCHIVE_REASON = "recorded-checkout-drift"
+_CHECKOUT_DRIFT_KEYS = frozenset(
+    {
+        "recorded_branch",
+        "observed_branch",
+        "recorded_remote_url_sha256",
+        "observed_remote_url_sha256",
+    }
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class _CheckoutDrift:
+    """How a dead owner's checkout differs from its recorded branch and remote.
+
+    remove --archive-drifted-checkouts reclaims such a checkout only after
+    keeping everything its found HEAD reaches, plus its uncommitted and
+    untracked non-ignored files, in a verified self-contained local bundle.
+    Nothing is pushed and no remote is asked whether HEAD is published: a
+    changed remote URL may name another repository, and its remote-tracking
+    refs prove nothing about where the commits are. The salvage receipt
+    carries this record, and every later check (before the path fence, after
+    it, and on recovery) compares the checkout against it instead of against
+    the recorded branch and remote, so any further change refuses.
+    ``observed_branch`` is None for a detached HEAD.
+    """
+
+    recorded_branch: str
+    observed_branch: str | None
+    recorded_remote_url_sha256: str
+    observed_remote_url_sha256: str
+
+    def to_obj(self) -> dict[str, object]:
+        return {
+            "recorded_branch": self.recorded_branch,
+            "observed_branch": self.observed_branch,
+            "recorded_remote_url_sha256": self.recorded_remote_url_sha256,
+            "observed_remote_url_sha256": self.observed_remote_url_sha256,
+        }
+
+
+def _observed_branch(vcs: _GitVcs, path: Path) -> str | None:
+    """Return the checked-out branch, or None for a detached HEAD."""
+
+    result = vcs._run(path, ["symbolic-ref", "--quiet", "--short", "HEAD"], check=False)
+    if result.returncode == 1 and not result.stdout and not result.stderr:
+        return None
+    if result.returncode != 0:
+        raise Refusal(
+            f"cannot read the branch of checkout {path}: git symbolic-ref failed"
+            + _git_failure_detail(result)
+        )
+    branch = result.stdout.strip()
+    _validate_ref(branch, "branch")
+    return branch
+
+
+def _observe_checkout_drift(
+    vcs: _GitVcs, checkout: Checkout, path: Path
+) -> _CheckoutDrift | None:
+    """Return how ``path`` differs from ``checkout``'s recorded branch and remote."""
+
+    observed_branch = _observed_branch(vcs, path)
+    observed_remote = vcs.remote_url_sha256(path, checkout.remote)
+    if (
+        observed_branch == checkout.branch
+        and observed_remote == checkout.remote_url_sha256
+    ):
+        return None
+    return _CheckoutDrift(
+        recorded_branch=checkout.branch,
+        observed_branch=observed_branch,
+        recorded_remote_url_sha256=checkout.remote_url_sha256,
+        observed_remote_url_sha256=observed_remote,
+    )
+
+
+def _checkout_drift_from_receipt(
+    receipt: Mapping[str, object] | None,
+) -> _CheckoutDrift | None:
+    """Parse the drift a salvage receipt recorded, refusing any other shape."""
+
+    if receipt is None or _CHECKOUT_DRIFT_RECEIPT_KEY not in receipt:
+        return None
+    label = f"salvage receipt.{_CHECKOUT_DRIFT_RECEIPT_KEY}"
+    raw = _as_mapping(receipt[_CHECKOUT_DRIFT_RECEIPT_KEY], label)
+    _exact_keys(raw, _CHECKOUT_DRIFT_KEYS, set(), label)
+    observed_branch = raw["observed_branch"]
+    drift = _CheckoutDrift(
+        recorded_branch=_as_str(raw["recorded_branch"], f"{label}.recorded_branch"),
+        observed_branch=(
+            None
+            if observed_branch is None
+            else _as_str(observed_branch, f"{label}.observed_branch")
+        ),
+        recorded_remote_url_sha256=_as_str(
+            raw["recorded_remote_url_sha256"], f"{label}.recorded_remote_url_sha256"
+        ),
+        observed_remote_url_sha256=_as_str(
+            raw["observed_remote_url_sha256"], f"{label}.observed_remote_url_sha256"
+        ),
+    )
+    if (
+        drift.observed_branch == drift.recorded_branch
+        and drift.observed_remote_url_sha256 == drift.recorded_remote_url_sha256
+    ):
+        raise StateError(f"{label} records no difference from the recorded checkout")
+    if receipt.get("disposition") != "archived-local":
+        raise StateError(
+            "a salvage receipt that records checkout drift must be archived-local"
+        )
+    return drift
+
+
+def _salvage_receipt_drift(
+    receipts: Sequence[Mapping[str, object]], checkout_name: str
+) -> _CheckoutDrift | None:
+    for receipt in receipts:
+        if receipt.get("checkout") == checkout_name:
+            return _checkout_drift_from_receipt(receipt)
+    return None
+
+
+def _assert_checkout_drift_unchanged(
+    vcs: _GitVcs, checkout: Checkout, path: Path, drift: _CheckoutDrift
+) -> None:
+    """Refuse unless ``path`` still differs from its record exactly as ``drift`` says."""
+
+    if (
+        drift.recorded_branch != checkout.branch
+        or drift.recorded_remote_url_sha256 != checkout.remote_url_sha256
+    ):
+        raise StateError(
+            f"checkout {checkout.name} drift receipt does not name its recorded "
+            "branch and remote"
+        )
+    if _observe_checkout_drift(vcs, checkout, path) != drift:
+        raise Refusal(
+            f"checkout {checkout.name} branch or remote changed after its recorded-"
+            "checkout drift was archived; preserve it and rerun remove so the "
+            "current state is archived before deletion"
+        )
+
+
 def _salvage_one_checkout(
     config: Config,
     record: ActiveRecord,
@@ -20975,7 +21285,14 @@ def _salvage_one_checkout(
     allow_detached: bool = False,
     prepared: _SalvageCandidate | None = None,
     archive_root: Path | None = None,
+    never_push: bool = False,
 ) -> dict[str, object]:
+    """Preserve one checkout's unpublished state before its slot is removed.
+
+    ``never_push`` (a submodule of a drifted checkout, see _CheckoutDrift)
+    keeps anything not already published in a verified local bundle instead
+    of pushing it to a salvage remote.
+    """
     path = path_override or _stored_path(config, checkout.path, "checkout path")
     facts = (
         _salvage_candidate(
@@ -21042,7 +21359,11 @@ def _salvage_one_checkout(
         raise _shallow_history_refusal(facts)
     # A submodule whose remote is its source repository is never pushed
     # through that alias (see _submodule_network_authority).
-    if facts.aliased or not _salvage_push_allowed(config, facts.remote_authority):
+    if (
+        never_push
+        or facts.aliased
+        or not _salvage_push_allowed(config, facts.remote_authority)
+    ):
         return _archive_salvage_locally(
             config,
             record.machine,
@@ -21054,6 +21375,7 @@ def _salvage_one_checkout(
             archive_root or _default_salvage_archive_root(config),
             None,
             vcs,
+            archive_reason=_CHECKOUT_DRIFT_ARCHIVE_REASON if never_push else None,
         )
     salvage_name = checkout.name.replace("/", "-")
     salvage_ref = (
@@ -21097,29 +21419,72 @@ def _salvage_one_checkout(
     }
 
 
+def _drifted_checkout_refusal(
+    checkout: Checkout, drift: _CheckoutDrift, reason: str
+) -> Refusal:
+    found = (
+        "a detached HEAD"
+        if drift.observed_branch is None
+        else f"branch {drift.observed_branch}"
+    )
+    remote = (
+        ""
+        if drift.observed_remote_url_sha256 == drift.recorded_remote_url_sha256
+        else f" and a changed remote {checkout.remote} URL"
+    )
+    return Refusal(
+        f"checkout {checkout.name} has {found}{remote}, not its recorded branch "
+        f"{drift.recorded_branch}; {reason}. state: REFUSED -- no checkout was "
+        "salvaged or removed"
+    )
+
+
 def _salvage_agent_slot(
     config: Config,
     record: ActiveRecord,
     vcs: _GitVcs,
     *,
     archive_root: Path | None = None,
+    archive_drifted: bool = False,
+    drift_refusal: str | None = None,
 ) -> tuple[dict[str, object], ...]:
-    candidates: list[tuple[Checkout, Path, bool]] = []
+    """Salvage every checkout and initialized submodule of an agent slot.
+
+    With ``archive_drifted`` (remove --archive-drifted-checkouts) a checkout
+    whose branch or remote URL differs from its record, a detached HEAD
+    included, is not refused: its found HEAD and uncommitted state are kept
+    in a verified local bundle, never pushed (see _CheckoutDrift), and its
+    submodules are never pushed either. ``drift_refusal`` names why this
+    removal may not do that (its owner is not proven dead), and a drifted
+    checkout then refuses with it. Without ``archive_drifted`` every drifted
+    checkout refuses exactly as before.
+    """
+
+    candidates: list[tuple[Checkout, Path, bool, _CheckoutDrift | None, bool]] = []
     for checkout in record.checkouts:
         path = _stored_path(config, checkout.path, "checkout path")
-        if vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256:
+        drift = _observe_checkout_drift(vcs, checkout, path) if archive_drifted else None
+        if drift is not None and drift_refusal is not None:
+            raise _drifted_checkout_refusal(checkout, drift, drift_refusal)
+        if drift is None and (
+            vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256
+        ):
             raise Refusal(
                 f"checkout {checkout.name} remote {checkout.remote} URL changed; restore the "
                 "recorded remote before reclaim so salvage cannot be sent elsewhere"
             )
-        candidates.append((checkout, path, False))
-        for submodule, path in _submodule_salvage_checkouts(config, checkout, vcs):
-            candidates.append((submodule, path, True))
+        candidates.append((checkout, path, False, drift, drift is not None))
+        for submodule, submodule_path in _submodule_salvage_checkouts(
+            config, checkout, vcs
+        ):
+            candidates.append((submodule, submodule_path, True, None, drift is not None))
     prepared = [
         (
             checkout,
             path,
             detached,
+            drift,
+            never_push,
             _salvage_candidate(
                 config,
                 record,
@@ -21129,23 +21494,47 @@ def _salvage_agent_slot(
                 allow_detached=detached,
                 verify_repository_membership=not detached,
                 allow_shallow=detached,
+                accept_drift=drift is not None,
             ),
         )
-        for checkout, path, detached in candidates
+        for checkout, path, detached, drift, never_push in candidates
     ]
-    return tuple(
-        _salvage_one_checkout(
-            config,
-            record,
-            checkout,
-            vcs,
-            path_override=path,
-            allow_detached=detached,
-            prepared=facts,
-            archive_root=archive_root,
+    receipts: list[dict[str, object]] = []
+    for checkout, path, detached, drift, never_push, facts in prepared:
+        if drift is not None:
+            # Recheck right before archiving that the drift is what was seen.
+            _assert_checkout_drift_unchanged(vcs, checkout, path, drift)
+            receipts.append(
+                _archive_salvage_locally(
+                    config,
+                    record.machine,
+                    record.slot,
+                    record.generation,
+                    checkout,
+                    path,
+                    facts,
+                    archive_root or _default_salvage_archive_root(config),
+                    None,
+                    vcs,
+                    drift=drift,
+                    archive_reason=_CHECKOUT_DRIFT_ARCHIVE_REASON,
+                )
+            )
+            continue
+        receipts.append(
+            _salvage_one_checkout(
+                config,
+                record,
+                checkout,
+                vcs,
+                path_override=path,
+                allow_detached=detached,
+                prepared=facts,
+                archive_root=archive_root,
+                never_push=never_push,
+            )
         )
-        for checkout, path, detached, facts in prepared
-    )
+    return tuple(receipts)
 
 
 def _salvage_ownerless_checkout(
@@ -21296,7 +21685,7 @@ def _assert_salvage_still_matches(
         _as_str(value.get("checkout"), "salvage receipt.checkout"): value
         for value in receipts
     }
-    targets: list[tuple[Checkout, Path, bool]] = []
+    targets: list[tuple[Checkout, Path, bool, bool]] = []
     selected_checkouts = record.checkouts if checkouts is None else checkouts
     for checkout in selected_checkouts:
         path = (
@@ -21304,19 +21693,22 @@ def _assert_salvage_still_matches(
             if paths is None
             else paths[checkout.name]
         )
-        if vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256:
+        drift = _checkout_drift_from_receipt(by_name.get(checkout.name))
+        if drift is not None:
+            _assert_checkout_drift_unchanged(vcs, checkout, path, drift)
+        elif vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256:
             raise Refusal(
                 f"checkout {checkout.name} remote {checkout.remote} URL changed after "
                 "salvage; preserve it and rerun remove"
             )
-        targets.append((checkout, path, False))
+        targets.append((checkout, path, False, drift is not None))
         targets.extend(
-            (submodule, submodule_path, True)
+            (submodule, submodule_path, True, False)
             for submodule, submodule_path in _submodule_salvage_checkouts(
                 config, checkout, vcs, path_override=path
             )
         )
-    expected_names = {checkout.name for checkout, _path, _detached in targets}
+    expected_names = {checkout.name for checkout, _path, _detached, _drift in targets}
     if (
         set(by_name) != expected_names
         if checkouts is None
@@ -21337,9 +21729,10 @@ def _assert_salvage_still_matches(
                 allow_detached=allow_detached,
                 verify_repository_membership=not allow_detached,
                 allow_shallow=allow_detached,
+                accept_drift=drifted,
             ),
         )
-        for checkout, path, allow_detached in targets
+        for checkout, path, allow_detached, drifted in targets
     ]
     for checkout, path, _allow_detached, facts in prepared:
         receipt = by_name[checkout.name]
@@ -22179,12 +22572,22 @@ def _reclaim_preconditions(
         path = _stored_path(config, checkout.path, "checkout path")
         _relative, repository = _stored_repository_path(config, checkout.repository)
         head = vcs.verify_existing_worktree(repository, path)
-        branch = vcs.branch(path)
-        if branch != checkout.branch:
-            raise Refusal(
-                f"checkout {checkout.name} branch changed: expected {checkout.branch}, "
-                f"found {branch}; preserve it and update the record before reclaim"
-            )
+        # A drifted checkout was archived locally under its found branch and
+        # remote (_CheckoutDrift); it must still differ exactly that way.
+        drift = (
+            _salvage_receipt_drift(finish.salvage, checkout.name)
+            if record.slot_type == "agent"
+            else None
+        )
+        if drift is not None:
+            _assert_checkout_drift_unchanged(vcs, checkout, path, drift)
+        else:
+            branch = vcs.branch(path)
+            if branch != checkout.branch:
+                raise Refusal(
+                    f"checkout {checkout.name} branch changed: expected {checkout.branch}, "
+                    f"found {branch}; preserve it and update the record before reclaim"
+                )
         if record.slot_type == "agent":
             operations = vcs.operation_paths(path)
             if operations:
@@ -22194,7 +22597,9 @@ def _reclaim_preconditions(
                 )
             vcs.assert_ordinary_history(path)
             vcs.assert_ordinary_index(path)
-        if vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256:
+        if drift is None and (
+            vcs.remote_url_sha256(path, checkout.remote) != checkout.remote_url_sha256
+        ):
             raise Refusal(
                 f"checkout {checkout.name} remote {checkout.remote} URL changed; "
                 "restore the recorded remote before reclaim"
@@ -29316,6 +29721,18 @@ _NESTED_GIT_OPERATION_MARKERS = (
 _NESTED_GIT_EVIDENCE_KEYS = frozenset(
     {"checkout", "path", "head", "remote_ref", "ignored_entries", "ignored_sample"}
 )
+# Present only for a repository kept in a local bundle before deletion.
+_NESTED_GIT_SALVAGE_EVIDENCE_KEYS = frozenset(
+    {
+        "salvage_bundle",
+        "salvage_bundle_sha256",
+        "salvage_receipt",
+        "salvage_commit",
+        "salvage_reason",
+    }
+)
+_NESTED_SALVAGE_RECEIPT_SCHEMA = 1
+_NESTED_SALVAGE_REF_PREFIX = "refs/wrkslots-nested"
 # Recorded beside the judged repositories in the slot-removed event: what the
 # judgment did not cover, so the evidence is not read as more than it is.
 _NESTED_GIT_SCOPE = (
@@ -29360,9 +29777,52 @@ class _NestedGitBudget:
         self.spent_seconds += max(0.0, seconds)
 
 
+class _NestedGitOutput(Protocol):
+    """The nested judgment's bounded, checked Git runner (see its ``output``)."""
+
+    def __call__(
+        self,
+        args: Sequence[str],
+        *,
+        work: bool = False,
+        stdin: bytes | None = None,
+        extra_env: Mapping[str, str] | None = None,
+        git_dir: Path | None = None,
+    ) -> str: ...
+
+
+@dataclasses.dataclass(frozen=True)
+class _NestedSalvageTarget:
+    """Where remove --archive-nested-cache-repositories keeps nested repositories."""
+
+    archive_root: Path
+    machine: str
+    slot: str
+    generation: int
+    recorded_at: str
+    canonical_slot: Path
+
+
+@dataclasses.dataclass(frozen=True)
+class _NestedSalvage:
+    """The verified local bundle that preserves one nested repository."""
+
+    bundle: str
+    bundle_sha256: str
+    bundle_bytes: int
+    receipt: str
+    salvage_commit: str | None
+    refs: int
+    reason: str
+
+
 @dataclasses.dataclass(frozen=True)
 class _DisposableNestedRepository:
-    """One nested repository holding no commit or change that exists only there."""
+    """One nested repository holding no commit or change that exists only there.
+
+    With ``salvage`` it held such commits or changes, and they were kept in
+    the verified bundle that ``salvage`` names before it was judged disposable.
+    """
 
     path: Path
     identity: tuple[int, int]
@@ -29370,6 +29830,7 @@ class _DisposableNestedRepository:
     remote_ref: str | None
     ignored_entries: int
     ignored_sample: tuple[str, ...]
+    salvage: _NestedSalvage | None = None
 
 
 def _assert_judged_git_metadata(
@@ -29539,13 +30000,15 @@ def _judge_nested_git_repository(
     *,
     display: Path | None = None,
     budget: _NestedGitBudget | None = None,
+    salvage: _NestedSalvageTarget | None = None,
 ) -> _DisposableNestedRepository:
     """Judge one nested repository; every failure, of any exception type, refuses.
 
     A removal rolls its path fence back only on a Refusal, so an OSError or
     RuntimeError escaping judgment would leave the slot fenced and the finish
     journal in place.  Converting here keeps every judgment failure on the
-    rollback path.
+    rollback path.  ``salvage`` is remove --archive-nested-cache-repositories
+    (see _salvage_nested_git_repository).
     """
 
     try:
@@ -29554,6 +30017,7 @@ def _judge_nested_git_repository(
             removed_roots,
             display=display,
             budget=_NestedGitBudget() if budget is None else budget,
+            salvage=salvage,
         )
     except Refusal:
         raise
@@ -29570,6 +30034,7 @@ def _judge_nested_git_repository_unchecked(
     *,
     display: Path | None,
     budget: _NestedGitBudget,
+    salvage: _NestedSalvageTarget | None = None,
 ) -> _DisposableNestedRepository:
     """Prove that the repository at ``dotgit`` holds nothing that exists only here.
 
@@ -29604,6 +30069,13 @@ def _judge_nested_git_repository_unchecked(
     invoking user's configuration, and neither runs a program.  Anything else refuses and names the condition that failed,
     reporting the entry as ``display`` (its canonical path while the slot is
     fenced).
+
+    With ``salvage``, the conditions that concern only content (stash
+    entries, uncommitted or untracked non-ignored files, and commits no
+    counted remote-tracking ref contains) do not refuse: every structural
+    check above and below still runs first, and then the repository is kept
+    in a verified local bundle (_salvage_nested_git_repository) before it is
+    judged disposable.  A failure to make or verify that bundle refuses.
     """
 
     def refuse(condition: str) -> Refusal:
@@ -29611,6 +30083,15 @@ def _judge_nested_git_repository_unchecked(
             f"cache directory contains nested Git metadata: {display or dotgit}: "
             f"not provably disposable: {condition}"
         )
+
+    # Content conditions that a salvage bundle preserves; without salvage
+    # each refuses at once, exactly where it is found.
+    deferred: list[str] | None = None if salvage is None else []
+
+    def defer(condition: str) -> None:
+        if deferred is None:
+            raise refuse(condition)
+        deferred.append(condition)
 
     try:
         metadata = os.lstat(dotgit)
@@ -29667,6 +30148,8 @@ def _judge_nested_git_repository_unchecked(
         work: bool = False,
         stdin: bytes | None = None,
         user_config: bool = False,
+        extra_env: Mapping[str, str] | None = None,
+        git_dir: Path | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
         seconds = budget.command_seconds()
         if seconds <= 0:
@@ -29699,10 +30182,13 @@ def _judge_nested_git_repository_unchecked(
             "core.ignoreStat=false",
             "-c",
             "protocol.allow=never",
-            f"--git-dir={dotgit}",
+            f"--git-dir={dotgit if git_dir is None else git_dir}",
             *((f"--work-tree={work_tree}",) if work else ()),
             *args,
         ]
+        selected_env = user_env if user_config else env
+        if extra_env:
+            selected_env = {**selected_env, **extra_env}
         started = time.monotonic()
         try:
             return subprocess.run(
@@ -29710,7 +30196,7 @@ def _judge_nested_git_repository_unchecked(
                 input=stdin,
                 capture_output=True,
                 check=False,
-                env=user_env if user_config else env,
+                env=selected_env,
                 cwd="/",
                 timeout=seconds,
             )
@@ -29729,8 +30215,17 @@ def _judge_nested_git_repository_unchecked(
         text = (completed.stderr or completed.stdout).decode(errors="replace").strip()
         return text.splitlines()[0][:300] if text else f"exit {completed.returncode}"
 
-    def output(args: Sequence[str], *, work: bool = False, stdin: bytes | None = None) -> str:
-        completed = run(args, work=work, stdin=stdin)
+    def output(
+        args: Sequence[str],
+        *,
+        work: bool = False,
+        stdin: bytes | None = None,
+        extra_env: Mapping[str, str] | None = None,
+        git_dir: Path | None = None,
+    ) -> str:
+        completed = run(
+            args, work=work, stdin=stdin, extra_env=extra_env, git_dir=git_dir
+        )
         if completed.returncode != 0:
             raise refuse(f"git {' '.join(args)} failed: {detail(completed)}")
         return completed.stdout.decode(errors="surrogateescape")
@@ -29820,8 +30315,8 @@ def _judge_nested_git_repository_unchecked(
             raise refuse(f"{operation} is in progress (.git/{marker} exists)")
     stash = run(["rev-parse", "-q", "--verify", "refs/stash"])
     if stash.returncode == 0:
-        raise refuse("stash entries exist (refs/stash)")
-    if stash.returncode != 1:
+        defer("stash entries exist (refs/stash)")
+    elif stash.returncode != 1:
         raise refuse(f"cannot read refs/stash: {detail(stash)}")
     hidden: list[str] = []
     gitlinks: list[str] = []
@@ -29880,7 +30375,7 @@ def _judge_nested_git_repository_unchecked(
         elif item:
             changes.append(item)
     if changes:
-        raise refuse(
+        defer(
             f"worktree has {len(changes)} uncommitted or untracked change(s), "
             f"first: {changes[0]!r}"
         )
@@ -30030,7 +30525,17 @@ def _judge_nested_git_repository_unchecked(
         return int(counted.strip() or "0")
 
     total = uncontained(["--all", "--reflog"], commit_objects)
-    if total:
+    if total and deferred is not None:
+        deferred.append(
+            f"{total} commit(s) exist only in this repository"
+            + (
+                "; uncounted remote(s): "
+                + ", ".join(f"{name} ({reason})" for name, reason in uncounted.items())
+                if uncounted
+                else ""
+            )
+        )
+    elif total:
         note = f"{total} commit(s) exist only in this repository" + (
             "; uncounted remote(s): "
             + ", ".join(f"{name} ({reason})" for name, reason in uncounted.items())
@@ -30084,8 +30589,23 @@ def _judge_nested_git_repository_unchecked(
             if line.endswith(" ") and line.split(" ", 1)[0] in counted_refs
         ]
         if not direct:
-            raise refuse(f"no counted refs/remotes/* ref reports containing HEAD {head}")
-        remote_ref = direct[0]
+            defer(f"no counted refs/remotes/* ref reports containing HEAD {head}")
+        else:
+            remote_ref = direct[0]
+    kept: _NestedSalvage | None = None
+    if deferred:
+        assert salvage is not None
+        kept = _salvage_nested_git_repository(
+            dotgit,
+            salvage,
+            display=display or dotgit,
+            conditions=deferred,
+            head=head,
+            worktree_changed=bool(changes),
+            output=output,
+            refuse=refuse,
+            commit_objects=commit_objects,
+        )
     return _DisposableNestedRepository(
         dotgit,
         (metadata.st_dev, metadata.st_ino),
@@ -30096,6 +30616,290 @@ def _judge_nested_git_repository_unchecked(
             item.encode(errors="surrogateescape").decode(errors="backslashreplace")
             for item in ignored[:_NESTED_GIT_IGNORED_SAMPLE]
         ),
+        kept,
+    )
+
+
+def _salvage_nested_git_repository(
+    dotgit: Path,
+    target: _NestedSalvageTarget,
+    *,
+    display: Path,
+    conditions: Sequence[str],
+    head: str | None,
+    worktree_changed: bool,
+    output: _NestedGitOutput,
+    refuse: Callable[[str], Refusal],
+    commit_objects: str,
+) -> _NestedSalvage:
+    """Keep one nested cache repository in a verified, self-contained local bundle.
+
+    Called by the judgment of remove --archive-nested-cache-repositories once
+    every structural check has passed and only content conditions remain.
+    The bundle holds, under refs/wrkslots-nested/: every non-symbolic ref
+    (ref/<name> for refs/<name>), HEAD, one ref per commit object that no
+    other commit object has as a parent (so every commit object in the
+    repository, reachable or not, is in the bundle), and, when the worktree
+    differs from HEAD, one salvage commit of its tracked and untracked
+    non-ignored files.  Gitignored files are not kept: they are the cache's
+    build output, deleted as before.
+
+    Nothing is written to the nested repository: the salvage commit's objects
+    go to a staging object directory that borrows the repository's objects,
+    so judging the repository again finds the same commits and makes the same
+    deterministic salvage commit (fixed identity, date and message).  The
+    bundle's directory is named by the digest of its exact ref listing, so the
+    judgment repeated just before deletion finds and rechecks the bundle the
+    first judgment made instead of making another.  A bundle is used only
+    after it was unbundled into an empty repository, listed exactly the
+    expected refs, and passed git fsck --full; its receipt binds its SHA-256.
+    ``git fsck --strict`` is not used: vendored third-party histories often
+    carry objects its format pedantry rejects (zero-padded file modes, for
+    one), while --full still checks every object and all connectivity.
+    Every Git command is charged to the removal's nested-judgment allowance.
+    Any failure refuses, and the repository is then not deleted.
+    """
+
+    if os.path.lexists(dotgit / "shallow"):
+        raise refuse(
+            "repository is shallow, so no bundle of it is self-contained; "
+            "salvage refused"
+        )
+    try:
+        relative = display.relative_to(target.canonical_slot).as_posix()
+    except ValueError:
+        relative = display.as_posix()
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", relative).strip("-.")[:96] or "nested"
+    archive_root = target.archive_root
+    parent = (
+        archive_root
+        / _LOCAL_SALVAGE_DIRECTORY
+        / target.machine
+        / target.slot
+        / str(target.generation)
+        / "nested"
+    )
+    _prepare_local_salvage_directory(archive_root, parent)
+    _ensure_no_symlink_components(archive_root, parent, "nested salvage archive")
+    prefix = _NESTED_SALVAGE_REF_PREFIX
+    with tempfile.TemporaryDirectory(
+        prefix=".wrkslots-nested-stage-", dir=str(parent)
+    ) as temporary:
+        stage_root = Path(temporary)
+        objects = stage_root / "objects"
+        objects.mkdir()
+        object_env = {
+            "GIT_OBJECT_DIRECTORY": str(objects),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(dotgit / "objects"),
+        }
+        salvage_commit: str | None = None
+        if worktree_changed:
+            index_env = {**object_env, "GIT_INDEX_FILE": str(stage_root / "index")}
+            output(
+                ["read-tree", "--empty"] if head is None else ["read-tree", head],
+                extra_env=index_env,
+            )
+            # Every tracked change and untracked file that the repository's
+            # own ignore rules do not ignore; .git/info/exclude rules were
+            # refused before salvage and core.excludesFile is /dev/null.
+            output(["add", "-A"], work=True, extra_env=index_env)
+            tree = output(["write-tree"], extra_env=index_env).strip()
+            if not SHA_RE.fullmatch(tree):
+                raise refuse("salvage tree is not a full Git object")
+            head_tree = (
+                None
+                if head is None
+                else output(["rev-parse", f"{head}^{{tree}}"]).strip()
+            )
+            if tree != head_tree:
+                identity = {
+                    "GIT_AUTHOR_NAME": "wrkslots salvage",
+                    "GIT_AUTHOR_EMAIL": "wrkslots@localhost",
+                    "GIT_AUTHOR_DATE": target.recorded_at,
+                    "GIT_COMMITTER_NAME": "wrkslots salvage",
+                    "GIT_COMMITTER_EMAIL": "wrkslots@localhost",
+                    "GIT_COMMITTER_DATE": target.recorded_at,
+                }
+                message = (
+                    f"Salvage nested repository {relative} of "
+                    f"{target.slot}/{target.generation}\n\n"
+                    f"source-head: {head or 'unborn'}\n"
+                )
+                salvage_commit = output(
+                    ["commit-tree", tree, *(() if head is None else ("-p", head))],
+                    stdin=message.encode("utf-8"),
+                    extra_env={**object_env, **identity},
+                ).strip()
+                if not SHA_RE.fullmatch(salvage_commit):
+                    raise refuse("salvage commit is not a full Git object")
+        staged: dict[str, str] = {}
+        for line in output(
+            ["for-each-ref", "--format=%(objectname) %(refname) %(symref)"]
+        ).splitlines():
+            sha, refname, symref = line.split(" ", 2)
+            if symref:
+                # Its target, when that is a ref, is listed on its own.
+                continue
+            if not refname.startswith("refs/"):
+                raise refuse(f"cannot salvage ref {refname!r} outside refs/")
+            staged[f"{prefix}/ref/{refname[len('refs/'):]}"] = sha
+        if head is not None:
+            staged[f"{prefix}/HEAD"] = head
+        if salvage_commit is not None:
+            staged[f"{prefix}/worktree"] = salvage_commit
+        commits = [item for item in commit_objects.split() if item]
+        if commits:
+            listed: set[str] = set()
+            parents: set[str] = set()
+            for line in output(
+                ["rev-list", "--no-walk=unsorted", "--parents", "--stdin"],
+                stdin="".join(f"{commit}\n" for commit in commits).encode(),
+            ).splitlines():
+                fields = line.split()
+                if fields:
+                    listed.add(fields[0])
+                    parents.update(fields[1:])
+            if listed != set(commits):
+                raise refuse("Git did not list every commit object of the repository")
+            for tip in sorted(listed - parents):
+                staged[f"{prefix}/commit/{tip}"] = tip
+        if not staged:
+            raise refuse("repository holds no ref, HEAD or commit to salvage")
+        for ref in staged:
+            _validate_full_ref(ref, "nested salvage ref")
+        ref_lines = "".join(f"{sha} {ref}\n" for ref, sha in sorted(staged.items()))
+        key = hashlib.sha256(ref_lines.encode("utf-8")).hexdigest()
+        directory = parent / f"{safe}-{key[:16]}"
+        bundle = directory / "repository.bundle"
+        receipt_path = directory / "receipt.json"
+        create_lines = "".join(
+            f"create {ref} {sha}\n" for ref, sha in sorted(staged.items())
+        ).encode("utf-8")
+
+        def verify(candidate: Path, digest: str, size: int) -> None:
+            verified = _VERIFIED_SALVAGE_BUNDLES.get()
+            cache_key = (f"nested\0{key}", digest, size)
+            if verified is not None and cache_key in verified:
+                return
+            with tempfile.TemporaryDirectory(
+                prefix=".wrkslots-nested-verify-", dir=str(directory)
+            ) as verify_temporary:
+                restored = Path(verify_temporary) / "restored.git"
+                output(["init", "--bare", "-q"], git_dir=restored)
+                unbundled: dict[str, str] = {}
+                for line in output(
+                    ["bundle", "unbundle", str(candidate)], git_dir=restored
+                ).splitlines():
+                    sha, _space, ref = line.partition(" ")
+                    unbundled[ref] = sha
+                if unbundled != staged:
+                    raise refuse(
+                        f"salvage bundle {candidate} does not list exactly the refs "
+                        "it was made from"
+                    )
+                output(["update-ref", "--stdin"], git_dir=restored, stdin=create_lines)
+                output(
+                    ["fsck", "--full", "--no-dangling", "--no-progress"],
+                    git_dir=restored,
+                )
+            if verified is not None:
+                verified.add(cache_key)
+
+        if not bundle.exists() and not bundle.is_symlink():
+            _prepare_local_salvage_directory(archive_root, directory)
+            stage = stage_root / "stage.git"
+            output(["init", "--bare", "-q"], git_dir=stage)
+            output(
+                ["update-ref", "--stdin"],
+                git_dir=stage,
+                extra_env=object_env,
+                stdin=create_lines,
+            )
+            temp_bundle = directory / f".{bundle.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+            try:
+                output(
+                    ["bundle", "create", "-q", str(temp_bundle), "--all"],
+                    git_dir=stage,
+                    extra_env=object_env,
+                )
+                descriptor = os.open(temp_bundle, os.O_RDONLY | os.O_CLOEXEC)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                os.chmod(temp_bundle, 0o444)
+                temp_digest, temp_size = _sha256_regular_file(
+                    temp_bundle, "temporary nested salvage bundle"
+                )
+                verify(temp_bundle, temp_digest, temp_size)
+                try:
+                    os.link(temp_bundle, bundle, follow_symlinks=False)
+                    _fsync_directory(directory)
+                except FileExistsError:
+                    pass
+            finally:
+                with contextlib.suppress(FileNotFoundError):
+                    temp_bundle.unlink()
+    _ensure_no_symlink_components(archive_root, directory, "nested salvage archive")
+    digest, size = _sha256_regular_file(bundle, "nested salvage bundle")
+    verify(bundle, digest, size)
+    expected_receipt: dict[str, object] = {
+        "schema": _NESTED_SALVAGE_RECEIPT_SCHEMA,
+        "kind": "wrkslots-nested-salvage-archive",
+        "machine": target.machine,
+        "slot": target.slot,
+        "generation": target.generation,
+        "repository": str(display),
+        "head": head,
+        "salvage_commit": salvage_commit,
+        "conditions": list(conditions),
+        "refs_count": len(staged),
+        "refs_sha256": key,
+        "bundle": str(bundle.relative_to(archive_root)),
+        "bundle_sha256": digest,
+        "bundle_bytes": size,
+        "verification": {
+            "unbundled_into_empty_repository": True,
+            "exact_refs": True,
+            "full_fsck": True,
+            "complete_history": True,
+        },
+    }
+    if receipt_path.exists() or receipt_path.is_symlink():
+        observed = _strict_json_object(
+            _read_bounded_regular_file(
+                receipt_path,
+                "nested salvage receipt",
+                _LOCAL_SALVAGE_RECEIPT_BYTES_LIMIT,
+            ),
+            "nested salvage receipt",
+        )
+        if not _json_equal(observed, expected_receipt):
+            raise refuse(
+                f"nested salvage receipt disagrees with the repository: {receipt_path}"
+            )
+    else:
+        _atomic_write_json(receipt_path, expected_receipt)
+        if not _json_equal(
+            _strict_json_object(
+                _read_bounded_regular_file(
+                    receipt_path,
+                    "nested salvage receipt",
+                    _LOCAL_SALVAGE_RECEIPT_BYTES_LIMIT,
+                ),
+                "nested salvage receipt",
+            ),
+            expected_receipt,
+        ):
+            raise refuse(f"nested salvage receipt readback failed: {receipt_path}")
+    return _NestedSalvage(
+        bundle=str(bundle),
+        bundle_sha256=digest,
+        bundle_bytes=size,
+        receipt=str(receipt_path),
+        salvage_commit=salvage_commit,
+        refs=len(staged),
+        reason=conditions[0],
     )
 
 
@@ -30106,6 +30910,7 @@ def _judge_cache_nested_repositories(
     fenced_slot: Path,
     canonical_slot: Path,
     budget: _NestedGitBudget,
+    salvage: _NestedSalvageTarget | None = None,
 ) -> tuple[_DisposableNestedRepository, ...]:
     """Judge every nested repository a removal of ``cache`` would reach, in order."""
 
@@ -30118,6 +30923,7 @@ def _judge_cache_nested_repositories(
                     (canonical_slot, fenced_slot),
                     display=canonical_slot / dotgit.relative_to(fenced_slot),
                     budget=budget,
+                    salvage=salvage,
                 )
             )
         return tuple(judged)
@@ -30139,7 +30945,7 @@ def _nested_git_evidence_item(
 ) -> dict[str, object]:
     """Describe one repository judged disposable by its canonical path."""
 
-    return {
+    item: dict[str, object] = {
         "checkout": checkout,
         "path": str(canonical_slot / repository.path.relative_to(fenced_slot)),
         "head": repository.head,
@@ -30147,6 +30953,17 @@ def _nested_git_evidence_item(
         "ignored_entries": repository.ignored_entries,
         "ignored_sample": list(repository.ignored_sample),
     }
+    if repository.salvage is not None:
+        item.update(
+            {
+                "salvage_bundle": repository.salvage.bundle,
+                "salvage_bundle_sha256": repository.salvage.bundle_sha256,
+                "salvage_receipt": repository.salvage.receipt,
+                "salvage_commit": repository.salvage.salvage_commit,
+                "salvage_reason": repository.salvage.reason,
+            }
+        )
+    return item
 
 
 def _nested_git_evidence_from_obj(value: object, label: str) -> list[dict[str, object]]:
@@ -30156,7 +30973,19 @@ def _nested_git_evidence_from_obj(value: object, label: str) -> list[dict[str, o
     for index, raw in enumerate(_as_list(value, label)):
         item_label = f"{label}[{index}]"
         item = _as_mapping(raw, item_label)
-        _exact_keys(item, _NESTED_GIT_EVIDENCE_KEYS, set(), item_label)
+        _exact_keys(
+            item,
+            _NESTED_GIT_EVIDENCE_KEYS,
+            _NESTED_GIT_SALVAGE_EVIDENCE_KEYS,
+            item_label,
+        )
+        salvage_keys = _NESTED_GIT_SALVAGE_EVIDENCE_KEYS & set(item)
+        if salvage_keys and salvage_keys != _NESTED_GIT_SALVAGE_EVIDENCE_KEYS:
+            raise StateError(f"{item_label} records an incomplete salvage bundle")
+        for key in sorted(salvage_keys):
+            if key == "salvage_commit" and item[key] is None:
+                continue
+            _as_str(item[key], f"{item_label}.{key}")
         _as_str(item["checkout"], f"{item_label}.checkout")
         _as_str(item["path"], f"{item_label}.path")
         for key in ("head", "remote_ref"):
@@ -31717,6 +32546,8 @@ def _finish_journal_payload(
         payload["validation_removal_proof"] = _validation_removal_proof_to_obj(
             finish.validation_removal_proof
         )
+    if finish.archive_nested:
+        payload["archive_nested_cache_repositories"] = True
     return payload
 
 
@@ -33281,7 +34112,16 @@ def _finish_remove_paths(
                     head = vcs.verify_existing_worktree(
                         _stored_repository_path(config, checkout.repository)[1], moved_path
                     )
-                    if head != checkout.head or vcs.branch(moved_path) != checkout.branch:
+                    drift = (
+                        _salvage_receipt_drift(salvage, checkout.name)
+                        if record.slot_type == "agent"
+                        else None
+                    )
+                    if head != checkout.head or (
+                        vcs.branch(moved_path) != checkout.branch
+                        if drift is None
+                        else _observe_checkout_drift(vcs, checkout, moved_path) != drift
+                    ):
                         raise Refusal(
                             f"fenced checkout {checkout.name} changed after reclaim was "
                             "prepared; preserve it and rerun remove"
@@ -33343,6 +34183,18 @@ def _finish_remove_paths(
             nested_evidence: dict[Path, dict[str, object]] = {}
             nested_budget = _NestedGitBudget()
             canonical_slot = _slot_directory(config, record.slot, record.slot_type)
+            nested_salvage = (
+                _NestedSalvageTarget(
+                    archive_root=_default_salvage_archive_root(config),
+                    machine=record.machine,
+                    slot=record.slot,
+                    generation=record.generation,
+                    recorded_at=record.heartbeat_at,
+                    canonical_slot=canonical_slot,
+                )
+                if finish.archive_nested and record.slot_type == "agent"
+                else None
+            )
             if record.slot_type == "agent":
                 # Every guard above has passed.  Judge each nested repository
                 # in every cache before the first deletion, so a refusal
@@ -33355,6 +34207,7 @@ def _finish_remove_paths(
                             fenced_slot=fenced_slot,
                             canonical_slot=canonical_slot,
                             budget=nested_budget,
+                            salvage=nested_salvage,
                         )
                         if not judged:
                             continue
@@ -33409,6 +34262,7 @@ def _finish_remove_paths(
                             fenced_slot=fenced_slot,
                             canonical_slot=canonical_slot,
                             budget=nested_budget,
+                            salvage=nested_salvage,
                         )
                         if rejudged != judged_here:
                             raise Refusal(
@@ -33443,7 +34297,11 @@ def _finish_remove_paths(
             def described(items: Sequence[Mapping[str, object]]) -> str:
                 return ", ".join(
                     f"{item['path']} head={item['head']} "
-                    f"contained-by={item['remote_ref']}"
+                    + (
+                        f"kept-in={item['salvage_bundle']}"
+                        if "salvage_bundle" in item
+                        else f"contained-by={item['remote_ref']}"
+                    )
                     for item in items
                 )
 
@@ -33468,6 +34326,16 @@ def _finish_remove_paths(
                     "configuration) and checking out the listed head restores the "
                     "head's commits, but not uncommitted files, hooks or "
                     "unreferenced objects"
+                    + (
+                        "; a repository listed with kept-in= was kept, every ref, "
+                        "commit and non-ignored file, in that verified bundle "
+                        "before deletion"
+                        if any(
+                            "salvage_bundle" in item
+                            for item in (*deleted_nested, *deleting_nested)
+                        )
+                        else ""
+                    )
                 )
             if not removed:
                 try:
@@ -34097,7 +34965,11 @@ def _cmd_remove(
 
 
 def _prefetch_remote_containment(
-    config: Config, slot: str, salvage_archive_root: Path | None = None
+    config: Config,
+    slot: str,
+    salvage_archive_root: Path | None = None,
+    *,
+    archive_drifted: bool = False,
 ) -> None:
     """Do removal's slow salvage work for ``slot`` before the registry lock is taken.
 
@@ -34115,6 +34987,9 @@ def _prefetch_remote_containment(
     verified here too; removal under the lock finds it, rechecks its bytes,
     and writes the receipt. Every refusal here is dropped: the removal under
     the lock asks the same questions and reports them there.
+    With ``archive_drifted`` a drifted checkout's bundle is made and
+    verified here too, without contacting any remote (see _CheckoutDrift),
+    and its submodules' bundles are made instead of being left for a push.
     """
 
     try:
@@ -34133,17 +35008,24 @@ def _prefetch_remote_containment(
         )
         archive_root = salvage_archive_root or _default_salvage_archive_root(config)
         vcs = _GitVcs()
-        prepared: list[tuple[Checkout, Path, _SalvageCandidate]] = []
+        # (checkout, path, facts, drifted, never_push)
+        prepared: list[tuple[Checkout, Path, _SalvageCandidate, bool, bool]] = []
         for checkout in record.checkouts:
             path = _stored_path(config, checkout.path, "checkout path")
-            candidates: list[tuple[Checkout, Path, bool]] = [(checkout, path, False)]
+            drifted = (
+                archive_drifted
+                and _observe_checkout_drift(vcs, checkout, path) is not None
+            )
+            candidates: list[tuple[Checkout, Path, bool, bool]] = [
+                (checkout, path, False, drifted)
+            ]
             candidates.extend(
-                (submodule, submodule_path, True)
+                (submodule, submodule_path, True, False)
                 for submodule, submodule_path in _submodule_salvage_checkouts(
                     config, checkout, vcs
                 )
             )
-            for candidate, candidate_path, detached in candidates:
+            for candidate, candidate_path, detached, candidate_drifted in candidates:
                 prepared.append(
                     (
                         candidate,
@@ -34157,13 +35039,36 @@ def _prefetch_remote_containment(
                             allow_detached=detached,
                             verify_repository_membership=not detached,
                             allow_shallow=detached,
+                            accept_drift=candidate_drifted,
                         ),
+                        candidate_drifted,
+                        drifted,
                     )
                 )
     except Refusal:
         return
-    for candidate, candidate_path, facts in prepared:
+    for candidate, candidate_path, facts, drifted, never_push in prepared:
         try:
+            if drifted:
+                # No remote is asked: a drifted checkout is always archived.
+                _checked_root, bundle, _receipt, archive_ref = (
+                    _ensure_local_salvage_bundle(
+                        config,
+                        record.machine,
+                        record.slot,
+                        record.generation,
+                        candidate,
+                        candidate_path,
+                        facts,
+                        archive_root,
+                        vcs,
+                    )
+                )
+                digest, size = _sha256_regular_file(bundle, "local salvage bundle")
+                _verify_local_salvage_bundle(
+                    bundle, digest, size, archive_ref, facts.commit, vcs
+                )
+                continue
             published = vcs.remote_heads_containing(
                 candidate_path,
                 candidate.remote,
@@ -34177,8 +35082,10 @@ def _prefetch_remote_containment(
             if facts.shallow is not None:
                 # Refused under the lock (_shallow_history_refusal).
                 continue
-            if not facts.aliased and _salvage_push_allowed(
-                config, facts.remote_authority
+            if (
+                not never_push
+                and not facts.aliased
+                and _salvage_push_allowed(config, facts.remote_authority)
             ):
                 # A push is decided, and made, under the lock as before.
                 continue
@@ -34295,7 +35202,12 @@ def _cmd_remove_in_scope(
     )
     if private_cleanup is None and not bool(args.validate_complete):
         # Network work happens here, before the registry lock, not under it.
-        _prefetch_remote_containment(config, args.slot, salvage_archive_root)
+        _prefetch_remote_containment(
+            config,
+            args.slot,
+            salvage_archive_root,
+            archive_drifted=bool(getattr(args, "archive_drifted_checkouts", False)),
+        )
     wait_deadline = getattr(args, "_wait_deadline", None)
     lock_scope = (
         _mutation_locks(config, args.wait_lock)
@@ -34644,8 +35556,45 @@ def _cmd_remove_in_scope(
                 "verified before deletion, so there was no checkout to salvage",
             )
         else:
+            archive_drifted = bool(getattr(args, "archive_drifted_checkouts", False))
+            # Drift is archived only when the owner is proven dead: its exact
+            # process identity is gone (or no owner was ever recorded) and the
+            # registered liveness command answered dead. Without a release that
+            # command was required above; with a release it was only recorded,
+            # so its answer is required here. An owner that is still alive, or
+            # consented while alive, can restore its own checkout first.
+            owner_proven_dead = (
+                (owner_release is None and (owner_state == "dead" or owner_unrecorded))
+                or (
+                    owner_release is not None
+                    and owner_state == "dead"
+                    and consent_liveness is not None
+                    and consent_liveness[0] == "dead"
+                )
+            )
+            drift_refusal = (
+                None
+                if owner_proven_dead and owner_consent is None and not live_validate_owner
+                else (
+                    "--archive-drifted-checkouts archives drift only when the "
+                    "recorded owner is proven dead by its exact process identity "
+                    "and by the registered liveness command; the owner here is "
+                    f"{owner_state}"
+                    + (
+                        ""
+                        if consent_liveness is None
+                        else f" and registered liveness says {consent_liveness[0]}"
+                    )
+                    + ", so have it restore its recorded branch and remote first"
+                )
+            )
             salvage = _salvage_agent_slot(
-                config, record, _GitVcs(), archive_root=salvage_archive_root
+                config,
+                record,
+                _GitVcs(),
+                archive_root=salvage_archive_root,
+                archive_drifted=archive_drifted,
+                drift_refusal=drift_refusal,
             )
             evidence = tuple(
                 f"checkout {item['checkout']}: {item['disposition']} commit "
@@ -34710,6 +35659,10 @@ def _cmd_remove_in_scope(
         finish_context = _FinishContext(
             mode="remove",
             actor="coordinator",
+            archive_nested=(
+                record.slot_type == "agent"
+                and bool(getattr(args, "archive_nested_cache_repositories", False))
+            ),
             salvage=salvage,
             validate_complete=bool(args.validate_complete),
             allow_live_validate_owner=live_validate_owner,
@@ -34822,6 +35775,15 @@ def _cmd_remove_in_scope(
 
 def _print_nested_git_evidence(evidence: Sequence[Mapping[str, object]]) -> None:
     for item in evidence:
+        if "salvage_bundle" in item:
+            print(
+                f"removed nested Git repository {item['path']} after keeping it in "
+                f"verified bundle {item['salvage_bundle']} head={item['head']} "
+                f"salvage-commit={item['salvage_commit']} "
+                f"ignored-entries={item['ignored_entries']} "
+                f"reason={item['salvage_reason']}"
+            )
+            continue
         print(
             f"removed disposable nested Git repository {item['path']} "
             f"head={item['head']} contained-by={item['remote_ref']} "
@@ -38607,6 +39569,7 @@ def _recover_finish(
             validation_removal_proof=removal_proof,
             live_use_recheck=selected_live_use_recheck,
             owner_consented=owner_waived,
+            archive_nested=journal.get("archive_nested_cache_repositories") is True,
         )
         journal = _finish_remove_paths(
             config,
@@ -52340,6 +53303,9 @@ class _FinishContext:
     nested_git_evidence: list[dict[str, object]] = dataclasses.field(
         default_factory=list
     )
+    # remove --archive-nested-cache-repositories; journaled so a recovery
+    # judges the remaining caches the same way.
+    archive_nested: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -55848,6 +56814,37 @@ def _cmd_config_convert(args: argparse.Namespace) -> int:
     return 0
 
 
+_ARCHIVE_DRIFTED_CHECKOUTS_HELP = (
+    "for an agent slot whose recorded owner is proven dead (exact process identity gone "
+    "and the registered liveness command answering dead), do not refuse a checkout that "
+    "is on another branch than the recorded one, on a detached HEAD, or whose remote URL "
+    "changed: first keep its found HEAD, with every commit that HEAD reaches and its "
+    "uncommitted and untracked non-ignored files, in a self-contained Git bundle that is "
+    "read back (fresh bare clone, exact ref, full fsck) under the control directory's "
+    "wrkslots-salvage/ (or --salvage-archive-root), then remove it as if the found "
+    "branch and remote had been recorded. Nothing is pushed and no remote is contacted "
+    "for that checkout, and its submodules are never pushed either. Every later check "
+    "compares the checkout with the drift recorded in its salvage receipt, so any "
+    "further change refuses. Gitignored files and the recorded branch ref are not "
+    "touched, as for any agent removal. A live, consenting, or releasing owner still "
+    "gets the ordinary refusal (default: off, drift refuses)"
+)
+_ARCHIVE_NESTED_CACHE_REPOSITORIES_HELP = (
+    "for an agent slot, do not refuse a Git repository nested in a configured cache "
+    "directory (for example a vendored dependency checkout under target/) only because "
+    "it holds commits no counted remote-tracking ref contains, stash entries, or "
+    "uncommitted or untracked non-ignored files: first keep every ref, HEAD, every commit "
+    "object, and those files (as one salvage commit) in a self-contained Git bundle "
+    "under the control directory's wrkslots-salvage/, read it back (unbundled into an "
+    "empty repository, exact refs, full fsck), and judge it again before deletion. A "
+    "repository that is structurally unsafe to judge (a .git file or symbolic link, "
+    "alternates, linked worktrees, submodules, includes, filters, an operation in "
+    "progress, hidden index entries, local exclude rules, a shallow history) still "
+    "refuses, and so does one whose bundle cannot be made or verified. Gitignored files "
+    "are deleted with the cache as before (default: off, such a repository refuses)"
+)
+
+
 def _cmd_quickstart(_args: argparse.Namespace) -> int:
     print(_QUICKSTART)
     return 0
@@ -56859,6 +57856,16 @@ usage or audit gate unknown, 3 fail-closed refusal.
         ),
     )
     retire_pending.add_argument(
+        "--archive-drifted-checkouts",
+        action="store_true",
+        help="as for remove, for every target: " + _ARCHIVE_DRIFTED_CHECKOUTS_HELP,
+    )
+    retire_pending.add_argument(
+        "--archive-nested-cache-repositories",
+        action="store_true",
+        help="as for remove, for every target: " + _ARCHIVE_NESTED_CACHE_REPOSITORIES_HELP,
+    )
+    retire_pending.add_argument(
         "--format",
         choices=("human", "json"),
         default="human",
@@ -57044,6 +58051,16 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "time out meanwhile"
         ),
     )
+    remove.add_argument(
+        "--archive-drifted-checkouts",
+        action="store_true",
+        help=_ARCHIVE_DRIFTED_CHECKOUTS_HELP,
+    )
+    remove.add_argument(
+        "--archive-nested-cache-repositories",
+        action="store_true",
+        help=_ARCHIVE_NESTED_CACHE_REPOSITORIES_HELP,
+    )
     remove.set_defaults(handler=_cmd_remove)
 
     remove_validate_batch = subparsers.add_parser(
@@ -57198,6 +58215,19 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help=(
             "as for remove: verified local bundle root when the remote salvage push refuses "
             "or the remote is not listed in salvage_push_remotes"
+        ),
+    )
+    remove_agent_batch.add_argument(
+        "--archive-drifted-checkouts",
+        action="store_true",
+        help="as for remove, for every slot of the batch: " + _ARCHIVE_DRIFTED_CHECKOUTS_HELP,
+    )
+    remove_agent_batch.add_argument(
+        "--archive-nested-cache-repositories",
+        action="store_true",
+        help=(
+            "as for remove, for every slot of the batch: "
+            + _ARCHIVE_NESTED_CACHE_REPOSITORIES_HELP
         ),
     )
     remove_agent_batch.add_argument(

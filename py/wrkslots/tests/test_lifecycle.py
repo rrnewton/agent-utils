@@ -30691,7 +30691,11 @@ def test_local_remote_path_classifies_git_url_forms(
 
 
 def _remove_with_patch(
-    project: Path, patch: str, *, env: dict[str, str] | None = None
+    project: Path,
+    patch: str,
+    *,
+    env: dict[str, str] | None = None,
+    extra_args: Sequence[str] = (),
 ) -> subprocess.CompletedProcess[str]:
     """Run one agent removal in a process whose cli module ``patch`` altered first."""
 
@@ -30714,6 +30718,7 @@ def _remove_with_patch(
             str(os.getpid()),
             "--expected-generation",
             "1",
+            *extra_args,
         ],
         text=True,
         capture_output=True,
@@ -55218,3 +55223,638 @@ def test_recover_absent_agent_rows_refuses_the_whole_batch_before_any_row(
     assert "must run on the row's machine" in stderr
     assert wrkslots._load_active(config).slots == tuple(records)
     assert registry_journals(project) == []
+
+
+# --- remove --archive-drifted-checkouts -------------------------------------
+
+
+def _remove_archiving(
+    project: Path, *flags: str, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    return command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        *flags,
+        env=env,
+    )
+
+
+def _drifted_dead_owner_slot(
+    tmp_path: Path, drift: str
+) -> tuple[Path, Path, Path, Path, str]:
+    """A handed-off slot whose dead owner then changed its checkout.
+
+    Returns the project, its source repository, its remote, the checkout, and
+    the checkout's found HEAD, which no remote ref contains.
+    """
+
+    project, repository, remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    tree = checkout(project)
+    commit_task(repository, tree, "codex/task")
+    handed_off = finish(project)
+    assert handed_off.returncode == 0, handed_off.stderr
+    if drift == "branch":
+        git(tree, "checkout", "-q", "-b", "codex/other")
+    elif drift == "detached":
+        git(tree, "checkout", "-q", "--detach")
+    elif drift == "remote":
+        elsewhere = tmp_path / "elsewhere.git"
+        subprocess.run(
+            ["git", "init", "--bare", "--initial-branch=main", str(elsewhere)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        # A linked worktree shares its repository's remotes, so this is how a
+        # recorded remote changes under a slot (for example after a move).
+        git(tree, "remote", "set-url", "origin", str(elsewhere))
+    else:
+        raise AssertionError(drift)
+    head = commit_local(tree, "drift.txt", "drift work\n", "unpushed drift")
+    (tree / "scratch.txt").write_text("untracked notes\n", encoding="utf-8")
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    return project, repository, remote, tree, head
+
+
+_DRIFT_REFUSALS = {
+    "branch": "checkout product branch changed: expected codex/task, found codex/other",
+    "detached": "checkout must be on its registered branch, not detached",
+    "remote": "checkout product remote origin URL changed",
+}
+
+
+@pytest.mark.parametrize("drift", ("branch", "detached", "remote"))
+def test_archive_drifted_checkouts_keeps_found_head_in_verified_bundle_then_removes(
+    tmp_path: Path, drift: str
+) -> None:
+    project, repository, remote, tree, head = _drifted_dead_owner_slot(tmp_path, drift)
+    before = remote_refs(remote)
+    elsewhere = tmp_path / "elsewhere.git"
+    elsewhere_before = remote_refs(elsewhere) if elsewhere.exists() else None
+
+    # Without the flag the old refusal stands and nothing changes.
+    refused = remove(project)
+
+    assert refused.returncode == 3, refused.stdout + refused.stderr
+    assert _DRIFT_REFUSALS[drift] in refused.stderr
+    assert git(tree, "rev-parse", "HEAD").stdout.strip() == head
+    assert len(active_slots(project)) == 1
+
+    removed = _remove_archiving(project, "--archive-drifted-checkouts")
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert "differs from its recorded branch or remote, so nothing was pushed" in (
+        removed.stderr
+    )
+    assert not tree.exists()
+    assert active_slots(project) == []
+    # The fixture remote is in salvage_push_remotes, yet nothing was pushed
+    # anywhere, including to a changed remote URL.
+    assert remote_refs(remote) == before
+    if elsewhere_before is not None:
+        assert remote_refs(elsewhere) == elsewhere_before
+    control = control_directory(project)
+    archive = json.loads((control / "ARCHIVED.testhost.json").read_text(encoding="utf-8"))
+    receipt = archive["records"][0]["salvage"][0]
+    assert receipt["checkout"] == "product"
+    assert receipt["disposition"] == "archived-local"
+    assert receipt["archive_reason"] == "recorded-checkout-drift"
+    assert receipt["source_head"] == head
+    config = wrkslots._load_config(str(project), "testhost")
+    recorded_remote = hashlib.sha256(str(remote).encode("utf-8")).hexdigest()
+    observed_remote = (
+        hashlib.sha256(str(elsewhere).encode("utf-8")).hexdigest()
+        if drift == "remote"
+        else recorded_remote
+    )
+    assert receipt["recorded_checkout_drift"] == {
+        "recorded_branch": "codex/task",
+        "observed_branch": {"branch": "codex/other", "detached": None, "remote": "codex/task"}[
+            drift
+        ],
+        "recorded_remote_url_sha256": recorded_remote,
+        "observed_remote_url_sha256": observed_remote,
+    }
+    bundle = Path(receipt["archive_bundle"])
+    assert bundle.is_relative_to(config.control / "wrkslots-salvage")
+    assert hashlib.sha256(bundle.read_bytes()).hexdigest() == receipt["archive_bundle_sha256"]
+    on_disk = json.loads(Path(receipt["archive_receipt"]).read_text(encoding="utf-8"))
+    assert on_disk["recorded_checkout_drift"] == receipt["recorded_checkout_drift"]
+    restored = tmp_path / "restored.git"
+    git(tmp_path, "clone", "--bare", str(bundle), str(restored))
+    salvage_commit = receipt["salvage_commit"]
+    assert git(restored, "rev-parse", receipt["archive_ref"]).stdout.strip() == salvage_commit
+    # The unpushed commit and the untracked file are both in the bundle.
+    assert git(restored, "rev-parse", f"{salvage_commit}^").stdout.strip() == head
+    assert git(restored, "show", f"{salvage_commit}:drift.txt").stdout == "drift work\n"
+    assert git(restored, "show", f"{salvage_commit}:scratch.txt").stdout == (
+        "untracked notes\n"
+    )
+    # The recorded branch, and a found branch, live on in the source repository.
+    assert git(repository, "rev-parse", "--verify", "refs/heads/codex/task").returncode == 0
+    if drift == "branch":
+        assert git(repository, "rev-parse", "codex/other").stdout.strip() == head
+
+
+def test_archive_drifted_checkouts_keeps_commits_only_the_worktree_reflog_reaches(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    tree = checkout(project)
+    commit_task(repository, tree, "codex/task")
+    handed_off = finish(project)
+    assert handed_off.returncode == 0, handed_off.stderr
+    # A commit made on a detached HEAD, then abandoned by switching branches,
+    # is reachable only from this worktree's private HEAD reflog, which
+    # removing the worktree deletes.
+    git(tree, "checkout", "-q", "--detach")
+    abandoned = commit_local(tree, "abandoned.txt", "abandoned\n", "detached work")
+    git(tree, "checkout", "-q", "-b", "codex/other", "codex/task")
+    head = commit_local(tree, "drift.txt", "drift work\n", "unpushed drift")
+    assert git(repository, "branch", "--contains", abandoned).stdout.strip() == ""
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    removed = _remove_archiving(project, "--archive-drifted-checkouts")
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+    control = control_directory(project)
+    archive = json.loads((control / "ARCHIVED.testhost.json").read_text(encoding="utf-8"))
+    receipt = archive["records"][0]["salvage"][0]
+    assert receipt["source_head"] == head
+    restored = tmp_path / "restored.git"
+    git(tmp_path, "clone", "--bare", receipt["archive_bundle"], str(restored))
+    salvage_commit = receipt["salvage_commit"]
+    parents = git(restored, "rev-list", "--no-walk", "--parents", salvage_commit).stdout.split()
+    assert parents == [salvage_commit, head, abandoned]
+    assert git(restored, "show", f"{abandoned}:abandoned.txt").stdout == "abandoned\n"
+    # The salvage commit's tree is the found HEAD's tree: nothing else changes.
+    assert (
+        git(restored, "rev-parse", f"{salvage_commit}^{{tree}}").stdout
+        == git(restored, "rev-parse", f"{head}^{{tree}}").stdout
+    )
+
+
+def test_archive_drifted_checkouts_refuses_while_registered_liveness_says_alive(
+    tmp_path: Path,
+) -> None:
+    project, _repository, remote, tree, head = _drifted_dead_owner_slot(tmp_path, "branch")
+    set_liveness(project, "alive")
+    before = remote_refs(remote)
+
+    refused = _remove_archiving(project, "--archive-drifted-checkouts")
+
+    assert refused.returncode == 3, refused.stdout + refused.stderr
+    assert "no checkout was salvaged or removed" in refused.stderr
+    assert tree.is_dir()
+    assert git(tree, "rev-parse", "HEAD").stdout.strip() == head
+    assert (tree / "scratch.txt").is_file()
+    assert len(active_slots(project)) == 1
+    assert remote_refs(remote) == before
+
+
+def test_archive_drifted_checkouts_refuses_a_live_consenting_owner(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    tree = checkout(project)
+    _write_owner_handoff(project, tmp_path)
+    _read_owner_handoff(project)
+    expire_heartbeat(project)
+    git(tree, "config", "user.name", "Wrkslots Test")
+    git(tree, "config", "user.email", "wrkslots@example.invalid")
+    git(tree, "checkout", "-q", "-b", "codex/other")
+    head = commit_local(tree, "drift.txt", "drift work\n", "unpushed drift")
+
+    refused = _remove_archiving(project, "--archive-drifted-checkouts")
+
+    assert refused.returncode == 3, refused.stdout + refused.stderr
+    assert (
+        "--archive-drifted-checkouts archives drift only when the recorded owner is "
+        "proven dead"
+    ) in refused.stderr
+    assert "the owner here is live" in refused.stderr
+    assert tree.is_dir()
+    assert git(tree, "rev-parse", "HEAD").stdout.strip() == head
+    assert len(active_slots(project)) == 1
+
+
+def test_archive_drifted_checkouts_refuses_when_the_bundle_cannot_be_made(
+    tmp_path: Path,
+) -> None:
+    project, _repository, remote, tree, head = _drifted_dead_owner_slot(tmp_path, "branch")
+    before = remote_refs(remote)
+
+    refused = _remove_with_patch(
+        project,
+        """
+        def broken(*_args, **_kwargs):
+            raise cli.Refusal("injected: local salvage bundle could not be verified")
+        cli._ensure_local_salvage_bundle = broken
+        """,
+        extra_args=("--archive-drifted-checkouts",),
+    )
+
+    assert refused.returncode == 3, refused.stdout + refused.stderr
+    assert "injected: local salvage bundle could not be verified" in refused.stderr
+    assert tree.is_dir()
+    assert git(tree, "rev-parse", "HEAD").stdout.strip() == head
+    assert (tree / "scratch.txt").read_text(encoding="utf-8") == "untracked notes\n"
+    assert len(active_slots(project)) == 1
+    assert not _finish_journal(project).exists()
+    assert remote_refs(remote) == before
+
+
+def test_archive_drifted_checkouts_refuses_a_checkout_that_changes_after_archiving(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote, tree, head = _drifted_dead_owner_slot(
+        tmp_path, "branch"
+    )
+
+    refused = _remove_with_patch(
+        project,
+        """
+        import subprocess
+        original = cli._archive_salvage_locally
+        def racing(*args, **kwargs):
+            receipt = original(*args, **kwargs)
+            subprocess.run(
+                ["git", "-C", str(args[5]), "checkout", "-q", "-b", "codex/raced"],
+                check=True,
+            )
+            return receipt
+        cli._archive_salvage_locally = racing
+        """,
+        extra_args=("--archive-drifted-checkouts",),
+    )
+
+    assert refused.returncode == 3, refused.stdout + refused.stderr
+    assert (
+        "checkout product branch or remote changed after its recorded-checkout drift "
+        "was archived"
+    ) in refused.stderr
+    assert tree.is_dir()
+    assert git(tree, "rev-parse", "HEAD").stdout.strip() == head
+    assert git(tree, "symbolic-ref", "--short", "HEAD").stdout.strip() == "codex/raced"
+    assert len(active_slots(project)) == 1
+    assert not _finish_journal(project).exists()
+
+
+def test_archive_drifted_checkouts_recovers_from_its_finish_journal(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote, tree, head = _drifted_dead_owner_slot(
+        tmp_path, "detached"
+    )
+
+    interrupted = _remove_archiving(
+        project,
+        "--archive-drifted-checkouts",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-finish-journal"},
+    )
+
+    assert interrupted.returncode == 86, interrupted.stdout + interrupted.stderr
+    journal = json.loads(_finish_journal(project).read_text(encoding="utf-8"))
+    assert journal["salvage"][0]["recorded_checkout_drift"]["observed_branch"] is None
+    assert journal["salvage"][0]["source_head"] == head
+
+    recovered = command(project, "recover", "--coordinator-pid", str(os.getpid()))
+
+    assert recovered.returncode == 0, recovered.stdout + recovered.stderr
+    assert not tree.exists()
+    assert active_slots(project) == []
+    assert not _finish_journal(project).exists()
+
+
+def test_checkout_drift_receipt_parsing_refuses_inconsistent_records() -> None:
+    drift = {
+        "recorded_branch": "codex/task",
+        "observed_branch": None,
+        "recorded_remote_url_sha256": "a" * 64,
+        "observed_remote_url_sha256": "a" * 64,
+    }
+    parsed = wrkslots._checkout_drift_from_receipt(
+        {"disposition": "archived-local", "recorded_checkout_drift": drift}
+    )
+    assert parsed == wrkslots._CheckoutDrift("codex/task", None, "a" * 64, "a" * 64)
+    assert wrkslots._checkout_drift_from_receipt({"disposition": "salvaged"}) is None
+    for receipt, message in (
+        (
+            {"disposition": "already-published", "recorded_checkout_drift": drift},
+            "must be archived-local",
+        ),
+        (
+            {
+                "disposition": "archived-local",
+                "recorded_checkout_drift": {**drift, "observed_branch": "codex/task"},
+            },
+            "records no difference",
+        ),
+        (
+            {
+                "disposition": "archived-local",
+                "recorded_checkout_drift": {**drift, "extra": 1},
+            },
+            "invalid fields",
+        ),
+    ):
+        with pytest.raises(wrkslots.StateError) as refused:
+            wrkslots._checkout_drift_from_receipt(receipt)
+        assert message in str(refused.value)
+
+
+# --- remove --archive-nested-cache-repositories -----------------------------
+
+
+def _unbundle(tmp_path: Path, bundle: Path, name: str) -> tuple[Path, dict[str, str]]:
+    restored = tmp_path / name
+    subprocess.run(
+        ["git", "init", "--bare", "-q", str(restored)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    listed = git(restored, "bundle", "unbundle", str(bundle)).stdout
+    refs = dict(
+        (ref, sha) for sha, _space, ref in (line.partition(" ") for line in listed.splitlines())
+    )
+    for ref, sha in refs.items():
+        git(restored, "update-ref", ref, sha)
+    git(restored, "fsck", "--full", "--no-dangling")
+    return restored, refs
+
+
+def _cargo_style_nested_checkout(tmp_path: Path, tree: Path) -> tuple[Path, str]:
+    """A dependency checkout shaped like Cargo's copy of a Git dependency.
+
+    It is cloned from a local database repository and keeps no
+    remote-tracking ref, and Cargo's untracked ``.cargo-ok`` marker sits at its
+    root, so no counted ref contains its HEAD and its worktree has a change.
+    """
+
+    upstream = _bare_upstream(
+        tmp_path, "e9patch", {".gitignore": "*.o\n", "build.sh": "make\n"}
+    )
+    clone = tree / "target" / "install-build" / "e9patch"
+    head = _nested_clone(upstream, clone)
+    git(clone, "remote", "set-url", "origin", f"file://{upstream}")
+    git(clone, "update-ref", "-d", "refs/remotes/origin/main")
+    git(clone, "remote", "set-head", "origin", "-d", check=False)
+    (clone / ".cargo-ok").write_text("", encoding="utf-8")
+    (clone / "e9tool.o").write_bytes(b"\x7fELF object\n")
+    return clone, head
+
+
+def test_archive_nested_cache_repositories_keeps_cargo_style_checkout_then_removes(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path, cache_globs=("target",))
+    assert create(project).returncode == 0
+    tree = checkout(project)
+    commit_task(repository, tree, "codex/task")
+    clone, head = _cargo_style_nested_checkout(tmp_path, tree)
+    dotgit = clone / ".git"
+    _prepare_removable_agent_slot(project)
+
+    refused = remove(project)
+
+    assert refused.returncode == 3, refused.stdout + refused.stderr
+    assert (
+        f"cache directory contains nested Git metadata: {dotgit}: not provably "
+        "disposable: worktree has 1 uncommitted or untracked change(s), first: "
+        "'?? .cargo-ok'"
+    ) in refused.stderr
+    assert dotgit.is_dir()
+
+    removed = _remove_archiving(project, "--archive-nested-cache-repositories")
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+    assert active_slots(project) == []
+    evidence = _slot_removed_evidence(project)
+    assert len(evidence) == 1
+    item = wrkslots._as_mapping(evidence[0], "test evidence")
+    assert item["path"] == str(dotgit)
+    assert item["head"] == head
+    assert item["remote_ref"] is None
+    assert item["ignored_entries"] == 1
+    assert item["salvage_reason"] == (
+        "worktree has 1 uncommitted or untracked change(s), first: '?? .cargo-ok'"
+    )
+    bundle = Path(wrkslots._as_str(item["salvage_bundle"], "test bundle"))
+    control = control_directory(project)
+    assert bundle.is_relative_to(control / "wrkslots-salvage" / "testhost" / "slot01" / "1")
+    assert hashlib.sha256(bundle.read_bytes()).hexdigest() == item["salvage_bundle_sha256"]
+    receipt = json.loads(
+        Path(wrkslots._as_str(item["salvage_receipt"], "test receipt")).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert receipt["bundle_sha256"] == item["salvage_bundle_sha256"]
+    assert receipt["head"] == head
+    assert (
+        f"removed nested Git repository {dotgit} after keeping it in verified bundle "
+        f"{bundle} head={head}"
+    ) in removed.stdout
+    restored, refs = _unbundle(tmp_path, bundle, "restored-e9patch.git")
+    assert refs["refs/wrkslots-nested/ref/heads/main"] == head
+    assert refs["refs/wrkslots-nested/HEAD"] == head
+    worktree_commit = refs["refs/wrkslots-nested/worktree"]
+    assert worktree_commit == item["salvage_commit"]
+    assert git(restored, "rev-parse", f"{worktree_commit}^").stdout.strip() == head
+    names = git(restored, "ls-tree", "-r", "--name-only", worktree_commit).stdout.split()
+    # The untracked marker is kept; the ignored build output is not.
+    assert ".cargo-ok" in names and "build.sh" in names
+    assert "e9tool.o" not in names
+
+
+def test_archive_nested_cache_repositories_keeps_every_commit_object(
+    tmp_path: Path,
+) -> None:
+    project, repository, remote = make_project(tmp_path, cache_globs=("target",))
+    assert create(project).returncode == 0
+    tree = checkout(project)
+    commit_task(repository, tree, "codex/task")
+    clone = tree / "target" / "deps" / "work"
+    _nested_clone(remote, clone)
+    local = commit_local(clone, "local.txt", "local\n", "local only")
+    git(clone, "checkout", "-q", "-b", "side")
+    side = commit_local(clone, "side.txt", "side\n", "side branch")
+    git(clone, "checkout", "-q", "main")
+    (clone / "seed.txt").write_text("stashed\n", encoding="utf-8")
+    git(clone, "stash")
+    stash = git(clone, "rev-parse", "refs/stash").stdout.strip()
+    (clone / "seed.txt").write_text("dropped\n", encoding="utf-8")
+    git(clone, "stash")
+    dropped = git(clone, "rev-parse", "refs/stash").stdout.strip()
+    git(clone, "stash", "drop", "-q")
+    (clone / "seed.txt").write_text("edited\n", encoding="utf-8")
+    _prepare_removable_agent_slot(project)
+
+    removed = _remove_archiving(project, "--archive-nested-cache-repositories")
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+    evidence = _slot_removed_evidence(project)
+    item = wrkslots._as_mapping(evidence[0], "test evidence")
+    bundle = Path(wrkslots._as_str(item["salvage_bundle"], "test bundle"))
+    restored, refs = _unbundle(tmp_path, bundle, "restored-work.git")
+    for sha in (local, side, stash, dropped):
+        assert git(restored, "cat-file", "-e", f"{sha}^{{commit}}").returncode == 0
+    assert refs["refs/wrkslots-nested/ref/heads/side"] == side
+    worktree_commit = refs["refs/wrkslots-nested/worktree"]
+    assert git(restored, "show", f"{worktree_commit}:seed.txt").stdout == "edited\n"
+    # The remote is never written.
+    assert git(remote, "rev-parse", "--verify", "-q", "refs/heads/side", check=False).returncode != 0
+
+
+@pytest.mark.parametrize("case", ("info-exclude", "rebase-in-progress", "shallow"))
+def test_archive_nested_cache_repositories_still_refuses_what_it_cannot_keep(
+    tmp_path: Path, case: str
+) -> None:
+    project, repository, remote = make_project(tmp_path, cache_globs=("target",))
+    assert create(project).returncode == 0
+    tree = checkout(project)
+    commit_task(repository, tree, "codex/task")
+    clone = tree / "target" / "deps" / "work"
+    if case == "shallow":
+        clone.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "clone", "--depth", "1", f"file://{remote}", str(clone)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        git(clone, "config", "user.name", "Wrkslots Test")
+        git(clone, "config", "user.email", "wrkslots@example.invalid")
+        local = commit_local(clone, "local.txt", "local\n", "local only")
+        expected = "repository is shallow, so no bundle of it is self-contained"
+    else:
+        _nested_clone(remote, clone)
+        local = commit_local(clone, "local.txt", "local\n", "local only")
+        if case == "info-exclude":
+            (clone / ".git" / "info").mkdir(exist_ok=True)
+            (clone / ".git" / "info" / "exclude").write_text("secret\n", encoding="utf-8")
+            expected = ".git/info/exclude ignores 'secret'"
+        else:
+            git(clone, "-c", "sequence.editor=printf 'break\\n' >", "rebase", "-i", "HEAD")
+            expected = "a rebase is in progress (.git/rebase-merge exists)"
+    dotgit = clone / ".git"
+    _prepare_removable_agent_slot(project)
+
+    refused = _remove_archiving(project, "--archive-nested-cache-repositories")
+
+    assert refused.returncode == 3, refused.stdout + refused.stderr
+    assert f"cache directory contains nested Git metadata: {dotgit}: " in refused.stderr
+    assert expected in refused.stderr
+    assert dotgit.is_dir()
+    assert git(clone, "rev-parse", "HEAD").stdout.strip() == local
+    assert tree.is_dir()
+    assert len(active_slots(project)) == 1
+    assert not _finish_journal(project).exists()
+
+
+def test_archive_nested_cache_repositories_refuses_when_the_bundle_fails(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path, cache_globs=("target",))
+    assert create(project).returncode == 0
+    tree = checkout(project)
+    commit_task(repository, tree, "codex/task")
+    clone, head = _cargo_style_nested_checkout(tmp_path, tree)
+    _prepare_removable_agent_slot(project)
+
+    refused = _remove_with_patch(
+        project,
+        """
+        def broken(*_args, refuse, **_kwargs):
+            raise refuse("injected: salvage bundle failed its readback")
+        cli._salvage_nested_git_repository = broken
+        """,
+        extra_args=("--archive-nested-cache-repositories",),
+    )
+
+    assert refused.returncode == 3, refused.stdout + refused.stderr
+    assert "injected: salvage bundle failed its readback" in refused.stderr
+    assert (clone / ".git").is_dir()
+    assert (clone / ".cargo-ok").is_file()
+    assert git(clone, "rev-parse", "HEAD").stdout.strip() == head
+    assert tree.is_dir()
+    assert len(active_slots(project)) == 1
+    assert not _finish_journal(project).exists()
+
+
+def test_archive_nested_cache_repositories_recovers_after_evidence_is_journaled(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path, cache_globs=("target",))
+    assert create(project).returncode == 0
+    tree = checkout(project)
+    commit_task(repository, tree, "codex/task")
+    clone, head = _cargo_style_nested_checkout(tmp_path, tree)
+    dotgit = clone / ".git"
+    _prepare_removable_agent_slot(project)
+
+    interrupted = _remove_archiving(
+        project,
+        "--archive-nested-cache-repositories",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-nested-git-evidence-journaled"},
+    )
+
+    assert interrupted.returncode == 86, interrupted.stdout + interrupted.stderr
+    journal = json.loads(_finish_journal(project).read_text(encoding="utf-8"))
+    assert journal["archive_nested_cache_repositories"] is True
+    [journaled] = journal["nested_git_evidence"]
+    assert journaled["path"] == str(dotgit)
+    bundle = Path(journaled["salvage_bundle"])
+    assert bundle.is_file()
+
+    # Recovery judges the remaining cache the same way and finds the same bundle.
+    recovered = command(project, "recover", "--coordinator-pid", str(os.getpid()))
+
+    assert recovered.returncode == 0, recovered.stdout + recovered.stderr
+    assert not tree.exists()
+    assert active_slots(project) == []
+    [item] = _slot_removed_evidence(project)
+    assert item == journaled
+    assert wrkslots._as_mapping(item, "test evidence")["head"] == head
+    assert sorted(path.name for path in bundle.parent.iterdir()) == [
+        "receipt.json",
+        "repository.bundle",
+    ]
+
+
+def test_nested_git_evidence_parser_requires_complete_salvage_fields() -> None:
+    base: dict[str, object] = {
+        "checkout": "product",
+        "path": "/slot/target/x/.git",
+        "head": "a" * 40,
+        "remote_ref": None,
+        "ignored_entries": 0,
+        "ignored_sample": [],
+    }
+    salvage: dict[str, object] = {
+        "salvage_bundle": "/control/wrkslots-salvage/b",
+        "salvage_bundle_sha256": "b" * 64,
+        "salvage_receipt": "/control/wrkslots-salvage/r",
+        "salvage_commit": None,
+        "salvage_reason": "stash entries exist (refs/stash)",
+    }
+    assert wrkslots._nested_git_evidence_from_obj([{**base, **salvage}], "test") == [
+        {**base, **salvage}
+    ]
+    partial = {**base, "salvage_bundle": salvage["salvage_bundle"]}
+    with pytest.raises(wrkslots.StateError) as refused:
+        wrkslots._nested_git_evidence_from_obj([partial], "test")
+    assert "incomplete salvage bundle" in str(refused.value)

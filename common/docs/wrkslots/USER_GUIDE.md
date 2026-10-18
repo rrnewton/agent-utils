@@ -1056,6 +1056,47 @@ alias: unpublished nested work is kept in a verified local bundle. A local path 
 repository, including one whose remote names a different repository or no remote at all, still
 refuses.
 
+Two opt-in `remove` flags (also accepted by `remove-agent-batch` and `retire-pending`) reclaim
+dead-owner agent slots that the checks above otherwise refuse forever, by keeping the work in a
+verified local bundle first. Both are off by default; without them those slots keep their refusals.
+
+`--archive-drifted-checkouts` covers a checkout that is on another branch than the recorded one, on a
+detached HEAD, or whose remote URL changed ("branch changed ... update the recorded checkout", "not
+detached", "remote URL changed"). Nobody can update the record once the owner is gone, so the flag
+applies only when the owner is proven dead: its exact process identity is gone (or no owner was
+recorded) and the registered liveness command answers dead. A live owner, including one that
+consented with a handoff, keeps the refusal. For each drifted checkout, removal makes the ordinary
+salvage commit of its found HEAD and its uncommitted and untracked non-ignored files and keeps it,
+with the complete history it reaches, in a self-contained bundle under the control directory's
+`wrkslots-salvage/` (or `--salvage-archive-root`), read back by a fresh bare clone, the exact ref,
+and `git fsck --full --strict`. It never pushes and never asks a remote whether HEAD is published,
+because a changed remote URL may name a different repository; the checkout's submodules are not
+pushed either. The salvage receipt, in the event log, the finish journal, and the archive row,
+records `archive_reason: recorded-checkout-drift` and a `recorded_checkout_drift` object with the
+recorded and found branch (null when detached) and remote URL digests. Every later check, before
+the path fence, after it, and in `recover`, compares the checkout with that object instead of the
+record, so any further change refuses. Branch refs in the source repository, including the recorded
+one, are left alone, as for every agent removal.
+
+`--archive-nested-cache-repositories` covers a Git repository nested in a configured cache directory,
+such as a vendored dependency that a build copied under `target/`, that is not provably disposable
+only because of its content: commits no counted remote-tracking ref contains, stash entries, or
+uncommitted or untracked non-ignored files (Cargo's `.cargo-ok` marker in a dependency checkout is
+one). Every structural check still runs and still refuses: a `.git` file or link, a bare
+configuration, alternates, linked worktrees, module repositories, remotes defined in `.git/remotes` or `.git/branches`, includes,
+content filters, `core.worktree`, URL rewrites, an operation in progress, gitlinks, assume-unchanged
+or skip-worktree entries, `.git/info/exclude` rules, a self-ignored `.gitignore`, a remote name with
+`/`, and a shallow history. Otherwise the repository is kept in a bundle under
+`wrkslots-salvage/<machine>/<slot>/<generation>/nested/` holding every ref, HEAD, every commit
+object (each commit no other commit names as a parent gets a ref), and, when its worktree differs
+from HEAD, one salvage commit of its tracked and untracked non-ignored files. Nothing is written to
+the nested repository. The bundle is unbundled into an empty repository, its refs are compared with
+the expected ones, and `git fsck --full` must pass (not `--strict`, which rejects formatting quirks
+common in third-party histories); a schema-1 receipt binds its SHA-256. The repository is judged
+again immediately before deletion, which finds and rechecks the same bundle. Gitignored files are
+deleted with the cache, as before. The slot-removed evidence and the human output name the bundle.
+The finish journal records the flag, so `recover` judges the remaining caches the same way.
+
 For `recover-absent-agent-row(s)`, only the digest of a checkout's remote URL was recorded. A source
 repository whose remote has since moved between the GitHub spellings above for the same owner and
 repository (for example from `git@github.com:` to `https://github.com/`) is accepted when the
