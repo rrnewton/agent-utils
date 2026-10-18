@@ -1,12 +1,13 @@
 ---
 title: 'wrkslots-foreign-mount-ns: slot image mounts copied into unrelated mount namespaces block removal, defeat mount identity, and get mounted twice'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-10-18T21:50:31.687706272+00:00
-updated_at: 2026-10-18T21:50:31.687706272+00:00
+updated_at: 2026-10-18T23:05:52.175402756+00:00
+closed_at: 2026-10-18T23:05:52.175402596+00:00
 ---
 
 # Description
