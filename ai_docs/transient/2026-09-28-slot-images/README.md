@@ -207,7 +207,12 @@ files), not containment of a hostile agent.
   it through the descriptor, and acts on `/proc/self/fd/N`. The loop device is configured by
   ioctl from the pinned image descriptor (autoclear), so neither `mount` nor `losetup`
   re-resolves a path. Unmount re-checks the mount identity by lstat, then uses UMOUNT_NOFOLLOW
-  (an open descriptor would keep the mount busy).
+  (an open descriptor would keep the mount busy). Later change (2026-10-18, #350
+  wrkslots-foreign-mount-ns): every operation on an existing mount also names the image and
+  checks the loop device with LOOP_GET_STATUS64 against it by device and inode, `mount` reuses a
+  device that already holds the image instead of attaching a second one, and `umount`/`grow`
+  refuse an image attached twice; see the user guide's "Mounts copied into other mount
+  namespaces".
 - **Root helper identity (B3, S1).** uid and gid come from SUDO_UID/SUDO_GID, and groups from
   getgrouplist for that user; a spec that disagrees is refused. The spec lives in
   `$XDG_RUNTIME_DIR/wrkslots` (tmpfs, 0700, read-only inside every box). It must be a 0600,

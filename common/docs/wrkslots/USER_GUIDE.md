@@ -1851,16 +1851,92 @@ Nothing is written to host configuration; mounts are created and removed by wrks
 
 `WRKSLOTS_IMAGE_BACKEND` overrides the choice for one command. Every wrkslots command first
 mounts any image-backed slot whose image is not mounted (after a reboot, for example), at the
-location its `IMAGE.json` records, so lifecycle logic always sees the slot content. A slot's own
-image mount is not treated as a process using the slot.
+location its `IMAGE.json` records, so lifecycle logic always sees the slot content. A slot that
+cannot be mounted does not stop the others: each failure is printed as a warning naming its slot,
+and `wrkslots image mount` mounts every slot it can, then lists each failure and exits 3.
 
 A mount point cannot be renamed, so the path fence that removal uses unmounts the image, renames
 the empty mount point, and mounts the image again at the fenced path. The unmount refuses while
 something uses that particular mount, which is the same refusal the fence already expects. A process
 working in another mount of the same file system, such as a bind copy in this or another mount
-namespace, does not stop it, and keeps the old mount after the image is mounted again. Removal
-therefore checks an image-backed slot with `lsof` before the fence, while the old mount is still the
-slot's mount.
+namespace, does not stop it. Removal therefore checks an image-backed slot with `lsof` before the
+fence, while the old mount is still the slot's mount.
+
+### Mounts copied into other mount namespaces
+
+A process that creates a private mount namespace while slot images are mounted (a sandboxed build,
+a container, a per-session namespace) keeps its own copy of every slot mount. An unmount on the
+host does not reach that copy, so the copy keeps the image's loop device bound and the image file
+open. wrkslots handles such copies as follows.
+
+- **A slot's own mount is recognised by what it is, not by a path.** sysfs renders a loop
+  device's backing file relative to the root of the mount namespace that attached it; once that
+  namespace has exited (a session that ended, for example) the rendering resolves nowhere. wrkslots
+  therefore identifies the file system a loop device holds by its UUID: ext4 derives
+  `statvfs().f_fsid` from the superblock UUID, which `mkfs` makes unique for every image and which
+  is read from the user-owned image file; failing that, a backing path that does resolve to the
+  image file's own device and inode, or udev's probed `ID_FS_UUID`. A backing file shown as
+  deleted never matches the image now at that path. No privilege is needed. A loop mount at a
+  slot's location that cannot be identified is treated as unknown: unmount, removal and conversion
+  refuse rather than take it for "not mounted", and doctor reports `image-identity-unverifiable`.
+- **A copy of the slot's own mount is storage, not use.** The process-use census ignores a mount
+  line in any process's table only when it has the slot's own device, mounts the whole file system
+  (mount root `/`), and sits at the slot's recorded location. Every process-level check still runs
+  for every process, including those in the namespace holding the copy: a working directory, root,
+  open file or mapping inside the slot refuses as before, and so does a bind of part of the image.
+- **An image is never attached to a second loop device.** When the slot is mounted again while a
+  copy still holds its device (for example at the removal fence, or after a host-only unmount), the
+  root helper mounts that same device, re-checked on a descriptor it holds across `mount(2)`, so
+  there is still one file system. `image mount` prints "reusing /dev/loopN, which a copy in another
+  mount namespace still holds". If two devices already hold the image, it refuses.
+- **Unmounting releases the copies.** After a host unmount, if a device still holds the image,
+  wrkslots replaces the empty mount-point directory with a fresh one; the kernel detaches every
+  mount on the removed directory entry, in every namespace (lazily: a copy still in use keeps
+  working until it is left). `image unmount` exits 3 when a device still holds the image afterwards,
+  because the image file is then still open: do not copy it yet.
+- **Offline image tools refuse while a device holds the image.** A kernel image grows online only:
+  `image grow` mounts it first (reusing a held device) and never runs `e2fsck` or `resize2fs` on the
+  image file. A FUSE image is resized offline only when no loop device provably holds it, and not at
+  all while an unidentifiable loop device exists.
+
+**An image attached twice** (left by versions that attached a new loop device on every mount) holds
+two independent ext4 file systems on one file. Doctor reports `image-attached-twice` with both
+devices. The root helper refuses to mount, unmount or grow such an image, and the census reports
+the other attachment as use (`mount=<slot> [stale-image-copy=/dev/loopN: ...]`), because salvage
+reads only this host's own file system and the stale copy writes its old metadata into the image
+when it is released. To retire such a slot, while this host mounts one of the two devices:
+
+```sh
+wrkslots remove SLOT --coordinator-pid $$ --expected-generation N \
+    --coordinator-authorized --discard-stale-image-copy
+```
+
+This first finds every process whose mount table holds the stale device and refuses unless each
+shares this process's root (only then can the census see a use of the stale copy by path). The
+removal records an `active-state-recorded` event with action `stale-image-copy-discard-authorized`
+(the stale devices, their holder PIDs and mount namespaces) before salvage, and the reclaim evidence
+repeats them as `image_copies`. Anything written only through the stale copy is lost. A slot whose
+image is attached twice while this host mounts neither device cannot be salvaged, so it refuses:
+release one of the copies (stop the processes holding it) first.
+
+**A stray `.git` in an unmounted mount point.** Older versions repaired a moved checkout with
+`git worktree repair`, which rewrites every linked worktree's `.git` and so wrote into the empty
+mount points of unmounted image slots of the same repository; wrkslots now rewrites only the moved
+checkout's own link. A mount point left holding exactly Git's pointer to its own slot's worktree
+registration (one `.git` file of at most 4096 bytes reading `gitdir: <admin>` for this checkout,
+whose `<admin>/gitdir` names the mount point) is reported by `image mount`, which removes it only
+when given `--coordinator-authorized` and records `stray-git-pointer-removed` in the event log.
+Anything else in a mount point is never removed. While an image is not mounted, no Git check,
+salvage or repair runs against its mount point: the row reports `image-not-mounted` in `status` and
+`doctor` (a finding about that row only; commands naming other slots proceed with a warning), and
+commands naming the slot refuse with the reason.
+
+The root helper (`imagehelper.py`, run through `sudo -n`) names the image for every operation on
+an existing mount (`umount|trim|grow|rmdir-lost-found IMAGE MOUNT-POINT`) and checks with
+`LOOP_GET_STATUS64` that the mounted loop device is backed by exactly that user-owned file, by
+device and inode. A sudoers rule that pins the helper's exact arguments must be updated for that.
+The end-to-end check with a real private-namespace copy, `wrkslots/tests/e2e_foreign_namespace.sh`,
+needs passwordless sudo and unprivileged user namespaces.
 
 ### Converting an existing slot in place
 
