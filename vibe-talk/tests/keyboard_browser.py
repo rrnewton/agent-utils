@@ -686,9 +686,14 @@ def settings_keys(walk: Walk) -> None:
         # screen) once, and stays open for the second chord.
         walk.page.evaluate("() => { const all = document.getElementById('fold-settings-all'); "
                            "if (all.textContent.trim() === 'Expand all') all.click(); }")
+        # From the top each time: Settings keeps its place between visits, and since `#345
+        # settings-multi-column` tiles it into columns at this width the second visit, left where the
+        # first one paged to, could be near the foot with less than a page left to go.
+        walk.page.evaluate("() => { document.getElementById('screen-settings').scrollTop = 0; }")
+        start = walk.settled("screen-settings")
         paged = walk.key("PageDown", "screen-settings")
-        check(number(paged, "top") > number(opened, "top") + number(opened, "height") * 0.5,
-              f"PgDn on Settings did not scroll it: {opened['top']} -> {paged['top']}")
+        check(number(paged, "top") > number(start, "top") + number(start, "height") * 0.5,
+              f"PgDn on Settings did not scroll it: {start['top']} -> {paged['top']}")
         walk.shot(f"settings-{'comma' if chord == ',' else 'ctrl-comma'}")
         back = walk.key("Escape")
         check(back["screen"] == "main", f"Escape did not leave Settings: {back}")
