@@ -532,6 +532,9 @@ const session = {
   // ...and what the bridge said to it: null, `waiting`, `accepted` or `refused`.
   /** @type {string | null} */
   recapAck: null,
+  // ...and the line above the call its recap was said on when the call opened, null for none.
+  /** @type {Element | null} */
+  recapSeam: null,
 };
 
 // Recording is FIRE-AND-FORGET and gives up after the first failure.
@@ -6372,11 +6375,11 @@ function setSeamRecap(li, boundary) {
  * call's end drew, or the one the restored record ends with — while nothing said is between the two.
  * There is always one when anything is above: a call that opened ended with one, and a restored
  * record ends with one. A screen with nothing on it has nothing above to have been recapped.
- * Answers whether it said so: false when something said, drawn as it comes and filed only when its
- * turn ends, already stands below the line, or there is no line.
+ * Answers the line it said so on, or null: none when something said, drawn as it comes and filed
+ * only when its turn ends, already stands below the line, or there is no line.
  *
  * @param {any} recap
- * @returns {boolean}
+ * @returns {Element | null}
  */
 function settleBoundary(recap) {
   const rows = [...leftEl("transcript").children];
@@ -6384,12 +6387,12 @@ function settleBoundary(recap) {
     const row = rows[at];
     if (row.getAttribute("data-ends") !== null) {
       setSeamRecap(row, boundaryFor(recap, row.getAttribute("data-cause")));
-      return true;
+      return row;
     }
     // Something said below every boundary: the line above it is not this call's.
-    if (row.getAttribute("data-search") !== null) return false;
+    if (row.getAttribute("data-search") !== null) return null;
   }
-  return false;
+  return null;
 }
 
 /**
@@ -6411,7 +6414,7 @@ function drawBoundary(cause, endsId) {
  */
 function noteCallRecap(recap) {
   session.recap = recap;
-  settleBoundary(recap);
+  session.recapSeam = settleBoundary(recap);
   renderCallRecap();
 }
 
@@ -6531,10 +6534,18 @@ function noteReplayAck(message) {
     addDetail(`the voice service refused the recap: ${reason}`);
     resumeLast = { ...resumeLast, armed: false, refused: true };
     const recap = { state: "none", why: "refused", dropped: 0 };
-    noteCallRecap(recap);
-    // The conversation's start marker, while it still waits to be filed, says so as well.
+    session.recap = recap;
+    // The session that refused it is the one every turn of the call went to, so the line above the
+    // call says so however much has been drawn below it, and so does the conversation's start
+    // marker. Once that marker is filed, with the first turn to end, a reload draws what it holds:
+    // the line keeps that as well, so the two never disagree.
     const start = startMarkers.get(session.conversationId);
-    if (start) start.recap = recap;
+    const seam = session.recapSeam;
+    if (start) {
+      start.recap = recap;
+      if (seam && seam.parentNode) setSeamRecap(seam, boundaryFor(recap, seam.getAttribute("data-cause")));
+    }
+    renderCallRecap();
   }
   renderResumeState();
 }
@@ -14850,6 +14861,7 @@ async function openConversation(options) {
   session.recordedAny = false;
   session.recap = null;
   session.recapAck = null;
+  session.recapSeam = null;
   session.pendingResume = null;
   session.conversationId = null;
   // Fetched HERE, before the socket exists, so a slow or failing store delays the call rather than

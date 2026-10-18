@@ -4493,7 +4493,9 @@ voice providers](#conversational-voice-providers)); what matters here is when it
   costs a call that says "this voice session takes no recap" — never a frame sent into a session
   that cannot take it. A `replay_ack` with `accepted: true` turns "Sent the agent …" into "Caught the
   agent up with …"; `accepted: false` makes the call "Started fresh: the voice service refused the
-  recap", and its seam "recap refused".
+  recap", and its seam and start marker "recap refused", even with a greeting already on screen.
+  Only a turn filed before the answer came (its marker goes with it) leaves both saying the recap
+  was sent, so a reload still draws what the live seam said.
 * **A replacement session is sent none.** The record goes once per call, to the session the call
   opened with. A second `session_started` on the same socket is a model session that never saw it,
   whatever it lists: the page sends it nothing, the line under the call says "Started fresh: the
