@@ -51,6 +51,14 @@
 //!   which the file still holds until the hourly expiry takes it out, is recorded as left out.
 //! - **A push lifting a drop**: no push vouches for a message a dropped change left in doubt, since
 //!   it says nothing of whether that change came before it.
+//!
+//! And what the fifth review of the fix found:
+//!
+//! - **A read begun before an un-timed pushed edit**: a push with no edit time leaves the held
+//!   edit time at the version before it, so a read begun no later than the push must not take a
+//!   later edit time of its own for proof of a later version. Nor may a read begun earlier once a
+//!   bridge's read that cannot say when its text was edited has replaced the held text, or proved
+//!   a pushed one whole.
 
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
@@ -2113,4 +2121,251 @@ fn a_push_never_lifts_the_doubt_a_dropped_change_left() {
         );
     }
     assert!(vouched.is_empty(), "a push lifted the drop: {vouched:#?}");
+}
+
+// ---- the fifth review of the fix: a read begun before an un-timed pushed edit ------------------
+
+/// What the cache would decide for a window of `limit` of a live-fed bridge's channel, asked at
+/// `asked_ms`, and the text it holds for m3.
+fn decide_window_m3(
+    cache: &MessageCache,
+    chan: &ChanKey,
+    limit: usize,
+    asked_ms: i64,
+) -> (shadow::Decision, Option<String>) {
+    let ask = window(limit);
+    let query = shadow::query(&ask, observe::Shape::Bridge, true).expect("a query");
+    let view = cache.shadow_view(chan, &query).served().expect("served");
+    let facts = shadow::Facts {
+        asked_ms,
+        live_fed: true,
+        fed_since_ms: Some(cache.fed_since_ms()),
+        dropped_ms: cache.last_drop_ms(chan),
+        barrier: true,
+        feed: shadow::Feed::Deletions,
+    };
+    let m3 = view
+        .rows
+        .iter()
+        .find(|r| r.message.id.0 == "m3")
+        .map(|r| r.message.content.clone());
+    (shadow::decide(&ask, &view, &facts), m3)
+}
+
+/// A bridge whose reads carry edit times, and whose adapter pushes edits without one (the contract
+/// lets `edited_timestamp` be absent). A read brings m3 as edited once (`v1`, edited at E0). The
+/// adapter pushes an un-timed edit to `v2`. A read begins and sees `v2`, edited at E2. The adapter
+/// pushes an un-timed edit to `v3`, and only then does the read land: a read by id, or with
+/// `listing` a proven listing of Flat's newest end. An un-timed edit leaves the held edit time at
+/// E0, so the read's E2 looked like a later edit than the one held, and its `v2` was stored as the
+/// whole message, with the read's older time: nothing recorded the push of `v3`, and the feed
+/// vouched for `v2`. The read began before that push, so it must change nothing (rule 5). Returns
+/// each answer that serves m3 as anything but `v3`, by id and in a window of 8, 5 s on and a day
+/// and an hour on.
+fn read_begun_before_an_untimed_edit(listing: bool) -> Vec<String> {
+    let dir = crate::testing::TempDir::new("cache-untimed-edit-race");
+    let first = T0 + 8 * STEP + SEC;
+    let clock = Arc::new(ManualClock(AtomicI64::new(first)));
+    let (cache, chan) = bridge_with_flat(&dir, &clock, first);
+    let edited = |text: &str, edited_ms: i64| Message {
+        content: text.to_owned(),
+        edited_timestamp: Some(crate::clock::iso_from_ms(edited_ms)),
+        ..m(3)
+    };
+    clock.set(first + 5 * SEC);
+    read_by_id(
+        &cache,
+        &chan,
+        edited("v1 text", first + 2 * SEC),
+        first + 5 * SEC,
+    );
+    clock.set(first + 10 * SEC);
+    push_text(&cache, &chan, m(3), "v2 text", true, first + 10 * SEC);
+    let read_began = first + 12 * SEC;
+    clock.set(read_began);
+    let stamp = cache.stamp(&chan);
+    clock.set(first + 20 * SEC);
+    push_text(&cache, &chan, m(3), "v3 text", true, first + 20 * SEC);
+    clock.set(first + 21 * SEC);
+    let v2 = edited("v2 text", first + 10 * SEC);
+    let observation = if listing {
+        Observation::Listing(Listing {
+            scope: Scope::Flat,
+            rows: (1..=8)
+                .map(|n| Incoming::new(if n == 3 { v2.clone() } else { m(n) }, Scope::Flat))
+                .collect(),
+            observed_ms: read_began,
+            proof: Some(newest_proof(ListStart::At(T0 + STEP))),
+        })
+    } else {
+        Observation::Rows {
+            rows: vec![Incoming::new(v2, Scope::Flat)],
+            scope: None,
+            observed_ms: read_began,
+        }
+    };
+    cache.offer(chan.clone(), stamp, observation);
+    assert!(cache.quiesce_blocking(WAIT));
+    let how = if listing { "a listing" } else { "a read by id" };
+    let mut vouched = Vec::new();
+    for asked in [first + 26 * SEC, first + 25 * HOUR] {
+        clock.set(asked);
+        let (decision, content, partial) = decide_id(&cache, &chan, "m3", asked);
+        if decision == shadow::Decision::Serve && content.as_deref() != Some("v3 text") {
+            vouched.push(format!(
+                "{how}, by id, asked {} s on: {decision:?} {content:?} partial {partial:?}",
+                (asked - first) / SEC
+            ));
+        }
+        let (decision, content) = decide_window_m3(&cache, &chan, 8, asked);
+        if decision == shadow::Decision::Serve && content.as_deref() != Some("v3 text") {
+            vouched.push(format!(
+                "{how}, a window of 8, asked {} s on: {decision:?} m3 {content:?}",
+                (asked - first) / SEC
+            ));
+        }
+    }
+    vouched
+}
+
+/// The review's probe
+/// `r7_a_a_read_begun_before_an_untimed_pushed_edit_never_puts_back_the_version_before_it`.
+#[test]
+fn a_read_begun_before_an_untimed_pushed_edit_never_puts_back_the_version_before_it() {
+    let mut vouched = read_begun_before_an_untimed_edit(false);
+    vouched.extend(read_begun_before_an_untimed_edit(true));
+    assert!(
+        vouched.is_empty(),
+        "text edited away vouched for: {vouched:#?}"
+    );
+}
+
+/// The review's control: the same race with no edit time on the read's copy keeps `v3`, held as
+/// possibly a snippet, so never served.
+#[test]
+fn control_a_read_begun_before_an_untimed_pushed_edit_without_an_edit_time_keeps_the_pushed_text() {
+    let dir = crate::testing::TempDir::new("cache-untimed-edit-race-control");
+    let first = T0 + 8 * STEP + SEC;
+    let clock = Arc::new(ManualClock(AtomicI64::new(first)));
+    let (cache, chan) = bridge_with_flat(&dir, &clock, first);
+    clock.set(first + 10 * SEC);
+    push_text(&cache, &chan, m(3), "v2 text", true, first + 10 * SEC);
+    let read_began = first + 12 * SEC;
+    clock.set(read_began);
+    let stamp = cache.stamp(&chan);
+    clock.set(first + 20 * SEC);
+    push_text(&cache, &chan, m(3), "v3 text", true, first + 20 * SEC);
+    clock.set(first + 21 * SEC);
+    cache.offer(
+        chan.clone(),
+        stamp,
+        Observation::Rows {
+            rows: vec![Incoming::new(
+                Message {
+                    content: "v2 text".to_owned(),
+                    ..m(3)
+                },
+                Scope::Flat,
+            )],
+            scope: None,
+            observed_ms: read_began,
+        },
+    );
+    assert!(cache.quiesce_blocking(WAIT));
+    let asked = first + 26 * SEC;
+    clock.set(asked);
+    let (decision, content, partial) = decide_id(&cache, &chan, "m3", asked);
+    assert_eq!(content.as_deref(), Some("v3 text"));
+    assert_eq!(partial, Some(true));
+    assert_ne!(decision, shadow::Decision::Serve);
+}
+
+/// The same root, by a read that carries no edit time (a bridge's copy may come by a path that
+/// cannot say). Proven whole by such a read, begun at 15 s, the pushed `v3` is served, so the read
+/// begun before the push that brings `v2`, edited at E2, must still change nothing. And with no push
+/// at all: such a read, begun at 30 s, brings `v3` over `v1`, and a read begun at 25 s lands with
+/// `v2`, edited at E2. E2 is later than `v1`'s E0, but not therefore than `v3`, whose edit time
+/// nothing said. Asked 5 s on, and a day and an hour on.
+#[test]
+fn a_read_that_cannot_say_when_its_text_was_edited_never_lets_an_earlier_read_put_back_an_older_one(
+) {
+    let mut vouched = Vec::new();
+    for case in ["a pushed text proven whole", "a read's text replaced"] {
+        let dir = crate::testing::TempDir::new("cache-untimed-read");
+        let first = T0 + 8 * STEP + SEC;
+        let clock = Arc::new(ManualClock(AtomicI64::new(first)));
+        let (cache, chan) = bridge_with_flat(&dir, &clock, first);
+        let edited = |text: &str, edited_ms: i64| Message {
+            content: text.to_owned(),
+            edited_timestamp: Some(crate::clock::iso_from_ms(edited_ms)),
+            ..m(3)
+        };
+        let untimed_v3 = Message {
+            content: "v3 text".to_owned(),
+            ..m(3)
+        };
+        clock.set(first + 5 * SEC);
+        read_by_id(
+            &cache,
+            &chan,
+            edited("v1 text", first + 2 * SEC),
+            first + 5 * SEC,
+        );
+        let read_began = if case == "a pushed text proven whole" {
+            clock.set(first + 10 * SEC);
+            push_text(&cache, &chan, m(3), "v2 text", true, first + 10 * SEC);
+            first + 12 * SEC
+        } else {
+            first + 25 * SEC
+        };
+        clock.set(read_began);
+        let stamp = cache.stamp(&chan);
+        if case == "a pushed text proven whole" {
+            clock.set(first + 20 * SEC);
+            push_text(&cache, &chan, m(3), "v3 text", true, first + 20 * SEC);
+            clock.set(first + 21 * SEC);
+            read_by_id(&cache, &chan, untimed_v3, first + 15 * SEC);
+        } else {
+            clock.set(first + 31 * SEC);
+            read_by_id(&cache, &chan, untimed_v3, first + 30 * SEC);
+        }
+        let asked = first + 32 * SEC;
+        clock.set(asked);
+        assert_eq!(
+            decide_id(&cache, &chan, "m3", asked),
+            (
+                shadow::Decision::Serve,
+                Some("v3 text".to_owned()),
+                Some(false)
+            ),
+            "{case}: the control, v3 held whole"
+        );
+        cache.offer(
+            chan.clone(),
+            stamp,
+            Observation::Rows {
+                rows: vec![Incoming::new(
+                    edited("v2 text", first + 10 * SEC),
+                    Scope::Flat,
+                )],
+                scope: None,
+                observed_ms: read_began,
+            },
+        );
+        assert!(cache.quiesce_blocking(WAIT));
+        for asked in [first + 37 * SEC, first + 25 * HOUR] {
+            clock.set(asked);
+            let (decision, content, partial) = decide_id(&cache, &chan, "m3", asked);
+            if decision == shadow::Decision::Serve && content.as_deref() != Some("v3 text") {
+                vouched.push(format!(
+                    "{case}, asked {} s on: {decision:?} {content:?} partial {partial:?}",
+                    (asked - first) / SEC
+                ));
+            }
+        }
+    }
+    assert!(
+        vouched.is_empty(),
+        "an older text vouched for: {vouched:#?}"
+    );
 }

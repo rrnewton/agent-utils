@@ -2062,6 +2062,18 @@ impl Writer<'_> {
         if hash == held.content_hash {
             next.edited_ms = later(held.edited_ms, incoming.edited_ms);
         }
+        // A read that cannot say when its text was edited (a bridge's copy with no edit time) and
+        // that replaces the held text, or proves a pushed text whole, leaves the row with no edit
+        // time. The one held may be of a version before that text (a push with no edit time keeps
+        // the one before it), so a read begun earlier that carries a later one is not therefore of
+        // a later version (merge rule 2).
+        if !arrival.is_push()
+            && incoming.edited_ms.is_none()
+            && !incoming.reports_edits
+            && matches!(verdict, Verdict::Replace { .. } | Verdict::Confirm)
+        {
+            next.edited_ms = None;
+        }
         // A read that began after the channel's latest drop, and found the text the file holds,
         // vouches for the row again: whatever the dropped offer said of it (an edit, a deletion)
         // came before this read. Only then does a read of unchanged text move the time, so that

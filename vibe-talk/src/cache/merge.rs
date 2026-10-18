@@ -15,7 +15,12 @@
 //!    version older than a held copy that reports one, and one that reports an edit is newer than
 //!    a held copy that reports none. That is what keeps a copy a provider served from memory (a
 //!    Slack reply Flat last read in full up to a quarter of an hour before, offered as seen at the
-//!    window's start) from putting back text a later read had already replaced.
+//!    window's start) from putting back text a later read had already replaced. But a copy with no
+//!    edit time, from a path that cannot say, may bring a later version than the held time is of,
+//!    so after it that time no longer shows which of two versions is later. A push leaves that
+//!    time in place, to keep out copies older still, and rule 5 keeps out a read begun no later
+//!    than the push, whatever its edit time; a bridge's read that replaces the held text, or
+//!    proves a pushed one whole, leaves the row with no edit time at all ([`super::writer`]).
 //! 3. **Deletions** delete the row and leave a [tombstone](crate::cache) holding nothing derived
 //!    from the content. Only a read that started after the deletion brings the id back. A push
 //!    never does: a pushed creation or edit that lands after the deletion (an event retried, two
@@ -38,7 +43,9 @@
 //!    replaces the held text, whether that text was a read's or a push's. Only a read proves it
 //!    whole: one that brings the same text, whenever it began, or one that began after the push,
 //!    whatever text it brings (rule 2). A read that began no later than the push, with other text,
-//!    changes nothing: it may be of the version before an edit the push brought. And a snippet
+//!    changes nothing, whatever edit time it carries: it may be of the version before an edit the
+//!    push brought, and a push with no edit time leaves the held one at the version before it, so
+//!    a later one on the read does not make it the later version (rule 2). And a snippet
 //!    never overwrites text a read brought: a pushed edit that is a strict prefix of it (a trailing
 //!    `…` ignored) changes nothing. Such a prefix may as well be the whole of an edit that cut the
 //!    end off, or a snippet of one that changed what follows it, so the writer records the push,
@@ -153,6 +160,12 @@ pub fn content_verdict(held: &Held<'_>, offered: &Offered<'_>) -> Verdict {
         return Verdict::Keep;
     }
     let newer_observation = offered.observed_ms > held.observed_ms;
+    // A read begun no later than the push that brought a partial text, with other text, changes
+    // nothing, whatever edit time it carries (rule 5): a push with no edit time leaves the held
+    // one at the version before it, so a later one on the read says nothing of which is newer.
+    if held.partial && !pushed && !newer_observation {
+        return Verdict::Keep;
+    }
     let newer_edit = order == Some(std::cmp::Ordering::Greater);
     if newer_observation || newer_edit {
         // What a push brings may be a snippet, whatever it replaces; a read's copy is whole.
@@ -418,6 +431,30 @@ mod tests {
                     Verdict::Keep,
                     "{arrival:?} at {at}"
                 );
+            }
+            // ...whatever edit time it carries: a push with no edit time left the held one at the
+            // version before it...
+            let (partial_hash, mut partial) = held("The full", 30, true);
+            partial.content_hash = &partial_hash;
+            partial.edited_ms = Some(100);
+            let whole = crate::cache::rows::content_hash(text);
+            for at in [5, 30] {
+                for reports_edits in [false, true] {
+                    let read = Offered {
+                        content: text,
+                        content_hash: &whole,
+                        observed_ms: at,
+                        edited_ms: Some(200),
+                        reports_edits,
+                        arrival,
+                        partial: false,
+                    };
+                    assert_eq!(
+                        content_verdict(&partial, &read),
+                        Verdict::Keep,
+                        "{arrival:?} at {at}, reporting edits {reports_edits}"
+                    );
+                }
             }
             // ...and one that carries the same text confirms it, whenever it began.
             assert_eq!(

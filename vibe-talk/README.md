@@ -3839,13 +3839,15 @@ A pushed text may be cut short. A bridge sends the start of a message rather tha
 when its live event carries no body, and nothing in the push says which it sent. So whatever text a
 push brings, a new message's or an edit's, is held as possibly cut short, and is never counted as
 one the cache would answer with until a read has brought the whole text: one that brings the same
-text, whenever it began, or one that began after the push. A read that began no later than the
-push and brings other text changes nothing, since it may be from before the edit. A pushed edit
-that is only the start of the text a read brought does not replace it; but it may as well be the
-whole of an edit that cut the end off, so the channel is then in doubt, as after a change left out.
-So it is whenever a pushed edit is not taken: one older, by its edit time, than the text held, one
-seen no later than the read that brought that text, or one of a message past the channel's age
-limit, which the cache still holds, with its old text, until the hourly expiry takes it out.
+text, whenever it began, or one that began after the push. A read that began no later than the push
+and brings other text changes nothing, since it may be from before the edit, even when it says the
+message was edited later than the cache knew: a push that does not say when the message was edited
+leaves the cache knowing only when the version before it was. A pushed edit that is only the start
+of the text a read brought does not replace it; but it may as well be the whole of an edit that cut
+the end off, so the channel is then in doubt, as after a change left out. So it is whenever a pushed
+edit is not taken: one older, by its edit time, than the text held, one seen no later than the read
+that brought that text, or one of a message past the channel's age limit, which the cache still
+holds, with its old text, until the hourly expiry takes it out.
 
 Nor does anything pushed lift a doubt. A push says nothing of whether the change left out came
 before it: an event sent again, or delivered out of order, can arrive after the deletion that took
