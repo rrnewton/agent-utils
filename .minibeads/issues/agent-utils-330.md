@@ -1,12 +1,13 @@
 ---
 title: 'voice-long-turn-drop: a long spoken summary is not shown as text and the call ends midway'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-15T15:52:38.613292169+00:00
-updated_at: 2026-10-15T15:52:38.613292169+00:00
+updated_at: 2026-10-18T15:51:00.071360545+00:00
+closed_at: 2026-10-18T15:51:00.071360455+00:00
 ---
 
 # Description
