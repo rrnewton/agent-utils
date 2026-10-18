@@ -209,3 +209,37 @@ def test_a_former_name_beyond_the_history_cap_still_finds_the_live_lifetime(
     write_record(registry / "new", "new", name_history=history("recent"), former_names=["old"],
                  harness_identity=identity(os.getpid()))
     assert run(tmp_path, "old")[0] == 1
+
+
+def test_a_name_no_record_carries_is_the_one_bound_no_record_line(tmp_path: Path) -> None:
+    """A readable registry with no record of the name says exactly that, on one line.
+
+    `wrkslots remove --attest-agent-stopped` accepts a coordinator's attestation
+    only for this answer, so its shape is part of the protocol.
+    """
+
+    (tmp_path / ".agentctl").mkdir()
+    assert run(tmp_path, "hold-x") == (
+        2, "unverifiable agent=hold-x rc=2 reason=no-agentctl-record\n"
+    )
+    write_record(tmp_path / ".agentctl/archive/other-abc", "other")
+    assert run(tmp_path, "hold-x") == (
+        2, "unverifiable agent=hold-x rc=2 reason=no-agentctl-record\n"
+    )
+
+
+def test_a_missing_registry_is_not_a_no_record_answer(tmp_path: Path) -> None:
+    """A registry that is not there says nothing about the agent.
+
+    A misconfigured registry location must not make every agent look
+    unregistered, or a coordinator's attestation would be accepted for an agent
+    whose real registry still records it.
+    """
+
+    assert run(tmp_path, "hold-x") == (
+        2, "unverifiable agent=hold-x rc=2 reason=no-agentctl-registry\n"
+    )
+    (tmp_path / ".agentctl").write_text("not a directory\n", encoding="utf-8")
+    assert run(tmp_path, "hold-x") == (
+        2, "unverifiable agent=hold-x rc=2 reason=no-agentctl-registry\n"
+    )
