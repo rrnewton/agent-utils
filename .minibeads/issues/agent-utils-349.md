@@ -1,12 +1,13 @@
 ---
 title: 'channel-settings-all: All channels in Settings'' channel picker, to set Clear unread everywhere at once'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-18T20:43:26.576172107+00:00
-updated_at: 2026-10-18T20:43:26.576172107+00:00
+updated_at: 2026-10-18T21:30:07.424826710+00:00
+closed_at: 2026-10-18T21:30:07.424826610+00:00
 ---
 
 # Description
