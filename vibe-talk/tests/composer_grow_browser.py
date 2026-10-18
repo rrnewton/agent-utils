@@ -15,9 +15,11 @@ page out in Chromium and measures the box, Send and the list they are in, with a
   no more, scrolling inside, `field-sizing: content` computed, Send wholly on screen inside the list ->
   three short lines fit the box, under its cap -> Send clears the box and it rests again; then at
   1280x800 a reload keeps it ticked, and with a long draft kept for the channel the reload is back at
-  the list's foot with Send on screen; in a short 1280x600 window the long paste still leaves Send on
-  screen; and at 1920x1080 in two columns, the right column's Grow ticked in step and a long paste into
-  its box growing it with that column's Send on screen.
+  the list's foot with Send on screen, and the call's box, with its recap line (`#331
+  resume-on-websocket`) shown above it, keeps that line across the composer and Grow left of Send on
+  Send's row; in a short 1280x600 window the long paste still leaves Send on screen; and at 1920x1080
+  in two columns, the right column's Grow ticked in step and a long paste into its box growing it with
+  that column's Send on screen.
 
   A second desk whose browser does not size a field by its text (`CSS.supports` answering no for
   `field-sizing`, and `field-sizing: fixed` forced): the box grows through the height the page writes,
@@ -60,6 +62,7 @@ SHORT = "first line\nsecond line\nthird line"
 # Each composer: the composer, its box, its Send, its Grow checkbox, and the list it is in.
 CHANNEL_PARTS = ("channel-composer", "channel-compose-text", "channel-send", "channel-compose-grow", "scroll-area")
 SIDE_PARTS = ("side-composer", "side-compose-text", "side-send", "side-compose-grow", "side-scroll")
+VOICE_PARTS = ("voice-composer", "compose-text", "send-text", "compose-grow", "scroll-area")
 
 GEOMETRY_JS = """([composerId, boxId, sendId, growId, listId]) => {
   const rect = (node) => {
@@ -394,6 +397,53 @@ def reload_with_a_long_draft(desk: Desk, url: str) -> None:
                       "Send on screen")
 
 
+def call_box_with_recap(desk: Desk) -> None:
+    """The call's box with its recap line shown above it: the line across the composer, Grow left of Send on its row."""
+    page = desk.page
+    where = f"{desk.label}, the call's box under its recap line"
+    page.click("#view-switch")
+    page.wait_for_selector(f"#{VOICE_PARTS[1]}", state="visible", timeout=10_000)
+    # What `renderCallRecap` draws once the voice service has taken a recap; no call is needed to lay it out.
+    page.evaluate("""() => {
+      const line = document.getElementById('call-recap');
+      line.textContent = 'Caught the agent up with 1,240 words from earlier';
+      line.setAttribute('data-recap', 'accepted');
+      line.hidden = false;
+    }""")
+    found = desk.geometry(VOICE_PARTS)
+    recap = page.evaluate("""() => {
+      const r = document.getElementById('call-recap').getBoundingClientRect();
+      return {top: r.top, bottom: r.bottom, left: r.left, right: r.right, height: r.height, width: r.width};
+    }""")
+    assert isinstance(recap, dict)
+    found["recap"] = recap
+    check(number(found, "recap", "height") > 0, f"{where}: the recap line is not drawn: {found}")
+    check(abs(number(found, "recap", "left") - number(found, "box", "left")) <= 1
+          and abs(number(found, "recap", "right") - number(found, "box", "right")) <= 1,
+          f"{where}: the recap line does not span the composer as the box does: {found}")
+    check(number(found, "recap", "bottom") <= number(found, "box", "top") + 0.5,
+          f"{where}: the recap line is not above the box: {found}")
+    check(found["labelShown"] is True, f"{where}: Grow is not drawn: {found}")
+    for part in ("label", "send"):
+        check(number(found, part, "top") >= number(found, "box", "bottom") - 0.5,
+              f"{where}: {part} is not below the box: {found}")
+    check(number(found, "label", "right") <= number(found, "send", "left"), f"{where}: Grow is not left of Send: {found}")
+    centre = (number(found, "label", "top") + number(found, "label", "bottom")) / 2
+    send_centre = (number(found, "send", "top") + number(found, "send", "bottom")) / 2
+    check(abs(centre - send_centre) <= 4, f"{where}: Grow is not on Send's row ({centre:.1f} vs {send_centre:.1f})")
+    desk.shot("call-recap")
+    page.evaluate("""() => {
+      const line = document.getElementById('call-recap');
+      line.textContent = '';
+      line.removeAttribute('data-recap');
+      line.hidden = true;
+    }""")
+    page.click("#view-switch")
+    page.wait_for_selector(FIRST_ROW, state="visible", timeout=10_000)
+    desk.notes.append(f"{desk.label}: the call's recap line spanned its composer above the box, Grow left of Send on "
+                      "Send's row")
+
+
 def two_columns(desk: Desk) -> None:
     page = desk.page
     page.click("#column-toggle")
@@ -441,6 +491,7 @@ def desk_walk(browser: Browser, url: str, args: argparse.Namespace, posts: list[
     rest = channel_box(desk, posts)
     typing_at_the_foot(desk, rest)
     reload_with_a_long_draft(desk, url)
+    call_box_with_recap(desk)
     short_window(desk)
     page.set_viewport_size({"width": 1920, "height": 1080})
     desk.label = "1920x1080"

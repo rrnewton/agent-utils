@@ -7361,7 +7361,9 @@ textarea {
      room left of Send was empty. So that room holds a Grow checkbox, and the box grows with its text
      while it is ticked (`data-composer-grow` on #screen-main, `applyComposerGrow`).
 
-     THE ROW. Two columns, the box, the state line and anything else across both, Send in the second
+     THE ROW. Two columns, the box, the state line, the call's recap line above its box (`#331
+     resume-on-websocket`) and anything else across both, said here even where a rule outside this
+     block already says it, so `dense` can never bring Send up beside one of them; Send in the second
      and the label in the first: `dense` puts the label on Send's row though it comes after Send in the
      markup, which it does so that Tab goes from the box to Send first. Not while a send card is up:
      the card's own rules give the box one line with Send beside it, and the label is not drawn. */
@@ -7373,6 +7375,7 @@ textarea {
     align-items: center;
   }
 
+  #screen-main:not([data-draft]) #call-recap,
   #screen-main:not([data-draft]) #compose-text,
   #screen-main:not([data-draft]) #channel-compose-text,
   #side-compose-text,

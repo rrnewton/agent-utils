@@ -6788,7 +6788,8 @@ draft put back) moves nothing under you. An empty box rests at the height it alw
 
 `make -C vibe-talk composer-grow-browser` measures this in a real Chromium at 1280x800, 1920x1080
 and a short 1280x600 window, with the checkbox off and on, with the browser's own sizing turned off,
-in the right column, after a reload with a long draft, and on a 393x852 phone.
+in the right column, in the call's box with its recap line (`#331 resume-on-websocket`) shown
+above it, after a reload with a long draft, and on a 393x852 phone.
 
 ### The keyboard: scrolling, search and Settings
 
