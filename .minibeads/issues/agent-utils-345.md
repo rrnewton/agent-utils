@@ -1,12 +1,13 @@
 ---
 title: 'settings-multi-column: on a wide desktop window, tile Settings'' sections into columns'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-18T20:43:26.565867201+00:00
-updated_at: 2026-10-18T20:43:26.565867201+00:00
+updated_at: 2026-10-18T22:31:17.414160940+00:00
+closed_at: 2026-10-18T22:31:17.414160789+00:00
 ---
 
 # Description
