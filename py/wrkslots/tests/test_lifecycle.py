@@ -55363,7 +55363,9 @@ def test_archive_drifted_checkouts_keeps_found_head_in_verified_bundle_then_remo
         assert git(repository, "rev-parse", "codex/other").stdout.strip() == head
 
 
-@pytest.mark.parametrize("root", ("head-reflog", "rewritten-ref", "old-endpoint"))
+@pytest.mark.parametrize(
+    "root", ("head-reflog", "rewritten-ref", "old-endpoint", "orig-head")
+)
 def test_archive_drifted_checkouts_keeps_commits_only_the_worktree_reflog_reaches(
     tmp_path: Path, root: str
 ) -> None:
@@ -55381,6 +55383,11 @@ def test_archive_drifted_checkouts_keeps_commits_only_the_worktree_reflog_reache
     if root == "rewritten-ref":
         # A per-worktree ref that removal deletes is then its only root.
         git(tree, "update-ref", "refs/rewritten/label", abandoned)
+    if root == "orig-head":
+        # A reset leaves ORIG_HEAD naming the commit; with the reflogs
+        # expired, that per-worktree pseudoref is its only name.
+        git(tree, "reset", "-q", "--hard", "codex/task")
+        assert git(tree, "rev-parse", "ORIG_HEAD").stdout.strip() == abandoned
     if root == "old-endpoint":
         # After the entry that made it is deleted, only the old object of the
         # reset entry that followed it still names the commit.
@@ -55391,11 +55398,12 @@ def test_archive_drifted_checkouts_keeps_commits_only_the_worktree_reflog_reache
         assert abandoned in head_log.read_text(encoding="utf-8")
     git(tree, "checkout", "-q", "-b", "codex/other", "codex/task")
     head = commit_local(tree, "drift.txt", "drift work\n", "unpushed drift")
-    if root == "rewritten-ref":
+    if root in ("rewritten-ref", "orig-head"):
         git(tree, "reflog", "expire", "--expire=now", "--expire-unreachable=now", "--all")
         git(tree, "reflog", "expire", "--expire=now", "--expire-unreachable=now", "HEAD")
         assert abandoned not in git(tree, "reflog", "show", "--format=%H", "HEAD").stdout
-        assert git(tree, "rev-parse", "refs/rewritten/label").stdout.strip() == abandoned
+        if root == "rewritten-ref":
+            assert git(tree, "rev-parse", "refs/rewritten/label").stdout.strip() == abandoned
     assert git(repository, "branch", "--contains", abandoned).stdout.strip() == ""
     mark_owner_dead(project)
     set_liveness(project, "dead")
@@ -55691,9 +55699,8 @@ def test_archive_nested_cache_repositories_keeps_cargo_style_checkout_then_remov
     assert worktree_commit == item["salvage_commit"]
     assert git(restored, "rev-parse", f"{worktree_commit}^").stdout.strip() == head
     names = git(restored, "ls-tree", "-r", "--name-only", worktree_commit).stdout.split()
-    # The untracked marker is kept; the ignored build output is not.
-    assert ".cargo-ok" in names and "build.sh" in names
-    assert "e9tool.o" not in names
+    # The untracked marker and the ignored build output are both kept.
+    assert ".cargo-ok" in names and "build.sh" in names and "e9tool.o" in names
 
 
 def test_archive_nested_cache_repositories_keeps_every_commit_object(
@@ -55738,7 +55745,14 @@ def test_archive_nested_cache_repositories_keeps_every_commit_object(
 
 @pytest.mark.parametrize(
     "case",
-    ("info-exclude", "rebase-in-progress", "shallow", "lfs-objects", "lfs-storage-config"),
+    (
+        "info-exclude",
+        "rebase-in-progress",
+        "shallow",
+        "lfs-objects",
+        "lfs-storage-config",
+        "unknown-git-entry",
+    ),
 )
 def test_archive_nested_cache_repositories_still_refuses_what_it_cannot_keep(
     tmp_path: Path, case: str
@@ -55775,6 +55789,12 @@ def test_archive_nested_cache_repositories_still_refuses_what_it_cannot_keep(
         elif case == "lfs-storage-config":
             git(clone, "config", "lfs.storage", "custom-store")
             expected = "repository config sets lfs.storage"
+        elif case == "unknown-git-entry":
+            # Where a user-level lfs.storage setting would put LFS objects.
+            stored = clone / ".git" / "binary-store" / "objects" / "ab" / "payload"
+            stored.parent.mkdir(parents=True)
+            stored.write_bytes(b"payload only this repository has\n")
+            expected = "repository keeps .git/binary-store, which is not part of Git's own"
         else:
             git(clone, "-c", "sequence.editor=printf 'break\\n' >", "rebase", "-i", "HEAD")
             expected = "a rebase is in progress (.git/rebase-merge exists)"
@@ -56092,3 +56112,67 @@ def test_archive_drifted_checkouts_refuses_an_owner_that_released_but_is_alive(
     assert "the owner here is live and registered liveness says alive" in refused.stderr
     assert git(tree, "rev-parse", "HEAD").stdout.strip() == head
     assert len(active_slots(project)) == 1
+
+
+def test_archive_nested_cache_repositories_keeps_files_hidden_by_unpublished_ignore_rules(
+    tmp_path: Path,
+) -> None:
+    project, repository, remote = make_project(tmp_path, cache_globs=("target",))
+    assert create(project).returncode == 0
+    tree = checkout(project)
+    commit_task(repository, tree, "codex/task")
+    clone = tree / "target" / "deps" / "work"
+    _nested_clone(remote, clone)
+    commit_local(clone, "local.txt", "local\n", "local only")
+    (clone / "notes").mkdir()
+    (clone / "notes" / ".gitignore").write_text("secret.txt\n", encoding="utf-8")
+    (clone / "notes" / "secret.txt").write_text("PRECIOUS WORK\n", encoding="utf-8")
+    _prepare_removable_agent_slot(project)
+
+    removed = _remove_archiving(project, "--archive-nested-cache-repositories")
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    item = wrkslots._as_mapping(_slot_removed_evidence(project)[0], "test evidence")
+    bundle = Path(wrkslots._as_str(item["salvage_bundle"], "test bundle"))
+    restored, refs = _unbundle(tmp_path, bundle, "restored-ignored.git")
+    worktree_commit = refs["refs/wrkslots-nested/worktree"]
+    assert git(restored, "show", f"{worktree_commit}:notes/secret.txt").stdout == (
+        "PRECIOUS WORK\n"
+    )
+
+
+@pytest.mark.parametrize("state", ("unlisted-submodule", "embedded-repository", "content-filter"))
+def test_archive_drifted_checkouts_refuses_state_its_bundle_cannot_keep(
+    tmp_path: Path, state: str
+) -> None:
+    project, tree, component, _component_head = _drifted_slot_with_submodules(tmp_path)
+    git(tree, "checkout", "-q", "-b", "codex/other")
+    if state == "unlisted-submodule":
+        # The branch stops listing the submodule, whose populated directory
+        # and private repository remain.
+        git(component, "checkout", "-q", "-b", "local-work")
+        commit_local(component, "local.txt", "submodule work\n", "submodule only")
+        git(tree, "rm", "-q", "--cached", "component")
+        git(tree, "commit", "-q", "-m", "drop the component gitlink")
+        expected = "no longer lists as an initialized submodule"
+    elif state == "embedded-repository":
+        inner = tree / "scratch-repo"
+        inner.mkdir()
+        git(inner, "init", "-q")
+        git(inner, "config", "user.name", "Wrkslots Test")
+        git(inner, "config", "user.email", "wrkslots@example.invalid")
+        commit_local(inner, "inner.txt", "inner work\n", "inner only")
+        expected = "holds a Git repository in untracked directory scratch-repo/"
+    else:
+        git(tree, "config", "filter.squash.clean", "cat")
+        expected = "configures filter.squash.clean"
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    refused = _remove_archiving(project, "--archive-drifted-checkouts")
+
+    assert refused.returncode == 3, refused.stdout + refused.stderr
+    assert expected in refused.stderr
+    assert tree.is_dir()
+    assert len(active_slots(project)) == 1
+    assert not _finish_journal(project).exists()

@@ -1060,57 +1060,78 @@ Two opt-in `remove` flags (also accepted by `remove-agent-batch` and `retire-pen
 dead-owner agent slots that the checks above otherwise refuse forever, by keeping the work in a
 verified local bundle first. Both are off by default; without them those slots keep their refusals.
 
-`--archive-drifted-checkouts` covers a checkout that is on another branch than the recorded one, on a
-detached HEAD, or whose remote URL changed ("branch changed ... update the recorded checkout", "not
-detached", "remote URL changed"). Nobody can update the record once the owner is gone, so the flag
-applies only when the owner is proven dead: its exact process identity is gone (or no owner was
+`--archive-drifted-checkouts` covers a checkout that is on another branch than the recorded one, on
+a detached HEAD, or whose remote URL changed ("branch changed ... update the recorded checkout",
+"not detached", "remote URL changed"). Nobody can update the record once the owner is gone, so the
+flag applies only when the owner is proven dead: its exact process identity is gone (or no owner was
 recorded) and the registered liveness command answers dead. A live owner, including one that
 consented with a handoff, keeps the refusal; an owner that ran `wrkslots release` qualifies only
 once it has exited and the registered liveness command answers dead, and `recover` checks that
-again before it resumes such a removal. For each drifted checkout, removal makes the ordinary
-salvage commit of its found HEAD and its uncommitted and untracked non-ignored files. Further
-parents keep what that commit alone would lose: a commit of exactly what the checkout's own index
-stages and a commit of its worktree read through a copy of that index (a file staged and then
-deleted, or force-added past `.gitignore` and edited), when either differs from HEAD and the
-salvage commit; and the tips of commits that only the worktree's own HEAD reflog, per-worktree refs
-(`refs/worktree/`, `refs/bisect/`, `refs/rewritten/`) or their reflogs reach, reading both object
-names of every reflog entry, and that no branch, tag or other shared ref outside `refs/remotes/`
-contains, since removing the worktree would leave them unreachable. Removal keeps the salvage commit, with the complete history
-it reaches, in a self-contained bundle under the control directory's
-`wrkslots-salvage/` (or `--salvage-archive-root`), read back by a fresh bare clone, the exact ref,
-and `git fsck --full --strict`. It never pushes and never asks a remote whether HEAD is published,
-because a changed remote URL may name a different repository. The checkout's submodules are not
-pushed either. A linked worktree's submodule repositories are deleted with it, so each submodule's
-salvage commit likewise keeps its index state and every commit that its own refs (remote-tracking
-refs included, which may be stale), stash and reflogs reach and that no ref of the source
-submodule repository contains; a submodule with any such state is kept in its own verified local
-bundle instead of being recorded as already published. Reftable ref storage refuses. The salvage receipt, in the event log, the finish journal, and the archive row,
-records `archive_reason: recorded-checkout-drift` and a `recorded_checkout_drift` object with the
-recorded and found branch (null when detached) and remote URL digests. Every later check, before
-the path fence, after it, and in `recover`, compares the checkout with that object instead of the
-record, so any further change refuses. Branch refs in the source repository, including the recorded
-one, are left alone, as for every agent removal.
+again before it resumes such a removal.
 
-`--archive-nested-cache-repositories` covers a Git repository nested in a configured cache directory,
-such as a vendored dependency that a build copied under `target/`, that is not provably disposable
-only because of its content: commits no counted remote-tracking ref contains, stash entries, or
-uncommitted or untracked non-ignored files (Cargo's `.cargo-ok` marker in a dependency checkout is
-one). Every structural check still runs and still refuses: a `.git` file or link, a bare
-configuration, alternates, linked worktrees, module repositories, remotes defined in `.git/remotes` or `.git/branches`, includes,
-content filters, `core.worktree`, URL rewrites, an operation in progress, gitlinks, assume-unchanged
-or skip-worktree entries, `.git/info/exclude` rules, a self-ignored `.gitignore`, a remote name with
-`/`, a shallow history, and Git LFS objects in `.git/lfs/objects`, which a bundle cannot carry.
-Otherwise the repository is kept in a bundle under the control directory's
+For each drifted checkout, removal makes the ordinary salvage commit of its found HEAD and its
+uncommitted and untracked non-ignored files. Further parents keep what that commit alone would
+lose: a commit of exactly what the checkout's own index stages and a commit of its worktree read
+through a copy of that index (a file staged and then deleted, or force-added past `.gitignore` and
+edited), when either differs from HEAD and the salvage commit; and the tips of commits that only the
+worktree's own HEAD reflog, `ORIG_HEAD`, per-worktree refs (`refs/worktree/`, `refs/bisect/`,
+`refs/rewritten/`) or their reflogs reach (both object names of every reflog entry are read) and
+that no branch, tag or other shared ref outside `refs/remotes/` contains, since removing the
+worktree would leave them unreachable. The salvage commit and the complete history it reaches go
+into a self-contained bundle under the control directory's `wrkslots-salvage/` (or
+`--salvage-archive-root`), read back by a fresh bare clone, the exact ref, and
+`git fsck --full --strict`. Nothing is pushed, and no remote is asked whether HEAD is published,
+because a changed remote URL may name a different repository.
+
+A linked worktree's submodule repositories live in its own Git directory and are deleted with it.
+The checkout's submodules are never pushed, and each submodule's salvage commit likewise keeps its
+index state, `ORIG_HEAD`, and every commit that its own refs (remote-tracking refs and tags
+included), stash and reflogs reach and that no ref of a repository removal keeps contains: the
+source submodule repository, and the submodule's remote when that remote, as configured or as the
+invoking user's Git configuration rewrites it, is a local repository outside the slot and outside
+the Git directories of its checkouts. A submodule with any such state is kept in its own verified
+local bundle instead of being recorded as already published.
+
+Drift archiving refuses what such a bundle cannot keep: a content filter or `lfs.*` setting in a
+checkout's or submodule's repository configuration, Git LFS storage in its Git directory, a Git
+repository embedded in an untracked directory, a module repository in the worktree's Git directory
+that the checkout no longer lists as an initialized submodule, reftable ref storage, and shallow
+history that holds anything to keep. The salvage receipt, in the event log, the finish journal and
+the archive row, records `archive_reason: recorded-checkout-drift` and a `recorded_checkout_drift`
+object with the recorded and found branch (null when detached) and remote URL digests. Every later
+check, before the path fence, after it, and in `recover`, compares the checkout with that object
+instead of the record and derives the salvage commits again, so any further change refuses.
+Gitignored files are not kept, and branch refs, including the recorded one, stay in the source
+repository, as for every agent removal.
+
+`--archive-nested-cache-repositories` covers a Git repository nested in a configured cache
+directory, such as a vendored dependency that a build copied under `target/`, that is not provably
+disposable only because of its content: commits no counted remote-tracking ref contains, stash
+entries, or uncommitted or untracked non-ignored files (Cargo's `.cargo-ok` marker in a dependency
+checkout is one). Every structural check still runs and still refuses: a `.git` file or link, a
+bare configuration, alternates, linked worktrees, module repositories, remotes defined in
+`.git/remotes` or `.git/branches`, includes, content filters, `core.worktree`, URL rewrites, an
+operation in progress, gitlinks, assume-unchanged or skip-worktree entries, `.git/info/exclude`
+rules, a self-ignored `.gitignore`, a remote name with `/`, a shallow history, any `lfs.*` setting
+in the repository configuration, and any entry in `.git` that is not part of Git's own layout
+(Git LFS storage, wherever a setting put it, among them), which a bundle cannot carry. Otherwise the
+repository is kept in a bundle under the control directory's
 `wrkslots-salvage/<machine>/<slot>/<generation>/nested/` (`--salvage-archive-root` does not apply)
 holding every ref, HEAD, every commit object (each commit no other commit names as a parent gets a
-ref), and, when its worktree differs from HEAD, one salvage commit of its tracked and untracked
-non-ignored files and, when its index differs from HEAD, one commit of exactly what is staged.
-Nothing is written to the nested repository. The bundle is unbundled into an empty repository, its refs are compared with
-the expected ones, and `git fsck --full` must pass (not `--strict`, which rejects formatting quirks
-common in third-party histories); a schema-1 receipt binds its SHA-256. The repository is judged
-again immediately before deletion, which finds and rechecks the same bundle. Gitignored files are
-deleted with the cache, as before. The slot-removed evidence and the human output name the bundle.
-The finish journal records the flag, so `recover` judges the remaining caches the same way.
+ref), one commit of exactly what its index stages when that differs from HEAD, and one salvage
+commit of its worktree read through a copy of that index, ignored files included, because an ignore
+rule can itself be unpublished work. Nothing is written to the nested repository. The bundle is
+unbundled into an empty repository, its refs are compared with the expected ones, and
+`git fsck --full` must pass (not `--strict`, which rejects formatting quirks common in third-party
+histories); a schema-1 receipt binds its SHA-256. The repository is judged again immediately before
+deletion, which finds and rechecks the same bundle. Objects that no ref or commit reaches (a
+dangling blob, tree or tag) are not kept. The slot-removed evidence and the human output name the
+bundle. The finish journal records the flag, so `recover` judges the remaining caches the same way.
+All of this nested work shares the removal's nested-repository time allowance, and a large
+repository can refuse for it.
+
+Both flags add files exactly as ordinary salvage does, so end-of-line conversion that a committed
+`.gitattributes` requests applies to the files they keep.
 
 For `recover-absent-agent-row(s)`, only the digest of a checkout's remote URL was recorded. A source
 repository whose remote has since moved between the GitHub spellings above for the same owner and

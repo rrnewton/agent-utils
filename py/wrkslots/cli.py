@@ -20493,6 +20493,112 @@ def _reflog_endpoints(files: Sequence[Path]) -> set[str]:
     return endpoints
 
 
+def _private_pseudoref_commits(vcs: _GitVcs, path: Path) -> set[str]:
+    """Return the commit ORIG_HEAD names, which removing ``path``'s Git directory deletes.
+
+    Unfinished-operation pseudorefs refuse elsewhere; FETCH_HEAD only lists
+    what a fetch received from a remote.
+    """
+
+    result = vcs._run(path, ["rev-parse", "-q", "--verify", "ORIG_HEAD^{commit}"], check=False)
+    if result.returncode == 0:
+        value = result.stdout.strip()
+        if not SHA_RE.fullmatch(value):
+            raise Refusal(f"ORIG_HEAD of checkout {path} is not a full commit")
+        return {value}
+    if os.path.lexists(_git_path(vcs, path, "ORIG_HEAD")):
+        raise Refusal(f"ORIG_HEAD of checkout {path} does not name a commit; preserve it")
+    return set()
+
+
+def _assert_no_unkept_repository_state(
+    vcs: _GitVcs, config: Config, checkout: Checkout, path: Path, *, submodule: bool
+) -> None:
+    """Refuse what a drifted checkout's local bundle cannot keep.
+
+    Content filters (Git LFS among them) configured for the repository turn
+    files into something other than their bytes when salvage adds them, and
+    LFS keeps its objects outside the object store a bundle reads; a
+    submodule repository that the current branch no longer lists, or a Git
+    repository embedded in an untracked directory, is not salvaged at all.
+    """
+
+    listed = vcs._run(
+        path, ["config", "--list", "--null", "--name-only", "--show-scope"]
+    ).stdout.split("\0")
+    for scope, name in zip(listed[0::2], listed[1::2]):
+        lowered = name.lower()
+        if scope in ("local", "worktree") and (
+            lowered.startswith("filter.") or lowered.startswith("lfs.")
+        ):
+            raise Refusal(
+                f"checkout {checkout.name} configures {name}, so salvage cannot keep its "
+                "files byte for byte or Git LFS objects may lie outside the bundle; "
+                "preserve it"
+            )
+    common = vcs.common_directory(path)
+    git_directory = Path(vcs._run(path, ["rev-parse", "--absolute-git-dir"]).stdout.strip())
+    for directory in dict.fromkeys((common, git_directory)):
+        try:
+            lfs = sorted(name for name in os.listdir(directory) if name.lower().startswith("lfs"))
+        except OSError as exc:
+            raise Refusal(f"cannot inspect {directory}: {exc}") from exc
+        if lfs:
+            raise Refusal(
+                f"checkout {checkout.name} keeps Git LFS storage at {directory / lfs[0]}, "
+                "which a bundle does not carry; preserve it"
+            )
+    if not submodule:
+        _assert_listed_module_repositories(vcs, config, checkout, path, git_directory)
+    # Listing untracked files stops at an embedded repository and names it
+    # with a trailing slash; salvage would record it only as a gitlink.
+    untracked = vcs._run(
+        path,
+        [
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+            *_salvage_pathspecs(config, checkout.name),
+        ],
+    ).stdout.split("\0")
+    for entry in untracked:
+        if entry.endswith("/"):
+            raise Refusal(
+                f"checkout {checkout.name} holds a Git repository in untracked directory "
+                f"{entry}, which salvage does not keep; preserve it"
+            )
+
+
+def _assert_listed_module_repositories(
+    vcs: _GitVcs, config: Config, checkout: Checkout, path: Path, git_directory: Path
+) -> None:
+    """Refuse a module repository in the worktree's Git directory that the checkout no longer lists."""
+
+    # Every module repository kept in this worktree's Git directory must be
+    # one the checkout lists, or its history would be deleted unseen.
+    modules = git_directory / "modules"
+    if not os.path.lexists(modules):
+        return
+    listed_dirs: set[Path] = set()
+    for _submodule, submodule_path in _submodule_salvage_checkouts(
+        config, checkout, vcs, path_override=path
+    ):
+        listed_dirs.add(
+            Path(vcs._run(submodule_path, ["rev-parse", "--absolute-git-dir"]).stdout.strip())
+        )
+    for root, directories, files in os.walk(modules, followlinks=False):
+        current = Path(root)
+        if "HEAD" in files and (current / "objects").is_dir():
+            if current not in listed_dirs:
+                raise Refusal(
+                    f"checkout {checkout.name} keeps submodule repository {current} that "
+                    "it no longer lists as an initialized submodule; preserve it"
+                )
+            directories[:] = [name for name in directories if name == "modules"]
+
+
 def _git_path(vcs: _GitVcs, path: Path, name: str) -> Path:
     return Path(
         vcs._run(path, ["rev-parse", "--path-format=absolute", "--git-path", name]).stdout.strip()
@@ -20551,6 +20657,7 @@ def _worktree_private_orphan_tips(vcs: _GitVcs, path: Path, kept: str) -> tuple[
     for prefix in _WORKTREE_PRIVATE_REF_PREFIXES:
         files.extend(_reflog_files_under(_git_path(vcs, path, f"logs/{prefix.rstrip('/')}")))
     positives = _reflog_endpoints(files)
+    positives |= _private_pseudoref_commits(vcs, path)
     negatives = {kept}
     for line in vcs._run(
         path, ["for-each-ref", "--format=%(objectname) %(refname)"]
@@ -20566,18 +20673,22 @@ def _worktree_private_orphan_tips(vcs: _GitVcs, path: Path, kept: str) -> tuple[
 
 
 def _submodule_private_tips(
-    vcs: _GitVcs, path: Path, kept: str, source: Path
+    vcs: _GitVcs,
+    path: Path,
+    kept: str,
+    durable: Sequence[Path],
 ) -> tuple[str, ...]:
     """Return the tips of commits that only a slot submodule's own repository holds.
 
     A linked worktree's submodule repositories live in the worktree's own Git
     directory, so removal deletes every ref, stash entry and reflog they hold,
-    remote-tracking refs included (those may also be stale).  This lists the
-    tips of the commits that any of them reaches (both object names of every
-    reflog entry) and that neither ``kept`` nor any ref of the source
-    submodule repository ``source``, which removal keeps, reaches.  Ancestry
-    is decided with the source's objects as an alternate, so every source
-    ref resolves.
+    remote-tracking refs and tags included (those may also be stale or
+    local).  This lists the tips of the commits that any of them reaches (both
+    object names of every reflog entry) and that neither ``kept`` nor any ref
+    of a ``durable`` repository, which removal keeps (the source submodule
+    repository, and the submodule's remote when that is a local repository
+    outside the slot), reaches.  Ancestry is decided with those repositories'
+    objects as alternates, so every durable ref resolves.
     """
 
     _assert_files_ref_storage(vcs, path)
@@ -20589,6 +20700,7 @@ def _submodule_private_tips(
     if git_directory != common:
         files.extend(_reflog_files_under(git_directory / "logs"))
     positives = _reflog_endpoints(files)
+    positives |= _private_pseudoref_commits(vcs, path)
     positives.update(
         line.split(" ", 1)[0]
         for line in vcs._run(path, ["for-each-ref", "--format=%(objectname) %(refname)"])
@@ -20596,20 +20708,112 @@ def _submodule_private_tips(
         if line
     )
     negatives = {kept}
-    negatives.update(
-        line.strip()
-        for line in vcs._run(source, ["for-each-ref", "--format=%(objectname)"])
-        .stdout.splitlines()
-        if line.strip()
-    )
-    source_objects = vcs.common_directory(source) / "objects"
+    alternates: list[str] = []
+    for repository in durable:
+        negatives.update(
+            line.strip()
+            for line in vcs._run(repository, ["for-each-ref", "--format=%(objectname)"])
+            .stdout.splitlines()
+            if line.strip()
+        )
+        objects = vcs.common_directory(repository) / "objects"
+        if ":" in str(objects):
+            raise Refusal(f"repository object directory path contains ':': {objects}")
+        alternates.append(str(objects))
     return _commit_tips(
         vcs,
         path,
         positives,
         negatives,
-        env_overrides={"GIT_ALTERNATE_OBJECT_DIRECTORIES": str(source_objects)},
+        env_overrides={"GIT_ALTERNATE_OBJECT_DIRECTORIES": ":".join(alternates)},
     )
+
+
+def _durable_submodule_repositories(
+    vcs: _GitVcs,
+    config: Config,
+    record: ActiveRecord,
+    submodule: Checkout,
+    path: Path,
+    authority: _RemoteAuthority,
+) -> tuple[Path, ...]:
+    """Return the repositories whose refs prove a slot submodule's commits survive removal.
+
+    Always the source submodule repository.  Also the submodule's remote when
+    its URL is an absolute path to an existing local repository that lies
+    neither in the slot nor in the Git directory of any of the slot's
+    checkouts (where a linked worktree keeps its submodule repositories), so
+    removal cannot delete it; a local mirror of the source's modules is the
+    usual case.  A network remote is never read: nothing here contacts one.
+    """
+
+    _relative, source = _stored_repository_path(config, submodule.repository)
+    durable = [source]
+    # The configured URL, and the URLs the invoking user's Git configuration
+    # rewrites it to (insteadOf), which is where its fetches actually went.
+    # Reading them runs no program and contacts nothing.
+    urls = [authority.url]
+    user_env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("GIT_") or key.startswith("GIT_CONFIG_")
+    }
+    user_env.update({"LC_ALL": "C", "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"})
+    try:
+        effective = subprocess.run(
+            ["git", "-C", str(path), "remote", "get-url", "--all", submodule.remote],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=user_env,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        effective = None
+    if effective is not None and effective.returncode == 0:
+        urls.extend(line for line in effective.stdout.splitlines() if line)
+    # What removal deletes: the slot directory, at its canonical path or
+    # fenced, and the Git directory of each of its checkouts.  The slot may be
+    # fenced, so its checkouts are found from this submodule's superprojects.
+    top = path
+    for _depth in range(64):
+        parent = vcs._run(
+            top, ["rev-parse", "--show-superproject-working-tree"]
+        ).stdout.strip()
+        if not parent:
+            break
+        top = Path(parent)
+    else:
+        raise Refusal(f"submodule {submodule.name} is nested too deeply to inspect")
+    actual_slot = top if _record_layout(config, record) == "flat" else top.parent
+    removed = [
+        _slot_directory(config, record.slot, record.slot_type).resolve(strict=False),
+        actual_slot.resolve(strict=False),
+    ]
+    for checkout in record.checkouts:
+        checkout_path = (
+            actual_slot
+            if _record_layout(config, record) == "flat"
+            else actual_slot / Path(checkout.path).name
+        )
+        if not checkout_path.is_dir():
+            continue
+        removed.append(
+            Path(
+                vcs._run(checkout_path, ["rev-parse", "--absolute-git-dir"]).stdout.strip()
+            ).resolve()
+        )
+    for url in dict.fromkeys(urls):
+        mirror = _absolute_local_remote_directory(
+            path, _RemoteAuthority(url=url, sha256=hashlib.sha256(url.encode()).hexdigest())
+        )
+        if mirror is None or mirror in durable:
+            continue
+        if any(mirror == root or mirror.is_relative_to(root) for root in removed):
+            continue
+        if vcs._run(mirror, ["rev-parse", "--git-dir"], check=False).returncode == 0:
+            durable.append(mirror)
+    return tuple(durable)
 
 
 def _index_state_trees(
@@ -20715,6 +20919,9 @@ def _salvage_candidate_uncached(
     if record is None:
         raise StateError("private-state salvage requires its registry row")
     path = path_override or _stored_path(config, checkout.path, "checkout path")
+    _assert_no_unkept_repository_state(
+        vcs, config, checkout, path, submodule=allow_detached
+    )
     identity = {
         "GIT_AUTHOR_NAME": "wrkslots salvage",
         "GIT_AUTHOR_EMAIL": "wrkslots@localhost",
@@ -20761,8 +20968,14 @@ def _salvage_candidate_uncached(
             )
         )
     if allow_detached:
-        _relative, source = _stored_repository_path(config, checkout.repository)
-        tips = _submodule_private_tips(vcs, path, facts.commit, source)
+        tips = _submodule_private_tips(
+            vcs,
+            path,
+            facts.commit,
+            _durable_submodule_repositories(
+                vcs, config, record, checkout, path, facts.remote_authority
+            ),
+        )
     else:
         tips = _worktree_private_orphan_tips(vcs, path, facts.commit)
     extra.extend(tip for tip in tips if tip not in extra)
@@ -29977,6 +30190,34 @@ _NESTED_GIT_SALVAGE_EVIDENCE_KEYS = frozenset(
     }
 )
 _NESTED_SALVAGE_RECEIPT_SCHEMA = 1
+# The .git entries a nested salvage accepts: Git's own files and directories
+# (see _GIT_DIR_FILES); operations, linked worktrees, modules and legacy
+# remote files refuse earlier, in the judgment.
+_NESTED_SALVAGE_GIT_ENTRIES = frozenset(
+    {
+        "HEAD",
+        "ORIG_HEAD",
+        "FETCH_HEAD",
+        "AUTO_MERGE",
+        "COMMIT_EDITMSG",
+        "config",
+        "config.worktree",
+        "description",
+        "index",
+        "packed-refs",
+        "gc.log",
+        "refs",
+        "logs",
+        "info",
+        "hooks",
+        "rr-cache",
+        "objects",
+        "branches",
+        "remotes",
+        "modules",
+        "worktrees",
+    }
+)
 _NESTED_SALVAGE_REF_PREFIX = "refs/wrkslots-nested"
 # Recorded beside the judged repositories in the slot-removed event: what the
 # judgment did not cover, so the evidence is not read as more than it is.
@@ -30846,7 +31087,7 @@ def _judge_nested_git_repository_unchecked(
             display=display or dotgit,
             conditions=deferred,
             head=head,
-            worktree_changed=bool(changes),
+            worktree_changed=bool(changes) or bool(ignored),
             output=output,
             refuse=refuse,
             commit_objects=commit_objects,
@@ -30885,12 +31126,13 @@ def _salvage_nested_git_repository(
     (ref/<name> for refs/<name>), HEAD, one ref per commit object that no
     other commit object has as a parent (so every commit object in the
     repository, reachable or not, is in the bundle), and, when the worktree
-    differs from HEAD, one salvage commit of its tracked and untracked
-    non-ignored files (``worktree``) and, when the repository's own index
-    differs from HEAD, one commit of exactly what is staged (``index``).
-    Gitignored files are not kept: they are the cache's build output, deleted
-    as before.  A repository that keeps Git LFS objects refuses, because a
-    bundle cannot carry them.
+    differs from HEAD or holds ignored files, one salvage commit of every file
+    in its worktree read through a copy of its own index, ignored files
+    included because an ignore rule can itself be unpublished work
+    (``worktree``) and, when the repository's own index differs from HEAD,
+    one commit of exactly what is staged (``index``).  A repository with Git
+    LFS storage or any .git entry outside Git's own layout refuses, because a
+    bundle cannot carry it.
 
     Nothing is written to the nested repository: the salvage commit's objects
     go to a staging object directory that borrows the repository's objects,
@@ -30914,15 +31156,26 @@ def _salvage_nested_git_repository(
             "salvage refused"
         )
     try:
-        lfs_entries = sorted(
-            name for name in os.listdir(dotgit) if name.lower().startswith("lfs")
-        )
+        entries = sorted(os.listdir(dotgit))
     except OSError as exc:
-        raise refuse(f"cannot inspect .git for Git LFS storage: {exc}") from exc
+        raise refuse(f"cannot inspect .git: {exc}") from exc
+    lfs_entries = [name for name in entries if name.lower().startswith("lfs")]
     if lfs_entries:
         raise refuse(
             f"repository has Git LFS storage (.git/{lfs_entries[0]}), whose objects a "
             "Git bundle does not carry; salvage refused"
+        )
+    # Anything else Git does not itself keep there (for example LFS objects
+    # that the user's lfs.storage setting moved) is not carried either.
+    unknown = [
+        name
+        for name in entries
+        if name not in _NESTED_SALVAGE_GIT_ENTRIES and not name.startswith("sharedindex.")
+    ]
+    if unknown:
+        raise refuse(
+            f"repository keeps .git/{unknown[0]}, which is not part of Git's own "
+            "repository layout and which a Git bundle does not carry; salvage refused"
         )
     for config_name in ("config", "config.worktree"):
         if not os.path.lexists(dotgit / config_name):
@@ -31037,10 +31290,10 @@ def _salvage_nested_git_repository(
                     ["read-tree", "--empty"] if head is None else ["read-tree", head],
                     extra_env=index_env,
                 )
-            # Every tracked change and untracked file that the repository's
-            # own ignore rules do not ignore; .git/info/exclude rules were
-            # refused before salvage and core.excludesFile is /dev/null.
-            output(["add", "-A"], work=True, extra_env=index_env)
+            # Every tracked change and every untracked file, ignored ones
+            # included: an ignore rule may itself be unpublished work (an
+            # edited or uncommitted .gitignore), so ignored files are kept.
+            output(["add", "-A", "--force"], work=True, extra_env=index_env)
             tree = output(["write-tree"], extra_env=index_env).strip()
             if not SHA_RE.fullmatch(tree):
                 raise refuse("salvage tree is not a full Git object")
@@ -57172,8 +57425,10 @@ _ARCHIVE_DRIFTED_CHECKOUTS_HELP = (
     "compares the checkout with the drift recorded in its salvage receipt, so any "
     "further change refuses. The salvage commit also keeps what the checkout's own "
     "index stages, its worktree read through that index, and every commit that only "
-    "its worktree-private reflogs and refs reach, and for each submodule its index and "
-    "whatever its own repository holds beyond its source repository. Gitignored files "
+    "its worktree-private reflogs, ORIG_HEAD and refs reach, and for each submodule its "
+    "index and whatever its own repository holds beyond the repositories removal keeps. "
+    "A content filter or lfs.* setting, Git LFS storage, an embedded untracked repository, "
+    "or a module repository the checkout no longer lists refuses. Gitignored files "
     "are not kept, and branch refs, the recorded one included, are left in the source "
     "repository, as for any agent removal. An owner that is alive, or consented while "
     "alive, keeps the refusal; one that ran 'wrkslots release' qualifies only after "
@@ -57185,15 +57440,17 @@ _ARCHIVE_NESTED_CACHE_REPOSITORIES_HELP = (
     "directory (for example a vendored dependency checkout under target/) only because "
     "it holds commits no counted remote-tracking ref contains, stash entries, or "
     "uncommitted or untracked non-ignored files: first keep every ref, HEAD, every commit "
-    "object, those files (as one salvage commit) and what is staged (as another) in a "
+    "object, its files, ignored ones included (as one salvage commit) and what is staged "
+    "(as another) in a "
     "self-contained Git bundle under the control directory's wrkslots-salvage/ (never "
     "--salvage-archive-root), read it back (unbundled into an empty repository, exact "
     "refs, full fsck), and judge it again before deletion. A repository that is "
     "structurally unsafe to judge (a .git file or symbolic link, alternates, linked "
     "worktrees, submodules, includes, filters, an operation in progress, hidden index "
-    "entries, local exclude rules, a shallow history, Git LFS storage) still refuses, "
-    "and so does one whose bundle cannot be made or verified. Gitignored files are "
-    "deleted with the cache as before (default: off, such a repository refuses)"
+    "entries, local exclude rules, a shallow history, Git LFS storage, any .git entry "
+    "outside Git's own layout) still refuses, and so does one whose bundle cannot be made "
+    "or verified. Its ignored files are kept too, since an ignore rule can itself be "
+    "unpublished work (default: off, such a repository refuses)"
 )
 
 
