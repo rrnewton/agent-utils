@@ -1074,8 +1074,9 @@ uncommitted and untracked non-ignored files. Further parents keep what that comm
 lose: a commit of exactly what the checkout's own index stages and a commit of its worktree read
 through a copy of that index (a file staged and then deleted, or force-added past `.gitignore` and
 edited), when either differs from HEAD and the salvage commit; and the tips of commits that only the
-worktree's own HEAD reflog, `ORIG_HEAD`, per-worktree refs (`refs/worktree/`, `refs/bisect/`,
-`refs/rewritten/`) or their reflogs reach (both object names of every reflog entry are read) and
+worktree's own HEAD reflog, pseudorefs (`ORIG_HEAD`, `FETCH_HEAD` or any other top-level file of
+its Git directory named like one, such as a custom `MY_HEAD`), per-worktree refs (`refs/worktree/`,
+`refs/bisect/`, `refs/rewritten/`) or their reflogs reach (both object names of every reflog entry are read) and
 that no branch, tag or other shared ref outside `refs/remotes/` contains, since removing the
 worktree would leave them unreachable. The salvage commit and the complete history it reaches go
 into a self-contained bundle under the control directory's `wrkslots-salvage/` (or
@@ -1085,18 +1086,21 @@ because a changed remote URL may name a different repository.
 
 A linked worktree's submodule repositories live in its own Git directory and are deleted with it.
 The checkout's submodules are never pushed, and each submodule's salvage commit likewise keeps its
-index state, `ORIG_HEAD`, and every commit that its own refs (remote-tracking refs and tags
-included), stash and reflogs reach and that no ref of a repository removal keeps contains: the
-source submodule repository, and the submodule's remote when that remote, as configured or as the
-invoking user's Git configuration rewrites it, is a local repository outside the slot and outside
-the Git directories of its checkouts. A submodule with any such state is kept in its own verified
+index state and every commit that its own refs (remote-tracking refs and tags included), stash,
+reflogs and pseudorefs reach, and every commit object in it that nothing names (a dropped stash),
+unless a ref of a repository removal keeps contains it: the source submodule repository, and the
+submodule's remote when that remote, as configured or as the invoking user's Git configuration
+rewrites it (`insteadOf`), is a local repository outside the slot (at its canonical or fenced
+path) and outside the Git directories of its checkouts. Every ref of such a repository counts,
+`refs/remotes/*` included. A submodule whose remote lies inside the slot gets its bundle, and then
+refuses after the path fence, because its remote no longer exists where it is configured. A submodule with any such state is kept in its own verified
 local bundle instead of being recorded as already published.
 
 Drift archiving refuses what such a bundle cannot keep: a content filter or `lfs.*` setting in a
 checkout's or submodule's repository configuration, Git LFS storage in its Git directory, a Git
 repository embedded in an untracked directory, a module repository in the worktree's Git directory
-that the checkout no longer lists as an initialized submodule, reftable ref storage, and shallow
-history that holds anything to keep. The salvage receipt, in the event log, the finish journal and
+that the checkout no longer lists as an initialized submodule, attribute rules in
+`.git/info/attributes`, reftable ref storage, and shallow history that holds anything to keep. The salvage receipt, in the event log, the finish journal and
 the archive row, records `archive_reason: recorded-checkout-drift` and a `recorded_checkout_drift`
 object with the recorded and found branch (null when detached) and remote URL digests. Every later
 check, before the path fence, after it, and in `recover`, compares the checkout with that object
@@ -1130,8 +1134,12 @@ bundle. The finish journal records the flag, so `recover` judges the remaining c
 All of this nested work shares the removal's nested-repository time allowance, and a large
 repository can refuse for it.
 
-Both flags add files exactly as ordinary salvage does, so end-of-line conversion that a committed
-`.gitattributes` requests applies to the files they keep.
+Both flags keep files as their exact bytes: the commands that add them set `core.autocrlf=false`
+and `core.attributesFile=/dev/null`, ignore system attributes, and read attributes from the empty
+tree instead of any `.gitattributes` in the worktree, committed or not, and they read every tracked
+file again rather than reuse a blob that conversion made when it was staged.
+`.git/info/attributes` cannot be switched off that way, so a repository with rules there refuses
+(a nested repository with one refuses salvage).
 
 For `recover-absent-agent-row(s)`, only the digest of a checkout's remote URL was recorded. A source
 repository whose remote has since moved between the GitHub spellings above for the same owner and

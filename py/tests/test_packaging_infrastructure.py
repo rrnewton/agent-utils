@@ -900,9 +900,13 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # evidence-parser case.
     # The two no-checkout-source submodule cases of 1cb3493d (one removal, one
     # refusal) are mapped.
-    assert len(all_tests) == 2001
+    # The 10 archive-flag cases of the round-4 review (a custom pseudoref, an
+    # unreferenced submodule commit, a commit an outside mirror holds, a mirror
+    # inside the slot, two mirrors removal deletes, a mirror vanishing before a
+    # batch deletes, exact bytes, and two .git/info/attributes refusals) are mapped.
+    assert len(all_tests) == 2011
     assert len(ordinary) == 336
-    assert len(mapped) == 1665
+    assert len(mapped) == 1675
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {

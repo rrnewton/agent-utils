@@ -55752,6 +55752,7 @@ def test_archive_nested_cache_repositories_keeps_every_commit_object(
         "lfs-objects",
         "lfs-storage-config",
         "unknown-git-entry",
+        "info-attributes",
     ),
 )
 def test_archive_nested_cache_repositories_still_refuses_what_it_cannot_keep(
@@ -55789,6 +55790,10 @@ def test_archive_nested_cache_repositories_still_refuses_what_it_cannot_keep(
         elif case == "lfs-storage-config":
             git(clone, "config", "lfs.storage", "custom-store")
             expected = "repository config sets lfs.storage"
+        elif case == "info-attributes":
+            (clone / ".git" / "info").mkdir(exist_ok=True)
+            (clone / ".git" / "info" / "attributes").write_text("*.txt text\n", encoding="utf-8")
+            expected = "has attribute rules in"
         elif case == "unknown-git-entry":
             # Where a user-level lfs.storage setting would put LFS objects.
             stored = clone / ".git" / "binary-store" / "objects" / "ab" / "payload"
@@ -56176,3 +56181,308 @@ def test_archive_drifted_checkouts_refuses_state_its_bundle_cannot_keep(
     assert tree.is_dir()
     assert len(active_slots(project)) == 1
     assert not _finish_journal(project).exists()
+
+
+# --- round-4 review: pseudorefs, unreferenced submodule commits, mirrors ----
+
+
+def _drift_receipts(project: Path) -> dict[str, dict[str, object]]:
+    control = control_directory(project)
+    archive = json.loads((control / "ARCHIVED.testhost.json").read_text(encoding="utf-8"))
+    return {item["checkout"]: item for item in archive["records"][0]["salvage"]}
+
+
+def _bundle_reaches(tmp_path: Path, receipt: Mapping[str, object], commit: str, name: str) -> bool:
+    restored = tmp_path / name
+    git(tmp_path, "clone", "-q", "--bare", str(receipt["archive_bundle"]), str(restored))
+    return (
+        git(
+            restored,
+            "merge-base",
+            "--is-ancestor",
+            commit,
+            str(receipt["salvage_commit"]),
+            check=False,
+        ).returncode
+        == 0
+    )
+
+
+def test_archive_drifted_checkouts_keeps_a_commit_only_a_custom_pseudoref_names(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote, tree, _head = _drifted_dead_owner_slot(tmp_path, "branch")
+    # The review's exact reproduction: a commit that only MY_HEAD, a
+    # per-worktree pseudoref removal deletes, names.
+    custom = git(
+        tree, "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "only MY_HEAD names this"
+    ).stdout.strip()
+    git(tree, "update-ref", "MY_HEAD", custom)
+    admin = Path(git(tree, "rev-parse", "--absolute-git-dir").stdout.strip())
+    assert (admin / "MY_HEAD").read_text(encoding="utf-8").strip() == custom
+
+    removed = _remove_archiving(project, "--archive-drifted-checkouts")
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert _bundle_reaches(tmp_path, _drift_receipts(project)["product"], custom, "r.git")
+
+
+def test_archive_drifted_checkouts_keeps_an_unreferenced_submodule_commit(
+    tmp_path: Path,
+) -> None:
+    project, tree, component, _component_head = _drifted_slot_with_submodules(tmp_path)
+    (component / "component.txt").write_text("stashed then dropped\n", encoding="utf-8")
+    git(component, "stash", "-q")
+    dropped = git(component, "rev-parse", "refs/stash").stdout.strip()
+    git(component, "stash", "drop", "-q")
+    assert git(component, "rev-parse", "-q", "--verify", "refs/stash", check=False).returncode != 0
+    git(component, "reflog", "expire", "--expire=now", "--expire-unreachable=now", "--all")
+    git(tree, "checkout", "-q", "-b", "codex/other")
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    removed = _remove_archiving(project, "--archive-drifted-checkouts")
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    kept = _drift_receipts(project)["product/component"]
+    assert kept["disposition"] == "archived-local"
+    assert _bundle_reaches(tmp_path, kept, dropped, "component.git-restored")
+
+
+def _publish_component_branch(tmp_path: Path, destination: Path, branch: str) -> str:
+    """Commit on ``branch`` in a scratch clone of component.git and push it to ``destination``."""
+
+    scratch = tmp_path / f"scratch-{branch}"
+    subprocess.run(
+        ["git", "clone", "-q", str(tmp_path / "component.git"), str(scratch)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    git(scratch, "config", "user.name", "Wrkslots Test")
+    git(scratch, "config", "user.email", "wrkslots@example.invalid")
+    git(scratch, "checkout", "-q", "-b", branch)
+    commit = commit_local(scratch, f"{branch}.txt", f"{branch}\n", f"{branch} work")
+    git(scratch, "push", "-q", str(destination), f"{branch}:{branch}")
+    return commit
+
+
+def test_archive_drifted_checkouts_omits_a_submodule_commit_an_outside_mirror_holds(
+    tmp_path: Path,
+) -> None:
+    project, tree, component, _component_head = _drifted_slot_with_submodules(tmp_path)
+    mirror = tmp_path / "component.git"
+    published = _publish_component_branch(tmp_path, mirror, "feature")
+    git(component, "fetch", "-q", "origin")
+    assert git(component, "rev-parse", "refs/remotes/origin/feature").stdout.strip() == published
+    # The source submodule repository does not have it; the mirror, a local
+    # repository outside the slot that removal keeps, does.
+    source_component = project / "repo" / "component"
+    assert git(source_component, "cat-file", "-e", published, check=False).returncode != 0
+    git(tree, "checkout", "-q", "-b", "codex/other")
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    removed = _remove_archiving(project, "--archive-drifted-checkouts")
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    receipts = _drift_receipts(project)
+    assert receipts["product"]["archive_reason"] == "recorded-checkout-drift"
+    assert receipts["product/component"]["disposition"] == "already-published"
+    assert git(mirror, "rev-parse", "feature").stdout.strip() == published
+
+
+def test_archive_drifted_checkouts_keeps_a_commit_held_only_by_a_mirror_inside_the_slot(
+    tmp_path: Path,
+) -> None:
+    project, tree, component, _component_head = _drifted_slot_with_submodules(tmp_path)
+    repository = project / "repo"
+    inner = tree / ".inner-mirror.git"
+    subprocess.run(
+        ["git", "clone", "-q", "--bare", str(tmp_path / "component.git"), str(inner)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    exclude = repository / ".git" / "info" / "exclude"
+    exclude.write_text(
+        exclude.read_text(encoding="utf-8") + ".inner-mirror.git/\n", encoding="utf-8"
+    )
+    inside_only = _publish_component_branch(tmp_path, inner, "inside")
+    git(component, "remote", "set-url", "origin", str(inner))
+    git(component, "fetch", "-q", "origin")
+    assert git(component, "rev-parse", "refs/remotes/origin/inside").stdout.strip() == inside_only
+    git(tree, "checkout", "-q", "-b", "codex/other")
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    removed = _remove_archiving(project, "--archive-drifted-checkouts")
+
+    # The mirror is deleted with the slot, so it proves nothing: the commit is
+    # kept in the submodule's verified bundle before the fence.  After the
+    # fence the submodule's remote no longer exists where it is configured, so
+    # its remote identity cannot be re-established and removal refuses, with
+    # the slot rolled back intact.
+    assert removed.returncode == 3, removed.stdout + removed.stderr
+    assert "remote origin differs from its configured source" in removed.stderr
+    assert tree.is_dir()
+    assert len(active_slots(project)) == 1
+    assert not _finish_journal(project).exists()
+    salvage = control_directory(project) / "wrkslots-salvage" / "testhost" / "slot01" / "1"
+    [bundle] = sorted(salvage.glob("product-component-*/repository.bundle"))
+    restored = tmp_path / "inside-restored.git"
+    git(tmp_path, "clone", "-q", "--bare", str(bundle), str(restored))
+    assert git(restored, "cat-file", "-e", f"{inside_only}^{{commit}}", check=False).returncode == 0
+
+
+@pytest.mark.parametrize("where", ("checkout-git-directory", "fenced-slot"))
+def test_durable_submodule_repositories_ignore_a_mirror_removal_deletes(
+    tmp_path: Path, where: str
+) -> None:
+    project, tree, component, _component_head = _drifted_slot_with_submodules(tmp_path)
+    repository = project / "repo"
+    config = wrkslots._load_config(str(project), "testhost")
+    record = wrkslots._load_active(config).slots[0]
+    vcs = wrkslots._GitVcs()
+    source_component = repository / "component"
+    outside = tmp_path / "component.git"
+    if where == "checkout-git-directory":
+        admin = Path(git(tree, "rev-parse", "--absolute-git-dir").stdout.strip())
+        mirror = admin / "mirror.git"
+        submodule_path = component
+    else:
+        # The slot as removal fences it: renamed beside itself, registrations repaired.
+        fenced = tree.parent.parent / f".{record.slot}.fenced.{record.generation}.test"
+        tree.parent.rename(fenced)
+        fenced_tree = fenced / tree.name
+        vcs.repair_worktree(repository, fenced_tree)
+        wrkslots._repair_nested_repositories(fenced_tree, vcs)
+        mirror = fenced / "mirror.git"
+        submodule_path = fenced_tree / "component"
+    subprocess.run(
+        ["git", "clone", "-q", "--bare", str(outside), str(mirror)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    submodule, _path = next(
+        (item, item_path)
+        for item, item_path in wrkslots._submodule_salvage_checkouts(
+            config, record.checkouts[0], vcs, path_override=submodule_path.parent
+        )
+        if item.name == "product/component"
+    )
+
+    def durable(url: Path) -> tuple[Path, ...]:
+        # The submodule's own remote is the mirror, as configured.
+        git(submodule_path, "remote", "set-url", "origin", str(url))
+        authority = wrkslots._RemoteAuthority(
+            url=str(url), sha256=hashlib.sha256(str(url).encode()).hexdigest()
+        )
+        return wrkslots._durable_submodule_repositories(
+            vcs, config, record, submodule, submodule_path, authority
+        )
+
+    # A mirror outside the slot counts; the same mirror where removal deletes it does not.
+    assert durable(outside) == (source_component, outside.resolve())
+    assert durable(mirror) == (source_component,)
+
+
+def test_archive_drifted_checkouts_batch_refuses_when_its_mirror_vanishes_before_deletion(
+    tmp_path: Path,
+) -> None:
+    project, tree, component, _component_head = _drifted_slot_with_submodules(tmp_path)
+    other_slot = tmp_path / "other-slot"
+    other_slot.mkdir()
+    mirror = other_slot / "component-mirror.git"
+    subprocess.run(
+        ["git", "clone", "-q", "--bare", str(tmp_path / "component.git"), str(mirror)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    held = _publish_component_branch(tmp_path, mirror, "elsewhere")
+    git(component, "remote", "set-url", "origin", str(mirror))
+    git(component, "fetch", "-q", "origin")
+    git(tree, "checkout", "-q", "-b", "codex/other")
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    launcher = (
+        "import shutil, sys\nfrom wrkslots import cli\n"
+        "original = cli._salvage_agent_slot\n"
+        "def vanishing(*args, **kwargs):\n"
+        "    receipts = original(*args, **kwargs)\n"
+        f"    shutil.rmtree({str(mirror)!r})\n"
+        "    return receipts\n"
+        "cli._salvage_agent_slot = vanishing\n"
+        "raise SystemExit(cli.main(sys.argv[1:]))\n"
+    )
+
+    batch = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            launcher,
+            "--project-root",
+            str(project),
+            "remove-agent-batch",
+            "--slot",
+            "slot01=1",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--archive-drifted-checkouts",
+            "--format",
+            "json",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+        env=source_environment(),
+    )
+
+    assert batch.returncode == 1, batch.stdout + batch.stderr
+    report = json.loads(batch.stdout)
+    assert report["removed"] == []
+    assert [item["slot"] for item in report["refused"]] == ["slot01"]
+    assert not mirror.exists()
+    assert tree.is_dir()
+    assert git(component, "cat-file", "-e", f"{held}^{{commit}}", check=False).returncode == 0
+    assert len(active_slots(project)) == 1
+    assert not _finish_journal(project).exists()
+
+
+def test_archive_drifted_checkouts_keeps_exact_bytes_despite_conversion_settings(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote, tree, _head = _drifted_dead_owner_slot(tmp_path, "branch")
+    (tree / ".gitattributes").write_text("* text=auto eol=lf\n", encoding="utf-8")
+    git(repository, "config", "core.autocrlf", "true")
+    crlf = b"line one\r\nline two\r\n"
+    (tree / "crlf.txt").write_bytes(crlf)
+
+    removed = _remove_archiving(project, "--archive-drifted-checkouts")
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    receipt = _drift_receipts(project)["product"]
+    restored = tmp_path / "bytes.git"
+    git(tmp_path, "clone", "-q", "--bare", str(receipt["archive_bundle"]), str(restored))
+    shown = subprocess.run(
+        ["git", "-C", str(restored), "cat-file", "blob", f"{receipt['salvage_commit']}:crlf.txt"],
+        capture_output=True,
+        check=True,
+    ).stdout
+    assert shown == crlf
+
+
+def test_archive_drifted_checkouts_refuses_rules_in_info_attributes(tmp_path: Path) -> None:
+    project, repository, _remote, tree, head = _drifted_dead_owner_slot(tmp_path, "branch")
+    (repository / ".git" / "info" / "attributes").write_text("*.txt text\n", encoding="utf-8")
+
+    refused = _remove_archiving(project, "--archive-drifted-checkouts")
+
+    assert refused.returncode == 3, refused.stdout + refused.stderr
+    assert "has attribute rules in" in refused.stderr
+    assert tree.is_dir()
+    assert git(tree, "rev-parse", "HEAD").stdout.strip() == head
+    assert len(active_slots(project)) == 1

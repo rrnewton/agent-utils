@@ -20493,22 +20493,83 @@ def _reflog_endpoints(files: Sequence[Path]) -> set[str]:
     return endpoints
 
 
-def _private_pseudoref_commits(vcs: _GitVcs, path: Path) -> set[str]:
-    """Return the commit ORIG_HEAD names, which removing ``path``'s Git directory deletes.
+_PSEUDOREF_NAME_RE = re.compile(r"[A-Z][A-Z0-9_]*")
+_EMPTY_TREE_SHA1 = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+# Salvage that keeps files byte for byte: no end-of-line or ident conversion
+# from core.autocrlf, a user or system attributes file, or a .gitattributes in
+# the worktree (attributes are read from the empty tree). .git/info/attributes
+# cannot be switched off this way, so a repository with rules there refuses
+# (_assert_no_info_attributes).
+_FAITHFUL_ADD_CONFIG: tuple[tuple[str, str], ...] = (
+    ("core.attributesFile", "/dev/null"),
+    ("core.autocrlf", "false"),
+    ("core.safecrlf", "false"),
+)
+_FAITHFUL_ADD_ENV = {"GIT_ATTR_SOURCE": _EMPTY_TREE_SHA1, "GIT_ATTR_NOSYSTEM": "1"}
 
-    Unfinished-operation pseudorefs refuse elsewhere; FETCH_HEAD only lists
-    what a fetch received from a remote.
+
+def _assert_no_info_attributes(info_attributes: Path, label: str) -> None:
+    """Refuse attribute rules in .git/info/attributes, which salvage cannot switch off."""
+
+    try:
+        contents = info_attributes.read_bytes()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise Refusal(f"cannot read {info_attributes}: {exc}") from exc
+    rules = [
+        line
+        for line in contents.decode(errors="surrogateescape").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if rules:
+        raise Refusal(
+            f"{label} has attribute rules in {info_attributes} ({rules[0]!r}), which "
+            "could convert the files salvage keeps; preserve it"
+        )
+
+
+def _private_pseudoref_commits(vcs: _GitVcs, path: Path) -> set[str]:
+    """Return the commits that pseudorefs in ``path``'s own Git directory name.
+
+    Removal deletes that directory (a linked worktree's administrative
+    directory, or a slot submodule's repository), so every top-level file
+    named like a pseudoref (ORIG_HEAD, a custom MY_HEAD, FETCH_HEAD's lines)
+    is a root: each object name in it that is, or peels to, a commit is
+    returned.  A symbolic pseudoref names a ref, which is judged on its own;
+    an object that is missing, or is a tree or blob (AUTO_MERGE), has no
+    commit to keep.  Unfinished-operation files refuse elsewhere.
     """
 
-    result = vcs._run(path, ["rev-parse", "-q", "--verify", "ORIG_HEAD^{commit}"], check=False)
-    if result.returncode == 0:
-        value = result.stdout.strip()
-        if not SHA_RE.fullmatch(value):
-            raise Refusal(f"ORIG_HEAD of checkout {path} is not a full commit")
-        return {value}
-    if os.path.lexists(_git_path(vcs, path, "ORIG_HEAD")):
-        raise Refusal(f"ORIG_HEAD of checkout {path} does not name a commit; preserve it")
-    return set()
+    git_directory = Path(vcs._run(path, ["rev-parse", "--absolute-git-dir"]).stdout.strip())
+    candidates: set[str] = set()
+    try:
+        names = sorted(os.listdir(git_directory))
+    except OSError as exc:
+        raise Refusal(f"cannot inspect {git_directory}: {exc}") from exc
+    for name in names:
+        if not _PSEUDOREF_NAME_RE.fullmatch(name):
+            continue
+        entry = git_directory / name
+        if entry.is_symlink() or not entry.is_file():
+            continue
+        try:
+            contents = entry.read_bytes()[: 4 * 1024 * 1024]
+        except OSError as exc:
+            raise Refusal(f"cannot read {entry}: {exc}") from exc
+        for line in contents.decode("ascii", "replace").splitlines():
+            token = line.split("\t", 1)[0].split(" ", 1)[0].strip()
+            if SHA_RE.fullmatch(token):
+                candidates.add(token)
+    commits: set[str] = set()
+    for candidate in sorted(candidates):
+        peeled = vcs._run(
+            path, ["rev-parse", "-q", "--verify", f"{candidate}^{{commit}}"], check=False
+        )
+        value = peeled.stdout.strip()
+        if peeled.returncode == 0 and SHA_RE.fullmatch(value):
+            commits.add(value)
+    return commits
 
 
 def _assert_no_unkept_repository_state(
@@ -20538,6 +20599,7 @@ def _assert_no_unkept_repository_state(
             )
     common = vcs.common_directory(path)
     git_directory = Path(vcs._run(path, ["rev-parse", "--absolute-git-dir"]).stdout.strip())
+    _assert_no_info_attributes(common / "info" / "attributes", f"checkout {checkout.name}")
     for directory in dict.fromkeys((common, git_directory)):
         try:
             lfs = sorted(name for name in os.listdir(directory) if name.lower().startswith("lfs"))
@@ -20683,8 +20745,9 @@ def _submodule_private_tips(
     A linked worktree's submodule repositories live in the worktree's own Git
     directory, so removal deletes every ref, stash entry and reflog they hold,
     remote-tracking refs and tags included (those may also be stale or
-    local).  This lists the tips of the commits that any of them reaches (both
-    object names of every reflog entry) and that neither ``kept`` nor any ref
+    local), and every commit object no ref names.  This lists the tips of the
+    commits that any of them reaches (both object names of every reflog entry,
+    every pseudoref, every commit object) and that neither ``kept`` nor any ref
     of a ``durable`` repository, which removal keeps (the source submodule
     repository, and the submodule's remote when that is a local repository
     outside the slot), reaches.  Ancestry is decided with those repositories'
@@ -20707,6 +20770,34 @@ def _submodule_private_tips(
         .stdout.splitlines()
         if line
     )
+    # Every commit object, named or not (a dropped stash, for one): the whole
+    # repository is deleted, so an unreferenced commit is kept too.  The
+    # commits salvage itself writes here (committer wrkslots@localhost) are
+    # left out, so a recheck derives the same salvage commit; whatever they
+    # keep is reached from the commit's other roots.
+    every_commit = [
+        line.strip()
+        for line in vcs._run(
+            path,
+            [
+                "cat-file",
+                "--batch-all-objects",
+                "--unordered",
+                "--batch-check=%(objectname)",
+                "--filter=object:type=commit",
+            ],
+        ).stdout.splitlines()
+        if line.strip()
+    ]
+    if every_commit:
+        for line in vcs._run(
+            path,
+            ["log", "--no-walk=unsorted", "--stdin", "--format=%H %ce"],
+            input_text="".join(f"{commit}\n" for commit in every_commit),
+        ).stdout.splitlines():
+            commit, _space, committer = line.partition(" ")
+            if committer != "wrkslots@localhost":
+                positives.add(commit)
     negatives = {kept}
     alternates: list[str] = []
     for repository in durable:
@@ -20826,8 +20917,9 @@ def _index_state_trees(
     deleted or changed back) nor the worktree content of a file tracked only
     in the real index (one force-added past .gitignore).  These two trees do:
     the first is exactly what is staged, the second is a copy of the real
-    index updated from the worktree with the ordinary salvage pathspecs.
-    Copies are used, so the real index is never written.
+    index updated from the worktree with the ordinary salvage pathspecs, every
+    file read as its exact bytes (_FAITHFUL_ADD_CONFIG).  Copies are used, so
+    the real index is never written.
     """
 
     index = _git_path(vcs, path, "index")
@@ -20847,8 +20939,13 @@ def _index_state_trees(
         staged_tree = vcs._run(
             path, ["write-tree"], env_overrides={"GIT_INDEX_FILE": str(staged_copy)}
         ).stdout.strip()
-        env = {"GIT_INDEX_FILE": str(worktree_copy)}
-        vcs._run(path, ["add", "-u", "--", *pathspecs], env_overrides=env)
+        env = {"GIT_INDEX_FILE": str(worktree_copy), **_FAITHFUL_ADD_ENV}
+        vcs._run(
+            path,
+            ["add", "-u", "--", *pathspecs],
+            env_overrides=env,
+            config=_FAITHFUL_ADD_CONFIG,
+        )
         untracked = vcs._run(
             path,
             ["ls-files", "--others", "--exclude-standard", "-z", "--", *pathspecs],
@@ -20860,7 +20957,16 @@ def _index_state_trees(
                 ["add", "--pathspec-from-file=-", "--pathspec-file-nul"],
                 input_text=untracked,
                 env_overrides={**env, "GIT_LITERAL_PATHSPECS": "1"},
+                config=_FAITHFUL_ADD_CONFIG,
             )
+        # Entries copied from the real index keep the blobs that conversion
+        # made when they were staged; read every tracked file again as bytes.
+        vcs._run(
+            path,
+            ["add", "--renormalize", "--", *pathspecs],
+            env_overrides=env,
+            config=_FAITHFUL_ADD_CONFIG,
+        )
         worktree_tree = vcs._run(path, ["write-tree"], env_overrides=env).stdout.strip()
     for tree in (staged_tree, worktree_tree):
         if not SHA_RE.fullmatch(tree):
@@ -20913,6 +21019,7 @@ def _salvage_candidate_uncached(
         allow_shallow=allow_shallow,
         detached_root=detached_root,
         accept_drift=accept_drift,
+        faithful=keep_private_state,
     )
     if not keep_private_state:
         return facts
@@ -21010,8 +21117,13 @@ def _salvage_candidate_facts(
     allow_shallow: bool = False,
     detached_root: bool = False,
     accept_drift: bool = False,
+    faithful: bool = False,
 ) -> _SalvageCandidate:
     """Return HEAD, status digest, durable commit candidate, and dirty state.
+
+    ``faithful`` builds the salvage commit from the files' exact bytes
+    (_FAITHFUL_ADD_CONFIG); only the local archive of a drifted checkout
+    uses it, so ordinary salvage is unchanged.
 
     ``accept_drift`` skips only the comparison of the checkout's branch and
     remote URL with the recorded ones (a detached HEAD included); every other
@@ -21110,10 +21222,33 @@ def _salvage_candidate_facts(
 
     with tempfile.TemporaryDirectory(prefix="wrkslots-salvage-") as temporary:
         index = str(Path(temporary) / "index")
-        env = {"GIT_INDEX_FILE": index}
+        env = {"GIT_INDEX_FILE": index, **(_FAITHFUL_ADD_ENV if faithful else {})}
+
+        def add(arguments: Sequence[str]) -> None:
+            # The faithful configuration is passed only when set, so ordinary
+            # salvage calls Git exactly as before.
+            if faithful:
+                vcs._run(path, arguments, env_overrides=env, config=_FAITHFUL_ADD_CONFIG)
+            else:
+                vcs._run(path, arguments, env_overrides=env)
+
+        def add_untracked(names: str) -> None:
+            literal = {**env, "GIT_LITERAL_PATHSPECS": "1"}
+            arguments = ["add", "--pathspec-from-file=-", "--pathspec-file-nul"]
+            if faithful:
+                vcs._run(
+                    path,
+                    arguments,
+                    input_text=names,
+                    env_overrides=literal,
+                    config=_FAITHFUL_ADD_CONFIG,
+                )
+            else:
+                vcs._run(path, arguments, input_text=names, env_overrides=literal)
+
         vcs._run(path, ["read-tree", "HEAD"], env_overrides=env)
         pathspecs = _salvage_pathspecs(config, checkout.name)
-        vcs._run(path, ["add", "-u", "--", *pathspecs], env_overrides=env)
+        add(["add", "-u", "--", *pathspecs])
         untracked = vcs._run(
             path,
             [
@@ -21130,12 +21265,7 @@ def _salvage_candidate_facts(
             # Each listed name is one exact path. Read as a glob pathspec, an
             # untracked file named `*.md` would also stage the excluded
             # HANDOFF.md and cache paths, so the names are matched literally.
-            vcs._run(
-                path,
-                ["add", "--pathspec-from-file=-", "--pathspec-file-nul"],
-                input_text=untracked,
-                env_overrides={**env, "GIT_LITERAL_PATHSPECS": "1"},
-            )
+            add_untracked(untracked)
         tree = vcs._run(path, ["write-tree"], env_overrides=env).stdout.strip()
         if not SHA_RE.fullmatch(tree):
             raise Refusal(f"salvage tree for checkout {checkout.name} is not a full Git object")
@@ -31159,6 +31289,10 @@ def _salvage_nested_git_repository(
         entries = sorted(os.listdir(dotgit))
     except OSError as exc:
         raise refuse(f"cannot inspect .git: {exc}") from exc
+    try:
+        _assert_no_info_attributes(dotgit / "info" / "attributes", "repository")
+    except Refusal as exc:
+        raise refuse(f"{exc}; salvage refused") from exc
     lfs_entries = [name for name in entries if name.lower().startswith("lfs")]
     if lfs_entries:
         raise refuse(
@@ -31293,7 +31427,21 @@ def _salvage_nested_git_repository(
             # Every tracked change and every untracked file, ignored ones
             # included: an ignore rule may itself be unpublished work (an
             # edited or uncommitted .gitignore), so ignored files are kept.
-            output(["add", "-A", "--force"], work=True, extra_env=index_env)
+            # Files are read as their exact bytes (_FAITHFUL_ADD_CONFIG), and
+            # tracked files are read again, since entries copied from the
+            # real index keep blobs that conversion made when staged.
+            faithful = [
+                argument
+                for key, value in _FAITHFUL_ADD_CONFIG
+                for argument in ("-c", f"{key}={value}")
+            ]
+            faithful_env = {**index_env, **_FAITHFUL_ADD_ENV}
+            output([*faithful, "add", "-A", "--force"], work=True, extra_env=faithful_env)
+            output(
+                [*faithful, "add", "--renormalize", "--", ":/"],
+                work=True,
+                extra_env=faithful_env,
+            )
             tree = output(["write-tree"], extra_env=index_env).strip()
             if not SHA_RE.fullmatch(tree):
                 raise refuse("salvage tree is not a full Git object")
@@ -57425,8 +57573,11 @@ _ARCHIVE_DRIFTED_CHECKOUTS_HELP = (
     "compares the checkout with the drift recorded in its salvage receipt, so any "
     "further change refuses. The salvage commit also keeps what the checkout's own "
     "index stages, its worktree read through that index, and every commit that only "
-    "its worktree-private reflogs, ORIG_HEAD and refs reach, and for each submodule its "
-    "index and whatever its own repository holds beyond the repositories removal keeps. "
+    "its worktree-private reflogs, pseudorefs and refs reach, and for each submodule its "
+    "index and every commit its own repository holds that no ref of a repository removal "
+    "keeps contains (the source submodule repository, and a local remote outside the slot "
+    "and its checkouts' Git directories, every ref of it counting, refs/remotes/* included). "
+    "Files are kept as their exact bytes; attribute rules in .git/info/attributes refuse. "
     "A content filter or lfs.* setting, Git LFS storage, an embedded untracked repository, "
     "or a module repository the checkout no longer lists refuses. Gitignored files "
     "are not kept, and branch refs, the recorded one included, are left in the source "
