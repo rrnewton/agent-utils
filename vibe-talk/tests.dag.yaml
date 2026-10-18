@@ -434,6 +434,30 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#340 composer-grow-box` in the browser engine, a real paste (the clipboard written, then Ctrl+V
+  # through CDP) into the message box: at 1280x800 and 1920x1080 the Grow checkbox drawn left of Send on
+  # its row and the box at its three-line resting height; Grow off, a long paste leaves it there; on, the
+  # paste grows it to within a line of 60% of the window, scrolling inside, Send on screen in the list;
+  # three short lines fit; Send clears it to rest; a reload keeps Grow, and with a long draft comes back at
+  # the list's foot with Send on screen; a short 1280x600 window keeps Send on screen; two columns grow the
+  # right column's box; a reader at the foot typing line after line stays there; the same through the
+  # page's own measured height with field-sizing turned off; and a 393x852 phone draws no checkbox and
+  # lays the box out alike with Grow stored on or off. Measured on 2026-10-18 outside dagrun on a host at
+  # load 18: about 14s wall, 2.3s CPU in the script.
+  - group: check
+    job: composer-grow-browser
+    desc: the Grow checkbox and the message box growing with a long paste up to 60% of the window, Send on screen, in current Chromium at 1280x800, 1920x1080, 1280x600 and two columns, without field-sizing, and unchanged on a 393x852 phone
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/composer_grow_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 15
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#220 view-switch-instant` in the browser engine: All to Main and back in the bar's real picker
   # with every timeline request intercepted — no read, never an empty list or the loading line, the
   # reader's message kept — and All never read drawn at once from held rows, read once behind them;
