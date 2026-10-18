@@ -141,7 +141,8 @@ pub struct CachedMessage {
     pub created_ms: i64,
     /// Local time of the observation that set this content.
     pub observed_ms: i64,
-    /// Whether the content came from a push that may carry only a snippet.
+    /// Whether the content came from a push, so that it may be only a snippet, and no read has
+    /// proven it whole since (merge rule 5). Such a text is never served as the message.
     pub content_partial: bool,
     /// For a row read through one scope: when the latest read of that scope's newest end to list
     /// it while it lay at or above the head's settled top began, local time. `None` when no such

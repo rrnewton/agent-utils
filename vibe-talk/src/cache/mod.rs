@@ -1463,6 +1463,11 @@ impl MessageCache {
     /// records a drop of the channel once it is carried out ([`MessageCache::last_drop_ms`]), as
     /// does a change such an erase discards on its way to the file. Either way nothing of the
     /// channel seen by then is vouched for until a read begun afterwards has seen it again.
+    ///
+    /// The feed vouches for what it could have contradicted, and no more: that a message exists
+    /// and its text has not changed since. It never makes a text whole. Whatever text a push
+    /// brought may be a snippet, and is never served until a read proves it whole (merge rule 5,
+    /// and [`shadow`]'s `gap`).
     #[must_use]
     pub fn fed_since_ms(&self) -> i64 {
         self.shared.fed_since_ms.load(Ordering::SeqCst)

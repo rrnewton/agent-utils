@@ -442,9 +442,9 @@ pub fn single(
 
 /// What one change from the live feed tells the cache: a creation or an edit carries the message,
 /// at its home by the provider's shape; a deletion carries its id. A push is never a claim about
-/// any scope, and a creation of a message the cache does not hold is kept as possibly a snippet
-/// until a read replaces it (the writer's rule, not this one's). Only the poller's copy, which its
-/// own read brought, reports edits as the provider's reads do ([`PushedBy`]).
+/// any scope, and whatever text it brings is kept as possibly a snippet until a read proves it
+/// whole (the writer's rule, merge rule 5, not this one's). Only the poller's copy, which its own
+/// read brought, reports edits as the provider's reads do ([`PushedBy`]).
 #[must_use]
 pub fn pushed(shape: Shape, live: &LiveMessage, by: PushedBy, observed_ms: i64) -> Observation {
     let push = match live.kind {

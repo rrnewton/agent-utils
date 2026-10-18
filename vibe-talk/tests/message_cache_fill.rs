@@ -1677,7 +1677,15 @@ async fn a_pushed_creation_is_a_possible_snippet_until_a_read_and_a_pushed_snipp
     assert_eq!(first.message.content, "a long body…");
     assert!(first.content_partial, "a pushed creation may be a snippet");
 
-    // A read lists it: its text replaces the snippet, even though it started no later.
+    // A read that started no later lists it: that changes nothing, since it may be of a version
+    // before an edit the push brought.
+    get(&d.state, &flat_page()).await;
+    let tied = cached(&d.cache, &read_chan(), &created);
+    assert_eq!(tied.message.content, "a long body…");
+    assert!(tied.content_partial);
+
+    // A read begun after the push lists it: its text replaces the snippet.
+    clock.advance(1);
     get(&d.state, &flat_page()).await;
     let listed = cached(&d.cache, &read_chan(), &created);
     assert_eq!(listed.message.content, full);
@@ -4108,6 +4116,108 @@ async fn a_polled_bridges_feed_never_vouches_for_a_message_it_could_not_report_d
             (0, 0),
             "{label}: the feed vouches for a deleted message nothing could report deleted: \
              {counted:?}"
+        );
+    }
+}
+
+/// An unpolled bridge with `[ingest]`, an adapter feeding it, its five messages seeded upstream.
+struct AdapterFed {
+    state: AppState,
+    fake: Arc<FakeDiscord>,
+    cache: Arc<MessageCache>,
+    ids: Vec<MessageId>,
+    _store: Arc<FakeStore>,
+    _dir: TempDir,
+}
+
+/// An [`AdapterFed`] bridge whose message `n` says `body(n)`, its cache's clock `clock`.
+async fn adapter_fed_bridge(
+    tag: &str,
+    body: impl Fn(i64) -> String,
+    clock: &Arc<ManualClock>,
+) -> AdapterFed {
+    let text = testing::config_toml().replace(
+        "[discord]",
+        "[discord]\nthread_api = \"bridge\"\napi_base = \"http://127.0.0.1:9/api\"",
+    );
+    let text = format!("{text}\n[ingest]\ntoken = \"{INGEST_TOKEN}\"\n");
+    let (mut state, fake, store) = testing::state_with_store_from_toml(&text);
+    let ids: Vec<MessageId> = (0..5)
+        .map(|n| fake.seed_at(&id(READ_CHANNEL), "Ada", &body(n), T0 + n * MINUTE))
+        .collect();
+    state.replace_chat(Arc::new(TimelineChat::new(fake.clone())));
+    let dir = TempDir::new(tag);
+    let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
+    let cache = state.message_cache.cache().expect("installed");
+    AdapterFed {
+        state,
+        fake,
+        cache,
+        ids,
+        _store: store,
+        _dir: dir,
+    }
+}
+
+/// Read `target` by id with the read token, `step` after the last such read, and hand back what
+/// the shadow has counted for lookups by id since the process started.
+async fn read_by_id_after(
+    state: &AppState,
+    clock: &ManualClock,
+    target: &MessageId,
+    step: i64,
+) -> vibe_talk::cache::shadow::ConsumerCounts {
+    clock.advance(step);
+    let status = call_as(
+        state,
+        &format!(
+            "/api/v1/channels/{READ_CHANNEL}/messages/{}",
+            target.as_str()
+        ),
+        testing::READ_TOKEN,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    shadow_of(state, "message_by_id").await
+}
+
+/// An unpolled bridge fed by an adapter. A message is posted upstream with a long body, and the
+/// adapter pushes its creation with a snippet for a body, as a bridge does when its live event has
+/// none. The cache holds the snippet as possibly one, so it must never count it as the whole
+/// message, 5 s on or a day and an hour on. (The review's probe
+/// `r4_p2_e2e_a_pushed_snippet_is_never_served_as_the_whole_message`.)
+#[tokio::test]
+async fn a_pushed_snippet_is_never_served_as_the_whole_message() {
+    let clock = ManualClock::at(T0 + HOUR);
+    let AdapterFed {
+        state,
+        fake,
+        cache,
+        ids,
+        _store,
+        _dir,
+    } = adapter_fed_bridge(
+        "cache-fill-pushed-snippet",
+        |n| format!("message {n} with its whole body"),
+        &clock,
+    )
+    .await;
+    let target = ids[4].clone();
+    clock.advance(MINUTE);
+    let status = ingest(
+        &state,
+        pushed("e1", "create", &said(&fake, &target, "message 4 with…")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let row = cached(&cache, &read_chan(), &target);
+    assert_eq!(row.message.content, "message 4 with…");
+    assert!(row.content_partial, "a pushed text may be a snippet");
+    for (step, label) in [(5_000, "5 s"), (25 * HOUR, "25 h")] {
+        let counted = read_by_id_after(&state, &clock, &target, step).await;
+        assert_eq!(
+            counted.content_differs, 0,
+            "{label}: the cache would serve a pushed snippet as the whole message: {counted:?}"
         );
     }
 }
