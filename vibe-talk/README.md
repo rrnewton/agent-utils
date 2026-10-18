@@ -6786,6 +6786,10 @@ draft put back) moves nothing under you. An empty box rests at the height it alw
   does not (Firefox today), the page measures the box as it changes and sets its height, capped by
   the same rule.
 
+`make -C vibe-talk composer-grow-browser` measures this in a real Chromium at 1280x800, 1920x1080
+and a short 1280x600 window, with the checkbox off and on, with the browser's own sizing turned off,
+in the right column, after a reload with a long draft, and on a 393x852 phone.
+
 ### The keyboard: scrolling, search and Settings
 
 `#224 keyboard-shortcuts`. On a desk, in a browser tab or the installed app, the list on screen
