@@ -514,8 +514,10 @@ const session = {
   // Text turns waiting for the backend, oldest first. `kind` is who wants it said, which decides
   // whether it may cut an answer short (`#330 voice-long-turn-drop`): the reader's own typed words
   // may, through an announced `interrupt`; a relayed channel message or the page's own notice may
-  // not, and waits for the answer to finish playing.
-  /** @type {{text: string, kind: "typed" | "notice" | "relay"}[]} */
+  // not, and waits for the answer to finish playing. `relays` are the channel messages a relayed
+  // turn carries, for the line that says they were not read out if the call ends first (`#337
+  // voice-relay-silent`).
+  /** @type {{text: string, kind: "typed" | "notice" | "relay", relays: {channel: string}[]}[]} */
   pendingPrompts: [],
   // `#330 voice-long-turn-drop`. This page sent `interrupt` to make way for a typed message and the
   // turn it cut has not completed yet: that turn's late audio is not played.
@@ -6559,8 +6561,9 @@ function onClear() {
  * @param {"typed" | "notice" | "relay"} [kind] who wants a `user_message` said: the reader (typed or
  *   a canned prompt), the page (its word on a yes), or a channel (a relayed message). Only the
  *   reader's own words may cut an answer short. `#330 voice-long-turn-drop`.
+ * @param {{channel: string}[]} [relays] the channel messages a relayed turn carries. `#337`.
  */
-function sendClientEvent(event, kind = "typed") {
+function sendClientEvent(event, kind = "typed", relays = []) {
   if (!canSendText()) {
     return false;
   }
@@ -6571,7 +6574,7 @@ function sendClientEvent(event, kind = "typed") {
   }
   if (session.protocol === "vibe-talk-v1") {
     if (event.type === "user_message") {
-      session.pendingPrompts.push({ text: String(event.text), kind });
+      session.pendingPrompts.push({ text: String(event.text), kind, relays });
       advanceVibeTalkInput();
     }
     // This protocol has no presence or contextual-update frame. Those events are advisory, so a
@@ -14959,6 +14962,7 @@ async function openConversation(options) {
       session.connected = true;
       conversationOpen = true;
       startPostWatch();
+      beginCallRelay();
       session.conversationId = conversationIdFrom(null);
       // `#270 voice-transcript-markers`. What this call was handed of the conversation above — on
       // this protocol, never a recap — on the line above it, and in its first record.
@@ -15019,6 +15023,7 @@ async function openConversation(options) {
     session.connected = true;
     conversationOpen = true;
     startPostWatch();
+    beginCallRelay();
     // A mute engaged during the CONNECT WINDOW could not be announced when it happened. The socket
     // is assigned before it is open, deliberately — that is what makes the talk control mute
     // rather than dial a second call — but `sendClientEvent` refuses a socket the page is not yet
@@ -16291,6 +16296,9 @@ function teardown() {
   if (session.replyArriving) markAnswerCut();
   settleSpoken();
   saveUnsettledTurns();
+  // `#337 voice-relay-silent`. What was still to be read out is said not to have been, before the
+  // turns waiting for the backend are let go below.
+  endCallRelay();
   stopPostWatch();
   sendStartupTiming();
   stopPlayback();
@@ -39677,22 +39685,44 @@ async function readChannelStream(channelId, generation) {
   // begun from here on will see.
   liveAttachReads = timelineReadsStarted;
   liveAttached = true;
+  // `#337 voice-relay-silent`. What a resumed attach replays is what it missed, which a call may
+  // not have heard: `relayToAgent` tells that apart from a fresh attach's history.
+  liveAttachResumed = Boolean(headers["Last-Event-ID"]);
   renderLiveState();
   releaseLiveAttachWaiters();
+  await readEventStream(reader, () => generation === liveGeneration, onStreamFrame);
+}
+
+/** Whether the channel stream's attach now open resumed from a cursor. `#337 voice-relay-silent`. */
+let liveAttachResumed = false;
+
+/**
+ * Hand each Server-Sent Event of `reader` to `onFrame` until the response ends, or `current()` says
+ * the stream it belongs to was stopped. Shared by the channel's stream and, since `#337
+ * voice-relay-silent`, the stream of every channel. Answers `reset` when a frame's handler said the
+ * server reset the stream, and `ended` otherwise.
+ *
+ * @param {ReadableStreamDefaultReader<Uint8Array>} reader
+ * @param {() => boolean} current
+ * @param {(frame: {id: string | null, event: string, data: string}) => (string | void)} onFrame
+ * @returns {Promise<"reset" | "ended">}
+ */
+async function readEventStream(reader, current, onFrame) {
   const decoder = new TextDecoder();
   let buffer = "";
+  let reset = false;
   for (;;) {
     const chunk = await reader.read();
-    if (generation !== liveGeneration) {
+    if (!current()) {
       // Deliberately not awaited and deliberately not fatal: a reader that will not cancel must
-      // not keep this loop alive, and the generation check above has already stopped it mattering.
+      // not keep this loop alive, and the check above has already stopped it mattering.
       if (typeof reader.cancel === "function") {
         Promise.resolve(reader.cancel()).catch(() => {});
       }
-      return;
+      return "ended";
     }
     if (chunk.done) {
-      return;
+      return reset ? "reset" : "ended";
     }
     buffer += decoder.decode(chunk.value, { stream: true });
     // An SSE event ends at a blank line. Anything after the last one is a partial frame and stays
@@ -39700,7 +39730,7 @@ async function readChannelStream(channelId, generation) {
     // ends.
     let at = buffer.indexOf("\n\n");
     while (at >= 0) {
-      onStreamFrame(parseEventFrame(buffer.slice(0, at)));
+      if (onFrame(parseEventFrame(buffer.slice(0, at))) === "reset") reset = true;
       buffer = buffer.slice(at + 2);
       at = buffer.indexOf("\n\n");
     }
@@ -39748,6 +39778,10 @@ function onStreamFrame(frame) {
     // must not have. The cursor is dropped with it — resuming from an id on the far side of a gap
     // would ask the server to replay what it has already said it cannot.
     liveLastEventId = null;
+    // `#337 voice-relay-silent`. The re-read puts the channel right; whether a call heard what fell
+    // into the gap cannot be known, so it is said — unless the stream of every channel, which
+    // carries this channel too, is what the call is hearing from.
+    if (!watchAllAttached && canSendText() && relayMode() !== "off") reportUnrelayed([], "gap");
     setStatus("the live feed fell behind — re-reading the channel.");
     refreshQuietly(() => loadDiscord({ keepPosition: true, reason: "reset" }))();
     return;
@@ -39855,6 +39889,8 @@ function refreshAfterLiveMutation() {
  * arrive twice.
  */
 function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
+  // `#337 voice-relay-silent`. How it came, for whether a call that may have missed it hears it.
+  const arrival = { fromTail: fromTail === true, resumed: liveAttachResumed };
   observeOutgoingMessages([message]);
   // The other free way to learn which account is ours: the server marks what IT posted, so the
   // author of a self-posted message is this bridge by construction. Done before the channel guard
@@ -39900,7 +39936,7 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
         followReplyStore();
       }
       renderOutgoingEverywhere();
-      relayToAgent(message, selfPosted, replayed);
+      relayToAgent(message, selfPosted, replayed, arrival);
       return;
     }
     // `#185 reply-new-thread`. An open Reply follows the store as the rows do, before the read below
@@ -39921,7 +39957,7 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
     }
     if (places) followPlacement();
     renderOutgoingEverywhere();
-    relayToAgent(message, selfPosted, replayed);
+    relayToAgent(message, selfPosted, replayed, arrival);
     // The server owns thread membership, counts and activity ordering. Re-read the active
     // context instead of dropping a reply from another thread into the visible conversation.
     // `#229 desktop-two-column`: a reply in the thread on the right is read as that thread, which
@@ -39963,7 +39999,7 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
   // A row that arrived because the SERVER said so is a row like any other: if it is long and the
   // reader is looking at it, it gets a summary. `#49 cached-summaries`.
   requestVisibleSummaries();
-  relayToAgent(message, selfPosted, replayed);
+  relayToAgent(message, selfPosted, replayed, arrival);
 }
 
 /**
@@ -40215,9 +40251,43 @@ function relayTurn(quotes, mode) {
   ].join("\n");
 }
 
-/** Messages that have arrived and not yet been spoken, and the timer that will speak them. */
+/**
+ * Messages that have arrived and not yet been spoken, oldest first, and the timer that will speak
+ * them. Each is its quoted line and its channel, for the line that says when one was not read out
+ * (`#337 voice-relay-silent`).
+ *
+ * @type {{line: string, channel: string}[]}
+ */
 let relayPending = [];
 let relayTimer = null;
+
+/**
+ * `#337 voice-relay-silent`. Every message this call has taken to relay, by channel and id: what
+ * makes a message relayed EXACTLY ONCE when two streams carry it — the channel on screen's and the
+ * stream of every channel — or a stream that dropped replays it on resuming. Emptied when a call
+ * opens.
+ *
+ * @type {Set<string>}
+ */
+let relayLedger = new Set();
+
+/** When the call now open connected, by the wall clock; 0 with no call. `#337 voice-relay-silent`. */
+let relayCallOpenedAt = 0;
+
+/**
+ * The most channel messages one relayed turn carries. `#337 voice-relay-silent`. Since the call
+ * hears every watched channel, a channel catching up after an outage can deliver a few hundred at
+ * once; read out in full, that is not a turn but an hour. The rest wait for the next turn, which
+ * goes when this one's answer has been heard out — each message still once, none dropped.
+ */
+const RELAY_TURN_MAX_MESSAGES = 8;
+
+/**
+ * How far before the call connected a message replayed on a resumed stream may have been posted and
+ * still be news to the call: phone clocks drift from the chat provider's by seconds, not minutes.
+ * `#337 voice-relay-silent`.
+ */
+const RELAY_CLOCK_SKEW_MS = 60000;
 
 /**
  * Say the held messages as ONE turn, and forget them.
@@ -40234,12 +40304,25 @@ let relayTimer = null;
  *
  * Both guards are re-checked HERE as well as at the door. Between the arrival and this flush the
  * call can end and the reader can turn the relay off, and either one means the turn must not go.
+ * `#337 voice-relay-silent`: neither drops a held message silently any more. Turned off, the
+ * connection details say how many were let go; with no call to reach, the transcript says they
+ * were not read out (`reportUnrelayed`).
  */
 function flushRelay() {
   relayTimer = null;
+  if (!relayPending.length) return false;
   const mode = relayMode();
-  if (!relayPending.length || mode === "off" || !canSendText()) {
+  if (mode === "off") {
+    addDetail(`${relayCount(relayPending.length)} waiting to be read out ${relayPending.length === 1 ? "was" : "were"} ` +
+      "let go: Live messages was turned off");
     relayPending = [];
+    relayWaitShown = 0;
+    return false;
+  }
+  if (!canSendText()) {
+    reportUnrelayed(relayPending, "ended");
+    relayPending = [];
+    relayWaitShown = 0;
     return false;
   }
   // `#330 voice-long-turn-drop`. Never into an answer. A relayed message used to be held thirty
@@ -40249,17 +40332,28 @@ function flushRelay() {
   if (relayMustWait()) {
     if (relayPending.length !== relayWaitShown) {
       relayWaitShown = relayPending.length;
-      setStatus(`${relayPending.length} new message${relayPending.length === 1 ? "" : "s"} will be read out ` +
-        "when the answer ends.");
+      setStatus(`${relayCount(relayPending.length)} will be read out when the answer ends.`);
     }
     relayTimer = setTimeout(flushRelay, Math.max(RELAY_RECHECK_MS,
       (session.answerPlayEndMs || 0) + ANSWER_PLAYED_GRACE_MS - Date.now()));
     return false;
   }
-  const quotes = relayPending;
-  relayPending = [];
+  const held = relayPending.splice(0, RELAY_TURN_MAX_MESSAGES);
   relayWaitShown = 0;
-  return sendClientEvent({ type: "user_message", text: relayTurn(quotes, mode) }, "relay");
+  const sent = sendClientEvent(
+    { type: "user_message", text: relayTurn(held.map((item) => item.line), mode) },
+    "relay",
+    held
+  );
+  if (!sent) reportUnrelayed(held, "ended");
+  // The rest of a burst too large for one turn waits behind this one's answer.
+  if (relayPending.length && relayTimer === null) relayTimer = setTimeout(flushRelay, RELAY_COALESCE_MS);
+  return sent;
+}
+
+/** "1 new message", "3 new messages". */
+function relayCount(count) {
+  return `${count} new message${count === 1 ? "" : "s"}`;
 }
 
 /**
@@ -40295,9 +40389,10 @@ function relayMustWait() {
  *     screen and they are NOT news. Relaying them says "a message was just posted" about text
  *     that may be hours old, in a burst, into a conversation billed by the minute — the same
  *     "existing history labelled as new" failure the server's seeding tick exists to prevent,
- *     arriving through the other door. The cost of the rule, stated: a message that lands while
- *     this page is between streams reaches the list but not the agent, exactly as one that lands
- *     while the tab is shut does.
+ *     arriving through the other door. `#337 voice-relay-silent` took back the cost this rule
+ *     used to carry: a stream that dropped during a call and RESUMED from its cursor replays only
+ *     what it missed, and what of that was posted since the call connected is news after all
+ *     (`missedDuringCall`).
  *   * SELF-POSTED. `ops::reply` posts as the bot and the server's own poller reads it back. Relay
  *     that and the agent hears its own answer as news and answers it — a loop that bills.
  *   * THE MODE. `off` is silence. The other two both speak, and both therefore cost a turn of a
@@ -40306,20 +40401,240 @@ function relayMustWait() {
  *     would deliver stale news at the start of a conversation about something else.
  *
  * Past the guards it is HELD rather than sent: see `flushRelay`, which turns a burst into one turn
- * instead of talking over itself once per message.
+ * instead of talking over itself once per message. And ONCE: a message already taken in this call
+ * (`relayLedger`) is not taken again, whichever stream brings it back. `#337 voice-relay-silent`.
+ *
+ * @param {{fromTail?: boolean, resumed?: boolean}} [arrival] how the stream delivered it: out of
+ *   its tail, on an attach that resumed from a cursor
  */
-function relayToAgent(message, selfPosted, replayed) {
+function relayToAgent(message, selfPosted, replayed, arrival = {}) {
   // `#196 auto-read-noise`. NOISE is a fifth guard, and the one the owner asked for by name: a
   // placeholder announced into a live call is the agent saying "a new message: Working…" while he
   // drives. The server already decided it is read; the call is not told otherwise.
-  if (replayed || selfPosted || isNoise(message) || relayMode() === "off" || !canSendText()) {
+  if (selfPosted || isNoise(message) || relayMode() === "off" || !canSendText()) {
     return false;
   }
-  relayPending.push(relayLine(message));
+  if (replayed && !missedDuringCall(message, arrival)) return false;
+  const key = `${message.channel_id}:${message.id}`;
+  if (relayLedger.has(key)) return false;
+  relayLedger.add(key);
+  relayPending.push({ line: relayLine(message), channel: String(message.channel_id) });
   if (relayTimer === null) {
     relayTimer = setTimeout(flushRelay, RELAY_COALESCE_MS);
   }
   return true;
+}
+
+/**
+ * Is this replayed message one the call missed while a stream was between attaches? Only on an
+ * attach that resumed from its cursor, out of the tail, and posted since the call connected (less
+ * `RELAY_CLOCK_SKEW_MS`): a fresh attach's tail, or an adapter's catch-up, is history.
+ * `#337 voice-relay-silent`.
+ *
+ * @param {{timestamp?: string}} message
+ * @param {{fromTail?: boolean, resumed?: boolean}} arrival
+ */
+function missedDuringCall(message, arrival) {
+  if (!arrival.resumed || !arrival.fromTail || !relayCallOpenedAt) return false;
+  const posted = Date.parse(String(message.timestamp || ""));
+  return Number.isFinite(posted) && posted >= relayCallOpenedAt - RELAY_CLOCK_SKEW_MS;
+}
+
+/**
+ * Say that channel messages this call should have heard were not read out, and why: in the
+ * transcript, where the reader looks for what the agent said, and in the connection details.
+ * `#337 voice-relay-silent` — never a silent drop.
+ *
+ *   * `ended`: they were waiting — behind an answer, or for the burst to gather — when the call
+ *     ended, and go nowhere now: not into the next call, which would be stale news.
+ *   * `gap`: a stream fell further behind than it could replay, so what was posted meanwhile is
+ *     unknown. The channel itself is re-read and complete; only the reading-out may have missed it.
+ *
+ * @param {{channel: string}[]} items the messages, for `ended`
+ * @param {"ended" | "gap"} why
+ */
+function reportUnrelayed(items, why) {
+  let detail;
+  if (why === "gap") {
+    detail = "The live feed fell behind here, so a message posted in a watched channel about then may " +
+      "not have been read out. The channels themselves are complete.";
+    addDetail("a live stream fell behind during the call; messages posted meanwhile may not have been read out");
+  } else {
+    if (!items.length) return;
+    const channels = [...new Set(items.map((item) => channelLabel(item.channel)))];
+    const where = channels.length === 1 ? channels[0] : `${channels[0]} and ${channels.length - 1} other channel${channels.length === 2 ? "" : "s"}`;
+    detail = `${relayCount(items.length)}, in ${where}, ${items.length === 1 ? "was" : "were"} still waiting when the ` +
+      `call ended, so the agent never read ${items.length === 1 ? "it" : "them"} out.`;
+    addDetail(`${relayCount(items.length)} in ${channels.join(", ")} ${items.length === 1 ? "was" : "were"} not read out: ` +
+      "the call ended first");
+  }
+  transcriptSeam("not read out", detail);
+}
+
+/**
+ * A call has connected: it has heard nothing yet, and the stream of every channel starts, so a
+ * message in any watched channel reaches it. `#337 voice-relay-silent`.
+ */
+function beginCallRelay() {
+  relayLedger = new Set();
+  relayCallOpenedAt = Date.now();
+  startWatchAll();
+}
+
+/**
+ * The call is over. What was still waiting to be read out is said not to have been, and the
+ * stream of every channel stops: nothing but a call reads it. `#337 voice-relay-silent`.
+ */
+function endCallRelay() {
+  const queued = session.pendingPrompts.flatMap((prompt) => (prompt.kind === "relay" ? prompt.relays : []));
+  const unsent = [...queued, ...relayPending];
+  if (relayCallOpenedAt && unsent.length) reportUnrelayed(unsent, "ended");
+  relayPending = [];
+  relayWaitShown = 0;
+  if (relayTimer !== null) {
+    clearTimeout(relayTimer);
+    relayTimer = null;
+  }
+  relayCallOpenedAt = 0;
+  stopWatchAll();
+}
+
+// --- the stream of every channel, while a call is open ------------------------------------------
+//
+// `#337 voice-relay-silent`. The owner was in a long call with Live messages set to read every new
+// message out in full, a message arrived in a channel he watches — his phone's own notification
+// showed it — and the call heard nothing. The page followed ONE stream, the channel on screen's
+// (`startChannelStream`), so a message anywhere else could never reach the agent. A call now also
+// follows `GET /api/v1/live/stream`, which carries every channel on the list, and relays from it as
+// from the channel's own: the ledger keeps a message both streams bring to one turn.
+//
+// Only during a call, because only a call hears it (`#226 page-energy-profile` keeps the page from
+// holding open what nobody uses). It resumes from its cursor after a drop, so what arrived meanwhile
+// is relayed, not lost; a reset, which says the gap cannot be filled, is said in the transcript. A
+// server that predates it answers 404, and the connection details say that only the channel on
+// screen is read out.
+
+/** Bumped on every start and stop of the stream of every channel, as `liveGeneration` is. */
+let watchAllGeneration = 0;
+/** The cursor of the last event it delivered, sent back as `Last-Event-ID` on a reconnect. */
+let watchAllLastEventId = null;
+/** Whether its response body is open now. */
+let watchAllAttached = false;
+/** Whether the attach now open resumed from a cursor: what it replays, the call missed. */
+let watchAllResumed = false;
+/** False once the server answered 404: it cannot stream every channel, and is not asked again. */
+let watchAllSupported = true;
+/**
+ * Aborts the attach now open, where the browser can: a call that has ended lets its connection go at
+ * once rather than at the stream's next keep-alive, so a phone on HTTP/1.1 does not spend one of
+ * its few connections to this server on a stream nobody reads.
+ *
+ * @type {AbortController | null}
+ */
+let watchAllAbort = null;
+
+/** Follow every watched channel for the call that has just connected. */
+function startWatchAll() {
+  stopWatchAll();
+  if (!watchAllSupported || liveDelivery === "off" || !token()) return;
+  const generation = watchAllGeneration;
+  guardQuietly(() => followWatchAll(generation))();
+}
+
+/** Stop following every channel. Idempotent. */
+function stopWatchAll() {
+  watchAllGeneration += 1;
+  if (watchAllAbort !== null) {
+    try {
+      watchAllAbort.abort();
+    } catch (_error) {
+      // Already finished: there is nothing left to let go.
+    }
+    watchAllAbort = null;
+  }
+  watchAllAttached = false;
+  watchAllResumed = false;
+  watchAllLastEventId = null;
+}
+
+/** Read the stream of every channel, and keep reading it, as `followChannel` does one channel's. */
+async function followWatchAll(generation) {
+  while (generation === watchAllGeneration) {
+    let ended = "dropped";
+    try {
+      ended = await readWatchAll(generation);
+    } catch (error) {
+      if (generation !== watchAllGeneration) return;
+      addDetail(`the stream of every channel dropped: ${error.message}`);
+    }
+    if (generation !== watchAllGeneration || ended === "unsupported") return;
+    watchAllAttached = false;
+    // A reset is answered at once, from now: the gap has been said, and waiting would widen it.
+    if (ended === "reset") continue;
+    const resumed = await new Promise((resolve) => {
+      setTimeout(() => resolve(generation === watchAllGeneration), LIVE_RETRY_MS);
+    });
+    if (!resumed) return;
+  }
+}
+
+/**
+ * One attach of the stream of every channel, until it ends. Answers how: `unsupported` for a server
+ * without it, `reset` when it said the gap cannot be filled, `ended` otherwise.
+ */
+async function readWatchAll(generation) {
+  const headers = { Authorization: `Bearer ${token()}` };
+  if (watchAllLastEventId) headers["Last-Event-ID"] = watchAllLastEventId;
+  const resumed = Boolean(watchAllLastEventId);
+  const abort = typeof AbortController === "function" ? new AbortController() : null;
+  watchAllAbort = abort;
+  const response = await fetch("/api/v1/live/stream", abort ? { headers, signal: abort.signal } : { headers });
+  if (generation !== watchAllGeneration) return "ended";
+  if (response.status === 404) {
+    watchAllSupported = false;
+    addDetail("this server cannot stream every channel at once, so a call reads out new messages only " +
+      "from the channel on screen");
+    return "unsupported";
+  }
+  if (!response.ok) {
+    throw new Error(`it was refused (HTTP ${response.status})`);
+  }
+  const body = response.body;
+  if (!body || typeof body.getReader !== "function") {
+    throw new Error("this browser cannot read a streaming response");
+  }
+  watchAllAttached = true;
+  watchAllResumed = resumed;
+  return readEventStream(body.getReader(), () => generation === watchAllGeneration, onWatchAllFrame);
+}
+
+/**
+ * One frame of the stream of every channel. Its `id` is the cursor over every channel; a message is
+ * relayed as one from the channel's own stream is, under the same guards and the same ledger.
+ *
+ * @returns {"reset" | undefined} `reset` when the server said it cannot fill the gap
+ */
+function onWatchAllFrame(frame) {
+  if (frame.id) watchAllLastEventId = frame.id;
+  if (frame.event === "reset") {
+    watchAllLastEventId = null;
+    if (canSendText() && relayMode() !== "off") reportUnrelayed([], "gap");
+    return "reset";
+  }
+  if (frame.event !== "message" || !frame.data) return undefined;
+  let payload = null;
+  try {
+    payload = JSON.parse(frame.data);
+  } catch (_error) {
+    return undefined;
+  }
+  if (!VibeTalkContract.is("LiveMessageEvent", payload)) return undefined;
+  if (payload.self_posted) noteSelfAuthor(payload.message.author_id);
+  relayToAgent(payload.message, payload.self_posted, payload.replayed, {
+    fromTail: payload.from_tail === true,
+    resumed: watchAllResumed,
+  });
+  return undefined;
 }
 
 // --- what to call a channel ----------------------------------------------------------------------

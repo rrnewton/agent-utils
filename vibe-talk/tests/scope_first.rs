@@ -205,6 +205,8 @@ fn inventory() -> Vec<Route> {
             Json(r#"{"handle":"x"}"#),
         ),
         route("GET", "/api/v1/channels/{channel_id}/stream", Read, Nothing),
+        // `#337 voice-relay-silent`.
+        route("GET", "/api/v1/live/stream", Read, Nothing),
         route("GET", "/api/v1/conversations", Write, Nothing),
         route("DELETE", "/api/v1/conversations", Write, Nothing),
         route(

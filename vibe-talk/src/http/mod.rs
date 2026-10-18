@@ -227,6 +227,9 @@ fn routes(state: AppState) -> Router {
         .route("/api/v1/post-proposals/commit", post(api::commit_post))
         .route("/api/v1/post-proposals/cancel", post(api::cancel_post))
         .route("/api/v1/channels/{channel_id}/stream", get(api::stream))
+        // `#337 voice-relay-silent`. READ scope, like each channel's own stream: every listed
+        // channel's arrivals in one stream, for a page in a call. See `api::stream_all`.
+        .route("/api/v1/live/stream", get(api::stream_all))
         // Durable state. The conversation routes all require the WRITE scope, reads included —
         // see the block comment above them in `api` for why a transcript is more sensitive than
         // a digest. `/inbox` is a read; moving a mark is a write, because it mutates state

@@ -134,6 +134,20 @@ pub const REPLAY_TAIL: usize = 200;
 /// produce.
 pub const BROADCAST_CAPACITY: usize = 64;
 
+/// How many published events the stream of every channel keeps for a page that reconnects.
+///
+/// `#337 voice-relay-silent`. More than one channel's [`REPLAY_TAIL`] would need, because every
+/// channel's events share it: a call whose stream dropped for a few seconds should get back what
+/// it missed in all of them, and a cursor that has fallen out of this is answered with a reset,
+/// never a short replay.
+pub const ALL_TAIL: usize = 512;
+
+/// How far behind a subscriber to the stream of every channel may fall before it is told so.
+///
+/// Larger than [`BROADCAST_CAPACITY`] for the reason [`ALL_TAIL`] is: one poll tick of one busy
+/// channel can publish a few hundred messages at once, and every channel's arrive here.
+pub const ALL_BROADCAST_CAPACITY: usize = 256;
+
 /// How many self-posted ids are remembered, across all channels.
 ///
 /// Bounded because it is a de-duplication window, not a record: the only thing that ever consults
@@ -219,6 +233,39 @@ struct Feed {
     dedupe: BTreeSet<String>,
 }
 
+/// One event as the stream of every channel carries it: its place in the hub's single order of
+/// everything published, and the channel it was published to. `#337 voice-relay-silent`.
+#[derive(Clone, Debug)]
+pub struct Arrival {
+    /// Its place in the order: 1 for the first event this hub published, counting every channel.
+    pub seq: u64,
+    /// The channel it was published to.
+    pub channel: ChannelId,
+    /// The event.
+    pub live: LiveMessage,
+}
+
+/// What a subscriber to the stream of every channel gets when it attaches.
+pub struct AllSubscription {
+    /// On a fresh attach, the newest [`Arrival::seq`] published when it attached (`0` before any):
+    /// where it starts. `None` on an attach that resumed from a cursor, or that is to be reset.
+    pub start: Option<u64>,
+    /// What was published after the caller's cursor, oldest first. Empty on a fresh attach: the
+    /// stream of every channel carries what arrives from now on, never the history before it.
+    pub replay: Vec<Arrival>,
+    /// Everything published from the instant of attachment onwards.
+    pub receiver: broadcast::Receiver<Arrival>,
+    /// Whether the caller's cursor cannot be resumed from: another process's, or fallen out of
+    /// [`ALL_TAIL`].
+    pub reset_on_attach: bool,
+}
+
+struct AllFeed {
+    sender: broadcast::Sender<Arrival>,
+    tail: VecDeque<Arrival>,
+    published: u64,
+}
+
 /// The fan-out: one publisher per channel, each with a bounded replay tail.
 ///
 /// Feeds are created on first use rather than from the configured channel list, and the map is
@@ -229,6 +276,12 @@ struct Feed {
 /// of them goes stale.
 pub struct LiveHub {
     feeds: Mutex<BTreeMap<ChannelId, Feed>>,
+    /// Every channel's events in the one order they were published, for a page in a call. `#337
+    /// voice-relay-silent`. Taken only while `feeds` is held, so that order is the feeds' order.
+    all: Mutex<AllFeed>,
+    /// This process's name in the cursors of [`LiveHub::subscribe_all`], so a cursor handed out
+    /// before a restart is told apart from one of this process's and answered with a reset.
+    epoch: String,
     self_posted: Mutex<(VecDeque<MessageId>, BTreeSet<MessageId>)>,
     hinted: Mutex<BTreeMap<Option<String>, BTreeSet<ChannelId>>>,
     hint_generation: watch::Sender<u64>,
@@ -264,8 +317,18 @@ impl LiveHub {
     #[must_use]
     pub fn with_recent(recent: std::sync::Arc<crate::recent::RecentWindows>) -> Self {
         let (hint_generation, _receiver) = watch::channel(0);
+        let (all_sender, _) = broadcast::channel(ALL_BROADCAST_CAPACITY);
+        let mut epoch = [0_u8; 8];
+        getrandom::fill(&mut epoch)
+            .expect("the system CSPRNG must be available to name a live hub");
         Self {
             feeds: Mutex::new(BTreeMap::new()),
+            all: Mutex::new(AllFeed {
+                sender: all_sender,
+                tail: VecDeque::new(),
+                published: 0,
+            }),
+            epoch: epoch.iter().map(|byte| format!("{byte:02x}")).collect(),
             self_posted: Mutex::new((VecDeque::new(), BTreeSet::new())),
             hinted: Mutex::new(BTreeMap::new()),
             hint_generation,
@@ -485,6 +548,22 @@ impl LiveHub {
         while feed.tail.len() > REPLAY_TAIL {
             feed.tail.pop_front();
         }
+        // `#337 voice-relay-silent`. And into the stream of every channel, still under the feed
+        // lock, so its order is the order every channel's own stream saw.
+        {
+            let mut all = lock(&self.all);
+            all.published += 1;
+            let arrival = Arrival {
+                seq: all.published,
+                channel: channel.clone(),
+                live: live.clone(),
+            };
+            all.tail.push_back(arrival.clone());
+            while all.tail.len() > ALL_TAIL {
+                all.tail.pop_front();
+            }
+            let _ = all.sender.send(arrival);
+        }
         let _ = feed.sender.send(live);
         true
     }
@@ -530,6 +609,60 @@ impl LiveHub {
             receiver,
             reset_on_attach,
         }
+    }
+
+    /// Attach to every channel at once, from `after` — a cursor this hub handed out — or, with
+    /// none, from now. `#337 voice-relay-silent`.
+    ///
+    /// The receiver is created before the tail is read, under one lock, for the reason
+    /// [`LiveHub::subscribe`] gives. A fresh attach replays NOTHING: a page in a call wants what
+    /// arrives during it, and every channel's history is not that. A cursor of this process's
+    /// still covered by [`ALL_TAIL`] replays exactly what followed it; any other cursor — another
+    /// process's, one past what was published, one whose successors fell out of the tail — is a
+    /// gap this stream cannot fill, and is answered with a reset.
+    #[must_use]
+    pub fn subscribe_all(&self, after: Option<&str>) -> AllSubscription {
+        let all = lock(&self.all);
+        let receiver = all.sender.subscribe();
+        let position = all.published;
+        let resumable = |seq: u64| {
+            let oldest = all.tail.front().map_or(position + 1, |held| held.seq);
+            seq <= position && seq + 1 >= oldest
+        };
+        let (replay, reset_on_attach) = match after.map(|cursor| self.all_seq(cursor)) {
+            None => (Vec::new(), false),
+            Some(Some(seq)) if resumable(seq) => (
+                all.tail
+                    .iter()
+                    .filter(|held| held.seq > seq)
+                    .cloned()
+                    .collect(),
+                false,
+            ),
+            Some(_) => (Vec::new(), true),
+        };
+        AllSubscription {
+            start: after.is_none().then_some(position),
+            replay,
+            receiver,
+            reset_on_attach,
+        }
+    }
+
+    /// The cursor naming [`Arrival::seq`] `seq` in this process: what the stream of every
+    /// channel sends as each event's `id`, and a page sends back as `Last-Event-ID`.
+    #[must_use]
+    pub fn all_cursor(&self, seq: u64) -> String {
+        format!("{}.{seq}", self.epoch)
+    }
+
+    /// The `seq` a cursor names, or `None` for one this process did not hand out.
+    fn all_seq(&self, cursor: &str) -> Option<u64> {
+        let (epoch, seq) = cursor.trim().split_once('.')?;
+        if epoch != self.epoch {
+            return None;
+        }
+        seq.parse().ok()
     }
 }
 
@@ -646,6 +779,81 @@ pub fn events(
     })
 }
 
+/// Turn one [`AllSubscription`] into the body of the stream of every channel: `GET
+/// /api/v1/live/stream`. `#337 voice-relay-silent`.
+///
+/// A page in a call reads it so that a message in ANY channel on the owner's list reaches the
+/// call, not only one in the channel on screen, whose stream ([`events`]) was the only one it had.
+/// Each event is the one that channel's own stream sends — the same payload, judged against the
+/// noise rules and rendered the same way on its way out — under this stream's own cursor as its
+/// `id`, so one `Last-Event-ID` resumes every channel at once.
+///
+/// * A fresh attach first sends one event with an `id` and nothing else: where it starts. A page
+///   that drops before any message arrives still has a cursor to resume from.
+/// * Resumed, it replays what followed the cursor, as `replayed` and `from_tail`, as a
+///   channel's stream replays its tail; the page tells those apart from a fresh attach's history
+///   by having sent the cursor.
+/// * A channel off the list — the owner took it off, or it was never on it — is not watched: its
+///   event goes out as a bare `id`, which moves the cursor past it and carries nothing.
+/// * A cursor it cannot resume from, or a subscriber further behind than
+///   [`ALL_BROADCAST_CAPACITY`], gets one [`EVENT_RESET`] and the stream ends, as [`events`] does.
+pub fn all_events(
+    subscription: AllSubscription,
+    app: AppState,
+) -> impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>
+{
+    struct State {
+        start: Option<u64>,
+        replay: VecDeque<Arrival>,
+        receiver: broadcast::Receiver<Arrival>,
+        reset_on_attach: bool,
+        done: bool,
+        app: AppState,
+    }
+    let start = State {
+        start: subscription.start,
+        replay: subscription.replay.into_iter().collect(),
+        receiver: subscription.receiver,
+        reset_on_attach: subscription.reset_on_attach,
+        done: false,
+        app,
+    };
+    futures_util::stream::unfold(start, |mut state| async move {
+        if state.reset_on_attach {
+            state.reset_on_attach = false;
+            state.done = true;
+            return Some((Ok(reset_event(0)), state));
+        }
+        if let Some(position) = state.start.take() {
+            let cursor = state.app.live.all_cursor(position);
+            return Some((Ok(axum::response::sse::Event::default().id(cursor)), state));
+        }
+        let (arrival, from_tail) = if let Some(held) = state.replay.pop_front() {
+            (held, true)
+        } else if state.done {
+            return None;
+        } else {
+            match state.receiver.recv().await {
+                Ok(arrival) => (arrival, false),
+                Err(broadcast::error::RecvError::Lagged(missed)) => {
+                    state.done = true;
+                    return Some((Ok(reset_event(missed)), state));
+                }
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        };
+        let cursor = state.app.live.all_cursor(arrival.seq);
+        let Some(channel) = state.app.channel(arrival.channel.as_str()) else {
+            return Some((Ok(axum::response::sse::Event::default().id(cursor)), state));
+        };
+        let mut live = arrival.live;
+        let noise = crate::noise::filter_for(&state.app, &channel.id).await;
+        let markup = crate::render::markup_for(&state.app.config, &channel);
+        judge(&noise, &state.app, &channel.id, markup, &mut live);
+        Some((Ok(message_event_as(&live, from_tail, &cursor)), state))
+    })
+}
+
 /// Decide whether one outgoing event's message is noise, and render its body and find its heading
 /// for the page. A delete carries no text to judge.
 ///
@@ -680,8 +888,14 @@ fn judge(
 }
 
 fn message_event(live: &LiveMessage, from_tail: bool) -> axum::response::sse::Event {
+    message_event_as(live, from_tail, &live.event_id)
+}
+
+/// [`message_event`] under another `id`: the stream of every channel's cursor, rather than the
+/// channel's own event id. `#337 voice-relay-silent`.
+fn message_event_as(live: &LiveMessage, from_tail: bool, id: &str) -> axum::response::sse::Event {
     let event = axum::response::sse::Event::default()
-        .id(&live.event_id)
+        .id(id)
         .event(match live.kind {
             LiveKind::Create => EVENT_MESSAGE,
             LiveKind::Update => EVENT_MESSAGE_UPDATE,
@@ -2308,6 +2522,63 @@ mod tests {
         }
         assert!(!hub.is_self_posted(&MessageId("0".to_owned())));
         assert!(hub.is_self_posted(&MessageId((SELF_POSTED_MEMORY + 4).to_string())));
+    }
+
+    #[test]
+    fn the_stream_of_every_channel_resumes_only_from_a_cursor_the_tail_still_covers() {
+        // `#337 voice-relay-silent`. The boundaries of `subscribe_all`, every channel in one order.
+        let hub = LiveHub::new();
+        let one = ChannelId("1111".to_owned());
+        let two = ChannelId("2222".to_owned());
+        let fresh = hub.subscribe_all(None);
+        assert_eq!(fresh.start, Some(0));
+        assert!(fresh.replay.is_empty() && !fresh.reset_on_attach);
+        let total = ALL_TAIL as u64 + 3;
+        for n in 1..=total {
+            let channel = if n % 2 == 0 { &one } else { &two };
+            hub.publish(channel, message(channel, n, &format!("m{n}")));
+        }
+        let fresh = hub.subscribe_all(None);
+        assert_eq!(
+            fresh.start,
+            Some(total),
+            "a fresh attach starts at the newest event"
+        );
+        assert!(fresh.replay.is_empty(), "and replays none of the past");
+
+        // The oldest event still held is `total - ALL_TAIL + 1`: a cursor just before it resumes.
+        let oldest = total - ALL_TAIL as u64 + 1;
+        let resumed = hub.subscribe_all(Some(&hub.all_cursor(oldest - 1)));
+        assert!(!resumed.reset_on_attach);
+        assert_eq!(resumed.start, None);
+        assert_eq!(resumed.replay.len(), ALL_TAIL);
+        assert_eq!(resumed.replay.first().map(|a| a.seq), Some(oldest));
+        let channels: BTreeSet<_> = resumed.replay.iter().map(|a| a.channel.clone()).collect();
+        assert_eq!(channels, BTreeSet::from([one.clone(), two.clone()]));
+        // One before that, and its successor is gone: a gap, said as a reset.
+        assert!(
+            hub.subscribe_all(Some(&hub.all_cursor(oldest - 2)))
+                .reset_on_attach
+        );
+        // The newest cursor resumes with nothing to replay; one past it is not this hub's to resume.
+        let newest = hub.subscribe_all(Some(&hub.all_cursor(total)));
+        assert!(!newest.reset_on_attach && newest.replay.is_empty());
+        assert!(
+            hub.subscribe_all(Some(&hub.all_cursor(total + 1)))
+                .reset_on_attach
+        );
+        // Another process's cursor, or one that is not a cursor at all, is reset too.
+        for foreign in ["0.1", "not a cursor", "", "."] {
+            assert!(
+                hub.subscribe_all(Some(foreign)).reset_on_attach,
+                "{foreign:?}"
+            );
+        }
+        assert_ne!(
+            LiveHub::new().all_cursor(1),
+            hub.all_cursor(1),
+            "two hubs name their cursors apart"
+        );
     }
 
     fn message(channel: &ChannelId, id: u64, content: &str) -> Message {

@@ -4082,6 +4082,7 @@ own adapter-only token; every other route uses the read/write tokens described a
 | POST | `/api/v1/post-proposals/commit` | **write** | `{handle, channel_id, text, reply_to, confirmed_by}` — confirm and post it, once; posted whole, its `reply_to` is then marked Done, and read at the provider where it can be (`#300 reply-marks-read`). The answer names the send memory's `send_seq` for it, and a 207 carries `serial`, `send_seq` when anything may have gone, and `uncertain` when the part that failed may have been posted anyway |
 | POST | `/api/v1/post-proposals/cancel` | **write** | `{handle}` — withdraw it; `204` |
 | GET | `/api/v1/channels/{id}/stream` | read | **Server-Sent Events**: messages as they arrive — see "Live push" |
+| GET | `/api/v1/live/stream` | read | **Server-Sent Events**: every listed channel's messages as they arrive, from now on, for a page in a call — see "The stream of every channel" |
 | GET | `/api/v1/conversations` | **write** | stored conversation transcripts, most recent first |
 | DELETE | `/api/v1/conversations` | **write** | erase every stored transcript |
 | GET | `/api/v1/conversations/{id}?records=` | **write** | one stored transcript, oldest turn first; `records=1` adds the record rows (`sent`, `marker`) and each row's `detail` (`#270 voice-transcript-markers`), which a read without it never sees |
@@ -4686,6 +4687,32 @@ are indistinguishable forever.
   A stream held open for an hour still logs zero. That is pinned by a test so nobody reads it as
   an instant request.
 
+### The stream of every channel
+
+`GET /api/v1/live/stream` (`#337 voice-relay-silent`) carries every listed channel's events in one
+stream, for a page in a call. A message arrived in a channel the owner watches while he was in a
+call, and the call never heard of it: the page followed one stream, the channel on screen's, so a
+message anywhere else could not reach the agent however Live messages was set. It is the same read
+scope, the same `Cache-Control: no-store` and `X-Accel-Buffering: no`, the same one access-log line
+at attach, and the same payloads, each judged against the noise rules and rendered as that
+channel's own stream would. What differs:
+
+* **Nothing of the past on a fresh attach.** A page in a call wants what arrives during it; every
+  channel's history is not that. The first event is an `id:` and nothing else, the place it starts,
+  so a page that drops before any message arrives still has a cursor to resume from.
+* **One cursor over every channel.** Each event's `id:` is the stream's own cursor — the order the
+  hub published everything in, under a name for this server process — not the channel's message id.
+  A page sends the last one back as `Last-Event-ID` and gets exactly what followed it in every
+  channel, as `replayed` and `from_tail`, from a tail of the last 512 events.
+* **A cursor it cannot resume from gets one `event: reset` and the stream ends**: one another
+  server process handed out (this one restarted), one past what was published, or one whose
+  successors have fallen out of the tail — and so does a subscriber more than 256 events behind.
+  The page then starts again from now, at once, and says in the transcript that a message may not
+  have been read out.
+* **A channel off the list is not carried.** Its event goes out as a bare `id:`, which moves the
+  cursor past it and says nothing else; a channel taken off the list during a call stops being
+  carried at once.
+
 ### What the page does with it
 
 The app reads the stream with `fetch` and a reader over the response body, **not** `EventSource`:
@@ -4793,7 +4820,29 @@ to the default it now means.
 agent posting four lines in two seconds would otherwise take four spoken turns, one after another,
 each interrupting the last and leaving no gap to answer in. Both guards below are re-checked at
 the flush as well as at the door, because the call can end and the reader can press Off inside
-that window.
+that window. A turn carries at most eight messages (`RELAY_TURN_MAX_MESSAGES`); the rest of a
+larger burst waits for the next turn, each message still read out once.
+
+**Every watched channel, each message once** (`#337 voice-relay-silent`). A call follows the stream
+of every channel (above) besides the channel on screen's, from when it connects until it ends, and
+relays from either under the same guards. A message the call has taken is not taken again in that
+call, whichever stream brings it, so a message in the open channel, which both carry, is read out
+once. A stream that dropped during a call resumes from its cursor, and what it then replays was
+missed, not history: a replayed message is relayed when the attach resumed from a cursor and the
+message was posted after the call connected, less a minute for clocks that disagree. A server
+without the stream of every channel answers 404, is not asked again, and the connection details
+say that only the channel on screen is read out.
+
+**Never into an answer** (`#330 voice-long-turn-drop`). A relayed message waits while the assistant
+is answering or its audio is still playing, on either protocol, and the status line says how many
+are waiting; see "How a call ended" for the rest.
+
+**Never dropped in silence** (`#337`). A message still waiting when the call ends — behind an
+answer, or for its burst to gather — goes nowhere, not into the next call, and the transcript says
+so with a **not read out** line naming how many and in which channels, as do the connection
+details. So does a stream reset during a call, which says the gap cannot be filled: the channel is
+re-read and complete, but whether the call heard what fell into the gap cannot be known. Turning
+Live messages off lets go of what was waiting, and the connection details count it.
 
 **Two controls over one value.** The bar carries **Read new**, a button that cycles
 off → gist → full → off, because the strip has room for a `.bar-button` and not for a
@@ -4807,9 +4856,9 @@ Four guards on the relay, all load-bearing:
   to 200 messages, and every attach without a `Last-Event-ID` gets all of it. Those rows belong on
   screen; announcing them says "a message was just posted" about text that may be hours old, in a
   burst, into a conversation billed by the minute — the same "existing history labelled as new"
-  failure the seeding tick exists to prevent, arriving through the other door. The cost of the
-  rule, stated: a message that lands while the page is between streams reaches the list but not
-  the agent, exactly as one that lands while the tab is shut does.
+  failure the seeding tick exists to prevent, arriving through the other door. What a stream
+  replays on resuming from its cursor during a call is the exception (above): that was missed, not
+  history. One that lands while the tab is shut is never heard.
 * **Self-posted messages are never relayed.** `ops::reply` posts as the bot and the poller reads
   that post back; relaying it would have the agent hear its own answer as news and answer it, in a
   loop that bills. The ids this server posted are recorded and travel with the message as
