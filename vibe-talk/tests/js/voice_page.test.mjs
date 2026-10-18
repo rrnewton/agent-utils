@@ -4700,6 +4700,11 @@ const TUNING_BANDS = {
     "how often held channel messages ask again whether the answer ended. Under a fifth of a second " +
     "it is a busy loop for the length of a long answer; past two seconds a message waits that long " +
     "into the silence after it"],
+  RELAY_STALLED_ANSWER_MS: [16000, 60000,
+    "how long an answer that has stopped arriving, with nothing left to play and no turn_complete, " +
+    "still holds a relayed message. Under sixteen seconds a tool call the voice runtime is still " +
+    "waiting on — it gives one fifteen — is cut by the relay's audio_end; past a minute a turn that " +
+    "stalled keeps the channel's news from the call for longer than anyone waits"],
   UNSETTLED_SAVE_MS: [1000, 10000,
     "how often a turn still being said is written down on the device. Under a second it rewrites " +
     "storage at every hypothesis of a long answer; past ten, an app killed mid-answer loses that much"],
@@ -67511,13 +67516,152 @@ test("`#330 voice-long-turn-drop`: a channel message during an answer longer tha
 test("`#330 voice-long-turn-drop`: negative control — the page that held a relay only 30 s cuts the answer with audio_end", async () => {
   // Without the change: the relay goes straight into the queue and the cap lets it go mid-answer.
   const page = newPage(new Map(), brokenScriptEach(
-    ["function relayMustWait() {\n", "function relayMustWait() {\n  return false;\n"],
+    ["function relayWait() {\n", "function relayWait() {\n  return null;\n"],
     ["  if (next && next.kind !== \"typed\" && (answerAudible() || (bound === \"cap\" && session.replyArriving))) {",
       "  if (false) {"],
     ["    if (next.kind !== \"typed\" && !answerHeardOut()) {", "    if (false) {"]
   ));
   const { socket } = await longAnswerWithRelay(page, 45);
   assert.ok(controlFrames(socket).includes("audio_end"), "the control did not cut the answer, so the test above proves nothing");
+});
+
+// A relayed message waits in the relay's own queue (`relayPending`), never among the protocol's text
+// turns, so the bounds `#268 voice-call-drops` put on a spoken turn that holds a text turn never saw
+// it: a turn that never got its `turn_complete` held every relayed message until the next one, or
+// until the call ended. These pin the relay to the same bounds on the owner's own open turn, and to
+// its own explicit bound on an answer that stalled.
+
+const RELAY_RECHECK_MS = sourceConstant("RELAY_RECHECK_MS");
+const RELAY_STALLED_ANSWER_MS =
+  optionalSourceConstant("RELAY_STALLED_ANSWER_MS") ?? TUNING_BANDS.RELAY_STALLED_ANSWER_MS[1];
+
+/**
+ * Walk the clock in half-second steps, feeding each step to `each`, until the page sends a control
+ * frame of `type` or `limit` ms have gone. Returns how long it took, or null if it never came.
+ */
+async function msUntilFrame(page, socket, type, limit, each = () => {}) {
+  for (let waited = 0; waited <= limit; waited += 500) {
+    if (controlFrames(socket).includes(type)) return waited;
+    await passTime(page, 500);
+    each(waited + 500);
+  }
+  return controlFrames(socket).includes(type) ? limit : null;
+}
+
+/** A neutral call with Live messages set to read out in full, nothing said yet. */
+async function relayingNeutralCall(page) {
+  const socket = await startNeutralCall(page);
+  await page.settle();
+  page.expireTimers(CAPTURE_RESUME_MS);
+  await setReadNew(page, "full");
+  return socket;
+}
+
+test("`#330 voice-long-turn-drop`: a relayed message held by the owner's own open turn goes once that turn has been quiet for the #268 bound, and the status speaks of no answer", async () => {
+  const page = newPage();
+  const socket = await relayingNeutralCall(page);
+  // One word of background speech, and the bridge never completes a turn for it.
+  speech(socket, "user", 1, "uh", false);
+  await passTime(page, 1000);
+  await deliver(page, page.stream(), sseMessage(message({ id: "3302", content: "the deploy finished" })));
+  await passTime(page, RELAY_COALESCE_MS);
+  assert.ok(!controlFrames(socket).includes("audio_end"), "the relay closed the owner's segment while his turn was still live");
+  assert.doesNotMatch(page.el("status").textContent, /when the answer ends/,
+    "the status line says an answer is being waited for, and none is being spoken");
+  assert.match(page.el("status").textContent, /1 new message will be read out when you finish speaking/);
+  const waited = await msUntilFrame(page, socket, "audio_end", 120_000);
+  assert.notEqual(waited, null, "a turn that went quiet without completing held the relay for two minutes");
+  // From the word, the turn's last sign of life: no sooner than the bound, and no later than one look after it.
+  const sinceWord = 1000 + RELAY_COALESCE_MS + waited;
+  assert.ok(sinceWord >= SPOKEN_TURN_HOLD_MS, `the relay went ${sinceWord} ms after the owner's last word, inside the ${SPOKEN_TURN_HOLD_MS} ms bound`);
+  assert.ok(sinceWord <= SPOKEN_TURN_HOLD_MS + 2 * RELAY_RECHECK_MS, `the relay went ${sinceWord} ms after the owner's last word, past the ${SPOKEN_TURN_HOLD_MS} ms bound`);
+  assert.match(page.el("settings-detail").textContent, /went quiet for \d+ s without completing/);
+  turnDone(socket, 1);
+  await page.settle();
+  assert.equal(timesRelayed(socket, "the deploy finished"), 1);
+  await page.el("hang-up").click();
+  await page.settle();
+  assert.deepEqual(unreadSeams(page), [], "a message that was read out was reported as not read out");
+
+  // A turn already quiet when the message arrives holds it no longer than the burst window.
+  const late = newPage();
+  const lateSocket = await relayingNeutralCall(late);
+  speech(lateSocket, "user", 1, "uh", false);
+  await passTime(late, 20_000);
+  await deliver(late, late.stream(), sseMessage(message({ id: "3303", content: "the tag is cut" })));
+  const lateWait = await msUntilFrame(late, lateSocket, "audio_end", 120_000);
+  assert.notEqual(lateWait, null, "a turn quiet for twenty seconds held the relay for two minutes");
+  assert.ok(lateWait <= RELAY_COALESCE_MS + RELAY_RECHECK_MS, `a turn quiet for twenty seconds held the relay ${lateWait} ms`);
+  turnDone(lateSocket, 1);
+  await late.settle();
+  assert.equal(timesRelayed(lateSocket, "the tag is cut"), 1);
+});
+
+test("`#330 voice-long-turn-drop`: a relayed message held by a trickle of the owner's hypotheses that never completes goes at the #268 cap", async () => {
+  const cap = optionalSourceConstant("SPOKEN_TURN_HOLD_CAP_MS") ?? TUNING_BANDS.SPOKEN_TURN_HOLD_CAP_MS[1];
+  const page = newPage();
+  const socket = await relayingNeutralCall(page);
+  speech(socket, "user", 1, "the", false);
+  await deliver(page, page.stream(), sseMessage(message({ id: "3304", content: "the release is out" })));
+  // A hypothesis every two seconds: the quiet bound never runs out, so only the cap can end it.
+  let heard = "the";
+  const waited = await msUntilFrame(page, socket, "audio_end", 90_000, (at) => {
+    if (at % 2000 === 0) {
+      heard += " radio";
+      speech(socket, "user", 1, heard, false);
+    }
+  });
+  assert.notEqual(waited, null, "a trickle of hypotheses held the relay for ninety seconds");
+  assert.ok(waited <= RELAY_COALESCE_MS + cap + 2 * RELAY_RECHECK_MS, `a trickle held the relay ${waited} ms, past the ${cap} ms cap`);
+  assert.ok(waited >= cap, `a trickle held the relay only ${waited} ms, inside the ${cap} ms cap`);
+  assert.match(page.el("settings-detail").textContent, /held the page's next message for \d+ s without completing/);
+  turnDone(socket, 1);
+  await page.settle();
+  assert.equal(timesRelayed(socket, "the release is out"), 1);
+  await page.el("hang-up").click();
+  await page.settle();
+  assert.deepEqual(unreadSeams(page), [], "the trickle's message was only ever reported as not read out");
+});
+
+test("`#330 voice-long-turn-drop`: a relayed message waits out a tool call inside an answer, and an answer that stalled lets it go after RELAY_STALLED_ANSWER_MS", async () => {
+  // Held: the filler line, a twelve-second tool call with nothing arriving, then the summary — one turn.
+  const page = newPage();
+  const socket = await relayingNeutralCall(page);
+  speech(socket, "user", 1, "summarize overnight", true);
+  speech(socket, "assistant", 1, "Checking overnight messages now.", false);
+  socket.onmessage({ data: secondOfSpeech(page) });
+  await passTime(page, 2000);
+  await deliver(page, page.stream(), sseMessage(message({ id: "3305", content: "the build broke" })));
+  await passTime(page, 12_000);
+  assert.deepEqual(controlFrames(socket).filter((type) => type !== "audio_start"), [],
+    "a relayed message closed the segment in the middle of a tool call");
+  assert.match(page.el("status").textContent, /1 new message will be read out when the answer ends/);
+  speech(socket, "assistant", 1, "Checking overnight messages now. Overnight, three merges.", true);
+  socket.onmessage({ data: secondOfSpeech(page) });
+  turnDone(socket, 1);
+  await passTime(page, 10_000);
+  assert.equal(controlFrames(socket).at(-1), "audio_end", "the answer was heard out and the relay never went");
+  turnDone(socket, 2);
+  await page.settle();
+  assert.equal(timesRelayed(socket, "the build broke"), 1);
+  assert.ok(!controlFrames(socket).includes("interrupt"));
+
+  // Let go: an answer that stops arriving and never completes.
+  const stalled = newPage();
+  const stalledSocket = await relayingNeutralCall(stalled);
+  speech(stalledSocket, "user", 1, "what is new", true);
+  speech(stalledSocket, "assistant", 1, "Let me look", false);
+  await passTime(stalled, 1000);
+  await deliver(stalled, stalled.stream(), sseMessage(message({ id: "3306", content: "the tag is cut" })));
+  const waited = await msUntilFrame(stalled, stalledSocket, "audio_end", 180_000);
+  assert.notEqual(waited, null, "an answer that stalled without completing held the relay for three minutes");
+  const sinceLast = 1000 + waited;
+  assert.ok(sinceLast >= RELAY_STALLED_ANSWER_MS, `the relay went ${sinceLast} ms into a stalled answer, inside the ${RELAY_STALLED_ANSWER_MS} ms bound`);
+  assert.ok(sinceLast <= RELAY_STALLED_ANSWER_MS + 2 * RELAY_RECHECK_MS, `the relay went ${sinceLast} ms into a stalled answer, past the ${RELAY_STALLED_ANSWER_MS} ms bound`);
+  assert.match(stalled.el("settings-detail").textContent, /an answer went quiet for \d+ s without completing/);
+  turnDone(stalledSocket, 1);
+  await stalled.settle();
+  assert.equal(timesRelayed(stalledSocket, "the tag is cut"), 1);
 });
 
 test("`#330 voice-long-turn-drop`: the reader's typed message cuts the answer at once, through interrupt, and says so; the cut answer keeps its words marked cut off", async () => {
@@ -67912,7 +68056,7 @@ test("`#337 voice-relay-silent`: a message in another channel during an answer l
   assert.deepEqual(unreadSeams(page), []);
   // The negative control, as for the open channel's: the page that held a relay only 30 s.
   const control = newPage(new Map(), brokenScriptEach(
-    ["function relayMustWait() {\n", "function relayMustWait() {\n  return false;\n"],
+    ["function relayWait() {\n", "function relayWait() {\n  return null;\n"],
     ["  if (next && next.kind !== \"typed\" && (answerAudible() || (bound === \"cap\" && session.replyArriving))) {",
       "  if (false) {"],
     ["    if (next.kind !== \"typed\" && !answerHeardOut()) {", "    if (false) {"]
@@ -67945,7 +68089,7 @@ test("`#337 voice-relay-silent`: while the call is idle a message is read out at
   assert.deepEqual(unreadSeams(page), [], "a message that was read out was reported as not read out");
   // The negative control: a page that holds a relay however idle the call is never reads it out —
   // and, since `#337`, says so when the call ends rather than dropping it.
-  const control = await run(brokenScript("function relayMustWait() {\n", "function relayMustWait() {\n  return true;\n"));
+  const control = await run(brokenScript("function relayWait() {\n", "function relayWait() {\n  return \"answer\";\n"));
   assert.notEqual(control.closedAt, "audio_end");
   assert.equal(timesRelayed(control.socket, "the tag is cut"), 0);
   await control.page.el("hang-up").click();

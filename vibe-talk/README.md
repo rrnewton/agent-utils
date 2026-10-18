@@ -5366,7 +5366,10 @@ waits out the rest of it too. A turn that sends nothing for 8 seconds without co
 (`SPOKEN_TURN_HOLD_MS`) is let go, as before, and so is a turn that keeps sending without ever
 completing — a trickle of hypotheses of background speech, a bridge that never sends the turn's
 `turn_complete` — 30 seconds after the hold began however often its frames came
-(`SPOKEN_TURN_HOLD_CAP_MS`). The connection details say which let it go.
+(`SPOKEN_TURN_HOLD_CAP_MS`). The connection details say which let it go. A relayed channel message
+waits in the relay's own queue rather than among the text turns, and is held to the same two
+bounds on the owner's own open turn, counted from that turn's last frame and from when the message
+began waiting on it.
 
 **Who wants it said decides whether it may cut an answer** (`#330 voice-long-turn-drop`). The owner
 asked for a summary of the night's messages; after a short filler line the agent spoke a long
@@ -5379,8 +5382,14 @@ its text, and closing the call when the backend is slow to confirm the cut. An a
 * **A relayed message, or the page's own word on a yes, never cuts an answer.** It waits for the
   answer's `turn_complete` and then for its audio to finish playing, plus 600 ms
   (`ANSWER_PLAYED_GRACE_MS`) for the owner to answer the answer first. The cap does not end that
-  wait while the answer is still arriving; only a turn that has gone quiet — nothing for 8 seconds
-  and nothing left to play, a stalled turn rather than an answer — is let go.
+  wait while the answer is still arriving; only a turn that has gone quiet — nothing arriving and
+  nothing left to play, a stalled turn rather than an answer — is let go: after 8 seconds for the
+  page's word on a yes, which the agent that said "One moment." is waiting for, and after 25 seconds
+  (`RELAY_STALLED_ANSWER_MS`) for a relayed message, which nobody is waiting for, so that a tool call
+  in the middle of an answer (a voice runtime gives one fifteen seconds) is not cut by it. Held by
+  the owner's own open turn, where nothing is being answered, a relayed message goes at the 8- and
+  30-second bounds above, and the status line says it will be read out when he finishes speaking,
+  not when the answer ends.
 * **A message the owner types while the assistant is speaking cuts the answer at once**, with the
   protocol's own `interrupt`, never a silent `audio_end`: playback stops, late audio of the cut turn
   is not played, the transcript draws an **answer cut off** line, the status line says "You cut the

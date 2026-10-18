@@ -508,6 +508,11 @@ const session = {
   // ...and one that keeps sending without completing is let go SPOKEN_TURN_HOLD_CAP_MS after the
   // hold began, however often its frames restarted the bound above.
   spokenTurnCapTimer: null,
+  // When the open spoken turn opened, and when anything of it last arrived, by the wall clock. A
+  // relayed message, which waits in the relay's own queue rather than behind these timers, is held
+  // to the same bounds from them (`relayWait`).
+  spokenTurnOpenedAt: 0,
+  spokenTurnActiveAt: 0,
   // The highest turn number a `turn_complete` has named, so a late frame of it opens no new turn.
   /** @type {number | null} */
   lastCompletedTurn: null,
@@ -6900,7 +6905,9 @@ function sendClientEvent(event, kind = "typed", relays = []) {
  *     `audio_end` into a turn that is still talking;
  *   * a relayed channel message (`relay`) or the page's word on a yes (`notice`) never cuts an
  *     answer: it waits for the turn to complete AND for its audio to finish playing, with no cap
- *     while the answer is still talking (`releaseSpokenTurnHold`, `waitForAnswerToPlay`).
+ *     while the answer is still talking (`releaseSpokenTurnHold`, `waitForAnswerToPlay`). A relayed
+ *     message has already waited out the open spoken turn in the relay's own queue (`relayWait`), so
+ *     it reaches this queue with no turn open, or with one opened since.
  */
 function advanceVibeTalkInput() {
   if (
@@ -6986,6 +6993,8 @@ const SPOKEN_TURN_HOLD_MS = 8000;
  * as `audio_end` thirty seconds into it. A page message now holds on while the assistant is talking,
  * and a typed one has cut the answer explicitly long before this runs out; the cap still ends a hold
  * on the owner's own open turn, where an `audio_end` closes nothing but the microphone's segment.
+ * That holds for a relayed channel message too, which waits in the relay's own queue and is held to
+ * both bounds from the turn's own times (`relayWait`).
  */
 const SPOKEN_TURN_HOLD_CAP_MS = 30000;
 
@@ -7126,9 +7135,20 @@ function releaseSpokenTurnHold(socket, bound, why) {
     advanceVibeTalkInput();
     return;
   }
+  letSpokenTurnGo(why);
+  advanceVibeTalkInput();
+}
+
+/**
+ * Stop waiting for the open spoken turn's `turn_complete`, which a bound says is not coming, and say
+ * why where the call's other mechanics are recorded. The next text turn then closes the segment.
+ *
+ * @param {string} why
+ */
+function letSpokenTurnGo(why) {
+  clearSpokenTurnHold();
   session.spokenTurnOpen = false;
   addDetail(why);
-  advanceVibeTalkInput();
 }
 
 /** Nothing is waiting on a spoken turn any more: both of the hold's bounds go. */
@@ -7153,6 +7173,9 @@ function clearSpokenTurnHold() {
 function noteSpokenTurnActivity(turn = null) {
   if (session.chat || session.protocol !== "vibe-talk-v1") return;
   if (turn !== null && session.lastCompletedTurn !== null && turn <= session.lastCompletedTurn) return;
+  const now = Date.now();
+  if (!session.spokenTurnOpen) session.spokenTurnOpenedAt = now;
+  session.spokenTurnActiveAt = now;
   session.spokenTurnOpen = true;
   // A text turn is waiting on this one, which is still talking: give it the whole bound again.
   if (session.spokenTurnTimer !== null) armSpokenTurnHold();
@@ -40726,31 +40749,35 @@ function flushRelay() {
   if (mode === "off") {
     addDetail(`${relayCount(relayPending.length)} waiting to be read out ${relayPending.length === 1 ? "was" : "were"} ` +
       "let go: Live messages was turned off");
-    relayPending = [];
-    relayWaitShown = 0;
+    forgetRelayPending();
     return false;
   }
   if (!canSendText()) {
     reportUnrelayed(relayPending, "ended");
-    relayPending = [];
-    relayWaitShown = 0;
+    forgetRelayPending();
     return false;
   }
   // `#330 voice-long-turn-drop`. Never into an answer. A relayed message used to be held thirty
   // seconds behind a long spoken summary and then sent anyway, which cut the summary off and lost
   // its text. It waits now while the assistant is answering or its audio is still playing — and
-  // whatever else arrives meanwhile joins it, so a night's worth of arrivals is still one turn.
-  if (relayMustWait()) {
-    if (relayPending.length !== relayWaitShown) {
-      relayWaitShown = relayPending.length;
-      setStatus(`${relayCount(relayPending.length)} will be read out when the answer ends.`);
+  // whatever else arrives meanwhile joins it, so a night's worth of arrivals is still one turn. It
+  // waits for the owner's own open turn too, but only within the bounds `relayWait` reads.
+  const heldBy = relayWait();
+  if (heldBy !== null) {
+    const said = `${relayCount(relayPending.length)} will be read out ` +
+      `${heldBy === "turn" ? "when you finish speaking" : "when the answer ends"}.`;
+    if (said !== relayWaitSaid) {
+      relayWaitSaid = said;
+      setStatus(said);
     }
     relayTimer = setTimeout(flushRelay, Math.max(RELAY_RECHECK_MS,
       (session.answerPlayEndMs || 0) + ANSWER_PLAYED_GRACE_MS - Date.now()));
     return false;
   }
   const held = relayPending.splice(0, RELAY_TURN_MAX_MESSAGES);
-  relayWaitShown = 0;
+  relayWaitSaid = "";
+  // What a burst leaves for the next turn starts waiting for it now.
+  relayWaitingSince = relayPending.length ? Date.now() : 0;
   const sent = sendClientEvent(
     { type: "user_message", text: relayTurn(held.map((item) => item.line), mode) },
     "relay",
@@ -40767,26 +40794,91 @@ function relayCount(count) {
   return `${count} new message${count === 1 ? "" : "s"}`;
 }
 
+/** Nothing is waiting to be read out any more. */
+function forgetRelayPending() {
+  relayPending = [];
+  relayWaitSaid = "";
+  relayWaitingSince = 0;
+}
+
 /**
  * How often held channel messages ask again whether the answer they wait for has ended, when nothing
  * says how long it has left to play. `#330 voice-long-turn-drop`.
  */
 const RELAY_RECHECK_MS = 500;
 
-/** How many held messages the status line last said were waiting, so it says it once a count. */
-let relayWaitShown = 0;
+/**
+ * How long an answer that has stopped arriving — no `turn_complete`, nothing of it for this long and
+ * nothing of it left to play — still holds a relayed channel message. `#330 voice-long-turn-drop`.
+ *
+ * Longer than `SPOKEN_TURN_HOLD_MS`, which bounds the same silence for the page's word on a yes, and
+ * on purpose: an agent that said "One moment." is waiting for that word, while nobody is waiting for
+ * a relayed message, and the silence in the middle of an answer is most often a tool call — which a
+ * voice runtime gives fifteen seconds before it drops it, then speaks again. A relay cut into that
+ * silence goes as an `audio_end`, which a bridge takes for an interrupt, and the answer still to come
+ * is lost. Past this the turn has stalled, and its `turn_complete` is not coming.
+ */
+const RELAY_STALLED_ANSWER_MS = 25000;
+
+/** What the status line last said about held messages, so it says it once a count and a reason. */
+let relayWaitSaid = "";
 
 /**
- * Must a relayed turn wait? While an answer's audio is still playing, on any protocol — the hosted
- * one included, where a `user_message` sent into a playing answer cuts it too — and on
- * `vibe-talk-v1` while anything else holds the floor: a spoken turn open, a reply arriving, a text
- * turn being answered or waiting its turn, the greeting, a segment closing. `#330`.
+ * When the oldest message still waiting to be read out began to wait, by the wall clock; 0 when none
+ * is. The cap on the owner's open turn runs from the later of this and the turn's opening.
  */
-function relayMustWait() {
-  if (!answerHeardOut()) return true;
-  if (session.protocol !== "vibe-talk-v1") return false;
-  return !session.v1Ready || session.waitingForGreeting || session.waitingForAudioEnd || session.spokenTurnOpen ||
-    session.replyArriving || session.typedTurnInFlight || session.pendingPrompts.length > 0;
+let relayWaitingSince = 0;
+
+/**
+ * What a relayed turn must wait for, or null when it may go. `#330 voice-long-turn-drop`.
+ *
+ *   * `"answer"`: an answer's audio still playing, on any protocol — the hosted one included, where
+ *     a `user_message` sent into a playing answer cuts it too — and on `vibe-talk-v1` an answer still
+ *     arriving, or anything else holding the floor: a text turn being answered or waiting its turn,
+ *     the greeting, a segment closing.
+ *   * `"turn"`: the owner's own spoken turn, open and not completed.
+ *
+ * A message waits here, in the relay's own queue, where the timers `#268 voice-call-drops` put on a
+ * spoken turn that holds a text turn never see it. So the open spoken turn is held to bounds read
+ * from its own times. The owner's turn is let go once nothing of it has arrived for
+ * SPOKEN_TURN_HOLD_MS, or SPOKEN_TURN_HOLD_CAP_MS after the message began waiting on it however often
+ * it went on — a word of background speech, a trickle of hypotheses, a lost `turn_complete`, as
+ * `#268` bounds them. An answer is never let go while it is arriving or playing, however long, but
+ * once nothing of it has arrived and nothing has played for RELAY_STALLED_ANSWER_MS it is a stalled
+ * turn. Letting a turn go is said in the connection details, as the `#268` bounds say it, and the
+ * message then closes the segment.
+ *
+ * @returns {"answer" | "turn" | null}
+ */
+function relayWait() {
+  if (!answerHeardOut()) return "answer";
+  if (session.protocol !== "vibe-talk-v1") return null;
+  if (!session.v1Ready || session.waitingForGreeting || session.waitingForAudioEnd || session.typedTurnInFlight ||
+    session.pendingPrompts.length > 0) {
+    return "answer";
+  }
+  // A typed call has no spoken turn and plays nothing: a reply still arriving holds it until its end.
+  if (session.chat) return session.replyArriving ? "answer" : null;
+  if (!session.spokenTurnOpen) return null;
+  const now = Date.now();
+  const quiet = now - Math.max(session.spokenTurnActiveAt, session.answerPlayEndMs || 0);
+  if (session.replyArriving) {
+    if (quiet < RELAY_STALLED_ANSWER_MS) return "answer";
+    letSpokenTurnGo(`an answer went quiet for ${Math.round(quiet / 1000)} s without completing; ` +
+      "a relayed message went anyway");
+    return null;
+  }
+  if (quiet >= SPOKEN_TURN_HOLD_MS) {
+    letSpokenTurnGo(`a spoken turn went quiet for ${Math.round(quiet / 1000)} s without completing; ` +
+      "a relayed message went anyway");
+    return null;
+  }
+  if (now - Math.max(session.spokenTurnOpenedAt, relayWaitingSince) >= SPOKEN_TURN_HOLD_CAP_MS) {
+    letSpokenTurnGo(`a spoken turn held the page's next message for ${Math.round(SPOKEN_TURN_HOLD_CAP_MS / 1000)} s ` +
+      "without completing; a relayed message went anyway");
+    return null;
+  }
+  return "turn";
 }
 
 /**
@@ -40829,6 +40921,7 @@ function relayToAgent(message, selfPosted, replayed, arrival = {}) {
   const key = `${message.channel_id}:${message.id}`;
   if (relayLedger.has(key)) return false;
   relayLedger.add(key);
+  if (!relayPending.length) relayWaitingSince = Date.now();
   relayPending.push({ line: relayLine(message), channel: String(message.channel_id) });
   if (relayTimer === null) {
     relayTimer = setTimeout(flushRelay, RELAY_COALESCE_MS);
@@ -40900,8 +40993,7 @@ function endCallRelay() {
   const queued = session.pendingPrompts.flatMap((prompt) => (prompt.kind === "relay" ? prompt.relays : []));
   const unsent = [...queued, ...relayPending];
   if (relayCallOpenedAt && unsent.length) reportUnrelayed(unsent, "ended");
-  relayPending = [];
-  relayWaitShown = 0;
+  forgetRelayPending();
   if (relayTimer !== null) {
     clearTimeout(relayTimer);
     relayTimer = null;
