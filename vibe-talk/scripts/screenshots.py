@@ -3300,6 +3300,77 @@ def _act_settings_prose(driver: Driver) -> None:
     driver.settle(300)
 
 
+# `#349 channel-settings-all`: a second channel the screenshot server does not have, and the mode the
+# server holds for each, so All channels has two channels to read and they differ.
+ALL_CHANNELS_SECOND = {"id": "100000000000000002", "label": "build noise"}
+ALL_CHANNELS_MODES = {"100000000000000001": "on", ALL_CHANNELS_SECOND["id"]: "off"}
+
+
+def _all_channels_config(route: Route) -> None:
+    """The real server's client configuration, with a second channel and clearing unread offered."""
+    body = cast(object, route.fetch().json())
+    if not isinstance(body, dict):
+        route.fulfill(status=502, content_type="application/json", body="{}")
+        return
+    body["upstream_clear_supported"] = True
+    providers = body.get("providers")
+    if isinstance(providers, list):
+        for provider in providers:
+            if isinstance(provider, dict):
+                provider["upstream_clear_supported"] = True
+    channels = body.get("channels")
+    if isinstance(channels, list) and channels and isinstance(channels[0], dict):
+        second = dict(channels[0])
+        second.update(ALL_CHANNELS_SECOND)
+        channels.append(second)
+    route.fulfill(status=200, content_type="application/json", body=json.dumps(body))
+
+
+def _all_channels_clear(route: Route) -> None:
+    """A channel's clear-unread state: on in the first channel, off in the second."""
+    from urllib.parse import unquote, urlsplit
+
+    channel_id = unquote(urlsplit(route.request.url).path.split("/")[-2])
+    channel = {"id": channel_id, "label": "lead team" if channel_id != ALL_CHANNELS_SECOND["id"] else "build noise",
+               "writable": True, "alias": None, "added": False}
+    route.fulfill(
+        status=200,
+        content_type="application/json",
+        body=json.dumps({"channel": channel, "provider_name": "Google Chat", "supported": True,
+                         "mode": ALL_CHANNELS_MODES.get(channel_id, "off"), "failures": 0, "pending": False}),
+    )
+
+
+def _act_channel_settings_all(driver: Driver) -> None:
+    """`#349 channel-settings-all`: Settings' channel box on All channels, its Clear unread Mixed.
+
+    Two channels whose service can clear unread, set differently (the server's answers are routed:
+    the screenshot server has one channel and a chat service that cannot), All channels chosen, and
+    the Channels section scrolled to the top: the count, Add and Browse without Rename and Remove,
+    and Clear unread showing Mixed with the line saying how they differ. Who is who is not there.
+    """
+    driver.page.route("**/api/v1/client-config", _all_channels_config)
+    driver.page.route("**/api/v1/channels/*/upstream-clear", _all_channels_clear)
+    driver.load(with_token=True)
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    driver.click("open-settings")
+    driver.page.wait_for_function("() => window.__visible('close-settings')", timeout=5_000)
+    driver.page.select_option("#settings-channel", "*")
+    driver.page.wait_for_function(
+        "() => /^Mixed:/.test(document.getElementById('upstream-clear-state').textContent || '')", timeout=10_000
+    )
+    driver.js(
+        "(() => { document.getElementById('settings-channels').scrollIntoView({ block: 'start' }); return true; })()"
+    )
+    driver.settle(300)
+
+
+def _after_channel_settings_all(driver: Driver) -> None:
+    """Put the server's own client configuration and clear-unread answers back for every later state."""
+    driver.page.unroute("**/api/v1/client-config", _all_channels_config)
+    driver.page.unroute("**/api/v1/channels/*/upstream-clear", _all_channels_clear)
+
+
 def _act_resume_unavailable(driver: Driver) -> None:
     """`#331 resume-on-websocket`: Settings on a server that cannot resume — its voice bridge does
     not take a recap — with Resuming's switch disabled and the reason right under it.
@@ -5701,7 +5772,7 @@ SCENES: tuple[Scene, ...] = (
                 # line or a quote of the server's, and every one of those has an id.
                 "no line of description is drawn under a heading in Messages",
                 "[...document.querySelectorAll('#settings-messages p.hint')]"
-                ".filter((p) => p.getClientRects().length > 0).every((p) => p.id !== '')",
+                ".filter((p) => p.getClientRects().length > 0 && !p.closest('#identity-list')).every((p) => p.id !== '')",
             ),
             (
                 # ...because it is the tooltip of the heading and of its ?, the same words on both.
@@ -5709,6 +5780,53 @@ SCENES: tuple[Scene, ...] = (
                 "[...document.querySelectorAll('#screen-settings .group-head')].every((head) => { "
                 "const h = head.querySelector('h2, h3'); const q = head.querySelector('.help-link'); "
                 "return !q || (h.title.length > 10 && h.title === q.title); })",
+            ),
+            (
+                "nothing on the settings screen is wider than it",
+                "(() => { const s = document.getElementById('screen-settings'); "
+                "return s.scrollWidth <= s.clientWidth + 1; })()",
+            ),
+        ),
+    ),
+    Scene(
+        name="64-channel-settings-all",
+        what="Settings, Channels on All channels: Rename and Remove aside, Clear unread Mixed across two channels, and no Who is who",
+        act=_act_channel_settings_all,
+        after=_after_channel_settings_all,
+        profiles=SETTINGS_PROFILES,
+        expect=(
+            ("the settings screen is up", "window.__visible('screen-settings')"),
+            (
+                "the picker opens with All channels, and it is chosen",
+                "(() => { const s = document.getElementById('settings-channel'); "
+                "return s.options[0].value === '*' && s.options[0].textContent === 'All channels' && s.value === '*'; })()",
+            ),
+            (
+                # THE claim: two channels set differently read as Mixed, said in words beside it.
+                "Clear unread shows Mixed, and the line says how they differ",
+                "(() => { const m = document.getElementById('upstream-clear-mode'); "
+                "return m.value === 'mixed' && m.selectedOptions[0].textContent === 'Mixed' "
+                "&& document.getElementById('upstream-clear-state').textContent === 'Mixed: On in 1, Off in 1.' "
+                "&& document.getElementById('upstream-clear-save').disabled; })()",
+            ),
+            (
+                "Rename and Remove step aside; Add a channel stays; the line says how many",
+                "!window.__visible('rename-channel') && !window.__visible('remove-channel') "
+                "&& window.__visible('open-add-channel') "
+                "&& document.getElementById('channel-facts').textContent === 'All 2 channels on your list.'",
+            ),
+            (
+                "the picker, the count and Clear unread are on the screen at once",
+                "['settings-channel', 'channel-facts', 'upstream-clear-mode', 'upstream-clear-state'].every((id) => { "
+                "const b = document.getElementById(id).getBoundingClientRect(); "
+                "const s = document.getElementById('screen-settings').getBoundingClientRect(); "
+                "return window.__visible(id) && b.top >= s.top - 1 && b.bottom <= s.bottom + 1; })",
+            ),
+            (
+                # ...and who is who is not in the box any more: it is under Messages.
+                "no Who is who in the Channels section; it is in Messages",
+                "!document.getElementById('settings-channels').contains(document.getElementById('identity-list')) "
+                "&& document.getElementById('settings-messages').contains(document.getElementById('identity-list'))",
             ),
             (
                 "nothing on the settings screen is wider than it",
@@ -6199,6 +6317,8 @@ def check_state_controls() -> list[str]:
         "62-call-caught-up": ("iphone15", "laptop-1280"),
         # `#347 settings-prose`. The owner's Settings batch is seen at the phone and both desks.
         "63-settings-prose": SETTINGS_PROFILES,
+        # `#349 channel-settings-all`.
+        "64-channel-settings-all": SETTINGS_PROFILES,
     }
     for name, wanted_profiles in restricted.items():
         scene = next((s for s in SCENES if s.name == name), None)
@@ -6407,6 +6527,9 @@ def check_state_controls() -> list[str]:
         # to no line of description drawn (`p.id !== ''`) and to the ? and its heading sharing one
         # tooltip (`h.title === q.title`).
         "63-settings-prose": ("Mark-read automatically", "p.id !== ''", "h.title === q.title"),
+        # `#349 channel-settings-all`. Pinned to All channels being chosen (`s.value === '*'`), to Mixed
+        # said in words (`Mixed: On in 1`), and to Who is who being out of the box (`settings-messages`).
+        "64-channel-settings-all": ("s.value === '*'", "Mixed: On in 1", "settings-messages"),
     }
     for name, needles in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)

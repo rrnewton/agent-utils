@@ -1347,6 +1347,34 @@
               </section>
 
               <!--
+                WHO IS WHO: which account in the channel being read is you, which is the coding agent,
+                and which are other people and bots, as the channel view draws them.
+
+                `#349 channel-settings-all`. The owner, 2026-10-18: "drop the who-is-who part" from
+                the per-channel box, whose picker now offers All channels, which no list of speakers
+                can follow. It moved here, beside the other settings about how messages are drawn,
+                rather than going: it is the one way to name a coding agent where the server cannot
+                guess one (a Slack channel, or a deployment that names its agents), and the choices
+                already made are stored and keep applying either way.
+
+                It follows the channel the reader is READING (`#discord-channel`), which its first line
+                names. It used to follow the box's picker, and before that it listed every account
+                seen anywhere, which let a bot from another channel spoil the sole-other-bot guess;
+                the census is still per channel. A CHOICE is about the ACCOUNT, in every channel it
+                speaks in — see `renderIdentityRows` in web/voice.js.
+              -->
+              <section class="settings-group" id="identity-group">
+                <div class="group-head">
+                  <h3 title="Everyone who has spoken in the channel you are reading. Italic means guessed. A choice follows the account into every channel.">Who is who</h3>
+                  <button class="help-link" id="help-link-identities" type="button" data-help="identities" aria-label="About who is who in a channel" title="Everyone who has spoken in the channel you are reading. Italic means guessed. A choice follows the account into every channel.">?</button>
+                </div>
+                <!-- Rows are built by `renderIdentityRows` in web/voice.js, under a line naming the
+                     channel. Empty until that channel has been read, and it says so. -->
+                <div id="identity-list"></div>
+                <p id="identity-state" class="hint" aria-live="polite"></p>
+              </section>
+
+              <!--
                 `#193 compose-draft-loss`. A send dismissed from the outbox unsent is not gone at one
                 tap: it is kept here, on this device only, for a week (the newest ten), and Put back
                 returns it to its channel's outbox. web/voice.js writes the list and the line above it.
@@ -1372,8 +1400,8 @@
 
             <section class="settings-section" id="settings-channels" aria-labelledby="settings-channels-title">
               <div class="group-head">
-                <h2 id="settings-channels-title" title="One channel at a time: your own name for it, taking it off the list, and clearing its unread in its chat service.">Channels</h2>
-                <button class="help-link" id="help-link-channel-alias" type="button" data-help="channel-alias" aria-label="About channels" title="One channel at a time: your own name for it, taking it off the list, and clearing its unread in its chat service.">?</button>
+                <h2 id="settings-channels-title" title="One channel at a time, or all of them: your own name for one, taking it off the list, and clearing unread in its chat service.">Channels</h2>
+                <button class="help-link" id="help-link-channel-alias" type="button" data-help="channel-alias" aria-label="About channels" title="One channel at a time, or all of them: your own name for one, taking it off the list, and clearing unread in its chat service.">?</button>
               </div>
 
               <!--
@@ -1408,6 +1436,13 @@
                 <!-- What this channel IS: the name in force, and where it came from. -->
                 <p id="channel-facts" class="hint" aria-live="polite"></p>
 
+                <!--
+                  `#349 channel-settings-all`. The picker's first choice is All channels, offered when
+                  there are two or more: the owner, 2026-10-18, "Clear unread can be set for all at
+                  once". With it chosen the line above says how many, Rename and Remove step aside
+                  (they name one channel), Add and Browse stay, and Clear unread below shows the
+                  channels' common mode, or Mixed, and Save sets it on every channel whose service can.
+                -->
                 <div class="channel-actions">
                   <button id="rename-channel" class="secondary" type="button" aria-expanded="false" aria-controls="rename-fields">Rename</button>
                   <!--
@@ -1540,9 +1575,15 @@
                     <option value="off">Off</option>
                     <option value="dry_run">Dry run: log only, mark nothing</option>
                     <option value="on">On</option>
+                    <!--
+                      `#349 channel-settings-all`. What the choice shows when All channels is picked
+                      and the channels are not all set alike. Never a mode that can be saved:
+                      disabled, and offered only while it is true.
+                    -->
+                    <option id="upstream-clear-mixed" value="mixed" disabled hidden>Mixed</option>
                   </select>
                   <p id="upstream-clear-warning" class="hint">
-                    Marks EVERY message in this channel read in
+                    Marks EVERY message in <span id="upstream-clear-scope">this channel</span> read in
                     <span id="upstream-clear-warning-provider">the chat service</span> as soon as
                     vibe-talk receives it, including messages from people. The first message
                     vibe-talk receives after it is on also marks everything already unread there
@@ -1570,34 +1611,6 @@
                   </div>
                   <p id="upstream-clear-state" class="hint" aria-live="polite"></p>
                 </div>
-
-                <!--
-                  WHO IS WHO, and it is IN HERE because it was always a fact about one channel and
-                  was drawn as a fact about the app.
-
-                  It used to be its own group, above this one, listing every account seen in every
-                  channel the reader had ever opened — so the answer to "who is in this channel" was
-                  a list that grew as OTHER channels were read, and the sole-other-bot guess was a
-                  census of the whole deployment rather than of the conversation being drawn. A
-                  second bot in a channel the reader had glanced at once could stop the coding agent
-                  being recognised in the channel they were actually reading. The heading said "in
-                  the channel" throughout, which is the tell: the copy already described the thing
-                  the code was not doing.
-
-                  It is subordinate to the picker above, like everything else in this box: change
-                  the channel and this list changes with it. A CHOICE made here is still about the
-                  ACCOUNT rather than about the channel — see `renderIdentityRows` in web/voice.js,
-                  and the sentence under the list, which says so on screen.
-                -->
-                <hr class="settings-rule" />
-                <div class="group-head">
-                  <h3 title="Everyone who has spoken in the channel above. Italic means guessed. A choice follows the account into every channel.">Who is who in this channel</h3>
-                  <button class="help-link" id="help-link-identities" type="button" data-help="identities" aria-label="About channel identities" title="Everyone who has spoken in the channel above. Italic means guessed. A choice follows the account into every channel.">?</button>
-                </div>
-                <!-- Rows are built by `renderIdentityRows` in web/voice.js. Empty until this channel
-                     has been read, and it says so rather than showing a blank panel. -->
-                <div id="identity-list"></div>
-                <p id="identity-state" class="hint" aria-live="polite"></p>
               </section>
             </section>
 
@@ -1975,14 +1988,14 @@
             </details>
 
             <details id="help-identities" class="help-entry">
-              <summary><h2>Who is who in this channel</h2></summary>
+              <summary><h2>Who is who</h2></summary>
               <p class="hint">
                 The call transcript tells its two speakers apart by side, colour and corner. The
                 channel can do the same, but only once it knows which account is which. A display
                 name alone cannot reliably distinguish you, the bridge and the coding agent. The
-                list sits inside <strong>Channels</strong>, under the channel picker, and shows
-                everyone who has spoken in <em>that</em> channel, with what this page guessed shown
-                in italics; change any of them and the channel is redrawn.
+                list is in <strong>Messages</strong>, and shows everyone who has spoken in the
+                channel you are reading, which its first line names, with what this page guessed
+                shown in italics; change any of them and the channel is redrawn.
               </p>
               <p class="hint">
                 The guesses, in the order they are tried: the account this bridge posts as is
@@ -2364,6 +2377,15 @@
               <p class="hint">
                 Everything in this group is about <strong>one channel</strong> — the one chosen at
                 the top of it. Every other setting on the screen applies to the whole app.
+              </p>
+              <p class="hint">
+                <strong>All channels</strong>, the picker's first choice when there are two or
+                more, is for setting <strong>Clear unread</strong> on every channel at once. Its
+                choice shows the mode they all have, or <em>Mixed</em> when they differ, and Save
+                sets the one chosen on every channel whose chat service can clear unread, saying how
+                many it reached. Rename and Remove name one channel, so they step aside; Add and
+                Browse stay. Who is who, which used to sit at the foot of this group, is under
+                <strong>Messages</strong>, for the channel you are reading.
               </p>
               <p class="hint">
                 <strong>Adding a channel</strong> needs the channel ID supplied by this deployment.

@@ -112,6 +112,12 @@ let activeColumn = columns.main;
 /** Whether that is the right column, for `el`, which asks on every call. */
 let sideActive = false;
 
+/**
+ * `#349 channel-settings-all`. The value of Settings' channel picker's first choice, All channels:
+ * not an id any chat service gives a channel. Up here because the picker is filled during start-up.
+ */
+const ALL_CHANNELS = "*";
+
 // The element with this id: in the column being worked on, for the ids of the channel's pane (see
 // `COLUMN_IDS`). Form controls are typed by their tag in voice.html, so the checker knows `.value`
 // and `.checked` exist; tests/js/contract.test.mjs keeps these lists equal to the page's real
@@ -1221,6 +1227,8 @@ function showScreen(name) {
   if (name === "settings" && previous !== "settings") refreshVoicePostPrefix();
   // `#193 compose-draft-loss`. Its ages and channel names as they are now, and none past its days.
   if (name === "settings" && previous !== "settings") renderDismissedSends();
+  // `#349 channel-settings-all`. Who is who in the channel being read, which may have changed since.
+  if (name === "settings" && previous !== "settings") renderIdentityRows();
   if (name !== previous || focusLost()) settleFocus();
   // `#304 back-gesture-in-app`. A screen opened has an entry to go back through, and one left has none.
   scheduleBackSync();
@@ -25076,23 +25084,24 @@ function bucketFor(authorId, isBot, channelId) {
 }
 
 /**
- * The Settings panel: one row per account seen IN THE CHANNEL ITS PICKER IS ON, saying what it is
- * and letting that be changed.
+ * The Settings panel: one row per account seen IN THE CHANNEL BEING READ, saying what it is and
+ * letting that be changed.
  *
  * Rebuilt wholesale rather than patched, because the set of accounts grows as the channel is read
  * and the guesses for accounts ALREADY listed can change when a new one arrives — the sole-other-
  * bot rule is a statement about the whole census. A partial update would leave a stale "coding
  * agent" beside the second bot that has just disqualified it.
  *
- * The channel comes from `#settings-channel`, the picker at the head of the box this list now sits
- * in, and NOT from `#discord-channel`, which is what the reader is looking at. They are separate on
- * purpose everywhere else in that box — pointing the rename editor at another channel does not
- * navigate — and this list follows the same rule, so the whole box is about one channel and says
- * which at the top.
+ * `#349 channel-settings-all`. The channel is `#discord-channel`, the one the reader is looking at,
+ * and the list's first line names it. It used to be `#settings-channel`, the picker of the per-channel
+ * box the list sat in; the owner asked for it out of that box, whose picker now offers All channels,
+ * and a list of who spoke cannot follow "all". So it is a group of Messages, about the channel whose
+ * messages it decides how to draw. Still one channel's census: a bot that only speaks somewhere else
+ * cannot spoil the guess here.
  */
 function renderIdentityRows() {
   const host = el("identity-list");
-  const channelId = el("settings-channel").value;
+  const channelId = el("discord-channel").value;
   const seen = seenIn(channelId);
   const ids = Object.keys(seen).sort((a, b) => {
     const left = seen[a];
@@ -25111,11 +25120,15 @@ function renderIdentityRows() {
     // says whatever the picker above it says. The list changes when that picker does, and "nobody
     // yet" without a name reads as a broken panel rather than as an unread channel.
     empty.textContent =
-      `Nobody yet in ${channelName(knownChannel(channelId))}. Read that channel, and everyone ` +
-      "who has spoken in it appears here.";
+      `Nobody yet in ${channelName(knownChannel(channelId))}, the channel you are reading. ` +
+      "Everyone who speaks in it appears here as it is read.";
     host.replaceChildren(empty);
     return;
   }
+  // Which channel the rows are about, through the one rule that names channels.
+  const about = document.createElement("p");
+  about.className = "hint identity-channel";
+  about.textContent = `In ${channelName(knownChannel(channelId))}, the channel you are reading:`;
   const rows = ids.map((id) => {
     const who = seen[id];
     // A <label> WRAPPING its control, rather than a <div> plus `for="identity-<id>"`.
@@ -25186,7 +25199,7 @@ function renderIdentityRows() {
     wrap.append(label, select, id_);
     return wrap;
   });
-  host.replaceChildren(...rows);
+  host.replaceChildren(about, ...rows);
 }
 
 /** Remember an author, in the channel they spoke in, so Settings can offer a row for them later. */
@@ -25343,9 +25356,9 @@ function renderChannelRows() {
   }
   if (learned) {
     persistJson(AUTHORS_KEY, authorsSeen);
-    // Only if Settings is pointed at the channel that just learned something. Otherwise the panel
-    // is showing a different channel's list and rebuilding it would draw the same rows again.
-    if (el("settings-channel").value === viewing) renderIdentityRows();
+    // `#349 channel-settings-all`. The list is the channel being read's, which is the one that just
+    // learned something.
+    renderIdentityRows();
   }
   // `#222 unread-replies`. The replies the store holds, counted once for every row's thread chip.
   const tally = replyTally();
@@ -41490,13 +41503,24 @@ function fillChannelSelect(id) {
   // picker and must not change the remembered reading destination merely by editing a channel.
   const chosen = select.value || (id === "discord-channel" ? storedActiveChannel() : "");
   select.replaceChildren();
+  // `#349 channel-settings-all`. Settings' picker opens with All channels where there is more than
+  // one: Clear unread set for every channel at once. Never the reading picker's: a view reads one.
+  const all = id === "settings-channel" && knownChannels.length >= 2;
+  if (all) {
+    const option = document.createElement("option");
+    option.value = ALL_CHANNELS;
+    option.textContent = "All channels";
+    select.append(option);
+  }
   for (const channel of knownChannels) {
     const option = document.createElement("option");
     option.value = channel.id;
     option.textContent = channelName(channel);
     select.append(option);
   }
-  if (knownChannels.some((channel) => String(channel.id) === String(chosen))) {
+  if (all && chosen === ALL_CHANNELS) {
+    select.value = ALL_CHANNELS;
+  } else if (knownChannels.some((channel) => String(channel.id) === String(chosen))) {
     select.value = chosen;
   } else if (knownChannels.length > 0) {
     select.value = knownChannels[0].id;
@@ -41871,21 +41895,34 @@ async function removeChannel() {
 }
 
 /**
- * Redraw everything in the channel box for the channel its picker is on.
+ * Redraw everything in the channel box for the channel its picker is on, or for all of them.
  *
- * ONE CALL, because the box now holds two things scoped by that picker — what this channel is
- * called, and who is in it — and every caller needs both. When the identity list moved in here it
- * was added beside each `renderAliasEditor()` by hand, and the third such site is where a list
- * belonging to the previously selected channel gets left on screen.
+ * ONE CALL, because the box holds more than one thing scoped by that picker — what this channel is
+ * called and what it offers, and whether its unread is cleared upstream — and every caller needs all
+ * of them. `#349 channel-settings-all` took the list of who is who out of the box (it follows the
+ * channel being read now, under Messages), so it is not redrawn here.
  */
 function renderChannelBox() {
   renderAliasEditor();
-  renderIdentityRows();
   renderUpstreamClear();
 }
 
+/** Whether Settings' channel box is on All channels. `#349 channel-settings-all`. */
+const allChannelsChosen = () => el("settings-channel").value === ALL_CHANNELS;
+
 /** What the editor says about the channel it is pointed at, including the label underneath. */
 function renderAliasEditor() {
+  // `#349 channel-settings-all`. Rename names one channel, so it steps aside for All channels, as
+  // Remove does below; Add and Browse are not about the channel chosen, and stay.
+  const all = allChannelsChosen();
+  el("rename-channel").hidden = all;
+  if (all) {
+    el("channel-alias").value = "";
+    el("channel-facts").textContent = `All ${knownChannels.length} channels on your list.`;
+    el("alias-state").textContent = "";
+    renderRemoveChannel(null);
+    return;
+  }
   const channel = knownChannel(el("settings-channel").value);
   if (!channel) {
     el("channel-alias").value = "";
@@ -41961,6 +41998,18 @@ let upstreamClearPushing = null;
  *   messageAtMs: number | null, before: string, asked: number, timer: number} | null}
  */
 let upstreamClearFollowing = null;
+
+/**
+ * `#349 channel-settings-all`. What the server last said about each channel All channels reaches: the channels (`ids`), each
+ * answer, each failure to read one, whether the owner has moved the choice since it was drawn
+ * (`chose`), and whether a Save is under way.
+ *
+ * @type {{ids: string[], views: Map<string, VibeTalk.UpstreamClearState>, failures: Map<string, string>,
+ *   chose: boolean, saving: boolean} | null}
+ */
+let upstreamClearAll = null;
+/** Counts the box's reads of every channel, so an answer to an older one is dropped. */
+let upstreamClearAllReads = 0;
 
 /** Whether the box offers the control for the channel `id`. */
 function upstreamClearOffered(id) {
@@ -42188,6 +42237,12 @@ function upstreamClearChanged() {
 
 /** Enable Save, and offer "Mark read now" or "Try it now", to match what is chosen and saved. */
 function renderUpstreamClearChoice() {
+  // `#349 channel-settings-all`. With All channels chosen the choice is about every channel at once.
+  if (allChannelsChosen()) {
+    if (upstreamClearAll) upstreamClearAll.chose = true;
+    renderUpstreamClearAllChoice();
+    return;
+  }
   const view = upstreamClear ? upstreamClear.view : null;
   const stored = view ? view.mode : "off";
   el("upstream-clear-save").disabled = !upstreamClearChanged();
@@ -42201,10 +42256,19 @@ function renderUpstreamClearChoice() {
 
 /** Redraw the box for the channel its picker is on, reading the server's state when it changed. */
 function renderUpstreamClear() {
+  if (allChannelsChosen()) {
+    renderUpstreamClearAll();
+    return;
+  }
+  upstreamClearAll = null;
   const id = el("settings-channel").value;
   const offered = upstreamClearOffered(id);
   el("upstream-clear").hidden = !offered;
   if (!offered) return;
+  // What All channels changed in the box, put back for one channel.
+  el("upstream-clear-scope").textContent = "this channel";
+  el("upstream-clear-mixed").hidden = true;
+  el("upstream-clear-mode").disabled = false;
   const service = chatServiceOf(id);
   el("upstream-clear-provider").textContent = service;
   el("upstream-clear-warning-provider").textContent = service;
@@ -42279,6 +42343,11 @@ async function loadUpstreamClear(channel) {
 
 /** Read the box's channel again, as when Settings opens: the server may have pushed since. */
 function refreshUpstreamClear() {
+  if (allChannelsChosen()) {
+    if (upstreamClearAll) loadUpstreamClearAll();
+    else renderUpstreamClear();
+    return;
+  }
   const id = el("settings-channel").value;
   if (!upstreamClearOffered(id)) return;
   if (upstreamClear && upstreamClear.channel === String(id)) {
@@ -42293,6 +42362,10 @@ function refreshUpstreamClear() {
  * marked, and everything before it, as the warning says; "Mark read now" does it at once.
  */
 async function saveUpstreamClear() {
+  if (allChannelsChosen()) {
+    await saveUpstreamClearAll();
+    return;
+  }
   const channel = el("settings-channel").value;
   if (!upstreamClearOffered(channel) || !upstreamClearChanged()) return;
   const mode = el("upstream-clear-mode").value;
@@ -42364,6 +42437,162 @@ async function pushUpstreamClearNow() {
   el("upstream-clear-state").textContent = upstreamClearNowSentence(answer, service);
   // The server stopped waiting before the push landed; ask again until something answers it.
   if (answer.outcome === "waiting") followUpstreamClear(channel, answer, service);
+}
+
+// --- clearing unread in every channel at once ----------------------------------------------------
+//
+// `#349 channel-settings-all`. The owner, 2026-10-18: the channel drop-down gains "All channels",
+// "Clear unread can be set for all at once", and it shows "Mixed" when the channels differ. With All
+// channels chosen the box reads every channel whose chat service can clear unread (`upstreamClearOffered`
+// answers that per channel, so a channel whose service cannot is left out and said to be), shows the
+// mode they share or Mixed, and Save puts the chosen mode on each, one PUT per channel, through the same
+// /upstream-clear the one-channel box writes. "Mark read now" is a push for one channel and is not
+// offered. The one-channel box's state (`upstreamClear`) is set aside while this is up, so nothing it
+// is still waiting on can draw over it.
+
+/** The modes, as the status line names them. */
+const UPSTREAM_CLEAR_MODE_WORDS = { on: "On", dry_run: "Dry run", off: "Off" };
+
+/** The channels All channels reaches: those whose chat service can clear unread, for this token. */
+function upstreamClearAllChannels() {
+  return knownChannels.map((channel) => String(channel.id)).filter((id) => upstreamClearOffered(id));
+}
+
+/**
+ * The mode every channel All channels reaches has: the mode, null when they differ (Mixed), or
+ * undefined while one of them has not been read.
+ *
+ * @returns {VibeTalk.UpstreamClearMode | null | undefined}
+ */
+function upstreamClearAllCommon() {
+  const held = upstreamClearAll;
+  if (!held || held.ids.some((id) => !held.views.has(id))) return undefined;
+  const modes = [...new Set(held.ids.map((id) => /** @type {VibeTalk.UpstreamClearState} */ (held.views.get(id)).mode))];
+  return modes.length === 1 ? modes[0] : null;
+}
+
+/** The status line for All channels: what they are set to, or why that is not known yet. */
+function upstreamClearAllSentence() {
+  const held = upstreamClearAll;
+  if (!held) return "";
+  const others = knownChannels.length - held.ids.length;
+  const tail = others === 0 ? ""
+    : others === 1 ? " 1 other channel's chat service cannot clear unread."
+      : ` ${others} other channels' chat services cannot clear unread.`;
+  if (held.failures.size > 0) {
+    const [id, why] = [...held.failures][0];
+    const more = held.failures.size > 1 ? ` (and ${held.failures.size - 1} more)` : "";
+    return `Could not read this setting for ${channelName(knownChannel(id))}${more}: ${why}`;
+  }
+  const common = upstreamClearAllCommon();
+  if (common === undefined) return "Checking with the server…";
+  if (common !== null) {
+    const where = held.ids.length === 1 ? channelName(knownChannel(held.ids[0])) : `all ${held.ids.length} channels`;
+    return `${UPSTREAM_CLEAR_MODE_WORDS[common]} in ${where}.${tail}`;
+  }
+  const counts = /** @type {Array<[VibeTalk.UpstreamClearMode, number]>} */ (
+    /** @type {VibeTalk.UpstreamClearMode[]} */ (["on", "dry_run", "off"])
+      .map((mode) => [mode, held.ids.filter((id) => /** @type {VibeTalk.UpstreamClearState} */ (held.views.get(id)).mode === mode).length])
+      .filter(([, count]) => Number(count) > 0));
+  return `Mixed: ${counts.map(([mode, count]) => `${UPSTREAM_CLEAR_MODE_WORDS[mode]} in ${count}`).join(", ")}.${tail}`;
+}
+
+/** Enable Save only for a mode that would change something, once every channel has been read. */
+function renderUpstreamClearAllChoice() {
+  const held = upstreamClearAll;
+  const common = upstreamClearAllCommon();
+  const chosen = el("upstream-clear-mode").value;
+  el("upstream-clear-mode").disabled = common === undefined;
+  el("upstream-clear-save").disabled = !held || held.saving || common === undefined || chosen === "mixed" ||
+    chosen === common;
+  el("upstream-clear-push").hidden = true;
+}
+
+/** Draw what the server said about every channel: their mode, or Mixed, and the status line. */
+function drawUpstreamClearAll() {
+  const held = upstreamClearAll;
+  if (!held) return;
+  const common = upstreamClearAllCommon();
+  el("upstream-clear-mixed").hidden = common !== null;
+  if (!held.chose) el("upstream-clear-mode").value = common === undefined ? "off" : common === null ? "mixed" : common;
+  el("upstream-clear-state").textContent = upstreamClearAllSentence();
+  renderUpstreamClearAllChoice();
+}
+
+/** Redraw the box for All channels, reading every channel's state when the set of them changed. */
+function renderUpstreamClearAll() {
+  // The one-channel box's own state is set aside: nothing it waits on draws over this.
+  stopFollowingUpstreamClear();
+  upstreamClear = null;
+  const ids = upstreamClearAllChannels();
+  el("upstream-clear").hidden = ids.length === 0;
+  if (ids.length === 0) {
+    upstreamClearAll = null;
+    return;
+  }
+  const services = [...new Set(ids.map((id) => chatServiceOf(id)))];
+  const service = services.length === 1 ? services[0] : "their chat services";
+  el("upstream-clear-provider").textContent = service;
+  el("upstream-clear-warning-provider").textContent = service;
+  el("upstream-clear-threads-provider").textContent = service;
+  el("upstream-clear-scope").textContent = "each of these channels";
+  if (!upstreamClearAll || upstreamClearAll.ids.join(" ") !== ids.join(" ")) {
+    upstreamClearAll = { ids, views: new Map(), failures: new Map(), chose: false, saving: false };
+    // Asked only while Settings is showing, as the one-channel box asks.
+    if (!el("screen-settings").hidden) loadUpstreamClearAll();
+  }
+  drawUpstreamClearAll();
+}
+
+/** Ask the server what it does for every channel All channels reaches, one channel after another. */
+async function loadUpstreamClearAll() {
+  const held = upstreamClearAll;
+  if (!held) return;
+  const read = ++upstreamClearAllReads;
+  held.failures.clear();
+  for (const id of held.ids) {
+    try {
+      const view = await apiDecoded("UpstreamClearState", `/api/v1/channels/${encodeURIComponent(id)}/upstream-clear`);
+      if (read !== upstreamClearAllReads || upstreamClearAll !== held) return;
+      held.views.set(id, view);
+    } catch (error) {
+      if (read !== upstreamClearAllReads || upstreamClearAll !== held) return;
+      held.failures.set(id, error.detail || error.message);
+    }
+  }
+  if (allChannelsChosen()) drawUpstreamClearAll();
+}
+
+/**
+ * Save the chosen mode on every channel All channels reaches, and say how many it reached. A channel
+ * that refuses keeps what it had, and is named.
+ */
+async function saveUpstreamClearAll() {
+  const held = upstreamClearAll;
+  const mode = el("upstream-clear-mode").value;
+  if (!held || held.saving || !Object.prototype.hasOwnProperty.call(UPSTREAM_CLEAR_MODE_WORDS, mode) ||
+      upstreamClearAllCommon() === undefined) return;
+  held.saving = true;
+  renderUpstreamClearAllChoice();
+  el("upstream-clear-state").textContent = "Saving…";
+  /** @type {string[]} */
+  const refused = [];
+  for (const id of held.ids) {
+    try {
+      const view = await apiDecoded("UpstreamClearState", `/api/v1/channels/${encodeURIComponent(id)}/upstream-clear`,
+        { method: "PUT", body: { mode } });
+      held.views.set(id, view);
+    } catch (error) {
+      refused.push(`${channelName(knownChannel(id))} (${error.detail || error.message})`);
+    }
+  }
+  held.saving = false;
+  if (upstreamClearAll !== held || !allChannelsChosen()) return;
+  held.chose = false;
+  drawUpstreamClearAll();
+  el("upstream-clear-state").textContent = refused.length === 0
+    ? `Saved. ${upstreamClearAllSentence()}`
+    : `Saved in ${held.ids.length - refused.length} of ${held.ids.length} channels; not in ${refused.join(", ")}.`;
 }
 
 /**
@@ -43404,13 +43633,9 @@ el("discord-channel").addEventListener("change", channelPicked);
 // losing it.
 el("settings-channel").addEventListener("change", () => {
   showChannelPanel(null);
-  // Everything in this box is about the channel the picker is on, and the identity list is now one
-  // of those things: pointing it somewhere else must change WHO is listed, not only what the
-  // rename field says.
+  // Everything in this box is about the channel the picker is on, or about all of them
+  // (`#349 channel-settings-all`).
   renderChannelBox();
-  // The saved-sentence belongs to a choice made about the previous channel's list. Left standing
-  // it reads as a report about the list now on screen.
-  el("identity-state").textContent = "";
 });
 // `#232 upstream-mark-read`. Choosing a mode only shows what Save would do; Save is the decision.
 el("upstream-clear-mode").addEventListener("change", renderUpstreamClearChoice);

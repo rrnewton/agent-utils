@@ -3194,6 +3194,14 @@ replies too. That is a possible future path, not something any bridge here does 
   that is off refuses it, so a page still showing On after another device turned it off cannot turn
   it back on. Turning a channel on pushes nothing by itself: the next message that arrives is pushed,
   and with it everything before it.
+* **All channels at once** (`#349 channel-settings-all`). With two or more channels, Settings'
+  channel picker opens with **All channels**. Chosen, the box reads the setting of every channel
+  whose provider can clear unread and shows the mode they share, or **Mixed** when they differ (a
+  choice that cannot be saved), with a line saying how many are in each mode and how many channels'
+  services cannot clear unread at all. **Save** puts the chosen mode on each of those channels, one
+  write per channel through the same per-channel setting, and says how many it reached and which
+  refused. Mark read now is a push for one channel, so it is not offered there; Rename and Remove
+  name one channel and step aside too, while Add a channel and Browse channels stay.
 * **Every attempt is logged on one line** beginning `upstream-clear:`, naming the mode, the channel,
   the message and its time, and the outcome (`advanced`, `already-read`, `dry-run`, `skipped`, or
   `failed`). A dry run decides everything and writes nothing, so an operator can check what would be
@@ -7174,8 +7182,8 @@ the groups sit as rows inside a handful of sections, and each section is the car
 | Section | Holds |
 |---|---|
 | **Voice agent** | Sending (ask before the agent sends — first, where it is looked for), Instructions, Resuming, Arriving messages during a call, Reading full messages in channel view, Canned prompts, Microphone, and the provider's console link |
-| **Messages** | Your own messages, Mark-read automatically, Combining messages, Rich headers, Recently dismissed |
-| **Channels** | the per-channel box: rename, remove, add, browse, clear unread upstream, who is who |
+| **Messages** | Your own messages, Mark-read automatically, Combining messages, Rich headers, Who is who, Recently dismissed |
+| **Channels** | the per-channel box: rename, remove, add, browse, clear unread upstream — for one channel, or for all of them (`#349 channel-settings-all`) |
 | **Screen and keys** | Text size, Reading width, Control bar, Typing, Keyboard |
 | **Storage and connection** | Stored conversations, Saved messages on this server (the message cache's switch, its Erase and what it holds; shown only to the write token, and only when client-config carries `message_cache` — `#208 persistent-cache`), Token, Connection status |
 
@@ -7232,6 +7240,16 @@ tooltip of the (?) and of the subsection title", with the `?` still opening the 
 The page suite holds each of these to the markup with a negative control for each, and
 `63-settings-prose` photographs the Messages section with no line of description under a heading at
 393x852, 1280x800 and 1920x1080. Tooltips are a mouse's: on a phone the `?` is the way in, as before.
+
+**Who is who left the channel box** (`#349 channel-settings-all`). The owner asked for "the
+who-is-who part" out of the per-channel box, whose picker now offers All channels, which no list of
+speakers can follow. It moved to **Messages**, beside the other settings about how messages are
+drawn, rather than going: it is the one way to name a coding agent where the server will not guess
+one (a Slack channel, or a deployment that names its agents), and the choices already made are kept
+in this browser and keep applying. It follows the channel being **read**, which its first line names,
+and is still one channel's census, so a bot that only speaks somewhere else cannot spoil the guess.
+`64-channel-settings-all` photographs the box on All channels, Clear unread Mixed across two
+channels, at 393x852, 1280x800 and 1920x1080.
 
 **Connection status moved to the end and gained a word.** It is a readout — what the conversation
 is, what audio format it negotiated, why the last one closed — and it was standing at the top of the

@@ -17887,24 +17887,41 @@ const listedNames = (page) =>
     .filter((node) => node.className === "identity-name")
     .map((node) => node.text());
 
-test("WHO IS WHO SITS INSIDE CHANNELS, UNDER THE PICKER THAT DECIDES WHAT IS IN IT", () => {
-  // Placement is the claim, not decoration: a list of accounts scoped by a channel and drawn in a
-  // group of its own is a list the reader cannot attribute to anything.
-  const from = HTML.indexOf('id="channel-settings"');
-  const box = HTML.slice(from, from + HTML.slice(from).indexOf("</section>"));
-  assert.ok(box.includes('id="identity-list"'), "the identity list is not inside the channel box");
-  assert.ok(
-    box.indexOf('id="settings-channel"') < box.indexOf('id="identity-list"'),
-    "the list is drawn above the picker that scopes it"
-  );
-  assert.equal(
-    (HTML.match(/id="identity-list"/g) || []).length,
-    1,
-    "a second copy of the list exists, and one of them is scoped by nothing"
-  );
+test("WHO IS WHO IS IN MESSAGES, out of the per-channel box, and names the channel it is about (#349)", async () => {
+  // `#349 channel-settings-all`. The owner: "drop the who-is-who part" from the per-channel box,
+  // whose picker now offers All channels. It moved to Messages rather than going, because it is the
+  // one way to name a coding agent where the server cannot guess one. Placement is the claim, not
+  // decoration: a list of accounts drawn without saying whose channel they are is a list the reader
+  // cannot attribute to anything, so its first line names the channel.
+  const problems = (html) => {
+    const found = [];
+    const code = html.replace(/<!--[\s\S]*?-->/g, " ");
+    const box = settingsSection("Channels", code);
+    if (box.includes('id="identity-list"') || /Who is who/.test(box)) found.push("who is who is in the channel box");
+    const group = new RegExp(settingsHeading(3, "Who is who")).test(settingsSection("Messages", code))
+      ? settingsGroup("Who is who", code) : "";
+    if (!group.includes('id="identity-list"')) found.push("Messages has no Who is who list");
+    if (!/data-help="identities"/.test(group)) found.push("Who is who has no way to the entry that explains the guesses");
+    if ((code.match(/id="identity-list"/g) || []).length !== 1) found.push("there is not exactly one list");
+    return found;
+  };
+  assert.deepStrictEqual(problems(HTML), []);
+  // The negative control: the group put back at the foot of the channel box, where it was.
+  const group = `${settingsGroup("Who is who")}</section>`;
+  const back = HTML.replace(group, "").replace(/(<p id="upstream-clear-state" class="hint" aria-live="polite"><\/p>\s*<\/div>)/,
+    `$1${group.replace(/<\/?section[^>]*>/g, "")}`);
+  assert.notEqual(back, HTML, "the negative control changed nothing");
+  assert.deepStrictEqual(problems(back), ["who is who is in the channel box", "Messages has no Who is who list",
+    "Who is who has no way to the entry that explains the guesses"]);
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, crowd());
+  await page.el("open-settings").click();
+  assert.match(page.el("identity-list").children[0].textContent, /^In lead team, the channel you are reading:$/,
+    "the list does not say which channel it is about");
 });
 
-test("the list follows the SETTINGS picker, not the channel being read", async () => {
+test("the list follows the channel being READ, and Settings' channel picker does not move it (#349)", async () => {
   const page = newPage();
   page.channels = [{ ...CHANNEL }, { ...OTHER_CHANNEL }];
   serveByChannel(page, {
@@ -17922,22 +17939,44 @@ test("the list follows the SETTINGS picker, not the channel being read", async (
   await page.el("open-settings").click();
 
   assert.deepStrictEqual(listedNames(page), ["alice"], "the list is not scoped to one channel");
+  // The box's picker is about the box: pointing it elsewhere, or at All channels, leaves the list on
+  // the channel being read, and navigates nowhere.
   await settingsChannel(page, OTHER_CHANNEL.id);
-  assert.deepStrictEqual(
-    listedNames(page),
-    ["mallory"],
-    "moving the picker renamed the channel but left the previous channel's cast on screen"
-  );
-  // ...and the view did not follow it. The whole box is a redraw of a channel, not a trip to one.
+  assert.deepStrictEqual(listedNames(page), ["alice"], "the box's picker moved the list off the channel being read");
+  await settingsChannel(page, "*");
+  assert.deepStrictEqual(listedNames(page), ["alice"]);
   assert.equal(page.el("discord-channel").value, CHANNEL.id, "a Settings redraw navigated");
+  // Reading the other channel and coming back to Settings lists that channel's cast.
+  await page.el("close-settings").click();
+  await readChannel(page, OTHER_CHANNEL.id);
+  await page.el("open-settings").click();
+  assert.deepStrictEqual(listedNames(page), ["mallory"], "the list kept the previous channel's cast");
+  assert.match(page.el("identity-list").children[0].textContent, /^In build noise,/);
+  // The negative control: the list as it was, following the box's picker. It then lists the cast of
+  // the channel the picker happens to be on, which is how this test would fail.
+  const before = newPage(new Map(), brokenScript('  const channelId = el("discord-channel").value;\n  const seen = seenIn(channelId);',
+    '  const channelId = el("settings-channel").value;\n  const seen = seenIn(channelId);'));
+  before.channels = [{ ...CHANNEL }, { ...OTHER_CHANNEL }];
+  serveByChannel(before, {
+    [CHANNEL.id]: [message({ id: "3000000000000000001", channel_id: CHANNEL.id, author: "alice", author_id: "10", author_is_bot: false })],
+    [OTHER_CHANNEL.id]: [message({ id: "3000000000000000002", channel_id: OTHER_CHANNEL.id, author: "mallory", author_id: "30", author_is_bot: false })],
+  });
+  await signIn(before);
+  await showDiscord(before, []);
+  await readChannel(before, OTHER_CHANNEL.id);
+  await readChannel(before, CHANNEL.id);
+  await settingsChannel(before, OTHER_CHANNEL.id);
+  await before.el("open-settings").click();
+  assert.deepStrictEqual(listedNames(before), ["mallory"], "the negative control lists the read channel's cast anyway");
 });
 
-test("an unread channel says WHICH channel is empty rather than showing a blank panel", async () => {
+test("a channel nobody has spoken in yet says WHICH channel is empty rather than showing a blank panel", async () => {
   const page = newPage();
   page.channels = [{ ...CHANNEL }, { ...OTHER_CHANNEL }];
+  serveByChannel(page, { [CHANNEL.id]: [], [OTHER_CHANNEL.id]: [] });
   await signIn(page);
+  await readChannel(page, OTHER_CHANNEL.id);
   await page.el("open-settings").click();
-  await settingsChannel(page, OTHER_CHANNEL.id);
   assert.match(page.el("identity-list").text(), /build noise/, "it does not say what is empty");
 });
 
@@ -51288,7 +51327,7 @@ test("TURNING IT ON is a deliberate Save of the mode alone, and draws what the s
 
 test("NO CHECKBOX, no second phase: the box holds one choice, Save, and the one-shot button", async () => {
   // The owner: "when I check that and save a NEW checkbox appears". There is no checkbox to appear.
-  const box = (/<div id="upstream-clear"[^>]*>([\s\S]*?)<\/div>\s*<!--\s*WHO IS WHO/.exec(HTML) ||
+  const box = (/<div id="upstream-clear"[^>]*>([\s\S]*?)<\/div>\s*<\/section>/.exec(HTML) ||
     assert.fail("no clear-unread box in web/voice.html"))[1];
   assert.doesNotMatch(box, /type="checkbox"/);
   assert.equal(PAGE_ELEMENTS.has("upstream-clear-now"), false);
@@ -57455,8 +57494,9 @@ test("`#271 settings-groups`: the Messages section holds the message options, an
   const messages = groupsIn("Messages");
   // `#332 settings-voice-agent-section` took the message-reading setting to Voice agent and How
   // messages are said to Help, so Messages is the marking and drawing of messages, and only that.
+  // `#349 channel-settings-all` moved Who is who here, out of the per-channel box.
   assert.deepStrictEqual(messages, ["Your own messages", "Mark-read automatically", "Combining messages", "Rich headers",
-    "Recently dismissed"]);
+    "Who is who", "Recently dismissed"]);
   for (const agentGroup of ["Sending", "Instructions", "Resuming", "Arriving messages during a call",
     "Reading full messages in channel view"]) {
     assert.ok(!messages.includes(agentGroup), `"${agentGroup}" is in Messages`);
@@ -57997,6 +58037,159 @@ test("`#347 settings-prose`: how live updates arrive is still said, in Connectio
   pushed.liveDelivery = "push";
   await signIn(pushed);
   assert.match(pushed.el("live-state").textContent, /adapter push/);
+});
+
+// --- `#349 channel-settings-all` ------------------------------------------------------------------
+//
+// The owner, 2026-10-18 ("settings complaints"): the channel drop-down gains "All channels"; Clear
+// unread can be set for all at once; show "Mixed" when channels differ; drop the who-is-who part from
+// that pane. Who is who moved to Messages, which the tests beside `renderIdentityRows` cover.
+
+/** Settings on a server with two channels whose chat service can clear unread, each in its `modes`. */
+async function allChannelsPage(modes = {}, arrange = (_page) => {}) {
+  return clearingPage((page) => {
+    page.channels = [{ ...CHANNEL }, { ...OTHER_CHANNEL }];
+    for (const [id, mode] of Object.entries(modes)) {
+      page.upstreamClear.set(id, { provider_name: "Google Chat", supported: true, mode, failures: 0, pending: false });
+    }
+    arrange(page);
+  });
+}
+
+/** The picker's choices, as [value, words]. */
+const pickerChoices = (page) => page.el("settings-channel").children.map((option) => [option.value, option.textContent]);
+
+test("`#349 channel-settings-all`: the picker opens with All channels where there are two or more, and only there", async () => {
+  const page = await allChannelsPage();
+  assert.deepStrictEqual(pickerChoices(page),
+    [["*", "All channels"], [CHANNEL.id, "lead team"], [OTHER_CHANNEL.id, "build noise"]]);
+  // Settings still opens on a channel, as it did: All is a choice, not where the box starts.
+  assert.equal(page.el("settings-channel").value, CHANNEL.id);
+  // The reading picker is about one channel, always.
+  assert.ok(!page.el("discord-channel").children.some((option) => option.value === "*"), "the channel view offers All channels");
+  // One channel: all of them is that one, and the choice would be a second name for it.
+  const one = await clearingPage();
+  assert.deepStrictEqual(pickerChoices(one), [[CHANNEL.id, "lead team"]]);
+});
+
+test("`#349 channel-settings-all`: with All channels, Rename and Remove step aside, Add and Browse stay, and the line says how many", async () => {
+  const page = await allChannelsPage({}, (page) => { page.channelDiscoverySupported = true; });
+  await settingsChannel(page, "*");
+  assert.equal(page.el("channel-facts").textContent, "All 2 channels on your list.");
+  assert.equal(page.el("rename-channel").hidden, true, "Rename is offered for all channels at once");
+  assert.equal(page.el("remove-channel").hidden, true, "Remove is offered for all channels at once");
+  assert.equal(page.el("open-add-channel").hidden, false, "Add a channel went with them");
+  // Back on one channel, its acts are back.
+  await settingsChannel(page, OTHER_CHANNEL.id);
+  assert.equal(page.el("rename-channel").hidden, false);
+  assert.equal(page.el("remove-channel").hidden, false);
+  assert.match(page.el("channel-facts").textContent, /"build noise"/);
+});
+
+test("`#349 channel-settings-all`: Clear unread for All channels shows their common mode, and Save sets it on every one", async () => {
+  const page = await allChannelsPage();
+  page.upstreamClearCalls.length = 0;
+  await settingsChannel(page, "*");
+  assert.deepStrictEqual(page.upstreamClearCalls, [`GET ${CHANNEL.id}`, `GET ${OTHER_CHANNEL.id}`],
+    "the box did not read every channel it would set");
+  assert.equal(page.el("upstream-clear").hidden, false);
+  assert.equal(page.el("upstream-clear-mode").value, "off");
+  assert.equal(page.el("upstream-clear-mixed").hidden, true, "Mixed offered when every channel is alike");
+  assert.equal(page.el("upstream-clear-state").textContent, "Off in all 2 channels.");
+  assert.equal(page.el("upstream-clear-save").disabled, true, "Save offered with nothing to change");
+  assert.equal(page.el("upstream-clear-push").hidden, true, "a one-channel push offered for all channels");
+  assert.equal(page.el("upstream-clear-scope").textContent, "each of these channels",
+    "the warning still speaks of one channel");
+  page.el("upstream-clear-mode").value = "on";
+  await page.el("upstream-clear-mode").dispatch("change");
+  assert.equal(page.el("upstream-clear-save").disabled, false);
+  await page.el("upstream-clear-save").click();
+  await page.settle();
+  assert.deepStrictEqual(page.upstreamClearCalls.slice(2),
+    [`PUT ${CHANNEL.id} {"mode":"on"}`, `PUT ${OTHER_CHANNEL.id} {"mode":"on"}`]);
+  assert.equal(page.el("upstream-clear-state").textContent, "Saved. On in all 2 channels.");
+  assert.equal(page.el("upstream-clear-mode").value, "on");
+  assert.equal(page.el("upstream-clear-save").disabled, true);
+  // One channel again: its own box, its own words, from what the server stored.
+  await settingsChannel(page, OTHER_CHANNEL.id);
+  assert.equal(page.el("upstream-clear-scope").textContent, "this channel");
+  assert.equal(page.el("upstream-clear-mode").value, "on");
+  assert.equal(page.el("upstream-clear-push").hidden, false, "Mark read now is not back for one channel");
+});
+
+test("`#349 channel-settings-all`: channels set differently show Mixed, which cannot be saved, until a mode is chosen", async () => {
+  const page = await allChannelsPage({ [CHANNEL.id]: "on", [OTHER_CHANNEL.id]: "off" });
+  await settingsChannel(page, "*");
+  assert.equal(page.el("upstream-clear-mode").value, "mixed");
+  assert.equal(page.el("upstream-clear-mixed").hidden, false, "Mixed is not offered when it is true");
+  assert.equal(PAGE_ELEMENTS.get("upstream-clear-mixed").tag, "option");
+  assert.match(HTML, /<option id="upstream-clear-mixed" value="mixed" disabled hidden>Mixed<\/option>/,
+    "Mixed is a mode the reader could choose and save");
+  assert.equal(page.el("upstream-clear-state").textContent, "Mixed: On in 1, Off in 1.");
+  assert.equal(page.el("upstream-clear-save").disabled, true, "Mixed can be saved");
+  page.el("upstream-clear-mode").value = "off";
+  await page.el("upstream-clear-mode").dispatch("change");
+  await page.el("upstream-clear-save").click();
+  await page.settle();
+  assert.deepStrictEqual(page.upstreamClearCalls.filter((call) => call.startsWith("PUT")),
+    [`PUT ${CHANNEL.id} {"mode":"off"}`, `PUT ${OTHER_CHANNEL.id} {"mode":"off"}`]);
+  assert.equal(page.el("upstream-clear-mode").value, "off");
+  assert.equal(page.el("upstream-clear-mixed").hidden, true);
+  assert.equal(page.el("upstream-clear-state").textContent, "Saved. Off in all 2 channels.");
+});
+
+test("`#349 channel-settings-all`: a channel whose service cannot clear unread is left out and said to be, and a refusal is named", async () => {
+  const space = { id: "1110000000000000201", label: "chat space", writable: true, provider: "gchat" };
+  const team = { id: "C0123ABCDE", label: "slack team", writable: true, provider: "slack" };
+  const other = { id: "1110000000000000202", label: "second space", writable: true, provider: "gchat" };
+  const provider = (key, name, clear) => ({
+    key, name, threading_supported: false, live_delivery: "push", live_poll_seconds: 0,
+    channel_registration_supported: false, channel_discovery_supported: false,
+    upstream_read_mark_supported: clear, upstream_clear_supported: clear || undefined,
+    self_author_id: null, owner_author_id: null,
+  });
+  const page = await clearingPage((page) => {
+    page.channels = [team, space, other];
+    page.providers = [provider("gchat", "Google Chat", true), provider("slack", "Slack", false)];
+  });
+  page.upstreamClearCalls.length = 0;
+  await settingsChannel(page, "*");
+  assert.deepStrictEqual(page.upstreamClearCalls, [`GET ${space.id}`, `GET ${other.id}`], "the box asked about a channel that cannot");
+  assert.equal(page.el("upstream-clear-provider").textContent, "Google Chat");
+  assert.equal(page.el("upstream-clear-state").textContent,
+    "Off in all 2 channels. 1 other channel's chat service cannot clear unread.");
+  // The server refuses every write now: nothing is said to be saved that was not.
+  page.upstreamClearFailure = { status: 503, error: "store_unavailable", detail: "the store is not writable" };
+  page.el("upstream-clear-mode").value = "dry_run";
+  await page.el("upstream-clear-mode").dispatch("change");
+  await page.el("upstream-clear-save").click();
+  await page.settle();
+  assert.equal(page.el("upstream-clear-state").textContent,
+    "Saved in 0 of 2 channels; not in chat space (the store is not writable), second space (the store is not writable).");
+  assert.equal(page.el("upstream-clear-mode").value, "off", "the choice still shows a mode the server refused");
+});
+
+test("`#349 channel-settings-all`: the Save check is not satisfied by a page that sets only the first channel (negative control)", async () => {
+  // Without this, the test above could pass on a Save that stopped after one channel.
+  const broken = newPage(new Map(), brokenScript(
+    "  for (const id of held.ids) {\n    try {\n      const view = await apiDecoded(\"UpstreamClearState\", `/api/v1/channels/${encodeURIComponent(id)}/upstream-clear`,\n        { method: \"PUT\"",
+    "  for (const id of held.ids.slice(0, 1)) {\n    try {\n      const view = await apiDecoded(\"UpstreamClearState\", `/api/v1/channels/${encodeURIComponent(id)}/upstream-clear`,\n        { method: \"PUT\""));
+  broken.chatProviderName = "Google Chat";
+  broken.upstreamClearSupported = true;
+  broken.channels = [{ ...CHANNEL }, { ...OTHER_CHANNEL }];
+  await signIn(broken);
+  await broken.el("open-settings").click();
+  await broken.settle();
+  await settingsChannel(broken, "*");
+  broken.el("upstream-clear-mode").value = "on";
+  await broken.el("upstream-clear-mode").dispatch("change");
+  await broken.el("upstream-clear-save").click();
+  await broken.settle();
+  assert.notDeepStrictEqual(broken.upstreamClearCalls.filter((call) => call.startsWith("PUT")),
+    [`PUT ${CHANNEL.id} {"mode":"on"}`, `PUT ${OTHER_CHANNEL.id} {"mode":"on"}`],
+    "the negative control set every channel anyway");
+  assert.equal(broken.el("upstream-clear-state").textContent.startsWith("Saved. On in all 2 channels."), false,
+    "the negative control's status line reads as the real one's");
 });
 
 // --- `#272 voice-agent-instructions` --------------------------------------------------------------
