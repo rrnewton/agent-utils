@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -270,7 +271,7 @@ def test_failed_seal_rewrite_still_retires_the_invocations_seal(
     ]
 
 
-@pytest.mark.parametrize("sealer", ("dead", "live"))
+@pytest.mark.parametrize("sealer", ("dead", "live", "live-with-wrkslots-operator"))
 def test_seal_whose_target_was_reaped_does_not_deadlock_absent_row_recovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -287,9 +288,13 @@ def test_seal_whose_target_was_reaped_does_not_deadlock_absent_row_recovery(
     remained, and 'recover-absent-validate-rows' refused because a seal
     journal existed, each waiting for the other.  With the seal's coordinator
     dead, 'recover' now retires the seal (there is no mode left to restore)
-    and keeps the row, and absent-row recovery then retires the row.  While
-    the seal's coordinator still runs, 'recover' still refuses and keeps the
-    journal.
+    and keeps the row, and absent-row recovery then retires the row.
+
+    The coordinator is often a long-lived agent session (2026-10-18: a Codex
+    lane whose interrupted removal blocked every validate-run for nine hours).
+    Only a wrkslots process can be part way through a sealed removal, so with
+    the coordinator live the seal is retired the same way when no other
+    wrkslots process is alive, and still refused while one is.
     """
 
     project, repository, _remote = make_project(tmp_path)
@@ -322,15 +327,32 @@ def test_seal_whose_target_was_reaped_does_not_deadlock_absent_row_recovery(
     seal.write_text(json.dumps(journal, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     sealed = seal.read_bytes()
 
-    recovered = raw_command_with_census_authority_stub(
-        project,
-        "recover",
-        "--coordinator-authorized",
-        "--coordinator-pid",
-        str(os.getpid()),
-    )
+    operator = None
+    if sealer == "live-with-wrkslots-operator":
+        # A process whose command line runs wrkslots, standing in for the
+        # removal that wrote the seal.
+        # sys.executable, not a "python3" launcher that could leave the real
+        # interpreter behind as an orphan when only the launcher is killed.
+        operator = subprocess.Popen(
+            [
+                sys.executable, "-c", "import time; time.sleep(120)",
+                "-m", "wrkslots", "--project-root", str(project), "remove",
+            ]
+        )
+    try:
+        recovered = raw_command_with_census_authority_stub(
+            project,
+            "recover",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+        )
+    finally:
+        if operator is not None:
+            operator.kill()
+            operator.wait()
 
-    if sealer == "live":
+    if sealer == "live-with-wrkslots-operator":
         assert recovered.returncode == 3, recovered.stderr
         assert "is absent while its ACTIVE row remains" in recovered.stderr
         assert "the seal's coordinator is live" in recovered.stderr
@@ -556,3 +578,30 @@ def test_a_seal_whose_actor_is_not_proven_dead_here_still_binds(
     assert "recovered the validation-batch seal" not in made.stderr
     assert seal.read_bytes() == sealed
     assert target.stat().st_mode & 0o777 == mode
+
+
+def test_only_wrkslots_processes_of_this_project_can_hold_a_seal_open(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    other = tmp_path / "other"
+    for directory in (project, other):
+        directory.mkdir()
+    proc = tmp_path / "proc"
+
+    def process(pid: int, argv: Sequence[str], cwd: Path) -> None:
+        entry = proc / str(pid)
+        entry.mkdir(parents=True)
+        (entry / "cmdline").write_bytes(b"\0".join(part.encode() for part in argv) + b"\0")
+        (entry / "cwd").symlink_to(cwd)
+
+    process(10, ["python3", "-m", "wrkslots", "--project-root", str(other), "remove"], tmp_path)
+    process(11, ["python3", "-m", "pytest", "wrkslots/tests/test_x.py", "remove"], project)
+    process(12, ["bash", "/x/ci-hub/bin/wrkslots", "remove-validate-batch"], other)
+    # Read-only commands and recover never hold a seal open.
+    process(16, ["python3", "-m", "wrkslots", "--project-root", str(project), "doctor"], tmp_path)
+    process(17, ["bash", "/x/ci-hub/bin/wrkslots", "recover", "--coordinator-pid", "1"], project)
+    assert wrkslots._other_live_wrkslots_processes(project, proc) == []
+
+    process(13, ["python3", "-m", "wrkslots", "--project-root", str(project), "remove"], tmp_path)
+    process(14, ["bash", "/x/ci-hub/bin/wrkslots", "remove-validate-batch"], project / ".")
+    process(15, ["python3", "/a/py/wrkslots/__main__.py", f"--project-root={project}", "retire-pending"], tmp_path)
+    assert sorted(wrkslots._other_live_wrkslots_processes(project, proc)) == [13, 14, 15]

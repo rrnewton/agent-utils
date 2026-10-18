@@ -18118,6 +18118,100 @@ def _assert_owner_liveness(
     )
 
 
+# Commands that can write or hold open a validation-batch seal. A removal
+# releases the registry lock between slots, so one of these can be alive and
+# part way through a batch while another command holds the lock.
+_SEAL_OPERATOR_COMMANDS = frozenset(
+    {"remove", "remove-validate-batch", "remove-agent-batch", "retire-pending"}
+)
+
+
+def _is_wrkslots_command(argv: Sequence[str]) -> bool:
+    """Whether a process command line runs a wrkslots removal command."""
+
+    runs_wrkslots = False
+    for index, argument in enumerate(argv):
+        if argument == "wrkslots" and index > 0 and argv[index - 1] == "-m":
+            runs_wrkslots = True
+        elif argument.endswith("/wrkslots/__main__.py"):
+            runs_wrkslots = True
+        elif os.path.basename(argument) == "wrkslots" and index <= 1:
+            runs_wrkslots = True
+    return runs_wrkslots and any(argument in _SEAL_OPERATOR_COMMANDS for argument in argv)
+
+
+def _wrkslots_project_of(argv: Sequence[str], cwd: Path | None) -> Path | None:
+    """The project a wrkslots command line operates on, when it can be told.
+
+    It is the --project-root argument; without one, wrkslots finds the
+    project from its working directory, so that directory stands in.
+    """
+
+    for index, argument in enumerate(argv):
+        if argument == "--project-root" and index + 1 < len(argv):
+            return Path(argv[index + 1])
+        if argument.startswith("--project-root="):
+            return Path(argument.partition("=")[2])
+    return cwd
+
+
+def _other_live_wrkslots_processes(
+    project_root: Path, proc_root: Path = Path("/proc")
+) -> list[int]:
+    """PIDs of every live wrkslots removal process for this project except this one.
+
+    Read-only commands and recover (which waits for, or holds, the registry
+    lock) cannot be part way through a sealed removal and do not count; nor
+    does a wrkslots process for another project. One whose project
+    cannot be told (its working directory is unreadable) counts, and so does a
+    process whose command line cannot be read for any reason other than its
+    exit, so an unreadable host never proves that none is running.
+    """
+
+    def same_project(candidate: Path | None) -> bool:
+        if candidate is None:
+            return True
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            return True
+        return _path_is_within(resolved, root) or _path_is_within(root, resolved)
+
+    root = project_root.resolve()
+
+    own = os.getpid()
+    found: list[int] = []
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return [-1]
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == own:
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except FileNotFoundError:
+            continue
+        except ProcessLookupError:
+            continue
+        except OSError:
+            found.append(pid)
+            continue
+        argv = [part.decode(errors="surrogateescape") for part in raw.split(b"\0") if part]
+        if not _is_wrkslots_command(argv):
+            continue
+        try:
+            cwd: Path | None = Path(os.readlink(entry / "cwd"))
+        except OSError:
+            cwd = None
+        if same_project(_wrkslots_project_of(argv, cwd)):
+            found.append(pid)
+    return found
+
+
 def _process_state(identity: ProcessIdentity | None) -> tuple[str, str]:
     if identity is None:
         return "indeterminate", "no owner process generation is recorded"
@@ -34488,6 +34582,17 @@ def _recover_validate_batch_seal_journal(
     actor_state, actor_reason = _process_state(
         _identity_from_obj(raw["actor"], "validation-batch seal journal.actor")
     )
+    # The seal's actor is the coordinator that authorized the removal, often a
+    # long-lived agent session, not the wrkslots process that wrote the seal.
+    # Only a wrkslots process can be part way through a sealed removal, so
+    # when none other than this one is alive on this host, nothing can still
+    # be acting on an absent target, whatever the coordinator is doing. On
+    # 2026-10-18 a Codex lane's interrupted removal of its validate slot left
+    # a seal for an absent target while the lane lived on, and every
+    # validate-run on the host refused for nine hours.
+    no_wrkslots_operator = actor_state != "dead" and not _other_live_wrkslots_processes(
+        config.root
+    )
     for slot, generation, target in targets:
         current = records.get(slot)
         path_present = target.path.exists() or target.path.is_symlink()
@@ -34516,7 +34621,7 @@ def _recover_validate_batch_seal_journal(
             )
             continue
         if not path_present:
-            if paired_finish is None and actor_state == "dead":
+            if paired_finish is None and (actor_state == "dead" or no_wrkslots_operator):
                 absent_rows.append(slot)
                 continue
             errors.append(
