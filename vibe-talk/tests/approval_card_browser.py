@@ -127,7 +127,7 @@ uncovered and wholly on screen. This lays it out on three phones and measures:
      the desk, and 60px up on the phone. One 150px up keeps the jump. Decided as the main screen was
      shown, under the header Settings kept (54px of it at the desk), the jump was offered to them, and its
      own room under the box then held it there.
- 22. On a phone with a keyboard, a reader of a long draft opened by More presses "?" or Ctrl+/ for Help, and
+ 22. On a phone with a keyboard, a reader of a long draft opened by More presses "?" or Ctrl+? for Help, and
      while Help is up the draft is settled elsewhere, its Send is tapped where it is docked under Help, or a
      short draft takes its place. Back by Esc, by Help's Back or by the browser's Back, a reader who was at
      the foot of Main, All or the call's view, and one 40 or 100px up who saw only the card, is on the newest
@@ -2446,7 +2446,7 @@ def settings_trip_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, siz
 # Esc, by its own Back tapped, or by the browser's Back.
 HELP_KEY_TRIPS: tuple[tuple[str, int, str, str, str], ...] = (
     ("Main", 0, "?", "settle", "esc"), ("Main", 0, "?", "settle", "back"), ("Main", 0, "?", "settle", "browser"),
-    ("Main", 0, "Control+/", "settle", "esc"), ("Main", 40, "?", "settle", "esc"),
+    ("Main", 0, "Control+Shift+?", "settle", "esc"), ("Main", 40, "?", "settle", "esc"),
     ("All", 0, "?", "tap", "back"), ("All", 100, "?", "settle", "browser"), ("All", 0, "?", "shorter", "esc"),
     ("the call's view", 0, "?", "settle", "esc"), ("the call's view", 0, "?", "tap", "back"),
 )
@@ -2461,7 +2461,7 @@ HELP_KEY_BACKS = {"esc": "Esc", "back": "Help's Back", "browser": "the browser's
 
 def help_key_trip_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: tuple[int, int],
                        trips: tuple[tuple[str, int, str, str, str], ...]) -> str:
-    """Point 22, on a phone with a keyboard: a reader of a long draft opened by More presses "?" or Ctrl+/ for
+    """Point 22, on a phone with a keyboard: a reader of a long draft opened by More presses "?" or Ctrl+? for
     Help, the draft goes from under Help or a short one takes its place, and the way back by Esc, Help's Back or
     the browser's Back finds them on the newest line, with no jump, now and once the box has taken back its
     room. The main screen was shown before Help's list, which held the focus, was hidden, and before the control
