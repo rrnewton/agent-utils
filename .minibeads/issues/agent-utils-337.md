@@ -1,12 +1,13 @@
 ---
 title: 'voice-relay-silent: a new message in a watched channel is not relayed into the call'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-15T19:03:00.279530093+00:00
-updated_at: 2026-10-15T19:03:00.279530093+00:00
+updated_at: 2026-10-18T15:51:15.724556585+00:00
+closed_at: 2026-10-18T15:51:15.724556484+00:00
 ---
 
 # Description
