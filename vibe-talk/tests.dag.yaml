@@ -1111,7 +1111,11 @@ steps:
       # shots.screenshots --ignore-selected-deps` and read `.dagrun/profiles/step_profiles_*.csv`.
       # Unusually for this file, the number travels: at 0.60 effective cores this step is waiting,
       # not computing, so a slower machine does not stretch it the way it stretches clippy.
-      est_duration_s: 300
+      #
+      # Re-measured on 2026-10-18 at 494s wall on a loaded host, after the owner's Settings batch
+      # (`#345 settings-multi-column` to `#349 channel-settings-all`) added scenes 63 to 71, most at
+      # three sizes, so the estimate is 500. The 900s timeout above still leaves room.
+      est_duration_s: 500
       # latency-bound, not cpu-bound: most of its wall time is waiting for a page to settle, and
       # telling the scheduler otherwise makes it reserve cores it will not use. Confirmed by the
       # same run -- 0.60 effective cores over 284 seconds.
