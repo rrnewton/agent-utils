@@ -58543,6 +58543,128 @@ test("`#346 settings-collapsible`: Expand all opens every fold and then reads Fo
   assert.equal(all.textContent, "Expand all");
 });
 
+// --- `#345 settings-multi-column` -----------------------------------------------------------------
+//
+// The owner, 2026-10-18: "on wide desktop windows, tile Settings' top-level panes into width-dependent
+// columns, each pane kept whole and packed, order and focus order unchanged; phone/narrow single column."
+
+/**
+ * What is wrong with Settings' columns against `#345`, as sentences; empty when nothing is. A function
+ * of the markup and the stylesheet, so each negative control can hand it one of them broken.
+ */
+function columnProblems(html, css) {
+  const problems = [];
+  const code = html.replace(/<!--[\s\S]*?-->/g, " ");
+  const settings = code.slice(code.indexOf('id="screen-settings"'), code.indexOf('id="screen-help"'));
+  const inside = (selector) => cssRules(mediaBodyOf(css, DESKTOP_QUERY), selector).join("\n");
+  const outside = (selector) => cssRules(cssWithoutIn(css, DESKTOP_QUERY), selector).join("\n");
+  // Width-dependent columns, on a wide desktop window only.
+  const panes = inside(".settings-panes");
+  const width = /column-width:\s*([\d.]+)rem/.exec(panes);
+  if (!width) problems.push("the panes have no column width on a desktop window");
+  else if (Number(width[1]) < 20 || Number(width[1]) > 34) problems.push(`a column of ${width[1]}rem is not a pane's width`);
+  if (/column/.test(outside(".settings-panes"))) problems.push("the panes are in columns on a phone too");
+  if (!/max-width:\s*(?:[4-9]\d|1\d\d)rem/.test(inside("#screen-settings > .settings-column"))) {
+    problems.push("the settings screen is still held to one pane's width on a desktop window");
+  }
+  if (!/max-width:\s*34rem/.test(cssRules(css, ".settings-column").join("\n"))) problems.push("the phone's column lost its measure");
+  // Each pane kept whole.
+  if (!/break-inside:\s*avoid/.test(inside(".settings-panes > .settings-section"))) problems.push("a pane can break across two columns");
+  // Order and focus order unchanged: nothing reorders the panes, and they are in the box in the order they were.
+  const reorders = [".settings-panes", ".settings-panes > .settings-section", ".settings-section"]
+    .map((selector) => cssRules(css, selector).join("\n")).join("\n");
+  if (/(?:^|[\s;{])order:|grid-row|column-span:\s*all|flex-direction:\s*\w+-reverse/.test(reorders)) {
+    problems.push("a rule reorders the panes");
+  }
+  if (/tabindex="[1-9]/.test(settings)) problems.push("a positive tabindex reorders the focus");
+  // The box to its own closing tag, found by counting, since sections hold <div>s of their own.
+  const opens = settings.indexOf('<div class="settings-panes" id="settings-panes">');
+  let box = "";
+  if (opens >= 0) {
+    const tags = /<div\b|<\/div>/g;
+    tags.lastIndex = opens;
+    let depth = 0;
+    for (let tag = tags.exec(settings); tag; tag = tags.exec(settings)) {
+      depth += tag[0] === "</div>" ? -1 : 1;
+      if (depth === 0) {
+        box = settings.slice(opens, tag.index);
+        break;
+      }
+    }
+  }
+  const held = [...box.matchAll(/<section class="settings-section" id="settings-([a-z-]+)"/g)].map((m) => m[1]);
+  if (held.join(" ") !== "voice-agent messages channels screen storage") {
+    problems.push(`the panes box holds ${held.join(", ") || "nothing"}, not the five sections in their order`);
+  }
+  if (!/<section class="settings-section" id="settings-server"[\s\S]*<div class="settings-panes"/.test(settings)) {
+    problems.push("the server's address is not above the panes");
+  }
+  return problems;
+}
+
+/** The body of the first `@media query` block of `css` (the CSS given, not only the page's). */
+function mediaBodyOf(css, query) {
+  const at = css.indexOf(`@media ${query}`);
+  assert.ok(at >= 0, `no "@media ${query}" block`);
+  let depth = 0;
+  for (let i = css.indexOf("{", at); i < css.length; i += 1) {
+    if (css[i] === "{") depth += 1;
+    else if (css[i] === "}" && (depth -= 1) === 0) return css.slice(css.indexOf("{", at) + 1, i);
+  }
+  return assert.fail(`the "@media ${query}" block never closes`);
+}
+
+/** `css` with that block's body cut out. */
+function cssWithoutIn(css, query) {
+  const body = mediaBodyOf(css, query);
+  const at = css.indexOf(body);
+  return css.slice(0, at) + css.slice(at + body.length);
+}
+
+test("`#345 settings-multi-column`: on a desktop window the sections tile into columns, each whole, in their order; a phone keeps one", () => {
+  assert.deepStrictEqual(columnProblems(HTML, CSS_CODE), []);
+});
+
+test("`#345 settings-multi-column`: the check refuses columns on a phone, a pane that breaks, a reorder, and a pane out of the box (negative controls)", () => {
+  const block = mediaBodyOf(CSS_CODE, DESKTOP_QUERY);
+  const panesRule = /\.settings-panes \{[^}]*\}/.exec(block)[0];
+  const everywhere = CSS_CODE.replace(panesRule, "") + `\n${panesRule}\n`;
+  assert.deepStrictEqual(columnProblems(HTML, everywhere), [
+    "the panes have no column width on a desktop window",
+    "the panes are in columns on a phone too",
+  ]);
+  const breaking = CSS_CODE.replace(/(\.settings-panes > \.settings-section \{[^}]*?)break-inside:\s*avoid;/, "$1");
+  assert.notEqual(breaking, CSS_CODE, "the negative control changed nothing");
+  assert.deepStrictEqual(columnProblems(HTML, breaking), ["a pane can break across two columns"]);
+  const reordered = CSS_CODE.replace(/(\.settings-panes > \.settings-section \{)/, "$1\n    order: -1;");
+  assert.deepStrictEqual(columnProblems(HTML, reordered), ["a rule reorders the panes"]);
+  const narrow = CSS_CODE.replace(/(#screen-settings > \.settings-column \{\s*)max-width:\s*125rem;/, "$1max-width: 34rem;");
+  assert.notEqual(narrow, CSS_CODE, "the negative control changed nothing");
+  assert.deepStrictEqual(columnProblems(HTML, narrow), ["the settings screen is still held to one pane's width on a desktop window"]);
+  // Storage and connection taken out of the box and put after it: out of the columns, and out of order.
+  const storage = settingsSection("Storage and connection");
+  const out = HTML.replace(`${storage}</section>`, "").replace('<p class="hint">\n              <button id="open-help"',
+    `${storage}</section><p class="hint">\n              <button id="open-help"`);
+  assert.notEqual(out, HTML, "the negative control changed nothing");
+  assert.deepStrictEqual(columnProblems(out, CSS_CODE),
+    ["the panes box holds voice-agent, messages, channels, screen, not the five sections in their order"]);
+});
+
+test("`#345 settings-multi-column`: a heading pressed is brought back on screen, since its section can move to another column", async () => {
+  const page = newPage();
+  await signIn(page);
+  await page.el("open-settings").click();
+  const before = page.el("fold-settings-messages").scrolledIntoView;
+  await page.el("fold-settings-messages").click();
+  assert.equal(page.el("fold-settings-messages").scrolledIntoView, before + 1, "opening a section left its heading where the columns put it");
+  await page.el("fold-settings-messages").click();
+  assert.equal(page.el("fold-settings-messages").scrolledIntoView, before + 2, "folding it did too");
+  // Expand all moves everything, and brings no one heading anywhere.
+  const group = page.el("fold-typing").scrolledIntoView;
+  await page.el("fold-settings-all").click();
+  assert.equal(page.el("fold-typing").scrolledIntoView, group, "Expand all scrolled to a heading of its own accord");
+});
+
 // --- `#272 voice-agent-instructions` --------------------------------------------------------------
 
 /** Sign in with the owner's words as the server reports them, and open Settings. */

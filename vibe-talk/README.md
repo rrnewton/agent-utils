@@ -7168,7 +7168,8 @@ Three things follow from that, and each is asserted rather than trusted:
   entry *and* the `?` that reaches it. A test that only looked at Help would pass just as well if
   nothing linked to it.
 
-Both screens are held to a **fixed 34rem column** — not `var(--reading-width)`. That variable is the
+Both screens are held to a **fixed 34rem column** — not `var(--reading-width)`; on a wide desktop
+window Settings' sections are tiled into several such columns (`#345 settings-multi-column`, below). That variable is the
 reader's choice about the transcript, and dragging the transcript wider has no business reflowing a
 form; a form's comfortable width is a property of the form. The desktop block had deliberately
 exempted these two screens ("they are forms rather than reading, and giving them a column is a
@@ -7250,6 +7251,30 @@ in this browser and keep applying. It follows the channel being **read**, which 
 and is still one channel's census, so a bot that only speaks somewhere else cannot spoil the guess.
 `64-channel-settings-all` photographs the box on All channels, Clear unread Mixed across two
 channels, at 393x852, 1280x800 and 1920x1080.
+
+**On a wide desktop window the sections tile into columns** (`#345 settings-multi-column`). The
+owner, 2026-10-18: "tile Settings' top-level panes into width-dependent columns, each pane kept whole
+and packed, order and focus order unchanged; phone/narrow single column". The five sections that
+fold sit in one box, `.settings-panes`, which in the desktop block (`(min-width: 900px) and
+(pointer: fine)`) is laid out in CSS columns at least 24rem wide, as many as the window has room for
+(two at 900px, three at 1280, four at 1920, inside a 125rem cap), with the server's address and
+Expand all above it at the form's measure:
+
+- **Whole**: a section never breaks across two columns (`break-inside: avoid`).
+- **Packed**: the columns are balanced, so the sections stack under one another with no gaps. That
+  can leave the last column empty: with everything open, Voice agent alone is as tall as two other
+  sections, and balancing uses fewer columns than there is room for rather than splitting it.
+- **Order and focus order**: the sections fill down a column and on into the next in the markup's
+  order, which is the Tab order; nothing reorders them (no `order`, no positive `tabindex`).
+- A heading pressed is scrolled back on screen by as little as it takes, since opening or folding a
+  section rebalances the columns and can move it.
+- A phone, or a window under 900px or without a fine pointer, keeps the one 34rem column.
+
+The page suite holds the rule to the desktop block, the sections to the box in their order, and
+nothing to reorder them, with negative controls for each; `70-settings-columns` (everything open)
+and `71-settings-columns-folded` (folded, with the real Tab key walked through the titles) check the
+columns, each section one box, the packing and the order in Chromium at 393x852, 1280x800 and
+1920x1080.
 
 **Every section folds, and so does every group in it** (`#346 settings-collapsible`). The owner,
 2026-10-18: "every top-level section collapsible, collapsed by default; its H2 subsections collapsed

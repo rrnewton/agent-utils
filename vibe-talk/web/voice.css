@@ -6779,6 +6779,29 @@ textarea {
  * so that the phone declaration is still the first one `cssBlock()` finds.
  */
 @media (min-width: 900px) and (pointer: fine) {
+  /* `#345 settings-multi-column`. Settings' sections in columns, as many as the window has room for at
+     24rem or more each: two at 900px, three at 1280, four at 1920, and no more than the 125rem the
+     screen is held to. Each section is kept whole (`break-inside: avoid`) and the columns are balanced,
+     so the sections pack under one another; they fill down a column and on into the next in the
+     markup's order, which is the Tab order. The server's address keeps the form's measure above them. */
+  #screen-settings > .settings-column {
+    max-width: 125rem;
+  }
+
+  #screen-settings #settings-server {
+    max-width: 34rem;
+  }
+
+  .settings-panes {
+    column-width: 24rem;
+    column-gap: 1rem;
+    column-fill: balance;
+  }
+
+  .settings-panes > .settings-section {
+    break-inside: avoid;
+  }
+
   /* THE reading column. Both panes, because the channel is read the same way the transcript is
      and a 180-character line is no better for being somebody else's words. */
   #pane-voice,

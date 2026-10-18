@@ -3511,6 +3511,29 @@ def _act_settings_find_opens(driver: Driver) -> None:
     driver.settle(300)
 
 
+def _act_settings_columns(driver: Driver) -> None:
+    """`#345 settings-multi-column`: Settings with everything open (Expand all), in as many columns as
+    the window has room for on a desk, and one on the phone."""
+    _act_settings_folded(driver)
+    driver.click("fold-settings-all")
+    driver.page.wait_for_function("() => window.__text('fold-settings-all') === 'Fold all'", timeout=5_000)
+    driver.js("(() => { document.getElementById('screen-settings').scrollTop = 0; return true; })()")
+    driver.settle(300)
+
+
+def _act_settings_columns_folded(driver: Driver) -> None:
+    """`#345 settings-multi-column`: Settings folded, its five titles tiled into columns on a desk, and
+    the Tab key walked from the first title through the rest, which is recorded for the check."""
+    _act_settings_folded(driver)
+    driver.js("(() => { document.getElementById('fold-settings-voice-agent').focus(); window.__tabbed = "
+              "[document.activeElement.id]; return true; })()")
+    for _ in range(5):
+        driver.page.keyboard.press("Tab")
+        driver.js("(() => { window.__tabbed.push(document.activeElement.id); return true; })()")
+    driver.js("(() => { document.activeElement.blur(); return true; })()")
+    driver.settle(300)
+
+
 def _act_resume_unavailable(driver: Driver) -> None:
     """`#331 resume-on-websocket`: Settings on a server that cannot resume — its voice bridge does
     not take a recap — with Resuming's switch disabled and the reason right under it.
@@ -6149,6 +6172,85 @@ SCENES: tuple[Scene, ...] = (
             ),
         ),
     ),
+    Scene(
+        name="70-settings-columns",
+        what="Settings with every section open: tiled into columns by the window's width on a desk, each whole and packed, in order; one column on the phone",
+        act=_act_settings_columns,
+        profiles=SETTINGS_PROFILES,
+        expect=(
+            ("the settings screen is up, everything open", "window.__visible('screen-settings') && window.__text('fold-settings-all') === 'Fold all'"),
+            (
+                # THE claim: width-dependent columns on a desk, one on a phone.
+                "on a desk the sections take two or more columns, no more than the width has room for; on a phone, one",
+                "(() => { const rem = parseFloat(getComputedStyle(document.documentElement).fontSize); "
+                "const desk = matchMedia('(min-width: 900px) and (pointer: fine)').matches; "
+                "const secs = [...document.querySelectorAll('#settings-panes > .settings-section')]; "
+                "const lefts = [...new Set(secs.map((s) => Math.round(s.getBoundingClientRect().left)))]; "
+                "const panes = document.getElementById('settings-panes'); "
+                "const room = Math.max(1, Math.floor((panes.clientWidth + rem) / (24 * rem + rem))); "
+                "return desk ? lefts.length >= 2 && lefts.length <= room && room >= (innerWidth >= 1800 ? 4 : innerWidth >= 1200 ? 3 : 2) "
+                ": lefts.length === 1; })()",
+            ),
+            (
+                # ...each pane kept whole: a section broken across two columns is two boxes.
+                "every section is one box, never broken across two columns",
+                "[...document.querySelectorAll('#settings-panes > .settings-section')].every((s) => s.getClientRects().length === 1)",
+            ),
+            (
+                # ...packed: in a column, each section starts where the one above it ends, its margin apart.
+                "in each column the sections stack with no gap but their margin",
+                "(() => { const rem = parseFloat(getComputedStyle(document.documentElement).fontSize); "
+                "const boxes = [...document.querySelectorAll('#settings-panes > .settings-section')].map((s) => s.getBoundingClientRect()); "
+                "return boxes.every((b, i) => boxes.slice(i + 1).filter((c) => Math.abs(c.left - b.left) < 2 && c.top > b.top)"
+                ".every((c, j, below) => j > 0 || c.top - b.bottom <= rem + 2)); })()",
+            ),
+            (
+                # ...order unchanged: down a column and on into the next is the markup's order.
+                "read down each column and on to the next, the sections are in their order",
+                "(() => { const secs = [...document.querySelectorAll('#settings-panes > .settings-section')]; "
+                "const placed = secs.slice().sort((a, b) => { const p = a.getBoundingClientRect(), q = b.getBoundingClientRect(); "
+                "return Math.abs(p.left - q.left) > 2 ? p.left - q.left : p.top - q.top; }); "
+                "return placed.every((s, i) => s === secs[i]); })()",
+            ),
+            (
+                "nothing on the settings screen is wider than it",
+                "(() => { const s = document.getElementById('screen-settings'); "
+                "return s.scrollWidth <= s.clientWidth + 1; })()",
+            ),
+        ),
+    ),
+    Scene(
+        name="71-settings-columns-folded",
+        what="Settings folded: the five titles tiled into columns on a desk, and Tab going through them in their order",
+        act=_act_settings_columns_folded,
+        profiles=SETTINGS_PROFILES,
+        expect=(
+            ("the settings screen is up", "window.__visible('screen-settings')"),
+            (
+                # THE other half: the focus order is the markup's, whatever the columns did with the boxes.
+                "Tab went through the five section titles in their order, Channels' ? after its title",
+                "JSON.stringify(window.__tabbed) === JSON.stringify(['fold-settings-voice-agent', 'fold-settings-messages', "
+                "'fold-settings-channels', 'help-link-channel-alias', 'fold-settings-screen', 'fold-settings-storage'])",
+            ),
+            (
+                "on a desk the titles take two or more columns; on a phone, one",
+                "(() => { const rem = parseFloat(getComputedStyle(document.documentElement).fontSize); "
+                "const desk = matchMedia('(min-width: 900px) and (pointer: fine)').matches; "
+                "const secs = [...document.querySelectorAll('#settings-panes > .settings-section')]; "
+                "const lefts = [...new Set(secs.map((s) => Math.round(s.getBoundingClientRect().left)))]; "
+                "const panes = document.getElementById('settings-panes'); "
+                "const room = Math.max(1, Math.floor((panes.clientWidth + rem) / (24 * rem + rem))); "
+                "return desk ? lefts.length >= 2 && lefts.length <= room : lefts.length === 1; })()",
+            ),
+            (
+                "read down each column and on to the next, the titles are in their order",
+                "(() => { const secs = [...document.querySelectorAll('#settings-panes > .settings-section')]; "
+                "const placed = secs.slice().sort((a, b) => { const p = a.getBoundingClientRect(), q = b.getBoundingClientRect(); "
+                "return Math.abs(p.left - q.left) > 2 ? p.left - q.left : p.top - q.top; }); "
+                "return placed.every((s, i) => s === secs[i]); })()",
+            ),
+        ),
+    ),
     # LAST IN THE WALK, and not by accident: it empties the server's durable store on the way in,
     # so that the summary the state above cached is really regenerated and can really fail. Nothing
     # after it in this profile would miss what it deletes, and the next profile purges anyway.
@@ -6640,6 +6742,9 @@ def check_state_controls() -> list[str]:
         # `#346 settings-collapsible`.
         "68-settings-folded": SETTINGS_PROFILES,
         "69-settings-find-opens": SETTINGS_PROFILES,
+        # `#345 settings-multi-column`.
+        "70-settings-columns": SETTINGS_PROFILES,
+        "71-settings-columns-folded": SETTINGS_PROFILES,
     }
     for name, wanted_profiles in restricted.items():
         scene = next((s for s in SCENES if s.name == name), None)
@@ -6863,6 +6968,11 @@ def check_state_controls() -> list[str]:
         # opening the group and its section (`fold-microphone`, `mic-noise-suppression`).
         "68-settings-folded": ("'until-found'", "checkVisibility()"),
         "69-settings-find-opens": ("fold-microphone", "mic-noise-suppression"),
+        # `#345 settings-multi-column`. Pinned to the columns the width has room for (`room`), to each
+        # section whole (`getClientRects().length === 1`), packed (`rem + 2`) and in order (`placed`),
+        # and to the Tab order through the titles (`__tabbed`).
+        "70-settings-columns": ("room", "getClientRects().length === 1", "rem + 2", "placed"),
+        "71-settings-columns-folded": ("__tabbed", "placed"),
     }
     for name, needles in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)

@@ -1324,7 +1324,14 @@ function renderSettingsFoldAll() {
 
 for (const slug of SETTINGS_FOLDS) {
   setFold(slug, false);
-  el(`fold-${slug}`).addEventListener("click", () => setFold(slug, !foldOpen(slug)));
+  el(`fold-${slug}`).addEventListener("click", () => {
+    setFold(slug, !foldOpen(slug));
+    // `#345 settings-multi-column`. In columns, a section opened or folded changes how they balance,
+    // and can move to another column: the heading just pressed is brought back on screen, by as
+    // little as it takes, so the reader does not lose what they opened.
+    const pressed = el(`fold-${slug}`);
+    if (typeof pressed.scrollIntoView === "function") pressed.scrollIntoView({ block: "nearest" });
+  });
   // The browser's find (or a link to a text fragment) is opening the body: it removes `hidden`
   // itself, and the button has to say so.
   el(`fold-${slug}-body`).addEventListener("beforematch", () => setFold(slug, true));
