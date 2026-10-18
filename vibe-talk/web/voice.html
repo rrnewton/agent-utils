@@ -15,6 +15,14 @@
     -->
     <meta name="color-scheme" content="dark light" />
     <title>vibe-talk</title>
+    <!--
+      `#343 pwa-app-name`. The label under the icon when the page is added to an iOS home screen,
+      the manifest's `short_name` in Apple's spelling. It names the app and nothing more: it is
+      not `apple-mobile-web-app-capable` (see below), and opts nothing into standalone. The server
+      writes the deployment's `[server] app_name` over `vibe-talk` in the title and the sign-in
+      heading, and its `short_name` here, so two deployments installed side by side are told apart.
+    -->
+    <meta name="apple-mobile-web-app-title" content="vibe-talk" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png" />
     <link rel="icon" type="image/svg+xml" sizes="any" href="/icons/icon.svg" />

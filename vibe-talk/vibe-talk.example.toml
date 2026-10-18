@@ -24,6 +24,18 @@ bind = "0.0.0.0:8080"
 # Environment: VIBE_TALK_TIMEZONE
 # timezone = "America/New_York"
 
+# What the installed app is called: the name an install offers and the app switcher shows, the
+# browser tab's title and the sign-in heading. Two deployments installed on one phone are two apps,
+# and with one name between them they cannot be told apart, so give each deployment its own.
+# short_name is the label under the icon (Android's from the manifest, iOS's from the page), where
+# a launcher shows about a dozen characters; it defaults to app_name. Both default to "vibe-talk".
+# At most 64 characters, not blank, no whitespace at either end and no control characters, or the
+# server refuses to start. The manifest's id, start_url and scope do not change, so a renamed app
+# is the same app; one already installed may keep its old name until it is installed again.
+# Environment: VIBE_TALK_APP_NAME, VIBE_TALK_APP_SHORT_NAME
+# app_name = "vibe-talk work"
+# short_name = "work"
+
 [discord]
 # Source service named in errors, diagnostics, and the app. A compatible bridge can set
 # this to "Google Chat"; the HTTP wire format and existing configuration keys stay the same.

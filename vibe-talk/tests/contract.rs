@@ -157,6 +157,9 @@ fn client_config(
     full: bool,
 ) -> ClientConfigResponse {
     ClientConfigResponse {
+        // `#343 pwa-app-name`. Present in the full sample, absent in the other, as from an older
+        // server.
+        app_name: full.then(|| "vibe-talk at work".into()),
         chat_provider_name: "Chat".into(),
         channels: vec![
             channel(),

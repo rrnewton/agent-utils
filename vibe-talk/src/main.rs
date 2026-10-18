@@ -488,6 +488,13 @@ async fn main() -> anyhow::Result<()> {
         timezone = config.timezone.name(),
         "message times will be spoken in this zone"
     );
+    // `#343 pwa-app-name`. What an installed copy of the page is called, so the log says which
+    // name a deployment is serving when two installed apps still look alike.
+    tracing::info!(
+        app_name = %config.app_name,
+        short_name = %config.app_short_name,
+        "the web app is installed under this name"
+    );
     // ElevenLabs credentials are relevant to live voice or read-aloud only when one of those
     // selected providers uses them. The summary backend reports its own configuration below.
     if config.conversation.backend == vibe_talk::config::ConversationBackend::ElevenLabs

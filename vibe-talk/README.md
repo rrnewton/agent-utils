@@ -452,6 +452,21 @@ Serve vibe-talk over HTTPS, open it (the app is the page at `/`) in Chrome on An
 opens in a standalone window. If an older shortcut still has a blank or generic icon, remove it and
 install again.
 
+**Two deployments, two names.** Each deployment is its own origin, so installing the app from two
+of them gives two apps, and both used to be called vibe-talk. `#343 pwa-app-name`: set
+`[server] app_name` (or `VIBE_TALK_APP_NAME`) on each deployment, for example `vibe-talk work` and
+`vibe-talk home`, and the two are told apart by it. It is the name an install offers and the app
+switcher shows, the browser tab's title, and the heading of the sign-in screen. `short_name` (or
+`VIBE_TALK_APP_SHORT_NAME`) is the label under the icon — on Android from the manifest, on iOS from
+the page's `apple-mobile-web-app-title` — where a launcher shows about a dozen characters; it
+defaults to `app_name`. Both default to `vibe-talk`, so a deployment that sets neither serves the
+manifest it always did. Nothing else changes: the manifest's `id`, `start_url` and `scope` stay as
+they are, so a renamed app is the same app, not a second one. An app installed before the name
+changed takes the new one only when the browser next updates it from the manifest, which on
+Android happens on a later launch rather than at once, and Chrome may ask before renaming an
+installed app or not rename it at all. If the old name stays, remove the app and install it again;
+on iOS, where a home-screen name is fixed when the page is added, add it again.
+
 **`/voice` forwards to `/`.** The app lived at `/voice` until `#302 root-is-the-app`, while `/`
 served an older, smaller page that is now gone. `/voice` and `/voice/` answer `302 Found` to `/`
 with the query string kept, and the browser carries the fragment over, so a bookmark such as
@@ -2152,6 +2167,7 @@ model provider or a real gateway.
 | Bind address | `server.bind` | `VIBE_TALK_BIND` | `0.0.0.0:8080` in a container |
 | Public URL | `server.public_base_url` | `VIBE_TALK_PUBLIC_BASE_URL` | informational |
 | Time zone | `server.timezone` | `VIBE_TALK_TIMEZONE` | IANA name, default `UTC`; an unknown one refuses to start |
+| App name | `server.app_name` / `server.short_name` | `VIBE_TALK_APP_NAME` / `VIBE_TALK_APP_SHORT_NAME` | what the installed app is called, default `vibe-talk`: the manifest's `name`, the page's title and sign-in heading. `short_name`, the label under the icon, defaults to `app_name`. At most 64 characters, not blank, no whitespace at either end and no control characters, or the server refuses to start. Give each deployment its own, so two installed on one phone are told apart; see [Installing the reader](#installing-the-reader) |
 | Fetch size | `chat.default_fetch_limit` / `chat.max_fetch_limit` | — | messages a read returns by default and at most, default `50` / `100`; older files set them under `[discord]`, and setting one in both places is refused |
 | Count ceiling | `chat.max_count_scan` | — | how many messages a count may walk, default `500`; also accepted as `discord.max_count_scan` |
 | Provider request timeout | `discord.request_timeout_seconds` | — | seconds for one ordinary provider HTTP request, default `20`, range `1`–`120`; compatible bridges may need longer |

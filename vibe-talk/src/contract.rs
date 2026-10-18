@@ -43,6 +43,13 @@ pub struct ApiErrorBody {
 /// What the web app needs to know at startup.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ClientConfigResponse {
+    /// What this deployment calls its installed app, `[server] app_name`. `#343 pwa-app-name`.
+    ///
+    /// The page's title, its sign-in heading and its install manifest carry it already, written by
+    /// the server; it is here so the page can use it once signed in. Always sent by this server;
+    /// absent from an older one, whose app was always `vibe-talk`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_name: Option<String>,
     /// Source chat service's human-readable name, supplied by the selected backend.
     pub chat_provider_name: String,
     /// Configured channels.

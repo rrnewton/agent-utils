@@ -41048,6 +41048,12 @@ function applyClientConfig(config) {
   for (const id of ["chat-provider-settings", "chat-provider-help"]) {
     el(id).textContent = chatProviderName || "Chat";
   }
+  // `#343 pwa-app-name`. What this deployment calls its app. The server already wrote it into the
+  // title of the page it served; taking it from this answer as well keeps the title the name the
+  // server gives now, should the two ever differ. An older server sends none, and the title stays
+  // as served.
+  const appName = typeof config.app_name === "string" ? config.app_name.trim() : "";
+  if (appName) document.title = appName;
   // WHO THIS BRIDGE IS, from the server, before a single message is drawn.
   //
   // The page used to learn this only as a side effect of the reader replying from the app, or of

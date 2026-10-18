@@ -66,6 +66,7 @@
   ],
   "ClientConfigResponse": [
     {
+      "app_name": "vibe-talk at work",
       "channel_discovery_supported": true,
       "channel_registration_supported": true,
       "channels": [

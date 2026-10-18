@@ -797,6 +797,7 @@ pub async fn client_config(
         _ => None,
     };
     Ok(Json(ClientConfigResponse {
+        app_name: Some(state.config.app_name.clone()),
         chat_provider_name: state.chat.provider_name().to_owned(),
         channels: ops::channels(&state).await,
         hidden_channels: if scope >= Scope::Write {

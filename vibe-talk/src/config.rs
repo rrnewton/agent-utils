@@ -48,6 +48,12 @@ pub const ENV_CHANNELS: &str = "VIBE_TALK_CHANNELS";
 pub const ENV_PUBLIC_BASE_URL: &str = "VIBE_TALK_PUBLIC_BASE_URL";
 /// Environment variable overriding the operator's time zone, as an IANA name.
 pub const ENV_TIMEZONE: &str = "VIBE_TALK_TIMEZONE";
+/// Environment variable overriding `[server] app_name`, what the installed web app is called.
+/// `#343 pwa-app-name`.
+pub const ENV_APP_NAME: &str = "VIBE_TALK_APP_NAME";
+/// Environment variable overriding `[server] short_name`, the installed app's label under its icon.
+/// `#343 pwa-app-name`.
+pub const ENV_APP_SHORT_NAME: &str = "VIBE_TALK_APP_SHORT_NAME";
 /// Environment variable naming the SQLite file that holds durable state.
 ///
 /// Unset means this server keeps nothing between restarts, and says so rather than pretending.
@@ -141,6 +147,16 @@ pub struct Config {
     /// Configured, never hard-coded, and validated at load: a name the bundled database does not
     /// know stops the server rather than quietly becoming UTC. See [`crate::clock`].
     pub timezone: crate::clock::Zone,
+    /// What this deployment's installed web app is called: the install manifest's `name`, the
+    /// page's title and its sign-in heading. `[server] app_name`, default [`DEFAULT_APP_NAME`].
+    /// `#343 pwa-app-name`.
+    ///
+    /// Two deployments installed on one phone are two apps already — each origin is its own — but
+    /// with one name between them they cannot be told apart in a launcher or an app switcher.
+    pub app_name: String,
+    /// The installed app's label under its icon: the manifest's `short_name` and the page's
+    /// `apple-mobile-web-app-title`. `[server] short_name`, default [`Config::app_name`].
+    pub app_short_name: String,
     /// Read limits shared by every chat provider.
     pub chat: ChatLimits,
     /// Every configured chat provider, in configuration order.
@@ -1062,6 +1078,8 @@ struct FileServer {
     bind: Option<String>,
     public_base_url: Option<String>,
     timezone: Option<String>,
+    app_name: Option<String>,
+    short_name: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1244,6 +1262,17 @@ pub const DEFAULT_ELEVENLABS_API_BASE: &str = "https://api.elevenlabs.io/v1";
 /// Discord reported, correctly labelled, rather than a plausible-looking local time from whichever
 /// datacentre the container happens to run in.
 pub const DEFAULT_TIMEZONE: &str = "UTC";
+/// Default `[server] app_name`, and so `short_name` too: the name every deployment had before it
+/// could choose one, so one that sets nothing serves exactly the manifest it always did.
+/// `#343 pwa-app-name`.
+pub const DEFAULT_APP_NAME: &str = "vibe-talk";
+/// The longest `[server] app_name` or `short_name`, in characters. `#343 pwa-app-name`.
+///
+/// Room for any name a person would give an app, and still a bound: the name rides on every
+/// client-config answer and into the page's title. A launcher shows about a dozen characters under
+/// an icon and cuts the rest, which is a matter of display rather than something to refuse; one
+/// limit for both keys, because `short_name` defaults to `app_name`.
+pub const MAX_APP_NAME_CHARS: usize = 64;
 const DEFAULT_FETCH_LIMIT: u16 = 50;
 const DEFAULT_MAX_FETCH_LIMIT: u16 = 100;
 const DEFAULT_PROVIDER_REQUEST_TIMEOUT_SECONDS: u64 = 20;
@@ -1302,6 +1331,19 @@ impl Config {
                 field: "server.timezone".to_owned(),
                 detail,
             })?;
+
+        // `#343 pwa-app-name`. The short name follows the name unless it is set itself, from
+        // either place: a deployment that names its app once gets that name under the icon too.
+        let app_name = get(ENV_APP_NAME)
+            .map(str::to_owned)
+            .or(file.server.app_name)
+            .unwrap_or_else(|| DEFAULT_APP_NAME.to_owned());
+        validate_app_name("server.app_name", &app_name)?;
+        let app_short_name = get(ENV_APP_SHORT_NAME)
+            .map(str::to_owned)
+            .or(file.server.short_name)
+            .unwrap_or_else(|| app_name.clone());
+        validate_app_name("server.short_name", &app_short_name)?;
 
         let FileConfig {
             discord: file_discord,
@@ -1417,6 +1459,8 @@ impl Config {
                 .map(str::to_owned)
                 .or(file.server.public_base_url),
             timezone,
+            app_name,
+            app_short_name,
             chat,
             providers,
             auth: AuthConfig {
@@ -2414,6 +2458,61 @@ fn validate_display_name(field: &str, name: &str) -> Result<(), ConfigError> {
         });
     }
     Ok(())
+}
+
+/// Validate `[server] app_name` or `short_name`: not blank, no whitespace at either end, at most
+/// [`MAX_APP_NAME_CHARS`] characters, and nothing invisible that would change how it is shown.
+/// `#343 pwa-app-name`.
+///
+/// Refused rather than tidied, as every other value here is. A control character in a launcher
+/// label is a typo or worse; a line break or a text-direction override makes a name that reads
+/// differently from what it is.
+fn validate_app_name(field: &str, name: &str) -> Result<(), ConfigError> {
+    let refuse = |detail: String| {
+        Err(ConfigError::Invalid {
+            field: field.to_owned(),
+            detail,
+        })
+    };
+    if name.trim().is_empty() {
+        return refuse(
+            "must not be empty: it is what the installed app is called on the home screen"
+                .to_owned(),
+        );
+    }
+    if name.trim() != name {
+        return refuse(format!(
+            "{name:?} begins or ends with whitespace; write the name without it"
+        ));
+    }
+    let chars = name.chars().count();
+    if chars > MAX_APP_NAME_CHARS {
+        return refuse(format!(
+            "is {chars} characters; at most {MAX_APP_NAME_CHARS}"
+        ));
+    }
+    if let Some(hidden) = name.chars().find(|c| changes_how_text_shows(*c)) {
+        return refuse(format!(
+            "contains U+{:04X}, a control character; use visible text only",
+            u32::from(hidden)
+        ));
+    }
+    Ok(())
+}
+
+/// A control character, a line or paragraph separator, or a text-direction mark, embedding,
+/// override or isolate: characters that are not drawn but change how the rest is shown.
+fn changes_how_text_shows(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{2028}'
+                | '\u{2029}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        )
 }
 
 /// The most accounts `coding_agent_user_ids` may name. A deployment has a handful of agents; the
@@ -3905,6 +4004,162 @@ provider = "slack"
         assert!(
             matches!(&err, ConfigError::Invalid { field, detail }
                 if field == "server.timezone" && detail.contains("America/Nowhere")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn the_app_name_defaults_to_vibe_talk_and_the_short_name_follows_it() {
+        // `#343 pwa-app-name`. Nothing set is the name every deployment had before it could choose.
+        let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
+        assert_eq!(cfg.app_name, DEFAULT_APP_NAME);
+        assert_eq!(cfg.app_name, "vibe-talk");
+        assert_eq!(cfg.app_short_name, "vibe-talk");
+
+        // A name set once is the name under the icon too.
+        let text = FULL.replace("[server]", "[server]\napp_name = \"vibe-talk work\"");
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
+        assert_eq!(cfg.app_name, "vibe-talk work");
+        assert_eq!(cfg.app_short_name, "vibe-talk work");
+
+        let text = FULL.replace(
+            "[server]",
+            "[server]\napp_name = \"vibe-talk at work\"\nshort_name = \"Work\"",
+        );
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
+        assert_eq!(cfg.app_name, "vibe-talk at work");
+        assert_eq!(cfg.app_short_name, "Work");
+
+        // Counted in characters, not bytes, and anything visible is a name.
+        let text = FULL.replace(
+            "[server]",
+            "[server]\napp_name = \"Работа · chat \u{1f4ac}\"",
+        );
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
+        assert_eq!(cfg.app_name, "Работа · chat \u{1f4ac}");
+        let longest = "é".repeat(MAX_APP_NAME_CHARS);
+        let cfg = Config::from_toml_and_env(FULL, &env(&[(ENV_APP_NAME, &longest)]))
+            .expect("the longest name is accepted");
+        assert_eq!(cfg.app_name, longest);
+    }
+
+    #[test]
+    fn the_environment_names_the_app_over_the_file() {
+        let text = FULL.replace(
+            "[server]",
+            "[server]\napp_name = \"from the file\"\nshort_name = \"File\"",
+        );
+        let cfg = Config::from_toml_and_env(&text, &env(&[(ENV_APP_NAME, "from the env")]))
+            .expect("valid config");
+        assert_eq!(cfg.app_name, "from the env");
+        assert_eq!(
+            cfg.app_short_name, "File",
+            "a short name set in the file is kept when only the name comes from the environment"
+        );
+
+        let cfg = Config::from_toml_and_env(
+            &text,
+            &env(&[(ENV_APP_NAME, "from the env"), (ENV_APP_SHORT_NAME, "Env")]),
+        )
+        .expect("valid config");
+        assert_eq!(cfg.app_short_name, "Env");
+
+        // With no short name anywhere, it follows the name, wherever the name came from.
+        let cfg =
+            Config::from_toml_and_env(FULL, &env(&[(ENV_APP_NAME, "Home")])).expect("valid config");
+        assert_eq!(
+            (cfg.app_name.as_str(), cfg.app_short_name.as_str()),
+            ("Home", "Home")
+        );
+
+        // An empty variable is unset, as every other one is, so it cannot blank the file's name.
+        let cfg =
+            Config::from_toml_and_env(&text, &env(&[(ENV_APP_NAME, ""), (ENV_APP_SHORT_NAME, "")]))
+                .expect("valid config");
+        assert_eq!(cfg.app_name, "from the file");
+        assert_eq!(cfg.app_short_name, "File");
+    }
+
+    #[test]
+    fn an_unusable_app_name_stops_the_server_and_names_the_key() {
+        let too_long = "x".repeat(MAX_APP_NAME_CHARS + 1);
+        for (field, variable, value, says) in [
+            ("server.app_name", ENV_APP_NAME, "   ", "must not be empty"),
+            (
+                "server.app_name",
+                ENV_APP_NAME,
+                " Work",
+                "begins or ends with whitespace",
+            ),
+            (
+                "server.app_name",
+                ENV_APP_NAME,
+                "Work\t",
+                "begins or ends with whitespace",
+            ),
+            (
+                "server.app_name",
+                ENV_APP_NAME,
+                too_long.as_str(),
+                "at most 64",
+            ),
+            ("server.app_name", ENV_APP_NAME, "Work\nchat", "U+000A"),
+            ("server.app_name", ENV_APP_NAME, "Work\u{7}chat", "U+0007"),
+            ("server.app_name", ENV_APP_NAME, "Work\u{9b}chat", "U+009B"),
+            (
+                "server.app_name",
+                ENV_APP_NAME,
+                "krow\u{202e}chat",
+                "U+202E",
+            ),
+            (
+                "server.app_name",
+                ENV_APP_NAME,
+                "Work\u{2028}chat",
+                "U+2028",
+            ),
+            (
+                "server.short_name",
+                ENV_APP_SHORT_NAME,
+                "Wo\u{2067}rk",
+                "U+2067",
+            ),
+            (
+                "server.short_name",
+                ENV_APP_SHORT_NAME,
+                too_long.as_str(),
+                "is 65 characters",
+            ),
+        ] {
+            let err = Config::from_toml_and_env(FULL, &env(&[(variable, value)]))
+                .expect_err("must refuse");
+            assert!(
+                matches!(&err, ConfigError::Invalid { field: f, detail }
+                    if f == field && detail.contains(says)),
+                "{value:?}: unexpected error: {err}"
+            );
+        }
+
+        // From the file too, including the empty string an environment variable cannot carry.
+        for (line, field) in [
+            ("app_name = \"\"", "server.app_name"),
+            ("short_name = \"\"", "server.short_name"),
+            ("app_name = \"tab\\there\"", "server.app_name"),
+        ] {
+            let text = FULL.replace("[server]", &format!("[server]\n{line}"));
+            let err = Config::from_toml_and_env(&text, &env(&[])).expect_err("must refuse");
+            assert!(
+                matches!(&err, ConfigError::Invalid { field: f, .. } if f == field),
+                "{line}: unexpected error: {err}"
+            );
+        }
+
+        // A name too long to be its own short name is refused as the name, not as a short name
+        // nobody wrote.
+        let err = Config::from_toml_and_env(FULL, &env(&[(ENV_APP_NAME, &too_long)]))
+            .expect_err("must refuse");
+        assert!(
+            matches!(&err, ConfigError::Invalid { field, .. } if field == "server.app_name"),
             "unexpected error: {err}"
         );
     }

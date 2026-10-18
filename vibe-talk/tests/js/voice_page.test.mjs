@@ -1720,6 +1720,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     clientConfig: async () =>
       json(200, {
         version: "test",
+        // `#343 pwa-app-name`. Absent unless a test names the app, as an older server sends none.
+        app_name: page.appName,
         chat_provider_name: page.chatProviderName,
         // Every `ChannelInfo` the server serializes carries both, so a test that describes only
         // the fields it cares about still gets a conformant answer.
@@ -1792,6 +1794,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     channels: [{ ...CHANNEL }],
     /** Human-facing platform name, provided by the selected backend rather than inferred here. */
     chatProviderName: "Discord",
+    /** What the deployment calls its app, `app_name`. `#343 pwa-app-name`. Unset: not sent. */
+    appName: undefined,
     /** Every add request, so "the id and name reached the server" is testable. */
     addChannelCalls: [],
     /** Every remove request. */
@@ -5015,6 +5019,24 @@ test("settings and help name the selected chat backend, with a neutral fallback"
   // Include hidden help/settings prose: users can open it after the initial page has loaded.
   // Internal DOM identifiers and implementation comments do not name a platform to the reader.
   assert.doesNotMatch(HTML_CODE.replace(/<[^>]+>/g, " "), /discord/i);
+});
+
+test("the title is the name the server gives its app, and stays as served when it gives none", async () => {
+  // `#343 pwa-app-name`. The server writes the name into the page it serves; client-config
+  // carries it too, and the page takes it from there once signed in.
+  const named = newPage();
+  named.document.title = "vibe-talk";
+  named.appName = "  vibe-talk at work  ";
+  await signIn(named);
+  assert.equal(named.document.title, "vibe-talk at work");
+
+  for (const appName of [undefined, "", "   "]) {
+    const page = newPage();
+    page.document.title = "as served";
+    page.appName = appName;
+    await signIn(page);
+    assert.equal(page.document.title, "as served", `app_name ${JSON.stringify(appName)}`);
+  }
 });
 
 test("a token the server REFUSES sends you back to sign in, and says which thing was wrong", async () => {

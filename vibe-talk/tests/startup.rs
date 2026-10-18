@@ -208,6 +208,51 @@ fn the_skip_switch_starts_the_server_anyway_and_says_so() {
     );
 }
 
+/// `#343 pwa-app-name`. An app name the server cannot use stops it before it serves anything, with
+/// the key named; one it can use is said out loud at startup.
+#[test]
+fn an_unusable_app_name_stops_the_server_and_a_usable_one_is_announced() {
+    let config = write_config("app-name");
+    let mut child = Command::new(binary())
+        .arg("--config")
+        .arg(&config)
+        .env("VIBE_TALK_APP_NAME", "work\nchat")
+        .env("VIBE_TALK_SKIP_STARTUP_PROBE", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawning the binary");
+    let status = wait_for_exit(&mut child, Duration::from_secs(20));
+    let output = collect_output(child);
+    let status = status.unwrap_or_else(|| {
+        panic!("the server kept running with a line break in its app name:\n{output}")
+    });
+    assert!(
+        !status.success(),
+        "an unusable app name must stop the server; it exited {status:?}\n{output}"
+    );
+    assert!(
+        output.contains("server.app_name is invalid") && output.contains("U+000A"),
+        "the refusal must name the key and the character:\n{output}"
+    );
+
+    let seen = run_until_listening(
+        &config,
+        &[
+            ("VIBE_TALK_APP_NAME", "vibe-talk at work".to_owned()),
+            ("VIBE_TALK_APP_SHORT_NAME", "Work".to_owned()),
+        ],
+    );
+    let announced = seen
+        .lines()
+        .find(|line| line.contains("the web app is installed under this name"))
+        .unwrap_or_else(|| panic!("the app's name was not announced:\n{seen}"));
+    assert!(
+        announced.contains("vibe-talk at work") && announced.contains("Work"),
+        "{announced}"
+    );
+}
+
 /// Run the binary until it says it is listening, then stop it. Returns everything it printed.
 ///
 /// Shared by the sweep test below and nothing else yet: what it is for is asserting on something

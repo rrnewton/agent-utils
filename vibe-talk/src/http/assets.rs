@@ -95,16 +95,38 @@
 //! is forwarded to `/`, and stays in the app window, because the manifest's `scope` is `/` and a
 //! same-origin navigation inside the scope never leaves it. `tests/pwa_installability.py` asks
 //! Chromium itself for each of these against the real server.
+//!
+//! # The app is called what the deployment calls it
+//!
+//! `#343 pwa-app-name`. Two deployments installed on one phone are two apps — each origin is its
+//! own — and both used to be called `vibe-talk`, in the launcher, the app switcher and the tab. So
+//! the manifest's `name` and `short_name`, the page's `<title>`, its sign-in heading and its
+//! `apple-mobile-web-app-title` are the configuration's `[server] app_name` and `short_name`
+//! ([`crate::config::Config::app_name`]). Nothing else in the manifest moves: its `id`, `start_url`
+//! and `scope` are the installed app's identity, and renaming an app must not make it another one.
+//!
+//! The files on disk still say `vibe-talk`, and the server writes the deployment's names over
+//! exactly those spellings ([`name_shell`], [`name_manifest`]); a unit test holds that each occurs
+//! once. So with the default name the manifest is served byte for byte as written, and its ETag
+//! is the one it always had. The name is escaped for where it lands — HTML text and attribute in
+//! the shell, a JSON string in the manifest — after the file references are linked, so a name can
+//! never be mistaken for one.
+//!
+//! The documents are built once per pair of names, on first use: a deployment has one pair, so
+//! once per process, as before; a test process holding several configurations builds one each.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::sync::LazyLock;
+use std::sync::{Arc, Mutex, PoisonError};
 
+use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 
 use super::api;
+use crate::config::DEFAULT_APP_NAME;
+use crate::state::AppState;
 
 /// The app's page, served at `/`. Its files keep the `voice` names they had when it lived at
 /// `/voice`, so a shell cached before the move still names files that exist.
@@ -131,10 +153,11 @@ enum Role {
     /// A script, stylesheet or icon. Named by the shells with its content hash, and immutable
     /// under that name.
     File,
-    /// An HTML page. Its references to files are rewritten to their hashed URLs at startup, and it
-    /// is revalidated on every load.
+    /// An HTML page. Its references to files are rewritten to their hashed URLs at startup, so is
+    /// the app's name ([`name_shell`]), and it is revalidated on every load.
     Shell,
-    /// The install manifest: revalidated like a shell, served exactly as written.
+    /// The install manifest: revalidated like a shell, served as written but for the app's name
+    /// ([`name_manifest`]).
     Manifest,
 }
 
@@ -219,20 +242,65 @@ struct Entry {
     etag: HeaderValue,
 }
 
-/// Every static path and its answer, computed once from [`SOURCES`].
+/// Every static path and its answer, computed once from [`SOURCES`] for one pair of names.
 struct Site {
+    names: Names,
     entries: BTreeMap<&'static str, Entry>,
 }
 
-/// Computed on first use, which is once per process: the bytes are compiled in, so nothing about
-/// them can change while it runs.
-static SITE: LazyLock<Site> = LazyLock::new(|| Site::new(SOURCES));
+/// What the installed app is called: `[server] app_name` and `short_name`. `#343 pwa-app-name`.
+#[derive(Debug, PartialEq, Eq)]
+struct Names {
+    /// The manifest's `name`, the page's title and its sign-in heading.
+    name: String,
+    /// The manifest's `short_name` and the page's `apple-mobile-web-app-title`: the label under
+    /// the icon, on Android and on iOS alike.
+    short_name: String,
+}
+
+impl Default for Names {
+    /// The names the files are written with.
+    fn default() -> Self {
+        Self {
+            name: DEFAULT_APP_NAME.to_owned(),
+            short_name: DEFAULT_APP_NAME.to_owned(),
+        }
+    }
+}
+
+/// Every [`Site`] built so far, one per pair of names; see the module documentation. A short list
+/// searched in place rather than a map, so asking for the one a deployment has allocates nothing.
+static SITES: Mutex<Vec<Arc<Site>>> = Mutex::new(Vec::new());
+
+/// The site whose documents carry `name` and `short_name`, built the first time they are asked for.
+///
+/// Built under the lock, so two first requests build it once. The bytes are compiled in and the
+/// names come from configuration that does not change while the process runs, so a site is never
+/// stale.
+fn site(name: &str, short_name: &str) -> Arc<Site> {
+    let mut sites = SITES.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(site) = sites
+        .iter()
+        .find(|site| site.names.name == name && site.names.short_name == short_name)
+    {
+        return Arc::clone(site);
+    }
+    let names = Names {
+        name: name.to_owned(),
+        short_name: short_name.to_owned(),
+    };
+    let site = Arc::new(Site::new(SOURCES, names));
+    sites.push(Arc::clone(&site));
+    site
+}
 
 /// `GET` any static path: the shell, the manifest, the scripts and stylesheets, and the icons.
 ///
-/// See the module documentation for what each is told about caching, and why.
-pub async fn serve(uri: Uri, headers: HeaderMap) -> Response {
-    match SITE.answer(&uri, &headers) {
+/// See the module documentation for what each is told about caching, and why, and for where the
+/// app's name comes from.
+pub async fn serve(State(state): State<AppState>, uri: Uri, headers: HeaderMap) -> Response {
+    let site = site(&state.config.app_name, &state.config.app_short_name);
+    match site.answer(&uri, &headers) {
         Some(response) => response,
         None => api::not_found().await.into_response(),
     }
@@ -266,7 +334,7 @@ fn root_keeping_query(uri: &Uri) -> HeaderValue {
 }
 
 impl Site {
-    fn new(sources: &[Source]) -> Self {
+    fn new(sources: &[Source], names: Names) -> Self {
         // Every file's hash first: a shell cannot be generated until each file it may name has one.
         let versions: BTreeMap<&'static str, String> = sources
             .iter()
@@ -281,16 +349,23 @@ impl Site {
                         Bytes::from_static(source.body),
                         versions.get(source.path).cloned(),
                     ),
+                    // Linked first, then named, so a name can never be read as a file reference.
                     Role::Shell => (
-                        Bytes::from(link(&String::from_utf8_lossy(source.body), &versions)),
+                        Bytes::from(name_shell(
+                            &link(&String::from_utf8_lossy(source.body), &versions),
+                            &names,
+                        )),
                         None,
                     ),
-                    Role::Manifest => (Bytes::from_static(source.body), None),
+                    Role::Manifest => (
+                        Bytes::from(name_manifest(&String::from_utf8_lossy(source.body), &names)),
+                        None,
+                    ),
                 };
                 (source.path, Entry::new(source.content_type, body, version))
             })
             .collect();
-        Self { entries }
+        Self { names, entries }
     }
 
     /// The answer for `uri`, or `None` when no static file lives at its path.
@@ -358,6 +433,83 @@ fn link(template: &str, versions: &BTreeMap<&'static str, String>) -> String {
     page
 }
 
+/// The shell's spellings of the app's name, as `web/voice.html` writes them: the title, the sign-in
+/// heading, and the iOS home-screen label. Each is written with the default name, and each occurs
+/// exactly once (a unit test holds both), so a reworded page fails that test rather than quietly
+/// going on calling every deployment `vibe-talk`. `#343 pwa-app-name`.
+fn shell_spellings(names: &Names) -> [(String, String); 3] {
+    let (name, short_name) = (html_escape(&names.name), html_escape(&names.short_name));
+    [
+        (
+            format!("<title>{DEFAULT_APP_NAME}</title>"),
+            format!("<title>{name}</title>"),
+        ),
+        (
+            format!("<h1>{DEFAULT_APP_NAME}</h1>"),
+            format!("<h1>{name}</h1>"),
+        ),
+        (
+            format!(r#"<meta name="apple-mobile-web-app-title" content="{DEFAULT_APP_NAME}" />"#),
+            format!(r#"<meta name="apple-mobile-web-app-title" content="{short_name}" />"#),
+        ),
+    ]
+}
+
+/// The manifest's two names, as `web/manifest.webmanifest` writes them, and what they become.
+///
+/// `"name": ` cannot match inside `"short_name": `, whose `name` follows an underscore rather than
+/// a quote, and a replacement cannot match either needle, because a JSON string escapes its quotes.
+fn manifest_spellings(names: &Names) -> [(String, String); 2] {
+    let json = |value: &str| serde_json::Value::from(value).to_string();
+    [
+        (
+            format!(r#""name": {}"#, json(DEFAULT_APP_NAME)),
+            format!(r#""name": {}"#, json(&names.name)),
+        ),
+        (
+            format!(r#""short_name": {}"#, json(DEFAULT_APP_NAME)),
+            format!(r#""short_name": {}"#, json(&names.short_name)),
+        ),
+    ]
+}
+
+/// The shell, calling the app what this deployment calls it. See [`shell_spellings`].
+///
+/// HTML-escaped, so a replacement holds no `<` or `"` and cannot match a later needle.
+fn name_shell(page: &str, names: &Names) -> String {
+    respell(page, &shell_spellings(names))
+}
+
+/// The manifest, with this deployment's `name` and `short_name` and every other byte as written.
+/// See [`manifest_spellings`]. With the default names it is the file itself.
+fn name_manifest(manifest: &str, names: &Names) -> String {
+    respell(manifest, &manifest_spellings(names))
+}
+
+fn respell(text: &str, spellings: &[(String, String)]) -> String {
+    spellings
+        .iter()
+        .fold(text.to_owned(), |text, (written, served)| {
+            text.replacen(written.as_str(), served, 1)
+        })
+}
+
+/// `text` escaped for HTML text and for a double- or single-quoted attribute value alike.
+fn html_escape(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
 /// Whether the client already holds the representation tagged `etag`.
 ///
 /// RFC 9110 §13.1.2: `If-None-Match` uses the WEAK comparison, so `W/` on either side is ignored,
@@ -418,11 +570,101 @@ mod tests {
         br#"<link href="/a.css"><script src="/a.js"></script><a href="/a">"/a.js"</a>"#;
 
     fn site(script: &'static [u8]) -> Site {
-        Site::new(&[
-            source("/a", HTML, PAGE, Role::Shell),
-            source("/a.js", JAVASCRIPT, script, Role::File),
-            source("/a.css", CSS, b"body {}", Role::File),
-        ])
+        Site::new(
+            &[
+                source("/a", HTML, PAGE, Role::Shell),
+                source("/a.js", JAVASCRIPT, script, Role::File),
+                source("/a.css", CSS, b"body {}", Role::File),
+            ],
+            Names::default(),
+        )
+    }
+
+    fn names(name: &str, short_name: &str) -> Names {
+        Names {
+            name: name.to_owned(),
+            short_name: short_name.to_owned(),
+        }
+    }
+
+    #[test]
+    fn each_spelling_of_the_name_is_in_the_files_exactly_once() {
+        // `#343 pwa-app-name`. Zero would leave every deployment called `vibe-talk` there without a
+        // word; two would rename the first and leave the second.
+        let custom = names("Work", "W");
+        for (written, _) in shell_spellings(&custom) {
+            assert_eq!(VOICE_HTML.matches(written.as_str()).count(), 1, "{written}");
+        }
+        for (written, _) in manifest_spellings(&custom) {
+            assert_eq!(MANIFEST.matches(written.as_str()).count(), 1, "{written}");
+        }
+    }
+
+    #[test]
+    fn with_the_default_names_the_documents_are_the_files_as_written() {
+        assert_eq!(name_manifest(MANIFEST, &Names::default()), MANIFEST);
+        assert_eq!(name_shell(VOICE_HTML, &Names::default()), VOICE_HTML);
+    }
+
+    #[test]
+    fn a_configured_name_changes_the_two_names_in_the_manifest_and_nothing_else() {
+        let written: serde_json::Value = serde_json::from_str(MANIFEST).expect("JSON");
+        let named = name_manifest(MANIFEST, &names("Work \"chat\" \\ ü", "Wörk"));
+        let mut served: serde_json::Value = serde_json::from_str(&named).expect("still JSON");
+        assert_eq!(served["name"], "Work \"chat\" \\ ü");
+        assert_eq!(served["short_name"], "Wörk");
+        // The identity an installed app is matched by is untouched.
+        for member in ["id", "start_url", "scope"] {
+            assert_eq!(served[member], written[member], "{member}");
+        }
+        served["name"] = written["name"].clone();
+        served["short_name"] = written["short_name"].clone();
+        assert_eq!(served, written, "a member other than the names moved");
+    }
+
+    #[test]
+    fn a_configured_name_is_escaped_into_the_shell() {
+        let page = name_shell(VOICE_HTML, &names("<b>Work</b> & 'co'", "W\"k"));
+        assert!(
+            page.contains("<title>&lt;b&gt;Work&lt;/b&gt; &amp; &#39;co&#39;</title>"),
+            "the title"
+        );
+        assert!(
+            page.contains("<h1>&lt;b&gt;Work&lt;/b&gt; &amp; &#39;co&#39;</h1>"),
+            "the sign-in heading"
+        );
+        assert!(
+            page.contains(r#"<meta name="apple-mobile-web-app-title" content="W&quot;k" />"#),
+            "the home-screen label is the short name"
+        );
+        assert!(!page.contains("<b>Work</b>"), "the name was not escaped");
+        assert!(!page.contains("<title>vibe-talk</title>"));
+    }
+
+    #[test]
+    fn one_site_is_built_per_pair_of_names() {
+        let first = super::site("one-site-per-names", "a");
+        let again = super::site("one-site-per-names", "a");
+        let other = super::site("one-site-per-names", "b");
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "the same names built a second site"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &other),
+            "a different short name shared a site"
+        );
+        assert_eq!(other.names, names("one-site-per-names", "b"));
+        // The files are the same bytes under the same URLs whatever the app is called.
+        assert_eq!(
+            first.entries["/voice.js"].version,
+            other.entries["/voice.js"].version
+        );
+        assert_ne!(first.entries["/"].etag, other.entries["/"].etag);
+        assert_ne!(
+            first.entries["/manifest.webmanifest"].etag,
+            other.entries["/manifest.webmanifest"].etag
+        );
     }
 
     #[test]
