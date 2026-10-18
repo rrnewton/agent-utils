@@ -33082,6 +33082,105 @@ def test_agent_remove_accepts_submodule_cloned_from_its_source_module_directory(
     assert git(module, "for-each-ref", "--format=%(refname)", "refs/salvage/").stdout == ""
 
 
+def no_checkout_source_clone(
+    project: Path, origin: Path, module: Path, name: str = "review-source"
+) -> Path:
+    """A ``git clone --no-checkout`` of ``origin`` inside the project.
+
+    Its submodule URL names ``module`` as a local module mirror would, so a
+    linked worktree added from it initializes component from that directory.
+    The clone itself has no index, no working files and no initialized
+    submodule. rel-041's review slots use this layout (2026-10-17).
+    """
+
+    clone = project / name
+    subprocess.run(
+        ["git", "clone", "--no-checkout", str(origin), str(clone)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    git(clone, "config", "submodule.component.url", str(module))
+    git(clone, "config", "submodule.component.active", "true")
+    assert sorted(entry.name for entry in clone.iterdir()) == [".git"]
+    return clone
+
+
+def test_agent_remove_judges_submodules_of_a_no_checkout_source_at_its_origin(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    _component_remote, module = add_component_cloned_from_source_module(
+        tmp_path, project, repository
+    )
+    source = no_checkout_source_clone(project, repository, module)
+    made = create(project, repository_name="review-source")
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project)
+    nested = tree / "component"
+    assert git(nested, "config", "--get", "remote.origin.url").stdout.strip() == str(module)
+    assert not (source / "component").exists()
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    removed = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+
+    assert removed.returncode == 0, removed.stderr
+    assert not tree.exists()
+    archive = json.loads(
+        (project / "worktrees" / "ARCHIVED.testhost.json").read_text(encoding="utf-8")
+    )
+    receipts = {
+        receipt["checkout"]: receipt for receipt in archive["records"][0]["salvage"]
+    }
+    assert receipts["product/component"]["disposition"] == "already-published"
+    assert receipts["product/component"]["containing_remote_refs"] == [
+        "refs/remotes/origin/main"
+    ]
+    # The source clone and its origin are untouched.
+    assert sorted(entry.name for entry in source.iterdir()) == [".git"]
+    assert (repository / "component" / "base.txt").is_file()
+    assert git(module, "for-each-ref", "--format=%(refname)", "refs/salvage/").stdout == ""
+
+
+def test_agent_remove_refuses_no_checkout_source_whose_origin_is_not_a_local_checkout(
+    tmp_path: Path,
+) -> None:
+    project, repository, remote = make_project(tmp_path)
+    _component_remote, module = add_component_cloned_from_source_module(
+        tmp_path, project, repository
+    )
+    # Cloned from the bare remote: no checkout of component exists to judge it by.
+    no_checkout_source_clone(project, remote, module)
+    made = create(project, repository_name="review-source")
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project)
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    removed = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+
+    assert removed.returncode != 0
+    assert "source submodule is unavailable" in removed.stderr
+    assert (tree / "component" / "base.txt").is_file()
+
+
 def test_agent_remove_archives_unpublished_work_of_a_submodule_cloned_from_its_source(
     tmp_path: Path,
 ) -> None:

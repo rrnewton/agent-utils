@@ -20617,7 +20617,7 @@ def _submodule_salvage_checkouts(
     ):
         try:
             sources = _submodule_source_identities(
-                config, checkout_path, source_repository, inventory
+                config, vcs, checkout_path, source_repository, inventory
             )
         except Refusal:
             sources = None
@@ -20632,15 +20632,65 @@ def _submodule_salvage_checkouts(
             result,
             inventory,
             _submodule_source_identities(
-                config, checkout_path, source_repository, inventory
+                config, vcs, checkout_path, source_repository, inventory
             ),
             time.monotonic(),
         )
     return result
 
 
+def _source_submodule_directory(
+    config: Config, vcs: _GitVcs, source_repository: Path, relative: Path
+) -> Path:
+    """The source repository's own checkout of the submodule at ``relative``.
+
+    Normally that is ``source_repository / relative``. A source clone made
+    without a checkout (``git clone --no-checkout``) has no index and no
+    working files, so none of its submodules can be initialized; a linked
+    worktree added from it initializes them from the clone's configuration.
+    For that layout only, the same submodule in the clone's origin stands in
+    when the origin is an absolute local path to a Git root inside the project
+    and the submodule there is itself a Git root. That checkout is outside the
+    slot and survives its removal. Every later check (remote authority, local
+    mirror identity, containment, salvage) then runs on it unchanged; any
+    other layout returns the ordinary path, so the caller refuses as before.
+    Measured 2026-10-17: rel-041's review slot rel-041-r1070-b6a7-review used
+    the no-checkout clone ignored/review-r1070-b6a7-source-reverie, whose
+    origin is the project's reverie checkout, and removal refused on all three
+    of its initialized submodules.
+    """
+
+    source = source_repository / relative
+    if os.path.lexists(source):
+        return source
+    index = vcs._run(
+        source_repository, ["rev-parse", "--path-format=absolute", "--git-path", "index"]
+    ).stdout.strip()
+    entries = {entry.name for entry in source_repository.iterdir()}
+    if os.path.lexists(index) or entries != {".git"}:
+        return source
+    origin = _absolute_local_remote_directory(
+        source_repository, vcs.remote_authority(source_repository, config.default_remote)
+    )
+    if (
+        origin is None
+        or not _path_is_within(origin, config.root.resolve())
+        or vcs.repository_root(origin) != origin
+    ):
+        return source
+    candidate = origin / relative
+    if (
+        candidate.is_symlink()
+        or not candidate.is_dir()
+        or vcs.repository_root(candidate) != candidate
+    ):
+        return source
+    return candidate
+
+
 def _submodule_source_identities(
     config: Config,
+    vcs: _GitVcs,
     checkout_path: Path,
     source_repository: Path,
     inventory: Sequence[str],
@@ -20655,7 +20705,7 @@ def _submodule_source_identities(
     for relative_value in inventory:
         relative = Path(relative_value)
         managed = checkout_path / relative
-        source = source_repository / relative
+        source = _source_submodule_directory(config, vcs, source_repository, relative)
         _ensure_no_symlink_components(checkout_path, managed, "submodule checkout")
         _ensure_no_symlink_components(config.root, source, "source submodule")
         if not source.is_dir() or source.is_symlink():
@@ -20685,7 +20735,7 @@ def _submodule_salvage_checkouts_uncached(
     ):
         relative = Path(relative_value)
         managed = checkout_path / relative
-        source = source_repository / relative
+        source = _source_submodule_directory(config, vcs, source_repository, relative)
         _ensure_no_symlink_components(checkout_path, managed, "submodule checkout")
         _ensure_no_symlink_components(config.root, source, "source submodule")
         if not source.is_dir() or source.is_symlink():
