@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser system-bots-browser edited-mark-browser rich-headers-browser read-aloud-browser post-confirm-browser approval-card-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser two-column-browser bookmark-browser reply-continuity-browser reply-in-column-browser reply-marks-read-browser done-sync-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser thread-card-header-browser all-thread-strip-browser scroll-stability-browser copy-message-browser fold-steps-browser back-gesture-browser live-pill-browser stale-live-read-browser
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser system-bots-browser edited-mark-browser rich-headers-browser read-aloud-browser post-confirm-browser approval-card-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser search-chord-browser two-column-browser bookmark-browser reply-continuity-browser reply-in-column-browser reply-marks-read-browser done-sync-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser thread-card-header-browser all-thread-strip-browser scroll-stability-browser copy-message-browser fold-steps-browser back-gesture-browser live-pill-browser stale-live-read-browser
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -255,6 +255,15 @@ read-modes-browser:
 # WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each step.
 keyboard-browser:
 	python3 tests/keyboard_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
+
+# `#344 search-shortcut` in a real Chromium at 1280x800, the keys pressed through CDP: Ctrl+/ opens the
+# search from the message box holding a draft (untouched), the pace popover and a ⋯ menu (closed first),
+# the channel picker, Settings, Help, the right column, past a listener that stops the key, the Reply
+# screen (its draft kept) and with single keys off; Ctrl+Shift+? opens Help; a German Shift+7 "/", an
+# AltGr "/" and a held chord; Cmd on an emulated Mac. Pass WEB_ROOT=dir to run it against another copy
+# of the page, and SCREENSHOTS=dir to keep a PNG of each step.
+search-chord-browser:
+	python3 tests/search_chord_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#229 desktop-two-column` in a real Chromium at 1440x900 and 1280x800: the layout button draws Main
 # and the right column side by side inside the window, the view picker saying so; `#281 view-keys`: the
