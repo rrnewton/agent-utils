@@ -25,6 +25,14 @@ An active record whose pinned process or pane is alive is alive. Anything else, 
 active record with nothing visibly alive behind it, a name agentctl never recorded, or an
 unreadable record, is unverifiable: agentctl has not confirmed that the agent stopped.
 
+Two unverifiable reasons are distinct on purpose. ``reason=no-agentctl-record`` means the registry
+directory exists, every record in it was read, and none has ever carried AGENT. That is the only
+answer for which ``wrkslots remove --attest-agent-stopped`` accepts a coordinator's attestation in
+place of a dead verdict, and only for a slot whose recorded owner process is proven dead. It speaks
+for this registry only: an agent registered in some other registry looks unregistered here.
+``reason=no-agentctl-registry`` means the registry directory itself is missing, which says nothing
+about AGENT, so a misconfigured location never looks like "no record".
+
 This is one input to removal, not the whole decision. wrkslots still requires its own census of
 processes using the slot, its time-to-live, and its Git and path checks.
 """
@@ -167,6 +175,10 @@ def check(agent: str, registry: Path) -> int:
     """Return the wrkslots exit status for one agent name."""
 
     current_boot = boot_id()
+    if not registry.is_dir():
+        # A missing registry is a location problem, not a statement that agentctl
+        # never recorded AGENT; only a readable registry can say "no record".
+        return verdict(agent, 2, "no-agentctl-registry")
     journals = registry / ".renames"
     if journals.is_dir():
         for path in sorted(journals.glob("*.json")):
@@ -176,7 +188,7 @@ def check(agent: str, registry: Path) -> int:
     active_paths = sorted(
         path / "agent.json" for path in registry.iterdir()
         if NAME.fullmatch(path.name) and path.name != "archive" and (path / "agent.json").exists()
-    ) if registry.is_dir() else []
+    )
     active = matching(active_paths, agent)
     for record in active:
         if identity_alive(record, current_boot):
