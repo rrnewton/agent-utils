@@ -4733,6 +4733,16 @@ const TUNING_BANDS = {
     "how long before the call connected a message replayed on a resumed stream may have been posted " +
     "and still be read out. Under ten seconds a phone clock a little ahead of the provider's drops " +
     "what the call missed; past five minutes, old news is read out as new"],
+  RELAY_ANSWER_WAIT_MS: [5000, 60000,
+    "on the hosted protocol, how long a relayed turn that has drawn no answer at all holds the next. " +
+    "Under five seconds the next lands before a slow agent has begun to answer the last, and cuts " +
+    "it; past a minute a turn the agent never answered keeps the rest of a burst from the call for " +
+    "longer than anyone waits"],
+  RELAY_ANSWER_SETTLE_MS: [500, 5000,
+    "on the hosted protocol, how long after the last of an answer to a relayed turn arrived the next " +
+    "still waits. Under half a second the next goes in the gap between the answer's text and its " +
+    "first audio, and cuts it; past five seconds the call sits silent that long after each answer " +
+    "before the rest of a burst is read out"],
   // `#267 quote-reply`.
   QUOTE_MAX_CHARS: [300, 1500,
     "the longest quote Quote reply puts in the box. Under three hundred, two sentences of a long " +
@@ -26998,6 +27008,10 @@ test("the three modes differ in WHAT THE AGENT IS ASKED TO DO, and off asks noth
     /one short sentence/i,
     "mode 2 is a summary, and the turn has to say so or the agent will read the message out"
   );
+  // The agent answers it. On this protocol the next relayed turn waits for that answer, which a
+  // `user_message` sent into it would cut (`#337 voice-relay-silent`).
+  assistantSays(page, "Lead team says the tag is cut.");
+  await passTime(page, 5000);
 
   await setReadNew(page, "full");
   await deliver(page, stream, sseMessage(message({ id: "521", content: "and deployed" })));
@@ -68223,13 +68237,14 @@ test("`#337 voice-relay-silent`: the stream of every channel is followed only du
   assert.deepEqual(relayedPrompts(next), []);
 });
 
-test("`#337 voice-relay-silent`: a burst too large for one turn is read out over several, each message once", async () => {
-  const page = newPage();
+/** A hosted call reading every new message out in full, with a burst one more than a turn carries plus one waiting. */
+async function hostedBurst(page, { soundOff = false } = {}) {
   const socket = await startTalking(page);
   page.messages = [];
   await page.el("view-switch").click();
   await page.settle();
   await setReadNew(page, "full");
+  if (soundOff) await page.el("speaker").click();
   const most = sourceConstant("RELAY_TURN_MAX_MESSAGES");
   let burst = "";
   for (let n = 0; n < most + 2; n += 1) {
@@ -68237,13 +68252,51 @@ test("`#337 voice-relay-silent`: a burst too large for one turn is read out over
   }
   await deliver(page, page.watchStream(), burst);
   await speakRelay(page);
-  await speakRelay(page);
-  const turns = relayed(page).map((frame) => frame.text);
-  assert.equal(turns.length, 2, `a burst of ${most + 2} was not split into two turns`);
-  assert.equal(turns[0].split("burst item").length - 1, most);
-  assert.equal(turns[1].split("burst item").length - 1, 2);
-  for (let n = 0; n < most + 2; n += 1) {
-    assert.equal(turns.join("\n").split(`burst item ${n}.`).length - 1, 1, `item ${n} was not read out exactly once`);
+  return { socket, most };
+}
+
+test("`#337 voice-relay-silent`: a burst too large for one turn is read out over several, each message once, the next only once the agent has answered the last", async () => {
+  for (const soundOff of [false, true]) {
+    const label = soundOff ? "Sound off" : "Sound on";
+    const page = newPage();
+    const { socket, most } = await hostedBurst(page, { soundOff });
+    assert.equal(relayed(page).length, 1, `${label}: the first turn of the burst did not go`);
+    // On this protocol a user_message sent while the agent answers cuts the answer, and nothing of the
+    // answer to the first turn has arrived: the rest waits for it.
+    await passTime(page, RELAY_COALESCE_MS * 4);
+    assert.equal(relayed(page).length, 1,
+      `${label}: the rest of the burst went before the agent had begun to answer the first turn, and cuts that answer`);
+    // A message arriving meanwhile joins the rest, and is read out once too.
+    await deliver(page, page.watchStream(), sseWatch(message({ id: "3379100", content: "late item." }), `w.${most + 2}`));
+    await passTime(page, RELAY_COALESCE_MS * 2);
+    assert.equal(relayed(page).length, 1, `${label}: a later arrival went before the agent had answered`);
+    // The agent answers: its text first, then three seconds of its audio.
+    assistantSays(page, "Build noise has news.");
+    await passTime(page, 1000);
+    assert.equal(relayed(page).length, 1, `${label}: the rest went between the answer's text and its audio`);
+    for (let s = 0; s < 3; s += 1) hostedAudio(socket);
+    await passTime(page, 2000);
+    assert.equal(relayed(page).length, 1, `${label}: the rest went while the agent was still saying its answer`);
+    await passTime(page, 6000);
+    const turns = relayed(page).map((frame) => frame.text);
+    assert.equal(turns.length, 2, `${label}: the rest of a burst of ${most + 2} never went, once the answer was over`);
+    assert.equal(turns[0].split("burst item").length - 1, most);
+    assert.equal(turns[1].split("burst item").length - 1, 2);
+    for (let n = 0; n < most + 2; n += 1) {
+      assert.equal(turns.join("\n").split(`burst item ${n}.`).length - 1, 1, `${label}: item ${n} was not read out exactly once`);
+    }
+    assert.equal(turns.join("\n").split("late item.").length - 1, 1, `${label}: the later arrival was not read out exactly once`);
   }
-  void socket;
+});
+
+test("`#337 voice-relay-silent`: on the hosted protocol a relayed turn the agent never answers holds the rest no longer than RELAY_ANSWER_WAIT_MS, and says so", async () => {
+  const wait = optionalSourceConstant("RELAY_ANSWER_WAIT_MS") ?? TUNING_BANDS.RELAY_ANSWER_WAIT_MS[1];
+  const page = newPage();
+  await hostedBurst(page);
+  assert.equal(relayed(page).length, 1);
+  await passTime(page, wait - 2000);
+  assert.equal(relayed(page).length, 1, "the rest went before the bound on an unanswered turn");
+  await passTime(page, 2000 + 2 * RELAY_RECHECK_MS);
+  assert.equal(relayed(page).length, 2, `an unanswered relayed turn held the rest past ${wait} ms`);
+  assert.match(page.el("settings-detail").textContent, /a relayed turn drew no answer in \d+ s; the next was read out anyway/);
 });

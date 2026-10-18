@@ -4946,7 +4946,8 @@ agent posting four lines in two seconds would otherwise take four spoken turns, 
 each interrupting the last and leaving no gap to answer in. Both guards below are re-checked at
 the flush as well as at the door, because the call can end and the reader can press Off inside
 that window. A turn carries at most eight messages (`RELAY_TURN_MAX_MESSAGES`); the rest of a
-larger burst waits for the next turn, each message still read out once.
+larger burst waits for the next turn, which goes once this one's answer has been heard out, each
+message still read out once.
 
 **Every watched channel, each message once** (`#337 voice-relay-silent`). A call follows the stream
 of every channel (above) besides the channel on screen's, from when it connects until it ends, and
@@ -4960,7 +4961,13 @@ say that only the channel on screen is read out.
 
 **Never into an answer** (`#330 voice-long-turn-drop`). A relayed message waits while the assistant
 is answering or its audio is still playing, on either protocol, and the status line says how many
-are waiting; see "How a call ended" for the rest.
+are waiting; see "How a call ended" for the rest. The hosted vendor's protocol says nothing when a
+turn ends, and a `user_message` sent while its agent answers cuts the answer, so there a relayed
+turn also waits for the agent's answer to the relayed turn before it (`#337`): until some of that
+answer, its text or its audio, has arrived, nothing more of it has for 1.5 seconds
+(`RELAY_ANSWER_SETTLE_MS`), and its audio has been heard out — or, with Sound off, has had as long
+as it takes to play — plus the 600 ms after it. A relayed turn that draws no answer at all holds
+the next for 20 seconds (`RELAY_ANSWER_WAIT_MS`), and the connection details say so.
 
 **Never dropped in silence** (`#337`). A message still waiting when the call ends — behind an
 answer, or for its burst to gather — goes nowhere, not into the next call, and the transcript says

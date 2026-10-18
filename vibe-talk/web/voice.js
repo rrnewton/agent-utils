@@ -15564,6 +15564,8 @@ function handle(socket, message) {
       break;
     }
     case "audio":
+      // Before anything below drops it: a relayed turn's answer is talking, heard or not. `#337`.
+      noteRelayAnswerOutput(pcmMsOfBase64((message.audio_event || {}).audio_base_64));
       // In chat mode there is NOTHING to play it with — no AudioContext was ever created — so this
       // is a hard drop rather than a preference. It is also evidence: audio arriving on a
       // conversation this page asked to be text-only means the override was not honoured. Said
@@ -15594,6 +15596,7 @@ function handle(socket, message) {
       // untouched.
       {
         const said = (message.agent_response_event || {}).agent_response || "";
+        noteRelayAnswerOutput();
         line("assistant", said);
         recordTurn("assistant", said);
         // Counted for the call-end record, which says how many turns a call had. `#330`.
@@ -15626,6 +15629,7 @@ function handle(socket, message) {
     case "interruption":
       stopPlayback();
       noteCutForSpokenYes();
+      noteRelayAnswerCut();
       break;
     case "ping":
       socket.send(
@@ -40784,7 +40788,11 @@ function flushRelay() {
     held
   );
   if (!sent) reportUnrelayed(held, "ended");
-  // The rest of a burst too large for one turn waits behind this one's answer.
+  // On the hosted protocol nothing else says when this turn's answer is over. `#337`.
+  if (sent && session.protocol !== "vibe-talk-v1") {
+    relayAnswerAwaited = { sentAt: Date.now(), outputAt: 0, audioEndsAt: 0 };
+  }
+  // The rest of a burst too large for one turn waits behind this one's answer (`relayWait`).
   if (relayPending.length && relayTimer === null) relayTimer = setTimeout(flushRelay, RELAY_COALESCE_MS);
   return sent;
 }
@@ -40820,6 +40828,81 @@ const RELAY_RECHECK_MS = 500;
  */
 const RELAY_STALLED_ANSWER_MS = 25000;
 
+/**
+ * On the hosted protocol, how long a relayed turn that has drawn no answer at all — none of the
+ * agent's text, none of its audio — holds the next relayed turn. `#337 voice-relay-silent`.
+ */
+const RELAY_ANSWER_WAIT_MS = 20000;
+
+/**
+ * On the hosted protocol, how long after the last of the agent's answer to a relayed turn arrived —
+ * its text or a piece of its audio — the next relayed turn still waits for more of it: an answer's
+ * text can come ahead of its first audio. `#337 voice-relay-silent`.
+ */
+const RELAY_ANSWER_SETTLE_MS = 1500;
+
+/**
+ * `#337 voice-relay-silent`, the hosted protocol: the relayed turn last sent, until the agent's
+ * answer to it has arrived and been heard out; null when none is outstanding.
+ *
+ * Nothing on this protocol says that a turn has ended — it has no `turn_complete` — and a
+ * `user_message` sent while the agent answers cuts the answer. A burst too large for one turn went
+ * out as two turns `RELAY_COALESCE_MS` apart, and the second, landing before the first one's answer
+ * had begun to play, could cut it: eight messages taken as relayed, never read out, and never said
+ * not to have been. So the next relayed turn waits for this one's answer: some of it has arrived
+ * (`outputAt`), nothing more of it for RELAY_ANSWER_SETTLE_MS, and its audio has been heard out —
+ * played, or with Sound off for as long as it would have taken to play (`audioEndsAt`) — plus
+ * ANSWER_PLAYED_GRACE_MS. A relayed turn that draws no answer at all holds the next no longer than
+ * RELAY_ANSWER_WAIT_MS, and the connection details say so.
+ *
+ * @type {{sentAt: number, outputAt: number, audioEndsAt: number} | null}
+ */
+let relayAnswerAwaited = null;
+
+/**
+ * Some of the agent's output arrived on the hosted protocol: its text, or `audioMs` of its audio,
+ * counted whether or not it is played. See `relayAnswerAwaited`.
+ *
+ * @param {number} [audioMs]
+ */
+function noteRelayAnswerOutput(audioMs = 0) {
+  const awaited = relayAnswerAwaited;
+  if (awaited === null) return;
+  const now = Date.now();
+  awaited.outputAt = now;
+  if (audioMs > 0) awaited.audioEndsAt = Math.max(awaited.audioEndsAt, now) + audioMs;
+}
+
+/** The hosted vendor cut the agent's answer off (`interruption`): no more of it will be said. */
+function noteRelayAnswerCut() {
+  const awaited = relayAnswerAwaited;
+  if (awaited !== null) awaited.audioEndsAt = Math.min(awaited.audioEndsAt, Date.now());
+}
+
+/** How long `b64` of the agent's 16-bit PCM takes to play at the call's output rate, in ms. */
+function pcmMsOfBase64(b64) {
+  const text = String(b64 || "");
+  const padding = text.endsWith("==") ? 2 : text.endsWith("=") ? 1 : 0;
+  const bytes = Math.max(0, Math.floor((text.length * 3) / 4) - padding);
+  return (bytes / 2 / (session.outputRate || 16000)) * 1000;
+}
+
+/** Must the next relayed turn on the hosted protocol wait for the last one's answer? */
+function relayAnswerPending() {
+  const awaited = relayAnswerAwaited;
+  if (awaited === null) return false;
+  const now = Date.now();
+  if (!awaited.outputAt) {
+    if (now - awaited.sentAt < RELAY_ANSWER_WAIT_MS) return true;
+    addDetail(`a relayed turn drew no answer in ${Math.round(RELAY_ANSWER_WAIT_MS / 1000)} s; ` +
+      "the next was read out anyway");
+  } else if (now - awaited.outputAt < RELAY_ANSWER_SETTLE_MS || now < awaited.audioEndsAt + ANSWER_PLAYED_GRACE_MS) {
+    return true;
+  }
+  relayAnswerAwaited = null;
+  return false;
+}
+
 /** What the status line last said about held messages, so it says it once a count and a reason. */
 let relayWaitSaid = "";
 
@@ -40833,9 +40916,11 @@ let relayWaitingSince = 0;
  * What a relayed turn must wait for, or null when it may go. `#330 voice-long-turn-drop`.
  *
  *   * `"answer"`: an answer's audio still playing, on any protocol — the hosted one included, where
- *     a `user_message` sent into a playing answer cuts it too — and on `vibe-talk-v1` an answer still
- *     arriving, or anything else holding the floor: a text turn being answered or waiting its turn,
- *     the greeting, a segment closing.
+ *     a `user_message` sent into a playing answer cuts it too; on the hosted protocol, which says
+ *     nothing when a turn ends, the agent's answer to the last relayed turn not yet arrived and
+ *     heard out (`relayAnswerAwaited`, `#337 voice-relay-silent`); and on `vibe-talk-v1` an answer
+ *     still arriving, or anything else holding the floor: a text turn being answered or waiting its
+ *     turn, the greeting, a segment closing.
  *   * `"turn"`: the owner's own spoken turn, open and not completed.
  *
  * A message waits here, in the relay's own queue, where the timers `#268 voice-call-drops` put on a
@@ -40852,7 +40937,7 @@ let relayWaitingSince = 0;
  */
 function relayWait() {
   if (!answerHeardOut()) return "answer";
-  if (session.protocol !== "vibe-talk-v1") return null;
+  if (session.protocol !== "vibe-talk-v1") return relayAnswerPending() ? "answer" : null;
   if (!session.v1Ready || session.waitingForGreeting || session.waitingForAudioEnd || session.typedTurnInFlight ||
     session.pendingPrompts.length > 0) {
     return "answer";
@@ -40981,6 +41066,7 @@ function reportUnrelayed(items, why) {
  */
 function beginCallRelay() {
   relayLedger = new Set();
+  relayAnswerAwaited = null;
   relayCallOpenedAt = Date.now();
   startWatchAll();
 }
@@ -40994,6 +41080,7 @@ function endCallRelay() {
   const unsent = [...queued, ...relayPending];
   if (relayCallOpenedAt && unsent.length) reportUnrelayed(unsent, "ended");
   forgetRelayPending();
+  relayAnswerAwaited = null;
   if (relayTimer !== null) {
     clearTimeout(relayTimer);
     relayTimer = null;
