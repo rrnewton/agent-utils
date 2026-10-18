@@ -81,6 +81,22 @@ const SANITIZED_TAGS = new Set(
   [...(/pub const TAGS: \[&str; \d+\] = \[([^\]]*)\]/.exec(RENDER_RS) ||
     assert.fail("src/render.rs no longer states its TAGS"))[1].matchAll(/"([a-z0-9]+)"/g)].map((m) => m[1])
 );
+/**
+ * The words a `conversation_start` marker's recap may hold, from src/store/mod.rs itself (each
+ * enum's `as_str`, which a test there holds to serde's word) rather than restated, so this
+ * fixture's store refuses a marker the server refuses. `#331 resume-on-websocket`: the page filed
+ * `replay_frame` and `refused` to a server that knew neither, and this suite, whose store took any
+ * word, passed.
+ */
+const STORE_RS = readFileSync(join(WEB, "..", "src", "store", "mod.rs"), "utf8");
+const storeWords = (type) => {
+  const found = new RegExp(`\\nimpl ${type} \\{([\\s\\S]*?)\\n\\}`).exec(STORE_RS) ||
+    assert.fail(`src/store/mod.rs no longer implements ${type}`);
+  const words = [...found[1].matchAll(/Self::\w+ => "([a-z_]+)"/g)].map((m) => m[1]);
+  assert.ok(words.length > 1, `src/store/mod.rs no longer states ${type}'s words in as_str`);
+  return new Set(words);
+};
+const MARKER_WORDS = { transports: storeWords("RecapTransport"), whys: storeWords("RecapNone") };
 const CSS = readFileSync(join(WEB, "voice.css"), "utf8");
 // The BASE sheet, web/style.css: the colours and components voice.css is layered on. Read so that
 // a claim about a colour differing from the resting one can be checked against the resting one,
@@ -2027,6 +2043,11 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     // a POSTed turn lands in `storedTurns` and a later GET returns it, so "the page recorded the
     // turn" and "the page can read its own record back" are the same fact here as on the server.
     storedTurns: new Map(),
+    /**
+     * `#331 resume-on-websocket`. The recap words this store's `conversation_start` markers may
+     * hold: the server's own, unless a test stands in an older server.
+     */
+    markerWords: MARKER_WORDS,
     /** Every request the page made against the store, in order, as `METHOD path`. */
     storeCalls: [],
     /** `#128 transcript-history`: every walk through the whole record, path and all. */
@@ -3489,6 +3510,16 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
             held.push({ speaker: "sent", text: send.text, at_ms, detail: { kind: "sent", ...send.detail } });
             page.storedTurns.set(id, held);
             return json(200, { id, turn: held[held.length - 1] });
+          }
+          // `#331 resume-on-websocket`. A start marker whose recap names a word the server does not
+          // know is refused, as `ops::parse_marker` refuses it.
+          const recap = body.speaker === "marker" && body.marker && body.marker.kind === "conversation_start"
+            ? body.marker.recap || {}
+            : null;
+          if (recap && !(recap.state === "sent" ? page.markerWords.transports.has(recap.transport)
+            : recap.state === "none" && page.markerWords.whys.has(recap.why))) {
+            const word = recap.state === "sent" ? recap.transport : recap.why;
+            return json(400, { error: "bad_record", detail: `not a marker this server knows: unknown variant \`${word}\`` });
           }
           // Appended when the request is ANSWERED, not when it is issued — the server assigns
           // `seq` on arrival, so the order that ends up stored is the order things landed in.
@@ -66822,6 +66853,58 @@ test("`#331 resume-on-websocket`: a bridge that refuses the record: the call, Se
   await page.el("hang-up").click();
   await page.settle();
   assert.equal(page.el("talk-note").textContent, "the agent starts fresh — the voice service took no recap");
+});
+
+/**
+ * A `vibe-talk-v1` call on a page with records, resuming, whose bridge answers the record with
+ * `answer`, and then a turn, so the conversation's start marker is filed. Hangs up; returns what
+ * the line above the call said before it did.
+ */
+async function answeredV1CallFiled(page, answer) {
+  page.transcriptRecordsSupported = true;
+  await withEarlierConversation(page, { resume: true });
+  const socket = await startV1Call(page, ["replay"]);
+  socket.onmessage({ data: JSON.stringify(answer) });
+  await page.settle();
+  speech(socket, "user", 1, "is it back now", true);
+  turnDone(socket, 1);
+  await watchTurns(page);
+  const live = boundaryLines(page).find((li) => li.getAttribute("data-ends") === "conv_earlier");
+  assert.ok(live, "no line above the call");
+  const said = boundaryWords(live);
+  await page.el("hang-up").click();
+  await page.settle();
+  return said;
+}
+
+test("`#331 resume-on-websocket`: the server keeps the start marker of a call sent the record as a replay frame, and of one that refused it, and a reload draws the same line above each (negative control: a server that knows neither word)", async () => {
+  const accepted = { type: "replay_ack", accepted: true };
+  const refused = { type: "replay_ack", accepted: false, reason: "too long for this model" };
+  for (const [answer, chip] of [[accepted, "11-word recap sent"], [refused, "recap refused"]]) {
+    const page = newPage();
+    const said = await answeredV1CallFiled(page, answer);
+    assert.equal(said.chip, chip);
+    assert.doesNotMatch(page.el("storage-state").textContent, /not kept/, "the server refused a record of the call");
+    const reloaded = await reloadOf(page);
+    const restored = boundaryLines(reloaded).find((li) => li.getAttribute("data-ends") === "conv_earlier");
+    assert.ok(restored, "a reload drew no line above the call");
+    assert.deepEqual(boundaryWords(restored), said, `a reload says something else above the call (${chip})`);
+  }
+
+  // The negative control: a server from before `#331`, which knows neither word, refuses both
+  // markers; Settings says a record was not kept, and a reload has no chip to draw.
+  for (const answer of [accepted, refused]) {
+    const page = newPage();
+    page.markerWords = {
+      transports: new Set(["contextual_update", "client_data"]),
+      whys: new Set(["off", "empty", "too_long", "failed", "unsupported", "replaced_session"]),
+    };
+    await answeredV1CallFiled(page, answer);
+    assert.match(page.el("storage-state").textContent, /^A record of this call was not kept: .*not a marker this server knows/,
+      "the negative control's store kept the marker too, so the check above proves nothing");
+    const restored = boundaryLines(await reloadOf(page)).find((li) => li.getAttribute("data-ends") === "conv_earlier");
+    assert.equal(restored ? seamChip(restored) : null, null);
+  }
 });
 
 test("`#331 resume-on-websocket`: a call that ends before its session starts was not resumed, and Settings does not say it was", async () => {

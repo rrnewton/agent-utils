@@ -446,7 +446,8 @@ pub enum EndCause {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Recap {
-    /// A recap went out. Neither transport acknowledges one, so this says it was sent, not heard.
+    /// A recap went out. This says it was sent, not heard: only a `replay_frame` is answered, and
+    /// a refusal is filed as [`RecapNone::Refused`] instead.
     Sent {
         /// Words of the lines it held.
         words: u32,
@@ -486,6 +487,21 @@ pub enum RecapTransport {
     ContextualUpdate,
     /// On the session's start request.
     ClientData,
+    /// A `vibe-talk-v1` `replay` frame, the first the page sent after the session started.
+    /// `#331 resume-on-websocket`.
+    ReplayFrame,
+}
+
+impl RecapTransport {
+    /// The word on the wire. The page's suite holds its fake store to these words.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ContextualUpdate => "contextual_update",
+            Self::ClientData => "client_data",
+            Self::ReplayFrame => "replay_frame",
+        }
+    }
 }
 
 /// Why a call was sent no recap.
@@ -504,10 +520,14 @@ pub enum RecapNone {
     Unsupported,
     /// The voice service replaced the session, and the new one was sent nothing.
     ReplacedSession,
+    /// The voice service took the recap and answered that it would not use it: a `vibe-talk-v1`
+    /// `replay_ack` with `accepted: false`. `#331 resume-on-websocket`.
+    Refused,
 }
 
 impl RecapNone {
-    /// The word a log line carries.
+    /// The word a log line carries, which is the word on the wire. The page's suite holds its fake
+    /// store to these words.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -517,6 +537,7 @@ impl RecapNone {
             Self::Failed => "failed",
             Self::Unsupported => "unsupported",
             Self::ReplacedSession => "replaced_session",
+            Self::Refused => "refused",
         }
     }
 }
@@ -2712,6 +2733,23 @@ mod tests {
                 },
                 previous_end: None,
             }),
+            // `#331 resume-on-websocket`: a `vibe-talk-v1` call's record, and a refusal of it.
+            TurnDetail::ConversationStart(StartRecord {
+                recap: Recap::Sent {
+                    words: 11,
+                    lines: 2,
+                    dropped: 0,
+                    transport: RecapTransport::ReplayFrame,
+                },
+                previous_end: None,
+            }),
+            TurnDetail::ConversationStart(StartRecord {
+                recap: Recap::NotSent {
+                    why: RecapNone::Refused,
+                    dropped: 0,
+                },
+                previous_end: Some(EndCause::Ended),
+            }),
             TurnDetail::NotSent {
                 why: NotSentWhy::Lapsed,
                 serial: 4,
@@ -2747,6 +2785,50 @@ mod tests {
             start,
             r#"{"kind":"conversation_start","recap":{"state":"none","why":"off","dropped":0}}"#
         );
+    }
+
+    #[test]
+    fn each_recap_word_is_the_word_on_the_wire() {
+        // `web/voice.js` files these words in a `conversation_start` marker, and the page's suite
+        // reads its fake store's words from the `as_str` arms above, so the two must be serde's.
+        // `#331 resume-on-websocket`: the page filed `replay_frame` and `refused` to a server that
+        // knew neither, and every such marker was refused.
+        for transport in [
+            RecapTransport::ContextualUpdate,
+            RecapTransport::ClientData,
+            RecapTransport::ReplayFrame,
+        ] {
+            // A variant added without a place in the list above fails to compile here.
+            match transport {
+                RecapTransport::ContextualUpdate
+                | RecapTransport::ClientData
+                | RecapTransport::ReplayFrame => {}
+            }
+            assert_eq!(
+                serde_json::to_value(transport).expect("serializes"),
+                transport.as_str()
+            );
+        }
+        for why in [
+            RecapNone::Off,
+            RecapNone::Empty,
+            RecapNone::TooLong,
+            RecapNone::Failed,
+            RecapNone::Unsupported,
+            RecapNone::ReplacedSession,
+            RecapNone::Refused,
+        ] {
+            match why {
+                RecapNone::Off
+                | RecapNone::Empty
+                | RecapNone::TooLong
+                | RecapNone::Failed
+                | RecapNone::Unsupported
+                | RecapNone::ReplacedSession
+                | RecapNone::Refused => {}
+            }
+            assert_eq!(serde_json::to_value(why).expect("serializes"), why.as_str());
+        }
     }
 
     #[test]

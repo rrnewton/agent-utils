@@ -1315,12 +1315,24 @@ async fn markers_and_answers_are_recorded_only_in_the_shapes_this_server_knows()
         json!({ "speaker": "marker", "marker": { "kind": "conversation_start", "recap": { "state": "sent", "words": 412, "lines": 9, "dropped": 0, "transport": "client_data" }, "previous_end": "closed" } }),
         json!({ "speaker": "marker", "marker": { "kind": "not_sent", "why": "withdrawn", "serial": 8 } }),
         json!({ "speaker": "marker", "marker": { "kind": "not_sent", "why": "lapsed", "serial": 1_000_000 } }),
+        // `#331 resume-on-websocket`: what `web/voice.js` files for a `vibe-talk-v1` call that was
+        // sent the record as its `replay` frame, and for one whose bridge refused it.
+        json!({ "speaker": "marker", "marker": { "kind": "conversation_start", "recap": { "state": "sent", "words": 11, "lines": 2, "dropped": 0, "transport": "replay_frame" } } }),
+        json!({ "speaker": "marker", "marker": { "kind": "conversation_start", "recap": { "state": "none", "why": "refused", "dropped": 0 }, "previous_end": "ended" } }),
     ] {
         let (status, answer) = record(&harness, "conv_m", body.clone()).await;
         assert_eq!(status, StatusCode::OK, "{body}: {answer}");
     }
     let with = stored(&harness, "conv_m", true).await;
-    assert_eq!(with.len(), 6);
+    assert_eq!(with.len(), 8);
+    assert_eq!(
+        with[6]["detail"]["recap"],
+        json!({ "state": "sent", "words": 11, "lines": 2, "dropped": 0, "transport": "replay_frame" })
+    );
+    assert_eq!(
+        with[7]["detail"]["recap"],
+        json!({ "state": "none", "why": "refused", "dropped": 0 })
+    );
     assert_eq!(with[0]["detail"]["recap"]["why"], "unsupported");
     assert_eq!(with[2]["detail"], json!({ "kind": "answer", "serial": 7 }));
     assert_eq!(with[3]["detail"]["previous_end"], "closed");
