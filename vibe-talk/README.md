@@ -4825,7 +4825,7 @@ are indistinguishable forever.
 `GET /api/v1/live/stream` (`#337 voice-relay-silent`) carries every listed channel's events in one
 stream, for a page in a call. A message arrived in a channel the owner watches while he was in a
 call, and the call never heard of it: the page followed one stream, the channel on screen's, so a
-message anywhere else could not reach the agent however Live messages was set. It is the same read
+message anywhere else could not reach the agent however Arriving messages during a call was set. It is the same read
 scope, the same `Cache-Control: no-store` and `X-Accel-Buffering: no`, the same one access-log line
 at attach, and the same payloads, each judged against the noise rules and rendered as that
 channel's own stream would. What differs:
@@ -4982,7 +4982,7 @@ answer, or for its burst to gather — goes nowhere, not into the next call, and
 so with a **not read out** line naming how many and in which channels, as do the connection
 details. So does a stream reset during a call, which says the gap cannot be filled: the channel is
 re-read and complete, but whether the call heard what fell into the gap cannot be known. Turning
-Live messages off lets go of what was waiting, and the connection details count it.
+Arriving messages during a call off lets go of what was waiting, and the connection details count it.
 
 **Two controls over one value.** The bar carries **Read new**, a button that cycles
 off → gist → full → off, because the strip has room for a `.bar-button` and not for a

@@ -40948,7 +40948,7 @@ function flushRelay() {
   const mode = relayMode();
   if (mode === "off") {
     addDetail(`${relayCount(relayPending.length)} waiting to be read out ${relayPending.length === 1 ? "was" : "were"} ` +
-      "let go: Live messages was turned off");
+      "let go: Arriving messages during a call was turned off");
     forgetRelayPending();
     return false;
   }
