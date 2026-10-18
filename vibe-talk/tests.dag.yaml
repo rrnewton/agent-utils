@@ -324,18 +324,21 @@ steps:
   # a mock `vibe-talk-v1` bridge — no microphone frame inside the greeting's hand-off; a "Yes." whose
   # final transcript arrives after the agent's "One moment." commits the card once; the page's notice
   # waits for that turn to complete before closing the segment; the server's close is said and
-  # recorded; a hang-up sends one goodbye. Measured on 2026-10-13: about 8s wall.
+  # recorded; a hang-up sends one goodbye. Measured on 2026-10-13: about 8s wall. `#330
+  # voice-long-turn-drop` and `#337 voice-relay-silent` added a fourth call — a long answer whose six
+  # banked seconds of audio play out in real time before a message from another watched channel
+  # goes, and a typed cut — which made it about 25s wall on 2026-10-18.
   - group: check
     job: voice-call-drops-browser
-    desc: a spoken call replaying the bridge's event order — the greeting hand-off, a yes answered before its final transcript, the notice's wait, and how the call ended — in current Chromium
+    desc: a spoken call replaying the bridge's event order — the greeting hand-off, a yes answered before its final transcript, the notice's wait, how the call ended, a long answer heard out before another channel's message, a typed cut — in current Chromium
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/voice_call_drops_browser.py
     jobs_flag: ""
-    timeout: 90
-    cpu_timeout: 45
+    timeout: 150
+    cpu_timeout: 90
     hint:
       resources: {browser: 1}
-      est_duration_s: 8
+      est_duration_s: 25
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 

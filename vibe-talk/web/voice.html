@@ -2479,6 +2479,12 @@
                 <strong>?</strong> beside the choice opens How messages are said.
               </p>
               <p class="hint">
+                A call hears <strong>every channel on your list</strong>, not only the one on
+                screen, and each message once. One that arrives while the agent is answering never
+                cuts the answer short: it waits until the answer has been heard to the end, and the
+                status line says how many are waiting.
+              </p>
+              <p class="hint">
                 A burst arriving at once becomes <strong>one</strong> spoken turn, not one per
                 message. Messages that land within about a second of each other are collected and
                 announced together, because a coding agent posting four lines in a row would
@@ -2490,12 +2496,14 @@
                 though the server keeps watching the channel.
               </p>
               <p class="hint">
-                <strong>Only messages that arrive while the feed is connected are sent.</strong>
-                When this page attaches to the channel it is first handed what the server already
-                published, so the list catches up; that catch-up is never announced to the agent,
-                because a burst of older messages read out as though they had just been said is
-                worse than not hearing them at all. Anything that landed while the feed was
-                reconnecting is on screen but was not spoken.
+                <strong>Only messages that arrive during the call are sent.</strong> When this page
+                attaches to the channel it is first handed what the server already published, so
+                the list catches up; that catch-up is never announced to the agent, because a burst
+                of older messages read out as though they had just been said is worse than not
+                hearing them at all. A feed that drops during a call picks up where it left off, and
+                what landed meanwhile is read out. When a message could not be — the call ended
+                while it waited, or the feed fell too far behind to know — the transcript says
+                <strong>not read out</strong>.
               </p>
             </details>
 

@@ -2512,6 +2512,46 @@ pub async fn stream(
         .into_response())
 }
 
+/// `GET /api/v1/live/stream` — every listed channel's arrivals, as Server-Sent Events. `#337
+/// voice-relay-silent`.
+///
+/// A message arrived in a channel the owner watches while he was in a call, and the call never
+/// heard of it: the page followed one stream, the channel on screen's, so a message anywhere else
+/// could not reach the agent however it was set to read new messages out. A page in a call reads
+/// this as well, and relays what it carries.
+///
+/// The same read scope, headers and access-log line as [`stream`], and the same payloads; what
+/// differs is said at [`crate::live::all_events`]: nothing of the past on a fresh attach, one
+/// cursor over every channel as each event's `id`, a channel off the list not carried, and a
+/// cursor it cannot resume from answered with `event: reset`.
+pub async fn stream_all(
+    State(state): State<AppState>,
+    _scope: ReadScope,
+    headers: HeaderMap,
+) -> Response {
+    let after = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let subscription = state.live.subscribe_all(after);
+    let body = axum::response::sse::Sse::new(crate::live::all_events(subscription, state.clone()))
+        .keep_alive(
+            axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)),
+        );
+    (
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                axum::http::HeaderName::from_static("x-accel-buffering"),
+                "no",
+            ),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::http::assets::VOICE_JS;

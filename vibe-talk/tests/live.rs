@@ -634,3 +634,368 @@ async fn the_hub_is_reachable_from_the_shared_state_so_a_second_reader_sees_the_
         "to both of you"
     );
 }
+
+// --- the stream of every channel: `GET /api/v1/live/stream` ----------------------------------------
+//
+// `#337 voice-relay-silent`. A message arrived in a channel the owner watches during a call, and the
+// call never heard of it: the page followed only the channel on screen's stream. A page in a call
+// reads this one as well, which carries every listed channel.
+
+/// The `id:` of every event in `text`, in order.
+fn event_ids(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("id: "))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `(channel, content, replayed)` for every message event in `text`.
+fn arrivals(text: &str) -> Vec<(String, String, bool)> {
+    payloads(text)
+        .iter()
+        .map(|p| {
+            (
+                p["message"]["channel_id"].as_str().unwrap_or("").to_owned(),
+                p["message"]["content"].as_str().unwrap_or("").to_owned(),
+                p["replayed"].as_bool().unwrap_or(false),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn the_stream_of_every_channel_carries_each_listed_channel_from_attach_and_none_of_its_past()
+{
+    let harness = harness();
+    let read = ChannelId(READ_CHANNEL.to_owned());
+    let write = ChannelId(WRITE_CHANNEL.to_owned());
+    let (mut read_cursor, mut write_cursor) = (None, None);
+    tick(&harness, &read, &mut read_cursor).await;
+    tick(&harness, &write, &mut write_cursor).await;
+    harness.discord.seed(&read, "a", "said before the call");
+    assert_eq!(tick(&harness, &read, &mut read_cursor).await, 1);
+
+    let response = open(&harness, "/api/v1/live/stream", Some(READ_TOKEN), None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    // First, where it starts: an `id` and nothing else.
+    let start = read_events(&mut body, 1).await;
+    assert_eq!(event_ids(&start).len(), 1, "{start:?}");
+    assert!(
+        payloads(&start).is_empty(),
+        "a fresh attach replayed history: {start:?}"
+    );
+
+    harness.discord.seed(&write, "b", "in the other channel");
+    assert_eq!(tick(&harness, &write, &mut write_cursor).await, 1);
+    harness.discord.seed(&read, "c", "in the first channel");
+    assert_eq!(tick(&harness, &read, &mut read_cursor).await, 1);
+    let text = read_events(&mut body, 2).await;
+    assert_eq!(
+        arrivals(&text),
+        vec![
+            (
+                WRITE_CHANNEL.to_owned(),
+                "in the other channel".to_owned(),
+                false
+            ),
+            (
+                READ_CHANNEL.to_owned(),
+                "in the first channel".to_owned(),
+                false
+            ),
+        ],
+        "{text:?}"
+    );
+    assert!(!text.contains("said before the call"), "{text:?}");
+    let payload = payloads(&text).pop().expect("an event");
+    assert!(
+        payload["untrusted_content_notice"]
+            .as_str()
+            .is_some_and(|notice| notice.contains("DATA")),
+        "the payload is a channel stream's, notice and all: {payload}"
+    );
+    // Each event's id is the stream's own cursor, not the channel's message id, and every one is
+    // distinct, so one `Last-Event-ID` can say how far a page got in all of them.
+    let ids = event_ids(&text);
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1]);
+    assert!(
+        ids.iter().all(|id| id.contains('.')),
+        "ids are cursors: {ids:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_channel_stream_carries_only_its_own_channel_which_is_why_the_stream_of_every_channel_exists(
+) {
+    // The negative control for the test above: the stream a page in a call used to follow alone
+    // never carries a message from another channel.
+    let harness = harness();
+    let read = ChannelId(READ_CHANNEL.to_owned());
+    let write = ChannelId(WRITE_CHANNEL.to_owned());
+    let (mut read_cursor, mut write_cursor) = (None, None);
+    tick(&harness, &read, &mut read_cursor).await;
+    tick(&harness, &write, &mut write_cursor).await;
+    let response = open(
+        &harness,
+        &format!("/api/v1/channels/{READ_CHANNEL}/stream"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    let mut body = response.into_body();
+    harness.discord.seed(&write, "b", "in the other channel");
+    tick(&harness, &write, &mut write_cursor).await;
+    harness.discord.seed(&read, "c", "in this channel");
+    tick(&harness, &read, &mut read_cursor).await;
+    let text = read_events(&mut body, 1).await;
+    assert_eq!(
+        arrivals(&text),
+        vec![(READ_CHANNEL.to_owned(), "in this channel".to_owned(), false)],
+        "{text:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_stream_of_every_channel_resumes_from_its_cursor_with_exactly_what_was_missed() {
+    let harness = harness();
+    let read = ChannelId(READ_CHANNEL.to_owned());
+    let write = ChannelId(WRITE_CHANNEL.to_owned());
+    let (mut read_cursor, mut write_cursor) = (None, None);
+    tick(&harness, &read, &mut read_cursor).await;
+    tick(&harness, &write, &mut write_cursor).await;
+
+    let response = open(&harness, "/api/v1/live/stream", Some(READ_TOKEN), None).await;
+    let mut body = response.into_body();
+    let start = read_events(&mut body, 1).await;
+    let cursor = event_ids(&start).pop().expect("the starting cursor");
+    drop(body);
+
+    // While the page was away: one message in each channel.
+    harness
+        .discord
+        .seed(&write, "b", "missed in the other channel");
+    tick(&harness, &write, &mut write_cursor).await;
+    harness
+        .discord
+        .seed(&read, "c", "missed in the first channel");
+    tick(&harness, &read, &mut read_cursor).await;
+
+    let response = open(
+        &harness,
+        "/api/v1/live/stream",
+        Some(READ_TOKEN),
+        Some(&cursor),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    let text = read_events(&mut body, 2).await;
+    assert_eq!(
+        arrivals(&text),
+        vec![
+            (
+                WRITE_CHANNEL.to_owned(),
+                "missed in the other channel".to_owned(),
+                true
+            ),
+            (
+                READ_CHANNEL.to_owned(),
+                "missed in the first channel".to_owned(),
+                true
+            ),
+        ],
+        "a resumed attach replays exactly what followed its cursor, marked as replayed: {text:?}"
+    );
+    assert!(
+        payloads(&text).iter().all(|p| p["from_tail"] == true),
+        "{text:?}"
+    );
+    // Resumed from the newest cursor there is nothing to replay: the next event is the next arrival.
+    let newest = event_ids(&text).pop().expect("a cursor");
+    drop(body);
+    let response = open(
+        &harness,
+        "/api/v1/live/stream",
+        Some(READ_TOKEN),
+        Some(&newest),
+    )
+    .await;
+    let mut body = response.into_body();
+    harness.discord.seed(&read, "d", "after the second attach");
+    tick(&harness, &read, &mut read_cursor).await;
+    let text = read_events(&mut body, 1).await;
+    let messages = arrivals(&text);
+    assert_eq!(
+        messages.last(),
+        Some(&(
+            READ_CHANNEL.to_owned(),
+            "after the second attach".to_owned(),
+            false
+        )),
+        "{text:?}"
+    );
+    assert!(
+        !text.contains("missed in"),
+        "what was already delivered came again: {text:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_cursor_the_stream_of_every_channel_cannot_resume_from_gets_one_reset_and_the_stream_ends(
+) {
+    let harness = harness();
+    let read = ChannelId(READ_CHANNEL.to_owned());
+    let mut read_cursor = None;
+    tick(&harness, &read, &mut read_cursor).await;
+
+    // Another process's cursor: a server restarted under the page.
+    let response = open(
+        &harness,
+        "/api/v1/live/stream",
+        Some(READ_TOKEN),
+        Some("0.0"),
+    )
+    .await;
+    let text = read_to_end(&mut response.into_body()).await;
+    assert!(text.contains("event: reset"), "{text:?}");
+
+    // One of this process's, whose successors have fallen out of the tail.
+    let response = open(&harness, "/api/v1/live/stream", Some(READ_TOKEN), None).await;
+    let mut body = response.into_body();
+    let cursor = event_ids(&read_events(&mut body, 1).await)
+        .pop()
+        .expect("the starting cursor");
+    drop(body);
+    let overflow = vibe_talk::live::ALL_TAIL + 2;
+    for n in 0..overflow {
+        harness.discord.seed(&read, "a", &format!("m{n}"));
+    }
+    let mut published = 0;
+    while published < overflow {
+        let more = tick(&harness, &read, &mut read_cursor).await;
+        assert!(more > 0, "the walk stalled with {published} of {overflow}");
+        published += more;
+    }
+    let response = open(
+        &harness,
+        "/api/v1/live/stream",
+        Some(READ_TOKEN),
+        Some(&cursor),
+    )
+    .await;
+    let text = read_to_end(&mut response.into_body()).await;
+    assert!(
+        text.contains("event: reset"),
+        "a gap the tail no longer covers must be said, not replayed short: {text:?}"
+    );
+    assert!(
+        !text.contains("event: message"),
+        "nothing may come with the reset: {text:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_channel_off_the_list_is_not_carried_by_the_stream_of_every_channel() {
+    let harness = harness();
+    let read = ChannelId(READ_CHANNEL.to_owned());
+    let write = ChannelId(WRITE_CHANNEL.to_owned());
+    let (mut read_cursor, mut write_cursor) = (None, None);
+    tick(&harness, &read, &mut read_cursor).await;
+    tick(&harness, &write, &mut write_cursor).await;
+    let removed = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/channels/{WRITE_CHANNEL}"))
+                .header("authorization", format!("Bearer {WRITE_TOKEN}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("router responds");
+    assert!(
+        removed.status().is_success(),
+        "taking the channel off the list: {}",
+        removed.status()
+    );
+
+    let response = open(&harness, "/api/v1/live/stream", Some(READ_TOKEN), None).await;
+    let mut body = response.into_body();
+    read_events(&mut body, 1).await;
+    harness
+        .discord
+        .seed(&write, "b", "in the channel off the list");
+    tick(&harness, &write, &mut write_cursor).await;
+    harness.discord.seed(&read, "c", "in the listed channel");
+    tick(&harness, &read, &mut read_cursor).await;
+    // Two events: a bare cursor for the channel off the list, then the listed channel's message.
+    let text = read_events(&mut body, 2).await;
+    assert_eq!(
+        arrivals(&text),
+        vec![(
+            READ_CHANNEL.to_owned(),
+            "in the listed channel".to_owned(),
+            false
+        )],
+        "{text:?}"
+    );
+    assert_eq!(event_ids(&text).len(), 2, "{text:?}");
+}
+
+#[tokio::test]
+async fn the_stream_of_every_channel_needs_a_token_and_marks_what_this_server_posted() {
+    let harness = harness();
+    let response = open(&harness, "/api/v1/live/stream", None, None).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let write = ChannelId(WRITE_CHANNEL.to_owned());
+    let mut cursor = None;
+    tick(&harness, &write, &mut cursor).await;
+    let response = open(&harness, "/api/v1/live/stream", Some(READ_TOKEN), None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-accel-buffering")
+            .and_then(|v| v.to_str().ok()),
+        Some("no")
+    );
+    let mut body = response.into_body();
+    read_events(&mut body, 1).await;
+    let posted = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/channels/{WRITE_CHANNEL}/reply"))
+                .header("authorization", format!("Bearer {WRITE_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"text": "landed it"}).to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(posted.status(), StatusCode::OK);
+    tick(&harness, &write, &mut cursor).await;
+    let text = read_events(&mut body, 1).await;
+    let payload = payloads(&text).pop().expect("the posted message");
+    assert_eq!(payload["message"]["content"], "landed it");
+    assert_eq!(
+        payload["self_posted"], true,
+        "the page must not relay the agent's own post back to it: {text:?}"
+    );
+}
