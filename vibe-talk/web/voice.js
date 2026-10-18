@@ -1151,7 +1151,7 @@ function showScreen(name) {
   // around it is as it will be (below). A browser lays a list on a hidden screen out again the first time it
   // lays the page out after the screen is shown, and clamps the reader's place to the list's window as it is
   // then. Hiding a control that holds the focus is such a time: Chromium blurs it on the spot, and lays the
-  // page out to do so. Help's list holds the focus after "?" or Ctrl+/, and Help's Back button after a tap on
+  // page out to do so. Help's list holds the focus after "?" or Ctrl+?, and Help's Back button after a tap on
   // it, and both were hidden after the main screen was shown and before the control pane was: the list was
   // laid out in a window 66px taller than its own on a 393x852 phone. A reader whose long draft was settled
   // while Help was up was left 58px above the foot, and 200px once the box took back its room, the jump
@@ -1419,7 +1419,7 @@ function showHelp(slug) {
 //   * EACH ENTRY IS A NATIVE <details> (web/voice.html), its heading the <summary>: a button to a
 //     screen reader, Enter and Space from the keyboard, a tap on a phone, with nothing written here
 //     to make it one.
-//   * FOLDED, EXCEPT THE ONE ASKED FOR. A settings group's ? opens its entry; "?" and Ctrl+/ (Cmd+/)
+//   * FOLDED, EXCEPT THE ONE ASKED FOR. A settings group's ? opens its entry; "?" and Ctrl+? (Cmd+?)
 //     open Keyboard, the entry about the keys (`#224`); Open help at the foot of Settings is about
 //     nothing in particular and opens none, so the screen is a list of what there is to read.
 //   * ONE BUTTON AT THE TOP opens every entry, and once they are all open folds them all. It names
@@ -7809,6 +7809,11 @@ function onComposerKey(event, send) {
 // using keyboard, I want to jump to text entry and start typing. Google chat uses Cmd-s for that and
 // I'm ok with that." The search keeps "/" and its glass. See `writeFromKeyboard`.
 //
+// `#344 search-shortcut` gave the search Ctrl+/ (Cmd+/), from anywhere, at the owner's word: "want
+// reliable cmd-/ for search ... Sometimes just pressing '/' doesn't work ... prefer it to just be Cmd-/.
+// Currently that pops open help ... map it to Cmd-? (i.e. Cmd-shift-/)." So the list of keys is "?" and
+// Ctrl+? (Cmd+?) now. See `searchFromAnywhere` and `onEverywhereKey`.
+//
 // WHY THE SCROLL KEYS DID NOTHING. A browser scrolls with PgUp, PgDn, Space, Home, End and the arrows
 // by scrolling the box that holds the focus (with nothing focused, the box the last click landed in)
 // and, failing both, the DOCUMENT. This page's document never scrolls: the frame is a fixed grid and
@@ -7838,14 +7843,17 @@ function onComposerKey(event, send) {
 // what the keys do. The message boxes keep their own Enter (`onComposerKey`), the reading-width handle
 // its arrows and the search field its Escape; each runs first, at its element, and a key it handled
 // arrives here with `defaultPrevented` and is left alone. The table names those keys too, as answered
-// by someone else, so that the list is whole.
+// by someone else, so that the list is whole. The one key heard before all of them is the search's
+// chord, which a binding marked `everywhere` hands to a second listener, at the window, in the capture
+// phase (`onEverywhereKey`, `#344 search-shortcut`); it walks the same table.
 //
 // THE RULES, which are the proposal's section 5:
 //
 //   * A key that types a character (a letter, a digit, a mark) never fires while the reader types in
 //     a field or works a picker or a slider, nor with Ctrl, Cmd or Alt held, which leaves every browser
 //     chord alone. Escape and the Ctrl/Cmd chords do fire in a field: a field is where the reader is
-//     when they want the search, Settings or the ends of the list. Nothing fires while an input method
+//     when they want the search, Settings or the ends of the list, and the search's Ctrl+/ (Cmd+/) is
+//     heard before any element's own listener (`onEverywhereKey`). Nothing fires while an input method
 //     composes, and a phone keyboard, which reports keyCode 229 and types only into fields, never
 //     reaches the table. A chord takes Ctrl or Cmd on every platform (the owner asked for Ctrl+S on
 //     his Mac, then for the search and now for the message box), except in a text field on a Mac, where Ctrl and a letter macOS edits text with
@@ -9503,7 +9511,8 @@ function channelPicked() {
 
 /**
  * "/": the search, with its field ready to type in. It was Ctrl+S (Cmd+S) as well until `#248
- * composer-key` gave that chord to the message box; the glass over the list is the other way in. Settings and Help are left
+ * composer-key` gave that chord to the message box; the glass over the list is the other way in, and
+ * Ctrl+/ (Cmd+/) the way in from anywhere (`searchFromAnywhere`). Settings and Help are left
  * first, as their Back button leaves them: the search is over the list they cover. Anywhere else off
  * the main screen there is nothing to search, and nothing happens. Pressed again while the search is
  * open, the field takes the focus back with its text selected, ready to be typed over. Returns whether
@@ -9516,6 +9525,27 @@ function searchFromKeyboard() {
   const field = el("search-field");
   field.focus();
   if (typeof field.select === "function") field.select();
+  return true;
+}
+
+/**
+ * Ctrl+/ (Cmd+/): the search from anywhere, whatever holds the focus. `#344 search-shortcut`. The owner:
+ * "want reliable cmd-/ for search ... Sometimes just pressing '/' doesn't work". A bare "/" is a character
+ * in a field, the type-to-find of a picker, a step of a slider, and nothing with single keys off, so
+ * after a send (the focus stays in the box) or a channel chosen with the mouse (it stays on the picker)
+ * it searched nothing. The chord has none of those exceptions.
+ *
+ * An open ⋯ menu, the pace popover or the prompts tray closes first, as the back gesture closes them, so
+ * the back stack stays in step (`#304 back-gesture-in-app`). The Reply screen is left with its draft
+ * kept, as its Back leaves it. A reply open at the foot of a column stays open: the search is over the
+ * list beside it. So does a message's details sheet, which is part of its row, not something over the
+ * list. Then it is "/" (`searchFromKeyboard`). Returns true wherever it is pressed, on sign-in too, where
+ * there is nothing to search: the chord is never the browser's.
+ */
+function searchFromAnywhere() {
+  for (const name of openMenus()) closeOpenMenu(name);
+  if (currentScreen === "reply") closeReply();
+  searchFromKeyboard();
   return true;
 }
 
@@ -9543,8 +9573,9 @@ function closeHelp() {
 }
 
 /**
- * "?" and Ctrl+/ (Cmd+/): the list of every key, the Keyboard entry of the Help screen, and Escape
- * back to where it was pressed with the place of the reader kept. From the screens the gear reaches.
+ * "?" and Ctrl+? (Cmd+?, which is Cmd+Shift+/): the list of every key, the Keyboard entry of the Help
+ * screen, and Escape back to where it was pressed with the place of the reader kept. From the screens
+ * the gear reaches. Ctrl+/ (Cmd+/) was this until `#344 search-shortcut` gave it to the search.
  */
 function keysFromKeyboard() {
   if (currentScreen !== "help") {
@@ -9667,6 +9698,21 @@ function isLetterKey(event, letter) {
 }
 
 /**
+ * The character a key typed, as the keymap reads it: what the browser says, with one correction made
+ * only while Cmd is held. Cmd and Shift on the key that types "/" and "?" (US, UK and the like) is "?",
+ * the list of keys, even where the browser says "/": a Mac browser may report the key as if Shift were
+ * not held while Cmd is, as it does for a letter. `#344 search-shortcut`. Whether one does for this key
+ * has not been seen on a Mac here; reading it so costs nothing where it does not. Never without Cmd, so
+ * Ctrl+/ on Linux or Windows is what the browser says, whatever the layout. On a layout where "/" takes
+ * Shift (Shift+7 on German), the key is not the Slash key and "/" stays "/": Cmd+/ there is the search.
+ * Cmd+: (Cmd+Shift+;) has no such correction, and no report has said it needs one.
+ */
+function typedKey(event) {
+  const key = String(event.key || "");
+  return key === "/" && event.metaKey && event.shiftKey && event.code === "Slash" ? "?" : key;
+}
+
+/**
  * Whether Ctrl or Cmd is held: every chord takes either, on every platform (see `modKeyName`), but
  * for the one exception `macFieldEditKey` makes in a text field on a Mac.
  */
@@ -9704,7 +9750,8 @@ function macFieldEditKey(event, target) {
  * @property {boolean} [alt] Alt (Option on a Mac). Only ever with an arrow: Option and a letter types
  *   a character on a Mac.
  * @property {boolean} [shift] For a letter or a named key. A character such as "?" or ":" is matched
- *   as it is typed, whatever it took to type it on the layout of the reader.
+ *   as it is typed, whatever it took to type it on the layout of the reader (`typedKey`): Ctrl+? is
+ *   Ctrl+Shift+/ on a US keyboard, and Ctrl+/ is Ctrl+Shift+7 on a German one.
  */
 
 /**
@@ -9718,6 +9765,8 @@ function macFieldEditKey(event, target) {
  * @property {boolean} [repeats] A held key repeats it. Only the keys that move, and a chord whose `run`
  *   keeps the default of the browser shut on every repeat of a held key (Ctrl+S, the Save page).
  * @property {boolean} [inField] Fires in a text field too, where `run` decides for itself.
+ * @property {boolean} [everywhere] Its Ctrl/Cmd chords are taken at the window in the capture phase,
+ *   before any element's own listener (`onEverywhereKey`), so they act whatever holds the focus.
  * @property {string[]} [controls] Ids of the buttons of the page this key presses, for `aria-keyshortcuts`.
  * @property {string[]} [rowControls] Classes of the buttons of a row this key presses, the same.
  * @property {(event: KeyboardEvent, target: HTMLElement) => boolean} [run] Do it; whether it did.
@@ -9764,13 +9813,16 @@ const KEYMAP = [
     run: (event, target) => jumpList(target, event.key === "End"),
   },
   {
-    group: KEYS_PAGE, chords: [{ key: "/" }],
+    // `#344 search-shortcut`. The chord is heard first, at the window, so it searches whatever holds
+    // the focus (`onEverywhereKey`); the bare "/" is as it was, a character in a field.
+    group: KEYS_PAGE, chords: [{ key: "/" }, { key: "/", mod: true }], everywhere: true,
     // `#248 composer-key`. Ctrl+S was the search's too, from `#224 keyboard-shortcuts`; it is the
     // message box's now, and the list of keys says so, for a reader whose hands still reach for it.
-    does: () => `Search the messages; pressed again, back to what you typed. ${modKeyName()}+S, which searched ` +
-      "until now, goes to the message box",
+    does: () => `Search the messages; pressed again, back to what you typed. ${modKeyName()}+/ searches from ` +
+      "anywhere: a message box, Settings, Help, Reply (its draft kept), an open menu, with single keys on or off. " +
+      `${modKeyName()}+S, which searched until now, goes to the message box`,
     controls: ["search-toggle"],
-    run: () => searchFromKeyboard(),
+    run: (event) => (modHeld(event) ? searchFromAnywhere() : searchFromKeyboard()),
   },
   {
     // `#262 search-load-older`. The field's own handler, which marks the hits and walks back.
@@ -9785,8 +9837,11 @@ const KEYMAP = [
     run: (event) => settingsFromKeyboard() || modHeld(event),
   },
   {
-    group: KEYS_PAGE, chords: [{ key: "?" }, { key: "/", mod: true }],
-    does: "This list of keys",
+    // `#344 search-shortcut`. Ctrl+/ (Cmd+/) was this list's until the owner gave it to the search:
+    // "map it to Cmd-? (i.e. Cmd-shift-/)". The list says where it went, as for Ctrl+S.
+    group: KEYS_PAGE, chords: [{ key: "?" }, { key: "?", mod: true }],
+    does: () => `This list of keys. ${modKeyName()}+? is ${modKeyName()}+Shift+/; ${modKeyName()}+/, which opened ` +
+      "this list until now, searches",
     controls: ["help-link-keyboard"],
     run: () => keysFromKeyboard(),
   },
@@ -10050,7 +10105,7 @@ function chordMatches(chord, event) {
   if (/^[a-z]$/.test(chord.key)) {
     return Boolean(chord.shift) === Boolean(event.shiftKey) && isLetterKey(event, chord.key);
   }
-  const key = String(event.key || "");
+  const key = typedKey(event);
   if (chord.key.length === 1 && chord.key !== " ") return key === chord.key || digitByPlace(chord, event);
   return key === chord.key && Boolean(chord.shift) === Boolean(event.shiftKey);
 }
@@ -10102,7 +10157,8 @@ function chordAllowed(binding, chord, target) {
 }
 
 /**
- * The one keydown listener of the page. See the top of this section.
+ * The keydown listener of the page, at the document: every key but the few `onEverywhereKey` takes
+ * first. See the top of this section.
  *
  * @param {KeyboardEvent} event
  */
@@ -10119,6 +10175,37 @@ function onPageKey(event) {
   // else the one the keys moved last.
   const pane = currentScreen === "main" ? paneFor(target) : null;
   inColumn(pane ? paneColumn(pane) : columns.main, () => dispatchKey(event, target));
+}
+
+/**
+ * The chords that act whatever holds the focus: those of the bindings marked `everywhere`, today the
+ * search's Ctrl+/ (Cmd+/). `#344 search-shortcut`.
+ *
+ * Registered at the WINDOW in the CAPTURE phase, which a keydown reaches first: before the document,
+ * before any element's own listener and before `onPageKey`. So nothing the page adds later can keep the
+ * chord from it, a listener that stops the key included. Only a window capture listener registered
+ * before it could, and the page has none; a browser extension's is out of the page's reach. The chord's
+ * default is refused at once, so it is never the browser's, even where it finds nothing to open; a held
+ * chord's repeats are refused too, and do nothing more. The key is NOT stopped: `onPageKey` still hears
+ * it, notes the keys in use, and leaves it alone as a key already taken (`defaultPrevented`), as does
+ * every element's own listener, none of which answers a Ctrl or Cmd chord with "/".
+ *
+ * Nothing fires while an input method composes. An AltGr chord (Ctrl and Alt together, as Windows sends
+ * it) matches no binding, so a "/" typed with AltGr is still a "/".
+ *
+ * @param {KeyboardEvent} event
+ */
+function onEverywhereKey(event) {
+  if (!event || event.isComposing || event.keyCode === 229) return;
+  const binding = KEYMAP.find((one) => one.everywhere && one.run &&
+    one.chords.some((chord) => chord.mod && chordMatches(chord, event)));
+  if (!binding) return;
+  swallow(event);
+  if (event.repeat) return;
+  keysInUse();
+  const target = /** @type {HTMLElement} */ (event.target || document.activeElement);
+  const pane = currentScreen === "main" ? paneFor(target) : null;
+  inColumn(pane ? paneColumn(pane) : columns.main, () => binding.run(event, target));
 }
 
 /** `onPageKey`, in the column it chose: the first binding that takes the key, else the scroll keys. */
@@ -10212,7 +10299,7 @@ function renderKeyHints() {
   el("single-keys").checked = singleKeys;
   el("single-keys-hint").textContent = singleKeys
     ? "Keys such as j, k, e and / act on the messages. Press ? for the list."
-    : `Off: Esc, the arrows, Enter and the ${mod} chords still work. ${mod}+/ lists them.`;
+    : `Off: Esc, the arrows, Enter and the ${mod} chords still work. ${mod}+? lists them.`;
   for (const [id, said] of controlShortcuts("controls")) {
     if (said.length) el(id).setAttribute("aria-keyshortcuts", said.join(" "));
     else el(id).removeAttribute("aria-keyshortcuts");
@@ -43287,6 +43374,9 @@ document.addEventListener("pointerdown", closeRowMenuOutside);
 // `#224 keyboard-shortcuts`. Every key the page answers, in one place: see `onPageKey`. The switch
 // for the single-key shortcuts is restored first, so the keys are said as they will act.
 document.addEventListener("keydown", onPageKey);
+// `#344 search-shortcut`. ...but for the chords that act whatever holds the focus, heard before any
+// other listener of the page: see `onEverywhereKey`.
+window.addEventListener("keydown", onEverywhereKey, { capture: true });
 // `#296 copy-highlighted-message`. A copy with nothing selected copies the highlighted message.
 document.addEventListener("beforecopy", onPageBeforeCopy);
 document.addEventListener("copy", onPageCopy);

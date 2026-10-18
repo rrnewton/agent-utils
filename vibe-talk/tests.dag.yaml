@@ -382,7 +382,7 @@ steps:
   # foot back from Settings on their row, or with the opened card where it stood, and one at the foot at it
   # (`#280`); and at 393x852 and 1280x800, with no card, a reader 30 to 60px up Main, All or the call's view
   # back from Settings offered no jump and nothing grown under them, one 150px up offered it still (`#207`);
-  # and at 393x852 and 375x667 a reader of that draft who pressed "?" or Ctrl+/ for Help, the draft settled
+  # and at 393x852 and 375x667 a reader of that draft who pressed "?" or Ctrl+? for Help, the draft settled
   # elsewhere, sent from under Help or replaced by a short one while Help was up, back by Esc, Help's Back or
   # the browser's Back on the newest line with no jump, at the foot of Main, All or the call's view or having
   # seen only the card (`#280`).

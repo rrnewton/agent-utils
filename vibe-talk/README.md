@@ -6776,6 +6776,7 @@ scrolls from the keyboard the way any web page does:
 | Home, End | The top of the list, or its newest message |
 | Ctrl+Home, Ctrl+End (Cmd on a Mac) | The same from anywhere, a message box included |
 | `/` | Open the search with its field ready; pressed again, back to what you typed |
+| Ctrl+/ (Cmd+/ on a Mac) | The search from anywhere, whatever holds the focus: a message box with a draft (no slash is typed), a picker or slider, Settings, Help, Reply (its draft kept), an open menu or the reading-pace popover (closed first); single keys on or off |
 | Enter, in the search field | Search older messages, a few pages at a time; the button at the head of the list says Stop meanwhile |
 | `,` or Ctrl+, (Cmd+,) | Settings; pressed again, or Esc, back to where you were |
 | Esc | Closes a menu, the search or a sheet; leaves Settings, Help, Reply or a thread (one opened from the thread list goes back to it); leaves the thread list for the view it was chosen from; never marks anything read |
@@ -6795,6 +6796,26 @@ beside the box while the box keeps the focus and the draft, unless the draft is 
 when they page the draft. Every control in Settings keeps its value the moment it changes, so leaving
 Settings, with Back or Esc, is all that saving needs. A key that types a character (`/`, `,`) never
 acts while you are typing in a field, and nothing acts while an input method is composing a word.
+Ctrl+/ (Cmd+/) does: it is the way to the search from wherever you are.
+
+`#344 search-shortcut`. The owner: "want reliable cmd-/ for search ... Sometimes just pressing '/'
+doesn't work ... prefer it to just be Cmd-/. Currently that pops open help ... map it to Cmd-? (i.e.
+Cmd-shift-/)." A bare `/` searches only from the list: right after a send the focus is still in the
+message box, where `/` is a slash, and after a channel chosen with the mouse it is on the picker,
+where `/` is the picker's type-to-find. The chord has no such exceptions. It is heard at the window in
+the capture phase, before any other listener of the page, so nothing on the page can swallow it, and
+its browser default is always refused. A held chord opens the search once. An open menu, the pace
+popover or the prompts tray closes first; the Reply screen is left with its draft kept, as its Back
+leaves it; a reply open at the foot of a column, and a message's details sheet, stay open. On sign-in,
+where there is nothing to search, it does nothing. The list of keys moved to `?` and Ctrl+? (Cmd+?,
+which is Cmd+Shift+/), and says where Ctrl+/ went.
+
+The chords read the character a key types, so on a layout where `/` takes Shift (Shift+7 on a German
+keyboard) Ctrl+Shift+7 is the search. A key typed with AltGr (Ctrl and Alt together on Windows) is
+never the search, so a `/` typed that way stays a `/`. Two things could not be checked here: macOS
+gives every application's Help menu Cmd+?, and Safari uses Cmd+/ for its status bar, and either may
+take the chord before the page sees it. `?` alone and the Help link still open the list of keys, and
+`/` and the magnifying glass still open the search.
 
 `make -C vibe-talk keyboard-browser` presses these keys through CDP `Input.dispatchKeyEvent` in a
 real Chromium at 1280x800, so the browser's own default scrolling runs, and measures the list on
@@ -6806,7 +6827,7 @@ box. Pass `SCREENSHOTS=/tmp/shots` to keep a PNG of each step.
 `#224 keyboard-shortcuts`. On a desk the messages can be read and dealt with without the mouse.
 The arrows, or `j` and `k`, move a ring from message to message. The ring is real keyboard focus on
 the row, so a screen reader announces the message and its buttons are one Tab away. What a key does
-to "the selected message" it does to the one in the ring. **`?`** (or Ctrl+/, Cmd+/ on a Mac) opens
+to "the selected message" it does to the one in the ring. **`?`** (or Ctrl+?, Cmd+? on a Mac: Shift+/ with the chord) opens
 the full list on the Help screen; the list is generated from the same table the keys are answered
 from, so it cannot name a key the page does not answer.
 
@@ -6919,7 +6940,8 @@ anywhere, including while you are typing in the search, and leaves Settings or H
 the agent's box starts nothing: a conversation starts only when you send. Ctrl+Enter (Cmd+Enter) does the same when the focus is not in a text box;
 in a message box it sends, as before. Held down from outside a box, it goes to the box and leaves the
 draft there unsent: its repeats arrive in the box, and a repeat never sends. The search keeps `/` and
-the magnifying glass, and the Help list says where Ctrl+S went.
+the magnifying glass, and Ctrl+/ (Cmd+/) from anywhere since `#344 search-shortcut`; the Help list
+says where Ctrl+S went.
 
 ### Copying the highlighted message
 
@@ -7333,7 +7355,7 @@ also read as somewhere you configure one.
 entry is now a native `<details>` whose heading is its `<summary>`, all folded, so the screen reads
 as a list of headings, and the way in decides which one is open: a settings group's `?` opens its
 own entry and folds the rest, every time (entries opened on an earlier visit do not pile up); `?`
-and Ctrl+/ (Cmd+/) open Keyboard, the list of keys; **Open help** at the foot of Settings opens
+and Ctrl+? (Cmd+?) open Keyboard, the list of keys; **Open help** at the foot of Settings opens
 none. **Expand all** at the top opens every entry and then reads **Fold all**. Because the
 disclosure is the browser's own, a heading is a button to a screen reader and to Enter and Space,
 and the browser's find (Ctrl+F) still searches folded entries and opens the one it lands in where

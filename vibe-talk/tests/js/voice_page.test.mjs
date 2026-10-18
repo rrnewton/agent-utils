@@ -2649,6 +2649,17 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   // The window's own listeners — today only `online`, the browser's word that the connection is
   // back, which `#195 send-resilience` resumes held sends on.
   const windowListeners = new Map();
+  // `#344 search-shortcut`. Those registered for the capture phase, apart: a browser runs them first of
+  // all, before the document's and the target's own (`page.windowCapture`). `true` or `{ capture: true }`.
+  const windowCaptureListeners = new Map();
+  /** Every listener the page registered at the window for `type`, in the capture phase or not. */
+  page.windowListenersFor = (type, capture) => [...((capture ? windowCaptureListeners : windowListeners).get(type) || [])];
+  /** Fire the window's capture-phase listeners for `type`, which hear an event before anything else on the page. */
+  page.windowCapture = async (type, event) => {
+    for (const fn of windowCaptureListeners.get(type) || []) {
+      await fn(event);
+    }
+  };
   /** Lose or regain the connection — the property AND the event, as a browser does. */
   page.setOnline = async (online) => {
     navigator.onLine = online;
@@ -2717,8 +2728,10 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     window: {
       AudioContext: function () { return new FakeAudioContext(page); },
       location: { origin: "https://vibe.example" },
-      addEventListener: (type, fn) => {
-        windowListeners.set(type, [...(windowListeners.get(type) || []), fn]);
+      addEventListener: (type, fn, options) => {
+        const capture = options === true || Boolean(options && typeof options === "object" && options.capture);
+        const listeners = capture ? windowCaptureListeners : windowListeners;
+        listeners.set(type, [...(listeners.get(type) || []), fn]);
       },
     },
     navigator,
@@ -17545,12 +17558,16 @@ test("A ? OPENS ITS OWN ENTRY AND FOLDS THE REST, every time; Open help opens no
   assert.deepStrictEqual(openHelp(page), [], "Open help, which is about nothing in particular, opened an entry");
 });
 
-test("? AND Ctrl+/ OPEN ONLY THE KEYBOARD ENTRY (#246)", async () => {
-  for (const [key, fields] of [["?", { shiftKey: true }], ["/", { ctrlKey: true }]]) {
+test("? AND Ctrl+? OPEN ONLY THE KEYBOARD ENTRY (#246)", async () => {
+  // `#344 search-shortcut`. Ctrl+? (Cmd+?) is Shift+/ with the chord; and on a Mac a browser may say
+  // "/" for Cmd+Shift+/, the Shift held all the same, which is Help too.
+  for (const [key, fields] of [["?", { shiftKey: true }], ["?", { ctrlKey: true, shiftKey: true, code: "Slash" }],
+    ["/", { metaKey: true, shiftKey: true, code: "Slash" }]]) {
     const page = await keyboardPage();
     await press(page, page.el("scroll-area"), key, fields);
-    assert.equal(page.screen(), "help");
+    assert.equal(page.screen(), "help", `${JSON.stringify(fields)} ${key} did not open Help`);
     assert.deepStrictEqual(openHelp(page), ["keyboard"], `${key} opened ${openHelp(page).join(", ") || "nothing"}`);
+    assert.equal(page.el("search-field").hidden, true, `${JSON.stringify(fields)} ${key} opened the search`);
   }
 });
 
@@ -20577,24 +20594,31 @@ function keyOn(target, key, fields = {}) {
   const event = {
     key, code: "", keyCode: 0, shiftKey: false, ctrlKey: false, metaKey: false, altKey: false,
     isComposing: false, repeat: false, defaultPrevented: false, target, ...fields, defaulted: true,
+    stopped: false,
   };
   event.preventDefault = () => {
     event.defaulted = false;
     event.defaultPrevented = true;
+  };
+  event.stopPropagation = () => {
+    event.stopped = true;
   };
   return event;
 }
 
 /**
  * Press `key` with the focus on `target` — null for nothing focused, which a browser reports as the
- * body — the target's own listeners first and then the document's, as a keydown bubbles.
+ * body — in the order a browser hands a keydown round: the window's capture-phase listeners first
+ * (`#344 search-shortcut`), then the target's own, then the document's as it bubbles. A listener that
+ * stops the key keeps it from those after it.
  */
 async function press(page, target, key, fields = {}) {
   if (target && typeof target.focus === "function") target.focus();
   else FakeElement.focused = null;
   const event = keyOn(target, key, fields);
-  if (target && typeof target.dispatch === "function") await target.dispatch("keydown", event);
-  await page.documentEvent("keydown", event);
+  await page.windowCapture("keydown", event);
+  if (!event.stopped && target && typeof target.dispatch === "function") await target.dispatch("keydown", event);
+  if (!event.stopped) await page.documentEvent("keydown", event);
   await page.settle();
   return event;
 }
@@ -21219,6 +21243,10 @@ test("NO KEY FIRES while an input method composes, from a phone's keyboard, or w
     // What a phone's on-screen keyboard reports for nearly every key.
     ["Unidentified", { keyCode: 229 }], ["/", { keyCode: 229 }],
     ["/", { altKey: true }], [",", { altKey: true }], ["j", { ctrlKey: true }], ["e", { metaKey: true }],
+    // `#344 search-shortcut`. The search's chord too: composing, from a phone's keyboard, and a "/" typed
+    // with AltGr, which Windows sends as Ctrl and Alt together.
+    ["/", { ctrlKey: true, isComposing: true }], ["/", { metaKey: true, keyCode: 229 }],
+    ["/", { ctrlKey: true, altKey: true }],
     // `#281 view-keys`. Ctrl+1 to Ctrl+4 choose the views now; a chord past them is still the browser's.
     ["e", { altKey: true }], ["5", { ctrlKey: true }], ["1", { ctrlKey: true, isComposing: true }],
     ["PageDown", { isComposing: true }],
@@ -24417,7 +24445,8 @@ test("ON A MAC, Ctrl+K in a message box is the box's own (delete to the end of t
 });
 
 test("HELP LEFT BY THE SEARCH OR SETTINGS KEY forgets the ?: the next Help from Settings goes back to Settings", async () => {
-  for (const [key, fields] of [[",", {}], [",", { ctrlKey: true }], ["/", {}], ["s", { ctrlKey: true }]]) {
+  for (const [key, fields] of [[",", {}], [",", { ctrlKey: true }], ["/", {}], ["/", { ctrlKey: true }],
+    ["s", { ctrlKey: true }]]) {
     const said = `${fields.ctrlKey ? "Ctrl+" : ""}${key}`;
     const page = await keyboardPage();
     await press(page, page.el("scroll-area"), "?", { shiftKey: true });
@@ -24471,8 +24500,9 @@ test("PgDn FROM THE SELECTED MESSAGE waits for ONE scroll to end, and for none a
   assert.equal(waiting(), 1, "the pane's one listener was added again");
 });
 
-test("? AND Ctrl+/ open the list of every key, and Esc goes back to where they were pressed", async () => {
-  for (const [key, fields] of [["?", { shiftKey: true }], ["/", { ctrlKey: true }], ["/", { metaKey: true }]]) {
+test("? AND Ctrl+? open the list of every key, and Esc goes back to where they were pressed", async () => {
+  for (const [key, fields] of [["?", { shiftKey: true }], ["?", { ctrlKey: true, shiftKey: true }],
+    ["?", { metaKey: true, shiftKey: true }], ["/", { metaKey: true, shiftKey: true, code: "Slash" }]]) {
     const page = await keyboardPage();
     const area = page.el("scroll-area");
     area.scrollTop = 1000;
@@ -24503,6 +24533,212 @@ test("? AND Ctrl+/ open the list of every key, and Esc goes back to where they w
   assert.equal(reply.screen(), "reply");
 });
 
+// --- the search from anywhere (#344 search-shortcut) ---------------------------------------------
+//
+// The owner: "want reliable cmd-/ for search ... Sometimes just pressing '/' doesn't work ... prefer it
+// to just be Cmd-/. Currently that pops open help ... map it to Cmd-? (i.e. Cmd-shift-/)." A bare "/"
+// is a character in a field, the picker's type-to-find and nothing with single keys off; the chord is
+// none of those. tests/search_chord_browser.py presses the same chords in Chromium through CDP.
+
+/** Whether the search is open with its field holding the focus. */
+const searchReady = (page) => !page.el("search-field").hidden && focused(page) === page.el("search-field");
+
+/** `keyboardPage`, on `script`. */
+async function keyboardPageOn(script, platform = "Linux x86_64") {
+  const page = newPage(new Map(), script, (p) => p.setPlatform(platform));
+  await signIn(page);
+  await showDiscord(page, tallChannel(30));
+  return page;
+}
+
+test("`#344 search-shortcut`: Ctrl+/ AND Cmd+/ OPEN THE SEARCH FROM ANYWHERE, whatever holds the focus, and a bare / is as it was", async () => {
+  for (const [platform, mod] of [["Linux x86_64", "ctrlKey"], ["MacIntel", "metaKey"]]) {
+    const said = `${platform}, ${mod === "ctrlKey" ? "Ctrl" : "Cmd"}+/`;
+    /** The chord on `target`: the key taken, the main screen up, the search open and its field focused. */
+    const opens = async (page, target, where, extra = {}) => {
+      const event = await press(page, target, "/", { [mod]: true, ...extra });
+      assert.equal(event.defaulted, false, `${said} ${where} was left to the browser`);
+      assert.equal(page.screen(), "main", `${said} ${where} left the screen on ${page.screen()}`);
+      assert.ok(searchReady(page), `${said} ${where}: the search is ${page.el("search-field").hidden ? "shut" : "open"}, ` +
+        `the focus on ${focusName(page)}`);
+      return event;
+    };
+    // The list, and a selected message.
+    let page = await keyboardPage(platform);
+    await opens(page, page.el("scroll-area"), "on the list");
+    page = await keyboardPage(platform);
+    await press(page, page.el("scroll-area"), "ArrowDown");
+    assert.ok(selectedId(page), "fixture: ↓ selected no message");
+    await opens(page, focused(page), "on a selected message");
+    // A message box with a draft: no slash typed and the draft as it was; a bare "/" there is still a slash.
+    page = await keyboardPage(platform);
+    const box = page.el("channel-compose-text");
+    await box.setValue("see the ");
+    const slash = await press(page, box, "/");
+    assert.equal(slash.defaulted, true, "a bare \"/\" in the message box was taken from it");
+    assert.equal(page.el("search-field").hidden, true, "a bare \"/\" in the message box opened the search");
+    await opens(page, box, "in the message box");
+    assert.equal(box.value, "see the ", `${said} touched the draft`);
+    // The search field with words in it: the field again, its text selected to be typed over.
+    await page.el("search-field").setValue("deploy");
+    const selected = page.el("search-field").selectedTimes || 0;
+    await opens(page, page.el("search-field"), "in the search field");
+    assert.equal(page.el("search-field").value, "deploy", `${said} in the search field lost its words`);
+    assert.equal(page.el("search-field").selectedTimes, selected + 1, `${said} in the search field did not select its text`);
+    // On a layout where "/" takes Shift (Shift+7 on German), the chord with that key.
+    page = await keyboardPage(platform);
+    await opens(page, page.el("channel-compose-text"), "as Shift+7 on a German keyboard", { shiftKey: true, code: "Digit7" });
+    // The pickers, where a bare "/" is the picker's type-to-find, and the reading-width handle.
+    for (const id of ["discord-channel", "thread-select", "width-grip"]) {
+      page = await keyboardPage(platform);
+      if (id !== "width-grip") {
+        await press(page, page.el(id), "/");
+        assert.equal(page.el("search-field").hidden, true, `a bare "/" on #${id} opened the search`);
+      }
+      await opens(page, page.el(id), `on #${id}`);
+    }
+    // An open ⋯ menu, the focus on an item: closed first.
+    page = await keyboardPage(platform);
+    const row = page.el("discord-log").children[4];
+    await rowMoreButton(row).click();
+    const item = rowMoreMenu(row).descendants().find((node) => node.tagName === "button");
+    assert.ok(item && !rowMoreMenu(row).hidden, "fixture: the ⋯ menu did not open with an item in it");
+    await opens(page, item, "on an item of an open ⋯ menu");
+    assert.equal(rowMoreMenu(row).hidden, true, `${said} left the ⋯ menu open`);
+    // The reading-pace popover, the focus on its slider: closed first.
+    page = await keyboardPage(platform);
+    await page.el("read-speed").click();
+    await page.settle();
+    assert.equal(page.el("speed-popover").hidden, false, "fixture: the pace button did not open its popover");
+    await press(page, page.el("read-speed-range"), "/");
+    assert.equal(page.el("search-field").hidden, true, "a bare \"/\" on the pace slider opened the search");
+    await opens(page, page.el("read-speed-range"), "on the pace popover's slider");
+    assert.equal(page.el("speed-popover").hidden, true, `${said} left the pace popover open`);
+    // The prompts tray: closed first.
+    page = await keyboardPage(platform);
+    await page.el("prompts-open").click();
+    await page.settle();
+    assert.equal(page.el("prompts-tray").hidden, false, "fixture: the prompts tray did not open");
+    await opens(page, page.el("prompts-open"), "with the prompts tray open");
+    assert.equal(page.el("prompts-tray").hidden, true, `${said} left the prompts tray open`);
+    // A message's details sheet is part of its row, not something over the list: it stays.
+    page = await keyboardPage(platform);
+    await press(page, page.el("scroll-area"), "ArrowDown");
+    const lit = focused(page);
+    await press(page, lit, "i");
+    const sheet = () => lit.descendants().find((node) => node.className === "msg-details");
+    assert.ok(sheet(), "fixture: i opened no details sheet");
+    await opens(page, lit, "on a message with its details open");
+    assert.ok(sheet(), `${said} closed the details sheet`);
+    // Settings, from a text field on it: left, the field's words as they were.
+    page = await keyboardPage(platform);
+    await page.el("open-settings").click();
+    await page.el("noise-rule-new").setValue("build bot");
+    await opens(page, page.el("noise-rule-new"), "in a text field on Settings");
+    assert.equal(page.el("noise-rule-new").value, "build bot", `${said} on Settings changed the field`);
+    // Help.
+    page = await keyboardPage(platform);
+    await press(page, page.el("scroll-area"), "?", { shiftKey: true });
+    assert.equal(page.screen(), "help", "fixture: ? did not open Help");
+    await opens(page, page.el("screen-help"), "on Help");
+    // Single keys off: the bare "/" goes with them, the chord does not.
+    page = await keyboardPage(platform);
+    await page.el("open-settings").click();
+    await page.el("single-keys").setChecked(false);
+    await page.el("close-settings").click();
+    const off = await press(page, page.el("scroll-area"), "/");
+    assert.equal(off.defaulted, true, "with single keys off, a bare \"/\" was taken");
+    assert.equal(page.el("search-field").hidden, true, "with single keys off, a bare \"/\" opened the search");
+    await opens(page, page.el("scroll-area"), "with single keys off");
+    // Reply: left with its draft kept, as its Back leaves it; the reply opened again holds it.
+    page = await keyboardPage(platform);
+    const answered = (await openReplyOn(page, tallChannel(30), 2)).getAttribute("data-id");
+    await page.el("reply-text").setValue("half a reply");
+    const bare = await press(page, page.el("reply-scroll"), "/");
+    assert.equal(page.screen(), "reply", "a bare \"/\" left the reply screen");
+    assert.equal(bare.defaulted, true, "a bare \"/\" on Reply, where there is nothing to search, was taken");
+    await opens(page, page.el("reply-text"), "on Reply");
+    await replyButton(channelRow(page, answered)).click();
+    assert.equal(page.screen(), "reply");
+    assert.equal(page.el("reply-text").value, "half a reply", `${said} on Reply lost the reply's draft`);
+  }
+  // Two columns: the right column's box, its draft as it was; then a reply open at the foot of that
+  // column stays open, its draft with it: the search is over the list beside it.
+  const { page } = await twoColumnServer();
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  assert.equal(page.el("side-pane").hidden, false, "fixture: the thread did not open on the right");
+  const side = page.el("side-compose-text");
+  await side.setValue("in the thread");
+  let event = await press(page, side, "/", { ctrlKey: true });
+  assert.equal(event.defaulted, false);
+  assert.ok(searchReady(page), `Ctrl+/ in the right column's box left the focus on ${focusName(page)}`);
+  assert.equal(side.value, "in the thread", "Ctrl+/ in the right column's box touched its draft");
+  await press(page, page.el("search-field"), "Escape");
+  await replyButton(sideRow(page, "202")).click();
+  await page.settle();
+  assert.equal(replyBoxAt(page), "right", "fixture: Reply in the right column did not open its box at that column's foot");
+  await page.el("reply-text").setValue("draft words");
+  event = await press(page, page.el("reply-text"), "/", { ctrlKey: true });
+  assert.equal(event.defaulted, false);
+  assert.ok(searchReady(page), `Ctrl+/ in a reply open in a column left the focus on ${focusName(page)}`);
+  assert.equal(replyBoxAt(page), "right", "Ctrl+/ put down the reply open in the column");
+  assert.equal(page.el("reply-text").value, "draft words");
+  // Sign-in, where there is nothing to search: nothing opens, and the chord is not the browser's either.
+  const signin = newPage();
+  assert.equal(signin.screen(), "signin", "fixture: a new page is not on sign-in");
+  event = await press(signin, signin.el("api-token"), "/", { ctrlKey: true });
+  assert.equal(event.defaulted, false, "Ctrl+/ on sign-in was left to the browser");
+  assert.equal(signin.screen(), "signin");
+  assert.equal(signin.el("search-field").hidden, true, "Ctrl+/ on sign-in opened the search");
+});
+
+test("`#344 search-shortcut`: THE SEARCH CHORD IS HEARD FIRST, at the window in the capture phase, so a listener that stops the key cannot keep it from the search", async () => {
+  const page = await keyboardPage();
+  assert.equal(page.windowListenersFor("keydown", true).length, 1, "not one keydown listener in the window's capture phase");
+  assert.equal(page.windowListenersFor("keydown", false).length, 0, "a keydown listener in the window's bubble phase");
+  /** A listener on the message box that notes whether the search is open when it runs, and stops the key there. */
+  const stopper = (target) => {
+    const seen = [];
+    target.addEventListener("keydown", (event) => {
+      seen.push(!page.el("search-field").hidden);
+      event.stopPropagation();
+      event.preventDefault();
+    });
+    return seen;
+  };
+  const seen = stopper(page.el("channel-compose-text"));
+  await page.el("channel-compose-text").setValue("draft");
+  const event = await press(page, page.el("channel-compose-text"), "/", { ctrlKey: true });
+  assert.deepStrictEqual(seen, [true], "the box's own listener ran before the search was open");
+  assert.equal(event.defaulted, false);
+  assert.ok(searchReady(page), `with the key stopped at the box, Ctrl+/ left the focus on ${focusName(page)}`);
+  // NEGATIVE CONTROL: without the window's listener the table's own walk still searches on Ctrl+/ (the
+  // same binding, from the document), until something on the way stops the key.
+  const deafScript = brokenScript('window.addEventListener("keydown", onEverywhereKey, { capture: true });', "");
+  const deaf = await keyboardPageOn(deafScript);
+  await press(deaf, deaf.el("channel-compose-text"), "/", { ctrlKey: true });
+  assert.ok(searchReady(deaf), "without the window's listener Ctrl+/ did not search from the document either");
+  const stopped = await keyboardPageOn(deafScript);
+  stopper(stopped.el("channel-compose-text"));
+  await press(stopped, stopped.el("channel-compose-text"), "/", { ctrlKey: true });
+  assert.equal(stopped.el("search-field").hidden, true, "the control without the window's listener searched though the key was stopped");
+});
+
+test("`#344 search-shortcut`: A HELD Ctrl+/ OPENS THE SEARCH ONCE, its repeats refused and doing nothing", async () => {
+  const page = await keyboardPage();
+  await press(page, page.el("scroll-area"), "/", { ctrlKey: true });
+  assert.ok(searchReady(page));
+  const field = page.el("search-field");
+  const selected = field.selectedTimes || 0;
+  for (let i = 0; i < 3; i += 1) {
+    const repeat = await press(page, field, "/", { ctrlKey: true, repeat: true });
+    assert.equal(repeat.defaulted, false, "a held Ctrl+/'s repeat was left to the browser");
+  }
+  assert.equal(field.selectedTimes || 0, selected, "a held Ctrl+/'s repeats selected the field again");
+  assert.ok(searchReady(page), "a held Ctrl+/'s repeats closed the search");
+});
+
 test("THE LIST OF KEYS IS THE KEYMAP: every binding's words and meaning, in the reader's own keyboard words", async () => {
   // Read off the source's own table, so the list cannot be checked against a second copy of it.
   const table = /const KEYMAP = \[([\s\S]*?)\n\];/.exec(SCRIPT_CODE);
@@ -24517,7 +24753,8 @@ test("THE LIST OF KEYS IS THE KEYMAP: every binding's words and meaning, in the 
       assert.ok(list.includes(meaning), `${platform}: the list of keys leaves out "${meaning}"`);
     }
     for (const words of ["↓ or j", "↑ or k", "Enter or o", "Esc", "PgUp", "Shift+E", `${mod}+1`, `${mod}+2`, `${mod}+3`,
-      `${mod}+4`, `${mod}+S`, `${mod}+,`, `${mod}+K`, `${mod}+/`, `${mod}+Home`, `${alt}+↓`, "Shift+P", "Shift+L"]) {
+      `${mod}+4`, `${mod}+S`, `${mod}+,`, `${mod}+K`, `${mod}+/`, `${mod}+?`, `${mod}+Home`, `${alt}+↓`, "Shift+P",
+      "Shift+L"]) {
       assert.ok(list.includes(words), `${platform}: the list of keys does not name ${words}`);
     }
     // `#281 view-keys`. The bare digits are gone from it, and it says so, and where a browser may keep the chords.
@@ -24529,8 +24766,12 @@ test("THE LIST OF KEYS IS THE KEYMAP: every binding's words and meaning, in the 
     assert.ok(list.includes("a browser that keeps them for its tabs switches tabs instead"),
       `${platform}: the list of keys does not say a browser may keep the chords`);
     assert.ok(!list.includes(`${other}+`), `${platform}: the list of keys names ${other}`);
-    // `#248 composer-key`. The chord left the search for the message box, and its tooltip with it.
-    assert.equal(page.el("search-toggle").getAttribute("title"), "Search messages (/)", platform);
+    // `#248 composer-key`. The chord left the search for the message box, and its tooltip with it;
+    // `#344 search-shortcut` gave it ${mod}+/, and the list says where that chord went from Help.
+    assert.equal(page.el("search-toggle").getAttribute("title"), `Search messages (/ or ${mod}+/)`, platform);
+    assert.ok(list.includes(`${mod}+/ searches from anywhere`), `${platform}: the list of keys does not say ${mod}+/ searches`);
+    assert.ok(list.includes(`${mod}+? is ${mod}+Shift+/; ${mod}+/, which opened this list until now, searches`),
+      `${platform}: the list of keys does not say where ${mod}+/ went`);
     assert.ok(list.includes(`${mod}+S, which searched until now, goes to the message box`),
       `${platform}: the list of keys does not say where ${mod}+S went`);
     assert.equal(page.el("open-settings").getAttribute("title"), `Settings (, or ${mod}+,)`, platform);
@@ -24544,7 +24785,8 @@ test("aria-keyshortcuts names each control's key, from the same table, and drops
   const page = await keyboardPage();
   const row = page.el("discord-log").children[3];
   const expected = new Map([
-    [page.el("search-toggle"), "/"],
+    [page.el("search-toggle"), "/ Control+/ Meta+/"],
+    [page.el("help-link-keyboard"), "? Control+? Meta+?"],
     [page.el("channel-compose-text"), "C Control+S Meta+S"],
     [page.el("reply-text"), "C Control+S Meta+S"],
     [page.el("compose-text"), "C Control+S Meta+S"],
@@ -24563,7 +24805,10 @@ test("aria-keyshortcuts names each control's key, from the same table, and drops
   }
   await page.el("open-settings").click();
   await page.el("single-keys").setChecked(false);
-  assert.equal(page.el("search-toggle").getAttribute("aria-keyshortcuts"), null, "a search key turned off is still announced");
+  assert.equal(page.el("search-toggle").getAttribute("aria-keyshortcuts"), "Control+/ Meta+/",
+    "a search key turned off is still announced, or the chord the switch leaves on is not");
+  assert.equal(page.el("help-link-keyboard").getAttribute("aria-keyshortcuts"), "Control+? Meta+?");
+  assert.equal(page.el("search-toggle").getAttribute("title"), "Search messages (Ctrl+/)");
   assert.equal(page.el("channel-compose-text").getAttribute("aria-keyshortcuts"), "Control+S Meta+S");
   assert.equal(page.el("todo-filter").getAttribute("aria-keyshortcuts"), null, "a key turned off is still announced");
   assert.equal(doneButton(page.el("discord-log").children[3]).getAttribute("aria-keyshortcuts"), null,
@@ -67476,7 +67721,7 @@ test("`#269 approval-card-inline` x `#280 scroll-stability`: BACK FROM SETTINGS,
 });
 
 // `#269 approval-card-inline` x `#280 scroll-stability`, from the final review. A trip to Help opened by its key,
-// "?" or Ctrl+/, still moved a reader who had not moved, on a narrow screen with a keyboard, when the long draft
+// "?" or Ctrl+/ (Ctrl+? since `#344 search-shortcut`), still moved a reader who had not moved, on a narrow screen with a keyboard, when the long draft
 // opened by More was settled elsewhere, sent from under Help or replaced while Help was up. In Chromium at
 // 393x852 a reader at the foot of Main came back 58px above it, by Esc, by Help's Back or by the browser's Back,
 // and 200px above it with the jump offered once the box took back its room. showScreen showed the main screen
@@ -67562,8 +67807,8 @@ test("`#269 approval-card-inline` x `#280 scroll-stability`: BACK FROM HELP OPEN
   // What the control pane's row gives the list on a 393x852 phone in Chromium while the pane is hidden.
   const PANE = 66;
   const HELP = [["?", "Esc"], ["?", "Back"], ["?", "Browser"]];
-  // Main's reader at its foot by the other key too.
-  const SLASH = [["Ctrl+/", "Esc"], ["Ctrl+/", "Back"], ["Ctrl+/", "Browser"]];
+  // Main's reader at its foot by the other key too (Ctrl+/ until `#344 search-shortcut`).
+  const SLASH = [["Ctrl+?", "Esc"], ["Ctrl+?", "Back"], ["Ctrl+?", "Browser"]];
   // Settings by the gear and its Back, which lets go of the focus before anything is shown.
   const GEAR = [["gear", "Back"]];
   const readers = [["Main", 0], ["Main", 40], ["Main", 150], ["All", 0], ["All", 40], ["All", 150], ["Call", 0]];
@@ -67624,7 +67869,7 @@ test("`#269 approval-card-inline` x `#280 scroll-stability`: BACK FROM HELP OPEN
           assert.ok(gap() === up && (up === 0 ? sendShown() : rowOnScreen(page) === null && card.getBoundingClientRect().top < 0),
             `the premise: the reader ${up === 0 ? "at the foot, Send on screen" : `${up}px up sees the card and no row`} (${where})`);
           if (key === "gear") await tap("open-settings");
-          else await press(page, focused(page) || main, key === "?" ? "?" : "/", key === "?" ? { shiftKey: true } : { ctrlKey: true });
+          else await press(page, focused(page) || main, "?", key === "?" ? { shiftKey: true } : { ctrlKey: true, shiftKey: true });
           await settled();
           const away = key === "gear" ? "settings" : "help";
           assert.ok(page.screen() === away && card.parentNode === page.el("frame-body") && !card.hidden,
