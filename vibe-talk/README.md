@@ -4500,7 +4500,8 @@ voice providers](#conversational-voice-providers)); what matters here is when it
   voice service replaced the session", and a `replay_ack` the old session still owed is ignored.
   The conversation is still the call's, so no line is drawn between the two sessions. While nothing
   has been said since the recap went, the seam above the call and its start marker turn to "no
-  recap sent" as well; after that they keep what the first session was sent.
+  recap sent" as well; once anything has been said below it, a turn still being spoken included,
+  both keep what the first session was sent.
 
 The privacy note below applies unchanged: on this backend the earlier conversation goes to the
 bridge, and on to whatever model it uses.

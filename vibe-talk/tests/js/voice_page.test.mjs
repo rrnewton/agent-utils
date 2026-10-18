@@ -67000,6 +67000,39 @@ test("`#331 resume-on-websocket`: a replacement session on the same socket was s
   assert.equal(careless.el("resume-state").textContent, "The last call was resumed: the agent took 11 words from earlier.");
 });
 
+test("`#331 resume-on-websocket`: a replacement while a turn to the first session is still open keeps what that session was sent, above the call and in its marker, and a reload says the same", async () => {
+  // The owner's words, or the agent's greeting, are drawn as they come and filed only when the turn
+  // ends, so the start marker is still unfiled when the bridge replaces the session mid-turn.
+  for (const [role, words] of [["user", "is it back now"], ["assistant", "welcome back"]]) {
+    const page = newPage();
+    page.transcriptRecordsSupported = true;
+    await withEarlierConversation(page, { resume: true });
+    const socket = await startV1Call(page, ["replay"]);
+    socket.onmessage({ data: JSON.stringify({ type: "replay_ack", accepted: true }) });
+    await page.settle();
+    speech(socket, role, 1, words, true);
+    await page.settle();
+    socket.onmessage({ data: JSON.stringify({ type: "session_started", greeting: false, capabilities: ["replay"] }) });
+    await page.settle();
+    turnDone(socket, 1);
+    await watchTurns(page);
+    assert.equal(callRecap(page), REPLACED_LINE, `${role}: the line under the call is about the session now running`);
+    const live = boundaryLines(page).find((li) => li.getAttribute("data-ends") === "conv_earlier");
+    assert.equal(seamChip(live), "11-word recap sent", `${role}: the line above denies the recap the first session took`);
+    const filed = [...page.storedTurns.entries()].find(([id]) => id !== "conv_earlier");
+    assert.ok(filed, `${role}: the call filed nothing`);
+    assert.deepEqual(filed[1][0].detail.recap,
+      { state: "sent", words: 11, lines: 2, dropped: 0, transport: "replay_frame" },
+      `${role}: the start marker says something else than the line above the call`);
+    const said = boundaryWords(live);
+    await page.el("hang-up").click();
+    await page.settle();
+    const restored = boundaryLines(await reloadOf(page)).find((li) => li.getAttribute("data-ends") === "conv_earlier");
+    assert.ok(restored, `${role}: a reload drew no line above the call`);
+    assert.deepEqual(boundaryWords(restored), said, `${role}: a reload says something else above the call`);
+  }
+});
+
 test("`#331 resume-on-websocket`: on the hosted backend the call says what it was SENT, in the server's words, and how much did not fit", async () => {
   const page = newPage();
   page.replayWords = 412;

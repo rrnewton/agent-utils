@@ -6372,8 +6372,11 @@ function setSeamRecap(li, boundary) {
  * call's end drew, or the one the restored record ends with — while nothing said is between the two.
  * There is always one when anything is above: a call that opened ended with one, and a restored
  * record ends with one. A screen with nothing on it has nothing above to have been recapped.
+ * Answers whether it said so: false when something said, drawn as it comes and filed only when its
+ * turn ends, already stands below the line, or there is no line.
  *
  * @param {any} recap
+ * @returns {boolean}
  */
 function settleBoundary(recap) {
   const rows = [...leftEl("transcript").children];
@@ -6381,11 +6384,12 @@ function settleBoundary(recap) {
     const row = rows[at];
     if (row.getAttribute("data-ends") !== null) {
       setSeamRecap(row, boundaryFor(recap, row.getAttribute("data-cause")));
-      return;
+      return true;
     }
     // Something said below every boundary: the line above it is not this call's.
-    if (row.getAttribute("data-search") !== null) return;
+    if (row.getAttribute("data-search") !== null) return false;
   }
+  return false;
 }
 
 /**
@@ -6588,13 +6592,15 @@ function noteSessionReplaced() {
  * under the call says the session now running started fresh, and, while nothing has been said
  * since a recap went, so do the line above the call and the conversation's start marker, as a
  * refusal does (`noteReplayAck`). Once something has been said, those keep what its session was sent.
+ * "Said" is the line's own test (`settleBoundary`), and the marker follows the line, so a reload says
+ * what it did: a turn is drawn as it comes but filed, with the marker before it, only when it ends,
+ * so a marker still unfiled is no sign that nothing was said.
  */
 function noteReplacedV1Session() {
   const handed = session.recap;
   const recap = noteSessionReplaced();
   addDetail("the voice service replaced the session, and the new one was sent no recap");
-  if (handed && handed.state === "sent") {
-    settleBoundary(recap);
+  if (handed && handed.state === "sent" && settleBoundary(recap)) {
     const start = startMarkers.get(session.conversationId);
     if (start) start.recap = recap;
   }
