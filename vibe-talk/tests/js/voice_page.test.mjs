@@ -20755,6 +20755,39 @@ test("`#340 composer-grow-box`: SEND STAYS IN VIEW as the box grows under the re
   assert.equal(area.scrollTop, 0, "with Grow off a resize of the box moved the list");
 });
 
+test("`#340 composer-grow-box`: A READER AT THE FOOT WHO PASTES AND THEN TICKS Grow stays at the foot as the box grows, the focus on the checkbox; one up the list is not moved", async () => {
+  const page = newPage(new Map(), SCRIPT, (p) => p.enableResizeObserver());
+  await signIn(page);
+  await showDiscord(page, tallChannel(30));
+  const screen = page.el("screen-main");
+  const area = page.el("scroll-area");
+  const box = page.el("channel-compose-text");
+  const grow = page.el("channel-compose-grow");
+  grow.getClientRects = () => [{ top: 0, bottom: 24 }];
+  // What the stylesheet does with a long draft: the box at rest is three lines, and ticked it grows to its cap.
+  box.height = () => (screen.hasAttribute("data-composer-grow") ? 400 : 80);
+  const gap = () => area.scrollHeight - area.scrollTop - area.clientHeight;
+  box.focus();
+  await box.setValue("line\n".repeat(40));
+  page.resized(box);
+  area.scrollTop = area.scrollHeight;
+  await area.dispatch("scroll");
+  assert.equal(gap(), 0, "the premise: the reader is at the foot of the list with the pasted draft");
+  // A click or Space on the checkbox puts the focus there, and ticks it.
+  grow.focus();
+  await grow.setChecked(true);
+  page.resized(box);
+  assert.ok(atBottomOf(area), `ticking Grow after a paste left the reader ${gap()}px above the foot`);
+  // From up the list, Grow off and on again moves nothing.
+  await grow.setChecked(false);
+  page.resized(box);
+  area.scrollTop = 0;
+  await area.dispatch("scroll");
+  await grow.setChecked(true);
+  page.resized(box);
+  assert.equal(area.scrollTop, 0, "ticking Grow moved a reader up the list");
+});
+
 // --- the keyboard (#224 keyboard-shortcuts) -------------------------------------------------------
 //
 // The owner, in the installed app on a Mac desk: PgUp, PgDn, Home and End did nothing, and he wanted

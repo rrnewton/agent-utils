@@ -7699,6 +7699,10 @@ function writingToAgent() {
 //   * SEND STAYS IN VIEW while the box grows under the reader's typing: its composer is brought into
 //     its list whole (`keepBoxInView`). Only for the box with the focus, so a draft put back into a box
 //     under a reader up the list moves nothing (`#280 scroll-stability`).
+//   * AND AS GROW IS TICKED: the owner pastes, sees the box tiny, then ticks Grow, and the box that
+//     grows then is not the one with the focus, which the click or Space has put on the checkbox. A
+//     reader at the foot of a list is kept at its foot as Grow changes the boxes in it
+//     (`applyComposerGrow`); one up the list is not moved.
 
 const COMPOSER_GROW_KEY = "vibe-talk.voice.composer-grow";
 
@@ -7725,14 +7729,21 @@ function storedComposerGrow() {
   }
 }
 
-/** Grow ticked or unticked by the reader: kept, and drawn. */
+/**
+ * Grow ticked or unticked by the reader: kept, and drawn. Each list the reader was at the foot of is
+ * put back at its foot once the boxes in it are drawn at their new height, so a draft pasted before
+ * Grow was ticked grows with Send in view; `keepGrowingBoxInView` cannot do it, since the focus is on
+ * the checkbox now, not the box. Both lists, as the one choice grows the boxes in both.
+ */
 function applyComposerGrow(on) {
   try {
     localStorage.setItem(COMPOSER_GROW_KEY, on ? "1" : "0");
   } catch (_error) {
     // A browser that refuses storage still honours the choice for this session.
   }
+  const footed = ["scroll-area", "side-scroll"].map((id) => leftEl(id)).filter((area) => atBottom(area));
   renderComposerGrow(on);
+  for (const area of footed) area.scrollTop = area.scrollHeight;
 }
 
 /**

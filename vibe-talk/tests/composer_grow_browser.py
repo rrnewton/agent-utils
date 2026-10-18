@@ -21,6 +21,11 @@ page out in Chromium and measures the box, Send and the list they are in, with a
   in two columns, the right column's Grow ticked in step and a long paste into its box growing it with
   that column's Send on screen.
 
+  The owner's own order, too: a paste with Grow off, the list at its foot, and only then Grow ticked,
+  which takes the focus from the box to the checkbox. The box grows and the reader stays at the foot
+  with Send and Grow on screen and no jump to the newest offered, in the channel's box (ten lines and
+  eighty), the call's and the right column's, and in the second desk below by a click and by Space.
+
   A second desk whose browser does not size a field by its text (`CSS.supports` answering no for
   `field-sizing`, and `field-sizing: fixed` forced): the box grows through the height the page writes,
   capped the same, and a reader at the foot of the list who types line after line stays at the foot
@@ -57,7 +62,11 @@ if TYPE_CHECKING:
 FIRST_ROW = "#discord-log > li[data-id]"
 GROW_KEY = "vibe-talk.voice.composer-grow"
 LONG = "\n".join(f"Line {n + 1}: the release notes as pasted, every target named and every step kept." for n in range(80))
+TEN = "\n".join(f"Line {n + 1} of a ten-line message." for n in range(10))
 SHORT = "first line\nsecond line\nthird line"
+
+# Each list's jump to its newest message, which a reader left above the foot is offered.
+JUMP_CHIPS = {"scroll-area": "jump-newest", "side-scroll": "side-jump-newest"}
 
 # Each composer: the composer, its box, its Send, its Grow checkbox, and the list it is in.
 CHANNEL_PARTS = ("channel-composer", "channel-compose-text", "channel-send", "channel-compose-grow", "scroll-area")
@@ -374,6 +383,63 @@ def typing_at_the_foot(desk: Desk, rest: Json) -> None:
     desk.notes.append(f"{desk.label}: a reader at the foot typing fourteen lines stayed at the foot, Send on screen")
 
 
+def tick_after_paste(desk: Desk, parts: tuple[str, ...], text: str, by: str = "click") -> None:
+    """The owner's order: paste with Grow off, the list at its foot, see the box tiny, then tick Grow.
+
+    The focus leaves the box for the checkbox as it is ticked (`by` "click" on its label, or "space" on
+    the checkbox), so nothing that follows the reader's typing can be what keeps them at the foot: the
+    box grows and the reader stays at the foot, Send, Grow and the box all on screen, no jump to the
+    newest offered; and clicking back into the box moves nothing.
+    """
+    _composer, box, _send, grow, list_id = parts
+    lines = text.count("\n") + 1
+    where = f"{desk.label}, #{box}, Grow ticked by {by} after a {lines}-line paste"
+    desk.tick(grow, False)
+    desk.clear(box)
+    desk.paste(box, text)
+    to_the_foot(desk, list_id)
+    before = desk.geometry(parts)
+    check(number(before, "gap") <= 2 and send_on_screen(before), f"{where}: the premise, at the foot with Send on "
+                                                                  f"screen before Grow is ticked, does not hold: {before}")
+    if by == "space":
+        desk.page.focus(f"#{grow}")
+        kb.press(desk.cdp, " ")
+    else:
+        desk.page.click(f"label:has(#{grow})")
+    desk.page.wait_for_function("(id) => document.getElementById(id).checked", arg=grow, timeout=5000)
+    check(desk.page.evaluate("() => document.activeElement && document.activeElement.id") == grow,
+          f"{where}: the premise, the focus on the checkbox just ticked, does not hold")
+    after = desk.geometry(parts)
+    check(number(after, "box", "height") > number(before, "box", "height") + 2 * number(after, "line"),
+          f"{where}: the box did not grow: {after}")
+    check(number(after, "gap") <= 2, f"{where}: the reader is left {number(after, 'gap'):.0f}px above the foot: {after}")
+    check(send_on_screen(after), f"{where}: Send is not wholly on screen inside the list: {after}")
+    check(number(after, "label", "bottom") <= min(number(after, "list", "bottom"), number(after, "innerHeight")) + 0.5,
+          f"{where}: the Grow checkbox just ticked left the screen: {after}")
+    check(number(after, "box", "top") >= number(after, "list", "top") - 0.5,
+          f"{where}: the top of the box is above the list: {after}")
+    chip = JUMP_CHIPS[list_id]
+    check(desk.page.evaluate("(id) => document.getElementById(id).hidden", chip) is True,
+          f"{where}: the jump to the newest message (#{chip}) is offered at the foot")
+    desk.shot(f"tick-after-paste-{box}-{lines}-{by}")
+    desk.page.click(f"#{box}")
+    back = desk.geometry(parts)
+    check(number(back, "gap") <= 2 and send_on_screen(back), f"{where}: clicking back into the box left the reader "
+                                                              f"{number(back, 'gap'):.0f}px above the foot: {back}")
+    desk.clear(box)
+    desk.notes.append(f"{where}: grown from {number(before, 'box', 'height'):.0f}px to "
+                      f"{number(after, 'box', 'height'):.0f}px with the reader kept at the foot, Send and Grow on screen")
+
+
+def call_tick_after_paste(desk: Desk) -> None:
+    """`tick_after_paste` in the call's box, on the call's view."""
+    desk.page.click("#view-switch")
+    desk.page.wait_for_selector(f"#{VOICE_PARTS[1]}", state="visible", timeout=10_000)
+    tick_after_paste(desk, VOICE_PARTS, TEN)
+    desk.page.click("#view-switch")
+    desk.page.wait_for_selector(FIRST_ROW, state="visible", timeout=10_000)
+
+
 def reload_with_a_long_draft(desk: Desk, url: str) -> None:
     box = CHANNEL_PARTS[1]
     desk.page.reload(wait_until="load")
@@ -458,10 +524,11 @@ def two_columns(desk: Desk) -> None:
     capped(grown, f"{desk.label}, the right column's box, a long paste")
     desk.shot("grow-on-two-columns")
     desk.clear(SIDE_PARTS[1])
-    page.click("#column-toggle")
-    page.wait_for_function("() => document.getElementById('side-column').getClientRects().length === 0", timeout=5000)
     desk.notes.append(f"{desk.label}: in two columns the right column's Grow was ticked in step, and a long paste grew "
                       "its box with its Send on screen")
+    tick_after_paste(desk, SIDE_PARTS, TEN)
+    page.click("#column-toggle")
+    page.wait_for_function("() => document.getElementById('side-column').getClientRects().length === 0", timeout=5000)
 
 
 def short_window(desk: Desk) -> None:
@@ -490,8 +557,11 @@ def desk_walk(browser: Browser, url: str, args: argparse.Namespace, posts: list[
           "this Chromium has no field-sizing: the fallback desk below is the only one that grows")
     rest = channel_box(desk, posts)
     typing_at_the_foot(desk, rest)
+    tick_after_paste(desk, CHANNEL_PARTS, TEN)
+    tick_after_paste(desk, CHANNEL_PARTS, LONG)
     reload_with_a_long_draft(desk, url)
     call_box_with_recap(desk)
+    call_tick_after_paste(desk)
     short_window(desk)
     page.set_viewport_size({"width": 1920, "height": 1080})
     desk.label = "1920x1080"
@@ -523,6 +593,8 @@ def fallback_walk(browser: Browser, url: str, args: argparse.Namespace, posts: l
     desk.clear(box)
     resting(desk.geometry(), rest, "without field-sizing, the box cleared")
     typing_at_the_foot(desk, rest)
+    tick_after_paste(desk, CHANNEL_PARTS, TEN)
+    tick_after_paste(desk, CHANNEL_PARTS, LONG, by="space")
     desk.tick(grow, False)
     off = desk.geometry()
     check(off["growHeight"] == "", f"without field-sizing, Grow off left a height on the box: {off}")
