@@ -898,9 +898,11 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # hidden by unpublished ignore rules kept, six refused unkeepable
     # repositories, a failed bundle, one journal recovery and one
     # evidence-parser case.
-    assert len(all_tests) == 1999
+    # The two no-checkout-source submodule cases of 1cb3493d (one removal, one
+    # refusal) are mapped.
+    assert len(all_tests) == 2001
     assert len(ordinary) == 336
-    assert len(mapped) == 1663
+    assert len(mapped) == 1665
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
