@@ -118,6 +118,15 @@ Use `doctor` for the diagnosis-oriented view of all registry/storage disagreemen
 it authorizes nothing and exits 0 when readable inconsistencies are found; unlike `status`, it is
 organized as findings rather than as the active roster.
 
+For image-backed slots, `image-not-mounted` means the slot's image is not mounted at its location:
+run `wrkslots image mount` and fix what it reports; never repair Git registrations through the
+empty mount point. `image-attached-twice` means two loop devices hold one image (two independent
+file systems); do not mount, unmount, grow or copy it, and retire the slot only with
+`remove --coordinator-authorized --discard-stale-image-copy`. `image-identity-unverifiable` means a
+loop mount sits at a slot's location that wrkslots cannot identify; it refuses to unmount, move or
+remove it. A mount copied into another process's private mount namespace is the slot's own storage,
+not use; a process working inside it still blocks removal.
+
 Use `audit [--format human|json]` for the lifecycle verdict view. It reports each slot as
 `DELETABLE`, `BLOCKED` with the collected reasons, or `HELD`, reports cache sizes, and raises the
 count-level leak signal when worktree count exceeds running-agent count. Treat a scan failure as occupied, never
