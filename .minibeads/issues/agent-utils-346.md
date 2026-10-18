@@ -1,12 +1,13 @@
 ---
 title: 'settings-collapsible: every Settings section and the groups inside it fold, folded by default, and find-in-page still finds them'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-18T20:43:26.568581984+00:00
-updated_at: 2026-10-18T20:43:26.568581984+00:00
+updated_at: 2026-10-18T22:20:19.991219002+00:00
+closed_at: 2026-10-18T22:20:19.991218891+00:00
 ---
 
 # Description
