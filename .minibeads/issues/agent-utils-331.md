@@ -1,12 +1,13 @@
 ---
 title: 'resume-on-websocket: make resuming honest, show what a new call was told, and support it on the websocket backend'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-15T15:52:38.617304322+00:00
-updated_at: 2026-10-15T15:52:38.617304322+00:00
+updated_at: 2026-10-18T14:59:53.467418411+00:00
+closed_at: 2026-10-18T14:59:53.467417290+00:00
 ---
 
 # Description
