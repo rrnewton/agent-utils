@@ -513,6 +513,10 @@ const session = {
   // to the same bounds from them (`relayWait`).
   spokenTurnOpenedAt: 0,
   spokenTurnActiveAt: 0,
+  // `#330 voice-long-turn-drop`. The owner's last words of the open turn arrived as a FINAL
+  // transcript: he has finished, and the agent is working on its answer — perhaps a tool call before
+  // it says anything — so a relayed message waits for that answer, not for him (`relayWait`).
+  spokenTurnHeard: false,
   // The highest turn number a `turn_complete` has named, so a late frame of it opens no new turn.
   /** @type {number | null} */
   lastCompletedTurn: null,
@@ -7148,6 +7152,7 @@ function releaseSpokenTurnHold(socket, bound, why) {
 function letSpokenTurnGo(why) {
   clearSpokenTurnHold();
   session.spokenTurnOpen = false;
+  session.spokenTurnHeard = false;
   addDetail(why);
 }
 
@@ -7169,21 +7174,39 @@ function clearSpokenTurnHold() {
  * transcript) opens nothing.
  *
  * @param {number | null} [turn] the frame's turn number, when it has one
+ * @returns {boolean} whether the frame counted as part of the open turn
  */
 function noteSpokenTurnActivity(turn = null) {
-  if (session.chat || session.protocol !== "vibe-talk-v1") return;
-  if (turn !== null && session.lastCompletedTurn !== null && turn <= session.lastCompletedTurn) return;
+  if (session.chat || session.protocol !== "vibe-talk-v1") return false;
+  if (turn !== null && session.lastCompletedTurn !== null && turn <= session.lastCompletedTurn) return false;
   const now = Date.now();
-  if (!session.spokenTurnOpen) session.spokenTurnOpenedAt = now;
+  if (!session.spokenTurnOpen) {
+    session.spokenTurnOpenedAt = now;
+    session.spokenTurnHeard = false;
+  }
   session.spokenTurnActiveAt = now;
   session.spokenTurnOpen = true;
   // A text turn is waiting on this one, which is still talking: give it the whole bound again.
   if (session.spokenTurnTimer !== null) armSpokenTurnHold();
+  return true;
+}
+
+/**
+ * The owner's words of a spoken turn arrived: the turn is open, and whether he has finished is what
+ * this transcript says — a final one says he has, a hypothesis that he is speaking again.
+ * `#330 voice-long-turn-drop`; see `spokenTurnHeard`.
+ *
+ * @param {number | null} turn the frame's turn number, when it has one
+ * @param {boolean} final
+ */
+function noteOwnerWords(turn, final) {
+  if (noteSpokenTurnActivity(turn)) session.spokenTurnHeard = final;
 }
 
 /** A `turn_complete`: no spoken turn is open, and nothing is waiting on one. */
 function closeSpokenTurn(turn = null) {
   session.spokenTurnOpen = false;
+  session.spokenTurnHeard = false;
   session.interruptPending = false;
   session.pageMessageHeldNoted = false;
   if (turn !== null) {
@@ -16421,8 +16444,9 @@ function handleVibeTalk(message) {
         noteAgentText();
         noteReplyArriving(turnNumber);
       } else if (said.trim()) {
-        // The owner is speaking: a spoken turn is open, whether or not anything answers it yet.
-        noteSpokenTurnActivity(turnNumber);
+        // The owner is speaking: a spoken turn is open, whether or not anything answers it yet. A
+        // final transcript says he has finished, and the turn is the agent's to answer.
+        noteOwnerWords(turnNumber, final);
       }
       if (!said || key === session.lastTranscriptKey) {
         break;
@@ -40825,6 +40849,11 @@ const RELAY_RECHECK_MS = 500;
  * voice runtime gives fifteen seconds before it drops it, then speaks again. A relay cut into that
  * silence goes as an `audio_end`, which a bridge takes for an interrupt, and the answer still to come
  * is lost. Past this the turn has stalled, and its `turn_complete` is not coming.
+ *
+ * The same holds BEFORE an answer's first word. Once the owner's words are final the turn is the
+ * agent's, and one that answers with a tool call and no filler line sends nothing at all until the
+ * call returns: that silence is the answer's, timed from his last word with this bound, not his own
+ * turn gone quiet (`spokenTurnHeard`).
  */
 const RELAY_STALLED_ANSWER_MS = 25000;
 
@@ -40919,9 +40948,11 @@ let relayWaitingSince = 0;
  *     a `user_message` sent into a playing answer cuts it too; on the hosted protocol, which says
  *     nothing when a turn ends, the agent's answer to the last relayed turn not yet arrived and
  *     heard out (`relayAnswerAwaited`, `#337 voice-relay-silent`); and on `vibe-talk-v1` an answer
- *     still arriving, or anything else holding the floor: a text turn being answered or waiting its
- *     turn, the greeting, a segment closing.
- *   * `"turn"`: the owner's own spoken turn, open and not completed.
+ *     still arriving, or one still to come: the owner's words of the open turn are final, so he has
+ *     finished and the agent is answering, perhaps with a tool call before its first word
+ *     (`spokenTurnHeard`); or anything else holding the floor: a text turn being answered or waiting
+ *     its turn, the greeting, a segment closing.
+ *   * `"turn"`: the owner's own spoken turn, open, not completed, and his words not yet final.
  *
  * A message waits here, in the relay's own queue, where the timers `#268 voice-call-drops` put on a
  * spoken turn that holds a text turn never see it. So the open spoken turn is held to bounds read
@@ -40930,8 +40961,10 @@ let relayWaitingSince = 0;
  * it went on — a word of background speech, a trickle of hypotheses, a lost `turn_complete`, as
  * `#268` bounds them. An answer is never let go while it is arriving or playing, however long, but
  * once nothing of it has arrived and nothing has played for RELAY_STALLED_ANSWER_MS it is a stalled
- * turn. Letting a turn go is said in the connection details, as the `#268` bounds say it, and the
- * message then closes the segment.
+ * turn — and so is a turn whose owner finished speaking that long ago with nothing answering him.
+ * Final words that keep on arriving are still his turn going on, and the cap still ends them, counted
+ * to the last of them rather than across the silence after it. Letting a turn go is said in the
+ * connection details, as the `#268` bounds say it, and the message then closes the segment.
  *
  * @returns {"answer" | "turn" | null}
  */
@@ -40953,14 +40986,31 @@ function relayWait() {
       "a relayed message went anyway");
     return null;
   }
+  const capFrom = Math.max(session.spokenTurnOpenedAt, relayWaitingSince);
+  const capped = `a spoken turn held the page's next message for ${Math.round(SPOKEN_TURN_HOLD_CAP_MS / 1000)} s ` +
+    "without completing; a relayed message went anyway";
+  if (session.spokenTurnHeard) {
+    // He has finished and nothing of the answer has arrived yet: the agent may be in a tool call
+    // before its first word, and this silence is the answer's, not his turn gone quiet.
+    if (quiet >= RELAY_STALLED_ANSWER_MS) {
+      letSpokenTurnGo(`a spoken turn drew no answer in ${Math.round(quiet / 1000)} s and did not complete; ` +
+        "a relayed message went anyway");
+      return null;
+    }
+    // Finished words that keep on arriving are his turn going on — background speech transcribed in
+    // whole sentences — and the cap still ends it: counted to the last of them, so never across the
+    // silence of a tool call after his question.
+    if (session.spokenTurnActiveAt - capFrom < SPOKEN_TURN_HOLD_CAP_MS) return "answer";
+    letSpokenTurnGo(capped);
+    return null;
+  }
   if (quiet >= SPOKEN_TURN_HOLD_MS) {
     letSpokenTurnGo(`a spoken turn went quiet for ${Math.round(quiet / 1000)} s without completing; ` +
       "a relayed message went anyway");
     return null;
   }
-  if (now - Math.max(session.spokenTurnOpenedAt, relayWaitingSince) >= SPOKEN_TURN_HOLD_CAP_MS) {
-    letSpokenTurnGo(`a spoken turn held the page's next message for ${Math.round(SPOKEN_TURN_HOLD_CAP_MS / 1000)} s ` +
-      "without completing; a relayed message went anyway");
+  if (now - capFrom >= SPOKEN_TURN_HOLD_CAP_MS) {
+    letSpokenTurnGo(capped);
     return null;
   }
   return "turn";

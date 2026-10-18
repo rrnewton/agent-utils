@@ -5393,10 +5393,14 @@ its text, and closing the call when the backend is slow to confirm the cut. An a
   nothing left to play, a stalled turn rather than an answer — is let go: after 8 seconds for the
   page's word on a yes, which the agent that said "One moment." is waiting for, and after 25 seconds
   (`RELAY_STALLED_ANSWER_MS`) for a relayed message, which nobody is waiting for, so that a tool call
-  in the middle of an answer (a voice runtime gives one fifteen seconds) is not cut by it. Held by
-  the owner's own open turn, where nothing is being answered, a relayed message goes at the 8- and
-  30-second bounds above, and the status line says it will be read out when he finishes speaking,
-  not when the answer ends.
+  in the middle of an answer (a voice runtime gives one fifteen seconds) is not cut by it. The same
+  25 seconds hold before an answer's first word: once the owner's words have arrived as a final
+  transcript he has finished, and an agent that answers with a tool call and no filler line sends
+  nothing until the call returns, so the message waits for the answer, timed from his last word,
+  and the status line says it will be read out when the answer ends. Held by the owner's own open
+  turn while he is still speaking — none of his latest words final yet — a relayed message goes at
+  the 8- and 30-second bounds above, and the status line says it will be read out when he finishes
+  speaking; final words that keep on coming with no answer are held to the 30-second bound too.
 * **A message the owner types while the assistant is speaking cuts the answer at once**, with the
   protocol's own `interrupt`, never a silent `audio_end`: playback stops, late audio of the cut turn
   is not played, the transcript draws an **answer cut off** line, the status line says "You cut the

@@ -67678,6 +67678,96 @@ test("`#330 voice-long-turn-drop`: a relayed message waits out a tool call insid
   assert.equal(timesRelayed(stalledSocket, "the tag is cut"), 1);
 });
 
+test("`#330 voice-long-turn-drop`: once the owner's words are final, a relayed message waits out a tool call the agent makes before saying anything", async () => {
+  // The owner asks to be caught up, which the agent answers with one tool call and no filler line
+  // first, so nothing of the answer arrives for as long as the call takes. The relay took that
+  // silence for the owner's own turn gone quiet and closed the segment 8 s after his last word: an
+  // `audio_end` into the turn being answered, which a bridge takes for an interrupt.
+  for (const [toolMs, relayAt] of [[9000, 2000], [11000, 2000], [11000, 5000], [14000, 6000]]) {
+    const where = `a ${toolMs} ms tool call, the message arriving ${relayAt} ms after the question`;
+    const page = newPage();
+    const socket = await relayingNeutralCall(page);
+    speech(socket, "user", 1, "catch me up", true);
+    await passTime(page, relayAt);
+    await deliver(page, page.stream(), sseMessage(message({ id: "3310", content: "the build broke" })));
+    await passTime(page, toolMs - relayAt);
+    assert.deepEqual(controlFrames(socket).filter((type) => type !== "audio_start"), [],
+      `${where}: the relay closed the segment in the middle of the agent's tool call`);
+    assert.match(page.el("status").textContent, /1 new message will be read out when the answer ends/,
+      `${where}: the status line says the owner is still speaking, and he has finished`);
+    speech(socket, "assistant", 1, "Overnight, three merges.", true);
+    socket.onmessage({ data: secondOfSpeech(page) });
+    turnDone(socket, 1);
+    await passTime(page, 5000);
+    assert.equal(controlFrames(socket).at(-1), "audio_end", `${where}: the answer was heard out and the relay never went`);
+    turnDone(socket, 2);
+    await page.settle();
+    assert.equal(timesRelayed(socket, "the build broke"), 1, where);
+    assert.doesNotMatch(page.el("settings-detail").textContent, /without completing|drew no answer/,
+      `${where}: a bound let the turn go`);
+  }
+
+  // A question that draws nothing at all — no answer, no `turn_complete` — has stalled, and is let go
+  // RELAY_STALLED_ANSWER_MS after the owner's last word, as an answer that stopped arriving is.
+  const silent = newPage();
+  const silentSocket = await relayingNeutralCall(silent);
+  speech(silentSocket, "user", 1, "catch me up", true);
+  await passTime(silent, 2000);
+  await deliver(silent, silent.stream(), sseMessage(message({ id: "3311", content: "the tag is cut" })));
+  const waited = await msUntilFrame(silent, silentSocket, "audio_end", 120_000);
+  assert.notEqual(waited, null, "a question that drew nothing held the relay for two minutes");
+  const sinceWords = 2000 + waited;
+  assert.ok(sinceWords >= RELAY_STALLED_ANSWER_MS,
+    `the relay went ${sinceWords} ms after the owner's final words, inside the ${RELAY_STALLED_ANSWER_MS} ms bound a tool call needs`);
+  assert.ok(sinceWords <= RELAY_STALLED_ANSWER_MS + 2 * RELAY_RECHECK_MS,
+    `the relay went ${sinceWords} ms after the owner's final words, past the ${RELAY_STALLED_ANSWER_MS} ms bound`);
+  assert.match(silent.el("settings-detail").textContent, /drew no answer in \d+ s and did not complete/);
+  turnDone(silentSocket, 1);
+  await silent.settle();
+  assert.equal(timesRelayed(silentSocket, "the tag is cut"), 1);
+
+  // He goes on speaking after a final transcript: his turn holds the message again, within its own bounds.
+  const more = newPage();
+  const moreSocket = await relayingNeutralCall(more);
+  speech(moreSocket, "user", 1, "catch me up", true);
+  await passTime(more, 1000);
+  speech(moreSocket, "user", 1, "and the", false);
+  await deliver(more, more.stream(), sseMessage(message({ id: "3312", content: "the release is out" })));
+  await passTime(more, RELAY_COALESCE_MS);
+  assert.match(more.el("status").textContent, /1 new message will be read out when you finish speaking/);
+  const moreWait = await msUntilFrame(more, moreSocket, "audio_end", 120_000);
+  assert.notEqual(moreWait, null, "the owner's open turn held the relay for two minutes");
+  const sinceLastWord = RELAY_COALESCE_MS + moreWait;
+  assert.ok(sinceLastWord >= SPOKEN_TURN_HOLD_MS && sinceLastWord <= SPOKEN_TURN_HOLD_MS + 2 * RELAY_RECHECK_MS,
+    `the relay went ${sinceLastWord} ms after the owner's last word, not at the ${SPOKEN_TURN_HOLD_MS} ms bound`);
+  turnDone(moreSocket, 1);
+  await more.settle();
+  assert.equal(timesRelayed(moreSocket, "the release is out"), 1);
+
+  // Finished utterances that keep coming and never complete — background speech the bridge
+  // transcribes in whole sentences — are held no longer than the #268 cap.
+  const cap = optionalSourceConstant("SPOKEN_TURN_HOLD_CAP_MS") ?? TUNING_BANDS.SPOKEN_TURN_HOLD_CAP_MS[1];
+  const chatter = newPage();
+  const chatterSocket = await relayingNeutralCall(chatter);
+  speech(chatterSocket, "user", 1, "Tonight's weather.", true);
+  await deliver(chatter, chatter.stream(), sseMessage(message({ id: "3313", content: "the deploy finished" })));
+  let heard = "Tonight's weather.";
+  const chatterWait = await msUntilFrame(chatter, chatterSocket, "audio_end", 120_000, (at) => {
+    if (at % 2000 === 0) {
+      heard += " More rain.";
+      speech(chatterSocket, "user", 1, heard, true);
+    }
+  });
+  assert.notEqual(chatterWait, null, "a stream of finished utterances held the relay for two minutes");
+  assert.ok(chatterWait >= cap, `finished utterances held the relay only ${chatterWait} ms, inside the ${cap} ms cap`);
+  assert.ok(chatterWait <= RELAY_COALESCE_MS + cap + 2000 + 2 * RELAY_RECHECK_MS,
+    `finished utterances held the relay ${chatterWait} ms, past the ${cap} ms cap`);
+  assert.match(chatter.el("settings-detail").textContent, /held the page's next message for \d+ s without completing/);
+  turnDone(chatterSocket, 1);
+  await chatter.settle();
+  assert.equal(timesRelayed(chatterSocket, "the deploy finished"), 1);
+});
+
 test("`#330 voice-long-turn-drop`: the reader's typed message cuts the answer at once, through interrupt, and says so; the cut answer keeps its words marked cut off", async () => {
   const page = newPage();
   const socket = await startNeutralCall(page);
