@@ -947,14 +947,22 @@
 
               Connection status is still LAST, for the reason given on it below.
             -->
+            <!--
+              `#347 settings-prose`. The owner, 2026-10-18: one-line descriptions "become the hover
+              tooltip of the (?) and of the subsection title, and clicking (?) opens the full help".
+              So a group's line of orientation is no longer drawn under its heading: it is the
+              `title` of the heading and of its `?`, word for word the same, and the paragraphs stay
+              one tap away in Help. A section's own line is its title's tooltip. What is still drawn
+              is what changes (a state line), what a field is described by (`aria-describedby`), and
+              the one warning that is the whole decision (Clear unread's).
+            -->
             <section class="settings-section" id="settings-voice-agent" aria-labelledby="settings-voice-agent-title">
-              <h2 id="settings-voice-agent-title">Voice agent</h2>
-              <p class="hint">What the agent may send and is told, what it hears, and how messages are read out.</p>
+              <h2 id="settings-voice-agent-title" title="What the agent may send and is told, what it hears, and how messages are read out.">Voice agent</h2>
 
               <section class="settings-group">
                 <div class="group-head">
-                  <h3>Sending</h3>
-                  <button class="help-link" id="help-link-voice-send" type="button" data-help="voice-send" aria-label="About asking before the voice agent sends" title="What this changes">?</button>
+                  <h3 title="Whether the voice agent reads a message back and waits for your yes before it sends.">Sending</h3>
+                  <button class="help-link" id="help-link-voice-send" type="button" data-help="voice-send" aria-label="About asking before the voice agent sends" title="Whether the voice agent reads a message back and waits for your yes before it sends.">?</button>
                 </div>
                 <!--
                   `#271 settings-groups`. FIRST in the Voice agent section, under a heading that says
@@ -1044,8 +1052,8 @@
               -->
               <section class="settings-group" id="voice-instructions-group">
                 <div class="group-head">
-                  <h3>Instructions</h3>
-                  <button class="help-link" id="help-link-voice-instructions" type="button" data-help="voice-instructions" aria-label="About the voice agent's instructions" title="What these change, and what they cannot">?</button>
+                  <h3 title="Your own words for the voice agent, and its system prompt, kept on this server for every call.">Instructions</h3>
+                  <button class="help-link" id="help-link-voice-instructions" type="button" data-help="voice-instructions" aria-label="About the voice agent's instructions" title="Your own words for the voice agent, and its system prompt, kept on this server for every call.">?</button>
                 </div>
                 <div id="voice-prompt-editor" hidden>
                   <label for="voice-instructions">Additional instructions</label>
@@ -1081,8 +1089,8 @@
 
               <section class="settings-group">
                 <div class="group-head">
-                  <h3>Resuming</h3>
-                  <button class="help-link" id="help-link-resuming" type="button" data-help="resuming" aria-label="About resuming" title="What this really does">?</button>
+                  <h3 title="Off by default: it re-sends earlier conversation content to the voice vendor.">Resuming</h3>
+                  <button class="help-link" id="help-link-resuming" type="button" data-help="resuming" aria-label="About resuming" title="Off by default: it re-sends earlier conversation content to the voice vendor.">?</button>
                 </div>
                 <!--
                   `#46 conversation-replay`. FOUR states, and the screen must be able to say each of
@@ -1107,48 +1115,42 @@
                   Tell a new call what was already said
                 </label>
                 <p id="resume-unavailable" class="toggle-why" hidden></p>
-                <p class="hint">Off by default: it re-sends earlier conversation content to the voice vendor.</p>
               </section>
 
-              <section class="settings-group">
+              <!--
+                `#44 live-push`. Two separate facts, and the screen must not let them blur into one
+                "live" light: whether the CHANNEL VIEW updates by itself, and whether an arriving
+                message is spoken into a call in progress. The first costs nothing and is on whenever
+                the server is ingesting; the second spends money and interrupts, and is off until it
+                is asked for.
+
+                `#347 settings-prose`. The owner, 2026-10-18: "Arriving messages during a call"
+                becomes the title, "with only its drop-down". It was a group called Live messages
+                whose first line said how this server delivers live updates — adapter push or polling,
+                and whether this page is attached to the stream — which is how the server works, not
+                a choice. That line is Connection status's now (`#live-state`, at the foot of the
+                screen), and the label is the heading the picker is named by. Its `?` is still Live
+                messages in Help, which says what each mode costs; How messages are said for the ear
+                is the link under Reading full messages in channel view below.
+
+                THREE options, not a checkbox, because "say something about it" and "read it out
+                word for word" are different amounts of the reader's time and the vendor's money,
+                and a two-state control forces the expensive one to stand in for both.
+
+                No `selected` here on purpose: the live value is filled in by `renderReadNew` from
+                the same key the bar button writes, so there is exactly one truth about the mode
+                and not a markup default that disagrees with it after a reload.
+              -->
+              <section class="settings-group" id="relay-group">
                 <div class="group-head">
-                  <h3>Live messages</h3>
-                  <button class="help-link" id="help-link-live-messages" type="button" data-help="live-messages" aria-label="About live messages" title="What this costs">?</button>
+                  <h3 id="relay-to-agent-title" title="Briefly, by default. Both speaking modes send channel text to the voice vendor and take conversation time.">Arriving messages during a call</h3>
+                  <button class="help-link" id="help-link-live-messages" type="button" data-help="live-messages" aria-label="About arriving messages during a call" title="Briefly, by default. Both speaking modes send channel text to the voice vendor and take conversation time.">?</button>
                 </div>
-                <!--
-                  `#44 live-push`. Two separate facts, and the screen must not let them blur into one
-                  "live" light: whether the CHANNEL VIEW updates by itself, and whether an arriving
-                  message is spoken into a call in progress. The first costs nothing and is on whenever
-                  the server is ingesting; the second spends money and interrupts, and is off until it
-                  is asked for.
-
-                  `#332 settings-voice-agent-section`. One short line per state, as Resuming's is.
-                -->
-                <p id="live-state" class="hint" aria-live="polite"></p>
-                <!--
-                  THREE options, not a checkbox, because "say something about it" and "read it out
-                  word for word" are different amounts of the reader's time and the vendor's money,
-                  and a two-state control forces the expensive one to stand in for both.
-
-                  No `selected` here on purpose: the live value is filled in by `renderReadNew` from
-                  the same key the bar button writes, so there is exactly one truth about the mode
-                  and not a markup default that disagrees with it after a reload.
-
-                  `#332 settings-voice-agent-section`. The `?` after the label is How messages are
-                  said, the server's rewrite for the ear, which is what an arriving message is read
-                  out in. Beside the words it is about, not hard right where the group's own `?` is,
-                  and before the picker, so Tab reaches it in the order the eye does.
-                -->
-                <div class="label-help">
-                  <label for="relay-to-agent">Arriving messages during a call</label>
-                  <button class="help-link" id="help-link-speech-prep-relay" type="button" data-help="speech-prep" aria-label="How an arriving message is said" title="How a message is said">?</button>
-                </div>
-                <select id="relay-to-agent">
+                <select id="relay-to-agent" aria-labelledby="relay-to-agent-title">
                   <option value="off">Don't tell the agent</option>
                   <option value="gist">Say what each one says, briefly</option>
                   <option value="full">Read them out in full</option>
                 </select>
-                <p class="hint">Briefly, by default. Both speaking modes send channel text to the voice vendor and take conversation time.</p>
               </section>
 
               <!--
@@ -1158,29 +1160,34 @@
                 the other two ways a message is read out — into a call as it arrives, and recapped
                 to a new one — so it sits under those, named for what it does.
 
-                Its `?` is How messages are said: the rewrite for the ear both voices read, and what
-                each voice is. `#settings-audio-source` and `#settings-agent-audio` keep their ids;
-                web/voice.js keeps the picker and the bar's switch in step (`setReadAudioSource`).
+                `#347 settings-prose`. "How messages are said" is a short link now, in the owner's
+                words "How messages are pre-processed for speech", under the picker: the rewrite for
+                the ear that both voices read, and that an arriving message is read out in too. It
+                keeps the id `#help-link-speech-prep`, so HELP_TOPICS wires it as it wired the `?`.
+                "Car audio: use Agent audio." meant nothing to the owner; what it meant — Agent audio
+                plays as ordinary audio, so a car's speakers carry it — is the heading's tooltip.
+                `#settings-audio-source` and `#settings-agent-audio` keep their ids; web/voice.js keeps
+                the picker and the bar's switch in step (`setReadAudioSource`).
               -->
               <section class="settings-group" id="reading-full-group">
                 <div class="group-head">
-                  <h3>Reading full messages in channel view</h3>
-                  <button class="help-link" id="help-link-speech-prep" type="button" data-help="speech-prep" aria-label="How a message is said, and by which voice" title="How a message is said">?</button>
+                  <h3 title="Which voice reads a message you tap: Agent audio plays as ordinary audio, so a car's speakers carry it; Device voice is this device's own speech.">Reading full messages in channel view</h3>
                 </div>
                 <label for="settings-audio-source">Read messages with</label>
                 <select id="settings-audio-source">
                   <option id="settings-agent-audio" value="agent">Agent audio</option>
                   <option value="device">Device voice</option>
                 </select>
-                <p class="hint">Car audio: use Agent audio.</p>
+                <p class="help-text-row">
+                  <button class="help-link help-link-text" id="help-link-speech-prep" type="button" data-help="speech-prep" title="The rewrite for the ear that every message is read out in, by either voice.">How messages are pre-processed for speech</button>
+                </p>
               </section>
 
               <section class="settings-group">
                 <div class="group-head">
-                  <h3>Canned prompts</h3>
-                  <button class="help-link" id="help-link-canned-prompts" type="button" data-help="canned-prompts" aria-label="About the canned prompts" title="What these send">?</button>
+                  <h3 title="What the two prompt buttons send. Empty a field to restore its default.">Canned prompts</h3>
+                  <button class="help-link" id="help-link-canned-prompts" type="button" data-help="canned-prompts" aria-label="About the canned prompts" title="What the two prompt buttons send. Empty a field to restore its default.">?</button>
                 </div>
-                <p class="hint">What the two prompt buttons send. Empty a field to restore its default.</p>
 
                 <label for="prompt-summary">Sumry</label>
                 <textarea id="prompt-summary" rows="3"></textarea>
@@ -1192,10 +1199,9 @@
 
               <section class="settings-group">
                 <div class="group-head">
-                  <h3>Microphone</h3>
-                  <button class="help-link" id="help-link-microphone" type="button" data-help="microphone" aria-label="About the microphone settings" title="What these do">?</button>
+                  <h3 title="Applied to your next call, not the one in progress.">Microphone</h3>
+                  <button class="help-link" id="help-link-microphone" type="button" data-help="microphone" aria-label="About the microphone settings" title="Applied to your next call, not the one in progress.">?</button>
                 </div>
-                <p class="hint">Applied to your next call, not the one in progress.</p>
 
                 <label class="toggle">
                   <input id="mic-echo-cancellation" type="checkbox" checked />
@@ -1243,13 +1249,12 @@
             </section>
 
             <section class="settings-section" id="settings-messages" aria-labelledby="settings-messages-title">
-              <h2 id="settings-messages-title">Messages</h2>
-              <p class="hint">How messages are marked and shown.</p>
+              <h2 id="settings-messages-title" title="How messages are marked and shown.">Messages</h2>
 
               <section class="settings-group">
                 <div class="group-head">
-                  <h3>Your own messages</h3>
-                  <button class="help-link" id="help-link-mark-own" type="button" data-help="mark-own" aria-label="About marking your own messages read" title="What this does">?</button>
+                  <h3 title="Greyed here, and kept out of the queue.">Your own messages</h3>
+                  <button class="help-link" id="help-link-mark-own" type="button" data-help="mark-own" aria-label="About marking your own messages read" title="Greyed here, and kept out of the queue.">?</button>
                 </div>
                 <!--
                   ON by default, and deliberately: a message this bridge posted is one the owner
@@ -1260,15 +1265,19 @@
                   <input id="mark-own-read" type="checkbox" checked />
                   Mark my own messages as read
                 </label>
-                <p class="hint">Greyed here, and kept out of the queue.</p>
               </section>
 
               <section class="settings-group">
                 <div class="group-head">
-                  <h3>Read automatically</h3>
-                  <button class="help-link" id="help-link-auto-read" type="button" data-help="auto-read" aria-label="About messages read automatically" title="What these match">?</button>
+                  <h3 title="A message whose whole text is one of these is marked read the moment it arrives.">Mark-read automatically</h3>
+                  <button class="help-link" id="help-link-auto-read" type="button" data-help="auto-read" aria-label="About marking messages read automatically" title="A message whose whole text is one of these is marked read the moment it arrives.">?</button>
                 </div>
                 <!--
+                  `#347 settings-prose`. "Mark-read automatically", the owner's name for it (2026-10-18,
+                  "he asked before"): what the list does is MARK a message read, and "Read
+                  automatically" read as though something read it out. Only the words changed; every
+                  id, and the server's list, are as they were.
+
                   `#196 auto-read-noise`. The SERVER's list, not this browser's: it is kept in the
                   store and shared by every device and by the voice agent, so it is edited here and
                   read back from the answer rather than from what was typed. The sentence saying how
@@ -1282,7 +1291,7 @@
                 <div id="noise-editor" hidden>
                   <p id="noise-matching" class="hint"></p>
                   <!-- Rows are built by `renderNoiseRules` in web/voice.js: the rule, and Remove. -->
-                  <ul id="noise-rule-list" class="noise-rules" aria-label="Messages read automatically"></ul>
+                  <ul id="noise-rule-list" class="noise-rules" aria-label="Messages marked read automatically"></ul>
                   <p id="noise-count" class="hint" aria-live="polite"></p>
                   <label for="noise-rule-new">Add a message</label>
                   <input
@@ -1303,8 +1312,8 @@
 
               <section class="settings-group">
                 <div class="group-head">
-                  <h3>Combining messages</h3>
-                  <button class="help-link" id="help-link-combining" type="button" data-help="combining" aria-label="About combining messages" title="What this does">?</button>
+                  <h3 title="Same author, within five seconds. Turn it off to see the raw rows.">Combining messages</h3>
+                  <button class="help-link" id="help-link-combining" type="button" data-help="combining" aria-label="About combining messages" title="Same author, within five seconds. Turn it off to see the raw rows.">?</button>
                 </div>
                 <!--
                   ON by default. An agent writing past Discord's length limit has its post split in
@@ -1316,13 +1325,12 @@
                   <input id="combine-messages" type="checkbox" checked />
                   Show messages sent seconds apart as one
                 </label>
-                <p class="hint">Same author, within five seconds. Turn it off to see the raw rows.</p>
               </section>
 
               <section class="settings-group">
                 <div class="group-head">
-                  <h3>Rich headers</h3>
-                  <button class="help-link" id="help-link-rich-headers" type="button" data-help="rich-headers" aria-label="About rich headers" title="What this does">?</button>
+                  <h3 title="Turn it off to see each message's first line as it was written.">Rich headers</h3>
+                  <button class="help-link" id="help-link-rich-headers" type="button" data-help="rich-headers" aria-label="About rich headers" title="Turn it off to see each message's first line as it was written.">?</button>
                 </div>
                 <!--
                   `#242 rich-headers`. ON by default. Agents posting through one shared account name
@@ -1336,7 +1344,6 @@
                   <input id="rich-headers" type="checkbox" checked />
                   Show an agent's tag, title and time in the message header
                 </label>
-                <p class="hint">Turn it off to see each message's first line as it was written.</p>
               </section>
 
               <!--
@@ -1365,8 +1372,8 @@
 
             <section class="settings-section" id="settings-channels" aria-labelledby="settings-channels-title">
               <div class="group-head">
-                <h2 id="settings-channels-title">Channels</h2>
-                <button class="help-link" id="help-link-channel-alias" type="button" data-help="channel-alias" aria-label="About channels" title="What this changes, and what it does not">?</button>
+                <h2 id="settings-channels-title" title="One channel at a time: your own name for it, taking it off the list, and clearing its unread in its chat service.">Channels</h2>
+                <button class="help-link" id="help-link-channel-alias" type="button" data-help="channel-alias" aria-label="About channels" title="One channel at a time: your own name for it, taking it off the list, and clearing its unread in its chat service.">?</button>
               </div>
 
               <!--
@@ -1584,13 +1591,9 @@
                 -->
                 <hr class="settings-rule" />
                 <div class="group-head">
-                  <h3>Who is who in this channel</h3>
-                  <button class="help-link" id="help-link-identities" type="button" data-help="identities" aria-label="About channel identities" title="How these are guessed">?</button>
+                  <h3 title="Everyone who has spoken in the channel above. Italic means guessed. A choice follows the account into every channel.">Who is who in this channel</h3>
+                  <button class="help-link" id="help-link-identities" type="button" data-help="identities" aria-label="About channel identities" title="Everyone who has spoken in the channel above. Italic means guessed. A choice follows the account into every channel.">?</button>
                 </div>
-                <p class="hint">
-                  Everyone who has spoken in the channel above. Italic means guessed. A choice
-                  follows the account into every channel.
-                </p>
                 <!-- Rows are built by `renderIdentityRows` in web/voice.js. Empty until this channel
                      has been read, and it says so rather than showing a blank panel. -->
                 <div id="identity-list"></div>
@@ -1647,8 +1650,8 @@
 
               <section class="settings-group">
                 <div class="group-head">
-                  <h3>Reading width</h3>
-                  <button class="help-link" id="help-link-reading-width" type="button" data-help="reading-width" aria-label="About the reading width" title="What this does">?</button>
+                  <h3 title="How wide the column of messages is on a wide screen, in characters.">Reading width</h3>
+                  <button class="help-link" id="help-link-reading-width" type="button" data-help="reading-width" aria-label="About the reading width" title="How wide the column of messages is on a wide screen, in characters.">?</button>
                 </div>
                 <input
                   id="reading-width"
@@ -1663,8 +1666,8 @@
 
               <section class="settings-group">
                 <div class="group-head">
-                  <h3>Control bar</h3>
-                  <button class="help-link" id="help-link-control-bar" type="button" data-help="control-bar" aria-label="About the control bar" title="What this does">?</button>
+                  <h3 title="Where the strip with the gear and the Voice/Channel switch sits: at the bottom, by your thumb, or at the top.">Control bar</h3>
+                  <button class="help-link" id="help-link-control-bar" type="button" data-help="control-bar" aria-label="About the control bar" title="Where the strip with the gear and the Voice/Channel switch sits: at the bottom, by your thumb, or at the top.">?</button>
                 </div>
                 <label for="bar-placement">Where the control bar sits</label>
                 <select id="bar-placement" aria-describedby="bar-placement-state">
@@ -1694,8 +1697,8 @@
 
               <section class="settings-group">
                 <div class="group-head">
-                  <h3>Keyboard</h3>
-                  <button class="help-link" id="help-link-keyboard" type="button" data-help="keyboard" aria-label="Every keyboard shortcut" title="Every key">?</button>
+                  <h3 title="The keys that type a character can be turned off; the ? lists every key.">Keyboard</h3>
+                  <button class="help-link" id="help-link-keyboard" type="button" data-help="keyboard" aria-label="Every keyboard shortcut" title="The keys that type a character can be turned off; the ? lists every key.">?</button>
                 </div>
                 <!--
                   `#224 keyboard-shortcuts`. The keys that type a character — j, k, e, /, ? and the rest
@@ -1717,8 +1720,8 @@
 
               <section class="settings-group">
                 <div class="group-head">
-                  <h3>Stored conversations</h3>
-                  <button class="help-link" id="help-link-storage" type="button" data-help="storage" aria-label="About stored conversations" title="Where these are kept">?</button>
+                  <h3 title="The transcript of each call, kept by this server so a reload does not lose it.">Stored conversations</h3>
+                  <button class="help-link" id="help-link-storage" type="button" data-help="storage" aria-label="About stored conversations" title="The transcript of each call, kept by this server so a reload does not lose it.">?</button>
                 </div>
                 <p id="storage-state" class="hint" aria-live="polite"></p>
                 <button id="forget-conversations" class="secondary" type="button">
@@ -1745,8 +1748,8 @@
               -->
               <section class="settings-group" id="message-cache-group" hidden>
                 <div class="group-head">
-                  <h3>Saved messages on this server</h3>
-                  <button class="help-link" id="help-link-message-cache" type="button" data-help="message-cache" aria-label="About saved messages on this server" title="What is kept, where, and for how long">?</button>
+                  <h3 title="The server's own copy of the channel messages it reads, kept for a limited time.">Saved messages on this server</h3>
+                  <button class="help-link" id="help-link-message-cache" type="button" data-help="message-cache" aria-label="About saved messages on this server" title="The server's own copy of the channel messages it reads, kept for a limited time.">?</button>
                 </div>
                 <label class="toggle">
                   <input id="message-cache-enabled" type="checkbox" />
@@ -1778,10 +1781,19 @@
               -->
               <section class="settings-group">
                 <div class="group-head">
-                  <h3>Connection status</h3>
-                  <button class="help-link" id="help-link-connection" type="button" data-help="connection" aria-label="About the connection status" title="What this is">?</button>
+                  <h3 title="A readout: what the current call is connected to, how live updates reach this page, and why the last call closed.">Connection status</h3>
+                  <button class="help-link" id="help-link-connection" type="button" data-help="connection" aria-label="About the connection status" title="A readout: what the current call is connected to, how live updates reach this page, and why the last call closed.">?</button>
                 </div>
                 <div id="settings-detail" class="panel muted">no conversation yet</div>
+                <!--
+                  `#347 settings-prose`. How live updates reach this page — the server polling the
+                  channel or a provider adapter pushing, and whether this page is attached to the
+                  server's stream — moved here from the head of Arriving messages during a call. The
+                  owner named it as the implementation detail to take out of the settings: it is a
+                  readout about how the server works, and this is the readout. Still one short line
+                  per state (`renderLiveState`), and the same element.
+                -->
+                <p id="live-state" class="hint" aria-live="polite"></p>
               </section>
             </section>
 
@@ -2269,7 +2281,7 @@
             </details>
 
             <details id="help-auto-read" class="help-entry">
-              <summary><h2>Read automatically</h2></summary>
+              <summary><h2>Mark-read automatically</h2></summary>
               <p class="hint">
                 Some messages are only placeholders — a coding agent posting <em>Working…</em>
                 while it works, with the real answer arriving later as a separate message. A
@@ -2454,13 +2466,13 @@
             </details>
 
             <details id="help-live-messages" class="help-entry">
-              <summary><h2>Live messages</h2></summary>
+              <summary><h2>Arriving messages during a call</h2></summary>
               <p class="hint">
                 When this server is set to watch the channel, new messages appear on their own
                 rather than at the next refresh. A deployment can use bounded polling or push
-                delivery from a provider adapter; the line under <strong>Live messages</strong> in
-                Settings says which mode this server is using, and whether this page is connected
-                to the server's stream right now — when it is not, it keeps trying. With adapter
+                delivery from a provider adapter; the last line of <strong>Connection status</strong>,
+                at the foot of Settings, says which mode this server is using, and whether this page
+                is connected to the server's stream right now — when it is not, it keeps trying. With adapter
                 push it cannot say whether the adapter itself is healthy, only that the page is
                 listening. <em>Off on this server</em> means the channel view re-reads on its own
                 timer while you are looking at it, and nothing reaches the agent between your
@@ -2475,8 +2487,9 @@
                 when it is not. Both speaking modes send channel text to
                 <strong>the voice vendor</strong> and spend conversation time. Replies this server
                 posted are never sent back — otherwise the agent would hear its own answer and
-                reply to it. Each message goes as this server prepares it for the ear: the
-                <strong>?</strong> beside the choice opens How messages are said.
+                reply to it. Each message goes as this server prepares it for the ear: the link
+                <strong>How messages are pre-processed for speech</strong>, under Reading full
+                messages in channel view, says how.
               </p>
               <p class="hint">
                 A call hears <strong>every channel on your list</strong>, not only the one on
@@ -2522,7 +2535,7 @@
               `renderSpeechPrepState` in web/voice.js.
             -->
             <details id="help-speech-prep" class="help-entry">
-              <summary><h2>How messages are said</h2></summary>
+              <summary><h2>How messages are pre-processed for speech</h2></summary>
               <p id="speech-prep-state" class="hint"></p>
               <p class="hint">
                 Before a message is read out — by the agent during a call, or by the tap-to-listen
@@ -2547,12 +2560,12 @@
                 two runs the prompt rather than this.
               </p>
               <p class="hint">
-                Two settings under <strong>Voice agent</strong> read messages out, and each has a
-                <strong>?</strong> that opens this entry. <strong>Arriving messages during a
+                Two settings under <strong>Voice agent</strong> read messages out, and the link
+                under the second one opens this entry. <strong>Arriving messages during a
                 call</strong> decides whether the agent is told about a new message, briefly or in
                 full. <strong>Reading full messages in channel view</strong> decides which voice
                 reads a message you tap with Read on: <em>Agent audio</em> is this server's voice
-                service, played here as ordinary audio, and is the one to use with car audio;
+                service, played here as ordinary audio, so it is the one a car's speakers carry;
                 <em>Device voice</em> is this phone's or computer's own speech, offered on every
                 server. Agent audio is offered only when this server has a voice for it. Both voices
                 read the rewritten form. The phone-or-cloud button on the control bar is the same
@@ -2727,6 +2740,13 @@
                 one closed — including the close code, which is the one thing on this page written
                 for whoever is debugging it rather than for you. It is a readout, not a setting,
                 which is why it sits at the end.
+              </p>
+              <p class="hint">
+                Its last line is how new messages reach this page: whether this server re-reads the
+                channel on a timer or a provider adapter pushes them, how often, and whether the
+                page is attached to the server's stream right now. Off on this server means the
+                channel view re-reads on its own while you look at it, and nothing reaches the
+                voice agent between your questions.
               </p>
             </details>
           </div>

@@ -21,9 +21,10 @@ under a person's fingers, and measures the list that is on screen:
   reached, from the list or from Reply; on the call's view Ctrl+S goes to the agent's box ->
   "," opens Settings with its screen focused, PgDn scrolls Settings, Escape returns to the list
   where the reader was; Ctrl+, does the same -> `#332 settings-voice-agent-section`: on Settings, Tab
-  from Resuming's ? goes through Resuming, Live messages and Reading full messages in channel view in
-  the order they are read, each ? before the control it is about, and Shift+Tab comes back the same
-  way -> in the channel's message box, PgUp pages the list
+  from Resuming's ? goes through Resuming, Arriving messages during a call (`#347 settings-prose`) and
+  Reading full messages in channel view in the order they are read, each ? before the control it is
+  about and the link to how messages are pre-processed for speech after its picker, and Shift+Tab
+  comes back the same way -> in the channel's message box, PgUp pages the list
   while the box keeps the focus and the draft, Home and End move the caret, and Ctrl+Home and
   Ctrl+End take the list to its top and its newest message -> the keymap: Home selects the first
   message with a ring drawn round it (real focus, `:focus-visible`), j, k and the arrows move the
@@ -693,10 +694,11 @@ def settings_keys(walk: Walk) -> None:
 
 
 # `#332 settings-voice-agent-section`. The Tab stops from Resuming through Reading full messages in
-# channel view, as the page suite pins them in the markup (`SETTINGS_TAB_STOPS` there).
-SETTINGS_TAB_STOPS = ["help-link-resuming", "resume-toggle", "help-link-live-messages",
-                      "help-link-speech-prep-relay", "relay-to-agent", "help-link-speech-prep",
-                      "settings-audio-source"]
+# channel view, as the page suite pins them in the markup (`SETTINGS_TAB_STOPS` there). `#347
+# settings-prose` took the ? from beside "Arriving messages during a call", now the group's title, and
+# made How messages are said a link under the reading picker.
+SETTINGS_TAB_STOPS = ["help-link-resuming", "resume-toggle", "help-link-live-messages", "relay-to-agent",
+                      "settings-audio-source", "help-link-speech-prep"]
 
 
 def settings_tab_order(walk: Walk) -> None:
@@ -726,7 +728,7 @@ def settings_tab_order(walk: Walk) -> None:
     check(back == stops[::-1], f"Shift+Tab went {back}, not {stops[::-1]}")
     out = walk.key("Escape")
     check(out["screen"] == "main", f"Escape did not leave Settings after the Tab walk: {out}")
-    walk.notes.append(f"Tab went through Resuming, Live messages and Reading full messages in channel view in "
+    walk.notes.append(f"Tab went through Resuming, Arriving messages during a call and Reading full messages in channel view in "
                       f"order, each ? before its control ({len(stops)} stops), and Shift+Tab came back")
 
 

@@ -494,6 +494,20 @@ const SCROLLERS = new Set(["scroll-area", "reply-scroll", "side-scroll"]);
 const REPLY_VIEWPORT_PX = 200;
 
 /** Where web/voice.html defines an id: which line, and how deeply indented. */
+/** `text` as a regex source that matches exactly those characters. */
+const literal = (text) => String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * A Settings heading of `level` — 2 for a section, 3 for a group inside one — as a regex source,
+ * its words captured, or only the heading whose words are the source `text`. `#347 settings-prose`
+ * gave a heading a `title`, its one-line description as a tooltip, so the tag is matched with
+ * whatever attributes it carries.
+ */
+const settingsHeading = (level, text = "([^<]+)") => `<h${level}\\b[^>]*>${text}</h${level}>`;
+
+/** The words of every Settings heading of `level` in `html`, in order. */
+const settingsHeadings = (html, level) => [...html.matchAll(new RegExp(settingsHeading(level), "g"))].map((m) => m[1]);
+
 /**
  * The markup of one settings group, `<section class="settings-group"…>` .. `</section>`.
  *
@@ -504,7 +518,8 @@ const REPLY_VIEWPORT_PX = 200;
  * heading an `<h3>`, under its section's `<h2>`.
  */
 function settingsGroup(heading, html = HTML) {
-  const at = html.indexOf(`<h3>${heading}</h3>`);
+  const found = new RegExp(settingsHeading(3, literal(heading))).exec(html);
+  const at = found ? found.index : -1;
   assert.ok(at > 0, `web/voice.html has no settings group headed "${heading}"`);
   const opens = html.lastIndexOf('<section class="settings-group"', at);
   assert.ok(opens > 0, `"${heading}" is not inside a settings group`);
@@ -522,7 +537,7 @@ function settingsGroup(heading, html = HTML) {
  * so the closing tag is found by counting rather than by the first one met.
  */
 function settingsSection(title, html = HTML) {
-  const head = new RegExp(`<h2 id="(settings-[a-z-]+)-title">${title}</h2>`).exec(html);
+  const head = new RegExp(`<h2 id="(settings-[a-z-]+)-title"[^>]*>${literal(title)}</h2>`).exec(html);
   assert.ok(head, `web/voice.html has no settings section titled "${title}"`);
   const opens = html.indexOf(`<section class="settings-section" id="${head[1]}"`);
   assert.ok(opens > 0 && opens < head.index, `"${title}" does not head a settings section`);
@@ -17337,7 +17352,7 @@ test("EVERY SETTINGS GROUP THAT EXPLAINS ITSELF HAS A HELP ENTRY, AND A WAY TO R
   // The generalising assertion, and the one that keeps the next group honest: pinning the entries
   // that happen to exist today leaves the next one unlinked, which is exactly where the split
   // silently stops being a split.
-  // A set: `#332 settings-voice-agent-section` reaches one entry from beside two settings.
+  // A set, as it was when `#332 settings-voice-agent-section` reached one entry from beside two settings.
   const wanted = [...new Set([...HTML.matchAll(/data-help="([a-z-]+)"/g)].map((m) => m[1]))];
   assert.ok(wanted.length >= 8, `only ${wanted.length} help links found — the scan is broken`);
   for (const slug of wanted) {
@@ -17367,55 +17382,45 @@ test("EVERY SETTINGS GROUP THAT EXPLAINS ITSELF HAS A HELP ENTRY, AND A WAY TO R
   const orphans = entries.filter((slug) => !wanted.includes(slug) && slug !== "controls" && slug !== "channel");
   assert.deepStrictEqual(orphans, [], `nothing links to the help entries ${orphans.join(", ")}`);
   // `#332 settings-voice-agent-section`. EVERY `?` is wired by its id, not merely one per entry: its
-  // own `help-link-<slug>` through HELP_TOPICS, or a pair in HELP_LINKS_BESIDE. A second `?` for an
-  // entry that is in neither list would be a button that does nothing.
+  // own `help-link-<slug>` through HELP_TOPICS. `#347 settings-prose` took away the one `?` that was
+  // wired otherwise, beside a label, so a `?` by any other id would be a button that does nothing.
   assert.deepStrictEqual(helpLinkProblems(HTML, SCRIPT_CODE), []);
 });
 
 /**
- * What is wrong with the `?` buttons of a page, as sentences: one in the markup whose id neither list
- * in the script wires, or one the script wires that the markup does not have. `#332
- * settings-voice-agent-section`. A function of the two texts, so its negative control can hand it a
- * page with the second `?` unwired.
+ * What is wrong with the `?` buttons of a page, as sentences: one in the markup whose id the script
+ * does not wire. `#332 settings-voice-agent-section`; since `#347 settings-prose` every one is
+ * `help-link-<slug>` with its slug in HELP_TOPICS, the round ones and the one written as words. A
+ * function of the two texts, so its negative control can hand it a page with a `?` unwired.
  */
 function helpLinkProblems(html, script) {
-  const beside = /const HELP_LINKS_BESIDE = (\[[\s\S]*?\]);/.exec(script);
-  assert.ok(beside, "web/voice.js no longer declares HELP_LINKS_BESIDE");
-  const pairs = JSON.parse(beside[1]);
   const topics = [.../const HELP_TOPICS = \[([\s\S]*?)\]/.exec(script)[1].matchAll(/"([a-z-]+)"/g)].map((m) => m[1]);
-  const links = [...html.matchAll(/<button class="help-link" id="([a-z-]+)" type="button" data-help="([a-z-]+)"/g)]
+  const links = [...html.matchAll(/<button class="help-link(?: help-link-text)?" id="([a-z-]+)" type="button" data-help="([a-z-]+)"/g)]
     .map((m) => [m[1], m[2]]);
   const problems = [];
   if (links.length !== [...html.matchAll(/data-help="/g)].length) {
     problems.push("a ? is not written as <button class=\"help-link\" id=… type=\"button\" data-help=…>, so it was not checked");
   }
   for (const [id, slug] of links) {
-    const own = id === `help-link-${slug}` && topics.includes(slug);
-    if (!own && !pairs.some(([link, topic]) => link === id && topic === slug)) {
+    if (id !== `help-link-${slug}` || !topics.includes(slug)) {
       problems.push(`#${id} opens "${slug}" and nothing in web/voice.js wires it`);
-    }
-  }
-  for (const [link, topic] of pairs) {
-    if (!links.some(([id, slug]) => id === link && slug === topic)) {
-      problems.push(`HELP_LINKS_BESIDE wires #${link} to "${topic}", and the markup has no such ?`);
     }
   }
   return problems;
 }
 
-test("`#332 settings-voice-agent-section`: the ? check finds a second ? nothing wires (negative control)", () => {
+test("`#332 settings-voice-agent-section`: the ? check finds a ? nothing wires (negative control)", () => {
   // Without this the check above could pass on any page at all. The second `?` for How messages are
-  // said, with the script's pair for it taken out: a button that would do nothing.
-  const unwired = SCRIPT_CODE.replace('[["help-link-speech-prep-relay", "speech-prep"]]', "[]");
-  assert.notEqual(unwired, SCRIPT_CODE, "the negative control changed nothing");
-  assert.deepStrictEqual(helpLinkProblems(HTML, unwired),
+  // said that `#347 settings-prose` took away, put back beside its label: nothing wires it any more.
+  const back = HTML.replace('<select id="relay-to-agent"',
+    '<button class="help-link" id="help-link-speech-prep-relay" type="button" data-help="speech-prep">?</button><select id="relay-to-agent"');
+  assert.notEqual(back, HTML, "the negative control changed nothing");
+  assert.deepStrictEqual(helpLinkProblems(back, SCRIPT_CODE),
     ['#help-link-speech-prep-relay opens "speech-prep" and nothing in web/voice.js wires it']);
-  // ...and a pair for a button the markup does not have.
-  const gone = HTML.replace('id="help-link-speech-prep-relay"', 'id="help-link-elsewhere"');
-  assert.deepStrictEqual(helpLinkProblems(gone, SCRIPT_CODE), [
-    '#help-link-elsewhere opens "speech-prep" and nothing in web/voice.js wires it',
-    'HELP_LINKS_BESIDE wires #help-link-speech-prep-relay to "speech-prep", and the markup has no such ?',
-  ]);
+  // ...and an entry taken out of the script's list, which leaves its own ? unwired.
+  const unlisted = SCRIPT_CODE.replace('  "combining",\n', "");
+  assert.notEqual(unlisted, SCRIPT_CODE, "the negative control changed nothing");
+  assert.deepStrictEqual(helpLinkProblems(HTML, unlisted), ['#help-link-combining opens "combining" and nothing in web/voice.js wires it']);
 });
 
 test("the settings screen is CONTROLS, not paragraphs", () => {
@@ -17449,7 +17454,7 @@ test("CONNECTION STATUS IS LAST, because it is a readout and not a setting", () 
     HTML.indexOf('id="screen-settings"'),
     HTML.indexOf('id="screen-help"')
   );
-  const headings = [...settings.matchAll(/<h3>([^<]+)<\/h3>/g)].map((m) => m[1]);
+  const headings = settingsHeadings(settings, 3);
   assert.ok(headings.length > 3, "the settings screen lost its groups");
   assert.equal(
     headings[headings.length - 1],
@@ -17459,8 +17464,8 @@ test("CONNECTION STATUS IS LAST, because it is a readout and not a setting", () 
   assert.notEqual(headings[0], "Connection status");
   // Renamed as well as moved: "Connection" reads as somewhere you configure one.
   assert.ok(!headings.includes("Connection"), "the old bare heading is still there");
-  const sections = [...settings.matchAll(/<h2 id="settings-[a-z-]+-title">([^<]+)<\/h2>/g)].map((m) => m[1]);
-  assert.ok(settingsSection(sections[sections.length - 1]).includes("<h3>Connection status</h3>"),
+  const sections = settingsHeadings(settings, 2);
+  assert.ok(new RegExp(settingsHeading(3, "Connection status")).test(settingsSection(sections[sections.length - 1])),
     "the readout is not in the last section");
 });
 
@@ -17512,12 +17517,12 @@ test("A ? OPENS ITS OWN ENTRY AND FOLDS THE REST, every time; Open help opens no
   const page = newPage();
   await signIn(page);
   await page.el("open-settings").click();
-  // Every `?` by its own id, so the second one for an entry (`#332 settings-voice-agent-section`) is
-  // pressed as well as the first.
-  const links = [...HTML_CODE.matchAll(/<button class="help-link" id="([a-z-]+)" type="button" data-help="([a-z-]+)"/g)]
+  // Every `?` by its own id, the round ones and the one written as words (`#347 settings-prose`).
+  const links = [...HTML_CODE.matchAll(/<button class="help-link(?: help-link-text)?" id="([a-z-]+)" type="button" data-help="([a-z-]+)"/g)]
     .map((m) => [m[1], m[2]]);
   assert.ok(links.length >= 10, "the settings screen links to too few help entries to test");
-  assert.ok(links.some(([link]) => link === "help-link-speech-prep-relay"), "the scan missed the ? beside a label");
+  // `#347 settings-prose`: the one written as words, How messages are pre-processed for speech.
+  assert.ok(links.some(([link]) => link === "help-link-speech-prep"), "the scan missed the link written as words");
   for (const [link, topic] of links) {
     if (page.screen() !== "settings") await page.el("close-help").click();
     const scrolled = page.el(`help-${topic}`).scrolledIntoView;
@@ -27479,7 +27484,9 @@ test("Settings says plainly what the relay costs and what it cannot do", () => {
   // The disclosure is therefore asserted in two halves, and the second half is what keeps the move
   // honest: the prose still exists, and the `?` beside this control is what reaches it. A test that
   // only looked at the help screen would pass just as well if nothing linked to it.
-  const settings = settingsGroup("Live messages");
+  // `#347 settings-prose` named the group for its control, and made its one-line summary the tooltip of
+  // its title and its `?`, which is where "voice vendor" and "by default" are read from now.
+  const settings = settingsGroup("Arriving messages during a call");
   assert.match(settings, /id="relay-to-agent"/);
   // ALL THREE modes are named on the screen, and none of them is `selected` in the markup. The
   // live value comes out of storage, so a markup default would be a second opinion about the mode
@@ -27812,7 +27819,7 @@ test("Help says which way this server says a message, and Settings offers no swi
   assert.match(off.el("speech-prep-state").textContent, /exactly as they were typed/);
 
   const block = helpEntry("speech-prep");
-  assert.match(block, /<summary><h2>How messages are said<\/h2><\/summary>\s*<p id="speech-prep-state" class="hint"><\/p>/,
+  assert.match(block, /<summary><h2>How messages are pre-processed for speech<\/h2><\/summary>\s*<p id="speech-prep-state" class="hint"><\/p>/,
     "the entry does not open on which arm this server is in");
   assert.ok(!/<(input|select|textarea)\b/.test(block),
     "a control here would silently govern one of the three paths that read a message out");
@@ -27835,7 +27842,8 @@ test("Settings states the privacy cost of resuming, and that it is a reconstruct
     "a control that re-sends prior conversation content to a vendor must not ship on"
   );
   assert.match(settings, /data-help="resuming"/, "the group offers no way to reach what it costs");
-  assert.match(settings, /voice vendor/, "the cost is not even summarised beside the switch");
+  // `#347 settings-prose`: summarised in the tooltip of the group's title and of its `?`.
+  assert.match(settings, /title="[^"]*voice vendor/, "the cost is not even summarised beside the switch");
 
   const block = helpEntry("resuming");
   assert.match(
@@ -39673,8 +39681,9 @@ test("an older server's missing rules hide the editor rather than show an empty 
   assert.match(page.el("noise-state").textContent, /does not say/);
 });
 
-test("the Read automatically group explains itself in Help, where its ? leads", () => {
-  const group = settingsGroup("Read automatically");
+test("the Mark-read automatically group explains itself in Help, where its ? leads", () => {
+  // `#347 settings-prose`: "Mark-read automatically", the owner's name for "Read automatically".
+  const group = settingsGroup("Mark-read automatically");
   assert.match(group, /data-help="auto-read"/, "the group offers no way to reach the detail");
   const help = helpEntry("auto-read");
   assert.match(help, /whole text/, "Help does not say a rule must match the whole message");
@@ -57402,10 +57411,10 @@ test("`#262 search-load-older`: Main drawn from All reads its own newest page fi
 // Messages group, and the switch that lets the agent send without approval somewhere he can find it.
 
 /** Every Settings section's title, in the order the markup gives them. */
-const SETTINGS_SECTIONS = [...HTML.matchAll(/<h2 id="settings-[a-z-]+-title">([^<]+)<\/h2>/g)].map((m) => m[1]);
+const SETTINGS_SECTIONS = settingsHeadings(HTML.slice(HTML.indexOf('id="screen-settings"'), HTML.indexOf('id="screen-help"')), 2);
 
 /** The group headings inside one section, in order. */
-const groupsIn = (title, html = HTML) => [...settingsSection(title, html).matchAll(/<h3>([^<]+)<\/h3>/g)].map((m) => m[1]);
+const groupsIn = (title, html = HTML) => settingsHeadings(settingsSection(title, html), 3);
 
 test("`#271 settings-groups`: Settings is a handful of sections, and every group is inside one", () => {
   assert.deepStrictEqual(
@@ -57429,8 +57438,8 @@ test("`#271 settings-groups`: Settings is a handful of sections, and every group
 
 test("`#271 settings-groups`: the Voice agent section holds sending, the instructions, resuming and live messages", () => {
   const voice = groupsIn("Voice agent");
-  for (const group of ["Sending", "Instructions", "Resuming", "Live messages", "Reading full messages in channel view",
-    "Canned prompts", "Microphone"]) {
+  for (const group of ["Sending", "Instructions", "Resuming", "Arriving messages during a call",
+    "Reading full messages in channel view", "Canned prompts", "Microphone"]) {
     assert.ok(voice.includes(group), `"${group}" is not in the Voice agent section: ${voice.join(", ")}`);
   }
   // FIRST, where the owner looks: the switch he could not find.
@@ -57446,9 +57455,10 @@ test("`#271 settings-groups`: the Messages section holds the message options, an
   const messages = groupsIn("Messages");
   // `#332 settings-voice-agent-section` took the message-reading setting to Voice agent and How
   // messages are said to Help, so Messages is the marking and drawing of messages, and only that.
-  assert.deepStrictEqual(messages, ["Your own messages", "Read automatically", "Combining messages", "Rich headers",
+  assert.deepStrictEqual(messages, ["Your own messages", "Mark-read automatically", "Combining messages", "Rich headers",
     "Recently dismissed"]);
-  for (const agentGroup of ["Sending", "Instructions", "Resuming", "Live messages", "Reading full messages in channel view"]) {
+  for (const agentGroup of ["Sending", "Instructions", "Resuming", "Arriving messages during a call",
+    "Reading full messages in channel view"]) {
     assert.ok(!messages.includes(agentGroup), `"${agentGroup}" is in Messages`);
   }
   assert.deepStrictEqual(groupsIn("Screen and keys"), ["Text size", "Reading width", "Control bar", "Typing", "Keyboard"]);
@@ -57456,7 +57466,7 @@ test("`#271 settings-groups`: the Messages section holds the message options, an
     ["Stored conversations", "Saved messages on this server", "Token", "Connection status"]);
   // The per-channel box is its own section, with its `?` beside the section's title.
   const channels = settingsSection("Channels");
-  assert.match(channels, /<h2 id="settings-channels-title">Channels<\/h2>\s*<button class="help-link" id="help-link-channel-alias"/);
+  assert.match(channels, /<h2 id="settings-channels-title"[^>]*>Channels<\/h2>\s*<button class="help-link" id="help-link-channel-alias"/);
   assert.match(channels, /<section class="settings-group" id="channel-settings"/);
 });
 
@@ -57480,11 +57490,15 @@ test("`#271 settings-groups`: the section is the card, and a group inside it is 
 // The owner, 2026-10-15, building on `#271 settings-groups`: Resuming, Live messages and the
 // message-reading setting together in the Voice agent section; "Message audio" renamed "Reading
 // full messages in channel view" and moved there; How messages are said is information, not a
-// setting, so its prose leaves Settings and is reached through small ? links beside the settings it
-// explains; and each state line short, the long explanations in Help.
+// setting, so its prose leaves Settings and is reached from beside the settings it explains; and
+// each state line short, the long explanations in Help.
+//
+// `#347 settings-prose` (2026-10-18) renamed Live messages for its control, "Arriving messages during
+// a call", and made How messages are said one short link under Reading full messages in channel
+// view, "How messages are pre-processed for speech", in place of a `?` beside each of the two.
 
 /** The three settings that read a message out, in the order the Voice agent section holds them. */
-const READING_GROUPS = ["Resuming", "Live messages", "Reading full messages in channel view"];
+const READING_GROUPS = ["Resuming", "Arriving messages during a call", "Reading full messages in channel view"];
 
 /**
  * What is wrong with a page's Settings against `#332`, as sentences; empty when nothing is. A function
@@ -57503,16 +57517,12 @@ function voiceAgentSectionProblems(html) {
   for (const gone of ["Message audio", "How messages are said"]) {
     if (settings.includes(gone)) problems.push(`Settings still says "${gone}"`);
   }
-  const reading = settings.includes(`<h3>${READING_GROUPS[2]}</h3>`) ? settingsGroup(READING_GROUPS[2], code) : "";
+  const reading = new RegExp(settingsHeading(3, READING_GROUPS[2])).test(settings) ? settingsGroup(READING_GROUPS[2], code) : "";
   if (!/<select id="settings-audio-source">/.test(reading)) {
     problems.push("the message-reading picker is not in Reading full messages in channel view");
   }
-  if (!/<div class="group-head">\s*<h3>[^<]+<\/h3>\s*<button class="help-link" id="help-link-speech-prep" type="button" data-help="speech-prep"/.test(reading)) {
-    problems.push("Reading full messages in channel view has no ? for How messages are said beside its heading");
-  }
-  const live = settings.includes("<h3>Live messages</h3>") ? settingsGroup("Live messages", code) : "";
-  if (!/<div class="label-help">\s*<label for="relay-to-agent">[^<]+<\/label>\s*<button class="help-link" id="help-link-speech-prep-relay" type="button" data-help="speech-prep"/.test(live)) {
-    problems.push("Arriving messages during a call has no ? for How messages are said beside its label");
+  if (!/<button class="help-link help-link-text" id="help-link-speech-prep" type="button" data-help="speech-prep"[^>]*>How messages are pre-processed for speech<\/button>/.test(reading)) {
+    problems.push("Reading full messages in channel view has no link to How messages are pre-processed for speech");
   }
   if (settings.includes('id="speech-prep-state"')) {
     problems.push("which arm of the rewrite this server is in is still on Settings");
@@ -57524,7 +57534,7 @@ function voiceAgentSectionProblems(html) {
   return problems;
 }
 
-test("`#332 settings-voice-agent-section`: Voice agent holds Resuming, Live messages and Reading full messages in channel view, together", () => {
+test("`#332 settings-voice-agent-section`: Voice agent holds Resuming, Arriving messages during a call and Reading full messages in channel view, together", () => {
   assert.deepStrictEqual(voiceAgentSectionProblems(HTML), []);
   // Still after Sending and Instructions, which `#271` put first, where the owner looks.
   assert.deepStrictEqual(groupsIn("Voice agent").slice(0, 5), ["Sending", "Instructions", ...READING_GROUPS]);
@@ -57537,76 +57547,50 @@ test("`#332 settings-voice-agent-section`: Voice agent holds Resuming, Live mess
 
 test("`#332 settings-voice-agent-section`: the check refuses the Settings from before, one change at a time (negative controls)", () => {
   // The whole arrangement from before: the picker in Messages as Message audio, beside a group that
-  // holds only which arm of the rewrite this server is in, and no ? beside Arriving messages.
+  // holds only which arm of the rewrite this server is in.
   const reading = `${settingsGroup(READING_GROUPS[2])}</section>`;
   const prose = '<section class="settings-group"><div class="group-head"><h3>How messages are said</h3>' +
     '<button class="help-link" id="help-link-speech-prep" type="button" data-help="speech-prep">?</button></div>' +
     '<p id="speech-prep-state" class="hint" aria-live="polite"></p></section>';
   const before = HTML
     .replace(reading, "")
-    .replace(/<div class="label-help">\s*(<label for="relay-to-agent">[^<]+<\/label>)\s*<button[^>]*>\?<\/button>\s*<\/div>/, "$1")
     .replace('<p id="speech-prep-state" class="hint"></p>', "")
-    .replace('<p class="hint">How messages are marked and shown.</p>',
-      `<p class="hint">How messages are marked and shown.</p>${prose}${reading.replace(READING_GROUPS[2], "Message audio")}`);
+    .replace(/(<h2 id="settings-messages-title"[^>]*>Messages<\/h2>)/,
+      `$1${prose}${reading.replace(READING_GROUPS[2], "Message audio").replace(/<p class="help-text-row">[\s\S]*?<\/p>/, "")}`);
   assert.notEqual(before, HTML, "the negative control changed nothing");
   assert.deepStrictEqual(voiceAgentSectionProblems(before), [
-    `Voice agent does not hold ${READING_GROUPS.join(", ")} together: Sending, Instructions, Resuming, Live messages, Canned prompts, Microphone, Provider`,
+    `Voice agent does not hold ${READING_GROUPS.join(", ")} together: Sending, Instructions, Resuming, Arriving messages during a call, Canned prompts, Microphone, Provider`,
     'Settings still says "Message audio"',
     'Settings still says "How messages are said"',
     "the message-reading picker is not in Reading full messages in channel view",
-    "Reading full messages in channel view has no ? for How messages are said beside its heading",
-    "Arriving messages during a call has no ? for How messages are said beside its label",
+    "Reading full messages in channel view has no link to How messages are pre-processed for speech",
     "which arm of the rewrite this server is in is still on Settings",
     "How messages are said in Help does not say which arm this server is in",
   ]);
   // Each change alone is caught by name: the old name, kept in place.
-  const renamed = HTML.replace(`<h3>${READING_GROUPS[2]}</h3>`, "<h3>Message audio</h3>");
+  const renamed = HTML.replace(new RegExp(`(<h3\\b[^>]*>)${READING_GROUPS[2]}</h3>`), "$1Message audio</h3>");
   assert.deepStrictEqual(voiceAgentSectionProblems(renamed), [
-    `Voice agent does not hold ${READING_GROUPS.join(", ")} together: Sending, Instructions, Resuming, Live messages, Message audio, Canned prompts, Microphone, Provider`,
+    `Voice agent does not hold ${READING_GROUPS.join(", ")} together: Sending, Instructions, Resuming, Arriving messages during a call, Message audio, Canned prompts, Microphone, Provider`,
     'Settings still says "Message audio"',
     "the message-reading picker is not in Reading full messages in channel view",
-    "Reading full messages in channel view has no ? for How messages are said beside its heading",
+    "Reading full messages in channel view has no link to How messages are pre-processed for speech",
   ]);
   // The group in Voice agent but not beside the other two.
   const apart = HTML.replace(reading, "").replace('<section class="settings-group" id="agent-settings"',
     `${reading}\n<section class="settings-group" id="agent-settings"`);
   assert.deepStrictEqual(voiceAgentSectionProblems(apart), [
-    `Voice agent does not hold ${READING_GROUPS.join(", ")} together: Sending, Instructions, Resuming, Live messages, Canned prompts, Microphone, ${READING_GROUPS[2]}, Provider`,
+    `Voice agent does not hold ${READING_GROUPS.join(", ")} together: Sending, Instructions, Resuming, Arriving messages during a call, Canned prompts, Microphone, ${READING_GROUPS[2]}, Provider`,
   ]);
-  // The second ? taken away, and nothing else.
-  const unlinked = HTML.replace(/(<label for="relay-to-agent">[^<]+<\/label>)\s*<button[^>]*>\?<\/button>/, "$1");
+  // The link taken away, and nothing else.
+  const unlinked = HTML.replace(/<p class="help-text-row">\s*<button[^>]*>How messages are pre-processed for speech<\/button>\s*<\/p>/, "");
+  assert.notEqual(unlinked, HTML, "the negative control changed nothing");
   assert.deepStrictEqual(voiceAgentSectionProblems(unlinked),
-    ["Arriving messages during a call has no ? for How messages are said beside its label"]);
-});
-
-test("`#332 settings-voice-agent-section`: each ? beside a setting that reads a message out opens How messages are said", async () => {
-  const page = newPage();
-  page.speechPrepEnabled = false;
-  await signIn(page);
-  await page.el("open-settings").click();
-  for (const link of ["help-link-speech-prep-relay", "help-link-speech-prep"]) {
-    await page.el(link).click();
-    assert.equal(page.screen(), "help", `#${link} did not open Help`);
-    assert.deepStrictEqual(openHelp(page), ["speech-prep"], `#${link} opened ${openHelp(page).join(", ") || "nothing"}`);
-    assert.equal(page.el("speech-prep-state").textContent,
-      "Off on this server: messages are read out exactly as they were typed.",
-      "the entry does not open on which arm this server is in");
-    await page.el("close-help").click();
-    assert.equal(page.screen(), "settings", "leaving Help did not return to Settings");
-  }
-  // The negative control: the second ? with its wiring taken out. It must then do nothing, or the
-  // loop above proves only that some ? opens Help.
-  const unwired = newPage(new Map(), brokenScript(
-    "for (const [link, topic] of HELP_LINKS_BESIDE) {\n  el(link).addEventListener(\"click\", () => showHelp(topic));\n}", ""));
-  await signIn(unwired);
-  await unwired.el("open-settings").click();
-  await unwired.el("help-link-speech-prep-relay").click();
-  assert.equal(unwired.screen(), "settings", "the negative control opened Help anyway, so the check above proves nothing");
+    ["Reading full messages in channel view has no link to How messages are pre-processed for speech"]);
 });
 
 /** The Tab stops from Resuming through Reading full messages in channel view, in order. */
-const SETTINGS_TAB_STOPS = ["help-link-resuming", "resume-toggle", "help-link-live-messages",
-  "help-link-speech-prep-relay", "relay-to-agent", "help-link-speech-prep", "settings-audio-source"];
+const SETTINGS_TAB_STOPS = ["help-link-resuming", "resume-toggle", "help-link-live-messages", "relay-to-agent",
+  "settings-audio-source", "help-link-speech-prep"];
 
 /**
  * Where the markup breaks `stops` as consecutive Tab stops on Settings, as sentences. The focus order
@@ -57636,25 +57620,21 @@ function tabStopProblems(html, stops) {
 
 test("`#332 settings-voice-agent-section`: Tab goes through the three in the order they are read, each ? before its control", () => {
   assert.deepStrictEqual(tabStopProblems(HTML, SETTINGS_TAB_STOPS), []);
-  // Negative controls. The ? beside Arriving messages after the picker instead of before it:
-  const after = HTML.replace(/(<button class="help-link" id="help-link-speech-prep-relay"[^>]*>\?<\/button>)\s*<\/div>\s*(<select id="relay-to-agent">[\s\S]*?<\/select>)/,
-    "</div>$2$1");
-  assert.notEqual(after, HTML, "the negative control changed nothing");
-  const moved = tabStopProblems(after, SETTINGS_TAB_STOPS);
-  // Three ways of saying it: the picker before the ?, standing after Live messages' own ?, and the ?
-  // left standing between the picker and the reading group's.
-  assert.deepStrictEqual(moved.map((problem) => problem.replace(/^(<[a-z]+ [^ ]+ id="[^"]+")[^>]*>/, "$1>")), [
-    '<select id="relay-to-agent"> stands between #help-link-live-messages and #help-link-speech-prep-relay',
-    "#relay-to-agent comes before #help-link-speech-prep-relay",
-    '<button class="help-link" id="help-link-speech-prep-relay"> stands between #relay-to-agent and #help-link-speech-prep',
+  // Negative controls. The link put above the picker it is about:
+  const link = /<p class="help-text-row">\s*<button[^>]*>How messages are pre-processed for speech<\/button>\s*<\/p>/.exec(HTML)[0];
+  const above = HTML.replace(link, "").replace('<label for="settings-audio-source">', `${link}<label for="settings-audio-source">`);
+  assert.notEqual(above, HTML, "the negative control changed nothing");
+  assert.deepStrictEqual(tabStopProblems(above, SETTINGS_TAB_STOPS).map((problem) => problem.replace(/^(<[a-z]+ [^ ]+ [^ ]+ id="[^"]+")[^>]*>/, "$1>")), [
+    '<button class="help-link help-link-text" id="help-link-speech-prep"> stands between #relay-to-agent and #settings-audio-source',
+    "#help-link-speech-prep comes before #settings-audio-source",
   ]);
-  // ...and Canned prompts put back between Live messages and the reading picker.
+  // ...and Canned prompts put back between Arriving messages and the reading picker.
   const canned = `${settingsGroup("Canned prompts")}</section>`;
   const between = HTML.replace(canned, "").replace('<section class="settings-group" id="reading-full-group">',
     `${canned}<section class="settings-group" id="reading-full-group">`);
   const found = tabStopProblems(between, SETTINGS_TAB_STOPS);
   assert.equal(found.length, 1, found.join("; "));
-  assert.match(found[0], /^<button class="help-link" id="help-link-canned-prompts"[^>]*> stands between #relay-to-agent and #help-link-speech-prep$/);
+  assert.match(found[0], /^<button class="help-link" id="help-link-canned-prompts"[^>]*> stands between #relay-to-agent and #settings-audio-source$/);
 });
 
 /** The longest a state line under one of the three may be: two lines on a phone, one at a desk. */
@@ -57819,9 +57799,204 @@ test("`#332 settings-voice-agent-section`: what the short lines no longer say is
   assert.match(live, /re-reads on its own\s+timer while you are looking at it, and nothing reaches the agent between your\s+questions/);
   const said = helpEntry("speech-prep");
   for (const words of ["Arriving messages during a\\s+call", "Reading full messages in channel view", "<em>Agent audio<\\/em>",
-    "<em>Device voice<\\/em>", "car audio"]) {
-    assert.match(said, new RegExp(words), `How messages are said does not explain ${words}`);
+    "<em>Device voice<\\/em>", "a car's speakers carry"]) {
+    assert.match(said, new RegExp(words), `How messages are pre-processed for speech does not explain ${words}`);
   }
+});
+
+// --- `#347 settings-prose` ------------------------------------------------------------------------
+//
+// The owner, 2026-10-18 ("settings complaints"): remove implementation-detail text, such as "Live
+// updates are configured for adapter push, and this page is connected to the server stream...";
+// "Arriving messages during a call" becomes the section title, with only its drop-down; rename "Read
+// automatically" to "Mark-read automatically"; one-line descriptions ("Same author, within five
+// seconds...", "Turn it off to see each message's first line...") become the hover tooltip of the
+// (?) and of the subsection title, and clicking (?) opens the full help; "How messages are said"
+// becomes a short link "How messages are pre-processed for speech" into help; rewrite or remove "Car
+// audio: use Agent audio.".
+
+/** The settings screen's markup, comments out: what a reader can be shown. */
+function settingsCode(html) {
+  const code = html.replace(/<!--[\s\S]*?-->/g, " ");
+  return code.slice(code.indexOf('id="screen-settings"'), code.indexOf('id="screen-help"'));
+}
+
+/**
+ * The one-line descriptions that stood under their headings, by the heading each describes: each is
+ * that heading's tooltip now, and its `?`'s. The owner's two examples are the last two.
+ */
+const MOVED_DESCRIPTIONS = new Map([
+  ["Resuming", "Off by default: it re-sends earlier conversation content to the voice vendor."],
+  ["Arriving messages during a call",
+    "Briefly, by default. Both speaking modes send channel text to the voice vendor and take conversation time."],
+  ["Canned prompts", "What the two prompt buttons send. Empty a field to restore its default."],
+  ["Microphone", "Applied to your next call, not the one in progress."],
+  ["Your own messages", "Greyed here, and kept out of the queue."],
+  ["Combining messages", "Same author, within five seconds. Turn it off to see the raw rows."],
+  ["Rich headers", "Turn it off to see each message's first line as it was written."],
+]);
+
+/** ...and the two sections that had a line of their own under their title. */
+const MOVED_SECTION_DESCRIPTIONS = new Map([
+  ["Voice agent", "What the agent may send and is told, what it hears, and how messages are read out."],
+  ["Messages", "How messages are marked and shown."],
+]);
+
+/** A tag's `title`, or null. */
+const titleOf = (tag) => (/\btitle="([^"]*)"/.exec(tag) || [])[1] ?? null;
+
+/**
+ * What is wrong with a page's Settings against `#347`, as sentences; empty when nothing is. A function
+ * of the markup, so each negative control can hand it a page with one of the old things put back.
+ */
+function settingsProseProblems(html) {
+  const problems = [];
+  const settings = settingsCode(html);
+  const help = html.replace(/<!--[\s\S]*?-->/g, " ").slice(html.replace(/<!--[\s\S]*?-->/g, " ").indexOf('id="screen-help"'));
+  // How live updates are delivered is a readout: Connection status's, and in no setting's group.
+  const relayAt = new RegExp(settingsHeading(3, "Arriving messages during a call")).exec(settings);
+  const relay = relayAt ? settingsGroup("Arriving messages during a call", settings) : "";
+  const status = new RegExp(settingsHeading(3, "Connection status")).test(settings) ? settingsGroup("Connection status", settings) : "";
+  if (!status.includes('id="live-state"')) problems.push("how live updates reach this page is not in Connection status");
+  if (settingsSection("Voice agent", settings).includes('id="live-state"')) {
+    problems.push("how live updates reach this page is still in the Voice agent section");
+  }
+  if (/adapter push|server stream|server's stream/i.test(settings)) {
+    problems.push("Settings still describes how live updates are delivered in words of its own");
+  }
+  // Arriving messages during a call is the title, with only its drop-down.
+  if (!relayAt) {
+    problems.push('no group is titled "Arriving messages during a call"');
+  } else {
+    const heading = /<h3\b[^>]*>/.exec(relay)[0];
+    const fields = [...relay.matchAll(/<(select|input|textarea|label|p)\b[^>]*>/g)].map((m) => m[0]);
+    if (fields.length !== 1 || !/^<select id="relay-to-agent"/.test(fields[0])) {
+      problems.push(`Arriving messages during a call holds more than its drop-down: ${fields.join(" ")}`);
+    }
+    const named = (/\bid="([^"]+)"/.exec(heading) || [])[1];
+    if (!named || !new RegExp(`<select id="relay-to-agent" aria-labelledby="${named}"`).test(relay)) {
+      problems.push("the drop-down is not named by the title above it");
+    }
+    if ([...relay.matchAll(/<button\b/g)].length !== 1 || !/data-help="live-messages"/.test(relay)) {
+      problems.push("Arriving messages during a call has some other button than its own ?");
+    }
+  }
+  // The owner's name for the list.
+  if (/>Read automatically</.test(settings) || !new RegExp(settingsHeading(3, "Mark-read automatically")).test(settings)) {
+    problems.push('the list is still called "Read automatically" on Settings');
+  }
+  if (!/<summary><h2>Mark-read automatically<\/h2><\/summary>/.test(help)) {
+    problems.push('Help does not call the list "Mark-read automatically"');
+  }
+  // Every ? says what its heading says, and the heading says it too.
+  for (const head of settings.matchAll(/<(h[23])\b([^>]*)>([^<]+)<\/\1>\s*<button class="help-link" id="([a-z-]+)"[^>]*>\?<\/button>/g)) {
+    const [, , attributes, words, link] = head;
+    const button = new RegExp(`<button class="help-link" id="${link}"[^>]*>`).exec(head[0])[0];
+    const said = titleOf(attributes);
+    if (!said || said !== titleOf(button)) {
+      problems.push(`"${words}" and its ? do not carry the same one-line description: ${said} / ${titleOf(button)}`);
+    } else if (!/^[A-Z].{10,150}\.$/.test(said)) {
+      problems.push(`"${words}" has a tooltip that is not a one-line sentence: ${said}`);
+    }
+  }
+  for (const [heading, line] of [...MOVED_DESCRIPTIONS, ...MOVED_SECTION_DESCRIPTIONS]) {
+    if (settings.includes(`<p class="hint">${line}</p>`)) problems.push(`"${line}" is still a line under ${heading}`);
+    const level = MOVED_SECTION_DESCRIPTIONS.has(heading) ? 2 : 3;
+    const tag = new RegExp(`<h${level}\\b[^>]*>${literal(heading)}</h${level}>`).exec(settings);
+    if (!tag || titleOf(tag[0]) !== line) problems.push(`${heading}'s tooltip is not "${line}"`);
+  }
+  // How messages are said is a short link into Help; Car audio is gone, and what it meant is said.
+  if (!/<button class="help-link help-link-text" id="help-link-speech-prep"[^>]*>How messages are pre-processed for speech<\/button>/.test(settings)) {
+    problems.push('there is no link "How messages are pre-processed for speech"');
+  }
+  if (/Car audio/.test(settings)) problems.push('"Car audio: use Agent audio." is still on Settings');
+  const reading = new RegExp(`<h3\\b[^>]*>Reading full messages in channel view</h3>`).exec(settings);
+  if (!reading || !/a car's speakers/.test(titleOf(reading[0]) || "")) {
+    problems.push("nothing says which voice a car's speakers carry");
+  }
+  return problems;
+}
+
+test("`#347 settings-prose`: Settings drops its implementation prose, and its one-line descriptions are tooltips", () => {
+  assert.deepStrictEqual(settingsProseProblems(HTML), []);
+});
+
+test("`#347 settings-prose`: the check refuses each old thing put back, one at a time (negative controls)", () => {
+  const relay = `${settingsGroup("Arriving messages during a call")}</section>`;
+  const cases = [
+    // The live-updates line back at the head of the group, and named as it was.
+    ["the live line", HTML.replace(/\s*<p id="live-state" class="hint" aria-live="polite"><\/p>/, "")
+      .replace('<select id="relay-to-agent"', '<p id="live-state" class="hint" aria-live="polite"></p><select id="relay-to-agent"'), [
+      "how live updates reach this page is not in Connection status",
+      "how live updates reach this page is still in the Voice agent section",
+      "Arriving messages during a call holds more than its drop-down: " +
+        '<p id="live-state" class="hint" aria-live="polite"> <select id="relay-to-agent" aria-labelledby="relay-to-agent-title">',
+    ]],
+    // The #332 group: Live messages, its label with a ? after it, and the line under the picker.
+    ["the old group", HTML.replace(relay, relay
+      .replace(/(<h3\b[^>]*>)Arriving messages during a call<\/h3>/, "$1Live messages</h3>")
+      .replace('<select id="relay-to-agent" aria-labelledby="relay-to-agent-title">',
+        '<div class="label-help"><label for="relay-to-agent">Arriving messages during a call</label>' +
+        '<button class="help-link" id="help-link-speech-prep-relay" type="button" data-help="speech-prep">?</button></div>' +
+        '<select id="relay-to-agent">')), [
+      'no group is titled "Arriving messages during a call"',
+      `Arriving messages during a call's tooltip is not "${MOVED_DESCRIPTIONS.get("Arriving messages during a call")}"`,
+    ]],
+    ["the old name", HTML.replace(/(<h3\b[^>]*>)Mark-read automatically<\/h3>/, "$1Read automatically</h3>"), [
+      'the list is still called "Read automatically" on Settings',
+    ]],
+    ["a line back under its heading", HTML.replace(/(Show messages sent seconds apart as one\s*<\/label>)/,
+      `$1<p class="hint">${MOVED_DESCRIPTIONS.get("Combining messages")}</p>`), [
+      `"${MOVED_DESCRIPTIONS.get("Combining messages")}" is still a line under Combining messages`,
+    ]],
+    ["a ? that says something else", HTML.replace(/(id="help-link-combining"[^>]*title=")[^"]*"/, '$1What this does"'), [
+      `"Combining messages" and its ? do not carry the same one-line description: ${MOVED_DESCRIPTIONS.get("Combining messages")} / What this does`,
+    ]],
+    ["Car audio back", HTML.replace('<p class="help-text-row">', '<p class="hint">Car audio: use Agent audio.</p><p class="help-text-row">'), [
+      '"Car audio: use Agent audio." is still on Settings',
+    ]],
+  ];
+  for (const [what, page, wanted] of cases) {
+    assert.notEqual(page, HTML, `${what}: the negative control changed nothing`);
+    assert.deepStrictEqual(settingsProseProblems(page), wanted, what);
+  }
+});
+
+test("`#347 settings-prose`: How messages are pre-processed for speech opens Help at the entry of that name", async () => {
+  const page = newPage();
+  page.speechPrepEnabled = false;
+  await signIn(page);
+  await page.el("open-settings").click();
+  await page.el("help-link-speech-prep").click();
+  assert.equal(page.screen(), "help", "the link did not open Help");
+  assert.deepStrictEqual(openHelp(page), ["speech-prep"], `the link opened ${openHelp(page).join(", ") || "nothing"}`);
+  assert.match(helpEntry("speech-prep"), /^id="help-speech-prep" class="help-entry">\s*<summary><h2>How messages are pre-processed for speech<\/h2><\/summary>/,
+    "the entry the link opens is not called what the link says");
+  assert.equal(page.el("speech-prep-state").textContent,
+    "Off on this server: messages are read out exactly as they were typed.",
+    "the entry does not open on which arm this server is in");
+  // The negative control: the link with its wiring taken out must then do nothing, or the check above
+  // proves only that something opens Help.
+  const unwired = newPage(new Map(), brokenScript('  "speech-prep",\n', ""));
+  await signIn(unwired);
+  await unwired.el("open-settings").click();
+  await unwired.el("help-link-speech-prep").click();
+  assert.equal(unwired.screen(), "settings", "the negative control opened Help anyway, so the check above proves nothing");
+});
+
+test("`#347 settings-prose`: how live updates arrive is still said, in Connection status, for every state", async () => {
+  // The line moved; it was not deleted. Connection status holds it, and each state still says itself.
+  assert.ok(markupHolds("settings-storage", "live-state"), "the line is not in Storage and connection");
+  const group = settingsGroup("Connection status");
+  assert.ok(group.indexOf('id="settings-detail"') < group.indexOf('id="live-state"'), "the line is not under the readout");
+  const polling = newPage();
+  await withLiveChannel(polling, []);
+  assert.match(polling.el("live-state").textContent, /re-reads the channel every \d+ seconds/);
+  const pushed = newPage();
+  pushed.livePollSeconds = 0;
+  pushed.liveDelivery = "push";
+  await signIn(pushed);
+  assert.match(pushed.el("live-state").textContent, /adapter push/);
 });
 
 // --- `#272 voice-agent-instructions` --------------------------------------------------------------

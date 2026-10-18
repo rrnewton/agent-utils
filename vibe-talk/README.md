@@ -6424,7 +6424,8 @@ real answer arrives later as a separate message. In the owner's main space nine 
 messages were exactly that, and each one was an unread row, a to-do item, and a line of every
 digest. So the server keeps a short list of **noise rules**, and a message matching one counts as
 read without anybody tapping Done. The list starts as one rule, `Working…`, and is edited in
-Settings under *Read automatically*.
+Settings under *Mark-read automatically* (*Read automatically* until `#347 settings-prose` gave it the
+owner's name).
 
 **The matcher is deliberately trivial.** A rule matches when the message's WHOLE text equals it,
 ignoring case, extra whitespace, `_ * ~` emphasis around it, and `...` versus `…`; a rule ending in
@@ -7172,8 +7173,8 @@ the groups sit as rows inside a handful of sections, and each section is the car
 
 | Section | Holds |
 |---|---|
-| **Voice agent** | Sending (ask before the agent sends — first, where it is looked for), Instructions, Resuming, Live messages, Reading full messages in channel view, Canned prompts, Microphone, and the provider's console link |
-| **Messages** | Your own messages, Read automatically, Combining messages, Rich headers, Recently dismissed |
+| **Voice agent** | Sending (ask before the agent sends — first, where it is looked for), Instructions, Resuming, Arriving messages during a call, Reading full messages in channel view, Canned prompts, Microphone, and the provider's console link |
+| **Messages** | Your own messages, Mark-read automatically, Combining messages, Rich headers, Recently dismissed |
 | **Channels** | the per-channel box: rename, remove, add, browse, clear unread upstream, who is who |
 | **Screen and keys** | Text size, Reading width, Control bar, Typing, Keyboard |
 | **Storage and connection** | Stored conversations, Saved messages on this server (the message cache's switch, its Erase and what it holds; shown only to the write token, and only when client-config carries `message_cache` — `#208 persistent-cache`), Token, Connection status |
@@ -7183,20 +7184,20 @@ A section's title is an `h2` a size up; a group inside it keeps its own small `h
 holds the section list and which groups each section holds.
 
 **Every way a message is read out is in Voice agent, together** (`#332
-settings-voice-agent-section`). Resuming (a new call is told what was said), Live messages (a
-message arriving during a call), and **Reading full messages in channel view** — the picker
-between Agent audio and Device voice that used to be a group called "Message audio" in Messages —
-sit one after another, in that order, and Tab goes through them in that order too, each `?` before
-the control it is about. The picker kept its ids, and the phone-or-cloud button on the bar is still
-the same setting.
+settings-voice-agent-section`). Resuming (a new call is told what was said), **Arriving messages
+during a call** (a message arriving during a call; the group was called Live messages until `#347
+settings-prose`), and **Reading full messages in channel view** — the picker between Agent audio and
+Device voice that used to be a group called "Message audio" in Messages — sit one after another, in
+that order, and Tab goes through them in that order too, each `?` before the control it is about. The
+picker kept its ids, and the phone-or-cloud button on the bar is still the same setting.
 
 **How messages are said is information, not a setting, so it is not on Settings.** It was a group
 holding one paragraph and no control: which arm of the server's rewrite for the ear this deployment
-is in (`speakable.enabled`). That line now opens Help's entry of the same name, and the entry is
-reached by a small `?` beside each setting it explains: after the words *Arriving messages during a
-call*, and beside the heading of Reading full messages in channel view. The second `?` for one entry
-is wired by id like every other (`HELP_LINKS_BESIDE` in `web/voice.js`), and the page suite holds
-every `?` in the markup to one of the two lists, so a `?` that does nothing cannot ship.
+is in (`speakable.enabled`). That line opens Help's entry, reached since `#347 settings-prose` by one
+short link under the reading picker, in the owner's words **How messages are pre-processed for
+speech** — the entry's title too. It replaced a small `?` beside each setting the entry explains. The
+link keeps the id `help-link-speech-prep`, so `HELP_TOPICS` wires it like every `?`, and the page
+suite holds every `?` in the markup to that list, so a `?` that does nothing cannot ship.
 
 **A state line is one short sentence.** The lines under Resuming and Live messages had grown into
 paragraphs — the budget settings, what adapter push cannot vouch for, what off on the server means
@@ -7205,7 +7206,32 @@ resumed IN PART: 3 earlier lines did not fit."), held by the page suite to 80 ch
 state, at most two lines on a phone; the clauses they dropped are in the entry their group's `?`
 opens. The one clause kept is the push caveat — "listening, but the adapter's health is not
 checked" — because "listening" alone would read as a claim about the adapter.
-`60-settings-voice-agent` photographs the three together at 393x852 and 1280x800.
+`60-settings-voice-agent` photographs the three together at 393x852, 1280x800 and 1920x1080.
+
+**No implementation prose, and the one-line descriptions are tooltips** (`#347 settings-prose`). The
+owner, 2026-10-18: take out text about how the server works — his example was the line saying live
+updates came by adapter push over the server stream — and make each one-line description "the hover
+tooltip of the (?) and of the subsection title", with the `?` still opening the full entry. So:
+
+- How live updates reach this page (polling every N seconds, or adapter push; attached to the stream
+  or retrying) is the last line of **Connection status**, the readout at the foot of the screen, and
+  no longer the head of a setting's group. The line and its states are unchanged.
+- **Arriving messages during a call** is the group's title, with only its drop-down under it; the
+  drop-down is named by the title (`aria-labelledby`).
+- A group's line of orientation ("Same author, within five seconds. Turn it off to see the raw
+  rows.") is not drawn: it is the `title` of the group's heading and of its `?`, word for word the
+  same; a section's own line is its title's tooltip. Every `?` has one, so "What this does" is gone.
+  What is still drawn is what changes (state lines), what a field is described by, and the warning
+  beside Clear unread, which is the whole decision.
+- *Read automatically* is **Mark-read automatically**, the owner's name for it: it marks a message
+  read, it does not read it out. Its Help entry carries the same name.
+- "Car audio: use Agent audio." is gone; what it meant — Agent audio plays as ordinary audio, so a
+  car's speakers carry it, where Device voice is the device's own speech — is the reading group's
+  tooltip and is said in Help.
+
+The page suite holds each of these to the markup with a negative control for each, and
+`63-settings-prose` photographs the Messages section with no line of description under a heading at
+393x852, 1280x800 and 1920x1080. Tooltips are a mouse's: on a phone the `?` is the way in, as before.
 
 **Connection status moved to the end and gained a word.** It is a readout — what the conversation
 is, what audio format it negotiated, why the last one closed — and it was standing at the top of the

@@ -775,14 +775,9 @@ a.search-hit-link {
   gap: 0.5rem;
 }
 
-/* `#332 settings-voice-agent-section`. A control's label with a `?` straight after its words: help
-   about that one control, so it stands by the label rather than hard right, where the group's own
-   `?` is and where the two would read as a pair. The control it labels goes on the next line. */
-.label-help {
-  display: flex;
-  align-items: center;
-  gap: 0.45rem;
-  margin: 0.35rem 0 0.25rem;
+/* `#347 settings-prose`. A heading whose one-line description is its tooltip says so to a mouse. */
+#screen-settings :is(h2, h3)[title] {
+  cursor: help;
 }
 
 /* Small, round, and quiet: it is an offer, not an instruction, and there is one on nearly every
@@ -811,6 +806,35 @@ a.search-hit-link {
 .help-link:focus-visible {
   color: var(--ink);
   border-color: var(--accent);
+}
+
+/* `#347 settings-prose`. "How messages are pre-processed for speech": the one entry into Help that is
+   words rather than a `?`, so it reads as a link — the accent, underlined, at the size of a hint — and
+   not as a round button stretched round a sentence. Still a button: it opens a screen of this page and
+   goes nowhere, which is what a link would claim. Tall enough to be a tap target on a phone. */
+.help-link.help-link-text {
+  display: inline-flex;
+  width: auto;
+  height: auto;
+  min-height: 2.4rem;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  color: var(--accent);
+  font-size: 0.85rem;
+  line-height: 1.3;
+  text-align: left;
+  text-decoration: underline;
+  text-underline-offset: 0.15em;
+}
+
+.help-link.help-link-text:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.help-text-row {
+  margin: 0.3rem 0 0;
 }
 
 /* `#224 keyboard-shortcuts`. Help's Keyboard entry: each key, then what it does, one per line, under

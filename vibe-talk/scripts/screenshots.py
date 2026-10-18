@@ -879,7 +879,25 @@ PROFILES: tuple[Profile, ...] = (
         user_agent=ANDROID_UA,
         opt_in=True,
     ),
+    Profile(
+        # The owner's Settings batch of 2026-10-18 (`#345 settings-multi-column` to `#349
+        # channel-settings-all`) asks to be seen at a full-HD desk as well as the small one: that is
+        # where Settings has room for more than two columns. Opt-in like the Android width, so only a
+        # scene that names it runs here.
+        name="desk-1920",
+        what="a full-HD desktop window, 1920x1080",
+        width=1920,
+        height=1080,
+        scale=1.0,
+        mobile=False,
+        user_agent=DESKTOP_UA,
+        opt_in=True,
+    ),
 )
+
+# `#345 settings-multi-column` and the rest of the owner's Settings batch: the phone he uses, the small
+# desk and the full-HD one.
+SETTINGS_PROFILES = ("iphone15", "laptop-1280", "desk-1920")
 
 # The profiles where `@media (min-width: 900px) and (pointer: fine)` is in force. A scene about the
 # desktop composition is meaningless on a phone, and worse than meaningless if it PASSES there.
@@ -3248,8 +3266,9 @@ def _act_settings_voice_agent(driver: Driver) -> None:
     """`#332 settings-voice-agent-section`: Voice agent at its three settings that read a message out.
 
     A fresh load, Settings, and the screen scrolled to put Resuming's group at the top, so the
-    picture holds Resuming, Live messages and Reading full messages in channel view together, each
-    with its short state line and its `?`s, at a phone's height as at a desk's.
+    picture holds Resuming, Arriving messages during a call (`#347 settings-prose`: its title and only
+    its drop-down) and Reading full messages in channel view with the link to how messages are
+    pre-processed for speech, together, at a phone's height as at a desk's.
     """
     driver.load(with_token=True)
     driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
@@ -3259,6 +3278,24 @@ def _act_settings_voice_agent(driver: Driver) -> None:
     driver.js(
         "(() => { document.getElementById('resume-toggle').closest('.settings-group')"
         ".scrollIntoView({ block: 'start' }); return true; })()"
+    )
+    driver.settle(300)
+
+
+def _act_settings_prose(driver: Driver) -> None:
+    """`#347 settings-prose`: Settings' Messages section with no line of description under any heading.
+
+    A fresh load, Settings, and the screen scrolled to put the Messages section at the top: Your own
+    messages, Mark-read automatically (the owner's name for it), Combining messages and Rich headers,
+    each a heading, its `?` and its control, the one-line descriptions that stood under them now the
+    tooltips of the heading and the `?`.
+    """
+    driver.load(with_token=True)
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    driver.click("open-settings")
+    driver.page.wait_for_function("() => window.__visible('close-settings')", timeout=5_000)
+    driver.js(
+        "(() => { document.getElementById('settings-messages').scrollIntoView({ block: 'start' }); return true; })()"
     )
     driver.settle(300)
 
@@ -5495,50 +5532,58 @@ SCENES: tuple[Scene, ...] = (
     ),
     Scene(
         name="60-settings-voice-agent",
-        what="Settings, Voice agent: Resuming, Live messages and Reading full messages in channel view together, short lines and ?s",
+        what="Settings, Voice agent: Resuming, Arriving messages during a call and Reading full messages in channel view together, and the link to how messages are pre-processed for speech",
         act=_act_settings_voice_agent,
-        profiles=("iphone15", "laptop-1280"),
+        profiles=SETTINGS_PROFILES,
         expect=(
             ("the settings screen is up", "window.__visible('screen-settings')"),
             (
                 # THE arrangement: the three, one after another, inside Voice agent.
-                "Voice agent holds Resuming, Live messages and Reading full messages in channel view, in a row",
-                "(() => { const heads = [...document.querySelectorAll('#settings-voice-agent > .settings-group "
-                "> .group-head > h3')].map((h) => h.textContent.trim()); "
+                "Voice agent holds Resuming, Arriving messages during a call and Reading full messages in channel view, in a row",
+                "(() => { const heads = [...document.querySelectorAll('#settings-voice-agent .settings-group "
+                ".group-head > h3')].map((h) => h.textContent.trim()); "
                 "const at = heads.indexOf('Resuming'); "
-                "return at >= 0 && heads[at + 1] === 'Live messages' "
+                "return at >= 0 && heads[at + 1] === 'Arriving messages during a call' "
                 "&& heads[at + 2] === 'Reading full messages in channel view'; })()",
             ),
             (
                 "the three headings and their controls are on the screen at once",
                 "['resume-toggle', 'relay-to-agent', 'settings-audio-source', 'help-link-resuming', "
-                "'help-link-live-messages', 'help-link-speech-prep-relay', 'help-link-speech-prep'].every((id) => { "
+                "'help-link-live-messages', 'help-link-speech-prep'].every((id) => { "
                 "const b = document.getElementById(id).getBoundingClientRect(); "
                 "const s = document.getElementById('screen-settings').getBoundingClientRect(); "
                 "return window.__visible(id) && b.top >= s.top - 1 && b.bottom <= s.bottom + 1; })",
             ),
             (
                 # Gone from Settings by name, and its line is Help's now.
-                "no Message audio and no How messages are said on Settings; the server's arm is in Help",
+                "no Message audio, Live messages or How messages are said on Settings; the server's arm is in Help",
                 "![...document.querySelectorAll('#screen-settings h3')]"
-                ".some((h) => /^(Message audio|How messages are said)$/.test(h.textContent.trim())) "
+                ".some((h) => /^(Message audio|Live messages|How messages are said)$/.test(h.textContent.trim())) "
                 "&& document.getElementById('speech-prep-state').closest('#help-speech-prep') !== null",
             ),
             (
-                # The second ? is about the label it follows: on its line, just after its words, and
-                # well clear of the group's own ? hard right.
-                "the ? beside Arriving messages during a call sits right after the label's words",
-                "(() => { const label = document.querySelector('label[for=\"relay-to-agent\"]').getBoundingClientRect(); "
-                "const q = document.getElementById('help-link-speech-prep-relay').getBoundingClientRect(); "
-                "const own = document.getElementById('help-link-live-messages').getBoundingClientRect(); "
-                "const mid = (b) => b.top + b.height / 2; "
-                "return Math.abs(mid(label) - mid(q)) < 4 && q.left >= label.right && q.left - label.right <= 16 "
-                "&& q.right <= own.left - 24; })()",
+                # `#347 settings-prose`: the title, and only its drop-down. Nothing else drawn in the
+                # group: no label, no state line, no line under the picker.
+                "Arriving messages during a call is its title and only its drop-down",
+                "(() => { const group = document.getElementById('relay-to-agent').closest('.settings-group'); "
+                "const drawn = [...group.querySelectorAll('p, label, select, input')].filter((e) => e.getClientRects().length > 0); "
+                "return drawn.length === 1 && drawn[0].id === 'relay-to-agent' "
+                "&& !group.contains(document.getElementById('live-state')); })()",
+            ),
+            (
+                # ...and How messages are said is a short link under the reading picker, reading as one.
+                "the link under the reading picker says How messages are pre-processed for speech, underlined",
+                "(() => { const link = document.getElementById('help-link-speech-prep'); "
+                "const pick = document.getElementById('settings-audio-source').getBoundingClientRect(); "
+                "const r = link.getBoundingClientRect(); "
+                "return link.textContent.trim() === 'How messages are pre-processed for speech' "
+                "&& r.top >= pick.bottom - 1 && getComputedStyle(link).textDecorationLine.includes('underline') "
+                "&& r.height >= 30; })()",
             ),
             (
                 # `#332`'s other half: a state line is a sentence, not a paragraph, on a phone too.
-                "each state line is at most two lines tall",
-                "['resume-state', 'live-state'].every((id) => { const e = document.getElementById(id); "
+                "the resuming state line is at most two lines tall",
+                "['resume-state'].every((id) => { const e = document.getElementById(id); "
                 "const line = parseFloat(getComputedStyle(e).lineHeight) || parseFloat(getComputedStyle(e).fontSize) * 1.5; "
                 "const h = e.getBoundingClientRect().height; return h > 0 && h <= line * 2 + 1; })",
             ),
@@ -5625,6 +5670,50 @@ SCENES: tuple[Scene, ...] = (
                 "the line above the call keeps the count",
                 "[...document.querySelectorAll('#transcript .seam-recap')]"
                 ".some((n) => /^[\\d,]+-word recap sent$/.test(n.textContent || ''))",
+            ),
+        ),
+    ),
+    Scene(
+        name="63-settings-prose",
+        what="Settings, Messages: Mark-read automatically and its neighbours, each one-line description now its heading's and its ?'s tooltip",
+        act=_act_settings_prose,
+        profiles=SETTINGS_PROFILES,
+        expect=(
+            ("the settings screen is up", "window.__visible('screen-settings')"),
+            (
+                # The owner's name for the list, and the old one gone.
+                "Messages holds Your own messages, Mark-read automatically, Combining messages and Rich headers",
+                "(() => { const heads = [...document.querySelectorAll('#settings-messages .settings-group .group-head > h3')]"
+                ".map((h) => h.textContent.trim()); "
+                "return ['Your own messages', 'Mark-read automatically', 'Combining messages', 'Rich headers']"
+                ".every((h, i) => heads[i] === h) && !heads.includes('Read automatically'); })()",
+            ),
+            (
+                "the Messages title and its first groups are on the screen",
+                "['settings-messages-title', 'help-link-mark-own', 'mark-own-read', 'help-link-auto-read', "
+                "'help-link-combining', 'combine-messages'].every((id) => { "
+                "const b = document.getElementById(id).getBoundingClientRect(); "
+                "const s = document.getElementById('screen-settings').getBoundingClientRect(); "
+                "return window.__visible(id) && b.top >= s.top - 1 && b.bottom <= s.bottom + 1; })",
+            ),
+            (
+                # THE claim: no line of description is drawn. What is drawn in the section is a state
+                # line or a quote of the server's, and every one of those has an id.
+                "no line of description is drawn under a heading in Messages",
+                "[...document.querySelectorAll('#settings-messages p.hint')]"
+                ".filter((p) => p.getClientRects().length > 0).every((p) => p.id !== '')",
+            ),
+            (
+                # ...because it is the tooltip of the heading and of its ?, the same words on both.
+                "every ? on Settings carries its heading's one-line description as its tooltip",
+                "[...document.querySelectorAll('#screen-settings .group-head')].every((head) => { "
+                "const h = head.querySelector('h2, h3'); const q = head.querySelector('.help-link'); "
+                "return !q || (h.title.length > 10 && h.title === q.title); })",
+            ),
+            (
+                "nothing on the settings screen is wider than it",
+                "(() => { const s = document.getElementById('screen-settings'); "
+                "return s.scrollWidth <= s.clientWidth + 1; })()",
             ),
         ),
     ),
@@ -6103,11 +6192,13 @@ def check_state_controls() -> list[str]:
         "58-all-thread-strip": ("android-412", "laptop-1280"),
         "59-all-thread-selected": ("android-412", "laptop-1280"),
         # `#332 settings-voice-agent-section`. The phone the owner uses and the small desk: the two
-        # sizes the issue asks the section to be seen at.
-        "60-settings-voice-agent": ("iphone15", "laptop-1280"),
+        # sizes the issue asks the section to be seen at; `#347 settings-prose` adds the full-HD desk.
+        "60-settings-voice-agent": SETTINGS_PROFILES,
         # `#331 resume-on-websocket`. The same two sizes, for the disabled switch and the call's line.
         "61-resume-unavailable": ("iphone15", "laptop-1280"),
         "62-call-caught-up": ("iphone15", "laptop-1280"),
+        # `#347 settings-prose`. The owner's Settings batch is seen at the phone and both desks.
+        "63-settings-prose": SETTINGS_PROFILES,
     }
     for name, wanted_profiles in restricted.items():
         scene = next((s for s in SCENES if s.name == name), None)
@@ -6302,14 +6393,20 @@ def check_state_controls() -> list[str]:
         "58-all-thread-strip": ("thread-strip", "::before", "data-thread-state"),
         "59-all-thread-selected": ("data-thread-in", "0.3", "__beforeTop"),
         # Pinned to the three in a row in Voice agent (`heads[at + 2]`), to the old names being gone
-        # with the server's arm in Help (`help-speech-prep`), to the ? after the label (`label.right`),
-        # and to the short lines (`line * 2`).
-        "60-settings-voice-agent": ("heads[at + 2]", "help-speech-prep", "label.right", "line * 2"),
+        # with the server's arm in Help (`help-speech-prep`), to Arriving messages during a call
+        # drawing only its drop-down (`drawn.length === 1`, `#347 settings-prose`), to the link under
+        # the reading picker (`pre-processed for speech`) and to the short lines (`line * 2`).
+        "60-settings-voice-agent": ("heads[at + 2]", "help-speech-prep", "drawn.length === 1",
+                                    "pre-processed for speech", "line * 2"),
         # `#331 resume-on-websocket`. Pinned to the switch being disabled (`t.disabled === true`) with
         # its reason under it (`why.top`), and to the call's line saying it was caught up
         # (`Caught the agent up`) after the record went first and once (`v1First`).
         "61-resume-unavailable": ("t.disabled === true", "why.top"),
         "62-call-caught-up": ("Caught the agent up", "v1First"),
+        # `#347 settings-prose`. Pinned to the owner's name for the list (`Mark-read automatically`),
+        # to no line of description drawn (`p.id !== ''`) and to the ? and its heading sharing one
+        # tooltip (`h.title === q.title`).
+        "63-settings-prose": ("Mark-read automatically", "p.id !== ''", "h.title === q.title"),
     }
     for name, needles in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)

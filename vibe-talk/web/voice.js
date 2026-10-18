@@ -156,7 +156,7 @@ let sideActive = false;
  *   | "help-link-identities" | "help-link-keyboard"
  *   | "help-link-live-messages" | "help-link-mark-own" | "help-link-microphone"
  *   | "help-link-reading-width" | "help-link-resuming" | "help-link-rich-headers"
- *   | "help-link-speech-prep" | "help-link-speech-prep-relay"
+ *   | "help-link-speech-prep"
  *   | "help-link-message-cache" | "help-link-storage" | "help-link-voice-instructions" | "help-link-voice-send" | "jump-bookmark" | "jump-newest" | "link-kind-action" | "link-kind-commit"
  *   | "link-kind-file" | "link-kind-issue" | "link-kind-other"
  *   | "link-kind-pr" | "links-filter" | "load-older" | "load-older-turns"
@@ -1272,18 +1272,6 @@ const HELP_TOPICS = [
   "voice-instructions",
   "connection",
 ];
-
-/**
- * A `?` that opens an entry from beside a setting other than its own group's: the button's id, and
- * the slug of the entry it opens.
- *
- * `#332 settings-voice-agent-section`. How messages are said is information rather than a setting,
- * so it has no group of its own: it is explained beside each setting that reads a message out. Its
- * own `#help-link-speech-prep` is on Reading full messages in channel view, through HELP_TOPICS like
- * every other; this is the second one, beside Arriving messages during a call. Declared in the
- * markup like every `?`, and the suite holds every `.help-link` there to one of the two lists.
- */
-const HELP_LINKS_BESIDE = [["help-link-speech-prep-relay", "speech-prep"]];
 
 /**
  * Open Help, optionally at one entry.
@@ -39704,7 +39692,9 @@ function resumeUnavailableReason() {
  *
  * `#332 settings-voice-agent-section`. The line opens Help's How messages are said, rather than
  * standing on Settings as a group with no control in it; the paragraphs under it say what the
- * rewrite does, so the line only says which arm.
+ * rewrite does, so the line only says which arm. `#347 settings-prose` renamed the entry "How
+ * messages are pre-processed for speech", the words of the link under Reading full messages in
+ * channel view that opens it.
  *
  * A server too old to send the field is NOT reported as off. Older servers prepared bodies
  * unconditionally, so "off" would be a false statement about a deployment that is in fact doing
@@ -40000,6 +39990,10 @@ function chooseReadNew(mode) {
  * means for the channel view and the agent, and what adapter push can and cannot vouch for, is the
  * Live messages entry in Help; the push line keeps only the caveat in a clause, because "listening"
  * with nothing after it would read as a statement that the adapter is healthy.
+ *
+ * `#347 settings-prose`. The line is Connection status's last, not the head of Arriving messages
+ * during a call: how the server delivers live updates is a readout about how it works, which the
+ * owner asked to have out of the settings, and that group is now its title and its drop-down.
  */
 function renderLiveState() {
   // "Live · updated" in the channel pill depends on the stream being attached.
@@ -43127,9 +43121,6 @@ el("close-help").addEventListener("click", closeHelp);
 el("open-help").addEventListener("click", () => showHelp(null));
 for (const topic of HELP_TOPICS) {
   el(`help-link-${topic}`).addEventListener("click", () => showHelp(topic));
-}
-for (const [link, topic] of HELP_LINKS_BESIDE) {
-  el(link).addEventListener("click", () => showHelp(topic));
 }
 // `#51 reply-view`. Both ways out of the reply screen go through `closeReply`, so neither can be
 // the one that forgets to put the reader back where they were reading.
