@@ -6505,6 +6505,7 @@ function offerReplayAtSessionStart(message) {
       words: count(resume.words),
     });
     session.recapAck = "waiting";
+    awaitReplayAnswer();
     noteCallRecap(recapFor(resume, "replay_frame"));
   } else {
     resumeLast = { ...resumeLast, armed: false, unsupported: true };
@@ -6536,10 +6537,11 @@ function noteReplayAck(message) {
     const recap = { state: "none", why: "refused", dropped: 0 };
     session.recap = recap;
     // The session that refused it is the one every turn of the call went to, so the line above the
-    // call says so however much has been drawn below it, and so does the conversation's start
-    // marker. Once that marker is filed, with the first turn to end, a reload draws what it holds:
-    // the line keeps that as well, so the two never disagree.
-    const start = startMarkers.get(session.conversationId);
+    // call says so however much has been drawn or filed below it, and so does the conversation's
+    // start marker, which waits for this answer (`replayAnswerWait`). A marker already written,
+    // because that wait ran out before an answer this late, is what a reload draws: the line keeps
+    // it as well, so the two never disagree.
+    const start = unwrittenStartMarker(session.conversationId);
     const seam = session.recapSeam;
     if (start) {
       start.recap = recap;
@@ -6548,6 +6550,73 @@ function noteReplayAck(message) {
     renderCallRecap();
   }
   renderResumeState();
+  // After the marker has what the answer said: it is written once the records ahead of it are.
+  endReplayAnswerWait();
+}
+
+/**
+ * `#331 resume-on-websocket`. How long after the `replay` frame the conversation's first record may
+ * wait for the bridge's answer to it (`replayAnswerWait`).
+ */
+const REPLAY_ANSWER_WAIT_MS = 5000;
+
+/**
+ * `#331 resume-on-websocket`. The wait for the bridge's answer to this call's `replay` frame, while
+ * there is one: what the record queue waits on, and what ends it.
+ *
+ * The conversation's start marker says what that answer did, and the line above the call follows the
+ * marker. Written before the answer, the marker would say "recap sent" for good, and a refusal could
+ * then change neither — and a typed call files its first message in the very handler that sends the
+ * frame, so every one would. So a first record filed while the answer is awaited goes into the queue
+ * behind this wait, with every record after it, and its marker is written as its request goes, from
+ * what is known by then. The wait ends with the answer, with a replacement session (the answer is
+ * then nobody's), with the call, or REPLAY_ANSWER_WAIT_MS after the frame went, whichever comes first:
+ * a bridge that never answers holds the record back no longer than that.
+ *
+ * @type {{done: Promise<void>, end: () => void, timer: ReturnType<typeof setTimeout>} | null}
+ */
+let replayAnswerWait = null;
+
+/**
+ * The start marker filed behind {@link replayAnswerWait} and not yet written, with its conversation.
+ *
+ * @type {{conversationId: string, start: {recap: any, previous_end?: string}} | null}
+ */
+let startAwaitingAnswer = null;
+
+/** The `replay` frame went: a first record filed from now waits for its answer. */
+function awaitReplayAnswer() {
+  endReplayAnswerWait();
+  /** @type {() => void} */
+  let end = () => {};
+  /** @type {Promise<void>} */
+  const done = new Promise((resolve) => {
+    end = () => resolve();
+  });
+  replayAnswerWait = { done, end, timer: setTimeout(endReplayAnswerWait, REPLAY_ANSWER_WAIT_MS) };
+}
+
+/** Stop waiting for the answer: a record held for it goes as soon as those ahead of it have. */
+function endReplayAnswerWait() {
+  const wait = replayAnswerWait;
+  if (!wait) return;
+  replayAnswerWait = null;
+  clearTimeout(wait.timer);
+  wait.end();
+}
+
+/**
+ * The start marker of `conversationId` while it can still change: not yet filed, or filed behind the
+ * wait for the answer and not yet written. Null once it is written.
+ *
+ * @param {string | null} conversationId
+ */
+function unwrittenStartMarker(conversationId) {
+  if (!conversationId) return null;
+  const start = startMarkers.get(conversationId);
+  if (start) return start;
+  const held = startAwaitingAnswer;
+  return held && held.conversationId === conversationId ? held.start : null;
 }
 
 /** The conversation `conversationId` has begun: its first record is preceded by its start marker. */
@@ -6588,6 +6657,8 @@ function noteSessionReplaced() {
   const recap = { state: "none", why: "replaced_session", dropped: 0 };
   session.recap = recap;
   session.recapAck = null;
+  // A record held for that answer goes, with what its caller makes of the replacement first.
+  endReplayAnswerWait();
   if (resumeLast.armed) {
     resumeLast = { ...resumeLast, replaced: true };
     renderResumeState();
@@ -6612,7 +6683,7 @@ function noteReplacedV1Session() {
   const recap = noteSessionReplaced();
   addDetail("the voice service replaced the session, and the new one was sent no recap");
   if (handed && handed.state === "sent" && settleBoundary(recap)) {
-    const start = startMarkers.get(session.conversationId);
+    const start = unwrittenStartMarker(session.conversationId);
     if (start) start.recap = recap;
   }
   renderCallRecap();
@@ -6628,15 +6699,26 @@ function fileStartMarker(conversationId) {
   if (!start) return;
   startMarkers.delete(conversationId);
   if (!transcriptRecordsSupported) return;
-  // A server that keeps records says how many words its replay held. Were one not to, the marker
-  // still needs a number: 0 over lines that hold words, which `recapWords` reads back as unknown.
-  const recap = start.recap && start.recap.state === "sent" && start.recap.words === null
-    ? { ...start.recap, words: 0 }
-    : start.recap;
-  /** @type {Record<string, unknown>} */
-  const marker = { kind: "conversation_start", recap };
-  if (start.previous_end) marker.previous_end = start.previous_end;
-  void postRecord(conversationId, { speaker: "marker", text: "", marker });
+  // `#331 resume-on-websocket`. While the bridge's answer to this call's recap is awaited, the
+  // marker, and every record filed after it, waits for that answer in the queue, and is written
+  // from what the answer made of it (`replayAnswerWait`).
+  const wait = conversationId === session.conversationId ? replayAnswerWait : null;
+  if (wait) {
+    startAwaitingAnswer = { conversationId, start };
+    recordQueue = recordQueue.then(() => wait.done);
+  }
+  void postRecord(conversationId, () => {
+    if (startAwaitingAnswer && startAwaitingAnswer.start === start) startAwaitingAnswer = null;
+    // A server that keeps records says how many words its replay held. Were one not to, the marker
+    // still needs a number: 0 over lines that hold words, which `recapWords` reads back as unknown.
+    const recap = start.recap && start.recap.state === "sent" && start.recap.words === null
+      ? { ...start.recap, words: 0 }
+      : start.recap;
+    /** @type {Record<string, unknown>} */
+    const marker = { kind: "conversation_start", recap };
+    if (start.previous_end) marker.previous_end = start.previous_end;
+    return { speaker: "marker", text: "", marker };
+  });
 }
 
 
@@ -11653,13 +11735,15 @@ function recordRecord(conversationId, body) {
  * {@link recordRecord}'s request, in the queue the turns go through.
  *
  * @param {string} conversationId
- * @param {Record<string, unknown>} body
+ * @param {Record<string, unknown> | (() => Record<string, unknown>)} body the record, or what writes
+ *   it as the request goes: a start marker held for an answer says what the answer was
  */
 function postRecord(conversationId, body) {
   const done = recordQueue.then(async () => {
     if (recordingBroken) return null;
     try {
-      const answer = await api(`/api/v1/conversations/${conversationId}/turns`, { method: "POST", body });
+      const record = typeof body === "function" ? body() : body;
+      const answer = await api(`/api/v1/conversations/${conversationId}/turns`, { method: "POST", body: record });
       return answer && answer.turn ? { turn: answer.turn } : null;
     } catch (error) {
       const status = Number(error.status) || 0;
@@ -14864,6 +14948,7 @@ async function openConversation(options) {
   session.recapSeam = null;
   session.pendingResume = null;
   session.conversationId = null;
+  startAwaitingAnswer = null;
   // Fetched HERE, before the socket exists, so a slow or failing store delays the call rather than
   // racing `onopen` — a payload that arrived after the agent had already spoken would be a
   // "here is what we said" delivered into the middle of a sentence.
@@ -16093,8 +16178,11 @@ function teardown() {
   session.playEndMs = 0;
   session.echoCancellation = false;
   session.sessionStarts = 0;
-  // `#331 resume-on-websocket`. A record still waiting for a `session_started` that never came was
-  // never sent: Settings must not say the call was resumed.
+  // `#331 resume-on-websocket`. No answer to the recap can come now: a record held for one goes,
+  // the turn in progress (stored above) included, saying what was known.
+  endReplayAnswerWait();
+  // A record still waiting for a `session_started` that never came was never sent: Settings must
+  // not say the call was resumed.
   if (session.pendingResume) {
     session.pendingResume = null;
     resumeLast = { ...resumeLast, armed: false, unsent: true };

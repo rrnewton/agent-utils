@@ -4575,6 +4575,13 @@ const TUNING_BANDS = {
     "the largest number a stored marker may hold, which the server checks (MAX_RECORD_NUMBER in " +
     "src/ops.rs). Larger, and the start marker of a call handed a long recap is refused as " +
     "bad_record; smaller, and a true count is filed as less than it was"],
+  // `#331 resume-on-websocket`.
+  REPLAY_ANSWER_WAIT_MS: [2000, 10000,
+    "how long after the recap went the conversation's first record waits for the bridge's answer to " +
+    "it. Under two seconds, a bridge that answers once the recap is in its model's context, a round " +
+    "trip to the model, answers after the start marker was written, and a refusal leaves the line " +
+    "above the call saying the recap was sent; past ten, a page closed early in a call loses every " +
+    "record held that long"],
   // `#269 approval-card-inline`. How long a user turn that may be a yes to the card stays out of sight.
   YES_HOLD_JUDGE_MS: [9000, 30000,
     "how long a turn drawn out of sight as a possible yes waits, after its last frame, to be judged. " +
@@ -66907,12 +66914,28 @@ test("`#331 resume-on-websocket`: the server keeps the start marker of a call se
   }
 });
 
-test("`#331 resume-on-websocket`: a refusal that comes while a turn is drawn says \"recap refused\" above the call and in its marker; one after a turn was filed leaves both at \"sent\"; a reload says the same either way", async () => {
+/** What the call on `page` filed, oldest first: a marker's detail, and a turn as `speaker: words`. */
+const callFiled = (page) => {
+  const filed = [...page.storedTurns.entries()].find(([id]) => id !== "conv_earlier");
+  return filed ? filed[1].map((turn) => turn.detail || `${turn.speaker}: ${turn.text}`) : [];
+};
+
+/** The line above the call on `page`: the one that ends the earlier conversation. */
+const lineAboveCall = (page) => boundaryLines(page).find((li) => li.getAttribute("data-ends") === "conv_earlier");
+
+const REFUSED_RECAP = { state: "none", why: "refused", dropped: 0 };
+const REPLAY_FRAME_RECAP = { state: "sent", words: 11, lines: 2, dropped: 0, transport: "replay_frame" };
+
+test("`#331 resume-on-websocket`: a refusal says \"recap refused\" above the call and in its marker whether a turn is still drawn or has ended, and only one later than the wait for it leaves both at \"sent\"; a reload says the same each time", async () => {
   // The bridge may greet before it answers the record. A turn is drawn as it comes and filed, with
-  // the conversation's start marker before it, only when it ends.
-  for (const [filedFirst, chip, recap] of [
-    [false, "recap refused", { state: "none", why: "refused", dropped: 0 }],
-    [true, "11-word recap sent", { state: "sent", words: 11, lines: 2, dropped: 0, transport: "replay_frame" }],
+  // the conversation's start marker before it, when it ends; while the answer is awaited, that
+  // record waits for it, for REPLAY_ANSWER_WAIT_MS after the record went at most.
+  const waitMs = optionalSourceConstant("REPLAY_ANSWER_WAIT_MS");
+  assert.ok(waitMs > 0, "web/voice.js states no wait for the bridge's answer to the record");
+  for (const [when, chip, recap] of [
+    ["while a turn was drawn", "recap refused", REFUSED_RECAP],
+    ["after a turn ended", "recap refused", REFUSED_RECAP],
+    ["after the wait for it ran out", "11-word recap sent", REPLAY_FRAME_RECAP],
   ]) {
     const page = newPage();
     page.transcriptRecordsSupported = true;
@@ -66920,28 +66943,127 @@ test("`#331 resume-on-websocket`: a refusal that comes while a turn is drawn say
     const socket = await startV1Call(page, ["replay"]);
     speech(socket, "assistant", 1, "welcome back", true);
     await page.settle();
-    if (filedFirst) {
+    if (when !== "while a turn was drawn") {
       turnDone(socket, 1);
       await watchTurns(page);
+      assert.deepEqual(callFiled(page), [], `${when}: the turn was filed before the answer it waits for`);
+    }
+    if (when === "after the wait for it ran out") {
+      assert.equal(page.expireTimers(waitMs), 1, "no wait for the answer was armed");
+      await watchTurns(page);
+      assert.deepEqual(callFiled(page), [{ kind: "conversation_start", recap }, "agent: welcome back"],
+        "a bridge that never answers held the record back past the wait");
     }
     socket.onmessage({ data: JSON.stringify({ type: "replay_ack", accepted: false, reason: "too long for this model" }) });
     await page.settle();
     turnDone(socket, 1);
     await watchTurns(page);
-    const when = filedFirst ? "after a turn was filed" : "while a turn was drawn";
     assert.equal(callRecap(page), "Started fresh: the voice service refused the recap", when);
-    const live = boundaryLines(page).find((li) => li.getAttribute("data-ends") === "conv_earlier");
+    const live = lineAboveCall(page);
     assert.equal(seamChip(live), chip, `${when}: the line above the call`);
-    const filed = [...page.storedTurns.entries()].find(([id]) => id !== "conv_earlier");
-    assert.ok(filed, `${when}: the call filed nothing`);
-    assert.deepEqual(filed[1][0].detail.recap, recap, `${when}: the start marker`);
+    assert.deepEqual(callFiled(page), [{ kind: "conversation_start", recap }, "agent: welcome back"],
+      `${when}: the start marker`);
     const said = boundaryWords(live);
     await page.el("hang-up").click();
     await page.settle();
-    const restored = boundaryLines(await reloadOf(page)).find((li) => li.getAttribute("data-ends") === "conv_earlier");
+    const restored = lineAboveCall(await reloadOf(page));
     assert.ok(restored, `${when}: a reload drew no line above the call`);
     assert.deepEqual(boundaryWords(restored), said, `${when}: a reload says something else above the call`);
   }
+});
+
+test("`#331 resume-on-websocket`: a turn that ended while the answer was awaited is filed when the call ends, whatever the bridge did not say", async () => {
+  const waitMs = optionalSourceConstant("REPLAY_ANSWER_WAIT_MS");
+  assert.ok(waitMs > 0, "web/voice.js states no wait for the bridge's answer to the record");
+  const page = newPage();
+  page.transcriptRecordsSupported = true;
+  await withEarlierConversation(page, { resume: true });
+  const socket = await startV1Call(page, ["replay"]);
+  speech(socket, "user", 1, "is it back now", true);
+  turnDone(socket, 1);
+  await watchTurns(page);
+  assert.deepEqual(callFiled(page), [], "the turn was filed before the answer it waits for");
+  await page.el("hang-up").click();
+  await watchTurns(page);
+  assert.deepEqual(callFiled(page), [{ kind: "conversation_start", recap: REPLAY_FRAME_RECAP }, "you: is it back now"],
+    "hanging up left the record waiting for an answer that can no longer come");
+  assert.equal([...page.timers.values()].filter((timer) => timer.ms === waitMs).length, 0,
+    "the wait outlived the call");
+});
+
+/**
+ * `#331 resume-on-websocket`. A typed `vibe-talk-v1` call on a page with records, resuming: its first
+ * message is held until the session starts, and goes in the handler that sends the record, so its
+ * turn ends — with the conversation's start marker before it — before the bridge can answer.
+ * Returns the socket.
+ */
+async function typedV1Call(page, first = "is it back now") {
+  page.transcriptRecordsSupported = true;
+  await withEarlierConversation(page, { resume: true });
+  page.setFetch(v1Minted);
+  await compose(page, first);
+  await page.el("send-text").click();
+  await page.settle();
+  const socket = page.sockets.at(-1);
+  socket.onopen();
+  socket.onmessage({ data: JSON.stringify({ type: "session_started", greeting: false, capabilities: ["replay"] }) });
+  await page.settle();
+  return socket;
+}
+
+test("`#331 resume-on-websocket`: a typed call files its first message in the handler that sends the record, yet a refusal still says \"recap refused\" above the call and in its marker, live, after hang-up and after a reload (negative control: a page that files the marker at once)", async () => {
+  const refused = { type: "replay_ack", accepted: false, reason: "too long for this model" };
+  const accepted = { type: "replay_ack", accepted: true };
+  for (const [answer, chip, recap] of [
+    [refused, "recap refused", REFUSED_RECAP],
+    [accepted, "11-word recap sent", REPLAY_FRAME_RECAP],
+  ]) {
+    const what = answer.accepted ? "taken" : "refused";
+    const page = newPage();
+    const socket = await typedV1Call(page);
+    assert.deepEqual(framesSent(socket).map((frame) => frame.type), ["replay", "prompt"],
+      `${what}: the record and the first message did not go together`);
+    assert.deepEqual(callFiled(page), [], `${what}: the first message was filed before the answer it waits for`);
+    socket.onmessage({ data: JSON.stringify(answer) });
+    await page.settle();
+    speech(socket, "assistant", 1, "hello there", true);
+    turnDone(socket, 1);
+    await watchTurns(page);
+    assert.deepEqual(callFiled(page),
+      [{ kind: "conversation_start", recap }, "you: is it back now", "agent: hello there"],
+      `${what}: the start marker, and the order of the record`);
+    assert.equal(seamChip(lineAboveCall(page)), chip, `${what}: the line above the call`);
+    if (!answer.accepted) {
+      assert.equal(callRecap(page), "Started fresh: the voice service refused the recap");
+      assert.equal(page.el("resume-state").textContent, "The last call was NOT resumed: the voice service refused the recap.");
+      assert.match(seamRecapDetail(lineAboveCall(page)), /^Nothing was recapped: the voice service refused the recap/);
+      assert.doesNotMatch(boundaryWords(lineAboveCall(page)).title, /carry on from there/,
+        "the line above the call claims a continuity the voice service refused");
+    }
+    const said = boundaryWords(lineAboveCall(page));
+    await page.el("hang-up").click();
+    await page.settle();
+    // The line under the call goes with it; the one above keeps what the call was given.
+    assert.equal(callRecap(page), null);
+    assert.deepEqual(boundaryWords(lineAboveCall(page)), said, `${what}: the line above the call changed at hang-up`);
+    const restored = lineAboveCall(await reloadOf(page));
+    assert.ok(restored, `${what}: a reload drew no line above the call`);
+    assert.deepEqual(boundaryWords(restored), said, `${what}: a reload says something else above the call`);
+  }
+
+  // The negative control: a page that files the marker with the first message, before the answer.
+  const careless = newPage(new Map(), brokenScript(
+    "  const wait = conversationId === session.conversationId ? replayAnswerWait : null;\n",
+    "  const wait = null;\n"));
+  const socket = await typedV1Call(careless);
+  assert.equal(callFiled(careless).length, 2,
+    "the negative control held the record as well, so the check above proves nothing");
+  socket.onmessage({ data: JSON.stringify(refused) });
+  await careless.settle();
+  assert.equal(callRecap(careless), "Started fresh: the voice service refused the recap");
+  assert.equal(seamChip(lineAboveCall(careless)), "11-word recap sent",
+    "the negative control's line above the call said the refusal too, so the check above proves nothing");
+  assert.equal(callFiled(careless)[0].recap.state, "sent");
 });
 
 test("`#331 resume-on-websocket`: a call that ends before its session starts was not resumed, and Settings does not say it was", async () => {

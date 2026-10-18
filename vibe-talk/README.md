@@ -4493,9 +4493,11 @@ voice providers](#conversational-voice-providers)); what matters here is when it
   costs a call that says "this voice session takes no recap" — never a frame sent into a session
   that cannot take it. A `replay_ack` with `accepted: true` turns "Sent the agent …" into "Caught the
   agent up with …"; `accepted: false` makes the call "Started fresh: the voice service refused the
-  recap", and its seam and start marker "recap refused", even with a greeting already on screen.
-  Only a turn filed before the answer came (its marker goes with it) leaves both saying the recap
-  was sent, so a reload still draws what the live seam said.
+  recap", and its seam and start marker "recap refused", even with a greeting already on screen
+  or a typed call's first message already sent. The conversation's first record, and every record
+  after it, waits for that answer — five seconds at most from when the recap went, and no longer
+  than the call — so its start marker is written with what the answer said. Only an answer later
+  than that leaves both saying the recap was sent, so a reload still draws what the live seam said.
 * **A replacement session is sent none.** The record goes once per call, to the session the call
   opened with. A second `session_started` on the same socket is a model session that never saw it,
   whatever it lists: the page sends it nothing, the line under the call says "Started fresh: the
@@ -5017,9 +5019,11 @@ The server answers every `replay` with exactly one
 its model, a mode that keeps no context). `replay_ack` is not a turn: no `turn_complete` follows it,
 and it opens none. The page says "Caught the agent up with 412 words from earlier" on an accepted
 one and "Started fresh: the voice service refused the recap" on a refusal; with no answer it keeps
-saying it sent them. A bridge that does not take the frame simply does not list it. The page sends
-`replay` only after a call's first `session_started`: a replacement session on the same socket is
-sent none, and the page says it started fresh.
+saying it sent them. Answer promptly: the page files nothing of the call until the answer comes, for
+five seconds at most, so that the call's start marker can say what it was. A bridge that does not
+take the frame simply does not list it. The page sends `replay` only after a call's first
+`session_started`: a replacement session on the same socket is sent none, and the page says it
+started fresh.
 
 `vibe_talk::testing::FakeVoiceBridge` is a loopback bridge that does all of this, for either answer,
 and `tests/replay_bridge.rs` holds the server and the frame to it.
