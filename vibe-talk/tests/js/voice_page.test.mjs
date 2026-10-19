@@ -70655,3 +70655,32 @@ test("`#355 provider-grouped-channels`: All channels is not offered for a servic
   await chooseService(page, "slack");
   assert.equal(pickerChoices(page)[0][1], "All Slack channels");
 });
+
+test("`#355 provider-grouped-channels`: a channel of no service the server describes is reached in Settings under Not connected, where nothing can be added", async () => {
+  const stray = { id: "1110000000000000406", label: "old bridge room", writable: false, alias: null, added: true, provider: null };
+  const page = await servicesPage((page) => {
+    page.channels = [{ ...TEAM_A }, { ...SPACE_A }, stray];
+  });
+  await page.el("open-settings").click();
+  await page.settle();
+  assert.deepStrictEqual(page.el("settings-service").children.map((option) => [String(option.value), option.textContent]),
+    [["slack", "Slack"], ["gchat", "Google Chat"], ["", "Not connected"]]);
+  await chooseService(page, "");
+  assert.deepStrictEqual(settingsOptions(page), [stray.id], "the stray channel cannot be reached from Settings");
+  assert.equal(page.el("open-add-channel").hidden, true, "Add offered for channels of no service");
+  assert.equal(page.el("open-browse-channels").hidden, true);
+  assert.match(page.el("service-facts").textContent, /no longer reads/);
+  assert.match(page.el("channel-facts").textContent, /"old bridge room"/);
+  await chooseService(page, "slack");
+  assert.equal(page.el("open-add-channel").hidden, false);
+  // Opened while the stray channel is read, Settings opens on it.
+  await page.el("close-settings").click();
+  await page.settle();
+  page.el("discord-channel").value = stray.id;
+  await page.el("discord-channel").dispatch("change");
+  await page.settle();
+  await page.el("open-settings").click();
+  await page.settle();
+  assert.equal(page.el("settings-service").value, "");
+  assert.equal(String(page.el("settings-channel").value), stray.id);
+});

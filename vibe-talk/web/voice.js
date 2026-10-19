@@ -42134,6 +42134,25 @@ function channelsInPickerOrder() {
 /** The service Settings is showing, by key, or null with one service. */
 let settingsService = null;
 
+/**
+ * The Service picker's entry for the channels of no service the server describes (an added channel
+ * whose bridge is no longer configured), shown only while there are some: every channel on the bar
+ * can be reached from Settings, to be renamed or looked at.
+ */
+const NO_SERVICE = "";
+
+/** The channels of no service the server describes: the bar's "Not connected" group. */
+function strayChannels() {
+  return knownChannels.filter(
+    (channel) => typeof channel.provider !== "string" || !providerDescriptions.has(channel.provider)
+  );
+}
+
+/** Whether `key` is an entry of the Service picker now: a described service, or "Not connected" while it holds channels. */
+function settingsServiceOffered(key) {
+  return providerDescriptions.has(key) || (key === NO_SERVICE && strayChannels().length > 0);
+}
+
 /** Whether Settings chooses a service first: the server describes two or more. */
 function servicesInSettings() {
   return providerDescriptions.size >= 2;
@@ -42151,13 +42170,15 @@ function settingsServiceName() {
 
 /** The channels Settings' picker lists: the chosen service's, or every one with one service. */
 function settingsChannels() {
-  return settingsServiceDescription() ? knownChannels.filter((channel) => channel.provider === settingsService) : knownChannels;
+  if (!servicesInSettings() || settingsService === null) return knownChannels;
+  if (settingsService === NO_SERVICE) return strayChannels();
+  return knownChannels.filter((channel) => channel.provider === settingsService);
 }
 
 /** The service Settings opens on with none chosen yet: the channel being read's, else the first with channels. */
 function defaultSettingsService() {
   const reading = knownChannel(el("discord-channel").value);
-  if (reading && providerDescriptions.has(reading.provider)) return reading.provider;
+  if (reading) return providerDescriptions.has(reading.provider) ? reading.provider : NO_SERVICE;
   const keys = [...providerDescriptions.keys()];
   return keys.find((key) => knownChannels.some((channel) => channel.provider === key)) || keys[0] || null;
 }
@@ -42209,16 +42230,20 @@ function fillServiceSelect() {
     select.replaceChildren();
     return;
   }
-  if (settingsService === null || !providerDescriptions.has(settingsService)) settingsService = defaultSettingsService();
-  select.replaceChildren(...[...providerDescriptions.keys()].map((key) => {
+  if (settingsService === null || !settingsServiceOffered(settingsService)) settingsService = defaultSettingsService();
+  const keys = [...providerDescriptions.keys()];
+  if (strayChannels().length > 0) keys.push(NO_SERVICE);
+  select.replaceChildren(...keys.map((key) => {
     const option = document.createElement("option");
     option.value = key;
-    option.textContent = serviceLabel(key);
+    option.textContent = key === NO_SERVICE ? UNDESCRIBED_SERVICE : serviceLabel(key);
     return option;
   }));
   select.value = settingsService;
   const chosen = settingsServiceDescription();
-  el("service-facts").textContent = chosen ? serviceFacts(chosen) : "";
+  el("service-facts").textContent = chosen
+    ? serviceFacts(chosen)
+    : "Channels on your list whose chat service this server no longer reads. They can be renamed here.";
 }
 
 /**
@@ -42227,7 +42252,7 @@ function fillServiceSelect() {
  * belonged to the service they were opened for.
  */
 function chooseSettingsService(key, channelId = null) {
-  if (!servicesInSettings() || !providerDescriptions.has(key)) return;
+  if (!servicesInSettings() || !settingsServiceOffered(key)) return;
   if (key !== settingsService) {
     settingsService = key;
     showChannelPanel(null);
@@ -42246,8 +42271,8 @@ function chooseSettingsService(key, channelId = null) {
 /** Point Settings at the channel `channelId`: its service, then it. */
 function pointSettingsAt(channelId) {
   const listed = knownChannel(channelId) || hiddenChannels.find((channel) => String(channel.id) === String(channelId));
-  if (listed && settingsServiceDescription() && providerDescriptions.has(listed.provider)) {
-    chooseSettingsService(listed.provider, channelId);
+  if (listed && servicesInSettings()) {
+    chooseSettingsService(providerDescriptions.has(listed.provider) ? listed.provider : NO_SERVICE, channelId);
   } else {
     el("settings-channel").value = String(channelId);
   }
@@ -42258,10 +42283,11 @@ function pointSettingsAt(channelId) {
  * another service than the one showing. Not on the way back from Help, which is the same visit.
  */
 function pointSettingsAtReading() {
-  if (!settingsServiceDescription()) return;
+  if (!servicesInSettings()) return;
   const reading = knownChannel(el("discord-channel").value);
-  if (!reading || reading.provider === settingsService) return;
-  chooseSettingsService(reading.provider, reading.id);
+  if (!reading) return;
+  const service = providerDescriptions.has(reading.provider) ? reading.provider : NO_SERVICE;
+  if (service !== settingsService) chooseSettingsService(service, reading.id);
 }
 
 /**
@@ -42273,7 +42299,10 @@ function renderAddChannelForm() {
   const byLink = addsByLink();
   const service = settingsServiceName();
   const anyId = !byLink && settingsServiceDescription() !== null;
-  el("open-browse-channels").hidden = !browseOffered();
+  // Nothing can be added to "Not connected": it is the channels of no service this server reads.
+  const stray = servicesInSettings() && settingsService === NO_SERVICE;
+  el("open-add-channel").hidden = stray;
+  el("open-browse-channels").hidden = stray || !browseOffered();
   el("new-channel-help").textContent = byLink
     ? `Paste a channel link or reference from ${service}. The channel is checked before it is added.`
     : `Enter the channel ID supplied by this deployment. The chat connector must already have access to the channel in ${service}.`;
@@ -42480,9 +42509,11 @@ function renderRemoveChannel(channel) {
  */
 function renderHiddenChannels() {
   // `#355 provider-grouped-channels`. With several services, the chosen service's hidden channels.
-  const shown = settingsServiceDescription()
-    ? hiddenChannels.filter((channel) => channel.provider === settingsService)
-    : hiddenChannels;
+  const shown = !servicesInSettings() || settingsService === null
+    ? hiddenChannels
+    : settingsService === NO_SERVICE
+      ? hiddenChannels.filter((channel) => typeof channel.provider !== "string" || !providerDescriptions.has(channel.provider))
+      : hiddenChannels.filter((channel) => channel.provider === settingsService);
   const rows = shown.map((channel) => {
     const row = document.createElement("li");
     const name = document.createElement("span");
