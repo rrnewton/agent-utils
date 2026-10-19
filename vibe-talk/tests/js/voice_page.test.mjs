@@ -2328,6 +2328,14 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     /** Make preparing fail, to prove the tap still works by the older, slower route. */
     prepareFails: false,
     /**
+     * `#290 speech-ticket-refresh`. How long the prepare route says its tickets last, in seconds as the
+     * server says it; how long the answer takes, on the page's clock; and what the URLs it mints end
+     * with, so a test can tell a URL prepared again from the one it replaced.
+     */
+    speechTicketTtlSeconds: 600,
+    prepareResponseDelayMs: 0,
+    speechTicketSuffix: "",
+    /**
      * `#191 read-aloud-first-lag`. When set, `(asked) => Promise | null`: each prepare request waits
      * on what it returns, after it is recorded, so a test can hold the batch open behind a tap.
      */
@@ -3080,15 +3088,16 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         page.prepareCalls.push(asked);
         const held = page.prepareHold && page.prepareHold(asked);
         if (held) await held;
+        page.setClock(page.clock() + page.prepareResponseDelayMs);
         if (page.prepareFails) {
           return json(500, { error: "nope", detail: "no" });
         }
         return json(200, {
           prepared: (asked.ids || []).map((id) => ({
             message_id: id,
-            url: `/api/v1/speech/ticket-for-${id}`,
+            url: `/api/v1/speech/ticket-for-${id}${page.speechTicketSuffix}`,
           })),
-          expires_in_seconds: 600,
+          expires_in_seconds: page.speechTicketTtlSeconds,
         });
       }
       // A prepared read the page streams into Web Audio itself, rather than handing to `<audio>`.
@@ -10515,6 +10524,110 @@ test("...and a message that could not be prepared still reads, by the older slow
     "preparing failed and took read-aloud down with it"
   );
   assert.equal(page.players[0].playCount, 1, "nothing was played on the fallback path");
+});
+
+// --- `#290 speech-ticket-refresh`: a prepared URL is never played after its ticket has ended ----------
+//
+// The server's tickets last `expires_in_seconds` (ten minutes) from when it minted them, and a tap that
+// hands the player a URL whose ticket has gone gets a 404 and "that message could not be played", with
+// no way back. So the page keeps a deadline per prepared row, counted from just before it asked, and a
+// row past it is a row with nothing prepared: the tap prepares it again, once, and reads it by the
+// authenticated route when that fails.
+
+/** The prepare requests made since `from` that asked for message `id`. */
+const preparedAgain = (page, from, id) => page.prepareCalls.slice(from).filter((call) => (call.ids || []).includes(id)).length;
+
+test("`#290 speech-ticket-refresh`: a prepared URL is played until the last millisecond of its ticket, counted from before the prepare request went, and at that moment its row is prepared again and the new URL played", async () => {
+  const ID = "1000000000000000001";
+  const tap = async (script, late) => {
+    const page = newPage(new Map(), script);
+    // The server takes five seconds to answer: counted from the answer, the URL would outlive its ticket by that.
+    page.prepareResponseDelayMs = 5_000;
+    await signIn(page);
+    const requestedAt = page.clock();
+    const rows = await inReadingMode(page, [message({ id: ID })]);
+    assert.equal(page.clock(), requestedAt + 5_000, "the premise: the prepare answer did not take its five seconds");
+    const before = page.prepareCalls.length;
+    page.setClock(requestedAt + page.speechTicketTtlSeconds * 1000 - (late ? 0 : 1));
+    page.speechTicketSuffix = "-again";
+    await rows[0].dispatch("click", {});
+    await page.settle();
+    return { again: preparedAgain(page, before, ID), url: page.players[0] && page.players[0].url, spoke: page.speakCalls.length };
+  };
+  const early = await tap(SCRIPT, false);
+  assert.equal(early.again, 0, "a URL a millisecond short of its ticket's end was prepared again");
+  assert.match(early.url, new RegExp(`^/api/v1/speech/ticket-for-${ID}\\?selection=tap-`), "the prepared URL was not played");
+  const at = await tap(SCRIPT, true);
+  assert.equal(at.again, 1, `the tap at its ticket's end prepared its row ${at.again} times, not once`);
+  assert.match(at.url, new RegExp(`^/api/v1/speech/ticket-for-${ID}-again\\?selection=tap-`), `the URL whose ticket had ended was played: ${at.url}`);
+  assert.equal(at.spoke, 0, "a refresh that worked fell back to the slower route");
+  // The control: the deadline counted from the answer. Five seconds later than the ticket's, the dead URL is played.
+  const fromAnswer = await tap(brokenScript("    const until = requestedAt + ", "    const until = speechTimingNow() + "), true);
+  assert.match(fromAnswer.url, new RegExp(`ticket-for-${ID}\\?selection=`),
+    "the negative control, counting from the answer, did not play the dead URL, so the check above proves nothing");
+});
+
+test("`#290 speech-ticket-refresh`: a tap after the ticket has ended, when preparing the row again fails, reads it by the authenticated route and never plays the dead URL", async () => {
+  const ID = "1000000000000000001";
+  const page = newPage();
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: ID })]);
+  const before = page.prepareCalls.length;
+  page.prepareFails = true;
+  page.setClock(page.clock() + page.speechTicketTtlSeconds * 1000 + 60_000);
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.ok(preparedAgain(page, before, ID) >= 1, "the tap did not try to prepare its row again");
+  assert.deepEqual(page.speakCalls, [ID], "a failed refresh did not fall back to the authenticated route");
+  assert.equal(page.players.length, 1, "more than one player was built");
+  assert.doesNotMatch(page.players[0].url, /ticket-for/, `the URL whose ticket had ended was played: ${page.players[0].url}`);
+  assert.equal(page.players[0].playCount, 1, "the audio fetched by the authenticated route was not played");
+});
+
+test("`#290 speech-ticket-refresh`: each row's URL keeps its own ticket's deadline — a row prepared by a later tap is still played as prepared when one prepared earlier has to be prepared again — and the screen's own preparation renews the rows whose tickets have ended", async () => {
+  const [FIRST, LATER, THIRD] = ["1000000000000000001", "1000000000000000002", "1000000000000000003"];
+  const said = (id, author, content, hour) => message({ id, author_id: author, content, timestamp: `2026-08-19T0${hour}:31:00.000Z` });
+  const page = newPage();
+  const stream = await withLiveChannel(page, [said(FIRST, "1000000000000000011", "first", 4)]);
+  const rowOf = (id) => page.el("discord-log").children.find((li) => String(li.getAttribute("data-ids")).split(" ").includes(id));
+  const tap = async (id) => {
+    await rowOf(id).dispatch("click", {});
+    await page.settle();
+    const player = page.players.at(-1);
+    await player.end();
+    await page.settle();
+    return player.url;
+  };
+  const start = page.clock();
+  await readButton(page).click();
+  await page.settle();
+  assert.deepEqual(page.prepareCalls.map((call) => call.ids), [[FIRST]], "the premise: turning Read on did not prepare the row");
+  // Five minutes on, a message arrives, and a tap on it prepares it alone.
+  page.setClock(start + 300_000);
+  await deliver(page, stream, sseMessage(said(LATER, "1000000000000000012", "later", 5)));
+  let before = page.prepareCalls.length;
+  assert.match(await tap(LATER), new RegExp(`ticket-for-${LATER}\\?`), "the premise: the later row was not read as prepared");
+  assert.deepEqual(page.prepareCalls.slice(before).map((call) => call.ids), [[LATER]], "the premise: the tap did not prepare its row alone");
+  // Ten minutes from the first: its ticket has ended, and the later row's has five minutes left.
+  page.setClock(start + page.speechTicketTtlSeconds * 1000);
+  page.speechTicketSuffix = "-again";
+  before = page.prepareCalls.length;
+  const later = await tap(LATER);
+  assert.equal(preparedAgain(page, before, LATER), 0, "the later row, its ticket alive, was prepared again");
+  assert.match(later, new RegExp(`^/api/v1/speech/ticket-for-${LATER}\\?selection=`), `the later row's prepared URL was not played: ${later}`);
+  const first = await tap(FIRST);
+  assert.equal(preparedAgain(page, before, FIRST), 1, "the first row, its ticket ended, was not prepared again exactly once");
+  assert.match(first, new RegExp(`^/api/v1/speech/ticket-for-${FIRST}-again\\?selection=`), `the first row's dead URL was played: ${first}`);
+  assert.deepEqual(page.speakCalls, [], "a row fell back to the slower route");
+  // Twenty minutes from the first: the later row's ticket ended at fifteen, and the first's renewed one at
+  // twenty. A tap on a new row prepares it, and the screen's preparation behind it asks for both again.
+  page.setClock(start + 2 * page.speechTicketTtlSeconds * 1000);
+  await deliver(page, stream, sseMessage(said(THIRD, "1000000000000000013", "third", 6)));
+  before = page.prepareCalls.length;
+  await tap(THIRD);
+  const asked = page.prepareCalls.slice(before).flatMap((call) => call.ids);
+  assert.ok(asked.includes(FIRST) && asked.includes(LATER),
+    `the screen's preparation did not renew the rows whose tickets had ended: ${JSON.stringify(page.prepareCalls.slice(before))}`);
 });
 
 test("with reading mode OFF a tap folds the message and speaks nothing", async () => {

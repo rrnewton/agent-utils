@@ -29607,21 +29607,43 @@ function readWithBrowserSpeech(parts, id, ticket) {
 /**
  * Where each visible message can be PLAYED from, resolved before the reader taps anything.
  *
- * Message id -> a URL that streams that message's audio. The server minted these when read-aloud
- * was switched on: it resolved every id on screen against one Discord window, normalised each for
- * speech, and warmed the voice lookup. What a tap then costs is opening this URL.
+ * Message id -> `{url, until}`: a URL that streams that message's audio, and when its ticket may have
+ * ended. The server minted these when read-aloud was switched on: it resolved every id on screen
+ * against one Discord window, normalised each for speech, and warmed the voice lookup. What a tap
+ * then costs is opening this URL.
  *
  * THE URL CARRIES ITS OWN AUTHORITY, which is the only reason any of this works: an `<audio src>`
  * cannot send an `Authorization` header, and without an `<audio src>` the browser will not stream —
  * it has to be handed a complete file. That is the wait being removed.
+ *
+ * AND THAT AUTHORITY ENDS. `#290 speech-ticket-refresh`: a ticket lives `expires_in_seconds` from when
+ * the server minted it, and a URL played after that is a 404 and "that message could not be played".
+ * So each entry keeps its own deadline, `until`, on the monotonic clock (`speechTimingNow`): when the
+ * request that minted it was SENT, plus that lifetime, so the server's work and the answer's journey
+ * shorten how long the URL is used and never stretch it past its ticket. Per entry, because rows are
+ * prepared at different times — the screen's batch, a tap's own row (`prepareSpeechFor`). An entry
+ * past its deadline is read as missing (`preparedEntry`).
  *
  * Empty is not an error. Anything missing falls back to fetching the audio as a blob, which is
  * exactly what this page did before and is still correct, only slower.
  */
 const preparedSpeech = new Map();
 
-/** How long the server said its tickets last, so they can be refreshed before they lapse. */
-let preparedUntil = 0;
+/**
+ * The prepared entry for message `id` while its ticket may still be good, else null: an entry past
+ * its deadline is dropped, and the row is one with nothing prepared, which the screen's preparation
+ * asks for again and a tap prepares again once before it reads by the slower route.
+ * `#290 speech-ticket-refresh`.
+ *
+ * @param {string} id
+ */
+function preparedEntry(id) {
+  const entry = preparedSpeech.get(String(id));
+  if (!entry) return null;
+  if (speechTimingNow() < entry.until) return entry;
+  preparedSpeech.delete(String(id));
+  return null;
+}
 
 /**
  * Resolve everything on screen so a tap does not have to.
@@ -29666,7 +29688,7 @@ async function prepareSpeechNow() {
     // message nobody is going to ask to hear. A tap on one still reads it, preparing it then.
     const held = rowMessages(li);
     idsOf(li).forEach((id, index) => {
-      if (id && !preparedSpeech.has(id) && !isNoise(held[index])) {
+      if (id && !preparedEntry(id) && !isNoise(held[index])) {
         ids.push(id);
       }
     });
@@ -29696,16 +29718,21 @@ async function requestPreparedSpeech(channel, ids) {
     if (!groups.has(threadId)) groups.set(threadId, []);
     groups.get(threadId).push(id);
   }
+  // Before the requests go: the tickets may be minted the moment they arrive, and counting from the
+  // answer would let a URL outlive its ticket by however long the answer took. `#290`.
+  const requestedAt = speechTimingNow();
   const batches = await Promise.all([...groups].map(([threadId, messageIds]) => api(
     `/api/v1/channels/${encodeURIComponent(channel)}/speech/prepare`,
     { method: "POST", body: { ids: messageIds, speed: readSpeed === null ? null : readSpeed / 100,
       ...(threadId ? { thread_id: threadId } : {}) } }
   )));
-  for (const entry of batches.flatMap((batch) => (batch && batch.prepared) || [])) {
-    preparedSpeech.set(String(entry.message_id), { url: entry.url });
+  for (const batch of batches) {
+    // A batch that says no lifetime gives URLs that are never played: none is not forever.
+    const until = requestedAt + (Number(batch && batch.expires_in_seconds) || 0) * 1000;
+    for (const entry of (batch && batch.prepared) || []) {
+      preparedSpeech.set(String(entry.message_id), { url: entry.url, until });
+    }
   }
-  const ttl = Math.min(...batches.map((batch) => (batch && batch.expires_in_seconds) || 0));
-  preparedUntil = Date.now() + ttl * 1000;
 }
 
 /**
@@ -29729,7 +29756,7 @@ async function requestPreparedSpeech(channel, ids) {
 async function prepareSpeechFor(ids) {
   const channel = el("discord-channel").value;
   if (!channel || readAloudPlayback !== "audio") return;
-  const missing = ids.map(String).filter((id) => id && !preparedSpeech.has(id));
+  const missing = ids.map(String).filter((id) => id && !preparedEntry(id));
   if (missing.length === 0) return;
   try {
     await requestPreparedSpeech(channel, missing);
@@ -29741,7 +29768,6 @@ async function prepareSpeechFor(ids) {
 /** Forget what was prepared. The pace is baked into a ticket, so changing it invalidates them. */
 function forgetPreparedSpeech() {
   preparedSpeech.clear();
-  preparedUntil = 0;
 }
 
 /** The message being read right now, and the player reading it. Null when nothing is playing. */
@@ -29869,7 +29895,10 @@ async function fetchSpeech(channel, id) {
   return response.blob();
 }
 
-/** Report only clocks for a prepared read. The ticket already authorizes this one observation. */
+/**
+ * Report only clocks for a prepared read. The ticket already authorizes this one observation. Also the
+ * clock a prepared URL's deadline is kept on (`preparedSpeech`): monotonic where the browser has one.
+ */
 function speechTimingNow() {
   return typeof performance !== "undefined" && typeof performance.now === "function"
     ? performance.now()
@@ -30263,7 +30292,8 @@ async function readAloud(ids) {
   // THE FAST PATH, and the whole point of preparing: every part already has a URL that streams, so
   // there is nothing to fetch and nothing to wait for. The player is handed the URL and the browser
   // starts playing against a response the server is still writing.
-  let ready = parts.map((part) => preparedSpeech.get(part));
+  // `#290 speech-ticket-refresh`: a URL whose ticket has ended is not ready, and is prepared again below.
+  let ready = parts.map((part) => preparedEntry(part));
   let streamed = ready.every((entry) => entry && typeof entry.url === "string" && entry.url.length > 0);
   // Turning Read on starts preparing the whole screen in the background. A tap that comes before
   // that reaches this row does NOT wait for it: it prepares this row alone and reads it, and the
@@ -30271,7 +30301,7 @@ async function readAloud(ids) {
   if (!streamed) {
     await prepareSpeechFor(parts);
     if (ticket !== readingTicket) return;
-    ready = parts.map((part) => preparedSpeech.get(part));
+    ready = parts.map((part) => preparedEntry(part));
     streamed = ready.every((entry) => entry && typeof entry.url === "string" && entry.url.length > 0);
     guardQuietly(prepareSpeech)();
   }
