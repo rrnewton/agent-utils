@@ -534,7 +534,9 @@ const session = {
   // not, and waits for the answer to finish playing. `relays` are the channel messages a relayed
   // turn carries, for the line that says they were not read out if the call ends first (`#337
   // voice-relay-silent`).
-  /** @type {{text: string, kind: "typed" | "notice" | "relay", relays: {channel: string}[]}[]} */
+  // `resent` marks the turn a lost session never started, sent again to the session that replaced it
+  // (`#352 voice-reconnect-on-bridge-error`).
+  /** @type {{text: string, kind: "typed" | "notice" | "relay", relays: {channel: string}[], resent?: boolean}[]} */
   pendingPrompts: [],
   // `#352 voice-reconnect-on-bridge-error`. The text turn on the wire, from its `prompt` until its
   // `turn_complete`: what it said and carried, the turn the protocol had completed before it went
@@ -583,6 +585,20 @@ const session = {
   // ...and the line above the call its recap was said on when the call opened, null for none.
   /** @type {Element | null} */
   recapSeam: null,
+  // `#352 voice-reconnect-on-bridge-error`. The reconnect in progress, from the voice service's
+  // error until the new session starts, or null: the error's words, the turn it named, what is to go
+  // again, and what the new session is to be handed. Hang up or teardown clears it, and the attempt
+  // stops at its next step.
+  /** @type {ReconnectAttempt | null} */
+  reconnect: null,
+  // ...how many times this call has been carried on a new session, and when the last one was asked
+  // for, by the wall clock, or 0.
+  reconnects: 0,
+  lastReconnectAt: 0,
+  // ...and the page's word on a send card that the lost session never answered: it goes to the new
+  // session only once that session has taken this call's record, which says what the card was.
+  /** @type {{item: {text: string, kind: "notice", relays: {channel: string}[]}, timer: ReturnType<typeof setTimeout>} | null} */
+  noticeAwaitingRecap: null,
 };
 
 // Recording is FIRE-AND-FORGET and gives up after the first failure.
@@ -6621,6 +6637,7 @@ const CALL_FRESH = {
  * @param {string | null} ack `accepted` once a `vibe-talk-v1` bridge has said it took the record
  */
 function callRecapLine(recap, ack) {
+  if (recap.reconnected) return reconnectedRecapLine(recap, ack);
   if (recap.state === "sent") {
     const words = recapWords(recap);
     const amount = words === null
@@ -6632,6 +6649,28 @@ function callRecapLine(recap, ack) {
     return `${ack === "accepted" ? "Caught the agent up with" : "Sent the agent"} ${amount}${older}`;
   }
   return `Started fresh: ${CALL_FRESH[recap.why] || freshBecause(recap.why)}`;
+}
+
+/**
+ * `#352 voice-reconnect-on-bridge-error`. The line under a call the page carried on a new session:
+ * that it did, and what the new session was handed of this call, or why nothing.
+ *
+ * @param {any} recap
+ * @param {string | null} ack
+ */
+function reconnectedRecapLine(recap, ack) {
+  if (recap.state === "sent") {
+    const words = recapWords(recap);
+    const amount = words === null
+      ? "this call so far"
+      : `${words.toLocaleString("en-US")} word${words === 1 ? "" : "s"} from this call`;
+    const older = recap.dropped > 0
+      ? `; ${recap.dropped} older line${recap.dropped === 1 ? "" : "s"} did not fit`
+      : "";
+    return `Reconnected after a lost turn: ${ack === "accepted" ? "caught the agent up with" : "sent the agent"} ` +
+      `${amount}${older}`;
+  }
+  return `Reconnected after a lost turn: started fresh, as ${RECONNECT_FRESH[recap.why] || freshBecause(recap.why)}`;
 }
 
 /** Why a call started fresh when it was resuming that was off or unsupported: the server's reason. */
@@ -6657,6 +6696,9 @@ function renderCallRecap() {
   } else {
     line.removeAttribute("data-recap");
   }
+  // `#352 voice-reconnect-on-bridge-error`. Whether the session now running is one a reconnect opened.
+  if (said && session.recap.reconnected) line.setAttribute("data-reconnected", "");
+  else line.removeAttribute("data-reconnected");
   followIfPinned(pinned);
 }
 
@@ -6674,14 +6716,7 @@ function offerReplayAtSessionStart(message) {
   session.pendingResume = null;
   const listed = Array.isArray(message.capabilities) && message.capabilities.includes("replay");
   if (listed) {
-    const count = (value) => Math.min(MARKER_NUMBER_MAX, Math.max(0, Math.round(Number(value) || 0)));
-    sendVibeTalkFrame({
-      type: "replay",
-      text: String(resume.text),
-      lines: count(resume.included),
-      dropped: count(resume.dropped),
-      words: count(resume.words),
-    });
+    sendReplayFrame(resume);
     session.recapAck = "waiting";
     awaitReplayAnswer();
     noteCallRecap(recapFor(resume, "replay_frame"));
@@ -6695,13 +6730,51 @@ function offerReplayAtSessionStart(message) {
 }
 
 /**
+ * The `replay` frame for `resume`, the server's record: the first frame a session that lists `replay`
+ * is sent, at the call's start or after a reconnect (`#352 voice-reconnect-on-bridge-error`).
+ *
+ * @param {any} resume what the server's replay route answered
+ */
+function sendReplayFrame(resume) {
+  const count = (value) => Math.min(MARKER_NUMBER_MAX, Math.max(0, Math.round(Number(value) || 0)));
+  sendVibeTalkFrame({
+    type: "replay",
+    text: String(resume.text),
+    lines: count(resume.included),
+    dropped: count(resume.dropped),
+    words: count(resume.words),
+  });
+}
+
+/**
  * The bridge's answer to the `replay` frame: taken, or refused with its reason. Exactly one per
  * frame; one nobody is waiting for says nothing.
+ *
+ * `#352 voice-reconnect-on-bridge-error`. The answer of a session a reconnect opened changes only
+ * what the call says now: the line under the call, the connection details, the transcript's
+ * "reconnected" line, and whether the page's word on a card goes again. Not the call's start
+ * marker, nor what Settings says about how the call began.
  *
  * @param {VibeTalk.VibeTalkV1ServerFrame} message the `replay_ack`
  */
 function noteReplayAck(message) {
   if (message.type !== "replay_ack" || session.recapAck !== "waiting") return;
+  if (session.recap && session.recap.reconnected) {
+    if (message.accepted === true) {
+      session.recapAck = "accepted";
+      addDetail("the reconnected session took this call's record");
+      settleNoticeForRecap(true, "");
+    } else {
+      const reason = typeof message.reason === "string" && message.reason.trim() ? message.reason.trim() : "no reason given";
+      session.recapAck = "refused";
+      session.recap = { state: "none", why: "refused", dropped: 0, reconnected: true };
+      addDetail(`the reconnected session refused this call's record: ${reason}`);
+      reconnectedSessionRefused();
+      settleNoticeForRecap(false, "the new session refused the record that says what the card was");
+    }
+    renderCallRecap();
+    return;
+  }
   if (message.accepted === true) {
     session.recapAck = "accepted";
     resumeLast = { ...resumeLast, acked: true };
@@ -7119,6 +7192,9 @@ function advanceVibeTalkInput() {
   }
   const next = session.pendingPrompts.shift();
   session.typedTurnInFlight = true;
+  // `#352 voice-reconnect-on-bridge-error`. Sent again after a reconnect: its words are already on
+  // screen and in the record, so the bridge's echo of them is not drawn as the owner's a second time.
+  if (next.resent) noteTypedTurn(next.text);
   session.turnInFlight = {
     text: next.text, kind: next.kind, relays: next.relays || [], after: session.lastCompletedTurn,
     echoed: false, turn: null, answered: false,
@@ -7435,12 +7511,16 @@ function noteTurnInFlightEcho(said, final, turn) {
  * text turn, `audio_end` and `interrupt` went is noted for the call-end record (`postCallEnd`).
  *
  * @param {VibeTalk.VibeTalkV1ClientFrame} frame
+ * @param {boolean} [counted] false for a goodbye's frames, which are not what ended anything
  */
-function sendVibeTalkFrame(frame) {
+function sendVibeTalkFrame(frame, counted = true) {
   const now = Date.now();
-  if (frame.type === "prompt") session.lastTextAt = now;
-  else if (frame.type === "audio_end") session.lastAudioEndAt = now;
-  else if (frame.type === "interrupt") session.lastInterruptAt = now;
+  // A goodbye's `audio_end` is not what a record after it is asking about, so it is not noted.
+  if (counted) {
+    if (frame.type === "prompt") session.lastTextAt = now;
+    else if (frame.type === "audio_end") session.lastAudioEndAt = now;
+    else if (frame.type === "interrupt") session.lastInterruptAt = now;
+  }
   session.socket.send(JSON.stringify(frame));
 }
 
@@ -15490,7 +15570,11 @@ const CLOSE_REASON_MAX_CHARS = 120;
  * bridge may take either of the last two for a cut), whether the page was in sight, and how much of
  * the answer's audio was still waiting to be played.
  *
- * @param {"hang_up" | "error_frame" | "server_closed" | "connection_lost" | "suspended"} endedBy
+ * `#352 voice-reconnect-on-bridge-error`. A call the page carried on a new session records each
+ * socket it replaced, as `reconnected`, and every record after the first reconnect says how many came
+ * before it (`reconnects`); a call that never reconnected sends no count, as before.
+ *
+ * @param {"hang_up" | "error_frame" | "server_closed" | "connection_lost" | "suspended" | "reconnected" | "reconnect_limit" | "reconnect_failed"} endedBy
  * @param {number | null} code the close code the browser reported, when it reported one
  * @param {string} [reason] the voice service's own words: its close reason, or its error
  */
@@ -15501,7 +15585,7 @@ function postCallEnd(endedBy, code, reason = "") {
   // Every protocol the server named for the call; its allowlist refuses one it does not know.
   if (session.protocol === "unknown") return;
   const now = Date.now();
-  /** @type {{protocol: string, chat: boolean, ended_by: string, since_open_ms: number, turns: number, close_code?: number, visibility: string, queued_audio_ms: number, last_text_ms?: number, last_audio_end_ms?: number, last_interrupt_ms?: number, close_reason?: string}} */
+  /** @type {{protocol: string, chat: boolean, ended_by: string, since_open_ms: number, turns: number, close_code?: number, visibility: string, queued_audio_ms: number, last_text_ms?: number, last_audio_end_ms?: number, last_interrupt_ms?: number, reconnects?: number, close_reason?: string}} */
   const body = {
     protocol: session.protocol,
     chat: health.chat,
@@ -15516,6 +15600,7 @@ function postCallEnd(endedBy, code, reason = "") {
   if (session.lastTextAt) body.last_text_ms = ago(session.lastTextAt);
   if (session.lastAudioEndAt) body.last_audio_end_ms = ago(session.lastAudioEndAt);
   if (session.lastInterruptAt) body.last_interrupt_ms = ago(session.lastInterruptAt);
+  if (session.reconnects > 0) body.reconnects = session.reconnects;
   const said = redact(String(reason || "")).replace(/[\u0000-\u001f\u007f]+/gu, " ").replace(/\s+/gu, " ").trim();
   if (said) body.close_reason = Array.from(said).slice(0, CLOSE_REASON_MAX_CHARS).join("");
   // Diagnostics, not the call: a failure here is not worth a word on the screen.
@@ -15689,6 +15774,11 @@ async function openConversation(options) {
   session.pendingResume = null;
   session.conversationId = null;
   startAwaitingAnswer = null;
+  // `#352 voice-reconnect-on-bridge-error`. A new call has reconnected nothing yet.
+  session.reconnect = null;
+  session.reconnects = 0;
+  session.lastReconnectAt = 0;
+  session.noticeAwaitingRecap = null;
   // Fetched HERE, before the socket exists, so a slow or failing store delays the call rather than
   // racing `onopen` — a payload that arrived after the agent had already spoken would be a
   // "here is what we said" delivered into the middle of a sentence.
@@ -15745,8 +15835,13 @@ async function openConversation(options) {
  * @param {string} socketUrl the address it was opened on, for the reason a start failed
  * @param {any} resume what `fetchResume` answered for this call, null for nothing
  * @param {boolean} chat whether the conversation is typed
+ * @param {ReconnectAttempt | null} [reconnect] `#352 voice-reconnect-on-bridge-error`: the reconnect
+ *   this socket carries the call on. It opens nothing the call already has, and until its session
+ *   starts, every way it can fail ends the call as `reconnect_failed` rather than as a start that
+ *   never reached the voice service, except a close while the page was in the background, which is
+ *   the suspension it is
  */
-function wireCallSocket(socket, socketUrl, resume, chat) {
+function wireCallSocket(socket, socketUrl, resume, chat, reconnect = null) {
   // `#209 voice-socket-open`. Whether THIS socket ever opened: a close before it did is a start
   // that never reached the voice service, whatever the close code says.
   let opened = false;
@@ -15771,6 +15866,10 @@ function wireCallSocket(socket, socketUrl, resume, chat) {
       clearTimeout(failureTimer);
       failureTimer = null;
     }
+    if (reconnect) {
+      failReconnect(`its new voice socket did not open within ${Math.round(SOCKET_OPEN_TIMEOUT_MS / 1000)} s`);
+      return;
+    }
     noteSocketFailure(null, true);
     try {
       socket.close();
@@ -15792,6 +15891,13 @@ function wireCallSocket(socket, socketUrl, resume, chat) {
     if (session.socket !== socket) return;
     opened = true;
     clearOpenTimer();
+    if (reconnect) {
+      // `#352`. The call is open already: the conversation, its relay and its post watch go on, and
+      // its record keeps counting from when the call opened. Only the new session is awaited.
+      session.connected = true;
+      renderControls();
+      return;
+    }
     markStartup("socket_open");
     if (session.health) {
       session.health.openedAt = Date.now();
@@ -15965,9 +16071,15 @@ function wireCallSocket(socket, socketUrl, resume, chat) {
       clearTimeout(failureTimer);
     }
     failureTimer = setTimeout(
-      opened
-        ? reportFailure
-        : () => reportUnreachable("Its address did not accept the connection.", foreignSocketHint(socketUrl)),
+      reconnect
+        ? () => {
+          failureTimer = null;
+          if (session.reconnect === reconnect) failReconnect("its new voice socket failed before its session started");
+          else reportFailure();
+        }
+        : opened
+          ? reportFailure
+          : () => reportUnreachable("Its address did not accept the connection.", foreignSocketHint(socketUrl)),
       FAILURE_REPORT_MS
     );
   };
@@ -15995,6 +16107,15 @@ function wireCallSocket(socket, socketUrl, resume, chat) {
       failureTimer = null;
     }
     clearOpenTimer();
+    if (reconnect && session.reconnect === reconnect && !wasSuspended()) {
+      // `#352`. Closed before the new session started: the reconnect failed, and the call ends.
+      addDetail(`closed with code ${event.code}${event.reason ? `: ${event.reason}` : ""}`);
+      const reason = redact(String(event.reason || "")).slice(0, 120).replace(/[\s.]+$/u, "");
+      failReconnect(opened
+        ? `its new voice session closed before it started${reason ? `: ${reason}` : ""}`
+        : "its new voice socket was refused");
+      return;
+    }
     // `#209 voice-socket-open`. Closed before it ever opened, and not by the reader: the start
     // never reached the voice service, whether or not an error came first.
     const neverOpened = !opened;
@@ -16022,7 +16143,8 @@ function wireCallSocket(socket, socketUrl, resume, chat) {
       // goes where numbers belong, in the connection details on the settings screen.
       setStatus(cause === "suspended" ? SUSPENDED_STATUS : closeReason(event.code));
     }
-    if (!neverOpened) {
+    // A reconnect's socket carries a call that opened long ago, so its end is recorded even unopened.
+    if (!neverOpened || reconnect) {
       postCallEnd(cause === "suspended" ? "suspended" : lost ? "connection_lost" : "server_closed", event.code,
         event.reason || "");
     }
@@ -16859,6 +16981,439 @@ function noteSpokenWithoutText(turn, cut) {
   postHealth("audio_without_text", turn);
 }
 
+// --- a voice session lost in the middle of a call ------------------------------------------------
+//
+// `#352 voice-reconnect-on-bridge-error`. Seen live: after an interrupt a `vibe-talk-v1` bridge never
+// started the next turn, and its watchdog sent `error` "turn 4 never started after an interrupt;
+// reconnect". An `error` ends the protocol's session, and the page ended the call with it, although
+// the bridge said how to recover, the microphone was still open and the owner had not hung up. So an
+// error that asks the client to reconnect, once the session has started, carries the call on a new
+// session instead. The page says goodbye to the old session and asks the server for a fresh one (a
+// new signed address, never the old one). It keeps the microphone, the audio, the conversation and
+// every channel message still to be read out. It hands the new session this call's record where that
+// session takes one and Resuming is on, and otherwise says it starts fresh. And it sends the turn the
+// bridge lost again: once, and only a turn the bridge named as never started with nothing of an
+// answer to it arrived, since a turn that began may have acted. The transcript, the line under the
+// call, the status line, the connection details and the stored record say so.
+//
+// Nothing else reconnects: not a hang-up, not a drop, not any other error, not an error before the
+// session started, and never the hosted vendor's protocol. And not for ever: a request within
+// RECONNECT_MIN_GAP_MS of the last reconnect, or past RECONNECTS_PER_CALL_MAX in one call, ends the
+// call as `reconnect_limit`, and a reconnect that cannot get a working session ends it as
+// `reconnect_failed`, each said in red as an `error` frame's end is.
+
+/** The bridge's words for "this session is lost; open another": an `error` ending in "; reconnect". */
+const RECONNECT_ASKED = /;\s*reconnect\s*\.?\s*$/iu;
+
+/** "turn 4 never started": the turn the bridge says never began. */
+const LOST_TURN = /\bturn\s+(\d+)\s+never\s+started\b/iu;
+
+/**
+ * How soon after one automatic reconnect another request ends the call instead: a bridge that keeps
+ * losing turns is not hidden behind reconnects.
+ */
+const RECONNECT_MIN_GAP_MS = 60000;
+
+/** The most automatic reconnects in one call: the request after them ends it. */
+const RECONNECTS_PER_CALL_MAX = 3;
+
+/**
+ * How long a reconnect waits for this call's turns to reach the server before it asks for the record
+ * it hands the new session, so that the record holds what was just said.
+ */
+const RECONNECT_RECORDS_WAIT_MS = 3000;
+
+/**
+ * What the transcript's "reconnected" line says, by what the new session was handed, the record of
+ * the call above (`recap_`) or nothing (`fresh_`), and by what went again: the lost turn's channel
+ * messages (`relay`), the reader's typed message (`typed`), nothing (`none`), or nothing though a
+ * typed message was lost (`unsent`). Each says what happened and what it means for the agent's
+ * memory, within the band every seam keeps.
+ */
+const RECONNECT_SEAM_DETAILS = {
+  recap_relay:
+    "The voice service lost a turn, so the call moved to a new session, which was sent what was " +
+    "said above, and the messages went again.",
+  recap_typed:
+    "The voice service lost a turn, so the call moved to a new session, which was sent what was " +
+    "said above, and your message went again.",
+  recap_none:
+    "The voice service lost a turn, so the call moved to a new session, which was sent what was " +
+    "said above. If you were speaking, say it again.",
+  recap_unsent:
+    "The voice service lost a turn, so the call moved to a new session, which was sent what was " +
+    "said above. Send your last message again.",
+  fresh_relay:
+    "The voice service lost a turn, so the call moved to a new session that has seen nothing above " +
+    "this line, and the messages went again.",
+  fresh_typed:
+    "The voice service lost a turn, so the call moved to a new session that has seen nothing above " +
+    "this line, and your message went again.",
+  fresh_none:
+    "The voice service lost a turn, so the call moved to a new session that has seen nothing above " +
+    "this line. If you were speaking, say it again.",
+  fresh_unsent:
+    "The voice service lost a turn, so the call moved to a new session that has seen nothing above " +
+    "this line. Send your last message again.",
+};
+
+/** Why a reconnected call's new session was handed nothing, as the end of its line under the call. */
+const RECONNECT_FRESH = {
+  ...CALL_FRESH,
+  empty: "nothing said in this call was recorded to send",
+  failed: "this call's record could not be read",
+};
+
+/**
+ * @typedef {object} ReconnectAttempt
+ * @property {string} said the voice service's words
+ * @property {"relay" | "typed" | "none" | "unsent"} resend what goes to the new session again
+ * @property {{text: string, kind: "notice", relays: {channel: string}[]} | null} notice the page's
+ *   word on a send card the lost session never answered
+ * @property {{resume: any, why: string | null} | null} recap what the new session is to be handed
+ * @property {Element | null} seam the transcript's line for it, once drawn
+ */
+
+/**
+ * Does the voice service's `error` ask the client to reconnect, on a `vibe-talk-v1` session that
+ * started? Before `session_started` there is no session to carry on from.
+ *
+ * @param {string} said the error's words
+ */
+function reconnectAsked(said) {
+  return session.protocol === "vibe-talk-v1" && session.v1Ready && RECONNECT_ASKED.test(said);
+}
+
+/**
+ * The voice service lost a turn and asked to reconnect: carry the call on a new session, or end it
+ * at the bound.
+ *
+ * @param {string} said the error's words
+ */
+function reconnectOrEnd(said) {
+  const now = Date.now();
+  if (session.reconnects >= RECONNECTS_PER_CALL_MAX) {
+    const times = session.reconnects;
+    endCall("reconnect_limit", said, `a lost turn after ${times} reconnects in this call`);
+    showError(
+      `The voice service lost a turn again after the page had reconnected this call ${times} times, ` +
+        `so the call has ended: ${said}. Tap Talk to start a new call.`,
+      { stay: true }
+    );
+    return;
+  }
+  if (session.lastReconnectAt && now - session.lastReconnectAt < RECONNECT_MIN_GAP_MS) {
+    endCall("reconnect_limit", said, "a second lost turn within a minute of reconnecting");
+    showError(
+      "The voice service lost a turn again less than a minute after the page reconnected, so the " +
+        `call has ended: ${said}. Tap Talk to start a new call.`,
+      { stay: true }
+    );
+    return;
+  }
+  reconnectCall(said, now);
+}
+
+/**
+ * Carry the call on a new session. Everything up to asking the server for that session happens here,
+ * in the handler of the error that asked for it: a bridge closes the lost session's socket straight
+ * after its error, and that close must find the socket already let go, not the call's.
+ *
+ * @param {string} said the error's words
+ * @param {number} now when the error arrived, by the wall clock
+ */
+function reconnectCall(said, now) {
+  const lost = session.socket;
+  // This socket's end, recorded as the session it was; the call goes on and records its own end later.
+  postCallEnd("reconnected", null, said);
+  const health = session.health;
+  if (health) {
+    health.endPosted = false;
+    // The error's verdict and what the lost turn produced belong to the lost session: the new
+    // session's first turn is judged from nothing.
+    health.errored = false;
+    health.heard = false;
+    health.peak = 0;
+    health.audioMs = 0;
+    health.text = false;
+    health.greetingPending = false;
+  }
+  session.reconnects += 1;
+  session.lastReconnectAt = now;
+  // What the lost session said is settled: an answer still arriving keeps its words, marked cut off.
+  if (session.replyArriving) markAnswerCut();
+  settleSpoken();
+  saveUnsettledTurns();
+  // The new session numbers its turns from the start.
+  session.liveTurns = new Map();
+  session.anonTurn = 0;
+  session.lastTranscriptKey = null;
+  /** @type {ReconnectAttempt} */
+  const attempt = { said, resend: "none", notice: null, recap: null, seam: null };
+  queueLostTurn(attempt, said);
+  // Goodbye to the lost session, and nothing more from it.
+  if (failureTimer !== null) {
+    clearTimeout(failureTimer);
+    failureTimer = null;
+  }
+  if (lost) {
+    sayGoodbye(lost);
+    lost.onopen = null;
+    lost.onmessage = null;
+    lost.onerror = null;
+    lost.onclose = (event) => {
+      addDetail(`closed with code ${event.code}${event.reason ? `: ${event.reason}` : ""}`);
+    };
+    lost.close();
+  }
+  // The turn state goes back to a session not yet started; the call does not.
+  resetVibeTalkTurnState();
+  clearNoReply();
+  session.sessionStarts = 0;
+  endReplayAnswerWait();
+  session.connected = false;
+  session.cutForTyped = false;
+  // The capture graph sends to the socket it was built on, so it is built again on the new one. The
+  // microphone stays open: no second permission prompt, and Mute keeps its place.
+  if (session.node) {
+    session.node.disconnect();
+    session.node.onaudioprocess = null;
+    session.node = null;
+  }
+  if (session.source) {
+    session.source.disconnect();
+    session.source = null;
+  }
+  // A draft read back to the lost session is not one the new session heard: a yes to it is not a yes.
+  resetSpokenYes("replaced_session");
+  session.reconnect = attempt;
+  setState("working");
+  setStatus("Reconnecting after a lost turn…");
+  addDetail(`reconnected after the voice service lost a turn: ${said}`);
+  renderControls();
+  continueReconnect(attempt).catch((error) => {
+    if (session.reconnect === attempt) failReconnect(String((error && error.message) || error));
+  });
+}
+
+/**
+ * Decide what of the lost session's turn goes to the new session, and queue it. A text turn goes
+ * again only when the bridge named it as the turn that never started and none of its answer arrived:
+ * a turn that began may have acted, a tool call with nothing said, and sent twice it would act twice.
+ * Spoken words are never sent again as text. The turn in flight is let go here, whatever is decided,
+ * so it is counted once if the call then ends.
+ *
+ * @param {ReconnectAttempt} attempt
+ * @param {string} said the error's words
+ */
+function queueLostTurn(attempt, said) {
+  const inFlight = session.turnInFlight;
+  session.turnInFlight = null;
+  if (!inFlight) return;
+  const named = LOST_TURN.exec(said);
+  const lostTurn = named ? Number(named[1]) : null;
+  const sent = inFlight.turn !== null ? inFlight.turn : (inFlight.after ?? 0) + 1;
+  let why = "";
+  if (inFlight.answered) why = "some of its answer had arrived";
+  else if (lostTurn === null) why = "the voice service did not say it never started";
+  else if (lostTurn !== sent) why = `the voice service named turn ${lostTurn}, not the page's turn ${sent}`;
+  if (!why && inFlight.kind === "notice") {
+    // The page's word on a send card goes only to a session that has taken the record of the card.
+    attempt.notice = { text: inFlight.text, kind: "notice", relays: [] };
+    return;
+  }
+  if (!why) {
+    session.pendingPrompts.unshift({ text: inFlight.text, kind: inFlight.kind, relays: inFlight.relays, resent: true });
+    attempt.resend = inFlight.kind === "relay" ? "relay" : "typed";
+    addDetail("the turn the voice service lost goes to the new session again");
+    return;
+  }
+  addDetail(`the turn the voice service lost does not go again: ${why}`);
+  if (inFlight.kind === "relay" && !inFlight.answered) reportUnrelayed(inFlight.relays, "lost");
+  if (inFlight.kind === "typed" && !inFlight.answered) attempt.resend = "unsent";
+}
+
+/**
+ * The rest of a reconnect, which waits on the server: a new session, the record to hand it, and its
+ * socket. Each step first checks the attempt is still the call's: Hang up, or a failure, ends it.
+ *
+ * @param {ReconnectAttempt} attempt
+ */
+async function continueReconnect(attempt) {
+  let minted;
+  try {
+    minted = await openVoiceSession();
+  } catch (error) {
+    if (session.reconnect === attempt) failReconnect(`the server gave no new voice session: ${error.message}`);
+    return;
+  }
+  if (session.reconnect !== attempt) return;
+  if (minted.protocol !== "vibe-talk-v1") {
+    failReconnect("the server now offers a different kind of voice session");
+    return;
+  }
+  session.providerName = String(minted.provider || conversationalVoice.name);
+  session.inputRate = minted.input_sample_rate || 16000;
+  session.outputRate = minted.output_sample_rate || 16000;
+  attempt.recap = await fetchCallRecap();
+  if (session.reconnect !== attempt) return;
+  const socketUrl = voiceSocketUrl(minted.websocket_url);
+  const socket = new WebSocket(socketUrl);
+  socket.binaryType = "arraybuffer";
+  session.socket = socket;
+  const voiceTarget = String(minted.websocket_url).split(/[?#]/u, 1)[0]
+    .replace(/^(wss?:\/\/)[^/@]+@/u, "$1");
+  addDetail(`reconnecting to ${minted.provider || "voice provider"}, ${session.protocol}, at ${voiceTarget}`);
+  renderControls();
+  wireCallSocket(socket, socketUrl, null, session.chat, attempt);
+}
+
+/**
+ * This call's record as the server would replay it, for the session a reconnect opens, with why
+ * there is none: `off` (the server's replay, or this device's Resuming switch), `empty` or `failed`.
+ * Never throws. Unlike a new call's (`fetchResume`), it says nothing to Settings: how the call
+ * started is unchanged.
+ *
+ * @returns {Promise<{resume: any, why: string | null}>}
+ */
+async function fetchCallRecap() {
+  if (!resumeAllowed || !resumeWanted()) return { resume: null, why: "off" };
+  const conversationId = session.conversationId;
+  if (!conversationId || !session.recordedAny) return { resume: null, why: "empty" };
+  // The turns settled a moment ago are still on their way to the server: wait for them, a while.
+  const queued = recordQueue;
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  let timer = null;
+  await Promise.race([
+    queued,
+    new Promise((resolve) => {
+      timer = setTimeout(resolve, RECONNECT_RECORDS_WAIT_MS);
+    }),
+  ]);
+  if (timer !== null) clearTimeout(timer);
+  try {
+    const payload = await api(`/api/v1/conversations/${encodeURIComponent(conversationId)}/replay`);
+    if (!payload || payload.enabled !== true || !(payload.included > 0) || !payload.text) {
+      return { resume: null, why: "empty" };
+    }
+    return { resume: payload, why: null };
+  } catch (error) {
+    addDetail(`this call's record could not be read for the new session: ${error.message}`);
+    return { resume: null, why: "failed" };
+  }
+}
+
+/**
+ * A reconnect could not get a working session: the call ends, said in red.
+ *
+ * @param {string} why
+ */
+function failReconnect(why) {
+  endCall("reconnect_failed", why, `a reconnect could not get a working session: ${why}`);
+  showError(
+    `The voice service lost a turn and the page could not reconnect: ${why}. Tap Talk to start a new call.`,
+    { stay: true }
+  );
+}
+
+/**
+ * The session a reconnect opened has started: hand it this call's record where it lists `replay` and
+ * one was fetched, otherwise start it fresh and say why. Not the call's start marker, which was filed
+ * when the call began, nor what Settings says about how it began.
+ *
+ * @param {VibeTalk.VibeTalkV1ServerFrame} message the `session_started`
+ * @param {ReconnectAttempt} attempt
+ */
+function offerReplayAtReconnect(message, attempt) {
+  const listed = message.type === "session_started" && Array.isArray(message.capabilities) &&
+    message.capabilities.includes("replay");
+  const fetched = attempt.recap || { resume: null, why: "off" };
+  if (session.recap && session.recap.state === "sent" && !session.recap.reconnected) {
+    addDetail("the conversation this call resumed from was not sent again: only this call's record goes");
+  }
+  if (listed && fetched.resume) {
+    sendReplayFrame(fetched.resume);
+    session.recapAck = "waiting";
+    session.recap = { ...recapFor(fetched.resume, "replay_frame"), reconnected: true };
+    addDetail("the reconnected session was sent this call's record");
+  } else {
+    const why = listed ? fetched.why || "empty" : "unsupported";
+    session.recapAck = null;
+    session.recap = { state: "none", why, dropped: 0, reconnected: true };
+    addDetail(`the reconnected session was sent no record: ${RECONNECT_FRESH[why] || freshBecause(why)}`);
+  }
+  renderCallRecap();
+  const notice = attempt.notice;
+  if (!notice) return;
+  if (session.recapAck === "waiting") {
+    session.noticeAwaitingRecap = {
+      item: notice,
+      timer: setTimeout(() => settleNoticeForRecap(false, "the new session did not say it took the record"),
+        REPLAY_ANSWER_WAIT_MS),
+    };
+  } else {
+    addDetail("the page's word on the card was not repeated to the new session: it was handed no record of the card");
+  }
+}
+
+/**
+ * The page's word on a card, held for the reconnected session's answer to this call's record: sent
+ * once that session took the record, which says what the card was, and otherwise let go, said.
+ *
+ * @param {boolean} taken
+ * @param {string} why
+ */
+function settleNoticeForRecap(taken, why) {
+  const held = session.noticeAwaitingRecap;
+  if (!held) return;
+  session.noticeAwaitingRecap = null;
+  clearTimeout(held.timer);
+  if (!taken) {
+    addDetail(`the page's word on the card was not repeated to the new session: ${why}`);
+    return;
+  }
+  session.pendingPrompts.unshift({ ...held.item, resent: true });
+  addDetail("the page's word on the card goes to the new session again");
+  advanceVibeTalkInput();
+}
+
+/**
+ * Say in the transcript, and in the stored record, that the call moved to a new session: what
+ * happened and what the new session knows.
+ *
+ * @param {ReconnectAttempt} attempt
+ */
+function noteReconnected(attempt) {
+  const handed = session.recap && session.recap.state === "sent" ? "recap" : "fresh";
+  const detail = RECONNECT_SEAM_DETAILS[`${handed}_${attempt.resend}`];
+  const li = transcriptSeam("reconnected", detail);
+  // What went again, so a refused record can change what the line says the session knows.
+  li.setAttribute("data-reconnected", attempt.resend);
+  attempt.seam = li;
+  recordTurn("note", `Reconnected: ${detail}`);
+}
+
+/**
+ * The reconnected session refused this call's record: the call's last "reconnected" line now says
+ * that session has seen nothing above it.
+ */
+function reconnectedSessionRefused() {
+  const rows = leftEl("transcript").children;
+  for (let at = rows.length - 1; at >= 0; at -= 1) {
+    const resend = rows[at].getAttribute("data-reconnected");
+    if (resend === null) continue;
+    const detail = RECONNECT_SEAM_DETAILS[`fresh_${resend}`];
+    const summary = childByClass(rows[at], "seam-summary");
+    const body = childByClass(rows[at], "seam-detail");
+    if (!detail || !summary || !body) return;
+    const pinned = atBottom(leftEl("scroll-area"));
+    body.textContent = detail;
+    summary.setAttribute("title", detail);
+    followIfPinned(pinned);
+    return;
+  }
+}
+
 /** @param {VibeTalk.VibeTalkV1ServerFrame} message */
 function handleVibeTalk(message) {
   switch (message.type) {
@@ -16871,9 +17426,17 @@ function handleVibeTalk(message) {
       session.lastCompletedTurn = null;
       addDetail(`voice session ${message.session_id || "started"}`);
       session.v1Ready = true;
+      // `#352 voice-reconnect-on-bridge-error`. The session a reconnect asked for: handed this
+      // call's record where it takes one, and then sent what the lost session never started.
+      const reconnected = session.reconnect;
       // `#331 resume-on-websocket`. Before anything else this call sends: the record of the
       // conversation above, when this session lists `replay`. A replacement session is sent none.
-      if (session.sessionStarts > 1) {
+      if (reconnected) {
+        session.reconnect = null;
+        offerReplayAtReconnect(message, reconnected);
+        noteReconnected(reconnected);
+        setState("live");
+      } else if (session.sessionStarts > 1) {
         noteReplacedV1Session();
       } else {
         offerReplayAtSessionStart(message);
@@ -16891,7 +17454,7 @@ function handleVibeTalk(message) {
         // FIRST message, which is what starts the call and is held until here. The transcript is
         // still right, rows being kept per turn number, and the next message waits behind the
         // reply it did not ask for (`replyArriving`) once any of that reply has arrived.
-        setStatus("Connected — type a message.");
+        setStatus(reconnected ? "Reconnected — type a message." : "Connected — type a message.");
         // The held first message: queued and, with nothing ahead of it, on the wire in this call.
         deliverHeldTurn();
         advanceVibeTalkInput();
@@ -16902,6 +17465,23 @@ function handleVibeTalk(message) {
         session.health.greetingPending = true;
         armNoReply();
       }
+      if (reconnected && !session.node) {
+        // `#352`. The microphone's graph goes to the new socket, paused, before anything is sent on it.
+        session.capturePaused = true;
+        startCapture(session.socket);
+      }
+      if (reconnected && !session.waitingForGreeting && session.pendingPrompts.length > 0) {
+        // `#352`. PROMPT FIRST: what the lost session never started goes at once, with no segment
+        // open, as a typed call's does, and the answer's `turn_complete` opens the microphone's
+        // segment after it (`vibeTalkTurnComplete`). An `audio_start` first would put an empty
+        // segment, and its `audio_end`, between the hand-off and the turn.
+        session.audioSegmentActive = false;
+        session.capturePaused = true;
+        setStatus("Reconnected — sending it again…");
+        advanceVibeTalkInput();
+        deliverHeldTurn();
+        break;
+      }
       session.capturePaused = session.waitingForGreeting;
       session.audioSegmentActive = true;
       sendVibeTalkFrame({ type: "audio_start" });
@@ -16910,8 +17490,8 @@ function handleVibeTalk(message) {
       }
       setStatus(
         session.waitingForGreeting
-          ? "Connected — the assistant is joining…"
-          : "Connected — say something."
+          ? `${reconnected ? "Reconnected" : "Connected"} — the assistant is joining…`
+          : `${reconnected ? "Reconnected" : "Connected"} — say something.`
       );
       if (!session.waitingForGreeting) {
         advanceVibeTalkInput();
@@ -16963,6 +17543,17 @@ function handleVibeTalk(message) {
       const said = message.message || message.detail || "the voice provider reported an error";
       noteAgentError();
       reportHealth("error_frame");
+      // `#352 voice-reconnect-on-bridge-error`. The session a reconnect opened failed before it
+      // started: the call ends, and says the reconnect failed.
+      if (session.reconnect) {
+        failReconnect(`the new voice session reported an error before it started: ${said}`);
+        break;
+      }
+      // ...and an error that asks to reconnect, on a session that started, carries the call on.
+      if (reconnectAsked(said)) {
+        reconnectOrEnd(said);
+        break;
+      }
       // `vibe-talk-v1`: an error ENDS the session — no `turn_complete` follows. Hanging up here is
       // what stops the page streaming the microphone into a session the server has already
       // closed: left open, every audio frame came back as another copy of this error and the
@@ -17209,6 +17800,12 @@ function teardown() {
   session.answerPlayEndMs = 0;
   session.echoCancellation = false;
   session.sessionStarts = 0;
+  // `#352 voice-reconnect-on-bridge-error`. A reconnect in progress stops at its next step.
+  session.reconnect = null;
+  session.reconnects = 0;
+  session.lastReconnectAt = 0;
+  if (session.noticeAwaitingRecap) clearTimeout(session.noticeAwaitingRecap.timer);
+  session.noticeAwaitingRecap = null;
   // `#331 resume-on-websocket`. No answer to the recap can come now: a record held for one goes,
   // the turn in progress (stored above) included, saying what was known.
   endReplayAnswerWait();
@@ -17274,19 +17871,40 @@ function stop() {
 }
 
 /**
+ * Say goodbye to a `vibe-talk-v1` session (`audio_end`, `quit`) on `socket` while it is open. The only
+ * place this page sends `quit`: when it ends the call (`endCall`), and when it replaces a session
+ * the voice service lost (`reconnectCall`, `#352 voice-reconnect-on-bridge-error`). Neither frame is
+ * noted as the last `audio_end` sent: a goodbye is not what ended anything.
+ *
+ * @param {WebSocket} socket the call's socket, `session.socket`
+ */
+function sayGoodbye(socket) {
+  if (session.protocol === "vibe-talk-v1" && socket.readyState === WebSocket.OPEN) {
+    sendVibeTalkFrame({ type: "audio_end" }, false);
+    sendVibeTalkFrame({ type: "quit" }, false);
+  }
+}
+
+/**
  * End the call from this page: tell a `vibe-talk-v1` server goodbye (`audio_end`, `quit`), close the
  * socket, and tear the call down.
  *
  * `#268 voice-call-drops`. There are exactly two reasons, and both are recorded (`postCallEnd`) and
  * said: the reader pressed Hang up, or the server sent an `error`, which the protocol says ends its
- * session — and the page then says so in red, with the server's words. Nothing else on this page
- * sends `quit`. A bridge log that shows one, then, shows one of these two, and this app's log says
- * which.
+ * session — and the page then says so in red, with the server's words. A bridge log that shows a
+ * `quit`, then, shows one of these two, or a reconnect's goodbye (`sayGoodbye`), and this app's log
+ * says which.
  *
- * @param {"hang_up" | "error_frame"} endedBy
+ * `#352 voice-reconnect-on-bridge-error`. An `error` that asks to reconnect does not end the call, up
+ * to a bound; past it the call ends as `reconnect_limit`, and a reconnect that cannot get a working
+ * session ends it as `reconnect_failed`. Both are the server's error too, said in red by the caller.
+ *
+ * @param {"hang_up" | "error_frame" | "reconnect_limit" | "reconnect_failed"} endedBy
  * @param {string} [reason] the voice service's error, when that is what ended it
+ * @param {string} [why] how the page came to end it, for the connection details, when not hang_up
+ *   or error_frame
  */
-function endCall(endedBy, reason = "") {
+function endCall(endedBy, reason = "", why = "") {
   // With no call there is no Hang up in the pane at all, so this is unreachable from the screen;
   // it stays as a guard rather than as a second way to end something that is already over.
   if (!session.socket) {
@@ -17295,15 +17913,14 @@ function endCall(endedBy, reason = "") {
   // Recorded BEFORE the goodbye: the record says when this page last sent `audio_end`, and the
   // goodbye's own is not what ended the call. `#330 voice-long-turn-drop`.
   postCallEnd(endedBy, null, reason);
-  if (session.protocol === "vibe-talk-v1" && session.socket.readyState === WebSocket.OPEN) {
-    sendVibeTalkFrame({ type: "audio_end" });
-    sendVibeTalkFrame({ type: "quit" });
-  }
+  sayGoodbye(session.socket);
   const span = callSpan();
   if (span) {
     addDetail(endedBy === "hang_up"
       ? `hung up ${span} into the call`
-      : `ended by this page ${span} into the call, after the voice service's error`);
+      : why
+        ? `ended by this page ${span} into the call: ${why}`
+        : `ended by this page ${span} into the call, after the voice service's error`);
   }
   // From here the socket is no longer the call's: its other handlers ignore it once `teardown` has
   // let it go, and its close — whenever it comes, which can be seconds after a `quit` — touches
@@ -41518,6 +42135,12 @@ function flushRelay() {
     forgetRelayPending();
     return false;
   }
+  if (session.reconnect && session.socket) {
+    // `#352 voice-reconnect-on-bridge-error`. The call is moving to a new session: what waits, waits
+    // for it, and says nothing over "Reconnecting".
+    relayTimer = setTimeout(flushRelay, RELAY_RECHECK_MS);
+    return false;
+  }
   if (!canSendText()) {
     reportUnrelayed(relayPending, "ended");
     forgetRelayPending();
@@ -41790,7 +42413,7 @@ function relayToAgent(message, selfPosted, replayed, arrival = {}) {
   // `#196 auto-read-noise`. NOISE is a fifth guard, and the one the owner asked for by name: a
   // placeholder announced into a live call is the agent saying "a new message: Working…" while he
   // drives. The server already decided it is read; the call is not told otherwise.
-  if (selfPosted || isNoise(message) || relayMode() === "off" || !canSendText()) {
+  if (selfPosted || isNoise(message) || relayMode() === "off" || !callReachable()) {
     return false;
   }
   if (replayed && !missedDuringCall(message, arrival)) return false;
@@ -41803,6 +42426,14 @@ function relayToAgent(message, selfPosted, replayed, arrival = {}) {
     relayTimer = setTimeout(flushRelay, RELAY_COALESCE_MS);
   }
   return true;
+}
+
+/**
+ * Is there a call for a channel message to be read out in: one open now, or one a reconnect is
+ * carrying to a new session (`#352 voice-reconnect-on-bridge-error`), whose message waits for it?
+ */
+function callReachable() {
+  return canSendText() || Boolean(session.reconnect && session.socket);
 }
 
 /**
@@ -41830,11 +42461,13 @@ function missedDuringCall(message, arrival) {
  *   * `unanswered`: they went to the agent as a turn, and the call ended before any of its answer
  *     arrived (`#352 voice-reconnect-on-bridge-error`): a voice service that lost the turn, or a
  *     hang-up while the agent was still taking it in.
+ *   * `lost`: they went to the agent as a turn the voice service lost, and the reconnect that
+ *     followed could not send them again: the service did not say the turn never started.
  *   * `gap`: a stream fell further behind than it could replay, so what was posted meanwhile is
  *     unknown. The channel itself is re-read and complete; only the reading-out may have missed it.
  *
- * @param {{channel: string}[]} items the messages, for `ended` and `unanswered`
- * @param {"ended" | "unanswered" | "gap"} why
+ * @param {{channel: string}[]} items the messages, for `ended`, `unanswered` and `lost`
+ * @param {"ended" | "unanswered" | "lost" | "gap"} why
  */
 function reportUnrelayed(items, why) {
   let detail;
@@ -41847,7 +42480,12 @@ function reportUnrelayed(items, why) {
     const channels = [...new Set(items.map((item) => channelLabel(item.channel)))];
     const where = channels.length === 1 ? channels[0] : `${channels[0]} and ${channels.length - 1} other channel${channels.length === 2 ? "" : "s"}`;
     const one = items.length === 1;
-    if (why === "unanswered") {
+    if (why === "lost") {
+      detail = `${relayCount(items.length)}, in ${where}, went to the agent, but the voice service lost the ` +
+        `turn, so ${one ? "it was" : "they were"} never read out.`;
+      addDetail(`${relayCount(items.length)} in ${channels.join(", ")} ${one ? "was" : "were"} not read out: ` +
+        "the voice service lost the turn");
+    } else if (why === "unanswered") {
       detail = `${relayCount(items.length)}, in ${where}, went to the agent, but the call ended before it ` +
         `answered, so ${one ? "it was" : "they were"} never read out.`;
       addDetail(`${relayCount(items.length)} in ${channels.join(", ")} ${one ? "was" : "were"} not read out: ` +
