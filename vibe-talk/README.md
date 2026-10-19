@@ -7358,8 +7358,10 @@ The channel picker lists only that service's channels; **Add a channel** sends t
 with the link or the id, and the form asks for whichever the service takes, with "Let this app post
 here" for an id; **Browse channels** is offered only where the service registers and lists channels,
 and asks the server for that service's channels alone; the hidden channels are that service's. A
-service with no channel on the list says how to add one. Another service closes any open panel and
-empties the browse list. Settings opens on the service of the channel being read, and coming back
+service with no channel on the list says how to add one. A channel whose provider the server no
+longer describes (an added channel whose bridge is gone) is reached under a last **Not connected**
+entry, shown only while there is one, where it can be renamed and nothing can be added. Another
+service closes any open panel and empties the browse list. Settings opens on the service of the channel being read, and coming back
 from Help keeps the service chosen. With one service none of this shows and every request is as
 before. `72-settings-services` photographs the box on Slack beside a Google Chat channel at 393x852,
 1280x800 and 1920x1080, and `make provider-groups-browser` checks in real Chromium, at a desk and a
