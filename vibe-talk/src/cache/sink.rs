@@ -630,7 +630,7 @@ impl Fill {
 /// comparison. Either way it is decided and counted in a detached task: nothing waits for it.
 #[derive(Debug)]
 pub struct Shadowed {
-    task: Option<ShadowTask>,
+    task: Option<Box<ShadowTask>>,
 }
 
 #[derive(Debug)]
@@ -684,7 +684,7 @@ impl Shadowed {
     pub fn compare(mut self, upstream: Upstream) {
         if let Some(task) = self.task.take() {
             let enqueued = task.cache.upgrade().map(|cache| cache.enqueued_seq());
-            task.settle(Some((upstream, enqueued)));
+            (*task).settle(Some((upstream, enqueued)));
         }
     }
 
@@ -714,7 +714,7 @@ impl Shadowed {
 impl Drop for Shadowed {
     fn drop(&mut self) {
         if let Some(task) = self.task.take() {
-            task.settle(None);
+            (*task).settle(None);
         }
     }
 }
@@ -727,7 +727,7 @@ impl Drop for Shadowed {
 /// whether the evaluation read the request's own writes.
 #[derive(Debug)]
 pub struct HeldShadow {
-    task: Option<ShadowTask>,
+    task: Option<Box<ShadowTask>>,
     first: Option<Upstream>,
     enqueued: Option<u64>,
 }
@@ -736,7 +736,7 @@ impl HeldShadow {
     /// The request answered with what it found elsewhere: compare with that.
     pub fn found(mut self, upstream: Upstream) {
         if let Some(task) = self.task.take() {
-            task.settle(Some((upstream, self.enqueued)));
+            (*task).settle(Some((upstream, self.enqueued)));
         }
     }
 
@@ -744,7 +744,7 @@ impl HeldShadow {
     /// [`Shadowed::compare`] would have.
     pub fn nothing_more(mut self) {
         if let (Some(task), Some(first)) = (self.task.take(), self.first.take()) {
-            task.settle(Some((first, self.enqueued)));
+            (*task).settle(Some((first, self.enqueued)));
         }
     }
 }
@@ -752,7 +752,7 @@ impl HeldShadow {
 impl Drop for HeldShadow {
     fn drop(&mut self) {
         if let Some(task) = self.task.take() {
-            task.settle(None);
+            (*task).settle(None);
         }
     }
 }
@@ -788,7 +788,7 @@ pub struct ServedAnswer {
 /// comparison either way settled. `#384 cache-serve`.
 #[derive(Debug)]
 pub struct PendingServe {
-    task: Option<ShadowTask>,
+    task: Option<Box<ShadowTask>>,
 }
 
 impl PendingServe {
@@ -797,7 +797,7 @@ impl PendingServe {
     pub fn compare(mut self, upstream: Upstream) {
         if let Some(task) = self.task.take() {
             let enqueued = task.cache.upgrade().map(|cache| cache.enqueued_seq());
-            task.settle(Some((upstream, enqueued)));
+            (*task).settle(Some((upstream, enqueued)));
         }
     }
 }
@@ -805,7 +805,7 @@ impl PendingServe {
 impl Drop for PendingServe {
     fn drop(&mut self) {
         if let Some(task) = self.task.take() {
-            task.settle(None);
+            (*task).settle(None);
         }
     }
 }
@@ -1299,7 +1299,7 @@ impl Sink {
             evaluated
         });
         Some(Shadowed {
-            task: Some(ShadowTask {
+            task: Some(Box::new(ShadowTask {
                 ask,
                 feed: shadow::Feed::of(route.shape),
                 live_fed,
@@ -1309,7 +1309,7 @@ impl Sink {
                 evaluated: None,
                 progress: Arc::clone(progress),
                 cache: weak,
-            }),
+            })),
         })
     }
 
