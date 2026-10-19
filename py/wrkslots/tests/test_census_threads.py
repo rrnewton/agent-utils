@@ -153,18 +153,22 @@ def _proc_root(tmp_path: Path, *pids: int) -> Path:
 def _started(
     slot: Path, hold: str, *extra: str,
 ) -> Iterator[subprocess.Popen[str]]:
-    child = subprocess.Popen(
+    # As a context manager, Popen closes both pipes on the way out. Killing and reaping alone
+    # leaves them to the Popen object's finalizer, and a test whose frame a reference cycle keeps
+    # alive (pytest.raises(...) as caught) then holds both descriptors until a full garbage
+    # collection, which may run inside a later test that compares descriptor snapshots.
+    with subprocess.Popen(
         [sys.executable, "-I", "-c", _ZOMBIE_LEADER_CHILD, str(slot), hold, *extra],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         text=True,
         cwd="/",
-    )
-    try:
-        yield child
-    finally:
-        child.kill()
-        child.wait(timeout=10)
+    ) as child:
+        try:
+            yield child
+        finally:
+            child.kill()
+            child.wait(timeout=10)
 
 
 def _exit_leader(child: subprocess.Popen[str]) -> None:
@@ -252,6 +256,19 @@ def _root_owned_as_same_uid(
         )
 
     return run
+
+
+def test_started_closes_both_pipes_however_long_its_popen_lives(tmp_path: Path) -> None:
+    """A frame a reference cycle keeps alive keeps its Popen; the pipes must not stay open with it.
+
+    `pytest.raises(...) as caught` is such a cycle. Pipes left to the Popen finalizer stay open
+    until a full garbage collection, which may run inside a later test that compares descriptor
+    snapshots. `#360 census-fd-snapshot`.
+    """
+    with _started(_slot(tmp_path), "cwd") as child:
+        _ready(child)
+    assert child.stdin is not None and child.stdin.closed
+    assert child.stdout is not None and child.stdout.closed
 
 
 def test_the_premise_a_zombie_leader_shows_nothing_its_thread_holds(tmp_path: Path) -> None:

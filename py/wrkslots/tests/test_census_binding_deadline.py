@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import gc
 import json
 import os
 import signal
@@ -91,6 +92,49 @@ def _assert_reaped(children: list[int]) -> None:
             os.waitpid(pid, os.WNOHANG)
 
 
+def _open_descriptors() -> set[str]:
+    """This process's open descriptors, once garbage that earlier tests left is collected.
+
+    A descriptor held only by unreachable objects -- a Popen's pipe in a frame that a reference
+    cycle keeps alive -- closes whenever the collector next runs, which can be in the middle of a
+    census. Collecting first leaves only descriptors something still owns, so a later difference
+    is the census's own doing. Use it for a "before" snapshot only: an "after" read stays raw, so
+    a descriptor the census leaves for the collector to close still fails the comparison.
+    `#360 census-fd-snapshot`.
+    """
+    gc.collect()
+    return set(os.listdir("/proc/self/fd"))
+
+
+def test_a_descriptor_snapshot_leaves_out_what_only_garbage_holds() -> None:
+    """A pipe held only by a reference cycle stays open until collected; the snapshot collects it."""
+
+    class Cycle:
+        def __init__(self) -> None:
+            self.me = self
+            read, write = os.pipe()
+            self.ends = (os.fdopen(read, "rb"), os.fdopen(write, "wb"))
+
+    def pipe_at(number: int, inode: int) -> bool:
+        try:
+            return os.fstat(number).st_ino == inode
+        except OSError:
+            return False
+
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        cycle = Cycle()
+        owned = {end.fileno(): os.fstat(end.fileno()).st_ino for end in cycle.ends}
+        del cycle
+        assert all(pipe_at(*end) for end in owned.items()), "the cycle still holds the pipe"
+        _open_descriptors()
+        assert not any(pipe_at(*end) for end in owned.items()), "collected before the snapshot"
+    finally:
+        if enabled:
+            gc.enable()
+
+
 def test_twelve_real_roots_stop_binding_at_the_default_five_second_deadline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -154,7 +198,7 @@ def test_one_blocked_open_is_cancelled_before_its_sleep_finishes(
     log = tmp_path / "blocked-open.jsonl"
     _delay_checkout_opens(monkeypatch, fixture, 3, log)
     children = _child_pids(monkeypatch)
-    before_fds = set(os.listdir("/proc/self/fd"))
+    before_fds = _open_descriptors()
     started = time.perf_counter()
 
     with pytest.raises(cli.Refusal, match="root binding exceeded the fixed wall"):
@@ -390,7 +434,7 @@ def test_pidfd_setup_failure_cancels_and_reaps_without_fd_leaks(
         raise OSError("injected pidfd failure")
 
     monkeypatch.setattr(os, "pidfd_open", fail_pidfd)
-    before = set(os.listdir("/proc/self/fd"))
+    before = _open_descriptors()
     started = time.perf_counter()
 
     with pytest.raises(OSError, match="injected pidfd failure"):
@@ -420,7 +464,7 @@ def test_cleanup_failure_still_closes_all_parent_descriptors(
         raise OSError("injected cancellation failure")
 
     monkeypatch.setattr(os, "kill", failed_kill)
-    before = set(os.listdir("/proc/self/fd"))
+    before = _open_descriptors()
     try:
         with pytest.raises(OSError, match="injected cancellation failure"):
             cli._audit_cache_root_identity(
@@ -442,7 +486,7 @@ def test_uncancellable_child_has_a_bounded_reap_wait(
     _delay_checkout_opens(monkeypatch, fixture, 3, tmp_path / "unreaped-open.jsonl")
     children = _child_pids(monkeypatch)
     original_kill = os.kill
-    before = set(os.listdir("/proc/self/fd"))
+    before = _open_descriptors()
     # Model SIGKILL not promptly ending a kernel-blocked child. The test's own
     # finally uses the real signal after checking the bounded cleanup result.
     monkeypatch.setattr(os, "kill", lambda _pid, _sig: None)
