@@ -58093,6 +58093,50 @@ test("`#262 search-load-older`: Main drawn from All reads its own newest page fi
   assert.match(page.el("search-empty").textContent, /^Nothing in the \d+ messages loaded so far/);
 });
 
+test("`#262 search-load-older`: Main's walk stopped with nothing more found says so, rather than nothing", async () => {
+  const { page, all } = await searchPage({ pages: 10, content: (i) => (i === 38 ? "engine" : `message ${i}`) });
+  page.enableAbort();
+  await search(page, "engine");
+  await page.settle();
+  assert.deepStrictEqual(matchedIds(page), [all[38].id]);
+  // The walk's second page is held until it is stopped.
+  const serve = page.channelPage;
+  const hold = searchHold();
+  let reads = 0;
+  page.channelPage = async (path, options) => {
+    if (/[?&]before=/.test(String(path)) && ++reads === 2) {
+      await new Promise((resolve, reject) => {
+        hold.promise.then(resolve);
+        options.signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })));
+      });
+    }
+    return serve(path, options);
+  };
+  void page.el("load-older").click();
+  await page.settle();
+  assert.equal(page.el("load-older").textContent, "Searching… 2 of 5 · Stop");
+  page.setClock(page.clock() + SEARCH_OLDER_TAP_MS);
+  await page.el("load-older").click();
+  hold.open();
+  await settleWalk(page);
+  assert.equal(reads, 2);
+  assert.equal(page.el("search-older-note").hidden, false, "a walk stopped with nothing found said nothing");
+  assert.equal(page.el("search-older-note").textContent,
+    `Stopped. Nothing more in 1 page (4 messages), back to ${searchDay(page, all[32].timestamp)}.`);
+  // Stopped before any page landed, it says that.
+  const second = await searchPage({ pages: 10, content: (i) => (i === 38 ? "engine" : `message ${i}`) });
+  second.page.enableAbort();
+  await search(second.page, "engine");
+  await second.page.settle();
+  second.page.olderHold = searchHold();
+  void second.page.el("load-older").click();
+  await second.page.settle();
+  second.page.setClock(second.page.clock() + SEARCH_OLDER_TAP_MS);
+  await second.page.el("load-older").click();
+  await settleWalk(second.page);
+  assert.equal(second.page.el("search-older-note").textContent, "Stopped before any older page was read.");
+});
+
 // --- `#271 settings-groups` -----------------------------------------------------------------------
 //
 // The owner: "organize the settings page a little more logically so it doesn't look like so many

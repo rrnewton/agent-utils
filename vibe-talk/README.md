@@ -6003,7 +6003,9 @@ What a walk found is counted among messages **older than where it started**, so 
 live or a poll can neither stop it nor be reported as found, and in messages, as the count is: a
 combined row is every message it holds, so the count beside the field and the lines between matches
 add up. It is said once, under the button, until the search changes: *Found 3 in 2 pages (98
-messages), back to Sep 30.* The button holds still while the walk runs and the matches open directly
+messages), back to Sep 30.* A walk stopped over matches says what it read even when it found nothing
+more — *Stopped. Nothing more in 1 page (50 messages), back to Oct 2.*, or *Stopped before any older
+page was read.* — where it used to say nothing. The button holds still while the walk runs and the matches open directly
 under it, the line above the first saying how many unmatched messages it skips; scroll away while it
 reads and the message you scrolled to is kept where it is instead. With nothing matched,
 the sentence where the messages were says how far back that is: *Nothing in the 643 messages loaded so
