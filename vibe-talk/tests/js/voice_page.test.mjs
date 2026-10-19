@@ -3874,13 +3874,16 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   /**
    * `#351 settings-polish`. A stylesheet that says, of each element, only whether it clips what overflows
    * it: `overflow-y: auto` for the ids in `clips`, as web/voice.css gives #screen-settings, and `visible`
-   * everywhere else. What the pop-out over Recently dismissed reads to know where its shadow stops.
+   * everywhere else; and whether it floats: `position: absolute` for the ids in `floats`, as it gives
+   * #status-line, and `static` everywhere else. What the pop-out over Recently dismissed reads to know
+   * where its shadow stops, and what floats over the box from outside it, under that shadow.
    */
-  page.clipOverflowOf = (clips) => {
+  page.clipOverflowOf = (clips, floats = []) => {
     context.window.getComputedStyle = (node) => ({
       fontSize: "16px",
       overflowX: "visible",
       overflowY: clips.includes(node.id) ? "auto" : "visible",
+      position: floats.includes(node.id) ? "absolute" : "static",
       getPropertyValue: () => "",
     });
   };
@@ -59274,7 +59277,10 @@ async function framedDismissedPage(script = SCRIPT) {
     for (const kid of kids) assertMarkupContains(parent, kid);
     page.el(parent).append(...kids.map((kid) => page.el(kid)));
   }
-  page.clipOverflowOf(["screen-settings"]);
+  // The stylesheet says what the fixture does: Settings' box clips, and the pill floats.
+  assert.match(cssBlock("#screen-settings"), /overflow-y:\s*auto/, "web/voice.css no longer makes Settings' box scroll");
+  assert.match(cssBlock("#status-line"), /position:\s*absolute/, "web/voice.css no longer floats the status pill");
+  page.clipOverflowOf(["screen-settings"], ["status-line"]);
   return page;
 }
 
@@ -59285,40 +59291,74 @@ test("`#351 settings-polish`: what the pop-out makes inert beyond the box its sh
   const page = await framedDismissedPage();
   await dismissedOpenerOf(dismissedItems(page)[0]).click();
   assert.equal(page.el("dismissed-send-popout").hidden, false);
-  // Beyond #screen-settings, which clips the shadow: the top bar with its Back, the pill, the dock, the
-  // error line, the main screen and the send card's confirmation are inert and dimmed where they stand.
-  assert.deepStrictEqual(underDimIds(page).sort(), ["dock", "error-wrap", "post-confirm", "screen-main", "status-line", "topbar"],
+  // Beyond #screen-settings, which clips the shadow, and laid out beside it: the top bar with its Back,
+  // the dock, the error line, the main screen and the send card's confirmation are inert and dimmed where
+  // they stand. The pill, which floats over the box, is under the shadow already: the test after this.
+  assert.deepStrictEqual(underDimIds(page).sort(), ["dock", "error-wrap", "post-confirm", "screen-main", "topbar"],
     "the elements dimmed are not those beyond Settings' scrolling box");
   for (const id of underDimIds(page)) assert.equal(page.el(id).hasAttribute("inert"), true, `#${id} is dimmed and not inert`);
-  // ...and the box keeps its shadow to itself, so the pill, which floats over it from outside, is not
-  // dimmed by the shadow as well.
-  assert.equal(page.el("screen-settings").hasAttribute("data-dim-box"), true, "Settings' box does not keep the shadow to itself");
   // Inside the box the shadow is the dim: what is inert there is not dimmed again.
   for (const id of ["fold-dismissed", "dismissed-sends", "settings-channels", "fold-settings-voice-agent", "fold-storage"]) {
     assert.equal(inertNow(page.el(id)), true, `#${id} can still be reached behind the pop-out`);
     assert.equal(page.el(id).hasAttribute("data-under-dim"), false, `#${id}, under the shadow, is dimmed twice`);
   }
-  // The stylesheet: the dim beyond the box is the shadow's own depth, and the box is a stacking context.
+  // The stylesheet: the dim beyond the box is the shadow's own depth.
   const shadow = /box-shadow:\s*0 0 0 100vmax rgb\(0 0 0 \/ ([0-9.]+)\)/.exec(cssBlock(".data-popout"));
   assert.ok(shadow, "the pop-out's dim is no longer a shadow of one colour");
   const filter = /filter:\s*brightness\(([0-9.]+)\)/.exec(cssBlock("[data-under-dim]"));
   assert.ok(filter, "what is dimmed beyond the box is not dimmed by a brightness filter");
   assert.equal(Number(filter[1]), Number((1 - Number(shadow[1])).toFixed(2)),
     `the dim beyond the box keeps ${filter[1]} of each colour and the shadow keeps ${1 - Number(shadow[1])}`);
-  assert.match(cssBlock("[data-dim-box]"), /isolation:\s*isolate/, "the shadow's box is not its own stacking context");
   // Every way it goes gives all of it back: Close here, and the rest as the test above.
   await page.el("dismissed-send-close").click();
   assert.deepStrictEqual(underDimIds(page), [], "something is still dimmed after Close");
-  assert.equal(page.el("screen-settings").hasAttribute("data-dim-box"), false, "Settings' box kept the shadow's stacking context");
   // Where nothing round the pop-out clips its shadow, the shadow covers the window and nothing more is dimmed.
   const open = await dismissedPageOf(["a message"]);
   await dismissedOpenerOf(dismissedItems(open)[0]).click();
   assert.deepStrictEqual(underDimIds(open), [], "something was dimmed where the shadow already covers it");
   // The negative control: a pop-out that makes the top bar inert and leaves it bright, as before.
-  const bright = await framedDismissedPage(brokenScript('      if (beyond) beside.setAttribute("data-under-dim", "");\n', ""));
+  const bright = await framedDismissedPage(brokenScript('      if (beyond && !floatsOverDimBox(beside)) beside.setAttribute("data-under-dim", "");\n', ""));
   await dismissedOpenerOf(dismissedItems(bright)[0]).click();
   assert.equal(bright.el("topbar").hasAttribute("inert"), true, "the negative control's top bar is not inert");
   assert.deepStrictEqual(underDimIds(bright), [], "the negative control dimmed the top bar anyway, so the check above proves nothing");
+});
+
+// `#351 settings-polish`, from the review of its second round. The pill was dimmed where it stood too,
+// and Settings' box made a stacking context of its own to keep the shadow off it; then the box, and the
+// pop-out in it, were drawn under the pill, which floats over the foot of the screen. Opened low on the
+// screen, the pop-out is brought on screen by its foot, and the pill, inert and dimmed, covered Copy,
+// Put back and Close, for six seconds or for as long as a call was not answering.
+
+test("`#351 settings-polish`: the status pill, floating over Settings' box, is left to the pop-out's shadow, and the pop-out is drawn over it", async () => {
+  const page = await framedDismissedPage();
+  page.el("status-line").hidden = false;
+  await dismissedOpenerOf(dismissedItems(page)[0]).click();
+  assert.equal(page.el("dismissed-send-popout").hidden, false);
+  // Inert, so nothing reaches it, and not dimmed where it stands: it is under the shadow, which dims it.
+  assert.equal(page.el("status-line").hasAttribute("inert"), true, "the pill can still be reached behind the pop-out");
+  assert.equal(page.el("status-line").hasAttribute("data-under-dim"), false, "the pill, under the shadow, is dimmed again where it stands");
+  // What stands beside the box is still dimmed: only what floats over it is left to the shadow.
+  for (const id of ["topbar", "dock"]) assert.equal(page.el(id).hasAttribute("data-under-dim"), true, `#${id} is no longer dimmed`);
+  // ...and nothing round the pop-out is made a box of its own that the pill could be drawn over.
+  assert.deepStrictEqual([...page.elements.values()].filter((node) => node.hasAttribute("data-dim-box")).map((node) => node.id), [],
+    "a box round the pop-out is still set apart from the pill");
+  // The stylesheet: the pop-out is drawn over the frame's overlays, the pill among them.
+  const zOf = (selector) => Number((/z-index:\s*(-?\d+)/.exec(cssBlock(selector)) || [])[1]);
+  assert.ok(zOf(".data-popout") > zOf("#status-line"),
+    `the pop-out's z-index, ${zOf(".data-popout")}, does not put it over the pill's, ${zOf("#status-line")}`);
+  // A pill that comes up while the pop-out is up is under it in the same way.
+  await page.el("dismissed-send-close").click();
+  page.el("status-line").hidden = true;
+  await dismissedOpenerOf(dismissedItems(page)[0]).click();
+  page.el("status-line").hidden = false;
+  assert.equal(page.el("status-line").hasAttribute("data-under-dim"), false, "a pill hidden when the pop-out opened is dimmed again when it comes up");
+  await page.el("dismissed-send-close").click();
+  assert.equal(page.el("status-line").hasAttribute("inert"), false, "Close did not give the pill back");
+  // The negative control: a pop-out that dims everything beyond its box, the pill included, as before.
+  const twice = await framedDismissedPage(brokenScript("if (beyond && !floatsOverDimBox(beside))", "if (beyond)"));
+  await dismissedOpenerOf(dismissedItems(twice)[0]).click();
+  assert.equal(twice.el("status-line").hasAttribute("data-under-dim"), true,
+    "the negative control left the pill to the shadow anyway, so the check above proves nothing");
 });
 
 test("`#351 settings-polish`: a row of Recently dismissed is named by its place, its age and its first line, and still holds the whole text", async () => {

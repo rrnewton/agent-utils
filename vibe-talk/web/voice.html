@@ -1475,8 +1475,9 @@
                     (its `aria-label`), not by all of its text, which a screen reader read out at every row
                     passed. The pop-out is a MODAL (`aria-modal`): while it is up web/voice.js makes the
                     rest of the page inert and keeps Tab among its own controls, and all it makes inert is
-                    under the dim: its shadow within this scrolling screen, and the same depth over what
-                    stands beyond it, the top bar with its Back, the status pill and the dock. Put back
+                    under the dim: its shadow within this scrolling screen and over the status pill, which
+                    floats over it, and the same depth over what stands beyond it, the top bar with its
+                    Back and the dock. It is drawn over all of them, the pill included. Put back
                     gives the focus to the row that took the place of the one put back, else to the list,
                     else to the line above it, which is why those two can hold the focus (`tabindex="-1"`,
                     not a Tab stop).

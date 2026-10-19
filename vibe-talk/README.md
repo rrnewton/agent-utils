@@ -7393,10 +7393,16 @@ the connection status should be drawn the same way, "a dark terminal-like panel"
   else to the list, else to the line above it that now says nothing is dismissed.
 - The dim is the pop-out's shadow, and Settings' scrolling box clips a shadow like any other
   overflow, so at first it stopped at the box's edges: the top bar stood above it bright, and a tap
-  on its Back did nothing while it looked live. What the pop-out makes inert beyond that box is now
-  dimmed where it stands by the shadow's own depth (`filter: brightness(0.55)`, the shadow being
-  `rgb(0 0 0 / 0.45)`), and the box is its own stacking context while the pop-out is up, so the pill,
-  which floats over the box from outside it, is dimmed once and not twice.
+  on its Back did nothing while it looked live. What the pop-out makes inert beyond that box and
+  beside it, the top bar and the dock, is now dimmed where it stands by the shadow's own depth
+  (`filter: brightness(0.55)`, the shadow being `rgb(0 0 0 / 0.45)`). The status pill is left to the
+  shadow: it floats over the box from outside it, under the pop-out, so the shadow dims it once.
+- The pop-out is drawn over the pill (`z-index` 6 to the pill's 5). For a while the pill was dimmed
+  where it stood as well, and the box made a stacking context of its own to keep the shadow off it;
+  the box, with the pop-out in it, was then drawn under the pill. Opened low on the screen, the
+  pop-out is brought on screen by its foot, where its buttons are and where the pill floats, and the
+  inert pill covered Copy, Put back and Close for its six seconds, or for as long as a call was not
+  answering.
 - Connection status puts each part of the connection detail on its own line, with how live updates
   reach the page (`#347 settings-prose`) last; the banner after a call keeps its one line.
 
@@ -7406,7 +7412,9 @@ Tab key round the pop-out both ways and asks every point of the dim what a tap t
 A hit test skips an inert element, so that says nothing about how the control under the point looks;
 the scene also measures every control on screen outside a pop-out, the top bar's Back and the pill's ×
 among them, in a screenshot before it opens and one with it up, and each must keep between 0.40 and
-0.70 of its brightness: under the dim, once.
+0.70 of its brightness: under the dim, once. It then opens the long message with Recently dismissed
+low on the screen, so the pop-out comes up at the foot, and photographs it so; there it is drawn with
+the pill hidden and with the pill up at its widest, and no pixel inside it may change.
 
 **Connection status moved to the end and gained a word.** It is a readout — what the conversation
 is, what audio format it negotiated, why the last one closed — and it was standing at the top of the

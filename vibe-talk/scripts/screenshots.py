@@ -3192,6 +3192,75 @@ def popout_dim_misses(lit_layout: DimLayout, lit: Image, dim_layout: DimLayout, 
     return judged, misses
 
 
+# `#351 settings-polish`, from the review of its second round. Where the pop-out, Settings' scrolling box
+# and the status pill are: CSS pixels, left, top, right, bottom.
+POPOUT_FOOT_LAYOUT_JS = (
+    "(() => { const at = (id) => { const b = document.getElementById(id).getBoundingClientRect(); "
+    "return [b.left, b.top, b.right, b.bottom]; }; "
+    "return { popout: at('dismissed-send-popout'), box: at('screen-settings'), pill: at('status-line') }; })()"
+)
+
+# How far above the foot of Settings' box Recently dismissed's top edge is put before the long message is
+# opened, so that opening it brings the pop-out on screen by its foot (`scrollIntoView`, `block: 'nearest'`).
+POPOUT_FOOT_LEAD_PX = 40
+
+# ...and how far above that foot its own foot may then be and still stand there: the box's padding at its
+# foot (`1rem`), which the page cannot scroll past when Recently dismissed is near the end of Settings.
+POPOUT_FOOT_SLACK_PX = 16
+
+# Said by the pill while the pop-out stands at the foot: long enough to draw the pill at its widest, as a
+# long channel name or a long error does, so it reaches into the pop-out wherever the column puts it.
+POPOUT_FOOT_STATUS = (
+    "A status long enough to draw the pill at its widest, as a long channel name or a long error does, "
+    "held up while the pop-out stands at the foot of the screen."
+)
+
+# How far in from each edge of the pop-out the comparison starts: its rounded corners (`0.8rem` at the
+# page's 16px rem), where, outside the curve, the shadow and the pill under it show within its rectangle.
+POPOUT_CORNER_PX = 13
+
+# A change in any colour channel larger than this is a pixel of the pop-out drawn differently.
+POPOUT_COVER_TOLERANCE = 8
+
+
+class FootLayout(TypedDict):
+    popout: list[float]
+    box: list[float]
+    pill: list[float]
+
+
+def popout_covered(bare: Image, pilled: Image, popout: list[float], pill: list[float]) -> list[str]:
+    """Whether anything is drawn over the pop-out where the status pill floats under it, by its pixels.
+
+    `#351 settings-polish`, from the review of its second round. The pop-out as drawn with the pill
+    hidden (`bare`) and with it up (`pilled`), where it stands in both: inside it, short of its rounded
+    corners, no pixel may change, because a modal is drawn over the pill and not the pill over it. The
+    pill must reach into that part of the pop-out, or the pictures say nothing. Returns why the pop-out
+    is not on top, or nothing.
+    """
+    x0, y0, x1, y1 = (int(round(value)) for value in popout)
+    x0, y0, x1, y1 = x0 + POPOUT_CORNER_PX, y0 + POPOUT_CORNER_PX, x1 - POPOUT_CORNER_PX, y1 - POPOUT_CORNER_PX
+    x1, y1 = min(x1, bare.width, pilled.width), min(y1, bare.height, pilled.height)
+    reach_x = min(x1, int(round(pill[2]))) - max(x0, int(round(pill[0])))
+    reach_y = min(y1, int(round(pill[3]))) - max(y0, int(round(pill[1])))
+    if reach_x <= 0 or reach_y <= 0:
+        return [f"the pill ({[round(value) for value in pill]}) does not reach into the pop-out "
+                f"({[round(value) for value in popout]}), so nothing here says which is drawn on top"]
+    changed = 0
+    first: tuple[int, int] | None = None
+    for y in range(max(y0, 0), y1):
+        for x in range(max(x0, 0), x1):
+            before = bare.pixels[y * bare.width + x]
+            after = pilled.pixels[y * pilled.width + x]
+            if any(abs(a - b) > POPOUT_COVER_TOLERANCE for a, b in zip(before[:3], after[:3])):
+                changed += 1
+                first = first or (x, y)
+    if changed:
+        return [f"{changed} pixels of the pop-out change when the pill comes up under it, the first at {first}: "
+                "the pill is drawn over the pop-out"]
+    return []
+
+
 def _act_settings_dismissed_popout(driver: Driver) -> None:
     """`#348 settings-dynamic-lists`: the long dismissed send opened in its pop-out, whole, with Copy.
 
@@ -3204,6 +3273,12 @@ def _act_settings_dismissed_popout(driver: Driver) -> None:
     dim, once (`__dimJudged`, `__dimMisses`, `popout_dim_misses`). That pop-out is the top row's, a short
     message: the long one's is brought on screen by scrolling, which would move every control between
     the two pictures, and the comparison is of each control where it stands.
+
+    From the review of the second round: the long one is opened with Recently dismissed low on the
+    screen, so opening it brings it on screen by its foot, its buttons where the pill floats, and it is
+    photographed so. There it is drawn with the pill hidden and with the pill up at its widest: nothing
+    inside it may change (`__footCovered`, `popout_covered`). The pill drawn over Copy, Put back and
+    Close at the foot is what keeping the shadow off the pill once did.
     """
     _act_settings_dismissed_list(driver)
     driver.js("(() => { setStatus('Ready.'); clearTimeout(statusTimer); return true; })()")
@@ -3221,8 +3296,30 @@ def _act_settings_dismissed_popout(driver: Driver) -> None:
                          [judged, misses])
     driver.click("dismissed-send-close")
     driver.page.wait_for_function("() => !window.__visible('dismissed-send-popout')", timeout=5_000)
-    driver.page.click("#dismissed-sends > li:nth-child(3) .dismissed-send-open")
+    # The group low on the screen, and its row opened where it is: a click by the pointer would scroll it up.
+    driver.js(
+        "(() => { const box = document.getElementById('screen-settings'); "
+        "const group = document.getElementById('dismissed-group').getBoundingClientRect(); "
+        f"box.scrollTop -= box.getBoundingClientRect().bottom - {POPOUT_FOOT_LEAD_PX} - group.top; return true; }})()"
+    )
+    driver.settle(200)
+    driver.js("(() => { document.querySelector('#dismissed-sends > li:nth-child(3) .dismissed-send-open').click(); return true; })()")
     driver.page.wait_for_function("() => window.__visible('dismissed-send-popout')", timeout=5_000)
+    driver.js("(() => { document.getElementById('status-line').hidden = true; return true; })()")
+    driver.settle(200)
+    bare_layout = cast(FootLayout, driver.js(POPOUT_FOOT_LAYOUT_JS))
+    bare = decode_png(driver.page.screenshot(scale="css", animations="disabled"))
+    driver.page.evaluate("(text) => { setStatus(text); clearTimeout(statusTimer); }", POPOUT_FOOT_STATUS)
+    driver.settle(200)
+    foot = cast(FootLayout, driver.js(POPOUT_FOOT_LAYOUT_JS))
+    pilled = decode_png(driver.page.screenshot(scale="css", animations="disabled"))
+    covered: list[str] = []
+    if not -1 <= foot["box"][3] - foot["popout"][3] <= POPOUT_FOOT_SLACK_PX:
+        covered.append(f"the pop-out's foot is at {foot['popout'][3]:.0f}, not at the foot of the screen ({foot['box'][3]:.0f})")
+    if any(abs(a - b) > 1 for a, b in zip(bare_layout["popout"], foot["popout"])):
+        covered.append("the pop-out moved when the pill came up")
+    covered += popout_covered(bare, pilled, foot["popout"], foot["pill"])
+    driver.page.evaluate("(covered) => { window.__footCovered = covered; }", covered)
     driver.js("(() => { window.__popoutTabbed = []; return true; })()")
     for key in ("Tab",) * 4 + ("Shift+Tab",) * 4:
         driver.page.keyboard.press(key)
@@ -6224,6 +6321,13 @@ SCENES: tuple[Scene, ...] = (
                 "Array.isArray(window.__dimJudged) && ['close-settings', 'dismiss-status'].every((id) => "
                 "window.__dimJudged.includes(id)) && Array.isArray(window.__dimMisses) && window.__dimMisses.length === 0",
             ),
+            (
+                # `#351 settings-polish`, from the review of its second round: with the shadow kept off the
+                # pill, the box and the pop-out in it were drawn under the pill, which covered Copy, Put
+                # back and Close wherever the pop-out stood at the foot. Measured in pixels.
+                "at the foot of the screen, with the pill up under it, nothing is drawn over the pop-out",
+                "Array.isArray(window.__footCovered) && window.__footCovered.length === 0",
+            ),
         ),
     ),
     Scene(
@@ -7114,10 +7218,12 @@ def check_state_controls() -> list[str]:
         # fact-a-line detail (`split(`). `#351 settings-polish` pins the pop-out to being a modal
         # (`aria-modal`), Tab kept round it (`__popoutTabbed`), no tap through its dim (`__dimHits`)
         # and every control outside it under the dim, the top bar's Back among them (`__dimMisses`,
-        # `'close-settings', 'dismiss-status'`).
+        # `'close-settings', 'dismiss-status'`), and to nothing drawn over it at the foot of the screen
+        # with the pill up under it (`__footCovered`).
         "65-settings-dismissed-list": ("Math.max(...rgb) < 48", "s.resize === 'vertical'", "textOverflow"),
         "66-settings-dismissed-popout": ("t.length > 400", "dismissed-send-copy", "aria-modal", "__popoutTabbed",
-                                         "__dimHits", "__dimMisses", "'close-settings', 'dismiss-status'"),
+                                         "__dimHits", "__dimMisses", "'close-settings', 'dismiss-status'",
+                                         "__footCovered"),
         "67-settings-connection-panel": ("Math.max(...rgb) < 48", "split("),
         # `#346 settings-collapsible`. Pinned to every section folded and hidden until found
         # (`'until-found'`), to no setting drawn (`!window.__visible(id)`), and to the browser's search
@@ -7563,6 +7669,43 @@ def check_popout_dim_controls() -> list[str]:
     return problems
 
 
+def check_popout_covered_controls() -> list[str]:
+    """`#351 settings-polish`. The pill-over-the-pop-out check, on pictures made here: the pill drawn
+    under the pop-out passes, and so does a change only in a rounded corner; the pill drawn over it, and
+    a pill that does not reach into it at all, each fail."""
+    problems: list[str] = []
+    width, height = 80, 60
+    popout, pill = [10.0, 10.0, 70.0, 50.0], [0.0, 35.0, 80.0, 45.0]
+
+    def picture(over: bool, corner: bool = False) -> Image:
+        pixels: list[tuple[int, ...]] = []
+        for y in range(height):
+            for x in range(width):
+                inside = 10 <= x < 70 and 10 <= y < 50
+                under_pill = 0 <= x < 80 and 35 <= y < 45
+                colour = (30, 34, 40)
+                if under_pill and (over or not inside):
+                    colour = (120, 120, 120)
+                elif inside:
+                    colour = (60, 66, 76)
+                if corner and x == 11 and y == 48:
+                    colour = (0, 0, 0)
+                pixels.append(colour)
+        return Image(width=width, height=height, pixels=pixels)
+
+    bare = Image(width=width, height=height, pixels=[
+        (60, 66, 76) if 10 <= x < 70 and 10 <= y < 50 else (30, 34, 40) for y in range(height) for x in range(width)])
+    if popout_covered(bare, picture(over=False), popout, pill):
+        problems.append("the pill-over-the-pop-out check failed a pill drawn under the pop-out.")
+    if popout_covered(bare, picture(over=False, corner=True), popout, pill):
+        problems.append("the pill-over-the-pop-out check counted a pixel in the pop-out's rounded corner.")
+    if not popout_covered(bare, picture(over=True), popout, pill):
+        problems.append("the pill-over-the-pop-out check passed a pill drawn over the pop-out.")
+    if not popout_covered(bare, bare, popout, [0.0, 52.0, 80.0, 58.0]):
+        problems.append("the pill-over-the-pop-out check passed a pill that does not reach into the pop-out.")
+    return problems
+
+
 def check_page_error_controls() -> list[str]:
     """A page that threw must not be photographed. The check lives on the capture path itself."""
     problems: list[str] = []
@@ -7618,6 +7761,7 @@ def check_stub_controls() -> list[str]:
 SELF_TEST_CHECKS = (
     "the PNG decoder reconstructs all five row filters correctly",
     "the pop-out's dim check fails a control drawn bright, dimmed twice or moved, and passes one dimmed once",
+    "the pill-over-the-pop-out check fails a pill drawn over the pop-out or not reaching it, and passes one under",
     "the PNG decoder reads dimensions from a real header",
     "a varied, rendered frame is accepted",
     "a flat WHITE frame is rejected",
@@ -7694,6 +7838,7 @@ def run_self_test(tmp: Path) -> int:
         + check_stub_controls()
         + check_page_error_controls()
         + check_popout_dim_controls()
+        + check_popout_covered_controls()
     )
     if problems:
         for problem in problems:
