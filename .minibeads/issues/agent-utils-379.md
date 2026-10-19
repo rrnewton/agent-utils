@@ -1,12 +1,13 @@
 ---
 title: 'read-aloud-sentences: inside the block being read aloud, light the sentence being said'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-19T19:41:59.584510395+00:00
-updated_at: 2026-10-19T19:41:59.584510395+00:00
+updated_at: 2026-10-19T19:44:00.805994780+00:00
+closed_at: 2026-10-19T19:44:00.805994639+00:00
 ---
 
 # Description
