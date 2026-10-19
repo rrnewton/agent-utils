@@ -875,6 +875,26 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#386 hide-empty-messages` in the browser engine, at 1280x800 with a mouse and at 393x852 by touch, in
+  # the dark scheme and the light: with the switch on, its default, no empty message is drawn in All, in
+  # Main or in a thread on the right, the headings count only what is drawn and a thread's card does not
+  # count an empty reply unread, while a file posted with no words and a message with only a reaction
+  # are drawn; Settings > Messages > Empty messages, beside Mark-read automatically, turned off draws
+  # every empty message again, kept across a reload, and on hides them again.
+  - group: check
+    job: empty-messages-browser
+    desc: empty messages drawn nowhere and counted nowhere while the Settings switch is on, by default, and drawn again when it is off, kept across a reload, a file alone and a reaction alone still drawn, in current Chromium at 1280x800 and 393x852 in both schemes
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/empty_messages_browser.py
+    jobs_flag: ""
+    timeout: 120
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 20
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#299 all-thread-strip` in the browser engine, at 1280x800 with a mouse and at 412x915 by touch, in the
   # dark scheme and the light, in All: a strip on every row of an answered thread and on no other row (not
   # a message in no thread, not a root nobody has answered), its bar at least 5px (6px) and four times the

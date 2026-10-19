@@ -365,6 +365,14 @@ post combined from several messages is marked if any of them was edited. The mar
 aloud and a search does not match it; the voice agent is told a message was edited, so it can say so
 when you ask. A service that does not report edits shows no mark, as before.
 
+**Empty messages are left out.** `#386 hide-empty-messages`. A message with no text but white space,
+no reaction, and not the first message of a thread somebody has answered draws no row in any view, is
+not counted as unread, and is never read aloud or passed to the voice agent as news. A file posted
+with no words is not empty where it reaches the page as a line naming the file, as Slack's do; a
+Discord post that is only a file or an embed reaches it with nothing in it, so it is hidden too
+(`#387 discord-file-posts`). **Empty messages** in Settings, beside **Mark-read automatically**, is
+on by default; turned off, every empty message is drawn again. It is this browser's own choice.
+
 **An agent's own heading moves into the header.** Agents posting through one shared account often
 open a message with who they are, a title and a time — `[build-bot coordinator] Backup check, 10:52
 PM ET. All shards are synced.` That first line is drawn in the row's header instead: the tag in quiet

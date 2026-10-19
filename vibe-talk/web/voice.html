@@ -1439,6 +1439,33 @@
 
                   <section class="settings-group">
                     <div class="group-head">
+                      <h3 title="A message with nothing in it to show is left out everywhere."><button class="fold-toggle" id="fold-empty-messages" type="button" aria-expanded="false" aria-controls="fold-empty-messages-body">Empty messages</button></h3>
+                      <button class="help-link" id="help-link-empty-messages" type="button" data-help="empty-messages" aria-label="About hiding empty messages" title="A message with nothing in it to show is left out everywhere.">?</button>
+                    </div>
+                    <div class="fold-body" id="fold-empty-messages-body" hidden="until-found">
+                      <!--
+                        `#386 hide-empty-messages`. ON by default. The owner, 2026-10-19: "there is a
+                        BLANK message from the coding agent ... I want to have a checked-by-default box
+                        in that same settings area that completely filters out empty messages." A row
+                        with a time, Reply and Done over nothing tells the reader nothing and still
+                        asks to be dealt with.
+
+                        EMPTY is decided in web/voice.js (`emptyMessage`), and narrowly: no text but
+                        white space, no reaction, and not the root of a thread anyone has answered. A
+                        file posted with no words is not empty: from Slack it reaches the page as a line
+                        naming the file, in the text (`#313 slack-file-posts`); Discord's adapter does not
+                        carry files yet (`#387 discord-file-posts`). This browser's choice, as the other
+                        switches here are; nothing is recorded on the server, and off, every row is back.
+                      -->
+                      <label class="toggle">
+                        <input id="hide-empty-messages" type="checkbox" checked />
+                        Hide messages with nothing in them
+                      </label>
+                    </div>
+                  </section>
+
+                  <section class="settings-group">
+                    <div class="group-head">
                       <h3 title="Same author, within five seconds. Turn it off to see the raw rows."><button class="fold-toggle" id="fold-combining" type="button" aria-expanded="false" aria-controls="fold-combining-body">Combining messages</button></h3>
                       <button class="help-link" id="help-link-combining" type="button" data-help="combining" aria-label="About combining messages" title="Same author, within five seconds. Turn it off to see the raw rows.">?</button>
                     </div>
@@ -2538,6 +2565,25 @@
                 The rules are kept on the server and shared by every device you use; the voice
                 agent cannot change them. Like <strong>Done</strong>, this is this app's own read
                 state and changes nothing in the source chat service.
+              </p>
+            </details>
+
+            <details id="help-empty-messages" class="help-entry">
+              <summary><h2>Empty messages</h2></summary>
+              <p class="hint">
+                A chat service sometimes delivers a message with nothing in it to show: no words, or
+                only spaces and line breaks. With this on, such a message is left out everywhere — it
+                draws no row in any view, is not counted as unread, and is never read aloud or passed
+                to the voice agent as news.
+              </p>
+              <p class="hint">
+                A message counts as empty only when it has <strong>no text</strong> but white space,
+                <strong>no reactions</strong>, and is not the first message of a thread somebody has
+                answered. A <strong>file posted with no words</strong> that shows as a line naming the
+                file is not empty. A post that reaches this app with nothing in it at all is hidden,
+                whatever the chat service had attached to it. Turn this off to see every empty message
+                again. It is this browser's own choice, and changes nothing on the server or in the
+                source chat service.
               </p>
             </details>
 

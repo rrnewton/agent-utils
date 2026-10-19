@@ -9927,8 +9927,8 @@ async function inReadingMode(page, messages) {
 // Device speech is selected by the backend; cloud audio remains covered by the existing tests.
 const DEVICE_SPEECH = { backend: "browser", label: "Device voice", playback: "browser", local_only: true };
 
-function devicePage(voices) {
-  const page = newPage();
+function devicePage(voices, store = new Map()) {
+  const page = newPage(store);
   page.readAloud = DEVICE_SPEECH;
   page.enableDeviceSpeech(voices);
   return page;
@@ -10139,9 +10139,10 @@ test("device speech reads the server-prepared body, including UID and diff names
   assert.deepEqual(page.prepareCalls, [], "device speech made a network preparation request");
 });
 
+// With empty messages shown (`#386 hide-empty-messages`): hidden, the default, there is no row to tap.
 for (const content of ["", "   "]) {
   test(`device speech does not archive a message with ${JSON.stringify(content)} text`, async () => {
-    const page = devicePage();
+    const page = devicePage(undefined, new Map([["vibe-talk.voice.hide-empty", "0"]]));
     await signIn(page);
     const rows = await inReadingMode(page, [message({ content })]);
     await rows[0].dispatch("click", {});
@@ -14159,8 +14160,8 @@ test("message text is styled as one block family: bullets, hanging indent, parag
   assert.match(cssBlock(".md .mention"), /color:\s*var\(--accent\)/);
 });
 
-test("a message with no content at all renders without throwing", async () => {
-  const page = newPage();
+test("a message with no content at all renders without throwing, with empty messages shown", async () => {
+  const page = newPage(new Map([["vibe-talk.voice.hide-empty", "0"]]));
   await signIn(page);
   const lines = await showDiscord(page, [message({ content: "" }), message({ content: null })]);
   assert.equal(lines.length, 2);
@@ -49099,6 +49100,133 @@ test("A SETTLED THREAD'S READ REPLIES CUT FROM THE DEVICE'S COPY move with what 
   assert.ok(saidB(again), "question B is back with nothing to say why");
 });
 
+// --- `#386 hide-empty-messages` ----------------------------------------------------------------------
+//
+// The owner, 2026-10-19: "there is a BLANK message from the coding agent... I want to have a
+// checked-by-default box in that same settings area that completely filters out empty messages."
+// Empty is no text but white space, no reaction, and not the root of a thread anyone has answered.
+
+const HIDE_EMPTY = "vibe-talk.voice.hide-empty";
+
+/**
+ * The inbox channel of `#222 unread-replies` with empty messages in it: question C's placeholder (11)
+ * an empty reply instead; question B's root (05) emptied, though it has a reply; and after the agent's
+ * newest (12), a message of spaces, a line break and a zero-width space (13), a file posted with no
+ * words, as the server writes one (14), and a message with no text and one reaction (15).
+ */
+function emptyChannel(page) {
+  const messages = inboxChannel(page);
+  const at = (n) => messages.find((m) => m.id === inboxId(n));
+  Object.assign(at(11), { content: "", noise: false });
+  at(5).content = "";
+  messages.push(
+    message({ id: inboxId(13), content: " \n​ ", ...CODER }),
+    message({ id: inboxId(14), content: "📎 [screenshot.png](<https://chat.example/files/F1/screenshot.png>) · PNG", ...CODER }),
+    message({ id: inboxId(15), content: "", reactions: [{ emoji: "👍", count: 1 }], ...CODER }),
+  );
+  return messages;
+}
+
+test("`#386 hide-empty-messages`: ON BY DEFAULT an empty message draws no row in All or Main and is not unread; a file alone, a reaction alone and an answered root keep theirs", async () => {
+  const page = newPage();
+  const messages = emptyChannel(page);
+  await signIn(page);
+  assert.equal(page.el("hide-empty-messages").checked, true, "the default is not on");
+  await showDiscord(page, messages);
+  const all = shownIds(page);
+  assert.ok(!all.includes(inboxId(11)) && !all.includes(inboxId(13)), `All drew an empty message: ${all}`);
+  // Negative controls: none of these is empty.
+  for (const n of [5, 14, 15]) assert.ok(all.includes(inboxId(n)), `All left out ${inboxId(n)}, which is not empty`);
+  await pickThread(page, "main");
+  assert.deepStrictEqual(shownIds(page), [1, 2, 5, 10, 7, 12, 14, 15].map(inboxId));
+  // Question C's empty reply is not one more unread: the agent's two answers are.
+  assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 5: null, 7: "2 unread" });
+});
+
+test("`#386 hide-empty-messages`: turned off, every empty message is drawn and counted again with no read; on, gone again; the choice is kept", async () => {
+  const page = newPage();
+  const messages = emptyChannel(page);
+  await inboxOnMain(page, messages);
+  const reads = page.timelineCalls.length;
+
+  await page.el("hide-empty-messages").setChecked(false);
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), [1, 2, 5, 10, 7, 12, 13, 14, 15].map(inboxId));
+  assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 5: null, 7: "3 unread" });
+  assert.equal(page.storage.get(HIDE_EMPTY), "0", "the choice was not kept");
+  assert.equal(page.timelineCalls.length, reads, "showing what the page holds cost a read");
+
+  await page.el("hide-empty-messages").setChecked(true);
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), [1, 2, 5, 10, 7, 12, 14, 15].map(inboxId));
+  assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 5: null, 7: "2 unread" });
+  assert.equal(page.storage.get(HIDE_EMPTY), "1");
+
+  // A page opened with it off draws them from the start.
+  const off = newPage(new Map([[HIDE_EMPTY, "0"]]));
+  await inboxOnMain(off, emptyChannel(off));
+  assert.equal(off.el("hide-empty-messages").checked, false, "the kept choice was not restored");
+  assert.ok(shownIds(off).includes(inboxId(13)), "a page opened with the switch off hid an empty message");
+});
+
+test("`#386 hide-empty-messages`: an empty message arriving on the stream draws no row; a file arriving alone does", async () => {
+  const page = newPage();
+  const stream = await withLiveChannel(page, [message({ id: "9500000000000000001", content: "already here" })]);
+  await deliver(page, stream, sseMessage(message({ id: "9500000000000000002", content: "   " })));
+  assert.deepStrictEqual(shownIds(page), ["9500000000000000001"], "an empty arrival drew a row");
+  await deliver(page, stream, sseMessage(message({ id: "9500000000000000003",
+    content: "📎 [build.log](<https://chat.example/files/F2/build.log>) · Plain Text" })));
+  assert.deepStrictEqual(shownIds(page), ["9500000000000000001", "9500000000000000003"], "a file arriving alone drew no row");
+});
+
+test("`#386 hide-empty-messages`: the arrow of a reply to a hidden empty message says so, and walks back through nothing", async () => {
+  const page = newPage();
+  page.threadingSupported = true;
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "9600000000000000001", content: "" }),
+    message({ id: "9600000000000000002", content: "that image is the failing run", reply_to: "9600000000000000001" }),
+  ]);
+  assert.deepStrictEqual(shownIds(page), ["9600000000000000002"]);
+  const reads = page.timelineCalls.length;
+  await tapArrow(page, rowWithId(page, "9600000000000000002"));
+  assert.equal(statusText(page), "Settings hides that empty message.");
+  assert.equal(page.timelineCalls.length, reads, "it walked back looking for a message it held and hides");
+});
+
+test("`#386 hide-empty-messages`: an empty root keeps its row when only the store knows it was answered — its copy saying 0 replies, or carrying no thread record", async () => {
+  const page = newPage();
+  page.threadingSupported = true;
+  const counted = { id: "spaces/A/threads/counted", root_message_id: "9600000000000000011", is_root: true,
+    reply_count: 0, reply_count_exact: false };
+  const bare = { id: "spaces/A/threads/bare", root_message_id: "9600000000000000013", is_root: false,
+    reply_count: 1, reply_count_exact: true };
+  const messages = [
+    message({ id: "9600000000000000011", content: "", thread: counted }),
+    message({ id: "9600000000000000012", content: "the screenshot shows the timeout", thread: { ...counted, is_root: false } }),
+    message({ id: "9600000000000000013", content: "" }),
+    message({ id: "9600000000000000014", content: "the log is attached above", thread: bare }),
+  ];
+  await signIn(page);
+  await showDiscord(page, messages);
+  const all = shownIds(page);
+  assert.ok(all.includes("9600000000000000011"), `the root whose copy says 0 replies, with one held, is hidden: ${all}`);
+  assert.ok(all.includes("9600000000000000013"), `the root with no record of its own, a reply to it held, is hidden: ${all}`);
+});
+
+test("`#386 hide-empty-messages`: the switch redraws the thread list's unread counts", async () => {
+  const page = newPage();
+  const messages = emptyChannel(page);
+  await signIn(page);
+  await showDiscord(page, messages);
+  await pickThread(page, "threads");
+  const saidOfC = () => cardPart(page, INBOX.c, "side-card-unread");
+  assert.equal(saidOfC(), "2 unread", "the card counts the empty reply unread");
+  await page.el("hide-empty-messages").setChecked(false);
+  await page.settle();
+  assert.equal(saidOfC(), "3 unread", "turned off, the card did not count the empty reply");
+});
+
 // --- how many replies a message has, and the way down to them ----------------------------------
 //
 // `#228 reply-visible`. The owner: "I would like the button to change to say Reply (1) Reply (2) if
@@ -60144,8 +60272,9 @@ test("`#271 settings-groups`: the Messages section holds the message options, an
   // `#332 settings-voice-agent-section` took the message-reading setting to Voice agent and How
   // messages are said to Help, so Messages is the marking and drawing of messages, and only that.
   // `#349 channel-settings-all` moved Who is who here, out of the per-channel box.
-  assert.deepStrictEqual(messages, ["Your own messages", "Mark-read automatically", "Combining messages", "Rich headers",
-    "Who is who", "Recently dismissed"]);
+  // `#386 hide-empty-messages` put Empty messages beside Mark-read automatically, the owner's place for it.
+  assert.deepStrictEqual(messages, ["Your own messages", "Mark-read automatically", "Empty messages", "Combining messages",
+    "Rich headers", "Who is who", "Recently dismissed"]);
   for (const agentGroup of ["Sending", "Instructions", "Resuming", "Arriving messages during a call",
     "Reading full messages in channel view"]) {
     assert.ok(!messages.includes(agentGroup), `"${agentGroup}" is in Messages`);
@@ -61461,7 +61590,7 @@ function foldProblems(html, css, script) {
 
 test("`#346 settings-collapsible`: every section but Server and every group in them folds, hidden until found", () => {
   assert.deepStrictEqual(foldProblems(HTML, CSS_CODE, SCRIPT_CODE), []);
-  assert.equal(scriptFolds(SCRIPT_CODE).length, 28, "a fold went missing from the list, or one was added unchecked");
+  assert.equal(scriptFolds(SCRIPT_CODE).length, 29, "a fold went missing from the list, or one was added unchecked");
 });
 
 test("`#346 settings-collapsible`: the check refuses a fold out of find's reach, an unfolding group, and a list that disagrees (negative controls)", () => {

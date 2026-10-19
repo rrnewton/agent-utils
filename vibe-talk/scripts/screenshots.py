@@ -3212,7 +3212,7 @@ POPOUT_FOOT_SLACK_PX = 16
 
 # The folds of the Messages section above Recently dismissed, in their order: opened by the foot scene
 # where the folded screen is too short to bring the group low (`#372 settings-header-layout`).
-DISMISSED_ABOVE_FOLDS = ("mark-own", "auto-read", "combining", "rich-headers", "identities")
+DISMISSED_ABOVE_FOLDS = ("mark-own", "auto-read", "empty-messages", "combining", "rich-headers", "identities")
 
 # Said by the pill while the pop-out stands at the foot: long enough to draw the pill at its widest, as a
 # long channel name or a long error does, so it reaches into the pop-out wherever the column puts it.
