@@ -1,10 +1,11 @@
 ---
 title: 'pytest-plugin-identity: keep sharder plugins hashable in pytest'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-10-11T18:28:28.753920213+00:00
-updated_at: 2026-10-11T18:35:10.477824034+00:00
+updated_at: 2026-10-19T09:38:13.586489887+00:00
+closed_at: 2026-10-19T09:38:13.586489736+00:00
 ---
 
 # Description
