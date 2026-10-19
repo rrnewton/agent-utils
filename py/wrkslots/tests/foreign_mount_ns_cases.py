@@ -964,6 +964,313 @@ def test_stale_copy_holders_reads_another_users_table_on_its_own(
     assert holders.holder_pids == (61,) and holders.mount_namespaces == ("pid:61",)
 
 
+
+# ------------------------------------- recovering a removal whose Git removal already finished
+#
+# The live shape: a flat image-backed slot whose removal was interrupted after `git worktree
+# remove` finished (journal phase "fenced", the checkout listed as removed). The fenced
+# directory is still the image's mount point, empty and with no .git file. Recovery must not
+# repair Git registration for a checkout Git already removed.
+
+
+def _interrupted_after_git_removal(tmp_path: Path) -> tuple[Path, dict[str, object], Path]:
+    """A flat slot whose removal stopped after Git removed its checkout; (project, journal, fenced)."""
+
+    project, repository, _remote = t.make_project(
+        tmp_path, worktrees_directory="worktrees/slots", layout="flat"
+    )
+    assert t.create(project).returncode == 0
+    t.commit_task(repository, t.checkout(project), "codex/task")
+    t.mark_owner_dead(project)
+    t.set_liveness(project, "dead")
+    interrupted = t.command(
+        project, "remove", "slot01", "--coordinator-pid", str(os.getpid()),
+        "--expected-generation", "1", env={"WRKSLOTS_TEST_INTERRUPT": "after-remove-worktree"},
+    )
+    assert interrupted.returncode == 86, interrupted.stdout + interrupted.stderr
+    journal = _the_journal(project)
+    assert journal["phase"] == "fenced"
+    return project, journal, project / str(journal["fenced"])
+
+
+def _the_journal(project: Path) -> dict[str, object]:
+    import json
+
+    [path] = sorted(t.control_directory(project).glob("ACTIVE.*.journal"))
+    value = json.loads(path.read_text(encoding="utf-8"))
+    assert isinstance(value, dict)
+    return value
+
+
+def _journals(project: Path) -> list[Path]:
+    return sorted(t.control_directory(project).glob("ACTIVE.*.journal"))
+
+
+def test_recover_skips_git_repair_for_a_checkout_git_already_removed(tmp_path: Path) -> None:
+    project, journal, fenced = _interrupted_after_git_removal(tmp_path)
+    record = journal["record"]
+    assert isinstance(record, dict)
+    [checkout] = record["checkouts"]
+    assert journal["removed"] == [checkout["name"]]
+    # A plain directory is deleted by Git; an image's mount point survives, empty, no .git.
+    assert not fenced.exists()
+    fenced.mkdir()
+
+    recovered = t.command(project, "recover", "--coordinator-pid", str(os.getpid()))
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert "no safe .git file" not in recovered.stderr
+    assert not fenced.exists()
+    assert t.active_slots(project) == []
+    assert _journals(project) == []
+
+
+def test_recover_refuses_a_removed_checkout_git_still_registers(tmp_path: Path) -> None:
+    """Negative control: the journal's word that Git removed a checkout is checked against Git."""
+
+    project, _journal, fenced = _interrupted_after_git_removal(tmp_path)
+    t.git(project / "repo", "worktree", "add", "-q", "--detach", str(fenced))
+
+    recovered = t.command(project, "recover", "--coordinator-pid", str(os.getpid()))
+
+    assert recovered.returncode == 3, recovered.stdout + recovered.stderr
+    assert "as removed, but Git still registers it" in recovered.stderr
+    assert fenced.is_dir() and len(t.active_slots(project)) == 1
+    assert len(_journals(project)) == 1
+
+
+# A fake image host for one wrkslots process: the slot's image counts as mounted at its
+# recorded location (device 7:46, state image 7:47) until unmounted, and FAKE_STALE_DEVICE
+# names a second, stale attachment of the slot image that the root helper's umount refuses
+# without --discard-stale-copies. Releasing the copies of a mount point detaches it, as the
+# kernel does once the directory entry is replaced. Content lives on the host, so a relocation
+# is a rename, and `git worktree remove` of the image root leaves the mount point behind, empty.
+# Every privileged call and release is logged to FAKE_IMAGE_LOG.
+_FAKE_IMAGE_HOST = r'''
+import dataclasses, functools, json, os, sys
+from pathlib import Path
+from wrkslots import cli, slotimage
+from wrkslots.tests import idle_validation_host as idle
+
+cli._validation_run_host_evidence = idle.no_validation_runs
+cli._retained_unit_cgroup_members = idle.no_retained_cgroup_members
+cli._assert_host_process_view = idle.whole_host_process_view
+
+LOG = Path(os.environ["FAKE_IMAGE_LOG"])
+STALE = os.environ.get("FAKE_STALE_DEVICE", "")
+unmounted = set()
+stale_attached = [bool(STALE)]
+
+
+def note(*entry):
+    with LOG.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps([str(item) for item in entry]) + "\n")
+
+
+def mount_state(image_file, mount_point, table=None):
+    if Path(image_file).exists() and Path(mount_point).is_dir() and str(image_file) not in unmounted:
+        return "kernel", "ext4 /dev/loop46 (fake)"
+    return "absent", "nothing is mounted there"
+
+
+def refusal(image_file):
+    return slotimage.ImageError(
+        f"{image_file} is attached to 2 loop devices (/dev/loop46, /dev/loop{STALE}): two "
+        "independent file systems on one image file; refusing to unmount it"
+    )
+
+
+def privileged(operation, *arguments, anchor=None, timeout=120.0):
+    note("privileged", operation, *arguments)
+    image_file = arguments[0] if arguments else ""
+    if operation == "umount":
+        if (
+            image_file.endswith(slotimage.SLOT_IMAGE_NAME)
+            and stale_attached[0]
+            and "--discard-stale-copies" not in arguments
+        ):
+            raise refusal(image_file)
+        unmounted.add(image_file)
+    elif operation == "mount":
+        unmounted.discard(image_file)
+    return ""
+
+
+def still_attached(image_file):
+    if str(image_file).endswith(slotimage.SLOT_IMAGE_NAME) and stale_attached[0]:
+        return (
+            slotimage.LoopEvidence(
+                device=os.makedev(7, int(STALE)), name=f"/dev/loop{STALE}",
+                backing=str(image_file), deleted=False, file_identity=None, fsid=None,
+                udev_uuid=None,
+            ),
+        )
+    return ()
+
+
+def release(point, anchor=None):
+    note("release", point)
+    stale_attached[0] = False
+
+
+def owned_mounts(control):
+    owned, stale = set(), set()
+    for image in slotimage.all_images(control):
+        location = Path(os.path.abspath(image.location))
+        if str(image.slot_image) not in unmounted:
+            owned.add((location, "7:46"))
+            if stale_attached[0]:
+                stale.add((location, f"7:{STALE}", f"/dev/loop{STALE}"))
+        if str(image.state_image) not in unmounted:
+            owned.add((Path(os.path.abspath(image.state_mount)), "7:47"))
+    return frozenset(owned), frozenset(stale)
+
+
+def relocate(image, destination):
+    if stale_attached[0] and image.slot_image not in slotimage.DISCARD_STALE_COPIES:
+        raise refusal(image.slot_image)
+    note("relocate", image.location, destination)
+    destination = Path(os.path.abspath(destination))
+    os.rename(image.location, destination)
+    moved = dataclasses.replace(image, location=destination)
+    slotimage._write_record(moved)
+    return moved
+
+
+real_remove_worktree = cli._GitVcs.remove_worktree
+
+
+def remove_worktree(self, repository, checkout, *, force=False):
+    image_root = cli._is_owned_image_root(checkout)
+    real_remove_worktree(self, repository, checkout, force=force)
+    if image_root and not checkout.exists():
+        checkout.mkdir()  # an image's mount point survives Git's removal
+
+
+cli._GitVcs.remove_worktree = remove_worktree
+slotimage.mount_state = mount_state
+slotimage._privileged = privileged
+slotimage.still_attached = still_attached
+slotimage.release_mount_point_copies = release
+slotimage.owned_mounts = owned_mounts
+slotimage.relocate = relocate
+slotimage.resolve_backend = lambda preference: "kernel"
+if os.environ.get("FAKE_PROC"):
+    cli._stale_copy_holders = functools.partial(
+        cli._stale_copy_holders, proc_root=Path(os.environ["FAKE_PROC"])
+    )
+'''
+
+
+def _fake_images(
+    project: Path,
+    log: Path,
+    *args: str,
+    stale: str = "",
+    proc: Path | None = None,
+    patch: str = "",
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run one wrkslots command against the fake image host (see _FAKE_IMAGE_HOST)."""
+
+    import sys
+    import textwrap
+
+    launcher = (
+        _FAKE_IMAGE_HOST
+        + textwrap.dedent(patch)
+        + "\nraise SystemExit(cli.main(sys.argv[1:]))\n"
+    )
+    extra = {"FAKE_IMAGE_LOG": str(log), "FAKE_STALE_DEVICE": stale}
+    if proc is not None:
+        extra["FAKE_PROC"] = str(proc)
+    return subprocess.run(
+        [sys.executable, "-c", launcher, "--project-root", str(project), *args],
+        text=True,
+        capture_output=True,
+        check=False,
+        env=t.source_environment({**extra, **(env or {})}),
+    )
+
+
+def _logged(log: Path) -> list[list[str]]:
+    import json
+
+    if not log.exists():
+        return []
+    return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+
+
+def _image_slot(tmp_path: Path) -> tuple[Path, Path]:
+    """A flat slot with a committed task, given an image record at its location."""
+
+    project, repository, _remote = t.make_project(
+        tmp_path, worktrees_directory="worktrees/slots", layout="flat"
+    )
+    assert t.create(project).returncode == 0
+    slot = t.checkout(project)
+    t.commit_task(repository, slot, "codex/task")
+    t.mark_owner_dead(project)
+    t.set_liveness(project, "dead")
+    _image_record_for(project, "slot01", slot)
+    return project, slot
+
+
+def _recover(project: Path, log: Path, *flags: str, stale: str = "54", proc: Path | None = None) -> subprocess.CompletedProcess[str]:
+    return _fake_images(
+        project, log, "recover", "--coordinator-pid", str(os.getpid()), *flags,
+        stale=stale, proc=proc,
+    )
+
+
+def test_recover_finishes_an_image_slot_removal_interrupted_before_its_journal_named_it(
+    tmp_path: Path,
+) -> None:
+    """Git removed the checkout, its image root survived, and the journal did not yet say so."""
+
+    project, _slot = _image_slot(tmp_path)
+    log = tmp_path / "fake-images.log"
+    interrupted = _fake_images(
+        project, log, "remove", "slot01", "--coordinator-pid", str(os.getpid()),
+        "--expected-generation", "1", "--coordinator-authorized",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-remove-before-journal"},
+    )
+    assert interrupted.returncode == 86, interrupted.stdout + interrupted.stderr
+    journal = _the_journal(project)
+    assert journal["phase"] == "fenced" and journal["removed"] == []
+    fenced = project / str(journal["fenced"])
+    assert fenced.is_dir() and list(fenced.iterdir()) == []
+
+    recovered = _recover(project, log, stale="")
+
+    assert recovered.returncode == 0, recovered.stdout + recovered.stderr
+    image_directory = slotimage.image_directory(t.control_directory(project), "agent", "slot01")
+    assert not fenced.exists() and not image_directory.exists()
+    assert t.active_slots(project) == [] and _journals(project) == []
+
+
+def test_recover_still_repairs_an_image_root_that_holds_its_checkout(tmp_path: Path) -> None:
+    """Negative control: only an empty, unregistered image root counts as removed by Git."""
+
+    project, _slot = _image_slot(tmp_path)
+    log = tmp_path / "fake-images.log"
+    interrupted = _fake_images(
+        project, log, "remove", "slot01", "--coordinator-pid", str(os.getpid()),
+        "--expected-generation", "1", "--coordinator-authorized",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-path-fence"},
+    )
+    assert interrupted.returncode == 86, interrupted.stdout + interrupted.stderr
+    journal = _the_journal(project)
+    assert journal["phase"] == "fenced" and journal["removed"] == []
+    fenced = project / str(journal["fenced"])
+    assert (fenced / ".git").is_file()
+
+    recovered = _recover(project, log, stale="")
+
+    assert recovered.returncode == 0, recovered.stdout + recovered.stderr
+    assert t.active_slots(project) == [] and _journals(project) == []
+
+
 #: What test_lifecycle.py collects from this module: its tests and the fixtures they use.
 COLLECTED: tuple[str, ...] = tuple(
     name for name in sorted(globals()) if name.startswith("test_")

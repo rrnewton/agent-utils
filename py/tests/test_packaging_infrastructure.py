@@ -919,9 +919,12 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # mounts and stale attachments, the root helper's reuse decisions, stray
     # Git pointers and the discard flag) are mapped, except the one real
     # second mount through sudo -n, which is ordinary.
-    assert len(all_tests) == 2069
+    # Its 4 cases of a removal whose Git removal already finished (the journal
+    # names the checkout, or a mounted image root was left empty before it
+    # could; and the two negative controls) are mapped.
+    assert len(all_tests) == 2073
     assert len(ordinary) == 337
-    assert len(mapped) == 1732
+    assert len(mapped) == 1736
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {

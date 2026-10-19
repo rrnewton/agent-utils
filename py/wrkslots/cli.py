@@ -35318,6 +35318,65 @@ def _rollback_path_fence(
     _clear_journal(config, journal, journal_path=journal_path)
 
 
+def _git_registers_checkout(
+    config: Config, checkout: Checkout, path: Path, vcs: _GitVcs
+) -> bool:
+    """Whether Git still lists ``checkout`` at ``path`` or at its canonical path."""
+
+    _relative, repository = _stored_repository_path(config, checkout.repository)
+    canonical = _stored_path(config, checkout.path, "checkout path")
+    listed = vcs.listed_worktrees(repository)
+    return path.absolute() in listed or canonical.absolute() in listed
+
+
+def _assert_git_removal_journaled(
+    config: Config,
+    record: ActiveRecord,
+    checkout: Checkout,
+    path: Path,
+    vcs: _GitVcs,
+) -> None:
+    """Refuse a checkout the journal names as removed while Git still registers it."""
+
+    if _git_registers_checkout(config, checkout, path, vcs):
+        raise Refusal(
+            f"the finish journal of slot {record.slot} records checkout {checkout.name} "
+            f"as removed, but Git still registers it at {path}; preserve the slot and "
+            "inspect it before recovery"
+        )
+
+
+def _git_removal_finished_at_image_root(
+    config: Config,
+    record: ActiveRecord,
+    checkout: Checkout,
+    path: Path,
+    vcs: _GitVcs,
+) -> bool:
+    """Whether Git already removed ``checkout`` whose root is the slot's own mounted image.
+
+    A flat image-backed checkout's root is the image's mount point. `git
+    worktree remove` deletes its contents and its registration but cannot
+    remove the mount point, so a removal interrupted after Git finished and
+    before the journal said so leaves an empty, mounted image root with no
+    .git file. That is recognised only while the image is mounted there (an
+    unmounted image's empty mount point says nothing about its content), the
+    root holds nothing but mkfs residue, and Git lists the checkout at
+    neither its fenced nor its canonical path. Destroying the image later
+    still refuses any content it holds.
+    """
+
+    if not _is_owned_image_root(path) or path.is_symlink() or not path.is_dir():
+        return False
+    try:
+        entries = {entry.name for entry in path.iterdir()}
+    except OSError as exc:
+        raise Refusal(f"cannot inspect image-backed checkout root {path}: {exc}") from exc
+    if entries - slotimage.REPRESENTATION_RESIDUE:
+        return False
+    return not _git_registers_checkout(config, checkout, path, vcs)
+
+
 def _begin_or_resume_path_fence(
     config: Config,
     record: ActiveRecord,
@@ -35395,8 +35454,22 @@ def _begin_or_resume_path_fence(
         raise Refusal(f"canonical slot still exists after path fence: {original}")
     if finish.private_cleanup is not None:
         _seal_cleanup_path_private(config, fenced)
+    removed_names = {
+        _as_str(item, "journal.removed item")
+        for item in _as_list(journal["removed"], "journal.removed")
+    }
     for checkout in record.checkouts:
         _moved, path = _checkout_at_slot(config, record, checkout, fenced)
+        if checkout.name in removed_names:
+            # Git already removed this checkout, so it has no registration
+            # left to repair. A flat image-backed checkout's root is the
+            # image's mount point, which survives that removal as an empty
+            # directory with no .git; repairing it refused, and the journal
+            # could never be resumed.
+            _assert_git_removal_journaled(config, record, checkout, path, vcs)
+            continue
+        if _git_removal_finished_at_image_root(config, record, checkout, path, vcs):
+            continue
         if path.exists() or path.is_symlink():
             _repair_registration_at_slot(config, record, checkout, fenced, vcs)
     journal["phase"] = "fenced"
@@ -35487,7 +35560,9 @@ def _finish_remove_paths(
         _moved, path = _checkout_at_slot(config, record, checkout, fenced_slot)
         if path.is_symlink():
             raise Refusal(f"interrupted fenced checkout became a symlink: {path}")
-        if path.exists():
+        if path.exists() and not _git_removal_finished_at_image_root(
+            config, record, checkout, path, vcs
+        ):
             present.append(checkout)
             continue
         _relative, repository = _stored_repository_path(config, checkout.repository)
@@ -35795,6 +35870,10 @@ def _finish_remove_paths(
     elif fenced_slot.exists():
         remaining_entries = {entry.name for entry in fenced_slot.iterdir()}
         allowed = {"HANDOFF.md"} if record.slot_type == "agent" else set()
+        if _is_owned_image_root(fenced_slot):
+            # The slot's own image root may keep mkfs residue; destroying the
+            # image still refuses anything else it holds.
+            allowed |= slotimage.REPRESENTATION_RESIDUE
         unexpected = sorted(remaining_entries - allowed)
         if unexpected:
             raise Refusal(
