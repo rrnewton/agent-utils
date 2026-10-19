@@ -89,7 +89,9 @@ fn redact_body(body: Body) -> Body {
             }
         },
     );
-    Body::from_stream(redacted)
+    // Fused: a body may be polled again after it ended (the compression layer does), and an
+    // unfolded stream panics if it is.
+    Body::from_stream(redacted.fuse())
 }
 
 const fn is_code_byte(byte: u8) -> bool {
