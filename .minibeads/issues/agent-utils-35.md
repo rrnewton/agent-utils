@@ -1,13 +1,14 @@
 ---
 title: 'contained-example-memory: make fixed-memory examples portable on small boxed runners'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
 - validation
 - dagrun
 created_at: 2026-09-25T17:13:12.778565056+00:00
-updated_at: 2026-09-25T17:13:12.778565056+00:00
+updated_at: 2026-10-19T11:34:52.108151476+00:00
+closed_at: 2026-10-19T11:34:52.108151316+00:00
 ---
 
 # Description
