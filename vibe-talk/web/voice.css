@@ -1372,8 +1372,25 @@ a.search-hit-link {
   border-radius: 0.8rem;
   /* The screen behind dimmed, so it reads as over the list rather than as part of it. A shadow, not an
      element: it takes no tap of its own, and what is under it takes none either while the pop-out is up,
-     because web/voice.js makes it inert (`#351 settings-polish`). Close, Escape or Back is how it goes. */
+     because web/voice.js makes it inert (`#351 settings-polish`). Close, Escape or Back is how it goes.
+     A shadow is clipped like any overflow, so this one ends at the edges of Settings' scrolling box;
+     what is inert beyond them is dimmed by the two rules below. */
   box-shadow: 0 0 0 100vmax rgb(0 0 0 / 0.45), 0 0.6rem 2rem rgb(0 0 0 / 0.45);
+}
+
+/* `#351 settings-polish`. The box the pop-out's shadow is drawn in (`dimBoxOf` in web/voice.js), while
+   the pop-out is up: a stacking context of its own, so the shadow covers what is in the box and nothing
+   that floats over it from outside, as the status pill does. That is dimmed by the rule after this. */
+[data-dim-box] {
+  isolation: isolate;
+}
+
+/* ...and what the pop-out makes inert beyond that box: the top bar with its Back, the status pill, the
+   dock (`inertAround`). The shadow's own depth, which leaves 0.55 of every colour under it, so the
+   whole screen reads as one dim and no control a tap cannot reach is left looking as if it could be
+   pressed. */
+[data-under-dim] {
+  filter: brightness(0.55);
 }
 
 .data-popout > .dismissed-send-meta {

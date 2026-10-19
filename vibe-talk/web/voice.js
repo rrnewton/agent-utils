@@ -1612,9 +1612,9 @@ const CHANNEL_DRAFT_REFUSED = "This browser could not save the draft. Keep this 
 let dismissedSends = [];
 /**
  * `#348 settings-dynamic-lists`. The dismissed send the pop-out over Recently dismissed shows, and the row that opened it, which takes the focus back.
- * `inert` is what the pop-out made inert behind it while it is up (`#351 settings-polish`, `inertAround`).
+ * `inert` is what the pop-out made inert behind it while it is up, and dimmed where its shadow does not reach, and `box` is the box its shadow is kept to (`#351 settings-polish`, `inertAround`, `dimBoxOf`).
  *
- * @type {{id: string, opener: HTMLElement | null, inert: Element[]} | null}
+ * @type {{id: string, opener: HTMLElement | null, box: Element, inert: Element[]} | null}
  */
 let dismissedPopout = null;
 /**
@@ -24944,14 +24944,47 @@ function renderDismissedSends() {
 // So while it is up everything else on the page is inert (`inertAround`), which no tap, click or Tab
 // reaches and a screen reader does not list, and Tab and Shift+Tab go round its own four stops
 // (`trapDismissedTab`). It is marked `aria-modal` to say so. Close, Escape and Back are how it goes.
+//
+// And everything it makes inert is under the dim. The dim is the pop-out's shadow, which Settings'
+// scrolling box clips, so the top bar with its Back stood bright above it, and a tap on that Back did
+// nothing while it looked live. The shadow is now kept to that box (`data-dim-box`, `dimBoxOf`), and
+// what is inert beyond it, the top bar, the status pill and the dock, is dimmed by the same depth
+// where it stands (`data-under-dim`): one dim over the whole screen, and nothing dimmed twice.
 
 /** The pop-out's Tab stops, in order: the message, Copy, Put back and Close. */
 const DISMISSED_POPOUT_STOPS = ["dismissed-send-popout-text", "dismissed-send-copy", "dismissed-send-restore", "dismissed-send-close"];
+
+/** The values of `overflow` that clip what overflows a box, a shadow drawn inside it included. */
+const CLIPPING_OVERFLOW = new Set(["auto", "scroll", "hidden", "clip"]);
+
+/**
+ * The box `node`'s dim is drawn in: the nearest element around it that clips its overflow, or the
+ * body. The dim is a shadow, and a shadow is overflow like any other, so on Settings it ends at the
+ * edges of the scrolling #screen-settings and is not drawn over the top bar or the dock. While the
+ * pop-out is up the box is its own stacking context too (`data-dim-box` in web/voice.css), so the
+ * shadow is not drawn over the status pill either, which floats over the box from outside it.
+ * `#351 settings-polish`.
+ *
+ * @param {Element} node
+ * @returns {Element}
+ */
+function dimBoxOf(node) {
+  if (typeof window.getComputedStyle !== "function") return document.body;
+  for (let at = /** @type {Element | null} */ (node.parentNode); at && at !== document.body; at = /** @type {Element | null} */ (at.parentNode)) {
+    const style = window.getComputedStyle(at);
+    if (CLIPPING_OVERFLOW.has(style.overflowX) || CLIPPING_OVERFLOW.has(style.overflowY)) return at;
+  }
+  return document.body;
+}
 
 /**
  * Make everything on the page but `node` inert: each element beside it, and beside every element
  * around it, up to the body. Returns what it made inert, for the close to give back; an element
  * already inert is left as it was, to whatever made it so.
+ *
+ * `#351 settings-polish`. What it makes inert beyond the box `node`'s dim is drawn in (`dimBoxOf`)
+ * is marked `data-under-dim` too, and web/voice.css dims it by the shadow's own depth: a control
+ * nothing can reach is never left looking as if it could be pressed.
  *
  * @param {Element} node
  * @returns {Element[]}
@@ -24959,10 +24992,15 @@ const DISMISSED_POPOUT_STOPS = ["dismissed-send-popout-text", "dismissed-send-co
 function inertAround(node) {
   /** @type {Element[]} */
   const made = [];
+  const box = dimBoxOf(node);
+  let beyond = false;
   for (let at = node; at !== document.body && at.parentNode; at = /** @type {Element} */ (at.parentNode)) {
+    // From the dim's own box outwards, what stands beside is out of the shadow's reach.
+    if (at === box) beyond = true;
     for (const beside of /** @type {Element} */ (at.parentNode).children) {
       if (beside === at || beside.hasAttribute("inert")) continue;
       beside.setAttribute("inert", "");
+      if (beyond) beside.setAttribute("data-under-dim", "");
       made.push(beside);
     }
   }
@@ -24981,7 +25019,10 @@ function openDismissedSend(id, opener) {
   el("dismissed-send-popout-state").textContent = "";
   const popout = el("dismissed-send-popout");
   popout.hidden = false;
-  dismissedPopout = { id, opener, inert: inertAround(popout) };
+  // Its shadow kept to the box it is drawn in, and what is inert beyond that box dimmed where it is.
+  const box = dimBoxOf(popout);
+  box.setAttribute("data-dim-box", "");
+  dismissedPopout = { id, opener, box, inert: inertAround(popout) };
   // Laid over its group, which may stand partly below the screen's edge: brought on screen whole.
   if (typeof popout.scrollIntoView === "function") popout.scrollIntoView({ block: "nearest" });
   el("dismissed-send-copy").focus({ preventScroll: true });
@@ -24991,10 +25032,14 @@ function openDismissedSend(id, opener) {
 /** Close the pop-out, giving the focus back to the row that opened it when `refocus` and it is still there. */
 function closeDismissedSend(refocus = true) {
   if (!dismissedPopout) return false;
-  const { opener, inert } = dismissedPopout;
+  const { opener, box, inert } = dismissedPopout;
   dismissedPopout = null;
   // The page behind it back first: an inert element cannot take the focus.
-  for (const node of inert) node.removeAttribute("inert");
+  for (const node of inert) {
+    node.removeAttribute("inert");
+    node.removeAttribute("data-under-dim");
+  }
+  box.removeAttribute("data-dim-box");
   el("dismissed-send-popout").hidden = true;
   if (refocus && opener && opener.parentNode && typeof opener.focus === "function") opener.focus({ preventScroll: true });
   scheduleBackSync();

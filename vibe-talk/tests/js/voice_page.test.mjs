@@ -3871,6 +3871,19 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       getPropertyValue: (name) => ({ "--column-glide": "smooth", "--card-flight": "220ms" })[name] || "",
     });
   };
+  /**
+   * `#351 settings-polish`. A stylesheet that says, of each element, only whether it clips what overflows
+   * it: `overflow-y: auto` for the ids in `clips`, as web/voice.css gives #screen-settings, and `visible`
+   * everywhere else. What the pop-out over Recently dismissed reads to know where its shadow stops.
+   */
+  page.clipOverflowOf = (clips) => {
+    context.window.getComputedStyle = (node) => ({
+      fontSize: "16px",
+      overflowX: "visible",
+      overflowY: clips.includes(node.id) ? "auto" : "visible",
+      getPropertyValue: () => "",
+    });
+  };
   page.resized = (target) => {
     for (const observer of page.resizeObservers) {
       if (observer.targets.includes(target)) {
@@ -59191,6 +59204,72 @@ test("`#351 settings-polish`: the pop-out is a modal: marked so, the page behind
   await dismissedOpenerOf(dismissedItems(loose)[0]).click();
   await press(loose, loose.el("dismissed-send-close"), "Tab");
   assert.equal(focused(loose), loose.el("dismissed-send-close"), "the negative control kept Tab anyway, so the check above proves nothing");
+});
+
+// `#351 settings-polish`, from its review. The dim is the pop-out's shadow, and the scrolling
+// #screen-settings clips it, so the top bar stood above it bright, with its Back inert: a tap on the
+// way out a phone shows first did nothing, and nothing said why.
+
+/** Settings with one dismissed send, inside the frame web/voice.html draws round it, as far as the dim needs. */
+async function framedDismissedPage(script = SCRIPT) {
+  const page = await dismissedPageOf(["a message to read whole"], script);
+  await page.el("fold-settings-all").click();
+  const frame = [
+    ["topbar", "frame-body", "dock"],
+    ["frame-body", "error-wrap", "status-line", "screens"],
+    ["screens", "screen-main", "screen-settings"],
+    ["screen-settings", "settings-panes"],
+  ];
+  page.document.body.append(page.el("topbar"), page.el("frame-body"), page.el("dock"));
+  for (const [parent, ...kids] of frame.slice(1)) {
+    for (const kid of kids) assertMarkupContains(parent, kid);
+    page.el(parent).append(...kids.map((kid) => page.el(kid)));
+  }
+  page.clipOverflowOf(["screen-settings"]);
+  return page;
+}
+
+/** The ids of the page's own elements dimmed where they stand. */
+const underDimIds = (page) => [...page.elements.values()].filter((node) => node.hasAttribute("data-under-dim")).map((node) => node.id);
+
+test("`#351 settings-polish`: what the pop-out makes inert beyond the box its shadow is drawn in is dimmed where it stands, and nothing twice", async () => {
+  const page = await framedDismissedPage();
+  await dismissedOpenerOf(dismissedItems(page)[0]).click();
+  assert.equal(page.el("dismissed-send-popout").hidden, false);
+  // Beyond #screen-settings, which clips the shadow: the top bar with its Back, the pill, the dock, the
+  // error line, the main screen and the send card's confirmation are inert and dimmed where they stand.
+  assert.deepStrictEqual(underDimIds(page).sort(), ["dock", "error-wrap", "post-confirm", "screen-main", "status-line", "topbar"],
+    "the elements dimmed are not those beyond Settings' scrolling box");
+  for (const id of underDimIds(page)) assert.equal(page.el(id).hasAttribute("inert"), true, `#${id} is dimmed and not inert`);
+  // ...and the box keeps its shadow to itself, so the pill, which floats over it from outside, is not
+  // dimmed by the shadow as well.
+  assert.equal(page.el("screen-settings").hasAttribute("data-dim-box"), true, "Settings' box does not keep the shadow to itself");
+  // Inside the box the shadow is the dim: what is inert there is not dimmed again.
+  for (const id of ["fold-dismissed", "dismissed-sends", "settings-channels", "fold-settings-voice-agent", "fold-storage"]) {
+    assert.equal(inertNow(page.el(id)), true, `#${id} can still be reached behind the pop-out`);
+    assert.equal(page.el(id).hasAttribute("data-under-dim"), false, `#${id}, under the shadow, is dimmed twice`);
+  }
+  // The stylesheet: the dim beyond the box is the shadow's own depth, and the box is a stacking context.
+  const shadow = /box-shadow:\s*0 0 0 100vmax rgb\(0 0 0 \/ ([0-9.]+)\)/.exec(cssBlock(".data-popout"));
+  assert.ok(shadow, "the pop-out's dim is no longer a shadow of one colour");
+  const filter = /filter:\s*brightness\(([0-9.]+)\)/.exec(cssBlock("[data-under-dim]"));
+  assert.ok(filter, "what is dimmed beyond the box is not dimmed by a brightness filter");
+  assert.equal(Number(filter[1]), Number((1 - Number(shadow[1])).toFixed(2)),
+    `the dim beyond the box keeps ${filter[1]} of each colour and the shadow keeps ${1 - Number(shadow[1])}`);
+  assert.match(cssBlock("[data-dim-box]"), /isolation:\s*isolate/, "the shadow's box is not its own stacking context");
+  // Every way it goes gives all of it back: Close here, and the rest as the test above.
+  await page.el("dismissed-send-close").click();
+  assert.deepStrictEqual(underDimIds(page), [], "something is still dimmed after Close");
+  assert.equal(page.el("screen-settings").hasAttribute("data-dim-box"), false, "Settings' box kept the shadow's stacking context");
+  // Where nothing round the pop-out clips its shadow, the shadow covers the window and nothing more is dimmed.
+  const open = await dismissedPageOf(["a message"]);
+  await dismissedOpenerOf(dismissedItems(open)[0]).click();
+  assert.deepStrictEqual(underDimIds(open), [], "something was dimmed where the shadow already covers it");
+  // The negative control: a pop-out that makes the top bar inert and leaves it bright, as before.
+  const bright = await framedDismissedPage(brokenScript('      if (beyond) beside.setAttribute("data-under-dim", "");\n', ""));
+  await dismissedOpenerOf(dismissedItems(bright)[0]).click();
+  assert.equal(bright.el("topbar").hasAttribute("inert"), true, "the negative control's top bar is not inert");
+  assert.deepStrictEqual(underDimIds(bright), [], "the negative control dimmed the top bar anyway, so the check above proves nothing");
 });
 
 test("`#351 settings-polish`: a row of Recently dismissed is named by its place, its age and its first line, and still holds the whole text", async () => {

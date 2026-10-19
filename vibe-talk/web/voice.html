@@ -1474,9 +1474,12 @@
                     `#351 settings-polish`. A row is NAMED by its place, its age and its text's first line
                     (its `aria-label`), not by all of its text, which a screen reader read out at every row
                     passed. The pop-out is a MODAL (`aria-modal`): while it is up web/voice.js makes the
-                    rest of the page inert and keeps Tab among its own controls. Put back gives the focus
-                    to the row that took the place of the one put back, else to the list, else to the line
-                    above it, which is why those two can hold the focus (`tabindex="-1"`, not a Tab stop).
+                    rest of the page inert and keeps Tab among its own controls, and all it makes inert is
+                    under the dim: its shadow within this scrolling screen, and the same depth over what
+                    stands beyond it, the top bar with its Back, the status pill and the dock. Put back
+                    gives the focus to the row that took the place of the one put back, else to the list,
+                    else to the line above it, which is why those two can hold the focus (`tabindex="-1"`,
+                    not a Tab stop).
                   -->
                   <section class="settings-group" id="dismissed-group">
                     <div class="group-head">

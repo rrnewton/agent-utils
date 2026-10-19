@@ -3107,15 +3107,120 @@ def _act_settings_dismissed_list(driver: Driver) -> None:
     driver.settle(300)
 
 
+# What a tap or a Tab could land on, for the two checks of the pop-out's dim below.
+POPOUT_DIM_CONTROLS = 'button, a, input, select, textarea, label, [tabindex]:not([tabindex="-1"])'
+
+# `#351 settings-polish`. Each control on screen outside the pop-out, with the part of it the window and
+# every box around it that clips leave showing, and where the pop-out is: CSS pixels, left, top, right,
+# bottom. In document order, so the same page lists the same controls in the same order.
+POPOUT_DIM_LAYOUT_JS = (
+    "(() => { const pop = document.getElementById('dismissed-send-popout'); "
+    "const p = pop.getBoundingClientRect(); const controls = []; "
+    f"for (const c of document.querySelectorAll('{POPOUT_DIM_CONTROLS}')) {{ "
+    "if (pop.contains(c) || !c.checkVisibility({ visibilityProperty: true })) continue; "
+    "const r = c.getBoundingClientRect(); let box = [r.left, r.top, r.right, r.bottom]; "
+    "for (let a = c.parentElement; a; a = a.parentElement) { const s = getComputedStyle(a); "
+    "if (s.overflowX === 'visible' && s.overflowY === 'visible') continue; "
+    "const q = a.getBoundingClientRect(); "
+    "box = [Math.max(box[0], q.left), Math.max(box[1], q.top), Math.min(box[2], q.right), Math.min(box[3], q.bottom)]; } "
+    "box = [Math.max(box[0], 0), Math.max(box[1], 0), Math.min(box[2], innerWidth), Math.min(box[3], innerHeight)]; "
+    "if (box[2] - box[0] < 2 || box[3] - box[1] < 2) continue; "
+    "controls.push({ name: c.id || `${c.tagName.toLowerCase()} \"${c.textContent.trim().slice(0, 30)}\"`, box }); } "
+    "return { controls, popout: [p.left, p.top, p.right, p.bottom] }; })()"
+)
+
+# How far the pop-out's own drop shadow (`0 0.6rem 2rem` in web/voice.css), which is deeper than the dim,
+# reaches past its edges at the page's 16px rem: up, to each side and down. A point there is left out.
+POPOUT_SHADOW_REACH_PX = (24, 34, 44)
+
+# The share of its brightness a control keeps under the dim: 0.55, the shadow's `rgb(0 0 0 / 0.45)`.
+# Under no dim it keeps all of it, and under two about 0.3, so the band takes neither.
+POPOUT_DIM_BAND = (0.40, 0.70)
+
+
+class DimControl(TypedDict):
+    name: str
+    box: list[float]
+
+
+class DimLayout(TypedDict):
+    controls: list[DimControl]
+    popout: list[float]
+
+
+def popout_dim_misses(lit_layout: DimLayout, lit: Image, dim_layout: DimLayout, dim: Image) -> tuple[list[str], list[str]]:
+    """Which controls on screen outside the pop-out are not under its dim, by their pixels.
+
+    `#351 settings-polish`. Each control as drawn with the pop-out up (`dim`) against the same control
+    with none up (`lit`), over the part of it not under the pop-out or the pop-out's drop shadow: its
+    brightness under the dim must be a share of it within POPOUT_DIM_BAND. A hit test cannot ask this.
+    `elementFromPoint` skips an inert element, so over a bright Back nothing can press it says only that
+    nothing is pressed. Returns the controls judged and, for each one that is not under the dim, why.
+    """
+    judged: list[str] = []
+    misses: list[str] = []
+    if len(lit_layout["controls"]) != len(dim_layout["controls"]):
+        return judged, [f"{len(dim_layout['controls'])} controls on screen with the pop-out up and "
+                        f"{len(lit_layout['controls'])} before it opened"]
+    left, top, right, bottom = dim_layout["popout"]
+    up, side, down = POPOUT_SHADOW_REACH_PX
+    low, high = POPOUT_DIM_BAND
+
+    def light(image: Image, x: int, y: int) -> float:
+        red, green, blue = image.pixels[y * image.width + x][:3]
+        return 0.299 * red + 0.587 * green + 0.114 * blue
+
+    for lit_control, dim_control in zip(lit_layout["controls"], dim_layout["controls"]):
+        name = dim_control["name"]
+        if lit_control["name"] != name or any(abs(a - b) > 1 for a, b in zip(lit_control["box"], dim_control["box"])):
+            misses.append(f"{name} moved when the pop-out opened")
+            continue
+        x0, y0, x1, y1 = (int(round(value)) for value in dim_control["box"])
+        lit_sum = dim_sum = 0.0
+        for y in range(y0, min(y1, dim.height, lit.height), 2):
+            for x in range(x0, min(x1, dim.width, lit.width), 2):
+                if left - side <= x <= right + side and top - up <= y <= bottom + down:
+                    continue
+                lit_sum += light(lit, x, y)
+                dim_sum += light(dim, x, y)
+        if lit_sum == 0:
+            continue  # wholly under the pop-out or its own shadow, or drawn in nothing but black
+        judged.append(name)
+        share = dim_sum / lit_sum
+        if not low <= share <= high:
+            misses.append(f"{name} keeps {share:.2f} of its brightness")
+    return judged, misses
+
+
 def _act_settings_dismissed_popout(driver: Driver) -> None:
     """`#348 settings-dynamic-lists`: the long dismissed send opened in its pop-out, whole, with Copy.
 
     `#351 settings-polish`: the pop-out is a modal, so the real Tab key is walked round it, four Tabs
     and four Shift+Tabs from Copy, recorded for the check (`__popoutTabbed`), which leaves Copy with the
     focus again; and every point of the dim outside it is asked what a tap there would land on
-    (`__dimHits`): never a control behind it.
+    (`__dimHits`): never a control behind it. Before that, with the status pill put up and held past
+    its six seconds, each control on screen is measured in two screenshots, before a pop-out opens and
+    with one up: each outside it, the top bar's Back and the pill's x among them, must be drawn under the
+    dim, once (`__dimJudged`, `__dimMisses`, `popout_dim_misses`). That pop-out is the top row's, a short
+    message: the long one's is brought on screen by scrolling, which would move every control between
+    the two pictures, and the comparison is of each control where it stands.
     """
     _act_settings_dismissed_list(driver)
+    driver.js("(() => { setStatus('Ready.'); clearTimeout(statusTimer); return true; })()")
+    driver.page.mouse.move(1, 1)
+    driver.settle(200)
+    lit_layout = cast(DimLayout, driver.js(POPOUT_DIM_LAYOUT_JS))
+    lit = decode_png(driver.page.screenshot(scale="css", animations="disabled"))
+    driver.page.click("#dismissed-sends > li:nth-child(1) .dismissed-send-open")
+    driver.page.wait_for_function("() => window.__visible('dismissed-send-popout')", timeout=5_000)
+    driver.settle(200)
+    dim_layout = cast(DimLayout, driver.js(POPOUT_DIM_LAYOUT_JS))
+    dim = decode_png(driver.page.screenshot(scale="css", animations="disabled"))
+    judged, misses = popout_dim_misses(lit_layout, lit, dim_layout, dim)
+    driver.page.evaluate("([judged, misses]) => { window.__dimJudged = judged; window.__dimMisses = misses; }",
+                         [judged, misses])
+    driver.click("dismissed-send-close")
+    driver.page.wait_for_function("() => !window.__visible('dismissed-send-popout')", timeout=5_000)
     driver.page.click("#dismissed-sends > li:nth-child(3) .dismissed-send-open")
     driver.page.wait_for_function("() => window.__visible('dismissed-send-popout')", timeout=5_000)
     driver.js("(() => { window.__popoutTabbed = []; return true; })()")
@@ -3128,7 +3233,7 @@ def _act_settings_dismissed_popout(driver: Driver) -> None:
         "for (let x = 6; x < innerWidth; x += 20) for (let y = 6; y < innerHeight; y += 20) { "
         "if (x >= p.left && x <= p.right && y >= p.top && y <= p.bottom) continue; "
         "const e = document.elementFromPoint(x, y); "
-        "const c = e && e.closest('button, a, input, select, textarea, label, [tabindex]:not([tabindex=\"-1\"])'); "
+        f"const c = e && e.closest('{POPOUT_DIM_CONTROLS}'); "
         "if (c && !c.closest('#dismissed-send-popout')) window.__dimHits.push(c.id || c.tagName); } "
         "return true; })()"
     )
@@ -6107,8 +6212,17 @@ SCENES: tuple[Scene, ...] = (
                 "'dismissed-send-popout-text', 'dismissed-send-close', 'dismissed-send-restore', 'dismissed-send-copy'])",
             ),
             (
+                # A hit test, as a tap is: an inert control is skipped, so this says what a tap there
+                # lands on, and nothing about how the control looks. The check after it does that.
                 "no tap on the dim reaches a control behind it",
                 "Array.isArray(window.__dimHits) && window.__dimHits.length === 0",
+            ),
+            (
+                # `#351 settings-polish`, from its review: the top bar's Back was inert and drawn bright,
+                # above the shadow, so a tap on it did nothing while it looked live. Measured in pixels.
+                "every control on screen outside the pop-out, the top bar's Back and the pill's x among them, is under the dim, once",
+                "Array.isArray(window.__dimJudged) && ['close-settings', 'dismiss-status'].every((id) => "
+                "window.__dimJudged.includes(id)) && Array.isArray(window.__dimMisses) && window.__dimMisses.length === 0",
             ),
         ),
     ),
@@ -6998,10 +7112,12 @@ def check_state_controls() -> list[str]:
         # to the fixed resizable scrolling list (`s.resize === 'vertical'`) and its one-line rows
         # (`textOverflow`); to the pop-out's whole text (`t.length > 400`); and to the readout's
         # fact-a-line detail (`split(`). `#351 settings-polish` pins the pop-out to being a modal
-        # (`aria-modal`), Tab kept round it (`__popoutTabbed`) and no tap through its dim (`__dimHits`).
+        # (`aria-modal`), Tab kept round it (`__popoutTabbed`), no tap through its dim (`__dimHits`)
+        # and every control outside it under the dim, the top bar's Back among them (`__dimMisses`,
+        # `'close-settings', 'dismiss-status'`).
         "65-settings-dismissed-list": ("Math.max(...rgb) < 48", "s.resize === 'vertical'", "textOverflow"),
         "66-settings-dismissed-popout": ("t.length > 400", "dismissed-send-copy", "aria-modal", "__popoutTabbed",
-                                         "__dimHits"),
+                                         "__dimHits", "__dimMisses", "'close-settings', 'dismiss-status'"),
         "67-settings-connection-panel": ("Math.max(...rgb) < 48", "split("),
         # `#346 settings-collapsible`. Pinned to every section folded and hidden until found
         # (`'until-found'`), to no setting drawn (`!window.__visible(id)`), and to the browser's search
@@ -7410,6 +7526,43 @@ def strip_js_comments(text: str) -> str:
     return "".join(out)
 
 
+def check_popout_dim_controls() -> list[str]:
+    """`#351 settings-polish`. The pop-out's dim check, on pictures made here: a control drawn under one
+    dim is judged and passes; one drawn bright, one dimmed twice and one that moved each fail by name; and
+    one wholly under the pop-out is not judged at all."""
+    problems: list[str] = []
+    width, height = 120, 60
+    grey = (200, 180, 160)
+
+    def picture(shares: dict[tuple[int, int, int, int], float]) -> Image:
+        pixels: list[tuple[int, ...]] = []
+        for y in range(height):
+            for x in range(width):
+                share = next((value for (x0, y0, x1, y1), value in shares.items() if x0 <= x < x1 and y0 <= y < y1), 1.0)
+                pixels.append(tuple(int(channel * share) for channel in grey))
+        return Image(width=width, height=height, pixels=pixels)
+
+    def layout(*controls: tuple[str, list[float]]) -> DimLayout:
+        return {"controls": [{"name": name, "box": box} for name, box in controls], "popout": [80.0, 0.0, 120.0, 20.0]}
+
+    once, bright, twice, beside = [0.0, 0.0, 10.0, 10.0], [0.0, 30.0, 10.0, 40.0], [20.0, 30.0, 30.0, 40.0], [90.0, 2.0, 100.0, 12.0]
+    lit = picture({})
+    dim = picture({(0, 0, 10, 10): 0.55, (20, 30, 30, 40): 0.3, (90, 2, 100, 12): 0.55})
+    controls = (("once", once), ("bright", bright), ("twice", twice), ("beside", beside))
+    judged, misses = popout_dim_misses(layout(*controls), lit, layout(*controls), dim)
+    if judged != ["once", "bright", "twice"]:
+        problems.append(f"the pop-out's dim check judged {judged}, not the three controls clear of the pop-out.")
+    if [miss.split(" ")[0] for miss in misses] != ["bright", "twice"]:
+        problems.append(f"the pop-out's dim check missed {misses}, not the control drawn bright and the one dimmed twice.")
+    _judged, moved = popout_dim_misses(layout(("once", once)), lit, layout(("once", [0.0, 5.0, 10.0, 15.0])), dim)
+    if moved != ["once moved when the pop-out opened"]:
+        problems.append(f"the pop-out's dim check compared a control that moved between its two pictures: {moved}.")
+    _judged, counted = popout_dim_misses(layout(("once", once)), lit, layout(), dim)
+    if not counted:
+        problems.append("the pop-out's dim check passed with a control gone from the screen when the pop-out opened.")
+    return problems
+
+
 def check_page_error_controls() -> list[str]:
     """A page that threw must not be photographed. The check lives on the capture path itself."""
     problems: list[str] = []
@@ -7464,6 +7617,7 @@ def check_stub_controls() -> list[str]:
 
 SELF_TEST_CHECKS = (
     "the PNG decoder reconstructs all five row filters correctly",
+    "the pop-out's dim check fails a control drawn bright, dimmed twice or moved, and passes one dimmed once",
     "the PNG decoder reads dimensions from a real header",
     "a varied, rendered frame is accepted",
     "a flat WHITE frame is rejected",
@@ -7539,6 +7693,7 @@ def run_self_test(tmp: Path) -> int:
         + check_viewport_meta_controls()
         + check_stub_controls()
         + check_page_error_controls()
+        + check_popout_dim_controls()
     )
     if problems:
         for problem in problems:

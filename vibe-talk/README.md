@@ -7382,17 +7382,28 @@ the connection status should be drawn the same way, "a dark terminal-like panel"
   row, where a button on every line made the list a column of controls) and **Close**. Escape and the
   phone's back gesture close it before they close Settings, as they close a menu; leaving Settings
   closes it; Close gives the focus back to the row. The list keeps its storage key and its limits.
-- The pop-out is a **modal** (`#351 settings-polish`). It dims the screen, and while it is up the
-  rest of the page is inert: a tap or click on the dim reaches nothing behind it, a screen reader
-  lists only the pop-out, and Tab and Shift+Tab go round its four controls. The page still scrolls
-  under it. **Put back** gives the focus to the row that took the place of the one put back, else to
-  the list, else to the line above it that now says nothing is dismissed.
+- The pop-out is a **modal** (`#351 settings-polish`). It dims the whole screen, the top bar with
+  its Back and the status pill included, and while it is up the rest of the page is inert: a tap or
+  click on the dim reaches nothing behind it, a screen reader lists only the pop-out, and Tab and
+  Shift+Tab go round its four controls. Close, Escape or the back gesture closes it. The page still
+  scrolls under it. **Put back** gives the focus to the row that took the place of the one put back,
+  else to the list, else to the line above it that now says nothing is dismissed.
+- The dim is the pop-out's shadow, and Settings' scrolling box clips a shadow like any other
+  overflow, so at first it stopped at the box's edges: the top bar stood above it bright, and a tap
+  on its Back did nothing while it looked live. What the pop-out makes inert beyond that box is now
+  dimmed where it stands by the shadow's own depth (`filter: brightness(0.55)`, the shadow being
+  `rgb(0 0 0 / 0.45)`), and the box is its own stacking context while the pop-out is up, so the pill,
+  which floats over the box from outside it, is dimmed once and not twice.
 - Connection status puts each part of the connection detail on its own line, with how live updates
   reach the page (`#347 settings-prose`) last; the banner after a call keeps its one line.
 
 `65-settings-dismissed-list`, `66-settings-dismissed-popout` and `67-settings-connection-panel`
 photograph them at 393x852, 1280x800 and 1920x1080; `66-settings-dismissed-popout` also walks the real
 Tab key round the pop-out both ways and asks every point of the dim what a tap there would land on.
+A hit test skips an inert element, so that says nothing about how the control under the point looks;
+the scene also measures every control on screen outside a pop-out, the top bar's Back and the pill's ×
+among them, in a screenshot before it opens and one with it up, and each must keep between 0.40 and
+0.70 of its brightness: under the dim, once.
 
 **Connection status moved to the end and gained a word.** It is a readout — what the conversation
 is, what audio format it negotiated, why the last one closed — and it was standing at the top of the
