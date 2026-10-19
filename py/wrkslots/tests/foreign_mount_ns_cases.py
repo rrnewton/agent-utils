@@ -510,7 +510,7 @@ def test_ensure_all_mounted_continues_past_a_failing_slot(
     second = dataclasses.replace(host.image, directory=directory, slot="s2", location=second_location)
     slotimage._write_record(second)
 
-    def ensure(image: slotimage.SlotImage) -> list[str]:
+    def ensure(image: slotimage.SlotImage, **_options: bool) -> list[str]:
         if image.slot == "s1":
             raise slotimage.ImageError("image mount point is not empty")
         return [f"mounted {image.slot}"]
@@ -885,12 +885,17 @@ def test_the_helper_reuses_one_attachment_and_refuses_two(
     monkeypatch.setattr(imagehelper, "_attachments", lambda found: [])
     assert imagehelper._reuse_loop(str(image), info) is None
 
+    assert imagehelper._reuse_loop(str(image), info, fresh=True) is None
+
     one = [("/dev/loop42", _status_of(info))]
     monkeypatch.setattr(imagehelper, "_attachments", lambda found: list(one))
     statuses[:] = [_status_of(info)]
     reused = imagehelper._reuse_loop(str(image), info)
     assert reused is not None and reused[1] == "/dev/loop42"
     os.close(reused[0])
+    # While a stale copy is discarded, the one device left may be that copy's: never reused.
+    with pytest.raises(imagehelper.HelperError, match=r"still attached to /dev/loop42.*\(--fresh\)"):
+        imagehelper._reuse_loop(str(image), info, fresh=True)
 
     # Rebound to another file between the scan and the descriptor: refused.
     statuses[:] = [((0, 1), 5, 0, 0, 4)]
@@ -920,7 +925,9 @@ def test_the_helper_never_detaches_a_device_it_reused(
     stand_in.write_bytes(b"")
     monkeypatch.setattr(imagehelper, "_invoking_uid", lambda: os.getuid())
     monkeypatch.setattr(
-        imagehelper, "_reuse_loop", lambda path, info: (os.open(stand_in, os.O_RDONLY), "/dev/loop42")
+        imagehelper,
+        "_reuse_loop",
+        lambda path, info, fresh=False: (os.open(stand_in, os.O_RDONLY), "/dev/loop42"),
     )
     configured: list[int] = []
     monkeypatch.setattr(imagehelper, "_configure_loop", lambda descriptor: configured.append(descriptor))
@@ -940,6 +947,9 @@ def test_the_helper_requires_the_image_for_every_existing_mount_operation() -> N
     for argv in (["umount", "/x"], ["trim", "/x"], ["grow", "/x"], ["rmdir-lost-found", "/x"]):
         assert imagehelper._main(argv) == 2
     assert imagehelper._main(["umount", "/i", "/x", "--discard-stale-copies", "extra"]) == 2
+    assert imagehelper._main(["mount", "/i", "/x", "--fresh", "extra"]) == 2
+    with pytest.raises(imagehelper.HelperError, match="unknown mount option: --reuse"):
+        imagehelper.mount("/i", "/x", "--reuse")
 
 
 def test_stale_copy_holders_reads_another_users_table_on_its_own(
@@ -1043,17 +1053,28 @@ def test_recover_refuses_a_removed_checkout_git_still_registers(tmp_path: Path) 
     assert len(_journals(project)) == 1
 
 
-# A fake image host for one wrkslots process: the slot's image counts as mounted at its
-# recorded location (device 7:46, state image 7:47) until unmounted, and FAKE_STALE_DEVICE
-# names a second, stale attachment of the slot image that the root helper's umount refuses
-# without --discard-stale-copies. Releasing the copies of a mount point detaches it, as the
-# kernel does once the directory entry is replaced; a relocation that discards the copy releases
-# it so. Content lives on the host, so a relocation is otherwise a rename, and `git worktree
-# remove` of the image root leaves the mount point behind, empty.
-# FAKE_STALE_VIEW names a directory whose files count as being on the stale device for the
-# census's device checks. Every privileged call and release is logged to FAKE_IMAGE_LOG.
+# A fake kernel for wrkslots commands run against image slots, modelling what the root helper
+# and the kernel do with loop devices, so that slotimage's own mount, unmount, relocate and
+# destroy run unchanged on top of it.
+#
+# - The host's image mounts ({mount point: [device, image file]}) persist from command to
+#   command in FAKE_IMAGE_LOG.kernel.json. An image the fake first meets counts as mounted at its
+#   recorded location: the slot image on 7:46, the state image on 7:47.
+# - A slot image's content is the files at its mount point while it is mounted. Unmounting moves
+#   them into the device's store; a device nothing else holds is released at once, and its
+#   content becomes the image file's. A fresh mount attaches a new device (7:60 on) and reads the
+#   image file; a mount while exactly one device holds the image reuses it and shows that
+#   device's content; two refuse, as does `mount --fresh` while any device holds the image.
+# - FAKE_STALE_DEVICE (per command) names a second, stale attachment of the slot image whose
+#   content is only a STALE-VIEW file. The root helper's umount refuses an image attached twice
+#   without --discard-stale-copies. Releasing the copies of a mount point detaches the stale
+#   copy, as the kernel does once the directory entry is replaced, unless FAKE_STALE_BUSY says
+#   it is in use. FAKE_STALE_VIEW names a directory whose files count as being on the stale device
+#   for the census's device checks.
+# - `git worktree remove` of an image root leaves its mount point behind, empty.
+# Every privileged call and release is logged to FAKE_IMAGE_LOG.
 _FAKE_IMAGE_HOST = r'''
-import dataclasses, functools, json, os, sys
+import functools, hashlib, json, os, shutil, sys
 from pathlib import Path
 from wrkslots import cli, slotimage
 from wrkslots.tests import idle_validation_host as idle
@@ -1063,9 +1084,18 @@ cli._retained_unit_cgroup_members = idle.no_retained_cgroup_members
 cli._assert_host_process_view = idle.whole_host_process_view
 
 LOG = Path(os.environ["FAKE_IMAGE_LOG"])
+KERNEL = LOG.with_name(LOG.name + ".kernel.json")
+STORE = LOG.with_name(LOG.name + ".store")
 STALE = os.environ.get("FAKE_STALE_DEVICE", "")
-unmounted = set()
-stale_attached = [bool(STALE)]
+STALE_BUSY = os.environ.get("FAKE_STALE_BUSY") == "1"
+STALE_VIEW = os.path.realpath(os.environ["FAKE_STALE_VIEW"]) if os.environ.get("FAKE_STALE_VIEW") else ""
+kernel = (
+    json.loads(KERNEL.read_text(encoding="utf-8"))
+    if KERNEL.exists()
+    else {"mounts": {}, "seen": [], "next": 60}
+)
+stale = {}  # device -> image file, while the stale copy is attached
+stale_released = [False]
 
 
 def note(*entry):
@@ -1073,76 +1103,137 @@ def note(*entry):
         handle.write(json.dumps([str(item) for item in entry]) + "\n")
 
 
-def mount_state(image_file, mount_point, table=None):
-    if Path(image_file).exists() and Path(mount_point).is_dir() and str(image_file) not in unmounted:
-        return "kernel", "ext4 /dev/loop46 (fake)"
-    return "absent", "nothing is mounted there"
+def save():
+    KERNEL.write_text(json.dumps(kernel), encoding="utf-8")
 
 
-def refusal(image_file):
-    return slotimage.ImageError(
-        f"{image_file} is attached to 2 loop devices (/dev/loop46, /dev/loop{STALE}): two "
-        "independent file systems on one image file; refusing to unmount it"
-    )
+def store(name):
+    path = STORE / name
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def file_store(image_file):
+    return store("file-" + hashlib.sha256(str(image_file).encode()).hexdigest()[:12])
+
+
+def move_entries(source, destination):
+    for entry in sorted(Path(source).iterdir()):
+        target = Path(destination) / entry.name
+        if target.is_dir() and not target.is_symlink():
+            shutil.rmtree(target)
+        elif target.exists() or target.is_symlink():
+            target.unlink()
+        os.rename(entry, target)
+
+
+real_all_images = slotimage.all_images
+
+
+def all_images(control):
+    images = real_all_images(control)
+    for image in images:
+        if str(image.slot_image) not in kernel["seen"]:
+            kernel["seen"].append(str(image.slot_image))
+            kernel["mounts"][str(image.location)] = ["46", str(image.slot_image)]
+            kernel["mounts"][str(image.state_mount)] = ["47", str(image.state_image)]
+            save()
+        if STALE and not stale_released[0] and image.slot_image.exists():
+            stale[STALE] = str(image.slot_image)
+            view = store(f"dev-{STALE}")
+            if not any(view.iterdir()):
+                (view / "STALE-VIEW").write_text("the stale file system\n", encoding="utf-8")
+    return images
+
+
+def attached(image_file):
+    image_file = str(image_file)
+    found = {device for device, image in kernel["mounts"].values() if image == image_file}
+    return sorted(found | {device for device, image in stale.items() if image == image_file})
+
+
+def mount_table(mountinfo=None):
+    return [
+        slotimage.MountEntry(
+            mount_point=Path(point), fstype="ext4", source=f"/dev/loop{device}",
+            device=f"7:{device}", root="/",
+        )
+        for point, (device, _image) in sorted(kernel["mounts"].items())
+    ]
+
+
+def fsid_of(image_file):
+    uuid_text = slotimage.image_uuid(Path(image_file))
+    return None if uuid_text is None else slotimage.uuid_fsid(uuid_text)
+
+
+def loop_evidence(table=None):
+    devices = {device: image for device, image in kernel["mounts"].values()}
+    devices.update(stale)
+    return {
+        os.makedev(7, int(device)): slotimage.LoopEvidence(
+            device=os.makedev(7, int(device)), name=f"/dev/loop{device}", backing=image,
+            deleted=False, file_identity=None, fsid=fsid_of(image), udev_uuid=None,
+        )
+        for device, image in devices.items()
+    }
+
+
+def mounted_fsid(path, device):
+    entry = kernel["mounts"].get(str(path))
+    if entry is None or os.makedev(7, int(entry[0])) != device:
+        return None
+    return fsid_of(entry[1])
 
 
 def privileged(operation, *arguments, anchor=None, timeout=120.0):
     note("privileged", operation, *arguments)
-    image_file = arguments[0] if arguments else ""
+    if operation not in ("umount", "mount"):
+        return ""
+    image_file, point = arguments[0], arguments[1]
+    devices = attached(image_file)
+    names = ", ".join(f"/dev/loop{device}" for device in devices)
     if operation == "umount":
-        if (
-            image_file.endswith(slotimage.SLOT_IMAGE_NAME)
-            and stale_attached[0]
-            and "--discard-stale-copies" not in arguments
-        ):
-            raise refusal(image_file)
-        unmounted.add(image_file)
-    elif operation == "mount":
-        unmounted.discard(image_file)
-    return ""
-
-
-def still_attached(image_file):
-    if str(image_file).endswith(slotimage.SLOT_IMAGE_NAME) and stale_attached[0]:
-        return (
-            slotimage.LoopEvidence(
-                device=os.makedev(7, int(STALE)), name=f"/dev/loop{STALE}",
-                backing=str(image_file), deleted=False, file_identity=None, fsid=None,
-                udev_uuid=None,
-            ),
+        if len(devices) > 1 and "--discard-stale-copies" not in arguments:
+            raise slotimage.ImageError(
+                f"{image_file} is attached to {len(devices)} loop devices ({names}): two "
+                "independent file systems on one image file; refusing to unmount it"
+            )
+        device, _image = kernel["mounts"].pop(point)
+        move_entries(point, store(f"dev-{device}"))
+        if device not in stale:
+            move_entries(store(f"dev-{device}"), file_store(image_file))
+        save()
+        return ""
+    if len(devices) > 1:
+        raise slotimage.ImageError(
+            f"{image_file} is attached to {len(devices)} loop devices ({names}): two "
+            "independent file systems on one image file; refusing to mount it again"
         )
-    return ()
+    if devices and "--fresh" in arguments:
+        raise slotimage.ImageError(
+            f"{image_file} is still attached to {names}, which may hold a stale copy of it; "
+            "refusing to mount it through that device (--fresh)"
+        )
+    if devices:
+        device = devices[0]
+        move_entries(store(f"dev-{device}"), point)
+        output = f"reused /dev/loop{device}\n"
+    else:
+        device = str(kernel["next"])
+        kernel["next"] += 1
+        move_entries(file_store(image_file), point)
+        output = f"attached /dev/loop{device}\n"
+    kernel["mounts"][point] = [device, image_file]
+    save()
+    return output
 
 
 def release(point, anchor=None):
     note("release", point)
-    stale_attached[0] = False
-
-
-def owned_mounts(control):
-    owned, stale = set(), set()
-    for image in slotimage.all_images(control):
-        location = Path(os.path.abspath(image.location))
-        if str(image.slot_image) not in unmounted:
-            owned.add((location, "7:46"))
-            if stale_attached[0]:
-                stale.add((location, f"7:{STALE}", f"/dev/loop{STALE}"))
-        if str(image.state_image) not in unmounted:
-            owned.add((Path(os.path.abspath(image.state_mount)), "7:47"))
-    return frozenset(owned), frozenset(stale)
-
-
-def relocate(image, destination):
-    if stale_attached[0] and image.slot_image not in slotimage.DISCARD_STALE_COPIES:
-        raise refusal(image.slot_image)
-    if stale_attached[0]:
-        release(image.location)  # its unmount releases the copies of the old mount point
-    note("relocate", image.location, destination)
-    destination = Path(os.path.abspath(destination))
-    os.rename(image.location, destination)
-    moved = dataclasses.replace(image, location=destination)
-    slotimage._write_record(moved)
-    return moved
+    if not STALE_BUSY:
+        stale.clear()
+        stale_released[0] = True
 
 
 real_remove_worktree = cli._GitVcs.remove_worktree
@@ -1156,17 +1247,19 @@ def remove_worktree(self, repository, checkout, *, force=False):
 
 
 cli._GitVcs.remove_worktree = remove_worktree
-slotimage.mount_state = mount_state
+slotimage.all_images = all_images
+slotimage.mount_table = mount_table
+slotimage.loop_evidence = loop_evidence
+slotimage._mounted_fsid = mounted_fsid
 slotimage._privileged = privileged
-slotimage.still_attached = still_attached
 slotimage.release_mount_point_copies = release
-slotimage.owned_mounts = owned_mounts
-slotimage.relocate = relocate
+slotimage._via_user_manager = lambda anchor=None: False
+slotimage._fuse_servers = lambda image_file: []
+slotimage._wait_until = lambda condition, timeout: condition()
 slotimage.resolve_backend = lambda preference: "kernel"
 cli._stale_copy_holders = functools.partial(
     cli._stale_copy_holders, proc_root=Path(os.environ["FAKE_PROC"])
 )
-STALE_VIEW = os.path.realpath(os.environ["FAKE_STALE_VIEW"]) if os.environ.get("FAKE_STALE_VIEW") else ""
 if STALE_VIEW:
     real_device = cli._stale_copy_device
 
@@ -1189,7 +1282,7 @@ def _fake_images(
     patch: str = "",
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run one wrkslots command against the fake image host (see _FAKE_IMAGE_HOST).
+    """Run one wrkslots command against the fake kernel (see _FAKE_IMAGE_HOST).
 
     Without ``proc``, the holder census reads an empty fake /proc: never this host's own, whose
     loop devices are unrelated to the test.
@@ -1388,6 +1481,7 @@ def test_recover_discards_a_stale_copy_only_on_the_coordinators_decision(tmp_pat
     image_directory = slotimage.image_directory(t.control_directory(project), "agent", "slot01")
     proc = tmp_path / "proc"
     _holder(proc, 41, fenced, root=Path("/"))
+    before = len(_logged(log))
 
     plain = _recover(project, log, proc=proc)
     assert plain.returncode == 3, plain.stdout + plain.stderr
@@ -1395,7 +1489,7 @@ def test_recover_discards_a_stale_copy_only_on_the_coordinators_decision(tmp_pat
     assert "also attached to /dev/loop54" in plain.stderr
     assert "--coordinator-authorized --discard-stale-image-copy" in plain.stderr
     assert len(_journals(project)) == 1 and (image_directory / "slot.img").exists()
-    assert not any(entry[:2] == ["privileged", "umount"] for entry in _logged(log))
+    assert not any(entry[:2] == ["privileged", "umount"] for entry in _logged(log)[before:])
 
     unauthorized = _fake_images(
         project, log, "recover", "--coordinator-pid", str(os.getpid()),
@@ -1557,9 +1651,11 @@ def test_a_recorded_discard_binds_only_its_own_removal() -> None:
 
 
 def test_remove_keeps_its_discard_decision_through_its_own_path_fence(tmp_path: Path) -> None:
-    """The fence relocates the image; the decision follows it, and the copy is discarded.
+    """The fence releases the stale copy, mounts the image again from its file only, and discards.
 
-    The copy sits on the slot's own mount point, as a copy of the slot's mount does.
+    The copy sits on the slot's own mount point, as a copy of the slot's mount does, so replacing
+    that directory entry releases it; the image is then mounted at the fenced path through a new
+    loop device, never the stale one.
     """
 
     project, slot = _image_slot(tmp_path)
@@ -1576,10 +1672,12 @@ def test_remove_keeps_its_discard_decision_through_its_own_path_fence(tmp_path: 
     assert removed.returncode == 0, removed.stdout + removed.stderr
     image_directory = slotimage.image_directory(t.control_directory(project), "agent", "slot01")
     assert not image_directory.exists() and t.active_slots(project) == []
-    assert any(
-        entry[:2] == ["privileged", "umount"] and entry[-1] == "--discard-stale-copies"
-        for entry in _logged(log)
-    )
+    logged = _logged(log)
+    image = str(image_directory / "slot.img")
+    assert ["privileged", "umount", image, str(slot), "--discard-stale-copies"] in logged
+    assert ["release", str(slot)] in logged
+    [fence_mount] = [entry for entry in logged if entry[:2] == ["privileged", "mount"]]
+    assert fence_mount[2] == image and fence_mount[-1] == "--fresh"
 
 
 # ----------------------------------- a discard sees work in the stale copy wherever it is reached
@@ -1827,6 +1925,149 @@ def test_a_discarding_census_refuses_work_begun_in_the_copy_after_the_decision(
     ) in removed.stderr
     assert not any(entry[:2] == ["privileged", "umount"] for entry in _logged(log))
     assert len(t.active_slots(project)) == 1 and (slot / ".git").is_file()
+
+
+# ------------------------------------------- a discard never mounts an image through a stale copy
+#
+# Review round 3, finding B2: while a discard was in effect, the path fence unmounted the host's
+# own device, released the copies on a best-effort basis, ignored the devices still holding the
+# image, and mounted it again; the root helper then reused the one device left, the stale copy's.
+# The host mounted the stale file system at the fenced path, and a rollback kept the slot on it.
+
+
+def test_a_fence_that_cannot_release_the_stale_copy_never_mounts_the_image_again(
+    tmp_path: Path,
+) -> None:
+    project, slot = _image_slot(tmp_path)
+    log = tmp_path / "fake-images.log"
+    proc = tmp_path / "proc"
+    _holder(proc, 41, slot, root=Path("/"))
+    busy = {"FAKE_STALE_BUSY": "1"}
+    image_directory = slotimage.image_directory(t.control_directory(project), "agent", "slot01")
+    image = str(image_directory / "slot.img")
+
+    def mounts(entries: list[list[str]]) -> list[list[str]]:
+        return [entry for entry in entries if entry[:2] == ["privileged", "mount"]]
+
+    removed = _fake_images(
+        project, log, "remove", "slot01", "--coordinator-pid", str(os.getpid()),
+        "--expected-generation", "1", "--coordinator-authorized", "--discard-stale-image-copy",
+        stale="54", proc=proc, env=busy,
+    )
+
+    assert removed.returncode == 3, removed.stdout + removed.stderr
+    assert "cannot establish path fence" in removed.stderr
+    assert "/dev/loop54 (7:54) still holds it; it is not mounted again" in removed.stderr
+    logged = _logged(log)
+    assert ["privileged", "umount", image, str(slot), "--discard-stale-copies"] in logged
+    assert ["release", str(slot)] in logged
+    assert mounts(logged) == []
+    record = slotimage.read_record(image_directory)
+    assert record.phase == slotimage.DISCARD_PHASE and record.location == slot
+    assert slot.is_dir() and list(slot.iterdir()) == []
+    assert len(t.active_slots(project)) == 1 and _journals(project) == []
+
+    # No later command mounts it while the stale copy holds it, nor automatically once it is gone.
+    for flags, stale, env in (
+        ((), "54", busy),
+        (("--coordinator-authorized",), "54", busy),
+        ((), "", {}),
+    ):
+        refused = _fake_images(project, log, "image", "mount", *flags, stale=stale, env=env)
+        assert refused.returncode == 3, refused.stdout + refused.stderr
+        assert "is not mounted again" in refused.stderr
+        assert mounts(_logged(log)) == []
+        assert slotimage.read_record(image_directory).phase == slotimage.DISCARD_PHASE
+
+    remounted = _fake_images(project, log, "image", "mount", "--coordinator-authorized")
+
+    assert remounted.returncode == 0, remounted.stdout + remounted.stderr
+    assert mounts(_logged(log)) == [["privileged", "mount", image, str(slot), "--fresh"]]
+    assert "from the image file" in remounted.stdout
+    assert slotimage.read_record(image_directory).phase == "ready"
+    assert (slot / ".git").is_file()
+
+
+def test_a_rolled_back_fence_keeps_the_slot_on_a_mount_of_its_image_file(tmp_path: Path) -> None:
+    """Negative control: the stale copy was released, so the fence and its rollback both mount."""
+
+    project, slot = _image_slot(tmp_path)
+    log = tmp_path / "fake-images.log"
+    proc = tmp_path / "proc"
+    _holder(proc, 41, slot, root=Path("/"))
+
+    removed = _fake_images(
+        project, log, "remove", "slot01", "--coordinator-pid", str(os.getpid()),
+        "--expected-generation", "1", "--coordinator-authorized", "--discard-stale-image-copy",
+        stale="54", proc=proc,
+        patch="""
+        real_matches = cli._assert_salvage_still_matches
+
+        def matches(*args, paths=None, **kwargs):
+            if paths is not None:  # only the check after the path fence names the moved paths
+                raise cli.Refusal("injected post-fence refusal")
+            return real_matches(*args, paths=paths, **kwargs)
+
+        cli._assert_salvage_still_matches = matches
+        """,
+    )
+
+    assert removed.returncode == 3, removed.stdout + removed.stderr
+    assert "injected post-fence refusal" in removed.stderr
+    image_directory = slotimage.image_directory(t.control_directory(project), "agent", "slot01")
+    image = str(image_directory / "slot.img")
+    mounts = [entry for entry in _logged(log) if entry[:2] == ["privileged", "mount"]]
+    assert len(mounts) == 2, _logged(log)
+    assert all(entry[2] == image and entry[-1] == "--fresh" for entry in mounts)
+    assert mounts[1][3] == str(slot)
+    record = slotimage.read_record(image_directory)
+    assert record.phase == "ready" and record.location == slot
+    assert (slot / ".git").is_file() and not (slot / "STALE-VIEW").exists()
+    assert len(t.active_slots(project)) == 1 and _journals(project) == []
+
+
+def test_destroying_an_image_whose_stale_copy_is_discarded_marks_it_before_unmounting(
+    host: _Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A command interrupted between the unmount and the deletion leaves nothing to remount."""
+
+    real_ensure_mounted = slotimage.ensure_mounted
+    monkeypatch.setattr(
+        slotimage, "DISCARD_STALE_COPIES", {host.image.slot_image, host.image.state_image}
+    )
+    monkeypatch.setattr(slotimage, "ensure_mounted", lambda image, **_options: [])
+    monkeypatch.setattr(slotimage, "root_entries", lambda image: [])
+    phases: list[str] = []
+
+    def interrupted(image_file: Path, mount_point: Path) -> list[str]:
+        phases.append(slotimage.read_record(host.image.directory).phase)
+        raise slotimage.ImageError("interrupted after the unmount")
+
+    monkeypatch.setattr(slotimage, "unmount", interrupted)
+    with pytest.raises(slotimage.ImageError, match="interrupted"):
+        slotimage.destroy(host.image)
+    assert phases == [slotimage.DISCARD_PHASE]
+
+    # A later command, given no discard, reads the record the interrupted one left.
+    monkeypatch.setattr(slotimage, "DISCARD_STALE_COPIES", set())
+    monkeypatch.setattr(slotimage, "ensure_mounted", real_ensure_mounted)
+    monkeypatch.setattr(slotimage, "is_mounted", lambda image_file, mount_point, table=None: False)
+    stale = slotimage.LoopEvidence(
+        device=os.makedev(7, 54), name="/dev/loop54", backing=str(host.image.slot_image),
+        deleted=False, file_identity=None, fsid=None, udev_uuid=None,
+    )
+    monkeypatch.setattr(
+        slotimage, "still_attached",
+        lambda image_file: (stale,) if image_file == host.image.slot_image else (),
+    )
+    mounted: list[Path] = []
+    monkeypatch.setattr(
+        slotimage, "mount", lambda image_file, *_args, **_options: mounted.append(image_file)
+    )
+    actions, failures = slotimage.ensure_all_mounted(host.control)
+    assert actions == [] and mounted == []
+    [failure] = failures
+    assert "/dev/loop54 (7:54) still holds it; it is not mounted again" in failure
 
 
 #: What test_lifecycle.py collects from this module: its tests and the fixtures they use.

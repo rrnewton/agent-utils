@@ -22831,13 +22831,21 @@ def _unmounted_slot_image(
         image = slotimage.load(config.control, slot_type, slot)
     except slotimage.ImageError as exc:
         return f"cannot read the slot image record of {slot}: {exc}"
-    if image is None or image.phase != "ready":
+    if image is None or image.phase not in ("ready", slotimage.DISCARD_PHASE):
         return None
     if Path(os.path.abspath(image.location)) != Path(os.path.abspath(slot_path)):
         return None
     state, detail = slotimage.mount_state(image.slot_image, image.location)
     if state in ("kernel", "fuse"):
         return None
+    if image.phase == slotimage.DISCARD_PHASE:
+        return (
+            f"no Git check, salvage or repair runs against {slot_path}, which is an unmounted "
+            "image's mount point: "
+            + slotimage.discard_hold_message(
+                image, [item.label for item in slotimage.still_attached(image.slot_image)]
+            )
+        )
     return (
         f"slot image {image.slot_image} is not mounted at {slot_path} ({detail}); no Git check, "
         "salvage or repair runs against an unmounted image's mount point. remedy: run "
@@ -34601,7 +34609,7 @@ def _repair_registration_at_slot(
     _moved, path = _checkout_at_slot(config, record, checkout, slot_path)
     _relative, repository = _stored_repository_path(config, checkout.repository)
     image = _slot_image_at(config, slot_path)
-    if image is not None and image.phase == "ready":
+    if image is not None and image.phase in ("ready", slotimage.DISCARD_PHASE):
         state, detail = slotimage.mount_state(image.slot_image, image.location)
         if state not in ("kernel", "fuse"):
             raise Refusal(
@@ -60401,9 +60409,12 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "of the copy sits on the slot's own mount-point entry, which the removal replaces "
             "to release it; every process-use check of the removal checks this again. Salvage "
             "reads only this host's own file system: anything written only through the stale "
-            "copy is lost. Requires --coordinator-authorized; recorded in the event log before "
-            "salvage; never accepted by retire-pending or remove-agent-batch (default: off, a "
-            "stale copy refuses removal)"
+            "copy is lost. If the path fence cannot release the copy, it refuses before "
+            "renaming and leaves the image unmounted in phase discarding-stale-copy, never "
+            "mounted again automatically (see image mount --coordinator-authorized). Requires "
+            "--coordinator-authorized; recorded in the event log before salvage; never accepted "
+            "by retire-pending or remove-agent-batch (default: off, a stale copy refuses "
+            "removal)"
         ),
     )
     remove.add_argument(

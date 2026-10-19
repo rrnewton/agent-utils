@@ -1933,6 +1933,21 @@ through the stale copy is lost. A slot whose image is attached twice while this 
 device cannot be salvaged, so it refuses: release one of the copies (stop the processes holding it)
 first.
 
+While the stale copy is discarded, the image's record (`IMAGE.json`) enters phase
+`discarding-stale-copy` before the host's own mount is unmounted, at the path fence (which must
+move the image) and when the image is destroyed. The fence mounts the image again only when no loop
+device holds it after the unmount and the release of the copies, and then only from the image file
+(`mount --fresh` in the root helper, which refuses while any device holds the image); the record
+then returns to `ready`. If a device still holds it, the fence refuses before renaming anything:
+mounting would reuse that device, and so put the stale file system where the slot's content was.
+The slot stays where it was, unmounted, in that phase, and is never mounted again automatically:
+every command reports it as not mounted, naming the device, and the census counts every device
+holding it as stale. Its content as of the removal is in the removal's salvage. Once nothing holds
+the image (stop the processes whose mount table holds the device), check the image file
+(`e2fsck -fn`), because a stale copy released after the host's own mount may have written its old
+metadata into it, and run `wrkslots image mount --coordinator-authorized`, which mounts it from the
+file only and returns it to `ready`.
+
 **An interrupted removal of an image-backed slot.** A removal interrupted after `git worktree remove`
 leaves its finish journal in phase `fenced`. For a flat image-backed slot the fenced directory is
 then still the image's mount point, empty and with no `.git` file. `recover` recognises that Git

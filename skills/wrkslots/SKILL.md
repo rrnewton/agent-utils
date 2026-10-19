@@ -127,7 +127,9 @@ file systems); do not mount, unmount, grow or copy it, and retire the slot only 
 decision; a removal that recorded the flag itself resumes with plain `recover`, only for the devices
 it recorded). The discard refuses while any process works in the stale copy (found by device,
 wherever it reaches it), a holder is under another root, or the copy is mounted anywhere but on the
-slot's own mount-point entry.
+slot's own mount-point entry. If the removal's fence cannot release the copy, the image is left
+unmounted in phase `discarding-stale-copy` and is never mounted again automatically: stop what
+holds the device, then `image mount --coordinator-authorized` mounts it from the file only.
 `image-identity-unverifiable` means a
 loop mount sits at a slot's location that wrkslots cannot identify; it refuses to unmount, move or
 remove it. A mount copied into another process's private mount namespace is the slot's own storage,

@@ -211,8 +211,9 @@ files), not containment of a hostile agent.
   wrkslots-foreign-mount-ns): every operation on an existing mount also names the image and
   checks the loop device with LOOP_GET_STATUS64 against it by device and inode, `mount` reuses a
   device that already holds the image instead of attaching a second one, and `umount`/`grow`
-  refuse an image attached twice; see the user guide's "Mounts copied into other mount
-  namespaces".
+  refuse an image attached twice. `mount --fresh`, used while a stale copy is being discarded,
+  refuses whenever any device holds the image; see the user guide's "Mounts copied into other
+  mount namespaces".
 - **Root helper identity (B3, S1).** uid and gid come from SUDO_UID/SUDO_GID, and groups from
   getgrouplist for that user; a spec that disagrees is refused. The spec lives in
   `$XDG_RUNTIME_DIR/wrkslots` (tmpfs, 0700, read-only inside every box). It must be a 0600,

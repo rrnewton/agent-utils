@@ -754,6 +754,7 @@ def test_image_helper_refuses_paths_it_should_not_touch(tmp_path: Path) -> None:
         (("rmdir-lost-found", str(image), "/"), "not the root of a loop-mounted slot image"),
         (("grow", str(image), "/"), "not the root of a loop-mounted slot image"),
         (("umount", str(image), str(target), "--force"), "unknown umount option"),
+        (("mount", str(image), str(target), "--force"), "unknown mount option"),
         (("umount", "/usr"), "usage: imagehelper.py"),  # the IMAGE argument is required
     ):
         result = run(*arguments)

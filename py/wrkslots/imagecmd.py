@@ -72,7 +72,11 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser], fo
             "twice is refused. A mount point that holds exactly one file, the .git pointer "
             "Git writes for this slot's own worktree registration (a repair that ran while "
             "the image was unmounted leaves it), is cleared only with --coordinator-authorized, "
-            "and the removal is recorded in the event log."
+            "and the removal is recorded in the event log. An image that a stale-copy discard "
+            "left unmounted (phase discarding-stale-copy) is never mounted automatically, "
+            "because a mount would reuse a loop device that may hold the stale file system; "
+            "--coordinator-authorized mounts it again from the image file, once no loop device "
+            "holds it."
         ),
         epilog="examples:\n  wrkslots image mount\n  wrkslots image mount --coordinator-authorized",
         formatter_class=formatter,
@@ -85,8 +89,12 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser], fo
             "Git's own pointer to that slot's registered worktree (one regular file of at "
             "most 4096 bytes reading 'gitdir: <admin>' for this checkout's administrative "
             "directory, whose gitdir names this mount point), record that in the event log, "
-            "then mount the slot. Anything else in a mount point is never removed (default: "
-            "off, such a slot is reported and left unmounted)"
+            "then mount the slot. Anything else in a mount point is never removed. Also mount "
+            "an image that a stale-copy discard left unmounted, from the image file only and "
+            "only once no loop device holds it, returning it to phase ready; check its content "
+            "first, since a stale copy released after the host's own mount may have written "
+            "its old metadata into it (default: off, such slots are reported and left "
+            "unmounted)"
         ),
     )
     mount.set_defaults(handler=_cmd_image_mount)
@@ -701,7 +709,10 @@ def _cmd_image_mount(args: argparse.Namespace) -> int:
     with cli._mutation_locks(config, args.wait_lock):
         notes = _clear_stray_pointers(config, bool(getattr(args, "coordinator_authorized", False)))
         try:
-            actions, failures = slotimage.ensure_all_mounted(config.control)
+            actions, failures = slotimage.ensure_all_mounted(
+                config.control,
+                remount_discarded=bool(getattr(args, "coordinator_authorized", False)),
+            )
         except slotimage.ImageError as exc:
             raise _refuse(str(exc)) from exc
         cli._refresh_owned_mounts(config)

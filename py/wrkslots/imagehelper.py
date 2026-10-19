@@ -20,9 +20,11 @@ invoking user, so nothing is trusted by name:
   mount namespace keeps it bound), re-checked on a descriptor held across
   mount(2), so the kernel returns the same file system; with two or more it
   refuses. ``umount`` and ``grow`` refuse an image attached twice unless
-  ``umount`` is told to discard the stale copy.
+  ``umount`` is told to discard the stale copy. ``mount --fresh`` refuses
+  whenever any device holds the image: while a stale copy is being
+  discarded, the device left holding the image may be that stale copy's.
 
-Operations: ``mount IMAGE MOUNT-POINT``, ``umount IMAGE MOUNT-POINT
+Operations: ``mount IMAGE MOUNT-POINT [--fresh]``, ``umount IMAGE MOUNT-POINT
 [--discard-stale-copies]``, ``rmdir-lost-found IMAGE MOUNT-POINT``,
 ``trim IMAGE MOUNT-POINT``, ``grow IMAGE MOUNT-POINT``.
 """
@@ -252,16 +254,25 @@ def _configure_loop(image: int) -> tuple[int, str]:
     raise HelperError("no free loop device")
 
 
-def _reuse_loop(image_path: str, info: os.stat_result) -> tuple[int, str] | None:
+def _reuse_loop(
+    image_path: str, info: os.stat_result, *, fresh: bool = False
+) -> tuple[int, str] | None:
     """Open the one loop device that already holds the image, re-checked on that descriptor.
 
     None when no device holds it. Refuses two or more, and a device bound with
     an offset, a size limit, or read-only, which is not a slot image mount.
+    With ``fresh``, refuses any device at all.
     """
 
     attached = _attachments(info)
     if not attached:
         return None
+    if fresh:
+        names = ", ".join(name for name, _status in attached)
+        raise HelperError(
+            f"{image_path} is still attached to {names}, which may hold a stale copy of it; "
+            "refusing to mount it through that device (--fresh)"
+        )
     _refuse_double_attachment(image_path, info, "mount it again")
     name, _status = attached[0]
     device = os.open(name, os.O_RDWR | os.O_CLOEXEC)
@@ -286,12 +297,15 @@ def _reuse_loop(image_path: str, info: os.stat_result) -> tuple[int, str] | None
     return device, name
 
 
-def mount(image_path: str, mount_point: str) -> None:
+def mount(image_path: str, mount_point: str, *options: str) -> None:
     """Mount a user-owned image on a pinned, empty directory, never through a second loop device.
 
     Prints ``reused /dev/loopN`` when another mount (typically a copy in another
     mount namespace) already held the image's device, else ``attached /dev/loopN``.
+    With ``--fresh`` it never reuses a device: it refuses while any holds the image.
     """
+    if any(option != "--fresh" for option in options):
+        raise HelperError(f"unknown mount option: {' '.join(options)}")
     uid = _invoking_uid()
     image = os.open(image_path, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
@@ -300,7 +314,7 @@ def mount(image_path: str, mount_point: str) -> None:
             raise HelperError(f"image is not a singly linked regular file owned by the invoking user: {image_path}")
         target = _open_mount_point(mount_point, uid)
         try:
-            reused = _reuse_loop(image_path, info)
+            reused = _reuse_loop(image_path, info, fresh="--fresh" in options)
             device, name = reused if reused is not None else _configure_loop(image)
             try:
                 libc = _libc()
@@ -409,14 +423,14 @@ def _system_tool(name: str) -> str:
 
 
 _OPERATIONS = {
-    "mount": (mount, 2, 2),
+    "mount": (mount, 2, 3),
     "umount": (umount, 2, 3),
     "rmdir-lost-found": (rmdir_lost_found, 2, 2),
     "trim": (trim, 2, 2),
     "grow": (grow, 2, 2),
 }
 _USAGE = (
-    "usage: imagehelper.py mount IMAGE MOUNT-POINT | umount IMAGE MOUNT-POINT "
+    "usage: imagehelper.py mount IMAGE MOUNT-POINT [--fresh] | umount IMAGE MOUNT-POINT "
     "[--discard-stale-copies] | rmdir-lost-found|trim|grow IMAGE MOUNT-POINT"
 )
 

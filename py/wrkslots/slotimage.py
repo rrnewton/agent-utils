@@ -1038,7 +1038,9 @@ def owned_mounts(control: Path) -> tuple[frozenset[tuple[Path, str]], frozenset[
     and is not use. ``stale`` holds ``(mount point, MAJOR:MINOR, /dev/loopN)``
     for every other attachment of a doubly attached image: a second, independent
     file system on the same file, which salvage cannot see and which the census
-    therefore keeps reporting.
+    therefore keeps reporting. For an image in :data:`DISCARD_PHASE`, only the
+    host's own mount is storage: every other device that holds it may hold the
+    stale file system, even when it is the only device left.
     """
 
     owned: set[tuple[Path, str]] = set()
@@ -1056,12 +1058,19 @@ def owned_mounts(control: Path) -> tuple[frozenset[tuple[Path, str]], frozenset[
         ):
             target = Path(os.path.abspath(mount_point))
             found = image_attachments(image_file, target, table=table, evidence=loops)
-            if len(found.devices) == 1:
-                owned.add((target, device_text(found.devices[0].device)))
-            elif found.host_device is not None:
-                owned.add((target, device_text(found.host_device.device)))
-            for item in found.stale:
-                stale.add((target, device_text(item.device), item.name))
+            if image.phase == DISCARD_PHASE:
+                if found.host_device is not None:
+                    owned.add((target, device_text(found.host_device.device)))
+                for item in found.devices:
+                    if item != found.host_device:
+                        stale.add((target, device_text(item.device), item.name))
+            else:
+                if len(found.devices) == 1:
+                    owned.add((target, device_text(found.devices[0].device)))
+                elif found.host_device is not None:
+                    owned.add((target, device_text(found.host_device.device)))
+                for item in found.stale:
+                    stale.add((target, device_text(item.device), item.name))
             for entry in table:
                 if (
                     entry.mount_point == target
@@ -1164,7 +1173,7 @@ def _undo_mount(image_file: Path, mount_point: Path) -> str:
 _REUSED_DEVICES: dict[Path, str] = {}
 
 
-def mount(image_file: Path, mount_point: Path, backend_preference: str) -> str:
+def mount(image_file: Path, mount_point: Path, backend_preference: str, *, fresh: bool = False) -> str:
     """Mount ``image_file`` at ``mount_point``; return the backend used.
 
     Every check reads the host's mount table (:func:`verification_table`). A
@@ -1174,6 +1183,10 @@ def mount(image_file: Path, mount_point: Path, backend_preference: str) -> str:
     device already holds it (a copy of an earlier mount in another mount
     namespace keeps it bound), the root helper mounts that same device, so
     there is still one file system; when two devices hold it, it refuses.
+    With ``fresh`` the helper refuses whenever any device already holds the
+    image, judged by the kernel's own record of each device's backing file:
+    an image whose stale copy is being discarded is mounted only from the
+    image file, never through a device that copy may still hold.
     """
 
     _REUSED_DEVICES.pop(image_file, None)
@@ -1194,7 +1207,13 @@ def mount(image_file: Path, mount_point: Path, backend_preference: str) -> str:
         raise ImageError(f"a fuse2fs process still serves {image_file}; refusing a second mount")
     try:
         if backend == "kernel":
-            output = _privileged("mount", str(image_file), str(mount_point), anchor=image_file.parent)
+            output = _privileged(
+                "mount",
+                str(image_file),
+                str(mount_point),
+                *(("--fresh",) if fresh else ()),
+                anchor=image_file.parent,
+            )
             for line in output.splitlines():
                 if line.startswith("reused "):
                     _REUSED_DEVICES[image_file] = line.removeprefix("reused ").strip()
@@ -1295,6 +1314,34 @@ def _wait_for_exit(pids: Sequence[int], timeout: float) -> bool:
 #: discard: only a single-slot remove given --discard-stale-image-copy, after
 #: salvage read the host's own file system, sets this (see cli).
 DISCARD_STALE_COPIES: set[Path] = set()
+
+#: The phase of an image whose stale copy is being discarded. Its record enters
+#: it, durably, before the host's own mount is unmounted (by :func:`relocate`
+#: or :func:`destroy`), and keeps it while the image may be unmounted with a
+#: loop device that a stale copy holds. Mounting such an image would reuse that
+#: device, and so put the stale file system where the slot's content was, so
+#: nothing mounts it automatically (:func:`ensure_mounted`), and the census
+#: counts every device holding it but the host's own mount as stale
+#: (:func:`owned_mounts`). It leaves the phase only through a mount made from
+#: the image file itself: :func:`relocate` once no device holds it, or
+#: ``image mount --coordinator-authorized``.
+DISCARD_PHASE = "discarding-stale-copy"
+
+
+def discard_hold_message(image: SlotImage, held: Sequence[str]) -> str:
+    """Why an image in :data:`DISCARD_PHASE` is not mounted, naming the devices ``held`` by it."""
+
+    return (
+        f"slot image {image.slot_image} was unmounted while a stale copy of it was being "
+        "discarded"
+        + (f", and {', '.join(held)} still holds it" if held else "")
+        + "; it is not mounted again: a mount would reuse a loop device that may hold the "
+        "stale file system, and a stale copy released after the host's own file system may "
+        "have written its old metadata into the image. remedy: stop the processes whose mount "
+        "table holds that device; once no loop device holds the image, check the image file "
+        "(e2fsck -fn) and run 'wrkslots image mount --coordinator-authorized', which mounts it "
+        "from the file only"
+    )
 
 
 def still_attached(image_file: Path) -> tuple[LoopEvidence, ...]:
@@ -1428,10 +1475,46 @@ def provision(
     return ready
 
 
-def ensure_mounted(image: SlotImage) -> list[str]:
-    """Mount whichever of a slot's images is not mounted; return what was done."""
+def ensure_mounted(image: SlotImage, *, remount_discarded: bool = False) -> list[str]:
+    """Mount whichever of a slot's images is not mounted; return what was done.
+
+    An image in :data:`DISCARD_PHASE` that is not mounted refuses instead: a
+    mount would reuse a loop device that may hold the stale file system. With
+    ``remount_discarded`` (``image mount --coordinator-authorized``) it is
+    mounted again once no loop device holds either of its images, only from
+    the image files (``fresh``), and returns to ``ready``.
+    """
 
     actions: list[str] = []
+    if image.phase == DISCARD_PHASE:
+        pending = [
+            (image_file, mount_point)
+            for image_file, mount_point in (
+                (image.slot_image, image.location),
+                (image.state_image, image.state_mount),
+            )
+            if not is_mounted(image_file, mount_point)
+        ]
+        if not pending:
+            return actions
+        held = [
+            item.label for image_file, _point in pending for item in still_attached(image_file)
+        ]
+        if held or not remount_discarded:
+            raise ImageError(discard_hold_message(image, held))
+        for image_file, mount_point in pending:
+            if not image_file.exists():
+                raise ImageError(f"slot image file is missing: {image_file}")
+            if not mount_point.exists():
+                mount_point.mkdir(mode=0o755 if mount_point == image.location else 0o700)
+            mount(image_file, mount_point, image.backend, fresh=True)
+            actions.append(
+                f"mounted {image_file.name} at {mount_point} from the image file, which a "
+                "stale-copy discard had left unmounted; a stale copy released since may have "
+                "written its old metadata into it, so check its content before relying on it"
+            )
+        _write_record(dataclasses.replace(image, phase="ready"))
+        return actions
     if image.phase != "ready":
         return actions
     for image_file, mount_point in (
@@ -1457,19 +1540,21 @@ def ensure_mounted(image: SlotImage) -> list[str]:
     return actions
 
 
-def ensure_all_mounted(control: Path) -> tuple[list[str], list[str]]:
+def ensure_all_mounted(
+    control: Path, *, remount_discarded: bool = False
+) -> tuple[list[str], list[str]]:
     """Mount every image-backed slot that is not mounted.
 
     Returns ``(actions, failures)``. One slot that cannot be mounted does not
     stop the others: each failure is reported, naming its slot, and the rest
-    are still mounted.
+    are still mounted. ``remount_discarded`` is passed to :func:`ensure_mounted`.
     """
 
     actions: list[str] = []
     failures: list[str] = []
     for image in all_images(control):
         try:
-            actions.extend(ensure_mounted(image))
+            actions.extend(ensure_mounted(image, remount_discarded=remount_discarded))
         except (ImageError, OSError) as exc:
             failures.append(f"{image.slot_type}/{image.slot}: {exc}")
     return actions, failures
@@ -1481,19 +1566,51 @@ def relocate(image: SlotImage, destination: Path) -> SlotImage:
     A mount point cannot be renamed, so this unmounts, renames the now-empty
     directory, records the new location, and mounts again. The unmount fails
     while anything still uses the file system, which is the correct refusal.
+
+    While the image's stale copy is being discarded (:data:`DISCARD_STALE_COPIES`,
+    or the image is already in :data:`DISCARD_PHASE`), its record enters that
+    phase before the unmount. If any loop device still holds the image after
+    the unmount and the release of the copies (a stale copy that stayed
+    attached), this refuses before the rename: the image stays unmounted where
+    it was, in that phase, because mounting it would reuse that device, and so
+    mount the stale file system. Otherwise it is mounted again from the image
+    file only (``fresh``) and returns to ``ready``. An image already in that
+    phase is relocated only from a mount of its own.
     """
 
     source = image.location
     destination = Path(os.path.abspath(destination))
     if destination.exists() or destination.is_symlink():
         raise ImageError(f"relocation destination already exists: {destination}")
+    discarding = image.slot_image in DISCARD_STALE_COPIES or image.phase == DISCARD_PHASE
+    if discarding:
+        if image.phase == DISCARD_PHASE and not is_mounted(image.slot_image, source):
+            raise ImageError(
+                discard_hold_message(
+                    image, [item.label for item in still_attached(image.slot_image)]
+                )
+            )
+        image = dataclasses.replace(image, phase=DISCARD_PHASE)
+        _write_record(image)
     unmount(image.slot_image, source)
+    if discarding:
+        # A released loop device is detached asynchronously; give it a moment
+        # (unmount waits only outside a coordinator box) before judging.
+        _wait_until(lambda: not still_attached(image.slot_image), 5)
+        held = [item.label for item in still_attached(image.slot_image)]
+        if held:
+            raise ImageError(discard_hold_message(image, held))
     if any(source.iterdir()):
         raise ImageError(f"slot mount point {source} is not empty after unmount")
     moved = dataclasses.replace(image, location=destination)
     _write_record(moved)
     rename_mount_point(source, destination, image.directory)
-    mount(moved.slot_image, destination, image.backend)
+    if not discarding:
+        mount(moved.slot_image, destination, image.backend)
+        return moved
+    mount(moved.slot_image, destination, image.backend, fresh=True)
+    moved = dataclasses.replace(moved, phase="ready")
+    _write_record(moved)
     return moved
 
 
@@ -1509,17 +1626,31 @@ def destroy(image: SlotImage, *, allow_content: bool = False) -> None:
 
     Refuses while the slot image still holds anything but mkfs residue, unless
     ``allow_content`` is set by a caller that has already salvaged it.
+
+    While the image's stale copy is being discarded, its record enters
+    :data:`DISCARD_PHASE` after that check and before anything is unmounted,
+    so a command interrupted between the unmount and the deletion leaves an
+    image that no later command mounts through a device the stale copy may
+    still hold. An image already in that phase is checked the same way while
+    this host mounts it; unmounted, it goes straight to the unmount and the
+    deletion, since nothing may mount it to look.
     """
 
+    entries: list[str] | None = None
     if image.phase == "ready":
         ensure_mounted(image)
-        leftover = [
-            name for name in root_entries(image) if name not in REPRESENTATION_RESIDUE
-        ]
+        entries = root_entries(image)
+    elif image.phase == DISCARD_PHASE and is_mounted(image.slot_image, image.location):
+        entries = sorted(entry.name for entry in image.location.iterdir())
+    if entries is not None:
+        leftover = [name for name in entries if name not in REPRESENTATION_RESIDUE]
         if leftover and not allow_content:
             raise ImageError(
                 f"slot image at {image.location} is not empty: {', '.join(leftover[:5])}"
             )
+        if image.phase == "ready" and image.slot_image in DISCARD_STALE_COPIES:
+            image = dataclasses.replace(image, phase=DISCARD_PHASE)
+            _write_record(image)
     unmount(image.state_image, image.state_mount)
     unmount(image.slot_image, image.location)
     if image.location.exists() and not image.location.is_symlink():
