@@ -580,8 +580,14 @@ pub fn channel_directory_request(
         .push("channel-directory");
     {
         let mut query = url.query_pairs_mut();
-        if let Some(text) = request.query.as_deref() {
-            query.append_pair("query", text);
+        // The bridge matches names in any case; it is never sent the `#` a channel is written
+        // with. `#371 channel-search-hash`.
+        if let Some(text) = request
+            .query
+            .as_deref()
+            .and_then(crate::directory::name_filter)
+        {
+            query.append_pair("query", &text);
         }
         query.append_pair("limit", &request.limit.to_string());
         if let Some(cursor) = request.cursor.as_deref() {
@@ -1893,6 +1899,32 @@ mod tests {
         .expect("valid request");
         assert_eq!(
             first.url,
+            "https://bridge.example/v1/channel-directory?limit=10"
+        );
+    }
+
+    #[test]
+    fn a_bridge_is_asked_for_the_name_without_the_hash_it_is_written_with() {
+        // `#371 channel-search-hash`. The case is the bridge's to match, as its contract says.
+        let asked = |query: &str| {
+            channel_directory_request(
+                "https://bridge.example/v1",
+                &crate::directory::DirectoryRequest {
+                    query: Some(query.to_owned()),
+                    cursor: None,
+                    limit: 10,
+                },
+            )
+            .expect("valid request")
+            .url
+        };
+        assert_eq!(
+            asked("#Team-Builds"),
+            "https://bridge.example/v1/channel-directory?query=Team-Builds&limit=10"
+        );
+        assert_eq!(asked("#Team-Builds"), asked("Team-Builds"));
+        assert_eq!(
+            asked("#"),
             "https://bridge.example/v1/channel-directory?limit=10"
         );
     }

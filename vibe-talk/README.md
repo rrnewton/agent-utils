@@ -3256,7 +3256,7 @@ leave this setting off.
 A registration-capable bridge may also list the channels its account can see, which lets
 Settings offer **Browse channels** (`#19 channel-browser`): a searchable list with one-tap Add and
 the channels already tracked marked as such. The bridge implements `GET /channel-directory` with
-optional `query` (trimmed, at most 100 characters; blank lists everything), `limit` (1 to 50, default
+optional `query` (trimmed, at most 100 characters; blank lists everything; matched in any case), `limit` (1 to 50, default
 25) and `cursor` (the opaque `next_cursor` of the previous page of the same query). It answers
 `{"entries":[{"source":"...","name":"...","registered_channel_id":"id-or-null"}],"next_cursor":"...-or-null","truncated":false}`,
 in its own order and never more entries than `limit`. `source` is handed back unchanged as the
@@ -3266,6 +3266,9 @@ malformed answer is refused rather than repaired. `401`/`403` reach the page as 
 `404`/`405`/`501` as "this bridge has no directory". vibe-talk probes nothing at startup: it offers
 the list whenever `discord.channel_registration` is on, and a bridge without the route simply
 answers the first read with one of those statuses. Every string the bridge returns is drawn as text.
+A leading `#` in a search is optional (`#371 channel-search-hash`): `#team` searches for `team`, at
+every service, so the bridge is never sent it, and Slack, which writes every channel `#name`, finds
+`#team-builds` for `team`, `Team` or `#team` alike. A search of nothing but `#` lists everything.
 
 A compatible provider bridge may separately implement `POST /channels/{id}/read` and opt in with
 `discord.upstream_read_marks = true`. The web app then offers **Mark read in** *the service* under each
@@ -8838,7 +8841,8 @@ nothing that proposes, commits, or cancels.
 **A channel may be named, but the id is what the model is told to pass.** Every tool's
 `channel_id` is described as "an id from list_channels" and lists the configured choices
 (`post_reply` lists only the writable ones). A model that passes the name it heard anyway —
-the configured label or the operator's alias, matched case-insensitively — reaches that channel;
+the configured label or the operator's alias, matched case-insensitively and with or without a
+leading `#` (`#371 channel-search-hash`) — reaches that channel;
 a name two channels share reaches neither. Naming only picks from the allowlist and never widens
 it: a read-only channel named by its label is still refused for posting. An `unknown_channel`
 result lists the ids to use instead, so a wrong guess costs one retry rather than the answer.

@@ -1153,6 +1153,37 @@ async fn discovery_names_conversations_filters_and_never_overflows_a_page() {
     assert_no_stray_methods(&fake);
 }
 
+/// `#371 channel-search-hash`: Slack writes every channel `#name`, and a search finds it whether
+/// or not it is typed with the `#`, in any case: `#OPS` finds `#eng-ops` as `ops` does.
+#[tokio::test]
+async fn discovery_finds_a_channel_with_or_without_its_hash_in_any_case() {
+    let fake = Fake::start(directory_fixture(), 50).await;
+    let client = fake.client();
+    let names = |query: &str| {
+        let request = DirectoryRequest {
+            query: Some(query.to_owned()),
+            cursor: None,
+            limit: 50,
+        };
+        let client = &client;
+        async move {
+            client
+                .discover_channels(&request)
+                .await
+                .expect("page")
+                .entries
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>()
+        }
+    };
+    let plain = names("ops").await;
+    assert!(plain.contains(&"#eng-ops".to_owned()), "{plain:?}");
+    assert_eq!(names("#OPS").await, plain);
+    assert_eq!(names("# Ops").await, plain);
+    assert_eq!(names("#eng-OPS").await, ["#eng-ops"]);
+}
+
 #[tokio::test]
 async fn identity_comes_from_auth_test_and_is_remembered() {
     let (state, _) = linear(1);

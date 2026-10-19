@@ -54,6 +54,16 @@ pub struct DirectoryPage {
     pub truncated: bool,
 }
 
+/// The name a search looks for: trimmed, and without a leading `#`, which is how a channel is
+/// written (Slack names every channel `#name`) but not part of its name. `None` when nothing is
+/// left, which lists everything. The case is kept: matching is case-insensitive at every provider,
+/// and a bridge is handed the text to match as its own contract says. `#371 channel-search-hash`.
+#[must_use]
+pub fn name_filter(query: &str) -> Option<String> {
+    let name = query.trim().trim_start_matches('#').trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
 fn shape(detail: &str) -> ChatError {
     ChatError::Shape(format!("channel directory answer {detail}"))
 }
@@ -152,6 +162,21 @@ pub fn parse_directory_page(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_search_finds_a_name_with_or_without_its_hash() {
+        assert_eq!(
+            name_filter("  #Team-Builds ").as_deref(),
+            Some("Team-Builds")
+        );
+        assert_eq!(name_filter("team-builds").as_deref(), Some("team-builds"));
+        assert_eq!(name_filter("# builds").as_deref(), Some("builds"));
+        assert_eq!(name_filter("##builds").as_deref(), Some("builds"));
+        // Only a leading hash: one inside the name is part of it.
+        assert_eq!(name_filter("c#-notes").as_deref(), Some("c#-notes"));
+        assert_eq!(name_filter(" # "), None);
+        assert_eq!(name_filter(""), None);
+    }
 
     #[test]
     fn a_well_formed_page_is_read_in_the_bridges_order() {

@@ -4923,7 +4923,8 @@ pub async fn channel_directory(
         ));
     }
     let request = DirectoryRequest {
-        query: search.map(str::to_owned),
+        // `#371 channel-search-hash`: "#builds" finds what "builds" finds, at every provider.
+        query: search.and_then(crate::directory::name_filter),
         cursor: query.cursor,
         limit,
     };

@@ -4418,6 +4418,57 @@ async fn the_channel_directory_marks_tracked_channels_and_pages_through_the_back
     assert_eq!(calls[2].limit, vibe_talk::directory::DEFAULT_LIMIT);
 }
 
+/// `#371 channel-search-hash`: a search finds a channel with or without the `#` it is written with,
+/// in any case, and a search of nothing but `#` lists everything.
+#[tokio::test]
+async fn the_channel_directory_search_treats_a_leading_hash_as_optional() {
+    let (harness, _store) = directory_harness();
+    for q in ["%23RELEASE", "release", "%23%20Release"] {
+        let (status, found) = call(
+            &harness,
+            "GET",
+            &format!("/api/v1/channel-directory?q={q}"),
+            Some(WRITE_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{found}");
+        let names: Vec<&str> = found["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .filter_map(|entry| entry["name"].as_str())
+            .collect();
+        assert_eq!(names, ["Release Train"], "q={q}");
+    }
+    let (status, all) = call(
+        &harness,
+        "GET",
+        "/api/v1/channel-directory?q=%23",
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{all}");
+    assert_eq!(all["entries"].as_array().map(Vec::len), Some(3), "{all}");
+    let asked: Vec<Option<String>> = harness
+        .discord
+        .directory_calls()
+        .into_iter()
+        .map(|call| call.query)
+        .collect();
+    assert_eq!(
+        asked,
+        [
+            Some("RELEASE".to_owned()),
+            Some("release".to_owned()),
+            Some("Release".to_owned()),
+            None
+        ],
+        "the provider was handed the hash, or lost the case"
+    );
+}
+
 /// `#19 channel-browser`: a bad request is refused here, before anything reaches the backend.
 #[tokio::test]
 async fn malformed_directory_requests_are_refused_locally() {

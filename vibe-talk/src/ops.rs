@@ -204,7 +204,9 @@ pub async fn hidden_channels(state: &AppState) -> Vec<ChannelInfo> {
 /// said to pass an id — so an exact id wins, and failing that, a configured label or operator
 /// alias matching case-insensitively (surrounding whitespace ignored) stands in for its id. This
 /// only picks a channel from the allowlist; it never admits one. A name two channels share
-/// names neither, so an ambiguous name resolves to nothing rather than to a guess.
+/// names neither, so an ambiguous name resolves to nothing rather than to a guess. A leading `#`
+/// is optional on either side: Slack writes `#team` for the channel called `team`
+/// (`#371 channel-search-hash`).
 ///
 /// With several services the model is told each channel as `team on Slack`
 /// (`#355 provider-grouped-channels`), so that is accepted too, when no channel is called the whole
@@ -219,7 +221,8 @@ pub async fn channel_named(state: &AppState, name: &str) -> Option<ChannelId> {
         return None;
     }
     let called = |channel: &ChannelInfo, name: &str| {
-        let same = |candidate: &str| candidate.trim().to_lowercase() == name.to_lowercase();
+        let bare = |text: &str| text.trim().trim_start_matches('#').trim().to_lowercase();
+        let same = |candidate: &str| bare(candidate) == bare(name);
         same(&channel.label) || channel.alias.as_deref().is_some_and(same)
     };
     let only =
@@ -5105,6 +5108,24 @@ mod tests {
             "the configured label still names the channel once it has an alias"
         );
         for stranger in ["9999999999", "", "   ", "build", "noise"] {
+            assert_eq!(channel_named(&state, stranger).await, None, "{stranger:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_channel_is_found_with_or_without_its_hash() {
+        // `#371 channel-search-hash`: a model hearing `#team-builds` may say `team-builds`, and
+        // one reading `build noise` may write `#build noise`.
+        let (state, _fake, _store) = testing::state_with_store();
+        let read = Some(crate::model::ChannelId(READ_CHANNEL.to_owned()));
+        assert_eq!(channel_named(&state, "#Build Noise").await, read);
+        set_channel_alias(&state, READ_CHANNEL, "#team-builds")
+            .await
+            .expect("set");
+        for said in ["team-builds", "#team-builds", " # TEAM-BUILDS "] {
+            assert_eq!(channel_named(&state, said).await, read, "{said:?}");
+        }
+        for stranger in ["#", "# ", "#team"] {
             assert_eq!(channel_named(&state, stranger).await, None, "{stranger:?}");
         }
     }

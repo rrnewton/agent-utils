@@ -699,7 +699,11 @@ impl ChatClient for FakeDiscord {
                 "the configured chat provider cannot list its channels".to_owned(),
             ));
         };
-        let needle = request.query.as_deref().map(str::to_lowercase);
+        let needle = request
+            .query
+            .as_deref()
+            .and_then(crate::directory::name_filter)
+            .map(|query| query.to_lowercase());
         let matching: Vec<&DirectoryEntry> = directory
             .iter()
             .filter(|entry| {

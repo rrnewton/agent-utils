@@ -1418,12 +1418,12 @@ impl HttpSlackClient {
                 o: 0,
             },
         };
+        // Every name here is written `#name` (or `DM: …`); a search's own `#` is optional.
         let query = request
             .query
             .as_deref()
-            .map(str::trim)
-            .filter(|query| !query.is_empty())
-            .map(str::to_lowercase);
+            .and_then(crate::directory::name_filter)
+            .map(|query| query.to_lowercase());
         let limit = usize::from(request.limit.max(1));
         let mut entries = Vec::new();
         for _ in 0..DISCOVERY_PAGES {
