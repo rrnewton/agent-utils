@@ -11,7 +11,8 @@
 //!
 //! What it does not cover: a client built before the process first used [`crate::testing`]; a URL
 //! whose host is an IP literal, which is never resolved (tests use loopback literals only); and
-//! websocket clients, which are not built here.
+//! websocket clients, which are not built here. The mock voice bridge's own client
+//! (`elevenlabs::mock`) is not a vendor client and is deliberately not built here either.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
