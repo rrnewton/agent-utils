@@ -1022,6 +1022,10 @@ async fn a_reaction_added_after_the_read_arrives_as_an_update() {
     let harness = harness();
     let channel = ChannelId(READ_CHANNEL.to_owned());
     // No reactions at all when seeded: the owner's case is the FIRST reaction on a message.
+    // The other message keeps a set throughout, so the refresh read always proves it reports
+    // reactions — the gate under which an absent field may read as a removal below.
+    let reporter = harness.discord.seed(&channel, "codex-eng", "looking");
+    harness.discord.set_reactions(&reporter, Some(thumbs(1)));
     let id = harness.discord.seed(&channel, "codex-eng", "ship it");
     let mut cursor = None;
     assert_eq!(
@@ -1104,4 +1108,32 @@ async fn a_pushed_reaction_update_reaches_the_stream() {
         .expect("the channel is open");
     assert_eq!(live.kind, vibe_talk::live::LiveKind::Update);
     assert_eq!(live.message.reactions, Some(thumbs(2)));
+}
+
+/// The refresh window is never smaller than the page a reader has open: a reaction on a message
+/// forty rows back — on screen, past any smaller window — still arrives.
+#[tokio::test]
+async fn a_reaction_deep_in_the_open_page_arrives() {
+    let harness = harness();
+    let channel = ChannelId(READ_CHANNEL.to_owned());
+    let target = harness
+        .discord
+        .seed(&channel, "codex-eng", "deep in the page");
+    for i in 0..44 {
+        harness
+            .discord
+            .seed(&channel, "codex-eng", &format!("filler {i}"));
+    }
+    let mut cursor = None;
+    tick(&harness, &channel, &mut cursor).await;
+    let mut subscription = harness.live.subscribe(&channel, None);
+    harness.discord.set_reactions(&target, Some(thumbs(3)));
+    tick(&harness, &channel, &mut cursor).await;
+    let live = tokio::time::timeout(Duration::from_secs(5), subscription.receiver.recv())
+        .await
+        .expect("the update arrives")
+        .expect("the channel is open");
+    assert_eq!(live.kind, vibe_talk::live::LiveKind::Update);
+    assert_eq!(live.message.id, target);
+    assert_eq!(live.message.reactions, Some(thumbs(3)));
 }

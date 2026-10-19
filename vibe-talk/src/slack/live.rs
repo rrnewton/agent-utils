@@ -193,23 +193,30 @@ impl LiveThreads {
         }
     }
 
-    /// Diff the reaction sets `raws` report against the remembered ones, remembering the new
-    /// sets, and return the messages whose set moved. `#378 live-reactions`.
+    /// Diff the reaction sets `raws` — one read's copies, from one endpoint — report against the
+    /// remembered ones, remembering the new sets, and return the messages whose set moved.
+    /// `#378 live-reactions`.
     ///
     /// The same rules as the hub's memory ([`crate::live::LiveHub::reactions_changed`]): a
     /// message never seen is learned silently; a known message's first reported set and a set
-    /// that moved are changes; and a read copy reporting nothing where a non-empty set stood is
-    /// the last reaction removed — Slack drops the field then, and a bridge that never reports
-    /// never put a set here to lose. That raw is stamped with the empty array it means, so the
-    /// message built from it says "none" outright (`#312 slack-reactions` keeps a merely absent
-    /// field as "not reported" everywhere else).
-    fn reaction_changes(&mut self, raws: &[Raw], owner: Option<&str>) -> Vec<Raw> {
+    /// that moved are changes. A copy reporting nothing where a non-empty set stood is the last
+    /// reaction removed ONLY under `absent_means_none` — where some copy in this same read
+    /// carried a set, proving the endpoint reports them; a shim may supply them on history and
+    /// not on replies, and its silent copies must never wipe chips (`#312 slack-reactions`
+    /// keeps a merely absent field as "not reported" everywhere else). A removal's raw is
+    /// stamped with the empty array it means, so the message built from it says "none" outright.
+    fn reaction_changes(
+        &mut self,
+        raws: &[Raw],
+        owner: Option<&str>,
+        absent_means_none: bool,
+    ) -> Vec<Raw> {
         let mut changed = Vec::new();
         for raw in raws {
             let set = reactions::parse(raw.value.get("reactions"), owner);
             let held = self.reactions.get(&raw.ts).cloned();
             match (&held, &set) {
-                (Some(Some(before)), None) if !before.is_empty() => {
+                (Some(Some(before)), None) if absent_means_none && !before.is_empty() => {
                     let mut stamped = raw.clone();
                     if let Some(object) = stamped.value.as_object_mut() {
                         object.insert("reactions".to_owned(), serde_json::Value::Array(Vec::new()));
@@ -401,21 +408,36 @@ impl HttpSlackClient {
                 held.note_roots(&roots);
                 let (replies, behind, thread_seen) = self.read_moved(conversation, &mut held).await;
                 // `#378 live-reactions`. The newest page this read already fetched, and every
-                // thread page it read, carry current reaction sets: diff them all, less the
-                // messages this read already reports as new, whose sets ride with them.
+                // thread page it read, carry current reaction sets: diff them, less the messages
+                // this read already reports as new, whose sets ride with them. The two endpoints
+                // are diffed as separate reads, each proving for itself whether it reports
+                // reactions, and a root in both is taken from history only.
                 let reported: HashSet<&str> = own
                     .iter()
                     .chain(&replies)
                     .map(|raw| raw.ts.as_str())
                     .collect();
-                let candidates: Vec<Raw> = newest
-                    .raws
+                let on_page: HashSet<&str> =
+                    newest.raws.iter().map(|raw| raw.ts.as_str()).collect();
+                let select = |raws: &[Raw]| -> Vec<Raw> {
+                    raws.iter()
+                        .filter(|raw| !reported.contains(raw.ts.as_str()))
+                        .cloned()
+                        .collect()
+                };
+                let diff = |held: &mut LiveThreads, batch: &[Raw]| {
+                    let reports = batch.iter().any(|raw| {
+                        reactions::parse(raw.value.get("reactions"), owner.as_deref()).is_some()
+                    });
+                    held.reaction_changes(batch, owner.as_deref(), reports)
+                };
+                let mut changed = diff(&mut held, &select(&newest.raws));
+                let thread_only: Vec<Raw> = thread_seen
                     .iter()
-                    .chain(&thread_seen)
-                    .filter(|raw| !reported.contains(raw.ts.as_str()))
+                    .filter(|raw| !on_page.contains(raw.ts.as_str()))
                     .cloned()
                     .collect();
-                let changed = held.reaction_changes(&candidates, owner.as_deref());
+                changed.extend(diff(&mut held, &select(&thread_only)));
                 // The reported messages' sets are learned too, so their next move is a change.
                 let fresh: Vec<Raw> = own.iter().chain(&replies).cloned().collect();
                 held.learn_reactions(&fresh, owner.as_deref());

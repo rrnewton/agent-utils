@@ -1312,6 +1312,15 @@ async fn a_reaction_added_in_the_native_app_arrives_as_an_update_with_no_extra_r
     let seed = poller.poll(&fake, &client).await;
     assert!(seed.published.is_empty(), "seeding publishes nothing");
 
+    // Another message keeps a set throughout, so every history page proves the endpoint
+    // reports reactions — the gate under which a vanished field may read as a removal below.
+    fake.with(|state| {
+        let list = state.history.get_mut(CH).expect("history");
+        list[6]["reactions"] = json!([{"name": "eyes", "count": 1, "users": ["UADA00001"]}]);
+    });
+    // Learn that standing set before the target's own changes begin.
+    poller.poll(&fake, &client).await;
+
     let target = ts(50, 0);
     fake.with(|state| {
         let list = state.history.get_mut(CH).expect("history");
@@ -1362,5 +1371,42 @@ async fn a_reaction_added_in_the_native_app_arrives_as_an_update_with_no_extra_r
         removed.published[0].message.reactions,
         Some(Vec::new()),
         "and it says none outright, so the page takes the chip away"
+    );
+}
+
+/// `#378 live-reactions`: a reaction on a message older than the hub's seed window — the poll
+/// limit caps what seeding teaches the hub, while Slack's own memory holds its whole newest
+/// page — is still published: the provider's report is trusted, not re-gated on the hub.
+#[tokio::test]
+async fn a_reaction_beyond_the_seed_window_arrives() {
+    let mut state = FakeState::default();
+    let list: Vec<Value> = (0..60)
+        .map(|i| profiled(&ts(i * 10, 0), "UADA00001", "Ada", &format!("message {i}")))
+        .collect();
+    state.history.insert(CH.to_owned(), list);
+    // One page holds them all here, so Slack seeds 60 sets while the hub learns the newest 50.
+    let fake = Fake::start(state, 200).await;
+    let client = fake.client();
+    let mut poller = Poller::new();
+    poller.poll(&fake, &client).await;
+
+    fake.with(|state| {
+        let list = state.history.get_mut(CH).expect("history");
+        list[0]["reactions"] = json!([{"name": "+1", "count": 1, "users": ["UADA00001"]}]);
+    });
+    let poll = poller.poll(&fake, &client).await;
+    assert_eq!(
+        poll.tick.changed, 1,
+        "the oldest message's reaction is published"
+    );
+    assert_eq!(poll.published.len(), 1);
+    assert_eq!(poll.published[0].message.content, "message 0");
+    assert_eq!(
+        poll.published[0]
+            .message
+            .reactions
+            .as_ref()
+            .map(|sets| sets[0].emoji.as_str()),
+        Some("👍")
     );
 }

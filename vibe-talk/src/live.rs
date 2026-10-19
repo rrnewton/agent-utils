@@ -176,14 +176,15 @@ const INGEST_EVENT_PREFIX: &str = "push:";
 pub const REACTION_MEMORY: usize = 512;
 
 /// How many of a watched channel's newest messages one tick re-reads to diff their reactions
-/// against the hub's memory. `#378 live-reactions`.
+/// against the hub's memory, at least. `#378 live-reactions`.
 ///
-/// Sized to what an open page shows, and spent only on a channel somebody is watching
-/// ([`LiveHub::is_watched`]): an unwatched channel costs no refresh read at all. A provider that
-/// reads its newest page on every live read anyway (Slack, through
-/// [`crate::chat::ChatClient::fetch_live`]) reports its changes in
+/// The refresh actually asks for the poll limit or this, whichever is larger, so its window is
+/// never smaller than the page a reader has open (the page reads the same limit). Spent only on
+/// a channel somebody is watching ([`LiveHub::is_watched`]): an unwatched channel costs no
+/// refresh read at all. A provider that reads its newest page on every live read anyway (Slack,
+/// through [`crate::chat::ChatClient::fetch_live`]) reports its changes in
 /// [`crate::chat::LiveRead::changed`] and pays nothing extra.
-pub const REACTION_REFRESH_MESSAGES: u16 = 30;
+pub const REACTION_REFRESH_MESSAGES: u16 = 50;
 
 /// The smallest polling interval the configuration will accept, in seconds.
 ///
@@ -499,43 +500,57 @@ impl LiveHub {
     }
 
     /// Whether a READ copy of `message` carries a different reaction set than the remembered
-    /// one, remembering the copy's either way. `#378 live-reactions`.
+    /// one, remembering the copy's either way — decided and recorded under one lock, so a push
+    /// landing meanwhile is never overwritten by this older copy. `#378 live-reactions`.
     ///
     /// A message never seen before is learned silently (`false`): its set reaches the page with
     /// the read that brought it, and announcing it would burst an update per message after every
-    /// restart. A KNOWN message is the live case: its first reported set, a set that moved, and
-    /// — where the provider reported a non-empty set before and this read reports nothing — its
-    /// last reaction removed, since both wire formats drop the field when none are left and a
-    /// provider that never reports never put a set in memory to lose. For that last case the
-    /// copy is stamped with the empty set it means, so what is published says "none" outright.
+    /// restart. A KNOWN message is the live case: its first reported set, or a set that moved.
+    ///
+    /// The last case is gated on `absent_means_none`. Both wire formats drop the field when the
+    /// last reaction goes, but absent equally means "this endpoint cannot say"
+    /// ([`crate::model::Message::reactions`]) — a bridge may carry reactions on one read path
+    /// and not another. So a copy reporting nothing reads as the removal ONLY where the caller
+    /// knows this read reports reactions where they exist: some message in the same read carried
+    /// a set. Without that, the remembered set stands. For the removal the copy is stamped with
+    /// the empty set it means, so what is published says "none" outright.
     #[must_use]
-    pub fn reactions_changed(&self, channel: &ChannelId, message: &mut Message) -> bool {
-        if message.reactions.is_none() {
-            let held = lock(&self.reaction_memory)
-                .get(channel)
-                .and_then(|(_, sets)| sets.get(&message.id))
-                .cloned();
-            match held {
-                Some(Some(set)) if !set.is_empty() => {
-                    message.reactions = Some(Vec::new());
-                    self.note_reactions(channel, message);
-                    return true;
-                }
-                _ => {
-                    self.note_reactions(channel, message);
-                    return false;
+    pub fn reactions_changed(
+        &self,
+        channel: &ChannelId,
+        message: &mut Message,
+        absent_means_none: bool,
+    ) -> bool {
+        let mut memory = lock(&self.reaction_memory);
+        let (order, sets) = memory.entry(channel.clone()).or_default();
+        let held = sets.get(&message.id).cloned();
+        let fresh_slot = held.is_none();
+        let changed = match (&held, &message.reactions) {
+            (Some(Some(set)), None) if absent_means_none && !set.is_empty() => {
+                message.reactions = Some(Vec::new());
+                true
+            }
+            (Some(before), Some(_)) => before != &message.reactions,
+            _ => false,
+        };
+        match &message.reactions {
+            Some(reactions) => {
+                sets.insert(message.id.clone(), Some(reactions.clone()));
+            }
+            None => {
+                if fresh_slot {
+                    sets.insert(message.id.clone(), None);
                 }
             }
         }
-        let known = lock(&self.reaction_memory)
-            .get(channel)
-            .and_then(|(_, sets)| sets.get(&message.id))
-            .cloned();
-        let changed = match known {
-            Some(held) => held != message.reactions,
-            None => false,
-        };
-        self.note_reactions(channel, message);
+        if fresh_slot {
+            order.push_back(message.id.clone());
+            while order.len() > REACTION_MEMORY {
+                if let Some(evicted) = order.pop_front() {
+                    sets.remove(&evicted);
+                }
+            }
+        }
         changed
     }
 
@@ -569,8 +584,11 @@ impl LiveHub {
             .updates
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
+        // The hub's epoch is in the id, as it is in the all-stream's cursors: a page reconnecting
+        // across a restart with a stale update cursor must get a reset, never a coincidental
+        // match against this process's same-numbered update for the same message.
         let live = LiveMessage {
-            event_id: format!("{}~u{at}", message.id.as_str()),
+            event_id: format!("{}~u{}-{at}", message.id.as_str(), self.epoch),
             kind: LiveKind::Update,
             historical: false,
             message,
@@ -1309,6 +1327,14 @@ pub async fn poll_once(
                 // where the tick started would republish it, and the page cannot tell a
                 // republished message from a new one once it has scrolled away.
                 *cursor = Some(at);
+                // `#378 live-reactions`. So did the reaction changes an earlier page reported:
+                // the provider already advanced its own memory past them, so leaving them
+                // unpublished here would lose them until the set moved again.
+                for message in reported_changed.drain(..) {
+                    if !published_ids.contains(&message.id) {
+                        hub.publish_update_read(channel, message, read_start.clone());
+                    }
+                }
                 return Err(error);
             }
         };
@@ -1381,18 +1407,26 @@ pub async fn poll_once(
     // the same sets. A refresh that fails loses nothing and fails nothing: the cursor already
     // stands where the walk put it, and the next tick diffs again.
     let mut changed = 0_usize;
-    for mut message in reported_changed {
+    // A provider's own report is trusted outright: it diffed against ITS memory, which may hold
+    // messages (a full newest page, pre-seed thread replies) the hub's smaller window never
+    // learned. Gating it on the hub's memory would drop exactly those updates, permanently:
+    // the provider already stands past them.
+    for message in reported_changed {
         if published_ids.contains(&message.id) {
             continue;
         }
-        if hub.reactions_changed(channel, &mut message) {
-            hub.publish_update_read(channel, message, read_start.clone());
-            changed += 1;
-        }
+        hub.publish_update_read(channel, message, read_start.clone());
+        changed += 1;
     }
     if !apart && hub.is_watched(channel) {
-        match chat.fetch_recent(channel, REACTION_REFRESH_MESSAGES).await {
+        match chat
+            .fetch_recent(channel, limit.max(REACTION_REFRESH_MESSAGES))
+            .await
+        {
             Ok(recent) => {
+                // Whether THIS read reports reactions at all: the gate under which an absent
+                // field may read as "the last one was removed" (`LiveHub::reactions_changed`).
+                let reports = recent.iter().any(|message| message.reactions.is_some());
                 for mut message in recent {
                     if published_ids.contains(&message.id) {
                         continue;
@@ -1403,8 +1437,11 @@ pub async fn poll_once(
                         hub.note_reactions(channel, &message);
                         continue;
                     }
-                    if hub.reactions_changed(channel, &mut message) {
-                        hub.publish_update_read(channel, message, read_start.clone());
+                    if hub.reactions_changed(channel, &mut message, reports) {
+                        // Dated now, not at the tick's start: this copy was read after the
+                        // whole walk, and an older stamp would lose the cache's dating race
+                        // to a read that began while the tick ran and still holds the old set.
+                        hub.publish_update_read(channel, message, None);
                         changed += 1;
                     }
                 }
@@ -2849,22 +2886,122 @@ mod tests {
         // Never seen: learned, not announced, whatever it carries.
         let mut fresh = message(&channel, 9, "new");
         fresh.reactions = thumbs(1);
-        assert!(!hub.reactions_changed(&channel, &mut fresh));
+        assert!(!hub.reactions_changed(&channel, &mut fresh, true));
         // Seen with no answer, as every seeded message is: its first set is a change.
         let mut known = message(&channel, 5, "ship it");
         hub.note_reactions(&channel, &known);
         known.reactions = thumbs(1);
-        assert!(hub.reactions_changed(&channel, &mut known.clone()));
+        assert!(hub.reactions_changed(&channel, &mut known.clone(), true));
         // The same set again is not.
-        assert!(!hub.reactions_changed(&channel, &mut known.clone()));
+        assert!(!hub.reactions_changed(&channel, &mut known.clone(), true));
         // A copy that cannot see reactions neither announces nor downgrades…
         let mut echo = message(&channel, 5, "ship it");
         hub.note_reactions(&channel, &echo);
-        assert!(!hub.reactions_changed(&channel, &mut known.clone()));
-        // …but a READ copy reporting nothing where a set stood is the removal, stamped empty.
-        assert!(hub.reactions_changed(&channel, &mut echo));
+        assert!(!hub.reactions_changed(&channel, &mut known.clone(), true));
+        // …but a READ copy reporting nothing, from a read that reports reactions where they
+        // exist, is the removal, stamped empty. From a read that cannot say, it is nothing.
+        assert!(!hub.reactions_changed(&channel, &mut echo.clone(), false));
+        assert!(hub.reactions_changed(&channel, &mut echo, true));
         assert_eq!(echo.reactions, Some(Vec::new()));
-        assert!(!hub.reactions_changed(&channel, &mut echo.clone()));
+        assert!(!hub.reactions_changed(&channel, &mut echo.clone(), true));
+    }
+
+    /// A provider that reads replies apart, reports one reaction change on its live read, and
+    /// fails every plain page: the burst-then-failure shape of `#378 live-reactions`.
+    struct ApartStub {
+        channel: ChannelId,
+    }
+
+    #[async_trait::async_trait]
+    impl ChatClient for ApartStub {
+        async fn identity(&self) -> Result<crate::chat::ChatIdentity, ChatError> {
+            Err(ChatError::Refused("stub".to_owned()))
+        }
+        async fn fetch_page(
+            &self,
+            _channel: &ChannelId,
+            _limit: u16,
+            _before: Option<&MessageId>,
+            _after: Option<&MessageId>,
+        ) -> Result<Vec<Message>, ChatError> {
+            Err(ChatError::Refused("page down".to_owned()))
+        }
+        async fn fetch_recent(
+            &self,
+            _channel: &ChannelId,
+            _limit: u16,
+        ) -> Result<Vec<Message>, ChatError> {
+            Ok(vec![message(&self.channel, 5, "ship it")])
+        }
+        async fn post_message(
+            &self,
+            _channel: &ChannelId,
+            _content: &str,
+            _reply_to: Option<&MessageId>,
+        ) -> Result<Message, ChatError> {
+            Err(ChatError::Refused("stub".to_owned()))
+        }
+        fn polls_thread_replies(&self, _channel: &ChannelId) -> bool {
+            true
+        }
+        async fn fetch_live(
+            &self,
+            _channel: &ChannelId,
+            limit: u16,
+            after: Option<&MessageId>,
+        ) -> Result<LiveRead, ChatError> {
+            let first = message(&self.channel, 5, "ship it");
+            match after {
+                None => Ok(LiveRead {
+                    messages: vec![first],
+                    ..LiveRead::default()
+                }),
+                Some(_) => {
+                    let mut reacted = first.clone();
+                    reacted.reactions = Some(vec![Reaction {
+                        emoji: "👍".to_owned(),
+                        custom: false,
+                        custom_id: None,
+                        count: 1,
+                        owner_reacted: false,
+                    }]);
+                    Ok(LiveRead {
+                        // A full page, so the tick walks on to the page that fails.
+                        messages: (0..u64::from(limit))
+                            .map(|i| message(&self.channel, 6 + i, "burst"))
+                            .collect(),
+                        changed: vec![reacted],
+                        ..LiveRead::default()
+                    })
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_page_failure_after_a_live_read_still_publishes_its_reaction_changes() {
+        // `#378 live-reactions`. The provider advanced its own memory when it reported the
+        // change, so a tick that then fails must not take the update down with it.
+        let channel = ChannelId("1111".to_owned());
+        let stub = ApartStub {
+            channel: channel.clone(),
+        };
+        let hub = LiveHub::new();
+        let mut receiver = hub.subscribe(&channel, None).receiver;
+        let mut cursor = None;
+        poll_once(&stub, &hub, &channel, 2, &mut cursor)
+            .await
+            .expect("the seed reads");
+        let failed = poll_once(&stub, &hub, &channel, 2, &mut cursor).await;
+        assert!(failed.is_err(), "the second page fails the tick");
+        let mut kinds = Vec::new();
+        while let Ok(live) = receiver.try_recv() {
+            kinds.push((live.kind, live.message.id.as_str().to_owned()));
+        }
+        assert!(
+            kinds.contains(&(LiveKind::Update, "5".to_owned())),
+            "the reaction update went out before the error: {kinds:?}"
+        );
     }
 
     fn message(channel: &ChannelId, id: u64, content: &str) -> Message {
