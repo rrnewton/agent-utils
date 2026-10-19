@@ -336,13 +336,15 @@ async fn a_slack_hint_wakes_only_the_slack_provider_task() {
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_millis(vibe_talk::live::HINT_COALESCE_MILLIS)).await;
+    // Three fetches in all: the seed, the hinted read, and that read's reaction refresh
+    // (`#378 live-reactions`) — the subscriber above makes the channel watched, so it pays one.
     for _ in 0..100 {
-        if slack.fetch_count() >= 2 {
+        if slack.fetch_count() >= 3 {
             break;
         }
         tokio::task::yield_now().await;
     }
-    assert_eq!(slack.fetch_count(), 2, "the Slack hint was not consumed");
+    assert_eq!(slack.fetch_count(), 3, "the Slack hint was not consumed");
     assert_eq!(
         discord.fetch_count(),
         2,
