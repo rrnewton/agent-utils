@@ -1,12 +1,13 @@
 ---
 title: 'compact-collapsed-rows: a collapsed message''s header fits on one line, with Reply and Done once it is opened'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-19T18:49:58.836382185+00:00
-updated_at: 2026-10-19T18:49:58.836382185+00:00
+updated_at: 2026-10-19T20:37:18.934410966+00:00
+closed_at: 2026-10-19T20:37:18.934410836+00:00
 ---
 
 # Description
