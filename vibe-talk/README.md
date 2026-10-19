@@ -3194,8 +3194,11 @@ replies too. That is a possible future path, not something any bridge here does 
   that is off refuses it, so a page still showing On after another device turned it off cannot turn
   it back on. Turning a channel on pushes nothing by itself: the next message that arrives is pushed,
   and with it everything before it.
-* **All channels at once** (`#349 channel-settings-all`). With two or more channels, Settings'
-  channel picker opens with **All channels**. Chosen, the box reads the setting of every channel
+* **All channels at once** (`#349 channel-settings-all`). With two or more channels, at least one of
+  which can take Clear unread with the token in use (the write token, on a chat service that can clear
+  unread), Settings' channel picker offers **All channels** as its first choice. With the read token,
+  or where no channel's chat service can clear unread, it is not offered, as it would have nothing to
+  set (`#351 settings-polish`). Chosen, the box reads the setting of every channel
   whose provider can clear unread and shows the mode they share, or **Mixed** when they differ (a
   choice that cannot be saved), with a line saying how many are in each mode and how many channels'
   services cannot clear unread at all. **Save** puts the chosen mode on each of those channels, one

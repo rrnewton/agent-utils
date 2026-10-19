@@ -58772,6 +58772,55 @@ test("`#351 settings-polish`: All channels is offered only where a channel can t
   assert.equal(offersAll(blind), true, "the negative control left All channels out anyway, so the check above proves nothing");
 });
 
+/**
+ * `#351 settings-polish`, from its review. What a description of All channels leaves out about when the
+ * picker offers it, as sentences: two channels or more, at least one of which can take Clear unread with
+ * the token in use, so not to the read token, nor where no channel's chat service can clear unread.
+ */
+function allChannelsOfferProblems(text) {
+  const flat = text.replace(/<[^>]+>/g, "").replace(/\s+/g, " ");
+  const problems = [];
+  if (!/two or more channels/.test(flat)) problems.push("two channels or more is not said");
+  if (!/at least one of (them|which) can take Clear unread with (this|your|the) token/.test(flat)) {
+    problems.push("a channel that can take Clear unread with the token is not said to be needed");
+  }
+  if (!/(With|never to) the read token/.test(flat)) problems.push("the read token is not said to go without it");
+  if (!/where no channel's chat service can clear unread/.test(flat)) {
+    problems.push("a chat service that cannot clear unread is not said to go without it");
+  }
+  return problems;
+}
+
+test("`#351 settings-polish`: Help, the README and the markup say when All channels is offered, as the picker does", async () => {
+  // The page first: two channels, offered with the write token on a service that can clear unread, and
+  // not with the read token. The test above covers each case; this one holds the words to them.
+  assert.equal(pickerChoices(await allChannelsPage())[0][0], "*", "All channels is not offered at all");
+  assert.notEqual(pickerChoices(await allChannelsPage({}, (page) => { page.tokenScope = "read"; }))[0][0], "*");
+  const paragraph = (html) => {
+    const at = html.indexOf("<strong>All channels</strong>");
+    assert.ok(at > 0, "Help no longer describes All channels");
+    return html.slice(html.lastIndexOf("<p", at), html.indexOf("</p>", at));
+  };
+  const help = paragraph(helpEntry("channel-alias"));
+  assert.deepStrictEqual(allChannelsOfferProblems(help), [], "Help's Channels entry");
+  const readme = readFileSync(join(WEB, "..", "README.md"), "utf8");
+  const bullet = readme.slice(readme.indexOf("* **All channels at once**"), readme.indexOf("\n* ", readme.indexOf("* **All channels at once**") + 1));
+  assert.ok(bullet.length > 0, "the README no longer has its All channels bullet");
+  assert.deepStrictEqual(allChannelsOfferProblems(bullet), [], "the README's All channels bullet");
+  const comment = HTML.slice(HTML.indexOf("`#349 channel-settings-all`. The picker's first choice"), HTML.indexOf("-->", HTML.indexOf("`#349 channel-settings-all`. The picker's first choice")));
+  assert.ok(comment.length > 0, "the markup no longer says what the picker's first choice is");
+  assert.deepStrictEqual(allChannelsOfferProblems(comment), [], "the markup comment over the channel box");
+  // The negative control: the entry as it was, offering it wherever there are two channels.
+  const old = "<p class=\"hint\"><strong>All channels</strong>, the picker's first choice when there are two or more, " +
+    "is for setting <strong>Clear unread</strong> on every channel at once.</p>";
+  assert.deepStrictEqual(allChannelsOfferProblems(old), [
+    "two channels or more is not said",
+    "a channel that can take Clear unread with the token is not said to be needed",
+    "the read token is not said to go without it",
+    "a chat service that cannot clear unread is not said to go without it",
+  ]);
+});
+
 test("`#349 channel-settings-all`: with All channels, Rename and Remove step aside, Add and Browse stay, and the line says how many", async () => {
   const page = await allChannelsPage({}, (page) => { page.channelDiscoverySupported = true; });
   await settingsChannel(page, "*");

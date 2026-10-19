@@ -1553,10 +1553,14 @@
 
                     <!--
                       `#349 channel-settings-all`. The picker's first choice is All channels, offered when
-                      there are two or more: the owner, 2026-10-18, "Clear unread can be set for all at
-                      once". With it chosen the line above says how many, Rename and Remove step aside
-                      (they name one channel), Add and Browse stay, and Clear unread below shows the
-                      channels' common mode, or Mixed, and Save sets it on every channel whose service can.
+                      there are two or more channels and, `#351 settings-polish`, at least one of them can
+                      take Clear unread with this token (`upstreamClearAllChannels`: the write token, on a
+                      chat service that can clear unread). So never to the read token, nor where no
+                      channel's chat service can clear unread: it would have nothing to set. The owner,
+                      2026-10-18: "Clear unread can be set for all at once". With it chosen the line above
+                      says how many, Rename and Remove step aside (they name one channel), Add and Browse
+                      stay, and Clear unread below shows the channels' common mode, or Mixed, and Save sets
+                      it on every channel whose service can.
                     -->
                     <div class="channel-actions">
                       <button id="rename-channel" class="secondary" type="button" aria-expanded="false" aria-controls="rename-fields">Rename</button>
@@ -2527,9 +2531,12 @@
                 the top of it. Every other setting on the screen applies to the whole app.
               </p>
               <p class="hint">
-                <strong>All channels</strong>, the picker's first choice when there are two or
-                more, is for setting <strong>Clear unread</strong> on every channel at once. Its
-                choice shows the mode they all have, or <em>Mixed</em> when they differ, and Save
+                <strong>All channels</strong> is for setting <strong>Clear unread</strong> on every
+                channel at once. It is the picker's first choice when there are two or more channels
+                and at least one of them can take Clear unread with your token: signed in with the
+                write token, on a chat service that can clear unread. With the read token, or where no
+                channel's chat service can clear unread, it is not offered. Its choice shows the mode
+                they all have, or <em>Mixed</em> when they differ, and Save
                 sets the one chosen on every channel whose chat service can clear unread, saying how
                 many it reached. Rename and Remove name one channel, so they step aside; Add and
                 Browse stay. Who is who, which used to sit at the foot of this group, is under
