@@ -656,15 +656,17 @@ agentctl watch-agents --coordinator coordinator
 ```
 
 Every `--interval` seconds (default 60) it lists the registry and reads each
-running agent except the coordinator — paused and agentcloud agents are
-skipped, and a `launch_failed` record, which `start` already reported, is left
-alone. It reports an agent to the coordinator when a condition holds past its
-threshold:
+running or starting agent except the coordinator — paused, mid-move, and
+agentcloud agents are skipped, and a `launch_failed` record, which `start`
+already reported, is left alone; a record that cannot be read is watched as
+unreachable rather than skipped. One watcher runs per `--state-dir`; a second
+is refused while the first holds its lock. It reports an agent to the
+coordinator when a condition holds past its threshold:
 
 | condition | threshold | meaning |
 |---|---|---|
 | `approval-prompt` | `--approval-minutes` (default 5) | a harness approval, permission, or trust prompt at the bottom of the screen |
-| `idle-no-verdict` | `--idle-minutes` (default 15) | idle or done, work was delivered and drained, and no line starts with a `--done-marker` (default `DONE:` or `BLOCKED:`) near the bottom of the screen |
+| `idle-no-verdict` | `--idle-minutes` (default 15) | idle or done, work was delivered and drained, and no line starts with a `--done-marker` near the bottom of the screen; markers are `DONE:` and `BLOCKED:` unless `--done-marker` is given, which replaces them |
 | `stalled` | `--stall-minutes` (default 30) | marked working, timed from the last screen change |
 | `dead` | `--dead-minutes` (default 5) | the record says running but the harness cannot be reached |
 
@@ -678,15 +680,20 @@ coordinator. A condition past its threshold becomes **one notice per episode**:
 notices from one pass ride in a single message, messages are at least
 `--min-notice-interval` seconds apart (default 300), and the message goes
 through the same durable queue as `agentctl send`, so a coordinator that is
-busy simply keeps it queued. The notice names the agent, the condition, and
+busy simply keeps it queued. If the agent recovers before its notice is sent,
+the notice is withdrawn. The notice names the agent, the condition, and
 the proving line or probe error, and points at `agentctl status NAME` and
 `agentctl read NAME`. Episode memory — when each condition was first seen,
 whether it was reported, and notices still owed — is kept in
 `agent-watch-state.json` in `--state-dir` (default
 `$XDG_STATE_HOME/agentctl/agent-watch`), next to the last pass's
-`agent-watch.json`, so restarting the watcher never reports an episode twice.
-`--once` runs a single pass, prints it as JSON, and exits 0 when no episode
-has been reported, 1 otherwise; `--check-only` sends nothing.
+`agent-watch.json`. A batch's queue ID is derived from its notices, so a
+watcher stopped between queueing a batch and recording that fact re-derives
+the same ID after a restart and the coordinator's queue recognises it instead
+of delivering it twice. `--once` runs a single pass, prints it as JSON, and
+exits 0 only when the team could be probed and no episode is reported or due,
+1 otherwise; `--check-only` sends nothing and does not consume an episode's
+one report.
 
 Run it beside `agent-watch.service` under its own user unit. This unit is a
 sample: `install-units` does not write it, and nothing here installs it.
