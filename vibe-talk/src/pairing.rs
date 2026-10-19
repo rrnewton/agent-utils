@@ -16,15 +16,19 @@
 //!   nothing about it outlives the process, and a restart burns every live code.
 //! * **Guessing is hopeless and is also limited.** A code is 32 bytes from the system CSPRNG
 //!   (256 bits), so it cannot be guessed; failed redemptions are capped per client address all the
-//!   same ([`FAILURE_LIMIT`] per [`FAILURE_WINDOW`]), and the cap answers before the code is looked
-//!   at. Comparison runs over every live hash without an early exit.
+//!   same ([`FAILURE_LIMIT`] per [`FAILURE_WINDOW`]). A live code is still granted to a limited
+//!   address, so one client's failures cannot lock everyone behind a shared proxy out of pairing.
+//!   Comparison runs over every live hash without an early exit.
 //! * **Nothing secret is logged.** Mint, redeem and expiry each log one line naming the code by
 //!   the first few hex digits of its hash ([`hash_prefix`]), which identifies it across the three
 //!   lines and is useless to anyone holding the log.
 //!
 //! What it does NOT do: it hands out the one write token the server has, so a redeemed link is as
 //! good as the token itself, for as long as the token is. Revoking a paired phone means rotating
-//! `VIBE_TALK_WRITE_TOKEN`, as it always did.
+//! `VIBE_TALK_WRITE_TOKEN`, as it always did. And the link is only as private as the place it is
+//! sent: pasted into a channel this server bridges, it can be read by any read-scope caller —
+//! the hosted voice agent included — who can then redeem it first. The person is then told the
+//! link was already used, and the redemption is logged at WARN with the client's address.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -41,8 +45,8 @@ pub const MAX_TTL: Duration = Duration::from_secs(600);
 /// The most codes that may be live at once. Each is a few dozen bytes, so this bounds memory
 /// rather than use: a minting agent that leaks codes is told so, and an expired code frees its slot.
 pub const MAX_LIVE: usize = 32;
-/// Failed redemptions a client address may make in one [`FAILURE_WINDOW`] before it is answered
-/// 429 without its code being looked at.
+/// Failed redemptions a client address may make in one [`FAILURE_WINDOW`] before its further
+/// failures are answered 429. A live code is still granted.
 pub const FAILURE_LIMIT: u32 = 10;
 /// The window [`FAILURE_LIMIT`] counts over.
 pub const FAILURE_WINDOW: Duration = Duration::from_secs(60);
@@ -81,7 +85,7 @@ pub enum Redeemed {
     /// No live code matched: wrong, expired, already used, or not a code at all. Deliberately one
     /// answer, so a caller cannot tell a used code from one that never existed.
     Refused,
-    /// This address has failed too often lately; the code was not looked at.
+    /// No live code matched, and this address has failed too often lately.
     Limited,
 }
 
@@ -237,25 +241,6 @@ impl Pairing {
     pub fn redeem_at(&self, presented: &str, client: Client, now: Instant) -> Redeemed {
         let mut table = self.lock();
         expire(&mut table, now);
-        // The limit answers first, so a limited caller learns nothing about its code.
-        table
-            .failures
-            .retain(|_, seen| now.saturating_duration_since(seen.since) < FAILURE_WINDOW);
-        let failed = table.failures.get(&client).map_or(0, |seen| seen.count);
-        if failed >= self.failure_limit {
-            tracing::warn!(
-                ?client,
-                "pairing redeem refused: too many failures from this client"
-            );
-            return Redeemed::Limited;
-        }
-        if failed == 0 && table.failures.len() >= MAX_TRACKED_ADDRESSES {
-            tracing::warn!(
-                ?client,
-                "pairing redeem refused: too many clients failing at once"
-            );
-            return Redeemed::Limited;
-        }
         let hash = digest(presented);
         // Every live hash is compared, all the way through, whichever matches.
         let mut found = None;
@@ -264,15 +249,41 @@ impl Pairing {
                 found = Some(index);
             }
         }
+        // A live code is granted even to a limited address. Behind a reverse proxy every client
+        // shares one address, and a limit that refused the right code would let one person's
+        // failures lock everyone out of pairing; a 256-bit code is what stops guessing, and the
+        // limit only bounds how fast anyone can be refused.
         if let Some(index) = found {
             let burned = table.live.swap_remove(index);
-            tracing::info!(code = %hash_prefix(&burned.hash), ?client, "pairing code redeemed");
+            // WARN, so a redemption is visible at any log level a deployment runs at: a person told
+            // "already used" for a link they never opened can find who did.
+            tracing::warn!(code = %hash_prefix(&burned.hash), ?client, "pairing code redeemed");
             return Redeemed::Granted;
         }
+        table
+            .failures
+            .retain(|_, seen| now.saturating_duration_since(seen.since) < FAILURE_WINDOW);
+        if !table.failures.contains_key(&client) && table.failures.len() >= MAX_TRACKED_ADDRESSES {
+            return Redeemed::Limited;
+        }
+        let limit = self.failure_limit;
         let seen = table.failures.entry(client).or_insert(Failures {
             since: now,
             count: 0,
         });
+        if seen.count >= limit {
+            // One line when an address first crosses the limit, and none for the rest of its
+            // window: the access log already has a line per request.
+            if seen.count == limit {
+                seen.count = limit.saturating_add(1);
+                tracing::warn!(
+                    ?client,
+                    "pairing redemptions from this client are refused for the rest of the minute: \
+                     too many failures"
+                );
+            }
+            return Redeemed::Limited;
+        }
         seen.count += 1;
         let count = seen.count;
         tracing::info!(
@@ -432,32 +443,53 @@ mod tests {
     }
 
     #[test]
-    fn failures_are_limited_per_address_and_the_limit_answers_before_the_code() {
+    fn failures_are_limited_per_address_and_a_live_code_is_still_granted() {
         let now = Instant::now();
         let pairing = Pairing::new();
         let minted = pairing.mint_at(None, now, wall()).expect("mint");
         for _ in 0..FAILURE_LIMIT {
             assert_eq!(pairing.redeem_at("wrong", HERE, now), Redeemed::Refused);
         }
-        // Even the right code is not looked at once the address is limited.
-        assert_eq!(
-            pairing.redeem_at(&minted.code, HERE, now),
-            Redeemed::Limited
-        );
+        assert_eq!(pairing.redeem_at("wrong", HERE, now), Redeemed::Limited);
+        assert_eq!(pairing.redeem_at("wrong", HERE, now), Redeemed::Limited);
         // Another address is not limited by this one's failures.
         let there = Client::of(Some("198.51.100.9".parse().expect("ip")));
+        assert_eq!(pairing.redeem_at("wrong", there, now), Redeemed::Refused);
+        // The right code is granted even to the limited address: behind a proxy, that address is
+        // everyone's.
         assert_eq!(
-            pairing.redeem_at(&minted.code, there, now),
+            pairing.redeem_at(&minted.code, HERE, now),
             Redeemed::Granted
         );
         // The window lapses.
-        let later = pairing
-            .mint_at(None, now + FAILURE_WINDOW, wall())
-            .expect("mint");
         assert_eq!(
-            pairing.redeem_at(&later.code, HERE, now + FAILURE_WINDOW),
-            Redeemed::Granted
+            pairing.redeem_at("wrong", HERE, now + FAILURE_WINDOW),
+            Redeemed::Refused
         );
+    }
+
+    #[test]
+    fn two_redemptions_racing_for_one_code_get_one_grant() {
+        for _ in 0..50 {
+            let pairing = std::sync::Arc::new(Pairing::new());
+            let code = pairing.mint(None).expect("mint").code;
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let racers: Vec<_> = (0..8)
+                .map(|_| {
+                    let (pairing, code, barrier) = (pairing.clone(), code.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        pairing.redeem(&code, HERE)
+                    })
+                })
+                .collect();
+            let granted = racers
+                .into_iter()
+                .map(|racer| racer.join().expect("join"))
+                .filter(|answer| *answer == Redeemed::Granted)
+                .count();
+            assert_eq!(granted, 1);
+        }
     }
 
     #[test]

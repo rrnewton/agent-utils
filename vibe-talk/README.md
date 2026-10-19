@@ -972,6 +972,14 @@ would, and then the link is dead: it works **once**, and only for **five minutes
    they open it on their phone, and the app comes up signed in. If it has expired or was already
    used, the page says so and asks for a new one; run step 3 again.
 
+**Send it where only the person will read it.** Whoever opens the link first gets the write token.
+In particular, do NOT paste it into a channel this server bridges: every read-scope caller can read
+that channel, the hosted voice agent holding the read token included, and could redeem the link
+before the person does. A direct conversation with the person that vibe-talk does not read is the
+right place. If the person is told the link was already used when they had not opened it, someone
+else did: the server logs every redemption at WARN with the client's address, and the remedy is to
+rotate `VIBE_TALK_WRITE_TOKEN`. `pair-link` repeats this on standard error each time it runs.
+
 What it does, so it can be judged:
 
 * `POST /api/v1/pair` (write token) mints the code: 32 bytes from the system CSPRNG, base64url.
@@ -980,10 +988,12 @@ What it does, so it can be judged:
 * `POST /api/v1/pair/redeem` with `{"code": "..."}` (no token) answers `{"token": "..."}` once for
   a live code and burns it. Every refusal, whether the code is unknown, expired, used or malformed,
   is the same `410 pairing_link_invalid`, and each counts against the client's address: after ten
-  in a minute the address gets `429` for the rest of that minute, before its code is even looked
-  at. An IPv6 client is counted by its /64. **Behind a reverse proxy every client has the proxy's
-  address**, so the limit is shared by everyone coming through it; the 256-bit code is what
-  actually stops guessing, and the limit only caps how fast anyone can try.
+  in a minute, that address's further failures get `429` for the rest of the minute. A live code is
+  still granted, because **behind a reverse proxy every client has the proxy's address** and one
+  person's failures must not lock everyone out of pairing. An IPv6 client is counted by its /64.
+  The 256-bit code is what actually stops guessing; the limit only caps how fast anyone can fail.
+* `vibe-talk pair-link` sends the write token only to an address of this host (loopback, or one
+  assigned to a local interface), never through a proxy, and follows no redirect.
 * The page takes the code out of its own address with `history.replaceState` before it makes any
   request, so it is not left in the address bar, the history or a bookmark. A fragment is never
   sent to a server, so the code reaches no access log; it travels only in the body of the one

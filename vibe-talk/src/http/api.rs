@@ -1287,8 +1287,9 @@ pub async fn mint_pairing(
 /// No bearer token: the code in the body is the credential, and the bearer layer exempts this one
 /// method on this one path. Every refusal is the SAME answer — a malformed body, an unknown code,
 /// an expired one and a used one all get 410 — so the route says nothing about which codes exist,
-/// and each counts against the client's failure limit, which answers 429 before the code is looked
-/// at. The client is the connection's peer address; see [`crate::pairing::Client`].
+/// and each counts against the client's failure limit, past which further failures get 429 (a live
+/// code is still granted). The client is the connection's peer address; see
+/// [`crate::pairing::Client`].
 pub async fn redeem_pairing(State(state): State<AppState>, request: Request) -> Response {
     let peer = request
         .extensions()
@@ -1320,7 +1321,7 @@ pub async fn redeem_pairing(State(state): State<AppState>, request: Request) -> 
             let mut response = ApiError::new(
                 StatusCode::TOO_MANY_REQUESTS,
                 "too_many_attempts",
-                "too many pairing attempts from this address; wait a minute, then ask for a new link",
+                "too many failed pairing attempts from this address; wait a minute, then ask for a new link",
             )
             .into_response();
             response.headers_mut().insert(

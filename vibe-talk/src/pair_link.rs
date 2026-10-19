@@ -25,12 +25,15 @@ USAGE:
 Asks the vibe-talk server running on this host for a single-use pairing code, and prints a link
 to the app carrying it, then when the link expires. Opening the link signs that browser in with the
 write token, exactly as pasting the token into the sign-in form would. The link works ONCE, and
-only until it expires; send it to the person in chat and they open it on their phone.
+only until it expires; send it to the person in chat and they open it on their phone. Send it
+where read-token holders cannot see it: anyone who reads the link first can use it, and in a channel
+vibe-talk bridges that includes the voice agent that holds the read token.
 
 The write token is read from the server's own configuration (the file, then VIBE_TALK_WRITE_TOKEN,
 which wins) and is never printed. The server is reached on the configuration's [server] bind
-address; 0.0.0.0 and [::] are reached on loopback. Nothing but the link and its expiry is written
-to standard output; diagnostics go to standard error.
+address; 0.0.0.0 and [::] are reached on loopback, and an address that is not this host's is
+refused. Nothing but the link and its expiry is written to standard output; diagnostics, and a
+reminder of where the link is safe to send, go to standard error.
 
 OPTIONS:
     --config PATH          the server's configuration file, found exactly as the server finds it
@@ -130,6 +133,13 @@ pub async fn run(options: Options) -> anyhow::Result<PairLink> {
         )?;
     let base = link_base(&base)?;
     let server = local_address(config.bind);
+    if !is_this_host(server.ip()) {
+        anyhow::bail!(
+            "the configuration's bind address {} is not an address of this host, and the write \
+             token is sent only to this host; run pair-link where the server runs",
+            server.ip()
+        );
+    }
     let client = reqwest::Client::builder()
         // The server is on this host. A proxy from the environment would carry the write token
         // somewhere else, so none is used, and a redirect is an answer, never followed.
@@ -201,6 +211,20 @@ pub fn local_address(bind: SocketAddr) -> SocketAddr {
     SocketAddr::new(ip, bind.port())
 }
 
+/// Whether `ip` is loopback or assigned to one of this host's interfaces: only such an address can
+/// be bound, so a configuration copied from another host cannot send the token there.
+#[must_use]
+pub fn is_this_host(ip: IpAddr) -> bool {
+    ip.is_loopback() || std::net::UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok()
+}
+
+/// What `pair-link` says on standard error once the link is printed: where it is safe to send.
+pub const SEND_WARNING: &str = "\
+Send this link only where the person will see it and read-token holders will not. Anyone who
+reads it first can use it — in a channel vibe-talk bridges, that includes the voice agent holding
+the read token. It works once: if the person is told it was already used when they had not opened
+it, someone else did, and VIBE_TALK_WRITE_TOKEN should be rotated.";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,6 +243,15 @@ mod tests {
             local_address("10.0.0.5:9".parse().expect("addr")),
             "10.0.0.5:9".parse::<SocketAddr>().expect("addr")
         );
+    }
+
+    #[test]
+    fn only_an_address_of_this_host_is_sent_the_token() {
+        assert!(is_this_host("127.0.0.1".parse().expect("ip")));
+        assert!(is_this_host("::1".parse().expect("ip")));
+        // TEST-NET-1 and the IPv6 documentation prefix: assigned to no host.
+        assert!(!is_this_host("192.0.2.1".parse().expect("ip")));
+        assert!(!is_this_host("2001:db8::1".parse().expect("ip")));
     }
 
     #[test]
