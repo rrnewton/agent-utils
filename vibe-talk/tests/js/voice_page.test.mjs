@@ -29661,7 +29661,7 @@ test("each channel uses its own provider's capabilities in a multi-provider depl
 const pickerGroups = (page, id) =>
   page.el(id).children
     .filter((kid) => kid.tagName === "optgroup")
-    .map((group) => [group.label, group.children.map((option) => option.textContent)]);
+    .map((group) => [group.getAttribute("label"), group.children.map((option) => option.textContent)]);
 
 /** A deployment of two providers whose channels the server lists interleaved. */
 function twoProviderPage(providers) {

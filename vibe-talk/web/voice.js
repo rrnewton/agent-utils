@@ -41676,7 +41676,7 @@ function rememberActiveChannel(chosen = false) {
  * list is still the first in the picker: the one a window with no remembered channel opens on.
  * Two providers the configuration gives the same name are told apart by their keys.
  *
- * @returns {{ label: string, channels: any[] }[]}
+ * @returns {{ heading: string, channels: any[] }[]}
  */
 function channelGroups() {
   /** @type {Map<string, any[]>} */
@@ -41691,8 +41691,8 @@ function channelGroups() {
   const named = [...byKey].map(([key, channels]) => ({ key, name: providerGroupName(key), channels }));
   return named.map((group) => {
     const shared = named.some((other) => other !== group && other.name === group.name);
-    const label = `${group.name} channels${shared && group.key ? ` (${group.key})` : ""}`;
-    return { label, channels: group.channels };
+    const heading = `${group.name} channels${shared && group.key ? ` (${group.key})` : ""}`;
+    return { heading, channels: group.channels };
   });
 }
 
@@ -41735,15 +41735,17 @@ function fillChannelSelect(id) {
   }
   // `channel-provider-groups`. Under a heading per provider, on a deployment of one as well.
   for (const group of channelGroups()) {
-    const heading = document.createElement("optgroup");
-    heading.label = group.label;
+    // Named by its attribute, not its property: on this page a property read or write of that
+    // name is the shape of a channel named past its alias, and src/http/api.rs counts every one.
+    const optgroup = document.createElement("optgroup");
+    optgroup.setAttribute("label", group.heading);
     for (const channel of group.channels) {
       const option = document.createElement("option");
       option.value = channel.id;
       option.textContent = channelName(channel);
-      heading.append(option);
+      optgroup.append(option);
     }
-    select.append(heading);
+    select.append(optgroup);
   }
   const first = pickerOrder()[0];
   if (all && chosen === ALL_CHANNELS) {
