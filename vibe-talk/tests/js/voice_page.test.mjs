@@ -5287,13 +5287,30 @@ function pairingPage(store = new Map(), arrangeMore = null) {
   return { page, seen };
 }
 
+/** Tap Sign this device in, and let the page finish. */
+async function confirmPairing(page) {
+  assert.equal(page.el("pair-offer").hidden, false, "no offer to pair");
+  await page.el("pair-confirm").click();
+  await page.settle();
+}
+
 test("a pairing link's code leaves the address before the page makes any request", async () => {
   const { page, seen } = pairingPage();
   await page.settle();
   assert.equal(seen.requestsBefore, 0, "the page made a request while the code was still in the address");
   assert.equal(seen.address, "/?from=chat", "the fragment, and only the fragment, is gone");
+  await confirmPairing(page);
   assert.ok(!page.history.addresses.some((address) => address.includes(PAIR_CODE)), "the code went into history");
   assert.ok(!page.requests.some((request) => request.includes(PAIR_CODE)), "the code went into a URL");
+});
+
+test("opening a pairing link spends nothing until the person taps Sign this device in", async () => {
+  const { page } = pairingPage();
+  await page.settle();
+  assert.equal(page.screen(), "signin");
+  assert.equal(page.el("pair-offer").hidden, false, "the page did not offer to pair");
+  assert.match(page.el("pair-offer-text").textContent, /signs this browser in/);
+  assert.deepStrictEqual(page.pairRedeems, [], "the page redeemed the code with nobody's tap: a link scanner would spend it");
 });
 
 test("a pairing link signs the browser in with the token it redeems for, as Save does", async () => {
@@ -5302,10 +5319,12 @@ test("a pairing link signs the browser in with the token it redeems for, as Save
     p.pairRedeem = async () => json(200, { token: "write-token-from-pairing-00" });
   });
   await page.settle();
+  await confirmPairing(page);
   assert.deepStrictEqual(page.pairRedeems.map((one) => one.body), [{ code: PAIR_CODE }]);
   assert.ok(!("Authorization" in page.pairRedeems[0].headers), "the redemption carried a bearer token");
   assert.equal(store.get("vibe-talk.token"), "write-token-from-pairing-00");
   assert.equal(page.screen(), "main", "pairing did not continue signed in");
+  assert.equal(page.el("pair-offer").hidden, true, "the spent offer stayed up");
   assert.ok(page.requests.indexOf("POST /api/v1/pair/redeem") < page.requests.findIndex((r) => r.startsWith("GET /api/v1/client-config")),
     "the page asked for its configuration before it had the token");
 });
@@ -5314,9 +5333,12 @@ test("an expired or used pairing link says so plainly, and to ask for a new one"
   const store = new Map();
   const { page } = pairingPage(store);
   await page.settle();
+  await confirmPairing(page);
   assert.equal(page.screen(), "signin");
   assert.equal(store.get("vibe-talk.token"), undefined, "a refused link stored something");
   assert.match(page.el("error").textContent, /expired or was already used\. Ask for a new one/);
+  assert.match(page.el("error").textContent, /someone else may have/);
+  assert.equal(page.el("pair-offer").hidden, true, "a spent link was offered again");
 });
 
 test("a pairing link refused for too many attempts says to wait, and a stale link leaves a signed-in phone signed in", async () => {
@@ -5325,9 +5347,21 @@ test("a pairing link refused for too many attempts says to wait, and a stale lin
     p.pairRedeem = async () => json(429, { error: "too_many_attempts", detail: "wait" });
   });
   await page.settle();
+  await confirmPairing(page);
   assert.equal(page.screen(), "main", "a failed link signed the phone out");
   assert.equal(store.get("vibe-talk.token"), "write-token-aaaaaaaaaaaaaaaa");
   assert.match(page.el("error").textContent, /Too many pairing attempts.*Wait a minute/);
+});
+
+test("Not now leaves the link unspent and a signed-in phone signed in", async () => {
+  const store = new Map([["vibe-talk.token", "write-token-aaaaaaaaaaaaaaaa"]]);
+  const { page } = pairingPage(store);
+  await page.settle();
+  await page.el("pair-dismiss").click();
+  await page.settle();
+  assert.deepStrictEqual(page.pairRedeems, []);
+  assert.equal(page.el("pair-offer").hidden, true);
+  assert.equal(page.screen(), "main");
 });
 
 test("a READ token is told it is the wrong SCOPE, not that it was refused", async () => {

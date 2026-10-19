@@ -302,7 +302,7 @@ async fn pair_link_prints_a_working_link_and_its_expiry_and_never_the_token() {
     let ahead = expires.duration_since(jiff::Timestamp::now()).as_secs();
     assert!((100..=120).contains(&ahead), "--ttl 120: {ahead}");
     assert!(
-        stderr.contains("read-token holders"),
+        stderr.contains("Send this link only where the person will read it"),
         "no reminder of where it is safe to send: {stderr}"
     );
     assert_eq!(pairing.live(), 1);
@@ -358,4 +358,129 @@ async fn pair_link_says_when_the_server_is_not_running() {
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("is it running"), "{stderr}");
     assert!(!stderr.contains(&WRITE_TOKEN[..12]), "{stderr}");
+}
+
+// --- a link pasted into a bridged channel ------------------------------------------------------
+
+/// GET `uri` with `token`, and the whole body as text.
+async fn read_text(router: &axum::Router, uri: &str, token: &str) -> String {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(response.status(), StatusCode::OK, "{uri}");
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[tokio::test]
+async fn a_link_in_a_bridged_channel_never_reaches_a_read_scope_caller() {
+    let (state, discord) = vibe_talk::testing::state();
+    let live = std::sync::Arc::clone(&state.live);
+    let router = router(state);
+    let code = mint(&router, "{}").await;
+    let channel = vibe_talk::model::ChannelId(vibe_talk::testing::READ_CHANNEL.to_owned());
+    let mut cursor = None;
+    vibe_talk::live::poll_once(discord.as_ref(), live.as_ref(), &channel, 50, &mut cursor)
+        .await
+        .expect("seed");
+    // A live stream, opened by the read token before the link is posted.
+    let mut stream = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/channels/{}/stream", channel.0))
+                .header("authorization", format!("Bearer {READ_TOKEN}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("router responds")
+        .into_body();
+    discord.seed(
+        &channel,
+        "coordinator",
+        &format!("here is your link: https://vibe.example/#pair={code} (five minutes)"),
+    );
+    vibe_talk::live::poll_once(discord.as_ref(), live.as_ref(), &channel, 50, &mut cursor)
+        .await
+        .expect("publish");
+    let mut streamed = String::new();
+    while !streamed.contains("five minutes") {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), stream.frame())
+            .await
+            .unwrap_or_else(|_| panic!("the stream sent nothing: {streamed:?}"))
+            .expect("the stream ended")
+            .expect("frame");
+        if let Some(data) = frame.data_ref() {
+            streamed.push_str(&String::from_utf8_lossy(data));
+        }
+    }
+
+    let messages = format!("/api/v1/channels/{}/messages?limit=5", channel.0);
+    let as_reader = read_text(&router, &messages, READ_TOKEN).await;
+    let as_owner = read_text(&router, &messages, WRITE_TOKEN).await;
+    let mcp = {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("authorization", format!("Bearer {READ_TOKEN}"))
+                    .header("content-type", "application/json")
+                    .header("accept", "application/json, text/event-stream")
+                    .body(Body::from(
+                        json!({
+                            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                            "params": { "name": "read_page",
+                                        "arguments": { "channel_id": channel.0 } },
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("router responds");
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    for (what, text) in [
+        ("the stream", &streamed),
+        ("a read", &as_reader),
+        ("an MCP tool", &mcp),
+    ] {
+        assert!(
+            text.contains("here is your link"),
+            "{what} did not carry the message at all, so this proves nothing: {text}"
+        );
+        assert!(
+            !text.contains(&code[..12]),
+            "{what} handed a read-scope caller the code: {text}"
+        );
+        assert!(text.contains("#pair=[redacted]"), "{what}: {text}");
+    }
+    assert!(
+        as_owner.contains(&code),
+        "the write token's own reader lost the link: {as_owner}"
+    );
+    // And the code is still live for the person it was sent to.
+    assert_eq!(redeem(&router, &code).await.0, StatusCode::OK);
 }

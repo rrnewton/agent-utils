@@ -25,9 +25,10 @@ USAGE:
 Asks the vibe-talk server running on this host for a single-use pairing code, and prints a link
 to the app carrying it, then when the link expires. Opening the link signs that browser in with the
 write token, exactly as pasting the token into the sign-in form would. The link works ONCE, and
-only until it expires; send it to the person in chat and they open it on their phone. Send it
-where read-token holders cannot see it: anyone who reads the link first can use it, and in a channel
-vibe-talk bridges that includes the voice agent that holds the read token.
+only until it expires; send it to the person in chat, and they open it on their phone and tap
+Sign this device in. Whoever uses it first is signed in, so send it where only the person reads it.
+vibe-talk redacts pairing codes from everything it sends its read-scope callers, so a bridged
+channel is safe from them, but not from anyone else in it.
 
 The write token is read from the server's own configuration (the file, then VIBE_TALK_WRITE_TOKEN,
 which wins) and is never printed. The server is reached on the configuration's [server] bind
@@ -220,10 +221,10 @@ pub fn is_this_host(ip: IpAddr) -> bool {
 
 /// What `pair-link` says on standard error once the link is printed: where it is safe to send.
 pub const SEND_WARNING: &str = "\
-Send this link only where the person will see it and read-token holders will not. Anyone who
-reads it first can use it — in a channel vibe-talk bridges, that includes the voice agent holding
-the read token. It works once: if the person is told it was already used when they had not opened
-it, someone else did, and VIBE_TALK_WRITE_TOKEN should be rotated.";
+Send this link only where the person will read it: whoever uses it first is signed in with the
+write token. vibe-talk never shows a pairing code to its read-scope callers, but anyone else who
+can read the chat can see it. It works once: if the person is told it was already used when they
+had not opened it, someone else did, and VIBE_TALK_WRITE_TOKEN should be rotated.";
 
 #[cfg(test)]
 mod tests {

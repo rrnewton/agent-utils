@@ -144,6 +144,16 @@
           <h1>vibe-talk</h1>
           <p class="hint">Server: <code id="signin-server-url"></code></p>
 
+          <!-- `#369 pairing-link`. Shown when the page was opened from a pairing link. The code is
+               redeemed only on the tap, so a link scanner that runs this page cannot spend it. -->
+          <div id="pair-offer" class="panel" hidden>
+            <p id="pair-offer-text">This pairing link signs this browser in. It works once.</p>
+            <div class="row">
+              <button id="pair-confirm" type="button">Sign this device in</button>
+              <button id="pair-dismiss" class="secondary" type="button">Not now</button>
+            </div>
+          </div>
+
           <label for="api-token">Write token</label>
           <input id="api-token" type="password" autocomplete="off" placeholder="paste the token" />
           <div class="row">

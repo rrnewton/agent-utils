@@ -44,6 +44,10 @@
 //! * `/api/v1/channels/{id}/stream` is a long-lived Server-Sent Events response and is otherwise
 //!   an ordinary read: same bearer token, same read scope, same channel allowlist. A stream is the
 //!   easiest thing here to leave accidentally open, so it is deliberately NOT a special case.
+//! * **A read-scope caller is never sent a pairing code.** A pairing link redeems for the write
+//!   token, and one pasted into a bridged channel would otherwise reach every read-scope caller.
+//!   [`redact_layer`] rewrites every `/api/` and `/mcp` answer to the read token as it leaves
+//!   (`#369 pairing-link`).
 //! * `/mcp` is the Streamable HTTP MCP endpoint. It requires a bearer token too, and answers a
 //!   credential-less caller with a bland 401 before it reads the body at all.
 
@@ -51,6 +55,7 @@ pub mod access_layer;
 pub mod api;
 pub mod assets;
 pub mod bearer_layer;
+pub mod redact_layer;
 
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, post};
@@ -70,6 +75,12 @@ use crate::state::AppState;
 pub fn router(state: AppState) -> Router {
     Router::new()
         .fallback_service(routes(state.clone()))
+        // Innermost: what a read-scope caller is sent carries no pairing code, whichever route
+        // produced it. `#369 pairing-link`; see `redact_layer`.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            redact_layer::redact_for_read_scope,
+        ))
         // Inside the access log, so a request refused here still leaves its one line.
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

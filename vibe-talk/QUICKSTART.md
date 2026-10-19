@@ -398,6 +398,11 @@ your host's address. None of them decides who may call. The thing deciding who m
 server's bearer token, and that is the part this codebase actually tests. If you do want a second
 fence in front, it has to be one a machine can satisfy with a header it was configured with.
 
+**Signing your phone in.** Rather than typing the write token on the phone, run
+`vibe-talk pair-link` on the server's host (with `public_url` set under `[server]`, or
+`--base-url`). It prints a link that works once, for five minutes; open it on the phone and tap
+**Sign this device in**. See "Pairing a phone" in the README.
+
 ## Step 5 — Create the ElevenLabs agent and register the MCP server
 
 Keep ElevenLabs' hosted LLM. Nothing in this project needs you to bring your own model.

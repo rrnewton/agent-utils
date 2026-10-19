@@ -31,8 +31,10 @@ const TOKEN_KEY = "vibe-talk.token";
 // credential for as long as it lives, so it comes out of the address FIRST — before any request
 // this page makes, and before anything could copy the address — with `replaceState`, which leaves
 // no history entry holding it. The fragment, never the query: a browser never sends a fragment to
-// any server, so the code reaches no log but the one request that redeems it, in its body.
-const pairingCode = takePairingCode();
+// any server, so the code reaches no log but the one request that redeems it, in its body. It is
+// redeemed only when the person taps Sign this device in (`pairFromLink`), never on load: a link
+// scanner that runs pages would otherwise spend it, and hold the token.
+let pairingCode = takePairingCode();
 
 /** The code in `#pair=`, with the fragment already gone from the address; null when there is none. */
 function takePairingCode() {
@@ -196,6 +198,7 @@ const ALL_CHANNELS = "*";
  *   | "message-cache-confirm-no" | "message-cache-confirm-yes" | "message-cache-erase"
  *   | "msg-scale-larger" | "msg-scale-smaller"
  *   | "open-add-channel" | "open-browse-channels" | "open-help" | "open-settings"
+ *   | "pair-confirm" | "pair-dismiss"
  *   | "pinned-filter" | "post-confirm-cancel" | "post-confirm-more" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-new" | "read-speed" | "remove-channel"
  *   | "rename-channel" | "reply-cancel" | "reply-context-more" | "reply-send"
  *   | "reset-voice-post-prefix"
@@ -44041,9 +44044,12 @@ const PAIRING_EXPIRED =
  * A failure is said plainly and leaves whatever this browser already held alone, so a stale link
  * opened on a phone that was signed in leaves it signed in.
  */
-async function pairFromLink(code) {
+async function pairFromLink() {
+  const code = pairingCode;
+  if (code === null) return false;
   clearError();
   setStatus("Pairing this device…");
+  el("pair-confirm").disabled = true;
   let response = null;
   try {
     response = await fetch("/api/v1/pair/redeem", {
@@ -44053,10 +44059,15 @@ async function pairFromLink(code) {
       cache: "no-store",
     });
   } catch (_error) {
-    return pairingFailed(
-      "Could not reach vibe-talk to pair this device. Check the connection, then ask for a new link."
-    );
+    // The code was not spent: the offer stays, to be tapped again once the connection is back.
+    el("pair-confirm").disabled = false;
+    showError("Could not reach vibe-talk to pair this device. Check the connection and tap again.");
+    setStatus("pairing failed");
+    return false;
   }
+  // Answered: spent or refused, the code is done with either way.
+  pairingCode = null;
+  el("pair-offer").hidden = true;
   let payload = null;
   try {
     payload = JSON.parse(await response.text());
@@ -44073,6 +44084,27 @@ async function pairFromLink(code) {
       ? "Too many pairing attempts from this network. Wait a minute, then ask for a new link."
       : PAIRING_EXPIRED
   );
+}
+
+/** The sign-in screen, offering to redeem the pairing link this page was opened from. */
+function offerPairing() {
+  showScreen("signin");
+  el("pair-offer").hidden = false;
+  el("pair-confirm").disabled = false;
+  el("pair-confirm").focus();
+}
+
+/** Not now: the link is left unspent, and the page carries on as it would have without it. */
+function declinePairing() {
+  pairingCode = null;
+  el("pair-offer").hidden = true;
+  if (token()) {
+    if (hydrateFromCache()) {
+      showScreen("main");
+      reopenSavedView();
+    }
+    guardQuietly(signIn)();
+  }
 }
 
 /** Say why pairing failed, and carry on as this browser would have without the link. */
@@ -44109,6 +44141,8 @@ function forgetToken() {
 el("api-token").value = token();
 el("save-token").addEventListener("click", guardQuietly(saveToken));
 el("forget-token").addEventListener("click", forgetToken);
+el("pair-confirm").addEventListener("click", guardQuietly(pairFromLink));
+el("pair-dismiss").addEventListener("click", declinePairing);
 
 // The checkboxes are the live truth `start()` reads, so they are what gets restored on load.
 const restoredMicSettings = storedMicSettings();
@@ -45263,7 +45297,7 @@ setTokenState(token() ? "token saved in this browser" : noTokenSentence());
 // With no token there is nothing to report YET, and firing a toast at page load to say so would
 // put a message over a screen whose entire subject is the thing it is asking for. The sign-in
 // screen says it in its own body; see `setTokenState`. `#63 status-line-placement`.
-if (token()) {
+if (token() && pairingCode === null) {
   setStatus("Checking your token…");
 }
 // Before the first screen is shown, so the bar is in its home from the first frame rather than
@@ -45288,9 +45322,8 @@ renderControls();
 // one read waits for the proof, and for the live stream it starts (`payReopenRead`).
 // `#189 restore-ui-state`.
 if (pairingCode !== null) {
-  // `#369 pairing-link`. The link decides: it signs this browser in, or says why it could not.
-  showScreen("signin");
-  guardQuietly(pairFromLink)(pairingCode);
+  // `#369 pairing-link`. The person decides, with one tap: sign in with the link, or not now.
+  offerPairing();
 } else if (token()) {
   if (hydrateFromCache()) {
     showScreen("main");

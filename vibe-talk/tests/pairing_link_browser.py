@@ -6,8 +6,9 @@
 signs the app in, exactly as pasting the token would. The fake-DOM suite pins the order of things
 inside the script; what it cannot show is a real browser's address bar and storage. So this walks:
 
-  a fresh browser opens the link -> the address no longer carries the code, and no request named it
-  in a URL -> one redemption, the code in its body and no bearer token -> the token is stored under
+  a fresh browser opens the link -> nothing is redeemed until Sign this device in is tapped -> the
+  address no longer carries the code, and no request named it in a URL -> one redemption, the code
+  in its body and no bearer token -> the token is stored under
   the page's own key -> the main screen is up -> a SECOND fresh browser opening the same link is
   told it expired or was already used, on the sign-in screen, with nothing stored.
 
@@ -166,6 +167,13 @@ def arguments() -> argparse.Namespace:
         default=Path(__file__).resolve().parents[1] / "web",
         help="the page assets to serve (default: this checkout's vibe-talk/web)",
     )
+    parser.add_argument(
+        "--shots",
+        type=Path,
+        default=None,
+        help="a directory to save phone-sized screenshots of the offer and each outcome in "
+        "(default: none are saved)",
+    )
     return parser.parse_args()
 
 
@@ -210,6 +218,16 @@ def main() -> int:
                     errors: list[str] = []
                     page.on("pageerror", lambda error: errors.append(str(error)))
                     page.goto(link, wait_until="load")
+                    # Opening the link alone spends nothing: a link scanner that runs the page
+                    # must not be able to use it up. The person taps.
+                    page.wait_for_selector("#pair-confirm", state="visible", timeout=10_000)
+                    page.wait_for_timeout(300)
+                    check(len(api.redemptions) == (0 if attempt == "first" else 1),
+                          f"the {attempt} browser redeemed the code before anyone tapped: {api.redemptions}")
+                    if args.shots:
+                        args.shots.mkdir(parents=True, exist_ok=True)
+                        page.screenshot(path=str(args.shots / f"{attempt}-offer.png"))
+                    page.tap("#pair-confirm")
                     if attempt == "first":
                         page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
                         stored = page.evaluate(f"() => localStorage.getItem({json.dumps(TOKEN_KEY)})")
@@ -224,6 +242,8 @@ def main() -> int:
                         stored = page.evaluate(f"() => localStorage.getItem({json.dumps(TOKEN_KEY)})")
                         check(stored is None, f"a used link stored a token: {stored!r}")
                         message = page.inner_text("#error")
+                    if args.shots:
+                        page.screenshot(path=str(args.shots / f"{attempt}-after.png"))
                     address = page.evaluate("() => location.href")
                     check(CODE not in address and "#" not in address,
                           f"the {attempt} browser's address still carries the code: {address!r}")

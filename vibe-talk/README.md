@@ -944,64 +944,77 @@ See [Pairing a phone](#pairing-a-phone): one command prints a link to send them.
 `#369 pairing-link`. For an agent that has set a server up for a person and now has to get them
 signed in on their phone. Typing a 24-character token on a phone is error-prone, and pasting the
 token itself into a chat leaves a permanent credential in that chat's history. A **pairing link**
-is the app's address with a single-use code in its fragment, `https://host/#pair=CODE`. Opening it
-signs that browser in with the write token, exactly as pasting the token into the sign-in form
-would, and then the link is dead: it works **once**, and only for **five minutes** (at most ten).
+is the app's address with a single-use code in its fragment, `https://host/#pair=CODE`. The person
+opens it and taps **Sign this device in**, which signs that browser in with the write token exactly
+as pasting the token into the sign-in form would. Then the link is dead: it works **once**, and
+only for **five minutes** (at most ten).
 
-1. Make sure the server is running on this host, and that it is reachable from the phone at some
-   address: see [From zero](#from-zero). A link to `127.0.0.1` is no use to a phone.
-2. Tell vibe-talk that address, once, in the configuration file:
+1. Make sure the server is running on this host and reachable from the phone at some address; see
+   [From zero](#from-zero). A link to `127.0.0.1` is no use to a phone.
+2. Tell vibe-talk that address, once, in its configuration file:
 
    ```toml
    [server]
    public_url = "https://vibe.example"   # also accepted as public_base_url, or VIBE_TALK_PUBLIC_BASE_URL
    ```
 
-   Or skip this and pass `--base-url https://vibe.example` in the next step.
-3. On the server's host, run:
+   Or pass `--base-url https://vibe.example` in the last step instead.
+3. **On the server's host, run `vibe-talk pair-link` and give the person the link in chat.**
 
    ```sh
    vibe-talk pair-link            # add --config PATH if the server was started with one
    ```
 
-   It reads the write token from the same configuration file and environment the server reads,
-   asks the running server for a code on the configuration's bind address, and prints exactly two
-   lines, the link and its expiry. It never prints the token. `--ttl SECONDS` (1 to 600) changes how
-   long the link works; the default is 300.
-4. **Give the person the link in chat**, and tell them it works once, for the next five minutes:
-   they open it on their phone, and the app comes up signed in. If it has expired or was already
-   used, the page says so and asks for a new one; run step 3 again.
+   It prints exactly two lines on standard output, the link and when it expires; send the person
+   the link, and tell them it works once, for the next five minutes: open it on the phone and tap
+   **Sign this device in**. If they are told it expired or was already used, run it again and send
+   the new link.
 
-**Send it where only the person will read it.** Whoever opens the link first gets the write token.
-In particular, do NOT paste it into a channel this server bridges: every read-scope caller can read
-that channel, the hosted voice agent holding the read token included, and could redeem the link
-before the person does. A direct conversation with the person that vibe-talk does not read is the
-right place. If the person is told the link was already used when they had not opened it, someone
-else did: the server logs every redemption at WARN with the client's address, and the remedy is to
-rotate `VIBE_TALK_WRITE_TOKEN`. `pair-link` repeats this on standard error each time it runs.
+What `pair-link` does: it reads the write token from the same configuration file and environment
+the server reads (see `vibe-talk pair-link --help`), asks the running server on the configuration's
+bind address for a code, and prints the link. It never prints the token. `--ttl SECONDS` (1 to
+600) changes how long the link works; the default is 300. It sends the token only to an address of
+this host (loopback, or one assigned to a local interface), never through a proxy, and follows no
+redirect.
 
-What it does, so it can be judged:
+**Whoever uses the link first gets the write token**, so it belongs in a conversation only the
+person reads. A channel this server bridges is safe from vibe-talk's own read-scope callers, the
+hosted voice agent included: a pairing code is redacted from every answer to the read token
+(below). It is not safe from anyone else in that channel. If the person is told the link was
+already used when they had not opened it, someone else did: every redemption is logged at WARN
+with the client's address, and the remedy is to rotate `VIBE_TALK_WRITE_TOKEN`. `pair-link` repeats
+this on standard error each time it runs.
+
+What the server and the page do, so it can be judged:
 
 * `POST /api/v1/pair` (write token) mints the code: 32 bytes from the system CSPRNG, base64url.
   The server keeps only its SHA-256, in memory, with its expiry; a restart burns every live code.
-  Up to 32 codes may be live at once.
+  Up to 32 codes may be live at once. The read token is refused, since a code redeems for the write
+  token.
 * `POST /api/v1/pair/redeem` with `{"code": "..."}` (no token) answers `{"token": "..."}` once for
-  a live code and burns it. Every refusal, whether the code is unknown, expired, used or malformed,
-  is the same `410 pairing_link_invalid`, and each counts against the client's address: after ten
-  in a minute, that address's further failures get `429` for the rest of the minute. A live code is
-  still granted, because **behind a reverse proxy every client has the proxy's address** and one
-  person's failures must not lock everyone out of pairing. An IPv6 client is counted by its /64.
-  The 256-bit code is what actually stops guessing; the limit only caps how fast anyone can fail.
-* `vibe-talk pair-link` sends the write token only to an address of this host (loopback, or one
-  assigned to a local interface), never through a proxy, and follows no redirect.
+  a live code and burns it, comparing against every live hash without an early exit. Every refusal,
+  whether the code is unknown, expired, used or malformed, is the same `410 pairing_link_invalid`,
+  and each counts against the client's address: after ten in a minute, that address's further
+  failures get `429` for the rest of the minute. A live code is still granted, because **behind a
+  reverse proxy every client has the proxy's address** and one person's failures must not lock
+  everyone out of pairing. An IPv6 client is counted by its /64. The 256-bit code is what stops
+  guessing; the limit only caps how fast anyone can fail.
+* **A read-scope caller is never sent a code.** Every answer under `/api/` and `/mcp` to the read
+  token, live streams included, has the code after any `pair=` replaced with `[redacted]` as it
+  leaves the server, whichever route produced it: a message, its rendered HTML, an MCP tool's text,
+  a summary. The write token's own reader is sent the text as it is.
 * The page takes the code out of its own address with `history.replaceState` before it makes any
-  request, so it is not left in the address bar, the history or a bookmark. A fragment is never
-  sent to a server, so the code reaches no access log; it travels only in the body of the one
-  redemption.
+  request, so it is not left in the address bar, the session history or a bookmark. A fragment is
+  never sent to a server, so the code reaches no access log; it travels only in the body of the one
+  redemption. The page redeems only when the person taps **Sign this device in**, never on load, so
+  a link scanner that runs pages cannot spend the link or receive the token. **Not now** leaves it
+  unspent.
 * The log names each code by the first eight hex digits of its hash when it is minted, redeemed
   or expires. Neither a code nor a token is logged.
 * A redeemed link is as good as the write token itself, for as long as that token is. Signing a
-  phone out for good means rotating `VIBE_TALK_WRITE_TOKEN`, as it always has.
+  phone out for good means rotating `VIBE_TALK_WRITE_TOKEN`, as it always has. A browser may keep
+  the address it was first opened at in its global history even after the page has removed the
+  fragment, which matters only while a code is still live.
 
 ## Running it
 
