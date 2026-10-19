@@ -1,12 +1,13 @@
 ---
 title: 'submodule-test-default-branch: two clone tests fail where git''s default branch is not main'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-10-19T09:35:55.087214621+00:00
-updated_at: 2026-10-19T09:35:55.087214621+00:00
+updated_at: 2026-10-19T09:37:32.529669475+00:00
+closed_at: 2026-10-19T09:37:32.529669335+00:00
 ---
 
 # Description
