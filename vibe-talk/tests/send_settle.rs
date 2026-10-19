@@ -330,17 +330,51 @@ async fn a_send_whose_caller_goes_away_while_it_is_posted_is_filed_with_what_it_
 }
 
 #[tokio::test]
-async fn a_send_whose_caller_goes_away_while_it_waits_for_its_turn_files_nothing() {
-    for door in DOORS {
+async fn a_yes_whose_caller_goes_away_while_it_waits_for_its_turn_is_still_posted_and_filed_once() {
+    let harness = harness();
+    // The destination held, as a post ahead of this one would hold it.
+    let turn = harness.state.post_lanes.turn(WRITE_CHANNEL, None).await;
+    let caller = start(&harness, Door::Commit, "on my way").await;
+    waiting_for_its_turn(&harness, Door::Commit).await;
+    assert_eq!(
+        *harness.held.reached.lock().expect("reached"),
+        0,
+        "the post went while its destination was held"
+    );
+    // The page stops waiting. The yes has spent its handle, so its card can never be tapped again:
+    // the post must still go, and be filed, or the owner's yes is lost without a trace.
+    caller.abort();
+    quiet().await;
+    drop(turn);
+    harness.held.gate.add_permits(1);
+    let sends = filed_count(&harness, 1).await;
+    assert_eq!(
+        harness.discord.posted().len(),
+        1,
+        "a yes given up while it waited was never posted"
+    );
+    assert_eq!(sends[0].record.outcome, SendOutcome::Sent, "{sends:?}");
+    quiet().await;
+    assert_eq!(filed(&harness).1, 1, "the yes was filed twice");
+    assert_eq!(
+        harness.discord.posted().len(),
+        1,
+        "the yes was posted twice"
+    );
+}
+
+#[tokio::test]
+async fn a_direct_send_whose_caller_goes_away_while_it_waits_for_its_turn_files_nothing() {
+    {
         let harness = harness();
         // The destination held, as a post ahead of this one would hold it.
         let turn = harness.state.post_lanes.turn(WRITE_CHANNEL, None).await;
-        let caller = start(&harness, door, "on my way").await;
-        waiting_for_its_turn(&harness, door).await;
+        let caller = start(&harness, Door::Direct, "on my way").await;
+        waiting_for_its_turn(&harness, Door::Direct).await;
         assert_eq!(
             *harness.held.reached.lock().expect("reached"),
             0,
-            "{door:?}: the post went while its destination was held"
+            "the post went while its destination was held"
         );
         caller.abort();
         quiet().await;
@@ -348,12 +382,12 @@ async fn a_send_whose_caller_goes_away_while_it_waits_for_its_turn_files_nothing
         quiet().await;
         assert!(
             harness.discord.posted().is_empty(),
-            "{door:?}: a send given up while it waited was posted"
+            "a direct send given up while it waited was posted"
         );
         assert_eq!(
             filed(&harness),
             (Vec::new(), 0),
-            "{door:?}: words that were never sent were filed"
+            "words that were never sent were filed"
         );
     }
     // A direct send given up while it waited is forgotten, not remembered as on its way or

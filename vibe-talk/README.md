@@ -8688,7 +8688,9 @@ send; a server that takes records files it in the stored transcript from its own
 draws the same card. A yes that sent nothing is a seam, as before. The server files what a send did
 once the chat service has answered for it, whether or not anyone still waits for that answer: a
 post that lands after the page stopped waiting, or after a client hung up mid-call, is filed as
-sent, not as "Not confirmed", and one given up before anything was posted is not filed at all
+sent, not as "Not confirmed". A yes is posted even when the page stops waiting while the post
+waits behind another to the same place, since its card can never be tapped again; a send made
+without asking that is given up before anything was posted is not filed at all, and may go again
 (`#283 send-settle-in-task`).
 
 **A yes that sends shows no turn of its own** (`#269 approval-card-inline`): the frozen card says

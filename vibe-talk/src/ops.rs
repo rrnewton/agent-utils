@@ -2941,9 +2941,14 @@ pub async fn reply_scoped(
 /// once the provider has answered for the last part tried, and not by the request: a caller that
 /// goes away while the post is on its way — the page stops waiting, a client hangs up mid-call —
 /// no longer files a post that then lands as not confirmed. Whoever is still waiting, the outcome
-/// is filed exactly once. Until that task holds the ticket nothing of the post has been sent, so a
-/// send refused before it is posted, or given up while it waits for its destination's turn, is
-/// forgotten, as a send that certainly posted nothing is.
+/// is filed exactly once. A send refused before it is posted is forgotten, as a send that certainly
+/// posted nothing is.
+///
+/// A confirmed proposal is posted by a task of its own from the start, waiting for its
+/// destination's turn included: the owner's yes has spent its handle, which can never be tapped
+/// again, so a caller that goes away while it waits must not leave the yes posting nothing and
+/// filed nowhere. A direct send given up while it waits is forgotten instead, and the voice agent
+/// may send the same words again at once.
 ///
 /// # Errors
 ///
@@ -2956,19 +2961,57 @@ pub async fn reply_settled(
     Result<(ChannelInfo, Message, Vec<Message>), OpError>,
     Option<u64>,
 ) {
-    let post = Post {
+    let committed = matches!(ticket, crate::post_gate::AnyTicket::Commit(_));
+    let settle = Settle {
+        ticket,
+        binding: binding.clone(),
+    };
+    if !committed {
+        return post_settled(state, binding_post(binding), Some(settle)).await;
+    }
+    let state = state.clone();
+    let binding = binding.clone();
+    joined(
+        tokio::spawn(
+            async move { post_settled(&state, binding_post(&binding), Some(settle)).await },
+        )
+        .await,
+    )
+}
+
+/// What a send the post gate keeps is asked to post: its binding's words, where they go.
+fn binding_post(binding: &crate::post_gate::Binding) -> Post<'_> {
+    Post {
         channel_id: &binding.channel_id,
         text: &binding.text,
         reply_to: binding.reply_to.as_deref(),
         thread_id: None,
         idempotency_key: None,
-    };
-    let settle = Settle {
-        ticket,
-        binding: binding.clone(),
-    };
-    post_settled(state, post, Some(settle)).await
+    }
 }
+
+/// The answer of a task that posts: a panic goes on up; only a runtime shutting down cancels it,
+/// and then whatever it had sent may have landed, and the send it held was filed as unconfirmed as
+/// it was dropped.
+fn joined(answer: Result<PostAnswer, tokio::task::JoinError>) -> PostAnswer {
+    match answer {
+        Ok(answer) => answer,
+        Err(stopped) if stopped.is_panic() => std::panic::resume_unwind(stopped.into_panic()),
+        Err(stopped) => (
+            Err(OpError::Chat(ChatError::Transport(format!(
+                "the post was stopped before the provider answered: {stopped}"
+            )))),
+            None,
+        ),
+    }
+}
+
+/// What a post came to — its channel, first message and every part, or why not — and the `send_seq`
+/// its send was filed under, `None` when nothing was.
+type PostAnswer = (
+    Result<(ChannelInfo, Message, Vec<Message>), OpError>,
+    Option<u64>,
+);
 
 /// What [`reply_scoped`] was asked to post, and where.
 struct Post<'a> {
@@ -3003,7 +3046,7 @@ impl Settle {
 }
 
 /// A send not yet handed to the task that posts it. Nothing of it has been sent, so dropped — the
-/// post refused, or its caller gone while it waited for its turn — it is forgotten.
+/// post refused, or a direct send's caller gone while it waited for its turn — it is forgotten.
 struct Unposted(Option<Settle>);
 
 impl Drop for Unposted {
@@ -3041,18 +3084,7 @@ async fn post_settled(
     // there, so a caller that has gone changes nothing that is recorded (`#283
     // send-settle-in-task`).
     let settle = unposted.0.take();
-    match tokio::spawn(post_parts(state.clone(), posting, turn, settle)).await {
-        Ok(answer) => answer,
-        Err(stopped) if stopped.is_panic() => std::panic::resume_unwind(stopped.into_panic()),
-        // Only a runtime shutting down cancels it; whatever it had sent may have landed, and the
-        // send it held was filed as unconfirmed as it was dropped.
-        Err(stopped) => (
-            Err(OpError::Chat(ChatError::Transport(format!(
-                "the post was stopped before the provider answered: {stopped}"
-            )))),
-            None,
-        ),
-    }
+    joined(tokio::spawn(post_parts(state.clone(), posting, turn, settle)).await)
 }
 
 /// Everything [`post_settled`] checks before anything is sent — the allowlist, the write policy,
