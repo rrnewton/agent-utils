@@ -71652,10 +71652,12 @@ test("`#352 voice-reconnect-on-bridge-error`: a session that lists replay is han
   assert.equal(frames[1] && frames[1].type, "prompt", `the lost turn did not go next: ${frames.map((f) => f.type)}`);
   assert.equal(frames[1].text, prompt);
   assert.ok(!frames.some((f) => f.type === "audio_start"), "an empty segment went before the lost turn");
-  assert.match(callRecap(page), /^Reconnected after a lost turn: sent the agent \d+ words from this call$/);
+  // Seven words: the owner's five and the agent's two. Not the relayed prompt's echo, which is no
+  // one's words (`#353 relay-echo-as-owner`).
+  assert.equal(callRecap(page), "Reconnected after a lost turn: sent the agent 7 words from this call");
   next.onmessage({ data: JSON.stringify({ type: "replay_ack", accepted: true }) });
   await page.settle();
-  assert.match(callRecap(page), /^Reconnected after a lost turn: caught the agent up with \d+ words from this call$/);
+  assert.equal(callRecap(page), "Reconnected after a lost turn: caught the agent up with 7 words from this call");
   assert.equal(seamDetail(reconnectedSeams(page)[0]),
     "The voice service lost a turn, so the call moved to a new session, which was sent what was said above, and the messages went again.");
   assert.match(page.el("settings-detail").textContent, /the conversation this call resumed from was not sent again/);
@@ -71695,7 +71697,7 @@ test("`#352 voice-reconnect-on-bridge-error`: a typed message the bridge lost go
   assert.equal(storedTexts(page).filter((t) => t === "you: what changed overnight?").length, 1, storedTexts(page).join("\n"));
   assert.equal(seamDetail(reconnectedSeams(page)[0]),
     "The voice service lost a turn, so the call moved to a new session that has seen nothing above this line, and your message went again.");
-  const control = await run(brokenScript("  if (next.resent) noteTypedTurn(next.text);\n", ""));
+  const control = await run(brokenScript("  if (next.resent && next.kind === \"typed\") noteTypedTurn(next.text);\n", ""));
   assert.equal(youRowsSaying(control.page, "what changed overnight?").length, 2,
     "the control drew the echo once, so the test above proves nothing");
 });
@@ -72135,4 +72137,79 @@ test("`#352 voice-reconnect-on-bridge-error`: the page's word on a send card tha
   assert.match(refused.page.el("settings-detail").textContent, /the page's word on the card was not repeated to the new session/);
   const unlisted = await run(null, null);
   assert.deepEqual(promptsSent(unlisted.next), [], "the word on the card went to a session handed no record");
+});
+
+// --- #353 relay-echo-as-owner -----------------------------------------------------------------------
+//
+// A `vibe-talk-v1` bridge echoes every prompt the page sends as a user transcript. The page knew the
+// echo of what the owner typed and of its own word on a card, but not of a relayed prompt, so every
+// relayed turn's echo was drawn as a "you" row and filed as the owner's words — and the recap a
+// resumed or reconnected session is handed repeated it as his.
+
+test("`#353 relay-echo-as-owner`: the bridge's echo of a relayed prompt is no \"you\" row and no turn of the owner's, and the relay is still read out (negative controls: the owner's own words after it, a second identical echo, and the page that matched typed text only)", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    const { socket, prompt, echo } = await relayInFlight(page);
+    speech(socket, "assistant", echo, "In build noise, codex said the release is tagged.", true);
+    turnDone(socket, echo);
+    await page.settle();
+    return { page, socket, prompt, echo };
+  };
+  const { page, socket, prompt, echo } = await run(SCRIPT);
+  assert.deepEqual(youRowsSaying(page, "the release is tagged"), [], "the relayed prompt's echo was drawn as the owner's words");
+  assert.ok(!storedTexts(page).some((t) => t.startsWith("you: ") && t.includes("the release is tagged")),
+    `the relayed prompt's echo was filed as the owner's words: ${storedTexts(page).join("\n")}`);
+  assert.ok(storedTexts(page).includes("agent: In build noise, codex said the release is tagged."), "the read-out was not kept");
+  await page.el("hang-up").click();
+  await page.settle();
+  assert.deepEqual(unreadSeams(page), [], "a relay that was read out was reported as not read out");
+  // The owner speaking straight after, in his own words, is drawn and filed.
+  const owner = await run(SCRIPT);
+  speech(owner.socket, "user", owner.echo + 1, "thanks, and anything from lead team?", true);
+  turnDone(owner.socket, owner.echo + 1);
+  await owner.page.settle();
+  assert.equal(youRowsSaying(owner.page, "anything from lead team").length, 1, "the owner's own words were taken for an echo");
+  assert.ok(storedTexts(owner.page).includes("you: thanks, and anything from lead team?"));
+  // An echo answers for one relay: the same words again, with no relay behind them, are drawn.
+  speech(owner.socket, "user", owner.echo + 2, prompt);
+  turnDone(owner.socket, owner.echo + 2);
+  await owner.page.settle();
+  assert.equal(youRowsSaying(owner.page, "the release is tagged").length, 1, "a second identical transcript was taken for the same echo");
+  // The negative control: the page that knew only typed text draws the echo as the owner's.
+  const control = await run(brokenScript("    entry.echo = who === \"you\" && final && (pageEcho || isEchoOfTyped(said));",
+    "    entry.echo = who === \"you\" && final && isEchoOfTyped(said);"));
+  assert.equal(youRowsSaying(control.page, "the release is tagged").length, 1,
+    "the control did not draw the echo, so the test above proves nothing");
+  assert.equal(socket.sent.length > 0, true);
+});
+
+test("`#353 relay-echo-as-owner`: the echo of a typed message is handled as before — drawn once, when it was sent, and filed once", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  await page.settle();
+  await compose(page, "what changed overnight?");
+  await page.el("send-text").click();
+  await page.settle();
+  turnDone(socket, 1);
+  await page.settle();
+  speech(socket, "user", 2, "what changed overnight?");
+  speech(socket, "assistant", 2, "Three merges.", true);
+  turnDone(socket, 2);
+  await page.settle();
+  assert.equal(youRowsSaying(page, "what changed overnight?").length, 1);
+  assert.equal(storedTexts(page).filter((t) => t === "you: what changed overnight?").length, 1, storedTexts(page).join("\n"));
+});
+
+test("`#353 relay-echo-as-owner`: a relayed prompt sent again after a reconnect is not drawn on the new session either", async () => {
+  const page = newPage();
+  const { socket, prompt, echo } = await relayInFlight(page);
+  loseTurn(socket, echo);
+  const next = await reconnectTo(page, socket);
+  assert.deepEqual(promptsSent(next), [prompt]);
+  speech(next, "user", 1, prompt);
+  speech(next, "assistant", 1, "In build noise, codex said the release is tagged.", true);
+  turnDone(next, 1);
+  await page.settle();
+  assert.deepEqual(youRowsSaying(page, "the release is tagged"), [], "a relayed prompt's echo was drawn as the owner's words");
+  assert.ok(!storedTexts(page).some((t) => t.startsWith("you: ") && t.includes("the release is tagged")), storedTexts(page).join("\n"));
 });

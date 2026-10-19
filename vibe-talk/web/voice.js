@@ -7226,9 +7226,11 @@ function advanceVibeTalkInput() {
   }
   const next = session.pendingPrompts.shift();
   session.typedTurnInFlight = true;
-  // `#352 voice-reconnect-on-bridge-error`. Sent again after a reconnect: its words are already on
-  // screen and in the record, so the bridge's echo of them is not drawn as the owner's a second time.
-  if (next.resent) noteTypedTurn(next.text);
+  // `#352 voice-reconnect-on-bridge-error`. A typed message sent again after a reconnect: its words
+  // are already on screen and in the record, so the bridge's echo of them is not drawn as the owner's
+  // a second time. A relayed turn's echo, or the page's own notice's, is the turn in flight's
+  // (`noteTurnInFlightEcho`, `#353 relay-echo-as-owner`).
+  if (next.resent && next.kind === "typed") noteTypedTurn(next.text);
   session.turnInFlight = {
     text: next.text, kind: next.kind, relays: next.relays || [], after: session.lastCompletedTurn,
     echoed: false, turn: null, answered: false,
@@ -16402,8 +16404,11 @@ function mergeHypothesis(held, frame) {
  * which is also what copes with a provider that sends every fragment, and then the whole turn
  * again, all marked final. A frame without a turn number cannot be matched to anything, so each
  * final one closes its own row.
+ *
+ * `pageEcho`: the frame is a bridge's echo of a prompt the page said on a channel's behalf or its
+ * own, never the owner's words (`#353 relay-echo-as-owner`), so it is not drawn or filed as his.
  */
-function upsertSpoken(who, turn, said, final) {
+function upsertSpoken(who, turn, said, final, pageEcho = false) {
   const anonymous = turn === undefined || turn === null;
   const key = anonymous ? `anon:${session.anonTurn}:${who}` : `${turn}:${who}`;
   // A new turn from a speaker ends that speaker's previous one.
@@ -16416,8 +16421,9 @@ function upsertSpoken(who, turn, said, final) {
   if (!entry) {
     entry = { key, who, settled: "", pending: "", li: null, atMs: Date.now(), stored: false, echo: false,
       cut: false, savedCopy: false, takenElsewhere: false };
-    // A typed prompt reflected back is already on screen; see `isEchoOfTyped`.
-    entry.echo = who === "you" && final && isEchoOfTyped(said);
+    // A typed prompt reflected back is already on screen; see `isEchoOfTyped`. A relayed one, or the
+    // page's own notice, was never the owner's to show. `#353 relay-echo-as-owner`.
+    entry.echo = who === "you" && final && (pageEcho || isEchoOfTyped(said));
     session.liveTurns.set(key, entry);
   }
   if (final) {
@@ -17546,12 +17552,16 @@ function handleVibeTalk(message) {
       const final = message.final !== false;
       const key = `${message.turn ?? ""}:${who}:${final}:${said}`;
       const turnNumber = typeof message.turn === "number" ? message.turn : null;
+      // `#353 relay-echo-as-owner`. The bridge echoing back a prompt the page said for a channel or
+      // for itself: never the owner's words, so neither drawn nor filed as his.
+      let pageEcho = false;
       if (who === "assistant" && said.trim()) {
         noteAgentText();
         noteReplyArriving(turnNumber, true);
       } else if (said.trim()) {
         // `#352 voice-reconnect-on-bridge-error`. Or the bridge echoing the page's own prompt back.
-        noteTurnInFlightEcho(said, final, turnNumber);
+        pageEcho = noteTurnInFlightEcho(said, final, turnNumber) && session.turnInFlight !== null &&
+          session.turnInFlight.kind !== "typed";
         // The owner is speaking: a spoken turn is open, whether or not anything answers it yet. A
         // final transcript says he has finished, and the turn is the agent's to answer.
         noteOwnerWords(turnNumber, final);
@@ -17563,7 +17573,7 @@ function handleVibeTalk(message) {
       if (who === "assistant") {
         markStartup("greeting_text");
       }
-      const spoken = upsertSpoken(who, message.turn, said, final);
+      const spoken = upsertSpoken(who, message.turn, said, final, pageEcho);
       // The turn's whole text so far, as the row shows it, and its number: the number, not the
       // order the frames arrive in, says whether assistant words came before an answer or in reply
       // to it. `#264 voice-send-approval`, `#268 voice-call-drops`.
