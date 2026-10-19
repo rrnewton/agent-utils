@@ -55,6 +55,11 @@ pub const MAX_AUDIO_MS: u32 = 3_600_000;
 /// The largest magnitude a 16-bit sample can have (`|-32768|`).
 pub const MAX_PEAK: u32 = 32_768;
 
+/// The most reconnects a call-end record may say came before it in one call. The page carries a call
+/// on a new session at most three times (`#352 voice-reconnect-on-bridge-error`); past a thousand the
+/// number is not a count of anything a call did.
+pub const MAX_RECONNECTS: u32 = 1_000;
+
 /// Wire protocols this signal is defined for. Only the provider-neutral one: a hosted vendor's
 /// protocol has error frames of its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -228,7 +233,7 @@ pub enum EndedBy {
     /// The reader pressed Hang up.
     HangUp,
     /// The voice service sent an `error` frame, which ends its session, and the page then said
-    /// goodbye (`audio_end`, `quit`) and closed. The only other way the page ends a call.
+    /// goodbye (`audio_end`, `quit`) and closed.
     ErrorFrame,
     /// The voice service's side closed the socket with a closing handshake while the reader was in
     /// the call and the page was in sight.
@@ -238,6 +243,18 @@ pub enum EndedBy {
     ConnectionLost,
     /// The socket closed while the page was in the background, or just after it came back.
     Suspended,
+    /// `#352 voice-reconnect-on-bridge-error`. This socket's session was lost: the voice service's
+    /// `error` asked the client to reconnect, and the page said goodbye to it and carried the call on
+    /// a new session. One per socket replaced; the call itself goes on, and its own end is recorded
+    /// later.
+    Reconnected,
+    /// `#352`. The voice service asked to reconnect again within a minute of the page's last
+    /// reconnect, or after the most the page makes in one call, so the page ended the call instead.
+    ReconnectLimit,
+    /// `#352`. A reconnect could not get a working session — the server refused one, its socket did
+    /// not open in time, or it closed or erred before its session started — so the page ended the
+    /// call.
+    ReconnectFailed,
 }
 
 impl EndedBy {
@@ -248,6 +265,9 @@ impl EndedBy {
             Self::ServerClosed => "server_closed",
             Self::ConnectionLost => "connection_lost",
             Self::Suspended => "suspended",
+            Self::Reconnected => "reconnected",
+            Self::ReconnectLimit => "reconnect_limit",
+            Self::ReconnectFailed => "reconnect_failed",
         }
     }
 }
@@ -297,6 +317,10 @@ pub struct EndReport {
     /// Milliseconds before the end that the page last sent `interrupt`; absent when it sent none.
     #[serde(default)]
     pub last_interrupt_ms: Option<u32>,
+    /// `#352 voice-reconnect-on-bridge-error`. How many times the page carried this call on a new
+    /// session before this record; absent when it never did.
+    #[serde(default)]
+    pub reconnects: Option<u32>,
     /// The voice service's own words: its close reason, or its `error`. At most
     /// [`MAX_CLOSE_REASON_CHARS`], with no control characters.
     #[serde(default)]
@@ -333,6 +357,9 @@ impl EndReport {
                 return Err(format!("{name} is longer than {MAX_SINCE_OPEN_MS} ms"));
             }
         }
+        if self.reconnects.is_some_and(|count| count > MAX_RECONNECTS) {
+            return Err(format!("reconnects is more than {MAX_RECONNECTS}"));
+        }
         if let Some(reason) = &self.close_reason {
             if reason.chars().count() > MAX_CLOSE_REASON_CHARS {
                 return Err(format!(
@@ -360,7 +387,7 @@ impl EndReport {
         format!(
             "protocol={} chat={} ended_by={} close_code={} since_open_ms={} turns={} visibility={} \
              queued_audio_ms={} last_text_ms={} last_audio_end_ms={} last_interrupt_ms={} \
-             close_reason={}",
+             reconnects={} close_reason={}",
             self.protocol.as_str(),
             self.chat,
             self.ended_by.as_str(),
@@ -373,6 +400,7 @@ impl EndReport {
             number(self.last_text_ms),
             number(self.last_audio_end_ms),
             number(self.last_interrupt_ms),
+            number(self.reconnects),
             self.close_reason
                 .as_deref()
                 .map_or_else(|| "-".to_owned(), |reason| format!("{reason:?}")),
@@ -535,6 +563,7 @@ mod tests {
             last_text_ms: Some(2_000),
             last_audio_end_ms: Some(1_900),
             last_interrupt_ms: None,
+            reconnects: None,
             close_reason: Some("interrupt boundary timed out; reconnect".to_owned()),
         }
     }
@@ -546,7 +575,7 @@ mod tests {
             end().log_fields(),
             "protocol=vibe-talk-v1 chat=false ended_by=server_closed close_code=1011 \
              since_open_ms=95000 turns=4 visibility=visible queued_audio_ms=41000 \
-             last_text_ms=2000 last_audio_end_ms=1900 last_interrupt_ms=- \
+             last_text_ms=2000 last_audio_end_ms=1900 last_interrupt_ms=- reconnects=- \
              close_reason=\"interrupt boundary timed out; reconnect\""
         );
         // A reason that tries to look like more fields stays inside its quotes.
@@ -572,6 +601,52 @@ mod tests {
     }
 
     #[test]
+    fn a_reconnect_is_recorded_per_socket_and_the_calls_end_says_how_many_came_before() {
+        // `#352 voice-reconnect-on-bridge-error`.
+        for (ended_by, word) in [
+            (EndedBy::Reconnected, "reconnected"),
+            (EndedBy::ReconnectLimit, "reconnect_limit"),
+            (EndedBy::ReconnectFailed, "reconnect_failed"),
+        ] {
+            let parsed: EndedBy =
+                serde_json::from_value(serde_json::json!(word)).expect("a documented cause");
+            assert_eq!(parsed, ended_by);
+            let report = EndReport { ended_by, ..end() };
+            report.validate().expect("valid");
+            assert!(
+                report.log_fields().contains(&format!(" ended_by={word} ")),
+                "{}",
+                report.log_fields()
+            );
+            assert!(
+                !report.by_the_reader(),
+                "{word} was taken for the reader's own hang-up"
+            );
+        }
+        let after = EndReport {
+            ended_by: EndedBy::HangUp,
+            close_code: None,
+            reconnects: Some(1),
+            close_reason: None,
+            ..end()
+        };
+        after.validate().expect("valid");
+        assert!(
+            after.log_fields().ends_with(" reconnects=1 close_reason=-"),
+            "{}",
+            after.log_fields()
+        );
+        assert!(after.by_the_reader());
+        // A page that predates the count still records its calls.
+        let older: EndReport = serde_json::from_value(serde_json::json!({
+            "protocol": "vibe-talk-v1", "chat": false, "ended_by": "hang_up",
+            "since_open_ms": 1000, "turns": 1,
+        }))
+        .expect("a record without a count reads");
+        assert_eq!(older.reconnects, None);
+    }
+
+    #[test]
     fn a_call_end_record_refuses_a_long_or_control_laden_reason_and_absurd_offsets() {
         end().validate().expect("valid");
         for absurd in [
@@ -589,6 +664,10 @@ mod tests {
             },
             EndReport {
                 last_text_ms: Some(MAX_SINCE_OPEN_MS + 1),
+                ..end()
+            },
+            EndReport {
+                reconnects: Some(MAX_RECONNECTS + 1),
                 ..end()
             },
         ] {
