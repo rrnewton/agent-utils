@@ -1,13 +1,14 @@
 ---
 title: 'public-internal-names: a vibe-talk example, its test and the README name an internal command-line client and its runtime'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 - validation
 created_at: 2026-10-19T09:35:55.905636075+00:00
-updated_at: 2026-10-19T09:35:55.905636075+00:00
+updated_at: 2026-10-19T09:43:32.721312461+00:00
+closed_at: 2026-10-19T09:43:32.721312140+00:00
 ---
 
 # Description
