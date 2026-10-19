@@ -804,9 +804,12 @@ def _run_cargo(argv: Sequence[str], *, gate: str | None) -> int:
             match = re.match(r"^test (.+) \.\.\. (ok|FAILED|ignored)$", line.strip())
             if match is None:
                 continue
+            # The run report suffixes compile-only doctests ("- compile",
+            # "- compile fail"); --list does not. Strip to the listed name.
+            doc_name = re.sub(r" - compile( fail)?$", "", match.group(1))
             outcome = {"ok": "pass", "FAILED": "fail", "ignored": "skip"}[match.group(2)]
             cases.append(
-                CaseRecord("libtest", resolved_gate, f"doc::{match.group(1)}", outcome, None)
+                CaseRecord("libtest", resolved_gate, f"doc::{doc_name}", outcome, None)
             )
     for failure in failures:
         print(failure, file=sys.stderr)

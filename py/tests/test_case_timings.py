@@ -487,6 +487,8 @@ def test_run_cargo_against_a_real_crate(tmp_path: Path) -> None:
     )
     (crate / "src" / "lib.rs").write_text(
         "/// ```\n/// assert_eq!(probe::add(1, 2), 3);\n/// ```\n"
+        "/// ```compile_fail\n/// let broken: i32 = \"no\";\n/// ```\n"
+        "/// ```no_run\n/// probe::add(1, 2);\n/// ```\n"
         "pub fn add(a: i32, b: i32) -> i32 { a + b }\n"
         "#[cfg(test)]\nmod tests {\n"
         "    #[test] fn alpha() { assert_eq!(super::add(1, 1), 2); }\n"
@@ -523,7 +525,9 @@ def test_run_cargo_against_a_real_crate(tmp_path: Path) -> None:
     outcomes = {case.case_id: case.outcome for case in report.primary_cases}
     assert outcomes["probe/probe::tests::alpha"] == "pass"
     assert outcomes["probe/probe::tests::beta"] == "skip"
-    assert any(case_id.startswith("doc::") and outcome == "pass" for case_id, outcome in outcomes.items())
+    doctests = [case_id for case_id in outcomes if case_id.startswith("doc::")]
+    assert len(doctests) == 3
+    assert all(outcomes[case_id] == "pass" for case_id in doctests)
     timed = next(case for case in report.primary_cases if case.case_id.endswith("tests::alpha"))
     assert timed.duration_s is not None and timed.duration_s >= 0
 
