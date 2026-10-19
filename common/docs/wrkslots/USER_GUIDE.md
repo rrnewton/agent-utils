@@ -550,6 +550,19 @@ slot immediately before deletion. A churning user-systemd snapshot refuses rathe
 rerun the removal. As for agent slots, only `dead` satisfies the reclaim condition, and the exact
 owner generation and the full process-use scan must independently agree.
 
+After a validation removal fences its checkout, a fresh scan of this user's processes checks that
+none still has its working directory, root, an open file, a mapping or a mount inside it. A process
+can fork after any one listing of `/proc`, hand what it holds to its child and exit, so the scan
+lists `/proc` again after scanning, scans only the process generations (exact PID and start time)
+that the listing added, and repeats until a listing taken after every scan adds nothing. A use it
+finds is never forgotten by a later round or retry. A process that exits, or whose PID another
+process takes, does not restart the scan: only the newcomer is scanned. The listing is repeated at
+most eight times, so a host where new processes keep starting refuses ("did not close"); rerun the
+removal. The scan assumes cooperative processes: once the checkout is fenced, a process can only
+keep what it already held or inherit it by fork. A process that passes an open descriptor over a
+Unix socket to a process already scanned, and closes its own copy before its own scan, is not
+detected.
+
 A slot imported from an older state file with no recorded owner identity cannot satisfy the
 owner-death condition, even after its heartbeat expires. `recover-unbound-owner` can record what was
 inspected but does not turn unavailable process evidence into proof of death. Preserve such a slot
