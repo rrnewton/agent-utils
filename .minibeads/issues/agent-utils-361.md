@@ -1,12 +1,13 @@
 ---
 title: 'python-minimum-timeout: the Python 3.10 test job is cancelled at its time limit on every run'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - validation
 created_at: 2026-10-19T09:35:54.635835330+00:00
-updated_at: 2026-10-19T09:35:54.635835330+00:00
+updated_at: 2026-10-19T10:39:39.471152307+00:00
+closed_at: 2026-10-19T10:39:39.471152207+00:00
 ---
 
 # Description
