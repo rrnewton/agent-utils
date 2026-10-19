@@ -3234,7 +3234,10 @@ replies too. That is a possible future path, not something any bridge here does 
   services cannot clear unread at all. **Save** puts the chosen mode on each of those channels, one
   write per channel through the same per-channel setting, and says how many it reached and which
   refused. Mark read now is a push for one channel, so it is not offered there; Rename and Remove
-  name one channel and step aside too, while Add a channel and Browse channels stay.
+  name one channel and step aside too, while Add a channel and Browse channels stay. With several
+  chat services (`#355 provider-grouped-channels`) it is the chosen service's channels only, named
+  **All Slack channels** for example, offered on the same terms within that service, so a Save never
+  reaches another service's channels.
 * **Every attempt is logged on one line** beginning `upstream-clear:`, naming the mode, the channel,
   the message and its time, and the outcome (`advanced`, `already-read`, `dry-run`, `skipped`, or
   `failed`). A dry run decides everything and writes nothing, so an operator can check what would be
