@@ -6102,6 +6102,33 @@ step `stale-live-read-browser`) samples every frame in Chromium while two live m
 first one's read answered late, and requires the second message's row in each; its negative control, the
 page without the fix, must miss it.
 
+### Room past the right column's foot
+
+`#338 column-overscroll`. The owner: on a desktop monitor the newest card in the right column sits at the
+very bottom of the screen, where the reader's attention is but which is the least comfortable place to
+read. So at a desk (the stylesheet's desktop block) the right column — its cards, a thread in it, and the
+thread list on its own (Ctrl+3) — scrolls on past its foot into blank room, as far as brings its last
+card's top to half the column's height. The foot is still where every list opens, lands and is followed
+from, its scrollbar at the bottom; the room opens only as the reader goes on down from the foot: a turn of
+the wheel once the wheel and the list have rested there for 150 ms (`OVERSCROLL_REST_MS`), PgDn or Space
+pressed afresh, or the down arrow pressed afresh on the last card. A fling of the wheel or a held key
+stops on the foot, and the next turn or press goes on. In the room the reader is at the newest: the jump
+stays down, a reply arriving opens in the room under the card they are reading (only one taller than they
+are past the foot takes them to it), the room is fitted again to the last card as it changes, and the
+last card changing size under them — pressed and shown whole, put out — is fitted to before the frame is
+drawn and left where they had it. The room closes as they go back up past the foot, after 700 ms resting
+at the foot without going into it (`OVERSCROLL_IDLE_MS`), on End and the Newest chip, and when the column
+shows anything else: another thread, layout, channel, view or screen, or another search or filter. A
+slow notched wheel goes into the room turn by turn; a main thread stalled for 150 ms in the middle of a
+fling can make it look like a rest, and the next turn goes into the room. A thread opened across the
+window from the thread list is in the left column's list and gets no room, nor does Main.
+
+`tests/column_overscroll_browser.py` (DAG step `column-overscroll-browser`) walks it in Chromium at
+1280x800 and 1920x1080: the cards, a thread on the right and the thread list on its own, the wheel, the
+keys, a press on the last card, a search in the room, a reply arriving in it, and a fling judged only on
+turns closer together than the page's rest as the page heard them; then six negative controls, each a copy
+of the page with one part taken out, which must fail at the check that part answers for.
+
 ### A filter keeps your place
 
 `#243 filter-keeps-selection`. The owner: *"when you adjust the filter, the highlighted message MUST
@@ -7861,7 +7888,9 @@ composer; with none selected, a card per thread, saying the summariser's `displa
 else the thread's first message, three lines at most. The cards run as the channel's lists do
 (`#261 two-column-connectors`): the newest activity at the foot, opened scrolled to it, a thread
 that moves going to the foot and followed there only by a reader already at the foot, and a reader up
-the list kept on their card; closing a thread comes back to the card it was chosen from. **Unread
+the list kept on their card; closing a thread comes back to the card it was chosen from. At a desk the
+right column scrolls on past its foot into blank room until its last card's top is at half its height
+(`#338 column-overscroll`, under "Room past the right column's foot"). **Unread
 only**, a toggle beside the column's "Thread list" heading (`#259 thread-list-unread-filter`), narrows the
 cards to the threads with unread replies, by the rule of the card's "N unread" or "N new" chip; it is
 kept per device, works with the search, keeps the selected card where it was as it goes on and off,

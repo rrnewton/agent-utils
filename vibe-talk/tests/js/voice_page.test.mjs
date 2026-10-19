@@ -463,7 +463,9 @@ const FIXTURE_TREE = {
   // `#298 thread-card-header`. Over a thread the heading is the thread's card, with the X in it.
   "side-heading": ["side-title", "side-unread-only", "side-thread-card"],
   "side-thread-card": ["side-thread-card-text", "side-thread-card-age", "side-thread-card-count", "side-close"],
-  "side-scroll": ["side-search-empty", "side-list", "side-pane"],
+  // `#338 column-overscroll`. Last, the room past the foot: no height, and so nothing in the layout, until the
+  // page gives it one, which a test draws with `drawOverscroll`.
+  "side-scroll": ["side-search-empty", "side-list", "side-pane", "side-overscroll"],
   "side-list": ["side-list-state", "side-more-threads", "side-cards"],
   "side-pane": [
     "side-summary",
@@ -4742,6 +4744,17 @@ const TUNING_BANDS = {
     "Under four, a hand on the mouse settling, or a pointer standing still as the card drawn whole moves " +
     "from under it, drops the glide the reader waits for; past twenty-four, a mouse that crossed a card " +
     "and stopped in the gap beside it counts as resting on it, and Main moves after the pointer has gone"],
+  // `#338 column-overscroll`. The room past the right column's foot.
+  OVERSCROLL_REST_MS: [80, 400,
+    "how long the wheel rests at the right column's foot before a turn of it goes on past the foot. " +
+    "Under about a tenth of a second, the turns of one spin of a wheel come further apart than that " +
+    "and a fling to the newest card overshoots into the blank room; past four tenths, a reader who " +
+    "stopped at the foot and turns the wheel again finds it does nothing"],
+  OVERSCROLL_IDLE_MS: [300, 2000,
+    "how long the room opened at the foot stays with the reader resting at the foot, not in it. " +
+    "Under a third of a second, a smooth scroll the key or the wheel started is still on its way into " +
+    "the room when it is taken away; past two seconds, the list keeps blank room below a reader who " +
+    "has gone back to reading at the foot"],
   // `#264 voice-send-approval`.
   SPOKEN_YES_SETTLE_MS: [800, 2000,
     "how long a heard yes waits for more before it sends. Under about a second, 'yes... wait' has " +
@@ -61899,11 +61912,179 @@ test("`#281 view-keys` x `#280 scroll-stability`: the dock growing under the car
   // not a rounding — and the reader up the cards and the window losing height come out the same.
   const threadOnly = await run(brokenScript(
     "    if (sideColumnUp() && currentView === \"discord\" && columns.side.mode === \"list\") {\n" +
-    "      if (!cardsOpening && grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) area.scrollTop = area.scrollHeight;\n" +
+    "      if (!cardsOpening && grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) followFoot(area);\n" +
     "      return;\n    }\n",
     ""));
   assert.ok(GROWTH > BOTTOM_SLACK_PX, "the premise: a second row is more than the slack");
   assert.deepStrictEqual(threadOnly, { ...real, listFoot: false, nearFoot: false, twoFoot: false });
+});
+
+// --- `#338 column-overscroll`: room past the right column's foot -------------------------------------
+//
+// The owner, 2026-10-15: at a desk the wheel and the page keys go on past the foot of the right column into
+// blank room, until the last card's top is at half the column's height. tests/column_overscroll_browser.py
+// walks it in Chromium, where the wheel, the browser's clamp at the end of a scroller and frames are real.
+// These hold the page's rules for it one at a time in the model above, which lays out heights and clamps
+// a position set past the end, but scrolls nothing by itself: where a browser would scroll for a key, the
+// test does, after the page has had the key.
+
+/**
+ * `#338 column-overscroll`. The one layout question the page asks of the room: whether web/voice.css gives
+ * it a box, which it does at a desk alone, the right column drawn. Left out of the ordinary fixture, so the
+ * rest of the suite runs with the room never offered, as on a phone.
+ */
+const drawOverscroll = (page) => {
+  page.el("side-overscroll").getClientRects = () =>
+    (page.wideDesk && page.el("side-column").getClientRects().length > 0 ? [{ top: 0, bottom: 0 }] : []);
+};
+
+/** The room's height as the page gave it, in px: 0 while it is closed. */
+const overscrollPx = (page) => Number.parseFloat(page.el("side-overscroll").style.height || "0") || 0;
+
+test("`#338 column-overscroll`: the room past the right column's foot is drawn at a desk alone, is the last thing in its scroller, is hidden from assistive technology, and is watched by neither observer of its neighbours", async () => {
+  assert.match(cssBlockIn(DESKTOP_QUERY, "#side-scroll > #side-overscroll"), /display:\s*block/,
+    "the desktop block does not draw the room");
+  assert.equal(cssBlockOutside(DESKTOP_QUERY, "#side-scroll > #side-overscroll"), "",
+    "the room is drawn outside the desktop block too");
+  assert.match(cssRules(CSS_UNCONDITIONAL, "#side-overscroll").join("\n"), /display:\s*none/,
+    "the room is not taken away everywhere else");
+  // The last child of the element after which the right column's place for a reply comes: #side-scroll, by
+  // the fixture's tree, which is checked against the markup as it is built.
+  assert.match(HTML_CODE, /<div id="side-overscroll" aria-hidden="true"><\/div>\s*<\/div>\s*<div id="side-reply"/,
+    "the room is not the last thing in the right column's scroller, or is not hidden from assistive technology");
+  const { page } = await manyThreadColumns(4, (p) => p.enableResizeObserver());
+  const room = page.el("side-overscroll");
+  const watching = page.resizeObservers.filter((observer) => observer.targets.includes(page.el("side-list")));
+  assert.ok(watching.length >= 2, "the premise: the right column's rows are watched by its jump's observer and its foot keeper");
+  assert.ok(watching.every((observer) => !observer.targets.includes(room)), "an observer of the rows watches the room");
+});
+
+test("`#338 column-overscroll`: at a desk PgDn or Space at the foot of the right column's cards opens room past it, as far as brings the last card's top to the middle; in it the reader is at the newest; End, the Newest chip, going back up past the foot and resting at the foot close it; and a held key, a key up the list, or a column with no box for it open none", async () => {
+  const IDLE_MS = sourceConstant("OVERSCROLL_IDLE_MS");
+  const run = async (script) => {
+    const { page } = await manyThreadColumns(16, drawOverscroll, script);
+    const side = page.el("side-scroll");
+    const room = page.el("side-overscroll");
+    const last = () => page.el("side-cards").children.at(-1);
+    const scrollSide = async (top) => {
+      side.scrollTop = top;
+      await side.dispatch("scroll");
+      await page.settle();
+    };
+    // A key with the focus on the column, and the scroll a browser makes for it, to the end of what it can.
+    const pageKey = async (key, fields = {}) => {
+      await press(page, side, key, fields);
+      if (!fields.repeat && (key === "PageDown" || key === " ")) await scrollSide(side.scrollHeight);
+    };
+    assert.ok(sideAtFoot(page), "the premise: the cards opened at their foot");
+    assert.ok(last().getBoundingClientRect().top > SCROLL_VIEWPORT_PX / 2 + LINE_PX,
+      "the premise: the last card's top is below the middle at the foot");
+    const out = {};
+    await pageKey("PageDown");
+    out.opened = overscrollPx(page) > 0;
+    out.middle = last().getBoundingClientRect().top;
+    // A little way into the room, further from its end than the slack: still at the newest (the jump over a
+    // thread on the right, which reads the same measure, is tests/column_overscroll_browser.py's JUMP).
+    await scrollSide(side.scrollHeight - overscrollPx(page) - side.clientHeight + 10);
+    out.inRoom = overscrollPx(page) - 10 > BOTTOM_SLACK_PX;
+    out.atNewest = page.pure("atBottom")(side);
+    await press(page, side, "End");
+    out.endClosed = overscrollPx(page) === 0 && sideAtFoot(page);
+    await pageKey(" ");
+    out.spaceOpened = overscrollPx(page) > 0;
+    await page.el("side-jump-newest").click();
+    await page.settle();
+    out.chipClosed = overscrollPx(page) === 0 && sideAtFoot(page);
+    await pageKey("PageDown");
+    await scrollSide(side.scrollHeight - overscrollPx(page) - side.clientHeight - 50);
+    out.backClosed = overscrollPx(page) === 0;
+    await scrollSide(side.scrollHeight);
+    await pageKey("PageDown", { repeat: true });
+    out.heldOpened = overscrollPx(page) > 0;
+    await scrollSide(100);
+    await pageKey("PageDown");
+    out.upOpened = overscrollPx(page) > 0;
+    await scrollSide(side.scrollHeight);
+    const drawn = room.getClientRects;
+    room.getClientRects = () => [];
+    await pageKey("PageDown");
+    out.noBoxOpened = overscrollPx(page) > 0;
+    room.getClientRects = drawn;
+    // Opened at the foot and not gone into: closed once the reader has rested there.
+    await press(page, side, "PageDown");
+    const waiting = overscrollPx(page) > 0;
+    page.expireTimers(IDLE_MS);
+    out.idleClosed = waiting && overscrollPx(page) === 0 && sideAtFoot(page);
+    return out;
+  };
+  const real = await run(SCRIPT);
+  assert.deepStrictEqual(real, {
+    opened: true, middle: SCROLL_VIEWPORT_PX / 2, inRoom: true, atNewest: true, endClosed: true,
+    spaceOpened: true, chipClosed: true, backClosed: true, heldOpened: false, upOpened: false, noBoxOpened: false,
+    idleClosed: true,
+  });
+
+  // THE CONTROLS. The room not counted as the foot: in it the reader is up the list.
+  const notFoot = await run(brokenScript(
+    "  return area.scrollHeight - overscrollRoom(area) - area.scrollTop - (area.clientHeight || 0);\n",
+    "  return area.scrollHeight - area.scrollTop - (area.clientHeight || 0);\n"));
+  assert.deepStrictEqual(notFoot, { ...real, atNewest: false });
+  // End and the chip landing where the room already is, rather than closing it: the reader stays in it.
+  const kept = await run(brokenScript(
+    "  if (area === leftEl(\"side-scroll\")) closeOverscroll();\n  area.scrollTop = area.scrollHeight;\n}",
+    "  area.scrollTop = area.scrollHeight;\n}").replace(
+    "  if (el(\"scroll-area\") === leftEl(\"side-scroll\")) closeOverscroll();\n", "").replace(
+    "  el(\"jump-newest\").addEventListener(\"click\", inThisColumn(() => {\n    closeOverscroll();\n",
+    "  el(\"jump-newest\").addEventListener(\"click\", inThisColumn(() => {\n"));
+  assert.deepStrictEqual(kept, { ...real, endClosed: false, chipClosed: false });
+});
+
+test("`#338 column-overscroll` x `#280 scroll-stability`: THE LAST CARD SHRINKING under a reader at the end of the room past the right column's foot, with nothing scrolled, is fitted to as its size is reported and left where the reader had it, its top at the middle; and the room closes once the cards left are too short to scroll past their foot even with it", async () => {
+  const run = async (script) => {
+    const { page } = await manyThreadColumns(16, (p) => {
+      p.enableResizeObserver();
+      drawOverscroll(p);
+    }, script);
+    const side = page.el("side-scroll");
+    const last = page.el("side-cards").children.at(-1);
+    // As a browser lays out a change of size: the position clamped to the new end first, then the sizes told.
+    const laidOut = () => {
+      side.scrollTop = side.scrollTop;
+      page.resized(page.el("side-list"));
+      page.expireTimers(0);
+    };
+    await press(page, side, "PageDown");
+    side.scrollTop = side.scrollHeight;
+    await side.dispatch("scroll");
+    const middle = last.getBoundingClientRect().top;
+    assert.equal(middle, SCROLL_VIEWPORT_PX / 2, "the premise: PgDn and the scroll for it left the last card's top at the middle");
+    const tall = last.height();
+    last.style.height = `${tall - 2 * LINE_PX}px`;
+    side.scrollTop = side.scrollTop;
+    const dropped = last.getBoundingClientRect().top - middle;
+    page.resized(page.el("side-list"));
+    page.expireTimers(0);
+    const held = last.getBoundingClientRect().top - middle;
+    const atEnd = side.scrollTop === side.scrollHeight - side.clientHeight;
+    // Every card but the last two gone, as a redraw could leave them: the two and the room fit in the column.
+    for (const row of page.el("side-cards").children.slice(0, -2)) row.hidden = true;
+    laidOut();
+    const shortClosed = overscrollPx(page) === 0;
+    return { dropped, held, atEnd, shortClosed };
+  };
+  const real = await run(SCRIPT);
+  assert.deepStrictEqual(real, { dropped: 2 * LINE_PX, held: 0, atEnd: true, shortClosed: true });
+
+  // THE CONTROLS. The foot keeper not holding the reader in the room: the room is fitted only after, and the
+  // card is left where the browser's clamp dropped it, the room now longer than where the reader is.
+  const unheld = await run(brokenScript("    holdOverscrollReader(area);\n    const was = footing;\n",
+    "    const was = footing;\n"));
+  assert.deepStrictEqual(unheld, { ...real, held: 2 * LINE_PX, atEnd: false });
+  // The room kept whatever the list's length: blank room left under two cards that do not scroll.
+  const kept = await run(brokenScript(
+    "  if (area.scrollHeight - (area.clientHeight || 0) > footTop(area) + 1) return true;\n  closeOverscroll();\n  return false;\n",
+    "  return true;\n"));
+  assert.deepStrictEqual(kept, { ...real, shortClosed: false });
 });
 
 // --- remote-ops-audit: every read of the channel says why it was made ----------------------------

@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser system-bots-browser edited-mark-browser rich-headers-browser read-aloud-browser post-confirm-browser approval-card-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser search-chord-browser two-column-browser bookmark-browser reply-continuity-browser reply-in-column-browser reply-marks-read-browser done-sync-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser composer-grow-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser thread-card-header-browser all-thread-strip-browser scroll-stability-browser copy-message-browser fold-steps-browser back-gesture-browser live-pill-browser stale-live-read-browser
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser system-bots-browser edited-mark-browser rich-headers-browser read-aloud-browser post-confirm-browser approval-card-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser search-chord-browser two-column-browser bookmark-browser reply-continuity-browser reply-in-column-browser reply-marks-read-browser done-sync-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser composer-grow-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser thread-card-header-browser all-thread-strip-browser scroll-stability-browser column-overscroll-browser copy-message-browser fold-steps-browser back-gesture-browser live-pill-browser stale-live-read-browser
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -388,6 +388,17 @@ stale-live-read-browser:
 # PNG of each stage.
 scroll-stability-browser:
 	python3 tests/scroll_stability_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
+
+# `#338 column-overscroll` in a real Chromium at 1280x800 and 1920x1080, in two columns with a mouse: at a
+# desk the right column scrolls on past its foot into blank room until the last card's top is at half the
+# column's height -- by the wheel after it has rested at the foot, by PgDn and Space, and by a fresh down
+# arrow on the last card -- and back up past the foot, End and a search close it. The mouse resting on the
+# last card, a press that shows it whole or puts it out, and a reply arriving in the room move nothing; a
+# fling of the wheel and a held key stop on the foot; and the thread list on its own (Ctrl+3) does the same.
+# Six negative controls follow at 1920x1080 (NO_CONTROLS=1 skips them). Pass WEB_ROOT=dir to run it against
+# another copy of the page, and SCREENSHOTS=dir to keep a PNG of each stage.
+column-overscroll-browser:
+	python3 tests/column_overscroll_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS)) $(if $(NO_CONTROLS),--no-controls)
 
 # `#240 reading-bookmark` in a real Chromium at 1280x800 (mouse and keys) and 412x915 (touch): the
 # bookmark set on a message (Shift+B, or the row's menu) is a line in the accent drawn in the room
