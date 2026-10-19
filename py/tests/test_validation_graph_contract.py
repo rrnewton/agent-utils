@@ -787,6 +787,95 @@ def test_distinct_cli_smokes_live_in_the_canonical_graph() -> None:
         assert command_fragment in by_tag[tag].cmd
 
 
+# ---- `#362 ci-failure-masking`: one failure must not hide the rest ------------------------------
+
+
+def _validate_module() -> ModuleType:
+    import validate
+
+    return validate
+
+
+def test_keep_going_reaches_dagrun_only_when_asked(monkeypatch: pytest.MonkeyPatch) -> None:
+    validate = _validate_module()
+    commands: list[list[str]] = []
+
+    def capture(command: list[str], **_kw: object) -> subprocess.CompletedProcess[str]:
+        commands.append(list(command))
+        return subprocess.CompletedProcess(command, 0)
+
+    for name in ("VALIDATE_DAGRUN_FLAGS", "BOX_FLAGS"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(validate.subprocess, "run", capture)
+    assert validate.run(frozenset(), frozenset(), all_contract=True) == 0
+    assert validate.run(frozenset(), frozenset(), all_contract=True, keep_going=True) == 0
+    eager, keep_going = commands
+    assert "--keep-going" not in eager
+    assert keep_going.count("--keep-going") == 1
+    assert [arg for arg in keep_going if arg != "--keep-going"] == eager
+
+
+def test_the_keep_going_flag_reaches_the_graph_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    validate = _validate_module()
+    seen: list[bool] = []
+
+    def fake_run(*_args: object, keep_going: bool = False, **_kw: object) -> int:
+        seen.append(keep_going)
+        return 1
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))  # no host settings file
+    monkeypatch.setattr(validate, "run", fake_run)
+    assert validate.main(["--all", "--keep-going"]) == 1
+    assert validate.main(["--all"]) == 1
+    assert seen == [True, False]
+
+
+def _workflow(name: str) -> dict[str, object]:
+    import yaml
+
+    loaded = yaml.safe_load((REPO_ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8"))
+    assert isinstance(loaded, dict)
+    return loaded
+
+
+def _job(workflow: dict[str, object], name: str) -> dict[str, object]:
+    jobs = workflow["jobs"]
+    assert isinstance(jobs, dict)
+    job = jobs[name]
+    assert isinstance(job, dict)
+    return job
+
+
+def _steps(job: dict[str, object]) -> list[dict[str, object]]:
+    steps = job["steps"]
+    assert isinstance(steps, list) and all(isinstance(step, dict) for step in steps)
+    return steps
+
+
+def _runs(job: dict[str, object]) -> list[str]:
+    return [str(step.get("run", "")) for step in _steps(job)]
+
+
+def test_ci_runs_the_whole_graph_past_a_failure() -> None:
+    validate_job = _job(_workflow("cross-dagrun.yml"), "validate")
+    assert any("python3 scripts/validate.py --keep-going $VALIDATE_ARGS" in run
+               for run in _runs(validate_job))
+    nightly = _job(_workflow("nightly-all.yml"), "everything")
+    assert "python3 scripts/validate.py --all --keep-going" in _runs(nightly)
+
+
+def test_the_rust_suites_run_past_a_failing_test_binary() -> None:
+    by_tag = dag_from_path(REPO_ROOT / "validation.dag.yaml").by_tag()
+    unit = by_tag["vibe-talk.test.unit"].cmd
+    assert "cargo test" in unit and "--no-fail-fast" in shlex.split(unit)
+    rust_tests = [step for tag, step in by_tag.items() if tag.startswith("rust.")
+                  and "cargo test" in step.cmd]
+    assert rust_tests
+    assert all("--no-fail-fast" in shlex.split(step.cmd) for step in rust_tests)
+
+
 # ---- `#365 package-step-cpu-budget` -------------------------------------------------------------
 
 

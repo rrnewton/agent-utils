@@ -1361,12 +1361,13 @@ steps:
   # ---- suites that need it ----------------------------------------------------------------------
   #
   # `cargo test` runs the Rust tests AND both page suites through their own harnesses, so each page
-  # suite has one owner in the complete graph rather than being paid for twice.
+  # suite has one owner in the complete graph rather than being paid for twice. --no-fail-fast: by
+  # default cargo stops at the first failing test binary, so one red binary hid every later one.
   - group: test
     job: unit
     desc: the Rust suites, and the page suites through their harnesses
     labels: [validation-vibe-talk]
-    cmd: cd vibe-talk && python3 ../scripts/case_timings.py run-cargo -- cargo test --release --locked
+    cmd: cd vibe-talk && python3 ../scripts/case_timings.py run-cargo -- cargo test --release --locked --no-fail-fast
     jobs_flag: ""
     jobs_env: CARGO_BUILD_JOBS
     deps: [build.release]

@@ -91,10 +91,11 @@ jobs:
       - name: check the declared Rust 1.85 MSRV
         run: cargo check --locked --workspace --all-targets --manifest-path rs/Cargo.toml
       # rs/Cargo.toml declares rust-version 1.85. Compiling the tests on it does not show that they
-      # pass on it: the selected graph runs them only on the stable toolchain.
+      # pass on it: the selected graph runs them only on the stable toolchain. --no-fail-fast, so
+      # the first failing test binary does not hide the others.
       - name: test all targets on the declared MSRV
         id: msrv-tests
-        run: cargo test --locked --workspace --all-targets --manifest-path rs/Cargo.toml
+        run: cargo test --locked --no-fail-fast --workspace --all-targets --manifest-path rs/Cargo.toml
       - name: verify registry artifacts on the declared MSRV
         # Also runs when only the test step failed, so a test failure does not hide this result.
         if: ${{ !cancelled() && (success() || steps.msrv-tests.outcome == 'failure') }}
@@ -150,7 +151,10 @@ jobs:
           # (which needs a core budget of eight) is skipped as eight-cpu and is covered locally.
           AGENT_UTILS_CROSS_ALLOW_SKIP: boxing,eight-cpu
           VALIDATE_ARGS: ${{ needs.plan.outputs.validate_args }}
-        run: python3 scripts/validate.py $VALIDATE_ARGS
+        # --keep-going: one failed step no longer aborts the independent ones, so a run names
+        # every failure instead of the first and "N not launched". Steps that depend on a failed
+        # step are still skipped.
+        run: python3 scripts/validate.py --keep-going $VALIDATE_ARGS
       - name: keep selected browser benchmark measurements
         if: always() && needs.plan.outputs.browser == 'true'
         uses: actions/upload-artifact@v4

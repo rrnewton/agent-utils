@@ -1675,9 +1675,11 @@ def _validate_with_one_cross_node(
         coverage_dir: Path,
         timing_dir: Path,
         host: object = None,
+        keep_going: bool = False,
     ) -> int:
         assert all_contract
         assert host == {}
+        assert not keep_going  # these runs do not ask for it
         seen.append(coverage_dir)
         monkeypatch.setenv(COVERAGE_DIR_ENV, str(coverage_dir))
         monkeypatch.setenv("AGENT_UTILS_CASE_TIMING_DIR", str(timing_dir))

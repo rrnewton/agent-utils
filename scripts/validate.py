@@ -24,6 +24,7 @@ Usage:
     python3 scripts/validate.py                 # against origin/main
     python3 scripts/validate.py --base HEAD~1
     python3 scripts/validate.py --all           # the entire portable contract, no selection
+    python3 scripts/validate.py --keep-going    # report every independent failure, not just the first
     python3 scripts/validate.py --list          # print the plan, run nothing
     python3 scripts/validate.py --self-test     # check the mapping itself, offline
 
@@ -599,13 +600,16 @@ def run(
     coverage_dir: Path | None = None,
     timing_dir: Path | None = None,
     host: Mapping[str, str] | None = None,
+    keep_going: bool = False,
 ) -> int:
     """Execute one flattened dagrun graph for the selected contract.
 
     With `coverage_dir`, every cross differential node writes its verdict record there. With
     `timing_dir`, every timing-capable runner writes its normalized per-case record there
     (see ``scripts/case_timings.py``). `host` is the validate.env settings, added to the
-    graph's environment only.
+    graph's environment only. With `keep_going`, a failed step no longer aborts the steps
+    that do not depend on it (dagrun --keep-going), so one run reports every independent
+    failure. `#362 ci-failure-masking`.
     """
 
     cpu_count = os.cpu_count() or 1
@@ -628,6 +632,8 @@ def run(
         labels = {GROUP_LABELS[group] for group in selected}
         labels.update(f"component-{name}" for name in components)
         command.extend(("--labels", ",".join(sorted(labels))))
+    if keep_going:
+        command.append("--keep-going")
     extra = os.environ.get("VALIDATE_DAGRUN_FLAGS", os.environ.get("BOX_FLAGS", ""))
     command.extend(shlex.split(extra))
     print(f"\n=== flattened validation DAG ({len(command)} argv entries) ===", flush=True)
@@ -1331,6 +1337,13 @@ def main(argv: list[str] | None = None) -> int:
         help="run the entire portable, current-toolchain contract, selecting nothing",
     )
     parser.add_argument("--list", action="store_true", help="print the plan and exit without running")
+    parser.add_argument(
+        "--keep-going",
+        action="store_true",
+        help="after a failed step, keep running every step that does not depend on it (dagrun "
+        "--keep-going), so one run reports every independent failure; default: stop at the "
+        "first failure, for fast feedback while editing",
+    )
     parser.add_argument("--self-test", action="store_true", help="check the mapping offline, then exit")
     args = parser.parse_args(argv)
 
@@ -1387,6 +1400,7 @@ def main(argv: list[str] | None = None) -> int:
             coverage_dir=Path(coverage),
             timing_dir=Path(timings),
             host=host,
+            keep_going=args.keep_going,
         )
         if code != 0:
             return code
