@@ -1,6 +1,9 @@
 //! One server, two chat providers: every channel-scoped route reaches the provider that owns the
 //! channel, the page is told each provider's own capabilities, and a channel added from the app
 //! stays with the provider that registered it across a restart.
+//!
+//! `#355 provider-grouped-channels`: the channel browser and the add form name the service they
+//! mean, a direct addition keeps its service, and a second account of one service is refused.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,6 +59,15 @@ impl ChatClient for SlackLike {
     }
     async fn unregister_channel(&self, channel: &ChannelId) -> Result<(), ChatError> {
         self.0.unregister_channel(channel).await
+    }
+    fn supports_channel_discovery(&self) -> bool {
+        self.0.supports_channel_discovery()
+    }
+    async fn discover_channels(
+        &self,
+        request: &vibe_talk::directory::DirectoryRequest,
+    ) -> Result<vibe_talk::directory::DirectoryPage, ChatError> {
+        self.0.discover_channels(request).await
     }
     async fn identity(&self) -> Result<ChatIdentity, ChatError> {
         self.0.identity().await
@@ -547,5 +559,641 @@ async fn each_channel_gets_the_forward_cursor_its_own_provider_can_answer() {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
         assert_eq!(refused["error"], "cursor_mismatch");
+    }
+}
+
+// --- `#355 provider-grouped-channels` ----------------------------------------------------------
+
+/// A provider that adds channels by id, not by registration: a Discord bot, or a Slack with
+/// registration off. Certain of the ids `claim` says are its own. Each probe is announced on
+/// `probing`.
+struct Direct {
+    inner: Arc<FakeDiscord>,
+    name: &'static str,
+    claim: fn(&str) -> SourceClaim,
+    probing: Arc<tokio::sync::Notify>,
+}
+
+impl Direct {
+    fn new(inner: &Arc<FakeDiscord>, name: &'static str, claim: fn(&str) -> SourceClaim) -> Self {
+        Self {
+            inner: Arc::clone(inner),
+            name,
+            claim,
+            probing: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+}
+
+fn digits(source: &str) -> SourceClaim {
+    if !source.is_empty() && source.chars().all(|c| c.is_ascii_digit()) {
+        SourceClaim::Certain
+    } else {
+        SourceClaim::Never
+    }
+}
+
+fn slack_ids(source: &str) -> SourceClaim {
+    if source.starts_with('C') {
+        SourceClaim::Certain
+    } else {
+        SourceClaim::Never
+    }
+}
+
+#[async_trait]
+impl ChatClient for Direct {
+    fn provider_name(&self) -> &str {
+        self.name
+    }
+    fn claims_source(&self, source: &str) -> SourceClaim {
+        (self.claim)(source)
+    }
+    async fn identity(&self) -> Result<ChatIdentity, ChatError> {
+        self.inner.identity().await
+    }
+    async fn fetch_page(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+        before: Option<&MessageId>,
+        after: Option<&MessageId>,
+    ) -> Result<Vec<Message>, ChatError> {
+        self.inner.fetch_page(channel, limit, before, after).await
+    }
+    async fn probe_channel(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+    ) -> Result<Vec<Message>, ChatError> {
+        self.probing.notify_one();
+        self.inner.fetch_recent(channel, limit).await
+    }
+    async fn post_message(
+        &self,
+        channel: &ChannelId,
+        content: &str,
+        reply_to: Option<&MessageId>,
+    ) -> Result<Message, ChatError> {
+        self.inner.post_message(channel, content, reply_to).await
+    }
+}
+
+const BOT_CHANNEL: &str = "1111111111";
+const ADDED_BOT_CHANNEL: &str = "3333333333";
+
+/// A server reading two services and no legacy `[discord]` section, so no service is the default:
+/// `providers` is the TOML of its `[[providers]]` and `[[channels]]`.
+fn no_default_config(providers: &str) -> String {
+    format!(
+        "[server]\nbind = \"127.0.0.1:0\"\n\n\
+         [auth]\nread_token = \"{}\"\nwrite_token = \"{WRITE_TOKEN}\"\n\n{providers}",
+        vibe_talk::testing::READ_TOKEN
+    )
+}
+
+/// A Discord bot keyed `bot` and a Slack keyed `slack`, one channel each.
+fn bot_and_slack_config() -> String {
+    no_default_config(&format!(
+        "[[providers]]\nkey = \"bot\"\nkind = \"discord\"\napi_base = \"https://bot.example/api/v10\"\ntoken = \"bot-token\"\n\n\
+         [[providers]]\nkey = \"slack\"\nkind = \"slack\"\ntoken = \"xoxb-test\"\n\n\
+         [[channels]]\nid = \"{BOT_CHANNEL}\"\nlabel = \"bot home\"\nprovider = \"bot\"\n\n\
+         [[channels]]\nid = \"{SLACK_CHANNEL}\"\nlabel = \"slack team\"\nwritable = true\nprovider = \"slack\"\n"
+    ))
+}
+
+/// A server over `config` whose providers are `clients`, each keyed, namespaced and polled as
+/// `config` configures the provider in the same place, over `store` when one is shared.
+fn served_by(
+    config: &str,
+    store: Option<Arc<vibe_talk::store::fake::FakeStore>>,
+    clients: Vec<Arc<dyn ChatClient>>,
+) -> (AppState, Arc<vibe_talk::store::fake::FakeStore>) {
+    let (mut state, _discord, fresh) = vibe_talk::testing::state_with_store_from_toml(config);
+    let store = match store {
+        Some(shared) => {
+            state.store = shared.clone();
+            shared
+        }
+        None => fresh,
+    };
+    let entries = state
+        .config
+        .providers
+        .iter()
+        .zip(clients)
+        .map(|(provider, client)| ProviderEntry {
+            key: provider.key.clone(),
+            namespace: provider.namespace(),
+            client,
+            live_poll_seconds: provider.live_poll_seconds,
+        })
+        .collect();
+    let router = ChatRouter::new(entries, state.config.default_provider_key());
+    state.replace_providers(Arc::new(router));
+    (state, store)
+}
+
+fn listed(source: &str, name: &str) -> vibe_talk::directory::DirectoryEntry {
+    vibe_talk::directory::DirectoryEntry {
+        source: source.to_owned(),
+        name: name.to_owned(),
+        registered_channel_id: None,
+    }
+}
+
+fn sources(page: &Value) -> Vec<String> {
+    page["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .map(|entry| entry["source"].as_str().expect("source").to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn the_browser_lists_only_the_service_it_is_asked_for() {
+    let Deployment {
+        state,
+        discord,
+        slack,
+        ..
+    } = deployment(None);
+    discord.enable_channel_registration(&ChannelId("9".to_owned()), false, false);
+    discord.enable_channel_directory(vec![listed("room/1", "bridge room")], false);
+    slack.enable_channel_registration(&ChannelId("C1".to_owned()), false, false);
+    slack.enable_channel_directory(
+        vec![
+            listed("C0999ZZZZZ", "#added"),
+            listed("C0888YYYYY", "#other"),
+        ],
+        false,
+    );
+
+    let (status, page) = call(
+        &state,
+        "GET",
+        "/api/v1/channel-directory?limit=1&provider=slack",
+        WRITE_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(sources(&page), ["C0999ZZZZZ"]);
+    assert_eq!(page["entries"][0]["provider"], "slack");
+    assert!(
+        discord.directory_calls().is_empty(),
+        "a page of Slack asked the bridge too"
+    );
+    let cursor = page["next_cursor"]
+        .as_str()
+        .expect("a second page")
+        .to_owned();
+    let (status, page) = call(
+        &state,
+        "GET",
+        &format!("/api/v1/channel-directory?limit=1&provider=slack&cursor={cursor}"),
+        WRITE_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(sources(&page), ["C0888YYYYY"]);
+    assert!(
+        page["next_cursor"].is_null(),
+        "the walk of one service ends with its last page: {page}"
+    );
+    assert!(discord.directory_calls().is_empty());
+
+    // A cursor from the bridge's walk is not one for Slack's.
+    let (status, bridge) = call(
+        &state,
+        "GET",
+        "/api/v1/channel-directory?limit=1&provider=discord",
+        WRITE_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{bridge}");
+    assert_eq!(sources(&bridge), ["room/1"]);
+    let (status, refused) = call(
+        &state,
+        "GET",
+        &format!("/api/v1/channel-directory?limit=1&provider=discord&cursor={cursor}"),
+        WRITE_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+
+    // Unscoped, both services are walked as before, and entries name no service.
+    let (status, page) = call(
+        &state,
+        "GET",
+        "/api/v1/channel-directory?limit=5",
+        WRITE_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(sources(&page), ["room/1"]);
+    assert!(page["entries"][0].get("provider").is_none(), "{page}");
+
+    let (status, refused) = call(
+        &state,
+        "GET",
+        "/api/v1/channel-directory?provider=teams",
+        WRITE_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(refused["error"], "unknown_provider");
+}
+
+#[tokio::test]
+async fn the_browser_says_a_service_cannot_list_channels_when_it_cannot() {
+    let Deployment { state, slack, .. } = deployment(None);
+    slack.enable_channel_registration(&ChannelId("C1".to_owned()), false, false);
+    slack.enable_channel_directory(vec![listed("C0999ZZZZZ", "#added")], false);
+    // The legacy Discord here neither registers nor lists.
+    let (status, refused) = call(
+        &state,
+        "GET",
+        "/api/v1/channel-directory?provider=discord",
+        WRITE_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{refused}");
+    assert_eq!(refused["error"], "channel_directory_unsupported");
+    assert!(
+        refused["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("Discord "),
+        "{refused}"
+    );
+}
+
+#[tokio::test]
+async fn a_link_for_the_named_service_is_registered_there_even_when_another_might_take_it() {
+    let Deployment {
+        state,
+        discord,
+        slack,
+        ..
+    } = deployment(None);
+    // The bridge might take any reference; Slack recognises none that is not Slack-shaped.
+    discord.enable_channel_registration(&ChannelId("9".to_owned()), true, false);
+    let added = ChannelId(ADDED_SLACK_CHANNEL.to_owned());
+    slack.enable_channel_registration(&added, true, true);
+    let (status, body) = call(
+        &state,
+        "POST",
+        "/api/v1/channels",
+        WRITE_TOKEN,
+        Some(json!({"source": "room/5", "label": "named", "provider": "slack"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["channel"]["provider"], "slack");
+    assert_eq!(
+        slack.registration_calls(),
+        [("room/5".to_owned(), "named".to_owned())]
+    );
+    assert!(discord.registration_calls().is_empty());
+
+    // A reference naming another service than the one asked for is refused, not guessed at.
+    let (status, refused) = call(
+        &state,
+        "POST",
+        "/api/v1/channels",
+        WRITE_TOKEN,
+        Some(json!({"source": "discord:room/6", "label": "x", "provider": "slack"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(refused["error"], "provider_mismatch");
+    let (status, refused) = call(
+        &state,
+        "POST",
+        "/api/v1/channels",
+        WRITE_TOKEN,
+        Some(json!({"source": "room/6", "label": "x", "provider": "teams"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(refused["error"], "unknown_provider");
+    assert!(discord.registration_calls().is_empty());
+}
+
+#[tokio::test]
+async fn an_id_for_a_service_that_is_not_the_default_keeps_its_service_at_once_and_after_a_restart()
+{
+    let bot = Arc::new(FakeDiscord::new());
+    let slack = Arc::new(FakeDiscord::new());
+    let added = ChannelId(ADDED_BOT_CHANNEL.to_owned());
+    bot.register_channel(&added);
+    let (state, store) = served_by(
+        &bot_and_slack_config(),
+        None,
+        vec![
+            Arc::new(Direct::new(&bot, "Discord", digits)),
+            Arc::new(SlackLike(slack.clone())),
+        ],
+    );
+    assert_eq!(state.config.default_provider_key(), None);
+    let (status, body) = call(
+        &state,
+        "POST",
+        "/api/v1/channels",
+        WRITE_TOKEN,
+        Some(json!({
+            "id": ADDED_BOT_CHANNEL,
+            "label": "added by id",
+            "writable": true,
+            "provider": "bot",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["channel"]["provider"], "bot");
+    assert_eq!(body["channel"]["writable"], true);
+    assert!(slack.registration_calls().is_empty());
+    // Straight after the add: the route re-derived from the stored row still reaches the bot.
+    assert_eq!(state.providers.key_for(&added).as_deref(), Some("bot"));
+    bot.seed(&added, "ada", "from the bot");
+    let (status, page) = call(
+        &state,
+        "GET",
+        &format!("/api/v1/channels/{ADDED_BOT_CHANNEL}/messages"),
+        WRITE_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert!(page.to_string().contains("from the bot"), "{page}");
+
+    // A new process over the same store.
+    let (second, _) = served_by(
+        &bot_and_slack_config(),
+        Some(store),
+        vec![
+            Arc::new(Direct::new(&bot, "Discord", digits)),
+            Arc::new(SlackLike(slack.clone())),
+        ],
+    );
+    second.restore_added_channels().await.expect("restore");
+    let restored = second.channel(ADDED_BOT_CHANNEL).expect("restored");
+    assert_eq!(restored.provider.as_deref(), Some("bot"));
+    assert!(restored.writable);
+    let (status, page) = call(
+        &second,
+        "GET",
+        &format!("/api/v1/channels/{ADDED_BOT_CHANNEL}/messages"),
+        WRITE_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert!(page.to_string().contains("from the bot"), "{page}");
+
+    // Removal touches nothing upstream for a direct channel, and the channel stops routing.
+    let (status, body) = call(
+        &second,
+        "DELETE",
+        &format!("/api/v1/channels/{ADDED_BOT_CHANNEL}"),
+        WRITE_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(second.providers.key_for(&added).is_none());
+}
+
+#[tokio::test]
+async fn an_id_with_no_service_named_goes_to_the_default_or_is_refused_by_name_when_there_is_none()
+{
+    // Discord (the legacy default) and a Slack that does not register channels: nothing manages
+    // registration, so an id is a direct addition.
+    let discord_fake = Arc::new(FakeDiscord::new());
+    let slack = Arc::new(FakeDiscord::new());
+    let added = ChannelId(ADDED_BOT_CHANNEL.to_owned());
+    discord_fake.register_channel(&ChannelId(READ_CHANNEL.to_owned()));
+    discord_fake.register_channel(&ChannelId(vibe_talk::testing::WRITE_CHANNEL.to_owned()));
+    discord_fake.register_channel(&added);
+    let (state, _) = served_by(
+        &config_text(),
+        None,
+        vec![
+            Arc::new(Direct::new(&discord_fake, "Discord", digits)),
+            Arc::new(Direct::new(&slack, "Slack", slack_ids)),
+        ],
+    );
+    let (status, body) = call(
+        &state,
+        "POST",
+        "/api/v1/channels",
+        WRITE_TOKEN,
+        Some(json!({"id": ADDED_BOT_CHANNEL, "label": "by id"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["channel"]["provider"], "discord");
+    assert_eq!(state.providers.key_for(&added).as_deref(), Some("discord"));
+
+    // A Slack that does not register channels takes its own ids directly when named.
+    let team = ChannelId(ADDED_SLACK_CHANNEL.to_owned());
+    slack.register_channel(&team);
+    let (status, body) = call(
+        &state,
+        "POST",
+        "/api/v1/channels",
+        WRITE_TOKEN,
+        Some(json!({"id": ADDED_SLACK_CHANNEL, "label": "slack by id", "provider": "slack"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["channel"]["provider"], "slack");
+    assert_eq!(state.providers.key_for(&team).as_deref(), Some("slack"));
+
+    // With no default service, an id with no service named is refused by name, not by a probe.
+    let bot = Arc::new(FakeDiscord::new());
+    bot.register_channel(&added);
+    let (state, _) = served_by(
+        &bot_and_slack_config(),
+        None,
+        vec![
+            Arc::new(Direct::new(&bot, "Discord", digits)),
+            Arc::new(Direct::new(&slack, "Slack", slack_ids)),
+        ],
+    );
+    let (status, refused) = call(
+        &state,
+        "POST",
+        "/api/v1/channels",
+        WRITE_TOKEN,
+        Some(json!({"id": ADDED_BOT_CHANNEL, "label": "by id"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(refused["error"], "provider_required");
+    assert!(state.channel(ADDED_BOT_CHANNEL).is_none());
+}
+
+#[tokio::test]
+async fn a_direct_addition_among_several_services_waits_for_other_changes_to_the_list() {
+    // Bound to its service before the probe and held there until stored: a removal or a hide
+    // re-deriving the routes meanwhile would drop the binding, so the addition takes the same
+    // lifecycle lock they do.
+    let bot = Arc::new(FakeDiscord::new());
+    let slack = Arc::new(FakeDiscord::new());
+    let added = ChannelId(ADDED_BOT_CHANNEL.to_owned());
+    bot.register_channel(&added);
+    let direct = Direct::new(&bot, "Discord", digits);
+    let probing = Arc::clone(&direct.probing);
+    let (state, _) = served_by(
+        &bot_and_slack_config(),
+        None,
+        vec![
+            Arc::new(direct),
+            Arc::new(Direct::new(&slack, "Slack", slack_ids)),
+        ],
+    );
+    let held = Arc::clone(&state.channel_registration_lock)
+        .lock_owned()
+        .await;
+    let adding = tokio::spawn({
+        let state = state.clone();
+        async move {
+            call(
+                &state,
+                "POST",
+                "/api/v1/channels",
+                WRITE_TOKEN,
+                Some(json!({"id": ADDED_BOT_CHANNEL, "label": "by id", "provider": "bot"})),
+            )
+            .await
+        }
+    });
+    let probed = tokio::time::timeout(Duration::from_millis(200), probing.notified()).await;
+    assert!(
+        probed.is_err() && !adding.is_finished(),
+        "the addition probed while another change to the channel list held the lock"
+    );
+    drop(held);
+    let (status, body) = adding.await.expect("add task");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(state.providers.key_for(&added).as_deref(), Some("bot"));
+}
+
+/// Two Slack workspaces at the same API base, `work` then `home`.
+fn two_workspaces_config() -> String {
+    no_default_config(&format!(
+        "[[providers]]\nkey = \"work\"\nkind = \"slack\"\ntoken = \"xoxb-work\"\n\n\
+         [[providers]]\nkey = \"home\"\nkind = \"slack\"\ntoken = \"xoxb-home\"\n\n\
+         [[channels]]\nid = \"{SLACK_CHANNEL}\"\nlabel = \"work team\"\nprovider = \"work\"\n"
+    ))
+}
+
+#[tokio::test]
+async fn a_second_account_at_the_same_api_base_is_refused_before_anything_is_registered() {
+    let work = Arc::new(FakeDiscord::new());
+    let home = Arc::new(FakeDiscord::new());
+    let added = ChannelId(ADDED_SLACK_CHANNEL.to_owned());
+    work.enable_channel_registration(&added, true, true);
+    home.enable_channel_registration(&added, true, true);
+    let (state, _) = served_by(
+        &two_workspaces_config(),
+        None,
+        vec![
+            Arc::new(SlackLike(work.clone())),
+            Arc::new(SlackLike(home.clone())),
+        ],
+    );
+    for body in [
+        json!({"source": ADDED_SLACK_CHANNEL, "label": "home", "provider": "home"}),
+        json!({"source": format!("home:{ADDED_SLACK_CHANNEL}"), "label": "home"}),
+    ] {
+        let (status, refused) =
+            call(&state, "POST", "/api/v1/channels", WRITE_TOKEN, Some(body)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["error"], "provider_namespace_shared");
+        let detail = refused["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("Slack (home)")
+                && detail.contains("filed under Slack (work)")
+                && detail.contains("configuration file"),
+            "{detail}"
+        );
+    }
+    assert!(
+        home.registration_calls().is_empty(),
+        "the refusal came after an upstream registration"
+    );
+    assert!(state.channel(ADDED_SLACK_CHANNEL).is_none());
+
+    // The first account of the pair adds as before.
+    let (status, body) = call(
+        &state,
+        "POST",
+        "/api/v1/channels",
+        WRITE_TOKEN,
+        Some(json!({"source": ADDED_SLACK_CHANNEL, "label": "work", "provider": "work"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["channel"]["provider"], "work");
+    assert_eq!(work.registration_calls().len(), 1);
+}
+
+/// Two Slack-like services at different API bases, `work` then `second`, each certain of every
+/// Slack-shaped id, and a channel of `second`'s on the list.
+fn two_slacks_config() -> String {
+    no_default_config(&format!(
+        "[[providers]]\nkey = \"work\"\nkind = \"slack\"\ntoken = \"xoxb-work\"\n\n\
+         [[providers]]\nkey = \"second\"\nkind = \"slack\"\napi_base = \"https://slack.example/api\"\ntoken = \"xoxb-second\"\n\n\
+         [[channels]]\nid = \"{SLACK_CHANNEL}\"\nlabel = \"work team\"\nprovider = \"work\"\n\n\
+         [[channels]]\nid = \"C0777XXXXX\"\nlabel = \"second team\"\nprovider = \"second\"\n"
+    ))
+}
+
+#[tokio::test]
+async fn a_channel_listed_under_its_service_key_is_already_added() {
+    let work = Arc::new(FakeDiscord::new());
+    let second = Arc::new(FakeDiscord::new());
+    work.enable_channel_registration(&ChannelId("C1".to_owned()), false, false);
+    second.enable_channel_registration(&ChannelId("C2".to_owned()), false, false);
+    second.enable_channel_directory(
+        vec![
+            listed("C0777XXXXX", "#second team"),
+            listed("C0666WWWWW", "#new"),
+        ],
+        false,
+    );
+    let (state, _) = served_by(
+        &two_slacks_config(),
+        None,
+        vec![
+            Arc::new(SlackLike(work.clone())),
+            Arc::new(SlackLike(second.clone())),
+        ],
+    );
+    for path in [
+        "/api/v1/channel-directory?provider=second",
+        "/api/v1/channel-directory",
+    ] {
+        let (status, page) = call(&state, "GET", path, WRITE_TOKEN, None).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        // Both services would take a bare Slack id, so the router names the service.
+        assert_eq!(
+            sources(&page),
+            ["second:C0777XXXXX", "second:C0666WWWWW"],
+            "{path}"
+        );
+        assert_eq!(page["entries"][0]["tracked"], true, "{path}: {page}");
+        assert_eq!(page["entries"][0]["channel_id"], "C0777XXXXX", "{path}");
+        assert_eq!(page["entries"][1]["tracked"], false, "{path}");
     }
 }

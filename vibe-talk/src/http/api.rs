@@ -13,7 +13,7 @@ use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, AuthError, Scope};
-use crate::chat::ChatError;
+use crate::chat::{ChatError, SourceClaim};
 use crate::conversation::{VoiceSession, VoiceSessionError};
 use crate::elevenlabs::{SignedUrl, SignedUrlError};
 use crate::model::{ChannelId, ChannelInfo, Message, MessageId, UserId};
@@ -4680,6 +4680,12 @@ pub struct ChannelDirectoryQuery {
     /// Entries per page, `1..=50`, default 25.
     #[serde(default)]
     pub limit: Option<u16>,
+    /// The configured key of the one chat service to list, for a server that reads several.
+    /// `#355 provider-grouped-channels`. Omitted, every service that can list its channels is
+    /// walked in turn behind one cursor, as before. A cursor belongs to the walk that issued it:
+    /// one from another service's walk is refused.
+    #[serde(default)]
+    pub provider: Option<String>,
 }
 
 /// A channel the bridge can see, and whether this app already tracks it.
@@ -4693,6 +4699,10 @@ pub struct ChannelDirectoryEntry {
     pub tracked: bool,
     /// That channel's id, when tracked.
     pub channel_id: Option<ChannelId>,
+    /// The key of the chat service that listed it, on a page asked of one service in a server
+    /// that reads several; absent otherwise. `#355 provider-grouped-channels`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 }
 
 /// One page of the channel directory.
@@ -4714,6 +4724,11 @@ pub struct ChannelDirectoryResponse {
 ///
 /// Tracked entries are marked here rather than by the bridge alone: a source is tracked when the
 /// bridge's existing registration for it, or the source itself, is a channel in this app's list.
+/// A source the router wrote with a service's key in front (`work:C0123`) is compared without
+/// the key, and only with a channel of that service. `#355 provider-grouped-channels`.
+///
+/// With `provider`, only that service is listed (`#355 provider-grouped-channels`): Settings asks
+/// for the service it is showing. A server with one service lists it either way.
 pub async fn channel_directory(
     State(state): State<AppState>,
     _scope: WriteScope,
@@ -4723,13 +4738,31 @@ pub async fn channel_directory(
         DirectoryRequest, DEFAULT_LIMIT, MAX_LIMIT, MAX_QUERY_CHARS, MAX_TOKEN_BYTES,
     };
 
-    if !state.chat.supports_channel_discovery() {
+    let scope = match named_provider(query.provider.as_deref()) {
+        None => None,
+        Some(key) => Some(
+            state
+                .providers
+                .entry(key)
+                .ok_or_else(|| unknown_provider(&state))?,
+        ),
+    };
+    let (can_list, service) = match scope {
+        Some(entry) => (
+            entry.client.supports_channel_discovery(),
+            entry.client.provider_name(),
+        ),
+        None => (
+            state.chat.supports_channel_discovery(),
+            state.chat.provider_name(),
+        ),
+    };
+    if !can_list {
         return Err(ApiError::new(
             StatusCode::NOT_IMPLEMENTED,
             "channel_directory_unsupported",
             format!(
-                "{} cannot list channels through this chat connector; add one by link or reference instead",
-                state.chat.provider_name()
+                "{service} cannot list channels through this chat connector; add one by link or reference instead"
             ),
         ));
     }
@@ -4769,33 +4802,44 @@ pub async fn channel_directory(
         cursor: query.cursor,
         limit,
     };
-    let page = state
-        .chat
-        .discover_channels(&request)
-        .await
-        .map_err(directory_error)?;
-    let local: std::collections::BTreeSet<String> = state
+    let scope = scope.filter(|_| state.providers.is_multi());
+    let page = match scope {
+        Some(entry) => {
+            state
+                .providers
+                .discover_channels_of(&entry.key, &request)
+                .await
+        }
+        None => state.chat.discover_channels(&request).await,
+    }
+    .map_err(directory_error)?;
+    // Each listed channel and the service it is read through.
+    let local: std::collections::BTreeMap<String, Option<String>> = state
         .all_channels()
         .into_iter()
-        .map(|channel| channel.id.as_str().to_owned())
+        .map(|channel| (channel.id.as_str().to_owned(), channel.provider))
         .collect();
     let entries = page
         .entries
         .into_iter()
         .map(|entry| {
+            let (written, bare) = state.providers.split_key(&entry.source);
+            let lister = scope.map(|service| service.key.as_str()).or(written);
+            let listed_here = |id: &str| {
+                local.get(id).is_some_and(|provider| {
+                    lister.is_none_or(|key| provider.as_deref().is_none_or(|owner| owner == key))
+                })
+            };
             let channel_id = entry
                 .registered_channel_id
-                .filter(|id| local.contains(id.as_str()))
-                .or_else(|| {
-                    local
-                        .contains(&entry.source)
-                        .then(|| ChannelId(entry.source.clone()))
-                });
+                .filter(|id| local.contains_key(id.as_str()))
+                .or_else(|| listed_here(bare).then(|| ChannelId(bare.to_owned())));
             ChannelDirectoryEntry {
                 source: entry.source,
                 name: entry.name,
                 tracked: channel_id.is_some(),
                 channel_id,
+                provider: scope.map(|service| service.key.clone()),
             }
         })
         .collect();
@@ -4849,6 +4893,12 @@ pub struct AddChannelRequest {
     /// targets must omit the field entirely because their bridge declares the policy.
     #[serde(default)]
     writable: Present<bool>,
+    /// The configured key of the chat service the channel is on, for a server that reads several.
+    /// `#355 provider-grouped-channels`. It decides whether the channel is registered (a link or
+    /// reference, as `source`) or added directly (an `id`), by what THAT service does. Omitted, a
+    /// link goes to the service that recognises it and an id to the default service, as before.
+    #[serde(default)]
+    provider: Option<String>,
 }
 
 /// What happened when a channel was added, removed, or shown again.
@@ -4907,6 +4957,74 @@ fn hidden_configured(state: &AppState, id: &str) -> Option<ChannelInfo> {
         .filter(|channel| state.channel(channel.id.as_str()).is_none())
 }
 
+/// A provider key a request named, trimmed, or `None` when it named none.
+fn named_provider(key: Option<&str>) -> Option<&str> {
+    key.map(str::trim).filter(|key| !key.is_empty())
+}
+
+/// The refusal of a provider key no configured service has, naming the ones there are.
+/// `#355 provider-grouped-channels`.
+fn unknown_provider(state: &AppState) -> ApiError {
+    let keys: Vec<&str> = state
+        .providers
+        .entries()
+        .iter()
+        .map(|entry| entry.key.as_str())
+        .collect();
+    ApiError::new(
+        StatusCode::BAD_REQUEST,
+        "unknown_provider",
+        format!(
+            "no chat service is configured under that key; this server has: {}",
+            keys.join(", ")
+        ),
+    )
+}
+
+/// Refuse adding a channel from the app for a second account of one service, before anything is
+/// created upstream. `#355 provider-grouped-channels`: the channel would be stored under the
+/// namespace both accounts share, and filed under the first account the moment the routes are
+/// re-derived. `#356 provider-namespace-per-key` is the fix.
+fn refuse_shared_namespace(state: &AppState, key: &str) -> Result<(), ApiError> {
+    let Some(first) = state.providers.namespace_owner_before(key) else {
+        return Ok(());
+    };
+    let name = state
+        .providers
+        .entry(key)
+        .map_or(key, |entry| entry.client.provider_name());
+    let first_name = first.client.provider_name();
+    Err(ApiError::new(
+        StatusCode::CONFLICT,
+        "provider_namespace_shared",
+        format!(
+            "{name} ({key}) uses the same API base as {first_name} ({}), which is configured \
+             before it, so a channel added here would be filed under {first_name} ({}) and read \
+             through that account. Add this channel in the server's configuration file instead, \
+             with provider = \"{key}\".",
+            first.key, first.key
+        ),
+    ))
+}
+
+/// Whether an added row is a direct channel, one no bridge registered: recorded with no
+/// namespace, or, where several providers each record theirs, under a provider that does not
+/// manage registration. `#355 provider-grouped-channels`.
+fn added_directly(state: &AppState, row: &crate::store::AddedChannel) -> bool {
+    match row.registration_provider.as_deref() {
+        None => true,
+        Some(namespace) => {
+            state.providers.is_multi()
+                && state
+                    .providers
+                    .entries()
+                    .iter()
+                    .find(|entry| entry.namespace == namespace)
+                    .is_some_and(|entry| !entry.client.supports_channel_registration())
+        }
+    }
+}
+
 /// `POST /api/v1/channels` — add a channel without editing a file or redeploying.
 ///
 /// WRITE SCOPE, AND NO MCP TOOL. Adding a channel widens what this bridge can read, and if
@@ -4924,6 +5042,14 @@ fn hidden_configured(state: &AppState, id: &str) -> Option<ChannelInfo> {
 /// ADDING A CONFIGURED CHANNEL THE OWNER HID SHOWS IT AGAIN. `#199 removable-config-channels`. To
 /// him it is not on the list, so the directory offers it and a pasted id names it; refusing it as
 /// "already configured" would leave no way back through the act he reached for.
+///
+/// SEVERAL SERVICES. `#355 provider-grouped-channels`. The request may name the service
+/// (`provider`), and then that service's own answer decides between registering a link and adding
+/// an id. A direct addition records its service's namespace, as a registration does, so the
+/// channel keeps its service when the routes are re-derived and across a restart; it is bound to
+/// its service before the probe, which could not otherwise reach it. With no service named, an id
+/// goes to the default service, and is refused by name when there is none. A second account of
+/// one service is refused before anything is created upstream (`refuse_shared_namespace`).
 pub async fn add_channel(
     State(state): State<AppState>,
     _scope: WriteScope,
@@ -4938,11 +5064,32 @@ pub async fn add_channel(
         ));
     }
 
-    let managed = state.chat.supports_channel_registration();
+    let named = match named_provider(request.provider.as_deref()) {
+        None => None,
+        Some(key) => Some(
+            state
+                .providers
+                .entry(key)
+                .ok_or_else(|| unknown_provider(&state))?,
+        ),
+    };
+    let multi = state.providers.is_multi();
+    // The service named, among several; with one, every answer is that one's, named or not.
+    let named = named.filter(|_| multi);
+    let managed = match named {
+        Some(entry) => entry.client.supports_channel_registration(),
+        None => state.chat.supports_channel_registration(),
+    };
+    let service = named.map_or_else(
+        || state.chat.provider_name(),
+        |entry| entry.client.provider_name(),
+    );
     // One transaction spans an upstream registration plus the local probe/store update. The two
     // systems cannot commit atomically, so serialize the whole managed lifecycle and make rollback
-    // compensation unable to race another add or removal.
-    let _managed_lifecycle = if managed {
+    // compensation unable to race another add or removal. Among several providers a direct
+    // addition is bound to its provider from before the probe until the store has it, and a
+    // concurrent re-derivation of the routes would drop that binding, so it is serialized too.
+    let lifecycle = if managed || multi {
         Some(state.channel_registration_lock.lock().await)
     } else {
         None
@@ -4968,10 +5115,25 @@ pub async fn add_channel(
                     "give a channel link or provider reference",
                 )
             })?;
+        // The reference without a service key in front of it, which is what a configured or a
+        // direct channel would be called. `#355 provider-grouped-channels`.
+        let (written, bare) = state.providers.split_key(source);
+        if let (Some(entry), Some(written)) = (named, written) {
+            if written != entry.key {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "provider_mismatch",
+                    format!(
+                        "that reference names the {written} service, not {}",
+                        entry.key
+                    ),
+                ));
+            }
+        }
         // A configured channel the owner hid is not "already a channel" to him: the directory
         // offers it as one he can add, and adding it shows it again. Nothing is registered
         // upstream for it, because the file, not this route, is what owns it.
-        if let Some(configured) = hidden_configured(&state, source) {
+        if let Some(configured) = hidden_configured(&state, bare) {
             unhide_configured_channel(&state, &configured.id).await?;
             return Ok(channel_list_answer(&state, configured).await);
         }
@@ -4979,11 +5141,11 @@ pub async fn add_channel(
             .config
             .channels
             .iter()
-            .any(|channel| channel.id.as_str() == source);
+            .any(|channel| channel.id.as_str() == bare);
         let source_is_direct = state.added_channels.read().ok().is_some_and(|added| {
-            added.iter().any(|channel| {
-                channel.channel.as_str() == source && channel.registration_provider.is_none()
-            })
+            added
+                .iter()
+                .any(|channel| channel.channel.as_str() == bare && added_directly(&state, channel))
         });
         if source_is_static || source_is_direct {
             let (code, detail) = if source_is_static {
@@ -4999,13 +5161,28 @@ pub async fn add_channel(
             };
             return Err(ApiError::new(StatusCode::CONFLICT, code, detail));
         }
-        Some(state.chat.register_channel(source, label).await?)
+        // The service the registration goes to, checked before anything is created upstream:
+        // the one named, or the one the router would choose.
+        if multi {
+            let registrar = named.map_or_else(
+                || state.providers.registrar_key(source),
+                |entry| Some(entry.key.as_str()),
+            );
+            if let Some(key) = registrar {
+                refuse_shared_namespace(&state, key)?;
+            }
+        }
+        let qualified = match named {
+            Some(entry) if written.is_none() => format!("{}:{bare}", entry.key),
+            _ => source.to_owned(),
+        };
+        Some(state.chat.register_channel(&qualified, label).await?)
     } else {
         if request.source.present {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
                 "channel_registration_unsupported",
-                format!("{} requires a channel id through this chat adapter; channel links and provider references are not supported", state.chat.provider_name()),
+                format!("{service} requires a channel id through this chat adapter; channel links and provider references are not supported"),
             ));
         }
         None
@@ -5022,35 +5199,59 @@ pub async fn add_channel(
     };
     // Which provider owns the channel, and the namespace that records it across a restart. A
     // managed registration was bound to its provider by the router; a direct id belongs to the
-    // deployment's default provider.
+    // service named, or else to the deployment's default provider.
     let provider_key = match registered.as_ref() {
         Some(channel) => state.providers.key_for(&channel.id),
-        None => state.config.default_provider_key().map(str::to_owned),
+        None => named.map_or_else(
+            || state.config.default_provider_key().map(str::to_owned),
+            |entry| Some(entry.key.clone()),
+        ),
     };
-    let registration_provider = if managed {
+    // Among several providers every addition records its provider's namespace: it is what says
+    // which provider owns the channel when the routes are next derived, which this route does
+    // itself once the channel is stored. `#355 provider-grouped-channels`.
+    let registration_provider = if managed || multi {
         state.registration_namespace(provider_key.as_deref())
     } else {
         None
     };
     let registration_provider = registration_provider.as_deref();
-    if id.is_empty() || (!managed && !id.chars().all(|c| c.is_ascii_digit())) {
+    // A direct id is a Discord snowflake, unless the named service is certain the id is its own
+    // (a Slack channel id, for a Slack that does not register channels).
+    let direct_id = |id: &str| {
+        id.chars().all(|c| c.is_ascii_digit())
+            || named.is_some_and(|entry| entry.client.claims_source(id) == SourceClaim::Certain)
+    };
+    if id.is_empty() || (!managed && !direct_id(id)) {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "invalid_channel_id",
             format!(
-                "{} requires a numeric channel id through this chat adapter. Ask the deployment operator for the channel ID.",
-                state.chat.provider_name()
+                "{service} requires a numeric channel id through this chat adapter. Ask the deployment operator for the channel ID."
             ),
         ));
+    }
+    if registered.is_none() && multi {
+        let Some(key) = provider_key.as_deref() else {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "provider_required",
+                format!(
+                    "this server reads {}, and none of them is the default; say which service the channel is on",
+                    state.chat.provider_name()
+                ),
+            ));
+        };
+        refuse_shared_namespace(&state, key)?;
     }
     if let Some(configured) = hidden_configured(&state, id) {
         // The same as a hidden source above: a direct id, or a link that resolved to one. The
         // file's label and write policy stand, not the ones in this request, because the file is
         // what owns the channel. A registration the bridge just answered is left alone for the
         // reason given below: the id is owned outside this transaction, so nothing here may
-        // delete it upstream. A direct add holds no lifecycle lock yet, and takes it here so that
+        // delete it upstream. A direct add that holds no lifecycle lock yet takes it here so that
         // showing the channel cannot interleave with a concurrent hide.
-        let _hide_lifecycle = if managed {
+        let _hide_lifecycle = if lifecycle.is_some() {
             None
         } else {
             Some(state.channel_registration_lock.lock().await)
@@ -5114,6 +5315,23 @@ pub async fn add_channel(
     } else {
         None
     };
+    // A direct addition among several providers reaches its provider only once bound to it. Every
+    // refusal from here on goes through `rollback_registration`, whose re-derivation of the
+    // routes drops the binding again. `#355 provider-grouped-channels`.
+    if registered.is_none() && multi {
+        if let Some(key) = provider_key.as_deref() {
+            state
+                .providers
+                .bind_key(&candidate.id, key)
+                .map_err(|error| {
+                    ApiError::new(
+                        StatusCode::CONFLICT,
+                        "channel_already_present",
+                        error.to_string(),
+                    )
+                })?;
+        }
+    }
     // The same read the startup check makes, against the one channel being added.
     let report =
         crate::probe::probe_channels(state.chat.as_ref(), std::slice::from_ref(&candidate)).await;
@@ -5132,7 +5350,7 @@ pub async fn add_channel(
             "channel_unreadable",
             // The PROBE'S own remedy, not a sentence written here. One explanation of "the bot
             // cannot see this channel", used by the startup check and by this route alike.
-            outcome.diagnosis.remedy_for(state.chat.provider_name()),
+            outcome.diagnosis.remedy_for(service),
         ));
     }
 
