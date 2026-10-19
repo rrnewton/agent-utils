@@ -5391,6 +5391,26 @@ test("both buttons are disabled while a redemption is in flight", async () => {
   assert.equal(page.screen(), "main");
 });
 
+test("a newer link opened while a redemption is answering is offered once that one fails", async () => {
+  let answer = null;
+  const { page } = pairingPage(new Map(), (p) => {
+    p.pairRedeem = () => new Promise((resolve) => { answer = resolve; });
+  });
+  await page.settle();
+  page.el("pair-confirm").click();
+  await page.settle();
+  await page.navigateToFragment("#pair=NewerCodeNewerCodeNewerCodeNewerCodeNewerCo");
+  assert.equal(page.el("pair-confirm").disabled, true, "a newer link re-enabled a button mid-request");
+  answer(json(410, { error: "pairing_link_invalid", detail: "gone" }));
+  await page.settle();
+  assert.equal(page.el("pair-offer").hidden, false, "the newer, unspent link vanished");
+  page.pairRedeem = async () => json(200, { token: "write-token-from-pairing-00" });
+  await confirmPairing(page);
+  assert.deepStrictEqual(page.pairRedeems.map((one) => one.body.code).slice(-1),
+    ["NewerCodeNewerCodeNewerCodeNewerCodeNewerCo"]);
+  assert.equal(page.screen(), "main");
+});
+
 test("Not now leaves the link unspent and a signed-in phone signed in", async () => {
   const store = new Map([["vibe-talk.token", "write-token-aaaaaaaaaaaaaaaa"]]);
   const { page } = pairingPage(store);

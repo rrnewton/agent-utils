@@ -278,6 +278,10 @@ impl Pairing {
             tracing::warn!(code = %hash_prefix(&burned.hash), ?client, "pairing code redeemed");
             return Redeemed::Granted;
         }
+        // EVERY miss counts toward the global limit, a limited address's included: a limited address
+        // is still granted a live code, so its misses are guesses like any other, and one address
+        // must not be able to guess forever where ten could not.
+        count_toward_global_limit(&mut table, now);
         table
             .failures
             .retain(|_, seen| now.saturating_duration_since(seen.since) < FAILURE_WINDOW);
@@ -309,29 +313,6 @@ impl Pairing {
             failures = count,
             "pairing redeem refused: no live code matched"
         );
-        let all = table
-            .all_failures
-            .take()
-            .filter(|all| now.saturating_duration_since(all.since) < FAILURE_WINDOW)
-            .unwrap_or(Failures {
-                since: now,
-                count: 0,
-            });
-        let all = Failures {
-            count: all.count + 1,
-            ..all
-        };
-        if all.count >= GLOBAL_FAILURE_LIMIT {
-            let burned = table.live.len();
-            table.live.clear();
-            tracing::warn!(
-                burned,
-                "{GLOBAL_FAILURE_LIMIT} failed pairing redemptions within a minute: every live \
-                 pairing code is burned; mint a new one"
-            );
-        } else {
-            table.all_failures = Some(all);
-        }
         Redeemed::Refused
     }
 
@@ -347,6 +328,34 @@ impl Pairing {
         let mut table = self.lock();
         expire(&mut table, Instant::now());
         table.live.len()
+    }
+}
+
+/// Count one failed redemption, from anyone, and burn every live code at [`GLOBAL_FAILURE_LIMIT`]
+/// in one window. The count starts again after a burn.
+fn count_toward_global_limit(table: &mut Table, now: Instant) {
+    let all = table
+        .all_failures
+        .take()
+        .filter(|all| now.saturating_duration_since(all.since) < FAILURE_WINDOW)
+        .unwrap_or(Failures {
+            since: now,
+            count: 0,
+        });
+    let all = Failures {
+        count: all.count + 1,
+        ..all
+    };
+    if all.count >= GLOBAL_FAILURE_LIMIT {
+        let burned = table.live.len();
+        table.live.clear();
+        tracing::warn!(
+            burned,
+            "{GLOBAL_FAILURE_LIMIT} failed pairing redemptions within a minute: every live pairing \
+             code is burned; mint a new one"
+        );
+    } else {
+        table.all_failures = Some(all);
     }
 }
 
@@ -397,10 +406,18 @@ pub fn redact_codes(text: &[u8]) -> Vec<u8> {
     while at < text.len() {
         if text[at..].starts_with(MARKER) {
             let start = at + MARKER.len();
-            let run = text[start..]
+            let mut run = text[start..]
                 .iter()
                 .take_while(|byte| is_code_byte(**byte))
                 .count();
+            // `pair` is code characters, so a run can swallow the next marker's first four bytes:
+            // stop before it, so that marker's code is redacted in its turn.
+            // Only at the run's end: `=` is not a code character, so a following marker can only
+            // be the run's last four bytes and the `=` after them.
+            if text[start + run..].starts_with(b"=") && text[start..start + run].ends_with(b"pair")
+            {
+                run -= 4;
+            }
             if run > 0 {
                 out.extend_from_slice(MARKER);
                 out.extend_from_slice(REDACTED.as_bytes());
@@ -630,6 +647,20 @@ mod tests {
                 "https://h/#pair=[redacted]…".to_owned(),
             ),
             ("pair=x".to_owned(), "pair=[redacted]".to_owned()),
+            // A run that would swallow the next marker stops before it.
+            (
+                format!("https://h/#pair=xpair={code}"),
+                "https://h/#pair=[redacted]pair=[redacted]".to_owned(),
+            ),
+            (
+                format!("pair=pair={code}"),
+                "pair=pair=[redacted]".to_owned(),
+            ),
+            // A code that happens to contain `pair` is redacted whole.
+            (
+                "pair=AbpairCd=rest".to_owned(),
+                "pair=[redacted]=rest".to_owned(),
+            ),
             ("pair= and #pair=".to_owned(), "pair= and #pair=".to_owned()),
             (
                 "naïve text, no marker".to_owned(),
@@ -671,6 +702,21 @@ mod tests {
         // A new code works; the count started again.
         let fresh = pairing.mint_at(None, now, wall()).expect("mint");
         assert_eq!(pairing.redeem_at(&fresh.code, HERE, now), Redeemed::Granted);
+    }
+
+    #[test]
+    fn one_limited_address_guessing_burns_every_live_code_too() {
+        let now = Instant::now();
+        let pairing = Pairing::new();
+        let minted = pairing.mint_at(None, now, wall()).expect("mint");
+        for _ in 0..200 {
+            assert_ne!(pairing.redeem_at("guess", HERE, now), Redeemed::Granted);
+        }
+        assert_ne!(
+            pairing.redeem_at(&minted.code, HERE, now),
+            Redeemed::Granted,
+            "one address guessed past the global limit and kept the code alive"
+        );
     }
 
     #[test]

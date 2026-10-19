@@ -1003,8 +1003,9 @@ What the server and the page do, so it can be judged:
   reverse proxy every client has the proxy's address** and one person's failures must not lock
   everyone out of pairing. An IPv6 client is counted by its /64. A hundred failures in a minute
   from all clients together burn every live code, so even a code partly seen somewhere cannot be
-  finished by guessing from many addresses; mint a new one. The 256-bit code is what stops
-  guessing outright.
+  finished by guessing, from one address or many; mint a new one. The flip side: someone sending
+  junk redemptions steadily can keep links failing. Each burn is logged at WARN, and the person can
+  still paste the token into the sign-in form. The 256-bit code is what stops guessing outright.
 * **A read-scope caller is never sent a code, and no model is handed one.** Every answer under
   `/api/` and `/mcp` to the read token, live streams included, has the run of code characters after
   any `pair=` replaced with `[redacted]` as it leaves the server, whichever route produced it: a

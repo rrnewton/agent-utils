@@ -35,6 +35,8 @@ const TOKEN_KEY = "vibe-talk.token";
 // redeemed only when the person taps Sign this device in (`pairFromLink`), never on load: a link
 // scanner that runs pages would otherwise spend it, and hold the token.
 let pairingCode = takePairingCode();
+/** Whether a redemption is waiting for the server's answer. */
+let pairingInFlight = false;
 
 /** The code in `#pair=`, with the fragment already gone from the address; null when there is none. */
 function takePairingCode() {
@@ -44053,6 +44055,7 @@ async function pairFromLink() {
   // an offer whose answer is about to sign the browser in anyway.
   el("pair-confirm").disabled = true;
   el("pair-dismiss").disabled = true;
+  pairingInFlight = true;
   let response = null;
   try {
     response = await fetch("/api/v1/pair/redeem", {
@@ -44062,6 +44065,7 @@ async function pairFromLink() {
       cache: "no-store",
     });
   } catch (_error) {
+    pairingInFlight = false;
     // The code was not spent: the offer stays, to be tapped again once the connection is back.
     el("pair-confirm").disabled = false;
     el("pair-dismiss").disabled = false;
@@ -44069,7 +44073,10 @@ async function pairFromLink() {
     setStatus("pairing failed");
     return false;
   }
-  // Answered: spent or refused, the code is done with either way.
+  pairingInFlight = false;
+  // Answered: spent or refused, the code is done with either way. A newer link opened meanwhile
+  // (`hashchange`) is not: it is kept, and offered again if this one did not sign the browser in.
+  const newer = pairingCode !== code ? pairingCode : null;
   pairingCode = null;
   el("pair-offer").hidden = true;
   let payload = null;
@@ -44083,11 +44090,16 @@ async function pairFromLink() {
     await saveToken();
     return true;
   }
-  return pairingFailed(
+  const failed = await pairingFailed(
     response.status === 429
       ? "Too many pairing attempts from this network. Wait a minute, then ask for a new link."
       : PAIRING_EXPIRED
   );
+  if (newer !== null) {
+    pairingCode = newer;
+    offerPairing();
+  }
+  return failed;
 }
 
 /** The sign-in screen, offering to redeem the pairing link this page was opened from. */
@@ -44154,6 +44166,8 @@ window.addEventListener("hashchange", () => {
   const code = takePairingCode();
   if (code === null) return;
   pairingCode = code;
+  // While a redemption is answering, the buttons stay as they are; its answer decides what next.
+  if (pairingInFlight) return;
   clearError();
   offerPairing();
 });
