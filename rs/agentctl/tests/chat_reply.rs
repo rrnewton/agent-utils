@@ -67,6 +67,7 @@ impl Scratch {
                 receipt_reaction: ReactionSetting::Inherit,
                 backend_configuration: None,
                 outbound_command: None,
+                reply_alias_range: None,
             },
         )
         .expect("initialize state");

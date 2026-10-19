@@ -677,6 +677,26 @@ are kept, the lowest ones. The number of a closed request stays recognized as
 long as that request's long ID does, so a late block under it is ignored rather
 than reported. An earlier release reports a short ID as belonging to no request.
 
+Every bridge that types into a pane reads every reply block in it, so when two
+bridges share one pane, say one per chat provider, each would read the other's
+short IDs as naming no request of its own and report them to the agent, after
+replies that its own bridge posted correctly. Give each such bridge a range of
+its own in its configuration, with no two ranges overlapping:
+
+```json
+"reply_alias_range": { "first": 5001, "last": 9999 }
+```
+
+`first` is at least 1 and `last` is at least `first`. The bridge assigns only
+numbers in its range, starting at `first` if its counter has not reached it, and
+once it has assigned `last`, its prompts give long reply IDs. A marker under a
+number outside the range is another bridge's: the bridge does not post, report,
+or skip it. A number it assigned before the range was set or changed still names
+its request. Absent, every number is the bridge's own, as before. Long reply IDs
+carry no bridge, so a long ID under another bridge's nonce is still reported.
+For a state directory that already exists, add the key to its `bridge.json`
+while no service runs on it.
+
 Just before it writes a prompt that gives a request its number, the bridge reads
 the agent's pane, as described above, and skips every number that the read shows
 written as a short reply ID anywhere: in a block, in running text, or in a
@@ -949,7 +969,8 @@ and provider faults are errors.
 A reply marker in the pane whose ID is not available, such as a typo or a stale
 block left in scrollback by another bridge state, produces one routing-error
 prompt to the agent. An ID is unavailable when its number is malformed or it
-names no request the bridge knows. A well-formed ID of a closed request is
+names no request the bridge knows, unless it is a short ID outside the bridge's
+`reply_alias_range`. A well-formed ID of a closed request is
 ignored. The prompt is never posted to chat. It says that the block marked with
 the unavailable ID was not sent, and then lists the open requests, each by the
 ID of its next reply, as they stood when the prompt was written. First come

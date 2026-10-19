@@ -136,6 +136,7 @@ fn a_bridge_configuration_for_slack_is_accepted_by_the_plugin() {
             ]),
         }),
         outbound_command: None,
+        reply_alias_range: None,
     };
     let request = configuration
         .subscribe_request(Some("slack1:seq:42"))

@@ -5947,6 +5947,7 @@ mod tests {
                 receipt_reaction: ReactionSetting::Inherit,
                 backend_configuration: None,
                 outbound_command: None,
+                reply_alias_range: None,
             },
         )
         .expect("initialize state");
@@ -7424,6 +7425,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 receipt_reaction: ReactionSetting::Inherit,
                 backend_configuration: None,
                 outbound_command: None,
+                reply_alias_range: None,
             },
         )
         .expect("initialize state");
@@ -8070,6 +8072,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                     timeout_millis: 1_000,
                     shutdown_grace_millis: 0,
                 }),
+                reply_alias_range: None,
             },
         )
         .expect("initialize state without opening helper");
@@ -8133,6 +8136,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                     timeout_millis: 2_000,
                     shutdown_grace_millis: 50,
                 }),
+                reply_alias_range: None,
             },
         )
         .expect("initialize state");
@@ -8514,6 +8518,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 receipt_reaction: ReactionSetting::Inherit,
                 backend_configuration: None,
                 outbound_command: None,
+                reply_alias_range: None,
             },
         )
         .expect("initialize state");
@@ -10326,6 +10331,7 @@ esac
                 timeout_millis: 30_000,
                 shutdown_grace_millis: 30_000,
             }),
+            reply_alias_range: None,
         };
         let outbound = configured_outbound_join_timeout(&configuration);
         assert_eq!(outbound, Duration::from_secs(67));
@@ -10779,6 +10785,7 @@ esac
                 receipt_reaction: ReactionSetting::Inherit,
                 backend_configuration: None,
                 outbound_command,
+                reply_alias_range: None,
             },
         )
         .expect("initialize state");

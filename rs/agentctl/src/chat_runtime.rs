@@ -11,6 +11,7 @@ use std::ffi::{CString, OsString};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
+use std::ops::RangeInclusive;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt as UnixFileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -592,6 +593,24 @@ pub struct BridgeConfiguration {
     /// Optional bounded request/response adapter for replies and reactions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outbound_command: Option<OutboundCommandConfiguration>,
+    /// The reply alias numbers this bridge assigns, when another bridge types into the same
+    /// pane: see [`ReplyAliasRange`]. Absent, every number is this bridge's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_alias_range: Option<ReplyAliasRange>,
+}
+
+/// The reply alias numbers, `first` to `last` inclusive, that one bridge assigns. Bridges that
+/// type into the same coordinator pane each read every reply block in it, so each is given a
+/// range of its own that no other overlaps. A marker under a number outside the range is another
+/// bridge's: it is neither reported to the agent as matching no request nor skipped by the
+/// counter. A number the bridge assigned before its range changed still names its request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplyAliasRange {
+    /// The lowest number assigned; at least 1.
+    pub first: u64,
+    /// The highest number assigned; at least `first`. Past it, prompts give long reply IDs.
+    pub last: u64,
 }
 
 impl BridgeConfiguration {
@@ -612,6 +631,14 @@ impl BridgeConfiguration {
     pub fn receipt_emoji(&self) -> Option<&str> {
         self.receipt_reaction
             .resolve(chat_subscription::reactions::DEFAULT_RECEIPT_REACTION.emoji)
+    }
+
+    /// The reply alias numbers this bridge assigns and reads as its own: `reply_alias_range`,
+    /// or every number when it is absent.
+    #[must_use]
+    pub fn reply_alias_numbers(&self) -> RangeInclusive<u64> {
+        self.reply_alias_range
+            .map_or(1..=u64::MAX, |range| range.first..=range.last)
     }
 
     /// The receipt emoji this bridge actually adds, or `None` when it adds none: the receipt is
@@ -643,6 +670,14 @@ impl BridgeConfiguration {
         }
         if let Some(outbound) = &self.outbound_command {
             outbound.validate()?;
+        }
+        if let Some(range) = self.reply_alias_range {
+            if range.first == 0 || range.first > range.last {
+                return Err(ChatRuntimeError::invalid(format!(
+                    "reply_alias_range must have 1 <= first <= last, not first {} and last {}",
+                    range.first, range.last
+                )));
+            }
         }
         // A receipt goes only to a request that was acknowledged, so an outbound-disabled
         // configuration may leave `receipt_reaction` to inherit, but may not choose one.
@@ -1938,10 +1973,18 @@ impl ReplyAliasRecord {
     /// lowest `MAX_BURNED_REPLY_ALIASES` skipped numbers, so a number in `seen` can be missing
     /// from them, and it is passed over all the same. Every skipped number still stays at or
     /// above `next_alias`: a number in `seen` is missing only when every skipped number is below
-    /// it, so the counter has passed them all by the time it reaches that number.
-    fn assign(&mut self, key: &str, seen: &BTreeSet<u64>) -> Result<u64> {
+    /// it, so the counter has passed them all by the time it reaches that number. Only a number
+    /// in `numbers`, the bridge's reply alias range, is assigned, and the counter starts at its
+    /// first number if it has not reached it.
+    fn assign(
+        &mut self,
+        key: &str,
+        seen: &BTreeSet<u64>,
+        numbers: &RangeInclusive<u64>,
+    ) -> Result<u64> {
         let exhausted = || ChatRuntimeError::invalid("reply alias numbers are exhausted");
-        let mut alias = self.next_alias;
+        let mut alias = self.next_alias.max(*numbers.start());
+        self.burned.retain(|burned| *burned >= alias);
         loop {
             if self.burned.first() == Some(&alias) {
                 self.burned.remove(0);
@@ -1949,6 +1992,9 @@ impl ReplyAliasRecord {
                 break;
             }
             alias = alias.checked_add(1).ok_or_else(exhausted)?;
+        }
+        if !numbers.contains(&alias) {
+            return Err(exhausted());
         }
         self.next_alias = alias.checked_add(1).ok_or_else(exhausted)?;
         self.aliases.push(ReplyAliasEntry {
@@ -7991,6 +8037,7 @@ and the replies captured for them. The provider's own thread is the complete rec
             &known_nonces,
             &inline_nonces,
             &aliases,
+            &self.config.reply_alias_numbers(),
             &reported,
         )?;
         let burned = alias_record
@@ -8242,6 +8289,7 @@ and the replies captured for them. The provider's own thread is the complete rec
             &nonces,
             &BTreeSet::new(),
             &aliases,
+            &self.config.reply_alias_numbers(),
             &BTreeSet::new(),
         )?;
         let mut changed = false;
@@ -8464,9 +8512,13 @@ still skipped, but a block under an old number that is out of view then could re
         if let Some(alias) = record.alias_of(key) {
             return Ok(alias);
         }
-        let seen = alias_numbers_in(screen);
+        // A number outside the bridge's range is another bridge's, so it is never assigned here
+        // either way, and is not kept among the skipped numbers.
+        let numbers = self.config.reply_alias_numbers();
+        let mut seen = alias_numbers_in(screen);
+        seen.retain(|alias| numbers.contains(alias));
         record.burn(&seen);
-        let alias = record.assign(key, &seen)?;
+        let alias = record.assign(key, &seen, &numbers)?;
         // Past the bound, forget the oldest aliases of requests whose long ID the bridge no
         // longer recognizes either: those with no request record and no retired route. At most
         // `MAX_REQUESTS` records and `RETIRED_ROUTE_SLOTS` routes exist, which is the bound, so
@@ -9551,6 +9603,7 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
                 .map(|alias| (format_reply_alias(alias), request.reply_nonce.clone()))
                 .into_iter()
                 .collect(),
+            &self.config.reply_alias_numbers(),
             &BTreeSet::new(),
         )?;
         let found = scan
@@ -12902,6 +12955,7 @@ fn scan_reply_blocks(rendered: &str, expected_nonce: &str) -> Result<ReplyScan> 
         &expected_nonces,
         &expected_nonces,
         &BTreeMap::new(),
+        &(1..=u64::MAX),
         &BTreeSet::new(),
     )?;
     Ok(ReplyScan {
@@ -12915,12 +12969,15 @@ fn scan_reply_blocks(rendered: &str, expected_nonce: &str) -> Result<ReplyScan> 
 /// the nonce. Only an invalid expected nonce is an error: a malformed, nested, oversized, or
 /// unterminated block is returned as a refusal or a partial block, so nothing the coordinator
 /// prints can stop the service. A block of a request `inline_nonces` names whose opening or
-/// closing tag shared its row with other text is returned as [`PartialBlock::Inline`].
+/// closing tag shared its row with other text is returned as [`PartialBlock::Inline`]. A marker
+/// under a reply alias outside `alias_numbers`, the bridge's reply alias range, that `aliases`
+/// does not name is another bridge's, so it is not returned as unknown.
 fn scan_reply_blocks_for_nonces(
     rendered: &str,
     expected_nonces: &BTreeSet<String>,
     inline_nonces: &BTreeSet<String>,
     aliases: &BTreeMap<String, String>,
+    alias_numbers: &RangeInclusive<u64>,
     reported: &BTreeSet<String>,
 ) -> Result<MultiReplyScan> {
     if expected_nonces
@@ -13242,9 +13299,11 @@ fn scan_reply_blocks_for_nonces(
         let head = std::mem::take(&mut unopened);
         let cut = std::mem::replace(&mut unopened_from_top, false);
         let expected = recognized_reply_marker(&marker.identifier, expected_nonces, aliases);
-        if expected.is_none() && seen_unknown_ids.insert(marker.identifier.clone()) {
+        let alias = parse_reply_alias(&marker.identifier);
+        let foreign = alias.is_some_and(|alias| !alias_numbers.contains(&alias));
+        if expected.is_none() && !foreign && seen_unknown_ids.insert(marker.identifier.clone()) {
             unavailable.push(bounded_detail(&marker.identifier, MAX_FEEDBACK_ID_BYTES));
-            unknown_aliases.extend(parse_reply_alias(&marker.identifier));
+            unknown_aliases.extend(alias);
         }
         let opening = |nonce: &str, margin: String| ActiveReply {
             protocol: marker.protocol,
@@ -14918,6 +14977,7 @@ mod tests {
             receipt_reaction: ReactionSetting::Inherit,
             backend_configuration: None,
             outbound_command: None,
+            reply_alias_range: None,
         }
     }
 
@@ -19043,6 +19103,7 @@ as a chat message. Use the same two lines for every reply, with no tool call bet
             &expected,
             &expected,
             &BTreeMap::new(),
+            &(1..=u64::MAX),
             &BTreeSet::new(),
         )
         .expect("scan once");
@@ -20986,6 +21047,7 @@ EOF)\n  ⎿  (No content)\n"
                     &nonces,
                     inline,
                     &BTreeMap::new(),
+                    &(1..=u64::MAX),
                     &BTreeSet::new(),
                 )
                 .expect("scan")
@@ -23535,8 +23597,18 @@ they were not typed: pane is gone"
         // shows it, it can be given, which is the documented limit.
         let none = BTreeSet::new();
         let mut record = ReplyAliasRecord::empty();
-        assert_eq!(record.assign(&"a".repeat(64), &none).expect("assign"), 1);
-        assert_eq!(record.assign(&"b".repeat(64), &none).expect("assign"), 2);
+        assert_eq!(
+            record
+                .assign(&"a".repeat(64), &none, &(1..=u64::MAX))
+                .expect("assign"),
+            1
+        );
+        assert_eq!(
+            record
+                .assign(&"b".repeat(64), &none, &(1..=u64::MAX))
+                .expect("assign"),
+            2
+        );
         assert!(record.burn(&BTreeSet::from([1, 2, 4])));
         assert_eq!(record.burned, [4]);
         assert!(!record.burn(&BTreeSet::from([2, 4])));
@@ -23547,9 +23619,16 @@ they were not typed: pane is gone"
         assert!(!record.burn(&BTreeSet::from([100 + bound])));
         assert_eq!(record.burned, (4..4 + bound).collect::<Vec<_>>());
         record.validate().expect("valid record");
-        assert_eq!(record.assign(&"c".repeat(64), &none).expect("assign"), 3);
         assert_eq!(
-            record.assign(&"d".repeat(64), &none).expect("assign"),
+            record
+                .assign(&"c".repeat(64), &none, &(1..=u64::MAX))
+                .expect("assign"),
+            3
+        );
+        assert_eq!(
+            record
+                .assign(&"d".repeat(64), &none, &(1..=u64::MAX))
+                .expect("assign"),
             4 + bound
         );
         assert!(record.burned.is_empty());
@@ -23564,13 +23643,17 @@ they were not typed: pane is gone"
         assert!(record.burn(&shown));
         assert_eq!(record.burned, (1..=bound).collect::<Vec<_>>());
         assert_eq!(
-            record.assign(&"e".repeat(64), &shown).expect("assign"),
+            record
+                .assign(&"e".repeat(64), &shown, &(1..=u64::MAX))
+                .expect("assign"),
             bound + 11
         );
         assert!(record.burned.is_empty());
         record.validate().expect("valid record");
         assert_eq!(
-            record.assign(&"f".repeat(64), &none).expect("assign"),
+            record
+                .assign(&"f".repeat(64), &none, &(1..=u64::MAX))
+                .expect("assign"),
             bound + 12
         );
         record.validate().expect("valid record");
@@ -23583,7 +23666,7 @@ they were not typed: pane is gone"
         // where a capture reads them again once their request's prompt is typed.
         let mut record = ReplyAliasRecord::empty();
         let alias = record
-            .assign(&"a".repeat(64), &BTreeSet::new())
+            .assign(&"a".repeat(64), &BTreeSet::new(), &(1..=u64::MAX))
             .expect("assign");
         let blocks = (0..=MAX_WITHHELD_REPLIES)
             .map(|index| ScannedReply {
@@ -24231,6 +24314,124 @@ one quoted in a message you received."
             );
         }
         assert_eq!(notices().len(), 3);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn bridges_sharing_a_pane_leave_each_others_reply_aliases_alone() {
+        // Live, 2026-10-15: two bridges, one per chat provider, typed into one coordinator pane,
+        // one numbering from 001 and the other, set by hand, from 5001. The agent answered under
+        // 104 exactly as its prompt asked, and that request's bridge posted the reply, but the
+        // other bridge read the same block, found no request of its own under 104, and told the
+        // agent its reply matched no open chat request, listing its own 500x requests; the first
+        // bridge did the same to every block under a 500x number. Given a reply alias range each,
+        // neither bridge reports, skips or posts the other's numbers, each still posts its own
+        // replies, and a number in its own range that names no request is still reported.
+        let bridges = [(1, 4_999), (5_001, 9_999)].map(|(first, last)| {
+            let root = temporary(&format!("shared-pane-{first}"));
+            let mut configuration = config();
+            configuration.reply_alias_range = Some(ReplyAliasRange { first, last });
+            let state = BridgeState::initialize(&root, configuration).expect("initialize state");
+            let key = admitted(&state, 1).remove(0);
+            (root, state, key)
+        });
+        let first_prompt = prompted(&bridges[0].1, &bridges[0].2);
+        assert!(first_prompt.contains("<CHAT_REPLY_001>"), "{first_prompt}");
+        // The second bridge's read before its prompt shows the first bridge's block.
+        let pane = FakeDelivery::default();
+        *pane.screen.lock().expect("screen lock") = reply_block("001", "first answer");
+        assert_eq!(
+            deliver_request_with(&bridges[1].1, &pane, &bridges[1].2, DrainOptions::default())
+                .expect("deliver request"),
+            CoordinatorDeliveryResult::Delivered
+        );
+        let second_prompt = pane.submitted_prompts.lock().expect("prompts")[0].clone();
+        assert!(
+            second_prompt.contains("<CHAT_REPLY_5001>"),
+            "{second_prompt}"
+        );
+
+        let rendered = [
+            reply_block("001", "first answer"),
+            reply_block("5001", "second answer"),
+            reply_block("002", "a guessed number"),
+            reply_block("5002", "another guessed number"),
+        ]
+        .concat();
+        for ((root, state, key), (answer, guessed)) in bridges
+            .iter()
+            .zip([("first answer", "002"), ("second answer", "5002")])
+        {
+            let capture = state.capture_snapshot(&rendered).expect("capture");
+            assert_eq!(capture.replies, [(key.clone(), vec![1])], "{root:?}");
+            assert_eq!(capture.unknown_ids, [guessed], "{root:?}");
+            assert!(capture.suppressed_ids.is_empty(), "{root:?}");
+            let mut transport = FakeReplyTransport::default();
+            while state
+                .publish_one(key, &mut transport)
+                .expect("publish captured reply")
+                .is_some()
+            {}
+            assert_eq!(
+                transport
+                    .submissions
+                    .iter()
+                    .map(|submission| submission.2.as_str())
+                    .collect::<Vec<_>>(),
+                [format!("[codex coordinator] {answer}")]
+            );
+            let coordinator = QueueDelivery::default();
+            deliver_fence_feedback_with(
+                state,
+                &coordinator,
+                &capture.unknown_ids,
+                DrainOptions::default(),
+            )
+            .expect("fence feedback");
+            let prompts = coordinator.prompts();
+            assert_eq!(prompts.len(), 1, "{prompts:#?}");
+            assert!(
+                prompts[0].starts_with(&format!(
+                    "Chat reply routing error: {guessed} matches no open chat request"
+                )),
+                "{prompts:#?}"
+            );
+            // Only the guessed number in its own range is skipped.
+            assert_eq!(
+                state.read_reply_aliases().expect("aliases").burned,
+                [guessed.parse::<u64>().expect("number")],
+                "{root:?}"
+            );
+        }
+        for (root, _, _) in bridges {
+            fs::remove_dir_all(root).expect("cleanup");
+        }
+    }
+
+    #[test]
+    fn a_reply_alias_range_bounds_the_numbers_a_bridge_assigns() {
+        // A range is checked when the state is made. Within it, numbering starts at `first`, and
+        // past `last` a prompt gives a long reply ID, as it does while the alias record cannot be
+        // read.
+        for (first, last) in [(0, 5), (6, 5)] {
+            let root = temporary(&format!("alias-range-invalid-{first}"));
+            let mut configuration = config();
+            configuration.reply_alias_range = Some(ReplyAliasRange { first, last });
+            let error = BridgeState::initialize(&root, configuration)
+                .expect_err("an invalid range is refused");
+            assert!(error.to_string().contains("reply_alias_range"), "{error}");
+            let _ = fs::remove_dir_all(root);
+        }
+        let root = temporary("alias-range-bounds");
+        let mut configuration = config();
+        configuration.reply_alias_range = Some(ReplyAliasRange { first: 7, last: 8 });
+        let state = BridgeState::initialize(&root, configuration).expect("initialize state");
+        let keys = admitted(&state, 3);
+        let nonce = state.read_request(&keys[2]).expect("request").reply_nonce;
+        for (key, id) in keys.iter().zip(["007", "008", &format!("{nonce}_1")]) {
+            let prompt = prompted(&state, key);
+            assert!(prompt.contains(&format!("<CHAT_REPLY_{id}>")), "{prompt}");
+        }
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -25198,6 +25399,7 @@ k │\n\
             &nonces,
             &nonces,
             &BTreeMap::new(),
+            &(1..=u64::MAX),
             &BTreeSet::new(),
         )
         .expect("an overfull capture is not an error");
@@ -27817,6 +28019,7 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
                         &nonces,
                         &nonces,
                         &BTreeMap::new(),
+                        &(1..=u64::MAX),
                         &BTreeSet::new(),
                     )
                     .expect("scan wrapped rows");
