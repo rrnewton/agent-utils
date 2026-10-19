@@ -27,9 +27,11 @@ import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-import case_timings
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
+# Loaded by path in the packaging-infrastructure tests; see check_python_packages.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import case_timings  # noqa: E402
 RS_ROOT = REPO_ROOT / "rs"
 
 

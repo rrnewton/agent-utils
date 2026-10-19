@@ -40,9 +40,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-import case_timings
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
+# This script is also loaded by path (not through its own directory) by the
+# packaging-infrastructure tests; make its sibling timing module importable.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import case_timings  # noqa: E402
 PY_ROOT = REPO_ROOT / "py"
 
 

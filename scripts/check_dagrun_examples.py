@@ -25,10 +25,12 @@ import tempfile
 import time
 from pathlib import Path
 
-import case_timings
-
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+# Loaded by path in graph-contract tests; see check_python_packages.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import case_timings  # noqa: E402
 VALIDATION_JOBS_ENV = "AGENT_UTILS_VALIDATION_JOBS"
 DEFAULT_VALIDATION_JOBS = 8
 FIXED_WIDTH_EXAMPLE = "05-inner-jobs.json"
