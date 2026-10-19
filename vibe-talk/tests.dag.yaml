@@ -139,6 +139,20 @@ steps:
       classification: light
       rss_baseline_bytes: 268435456
 
+  # `#354 live-relay-check`. The live check makes real calls and is never run here; its verdict logic,
+  # on synthetic frame logs, is pure and offline.
+  - group: check
+    job: live-relay-check-self-test
+    desc: offline verdict controls for the opt-in live check of relays during a call
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 scripts/live-relay-check.py --self-test
+    jobs_flag: ""
+    cpu_timeout: 30
+    hint:
+      est_duration_s: 1
+      classification: light
+      rss_baseline_bytes: 268435456
+
   - group: check
     job: live-hint-adapter-self-test
     desc: offline framing, retry, privacy, and child-cleanup controls for live change hints
