@@ -855,6 +855,26 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#385 thread-line-overlap` in the browser engine, at 1000x800, 1280x800 (both schemes) and 1920x1080
+  # with a mouse: a thread opened on the right under its card, its one line from the root on Main runs
+  # down a lane right of the divider and at least 4px left of every row of the thread, whole and clipped
+  # at Main's top, the rows level with the card; the agent's rows and a third party's span the column and
+  # the owner's stay partial width; and at 393x852 by touch, in both schemes, the thread across the
+  # window draws no line and the owner's rows are partial width.
+  - group: check
+    job: thread-line-browser
+    desc: the line from a thread's root to its card runs beside the thread's rows and never over them, and the owner's rows stay partial width, in current Chromium at 1000x800, 1280x800 in both schemes and 1920x1080, and at 393x852 by touch
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/thread_line_browser.py
+    jobs_flag: ""
+    timeout: 120
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 20
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#299 all-thread-strip` in the browser engine, at 1280x800 with a mouse and at 412x915 by touch, in the
   # dark scheme and the light, in All: a strip on every row of an answered thread and on no other row (not
   # a message in no thread, not a root nobody has answered), its bar at least 5px (6px) and four times the

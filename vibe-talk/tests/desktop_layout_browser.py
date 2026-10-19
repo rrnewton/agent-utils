@@ -71,6 +71,9 @@ THREAD_SIZE = ("desk-1920", 1920, 1080)
 # How much narrower than its column a row other than the owner's may be in two columns: the list's
 # gutter inside each edge (0.75rem), and a pixel of rounding. Such a row stops at the gutter alone.
 ROW_SLACK_PX = 2 * 12 + 1
+# ...and a thread on the right stands 2.5rem further in, level with the card at its top, so the line from
+# its root on Main has a gutter of its own beside the rows (`#385 thread-line-overlap`).
+THREAD_GUTTER_PX = 40
 AGENT_SLACK_PX = 12 + 1
 # ...and how far in from the left the owner's own rows stand, at least: they keep their partial width
 # (the desk's inset, 6rem in a half of a desk), so they read as the owner's beside the others.
@@ -466,8 +469,8 @@ def thread_walk(desk: Desk) -> None:
     right = found["right"]
     desk.check(right is not None, "the right column is not drawn")
     rows = found["thread"]
-    short = [row for row in rows if row["width"] < right["width"] - ROW_SLACK_PX]
-    desk.check(not short, f"rows of the thread stop short of the {right['width']:.0f}px column: "
+    short = [row for row in rows if row["width"] < right["width"] - ROW_SLACK_PX - THREAD_GUTTER_PX]
+    desk.check(not short, f"rows of the thread stop short of the {right['width']:.0f}px column, less the line's gutter: "
                + ", ".join(f"{row['who']} {row['id']} {row['left']:.0f}-{row['right']:.0f}" for row in short))
     desk.check(found["overflow"] <= 0, "the page scrolls sideways with a thread open")
     page.wait_for_timeout(300)  # the thread's 220 ms fade in under its card (`#298 thread-card-header`)
