@@ -356,6 +356,7 @@ fn routed(id: &ChannelId, provider: &str) -> ChannelInfo {
         alias: None,
         added: false,
         provider: Some(provider.to_owned()),
+        write_source: None,
     }
 }
 

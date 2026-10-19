@@ -61,6 +61,7 @@ fn channel() -> ChannelInfo {
         alias: None,
         added: false,
         provider: Some("discord".into()),
+        write_source: None,
     }
 }
 

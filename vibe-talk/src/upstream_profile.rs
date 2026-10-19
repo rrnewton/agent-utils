@@ -1497,6 +1497,10 @@ impl ChatClient for ProfiledClient {
         self.inner.forget_channel_directory();
     }
 
+    fn added_channels_writable(&self) -> Option<bool> {
+        self.inner.added_channels_writable()
+    }
+
     async fn discover_channels(
         &self,
         request: &crate::directory::DirectoryRequest,

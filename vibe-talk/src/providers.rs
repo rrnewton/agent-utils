@@ -999,6 +999,15 @@ impl ChatClient for ChatRouter {
         }
     }
 
+    /// One provider's own policy; among several there is no one policy, and each channel is
+    /// asked of its own provider (`state::added_channel_info`).
+    fn added_channels_writable(&self) -> Option<bool> {
+        match self.entries.as_slice() {
+            [only] => only.client.added_channels_writable(),
+            _ => None,
+        }
+    }
+
     async fn discover_channels(
         &self,
         request: &crate::directory::DirectoryRequest,
@@ -1275,6 +1284,7 @@ mod tests {
             alias: None,
             added: false,
             provider: Some(provider.to_owned()),
+            write_source: None,
         }
     }
 

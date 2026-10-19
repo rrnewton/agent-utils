@@ -832,6 +832,7 @@ mod tests {
                 alias: None,
                 added: false,
                 provider: None,
+                write_source: None,
             }],
             approval,
         )

@@ -888,6 +888,14 @@ pub trait ChatClient: Send + Sync {
         ))
     }
 
+    /// The write policy this provider sets for every channel added in the app through it, as it
+    /// is now; `None` where the channel keeps what was chosen when it was added. A Slack provider
+    /// that registers channels answers its `registered_channels_writable`.
+    /// `#374 registered-writable-follows-policy`; see `state::added_channel_info`.
+    fn added_channels_writable(&self) -> Option<bool> {
+        None
+    }
+
     /// Forget any channel listing this provider keeps, because this server's list of channels
     /// changed. `#371 channel-search-hash`; see [`crate::directory::Kept`]. Nothing by default:
     /// a provider that keeps nothing has nothing to forget.

@@ -1425,6 +1425,9 @@ impl Config {
                     // From the file, so not removable from the app.
                     added: false,
                     provider: c.provider,
+                    // The entry's own `writable`, whatever any provider's policy for channels
+                    // added in the app. `#374 registered-writable-follows-policy`.
+                    write_source: Some(crate::model::WriteSource::Configuration),
                 })
                 .collect(),
         };
@@ -3313,6 +3316,7 @@ fn parse_channel_spec(spec: &str) -> Result<Vec<ChannelInfo>, ConfigError> {
             alias: None,
             added: false,
             provider,
+            write_source: Some(crate::model::WriteSource::Configuration),
         });
     }
     Ok(out)

@@ -5446,6 +5446,7 @@ pub async fn add_channel(
         alias: None,
         added: true,
         provider: provider_key.clone(),
+        write_source: None,
     };
     let rollback_if_failed = if existing.is_none() {
         registered.as_ref()
@@ -5650,6 +5651,7 @@ pub async fn remove_channel(
             alias: None,
             added: true,
             provider: None,
+            write_source: None,
         },
     )
     .await)

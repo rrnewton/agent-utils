@@ -966,6 +966,13 @@ impl ChatClient for HttpSlackClient {
         self.directory_pages.forget();
     }
 
+    /// While it registers channels, every conversation added in the app is one it registered, and
+    /// `registered_channels_writable` is its policy for them. `#374 registered-writable-follows-policy`.
+    fn added_channels_writable(&self) -> Option<bool> {
+        self.channel_registration
+            .then_some(self.registered_writable)
+    }
+
     async fn discover_channels(
         &self,
         request: &crate::directory::DirectoryRequest,

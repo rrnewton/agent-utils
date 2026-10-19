@@ -163,6 +163,7 @@ pub struct AppState {
 }
 
 fn added_channel_info(row: &AddedChannel, providers: &ChatRouter) -> ChannelInfo {
+    use crate::model::WriteSource;
     // A registration recorded under a namespace no configured provider has belongs to a bridge
     // this deployment no longer runs. It stays listed and readable, but nothing may be posted
     // there until that bridge is configured again.
@@ -170,15 +171,30 @@ fn added_channel_info(row: &AddedChannel, providers: &ChatRouter) -> ChannelInfo
         .registration_provider
         .as_deref()
         .is_none_or(|namespace| providers.knows_namespace(namespace));
+    let provider = providers
+        .key_for_namespace(row.registration_provider.as_deref())
+        .map(str::to_owned);
+    // `#374 registered-writable-follows-policy`. A provider with a policy for the channels added in
+    // the app through it (Slack's `registered_channels_writable`) decides as the policy is NOW,
+    // not as it was when the row was stored, so raising or lowering it reaches every channel added
+    // before. Elsewhere the row keeps what was chosen when it was added.
+    let policy = provider
+        .as_deref()
+        .and_then(|key| providers.entry(key))
+        .and_then(|entry| entry.client.added_channels_writable());
+    let (writable, write_source) = match policy {
+        _ if !provider_matches => (false, WriteSource::ProviderGone),
+        Some(writable) => (writable, WriteSource::ProviderPolicy),
+        None => (row.writable, WriteSource::Added),
+    };
     ChannelInfo {
         id: row.channel.clone(),
         label: row.label.clone(),
-        writable: row.writable && provider_matches,
+        writable,
         alias: None,
         added: true,
-        provider: providers
-            .key_for_namespace(row.registration_provider.as_deref())
-            .map(str::to_owned),
+        provider,
+        write_source: Some(write_source),
     }
 }
 

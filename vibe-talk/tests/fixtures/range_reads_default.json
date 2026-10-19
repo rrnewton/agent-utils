@@ -11,7 +11,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "dismissed": [],
       "has_more": true,
@@ -99,7 +100,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "dismissed": [],
       "has_more": true,
@@ -187,7 +189,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "dismissed": [],
       "has_more": true,
@@ -274,7 +277,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "dismissed": [],
       "has_more": true,
@@ -362,7 +366,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "dismissed": [],
       "has_more": true,
@@ -450,7 +455,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "dismissed": [],
       "has_more": true,
@@ -538,7 +544,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "dismissed": [],
       "has_more": true,
@@ -625,7 +632,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "dismissed": [],
       "has_more": true,
@@ -713,7 +721,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "dismissed": [],
       "has_more": true,
@@ -801,7 +810,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "dismissed": [],
       "has_more": true,
@@ -888,7 +898,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "dismissed": [],
       "has_more": true,
@@ -976,7 +987,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "dismissed": [],
       "has_more": true,
@@ -1064,7 +1076,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "dismissed": [],
       "has_more": true,
@@ -1152,7 +1165,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "dismissed": [],
       "has_more": true,
@@ -1239,7 +1253,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "dismissed": [],
       "has_more": false,
@@ -1293,7 +1308,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "dismissed": [],
       "has_more": true,
@@ -1359,7 +1375,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "dismissed": [],
       "has_more": false,
@@ -1414,7 +1431,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "dismissed": [],
       "has_more": false,
@@ -1445,7 +1463,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "dismissed": [],
       "has_more": false,
@@ -1533,7 +1552,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "dismissed": [],
       "has_more": false,
@@ -1587,7 +1607,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "dismissed": [],
       "has_more": true,
@@ -1663,7 +1684,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "dismissed": [],
       "has_more": true,
@@ -1737,7 +1759,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "counted": 182,
       "newest_seen": "1539074435317760000",
@@ -1763,7 +1786,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "counted": 86,
       "newest_seen": "1539074435317760000",
@@ -1787,7 +1811,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "counted": 172,
       "newest_seen": "1539074435317760000",
@@ -1812,7 +1837,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "counted": 209,
       "newest_seen": "1539074435317760000",
@@ -1838,7 +1864,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "counted": 0,
       "newest_seen": "1539074435317760000",
@@ -1862,7 +1889,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "counted": 209,
       "newest_seen": "1539074435317760000",

@@ -156,6 +156,12 @@ declare namespace VibeTalk {
      * Whether posting into this channel is permitted at all.
      */
     writable: boolean;
+    /**
+     * Whose setting [`ChannelInfo::writable`] is, so the page can say why a channel is read
+     * only. `#374 registered-writable-follows-policy`. Absent from an older server, and on a
+     * channel built for a test or a single answer rather than read from the list.
+     */
+    write_source?: WriteSource | null;
   }
 
   /**
@@ -2136,6 +2142,11 @@ declare namespace VibeTalk {
      */
     changeable: boolean;
   }
+
+  /**
+   * Whose setting decides whether a channel may be posted to. `#374 registered-writable-follows-policy`.
+   */
+  type WriteSource = "configuration" | "provider_policy" | "added" | "provider_gone";
 
   /** Every type that crosses a boundary on its own, by name. */
   interface Contract {

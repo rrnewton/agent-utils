@@ -7,7 +7,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "message": {
         "author": "linus",
@@ -49,7 +50,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "message": {
         "author": "grace",
@@ -164,7 +166,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "generated_in_ms": "<ms>",
       "message_id": "t1",
@@ -205,7 +208,8 @@
         "id": "1111111111",
         "label": "build noise",
         "provider": "discord",
-        "writable": false
+        "writable": false,
+        "write_source": "configuration"
       },
       "through": "t6",
       "upstream_read_notice": "The source chat provider's read cursor was moved through this message. Read cursors only move forward; thread-level behavior is defined by the provider."

@@ -155,6 +155,17 @@
         "writable": {
           "description": "Whether posting into this channel is permitted at all.",
           "type": "boolean"
+        },
+        "write_source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WriteSource"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Whose setting [`ChannelInfo::writable`] is, so the page can say why a channel is read\nonly. `#374 registered-writable-follows-policy`. Absent from an older server, and on a\nchannel built for a test or a single answer rather than read from the list."
         }
       },
       "required": [
@@ -2816,6 +2827,31 @@
         "changeable"
       ],
       "type": "object"
+    },
+    "WriteSource": {
+      "description": "Whose setting decides whether a channel may be posted to. `#374 registered-writable-follows-policy`.",
+      "oneOf": [
+        {
+          "const": "configuration",
+          "description": "The channel's own `writable` in the configuration file's `[[channels]]` entry.",
+          "type": "string"
+        },
+        {
+          "const": "provider_policy",
+          "description": "The chat service's current policy for channels added in the app: a Slack provider's\n`registered_channels_writable`, while it registers channels. Changing the policy changes\nevery channel added in the app through it, from the next start.",
+          "type": "string"
+        },
+        {
+          "const": "added",
+          "description": "What was chosen when the channel was added in the app (\"Let this app post here\", or what a\nbridge answered when it registered the channel), kept since.",
+          "type": "string"
+        },
+        {
+          "const": "provider_gone",
+          "description": "Registered in the app through a chat service this server no longer runs, or that no longer\nregisters channels, so nothing may be posted there until it is configured to again.",
+          "type": "string"
+        }
+      ]
     }
   },
   "$id": "https://github.com/rrnewton/agent-utils/vibe-talk/contract/vibe-talk.schema.json",

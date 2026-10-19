@@ -44258,9 +44258,34 @@ function renderAliasEditor() {
   const origin = channel.added
     ? "Added in this app."
     : "From the server's configuration file.";
-  el("channel-facts").textContent = `${named} ${origin}`;
+  const posting = writeSourceSentence(channel);
+  el("channel-facts").textContent = posting ? `${named} ${origin} ${posting}` : `${named} ${origin}`;
   // The same sentence inside the rename panel, where it is what the input is described by.
   el("alias-state").textContent = named;
+}
+
+/**
+ * Why a channel may not be posted to, or that posting follows a service's policy, by whose setting
+ * `writable` is. `#374 registered-writable-follows-policy`. An older server sends no `write_source`,
+ * and then nothing is said beyond what was said before.
+ */
+function writeSourceSentence(channel) {
+  const described = providerOfChannel(channel.id);
+  const service = (described && typeof described.name === "string" && described.name.trim()) || chatProviderName || "the chat service";
+  switch (channel.write_source) {
+    case "provider_policy":
+      return channel.writable
+        ? `Posting allowed: ${service} lets every channel added in this app be posted to (registered_channels_writable in the server's configuration).`
+        : `Read only: ${service} adds every channel in this app read only (registered_channels_writable in the server's configuration).`;
+    case "configuration":
+      return channel.writable ? "" : "Read only: the server's configuration file lists it read only.";
+    case "added":
+      return channel.writable ? "" : "Read only: it was added read only, and keeps what was chosen then.";
+    case "provider_gone":
+      return "Read only: the chat service it was added through is no longer configured to add channels on this server.";
+    default:
+      return "";
+  }
 }
 
 // --- clearing unread in the chat service's own app ----------------------------------------------

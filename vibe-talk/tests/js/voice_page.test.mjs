@@ -34720,6 +34720,43 @@ test("channel browser: a slow read says how long it has taken, then why, and sto
   assert.deepEqual(directoryRows(page), [], "a closed list drew the answer it gave up on");
 });
 
+test("Settings says why a channel is read only, by whose setting it is", async () => {
+  // `#374 registered-writable-follows-policy`. The owner raised Slack's policy for channels added in
+  // the app, and a channel added earlier still said read only, with nothing to say why.
+  const page = newPage();
+  page.chatProviderName = "Slack";
+  const channels = [
+    { id: "C0000POL01", label: "policy off", writable: false, added: true, write_source: "provider_policy" },
+    { id: "C0000POL02", label: "policy on", writable: true, added: true, write_source: "provider_policy" },
+    { id: "C0000CFG01", label: "file says no", writable: false, write_source: "configuration" },
+    { id: "C0000ADD01", label: "added read only", writable: false, added: true, write_source: "added" },
+    { id: "C0000GON01", label: "gone", writable: false, added: true, write_source: "provider_gone" },
+    { id: "C0000OLD01", label: "older server", writable: false, added: true },
+    { id: "C0000CFG02", label: "file says yes", writable: true, write_source: "configuration" },
+  ];
+  page.channels = channels;
+  page.channelPage = async (path) => {
+    const selected = page.channels.find((channel) => String(path).includes(channel.id));
+    return json(200, { channel: selected, messages: [] });
+  };
+  await signIn(page);
+  await page.el("open-settings").click();
+  await page.settle();
+  const facts = async (id) => {
+    page.el("settings-channel").value = id;
+    await page.el("settings-channel").dispatch("change");
+    await page.settle();
+    return page.el("channel-facts").text();
+  };
+  assert.match(await facts("C0000POL01"), /Read only: Slack adds every channel in this app read only \(registered_channels_writable in the server's configuration\)\.$/);
+  assert.match(await facts("C0000POL02"), /Posting allowed: Slack lets every channel added in this app be posted to/);
+  assert.match(await facts("C0000CFG01"), /Read only: the server's configuration file lists it read only\.$/);
+  assert.match(await facts("C0000ADD01"), /Read only: it was added read only, and keeps what was chosen then\.$/);
+  assert.match(await facts("C0000GON01"), /Read only: the chat service it was added through is no longer configured to add channels on this server\.$/);
+  assert.match(await facts("C0000OLD01"), /Added in this app\.$/, "an older server's channel grew a reason it did not send");
+  assert.match(await facts("C0000CFG02"), /From the server's configuration file\.$/, "a writable channel was given a reason");
+});
+
 test("channel pickers list a channel without its leading '#', so typing its name reaches it", async () => {
   // `#371 channel-search-hash`. A native picker finds an option by the first letters of its text, so
   // `#team-builds` was never reached by typing `team`. Elsewhere the name stays as written.

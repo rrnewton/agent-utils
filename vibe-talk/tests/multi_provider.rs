@@ -19,6 +19,7 @@ use vibe_talk::discord::fake::FakeDiscord;
 use vibe_talk::model::{ChannelId, Message, MessageId};
 use vibe_talk::providers::{ChatRouter, ProviderEntry};
 use vibe_talk::state::AppState;
+use vibe_talk::store::StateStore as _;
 use vibe_talk::testing::{READ_CHANNEL, WRITE_TOKEN};
 
 const SLACK_CHANNEL: &str = "C0123ABCDE";
@@ -1394,4 +1395,125 @@ async fn with_one_service_the_provider_field_is_not_read() {
     .await;
     assert_eq!(status, StatusCode::OK, "{named}");
     assert_eq!(named, plain);
+}
+
+/// One Slack provider that registers channels, with `registered_channels_writable` as given, a
+/// writable configured channel and a read-only one.
+fn slack_policy_config(registration: bool, writable: bool) -> String {
+    no_default_config(&format!(
+        "[[providers]]\nkey = \"slack\"\nkind = \"slack\"\ntoken = \"xoxb-test\"\n\
+         channel_registration = {registration}\nregistered_channels_writable = {writable}\n\n\
+         [[channels]]\nid = \"{SLACK_CHANNEL}\"\nlabel = \"slack team\"\nwritable = true\nprovider = \"slack\"\n\n\
+         [[channels]]\nid = \"C0000READ01\"\nlabel = \"announcements\"\nwritable = false\nprovider = \"slack\"\n"
+    ))
+}
+
+/// A server over `config` and its real providers, over `store` when one is shared: a restart.
+async fn restarted(
+    config: &str,
+    store: Option<Arc<vibe_talk::store::fake::FakeStore>>,
+) -> (AppState, Arc<vibe_talk::store::fake::FakeStore>) {
+    let (mut state, _discord, fresh) = vibe_talk::testing::state_with_store_from_toml(config);
+    let store = match store {
+        Some(shared) => {
+            state.store = shared.clone();
+            shared
+        }
+        None => fresh,
+    };
+    let router = ChatRouter::from_config(&state.config).expect("providers build");
+    state.replace_providers(Arc::new(router));
+    state.restore_added_channels().await.expect("restore");
+    (state, store)
+}
+
+/// `#374 registered-writable-follows-policy`. The owner raised a Slack provider's
+/// `registered_channels_writable` and restarted; the configured channel could be posted to, but a
+/// channel added in the app while the policy was off still said read only.
+#[tokio::test]
+async fn a_channel_added_in_the_app_follows_the_providers_policy_as_it_is_now() {
+    use vibe_talk::model::WriteSource;
+    let (state, store) = restarted(&slack_policy_config(true, false), None).await;
+    let namespace = state.config.providers[0].namespace();
+    // Added while the policy was off, so stored read only; and one stored writable.
+    store
+        .add_channel(
+            &ChannelId(ADDED_SLACK_CHANNEL.to_owned()),
+            "added",
+            false,
+            Some(namespace.as_str()),
+            1,
+        )
+        .await
+        .expect("add");
+    store
+        .add_channel(
+            &ChannelId("C0000WRIT01".to_owned()),
+            "added writable",
+            true,
+            Some(namespace.as_str()),
+            2,
+        )
+        .await
+        .expect("add");
+    let posting = |state: &AppState, id: &str| {
+        let channel = state.channel(id).expect("listed");
+        (channel.writable, channel.write_source)
+    };
+    for (policy, why) in [(true, "raised"), (false, "lowered"), (true, "raised again")] {
+        let (state, _) = restarted(&slack_policy_config(true, policy), Some(store.clone())).await;
+        for added in [ADDED_SLACK_CHANNEL, "C0000WRIT01"] {
+            assert_eq!(
+                posting(&state, added),
+                (policy, Some(WriteSource::ProviderPolicy)),
+                "policy {why}: {added} did not follow it"
+            );
+        }
+        // The configuration file's own entries keep their own writable.
+        assert_eq!(
+            posting(&state, SLACK_CHANNEL),
+            (true, Some(WriteSource::Configuration))
+        );
+        assert_eq!(
+            posting(&state, "C0000READ01"),
+            (false, Some(WriteSource::Configuration))
+        );
+        let (status, config) =
+            call(&state, "GET", "/api/v1/client-config", WRITE_TOKEN, None).await;
+        assert_eq!(status, StatusCode::OK, "{config}");
+        let sent = config["channels"]
+            .as_array()
+            .expect("channels")
+            .iter()
+            .find(|channel| channel["id"] == ADDED_SLACK_CHANNEL)
+            .cloned()
+            .expect("the added channel");
+        assert_eq!(sent["writable"], policy, "{sent}");
+        assert_eq!(sent["write_source"], "provider_policy", "{sent}");
+    }
+
+    // A Slack that no longer registers channels has no policy for them, and, as before, no longer
+    // vouches for the ones it registered: those are read only, and say why. A channel added by id
+    // keeps what was chosen when it was added.
+    store
+        .add_channel(&ChannelId("C0000DIRE01".to_owned()), "by id", true, None, 3)
+        .await
+        .expect("add");
+    let (state, _) = restarted(&slack_policy_config(false, true), Some(store.clone())).await;
+    assert_eq!(
+        posting(&state, ADDED_SLACK_CHANNEL),
+        (false, Some(WriteSource::ProviderGone))
+    );
+    assert_eq!(
+        posting(&state, "C0000WRIT01"),
+        (false, Some(WriteSource::ProviderGone))
+    );
+    assert_eq!(
+        posting(&state, "C0000DIRE01"),
+        (true, Some(WriteSource::Added))
+    );
+    assert_eq!(
+        posting(&state, SLACK_CHANNEL),
+        (true, Some(WriteSource::Configuration))
+    );
 }

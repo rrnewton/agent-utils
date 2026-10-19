@@ -1317,6 +1317,18 @@ from Slack (`https://<workspace>.slack.com/archives/C…`, or a message link `�
 which adds that message's thread), or a web-client link (`https://app.slack.com/client/T…/C…`).
 Adding creates nothing in Slack, so removing a channel from the app changes nothing there either.
 
+**Who may post in a channel added in the app** (`#374 registered-writable-follows-policy`). While the
+provider has `channel_registration` on, every conversation added in the app follows
+`registered_channels_writable` as it is now: raise it and restart, and the channels added while it
+was false may be posted to; lower it, and they are read only. A `[[channels]]` entry keeps its own
+`writable` either way. With `channel_registration` off the provider has no policy for them: a
+conversation registered while it was on is read only, as before, and one added by its id keeps
+whether "Let this app post here" was ticked. Nothing in the store changes; the policy is applied as
+the list is read. Settings says, under the channel picker, why a channel is read only: the
+configuration file, this policy, what was chosen when it was added, or a service no longer
+configured to add channels (`write_source` on each channel in `GET /api/v1/client-config`:
+`configuration`, `provider_policy`, `added` or `provider_gone`).
+
 **Message ids.** Slack names a message by its `ts`, seconds and microseconds. vibe-talk orders,
 pages and dates messages by Discord-style snowflakes, so a `ts` is encoded as one —
 `((ms − 1420070400000) << 22) | (µs % 1000)` — which orders exactly as the `ts` does, carries its

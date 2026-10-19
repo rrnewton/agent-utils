@@ -529,6 +529,29 @@ pub struct ChannelInfo {
     /// Absent only from an older server, which had exactly one provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// Whose setting [`ChannelInfo::writable`] is, so the page can say why a channel is read
+    /// only. `#374 registered-writable-follows-policy`. Absent from an older server, and on a
+    /// channel built for a test or a single answer rather than read from the list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_source: Option<WriteSource>,
+}
+
+/// Whose setting decides whether a channel may be posted to. `#374 registered-writable-follows-policy`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteSource {
+    /// The channel's own `writable` in the configuration file's `[[channels]]` entry.
+    Configuration,
+    /// The chat service's current policy for channels added in the app: a Slack provider's
+    /// `registered_channels_writable`, while it registers channels. Changing the policy changes
+    /// every channel added in the app through it, from the next start.
+    ProviderPolicy,
+    /// What was chosen when the channel was added in the app ("Let this app post here", or what a
+    /// bridge answered when it registered the channel), kept since.
+    Added,
+    /// Registered in the app through a chat service this server no longer runs, or that no longer
+    /// registers channels, so nothing may be posted there until it is configured to again.
+    ProviderGone,
 }
 
 impl ChannelInfo {
@@ -705,6 +728,7 @@ mod tests {
             alias: None,
             added: false,
             provider: None,
+            write_source: None,
         };
         assert_eq!(
             channel.display_name(),
