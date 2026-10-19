@@ -229,7 +229,7 @@ struct AgentMemory {
     screen_changed_at: f64,
 }
 
-/// One notice that is owed to the coordinator but not yet durably queued for it.
+/// One notice that is owed to the coordinator and waiting to be durably queued for it.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PendingNotice {
     agent: String,
