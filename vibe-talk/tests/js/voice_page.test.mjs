@@ -70368,7 +70368,7 @@ const twoServices = (page) => {
 /** What a channel picker holds: each service header with its channels' ids, or bare ids. */
 function pickerShape(page, id = "discord-channel") {
   return page.el(id).children.map((child) => String(child.tagName).toLowerCase() === "optgroup"
-    ? { group: child.label, channels: child.children.map((option) => String(option.value)) }
+    ? { group: child.getAttribute("label"), channels: child.children.map((option) => String(option.value)) }
     : String(child.value));
 }
 

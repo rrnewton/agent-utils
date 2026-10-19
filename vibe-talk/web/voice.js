@@ -42093,18 +42093,18 @@ const UNDESCRIBED_SERVICE = "Not connected";
  * order, then the channels of no described service (an added channel whose bridge is no longer
  * configured), never dropped.
  *
- * @returns {{provider: string | null, label: string, channels: any[]}[]}
+ * @returns {{provider: string | null, heading: string, channels: any[]}[]}
  */
 function channelGroups(channels = knownChannels) {
   const groups = [...providerDescriptions.keys()].map((key) => ({
     provider: /** @type {string | null} */ (key),
-    label: serviceLabel(key),
+    heading: serviceLabel(key),
     channels: channels.filter((channel) => channel.provider === key),
   }));
   const rest = channels.filter(
     (channel) => typeof channel.provider !== "string" || !providerDescriptions.has(channel.provider)
   );
-  groups.push({ provider: null, label: UNDESCRIBED_SERVICE, channels: rest });
+  groups.push({ provider: null, heading: UNDESCRIBED_SERVICE, channels: rest });
   return groups.filter((group) => group.channels.length > 0);
 }
 
@@ -42463,7 +42463,9 @@ function fillChannelSelect(id) {
   if (grouped) {
     for (const group of channelGroups()) {
       const header = document.createElement("optgroup");
-      header.label = group.label;
+      // The attribute, not the property of that name: reading or writing a `label` property is
+      // what the server's `#39 channel-alias` guard counts, as a channel named past its alias.
+      header.setAttribute("label", group.heading);
       header.append(...group.channels.map(optionFor));
       select.append(header);
     }
