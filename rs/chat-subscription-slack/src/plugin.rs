@@ -438,6 +438,7 @@ impl ChatSubscriptionBackend for SlackBackend {
         }
         let config = PluginConfig::from_request(request)?;
         let diagnostics = Diagnostics::new(config.diagnostics_log.clone(), "slack-plugin");
+        let refusals = crate::refusals::RefusalRecorder::beside(config.diagnostics_log.as_deref());
         let channels: BTreeSet<String> = request
             .channel_ids()
             .iter()
@@ -531,6 +532,7 @@ impl ChatSubscriptionBackend for SlackBackend {
             initial,
             cancel: Arc::clone(&self.cancel),
             diagnostics,
+            refusals,
             _transport: transport,
         }))
     }
@@ -554,6 +556,7 @@ struct SlackDriver {
     initial: Option<Initial>,
     cancel: Arc<SharedCancel>,
     diagnostics: Diagnostics,
+    refusals: crate::refusals::RefusalRecorder,
     _transport: Box<dyn SlackTransport>,
 }
 
@@ -765,6 +768,30 @@ impl ChatSubscriptionDriver for SlackDriver {
                             self.diagnostics.log(&format!(
                                 "event {sequence}: checkpoint ({reason}; user {author})"
                             ));
+                            // A refused message from an allowed sender is counted durably, so
+                            // agentctl can raise an alarm: a person's message was meant to be a
+                            // request (live finding 2026-10-19: three owner replies were dropped
+                            // while every health signal stayed green).
+                            if let Some(message) = message.as_ref().filter(|message| {
+                                message
+                                    .user_id
+                                    .as_deref()
+                                    .is_some_and(|user| self.senders.contains(user))
+                            }) {
+                                let refusal = crate::refusals::Refusal {
+                                    at_millis: crate::refusals::now_millis(),
+                                    sequence,
+                                    channel_id: message.channel_id.clone(),
+                                    message_ts: message.message_ts.clone(),
+                                    user_id: author.to_owned(),
+                                    reason: reason.to_owned(),
+                                };
+                                if let Err(error) = self.refusals.record(&refusal) {
+                                    self.diagnostics.log(&format!(
+                                        "event {sequence}: the allowed-sender refusal could not be saved: {error}"
+                                    ));
+                                }
+                            }
                             CommittableEvent::Checkpoint
                         }
                         None => {

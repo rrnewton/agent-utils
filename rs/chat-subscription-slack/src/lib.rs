@@ -28,6 +28,7 @@ pub mod fake;
 pub mod ids;
 pub mod outbound;
 pub mod plugin;
+pub mod refusals;
 pub mod transport;
 pub mod warm;
 

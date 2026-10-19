@@ -151,6 +151,16 @@ pub const REQUEST_INSPECTION_SCHEMA: &str = "agentctl-chat-request-inspection/v1
 // state directory: see `DeliveryAlarm`.
 const DELIVERY_ALARM_SCHEMA: &str = "agentctl-chat-delivery-alarm/v1";
 const DELIVERY_ALARM_FILE: &str = "delivery-alarm.json";
+/// A subscription plugin's durable count of messages from allowed senders that it did not admit,
+/// kept beside the diagnostics log its backend configuration names (`diagnostics_log`). The Slack
+/// plugin writes it; agentctl only reads it. See [`BridgeState::allowed_sender_refusals`].
+pub(crate) const ALLOWED_SENDER_REFUSALS_FILE: &str = "allowed-sender-refusals.json";
+const ALLOWED_SENDER_REFUSALS_SCHEMA: &str = "agentctl.allowed-sender-refusals.v1";
+/// How long after an allowed sender's message was refused the delivery alarm reports it. A
+/// window, not an acknowledgement: one dropped message alarms for a day, then clears by itself,
+/// while `chat status` keeps the full count.
+pub(crate) const ALLOWED_SENDER_REFUSAL_ALARM_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_ALLOWED_SENDER_REFUSALS_BYTES: u64 = 1 << 20;
 // The schema of each file in `receipt-reactions/`, a ✅ reaction that a request earned and that is
 // not on its message yet: see `ReceiptReactionRecord`.
 const RECEIPT_REACTION_SCHEMA: &str = "agentctl-chat-receipt-reaction/v1";
@@ -2821,6 +2831,22 @@ struct DeliveryAlarmDocument<'a> {
     /// Credential files that are missing, unreadable, expired or about to expire.
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     credential_problems: &'a [crate::credentials::CredentialProblem],
+    /// Refused messages from allowed senders within the alarm window, or an unreadable record:
+    /// see [`BridgeState::allowed_sender_refusals`] and [`allowed_sender_refusal_alarm`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allowed_sender_refusals: Option<&'a Value>,
+}
+
+/// What `delivery-alarm.json` reports from [`BridgeState::allowed_sender_refusals`]: the summary
+/// when a refusal is within the alarm window or the record cannot be read, otherwise nothing.
+pub(crate) fn allowed_sender_refusal_alarm(summary: Option<Value>) -> Option<Value> {
+    summary.filter(|summary| {
+        summary.get("unreadable").is_some()
+            || summary
+                .get("recent_in_window")
+                .and_then(Value::as_u64)
+                .is_some_and(|recent| recent > 0)
+    })
 }
 
 /// A receipt reaction (✅ unless configured otherwise) that a request earned and that is not on
@@ -6391,6 +6417,7 @@ impl BridgeState {
                 "credential_evidence": credential_evidence,
                 "credential_problems": crate::credentials::problems(&credential_files, now_millis),
                 "credential_warning_seconds": crate::credentials::CREDENTIAL_EXPIRY_WARNING.as_secs(),
+                "allowed_sender_refusals": self.allowed_sender_refusals(now_millis),
             },
             "requests": requests,
             "reply_breaker": self.reply_breaker_status(),
@@ -6417,6 +6444,7 @@ impl BridgeState {
     /// receipt reaction was lost, `refused` once the outbound helper refused any, each
     /// provider path that `provider` reports down, and the names of the records in `unreadable`
     /// that could not be read and had no earlier value.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn write_delivery_alarm(
         &self,
         alarm: &DeliveryAlarm,
@@ -6425,6 +6453,7 @@ impl BridgeState {
         provider: &ProviderDown,
         unreadable: &[&str],
         credential_problems: &[crate::credentials::CredentialProblem],
+        allowed_sender_refusals: Option<&Value>,
     ) -> Result<()> {
         write_document(
             &self.root.join(DELIVERY_ALARM_FILE),
@@ -6435,6 +6464,7 @@ impl BridgeState {
                 provider,
                 unreadable_records: unreadable,
                 credential_problems,
+                allowed_sender_refusals,
             },
         )
     }
@@ -6510,6 +6540,80 @@ impl BridgeState {
             return Ok(());
         }
         write_document(&self.root.join(PROVIDER_HEALTH_FILE), &record)
+    }
+
+    /// The plugin's record of refused messages from allowed senders, summarised at `now_millis`:
+    /// `{"count", "by_reason", "last", "recent_in_window", "window_seconds"}`. `None` when the
+    /// backend configuration names no `diagnostics_log` (there is nowhere to look); zero counts
+    /// when the record does not exist yet; `{"unreadable": <why>}` when it exists but cannot be
+    /// read, so a damaged record is reported rather than read as clear. Live finding 2026-10-19:
+    /// three of the owner's messages were dropped by the plugin while every health signal stayed
+    /// green, because the bridge only ever sees a bare checkpoint for a refused message.
+    pub(crate) fn allowed_sender_refusals(&self, now_millis: u64) -> Option<Value> {
+        let log = self
+            .config
+            .backend_configuration
+            .as_ref()?
+            .data
+            .get("diagnostics_log")?
+            .as_str()?;
+        let path = Path::new(log).parent()?.join(ALLOWED_SENDER_REFUSALS_FILE);
+        let window_seconds = ALLOWED_SENDER_REFUSAL_ALARM_WINDOW.as_secs();
+        let record = match fs::metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Some(serde_json::json!({
+                    "count": 0,
+                    "by_reason": {},
+                    "last": null,
+                    "recent_in_window": 0,
+                    "window_seconds": window_seconds,
+                }));
+            }
+            Err(error) => return Some(serde_json::json!({ "unreadable": error.to_string() })),
+            Ok(metadata) if metadata.len() > MAX_ALLOWED_SENDER_REFUSALS_BYTES => {
+                return Some(serde_json::json!({ "unreadable": "the record is too large" }));
+            }
+            Ok(_) => match fs::read(&path)
+                .map_err(|error| error.to_string())
+                .and_then(|bytes| {
+                    serde_json::from_slice::<Value>(&bytes).map_err(|error| error.to_string())
+                }) {
+                Ok(record)
+                    if record.get("schema").and_then(Value::as_str)
+                        == Some(ALLOWED_SENDER_REFUSALS_SCHEMA) =>
+                {
+                    record
+                }
+                Ok(_) => {
+                    return Some(
+                        serde_json::json!({ "unreadable": "the record has another schema" }),
+                    );
+                }
+                Err(error) => return Some(serde_json::json!({ "unreadable": error })),
+            },
+        };
+        let recent = record
+            .get("recent")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let window_start = now_millis.saturating_sub(window_seconds.saturating_mul(1000));
+        let recent_in_window = recent
+            .iter()
+            .filter(|refusal| {
+                refusal
+                    .get("at_millis")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|at| at >= window_start)
+            })
+            .count();
+        Some(serde_json::json!({
+            "count": record.get("count").and_then(Value::as_u64).unwrap_or(0),
+            "by_reason": record.get("by_reason").cloned().unwrap_or_else(|| serde_json::json!({})),
+            "last": recent.last().cloned().unwrap_or(Value::Null),
+            "recent_in_window": recent_in_window,
+            "window_seconds": window_seconds,
+        }))
     }
 
     /// The credential files named by the plugin and outbound helper environment, as this process
@@ -29673,6 +29777,97 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
         assert_eq!(reported.failures, 2);
         assert_eq!(reported.last_error_class, "provider_timeout");
         assert_eq!(recovered, ProviderDown::default());
+    }
+
+    #[test]
+    fn an_allowed_senders_refused_message_reaches_status_and_the_delivery_alarm() {
+        // Live finding 2026-10-19: the Slack plugin dropped three of the owner's messages and
+        // the bridge only saw bare checkpoints, so nothing alarmed. The plugin now counts them
+        // beside its diagnostics log, and agentctl reports them.
+        let root = temporary("allowed-sender-refusals");
+        let logs = temporary("allowed-sender-refusals-logs");
+        let mut configuration = config();
+        let mut data = Map::new();
+        data.insert(
+            "diagnostics_log".to_owned(),
+            Value::from(logs.join("plugin.log").display().to_string()),
+        );
+        configuration.backend_configuration = Some(BackendConfigurationDocument {
+            schema: "fixture.v1".to_owned(),
+            data,
+        });
+        let state = BridgeState::initialize(&root, configuration).expect("initialize");
+        let now = unix_millis();
+        let empty = state
+            .allowed_sender_refusals(now)
+            .expect("a diagnostics log is configured");
+        assert_eq!(empty["count"], 0);
+        assert!(allowed_sender_refusal_alarm(Some(empty)).is_none());
+
+        let record = json!({
+            "schema": ALLOWED_SENDER_REFUSALS_SCHEMA,
+            "count": 3,
+            "by_reason": {"bot author": 2, "other channel": 1},
+            "recent": [
+                {"at_millis": now - 3 * 24 * 60 * 60 * 1000, "sequence": 1, "channel_id": "C1",
+                 "message_ts": "1.1", "user_id": "U1", "reason": "bot author"},
+                {"at_millis": now - 1000, "sequence": 2, "channel_id": "C1",
+                 "message_ts": "1.2", "user_id": "U1", "reason": "other channel"},
+            ],
+        });
+        fs::write(
+            logs.join(ALLOWED_SENDER_REFUSALS_FILE),
+            serde_json::to_vec(&record).expect("record JSON"),
+        )
+        .expect("write the plugin's record");
+        let summary = state.allowed_sender_refusals(now).expect("summary");
+        assert_eq!(summary["count"], 3);
+        assert_eq!(summary["by_reason"]["bot author"], 2);
+        assert_eq!(
+            summary["recent_in_window"], 1,
+            "the 3-day-old refusal is outside the window"
+        );
+        assert_eq!(summary["last"]["message_ts"], "1.2");
+
+        let status = state.status().expect("status");
+        assert_eq!(
+            status["delivery_alarm"]["allowed_sender_refusals"]["count"],
+            3
+        );
+
+        let alarm = allowed_sender_refusal_alarm(Some(summary)).expect("a recent refusal alarms");
+        state
+            .write_delivery_alarm(
+                &DeliveryAlarm::new(&[], now, DELIVERY_STALL_AFTER),
+                &LostReceiptReactions::default(),
+                &RefusedReceiptReactions::default(),
+                &ProviderDown::default(),
+                &[],
+                &[],
+                Some(&alarm),
+            )
+            .expect("write the delivery alarm");
+        let written: Value = serde_json::from_slice(
+            &fs::read(root.join(DELIVERY_ALARM_FILE)).expect("read the delivery alarm"),
+        )
+        .expect("alarm JSON");
+        // A refusal outside the window alone does not alarm.
+        let old_only = state
+            .allowed_sender_refusals(now + 2 * 24 * 60 * 60 * 1000)
+            .expect("summary later");
+        fs::write(logs.join(ALLOWED_SENDER_REFUSALS_FILE), b"{ not json").expect("damage");
+        let damaged = state.allowed_sender_refusals(now).expect("damaged summary");
+        fs::remove_dir_all(root).expect("cleanup");
+        fs::remove_dir_all(logs).expect("cleanup");
+        assert_eq!(written["allowed_sender_refusals"]["recent_in_window"], 1);
+        assert_eq!(
+            written["allowed_sender_refusals"]["last"]["reason"],
+            "other channel"
+        );
+        assert!(allowed_sender_refusal_alarm(Some(old_only)).is_none());
+        // A damaged record alarms instead of reading as clear.
+        assert!(damaged.get("unreadable").is_some());
+        assert!(allowed_sender_refusal_alarm(Some(damaged)).is_some());
     }
 
     /// A state whose plugin environment names a credential file through

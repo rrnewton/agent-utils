@@ -5003,6 +5003,7 @@ type WrittenAlarm = (
     chat_runtime::ProviderDown,
     Vec<&'static str>,
     Vec<crate::credentials::CredentialProblem>,
+    Option<serde_json::Value>,
 );
 
 struct DeliveryWatch {
@@ -5295,12 +5296,28 @@ impl DeliveryWatch {
             }
         }
         let credentials = crate::credentials::problems(&files, now_millis);
-        let alarm = (alarm, lost, refused, provider, unreadable, credentials);
+        let refusals =
+            chat_runtime::allowed_sender_refusal_alarm(state.allowed_sender_refusals(now_millis));
+        let alarm = (
+            alarm,
+            lost,
+            refused,
+            provider,
+            unreadable,
+            credentials,
+            refusals,
+        );
         if self.written.as_ref() != Some(&alarm) {
             self.written = None;
-            match state
-                .write_delivery_alarm(&alarm.0, &alarm.1, &alarm.2, &alarm.3, &alarm.4, &alarm.5)
-            {
+            match state.write_delivery_alarm(
+                &alarm.0,
+                &alarm.1,
+                &alarm.2,
+                &alarm.3,
+                &alarm.4,
+                &alarm.5,
+                alarm.6.as_ref(),
+            ) {
                 Ok(()) => self.written = Some(alarm),
                 Err(error) => {
                     problem.get_or_insert_with(|| {

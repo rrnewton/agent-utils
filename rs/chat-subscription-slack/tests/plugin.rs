@@ -367,3 +367,58 @@ fn authorship_is_the_sender_allowlist_not_the_bot_id() {
     let plain = commit_next(&mut subscription);
     assert_eq!(single_message(&plain).text(), "plain");
 }
+
+#[test]
+fn an_allowed_senders_refused_message_is_counted_durably_and_no_one_elses() {
+    // Live finding 2026-10-19: owner messages were dropped while every health signal stayed
+    // green. A refused message from an allowed sender is now counted beside the diagnostics log.
+    let directory = std::env::temp_dir().join(format!("slack-refusal-test-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let log = directory.join("plugin.log");
+    let fake = FakeTransport::new();
+    fake.push_script(vec![
+        // The owner, with an ignored prefix: refused, counted.
+        owner_message(301, "1792000901.000200", None, "[coordinator] note"),
+        // The owner in a channel this bridge does not watch: refused, counted.
+        event(302, json!({"channel_id": "C0OTHERCHAN", "message_ts": "1792000902.000200", "slack_user_id": OWNER, "text": "elsewhere"})),
+        // Someone not allowed: refused, NOT counted.
+        event(303, json!({"channel_id": CHANNEL, "message_ts": "1792000903.000200", "slack_user_id": "U0STRANGER0", "text": "hi"})),
+        FakeStep::Line(r#"{"type":"HEARTBEAT","ts":1.0}"#.to_owned()),
+    ]);
+    let mut backend = make_backend(&fake);
+    let mut subscription = ChatSubscription::open(
+        &mut backend,
+        &request(
+            None,
+            json!({
+                "ignore_text_prefixes": ["[coordinator]"],
+                "diagnostics_log": log.to_str().unwrap(),
+            }),
+        ),
+    )
+    .unwrap();
+    let first = commit_next(&mut subscription);
+    assert_eq!(first.events(), [CommittableEvent::Checkpoint]);
+    for _ in 0..3 {
+        assert_eq!(
+            commit_next(&mut subscription).events(),
+            [CommittableEvent::Checkpoint]
+        );
+    }
+    let record: Value = serde_json::from_slice(
+        &std::fs::read(directory.join(chat_subscription_slack::refusals::REFUSALS_FILE)).unwrap(),
+    )
+    .unwrap();
+    std::fs::remove_dir_all(&directory).unwrap();
+    assert_eq!(
+        record["schema"],
+        chat_subscription_slack::refusals::REFUSALS_SCHEMA
+    );
+    assert_eq!(record["count"], 2);
+    assert_eq!(record["by_reason"]["ignored prefix"], 1);
+    assert_eq!(record["by_reason"]["other channel"], 1);
+    let recent = record["recent"].as_array().unwrap();
+    assert_eq!(recent[0]["message_ts"], "1792000901.000200");
+    assert_eq!(recent[1]["channel_id"], "C0OTHERCHAN");
+    assert!(recent.iter().all(|refusal| refusal["user_id"] == OWNER));
+}
