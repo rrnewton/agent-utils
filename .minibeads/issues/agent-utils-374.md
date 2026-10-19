@@ -1,12 +1,13 @@
 ---
 title: 'registered-writable-follows-policy: a channel added in the app follows its provider''s current write policy, and Settings says why a channel is read only'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-19T16:42:11.061339057+00:00
-updated_at: 2026-10-19T16:42:11.061339057+00:00
+updated_at: 2026-10-19T17:14:28.599570669+00:00
+closed_at: 2026-10-19T17:14:28.599570489+00:00
 ---
 
 # Description
