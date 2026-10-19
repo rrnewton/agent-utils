@@ -1,5 +1,7 @@
 //! Inbound behaviour of the Slack subscription backend against the fake transport.
 
+use std::fs;
+use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
@@ -101,7 +103,7 @@ fn fresh_lineage_checkpoints_then_delivers_owner_messages_and_thread_replies() {
         owner_message(101, "1792000801.000100", None, "please &amp; thank you"),
         // A stranger and a bot are checkpoints, not requests.
         event(102, json!({"channel_id": CHANNEL, "message_ts": "1792000802.000100", "slack_user_id": "U0STRANGER1", "text": "hi"})),
-        event(103, json!({"channel_id": CHANNEL, "message_ts": "1792000803.000100", "slack_user_id": OWNER, "bot_id": "B0BOT000001", "text": "[bot] reply"})),
+        event(103, json!({"channel_id": CHANNEL, "message_ts": "1792000803.000100", "slack_user_id": "U0BOTUSER01", "bot_id": "B0BOT000001", "text": "[bot] reply"})),
         // The owner replies inside the first message's thread.
         owner_message(104, "1792000804.000100", Some("1792000801.000100"), "follow-up"),
         // An edit notice is not a request.
@@ -252,6 +254,67 @@ fn provider_gaps_and_unreadable_cursors_are_reported_as_gaps() {
         ChatSubscription::open(&mut second, &request(Some("18230"), json!({}))).unwrap();
     let gap = next_batch(&mut subscription);
     assert!(gap.events()[0].requires_reconciliation());
+}
+
+#[test]
+fn an_allowed_sender_posting_through_an_app_is_admitted_and_other_bots_are_not() {
+    // An app acting for the owner (the owner's user token) is attributed to
+    // the owner but stamped with the delivering app's bot_id and app_id.
+    let log = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("slack-plugin-via-app.log");
+    let _ = fs::remove_file(&log);
+    let via_app = |sequence, ts: &str, user: &str, text: &str| {
+        event(
+            sequence,
+            json!({"channel_id": CHANNEL, "message_ts": ts, "thread_ts": "1792000801.000100",
+                "slack_user_id": user, "bot_id": "B0VIAAPP001", "app_id": "A0VIAAPP001", "text": text}),
+        )
+    };
+    let fake = FakeTransport::new();
+    fake.push_script(vec![
+        via_app(21, "1792000802.000100", OWNER, "sent from another app"),
+        // The bridge's own reply comes from its bot user, not an allowed sender.
+        via_app(22, "1792000803.000100", "U0BRIDGEBOT1", "a bridge reply"),
+        // The owner's message that only names the delivering app.
+        event(
+            23,
+            json!({"channel_id": CHANNEL, "message_ts": "1792000804.000100",
+            "slack_user_id": OWNER, "app_id": "A0VIAAPP001", "text": "typed in Slack"}),
+        ),
+        // Ignored prefixes still apply to the owner's posts through an app.
+        via_app(24, "1792000805.000100", OWNER, "[coordinator] echo"),
+    ]);
+    let mut backend = make_backend(&fake);
+    let mut subscription = ChatSubscription::open(
+        &mut backend,
+        &request(
+            Some("slack1:seq:20"),
+            json!({"ignore_text_prefixes": ["[coordinator]"], "diagnostics_log": log}),
+        ),
+    )
+    .unwrap();
+
+    let admitted = commit_next(&mut subscription);
+    let message = single_message(&admitted);
+    assert_eq!(message.sender_id().as_str(), OWNER);
+    assert_eq!(message.text(), "sent from another app");
+    assert!(message.is_thread_reply());
+
+    let bot = commit_next(&mut subscription);
+    assert_eq!(bot.cursor().as_str(), "slack1:seq:22");
+    assert_eq!(bot.events(), [CommittableEvent::Checkpoint]);
+
+    assert_eq!(
+        single_message(&commit_next(&mut subscription)).text(),
+        "typed in Slack"
+    );
+
+    let echo = commit_next(&mut subscription);
+    assert_eq!(echo.cursor().as_str(), "slack1:seq:24");
+    assert_eq!(echo.events(), [CommittableEvent::Checkpoint]);
+
+    let diagnostics = fs::read_to_string(&log).unwrap();
+    assert!(diagnostics.contains("event 22: checkpoint (bot author; user U0BRIDGEBOT1)"));
+    assert!(diagnostics.contains("event 24: checkpoint (ignored prefix; user U0OWNER0001)"));
 }
 
 #[test]
