@@ -70,9 +70,10 @@ use std::collections::{HashMap, HashSet};
 use super::client::{HttpSlackClient, Raw};
 use super::history::{nearest, Feed, Toward, SCAN_PAGE_LIMIT};
 use super::ids;
+use super::reactions;
 use super::timeline::{cursor_micros, root_says_replies_after};
 use crate::chat::{ChatError, LiveRead};
-use crate::model::{ChannelId, MessageId};
+use crate::model::{ChannelId, MessageId, Reaction};
 
 /// Most threads whose new replies one live read reads, one `conversations.replies` call each. The
 /// rest are read by the next read, the longest waiting first.
@@ -148,11 +149,18 @@ pub(super) struct LiveThreads {
     /// Threads waiting to be read, the longest waiting first; a read takes those whose last read
     /// failed after the rest.
     moved: Vec<Moved>,
+    /// The reaction set last seen for each message, by `ts`: `None` for a known message no copy
+    /// has reported reactions for. `#378 live-reactions`. The newest page every live read
+    /// already fetches carries the current sets, so a diff against this is the whole cost of
+    /// seeing a reaction added in the native app.
+    reactions: HashMap<String, Option<Vec<Reaction>>>,
 }
 
 impl LiveThreads {
     /// The places of a conversation whose newest page of history is `raws`, as it stands.
-    fn seeded(raws: &[Raw], roots: &[&Raw]) -> Self {
+    /// `owner` reads the reaction sets the page reports, for the diff later reads make
+    /// (`#378 live-reactions`): seeding learns them and reports no change.
+    fn seeded(raws: &[Raw], roots: &[&Raw], owner: Option<&str>) -> Self {
         let floor = raws
             .iter()
             .map(|raw| raw.micros)
@@ -168,10 +176,75 @@ impl LiveThreads {
                 (root.ts.clone(), Place::at(through, root.reply_count()))
             })
             .collect();
+        let reactions = raws
+            .iter()
+            .map(|raw| {
+                (
+                    raw.ts.clone(),
+                    reactions::parse(raw.value.get("reactions"), owner),
+                )
+            })
+            .collect();
         Self {
             floor,
             places,
             moved: Vec::new(),
+            reactions,
+        }
+    }
+
+    /// Diff the reaction sets `raws` report against the remembered ones, remembering the new
+    /// sets, and return the messages whose set moved. `#378 live-reactions`.
+    ///
+    /// The same rules as the hub's memory ([`crate::live::LiveHub::reactions_changed`]): a
+    /// message never seen is learned silently; a known message's first reported set and a set
+    /// that moved are changes; and a read copy reporting nothing where a non-empty set stood is
+    /// the last reaction removed — Slack drops the field then, and a bridge that never reports
+    /// never put a set here to lose. That raw is stamped with the empty array it means, so the
+    /// message built from it says "none" outright (`#312 slack-reactions` keeps a merely absent
+    /// field as "not reported" everywhere else).
+    fn reaction_changes(&mut self, raws: &[Raw], owner: Option<&str>) -> Vec<Raw> {
+        let mut changed = Vec::new();
+        for raw in raws {
+            let set = reactions::parse(raw.value.get("reactions"), owner);
+            let held = self.reactions.get(&raw.ts).cloned();
+            match (&held, &set) {
+                (Some(Some(before)), None) if !before.is_empty() => {
+                    let mut stamped = raw.clone();
+                    if let Some(object) = stamped.value.as_object_mut() {
+                        object.insert("reactions".to_owned(), serde_json::Value::Array(Vec::new()));
+                    }
+                    changed.push(stamped);
+                    self.reactions.insert(raw.ts.clone(), Some(Vec::new()));
+                }
+                (Some(before), Some(now)) => {
+                    if before.as_ref() != Some(now) {
+                        changed.push(raw.clone());
+                    }
+                    self.reactions.insert(raw.ts.clone(), set);
+                }
+                (Some(_), None) => {}
+                (None, _) => {
+                    self.reactions.insert(raw.ts.clone(), set);
+                }
+            }
+        }
+        changed
+    }
+
+    /// Learn the reaction sets `raws` report without reporting any change: for the messages a
+    /// read already reports as new, whose sets ride with them. `#378 live-reactions`.
+    fn learn_reactions(&mut self, raws: &[Raw], owner: Option<&str>) {
+        for raw in raws {
+            let set = reactions::parse(raw.value.get("reactions"), owner);
+            match set {
+                Some(_) => {
+                    self.reactions.insert(raw.ts.clone(), set);
+                }
+                None => {
+                    self.reactions.entry(raw.ts.clone()).or_insert(None);
+                }
+            }
         }
     }
 
@@ -221,9 +294,23 @@ impl LiveThreads {
         }
     }
 
-    /// Forget the places of the oldest roots past [`LIVE_REMEMBERED_ROOTS`], never one waiting.
+    /// Forget the places of the oldest roots past [`LIVE_REMEMBERED_ROOTS`], never one waiting,
+    /// and the oldest reaction sets past the same bound (`#378 live-reactions`): a set forgotten
+    /// is re-learned silently by the next read that reports it.
     /// A root that left the newest page comes back to it only when newer messages are deleted.
     fn bound(&mut self) {
+        let excess = self.reactions.len().saturating_sub(LIVE_REMEMBERED_ROOTS);
+        if excess > 0 {
+            let mut oldest: Vec<(i64, String)> = self
+                .reactions
+                .keys()
+                .map(|ts| (ids::ts_micros(ts).unwrap_or(0), ts.clone()))
+                .collect();
+            oldest.sort_unstable();
+            for (_, ts) in oldest.into_iter().take(excess) {
+                self.reactions.remove(&ts);
+            }
+        }
         let excess = self.places.len().saturating_sub(LIVE_REMEMBERED_ROOTS);
         if excess == 0 {
             return;
@@ -307,32 +394,62 @@ impl HttpSlackClient {
         if !roots.is_empty() || own.iter().any(Raw::is_thread_root) {
             self.mark_threaded(conversation);
         }
+        let owner = self.owner_id();
         let held = after.and_then(|_| self.live_threads(conversation));
-        let (replies, replies_behind) = match held {
+        let (replies, replies_behind, changed) = match held {
             Some(mut held) => {
                 held.note_roots(&roots);
-                let (replies, behind) = self.read_moved(conversation, &mut held).await;
+                let (replies, behind, thread_seen) = self.read_moved(conversation, &mut held).await;
+                // `#378 live-reactions`. The newest page this read already fetched, and every
+                // thread page it read, carry current reaction sets: diff them all, less the
+                // messages this read already reports as new, whose sets ride with them.
+                let reported: HashSet<&str> = own
+                    .iter()
+                    .chain(&replies)
+                    .map(|raw| raw.ts.as_str())
+                    .collect();
+                let candidates: Vec<Raw> = newest
+                    .raws
+                    .iter()
+                    .chain(&thread_seen)
+                    .filter(|raw| !reported.contains(raw.ts.as_str()))
+                    .cloned()
+                    .collect();
+                let changed = held.reaction_changes(&candidates, owner.as_deref());
+                // The reported messages' sets are learned too, so their next move is a change.
+                let fresh: Vec<Raw> = own.iter().chain(&replies).cloned().collect();
+                held.learn_reactions(&fresh, owner.as_deref());
                 held.bound();
                 self.keep_live_threads(conversation, held);
-                (replies, behind)
+                (replies, behind, changed)
             }
             // Seeding, or a conversation whose places were forgotten: as it stands, and no reply.
             None => {
-                self.keep_live_threads(conversation, LiveThreads::seeded(&newest.raws, &roots));
-                (Vec::new(), false)
+                self.keep_live_threads(
+                    conversation,
+                    LiveThreads::seeded(&newest.raws, &roots, owner.as_deref()),
+                );
+                (Vec::new(), false, Vec::new())
             }
         };
         Ok(LiveRead {
             messages: self.messages(channel, &own).await,
             replies: self.messages(channel, &replies).await,
             replies_behind,
+            changed: self.messages(channel, &changed).await,
         })
     }
 
     /// Read the new replies of the threads waiting in `held`, at most [`LIVE_THREAD_READS`] of
     /// them, one call each, and none after a read that fails. Returns the replies to report,
-    /// oldest first, and whether any thread is still waiting.
-    async fn read_moved(&self, conversation: &str, held: &mut LiveThreads) -> (Vec<Raw>, bool) {
+    /// oldest first, whether any thread is still waiting, and every raw those pages carried —
+    /// roots and already-known replies included, whose current reaction sets the caller diffs
+    /// (`#378 live-reactions`).
+    async fn read_moved(
+        &self,
+        conversation: &str,
+        held: &mut LiveThreads,
+    ) -> (Vec<Raw>, bool, Vec<Raw>) {
         let mut waiting = std::mem::take(&mut held.moved);
         // A thread whose last read failed waits behind every thread whose last read did not, in
         // the order they were waiting, so one that keeps failing holds up no other.
@@ -342,6 +459,7 @@ impl HttpSlackClient {
                 .is_some_and(|place| place.failed > 0)
         });
         let mut found: Vec<Raw> = Vec::new();
+        let mut seen: Vec<Raw> = Vec::new();
         let mut reads = 0;
         // The thread whose read failed, which goes behind every other thread still waiting.
         let mut failing = None;
@@ -369,6 +487,7 @@ impl HttpSlackClient {
                 .await;
             match page {
                 Ok(page) => {
+                    seen.extend(page.raws.iter().cloned());
                     // A server may repeat the root on every replies page; it is not news.
                     let fresh: Vec<Raw> = page
                         .raws
@@ -457,7 +576,7 @@ impl HttpSlackClient {
         held.moved.extend(failing);
         found.sort_by_key(|raw| raw.micros);
         found.dedup_by_key(|raw| raw.micros);
-        (found, !held.moved.is_empty())
+        (found, !held.moved.is_empty(), seen)
     }
 
     /// What the poller holds for `conversation`, when it has seeded it.

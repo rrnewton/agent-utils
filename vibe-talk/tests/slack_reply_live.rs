@@ -1299,3 +1299,68 @@ async fn the_recent_window_the_voice_tools_read_includes_the_reply() {
     assert!(read.contains("rollout finished"), "{read}");
     assert!(read.contains("build is green"), "{read}");
 }
+
+/// `#378 live-reactions`: a thumbs-up added in the native app to a message already read is
+/// published as one update on the next poll, from the newest page that poll already reads —
+/// no extra Web API call — and its removal (the field disappears) is published the same way.
+#[tokio::test]
+async fn a_reaction_added_in_the_native_app_arrives_as_an_update_with_no_extra_read() {
+    let (state, _root) = one_thread();
+    let fake = Fake::start(state, PAGE_CAP).await;
+    let client = fake.client();
+    let mut poller = Poller::new();
+    let seed = poller.poll(&fake, &client).await;
+    assert!(seed.published.is_empty(), "seeding publishes nothing");
+
+    let target = ts(50, 0);
+    fake.with(|state| {
+        let list = state.history.get_mut(CH).expect("history");
+        let message = list
+            .iter_mut()
+            .find(|message| message["ts"] == json!(target))
+            .expect("the message");
+        message["reactions"] = json!([{"name": "+1", "count": 1, "users": ["UADA00001"]}]);
+    });
+    let poll = poller.poll(&fake, &client).await;
+    assert_eq!(poll.tick.published, 0, "no new message arrived");
+    assert_eq!(poll.tick.changed, 1, "one reaction update");
+    assert_eq!(
+        poll.history, 1,
+        "the page the poll already reads carried it"
+    );
+    assert!(
+        poll.replies.is_empty(),
+        "no thread moved, so no thread is read"
+    );
+    assert_eq!(poll.published.len(), 1, "{:?}", poll.texts());
+    let update = &poll.published[0];
+    assert_eq!(update.kind, vibe_talk::live::LiveKind::Update);
+    let reactions = update.message.reactions.clone().expect("reported");
+    assert_eq!(reactions.len(), 1);
+    assert_eq!(reactions[0].emoji, "👍");
+    assert_eq!(reactions[0].count, 1);
+    assert!(!reactions[0].owner_reacted);
+
+    let quiet = poller.poll(&fake, &client).await;
+    assert!(
+        quiet.published.is_empty(),
+        "an unchanged set is not announced again"
+    );
+    assert_eq!(quiet.tick.changed, 0);
+
+    fake.with(|state| {
+        let list = state.history.get_mut(CH).expect("history");
+        let message = list
+            .iter_mut()
+            .find(|message| message["ts"] == json!(target))
+            .expect("the message");
+        message.as_object_mut().expect("object").remove("reactions");
+    });
+    let removed = poller.poll(&fake, &client).await;
+    assert_eq!(removed.tick.changed, 1, "the removal is an update too");
+    assert_eq!(
+        removed.published[0].message.reactions,
+        Some(Vec::new()),
+        "and it says none outright, so the page takes the chip away"
+    );
+}

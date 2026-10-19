@@ -453,6 +453,7 @@ impl ChatClient for Recorder {
             messages: Vec::new(),
             replies: vec![self.message.clone()],
             replies_behind: true,
+            changed: Vec::new(),
         })
     }
     fn read_caps(&self, _channel: &ChannelId) -> ReadCaps {

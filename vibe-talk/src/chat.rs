@@ -415,6 +415,12 @@ pub struct LiveRead {
     /// reads, a thread had more new replies than one call returns, or a read of one failed. Not a
     /// gap: they are reported by a later read.
     pub replies_behind: bool,
+    /// Already-reported messages whose reactions changed since the provider's previous live
+    /// read, each carrying its full current reaction list. `#378 live-reactions`. The poller
+    /// publishes each as a live update; a message also in `messages` or `replies` is never
+    /// repeated here. Empty from a provider that cannot say, and from the seeding read, which
+    /// only notes where reactions stand.
+    pub changed: Vec<Message>,
 }
 
 /// Which messages of a channel a range read covers. remote-ops-audit W10 `#287 bulk-reads`.

@@ -999,3 +999,109 @@ async fn the_stream_of_every_channel_needs_a_token_and_marks_what_this_server_po
         "the page must not relay the agent's own post back to it: {text:?}"
     );
 }
+
+// --- `#378 live-reactions` -----------------------------------------------------------------
+
+fn thumbs(count: u32) -> Vec<vibe_talk::model::Reaction> {
+    vec![vibe_talk::model::Reaction {
+        emoji: "👍".to_owned(),
+        custom: false,
+        custom_id: None,
+        count,
+        owner_reacted: false,
+    }]
+}
+
+/// A reaction added in the native app to a message already read reaches an attached page as a
+/// `message_update` on the next poll tick of the watched channel — the owner's thumbs-up case.
+/// The elapsed time from the native change to the frame is the latency this task reports: with
+/// fakes it is one tick's read, so in production it is bounded by the poll interval (or by the
+/// hint wake-up where a bridge sends one).
+#[tokio::test]
+async fn a_reaction_added_after_the_read_arrives_as_an_update() {
+    let harness = harness();
+    let channel = ChannelId(READ_CHANNEL.to_owned());
+    // No reactions at all when seeded: the owner's case is the FIRST reaction on a message.
+    let id = harness.discord.seed(&channel, "codex-eng", "ship it");
+    let mut cursor = None;
+    assert_eq!(
+        tick(&harness, &channel, &mut cursor).await,
+        0,
+        "seed publishes nothing"
+    );
+
+    let response = open(
+        &harness,
+        &format!("/api/v1/channels/{READ_CHANNEL}/stream"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+
+    let changed_at = std::time::Instant::now();
+    harness.discord.set_reactions(&id, Some(thumbs(1)));
+    tick(&harness, &channel, &mut cursor).await;
+
+    let text = read_events(&mut body, 1).await;
+    let latency = changed_at.elapsed();
+    assert!(
+        text.contains("event: message_update"),
+        "a reaction-only change must ride the stream as an update: {text:?}"
+    );
+    let payload = payloads(&text).pop().expect("one parsed event");
+    assert_eq!(
+        payload["message"]["reactions"][0]["emoji"], "👍",
+        "{payload}"
+    );
+    assert_eq!(payload["message"]["reactions"][0]["count"], 1, "{payload}");
+    assert!(
+        latency < Duration::from_secs(5),
+        "native reaction to stream frame took {latency:?} with fakes (one tick expected)"
+    );
+    eprintln!("live-reactions latency (fake, one tick): {latency:?}");
+
+    // Removing the last reaction is an update too, with an empty list — not silence. On the
+    // wire the field disappears entirely, which a read of a provider that reported a set before
+    // reads as "none left".
+    harness.discord.set_reactions(&id, None);
+    tick(&harness, &channel, &mut cursor).await;
+    let text = read_events(&mut body, 1).await;
+    assert!(text.contains("event: message_update"), "{text:?}");
+    let payload = payloads(&text).pop().expect("one parsed event");
+    assert_eq!(
+        payload["message"]["reactions"],
+        serde_json::json!([]),
+        "{payload}"
+    );
+}
+
+/// A reaction pushed by an adapter as an update reaches the stream and the held window, so a
+/// page that re-reads after the update is never served the older reaction set.
+#[tokio::test]
+async fn a_pushed_reaction_update_reaches_the_stream() {
+    let harness = harness();
+    let channel = ChannelId(READ_CHANNEL.to_owned());
+    let id = harness.discord.seed(&channel, "codex-eng", "ship it");
+    harness.discord.set_reactions(&id, Some(Vec::new()));
+    let mut cursor = None;
+    tick(&harness, &channel, &mut cursor).await;
+
+    let mut subscription = harness.live.subscribe(&channel, None);
+    let mut message = harness.discord.message(&id).expect("seeded");
+    message.reactions = Some(thumbs(2));
+    assert!(harness.live.publish_ingested(
+        "reaction-1".to_owned(),
+        vibe_talk::live::LiveKind::Update,
+        false,
+        &channel,
+        message,
+    ));
+    let live = tokio::time::timeout(Duration::from_secs(5), subscription.receiver.recv())
+        .await
+        .expect("the update arrives")
+        .expect("the channel is open");
+    assert_eq!(live.kind, vibe_talk::live::LiveKind::Update);
+    assert_eq!(live.message.reactions, Some(thumbs(2)));
+}

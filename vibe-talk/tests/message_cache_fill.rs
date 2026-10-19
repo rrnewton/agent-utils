@@ -1945,6 +1945,7 @@ async fn the_poller_claims_what_it_walked_only_when_its_page_bound_did_not_stop_
             published: 3,
             backlog: false,
             replies_behind: false,
+            changed: 0,
         }
     );
     assert_eq!(held(&d.cache), 13);
@@ -1997,6 +1998,7 @@ async fn the_poller_claims_what_it_walked_only_when_its_page_bound_did_not_stop_
             published: 8,
             backlog: true,
             replies_behind: false,
+            changed: 0,
         }
     );
     assert_eq!(held(&d.cache), 21, "what it read is kept");
@@ -2018,6 +2020,7 @@ async fn the_poller_claims_what_it_walked_only_when_its_page_bound_did_not_stop_
             published: 12,
             backlog: false,
             replies_behind: false,
+            changed: 0,
         }
     );
     assert_eq!(
