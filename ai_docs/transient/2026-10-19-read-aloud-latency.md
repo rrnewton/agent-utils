@@ -89,3 +89,49 @@ read started about 0.3 s after the tap (`#191`); nothing measured so far suggest
 with the length of the message (an inference, not a measurement), so splitting the first block
 would add a turn without shortening it. Blocks (`#376`) make the first request one block of the message anyway, and the
 new `said_chars` field will show if that assumption stops holding.
+
+## Block boundaries (`#376 read-aloud-blocks`)
+
+A long message is now read one block at a time (paragraph, heading, list item, block quote; a code
+block or table as a short description), one request per block under one selection, so the server
+queues each block behind the one before it on the same voice session. The page asks for the next
+block as soon as the current one has audio, and schedules it on the same audio clock to begin
+where the current one ends, or half a second (the jitter cushion) after its first audio arrives,
+whichever is later.
+
+What a boundary costs therefore depends on how fast the voice generates compared with how fast it
+speaks:
+
+- **A voice that generates faster than it speaks** has finished the current block before it is
+  heard, starts the next at once, and the next block is waiting when the current one ends: **no
+  gap**.
+- **A voice that streams at speaking pace**, as the deployed provider does (`#47`), cannot start the
+  next block until the current one has been generated, which is about when it finishes playing; the
+  next block's first audio then takes the provider's per-turn wait. That wait is **a pause at each
+  boundary, about as long as the provider's first audio for a warm turn**. The page spends none of
+  its jitter cushion on it, so a boundary never turns a later network stall into a longer gap. The
+  deployed warm first-audio time was about 0.2 to 0.3 s (`#191`), a short paragraph pause.
+
+Measured (loopback, real server, fake voice bridge with 300 ms first audio, six-block message):
+
+| Voice | Boundary gaps | Tap to audible |
+|---|---|---|
+| Streams at speaking pace | 325, 330, 330, 330, 335 ms | 1.04 s |
+| Generates 3x faster than it speaks | 0 ms at every boundary | 1.04 s |
+
+The Chromium walk in the validation suite (`tests/read_aloud_blocks_browser.py`, fake page API with
+a one-session voice) measures the same: at speaking pace each boundary equals the voice's first
+audio (300 ms), generating twice as fast the boundaries are 0 ms, and a negative control with
+1.2 s first audio shows 1.2 s gaps.
+
+To remove the pause on a speaking-pace voice the next block would have to be generated while the
+current one plays: a second voice session used only for the block after next, or a provider that
+accepts the next prompt before the current turn ends. Neither is done here; the first doubles the
+provider sessions read-aloud holds, and the second is not in the `vibe-talk-v1` protocol.
+
+### Sentences, next
+
+Sentence highlighting inside the current block (`read-aloud-sentences`) should not add requests:
+another boundary per sentence would add the same per-turn pause at every sentence. It can light the
+sentence by its share of the block's characters against the block's own audio time, which drifts
+only within one block.

@@ -1095,3 +1095,90 @@ async fn elevenlabs_audio_failures_keep_their_codes_status_and_redaction() {
         assert!(!String::from_utf8_lossy(&bytes).contains(REJECTED_KEY));
     }
 }
+
+/// `#376 read-aloud-blocks`. A message of several blocks is prepared as the blocks the page draws
+/// it as, in order, and each block plays on its own from the message's one ticket, said by the same
+/// speech rules as the whole. A message of one block is prepared and played exactly as before.
+#[tokio::test]
+async fn a_message_of_several_blocks_is_prepared_and_played_block_by_block() {
+    let (mut state, chat, _elevenlabs) =
+        testing::state_from_toml(&testing::config_toml_without_elevenlabs());
+    state.speech = Arc::new(IndependentSpeech);
+    let channel = ChannelId(READ_CHANNEL.to_owned());
+    let long = chat.seed(
+        &channel,
+        "Reader",
+        "Where the run got to.\n\n- the **budget** landed\n- the rewrite is a draft\n  - waiting on review\n\n> nothing failed\n\nThat is all.",
+    );
+    let short = chat.seed(&channel, "Reader", "one block only");
+    let app = router(state);
+    let (status, bytes) = call(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{READ_CHANNEL}/speech/prepare"),
+        Some(json!({"ids": [long.0, short.0]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let prepared: Value = serde_json::from_slice(&bytes).expect("prepared");
+    let blocks = &prepared["prepared"][0]["blocks"];
+    assert_eq!(
+        blocks,
+        &json!([
+            {"kind": "paragraph", "spoken": true},
+            {"kind": "item", "spoken": true},
+            {"kind": "item", "spoken": true},
+            {"kind": "item", "spoken": true},
+            {"kind": "quote", "spoken": true},
+            {"kind": "paragraph", "spoken": true},
+        ])
+    );
+    // One block: no list, and the page plays the URL whole, as every page always has.
+    assert!(
+        prepared["prepared"][1].get("blocks").is_none(),
+        "{prepared}"
+    );
+    let url = prepared["prepared"][0]["url"].as_str().expect("ticket");
+    let said = |bytes: Vec<u8>| String::from_utf8(bytes).expect("test audio");
+    let mut heard = Vec::new();
+    for block in 0..6 {
+        let (status, bytes) = call(&app, "GET", &format!("{url}?block={block}"), None).await;
+        assert_eq!(status, StatusCode::OK, "block {block}");
+        heard.push(said(bytes));
+    }
+    assert_eq!(
+        heard,
+        [
+            "Where the run got to.",
+            "the budget landed",
+            "the rewrite is a draft",
+            "waiting on review",
+            "nothing failed",
+            "That is all.",
+        ]
+    );
+    // The whole message still plays from the bare URL, for a page that reads it whole.
+    let (status, bytes) = call(&app, "GET", url, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let whole = said(bytes);
+    assert!(
+        whole.starts_with("Where the run got to.") && whole.ends_with("That is all."),
+        "{whole}"
+    );
+    let (status, bytes) = call(&app, "GET", &format!("{url}?block=6"), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).expect("error")["error"],
+        "unknown_speech_block"
+    );
+    let short_url = prepared["prepared"][1]["url"].as_str().expect("ticket");
+    let (status, bytes) = call(&app, "GET", &format!("{short_url}?block=0"), None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a message of one block is its own block 0"
+    );
+    assert_eq!(said(bytes), "one block only");
+    let (status, _bytes) = call(&app, "GET", &format!("{short_url}?block=1"), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

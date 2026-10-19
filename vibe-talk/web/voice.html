@@ -138,6 +138,18 @@
         <button id="dismiss-status" class="chip" type="button" aria-label="Dismiss">×</button>
       </div>
 
+      <!--
+        `#376 read-aloud-blocks`. Where a read of several blocks is, and the way through it: Previous,
+        "2 of 5", Next. Shown only while such a read plays, floating as the status line does and for
+        the same reason (nothing under the reader's thumb moves when it comes and goes). The media
+        keys a steering wheel or a headset sends do the same as its buttons.
+      -->
+      <div id="read-steer" role="group" aria-label="Reading position" hidden>
+        <button id="read-prev" class="read-steer-button" type="button" aria-label="Previous block">Previous</button>
+        <span id="read-steer-count" aria-live="polite"></span>
+        <button id="read-next" class="read-steer-button" type="button" aria-label="Next block">Next</button>
+      </div>
+
       <div id="screens">
         <!-- ------------------------------------------------------------------ sign-in screen -->
         <section id="screen-signin" class="screen" tabindex="-1" aria-label="Sign in">

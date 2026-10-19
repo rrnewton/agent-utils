@@ -201,7 +201,7 @@ const ALL_CHANNELS = "*";
  *   | "msg-scale-larger" | "msg-scale-smaller"
  *   | "open-add-channel" | "open-browse-channels" | "open-help" | "open-settings"
  *   | "pair-confirm" | "pair-dismiss"
- *   | "pinned-filter" | "post-confirm-cancel" | "post-confirm-more" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-new" | "read-speed" | "remove-channel"
+ *   | "pinned-filter" | "post-confirm-cancel" | "post-confirm-more" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-new" | "read-next" | "read-prev" | "read-speed" | "remove-channel"
  *   | "rename-channel" | "reply-cancel" | "reply-context-more" | "reply-send"
  *   | "reset-voice-post-prefix"
  *   | "restore-voice-system-prompt" | "save-alias" | "save-token" | "save-voice-instructions"
@@ -26917,9 +26917,12 @@ function renderChannelRows() {
     const named = childByClass(row, "msg-author");
     if (named) {
       named.className = isReading ? "msg-author reading-mark" : "msg-author";
-      named.textContent = isReading ? "reading" : authorLabel(row);
+      // `#376 read-aloud-blocks`: and how far through, "reading 2 of 5", in a read of several parts.
+      named.textContent = isReading ? readingLabel() : authorLabel(row);
       named.hidden = !isReading && (who === "me" || who === "coder");
     }
+    // The block being read, lit again on a row the poll has just rebuilt. `#376`.
+    markReadingBlock(row);
     const done = doneButtonOf(row);
     if (done) {
       done.textContent = isArchived ? "Unarchive" : "Done";
@@ -29799,7 +29802,10 @@ async function requestPreparedSpeech(channel, ids, signal = null) {
     const lifetimeMs = (Number(batch && batch.expires_in_seconds) || 0) * 1000;
     const until = { mono: requestedAt.mono + lifetimeMs, wall: requestedAt.wall + lifetimeMs };
     for (const entry of (batch && batch.prepared) || []) {
-      preparedSpeech.set(String(entry.message_id), { url: entry.url, until });
+      // `#376 read-aloud-blocks`. The blocks the server will read the message as, when it is more
+      // than one: `[{kind, spoken}]`, in drawing order.
+      const blocks = Array.isArray(entry.blocks) && entry.blocks.length > 1 ? entry.blocks : null;
+      preparedSpeech.set(String(entry.message_id), { url: entry.url, until, blocks });
     }
   }
 }
@@ -29836,6 +29842,18 @@ async function prepareSpeechFor(ids) {
     // As for the batch: the slower route still reads it.
   }
 }
+
+/** How long a prepared entry's ticket has left, on the nearer of its two deadlines. */
+function ticketLeftMs(entry) {
+  const now = speechDeadlineNow();
+  return Math.min(entry.until.mono - now.mono, entry.until.wall - now.wall);
+}
+
+/**
+ * `#376 read-aloud-blocks`. The life a ticket must still have for a read in blocks to start on it:
+ * half of the ten minutes a ticket lasts, longer than the messages read aloud take.
+ */
+const BLOCK_READ_TICKET_MARGIN_MS = 5 * 60 * 1000;
 
 /**
  * Forget what was prepared. The pace is baked into a ticket, so changing it invalidates them, and a
@@ -29918,6 +29936,10 @@ function stopReading() {
   }
   const { audio, urls, speechTimer, players } = nowPlaying;
   nowPlaying = null;
+  // `#376 read-aloud-blocks`. The media keys and the steering strip belong to a read in progress,
+  // and a jump to another block of it is still that read.
+  if (!readJumping) releaseMediaSession();
+  renderReadSteer();
   if (speechTimer !== null && speechTimer !== undefined) clearTimeout(speechTimer);
   for (const player of players || [audio]) {
     try {
@@ -29933,7 +29955,7 @@ function stopReading() {
       // A player that will not pause is not a reason to leave the page in a reading state.
     }
   }
-  quietReadAloudContext();
+  if (!readJumping) quietReadAloudContext();
   // The object URL holds the audio alive until it is revoked, and this mode fetches one per
   // message: not revoking is a leak that grows with the length of the backlog. ALL of them on a
   // combined row, including the parts that had not been reached — they were all fetched.
@@ -30010,9 +30032,10 @@ function speechSelection() {
   return `tap-${Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
 }
 
-function reportSpeechPlayback(url, timing) {
+function reportSpeechPlayback(url, timing, block = null) {
   if (typeof url !== "string" || !url.startsWith("/api/v1/speech/")) return;
-  fetch(`${url}/timing`, {
+  // `#376 read-aloud-blocks`. A block is its own request, with its own server timing.
+  fetch(`${url}/timing${block === null ? "" : `?block=${block}`}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(timing),
@@ -30075,7 +30098,9 @@ function readAloudAudioContext() {
       return null;
     }
   }
-  if (readAloudContext.state === "suspended" && typeof readAloudContext.resume === "function") {
+  // Not while the reader has paused: the clock stays stopped until they play. `#376`.
+  const paused = nowPlaying !== null && nowPlaying.paused === true;
+  if (readAloudContext.state === "suspended" && !paused && typeof readAloudContext.resume === "function") {
     readAloudContext.resume().catch(() => {});
   }
   return readAloudContext;
@@ -30123,7 +30148,16 @@ function wavLayout(bytes) {
   return null;
 }
 
-function streamingPlayer(url, context) {
+/**
+ * `#376 read-aloud-blocks`. Where the parts of one read are scheduled on the audio clock: each part
+ * begins where the one before it ends, so a block boundary adds no silence when the next block's
+ * audio is already there. `playAt` is the context time the next sample is due.
+ */
+function readClock() {
+  return { playAt: 0 };
+}
+
+function streamingPlayer(url, context, clock = readClock()) {
   const listeners = new Map();
   const emit = (type, ...details) => {
     for (const fn of listeners.get(type) || []) fn(...details);
@@ -30137,7 +30171,7 @@ function streamingPlayer(url, context) {
   let loaded = false;
   let announced = false;
   let spoke = false;
-  let playAt = 0;
+  let drained = false;
   let lead = STREAM_START_LEAD_SECONDS;
 
   const silence = () => {
@@ -30163,16 +30197,30 @@ function streamingPlayer(url, context) {
     over = true;
     emit("ended");
   };
+  // Every sample is scheduled: what plays next can be scheduled after it. Said once.
+  const drainIfDone = () => {
+    if (over || drained || !finished || !wanted || waiting.length > 0) return;
+    drained = true;
+    emit("drained");
+  };
   const schedule = (buffer) => {
     const node = context.createBufferSource();
     node.buffer = buffer;
     node.connect(context.destination);
     const now = context.currentTime;
-    if (playAt < now + 0.005) {
-      // The first piece, or an underrun: start a lead ahead, and a longer one after a gap.
-      if (announced) lead = Math.min(STREAM_MAX_LEAD_SECONDS, lead * 2);
-      playAt = now + lead;
+    if (!announced) {
+      // A part's first piece: where the part before it ends, or the cushion ahead of now, whichever
+      // is later. `#376 read-aloud-blocks`. Where the voice generates faster than it speaks, the
+      // next block is waiting before this one ends and follows it without a gap; where it speaks
+      // as it generates, each block's own first-audio wait is a pause at the boundary, and the
+      // cushion against a network stall is never spent on it.
+      clock.playAt = Math.max(clock.playAt, now + lead);
+    } else if (clock.playAt < now + 0.005) {
+      // An underrun: start again a longer lead ahead.
+      lead = Math.min(STREAM_MAX_LEAD_SECONDS, lead * 2);
+      clock.playAt = now + lead;
     }
+    const playAt = clock.playAt;
     node.start(playAt);
     const startsInMs = Math.round((playAt - now + (context.outputLatency || 0)) * 1000);
     if (!spoke) {
@@ -30184,7 +30232,7 @@ function streamingPlayer(url, context) {
         emit("speech", startsInMs + Math.round((onset / buffer.sampleRate) * 1000));
       }
     }
-    playAt += buffer.duration;
+    clock.playAt = playAt + buffer.duration;
     sounding.add(node);
     node.onended = () => {
       sounding.delete(node);
@@ -30192,11 +30240,33 @@ function streamingPlayer(url, context) {
     };
     if (!announced) {
       announced = true;
-      // `playing` is when the first sample is due at the speaker, not when it was queued.
-      setTimeout(() => {
-        if (!over) emit("playing");
-      }, startsInMs);
+      // `playing` is when the first sample is due at the speaker, not when it was queued: on the
+      // audio clock, so a pause in between holds it back as long as it holds the sample back.
+      announceAt(playAt, startsInMs);
     }
+  };
+  /**
+   * Say `playing` in `inMs`, or, when the reader paused the audio clock in between, when the clock
+   * reaches `due`. `#376 read-aloud-blocks`: the highlight follows the voice, not the wall clock.
+   */
+  const announceAt = (due, inMs) => {
+    let held = false;
+    const check = () => {
+      if (over) return;
+      if (context.state === "suspended") {
+        held = true;
+        setTimeout(check, 250);
+        return;
+      }
+      const left = held ? Math.round((due - context.currentTime) * 1000) : 0;
+      held = false;
+      if (left > 20) {
+        setTimeout(check, left);
+        return;
+      }
+      emit("playing");
+    };
+    setTimeout(check, inMs);
   };
   /** The first frame of `buffer` loud enough to be speech, in any channel; -1 when none is. */
   const loudFrom = (buffer) => {
@@ -30283,6 +30353,7 @@ function streamingPlayer(url, context) {
       return;
     }
     finished = true;
+    drainIfDone();
     endIfDone();
   };
   run();
@@ -30299,6 +30370,7 @@ function streamingPlayer(url, context) {
         wanted = true;
         readAloudAudioContext();
         while (waiting.length > 0) schedule(waiting.shift());
+        drainIfDone();
         endIfDone();
       }
       return Promise.resolve();
@@ -30309,10 +30381,358 @@ function streamingPlayer(url, context) {
   };
 }
 
-/** A player for one streamed part: Web Audio as it arrives where the browser can, else `<audio>`. */
-function streamedSpeechPlayer(url) {
+/**
+ * A player for one streamed part: Web Audio as it arrives where the browser can, else `<audio>`.
+ * The parts of one read share `clock`, so each begins where the one before it ends.
+ */
+function streamedSpeechPlayer(url, clock) {
   const context = readAloudAudioContext();
-  return context === null ? new Audio(url) : streamingPlayer(url, context);
+  return context === null ? new Audio(url) : streamingPlayer(url, context, clock);
+}
+
+// --- reading a message block by block: `#376 read-aloud-blocks` ---------------------------------
+//
+// The owner listens to long messages in the car. A message of paragraphs and bullets used to be read
+// as one stretch, with no way to see or change where in it the voice was. Now each message is read
+// in the BLOCKS it is drawn as — a paragraph, a heading, a list item, a block quote; a code block or a
+// table as a short description — one request per block, so the block being read can be lit, counted
+// ("2 of 5") and moved between: a tap on another block of the message being read, Previous and Next,
+// and the media keys a steering wheel or a headset sends.
+//
+// THE SERVER DECIDES WHAT EACH BLOCK SAYS, from the message itself, and lists the blocks' kinds in
+// drawing order (`source_blocks` in src/render.rs). The page finds the same blocks in the body it
+// drew by the same rule (`readingBlocks`) and lights block k. When the two lists of kinds differ the
+// read still goes block by block, with the row lit and counted, and no block lit.
+//
+// NO GAP AT A BOUNDARY: the next block is asked for as soon as the current one has audio, so on a
+// provider with one session it is generated the moment the current one is; and it is scheduled on
+// the same audio clock, to begin where the current one ends (`readClock`).
+
+/**
+ * What one read plays, in order: each block that says something of each message in the row, or the
+ * message whole where it was not prepared in blocks. `{part, block}`: the message's place in the
+ * row, and its block, or null for the whole message.
+ *
+ * @param {Array<{blocks?: Array<{kind: string, spoken?: boolean}> | null}>} ready the row's prepared entries.
+ */
+function speechSegments(ready) {
+  const segments = [];
+  ready.forEach((entry, part) => {
+    const blocks = entry && Array.isArray(entry.blocks) ? entry.blocks : null;
+    if (!blocks) {
+      segments.push({ part, block: null });
+      return;
+    }
+    blocks.forEach((block, index) => {
+      if (block && block.spoken !== false) segments.push({ part, block: index });
+    });
+  });
+  return segments;
+}
+
+/** The element each block kind is drawn as: src/render.rs `html_block_kinds`, the same rule. */
+const READING_BLOCK_KINDS = new Map([
+  ["p", "paragraph"], ["h1", "heading"], ["h2", "heading"], ["h3", "heading"], ["h4", "heading"],
+  ["h5", "heading"], ["h6", "heading"], ["blockquote", "quote"], ["pre", "code"], ["table", "table"],
+]);
+
+/**
+ * The blocks one drawn body holds, in order, as `{element, kind}`. A `p`, a heading, a block quote,
+ * a `pre` and a table are each one block with nothing inside them another; a list item is one
+ * block, and the items of the lists nested in it are blocks of their own; lists are walked through.
+ * The server walks its rendering by exactly this rule (`html_block_kinds`).
+ */
+function readingBlocks(box) {
+  const found = [];
+  const walk = (node, inside) => {
+    for (const kid of node.children || []) {
+      const tag = String(kid.tagName || "").toLowerCase();
+      if (tag === "ul" || tag === "ol" || (inside === "blocks" && tag === "div")) {
+        walk(kid, "blocks");
+        continue;
+      }
+      if (inside !== "blocks") continue;
+      if (tag === "li") {
+        found.push({ element: kid, kind: "item" });
+        walk(kid, "lists");
+        continue;
+      }
+      const kind = READING_BLOCK_KINDS.get(tag);
+      if (kind) found.push({ element: kid, kind });
+    }
+  };
+  walk(box, "blocks");
+  return found;
+}
+
+/** The attribute on the block being read. An attribute, so nothing about the body's classes moves. */
+const READING_BLOCK_ATTRIBUTE = "data-reading-block";
+
+/**
+ * The drawn blocks of message `part` of `row`, when they are the blocks the server prepared it as;
+ * null when it was not prepared in blocks or the two disagree.
+ */
+function preparedBlocksOf(row, part) {
+  const body = childByClass(row, "body");
+  const box = body && body.children ? body.children[part] : null;
+  const id = idsOf(row)[part];
+  // The read in progress keeps the blocks it was prepared in; any other row asks what is prepared.
+  const playing = nowPlaying !== null && nowPlaying.blocks && nowPlaying.id === row.getAttribute("data-id");
+  const entry = id ? preparedSpeech.get(String(id)) : null;
+  const listed = playing ? nowPlaying.blocks[part] : entry && entry.blocks;
+  if (!box || !listed) return null;
+  const drawn = readingBlocks(box);
+  const same = drawn.length === listed.length &&
+    drawn.every((block, index) => block.kind === listed[index].kind);
+  return same ? drawn : null;
+}
+
+/** Light the block being read in `row`, and only that one. The row is marked while one is lit. */
+function markReadingBlock(row) {
+  if (row.getAttribute("data-reading-marked") !== null) {
+    const clear = (node) => {
+      for (const kid of node.children || []) {
+        if (kid.getAttribute && kid.getAttribute(READING_BLOCK_ATTRIBUTE) !== null) {
+          kid.removeAttribute(READING_BLOCK_ATTRIBUTE);
+        }
+        clear(kid);
+      }
+    };
+    clear(row);
+    row.removeAttribute("data-reading-marked");
+  }
+  const playing = nowPlaying;
+  if (playing === null || !playing.segments || playing.id !== row.getAttribute("data-id")) return;
+  const segment = playing.segments[playing.segment];
+  if (!segment || segment.block === null) return;
+  const drawn = preparedBlocksOf(row, segment.part);
+  const block = drawn ? drawn[segment.block] : null;
+  if (!block) return;
+  block.element.setAttribute(READING_BLOCK_ATTRIBUTE, "current");
+  row.setAttribute("data-reading-marked", "");
+}
+
+/** "2 of 5" for a read of several parts; "" for a read of one, or none. */
+function readingPosition() {
+  if (nowPlaying === null || !nowPlaying.segments || nowPlaying.segments.length < 2) return "";
+  return `${nowPlaying.segment + 1} of ${nowPlaying.segments.length}`;
+}
+
+/** What the author line of the row being read says: "reading", or "reading 2 of 5". */
+function readingLabel() {
+  const position = readingPosition();
+  return position ? `reading ${position}` : "reading";
+}
+
+/**
+ * Show where in its message the read is: the block lit, "reading 2 of 5" where the author was, and
+ * the steering strip. Cheap, so it runs at every boundary rather than redrawing the lists.
+ */
+function showReadingPosition() {
+  eachColumn(() => {
+    for (const list of [el("discord-log"), el("pinned-log")]) {
+      for (const row of (list && list.children) || []) {
+        const reading = nowPlaying !== null && row.getAttribute("data-id") === nowPlaying.id;
+        if (!reading && row.getAttribute("data-reading-marked") === null) continue;
+        markReadingBlock(row);
+        const named = childByClass(row, "msg-author");
+        if (named && reading && row.getAttribute("data-reading") === "true") named.textContent = readingLabel();
+      }
+    }
+  });
+  renderReadSteer();
+}
+
+/** The steering strip: Previous, "k of n", Next, while a read of several parts is playing. */
+function renderReadSteer() {
+  const strip = el("read-steer");
+  if (!strip) return;
+  const position = readingPosition();
+  strip.hidden = position === "";
+  if (position === "") return;
+  el("read-steer-count").textContent = position;
+  el("read-next").disabled = nowPlaying.segment + 1 >= nowPlaying.segments.length;
+}
+
+/**
+ * Move the read in progress to part `index` of it. The same row, read again from there under a new
+ * selection, so the server cuts off what it was saying and begins the block asked for.
+ */
+function jumpReading(index) {
+  const playing = nowPlaying;
+  if (playing === null || !playing.segments) return false;
+  const at = Math.max(0, Math.min(playing.segments.length - 1, index));
+  const segment = playing.segments[at];
+  // The read goes on, only from elsewhere: its stop keeps the media keys and the audio output,
+  // which a jump from a media key could not take back without a gesture.
+  readJumping = true;
+  try {
+    guardQuietly(() => readAloud(playing.parts, { part: segment.part, block: segment.block }))();
+  } finally {
+    readJumping = false;
+  }
+  return true;
+}
+
+/** True while `jumpReading` stops the read it is about to start again elsewhere. */
+let readJumping = false;
+
+/** Previous (-1) or Next (+1). Previous on the first block starts it again. */
+function stepReading(delta) {
+  const playing = nowPlaying;
+  if (playing === null || !playing.segments) return false;
+  if (delta > 0 && playing.segment + 1 >= playing.segments.length) return false;
+  return jumpReading(playing.segment + delta);
+}
+
+/**
+ * Pause what is being read where it is, and carry on from there. Played through Web Audio, the
+ * audio clock simply stops; played by an `<audio>` element, the element pauses.
+ */
+function pauseReading() {
+  if (nowPlaying === null || nowPlaying.paused) return;
+  const audio = nowPlaying.audio;
+  if (audio && audio.hearsSpeech === true) {
+    if (readAloudContext === null || typeof readAloudContext.suspend !== "function") return;
+    readAloudContext.suspend().catch(() => {});
+  } else if (audio && typeof audio.pause === "function") {
+    audio.pause();
+  } else {
+    return;
+  }
+  nowPlaying = { ...nowPlaying, paused: true };
+  mediaSessionState("paused");
+}
+
+function resumeReading() {
+  if (nowPlaying === null || !nowPlaying.paused) return;
+  nowPlaying = { ...nowPlaying, paused: false };
+  const audio = nowPlaying.audio;
+  if (audio && audio.hearsSpeech === true) {
+    if (readAloudContext !== null && typeof readAloudContext.resume === "function") {
+      readAloudContext.resume().catch(() => {});
+    }
+  } else if (audio && typeof audio.play === "function") {
+    const begun = audio.play();
+    if (begun && typeof begun.catch === "function") begun.catch(() => {});
+  }
+  mediaSessionState("playing");
+}
+
+/**
+ * The Media Session: a steering wheel's or a headset's previous, next, play and pause reach the
+ * read. A browser routes those keys to a page that is playing a MEDIA ELEMENT, and Web Audio is not
+ * one, so a silent looping element plays alongside while a read runs (`readAloudKeeper`).
+ */
+let readAloudKeeper = null;
+
+function mediaSessionOf() {
+  return typeof navigator !== "undefined" && navigator && navigator.mediaSession ? navigator.mediaSession : null;
+}
+
+function mediaSessionState(state) {
+  const session = mediaSessionOf();
+  if (session === null) return;
+  try {
+    session.playbackState = state;
+  } catch (_error) {
+    // Informative only.
+  }
+  readAloudKeeperWanted = state === "playing";
+  if (readAloudKeeper !== null) {
+    if (state === "playing") {
+      const begun = readAloudKeeper.play();
+      if (begun && typeof begun.catch === "function") begun.catch(() => {});
+    } else {
+      readAloudKeeper.pause();
+    }
+  }
+}
+
+/**
+ * Inside the tap that starts any read: make the keeper and play it once, which is what lets a
+ * phone's browser play it again later, outside a gesture, when the read turns out to have several
+ * parts. Nothing without a Media Session.
+ */
+function primeReadAloudKeeper() {
+  if (mediaSessionOf() === null) return;
+  if (readAloudKeeper === null && typeof Audio === "function" && typeof URL !== "undefined" &&
+      typeof URL.createObjectURL === "function" && typeof Blob === "function") {
+    readAloudKeeper = new Audio(URL.createObjectURL(silentWav()));
+    readAloudKeeper.loop = true;
+  }
+  if (readAloudKeeper === null || readAloudKeeperWanted) return;
+  const begun = readAloudKeeper.play();
+  const settle = () => {
+    if (!readAloudKeeperWanted) readAloudKeeper.pause();
+  };
+  if (begun && typeof begun.then === "function") begun.then(settle, () => {});
+  else settle();
+}
+
+/** Whether the keeper should be playing: a read of several parts is. */
+let readAloudKeeperWanted = false;
+
+/** One second of silence as a WAV, for the keeper: 8 kHz, 8-bit, mono. */
+function silentWav() {
+  const rate = 8000;
+  const bytes = new Uint8Array(44 + rate);
+  const view = new DataView(bytes.buffer);
+  const text = (at, word) => [...word].forEach((c, i) => { bytes[at + i] = c.charCodeAt(0); });
+  text(0, "RIFF"); view.setUint32(4, 36 + rate, true); text(8, "WAVEfmt ");
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, rate, true); view.setUint32(28, rate, true); view.setUint16(32, 1, true);
+  view.setUint16(34, 8, true); text(36, "data"); view.setUint32(40, rate, true);
+  bytes.fill(128, 44);
+  return new Blob([bytes], { type: "audio/wav" });
+}
+
+/** Called inside the tap that starts a read: the only moment a browser lets the keeper start. */
+function claimMediaSession() {
+  const session = mediaSessionOf();
+  if (session === null) return;
+  const handle = (action, fn) => {
+    try {
+      session.setActionHandler(action, fn);
+    } catch (_error) {
+      // An action this browser does not know.
+    }
+  };
+  handle("previoustrack", () => { stepReading(-1); });
+  handle("nexttrack", () => { stepReading(1); });
+  handle("pause", () => { pauseReading(); });
+  handle("play", () => { resumeReading(); });
+  handle("stop", () => { stopReading(); });
+  try {
+    if (typeof MediaMetadata === "function") {
+      session.metadata = new MediaMetadata({ title: "Reading a message", artist: readAloudLabel });
+    }
+  } catch (_error) {
+    // Metadata is decoration.
+  }
+  primeReadAloudKeeper();
+  mediaSessionState("playing");
+}
+
+/** Nothing is being read: let the media keys, the lock-screen title and the keeper go. */
+function releaseMediaSession() {
+  const session = mediaSessionOf();
+  if (session === null) return;
+  /** @type {Array<MediaSessionAction>} */
+  const actions = ["previoustrack", "nexttrack", "pause", "play", "stop"];
+  for (const action of actions) {
+    try {
+      session.setActionHandler(action, null);
+    } catch (_error) {
+      // An action this browser does not know.
+    }
+  }
+  try {
+    session.metadata = null;
+  } catch (_error) {
+    // Decoration.
+  }
+  mediaSessionState("none");
 }
 
 /**
@@ -30332,7 +30752,7 @@ function streamedSpeechPlayer(url) {
  *
  * @param {Array<string>} ids the row's Discord ids, oldest first.
  */
-async function readAloud(ids) {
+async function readAloud(ids, from = null) {
   const tapBegan = speechTimingNow();
   const parts = ids.map(String);
   // THE ROW'S IDENTITY is its first message, everywhere: the highlight, the pending mark and the
@@ -30342,7 +30762,9 @@ async function readAloud(ids) {
   // where a mis-tap is noticed — the message is long, the reader realises they did not want it,
   // and the only thing they can do is tap the thing they just tapped. Checking `nowPlaying` alone
   // made that start a SECOND read instead of cancelling the first.
-  const already = (nowPlaying !== null && nowPlaying.id === id) || pendingRead === id;
+  //
+  // `#376 read-aloud-blocks`. Not a JUMP: `from` moves a read to another of its blocks.
+  const already = from === null && ((nowPlaying !== null && nowPlaying.id === id) || pendingRead === id);
   // Also cancels anything still being fetched, so a double tap cannot end in two players.
   stopReading();
   if (already || parts.length === 0) {
@@ -30375,6 +30797,13 @@ async function readAloud(ids) {
   }
   // Still inside the tap, before anything is awaited: the only moment a browser lets audio start.
   readAloudAudioContext();
+  primeReadAloudKeeper();
+  // `#376 read-aloud-blocks`. A read in blocks asks for its last block minutes after the tap, so a
+  // ticket with little life left is prepared again now rather than failing part-way through.
+  for (const part of parts) {
+    const entry = preparedEntry(part);
+    if (entry && entry.blocks && ticketLeftMs(entry) < BLOCK_READ_TICKET_MARGIN_MS) preparedSpeech.delete(part);
+  }
   // THE FAST PATH, and the whole point of preparing: every part already has a URL that streams, so
   // there is nothing to fetch and nothing to wait for. The player is handed the URL and the browser
   // starts playing against a response the server is still writing.
@@ -30425,10 +30854,19 @@ async function readAloud(ids) {
   // cleanup either leaking blobs or throwing on something it does not own.
   const objectUrls = streamed ? [] : blobs.map((blob) => URL.createObjectURL(blob));
   const selection = speechSelection();
+  // `#376 read-aloud-blocks`. What is played, in order: every block of every message in the row, or
+  // the whole message where it is one block or was not prepared in blocks.
+  const segments = streamed ? speechSegments(ready) : parts.map((_part, part) => ({ part, block: null }));
   const sources = streamed
-    ? ready.map((entry) => `${entry.url}?selection=${selection}`)
+    ? segments.map((segment) => `${ready[segment.part].url}?selection=${selection}` +
+      (segment.block === null ? "" : `&block=${segment.block}`))
     : objectUrls;
+  // Where this read starts: the block a jump asked for, else the first.
+  const first = from === null ? 0 : Math.max(0, segments.findIndex((segment) =>
+    segment.part === from.part && (from.block === null || segment.block === null || segment.block >= from.block)));
+  const clock = readClock();
   const players = [];
+  const started = sources.map(() => false);
   const requestBegan = sources.map(() => null);
   const playInvokedAt = sources.map(() => null);
   const loadedAt = sources.map(() => null);
@@ -30443,28 +30881,64 @@ async function readAloud(ids) {
     const invokedAt = playInvokedAt[at] === null ? audibleAt[at] : playInvokedAt[at];
     const mediaAt = loadedAt[at] === null ? audibleAt[at] : loadedAt[at];
     // The bare ticket URL: the selection only routes playback.
-    reportSpeechPlayback(ready[at].url, {
+    reportSpeechPlayback(ready[segments[at].part].url, {
       tap_to_play_ms: speechElapsedMs(tapBegan, invokedAt),
       request_to_loaded_ms: speechElapsedMs(requestBegan[at], mediaAt),
       loaded_to_playing_ms: speechElapsedMs(mediaAt, audibleAt[at]),
       tap_to_audible_ms: speechElapsedMs(tapBegan, audibleAt[at]),
       ...(speechAt[at] === null ? {} : { tap_to_speech_ms: speechElapsedMs(tapBegan, speechAt[at]) }),
-    });
+    }, segments[at].block);
+  };
+  // ONE block ahead, never more: the next is asked for once this one is both playing and has
+  // audio. A provider that serves reads side by side would otherwise be asked for the whole message
+  // at once, each block's first audio asking for the one after it.
+  const prefetchAfter = (at) => {
+    if (streamed && started[at] && loadedAt[at] !== null && at + 1 < sources.length && !players[at + 1]) {
+      addPlayer(at + 1);
+    }
   };
   const startPlayer = (at) => {
+    started[at] = true;
     playInvokedAt[at] = speechTimingNow();
-    return players[at].play();
+    const begun = players[at].play();
+    prefetchAfter(at);
+    return begun;
+  };
+  // The next part, once the one before it is all scheduled or has ended. `play()` answers with a
+  // promise a browser is allowed to reject, and this one is not awaited by anybody — an unhandled
+  // rejection here would take the next part down silently and leave the row lit with nothing
+  // coming.
+  const startNext = (at) => {
+    if (started[at]) return;
+    const next = players[at] || addPlayer(at);
+    // Still the same row being read, so nothing on screen changes yet: only the player does.
+    nowPlaying = { ...nowPlaying, audio: next };
+    const begun = startPlayer(at);
+    if (begun && typeof begun.catch === "function") {
+      begun.catch(() => {
+        stopReading();
+        setStatus("that message could not be played.");
+      });
+    }
   };
   const addPlayer = (at) => {
     requestBegan[at] = speechTimingNow();
-    const audio = streamed ? streamedSpeechPlayer(sources[at]) : new Audio(sources[at]);
+    const audio = streamed ? streamedSpeechPlayer(sources[at], clock) : new Audio(sources[at]);
     players[at] = audio;
     // Only the Web Audio player hears its own samples; an `<audio>` element cannot.
     const hearsSpeech = "hearsSpeech" in audio && audio.hearsSpeech === true;
     audio.addEventListener("loadeddata", () => {
       if (ticket !== readingTicket || loadedAt[at] !== null) return;
       loadedAt[at] = speechTimingNow();
-      if (streamed && at + 1 < sources.length && !players[at + 1]) addPlayer(at + 1);
+      // The next part is asked for as soon as this one has audio: on a provider with one session
+      // it queues behind this one there, and is generated the moment this one is.
+      prefetchAfter(at);
+    });
+    // `#376 read-aloud-blocks`. All of this part is scheduled: the next is scheduled to begin where
+    // it ends, so the boundary is as long as the next part's audio is late, and no longer.
+    audio.addEventListener("drained", () => {
+      if (ticket !== readingTicket || nowPlaying === null || nowPlaying.id !== id) return;
+      if (at + 1 < sources.length) startNext(at + 1);
     });
     audio.addEventListener("speech", (inMs) => {
       if (!streamed || speechAt[at] !== null) return;
@@ -30472,7 +30946,13 @@ async function readAloud(ids) {
       reportTiming(at);
     });
     audio.addEventListener("playing", () => {
-      if (ticket !== readingTicket || audibleAt[at] !== null || !streamed) return;
+      if (ticket !== readingTicket) return;
+      // This part is the one being heard now: the highlight moves to it.
+      if (nowPlaying !== null && nowPlaying.id === id && nowPlaying.segment !== at) {
+        nowPlaying = { ...nowPlaying, segment: at };
+        showReadingPosition();
+      }
+      if (audibleAt[at] !== null || !streamed) return;
       audibleAt[at] = speechTimingNow();
       if (speechAt[at] !== null || !hearsSpeech) {
         reportTiming(at);
@@ -30487,20 +30967,10 @@ async function readAloud(ids) {
       if (ticket !== readingTicket || nowPlaying === null || nowPlaying.id !== id) {
         return;
       }
-      const next = players[at + 1] || (at + 1 < sources.length ? addPlayer(at + 1) : null);
-      if (next) {
-        // Still the same row being read, so nothing on screen changes: only the player does.
-        nowPlaying = { ...nowPlaying, audio: next };
-        // `play()` answers with a promise a browser is allowed to reject, and this one is not
-        // awaited by anybody — an unhandled rejection here would take the next part down silently
-        // and leave the row lit with nothing coming.
-        const started = startPlayer(at + 1);
-        if (started && typeof started.catch === "function") {
-          started.catch(() => {
-            stopReading();
-            setStatus("that message could not be played.");
-          });
-        }
+      if (at + 1 < sources.length) {
+        // A part that was not started when this one drained (an `<audio>` element says no such
+        // thing) starts now.
+        startNext(at + 1);
         return;
       }
       stopReading();
@@ -30518,15 +30988,21 @@ async function readAloud(ids) {
     return audio;
   };
   if (streamed) {
-    addPlayer(0);
+    addPlayer(first);
   } else {
     sources.forEach((_source, at) => addPlayer(at));
   }
   // The same array the players are added to, so a stop reaches a part requested later.
-  nowPlaying = { id, audio: players[0], urls: objectUrls, players };
+  // The blocks the read was prepared in travel with it, so a pace change that forgets what was
+  // prepared does not take the light off the read in progress.
+  const blocks = ready.map((entry) => (entry && entry.blocks) || null);
+  nowPlaying = { id, audio: players[first], urls: objectUrls, players, parts, segments, segment: first, blocks };
   setReadState("ready");
   eachColumn(renderChannelRows);
-  await startPlayer(0);
+  renderReadSteer();
+  if (segments.length > 1) claimMediaSession();
+  else releaseMediaSession();
+  await startPlayer(first);
 }
 
 /**
@@ -30562,18 +31038,49 @@ function tapRow(li, fold) {
     if (selection && String(selection) !== "") {
       return;
     }
-    actOnRow(li, fold);
+    actOnRow(li, fold, target ? blockTapped(li, target) : null);
   }));
+}
+
+/**
+ * `#376 read-aloud-blocks`. Which block of which message in `li` the tap at `target` landed in, as
+ * `{part, block}`; `block` is null where the message was not prepared in blocks, and the answer is
+ * null outside every message's body.
+ */
+function blockTapped(li, target) {
+  const body = childByClass(li, "body");
+  const boxes = body && body.children ? [...body.children] : [];
+  const part = boxes.findIndex((box) => nodeWithin(box, target));
+  if (part < 0) return null;
+  const drawn = preparedBlocksOf(li, part);
+  let block = null;
+  // The innermost: an item nested in another comes after it.
+  (drawn || []).forEach((found, index) => {
+    if (nodeWithin(found.element, target)) block = index;
+  });
+  return { part, block };
 }
 
 /**
  * What a tap that is meant for the row does to it. `#224 keyboard-shortcuts`: and Enter, or o, on the
  * selected message: the same act, so the key and the tap cannot become two opinions about a row.
  */
-function actOnRow(li, fold) {
+function actOnRow(li, fold, tapped = null) {
   // IN READING MODE A TAP IS A REQUEST TO HEAR IT, not to fold it. One gesture, two meanings,
   // decided by a mode the reader turned on deliberately and can see in the control bar.
   if (readingMode) {
+    // `#376 read-aloud-blocks`. A tap on ANOTHER block of the message being read moves the read
+    // there. A tap on the block being read stops it, as a tap on the row always has.
+    const playing = nowPlaying;
+    if (tapped && tapped.block !== null && playing !== null && playing.segments &&
+        playing.id === li.getAttribute("data-id")) {
+      const index = playing.segments.findIndex((segment) =>
+        segment.part === tapped.part && segment.block === tapped.block);
+      if (index >= 0 && index !== playing.segment) {
+        jumpReading(index);
+        return;
+      }
+    }
     // EVERY message the row is showing, so a combined row is heard whole rather than half.
     guardQuietly(() => readAloud(idsOf(li)))();
     return;
@@ -45757,6 +46264,10 @@ el("back-to-reply").addEventListener("click", backToReply);
 el("read-speed-range").addEventListener("input", () => {
   applyReadSpeed(el("read-speed-range").value);
 });
+
+// `#376 read-aloud-blocks`. Through the blocks of the read in progress.
+el("read-prev").addEventListener("click", () => { stepReading(-1); });
+el("read-next").addEventListener("click", () => { stepReading(1); });
 
 el("read-aloud").addEventListener("click", () => {
   readingMode = !readingMode;

@@ -4404,6 +4404,20 @@ pub struct PreparedSpeech {
     pub message_id: String,
     /// Where to play it from. Carries its own authority; see [`crate::speech_tickets`].
     pub url: String,
+    /// `#376 read-aloud-blocks`. The blocks the page draws this message as, in order, when there
+    /// is more than one: block `k` plays from `url` with `block=k`. Absent for a message of one
+    /// block, which `url` plays whole, as it plays every message for a page older than this.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<PreparedBlock>,
+}
+
+/// One block of a prepared message. `#376 read-aloud-blocks`.
+#[derive(Debug, Serialize)]
+pub struct PreparedBlock {
+    /// The element it is drawn as, so the page can check it walks the same blocks.
+    pub kind: crate::render::BlockKind,
+    /// Whether it says anything. A block of nothing speakable is drawn and never played.
+    pub spoken: bool,
 }
 
 /// Everything the page needs to make a tap instant.
@@ -4479,6 +4493,7 @@ pub async fn prepare_speech(
     .await?;
     let normalizing = std::time::Instant::now();
     let now = jiff::Timestamp::now().as_millisecond();
+    let markup = crate::render::markup_for(&state.config, &channel);
     let mut resolved = Vec::new();
     for id in &request.ids {
         // Silently absent rather than a 404 for the batch. The page sends what it has on screen,
@@ -4495,7 +4510,8 @@ pub async fn prepare_speech(
         if said.trim().is_empty() {
             continue;
         }
-        resolved.push((message.id.0.clone(), said));
+        let blocks = spoken_blocks(message, markup, now, &state.config.timezone);
+        resolved.push((message.id.0.clone(), said, blocks));
     }
     // Message preparation is lookup, fetch and normalization. The provider warm-up is a separate
     // phase, running beside this one and logged when it ends; its readiness reaches the tap
@@ -4516,11 +4532,19 @@ pub async fn prepare_speech(
         "read-aloud preparation"
     );
     let mut prepared = Vec::new();
-    for (message_id, said) in resolved {
+    for (message_id, said, blocks) in resolved {
+        let described = blocks
+            .iter()
+            .map(|(kind, said)| PreparedBlock {
+                kind: *kind,
+                spoken: !said.trim().is_empty(),
+            })
+            .collect();
         let ticket = state.speech_tickets.mint(crate::speech_tickets::Prepared {
             channel: channel.id.0.clone(),
             message: message_id.clone(),
             said,
+            blocks: blocks.into_iter().map(|(_, said)| said).collect(),
             speed: crate::speech::clamp_speed(request.speed),
             observation: crate::speech_tickets::fresh_observation(),
             preparation_ms,
@@ -4528,12 +4552,43 @@ pub async fn prepare_speech(
         prepared.push(PreparedSpeech {
             message_id,
             url: format!("/api/v1/speech/{ticket}"),
+            blocks: described,
         });
     }
     Ok(Json(PrepareSpeechResponse {
         prepared,
         expires_in_seconds: crate::speech_tickets::TICKET_TTL.as_secs(),
     }))
+}
+
+/// `#376 read-aloud-blocks`. What each block of `message` says, in the order the page draws its
+/// blocks (see [`crate::render::source_blocks`]); empty when it is one block.
+///
+/// Every block through the same speech rules as the whole message, sharing one set of short names
+/// so a hash is "hash code A" in whichever block it is said.
+fn spoken_blocks(
+    message: &crate::model::Message,
+    markup: crate::render::Markup,
+    now: i64,
+    zone: &crate::clock::Zone,
+) -> Vec<(crate::render::BlockKind, String)> {
+    let blocks = crate::render::source_blocks(&message.content, markup, &message.mentions);
+    if blocks.len() < 2 {
+        return Vec::new();
+    }
+    let mut names = crate::speakable::Names::default();
+    blocks
+        .into_iter()
+        .map(|block| {
+            let said = crate::speakable::for_speech_with(
+                &crate::speakable::with_mention_names(&block.source, &message.mentions),
+                now,
+                zone,
+                &mut names,
+            );
+            (block.kind, said)
+        })
+        .collect()
 }
 
 /// Query parameters for playing a prepared message.
@@ -4543,6 +4598,9 @@ pub struct PlayQuery {
     /// progress interrupts it; parts of one selection play in order. Letters, digits, `-` and `_`,
     /// at most 64. Omitted, the read queues behind whatever is playing.
     pub selection: Option<String>,
+    /// `#376 read-aloud-blocks`. One block of the message, counting from 0 in the order the
+    /// preparation listed them. Omitted, the whole message.
+    pub block: Option<usize>,
 }
 
 fn millis(duration: std::time::Duration) -> u64 {
@@ -4581,10 +4639,26 @@ pub async fn play_speech(
     let Some(prepared) = state.speech_tickets.claim(&ticket) else {
         return Err(unknown_speech_ticket());
     };
+    let said = match query.block {
+        None => prepared.said.as_str(),
+        // A message of one block is its own block 0.
+        Some(0) if prepared.blocks.is_empty() => prepared.said.as_str(),
+        Some(block) => prepared
+            .blocks
+            .get(block)
+            .map(String::as_str)
+            .ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    "unknown_speech_block",
+                    "that prepared message has no such block",
+                )
+            })?,
+    };
     let requested = std::time::Instant::now();
     let mut stream = state
         .speech
-        .speak_stream_for_selection(&prepared.said, prepared.speed, selection)
+        .speak_stream_for_selection(said, prepared.speed, selection)
         .await?;
     let first_audio = match stream.chunks.next().await {
         Some(Ok(chunk)) => chunk,
@@ -4623,13 +4697,14 @@ pub async fn play_speech(
     };
     state
         .speech_tickets
-        .record_server_timing(&ticket, server_timing);
+        .record_server_timing(&ticket, query.block, server_timing);
     tracing::info!(
         observation = prepared.observation,
         message_preparation_ms = prepared.preparation_ms,
         // A count, not content: whether the provider's wait for its first audio grows with the
         // length of what it was asked to say. `#375 read-aloud-latency`.
-        said_chars = prepared.said.chars().count(),
+        said_chars = said.chars().count(),
+        block = query.block,
         session = session.map(|session| session.generation),
         turn = session.map(|session| session.turn),
         session_reused = session.map(|session| session.reused),
@@ -4705,6 +4780,13 @@ pub struct SpeechPlaybackTiming {
     pub tap_to_speech_ms: Option<u64>,
 }
 
+/// Which read a playback report is about. `#376 read-aloud-blocks`.
+#[derive(Debug, Default, Deserialize)]
+pub struct TimingQuery {
+    /// The block that read played, as [`PlayQuery::block`] names it; omitted, the whole message.
+    pub block: Option<usize>,
+}
+
 /// Record the browser half of an already-authorized read-aloud observation.
 ///
 /// There is intentionally no bearer header: the random ticket is the same narrow capability the
@@ -4712,6 +4794,7 @@ pub struct SpeechPlaybackTiming {
 pub async fn speech_playback_timing(
     State(state): State<AppState>,
     SpeechTicket(ticket): SpeechTicket,
+    Query(read): Query<TimingQuery>,
     Json(timing): Json<SpeechPlaybackTiming>,
 ) -> Result<StatusCode, ApiError> {
     const MAX_TIMING_MS: u64 = 10 * 60 * 1_000;
@@ -4729,7 +4812,7 @@ pub async fn speech_playback_timing(
             "read-aloud timing values must be at most 600000 milliseconds",
         ));
     }
-    let Some((prepared, server)) = state.speech_tickets.observed_timing(&ticket) else {
+    let Some((prepared, server)) = state.speech_tickets.observed_timing(&ticket, read.block) else {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
             "unknown_speech_ticket",
@@ -4746,7 +4829,13 @@ pub async fn speech_playback_timing(
     tracing::info!(
         observation = prepared.observation,
         message_preparation_ms = prepared.preparation_ms,
-        said_chars = prepared.said.chars().count(),
+        said_chars = read
+            .block
+            .and_then(|block| prepared.blocks.get(block))
+            .unwrap_or(&prepared.said)
+            .chars()
+            .count(),
+        block = read.block,
         session = server.session.map(|session| session.generation),
         turn = server.session.map(|session| session.turn),
         session_reused = server.session.map(|session| session.reused),

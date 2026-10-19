@@ -5894,6 +5894,66 @@ a.search-hit-link {
      0.8rem would be a fifth narrower than the control pane beneath it. */
 }
 
+/* `#376 read-aloud-blocks`. Previous, "2 of 5", Next, while a read of several blocks plays. Floating
+   above the status line's place for the reason the status line floats: coming and going, it moves
+   nothing under the reader's thumb. Only its buttons take taps; between them the row underneath can
+   still be tapped. Large targets, because the reader may be in a car. */
+#read-steer {
+  position: absolute;
+  z-index: 5;
+  inset-inline: 0;
+  bottom: calc(var(--chips-foot, 0.5rem) + var(--scroll-tools-clearance, 0px) + 2.6rem);
+  width: max-content;
+  max-width: calc(100% - 1.5rem);
+  margin-inline: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.3rem 0.4rem;
+  background: var(--panel);
+  border: 1px solid var(--warn);
+  border-radius: 999px;
+  box-shadow: 0 1px 8px rgb(0 0 0 / 35%);
+  pointer-events: none;
+}
+
+#read-steer[hidden] {
+  display: none;
+}
+
+.read-steer-button {
+  pointer-events: auto;
+  min-height: 2.75rem;
+  min-width: 6rem;
+  border-radius: 999px;
+  border: 1px solid var(--warn);
+  background: color-mix(in srgb, var(--warn) 18%, var(--panel));
+  color: inherit;
+  font: inherit;
+}
+
+.read-steer-button:disabled {
+  opacity: 0.45;
+}
+
+#read-steer-count {
+  min-width: 4.5rem;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The block being read, inside the row being read: the row's own colour, stronger. */
+.md [data-reading-block="current"] {
+  background: color-mix(in srgb, var(--warn) 45%, var(--theirs));
+  border-radius: 0.3rem;
+  box-shadow: 0 0 0 0.2rem color-mix(in srgb, var(--warn) 45%, var(--theirs));
+}
+
+/* An item's nested lists are blocks of their own, and are not lit with it: the row's colour. */
+.md li[data-reading-block="current"] > :is(ul, ol) {
+  background: color-mix(in srgb, var(--warn) 22%, var(--theirs));
+}
+
 /* Quiet, and the same size as the dot beside it. It is the way out for somebody who has read the
    message and does not want to wait six seconds; it is not a thing to notice. */
 #dismiss-status {

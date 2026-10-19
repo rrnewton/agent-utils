@@ -571,15 +571,27 @@ pub fn to_html(text: &str, markup: Markup) -> String {
 /// does not name is drawn by id, as every mention was before.
 #[must_use]
 pub fn to_html_named(text: &str, markup: Markup, mentions: &[MentionName]) -> String {
+    render_visiting(text, markup, mentions, |_, _| ()).0
+}
+
+/// [`to_html_named`], handing the parsed and adjusted tree, and the text it was parsed from, to
+/// `visit` before it is written. `visit` runs only when the body is rendered: not when a bound
+/// draws it as [`plain_html`] instead, and then its answer is `None`.
+fn render_visiting<T>(
+    text: &str,
+    markup: Markup,
+    mentions: &[MentionName],
+    visit: impl for<'a> FnOnce(&'a AstNode<'a>, &str) -> T,
+) -> (String, Option<T>) {
     if text.len() > MAX_RENDERED_BYTES {
-        return plain_html(text);
+        return (plain_html(text), None);
     }
     let options = options(table_cells_bound(text) <= MAX_TABLE_CELLS);
     let mut source = markup.prepare(text, &options);
     let arena = Arena::new();
     let mut root = comrak::parse_document(&arena, &source, &options);
     if deeper_than(root, MAX_DEPTH) {
-        return plain_html(text);
+        return (plain_html(text), None);
     }
     // Where a chat service ends a list at a line CommonMark runs into it, the text is told so with
     // a blank line and parsed again. `#237 nested-lists`.
@@ -588,22 +600,335 @@ pub fn to_html_named(text: &str, markup: Markup, mentions: &[MentionName]) -> St
         if let Some(split) = end_lists_at_unindented_lines(&arena, root, &source, &options) {
             (source, inserted, root) = (Cow::Owned(split.source), split.inserted, split.root);
             if deeper_than(root, MAX_DEPTH) {
-                return plain_html(text);
+                return (plain_html(text), None);
             }
         }
     }
     adjust(&arena, root, &source, &inserted, markup, mentions);
     // Measured again: nesting the lists the writer indented makes the tree deeper than it parsed.
     if deeper_than(root, MAX_DEPTH) {
-        return plain_html(text);
+        return (plain_html(text), None);
     }
+    let visited = visit(root, &source);
     let mut html = String::new();
     comrak::format_html(root, &options, &mut html).expect("formatting into a String cannot fail");
     let html = SANITIZER.clean(&html).to_string();
     if html.len() > text.len().saturating_mul(MAX_GROWTH) + GROWTH_ALLOWANCE {
-        return plain_html(text);
+        return (plain_html(text), None);
     }
-    html
+    (html, Some(visited))
+}
+
+// --- read-aloud blocks: `#376 read-aloud-blocks` ----------------------------------------------
+//
+// A long message is read one BLOCK at a time, the blocks being the elements the page draws it as:
+// a paragraph, a heading, a list item, a block quote, a code block, a table. The page highlights
+// the block being read and moves between blocks, so the server and the page must agree on what
+// the blocks are, in order, without either sending the other any markup.
+//
+// They agree by both walking the same drawn structure by the same rule:
+//
+// - **The page** walks the body it inserted ([`body_html`], or [`plain_html`]'s paragraphs when
+//   that is empty), element by element (`readingBlocks` in web/voice.js).
+// - **The server** walks the tree this module renders that body from, and takes each block's
+//   Markdown from the source positions of its node ([`source_blocks`]), so what is SAID of a block
+//   goes through the same speech rules as a whole message.
+//
+// The rule, both sides: a `p`, an `h1` to `h6`, a `blockquote`, a `pre` and a `table` are each one
+// block and nothing inside them is another; an `li` is one block, holding everything in it except
+// the lists nested in it, whose items are blocks of their own; `ul`, `ol` and `div` are walked
+// through; anything else is no block. A `hr` is never one.
+//
+// THE SERVER CHECKS ITSELF: the kinds it found in the tree must be the kinds [`html_block_kinds`]
+// reads from the HTML it rendered, in order, or the message is one block. The page checks the
+// same against the kinds it is sent, and highlights the whole body when they differ. A mismatch
+// costs the highlight its precision, never the read.
+
+/// What one block of a drawn body is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockKind {
+    /// A paragraph, `p`.
+    Paragraph,
+    /// A heading, `h1` to `h6`.
+    Heading,
+    /// A list item, `li`, without the lists nested in it.
+    Item,
+    /// A block quote, `blockquote`, whole.
+    Quote,
+    /// A code block, `pre`: said as a short description of it.
+    Code,
+    /// A table: said as a short description of it.
+    Table,
+}
+
+/// One block of a body, in drawing order: its kind and the Markdown it was drawn from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceBlock {
+    /// The element the page draws it as.
+    pub kind: BlockKind,
+    /// The text it was drawn from: a slice of what was parsed, never anything the page sent, less
+    /// a list item's bullet.
+    pub source: String,
+}
+
+/// The blocks `text` is drawn as, in order, written in `markup`, with `mentions` named as
+/// [`to_html_named`] names them. See the section note.
+///
+/// One block, the whole text, when the tree and the HTML disagree about the blocks.
+#[must_use]
+pub fn source_blocks(text: &str, markup: Markup, mentions: &[MentionName]) -> Vec<SourceBlock> {
+    let (html, walked) = render_visiting(text, markup, mentions, |root, source| {
+        let lines = line_starts(source);
+        let mut found = Vec::new();
+        tree_blocks(root, source, &lines, Walk::Blocks, &mut found);
+        found
+    });
+    let Some(blocks) = walked.filter(|_| html != plain_html(text)) else {
+        // Drawn as plain paragraphs, by the page from the text itself.
+        return plain_blocks(text);
+    };
+    let kinds: Vec<BlockKind> = blocks.iter().map(|block| block.kind).collect();
+    if !blocks.is_empty() && kinds == html_block_kinds(&html) {
+        blocks
+    } else {
+        vec![SourceBlock {
+            kind: BlockKind::Paragraph,
+            source: text.to_owned(),
+        }]
+    }
+}
+
+/// [`plain_html`]'s paragraphs: each run of lines that are not blank.
+fn plain_blocks(text: &str) -> Vec<SourceBlock> {
+    let mut blocks = Vec::new();
+    let mut run: Vec<&str> = Vec::new();
+    for line in text.split('\n').chain(std::iter::once("")) {
+        if line.trim_matches([' ', '\t']).is_empty() {
+            if !run.is_empty() {
+                blocks.push(SourceBlock {
+                    kind: BlockKind::Paragraph,
+                    source: run.join("\n"),
+                });
+                run.clear();
+            }
+        } else {
+            run.push(line);
+        }
+    }
+    blocks
+}
+
+/// Where a walk is: among blocks, or inside a list item, where only nested lists hold more.
+#[derive(Clone, Copy)]
+enum Walk {
+    Blocks,
+    ListsOnly,
+}
+
+/// The blocks under `node`, by the section note's rule, with their source.
+fn tree_blocks<'a>(
+    node: &'a AstNode<'a>,
+    source: &str,
+    lines: &[usize],
+    walk: Walk,
+    found: &mut Vec<SourceBlock>,
+) {
+    for child in node.children() {
+        let ast = child.data.borrow();
+        let kind = match (&ast.value, walk) {
+            (NodeValue::List(_), _) => {
+                drop(ast);
+                tree_blocks(child, source, lines, Walk::Blocks, found);
+                continue;
+            }
+            (_, Walk::ListsOnly) => continue,
+            (NodeValue::Paragraph, Walk::Blocks) => BlockKind::Paragraph,
+            (NodeValue::Heading(_), Walk::Blocks) => BlockKind::Heading,
+            (NodeValue::BlockQuote, Walk::Blocks) => BlockKind::Quote,
+            (NodeValue::CodeBlock(_), Walk::Blocks) => BlockKind::Code,
+            (NodeValue::Table(_), Walk::Blocks) => BlockKind::Table,
+            (NodeValue::Item(_) | NodeValue::TaskItem(_), Walk::Blocks) => BlockKind::Item,
+            _ => continue,
+        };
+        let (start, end) = (ast.sourcepos.start, ast.sourcepos.end);
+        drop(ast);
+        let from = offset(lines, start.line, start.column).unwrap_or(source.len());
+        let mut to = offset(lines, end.line, end.column).map_or(source.len(), |at| at + 1);
+        // Never past where whatever follows it begins: a list's last item can claim the lines after
+        // the list as its own.
+        if let Some(next) = following(child) {
+            let at = next.data.borrow().sourcepos.start;
+            if let Some(at) = offset(lines, at.line, at.column) {
+                to = to.min(at);
+            }
+        }
+        found.push(SourceBlock {
+            kind,
+            source: if kind == BlockKind::Item {
+                item_source(&item_text(child, source, lines, from))
+            } else {
+                slice_chars(source, from, to).to_owned()
+            },
+        });
+        if kind == BlockKind::Item {
+            tree_blocks(child, source, lines, Walk::ListsOnly, found);
+        }
+    }
+}
+
+/// What a list item holds besides the lists nested in it, from `from`, where it begins: each of
+/// its other children in order, wherever in the source it came from. A paragraph after a nested
+/// list, and a block that `#237 nested-lists` moved into the item, are its words too.
+fn item_text<'a>(item: &'a AstNode<'a>, source: &str, lines: &[usize], from: usize) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for kid in item.children() {
+        let ast = kid.data.borrow();
+        if matches!(ast.value, NodeValue::List(_)) {
+            continue;
+        }
+        let (start, end) = (ast.sourcepos.start, ast.sourcepos.end);
+        drop(ast);
+        // The first from the item's own start, so its marker comes with it to be taken off.
+        let begin = if parts.is_empty() {
+            from
+        } else {
+            offset(lines, start.line, start.column).unwrap_or(source.len())
+        };
+        let mut finish = offset(lines, end.line, end.column).map_or(source.len(), |at| at + 1);
+        if let Some(next) = following(kid) {
+            let at = next.data.borrow().sourcepos.start;
+            if let Some(at) = offset(lines, at.line, at.column).filter(|at| *at >= begin) {
+                finish = finish.min(at);
+            }
+        }
+        parts.push(slice_chars(source, begin, finish));
+    }
+    parts.join(
+        "
+
+",
+    )
+}
+
+/// The node after `node` in the document, outside it: its next sibling, or its parent's, and so on.
+fn following<'a>(node: &'a AstNode<'a>) -> Option<&'a AstNode<'a>> {
+    let mut at = node;
+    loop {
+        if let Some(next) = at.next_sibling() {
+            return Some(next);
+        }
+        at = at.parent()?;
+    }
+}
+
+/// A list item's text without the bullet the page draws for it, which a voice would say as a dash,
+/// and a task's box said in words. A number stays: "2." is part of what the list says.
+fn item_source(text: &str) -> String {
+    let text = text.trim_start();
+    let text = ["- ", "* ", "+ "]
+        .iter()
+        .find_map(|bullet| text.strip_prefix(bullet))
+        .unwrap_or(text)
+        .trim_start();
+    if let Some(open) = text.strip_prefix("[ ] ") {
+        format!("To do: {open}")
+    } else if let Some(done) = text
+        .strip_prefix("[x] ")
+        .or_else(|| text.strip_prefix("[X] "))
+    {
+        format!("Done: {done}")
+    } else {
+        text.to_owned()
+    }
+}
+
+/// `source[from..to]`, each end moved back onto a character boundary and kept inside the text.
+fn slice_chars(source: &str, from: usize, to: usize) -> &str {
+    let boundary = |mut at: usize| {
+        at = at.min(source.len());
+        while !source.is_char_boundary(at) {
+            at -= 1;
+        }
+        at
+    };
+    let (from, to) = (boundary(from), boundary(to));
+    if from < to {
+        &source[from..to]
+    } else {
+        ""
+    }
+}
+
+/// The kinds of the blocks in sanitized `html`, by the section note's rule: what the page finds
+/// walking the body it inserted. Only for what [`SANITIZER`] wrote: well-formed and properly
+/// nested tags, attribute values in double quotes.
+#[must_use]
+pub fn html_block_kinds(html: &str) -> Vec<BlockKind> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Inside {
+        Blocks,
+        ListsOnly,
+        Nothing,
+    }
+    let bytes = html.as_bytes();
+    let mut kinds = Vec::new();
+    let mut open: Vec<(&str, Inside)> = Vec::new();
+    let mut at = 0;
+    while let Some(found) = html[at..].find('<') {
+        let start = at + found + 1;
+        let closing = bytes.get(start) == Some(&b'/');
+        let name_from = start + usize::from(closing);
+        let name_len = bytes[name_from..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_alphanumeric())
+            .count();
+        let name = &html[name_from..name_from + name_len];
+        let mut end = name_from + name_len;
+        let mut quoted = false;
+        while end < bytes.len() && (quoted || bytes[end] != b'>') {
+            quoted ^= bytes[end] == b'"';
+            end += 1;
+        }
+        at = (end + 1).min(bytes.len());
+        if name.is_empty() {
+            continue;
+        }
+        if closing {
+            if let Some(level) = open.iter().rposition(|(tag, _)| *tag == name) {
+                open.truncate(level);
+            }
+            continue;
+        }
+        if matches!(name, "br" | "hr" | "img" | "input" | "wbr") {
+            continue;
+        }
+        let here = open.last().map_or(Inside::Blocks, |(_, inside)| *inside);
+        let inner = match (here, name) {
+            (Inside::Blocks | Inside::ListsOnly, "ul" | "ol") | (Inside::Blocks, "div") => {
+                Inside::Blocks
+            }
+            (Inside::Blocks, "li") => {
+                kinds.push(BlockKind::Item);
+                Inside::ListsOnly
+            }
+            (Inside::Blocks, _) => {
+                let kind = match name {
+                    "p" => Some(BlockKind::Paragraph),
+                    "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => Some(BlockKind::Heading),
+                    "blockquote" => Some(BlockKind::Quote),
+                    "pre" => Some(BlockKind::Code),
+                    "table" => Some(BlockKind::Table),
+                    _ => None,
+                };
+                kinds.extend(kind);
+                Inside::Nothing
+            }
+            _ => Inside::Nothing,
+        };
+        open.push((name, inner));
+    }
+    kinds
 }
 
 /// The longest body rendered, in bytes. Four times the longest message Discord or Google Chat
@@ -3342,6 +3667,168 @@ mod search_text_tests {
             "the index text of the corpus is now {digest} under {}: if the rendering changed on \
              purpose, bump SearchText::VERSION and pin the new digest under it",
             SearchText::VERSION
+        );
+    }
+}
+
+#[cfg(test)]
+mod read_aloud_blocks {
+    //! `#376 read-aloud-blocks`: the blocks a body is read in are the blocks the page draws.
+
+    use super::*;
+
+    /// The message tests/read_aloud_blocks_browser.py walks and the page suite draws, its rendering
+    /// and its blocks, shared by all three.
+    const FIXTURE: &str = include_str!("../tests/fixtures/read_aloud_blocks.json");
+
+    fn fixture(key: &str) -> serde_json::Value {
+        let fixture: serde_json::Value =
+            serde_json::from_str(FIXTURE).expect("the fixture is JSON");
+        fixture[key].clone()
+    }
+
+    fn kinds(blocks: &[SourceBlock]) -> Vec<BlockKind> {
+        blocks.iter().map(|block| block.kind).collect()
+    }
+
+    #[test]
+    fn a_long_message_is_read_in_the_blocks_it_is_drawn_as() {
+        let text = fixture("content");
+        let text = text.as_str().expect("content");
+        let html = fixture("html");
+        assert_eq!(
+            body_html(text, Markup::Discord),
+            html.as_str().expect("html"),
+            "the browser walk and the page suite draw a body this server does not render"
+        );
+        let blocks = source_blocks(text, Markup::Discord, &[]);
+        assert_eq!(
+            serde_json::to_value(kinds(&blocks)).expect("kinds"),
+            fixture("blocks")
+        );
+        assert_eq!(
+            html_block_kinds(html.as_str().expect("html")),
+            kinds(&blocks)
+        );
+        let sources: Vec<&str> = blocks.iter().map(|block| block.source.trim()).collect();
+        assert_eq!(
+            sources,
+            [
+                "Where the overnight run got to.",
+                // An item's own words, without the bullet and without the list nested in it.
+                "the retry budget landed",
+                "the cache rewrite is a draft",
+                "waiting on review",
+                "> nothing failed outright",
+                "```\nqueued 41m\n```",
+                "That is everything.",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_plain_body_is_its_paragraphs_as_the_page_draws_them_from_the_text() {
+        let text = "one\ntwo\n\n  \nthree";
+        assert_eq!(body_html(text, Markup::Discord), "");
+        let blocks = source_blocks(text, Markup::Discord, &[]);
+        assert_eq!(
+            blocks
+                .iter()
+                .map(|block| block.source.as_str())
+                .collect::<Vec<_>>(),
+            ["one\ntwo", "three"]
+        );
+        assert_eq!(
+            html_block_kinds(&plain_html(text)),
+            [BlockKind::Paragraph, BlockKind::Paragraph]
+        );
+    }
+
+    #[test]
+    fn headings_numbered_items_tables_and_tasks_are_blocks_and_a_rule_is_not() {
+        use BlockKind::{Heading, Item, Paragraph, Table};
+        let text = "# Title\nbody line\n\n1. first\n2. second\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n- [ ] open task\n- [x] done task\n\n---\n\nend";
+        let blocks = source_blocks(text, Markup::Discord, &[]);
+        assert_eq!(
+            kinds(&blocks),
+            [Heading, Paragraph, Item, Item, Table, Item, Item, Paragraph]
+        );
+        assert_eq!(
+            blocks[2].source.trim(),
+            "1. first",
+            "a number is part of what a list says"
+        );
+        assert_eq!(blocks[5].source.trim(), "To do: open task");
+        assert_eq!(blocks[6].source.trim(), "Done: done task");
+        assert_eq!(
+            html_block_kinds(&to_html(text, Markup::Discord)),
+            kinds(&blocks)
+        );
+    }
+
+    #[test]
+    fn an_items_words_after_its_nested_list_are_its_own() {
+        let text = "- a\n  - b\n\n  tail of a\n- c";
+        let blocks = source_blocks(text, Markup::Discord, &[]);
+        assert_eq!(
+            kinds(&blocks),
+            [BlockKind::Item, BlockKind::Item, BlockKind::Item]
+        );
+        assert!(
+            blocks[0].source.contains('a') && blocks[0].source.contains("tail of a"),
+            "{blocks:?}"
+        );
+        assert!(!blocks[0].source.contains('b'), "{blocks:?}");
+        assert_eq!(blocks[1].source.trim(), "b");
+        assert_eq!(blocks[2].source.trim(), "c");
+        assert_eq!(
+            html_block_kinds(&to_html(text, Markup::Discord)),
+            kinds(&blocks)
+        );
+    }
+
+    #[test]
+    fn a_google_chat_outline_reads_the_lines_moved_into_an_item() {
+        // `#237 nested-lists`: a line the service shows under an item is nested into it.
+        let text = "1. First step\nIn review:\n- one\n- two\n2. Second step";
+        let blocks = source_blocks(text, Markup::GoogleChat, &[]);
+        let all: String = blocks.iter().map(|block| block.source.clone()).collect();
+        for words in ["First step", "In review", "one", "two", "Second step"] {
+            assert!(all.contains(words), "{words:?} is never read: {blocks:?}");
+        }
+        assert_eq!(
+            html_block_kinds(&to_html(text, Markup::GoogleChat)),
+            kinds(&blocks)
+        );
+    }
+
+    #[test]
+    fn a_loose_item_is_one_block_with_all_its_paragraphs() {
+        let text = "- a\n\n  more of a\n- b";
+        let blocks = source_blocks(text, Markup::Discord, &[]);
+        assert_eq!(kinds(&blocks), [BlockKind::Item, BlockKind::Item]);
+        assert!(blocks[0].source.contains("more of a"), "{blocks:?}");
+    }
+
+    #[test]
+    fn a_body_past_a_rendering_bound_is_read_as_its_plain_paragraphs() {
+        let text = format!("{}\n\n- x", "w".repeat(MAX_RENDERED_BYTES));
+        let blocks = source_blocks(&text, Markup::Discord, &[]);
+        assert_eq!(kinds(&blocks), [BlockKind::Paragraph, BlockKind::Paragraph]);
+        assert_eq!(blocks[1].source, "- x");
+    }
+
+    #[test]
+    fn the_html_walk_follows_the_page_rule() {
+        use BlockKind::{Code, Item, Paragraph, Quote, Table};
+        // Nothing inside a quote, a pre or a table is another block; an item's nested lists are.
+        let html = "<blockquote>\n<p>a</p>\n<ul>\n<li>in a quote</li>\n</ul>\n</blockquote>\n\
+                    <ul>\n<li>\n<p>loose</p>\n<pre><code>x</code></pre>\n<ol>\n<li>nested</li>\n</ol>\n</li>\n</ul>\n\
+                    <table>\n<tbody>\n<tr>\n<td><p>cell</p></td>\n</tr>\n</tbody>\n</table>\n\
+                    <hr>\n<pre><code>&lt;p&gt;not a tag</code></pre>\n<p><a href=\"https://example.com/?a=1>2\" title=\"x\">link</a></p>\n";
+        assert_eq!(
+            html_block_kinds(html),
+            [Quote, Item, Item, Table, Code, Paragraph]
         );
     }
 }

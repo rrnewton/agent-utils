@@ -2330,6 +2330,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     /** `#375`: prepare requests unanswered right now, and the most there ever were at once. */
     preparesInFlight: 0,
     maxPreparesInFlight: 0,
+    /** `#376 read-aloud-blocks`: message id -> the `blocks` the prepare route answers for it. */
+    speechBlocks: {},
     /** Content-free browser playback timing reports, kept apart from synthesis calls. */
     speechTimingCalls: [],
     /** Make preparing fail, to prove the tap still works by the older, slower route. */
@@ -2853,6 +2855,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
 
       async play() {
         this.playCount += 1;
+        this.paused = false;
       }
 
       pause() {
@@ -3132,6 +3135,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
           prepared: (asked.ids || []).map((id) => ({
             message_id: id,
             url: `/api/v1/speech/ticket-for-${id}${page.speechTicketSuffix}`,
+            // `#376 read-aloud-blocks`: the blocks the server prepared this message as, if any.
+            ...(page.speechBlocks[id] ? { blocks: page.speechBlocks[id] } : {}),
           })),
           expires_in_seconds: page.speechTicketTtlSeconds,
         });
@@ -3827,6 +3832,24 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   /** `#262 search-load-older`. A way to abort a request, which a current browser has, and nothing else. */
   page.enableAbort = () => {
     context.AbortController = AbortController;
+  };
+  /**
+   * `#376 read-aloud-blocks`. A Media Session, as a phone's browser has one: the handlers the page
+   * sets, the states it reports and its metadata, kept for the test; and a `Blob` to make the
+   * keeper's silence from.
+   */
+  page.enableMediaSession = () => {
+    const session = { handlers: {}, states: [], metadata: null };
+    session.setActionHandler = (action, fn) => { session.handlers[action] = fn; };
+    Object.defineProperty(session, "playbackState", {
+      get: () => session.states.at(-1) || "none",
+      set: (state) => { session.states.push(state); },
+    });
+    navigator.mediaSession = session;
+    context.MediaMetadata = function MediaMetadata(init) { Object.assign(this, init); };
+    context.Blob = class { constructor(parts, options) { this.bytes = "silence"; this.type = options && options.type; } };
+    page.mediaSession = session;
+    return session;
   };
   page.enableStreamedAudio = () => {
     context.ReadableStream = class {};
@@ -10697,6 +10720,388 @@ test("...and a message that could not be prepared still reads, by the older slow
     "preparing failed and took read-aloud down with it"
   );
   assert.equal(page.players[0].playCount, 1, "nothing was played on the fallback path");
+});
+
+// --- `#376 read-aloud-blocks`: a long message read block by block -----------------------------------
+
+/**
+ * A message of three blocks as the server renders it: a paragraph, a list of two items. The
+ * server's own walk of the same HTML (`html_block_kinds` in src/render.rs) finds these kinds.
+ */
+const BLOCKED_HTML = "<p>The run finished.</p>\n<ul>\n<li>the budget landed</li>\n<li>the rewrite is a draft</li>\n</ul>\n";
+const BLOCKED_KINDS = [{ kind: "paragraph", spoken: true }, { kind: "item", spoken: true },
+  { kind: "item", spoken: true }];
+const BLOCKED_ID = "1000000000000000001";
+
+/** A page in Read with one message of three blocks prepared as such, streamed into Web Audio. */
+async function blockedRead(options = {}) {
+  const page = newPage();
+  page.enableStreamedAudio();
+  page.enableAbort();
+  if (options.mediaSession) page.enableMediaSession();
+  page.speechBlocks[BLOCKED_ID] = options.kinds || BLOCKED_KINDS;
+  await signIn(page);
+  const rows = await inReadingMode(page, [
+    message({ id: BLOCKED_ID, content: options.content || "The run finished.\n\n- the budget landed\n- the rewrite is a draft",
+      content_html: options.html || BLOCKED_HTML }),
+    message({ id: "1000000000000000002", author_id: "1000000000000000012", content: "one block" }),
+  ]);
+  return { page, rows };
+}
+
+const blockOf = (url) => new URL(url, "http://page").searchParams.get("block");
+const selectionOf = (url) => new URL(url, "http://page").searchParams.get("selection");
+
+/** Every element in `node`, depth first. */
+const everyElement = (node) => (node.children || []).flatMap((kid) => [kid, ...everyElement(kid)]);
+
+/** The tag and text of the element lit as the block being read in `row`, or "" when none is. */
+function litBlock(row) {
+  const lit = everyElement(row).filter((node) => node.getAttribute && node.getAttribute("data-reading-block") === "current");
+  assert.ok(lit.length <= 1, "more than one block is lit");
+  return lit.length === 0 ? "" : `${String(lit[0].tagName).toLowerCase()}:${lit[0].text().trim()}`;
+}
+
+/** The block elements of `row`'s first message, in order: the fixture's p, li, li. */
+function blockElements(row) {
+  const body = everyElement(row).find((node) => node.className === "md");
+  return everyElement(body).filter((node) => ["p", "li"].includes(String(node.tagName).toLowerCase()));
+}
+
+/** Feed stream `at` a header and `frames` samples at 1 kHz, then end it. */
+async function speakBlock(page, at, frames = 100) {
+  const stream = page.audioStreams[at];
+  stream.controller.bytes(joined(wavHeader(1000, 1), pcm(...new Array(frames).fill(0x2000))));
+  await page.settle();
+  stream.controller.drop();
+  await page.settle();
+}
+
+/**
+ * The message tests/read_aloud_blocks_browser.py walks: its text, the HTML the server renders it as
+ * (src/render.rs's tests hold the two together), the blocks the server lists, and the element each
+ * is drawn as.
+ */
+const BLOCKS_FIXTURE = JSON.parse(readFileSync(join(WEB, "..", "tests", "fixtures", "read_aloud_blocks.json"), "utf8"));
+
+test("THE PAGE FINDS, in the server's rendering of a long message, exactly the blocks the server lists", async () => {
+  // The two halves of one rule: the server walks its tree and its HTML, the page walks the body it
+  // drew. Stepped through with Next, every block lit is the element the fixture says, in order.
+  const { page, rows } = await blockedRead({ content: BLOCKS_FIXTURE.content, html: BLOCKS_FIXTURE.html,
+    kinds: BLOCKS_FIXTURE.blocks.map((kind) => ({ kind, spoken: true })) });
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  const lit = [];
+  for (let at = 0; at < BLOCKS_FIXTURE.blocks.length; at += 1) {
+    lit.push(litBlock(page.el("discord-log").children[0]).split(":")[0]);
+    await page.el("read-next").click();
+    await page.settle();
+  }
+  assert.deepEqual(lit, BLOCKS_FIXTURE.elements);
+});
+
+test("A MESSAGE PREPARED IN BLOCKS IS READ BLOCK BY BLOCK, the next asked for once the current has audio", async () => {
+  // The owner listens to long messages in the car, and one read as a single stretch gave him no way
+  // to see or change where he was in it.
+  const { page, rows } = await blockedRead();
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.equal(page.audioStreams.length, 1, "more than the first block was asked for before any audio");
+  assert.equal(blockOf(page.audioStreams[0].url), "0");
+  page.audioStreams[0].controller.bytes(joined(wavHeader(1000, 1), pcm(0x2000, 0x2000)));
+  await page.settle();
+  // On a voice with one session the next block queues behind this one and is generated the moment
+  // it is: asked for now, it is there when this one ends.
+  assert.equal(page.audioStreams.length, 2, "the next block was not asked for when the first had audio");
+  assert.equal(blockOf(page.audioStreams[1].url), "1");
+  assert.equal(selectionOf(page.audioStreams[1].url), selectionOf(page.audioStreams[0].url),
+    "the blocks of one read were asked for under two selections, so the second would cut off the first");
+  // ONE ahead: the next block's own audio, before it plays, asks for nothing more. A provider that
+  // serves reads side by side would otherwise be asked for the whole message at once.
+  page.audioStreams[1].controller.bytes(joined(wavHeader(1000, 1), pcm(0x2000, 0x2000)));
+  await page.settle();
+  assert.equal(page.audioStreams.length, 2, "more than one block ahead was asked for");
+});
+
+test("the next block is scheduled to BEGIN WHERE THE CURRENT ONE ENDS, so the boundary has no gap", async () => {
+  const { page, rows } = await blockedRead();
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  // Block 1's audio arrives while block 0 is still being received.
+  page.audioStreams[0].controller.bytes(joined(wavHeader(1000, 1), pcm(...new Array(100).fill(0x2000))));
+  await page.settle();
+  page.audioStreams[1].controller.bytes(joined(wavHeader(1000, 1), pcm(...new Array(80).fill(0x2000))));
+  await page.settle();
+  const before = page.audio.sources.length;
+  assert.equal(before, 1, "the next block played before the current one had all arrived");
+  page.audioStreams[0].controller.drop();
+  await page.settle();
+  const [first, second] = page.audio.sources;
+  assert.ok(second, "the next block was not scheduled once the current one had all arrived");
+  const end = first.startedAt + first.buffer.duration;
+  assert.ok(Math.abs(second.startedAt - end) < 1e-9,
+    `the next block starts at ${second.startedAt}, the current ends at ${end}: a gap at the boundary`);
+
+  // THE CONTROL: a block whose audio comes after the one before has finished playing cannot begin
+  // where it ended, and starts the cushion ahead of now instead. The check above can tell the two.
+  page.audio.currentTime = second.startedAt + second.buffer.duration + 1;
+  page.audioStreams[1].controller.drop();
+  await page.settle();
+  page.audioStreams[2].controller.bytes(joined(wavHeader(1000, 1), pcm(0x2000, 0x2000)));
+  await page.settle();
+  const third = page.audio.sources.at(-1);
+  assert.ok(Math.abs(third.startedAt - (page.audio.currentTime + 0.5)) < 1e-9,
+    `a late block started at ${third.startedAt} with the clock at ${page.audio.currentTime}`);
+});
+
+test("THE BLOCK BEING READ IS LIT and the row counts it, 'reading 1 of 3', with Previous and Next shown", async () => {
+  const { page, rows } = await blockedRead();
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  const row = page.el("discord-log").children[0];
+  assert.equal(litBlock(row), "p:The run finished.");
+  const mark = row.descendants().find((n) => n.className === "msg-author reading-mark");
+  assert.equal(mark.text(), "reading 1 of 3");
+  assert.equal(page.el("read-steer").hidden, false, "the steering strip is not shown");
+  assert.equal(page.el("read-steer-count").text(), "1 of 3");
+  assert.equal(page.el("read-next").disabled, false);
+
+  // The light moves when the next block is HEARD, not when it is asked for.
+  // Block 0 is due half a second from now (the cushion), and is 0.1 s long.
+  page.audioStreams[0].controller.bytes(joined(wavHeader(1000, 1), pcm(...new Array(100).fill(0x2000))));
+  await page.settle();
+  assert.equal(page.expireTimers(500), 1, "nothing waited for block 0 to be heard");
+  await page.settle();
+  page.audioStreams[1].controller.bytes(joined(wavHeader(1000, 1), pcm(...new Array(100).fill(0x2000))));
+  await page.settle();
+  page.audioStreams[0].controller.drop();
+  await page.settle();
+  assert.equal(litBlock(row), "p:The run finished.", "the light moved before the next block was heard");
+  // Block 1 is due where block 0 ends, 0.6 s from now.
+  assert.equal(page.expireTimers(600), 1, "nothing waited for block 1 to be heard");
+  await page.settle();
+  assert.equal(litBlock(row), "li:the budget landed");
+  assert.equal(page.el("read-steer-count").text(), "2 of 3");
+  assert.equal(row.descendants().find((n) => n.className === "msg-author reading-mark").text(), "reading 2 of 3");
+
+  // A PAUSE holds the light where the voice is: block 2 is due on the audio clock, and the clock
+  // has stopped.
+  page.audioStreams[1].controller.drop();
+  await page.settle();
+  page.audioStreams[2].controller.bytes(joined(wavHeader(1000, 1), pcm(...new Array(100).fill(0x2000))));
+  await page.settle();
+  page.audio.state = "suspended";
+  assert.equal(page.expireTimers(700), 1, "nothing waited for block 2 to be heard");
+  await page.settle();
+  assert.equal(litBlock(row), "li:the budget landed", "the light moved on while the audio was paused");
+  page.audio.state = "running";
+  page.audio.currentTime = 0.7;
+  assert.equal(page.expireTimers(250), 1, "nothing looked again once the audio played on");
+  await page.settle();
+  assert.equal(litBlock(row), "li:the rewrite is a draft");
+
+  // ...and is lit again on a row the poll rebuilds under it.
+  await reReadChannel(page);
+  assert.equal(litBlock(page.el("discord-log").children[0]), "li:the rewrite is a draft", "the rebuild lost the light");
+});
+
+test("a tap on ANOTHER block of the message being read jumps there; on the block being read, stops it", async () => {
+  const { page, rows } = await blockedRead();
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  const row = page.el("discord-log").children[0];
+  const [, , last] = blockElements(row);
+  const first = page.audioStreams[0];
+  await row.dispatch("click", { target: last });
+  await page.settle();
+  assert.equal(first.options.signal.aborted, true, "the read before the jump was left open");
+  const jumped = page.audioStreams.at(-1);
+  assert.equal(blockOf(jumped.url), "2", "the jump did not ask for the block tapped");
+  assert.notEqual(selectionOf(jumped.url), selectionOf(first.url),
+    "the jump reused the old selection, so the server would queue it behind the old read");
+  assert.equal(litBlock(page.el("discord-log").children[0]), "li:the rewrite is a draft");
+  assert.equal(page.el("read-steer-count").text(), "3 of 3");
+  assert.equal(page.el("read-next").disabled, true, "Next is offered on the last block");
+
+  await page.el("discord-log").children[0].dispatch("click", { target: blockElements(page.el("discord-log").children[0])[2] });
+  await page.settle();
+  assert.equal(jumped.options.signal.aborted, true, "a tap on the block being read did not stop it");
+  assert.equal(page.el("read-steer").hidden, true, "the strip outlived the read");
+  assert.equal(litBlock(page.el("discord-log").children[0]), "", "a block stayed lit after the read stopped");
+});
+
+test("Previous and Next move the read a block at a time; Previous on the first block starts it again", async () => {
+  const { page, rows } = await blockedRead();
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  await page.el("read-next").click();
+  await page.settle();
+  assert.equal(blockOf(page.audioStreams.at(-1).url), "1");
+  assert.equal(page.el("read-steer-count").text(), "2 of 3");
+  await page.el("read-next").click();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "3 of 3");
+  const before = page.audioStreams.length;
+  await page.el("read-next").click();
+  await page.settle();
+  assert.equal(page.audioStreams.length, before, "Next past the last block asked for something");
+  await page.el("read-prev").click();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "2 of 3");
+  await page.el("read-prev").click();
+  await page.settle();
+  await page.el("read-prev").click();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "1 of 3");
+  assert.equal(blockOf(page.audioStreams.at(-1).url), "0", "Previous on the first block did not start it again");
+});
+
+test("THE MEDIA KEYS move the read: previoustrack, nexttrack, pause and play, kept by a silent element", async () => {
+  // A steering wheel's or a headset's buttons reach a page only while it plays a media element,
+  // and Web Audio is not one: the page plays silence alongside the read to hold them.
+  const { page, rows } = await blockedRead({ mediaSession: true });
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  const session = page.mediaSession;
+  assert.deepEqual(Object.keys(session.handlers).sort(), ["nexttrack", "pause", "play", "previoustrack", "stop"]);
+  assert.equal(session.playbackState, "playing");
+  const keeper = page.players.find((player) => /^blob:/.test(player.url));
+  assert.ok(keeper && keeper.playCount >= 1 && keeper.loop === true, "no silent element holds the media keys");
+
+  session.handlers.nexttrack();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "2 of 3");
+  session.handlers.previoustrack();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "1 of 3");
+
+  page.audio.state = "running";
+  page.audio.suspend = async () => { page.audio.state = "suspended"; };
+  session.handlers.pause();
+  await page.settle();
+  assert.equal(page.audio.state, "suspended", "pause did not stop the audio clock");
+  assert.equal(session.playbackState, "paused");
+  assert.equal(keeper.paused, true, "the silent element played on through a pause");
+  assert.equal(page.el("read-steer-count").text(), "1 of 3", "pausing moved the read");
+  session.handlers.play();
+  await page.settle();
+  assert.equal(page.audio.state, "running", "play did not start the audio clock again");
+  assert.equal(session.playbackState, "playing");
+
+  // A media key's jump keeps the read's keys and its silence: nothing in between let them go.
+  const statesBefore = session.states.length;
+  session.handlers.nexttrack();
+  await page.settle();
+  assert.ok(!session.states.slice(statesBefore).includes("none"), `a jump let the media keys go: ${session.states}`);
+
+  // When the read stops, the keys, the title and the silence go with it.
+  await page.el("read-aloud").click();
+  await page.settle();
+  assert.equal(session.playbackState, "none");
+  assert.equal(keeper.paused, true);
+  assert.equal(session.handlers.nexttrack, null, "the page kept the media keys after the read");
+  assert.equal(session.metadata, null);
+});
+
+test("...and on a browser without Web Audio, pause and play pause and play the element reading", async () => {
+  const page = newPage();
+  page.enableMediaSession();
+  page.speechBlocks[BLOCKED_ID] = BLOCKED_KINDS;
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: BLOCKED_ID,
+    content: "The run finished.\n\n- the budget landed\n- the rewrite is a draft", content_html: BLOCKED_HTML })]);
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  const reading = page.players.find((player) => /block=0/.test(player.url));
+  assert.ok(reading, "the first block was not handed to an <audio>");
+  page.mediaSession.handlers.pause();
+  await page.settle();
+  assert.equal(reading.paused, true, "pause left the element playing");
+  const plays = reading.playCount;
+  page.mediaSession.handlers.play();
+  await page.settle();
+  assert.equal(reading.playCount, plays + 1, "play did not play the element again");
+});
+
+test("a read in blocks on a ticket with under five minutes left prepares the row again first", async () => {
+  // Its last block is asked for minutes after the tap; a ticket that ends part-way through is a
+  // read that stops with "could not be played".
+  const page = newPage();
+  page.enableStreamedAudio();
+  page.speechBlocks[BLOCKED_ID] = BLOCKED_KINDS;
+  page.speechTicketTtlSeconds = 200;
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: BLOCKED_ID,
+    content: "The run finished.\n\n- the budget landed\n- the rewrite is a draft", content_html: BLOCKED_HTML })]);
+  const before = page.prepareCalls.length;
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.equal(page.prepareCalls.length, before + 1, "the read started on a ticket about to end");
+  assert.deepEqual(page.prepareCalls.at(-1).ids, [BLOCKED_ID]);
+  // THE CONTROL: with the whole ten minutes the tap prepares nothing.
+  const fresh = newPage();
+  fresh.enableStreamedAudio();
+  fresh.speechBlocks[BLOCKED_ID] = BLOCKED_KINDS;
+  await signIn(fresh);
+  const freshRows = await inReadingMode(fresh, [message({ id: BLOCKED_ID,
+    content: "The run finished.\n\n- the budget landed\n- the rewrite is a draft", content_html: BLOCKED_HTML })]);
+  const freshBefore = fresh.prepareCalls.length;
+  await freshRows[0].dispatch("click", {});
+  await fresh.settle();
+  assert.equal(fresh.prepareCalls.length, freshBefore, "a fresh ticket was prepared again");
+});
+
+test("blocks the page draws DIFFERENTLY from the server's list still read block by block, with no block lit", async () => {
+  // The negative control for the mapping: when the two walks disagree, lighting block k would light
+  // the wrong words. The row stays lit and counted; no block is.
+  const { page, rows } = await blockedRead({ kinds: [{ kind: "paragraph", spoken: true },
+    { kind: "quote", spoken: true }, { kind: "item", spoken: true }] });
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  const row = page.el("discord-log").children[0];
+  assert.equal(blockOf(page.audioStreams[0].url), "0");
+  assert.equal(page.el("read-steer-count").text(), "1 of 3");
+  assert.equal(litBlock(row), "", "a block was lit though the page and the server disagree about the blocks");
+});
+
+test("a block that says nothing is drawn and skipped, and a message of ONE block reads whole as before", async () => {
+  const { page, rows } = await blockedRead({ kinds: [{ kind: "paragraph", spoken: true },
+    { kind: "item", spoken: false }, { kind: "item", spoken: true }] });
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "1 of 2");
+  page.audioStreams[0].controller.bytes(joined(wavHeader(1000, 1), pcm(0x2000)));
+  await page.settle();
+  assert.equal(blockOf(page.audioStreams[1].url), "2", "the silent block was asked for");
+
+  await rows[1].dispatch("click", {});
+  await page.settle();
+  const whole = page.audioStreams.at(-1);
+  assert.match(whole.url, /ticket-for-1000000000000000002\?selection=tap-[0-9a-f]{16}$/, "a one-block message was read by block");
+  assert.equal(page.el("read-steer").hidden, true, "a one-block read shows the steering strip");
+  const mark = page.el("discord-log").children[1].descendants().find((n) => n.className === "msg-author reading-mark");
+  assert.equal(mark.text(), "reading");
+});
+
+test("the blocks of a message heard to its end archive it once, after the last block ends", async () => {
+  const { page, rows } = await blockedRead();
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  const tenFrames = () => joined(wavHeader(1000, 1), pcm(...new Array(10).fill(0x2000)));
+  for (let at = 0; at < 3; at += 1) {
+    page.audioStreams[at].controller.bytes(tenFrames());
+    await page.settle();
+    page.audioStreams[at].controller.drop();
+    await page.settle();
+  }
+  assert.equal(page.audio.sources.length, 3, "not every block was scheduled");
+  for (const source of page.audio.sources.slice(0, -1)) source.onended();
+  await page.settle();
+  assert.deepEqual(page.dismissCalls, [], "archived before the last block ended");
+  page.audio.sources.at(-1).onended();
+  await page.settle();
+  assert.deepEqual(page.dismissCalls, [{ messages: [BLOCKED_ID] }]);
+  assert.equal(page.el("read-steer").hidden, true);
 });
 
 // --- `#290 speech-ticket-refresh`: a prepared URL is never played after its ticket has ended ----------

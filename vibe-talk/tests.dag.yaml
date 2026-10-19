@@ -336,6 +336,25 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#376 read-aloud-blocks` in the browser engine: a long message walked block by block against a
+  # voice with one session that speaks at speaking pace -- the block lit and counted, a tap on another
+  # block jumping there, Previous and Next, the media keys, and each boundary no longer than the
+  # voice's own first-audio wait (none where it generates ahead). The control's slow first audio
+  # must show as a gap, at a phone and a desk.
+  - group: check
+    job: read-aloud-blocks-browser
+    desc: a long message read block by block in current Chromium, with boundary gaps measured on the audio clock and a slow-voice negative control
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/read_aloud_blocks_browser.py
+    jobs_flag: ""
+    timeout: 150
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 40
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#49 post-confirmation-card-hold` in the browser engine: a real touch on Send the moment a first
   # card appears in a typed call commits nothing, and Send enables itself after the hold.
   - group: check

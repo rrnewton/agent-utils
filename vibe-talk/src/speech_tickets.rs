@@ -66,6 +66,10 @@ pub struct Prepared {
     /// The text as it will be SENT: already through `speakable::for_speech`, so the tap does not
     /// pay for normalisation either.
     pub said: String,
+    /// The same message block by block, in the order the page draws its blocks, each through the
+    /// same speech rules: what `?block=k` says. Empty when the message is one block, which `said`
+    /// already is. `#376 read-aloud-blocks`.
+    pub blocks: Vec<String>,
     /// The pace the reader had chosen when this was minted, if they had chosen one.
     pub speed: Option<f64>,
     /// Opaque correlation key for content-free server and browser timing records.
@@ -100,7 +104,8 @@ pub struct ServerTiming {
 struct Entry {
     prepared: Prepared,
     minted: Instant,
-    server_timing: Option<ServerTiming>,
+    /// Per block read (`None` for the whole message), because each is its own request.
+    server_timing: HashMap<Option<usize>, ServerTiming>,
 }
 
 /// A short-lived table of prepared messages, keyed by an unguessable ticket.
@@ -149,7 +154,7 @@ impl SpeechTickets {
                 Entry {
                     prepared,
                     minted: now,
-                    server_timing: None,
+                    server_timing: HashMap::new(),
                 },
             );
         }
@@ -185,24 +190,30 @@ impl SpeechTickets {
         })
     }
 
-    /// Attach the provider phases measured by the streaming handler to this observation.
-    pub fn record_server_timing(&self, ticket: &str, timing: ServerTiming) {
+    /// Attach the provider phases measured by the streaming handler to this observation: of the
+    /// whole message (`block` is `None`) or of one of its blocks.
+    pub fn record_server_timing(&self, ticket: &str, block: Option<usize>, timing: ServerTiming) {
         if let Ok(mut held) = self.held.lock() {
             if let Some(entry) = held.get_mut(ticket) {
-                entry.server_timing = Some(timing);
+                entry.server_timing.insert(block, timing);
             }
         }
     }
 
-    /// Resolve a browser report to its content-free observation and server phases.
+    /// Resolve a browser report to its content-free observation and the server phases of the
+    /// same read: the whole message, or the block it names.
     #[must_use]
-    pub fn observed_timing(&self, ticket: &str) -> Option<(Prepared, ServerTiming)> {
+    pub fn observed_timing(
+        &self,
+        ticket: &str,
+        block: Option<usize>,
+    ) -> Option<(Prepared, ServerTiming)> {
         let held = self.held.lock().ok()?;
         let entry = held.get(ticket)?;
         if Instant::now().duration_since(entry.minted) >= TICKET_TTL {
             return None;
         }
-        Some((entry.prepared.clone(), entry.server_timing?))
+        Some((entry.prepared.clone(), *entry.server_timing.get(&block)?))
     }
 
     /// How many tickets are held. For tests and the diagnostics line; not a stable API.
@@ -251,6 +262,7 @@ mod tests {
             channel: "2222222222".to_owned(),
             message: message.to_owned(),
             said: format!("the text of {message}"),
+            blocks: Vec::new(),
             speed: None,
             observation: fresh_observation(),
             preparation_ms: 1,

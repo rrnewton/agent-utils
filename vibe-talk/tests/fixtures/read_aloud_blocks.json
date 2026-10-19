@@ -1,0 +1,23 @@
+{
+  "about": "#376 read-aloud-blocks: one message, its rendering, and the blocks the server and the page find in it. Read by tests/read_aloud_blocks_browser.py, the page suite, and src/render.rs's tests, which hold `html` to what the server renders.",
+  "content": "Where the overnight run got to.\n\n- the retry budget landed\n- the cache rewrite is a draft\n  - waiting on review\n\n> nothing failed outright\n\n```\nqueued 41m\n```\n\nThat is everything.",
+  "html": "<p>Where the overnight run got to.</p>\n<ul>\n<li>the retry budget landed</li>\n<li>the cache rewrite is a draft\n<ul>\n<li>waiting on review</li>\n</ul>\n</li>\n</ul>\n<blockquote>\n<p>nothing failed outright</p>\n</blockquote>\n<pre><code>queued 41m\n</code></pre>\n<p>That is everything.</p>\n",
+  "blocks": [
+    "paragraph",
+    "item",
+    "item",
+    "item",
+    "quote",
+    "code",
+    "paragraph"
+  ],
+  "elements": [
+    "p",
+    "li",
+    "li",
+    "li",
+    "blockquote",
+    "pre",
+    "p"
+  ]
+}

@@ -698,6 +698,22 @@ nothing ready: the screen's preparation asks for it again, and a tap prepares it
 if that fails, reads it by the authenticated route instead of playing a URL the server no longer
 accepts.
 
+A long message is read **block by block** (`#376 read-aloud-blocks`): each paragraph, heading, list
+item and block quote it is drawn as, and a code block or a table as a short description of it. The
+block being read is lit, the row says `reading 2 of 5`, and a strip over the list offers Previous
+and Next. A tap on another block of the message being read jumps there; a tap on the block being
+read stops it. The Media Session's previous, next, pause and play (a steering wheel's or a
+headset's buttons) do the same; the page plays a silent element beside the read so that the
+browser routes those keys to it. The server decides what each block says, from the message itself:
+`POST /speech/prepare` lists a message's blocks (`blocks: [{kind, spoken}]`, only when there is more
+than one) and block `k` plays from the message's one ticket with `?block=k`; the page finds the
+same blocks in the body it drew and lights block `k` only when the two lists of kinds agree. The
+next block is asked for as soon as the current one has audio and is scheduled to begin where it
+ends, so where the voice generates faster than it speaks a boundary has no gap; a voice that speaks
+as it generates pauses at each boundary for as long as its own first audio takes.
+`make -C vibe-talk read-aloud-blocks-browser` walks a long message in a real Chromium and measures
+every boundary on the audio clock.
+
 On the server, preparation first looks at messages fetched for the page in the last 30 seconds,
 kept in memory (`src/read_ahead.rs`, apart from the voice catch-up's windows in `src/recent.rs`).
 It fetches only what is missing:
