@@ -265,6 +265,22 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#378 live-reactions` in the browser engine: a reaction pushed as a live update appears under
+  # its row on the open page with no reload, and its removal takes the strip away.
+  - group: check
+    job: live-reactions-browser
+    desc: a live reaction update drawn on the open page in current Chromium at a 412x915 Android viewport
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/live_reactions_browser.py
+    jobs_flag: ""
+    timeout: 60
+    cpu_timeout: 30
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 4
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#323 slack-system-bots` in the browser engine: a Slack welcome bot alone in a channel drawn as
   # another bot, its name and "(bot)" on screen, set in and coloured as a colleague is, with no coding
   # agent unless one is named; and a named coding agent drawn as the agent beside it.
