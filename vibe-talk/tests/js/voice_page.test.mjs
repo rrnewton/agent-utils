@@ -27981,7 +27981,14 @@ test("AN EARLIER CONVERSATION TOO LARGE TO REPLAY IS NOT REPORTED AS AN EMPTY ON
 const ALIASED = { ...CHANNEL, alias: "the build channel" };
 
 /** The text of each option in a picker, in order. */
-const optionText = (page, id) => [...page.el(id).children].map((option) => option.textContent);
+/**
+ * A picker's options, in order, as a browser's `select.options` lists them: those under an
+ * `optgroup` heading as well as those outside one. `channel-provider-groups` puts every channel
+ * under its provider's heading.
+ */
+const pickerOptions = (page, id) =>
+  page.el(id).children.flatMap((kid) => (kid.tagName === "optgroup" ? kid.children : [kid]));
+const optionText = (page, id) => pickerOptions(page, id).map((option) => option.textContent);
 
 test("THE CHANNEL BOX IS SMALL WHEN IT IS DOING NOTHING", async () => {
   // The owner's complaint about the first version: a rename box, an id box, a name box and a
@@ -28066,7 +28073,7 @@ test("A CHANNEL CAN BE ADDED FROM INSIDE THE APP, AND APPEARS IN THE PICKER", as
   await signIn(page);
   await page.el("open-settings").click();
   assert.equal(
-    page.el("discord-channel").children.length,
+    pickerOptions(page, "discord-channel").length,
     1,
     "the fixture already has more than one channel, so adding one proves nothing"
   );
@@ -28083,7 +28090,7 @@ test("A CHANNEL CAN BE ADDED FROM INSIDE THE APP, AND APPEARS IN THE PICKER", as
     [{ id: "1110000000000000002", label: "second team", writable: false }],
     "the id and name did not reach the server, or writable defaulted ON"
   );
-  const options = page.el("discord-channel").children.map((o) => o.value);
+  const options = pickerOptions(page, "discord-channel").map((o) => o.value);
   assert.deepEqual(
     options,
     ["1110000000000000001", "1110000000000000002"],
@@ -28123,7 +28130,7 @@ test("MANAGED REGISTRATION HIDES THE CHECKBOX AND ACCEPTS BRIDGE WRITE POLICY", 
     "the managed response lost the bridge-declared write policy"
   );
   assert.ok(
-    page.el("discord-channel").children.some((option) => option.value === page.registeredChannelId),
+    pickerOptions(page, "discord-channel").some((option) => option.value === page.registeredChannelId),
     "the picker used the source instead of the bridge-issued id"
   );
 });
@@ -28166,7 +28173,7 @@ test("...and a channel the bot cannot read is refused IN THE SERVER'S OWN WORDS"
     "the reason was replaced with a vaguer one of the page's own"
   );
   assert.equal(
-    page.el("discord-channel").children.length,
+    pickerOptions(page, "discord-channel").length,
     1,
     "a channel that was refused was added to the picker anyway"
   );
@@ -28188,7 +28195,7 @@ test("REMOVING A CHANNEL ADDED HERE FORGETS IT", async () => {
   await page.settle();
   assert.deepEqual(page.removeChannelCalls, ["1110000000000000004"]);
   assert.deepEqual(
-    page.el("discord-channel").children.map((o) => o.value),
+    pickerOptions(page, "discord-channel").map((o) => o.value),
     ["1110000000000000001"],
     "the removed channel is still in the picker"
   );
@@ -28218,7 +28225,7 @@ test("REMOVE IS OFFERED FOR A CHANNEL FROM THE FILE, WHICH IS HIDDEN AND CAN BE 
   await page.settle();
   assert.deepEqual(page.removeChannelCalls, [CHANNEL.id]);
   assert.deepEqual(
-    page.el("discord-channel").children.map((o) => o.value),
+    pickerOptions(page, "discord-channel").map((o) => o.value),
     [],
     "the hidden channel is still in the picker"
   );
@@ -28240,7 +28247,7 @@ test("REMOVE IS OFFERED FOR A CHANNEL FROM THE FILE, WHICH IS HIDDEN AND CAN BE 
   await page.settle();
   assert.deepEqual(page.showChannelCalls, [CHANNEL.id]);
   assert.deepEqual(
-    page.el("discord-channel").children.map((o) => o.value),
+    pickerOptions(page, "discord-channel").map((o) => o.value),
     [CHANNEL.id],
     "Show again did not put the channel back in the picker"
   );
@@ -28263,7 +28270,7 @@ test("the hidden channels client-config reports are offered back under the owner
   assert.equal(rows.length, 1);
   assert.equal(rows[0].children[0].text(), "the base");
   assert.equal(
-    page.el("discord-channel").children.map((o) => o.value).includes("1110000000000000007"),
+    pickerOptions(page, "discord-channel").map((o) => o.value).includes("1110000000000000007"),
     false,
     "a hidden channel was put in the picker"
   );
@@ -28329,7 +28336,7 @@ test("THE PICKER SHOWS THE NAME THE OWNER GAVE THE CHANNEL, NOT THE CONFIGURED L
   await signIn(page);
   assert.deepStrictEqual(optionText(page, "discord-channel"), ["the build channel"]);
   assert.deepStrictEqual(
-    [...page.el("discord-channel").children].map((option) => option.value),
+    pickerOptions(page, "discord-channel").map((option) => option.value),
     [CHANNEL.id],
     "the VALUE is still the snowflake: it is what every route on the server takes"
   );
@@ -29648,6 +29655,87 @@ test("each channel uses its own provider's capabilities in a multi-provider depl
   assert.equal(page.timelineCalls.length, 1, "the threaded provider's channel was not read as a timeline");
   assert.match(page.timelineCalls[0], new RegExp(team.id));
   assert.match(page.el("live-state").textContent, /every 15 seconds/);
+});
+
+/** A channel picker as it is drawn: each heading, and the names of the channels under it. */
+const pickerGroups = (page, id) =>
+  page.el(id).children
+    .filter((kid) => kid.tagName === "optgroup")
+    .map((group) => [group.label, group.children.map((option) => option.textContent)]);
+
+/** A deployment of two providers whose channels the server lists interleaved. */
+function twoProviderPage(providers) {
+  const page = newPage();
+  const general = { id: "C0GENERAL01", label: "general", writable: true, provider: "slack" };
+  const space = { id: "1110000000000000201", label: "chat space", writable: false, provider: "gchat" };
+  const builds = { id: "C0BUILDS001", label: "builds", writable: true, provider: "slack" };
+  page.channels = [general, space, builds];
+  page.selfAuthorId = null;
+  const described = (key, name) => ({ key, name, threading_supported: false, live_delivery: "off",
+    live_poll_seconds: 0, channel_registration_supported: false, channel_discovery_supported: false,
+    upstream_read_mark_supported: false, self_author_id: null, owner_author_id: null });
+  page.providers = providers.map(([key, name]) => described(key, name));
+  page.channelPage = async (path) =>
+    json(200, { channel: page.channels.find((channel) => String(path).includes(channel.id)), messages: [] });
+  return { page, general, space, builds };
+}
+
+test("`channel-provider-groups`: the channel pickers list each provider's channels under its own heading", async () => {
+  const { page, general, space, builds } = twoProviderPage([["slack", "Slack"], ["gchat", "Google Chat"]]);
+  await signIn(page);
+  await showDiscord(page, []);
+  // The owner's words: "Slack channels" and "Google Chat channels". Each provider's channels keep
+  // the server's order inside its group, and the groups come in the order of their first channel.
+  const expected = [["Slack channels", ["general", "builds"]], ["Google Chat channels", ["chat space"]]];
+  assert.deepStrictEqual(pickerGroups(page, "discord-channel"), expected);
+  assert.deepStrictEqual(pickerOptions(page, "discord-channel").map((option) => option.value),
+    [general.id, builds.id, space.id], "an option's value stopped being the channel's id");
+  assert.equal(page.el("discord-channel").value, general.id, "the first channel listed is not where it opened");
+  // Settings' picker is grouped the same way, with All channels above the groups.
+  assert.deepStrictEqual(pickerGroups(page, "settings-channel"), expected);
+  assert.deepStrictEqual(optionText(page, "settings-channel"), ["All channels", "general", "builds", "chat space"]);
+  // Alt+↓ steps in the order the picker shows, which is no longer the server's order.
+  await press(page, page.el("scroll-area"), "ArrowDown", { altKey: true });
+  await page.settle();
+  assert.equal(page.el("discord-channel").value, builds.id, "Alt+↓ left the group the picker shows it in");
+  await press(page, focused(page) || page.el("scroll-area"), "ArrowDown", { altKey: true });
+  await page.settle();
+  assert.equal(page.el("discord-channel").value, space.id, "Alt+↓ did not cross into the next group");
+  await press(page, focused(page) || page.el("scroll-area"), "ArrowUp", { altKey: true });
+  await page.settle();
+  assert.equal(page.el("discord-channel").value, builds.id, "Alt+↑ did not step back across the groups");
+});
+
+test("`channel-provider-groups`: two providers of one name are told apart by their keys, and a nameless one by its key", async () => {
+  const twins = twoProviderPage([["slack", "Slack"], ["gchat", "Slack"]]);
+  await signIn(twins.page);
+  assert.deepStrictEqual(pickerGroups(twins.page, "discord-channel").map(([label]) => label),
+    ["Slack channels (slack)", "Slack channels (gchat)"]);
+  const nameless = twoProviderPage([["slack", "Slack"], ["gchat", " "]]);
+  await signIn(nameless.page);
+  assert.deepStrictEqual(pickerGroups(nameless.page, "discord-channel").map(([label]) => label),
+    ["Slack channels", "gchat channels"]);
+});
+
+test("`channel-provider-groups`: a deployment of one provider still shows its one heading, named by the service", async () => {
+  const page = newPage();
+  const second = { id: "1110000000000000002", label: "second", writable: true };
+  page.channels = [{ ...CHANNEL }, second];
+  page.chatProviderName = "Google Chat";
+  await signIn(page);
+  assert.deepStrictEqual(pickerGroups(page, "discord-channel"), [["Google Chat channels", ["lead team", "second"]]]);
+  // An older server names no service: the heading is still there, and still says what it holds.
+  const older = newPage();
+  older.chatProviderName = "";
+  await signIn(older);
+  assert.deepStrictEqual(pickerGroups(older, "discord-channel"), [["Chat channels", ["lead team"]]]);
+  // A cold start draws the heading from what it saved, before /client-config has answered.
+  await showDiscord(page, [message({ id: "501", content: "saved" })]);
+  const reloaded = newPage(page.storage, SCRIPT, (p) => {
+    p.clientConfig = gate(p.clientConfig).respond;
+  });
+  assert.equal(reloaded.screen(), "main", "the reload waited for the network");
+  assert.deepStrictEqual(pickerGroups(reloaded, "discord-channel"), [["Google Chat channels", ["lead team", "second"]]]);
 });
 
 // `gchat-thread-selector`. What the bar's thread picker offers, as [value, label] pairs.
@@ -33626,7 +33714,7 @@ test("channel browser: Add registers the source through the ordinary add route",
   assert.equal(directoryRows(page)[1], "Release Train | Already added");
   assert.match(page.el("channel-directory-state").text(), /^Added\. "Release Train" is now in/);
   assert.ok(
-    page.el("discord-channel").children.some((option) => option.value === page.registeredChannelId),
+    pickerOptions(page, "discord-channel").some((option) => option.value === page.registeredChannelId),
     "the added channel is not in the picker"
   );
 });
@@ -34493,7 +34581,7 @@ test("a channel added or removed here is in the saved picker the next cold start
     p.clientConfig = config.respond;
   });
   assert.ok(
-    reloaded.el("discord-channel").children.some((option) => option.value === added),
+    pickerOptions(reloaded, "discord-channel").some((option) => option.value === added),
     "the cold start drew the picker from before the add"
   );
   config.open();
@@ -58075,7 +58163,7 @@ async function allChannelsPage(modes = {}, arrange = (_page) => {}) {
 }
 
 /** The picker's choices, as [value, words]. */
-const pickerChoices = (page) => page.el("settings-channel").children.map((option) => [option.value, option.textContent]);
+const pickerChoices = (page) => pickerOptions(page, "settings-channel").map((option) => [option.value, option.textContent]);
 
 test("`#349 channel-settings-all`: the picker opens with All channels where there are two or more, and only there", async () => {
   const page = await allChannelsPage();
@@ -58084,7 +58172,7 @@ test("`#349 channel-settings-all`: the picker opens with All channels where ther
   // Settings still opens on a channel, as it did: All is a choice, not where the box starts.
   assert.equal(page.el("settings-channel").value, CHANNEL.id);
   // The reading picker is about one channel, always.
-  assert.ok(!page.el("discord-channel").children.some((option) => option.value === "*"), "the channel view offers All channels");
+  assert.ok(!pickerOptions(page, "discord-channel").some((option) => option.value === "*"), "the channel view offers All channels");
   // One channel: all of them is that one, and the choice would be a second name for it.
   const one = await clearingPage();
   assert.deepStrictEqual(pickerChoices(one), [[CHANNEL.id, "lead team"]]);

@@ -2238,6 +2238,11 @@ One running server can read Discord, a compatible bridge for another service suc
 Chat, and Slack at the same time. You serve one copy of the app, sign in once, and pick any
 channel from any of them in the same channel picker.
 
+The picker lists each provider's channels under a heading named for it — "Slack channels",
+"Google Chat channels" — taken from the provider's `name`. Within a heading, channels keep the
+server's order. A server with a single provider still shows its one heading. When two providers
+share a `name`, their headings add the key, for example "Slack channels (work)".
+
 Each provider is a `[[providers]]` entry with a short `key`. Each channel names the key of the
 provider it is read through. The legacy `[discord]` section is still accepted: when present, it
 becomes the provider keyed `discord`, and channels that name no provider belong to it.

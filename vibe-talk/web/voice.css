@@ -6418,6 +6418,24 @@ a.search-hit-link {
   -webkit-tap-highlight-color: transparent;
 }
 
+/* `channel-provider-groups`. The heading over each provider's channels in the two channel pickers,
+   "Slack channels", in the muted semibold the page's other headings over a list wear, and upright:
+   a browser's default italic reads as a hint rather than a name. The channels under it keep the
+   picker's own ink and weight. Where the platform draws its own menu — iOS, macOS — it draws the
+   heading in its own style, which is the one a thumb already knows. */
+#discord-channel optgroup,
+#settings-channel optgroup {
+  font-style: normal;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+#discord-channel optgroup > option,
+#settings-channel optgroup > option {
+  font-weight: normal;
+  color: var(--ink);
+}
+
 /* style.css dresses `select` and `input` but not `textarea`, so the prompt fields on the settings
    screen would otherwise be unstyled system boxes sitting between two that are not. */
 textarea {

@@ -9449,8 +9449,9 @@ function stepChannel(event) {
   if (!channelOnScreen()) return false;
   const picker = el("discord-channel");
   if (picker.hidden || picker.disabled) return false;
-  const at = knownChannels.findIndex((channel) => String(channel.id) === String(picker.value));
-  const next = at < 0 ? null : knownChannels[at + (event.key === "ArrowDown" ? 1 : -1)];
+  const order = pickerOrder();
+  const at = order.findIndex((channel) => String(channel.id) === String(picker.value));
+  const next = at < 0 ? null : order[at + (event.key === "ArrowDown" ? 1 : -1)];
   // At either end the list stops, rather than wrapping round to a channel at the other end.
   if (!next) return true;
   picker.value = String(next.id);
@@ -17499,6 +17500,8 @@ function saveCacheShell(config) {
     coding_agent_ids: Array.isArray(config.coding_agent_ids) ? config.coding_agent_ids : [],
     coding_agents_named_only: config.coding_agents_named_only === true,
     providers: Array.isArray(config.providers) ? config.providers : [],
+    // What the picker's one group is named on a deployment that describes no providers.
+    chat_provider_name: typeof config.chat_provider_name === "string" ? config.chat_provider_name.trim() : "",
   };
   const listed = new Set(channels.map((channel) => String(channel.id)));
   for (const key of Object.keys(cache.scopes)) {
@@ -18376,6 +18379,7 @@ function hydrateFromCache() {
   deploymentCapabilities.threading = threadingSupported;
   knownChannels = shell.channels;
   learnProviders(shell.providers);
+  if (typeof shell.chat_provider_name === "string") chatProviderName = shell.chat_provider_name;
   deploymentCodingAgents = codingAgentsFrom(shell);
   if (shell.self_author_id) noteSelfAuthor(shell.self_author_id);
   ownerAuthorId = shell.owner_author_id || null;
@@ -40825,10 +40829,8 @@ function settleReplays(read, page) {
 
 /** The label the channel select shows for a snowflake, or the snowflake itself. */
 function channelLabel(channelId) {
-  const option = /** @type {HTMLOptionElement[]} */ ([...el("discord-channel").children]).find(
-    (child) => child.value === String(channelId)
-  );
-  return option ? option.textContent : String(channelId);
+  const channel = knownChannel(channelId);
+  return channel ? channelName(channel) : String(channelId);
 }
 
 /**
@@ -41664,6 +41666,52 @@ function rememberActiveChannel(chosen = false) {
 }
 
 /**
+ * The channel pickers' groups: one per chat provider, in the order its first channel has in
+ * `knownChannels`, holding its channels in the server's order. `channel-provider-groups`. The owner
+ * asked to see which service each channel is read through when the list opens — "Slack channels",
+ * "Google Chat channels" — and a deployment of one provider keeps its one heading, so the list says
+ * the same thing whichever deployment it is on.
+ *
+ * Grouped by first appearance rather than by configuration order, so the first channel of the
+ * list is still the first in the picker: the one a window with no remembered channel opens on.
+ * Two providers the configuration gives the same name are told apart by their keys.
+ *
+ * @returns {{ label: string, channels: any[] }[]}
+ */
+function channelGroups() {
+  /** @type {Map<string, any[]>} */
+  const byKey = new Map();
+  for (const channel of knownChannels) {
+    // Without provider descriptions the deployment has one provider, whatever a channel says.
+    const key = providerDescriptions.size > 0 && typeof channel.provider === "string" ? channel.provider : "";
+    const members = byKey.get(key) || [];
+    members.push(channel);
+    byKey.set(key, members);
+  }
+  const named = [...byKey].map(([key, channels]) => ({ key, name: providerGroupName(key), channels }));
+  return named.map((group) => {
+    const shared = named.some((other) => other !== group && other.name === group.name);
+    const label = `${group.name} channels${shared && group.key ? ` (${group.key})` : ""}`;
+    return { label, channels: group.channels };
+  });
+}
+
+/**
+ * What a group of the channel pickers is named after: the provider's configured name, the
+ * deployment's one service when it describes no providers, or the provider's key.
+ */
+function providerGroupName(key) {
+  const provider = providerDescriptions.get(key);
+  const named = provider && typeof provider.name === "string" ? provider.name.trim() : "";
+  return named || (providerDescriptions.size === 0 ? chatProviderName : "") || key || "Chat";
+}
+
+/** The channels in the order the picker lists them, which is the order Alt+↓ and Alt+↑ step. */
+function pickerOrder() {
+  return channelGroups().flatMap((group) => group.channels);
+}
+
+/**
  * Redraw one channel picker from `knownChannels`, keeping it on the channel it was showing.
  *
  * A rename is a redraw, NOT a change of channel. Rebuilding the options moves a `select` to its
@@ -41685,18 +41733,25 @@ function fillChannelSelect(id) {
     option.textContent = "All channels";
     select.append(option);
   }
-  for (const channel of knownChannels) {
-    const option = document.createElement("option");
-    option.value = channel.id;
-    option.textContent = channelName(channel);
-    select.append(option);
+  // `channel-provider-groups`. Under a heading per provider, on a deployment of one as well.
+  for (const group of channelGroups()) {
+    const heading = document.createElement("optgroup");
+    heading.label = group.label;
+    for (const channel of group.channels) {
+      const option = document.createElement("option");
+      option.value = channel.id;
+      option.textContent = channelName(channel);
+      heading.append(option);
+    }
+    select.append(heading);
   }
+  const first = pickerOrder()[0];
   if (all && chosen === ALL_CHANNELS) {
     select.value = ALL_CHANNELS;
   } else if (knownChannels.some((channel) => String(channel.id) === String(chosen))) {
     select.value = chosen;
-  } else if (knownChannels.length > 0) {
-    select.value = knownChannels[0].id;
+  } else if (first) {
+    select.value = first.id;
   } else {
     select.value = "";
   }

@@ -1408,6 +1408,26 @@ def view_keys(walk: Walk, mod: str, words: str) -> None:
 
 def picker_and_help_keys(walk: Walk) -> None:
     """Ctrl+K and a channel chosen gives the keys back to the list; Esc leaves the picker; Help's Back after "?"."""
+    # `channel-provider-groups`. What Ctrl+K opens: the channels under their provider's heading, on a
+    # server of one provider too, drawn by Chromium's own select with the heading upright and semibold.
+    groups = walk.page.evaluate("""() => {
+      const picker = document.getElementById('discord-channel');
+      return {
+        groups: [...picker.children].map((kid) => [kid.tagName.toLowerCase(), kid.label,
+          [...kid.children].map((option) => option.value)]),
+        options: [...picker.options].map((option) => option.value),
+        style: [...picker.querySelectorAll('optgroup')].map((group) => {
+          const seen = getComputedStyle(group);
+          return [seen.fontStyle, seen.fontWeight];
+        }),
+      };
+    }""")
+    check(groups["groups"] == [["optgroup", "Google Chat channels", [CHANNEL["id"], SECOND["id"]]]],
+          f"the channel picker is not one Google Chat group holding both channels: {groups['groups']}")
+    check(groups["options"] == [CHANNEL["id"], SECOND["id"]], f"the picker's options are not the channels: {groups['options']}")
+    check(groups["style"] == [["normal", "600"]], f"the provider heading is not upright and semibold: {groups['style']}")
+    walk.notes.append('the channel picker held both channels under one "Google Chat channels" heading, upright and semibold')
+
     opened = walk.key("Control+k")
     check(opened["focus"] == "discord-channel", f"Ctrl+K left the focus on {opened['focus']!r}, not the channel picker")
     check(walk.last_key()["prevented"] is True, "Ctrl+K was left to the browser")
