@@ -2325,6 +2325,11 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     speakCalls: [],
     /** `#read-aloud-latency`: every prepare request, so "ahead of the tap" is testable. */
     prepareCalls: [],
+    /** `#375 read-aloud-latency`: each prepare request's abort signal, null when it had none. */
+    prepareSignals: [],
+    /** `#375`: prepare requests unanswered right now, and the most there ever were at once. */
+    preparesInFlight: 0,
+    maxPreparesInFlight: 0,
     /** Content-free browser playback timing reports, kept apart from synthesis calls. */
     speechTimingCalls: [],
     /** Make preparing fail, to prove the tap still works by the older, slower route. */
@@ -3100,8 +3105,25 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       if (/\/speech\/prepare$/.test(String(path))) {
         const asked = JSON.parse((options && options.body) || "{}");
         page.prepareCalls.push(asked);
-        const held = page.prepareHold && page.prepareHold(asked);
-        if (held) await held;
+        const signal = (options && options.signal) || null;
+        page.prepareSignals.push(signal);
+        page.preparesInFlight += 1;
+        page.maxPreparesInFlight = Math.max(page.maxPreparesInFlight, page.preparesInFlight);
+        try {
+          const held = page.prepareHold && page.prepareHold(asked);
+          // `#375 read-aloud-latency`. A held request the page cancels fails as a browser's does.
+          if (held) {
+            await new Promise((resolve, reject) => {
+              held.then(resolve, reject);
+              if (signal) {
+                signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })));
+              }
+            });
+          }
+        } finally {
+          page.preparesInFlight -= 1;
+        }
+        if (signal && signal.aborted) throw Object.assign(new Error("aborted"), { name: "AbortError" });
         page.setClock(page.clock() + page.prepareResponseDelayMs);
         if (page.prepareFails) {
           return json(500, { error: "nope", detail: "no" });
@@ -10584,20 +10606,23 @@ test("A TAP DOES NOT WAIT FOR THE BATCH: it prepares only its own row and reads 
   await rows[1].dispatch("click", {});
   await page.settle();
 
-  assert.equal(page.prepareCalls.length, 2, "the tap did not prepare its own row");
   assert.deepEqual(page.prepareCalls[1].ids, ["1000000000000000002"], "the tap prepared more than its row");
   assert.equal(page.players.length, 1, "the read waited for the batch");
   assert.match(page.players[0].url, /^\/api\/v1\/speech\/ticket-for-1000000000000000002\?selection=tap-/);
   assert.equal(page.players[0].playCount, 1, "nothing was played");
   assert.deepEqual(page.speakCalls, [], "the tap fell back to the slow route");
+  // `#375 read-aloud-latency`. The batch gave way to the tap and starts again behind it, for the
+  // rows still unprepared.
+  assert.equal(page.prepareCalls.length, 3, "the batch did not start again behind the tap");
+  assert.deepEqual([...page.prepareCalls[2].ids].sort(), ["1000000000000000001", "1000000000000000003"]);
 
   // The batch finishes behind the read, and the other rows are then ready for their own taps.
   releaseBatch();
   await page.settle();
-  assert.equal(page.prepareCalls.length, 2, "the batch was asked for again");
+  assert.equal(page.prepareCalls.length, 3, "the batch was asked for again");
   await rows[2].dispatch("click", {});
   await page.settle();
-  assert.equal(page.prepareCalls.length, 2, "a row the batch had prepared was prepared again");
+  assert.equal(page.prepareCalls.length, 3, "a row the batch had prepared was prepared again");
   assert.match(page.players[1].url, /^\/api\/v1\/speech\/ticket-for-1000000000000000003\?selection=tap-/);
 });
 
@@ -10616,7 +10641,10 @@ test("a tap on a COMBINED row prepares every message in that row, and nothing el
   await rows[0].dispatch("click", {});
   await page.settle();
 
-  assert.deepEqual(page.prepareCalls.at(-1).ids, ["1000000000000000001", "1000000000000000002"]);
+  assert.ok(
+    page.prepareCalls.some((call) => JSON.stringify(call.ids) === JSON.stringify(["1000000000000000001", "1000000000000000002"])),
+    `the combined row was not prepared on its own: ${JSON.stringify(page.prepareCalls)}`
+  );
   assert.equal(page.players.length, 1, "the combined read did not start");
   assert.match(page.players[0].url, /ticket-for-1000000000000000001\?/);
 });
@@ -32263,15 +32291,97 @@ test("thread-aware speech batches never mix threads and summaries and read marks
   await readButton(page).click();
   await page.settle();
   assert.equal(page.prepareCalls.length, 3);
-  assert.deepEqual(page.prepareCalls.map((call) => [call.thread_id || null, call.ids]), [
+  // In any order: the rows on screen go first (`#375 read-aloud-latency`).
+  assert.deepEqual(page.prepareCalls.map((call) => [call.thread_id || null, call.ids]).sort(), [
     [null, ["200"]], [data.threads[0].id, ["201", "202"]], [data.threads[1].id, ["203", "204"]],
-  ]);
+  ].sort());
   await page.el("summarise").click();
   await page.settle();
   assert.ok(page.summaryPaths.some((path) => new URL(path, "http://fixture.test").searchParams.get("thread_id") === data.threads[0].id));
   const row = page.el("discord-log").children[2];
   await upstreamReadButton(row).click();
   assert.deepEqual(page.upstreamReadCalls.at(-1), { message_id: "202", thread_id: data.threads[0].id });
+});
+
+// --- `#375 read-aloud-latency`: one preparation at a time, and a tap takes its place ---------------
+
+/** A channel of three threads' worth of rows in Read, with every preparation held until released. */
+async function heldThreadPreparations() {
+  const page = newPage();
+  const data = threadData();
+  data.messages.forEach((m) => { m.content = longMessage(m.id); });
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  const releases = [];
+  page.prepareHold = () => new Promise((resolve) => { releases.push(resolve); });
+  page.enableAbort();
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await page.el("channel-view-flat").click();
+  await readButton(page).click();
+  await page.settle();
+  return { page, data, releases };
+}
+
+test("THE THREADS ON SCREEN ARE PREPARED ONE AFTER ANOTHER, never all at once", async () => {
+  // The owner's lag on 2026-10-19: ten preparations for one channel in flight together, each 46 to
+  // 53 s, because one upstream slot served them in turn. One at a time, each is answered as fast as
+  // that slot allows, and the first rows are ready while the last are still being asked for.
+  const { page, data, releases } = await heldThreadPreparations();
+  assert.equal(page.prepareCalls.length, 1, "the threads were not prepared one at a time");
+  assert.equal(page.maxPreparesInFlight, 1);
+  for (let answered = 1; answered < 3; answered += 1) {
+    releases[answered - 1]();
+    await page.settle();
+    assert.equal(page.prepareCalls.length, answered + 1, `thread ${answered + 1} was never asked for`);
+    assert.equal(page.maxPreparesInFlight, 1, "two preparations were in flight at once");
+  }
+  releases[2]();
+  await page.settle();
+  assert.deepEqual(page.prepareCalls.map((call) => [call.thread_id || null, call.ids]).sort(), [
+    [null, ["200"]], [data.threads[0].id, ["201", "202"]], [data.threads[1].id, ["203", "204"]],
+  ].sort());
+});
+
+test("a tap that needs preparing CANCELS the batch in flight, reads at once, and the batch resumes", async () => {
+  const { page, data, releases } = await heldThreadPreparations();
+  assert.equal(page.prepareCalls.length, 1);
+  const batchSignal = page.prepareSignals[0];
+  assert.ok(batchSignal, "the batch cannot be cancelled");
+  // The tap's own preparation is answered at once; only the batch is held.
+  page.prepareHold = (asked) => (asked.ids.includes("203") && asked.ids.length === 1
+    ? null : new Promise((resolve) => { releases.push(resolve); }));
+  const row = [...page.el("discord-log").children].find((li) => li.getAttribute("data-id") === "203");
+  await row.dispatch("click", {});
+  await page.settle();
+  assert.equal(batchSignal.aborted, true, "the batch's request was left ahead of the tap's on the server");
+  const tapCall = page.prepareCalls.find((call) => call.ids.length === 1 && call.ids[0] === "203");
+  assert.ok(tapCall, `the tap did not prepare its own row: ${JSON.stringify(page.prepareCalls)}`);
+  assert.equal(tapCall.thread_id, data.threads[1].id);
+  assert.equal(page.players.length, 1, "the read waited for the batch");
+  assert.match(page.players[0].url, /ticket-for-203\?selection=tap-/);
+  // ...and the batch starts again behind the read, without the row the tap prepared.
+  const after = page.prepareCalls.slice(page.prepareCalls.indexOf(tapCall) + 1);
+  assert.equal(after.length, 1, "the batch did not resume, or resumed more than once");
+  assert.ok(after[0].ids.length > 0 && !after[0].ids.includes("203"),
+    `the resumed batch asked again for the row the tap prepared: ${JSON.stringify(after[0])}`);
+  assert.ok(page.maxPreparesInFlight <= 2, "more than the tap's and one batch request were in flight");
+});
+
+test("a batch cancelled while it was being answered keeps nothing it was answered with", async () => {
+  // Changing the pace forgets every ticket; a batch already in flight at the old pace must not put
+  // them back.
+  const { page, releases } = await heldThreadPreparations();
+  const first = page.prepareSignals[0];
+  page.prepareHold = null;
+  page.el("read-speed-range").value = "150";
+  await page.el("read-speed-range").dispatch("input");
+  await page.settle();
+  assert.equal(first.aborted, true, "the batch at the old pace was left running");
+  releases[0]();
+  await page.settle();
+  const speeds = page.prepareCalls.slice(1).map((call) => call.speed);
+  assert.ok(speeds.length > 0 && speeds.every((speed) => speed === 1.5), `re-prepared at ${speeds}`);
 });
 
 test("a failed standalone send keeps its text in a retryable row and its composer usable", async () => {

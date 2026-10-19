@@ -29674,27 +29674,53 @@ function preparedEntry(id) {
  * Resolve everything on screen so a tap does not have to.
  *
  * Called when read-aloud is switched on, and again as rows arrive or scroll into reach. Cheap to
- * repeat: it is one request covering every visible row, against messages the server has usually
+ * repeat: it asks only for rows with nothing prepared, against messages the server has usually
  * just fetched anyway. It spends NOTHING at the vendor — no audio is generated until a tap.
  *
  * A TAP NEVER WAITS FOR THIS. `#191 read-aloud-first-lag`: a tap on a row that has no ticket yet
  * prepares that row on its own (`prepareSpeechFor`) and starts reading it, and this batch carries
  * on behind it.
+ *
+ * ONE REQUEST AT A TIME, and a tap takes its place. `#375 read-aloud-latency`: the server prepares
+ * one thread per request, and this used to send every thread's request at once. On a chat service
+ * whose lookups queue behind one upstream slot, ten threads on screen were ten lookups queued
+ * behind each other, and the tapped row's own preparation queued behind all ten: the owner's tap
+ * waited 46 to 53 seconds and then failed with them. Now the threads go one after another, the
+ * rows on screen first, and a tap that needs a preparation cancels the one in flight
+ * (`cancelPrepareSpeech`), which starts again once the tap's own request is answered.
  */
 let prepareSpeechInFlight = null;
+/** Cancels the batch in flight; null when none is. */
+let prepareSpeechAbort = null;
 
 async function prepareSpeech() {
   if (prepareSpeechInFlight !== null) return prepareSpeechInFlight;
-  const running = prepareSpeechNow();
+  const abort = typeof AbortController === "function" ? new AbortController() : null;
+  const running = prepareSpeechNow(abort ? abort.signal : null);
   prepareSpeechInFlight = running;
+  prepareSpeechAbort = abort;
   try {
     return await running;
   } finally {
-    if (prepareSpeechInFlight === running) prepareSpeechInFlight = null;
+    if (prepareSpeechInFlight === running) {
+      prepareSpeechInFlight = null;
+      prepareSpeechAbort = null;
+    }
   }
 }
 
-async function prepareSpeechNow() {
+/**
+ * Stop the batch in flight, so the next `prepareSpeech` starts afresh. Its request is closed, which
+ * frees the server's lookup for a tap, and nothing it was answered with afterwards is kept.
+ */
+function cancelPrepareSpeech() {
+  if (prepareSpeechAbort !== null) prepareSpeechAbort.abort();
+  prepareSpeechInFlight = null;
+  prepareSpeechAbort = null;
+}
+
+/** @param {AbortSignal | null} signal */
+async function prepareSpeechNow(signal) {
   if (!readingMode || currentView !== "discord") {
     return;
   }
@@ -29707,22 +29733,31 @@ async function prepareSpeechNow() {
   if (!channel) {
     return;
   }
-  const ids = [];
+  // The rows the reader can see first, then the rest, each in screen order. `#375`.
+  const seen = [];
+  const beyond = [];
   for (const li of shownChannelList().children) {
     // `#196 auto-read-noise`. A placeholder is not prepared: preparing warms a vendor lookup for a
     // message nobody is going to ask to hear. A tap on one still reads it, preparing it then.
     const held = rowMessages(li);
+    let visible = true;
+    try {
+      visible = rowOnScreen(li);
+    } catch (_error) {
+      // Nothing laid out to ask: screen order alone.
+    }
     idsOf(li).forEach((id, index) => {
       if (id && !preparedEntry(id) && !isNoise(held[index])) {
-        ids.push(id);
+        (visible ? seen : beyond).push(id);
       }
     });
   }
+  const ids = [...seen, ...beyond];
   if (ids.length === 0) {
     return;
   }
   try {
-    await requestPreparedSpeech(channel, ids);
+    await requestPreparedSpeech(channel, ids, signal);
   } catch (_error) {
     // PREPARING IS AN OPTIMISATION AND FAILS LIKE ONE. The tap still works without it, by the
     // older and slower route, so taking the channel away over this would trade a slow feature for
@@ -29733,25 +29768,33 @@ async function prepareSpeechNow() {
 /**
  * Prepare exactly these messages, one request per thread they belong to, and keep their tickets.
  *
+ * The requests go ONE AFTER ANOTHER, in the order their threads first appear in `ids`, and each
+ * thread's tickets are kept as soon as they arrive. `#375 read-aloud-latency`: sent all at once
+ * they queued behind each other upstream anyway, and every one waited for the slowest.
+ *
  * @param {string} channel the channel the ids are in.
- * @param {Array<string>} ids message ids, in screen order.
+ * @param {Array<string>} ids message ids, most wanted first.
+ * @param {AbortSignal | null} [signal] stops it between requests, and closes the one in flight.
  */
-async function requestPreparedSpeech(channel, ids) {
+async function requestPreparedSpeech(channel, ids, signal = null) {
   const groups = new Map();
   for (const id of ids) {
     const threadId = threadForMessageId(id);
     if (!groups.has(threadId)) groups.set(threadId, []);
     groups.get(threadId).push(id);
   }
-  // Before the requests go: the tickets may be minted the moment they arrive, and counting from the
-  // answer would let a URL outlive its ticket by however long the answer took. `#290`.
-  const requestedAt = speechDeadlineNow();
-  const batches = await Promise.all([...groups].map(([threadId, messageIds]) => api(
-    `/api/v1/channels/${encodeURIComponent(channel)}/speech/prepare`,
-    { method: "POST", body: { ids: messageIds, speed: readSpeed === null ? null : readSpeed / 100,
-      ...(threadId ? { thread_id: threadId } : {}) } }
-  )));
-  for (const batch of batches) {
+  for (const [threadId, messageIds] of groups) {
+    if (signal && signal.aborted) return;
+    // Before the request goes: the tickets may be minted the moment it arrives, and counting from
+    // the answer would let a URL outlive its ticket by however long the answer took. `#290`.
+    const requestedAt = speechDeadlineNow();
+    const batch = await api(
+      `/api/v1/channels/${encodeURIComponent(channel)}/speech/prepare`,
+      { method: "POST", body: { ids: messageIds, speed: readSpeed === null ? null : readSpeed / 100,
+        ...(threadId ? { thread_id: threadId } : {}) }, ...(signal ? { signal } : {}) }
+    );
+    // Cancelled while it was answered: its tickets may be for a pace or a screen that has gone.
+    if (signal && signal.aborted) return;
     // A batch that says no lifetime gives URLs that are never played: none is not forever.
     const lifetimeMs = (Number(batch && batch.expires_in_seconds) || 0) * 1000;
     const until = { mono: requestedAt.mono + lifetimeMs, wall: requestedAt.wall + lifetimeMs };
@@ -29784,6 +29827,9 @@ async function prepareSpeechFor(ids) {
   if (!channel || readAloudPlayback !== "audio") return;
   const missing = ids.map(String).filter((id) => id && !preparedEntry(id));
   if (missing.length === 0) return;
+  // The batch gives way: on the server its lookup would sit ahead of this one. `#375`. The tap
+  // starts it again (`readAloud`) once this is answered.
+  cancelPrepareSpeech();
   try {
     await requestPreparedSpeech(channel, missing);
   } catch (_error) {
@@ -29791,8 +29837,12 @@ async function prepareSpeechFor(ids) {
   }
 }
 
-/** Forget what was prepared. The pace is baked into a ticket, so changing it invalidates them. */
+/**
+ * Forget what was prepared. The pace is baked into a ticket, so changing it invalidates them, and a
+ * batch still in flight would bring back tickets at the old pace: it is cancelled.
+ */
 function forgetPreparedSpeech() {
+  cancelPrepareSpeech();
   preparedSpeech.clear();
 }
 

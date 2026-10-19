@@ -4627,6 +4627,9 @@ pub async fn play_speech(
     tracing::info!(
         observation = prepared.observation,
         message_preparation_ms = prepared.preparation_ms,
+        // A count, not content: whether the provider's wait for its first audio grows with the
+        // length of what it was asked to say. `#375 read-aloud-latency`.
+        said_chars = prepared.said.chars().count(),
         session = session.map(|session| session.generation),
         turn = session.map(|session| session.turn),
         session_reused = session.map(|session| session.reused),
@@ -4743,6 +4746,7 @@ pub async fn speech_playback_timing(
     tracing::info!(
         observation = prepared.observation,
         message_preparation_ms = prepared.preparation_ms,
+        said_chars = prepared.said.chars().count(),
         session = server.session.map(|session| session.generation),
         turn = server.session.map(|session| session.turn),
         session_reused = server.session.map(|session| session.reused),
