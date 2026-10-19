@@ -3212,7 +3212,7 @@ POPOUT_FOOT_SLACK_PX = 16
 
 # The folds of the Messages section above Recently dismissed, in their order: opened by the foot scene
 # where the folded screen is too short to bring the group low (`#372 settings-header-layout`).
-DISMISSED_ABOVE_FOLDS = ("mark-own", "auto-read", "combining", "rich-headers", "identities")
+DISMISSED_ABOVE_FOLDS = ("mark-own", "auto-read", "empty-messages", "combining", "rich-headers", "identities")
 
 # Said by the pill while the pop-out stands at the foot: long enough to draw the pill at its widest, as a
 # long channel name or a long error does, so it reaches into the pop-out wherever the column puts it.
@@ -3642,15 +3642,15 @@ def _act_settings_prose(driver: Driver) -> None:
     """`#347 settings-prose`: Settings' Messages section with no line of description under any heading.
 
     A fresh load, Settings, and the screen scrolled to put the Messages section at the top: Your own
-    messages, Mark-read automatically (the owner's name for it), Combining messages and Rich headers,
-    each a heading, its `?` and its control, the one-line descriptions that stood under them now the
+    messages, Mark-read automatically (the owner's name for it), Empty messages beside it (`#386
+    hide-empty-messages`), Combining messages and Rich headers, each a heading, its `?` and its control, the one-line descriptions that stood under them now the
     tooltips of the heading and the `?`.
     """
     driver.load(with_token=True)
     driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
     driver.click("open-settings")
     driver.page.wait_for_function("() => window.__visible('close-settings')", timeout=5_000)
-    _unfold(driver, "mark-own-read", "help-link-auto-read", "combine-messages")
+    _unfold(driver, "mark-own-read", "help-link-auto-read", "hide-empty-messages", "combine-messages")
     driver.js(
         "(() => { document.getElementById('settings-messages').scrollIntoView({ block: 'start' }); return true; })()"
     )
@@ -6238,16 +6238,16 @@ SCENES: tuple[Scene, ...] = (
             ("the settings screen is up", "window.__visible('screen-settings')"),
             (
                 # The owner's name for the list, and the old one gone.
-                "Messages holds Your own messages, Mark-read automatically, Combining messages and Rich headers",
+                "Messages holds Your own messages, Mark-read automatically, Empty messages, Combining messages and Rich headers",
                 "(() => { const heads = [...document.querySelectorAll('#settings-messages .settings-group .group-head > h3')]"
                 ".map((h) => h.textContent.trim()); "
-                "return ['Your own messages', 'Mark-read automatically', 'Combining messages', 'Rich headers']"
+                "return ['Your own messages', 'Mark-read automatically', 'Empty messages', 'Combining messages', 'Rich headers']"
                 ".every((h, i) => heads[i] === h) && !heads.includes('Read automatically'); })()",
             ),
             (
                 "the Messages title and its first groups are on the screen",
                 "['settings-messages-title', 'help-link-mark-own', 'mark-own-read', 'help-link-auto-read', "
-                "'help-link-combining', 'combine-messages'].every((id) => { "
+                "'help-link-empty-messages', 'hide-empty-messages', 'help-link-combining', 'combine-messages'].every((id) => { "
                 "const b = document.getElementById(id).getBoundingClientRect(); "
                 "const s = document.getElementById('screen-settings').getBoundingClientRect(); "
                 "return window.__visible(id) && b.top >= s.top - 1 && b.bottom <= s.bottom + 1; })",

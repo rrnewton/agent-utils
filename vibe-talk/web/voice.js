@@ -70,6 +70,7 @@ const READ_SPEED_KEY = "vibe-talk.voice.read-speed";
 const MARK_OWN_KEY = "vibe-talk.voice.mark-own-read";
 const MARKER_KEY = "vibe-talk.voice.place-marker";
 const COMBINE_KEY = "vibe-talk.voice.combine";
+const HIDE_EMPTY_KEY = "vibe-talk.voice.hide-empty";
 const RICH_HEADERS_KEY = "vibe-talk.voice.rich-headers";
 const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
 
@@ -154,7 +155,7 @@ const ALL_CHANNELS = "*";
 /**
  * @overload
  * @param {"api-token" | "channel-alias" | "channel-compose-grow" | "channel-directory-search"
- *   | "combine-messages" | "compose-grow" | "enter-sends" | "mark-own-read" | "mic-auto-gain"
+ *   | "combine-messages" | "compose-grow" | "enter-sends" | "hide-empty-messages" | "mark-own-read" | "mic-auto-gain"
  *   | "mic-echo-cancellation" | "side-compose-grow"
  *   | "message-cache-enabled"
  *   | "mic-noise-suppression" | "msg-scale" | "new-channel-id" | "new-channel-label"
@@ -183,13 +184,13 @@ const ALL_CHANNELS = "*";
  *   | "channel-view-flat" | "channel-view-main" | "channel-view-threads" | "clear-alias"
  *   | "clear-backlog" | "clear-view" | "close-browse-channels" | "close-help" | "close-reply"
  *   | "close-settings" | "collapse-all" | "column-toggle" | "dismiss-banner"
- *   | "dismiss-error" | "dismiss-status" | "expand-all" | "fold-help" | "fold-auto-read" | "fold-canned-prompts" | "fold-combining" | "fold-connection" | "fold-control-bar" | "fold-dismissed" | "fold-identities" | "fold-instructions" | "fold-keyboard" | "fold-mark-own" | "fold-message-cache" | "fold-microphone" | "fold-provider" | "fold-reading-full" | "fold-reading-width" | "fold-relay" | "fold-resuming" | "fold-rich-headers" | "fold-sending" | "fold-settings-all" | "fold-settings-channels" | "fold-settings-messages" | "fold-settings-screen" | "fold-settings-storage" | "fold-settings-voice-agent" | "fold-storage" | "fold-text-size" | "fold-token" | "fold-typing" | "forget-conversations"
+ *   | "dismiss-error" | "dismiss-status" | "expand-all" | "fold-help" | "fold-auto-read" | "fold-canned-prompts" | "fold-combining" | "fold-connection" | "fold-control-bar" | "fold-dismissed" | "fold-empty-messages" | "fold-identities" | "fold-instructions" | "fold-keyboard" | "fold-mark-own" | "fold-message-cache" | "fold-microphone" | "fold-provider" | "fold-reading-full" | "fold-reading-width" | "fold-relay" | "fold-resuming" | "fold-rich-headers" | "fold-sending" | "fold-settings-all" | "fold-settings-channels" | "fold-settings-messages" | "fold-settings-screen" | "fold-settings-storage" | "fold-settings-voice-agent" | "fold-storage" | "fold-text-size" | "fold-token" | "fold-typing" | "forget-conversations"
  *   | "forget-dismissed-sends" | "forget-token"
  *   | "dismissed-send-close" | "dismissed-send-copy" | "dismissed-send-restore"
  *   | "retry-start"
  *   | "hang-up"
  *   | "help-link-auto-read" | "help-link-canned-prompts" | "help-link-channel-alias"
- *   | "help-link-combining" | "help-link-connection" | "help-link-control-bar"
+ *   | "help-link-combining" | "help-link-connection" | "help-link-control-bar" | "help-link-empty-messages"
  *   | "help-link-identities" | "help-link-keyboard"
  *   | "help-link-live-messages" | "help-link-mark-own" | "help-link-microphone"
  *   | "help-link-reading-width" | "help-link-resuming" | "help-link-rich-headers"
@@ -1363,6 +1364,7 @@ const SETTINGS_FOLDS = [
   "settings-messages",
   "mark-own",
   "auto-read",
+  "empty-messages",
   "combining",
   "rich-headers",
   "identities",
@@ -1475,6 +1477,7 @@ const HELP_TOPICS = [
   "channel-alias",
   "mark-own",
   "auto-read",
+  "empty-messages",
   "combining",
   "rich-headers",
   "reading-width",
@@ -20938,7 +20941,7 @@ function catchUpFromAll() {
   const position = channelReadPosition(area);
   if (catchUpHeldView()) {
     const keeps = readFilterKeeps();
-    settleAfterRead(timelineMessages.filter((message) => !hidingRead() || keeps(message)),
+    settleAfterRead(timelineMessages.filter((message) => !hiddenEmpty(message) && (!hidingRead() || keeps(message))),
       { keepPosition: true, area, ...position });
   }
   renderChannelFreshness();
@@ -22493,7 +22496,8 @@ function syncUnreadReplies() {
   if (!threadingSupported || channelView !== "main" || channelCanon.channel !== String(el("discord-channel").value)) return;
   if (hidingRead()) {
     const keeps = readFilterKeeps();
-    const wanted = timelineMessages.filter(keeps).map((message) => String(message.id)).sort().join(" ");
+    const wanted = timelineMessages.filter((message) => !hiddenEmpty(message) && keeps(message))
+      .map((message) => String(message.id)).sort().join(" ");
     const drawn = [...el("discord-log").children].flatMap(idsOf).sort().join(" ");
     if (wanted !== drawn) {
       renderCachedTimeline();
@@ -23300,7 +23304,7 @@ function applyTimelinePage(payload, older = false, saved = false, delta = false,
   if (payload.thread) selectedThread = payload.thread;
   noteArchived(payload, !delta && !older && merged.length <= incoming.length);
   const keeps = readFilterKeeps();
-  const shown = timelineMessages.filter((message) => !hidingRead() || keeps(message));
+  const shown = timelineMessages.filter((message) => !hiddenEmpty(message) && (!hidingRead() || keeps(message)));
   if (older) {
     // Keep existing elements attached to the same messages: scroll restoration holds one of
     // those elements as its anchor, and recreating it would throw away the reader's position.
@@ -23360,7 +23364,7 @@ function holdingMessage(mutate) {
 function renderCachedTimeline() {
   if (!threadingSupported || channelView === "threads") return;
   const keeps = readFilterKeeps();
-  const shown = timelineMessages.filter((message) => !hidingRead() || keeps(message));
+  const shown = timelineMessages.filter((message) => !hiddenEmpty(message) && (!hidingRead() || keeps(message)));
   const redraw = () => {
     el("discord-log").replaceChildren(...glom(shown).map(discordNode));
     holdingReplyArrows(renderChannelRows);
@@ -24721,7 +24725,7 @@ function followPlacement() {
     timelineMessages = projected;
     renderCachedTimeline();
     const keeps = readFilterKeeps();
-    const shown = timelineMessages.filter((message) => !hidingRead() || keeps(message));
+    const shown = timelineMessages.filter((message) => !hiddenEmpty(message) && (!hidingRead() || keeps(message)));
     const newestNow = timeOf(shown[shown.length - 1], "timestamp");
     const newer = newestNow > newestAt;
     settleAfterRead(shown, { keepPosition: true, area, ...position, ownAct: !newer });
@@ -28055,6 +28059,13 @@ async function seekMessage(target, arrive, openAll) {
       return true;
     };
     if (hiddenAsRead()) return;
+    // `#386 hide-empty-messages`. Nor would any walk find an empty message while the reader hides those:
+    // the store holds it, and no list draws it.
+    const held = threadingSupported ? heldMessage(target) : null;
+    if (held && hiddenEmpty(held)) {
+      setStatus("Settings hides that empty message.");
+      return;
+    }
     // Never in two columns, whose left column is Main by the layout, and whose right column is a thread
     // a reply's arrow or a gathering does not leave. `#229 desktop-two-column`.
     if (!columnsShown && openAll()) {
@@ -29385,8 +29396,82 @@ function isNoise(message) {
  * a reply Main does not draw (`#222 unread-replies`, `replyTally`).
  */
 function stillToDo(message, done = archivedIds) {
-  return !done.has(String(message.id)) && !isNoise(message) &&
+  return !done.has(String(message.id)) && !isNoise(message) && !hiddenEmpty(message) &&
     (!markOwnRead || bucketFor(message.author_id, message.author_is_bot, messageChannel(message)) !== "me");
+}
+
+// --- empty messages ---------------------------------------------------------------------------
+//
+// `#386 hide-empty-messages`. The owner, 2026-10-19: "there is a BLANK message from the coding
+// agent... I want to have a checked-by-default box in that same settings area that completely
+// filters out empty messages." A row with a time, Reply and Done over nothing says nothing and still
+// asks to be dealt with.
+//
+// WHAT EMPTY IS (`emptyMessage`): no text but white space, no reaction, and not the root of a thread
+// anyone has answered or may have — that row is the way into its replies and where its line between
+// the columns starts. A file posted with no words is NOT empty: the server writes each file into the
+// text as a line naming it (`#313 slack-file-posts`), so the message has text, and is drawn, counted
+// and read as any other. (A Discord message's attachments and embeds are not carried into the message
+// at all, so one that is only a file reaches the page with no text, and was drawn as a blank row
+// before this; it is left out with the rest until `#387 discord-file-posts`.)
+//
+// WHAT HIDING IT DOES, while the switch is on (`hiddenEmpty`): no row in any view — every list is
+// drawn through `glom`, which leaves it out, and the one appender that adds a live row alone,
+// `appendChannelRow`, holds it back — so nothing can read it aloud, which reads rows; not in the list
+// a view counts in its heading and settles the reader by, so it is not "new" at the foot; not unread
+// (`stillToDo`), so no count, tally or Hide read list has it; no offer to jump to it, and nothing
+// relayed into a call. The store keeps it, as it keeps every message, so turning the switch off
+// draws it again from what is held, with no read.
+
+/** Text with nothing in it to see: white space, and the zero-width characters a body can carry. */
+const BLANK_TEXT = /^[\s\u200b-\u200d\u2060]*$/u;
+
+/** Is `message` one with nothing in it to show? See "WHAT EMPTY IS" above. */
+function emptyMessage(message) {
+  if (!message || !BLANK_TEXT.test(String(message.content || ""))) return false;
+  if (Array.isArray(message.reactions) && message.reactions.some((reaction) => reaction && reaction.count > 0)) return false;
+  return !mayLeadToReplies(message);
+}
+
+/**
+ * Whether `message` is, or may be, the root of a thread somebody has answered: by its own record, a
+ * root whose count is not known counting as answered; by the store's summary of a thread it is the
+ * root of, for a copy that arrived without its record; or by a reply to it the store holds. Asked
+ * only of a message with no text, which is rare, so the store's lists are read through each time.
+ */
+function mayLeadToReplies(message) {
+  const thread = message.thread;
+  if (thread && thread.is_root === true && thread.reply_count !== 0) return true;
+  const id = String(message.id);
+  // A reply's thread is its siblings' too: only a root's own thread holds replies to it.
+  const own = thread && thread.is_root === true ? threadOf(message) : null;
+  return channelCanon.threads.some((summary) => summary && summary.root && String(summary.root.id) === id &&
+      summary.reply_count !== 0) ||
+    channelCanon.messages.some((held) => held.thread && held.thread.is_root !== true &&
+      (String(held.thread.root_message_id) === id || (own !== null && threadOf(held) === own)));
+}
+
+/** Are empty messages left out? ON unless the reader has turned it off — see `storedHideEmptyMessages`. */
+let hideEmptyMessages = true;
+
+function applyHideEmptyMessages(on) {
+  hideEmptyMessages = Boolean(on);
+  el("hide-empty-messages").checked = hideEmptyMessages;
+  try {
+    localStorage.setItem(HIDE_EMPTY_KEY, hideEmptyMessages ? "1" : "0");
+  } catch (_error) {
+    // A browser that refuses storage still honours the choice for this session.
+  }
+}
+
+/** What was stored. ABSENT MEANS ON: the default is the behaviour, not merely the initial value. */
+function storedHideEmptyMessages() {
+  return localStorage.getItem(HIDE_EMPTY_KEY) !== "0";
+}
+
+/** Is `message` left out of the page: empty, while the reader has said to hide those? */
+function hiddenEmpty(message) {
+  return hideEmptyMessages && emptyMessage(message);
 }
 
 /** Is a tap on a message a request to hear it? Session-only, and only in the channel view. */
@@ -31645,11 +31730,13 @@ function joinsGroup(previous, message) {
  * A list of messages, oldest first, as the list of ROWS to draw.
  *
  * Every message appears exactly once, in order, in exactly one group — so the row count changes
- * and nothing else does.
+ * and nothing else does. Save an empty one while the reader hides those (`#386
+ * hide-empty-messages`), which is in none: every list is drawn through here, so none draws it.
  */
 function glom(messages) {
   const groups = [];
   for (const message of messages) {
+    if (hiddenEmpty(message)) continue;
     const last = groups[groups.length - 1];
     if (last && joinsGroup(last[last.length - 1], message)) {
       last.push(message);
@@ -34099,7 +34186,8 @@ function drawChannelPage(payload, area, at) {
   // status-line-placement`: this is a standing fact about what you are looking at, and the strip
   // takes itself away after a few seconds.
   renderChannelSeam(channelSummary(loaded, loadedIsWhole(), channelName(payload.channel)));
-  const messages = payload.messages || [];
+  // What is drawn: an empty message the reader hides is not news at the foot (`#386 hide-empty-messages`).
+  const messages = (payload.messages || []).filter((message) => !hiddenEmpty(message));
   settleAfterRead(messages, { area, ...at });
   channelFreshAt = Date.now();
   setChannelFreshness("fresh");
@@ -34704,9 +34792,9 @@ async function loadTodo(options) {
     // believing.
     const served = payload.messages || [];
     observeOutgoingMessages(served);
-    const messages = markOwnRead
-      ? served.filter((m) => bucketFor(m.author_id, m.author_is_bot, messageChannel(m)) !== "me")
-      : served;
+    // And empty messages, while the reader hides those (`#386 hide-empty-messages`).
+    const messages = served.filter((m) => !hiddenEmpty(m) &&
+      (!markOwnRead || bucketFor(m.author_id, m.author_is_bot, messageChannel(m)) !== "me"));
     const list = el("discord-log");
     list.replaceChildren(...glom(messages).map(discordNode));
     renderChannelRows();
@@ -34829,6 +34917,11 @@ function appendChannelRow(arriving, live = false, folded = false) {
   if (hidingRead() && isNoise(message)) {
     save();
     renderNoiseCount();
+    return;
+  }
+  // `#386 hide-empty-messages`. An empty message is held with the rest and drawn nowhere.
+  if (hiddenEmpty(message)) {
+    save();
     return;
   }
   const list = el("discord-log");
@@ -35819,7 +35912,7 @@ function syncPinnedList() {
   const messages = pinnedMessages();
   // The heading too (`#242 rich-headers`): a plain body's HTML is "" with or without one, and a paren
   // tag confirmed by a later read brings a heading to a message whose text has not changed.
-  const drawn = JSON.stringify([combineMessages, channelCanon.scope, threadingSupported,
+  const drawn = JSON.stringify([combineMessages, hideEmptyMessages, channelCanon.scope, threadingSupported,
     ...messages.map((m) => [m.id, m.timestamp, m.content, renderedHtmlOf(m), m.author, threadOf(m), isNoise(m),
       keptByPin.has(m), reactionsDrawn(m), m.heading || null, editedDrawn(m)])]);
   if (drawn === pinnedListDrawn) return;
@@ -38356,7 +38449,9 @@ function replyContextPool() {
 /** Draw the earlier messages, and the control and the sentence over them. */
 function renderReplyContext() {
   const list = el("reply-context");
-  const { earlier, more } = replyTarget ? replyContextPool() : { earlier: [], more: false };
+  const { earlier: pool, more } = replyTarget ? replyContextPool() : { earlier: [], more: false };
+  // Counted without the empty messages the reader hides, so More brings as many as it says (`#386`).
+  const earlier = pool.filter((message) => !hiddenEmpty(message));
   const shown = earlier.slice(Math.max(0, earlier.length - replyContext.shown));
   // The heading as well as the body, as the Pinned list keys it (`#242 rich-headers`).
   const drawn = JSON.stringify(shown.map((message) =>
@@ -39084,7 +39179,7 @@ function followInOtherColumn() {
   inOtherColumn(() => {
     if (catchUpHeldView()) {
       const keeps = readFilterKeeps();
-      settleAfterRead(timelineMessages.filter((message) => !hidingRead() || keeps(message)),
+      settleAfterRead(timelineMessages.filter((message) => !hiddenEmpty(message) && (!hidingRead() || keeps(message))),
         { keepPosition: true, area: el("scroll-area"), ...channelReadPosition(el("scroll-area")) });
     } else {
       syncUnreadReplies();
@@ -42161,7 +42256,7 @@ function catchUpHiddenArrivals() {
     const position = channelReadPosition(area);
     if (catchUpHeldView()) {
       const keeps = readFilterKeeps();
-      settleAfterRead(timelineMessages.filter((message) => !hidingRead() || keeps(message)),
+      settleAfterRead(timelineMessages.filter((message) => !hiddenEmpty(message) && (!hidingRead() || keeps(message))),
         { keepPosition: true, area, ...position });
     } else {
       // Nothing of this view's own, but a reply on Main is one more on its root's chip.
@@ -42173,7 +42268,7 @@ function catchUpHiddenArrivals() {
       const place = channelReadPosition(there);
       if (catchUpHeldView()) {
         const keeps = readFilterKeeps();
-        settleAfterRead(timelineMessages.filter((message) => !hidingRead() || keeps(message)),
+        settleAfterRead(timelineMessages.filter((message) => !hiddenEmpty(message) && (!hidingRead() || keeps(message))),
           { keepPosition: true, area: there, ...place });
       }
     });
@@ -43146,7 +43241,7 @@ function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
   discordNewestId = id;
   if (wasAtNewest) {
     scrollToNewest();
-  } else if (!isNoise(message)) {
+  } else if (!isNoise(message) && !hiddenEmpty(message)) {
     // Somewhere else in the history, or looking at the call. Offer the jump; never take it.
     // Never for a placeholder the server reads automatically (`#196 auto-read-noise`): an offer to
     // go and look at "Working…" is the interruption the owner asked to be rid of.
@@ -43755,7 +43850,8 @@ function relayToAgent(message, selfPosted, replayed, arrival = {}) {
   // `#196 auto-read-noise`. NOISE is a fifth guard, and the one the owner asked for by name: a
   // placeholder announced into a live call is the agent saying "a new message: Working…" while he
   // drives. The server already decided it is read; the call is not told otherwise.
-  if (selfPosted || isNoise(message) || relayMode() === "off" || !callReachable()) {
+  // `#386 hide-empty-messages`: nor is an empty message, which has nothing to announce.
+  if (selfPosted || isNoise(message) || hiddenEmpty(message) || relayMode() === "off" || !callReachable()) {
     return false;
   }
   if (replayed && !missedDuringCall(message, arrival)) return false;
@@ -46356,6 +46452,7 @@ applyMsgScale(storedMsgScale());
 applyReadSpeed(storedReadSpeed());
 applyMarkOwnRead(storedMarkOwnRead());
 applyCombineMessages(storedCombineMessages());
+applyHideEmptyMessages(storedHideEmptyMessages());
 applyRichHeaders(storedRichHeaders());
 applyEnterSends(storedEnterSends());
 // `#340 composer-grow-box`. Drawn as stored, and stored only once the reader ticks one: absent means off.
@@ -46466,6 +46563,30 @@ el("mark-own-read").addEventListener("change", () => {
   if (todoMode && !threadingSupported) {
     guardQuietly(() => loadTodo({ keepPosition: true, ownAct: true, readAs: "mutation" }))();
   }
+});
+
+// `#386 hide-empty-messages`. Each column drawn again from what it holds, as for Your own messages: an
+// empty message comes back, or goes, with no read. The page without threads holds no store to draw
+// from: turned on, its rows are regrouped, which leaves the empty ones out; turned off, its newest page
+// is read again in place, and an empty message further back comes back when that history is re-read.
+el("hide-empty-messages").addEventListener("change", () => {
+  applyHideEmptyMessages(el("hide-empty-messages").checked);
+  if (threadingSupported) {
+    eachColumn(renderCachedTimeline);
+    // ...and the thread cards, whose unread counts it changes: the Threads list's, which that redraw
+    // leaves alone, and the right column's.
+    eachColumn(() => {
+      if (channelView === "threads") el("thread-list").replaceChildren(...threadCards(timelineThreads));
+    });
+    renderSideColumn();
+  } else if (hideEmptyMessages && !todoMode) {
+    regroupChannelRows();
+  } else {
+    guardQuietly(() => (todoMode ? loadTodo : loadDiscord)({ keepPosition: true, ownAct: true, readAs: "mutation" }))();
+  }
+  setStatus(el("hide-empty-messages").checked
+    ? "messages with nothing in them are hidden."
+    : "messages with nothing in them are shown.");
 });
 
 el("combine-messages").addEventListener("change", () => {
