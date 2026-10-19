@@ -1,12 +1,13 @@
 ---
 title: 'census-fd-snapshot: a census test''s descriptor snapshot fails after another test leaks two pipes'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-10-19T09:35:54.440643709+00:00
-updated_at: 2026-10-19T09:35:54.440643709+00:00
+updated_at: 2026-10-19T09:37:58.473423821+00:00
+closed_at: 2026-10-19T09:37:58.473423721+00:00
 ---
 
 # Description
