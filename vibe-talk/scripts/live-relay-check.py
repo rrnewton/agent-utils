@@ -2046,6 +2046,11 @@ def judge_interrupt(case: Case, call_notices: list[str]) -> None:
         elif again == 0:
             reasons.append("the lost relay was neither sent again nor said not to have been read out")
             blame.append("page")
+        elif notices:
+            # Sent again once and lost again, past the minute, on a call that went on: the page may
+            # not send it a third time, so its word is all it owes.
+            passed = ("sent again once after the reconnect and lost again; the page said the message was not "
+                      f"read out: {notices[0][:120]}")
         else:
             reasons.append("sent again once after the reconnect, but no assistant turn said the marker")
             blame.append("bridge/agent")
@@ -2812,6 +2817,17 @@ def self_test() -> int:
     judge(f, [])
     check("f: lost again within the minute, ended saying the message was not read out: PASS",
           f.result.verdict == "PASS" and "lost the turn again" in (f.result.reason or ""), (f.result.verdict, f.result.reason))
+
+    w = interrupted(*reconnected, (88.0, "recv", 2, lost(3)), (88.1, "close", 2, ""), (89.0, "open", 3, ""),
+                    (89.1, "recv", 3, json.dumps({"type": "session_started", "greeting": False})))
+    f = f_case(notices_after_call=[
+        "transcript: not read out: 1 new message, in qa-bravo, went to the agent, but the voice service lost the turn, "
+        "so it was never read out."])
+    w.finalize(f, on(1, 2, 3, ended_by=["reconnected", "reconnected", "hang_up"]))
+    judge(f, [])
+    check("f: sent again once, lost again past the minute, the call went on and said not read out: PASS, the bridge blamed",
+          f.result.verdict == "PASS" and "lost again" in (f.result.reason or "")
+          and "bridge (lost a turn)" in (f.result.attribution or ""), (f.result.verdict, f.result.reason, f.result.attribution))
 
     w = interrupted(*reconnected, (27.0, "recv", 2, said("assistant", 3, "the marmalade build finished", True)),
                     (28.0, "recv", 2, done(3)))
