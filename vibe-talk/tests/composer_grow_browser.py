@@ -30,6 +30,11 @@ page out in Chromium and measures the box, Send and the list they are in, with a
   1280x800 by a click and by Space, at 1920x1080 by a click, and in the second desk by Space. With
   the checkbox given the focus and then scrolled out of view up the list, Space moves nothing.
 
+  Safari and Firefox on a Mac focus no checkbox a click ticks, and the focus leaves the box for the
+  body; Chromium focuses it everywhere. So the channel's box is ticked by such a click too (the press
+  kept from moving the focus, the box let go): at the foot and 30 and 40px above it at 1280x800, 30px
+  above it at 1920x1080, and 40px above it in the second desk, each with the focus on the body.
+
   A second desk whose browser does not size a field by its text (`CSS.supports` answering no for
   `field-sizing`, and `field-sizing: fixed` forced): the box grows through the height the page writes,
   capped the same, and a reader at the foot of the list who types line after line stays at the foot
@@ -119,6 +124,30 @@ NO_FIELD_SIZING_JS = """(() => {
     document.head.append(style);
   });
 })();"""
+
+# A click as Safari and Firefox on a Mac make it, which ticks a checkbox without focusing it: the focus
+# leaves the box for nothing, which the document reports as the body. Chromium focuses a clicked
+# checkbox on every system, so for one click (`on` true, then false to take it away) the press is kept
+# from moving the focus, the box is let go, and a focus the label's click hands the checkbox is undone.
+MAC_CLICK_JS = """(on) => {
+  const held = window.__macClick || [];
+  for (const [type, listener] of held) document.removeEventListener(type, listener, true);
+  delete window.__macClick;
+  if (!on) return;
+  const inGrow = (event) => event.target instanceof Element && event.target.closest('.composer-grow') !== null;
+  const listeners = [
+    ['mousedown', (event) => {
+      if (!inGrow(event)) return;
+      event.preventDefault();
+      if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+    }],
+    ['focusin', (event) => {
+      if (inGrow(event)) event.target.blur();
+    }],
+  ];
+  for (const [type, listener] of listeners) document.addEventListener(type, listener, true);
+  window.__macClick = listeners;
+}"""
 
 
 def handler_for(api: kb.FakeApi, web_root: Path, posts: list[Json]) -> type[BaseHTTPRequestHandler]:
@@ -391,9 +420,10 @@ def tick_after_paste(desk: Desk, parts: tuple[str, ...], text: str, by: str = "c
     """The owner's order: paste with Grow off, the list at its foot, see the box tiny, then tick Grow.
 
     The focus leaves the box for the checkbox as it is ticked (`by` "click" on its label, or "space" on
-    the checkbox), so nothing that follows the reader's typing can be what keeps them at the foot: the
-    box grows and the reader stays at the foot, Send, Grow and the box all on screen, no jump to the
-    newest offered; and clicking back into the box moves nothing.
+    the checkbox), or for nothing (`by` "mac-click": a click on its label as Safari and Firefox on a Mac
+    make it, focusing no checkbox), so nothing that follows the reader's typing can be what keeps them
+    at the foot: the box grows and the reader stays at the foot, Send, Grow and the box all on screen,
+    no jump to the newest offered; and clicking back into the box moves nothing.
 
     `up` px above the foot instead, past the 24px that still counts as the foot but with Send and Grow
     on screen (at 1280x800 the label shows up to about 47px up): the checkbox just ticked stays where it
@@ -420,10 +450,14 @@ def tick_after_paste(desk: Desk, parts: tuple[str, ...], text: str, by: str = "c
         desk.page.focus(f"#{grow}")
         kb.press(desk.cdp, " ")
     else:
+        desk.page.evaluate(MAC_CLICK_JS, by == "mac-click")
         desk.page.click(f"label:has(#{grow})")
     desk.page.wait_for_function("(id) => document.getElementById(id).checked", arg=grow, timeout=5000)
-    check(desk.page.evaluate("() => document.activeElement && document.activeElement.id") == grow,
-          f"{where}: the premise, the focus on the checkbox just ticked, does not hold")
+    focused = desk.page.evaluate("() => document.activeElement === document.body ? 'body' "
+                                 ": document.activeElement && document.activeElement.id")
+    desk.page.evaluate(MAC_CLICK_JS, False)
+    held, named = ("body", "nothing") if by == "mac-click" else (grow, "the checkbox just ticked")
+    check(focused == held, f"{where}: the premise, the focus on {named}, does not hold: it is on {focused!r}")
     # Where the reader is to be left: at the foot, or as far above it as they were.
     gap = number(before, "gap") if up else 0
     after = desk.geometry(parts)
@@ -614,6 +648,9 @@ def desk_walk(browser: Browser, url: str, args: argparse.Namespace, posts: list[
     tick_after_paste(desk, CHANNEL_PARTS, LONG)
     tick_after_paste(desk, CHANNEL_PARTS, TEN, up=30)
     tick_after_paste(desk, CHANNEL_PARTS, TEN, by="space", up=40)
+    tick_after_paste(desk, CHANNEL_PARTS, TEN, by="mac-click")
+    tick_after_paste(desk, CHANNEL_PARTS, TEN, by="mac-click", up=30)
+    tick_after_paste(desk, CHANNEL_PARTS, TEN, by="mac-click", up=40)
     space_from_up_the_list(desk)
     reload_with_a_long_draft(desk, url)
     call_box_with_recap(desk)
@@ -623,6 +660,7 @@ def desk_walk(browser: Browser, url: str, args: argparse.Namespace, posts: list[
     desk.label = "1920x1080"
     channel_box(desk, posts)
     tick_after_paste(desk, CHANNEL_PARTS, TEN, up=30)
+    tick_after_paste(desk, CHANNEL_PARTS, TEN, by="mac-click", up=30)
     two_columns(desk)
     context.close()
     return desk.notes
@@ -653,6 +691,7 @@ def fallback_walk(browser: Browser, url: str, args: argparse.Namespace, posts: l
     tick_after_paste(desk, CHANNEL_PARTS, TEN)
     tick_after_paste(desk, CHANNEL_PARTS, LONG, by="space")
     tick_after_paste(desk, CHANNEL_PARTS, TEN, by="space", up=30)
+    tick_after_paste(desk, CHANNEL_PARTS, TEN, by="mac-click", up=40)
     desk.tick(grow, False)
     off = desk.geometry()
     check(off["growHeight"] == "", f"without field-sizing, Grow off left a height on the box: {off}")

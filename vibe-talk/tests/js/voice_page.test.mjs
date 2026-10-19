@@ -20793,7 +20793,7 @@ test("`#340 composer-grow-box`: A READER AT THE FOOT WHO PASTES AND THEN TICKS G
   assert.equal(area.scrollTop, 0, "ticking Grow moved a reader up the list");
 });
 
-test("`#340 composer-grow-box`: A READER A LITTLE ABOVE THE FOOT, past its slack, WHO TICKS Grow after a paste keeps the checkbox where it was as the box grows, and the room under it, so Send and Grow stay on screen", async () => {
+test("`#340 composer-grow-box`: A READER A LITTLE ABOVE THE FOOT, past its slack, WHO TICKS Grow after a paste keeps the checkbox where it was as the box grows, and the room under it, so Send and Grow stay on screen, whether the tick focused the checkbox or, as a click in Safari or Firefox on a Mac does, nothing", async () => {
   const page = newPage(new Map(), SCRIPT, (p) => p.enableResizeObserver());
   await signIn(page);
   await showDiscord(page, tallChannel(30));
@@ -20812,15 +20812,23 @@ test("`#340 composer-grow-box`: A READER A LITTLE ABOVE THE FOOT, past its slack
   box.focus();
   await box.setValue("line\n".repeat(40));
   page.resized(box);
-  for (const up of [BOTTOM_SLACK_PX + 6, BOTTOM_SLACK_PX + 16]) {
-    const where = `${up}px above the foot`;
+  // Space, and a click in Chromium, focus the checkbox they tick. A click in Safari or Firefox on a Mac
+  // focuses no checkbox: the focus leaves the box for nothing, which a browser reports as the body.
+  const ticks = [BOTTOM_SLACK_PX + 6, BOTTOM_SLACK_PX + 16].flatMap((up) => [
+    { up, focus: "the checkbox" }, { up, focus: "nothing" },
+  ]);
+  for (const { up, focus } of ticks) {
+    const where = `${up}px above the foot with the focus on ${focus}`;
     assert.equal(grow.checked, false, `the premise: Grow is off (${where})`);
     area.scrollTop = area.scrollHeight - area.clientHeight - up;
     await area.dispatch("scroll");
     assert.ok(gap() === up && !atBottomOf(area), `the premise: the reader is ${up}px above the foot, not at it: ${gap()}`);
     const seen = grow.getBoundingClientRect();
     assert.ok(seen.top >= 0 && seen.bottom <= area.clientHeight, `the premise: the checkbox is on screen (${where})`);
-    grow.focus();
+    box.focus();
+    if (focus === "the checkbox") grow.focus();
+    else box.blur();
+    assert.equal(page.document.activeElement, focus === "the checkbox" ? grow : null, `the premise: the focus is on ${focus}`);
     await grow.setChecked(true);
     page.resized(box);
     assert.equal(grow.getBoundingClientRect().top, seen.top,

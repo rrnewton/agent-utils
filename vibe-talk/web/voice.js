@@ -7700,10 +7700,12 @@ function writingToAgent() {
 //     its list whole (`keepBoxInView`). Only for the box with the focus, so a draft put back into a box
 //     under a reader up the list moves nothing (`#280 scroll-stability`).
 //   * AND AS GROW IS TICKED: the owner pastes, sees the box tiny, then ticks Grow, and the box that
-//     grows then is not the one with the focus, which the click or Space has put on the checkbox. A
-//     reader at the foot of a list is kept at its foot as Grow changes the boxes in it
-//     (`applyComposerGrow`); one a little above it, the checkbox on screen, has the checkbox kept
-//     where it was, under the pointer, and Send with it; one who scrolled it away is not moved.
+//     grows then is not the one with the focus, which has left it: Space, and a click in Chromium,
+//     put it on the checkbox; a click in Safari or Firefox on a Mac puts it nowhere, as they focus no
+//     checkbox a click ticks. A reader at the foot of a list is kept at its foot as Grow changes the
+//     boxes in it (`applyComposerGrow`); one a little above it, the checkbox on screen, has the
+//     checkbox kept where it was, under the pointer, and Send with it; one who scrolled it away is not
+//     moved. The checkbox ticked is the one the change came from, never read off the focus.
 
 const COMPOSER_GROW_KEY = "vibe-talk.voice.composer-grow";
 
@@ -7731,25 +7733,30 @@ function storedComposerGrow() {
 }
 
 /**
- * Grow ticked or unticked by the reader: kept, and drawn. Each list the reader was at the foot of is
- * put back at its foot once the boxes in it are drawn at their new height, so a draft pasted before
- * Grow was ticked grows with Send in view; `keepGrowingBoxInView` cannot do it, since the focus is on
- * the checkbox now, not the box. Both lists, as the one choice grows the boxes in both.
+ * Grow ticked or unticked by the reader, on the checkbox `grow`: kept, and drawn. Each list the
+ * reader was at the foot of is put back at its foot once the boxes in it are drawn at their new
+ * height, so a draft pasted before Grow was ticked grows with Send in view; `keepGrowingBoxInView`
+ * cannot do it, since the focus has left the box. Both lists, as the one choice grows the boxes in both.
  *
  * A reader a little above the foot, past its slack, can still have Send and Grow on screen (at
  * 1280x800 the label shows up to about 47px above it), and the box growing above the checkbox would
  * push both off. So the checkbox just ticked, if any of it was on screen in its list, is kept where it
  * was, under the pointer, by scrolling its list as far as the redraw moved it, and with it the room
- * under Send. A checkbox the reader had scrolled away before pressing Space moves nothing.
+ * under Send. A checkbox the reader had scrolled away before pressing Space moves nothing. Which
+ * checkbox that is comes from the change, `grow`, and not from the focus: Safari and Firefox on a Mac
+ * focus no checkbox a click ticks, so there the focus is on nothing as the change arrives.
+ *
+ * @param {boolean} on
+ * @param {HTMLElement} grow
  */
-function applyComposerGrow(on) {
+function applyComposerGrow(on, grow) {
   try {
     localStorage.setItem(COMPOSER_GROW_KEY, on ? "1" : "0");
   } catch (_error) {
     // A browser that refuses storage still honours the choice for this session.
   }
   const footed = ["scroll-area", "side-scroll"].map((id) => leftEl(id)).filter((area) => atBottom(area));
-  const ticked = growTickedInView();
+  const ticked = growInView(grow);
   renderComposerGrow(on);
   for (const area of footed) area.scrollTop = area.scrollHeight;
   if (ticked && !footed.includes(ticked.area)) {
@@ -7758,15 +7765,15 @@ function applyComposerGrow(on) {
 }
 
 /**
- * The Grow checkbox with the focus, which a click or Space has just ticked, if any of it is on screen
- * in its list: with that list, and where in the window it is.
+ * The Grow checkbox `grow`, just ticked, if any of it is on screen in its list: with that list, and
+ * where in the window it is.
  *
+ * @param {HTMLElement} grow
  * @returns {{ grow: HTMLElement, area: HTMLElement, top: number } | null}
  */
-function growTickedInView() {
-  const grow = /** @type {HTMLElement | null} */ (document.activeElement);
-  const at = grow ? COMPOSER_GROW_IDS.indexOf(grow.id) : -1;
-  if (!grow || at < 0) return null;
+function growInView(grow) {
+  const at = COMPOSER_GROW_IDS.indexOf(grow.id);
+  if (at < 0) return null;
   const area = growingBoxList(leftEl(COMPOSER_GROW_BOXES[at]));
   const rect = grow.getBoundingClientRect();
   const top = area.getBoundingClientRect().top;
@@ -43560,7 +43567,8 @@ applyEnterSends(storedEnterSends());
 // `#340 composer-grow-box`. Drawn as stored, and stored only once the reader ticks one: absent means off.
 renderComposerGrow(storedComposerGrow());
 for (const id of COMPOSER_GROW_IDS) {
-  leftEl(id).addEventListener("change", () => applyComposerGrow(/** @type {HTMLInputElement} */ (leftEl(id)).checked));
+  // The checkbox the change came from, not the focus, which a click in Safari or Firefox on a Mac leaves on nothing.
+  leftEl(id).addEventListener("change", () => applyComposerGrow(/** @type {HTMLInputElement} */ (leftEl(id)).checked, leftEl(id)));
 }
 // The call's box is measured as it saves its draft (`rememberComposeDraft`); these two, as they are typed in.
 for (const id of ["channel-compose-text", "side-compose-text"]) {

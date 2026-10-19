@@ -442,10 +442,10 @@ steps:
   # the list's foot with Send on screen; a short 1280x600 window keeps Send on screen; two columns grow the
   # right column's box; a reader at the foot typing line after line stays there; Grow ticked after a
   # paste keeps a reader at the foot there, and one 30-40px above it with the checkbox under the pointer,
-  # and moves none who scrolled the checkbox away; the same through the page's own measured height with
-  # field-sizing turned off; and a 393x852 phone draws no checkbox and lays the box out alike with Grow
-  # stored on or off. Measured on 2026-10-18 outside dagrun on a host at load 46: about 21s wall, 2.6s CPU
-  # in the script.
+  # also by a click that focuses no checkbox, as in Safari and Firefox on a Mac, and moves none who
+  # scrolled the checkbox away; the same through the page's own measured height with field-sizing turned
+  # off; and a 393x852 phone draws no checkbox and lays the box out alike with Grow stored on or off.
+  # Measured on 2026-10-18 outside dagrun on a host at load 42: about 25s wall, 2.8s CPU in the script.
   - group: check
     job: composer-grow-browser
     desc: the Grow checkbox and the message box growing with a long paste up to 60% of the window, Send on screen, in current Chromium at 1280x800, 1920x1080, 1280x600 and two columns, without field-sizing, and unchanged on a 393x852 phone
@@ -456,7 +456,7 @@ steps:
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
-      est_duration_s: 21
+      est_duration_s: 25
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
