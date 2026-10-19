@@ -218,11 +218,25 @@ class Bridge:
         return f"{'wss' if self.tls else 'ws'}://{self.host}:{self.port}{self.target.split('?', 1)[0]}"
 
 
+def asks_for_tools(value: str) -> bool:
+    """Whether an address asks the bridge for agent tools, however the key is cased or percent-encoded.
+
+    Every query key is decoded and case-folded, and the whole address is also searched with its escapes
+    undone until none are left, so `Tools=`, `%74ools=` and a key hidden in a fragment are refused alike.
+    """
+    decoded = value
+    while (undone := unquote(decoded)) != decoded:
+        decoded = undone
+    if "tools=" in decoded.casefold():
+        return True
+    return any(key.casefold() == "tools" for key in parse_qs(urlsplit(value).query, keep_blank_values=True))
+
+
 def parse_bridge(value: str) -> Bridge:
     """`fake`, or a `ws://` or `wss://` address. Raises ValueError with the reason it is refused."""
     if value == "fake":
         return Bridge(fake=True)
-    if "tools=" in value:
+    if asks_for_tools(value):
         raise ValueError("refusing a bridge address with tools=: agent tools act on a real chat, so a test "
                          "call could read or post in one")
     parts = urlsplit(value)
@@ -2814,7 +2828,9 @@ def self_test() -> int:
           and never.result.attribution == "harness/bridge", (never.result.verdict, never.result.attribution))
 
     # The safety rules and the plumbing.
-    for refused in ["ws://127.0.0.1:9100/ws?mode=voice&tools=chat", "http://127.0.0.1:9100/ws", "127.0.0.1:9100"]:
+    for refused in ["ws://127.0.0.1:9100/ws?mode=voice&tools=chat", "ws://example.invalid/x?Tools=chat",
+                    "ws://example.invalid/x?mode=a&%74ools=x", "ws://example.invalid/x?%2574OOLS=x",
+                    "ws://example.invalid/x?mode=a&tools", "http://127.0.0.1:9100/ws", "127.0.0.1:9100"]:
         try:
             parse_bridge(refused)
             check(f"{refused!r} is refused", False, "accepted")
