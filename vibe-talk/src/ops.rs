@@ -11,7 +11,8 @@
 //! Every function below assumes the caller has already been authorized for the scope it needs;
 //! the scope each one needs is stated in its documentation and enforced by its only callers.
 
-use crate::cache::shadow::{Ask, Consumer, Upstream, Wants};
+use crate::cache::shadow::{Ask, Consumer, Upstream, View, Wants};
+use crate::cache::{PendingServe, RefreshClaim, RefreshKey, ServeOutcome, ServedAnswer};
 use crate::chat::ChatError;
 use crate::model::{ChannelId, ChannelInfo, Message, MessageId};
 use crate::retrieval::{self, Resolution};
@@ -457,6 +458,173 @@ pub(crate) async fn messages_for(
         .map(|(window, _)| window)
 }
 
+/// Whether `caller` may be answered from the message cache (`#384 cache-serve`): serving is
+/// on, and the caller holds the write scope. A served read's background refresh fills under
+/// the caller's own grant, and a read-scope caller has none — its reads write nothing durable
+/// — so the read token keeps today's upstream path in this milestone, shadowed as ever.
+fn may_serve(state: &AppState, caller: crate::auth::Scope) -> bool {
+    caller == crate::auth::Scope::Write && state.message_cache.serve_enabled()
+}
+
+/// The messages a served snapshot answers with, oldest first and unstamped exactly as the
+/// cache holds them, and the instant the answer is complete to: its head's own time, said the
+/// way a provider's `as_of` is. Stamp and mark the messages as an upstream read's are; keep an
+/// unstamped copy for the refresh's corrections, which compare like with like.
+fn served_messages(view: &View) -> (Vec<Message>, Option<String>) {
+    let messages = view.rows.iter().map(|row| row.message.clone()).collect();
+    let as_of = view.head.map(|head| crate::clock::iso_from_ms(head.head_ms));
+    (messages, as_of)
+}
+
+/// Put right, by live event, each message of `served` that the cache now holds otherwise than
+/// it was served (`#384 cache-serve`): edited since, or deleted. Called by a served answer's
+/// background refresh once its read has been offered, with the cache as arbiter — what it
+/// holds after the writer has applied the refresh, never the refresh's raw answer, so a copy
+/// the provider itself could not bring up to date corrects nothing backwards. A message the
+/// cache simply no longer holds, with no tombstone saying it was deleted, is left alone: aged
+/// out of the cache is not gone upstream. Nothing is published when what the refresh offered
+/// has not been applied in time; the next read or poll is correct regardless.
+async fn publish_serve_corrections(state: &AppState, channel: &ChannelId, served: Vec<Message>) {
+    let (Some(cache), Some(chan)) = (
+        state.message_cache.cache(),
+        state.message_cache.chan_key(channel),
+    ) else {
+        return;
+    };
+    if !cache.barrier(std::time::Duration::from_secs(2)).await {
+        return;
+    }
+    let checked = tokio::task::spawn_blocking(move || {
+        served
+            .into_iter()
+            .filter_map(|was| match cache.message(&chan, &was.id).served() {
+                Some(Some(now)) if now.message != was => {
+                    Some((crate::live::LiveKind::Update, now.message))
+                }
+                Some(None) if cache.tombstoned(&chan, &was.id).served() == Some(true) => {
+                    Some((crate::live::LiveKind::Delete, was))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    for (kind, message) in checked {
+        state.live.publish_correction(channel, kind, message);
+    }
+}
+
+/// Refresh one served timeline page upstream (`#384 cache-serve`): the read the request did
+/// not wait for, offered and compared exactly as [`timeline`] offers and compares its own,
+/// then the served rows it proves changed are corrected by live event. One per read at a
+/// time, under `claim`; a serve whose claim found a refresh already running starts none.
+fn spawn_timeline_refresh(
+    state: AppState,
+    caller: crate::auth::Scope,
+    channel: ChannelId,
+    request: crate::threads::TimelineRequest,
+    claim: RefreshClaim,
+    served: Vec<Message>,
+    pending: PendingServe,
+) {
+    drop(tokio::spawn(async move {
+        let _claim = claim;
+        let fetch_began = std::time::Instant::now();
+        let fill = state.message_cache.begin_for(caller, &channel);
+        let mut page = match state.chat.fetch_timeline(&channel, &request).await {
+            Ok(page) => page,
+            Err(_) => {
+                tracing::warn!(
+                    consumer = "timeline_fallback",
+                    "a page answered from the message cache could not be refreshed; it stands \
+                     until the next read"
+                );
+                return;
+            }
+        };
+        // Before the read is offered, as in `timeline`, so the comparison knows its own writes.
+        pending.compare(Upstream::of(&page.messages, page.has_more));
+        if let Some(fill) = fill {
+            fill.offer_timeline(
+                &request,
+                crate::cache::observe::TimelineRead::Newest,
+                &page,
+            );
+        }
+        publish_serve_corrections(&state, &channel, served).await;
+        // What the page is about to draw is what it will ask to hear, as in `timeline`.
+        let noise = crate::noise::filter_for(&state, &channel).await;
+        stamp(&state, &mut page.messages);
+        noise.mark(&mut page.messages);
+        for summary in page.threads.iter_mut().chain(page.thread.iter_mut()) {
+            if let Some(root) = &mut summary.root {
+                stamp(&state, std::slice::from_mut(root));
+                noise.mark(std::slice::from_mut(root));
+                state.read_ahead.remember(
+                    &channel,
+                    Some(&summary.id),
+                    std::slice::from_ref(root),
+                    fetch_began,
+                );
+            }
+        }
+        state
+            .read_ahead
+            .remember(&channel, request.thread_id.as_deref(), &page.messages, fetch_began);
+    }));
+}
+
+/// Refresh one served window upstream (`#384 cache-serve`): [`read_window`]'s own read,
+/// behind the answer, offered, compared, recorded and corrected as there.
+fn spawn_window_refresh(
+    state: AppState,
+    caller: crate::auth::Scope,
+    channel: ChannelId,
+    limit: u16,
+    claim: RefreshClaim,
+    served: Vec<Message>,
+    pending: PendingServe,
+) {
+    drop(tokio::spawn(async move {
+        let _claim = claim;
+        let fetch_began = std::time::Instant::now();
+        let mark = state.live.recent().mark(&channel);
+        let fill = state.message_cache.begin_for(caller, &channel);
+        let read = match crate::recent_view::read(&state, &channel, limit).await {
+            Ok(read) => read,
+            Err(_) => {
+                tracing::warn!(
+                    consumer = "messages",
+                    "a window answered from the message cache could not be refreshed; it \
+                     stands until the next read"
+                );
+                return;
+            }
+        };
+        pending.compare(Upstream::of(&read.messages, !read.exhausted));
+        if let Some(fill) = fill {
+            fill.offer_recent_dated(&read);
+        }
+        state.live.recent().record_as_of(
+            &channel,
+            &read.messages,
+            limit,
+            mark,
+            read.as_of.as_deref(),
+        );
+        publish_serve_corrections(&state, &channel, served).await;
+        let mut messages = read.messages;
+        stamp(&state, &mut messages);
+        crate::noise::filter_for(&state, &channel)
+            .await
+            .mark(&mut messages);
+        state
+            .read_ahead
+            .remember(&channel, None, &messages, fetch_began);
+    }));
+}
+
 /// [`messages_for`]. With `look_further`, a read for one message ([`Wants::Message`]) that the
 /// window does not hold leaves its shadow evaluation uncompared and hands it back, noted, for the
 /// caller to compare with what it finds where it looks next (`#319 slack-reply-by-id`).
@@ -478,11 +646,66 @@ async fn read_window(
     // it, whoever asked: kept raw, before anything below prepares it, with the pushes that arrived
     // while it ran applied again on top. See `crate::recent`.
     let mark = state.live.recent().mark(&channel.id);
-    let shadow = state
-        .message_cache
-        .shadow(&channel.id, wants.ask(usize::from(limit)), || {
-            crate::recent::live_fed(state, &channel.id)
-        });
+    // `#384 cache-serve`: with serving on, the evaluation is awaited, briefly, where the
+    // shadow was begun — the same evaluation, decided by the same rule — and a window it
+    // serves is answered from the cache at once, with its refresh reading upstream behind it.
+    // Anything else falls through with the ask's shadow in hand, exactly as before.
+    let (shadow, served) = if may_serve(state, caller) {
+        match state
+            .message_cache
+            .try_serve(&channel.id, wants.ask(usize::from(limit)), || {
+                crate::recent::live_fed(state, &channel.id)
+            })
+            .await
+        {
+            ServeOutcome::Served(answer) => (None, Some(answer)),
+            ServeOutcome::NotServed(shadow) => (shadow, None),
+        }
+    } else {
+        (
+            state
+                .message_cache
+                .shadow(&channel.id, wants.ask(usize::from(limit)), || {
+                    crate::recent::live_fed(state, &channel.id)
+                }),
+            None,
+        )
+    };
+    if let Some(answer) = served {
+        let ServedAnswer { view, pending } = *answer;
+        let (raw, as_of) = served_messages(&view);
+        if let Some(claim) = state.message_cache.claim_refresh(RefreshKey {
+            channel: channel.id.clone(),
+            read: format!("window:{limit}"),
+        }) {
+            spawn_window_refresh(
+                state.clone(),
+                caller,
+                channel.id.clone(),
+                limit,
+                claim,
+                raw.clone(),
+                pending,
+            );
+        }
+        // As an upstream window is prepared below, minus what only a real fetch earns: nothing
+        // is recorded as the newest copy read, nor remembered for speech — the refresh does
+        // both when it lands, from the provider's own answer.
+        let mut messages = raw;
+        stamp(state, &mut messages);
+        crate::noise::filter_for(state, &channel.id)
+            .await
+            .mark(&mut messages);
+        return Ok((
+            Window {
+                channel,
+                messages,
+                limit,
+                as_of,
+            },
+            None,
+        ));
+    }
     let fill = state.message_cache.begin_for(caller, &channel.id);
     let read = crate::recent_view::read(state, &channel.id, limit).await?;
     // Before the read is offered, so the shadow knows which offers are this read's own.
@@ -1071,19 +1294,84 @@ pub async fn timeline(
     } else {
         crate::cache::observe::TimelineRead::Newest
     };
-    // Only a newest page: what a page answered from the cache would stand in for were upstream to
-    // fail. A step back, and what changed since a cursor, are never answered from it.
-    let shadow = (timeline_read == crate::cache::observe::TimelineRead::Newest)
-        .then(|| Ask::Timeline {
+    // Only a newest page: what a page answered from the cache stands in for while upstream is
+    // read behind it. A step back, and what changed since a cursor, are never answered from it.
+    let newest_ask = (timeline_read == crate::cache::observe::TimelineRead::Newest).then(|| {
+        Ask::Timeline {
             view: request.view,
             thread: request.thread_id.clone(),
             limit: usize::from(request.limit.max(1)),
-        })
-        .and_then(|ask| {
-            state.message_cache.shadow(&channel.id, ask, || {
+        }
+    });
+    // `#384 cache-serve`: as in `read_window`, the newest page's evaluation is awaited where
+    // its shadow was begun, and a page it serves is handed back at once — provisional, its
+    // `as_of` the head it was served from, no backward cursor a backend never issued — with
+    // the read it stands in for refreshing it upstream in the background.
+    let mut shadow = None;
+    if let Some(ask) = newest_ask {
+        if may_serve(state, caller) {
+            match state
+                .message_cache
+                .try_serve(&channel.id, ask, || {
+                    crate::recent::live_fed(state, &channel.id)
+                })
+                .await
+            {
+                ServeOutcome::Served(answer) => {
+                    let ServedAnswer { view, pending } = *answer;
+                    let (raw, as_of) = served_messages(&view);
+                    if let Some(claim) = state.message_cache.claim_refresh(RefreshKey {
+                        channel: channel.id.clone(),
+                        read: format!(
+                            "timeline:{:?}:{}:{}",
+                            request.view,
+                            thread.unwrap_or_default(),
+                            request.limit
+                        ),
+                    }) {
+                        spawn_timeline_refresh(
+                            state.clone(),
+                            caller,
+                            channel.id.clone(),
+                            request.clone(),
+                            claim,
+                            raw.clone(),
+                            pending,
+                        );
+                    }
+                    let mut page = crate::threads::TimelinePage {
+                        messages: raw,
+                        has_threads: view.has_threads,
+                        // Never a claim that the scope's start is here: the cache's coverage
+                        // is clipped at its age limit, so older history upstream is unknown
+                        // to it. With no `next_before` the page reads this as "more above:
+                        // unknown", and steps back only after a read of the provider's own.
+                        has_more: true,
+                        as_of,
+                        ..crate::threads::TimelinePage::default()
+                    };
+                    page.next_after = Some(forward::encode(
+                        &channel.id,
+                        request.view,
+                        thread,
+                        &forward::Forward::Generic(forward::position_of(&page, request.view)),
+                    )?);
+                    let noise = crate::noise::filter_for(state, &channel.id).await;
+                    stamp(state, &mut page.messages);
+                    noise.mark(&mut page.messages);
+                    state
+                        .read_ahead
+                        .remember(&channel.id, thread, &page.messages, fetch_began);
+                    return Ok((channel, page));
+                }
+                ServeOutcome::NotServed(not_served) => shadow = not_served,
+            }
+        } else {
+            shadow = state.message_cache.shadow(&channel.id, ask, || {
                 crate::recent::live_fed(state, &channel.id)
-            })
-        });
+            });
+        }
+    }
     let fill = state.message_cache.begin_for(caller, &channel.id);
     let (mut page, position) = match resumed {
         Some(Forward::Native(own)) => {

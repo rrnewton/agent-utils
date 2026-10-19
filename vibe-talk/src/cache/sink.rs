@@ -630,7 +630,12 @@ struct ShadowTask {
     /// [`MessageCache::fed_since_ms`] when the ask was made.
     fed_since_ms: Option<i64>,
     asked_ms: i64,
-    evaluated: tokio::task::JoinHandle<Evaluated>,
+    /// The evaluation reading the cache on the blocking pool, until awaited: by the counting
+    /// task, or on the request's own path by [`Sink::try_serve`], which must know the verdict
+    /// before it answers.
+    reading: Option<tokio::task::JoinHandle<Evaluated>>,
+    /// What the evaluation read, once awaited.
+    evaluated: Option<Evaluated>,
     progress: Arc<ShadowProgress>,
     cache: Weak<MessageCache>,
 }
@@ -741,7 +746,70 @@ impl Drop for HeldShadow {
     }
 }
 
+/// How long [`Sink::try_serve`] waits for its evaluation before the request goes upstream as
+/// it always did: the barrier's own wait, the cache read, and room to spare, against a
+/// provider read of seconds. A slower evaluation still counts, off the path, as a shadow.
+pub const SERVE_WAIT: Duration = Duration::from_millis(300);
+
+/// What [`Sink::try_serve`] decided. `#384 cache-serve`.
+#[derive(Debug)]
+pub enum ServeOutcome {
+    /// Answer from the cache: the snapshot read, and the handle the background refresh hands
+    /// upstream's answer to, so the serve is compared and counted like any shadow.
+    Served(Box<ServedAnswer>),
+    /// Go upstream as without serving, with this ask's shadow (when there is one) to hand the
+    /// answer to, exactly as [`Sink::shadow`] returned it.
+    NotServed(Option<Shadowed>),
+}
+
+/// An answer to hand back from the cache. `#384 cache-serve`.
+#[derive(Debug)]
+pub struct ServedAnswer {
+    /// What the evaluation read of the channel, in one snapshot: the rows to answer with, and
+    /// the head and coverage the rule served on.
+    pub view: View,
+    /// Hand the refreshing read's answer here once upstream has spoken.
+    pub pending: PendingServe,
+}
+
+/// A served answer's comparison, waiting for the background refresh's word from upstream:
+/// [`PendingServe::compare`] with it, or dropped when the refresh failed, counted with no
+/// comparison either way settled. `#384 cache-serve`.
+#[derive(Debug)]
+pub struct PendingServe {
+    task: Option<ShadowTask>,
+}
+
+impl PendingServe {
+    /// Compare what was served with what the refresh read upstream, as
+    /// [`Shadowed::compare`] does before that read is offered to the cache.
+    pub fn compare(mut self, upstream: Upstream) {
+        if let Some(task) = self.task.take() {
+            let enqueued = task.cache.upgrade().map(|cache| cache.enqueued_seq());
+            task.settle(Some((upstream, enqueued)));
+        }
+    }
+}
+
+impl Drop for PendingServe {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.settle(None);
+        }
+    }
+}
+
 impl ShadowTask {
+    /// Await the evaluation's read of the cache, once: what counting decides on, and what
+    /// [`Sink::try_serve`] awaits (briefly) before answering from the cache.
+    async fn evaluate(&mut self) {
+        if self.evaluated.is_none() {
+            if let Some(reading) = self.reading.take() {
+                self.evaluated = reading.await.ok();
+            }
+        }
+    }
+
     /// Decide, compare and count, in a detached task.
     fn settle(self, upstream: Option<(Upstream, Option<u64>)>) {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
@@ -752,7 +820,8 @@ impl ShadowTask {
         }
     }
 
-    async fn count(self, upstream: Option<(Upstream, Option<u64>)>) {
+    async fn count(mut self, upstream: Option<(Upstream, Option<u64>)>) {
+        self.evaluate().await;
         let Self {
             ask,
             feed,
@@ -764,12 +833,12 @@ impl ShadowTask {
             ..
         } = self;
         let consumer = ask.consumer();
-        if let Ok(Evaluated {
+        if let Some(Evaluated {
             read,
             barrier,
             dropped_ms,
             applied_after,
-        }) = evaluated.await
+        }) = evaluated
         {
             let (decision, view) = match read {
                 Read::Served(view) => {
@@ -1229,11 +1298,97 @@ impl Sink {
                 live_fed,
                 fed_since_ms,
                 asked_ms,
-                evaluated,
+                reading: Some(evaluated),
+                evaluated: None,
                 progress: Arc::clone(progress),
                 cache: weak,
             }),
         })
+    }
+
+    /// Ask the cache to answer `ask` of `channel` at once (`#384 cache-serve`): the serving
+    /// form of [`Sink::shadow`]. Call it where `shadow` is called — before any upstream read —
+    /// and only it, never both for one ask: it begins the ask's one evaluation, awaits it for
+    /// at most [`SERVE_WAIT`], and decides by the same rule the shadow counts by.
+    ///
+    /// [`ServeOutcome::Served`] only when serving is on ([`Sink::serve_enabled`]), the ask is
+    /// one this milestone may answer ([`shadow::serve_eligible`]), and the rule decides
+    /// [`Decision::Serve`] on the snapshot read. The serve is counted as it is handed back;
+    /// the caller starts the read's refresh upstream and hands its answer to the returned
+    /// [`PendingServe`], so the comparison runs as for any shadow. Anything else is
+    /// [`ServeOutcome::NotServed`] with the ask's shadow to carry on with, and the request
+    /// goes upstream exactly as it did before serving existed.
+    pub async fn try_serve(
+        &self,
+        channel: &ChannelId,
+        ask: Ask,
+        live_fed: impl FnOnce() -> bool,
+    ) -> ServeOutcome {
+        if !self.serve_enabled() {
+            return ServeOutcome::NotServed(self.shadow(channel, ask, live_fed));
+        }
+        let shape = {
+            let routes = self.state.routes();
+            routes.fills.get(channel).map(|route| route.shape)
+        };
+        if !shape.is_some_and(|shape| shadow::serve_eligible(&ask, shape)) {
+            return ServeOutcome::NotServed(self.shadow(channel, ask, live_fed));
+        }
+        let Some(mut shadowed) = self.shadow(channel, ask.clone(), live_fed) else {
+            return ServeOutcome::NotServed(None);
+        };
+        let Some(task) = shadowed.task.as_mut() else {
+            return ServeOutcome::NotServed(Some(shadowed));
+        };
+        if tokio::time::timeout(SERVE_WAIT, task.evaluate()).await.is_err() {
+            return ServeOutcome::NotServed(Some(shadowed));
+        }
+        let decision = match task.evaluated.as_ref().map(|evaluated| &evaluated.read) {
+            Some(Read::Served(view)) => {
+                let evaluated = task.evaluated.as_ref().expect("just matched");
+                shadow::decide(
+                    &ask,
+                    view,
+                    &shadow::Facts {
+                        asked_ms: task.asked_ms,
+                        live_fed: task.live_fed,
+                        fed_since_ms: task.fed_since_ms,
+                        dropped_ms: evaluated.dropped_ms,
+                        barrier: evaluated.barrier,
+                        feed: task.feed,
+                    },
+                )
+            }
+            _ => Decision::Miss(Miss::Blocked),
+        };
+        if decision != Decision::Serve {
+            return ServeOutcome::NotServed(Some(shadowed));
+        }
+        let task = shadowed.task.take().expect("a task was evaluated");
+        let view = match task.evaluated.as_ref().map(|evaluated| &evaluated.read) {
+            Some(Read::Served(view)) => view.clone(),
+            _ => {
+                return ServeOutcome::NotServed(Some(Shadowed {
+                    task: Some(task),
+                }));
+            }
+        };
+        self.state.shadow.tallies.served(ask.consumer());
+        ServeOutcome::Served(Box::new(ServedAnswer {
+            view,
+            pending: PendingServe { task: Some(task) },
+        }))
+    }
+
+    /// `channel` as the cache names it, under the provider the latest routes give it: for a
+    /// caller reading the cache back beside the sink (a served answer's corrections).
+    #[must_use]
+    pub fn chan_key(&self, channel: &ChannelId) -> Option<ChanKey> {
+        let routes = self.state.routes();
+        routes
+            .fills
+            .get(channel)
+            .map(|route| ChanKey::new(route.key.clone(), channel.as_str()))
     }
 
     /// What the shadow has counted since this process started, per consumer, in

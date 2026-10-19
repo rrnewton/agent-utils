@@ -703,12 +703,44 @@ impl LiveHub {
         true
     }
 
+    /// Publish a correction of a message a reader may already have been shown: an edit or a
+    /// deletion a background refresh found after the message cache answered a newest page
+    /// from what it held (`#384 cache-serve`). Broadcast, replayed and merged into the held
+    /// windows like any event, so a page showing the served copy is put right where it stands.
+    ///
+    /// Unlike every other publish, nothing is offered to the message cache: the refresh's own
+    /// read has already offered what it saw, whole, under its fill, and offering the same
+    /// message again as a push would hold its text as possibly a snippet. Nor is a correction
+    /// offered for clearing unread at the provider: it is not a message that just arrived.
+    pub fn publish_correction(&self, channel: &ChannelId, kind: LiveKind, message: Message) {
+        let self_posted = kind != LiveKind::Delete && self.is_self_posted(&message.id);
+        let live = LiveMessage {
+            event_id: message.id.as_str().to_owned(),
+            kind,
+            historical: false,
+            message,
+            self_posted,
+        };
+        self.publish_to_feed_offering(channel, live, false, None, false);
+    }
+
     fn publish_to_feed(
         &self,
         channel: &ChannelId,
         live: LiveMessage,
         deduplicate: bool,
         read: Option<crate::cache::ReadStart>,
+    ) -> bool {
+        self.publish_to_feed_offering(channel, live, deduplicate, read, true)
+    }
+
+    fn publish_to_feed_offering(
+        &self,
+        channel: &ChannelId,
+        live: LiveMessage,
+        deduplicate: bool,
+        read: Option<crate::cache::ReadStart>,
+        offer_to_cache: bool,
     ) -> bool {
         let mut feeds = lock(&self.feeds);
         let feed = feeds.entry(channel.clone()).or_insert_with(new_feed);
@@ -734,13 +766,18 @@ impl LiveHub {
         // `#208 persistent-cache`. Queued for the message cache here, under the feed lock and
         // before the send below, so every change a subscriber can have seen is already in the
         // cache's queue by the time it could read the cache. Never waits; see `Sink::offer_push`.
-        if let Some(sink) = self.cache.get() {
+        // A correction (`#384 cache-serve`) is the one publish offered nothing: the read that
+        // found the change offered it already, whole. Its subscribers see no less for that:
+        // what a correction says was in the cache's queue before the correction was checked.
+        if offer_to_cache {
+            if let Some(sink) = self.cache.get() {
             let producer = if deduplicate {
                 crate::cache::ServerFill::Ingest
             } else {
                 crate::cache::ServerFill::Poller
             };
             sink.offer_push(channel, &live, producer, read);
+            }
         }
         feed.tail.push_back(live.clone());
         while feed.tail.len() > REPLAY_TAIL {

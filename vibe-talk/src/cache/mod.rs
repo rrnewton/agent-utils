@@ -143,7 +143,10 @@ pub use file::default_path;
 pub use grant::{FillGrant, ServerFill};
 pub use rows::{CachedMessage, ChanKey, Incoming, Scope};
 pub use search_text::{PlainText, Rendered, SearchTextSource};
-pub use sink::{Fill, HeldShadow, ReadStart, Shadowed, Sink};
+pub use sink::{
+    Fill, HeldShadow, PendingServe, ReadStart, RefreshClaim, RefreshKey, ServeOutcome,
+    ServedAnswer, Shadowed, Sink,
+};
 
 use crate::model::{ChannelId, MessageId};
 

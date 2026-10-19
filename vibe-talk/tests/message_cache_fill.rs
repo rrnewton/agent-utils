@@ -2732,9 +2732,33 @@ async fn a_deletion_made_while_the_server_was_down_is_never_vouched_for() {
 
     // A read of the whole channel since this start revalidates what it lists, and from then on
     // the feed carries every deletion: a message it lists is vouched for, past the read's own
-    // twenty-four hours too.
+    // twenty-four hours too — once an adapter is actually pushing for the provider. Merely
+    // having `[ingest]` on vouches for nothing any more (`#384 cache-serve`, on `#297
+    // cache-coverage-races` (g)): an adapter that never connects delivers no deletion, so
+    // twenty-five silent hours leave the message stale, exactly as the downtime did.
     get(&state, &flat_page()).await;
     clock.advance(25 * HOUR);
+    let status = call_as(&state, &by_id(&ids[3]), testing::READ_TOKEN).await;
+    assert_eq!(status, StatusCode::OK);
+    let counted = shadow_of(&state, "message_by_id").await;
+    assert_eq!(
+        (counted.would_serve, counted.misses.stale_head),
+        (0, 2),
+        "no adapter has pushed since this start, so the feed vouches for nothing: {counted:?}"
+    );
+
+    // An adapter pushes again: from its latest push, the feed's word stands.
+    let alive_id = fake.seed_at(
+        &id(READ_CHANNEL),
+        "Ada",
+        "adapter still here",
+        T0 + 51 * HOUR + MINUTE,
+    );
+    let alive = said(&fake, &alive_id, "adapter still here");
+    assert_eq!(
+        ingest(&state, pushed("still-here", "create", &alive)).await,
+        StatusCode::ACCEPTED
+    );
     let status = call_as(&state, &by_id(&ids[3]), testing::READ_TOKEN).await;
     assert_eq!(status, StatusCode::OK);
     let counted = shadow_of(&state, "message_by_id").await;
