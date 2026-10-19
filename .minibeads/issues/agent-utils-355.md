@@ -1,12 +1,13 @@
 ---
 title: 'provider-grouped-channels: with several chat services in one server, group every channel picker by service and choose the service first in Settings'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-19T08:28:09.877914416+00:00
-updated_at: 2026-10-19T08:28:09.877914416+00:00
+updated_at: 2026-10-19T12:29:09.942397181+00:00
+closed_at: 2026-10-19T12:29:09.942397011+00:00
 ---
 
 # Description
