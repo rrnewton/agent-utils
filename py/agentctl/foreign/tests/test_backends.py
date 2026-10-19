@@ -1945,3 +1945,87 @@ def test_migration_rollback_stops_the_staged_runner_only_through_its_pidfd(
             if process.poll() is None:
                 process.kill()
             process.wait(timeout=5)
+
+
+# --------------------------------------------------------------------------- #
+# Archiving never forgets a process that may still run
+# --------------------------------------------------------------------------- #
+
+
+def _dead_runner_worker(name: str, cwd: Path) -> None:
+    lib.ensure_agent_dirs(name)
+    with lib.registry_lock() as agents:
+        agents[name] = lib.AgentRecord(
+            name=name, harness="codex", backend="tmux", tmux_target=f"subagents:{name}", cwd=str(cwd),
+            model=None, session_id=None, status="idle", runner_pid=4_000_002, runner_started_at="1",
+            next_seq=1, created_at="2026-10-01T00:00:00+00:00", last_turn_at=None,
+        )
+
+
+def _stage(name: str, process: subprocess.Popen[bytes]) -> None:
+    lib.write_staged_runner(name, "left-by-a-failed-migration", lib.RunnerIdentity(
+        process.pid, lib.pid_start_time(process.pid), ownership.current_boot_id()))
+
+
+def test_gc_keeps_a_worker_whose_staged_runner_still_runs(
+    fake_backend_state: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "staged-orphan"
+    cwd = fake_backend_state / "cwd"
+    cwd.mkdir(parents=True)
+    _dead_runner_worker(name, cwd)
+    staged = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        _stage(name, staged)
+        monkeypatch.setattr(lib, "window_exists", lambda _rec: False)
+        notes = lib.gc()
+        assert any("staged replacement runner" in note and "preserving state" in note for note in notes), notes
+        assert name in lib.read_registry() and lib.agent_dir(name).is_dir()
+        assert staged.poll() is None
+    finally:
+        staged.kill()
+        staged.wait(timeout=5)
+    assert any(name in note and "reaped" in note for note in lib.gc())
+
+
+def test_down_stops_a_staged_runner_left_by_a_failed_migration(
+    fake_backend_state: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "staged-down"
+    cwd = fake_backend_state / "cwd"
+    cwd.mkdir(parents=True)
+    _dead_runner_worker(name, cwd)
+    staged = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        _stage(name, staged)
+        monkeypatch.setattr(lib, "window_exists", lambda _rec: False)
+        result = lib.bring_down_agent(name, grace=0)
+        assert result.archived_to is not None
+        assert staged.wait(timeout=5) == -signal.SIGTERM
+    finally:
+        if staged.poll() is None:
+            staged.kill()
+        staged.wait(timeout=5)
+
+
+def test_down_refuses_unprovable_evidence_unless_forced(
+    fake_backend_state: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "unprovable"
+    cwd = fake_backend_state / "cwd"
+    cwd.mkdir(parents=True)
+    _dead_runner_worker(name, cwd)
+    stranger = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        # A runner.pid naming a live process cannot be proven to be some other process.
+        lib.runner_pid_path(name).write_text(f"{stranger.pid}\n")
+        monkeypatch.setattr(lib, "window_exists", lambda _rec: False)
+        with pytest.raises(lib.AgentOperationError) as caught:
+            lib.bring_down_agent(name, grace=0)
+        assert caught.value.code == "worker_processes_remain"
+        assert name in lib.read_registry() and lib.agent_dir(name).is_dir()
+        assert lib.bring_down_agent(name, grace=0, force=True).archived_to is not None
+        assert stranger.poll() is None
+    finally:
+        stranger.kill()
+        stranger.wait(timeout=5)

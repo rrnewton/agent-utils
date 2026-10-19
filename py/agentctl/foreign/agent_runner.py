@@ -929,6 +929,9 @@ def main() -> int:
             if lib.staged_runner_activate_path(name, stage_token).exists():
                 lib.acknowledge_staged_runner_activation(name, stage_token)
                 stage_token = None
+                # The migration committed this runner to the registry; keep
+                # runner.pid naming the same process for retirement proofs.
+                lib.runner_pid_path(name).write_text(f"{os.getpid()}\n")
                 break
             if not lib.staged_runner_path(name, stage_token).exists():
                 _exit_reason(name, "staged marker removed before activation acknowledgement")

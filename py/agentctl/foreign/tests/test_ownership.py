@@ -667,8 +667,23 @@ def test_cgroup_require_fails_closed_and_auto_falls_back(
 
 
 def test_runtime_never_signals_by_number_outside_the_parent_pinned_fallback() -> None:
-    """Every numeric kill left in the runtime targets this process's own unreaped child."""
-    allowed = {("ownership.py", "send"), ("ownership.py", "_peel_children")}
+    """Every numeric kill left in the runtime targets this process's own unreaped child.
+
+    The scan matches any ``.kill``/``.killpg``/``.send_signal``/``.terminate``
+    call, whatever the receiver, so a numeric fallback cannot hide behind
+    ``Popen.kill`` or ``super().send_signal``. The allowlist is the complete
+    account: the two parent-pinned ``os.kill`` sites, ``OwnedHarnessProcess``
+    dispatching to its own verified ``send_signal``, and the runner's
+    test-double branch (production harnesses are always owned processes and
+    take ``kill_tree``).
+    """
+    allowed = {
+        ("ownership.py", "send"),
+        ("ownership.py", "_peel_children"),
+        ("ownership.py", "terminate"),
+        ("ownership.py", "kill"),
+        ("agent_runner.py", "_kill_harness"),
+    }
     package = Path(ownership.__file__).resolve().parent
     found: list[tuple[str, str, int]] = []
     for path in sorted(package.rglob("*.py")):
@@ -680,9 +695,92 @@ def test_runtime_never_signals_by_number_outside_the_parent_pinned_fallback() ->
                 continue
             for node in ast.walk(function):
                 if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                        and node.func.attr in ("kill", "killpg")
-                        and isinstance(node.func.value, ast.Name) and node.func.value.id == "os"):
+                        and node.func.attr in ("kill", "killpg", "send_signal", "terminate")):
                     found.append((path.name, function.name, node.lineno))
     unexpected = [item for item in found if (item[0], item[1]) not in allowed]
     assert unexpected == [], unexpected
     assert {(name, function) for name, function, _line in found} <= allowed
+
+
+# --------------------------------------------------------------------------- #
+# The corpus shared with the other edition's retirement proof
+# --------------------------------------------------------------------------- #
+
+CORPUS = PY_ROOT.parent / "rs" / "agentctl" / "testdata" / "headless-ownership" / "cases.json"
+_CORPUS_ROW: dict[str, object] = {
+    "name": "worker", "harness": "codex", "backend": "tmux", "tmux_target": "subagents:worker",
+    "cwd": "/work/project", "model": None, "session_id": "thread", "status": "idle", "runner_pid": 4242,
+    "runner_started_at": "555", "next_seq": 3, "created_at": "2026-10-01T00:00:00+00:00",
+    "last_turn_at": None, "mode": "headless", "presentation_pane": None,
+    "codex_bypass_permissions": False, "harness_args": [],
+}
+
+
+def _corpus() -> dict[str, object]:
+    value: object = json.loads(CORPUS.read_text())
+    assert isinstance(value, dict)
+    return value
+
+
+def _corpus_cases() -> list[dict[str, object]]:
+    cases = _corpus()["cases"]
+    assert isinstance(cases, list)
+    return [case for case in cases if isinstance(case, dict)]
+
+
+def _stat_line(pid: int, start: int, state: str) -> str:
+    return f"{pid} (corpus (proc)) {state} 1 {pid} {pid} 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 {start} 1000 10\n"
+
+
+@pytest.mark.parametrize("case", _corpus_cases(), ids=lambda case: str(case["name"]))
+def test_shared_corpus_verdicts(
+    case: dict[str, object], tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    corpus = _corpus()
+    boot, other_boot = str(corpus["boot"]), str(corpus["other_boot"])
+    cgroup_root = tmp_path / "cgroup"
+    cgroup_root.mkdir()
+
+    def expand(text: str) -> str:
+        return (text.replace("$OTHER_BOOT", other_boot).replace("$BOOT", boot)
+                .replace("$CGROUP", str(cgroup_root)))
+
+    fake_proc = tmp_path / "proc"
+    (fake_proc / "self").mkdir(parents=True)
+    (fake_proc / "self" / "status").write_text("Name:\tagentctl\nNSpid:\t100\n")
+    if case.get("boot", "current") is not None:
+        (fake_proc / "sys/kernel/random").mkdir(parents=True)
+        (fake_proc / "sys/kernel/random/boot_id").write_text(boot + "\n")
+    processes = case["processes"]
+    assert isinstance(processes, list)
+    for entry in processes:
+        assert isinstance(entry, dict)
+        pid, start, process_state = int(entry["pid"]), int(entry["start"]), str(entry["state"])
+        (fake_proc / str(pid)).mkdir()
+        (fake_proc / str(pid) / "stat").write_text(_stat_line(pid, start, process_state))
+        environ = entry.get("environ")
+        if isinstance(environ, list):
+            (fake_proc / str(pid) / "environ").write_bytes(
+                b"".join(str(item).encode() + b"\0" for item in environ))
+    cgroups = case["cgroups"]
+    assert isinstance(cgroups, dict)
+    for directory, events in cgroups.items():
+        (cgroup_root / str(directory)).mkdir()
+        (cgroup_root / str(directory) / "cgroup.events").write_text(str(events))
+    home = tmp_path / "runtime"
+    state = home / "state" / "worker"
+    state.mkdir(parents=True)
+    rows = [] if case.get("row", "default") is None else [_CORPUS_ROW]
+    (home / "registry.json").write_text(json.dumps(rows))
+    files = case["files"]
+    assert isinstance(files, dict)
+    for file_name, content in files.items():
+        text = content if isinstance(content, str) else json.dumps(content)
+        (state / str(file_name)).write_text(expand(text))
+    monkeypatch.setattr(ownership, "PROC", fake_proc)
+    monkeypatch.setattr(lib, "BASE", home)
+    monkeypatch.setattr(lib, "STATE", home / "state")
+    monkeypatch.setattr(lib, "REGISTRY", home / "registry.json")
+    monkeypatch.setattr(lib, "LOCKFILE", home / ".registry.lock")
+    verdict, detail = lib.recorded_liveness("worker")
+    assert verdict == case["expect"], f"{case['name']}: {case['why']}: {detail}"

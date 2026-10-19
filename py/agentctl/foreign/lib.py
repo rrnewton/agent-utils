@@ -1005,7 +1005,8 @@ def terminate_active_harness(rec: AgentRecord) -> bool:
 
     Returns True when a process was signalled. A tree that is still present
     after the bounded wait keeps its record and raises
-    ``harness_cleanup_incomplete``; a legacy record follows the legacy policy.
+    ``harness_cleanup_incomplete``; a record without same-boot identity is
+    resolved without signalling anything it cannot prove.
     """
     record = read_active_harness(rec.name)
     if record is None or not _owned_by(rec, record):
@@ -2068,7 +2069,7 @@ def terminate_runner_identity(
     """Stop one recorded runner through a pidfd: SIGTERM, then SIGKILL after ``grace``.
 
     Returns False when it was already gone. An identity that cannot be pinned
-    (legacy without proof, no start time, no pidfds) raises without a signal.
+    (no boot identity and no proof, no start time, no pidfds) raises without a signal.
     """
     return ownership.stop_process(
         identity, grace=grace, legacy_proof=_runner_cmdline_proof(name),
@@ -2152,6 +2153,128 @@ def _reap_workspace_loss(rec: AgentRecord, workspace_id: str) -> str:
         f"reaped {rec.name} (Herdr workspace {workspace_id} is gone; hard workspace death may have "
         f"interrupted a turn; recovery snapshot {saved_snapshot}{tail})"
     )
+
+
+LIVENESS_DEAD = "dead"
+LIVENESS_ALIVE = "alive"
+LIVENESS_INCONCLUSIVE = "inconclusive"
+
+
+def _recorded_identity(path: Path) -> ownership.ProcessIdentity:
+    try:
+        value: object = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise AgentOperationError("runner_identity_unknown", f"{path} is unreadable or malformed: {exc}") from exc
+    if not isinstance(value, dict):
+        raise AgentOperationError("runner_identity_unknown", f"{path} is not an object")
+    pid = value.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or not 2 <= pid <= (1 << 31) - 1:
+        raise AgentOperationError("runner_identity_unknown", f"{path} has no valid pid")
+    started_at, boot_id = value.get("started_at"), value.get("boot_id")
+    if started_at is not None and not isinstance(started_at, str):
+        raise AgentOperationError("runner_identity_unknown", f"{path} has an invalid started_at")
+    if boot_id is not None and not ownership.valid_boot_id(boot_id):
+        raise AgentOperationError("runner_identity_unknown", f"{path} has an invalid boot_id")
+    return ownership.ProcessIdentity(pid, started_at, boot_id if isinstance(boot_id, str) else None)
+
+
+def recorded_liveness(name: str, *, starting_grace: bool = True) -> tuple[str, str]:
+    """Whether every process recorded for one worker is provably gone.
+
+    Returns ("dead" | "alive" | "inconclusive", detail). The records are, in
+    this order: the registry row's runner (bound to its boot by the
+    runner-identity sidecar), a different pid in runner.pid, the recorded
+    harness leader and then its tree (per-turn cgroup, generation), and staged
+    replacement runners by file name. The first that may live decides.
+    Unreadable evidence is never a death certificate.
+    ``starting_grace`` keeps a row younger than the startup grace without a
+    runner pid inconclusive; an explicit retirement turns it off.
+    """
+    state = STATE / name
+    try:
+        rows: object = json.loads(REGISTRY.read_text()) if REGISTRY.exists() else []
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            return LIVENESS_INCONCLUSIVE, f"{REGISTRY} is not a JSON array of objects"
+        matching = [row for row in rows if isinstance(row, dict) and row.get("name") == name]
+        if len(matching) > 1:
+            return LIVENESS_INCONCLUSIVE, f"{REGISTRY} has more than one row for {name!r}"
+        row = matching[0] if matching else None
+        processes: list[tuple[str, ownership.ProcessIdentity]] = []
+        row_pid: Optional[int] = None
+        if row is not None:
+            mode = row.get("mode")
+            if mode == TUI_MODE:
+                return LIVENESS_INCONCLUSIVE, "the row is an interactive TUI, whose liveness this proof does not cover"
+            if mode is None and presentation_identity_path(name).exists():
+                return LIVENESS_INCONCLUSIVE, "the row has no mode and a presentation sidecar marks it as a possible TUI"
+            if mode not in (None, HEADLESS_MODE):
+                return LIVENESS_INCONCLUSIVE, f"the row has an unsupported mode {mode!r}"
+            raw_pid, raw_started = row.get("runner_pid"), row.get("runner_started_at")
+            if raw_started is not None and not isinstance(raw_started, str):
+                return LIVENESS_INCONCLUSIVE, "the row has an invalid runner_started_at"
+            if raw_pid is not None:
+                if isinstance(raw_pid, bool) or not isinstance(raw_pid, int) or not 1 <= raw_pid <= (1 << 31) - 1:
+                    return LIVENESS_INCONCLUSIVE, "the row has an invalid runner_pid"
+                row_pid = raw_pid
+                boot_id = _load_runner_boot_id(name, str(row.get("created_at")), raw_pid, raw_started)
+                processes.append(("its runner", ownership.ProcessIdentity(raw_pid, raw_started, boot_id)))
+        pid_file = runner_pid_path(name)
+        if pid_file.exists():
+            text = pid_file.read_text().strip()
+            if not text.isdigit() or not 1 <= int(text) <= (1 << 31) - 1:
+                return LIVENESS_INCONCLUSIVE, f"{pid_file} is malformed"
+            if int(text) != row_pid:
+                processes.append(("the runner named in runner.pid", ownership.ProcessIdentity(int(text), None)))
+        harness: Optional[ownership.HarnessRecord] = None
+        harness_path = state / "active-harness.json"
+        if harness_path.exists():
+            processes.append(("its harness", _recorded_identity(harness_path)))
+            harness = read_active_harness(name)
+        for path in sorted(state.glob("MIGRATION_STAGED_*.json")) if state.is_dir() else []:
+            processes.append(("a staged replacement runner", _recorded_identity(path)))
+        gone: list[str] = []
+        for label, identity in processes:
+            alive = ownership.recorded_process_alive(label, identity)
+            if alive is not None:
+                return LIVENESS_ALIVE, alive
+            gone.append(f"{label} (pid {identity.pid})")
+            if label == "its harness" and harness is not None:
+                member = ownership.tree_alive(harness)
+                if member is not None:
+                    return LIVENESS_ALIVE, member
+        if starting_grace and row is not None and row_pid is None:
+            created = row.get("created_at")
+            try:
+                instant = datetime.datetime.fromisoformat(str(created))
+            except ValueError:
+                return LIVENESS_INCONCLUSIVE, (
+                    f"the row records no runner process and its created_at {created!r} cannot be read")
+            if instant.tzinfo is None:
+                return LIVENESS_INCONCLUSIVE, (
+                    f"the row records no runner process and its created_at {created!r} has no time zone")
+            age = (datetime.datetime.now(datetime.timezone.utc) - instant).total_seconds()
+            if age < STARTUP_GRACE_S:
+                return LIVENESS_INCONCLUSIVE, "the row records no runner process yet; its runner may still be starting"
+    except AgentOperationError as exc:
+        return LIVENESS_INCONCLUSIVE, exc.message
+    except OSError as exc:
+        return LIVENESS_INCONCLUSIVE, f"cannot read the runtime records: {exc}"
+    except ValueError as exc:
+        return LIVENESS_INCONCLUSIVE, f"the runtime records are malformed: {exc}"
+    detail = ("every recorded process has exited or its PID now names a newer process: " + ", ".join(gone)
+              if gone else "no recorded process")
+    return LIVENESS_DEAD, detail
+
+
+def _stop_recorded_staged_runners(name: str) -> None:
+    """Stop staged replacement runners a failed migration left running, through pidfds."""
+    state = STATE / name
+    if not state.is_dir():
+        return
+    for path in sorted(state.glob("MIGRATION_STAGED_*.json")):
+        identity = _recorded_identity(path)
+        if ownership.recorded_process_alive("a staged replacement runner", identity) is not None:
+            terminate_runner_identity(identity, name=name)
 
 
 def _within_startup_grace(rec: AgentRecord) -> bool:
@@ -2263,6 +2386,11 @@ def gc() -> list[str]:
                 # processes are this worker's; keep it for a later attempt.
                 notes.append(f"{name} degraded: {reason}, but its harness could not be cleaned "
                              f"({exc.message}); preserving state")
+                continue
+            verdict, detail = recorded_liveness(name)
+            if verdict != LIVENESS_DEAD:
+                notes.append(f"{name} degraded: {reason}, but a recorded process is {verdict} "
+                             f"({detail}); preserving state")
                 continue
             if win:
                 kill_window(rec)
@@ -3066,6 +3194,16 @@ def bring_down_agent(
             cur = read_registry().get(valid_name)
             if cur is not None:
                 terminate_runner(cur)
+            _stop_recorded_staged_runners(valid_name)
+            verdict, detail = recorded_liveness(valid_name, starting_grace=False)
+            # A proven live process is never abandoned. Evidence that cannot
+            # prove death refuses too, unless the operator forces retirement.
+            if verdict == LIVENESS_ALIVE or (verdict == LIVENESS_INCONCLUSIVE and not force):
+                raise AgentOperationError(
+                    "worker_processes_remain",
+                    f"refusing to retire {valid_name!r}: a recorded process is {verdict} ({detail}); "
+                    "its state and registry row are unchanged",
+                )
 
     unverified_presentation: Optional[str] = None
     if force and rec is not None:
