@@ -4965,17 +4965,19 @@ a minute (`#308 live-reply-in-main`). A bridge that streams its answer by editin
 is out has it placed with the text the read found, not the text it was first pushed with (`#316
 late-counts-resurrect`). The same holds when a reply to the message is what places it
 (`reason=reply-place`): a read of All sent before that one and landing after it does not put the
-pushed text back. So an adapter that can say where a message is should say so in every create
-and update, not only in its reads.
+pushed text back, and a reply that read places after a newest page of Main took it out does not count
+twice on its root (`#328 removal-outside-window`). So an adapter that can say where a message is should
+say so in every create and update, not only in its reads.
 
 Updates use `kind: "update"` with the complete current message. Deletes use
 `{"event_id":"…","historical":false,"kind":"delete","channel_id":"123","message_id":"9001"}`.
 They become `event: message_update` and `event: message_delete`; the page re-reads the authoritative
 window while preserving its scroll position, rather than leaving a stale row or trying to patch a
 derived combined row in place. A removal is believed from then on: the first newest page to land
-takes the message out, even one sent before the removal (`#316 late-counts-resurrect`). One answered
-after the removal does not carry the message, and its cursor is past the deletion, so the re-read,
-which continues from that cursor, would never report it. Creates remain `event: message`, so existing
+takes the message out, even one sent before the removal (`#316 late-counts-resurrect`), and even a
+message older than that page reaches back to (`#328 removal-outside-window`). One answered after the
+removal does not carry the message, and its cursor is past the deletion, so the re-read, which
+continues from that cursor, would never report it. Creates remain `event: message`, so existing
 polling producers and older clients keep their wire contract.
 
 SSE resume ids are event ids, not message-order cursors. Adapter ids are namespaced with `push:` on

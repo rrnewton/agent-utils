@@ -18756,6 +18756,12 @@ function inTimeOrder(items, field) {
  * a row of that view it does not carry there was deleted upstream and goes; an older page only
  * adds. Rows another view holds are untouched either way. `page` is every row the page carries, where
  * it reaches back to, when `arriving` is only the rows the store takes of it (`pageFold`).
+ *
+ * `#328 removal-outside-window`. Below the page's oldest row a newest page speaks for nothing, so a row
+ * held there stays, except one removed upstream (`noteRemoved`): the stream has said it is gone, and
+ * the page, which answers for its view, does not bring it back. It used to stay, shown and saved, until
+ * a read reached back to it, which a removed message never does: the README's "the first newest page to
+ * land takes the message out" was true only within that page's window.
  */
 function mergeIntoCanon(field, arriving, older, hasMore, belongs, page = arriving) {
   const timeField = field === "threads" ? "updated_at" : "timestamp";
@@ -18772,8 +18778,9 @@ function mergeIntoCanon(field, arriving, older, hasMore, belongs, page = arrivin
   }
   const incoming = new Set(arriving.map((item) => String(item.id)));
   const edge = page.length ? timeOf(page[0], timeField) : NaN;
+  const removed = (/** @type {any} */ item) => field === "messages" && channelCanon.removed.has(String(item.id));
   const kept = channelCanon[field].filter((item) => !incoming.has(String(item.id)) &&
-    (older || !belongs(item) || (hasMore && Number.isFinite(edge) && timeOf(item, timeField) < edge)));
+    (older || !belongs(item) || (hasMore && Number.isFinite(edge) && timeOf(item, timeField) < edge && !removed(item))));
   channelCanon[field] = inTimeOrder(older ? [...arriving, ...kept] : [...kept, ...arriving], timeField);
 }
 
@@ -19157,7 +19164,8 @@ function deltaSideState(thread) {
  * `#316 late-counts-resurrect`: taken for the stream's copy, built on its bare one, it let the read of
  * All for Main's counts, sent before the reply's read and landing after it, take its own older copy
  * over it. A bridge's finished answer, which the reply's read had brought, went back to the text it
- * was pushed with, saved, and shown in its thread or in All until a read of either landed.
+ * was pushed with, saved, and shown in its thread or in All until a read of either landed. Nor does that
+ * copy add to its root's count of replies (`#328 removal-outside-window`).
  */
 function foldLiveMessage(message, live = false, replayed = false, read = null) {
   const channel = String(el("discord-channel").value);
@@ -19193,7 +19201,11 @@ function foldLiveMessage(message, live = false, replayed = false, read = null) {
     channelCanon.unplacedAnswered.delete(id);
   }
   const thread = threadOf(kept);
-  const fresh = !held && !replayed && thread !== null && kept.thread.is_root !== true && thread !== channelCanon.scope;
+  // `#328 removal-outside-window`. Never the copy a reply's read brought (`read`): the store held that
+  // message once, unplaced, and a newest page took it out, so the counts of that page or a later one
+  // have it already. Counted again, a root said one reply more than its thread had.
+  const fresh = !held && !replayed && read === null && thread !== null && kept.thread.is_root !== true &&
+    thread !== channelCanon.scope;
   /** @param {any} record a summary or a root's thread record: its count with this reply, or null */
   const withReply = (record) => (fresh && typeof record.reply_count === "number" && record.reply_count > 0
     ? record.reply_count + 1 : null);
