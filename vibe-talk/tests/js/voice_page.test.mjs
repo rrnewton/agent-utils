@@ -72197,6 +72197,112 @@ test("`#352 voice-reconnect-on-bridge-error`: a typed call reconnects too, and o
   assert.match(page.el("status").textContent, /Waiting for the assistant|Reconnected — type a message/);
 });
 
+/** A typed call, after one exchange, with a channel message relayed into it and echoed as turn 2. */
+async function typedRelayInFlight(page) {
+  page.channels = [CHANNEL, OTHER_CHANNEL];
+  const socket = await startTypedNeutralCall(page, false, "hello");
+  await page.settle();
+  await setReadNew(page, "full");
+  speech(socket, "user", 1, "hello");
+  speech(socket, "assistant", 1, "Hi.", true);
+  turnDone(socket, 1);
+  await page.settle();
+  await deliver(page, page.watchStream(),
+    sseWatch(message({ id: "3520", channel_id: OTHER_CHANNEL.id, author: "codex", content: "the release is tagged" }), "w.1"));
+  page.expireTimers(RELAY_COALESCE_MS);
+  await page.settle();
+  const [prompt] = relayedPrompts(socket);
+  assert.ok(prompt, "the premise: the channel message was not relayed into the typed call");
+  speech(socket, "user", 2, prompt);
+  await page.settle();
+  return { socket, prompt, echo: 2 };
+}
+
+test("`#352 voice-reconnect-on-bridge-error`: in a TYPED call, the lost relay waits for the new session's greeting — hung up mid-greeting it is said not read out, and after the greeting it goes once and its echo is not the reader's words (negative control: the page that sent it into the greeting)", async () => {
+  const run = async (script) => {
+    const out = {};
+    {
+      const page = newPage(new Map(), script);
+      const { socket, prompt, echo } = await typedRelayInFlight(page);
+      loseTurn(socket, echo);
+      await page.settle();
+      const next = await reconnectTo(page, socket, { greeting: true });
+      out.beforeGreeting = promptsSent(next).filter((t) => t === prompt).length;
+      speech(next, "assistant", 1, "Hello", false);
+      await page.settle();
+      await page.el("hang-up").click();
+      await page.settle();
+      out.midGreeting = unreadSeams(page).length;
+    }
+    {
+      const page = newPage(new Map(), script);
+      page.transcriptRecordsSupported = true;
+      const { socket, prompt, echo } = await typedRelayInFlight(page);
+      loseTurn(socket, echo);
+      await page.settle();
+      const next = await reconnectTo(page, socket, { greeting: true });
+      speech(next, "assistant", 1, "Hello again.", true);
+      turnDone(next, 1);
+      await page.settle();
+      out.afterGreeting = promptsSent(next).filter((t) => t === prompt).length;
+      out.status = page.el("status").textContent;
+      speech(next, "user", 2, prompt);
+      speech(next, "assistant", 2, "In build noise, codex said the release is tagged.", true);
+      turnDone(next, 2);
+      await page.settle();
+      await page.el("hang-up").click();
+      for (let step = 0; step < 10; step += 1) await page.settle();
+      out.youRows = youRowsSaying(page, "the release is tagged").length;
+      out.storedAsYou = storedTexts(page).filter((t) => t.startsWith("you:") && t.includes("the release is tagged")).length;
+      out.unread = unreadSeams(page).length;
+    }
+    return out;
+  };
+  const out = await run(SCRIPT);
+  assert.equal(out.beforeGreeting, 0, "the lost relay was sent into the new session's greeting");
+  assert.equal(out.midGreeting, 1, "a call hung up during the greeting let the lost relay go with no word");
+  assert.equal(out.afterGreeting, 1, "the lost relay did not go once after the greeting");
+  assert.match(out.status, /type a message|Waiting for the assistant/, `a typed call was told to speak: ${out.status}`);
+  assert.equal(out.youRows, 0, "the relay's echo was drawn as the reader's words");
+  assert.equal(out.storedAsYou, 0, "the relay's echo was stored as the reader's words");
+  assert.equal(out.unread, 0, "a relay read out after the greeting was said not read out");
+  const control = await run(brokenScript("        if (reconnected && message.greeting === true) {\n          session.waitingForGreeting = true;",
+    "        if (false) {\n          session.waitingForGreeting = true;"));
+  assert.equal(control.beforeGreeting, 1,
+    "the negative control did not send the relay into the greeting, so the checks above prove nothing");
+  assert.equal(control.midGreeting, 0, "the negative control reported the relay, so the check above proves nothing");
+});
+
+test("`#352 voice-reconnect-on-bridge-error`: in a TYPED call, a reconnect's greeting of audio alone releases the lost relay and raises no alarm, as a first typed call's does not (negative control: the greeting judged as a spoken call's)", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    const { socket, prompt, echo } = await typedRelayInFlight(page);
+    loseTurn(socket, echo);
+    await page.settle();
+    const next = await reconnectTo(page, socket, { greeting: true });
+    next.onmessage({ data: page.pcmFrame(24000, SPEECH) });
+    turnDone(next, 1);
+    await passTime(page, 1000);
+    const sent = promptsSent(next).filter((t) => t === prompt).length;
+    const status = page.el("status").textContent;
+    speech(next, "user", 2, prompt);
+    speech(next, "assistant", 2, "In build noise, codex said the release is tagged.", true);
+    turnDone(next, 2);
+    await passTime(page, 1000);
+    return { sent, status, health: page.healthPosts.map((r) => r.cause) };
+  };
+  const out = await run(SCRIPT);
+  assert.equal(out.sent, 1, "the greeting of audio alone did not release the lost relay");
+  assert.doesNotMatch(out.status, /not responding/, `a typed call's audio greeting was taken for silence: ${out.status}`);
+  // The lost session's own record (`error_frame`) is there; nothing about the new session's greeting is.
+  assert.ok(!out.health.includes("silent_greeting") && !out.health.includes("no_reply"),
+    `a typed call's audio greeting posted a health record: ${out.health}`);
+  const control = await run(brokenScript("          session.waitingForGreeting = true;\n          armNoReply();",
+    "          session.waitingForGreeting = true;\n          if (session.health) session.health.greetingPending = true;\n          armNoReply();"));
+  assert.ok(control.health.includes("silent_greeting"),
+    `the negative control raised no alarm, so the check above proves nothing: ${control.health}`);
+});
+
 test("`#352 voice-reconnect-on-bridge-error`: the page's word on a send card that the bridge lost goes again only to a session that took this call's record", async () => {
   /** A call where the card was sent by a tap, and the page's word on it is the turn the bridge lost. */
   const run = async (capabilities, ack) => {

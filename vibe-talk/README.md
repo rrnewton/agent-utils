@@ -5541,7 +5541,9 @@ on a session that has started keeps the call:
 * **What the bridge lost goes again, once**, and only a text turn the bridge named as never started
   with nothing of an answer to it arrived — a relayed turn's messages, or a typed message, whose echo
   is not drawn a second time. It goes first, with no microphone segment before it, unless the new
-  session greets, in which case it waits for the greeting as any text turn does. A turn that had
+  session greets, in which case it waits for the greeting's `turn_complete` — in a typed call too,
+  though a typed call's first session is not waited on, so the greeting is never taken for the
+  answer to a turn already sent once. A turn that had
   begun to be answered is never sent again: it may have acted, and its words are kept marked cut off.
   A relayed turn the bridge did not name is said "not read out"; a typed one is left to the reader
   to send again; the page's word on a send card goes again only to a session that took the record,

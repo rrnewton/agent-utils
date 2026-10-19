@@ -17504,7 +17504,24 @@ function handleVibeTalk(message) {
         // FIRST message, which is what starts the call and is held until here. The transcript is
         // still right, rows being kept per turn number, and the next message waits behind the
         // reply it did not ask for (`replyArriving`) once any of that reply has arrived.
-        setStatus(reconnected ? "Reconnected — type a message." : "Connected — type a message.");
+        //
+        // `#352`. A reconnect's new session that promises a greeting IS waited for: what goes again
+        // there is a turn already sent once — the lost relay, or the reader's message — and sent
+        // into the greeting, the greeting would be taken for its answer and the turn let go unread,
+        // and its echo after the greeting drawn as the reader's words. The no-reply bound holds a
+        // greeting that never comes. Not judged as a spoken greeting is (`greetingPending`): a typed
+        // call hears no audio, so a greeting of audio alone would be taken for a silent one.
+        if (reconnected && message.greeting === true) {
+          session.waitingForGreeting = true;
+          armNoReply();
+        }
+        setStatus(
+          session.waitingForGreeting
+            ? "Reconnected — the assistant is joining…"
+            : reconnected
+              ? "Reconnected — type a message."
+              : "Connected — type a message."
+        );
         // The held first message: queued and, with nothing ahead of it, on the wire in this call.
         deliverHeldTurn();
         advanceVibeTalkInput();
@@ -17681,7 +17698,7 @@ function vibeTalkTurnComplete() {
     // below was measured to close the whole session on. Every other turn's end already waited; the
     // greeting's opened the microphone straight away, a few seconds into every call that greets.
     deferVoiceCaptureAcrossTurn();
-    setStatus("Connected — say something.");
+    setStatus(session.chat ? "Connected — type a message." : "Connected — say something.");
     advanceVibeTalkInput();
     return;
   }
