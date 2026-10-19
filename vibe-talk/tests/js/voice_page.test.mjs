@@ -482,6 +482,30 @@ const FIXTURE_TREE = {
   ],
   "side-composer": ["side-compose-text", "side-send", "side-compose-state"],
   "side-tools": ["side-jump-newest"],
+  // `#351 settings-polish`. Settings, as far down as two questions need it: what the pop-out over
+  // Recently dismissed makes inert around it (everything beside it and beside each box around it), and
+  // which folds a hidden group takes out of Expand all. From the box of sections down, not from
+  // #screen-settings, which scrolls and so stays out of this model (see SCROLLERS); a control nested
+  // deeper in an unnamed box is listed under the nearest named one, which holds it all the same.
+  "settings-panes": ["settings-voice-agent", "settings-messages", "settings-channels", "settings-screen", "settings-storage"],
+  "settings-voice-agent": ["fold-settings-voice-agent", "fold-settings-voice-agent-body"],
+  "fold-settings-voice-agent-body": ["fold-sending", "agent-settings"],
+  "agent-settings": ["fold-provider", "fold-provider-body"],
+  "settings-messages": ["fold-settings-messages", "fold-settings-messages-body"],
+  "fold-settings-messages-body": ["fold-mark-own", "identity-group", "dismissed-group"],
+  "dismissed-group": ["fold-dismissed", "fold-dismissed-body"],
+  "fold-dismissed-body": ["dismissed-sends-state", "dismissed-sends", "forget-dismissed-sends", "dismissed-send-popout"],
+  "dismissed-send-popout": [
+    "dismissed-send-popout-meta",
+    "dismissed-send-popout-text",
+    "dismissed-send-copy",
+    "dismissed-send-restore",
+    "dismissed-send-close",
+    "dismissed-send-popout-state",
+  ],
+  "settings-storage": ["fold-settings-storage", "fold-settings-storage-body"],
+  "fold-settings-storage-body": ["fold-storage", "message-cache-group"],
+  "message-cache-group": ["fold-message-cache", "fold-message-cache-body"],
 };
 
 /**
@@ -4261,6 +4285,10 @@ const TUNING_BANDS = {
     "how much of a message the Undo chip and Put back quote to name it (#193 compose-draft-loss). " +
     "Under sixteen characters two messages read the same; past forty-eight the chip wraps the row " +
     "of chips on a phone"],
+  DISMISSED_LABEL_CHARS: [60, 200,
+    "how much of a dismissed message's first line names its row to a screen reader (#351 " +
+    "settings-polish). Under sixty a row says little more than where it was going; past two hundred " +
+    "it is a paragraph read out at every row passed, which is what the name is there to stop"],
   CHANNEL_READ_TIMEOUT_MS: [15000, 45000,
     "how long a read of the newest messages is waited for (#195 send-resilience). A slow service " +
     "ordinarily answers in ten to twelve seconds, so under fifteen every slow read fails; past " +
@@ -58902,6 +58930,158 @@ test("`#348 settings-dynamic-lists` x `#346 settings-collapsible`: folding the g
   await dismissedOpenerOf(dismissedItems(blind)[0]).click();
   await blind.el("fold-dismissed").click();
   assert.equal(blind.el("dismissed-send-popout").hidden, false, "the negative control closed it anyway, so the check above proves nothing");
+});
+
+// --- `#351 settings-polish`: the pop-out over Recently dismissed ---------------------------------
+//
+// Found in a review of `#348 settings-dynamic-lists`: Put back from the pop-out dropped the focus to
+// nowhere, the pop-out dimmed the screen like a modal without being one, and each row was named by
+// its whole message.
+
+/** A page on Settings with each of `texts` sent, refused and dismissed: the list has them newest first. */
+async function dismissedPageOf(texts, script = SCRIPT) {
+  const page = newPage(new Map(), script);
+  await signIn(page);
+  await showDiscord(page, []);
+  for (const text of texts) await outgoingDismiss(await failedSend(page, text)).click();
+  page.expireTimers(SEND_UNDO_MS);
+  await page.el("open-settings").click();
+  return page;
+}
+
+/** The text of each row of Recently dismissed, top to bottom. */
+const dismissedTexts = (page) =>
+  dismissedItems(page).map((item) => item.descendants().find((node) => node.hasClass("dismissed-send-text")).textContent);
+
+/** The pop-out's Tab stops, in order. */
+const DISMISSED_STOPS = ["dismissed-send-popout-text", "dismissed-send-copy", "dismissed-send-restore", "dismissed-send-close"];
+
+/** Whether `node` is inert: it, or an element around it, carries `inert`. */
+function inertNow(node) {
+  for (let at = node; at; at = at.parentNode) if (at.hasAttribute("inert")) return true;
+  return false;
+}
+
+/** The page's own elements carrying `inert` now, by id. */
+const inertIds = (page) => [...page.elements.values()].filter((node) => node.hasAttribute("inert")).map((node) => node.id);
+
+test("`#351 settings-polish`: Put back from the pop-out gives the focus to the row that took its place, else the list, else its state line", async () => {
+  const page = await dismissedPageOf(["first", "second", "third"]);
+  assert.deepStrictEqual(dismissedTexts(page), ["third", "second", "first"]);
+  // The top row: the one under it takes its place, and the focus.
+  await (await putBackOf(page, dismissedItems(page)[0])).click();
+  await page.settle();
+  assert.deepStrictEqual(dismissedTexts(page), ["second", "first"]);
+  assert.equal(focused(page), dismissedOpenerOf(dismissedItems(page)[0]), `after the top row went, the focus is on ${focusName(page)}`);
+  // The last row: nothing takes its place, so the list.
+  await (await putBackOf(page, dismissedItems(page)[1])).click();
+  await page.settle();
+  assert.deepStrictEqual(dismissedTexts(page), ["second"]);
+  assert.equal(focused(page), page.el("dismissed-sends"), `after the last row went, the focus is on ${focusName(page)}`);
+  // The only row: the list goes with it, so the line that now says it is empty.
+  await (await putBackOf(page, dismissedItems(page)[0])).click();
+  await page.settle();
+  assert.equal(page.el("dismissed-sends").hidden, true);
+  assert.equal(focused(page), page.el("dismissed-sends-state"), `after the only row went, the focus is on ${focusName(page)}`);
+  assert.match(page.el("dismissed-sends-state").textContent, /^Nothing dismissed/);
+  // Each of the two can hold the focus from script, and neither is a Tab stop.
+  for (const id of ["dismissed-sends", "dismissed-sends-state"]) {
+    assert.match(new RegExp(`<[a-z]+ id="${id}"[^>]*>`).exec(HTML_CODE)[0], /\btabindex="-1"/, `#${id} cannot hold the focus`);
+  }
+  // The negative control: a page that leaves the focus in the pop-out it has just hidden, on nothing
+  // drawn, which a browser hands to the body.
+  const blind = await dismissedPageOf(["first", "second"], brokenScript("  focusDismissedAt(at);\n", ""));
+  await (await putBackOf(blind, dismissedItems(blind)[0])).click();
+  await blind.settle();
+  assert.equal(blind.el("dismissed-send-popout").hidden, true);
+  assert.equal(nodeIn(blind.el("dismissed-send-popout"), focused(blind)), true,
+    `the negative control moved the focus anyway, to ${focusName(blind)}, so the check above proves nothing`);
+});
+
+test("`#351 settings-polish`: the pop-out is a modal: marked so, the page behind it inert while it is up, and Tab kept inside it", async () => {
+  assert.match(HTML_CODE, /<div id="dismissed-send-popout"[^>]*role="dialog"[^>]*aria-modal="true"/, "the pop-out is not marked modal");
+  const page = await dismissedPageOf(["a message to read whole"]);
+  await page.el("fold-settings-all").click();
+  assert.deepStrictEqual(inertIds(page), [], "something is inert before the pop-out is up");
+  await dismissedOpenerOf(dismissedItems(page)[0]).click();
+  assert.equal(page.el("dismissed-send-popout").hidden, false);
+  // Behind it: its own group's fold, list, line and Forget, the groups beside it and the sections beside
+  // its section, and the row that opened it, inside the list.
+  for (const id of ["fold-dismissed", "dismissed-sends", "dismissed-sends-state", "forget-dismissed-sends", "fold-mark-own",
+    "identity-group", "fold-settings-messages", "settings-channels", "fold-settings-voice-agent", "fold-storage"]) {
+    assert.equal(inertNow(page.el(id)), true, `#${id} can still be reached behind the pop-out`);
+  }
+  assert.equal(inertNow(dismissedOpenerOf(dismissedItems(page)[0])), true, "the row behind the pop-out can still be reached");
+  // Not the pop-out, nor anything in it.
+  for (const id of ["dismissed-send-popout", ...DISMISSED_STOPS, "dismissed-send-popout-meta", "dismissed-send-popout-state"]) {
+    assert.equal(inertNow(page.el(id)), false, `#${id}, in the pop-out, is inert`);
+  }
+  // Tab goes round its own stops: Close to the message, and Shift+Tab back; from the page, as after a
+  // tap on the dim, to its first stop, or its last; between two of its stops it is the browser's.
+  let key = await press(page, page.el("dismissed-send-close"), "Tab");
+  assert.equal(focused(page), page.el("dismissed-send-popout-text"), `Tab from Close went to ${focusName(page)}`);
+  assert.equal(key.defaultPrevented, true, "the browser's Tab still ran after the pop-out moved the focus");
+  await press(page, page.el("dismissed-send-popout-text"), "Tab", { shiftKey: true });
+  assert.equal(focused(page), page.el("dismissed-send-close"), `Shift+Tab from the message went to ${focusName(page)}`);
+  await press(page, null, "Tab");
+  assert.equal(focused(page), page.el("dismissed-send-popout-text"), `Tab from the page went to ${focusName(page)}`);
+  await press(page, null, "Tab", { shiftKey: true });
+  assert.equal(focused(page), page.el("dismissed-send-close"), `Shift+Tab from the page went to ${focusName(page)}`);
+  key = await press(page, page.el("dismissed-send-copy"), "Tab");
+  assert.equal(key.defaultPrevented, false, "Tab from Copy to Put back was taken from the browser");
+  key = await press(page, page.el("dismissed-send-close"), "Tab", { ctrlKey: true });
+  assert.equal(key.defaultPrevented, false, "Ctrl+Tab, the browser's next tab, was taken");
+  // Close gives the page back, and the focus to the row.
+  await page.el("dismissed-send-close").click();
+  assert.deepStrictEqual(inertIds(page), [], "the page stayed inert after Close");
+  assert.equal(focused(page), dismissedOpenerOf(dismissedItems(page)[0]));
+  // ...as every other way it goes does: Escape, folding its group, leaving Settings and Put back.
+  await dismissedOpenerOf(dismissedItems(page)[0]).click();
+  await press(page, page.el("dismissed-send-copy"), "Escape");
+  assert.equal(page.screen(), "settings");
+  assert.deepStrictEqual(inertIds(page), [], "the page stayed inert after Escape");
+  await dismissedOpenerOf(dismissedItems(page)[0]).click();
+  await page.el("fold-dismissed").click();
+  assert.deepStrictEqual(inertIds(page), [], "the page stayed inert after its group was folded");
+  await page.el("fold-dismissed").click();
+  await dismissedOpenerOf(dismissedItems(page)[0]).click();
+  await page.el("close-settings").click();
+  assert.deepStrictEqual(inertIds(page), [], "the page stayed inert after Settings was left");
+  await page.el("open-settings").click();
+  // An element already inert is left inert: it is not the pop-out's to give back.
+  page.el("settings-screen").setAttribute("inert", "");
+  await dismissedOpenerOf(dismissedItems(page)[0]).click();
+  await page.el("dismissed-send-restore").click();
+  await page.settle();
+  assert.deepStrictEqual(inertIds(page), ["settings-screen"], "Put back gave back more, or less, than the pop-out took");
+  // The negative controls: a pop-out that makes nothing inert, and one that does not keep Tab.
+  const open = await dismissedPageOf(["a message"], brokenScript("inert: inertAround(popout) }", "inert: [] }"));
+  await dismissedOpenerOf(dismissedItems(open)[0]).click();
+  assert.equal(inertNow(open.el("fold-dismissed")), false, "the negative control made the page inert anyway, so the check above proves nothing");
+  const loose = await dismissedPageOf(["a message"], brokenScript('document.addEventListener("keydown", trapDismissedTab);\n', ""));
+  await dismissedOpenerOf(dismissedItems(loose)[0]).click();
+  await press(loose, loose.el("dismissed-send-close"), "Tab");
+  assert.equal(focused(loose), loose.el("dismissed-send-close"), "the negative control kept Tab anyway, so the check above proves nothing");
+});
+
+test("`#351 settings-polish`: a row of Recently dismissed is named by its place, its age and its first line, and still holds the whole text", async () => {
+  const cut = sourceConstant("DISMISSED_LABEL_CHARS");
+  const lines = `\n  \ndeploy note: the cache is warm again\nthe second line, which the row's name leaves out\n${"and more after it ".repeat(20)}`;
+  const one = `${"a single line of words ".repeat(12)}to the end`;
+  const page = await dismissedPageOf([lines, one]);
+  const nameOf = (item) => dismissedOpenerOf(item).getAttribute("aria-label") ?? dismissedOpenerOf(item).text();
+  const metaOf = (item) => item.descendants().find((node) => node.hasClass("dismissed-send-meta")).textContent;
+  const [single, multi] = dismissedItems(page);
+  assert.equal(nameOf(multi), `${metaOf(multi)}: deploy note: the cache is warm again`, "the row is not named by its place, age and first line");
+  assert.match(multi.text(), /the second line[\s\S]*and more after it/, "the row no longer holds the whole text for find-in-page");
+  // One long line is cut where a word ends, as a name, not read out whole.
+  assert.ok(nameOf(single).startsWith(`${metaOf(single)}: a single line of words`));
+  assert.ok(nameOf(single).endsWith("…") && nameOf(single).length <= metaOf(single).length + 2 + cut,
+    `a one-line message's row is named by ${nameOf(single).length} characters`);
+  assert.match(single.text(), /to the end$/);
+  // The negative control: a row with no name of its own is named by everything in it.
+  const blind = await dismissedPageOf([lines], brokenScript('    open.setAttribute("aria-label", dismissedRowLabel(held));\n', ""));
+  assert.match(nameOf(dismissedItems(blind)[0]), /the second line/, "the negative control's row is named by one line anyway, so the check above proves nothing");
 });
 
 test("`#348 settings-dynamic-lists`: Connection status puts each part of the detail on its own line; the banner keeps one", async () => {

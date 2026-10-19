@@ -1572,6 +1572,11 @@ const DISMISSED_SENDS_DAYS = 7;
 const DISMISSED_SENDS_MAX_AGE_MS = DISMISSED_SENDS_DAYS * 24 * 60 * 60 * 1000;
 /** How much of a message a control quotes to name it. */
 const SEND_SNIPPET_CHARS = 28;
+/**
+ * `#351 settings-polish`. How much of a message's first line names its row in Recently dismissed to a
+ * screen reader (`dismissedRowLabel`): a line, not a paragraph.
+ */
+const DISMISSED_LABEL_CHARS = 120;
 const CHANNEL_DRAFT_REFUSED = "This browser could not save the draft. Keep this page open until you send it.";
 /**
  * The sends dismissed from the outbox, newest first, each with when it was dismissed.
@@ -1581,8 +1586,9 @@ const CHANNEL_DRAFT_REFUSED = "This browser could not save the draft. Keep this 
 let dismissedSends = [];
 /**
  * `#348 settings-dynamic-lists`. The dismissed send the pop-out over Recently dismissed shows, and the row that opened it, which takes the focus back.
+ * `inert` is what the pop-out made inert behind it while it is up (`#351 settings-polish`, `inertAround`).
  *
- * @type {{id: string, opener: HTMLElement | null} | null}
+ * @type {{id: string, opener: HTMLElement | null, inert: Element[]} | null}
  */
 let dismissedPopout = null;
 /**
@@ -24592,14 +24598,14 @@ function underDraft(draft, text) {
   return kept.trim() ? `${kept}\n\n${text}` : text;
 }
 
-/** The first few words of a message, on one line, for a control that has to name it. */
-function sendSnippet(text) {
+/** The first few words of a message (`chars` at most), on one line, for a control that has to name it. */
+function sendSnippet(text, chars = SEND_SNIPPET_CHARS) {
   const words = String(text).replace(/\s+/g, " ").trim();
-  if (words.length <= SEND_SNIPPET_CHARS) return words;
-  let cut = words.slice(0, SEND_SNIPPET_CHARS - 1);
+  if (words.length <= chars) return words;
+  let cut = words.slice(0, chars - 1);
   // At the end of a word, where one ends in the second half, rather than in the middle of one.
   const end = words[cut.length] === " " ? cut.length : cut.lastIndexOf(" ");
-  if (end > SEND_SNIPPET_CHARS / 2) cut = cut.slice(0, end);
+  if (end > chars / 2) cut = cut.slice(0, end);
   return `${cut.trimEnd()}…`;
 }
 
@@ -24847,12 +24853,26 @@ function dismissedSendMeta(held) {
 }
 
 /**
+ * What a row of Recently dismissed is called to a screen reader: its place and age, and the first line
+ * of its text, cut to DISMISSED_LABEL_CHARS.
+ *
+ * `#351 settings-polish`. A button is named by everything inside it unless it is given a name, and the
+ * row holds the whole message, for find-in-page: so each row passed read a whole message out, where the
+ * eye sees one line. The pop-out the row opens is where the whole message is read.
+ */
+function dismissedRowLabel(held) {
+  const first = String(unsentText(held.entry)).split("\n").find((line) => line.trim()) || "";
+  return [dismissedSendMeta(held), sendSnippet(first, DISMISSED_LABEL_CHARS)].filter(Boolean).join(": ");
+}
+
+/**
  * Settings' Recently dismissed: each send's place, its age and the first line of its text.
  *
  * `#348 settings-dynamic-lists`. A data panel rather than a column of cards with a Put back on each:
  * a row is one button, its two lines the place and age and the text, cut to one line by the stylesheet
- * (the whole text is still in the row, for find-in-page and a screen reader), and it opens the pop-out
- * where the whole message is, with Copy and Put back (`openDismissedSend`).
+ * (the whole text is still in the row, for find-in-page), and it opens the pop-out where the whole
+ * message is, with Copy and Put back (`openDismissedSend`). A screen reader is told the row's name,
+ * `dismissedRowLabel`, rather than everything in it.
  */
 function renderDismissedSends() {
   pruneDismissedSends();
@@ -24866,6 +24886,7 @@ function renderDismissedSends() {
     open.setAttribute("aria-haspopup", "dialog");
     open.setAttribute("aria-controls", "dismissed-send-popout");
     open.setAttribute("data-outgoing-id", String(entry.id));
+    open.setAttribute("aria-label", dismissedRowLabel(held));
     open.addEventListener("click", () => openDismissedSend(entry.id, open));
     open.append(
       styled("span", "dismissed-send-meta", dismissedSendMeta(held)),
@@ -24891,18 +24912,50 @@ function renderDismissedSends() {
 // `#348 settings-dynamic-lists`. One message, whole: where it was going and when it was dismissed, its
 // text as typed, Copy, Put back and Close. It is a menu to the keys and to the back gesture
 // (`openMenus`): Escape closes it first, and so does Back, before Settings. Leaving Settings closes it.
+//
+// `#351 settings-polish`. A MODAL. It dims the screen around it, and the dim used to be only a shadow:
+// Tab went on past Close to the controls behind it, and a tap on the dim pressed whatever was under it.
+// So while it is up everything else on the page is inert (`inertAround`), which no tap, click or Tab
+// reaches and a screen reader does not list, and Tab and Shift+Tab go round its own four stops
+// (`trapDismissedTab`). It is marked `aria-modal` to say so. Close, Escape and Back are how it goes.
+
+/** The pop-out's Tab stops, in order: the message, Copy, Put back and Close. */
+const DISMISSED_POPOUT_STOPS = ["dismissed-send-popout-text", "dismissed-send-copy", "dismissed-send-restore", "dismissed-send-close"];
+
+/**
+ * Make everything on the page but `node` inert: each element beside it, and beside every element
+ * around it, up to the body. Returns what it made inert, for the close to give back; an element
+ * already inert is left as it was, to whatever made it so.
+ *
+ * @param {Element} node
+ * @returns {Element[]}
+ */
+function inertAround(node) {
+  /** @type {Element[]} */
+  const made = [];
+  for (let at = node; at !== document.body && at.parentNode; at = /** @type {Element} */ (at.parentNode)) {
+    for (const beside of /** @type {Element} */ (at.parentNode).children) {
+      if (beside === at || beside.hasAttribute("inert")) continue;
+      beside.setAttribute("inert", "");
+      made.push(beside);
+    }
+  }
+  return made;
+}
 
 /** Open the pop-out on the dismissed send `id`, from the row `opener`. */
 function openDismissedSend(id, opener) {
   const held = dismissedSends.find((one) => one.entry.id === id);
   if (!held) return;
-  dismissedPopout = { id, opener };
+  // One at a time: what the one before made inert is given back before this one makes its own.
+  closeDismissedSend(false);
   el("dismissed-send-popout-meta").textContent = dismissedSendMeta(held);
   el("dismissed-send-popout-text").textContent = unsentText(held.entry);
   el("dismissed-send-restore").setAttribute("aria-label", `Put back “${sendSnippet(unsentText(held.entry))}”`);
   el("dismissed-send-popout-state").textContent = "";
   const popout = el("dismissed-send-popout");
   popout.hidden = false;
+  dismissedPopout = { id, opener, inert: inertAround(popout) };
   // Laid over its group, which may stand partly below the screen's edge: brought on screen whole.
   if (typeof popout.scrollIntoView === "function") popout.scrollIntoView({ block: "nearest" });
   el("dismissed-send-copy").focus({ preventScroll: true });
@@ -24912,12 +24965,46 @@ function openDismissedSend(id, opener) {
 /** Close the pop-out, giving the focus back to the row that opened it when `refocus` and it is still there. */
 function closeDismissedSend(refocus = true) {
   if (!dismissedPopout) return false;
-  const { opener } = dismissedPopout;
+  const { opener, inert } = dismissedPopout;
   dismissedPopout = null;
+  // The page behind it back first: an inert element cannot take the focus.
+  for (const node of inert) node.removeAttribute("inert");
   el("dismissed-send-popout").hidden = true;
   if (refocus && opener && opener.parentNode && typeof opener.focus === "function") opener.focus({ preventScroll: true });
   scheduleBackSync();
   return true;
+}
+
+/**
+ * Tab and Shift+Tab while the pop-out is up: round its own stops, from the last to the first and the
+ * first to the last, and from anywhere outside them (the page, after a tap on the dim) to its first or
+ * last. A key the page has already taken, or one held with Ctrl, Alt or Cmd, is left alone.
+ *
+ * @param {KeyboardEvent} event
+ */
+function trapDismissedTab(event) {
+  if (!dismissedPopout || !event || event.key !== "Tab" || event.defaultPrevented ||
+      event.ctrlKey || event.altKey || event.metaKey) return;
+  const stops = DISMISSED_POPOUT_STOPS.map((id) => el(id));
+  const at = stops.indexOf(/** @type {HTMLElement} */ (document.activeElement));
+  if (at !== -1 && at !== (event.shiftKey ? 0 : stops.length - 1)) return;
+  event.preventDefault();
+  stops[event.shiftKey ? stops.length - 1 : 0].focus();
+}
+document.addEventListener("keydown", trapDismissedTab);
+
+/**
+ * After Put back: the focus on the row that took the place of the one put back (`at` in the list),
+ * else on the list, else on the line that says it is empty. `#351 settings-polish`. The row that
+ * opened the pop-out went with its message, and the focus with it, to nowhere.
+ *
+ * @param {number} at
+ */
+function focusDismissedAt(at) {
+  const list = el("dismissed-sends");
+  const item = at >= 0 ? list.children[at] : undefined;
+  const row = item ? /** @type {HTMLElement | null} */ (item.firstChild) : null;
+  (row || (list.hidden ? el("dismissed-sends-state") : list)).focus();
 }
 
 el("dismissed-send-close").addEventListener("click", () => closeDismissedSend());
@@ -24930,8 +25017,10 @@ el("dismissed-send-copy").addEventListener("click", async () => {
 el("dismissed-send-restore").addEventListener("click", () => {
   if (!dismissedPopout) return;
   const id = dismissedPopout.id;
+  const at = dismissedSends.findIndex((held) => held.entry.id === id);
   closeDismissedSend(false);
   putBackDismissedSend(id);
+  focusDismissedAt(at);
 });
 
 async function sendChannelMessage() {

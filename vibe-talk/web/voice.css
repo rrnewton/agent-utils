@@ -1371,7 +1371,8 @@ a.search-hit-link {
   border: 1px solid var(--edge);
   border-radius: 0.8rem;
   /* The screen behind dimmed, so it reads as over the list rather than as part of it. A shadow, not an
-     element: it takes no tap, and Close, Escape or Back is how it goes. */
+     element: it takes no tap of its own, and what is under it takes none either while the pop-out is up,
+     because web/voice.js makes it inert (`#351 settings-polish`). Close, Escape or Back is how it goes. */
   box-shadow: 0 0 0 100vmax rgb(0 0 0 / 0.45), 0 0.6rem 2rem rgb(0 0 0 / 0.45);
 }
 

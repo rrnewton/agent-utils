@@ -3108,10 +3108,30 @@ def _act_settings_dismissed_list(driver: Driver) -> None:
 
 
 def _act_settings_dismissed_popout(driver: Driver) -> None:
-    """`#348 settings-dynamic-lists`: the long dismissed send opened in its pop-out, whole, with Copy."""
+    """`#348 settings-dynamic-lists`: the long dismissed send opened in its pop-out, whole, with Copy.
+
+    `#351 settings-polish`: the pop-out is a modal, so the real Tab key is walked round it, four Tabs
+    and four Shift+Tabs from Copy, recorded for the check (`__popoutTabbed`), which leaves Copy with the
+    focus again; and every point of the dim outside it is asked what a tap there would land on
+    (`__dimHits`): never a control behind it.
+    """
     _act_settings_dismissed_list(driver)
     driver.page.click("#dismissed-sends > li:nth-child(3) .dismissed-send-open")
     driver.page.wait_for_function("() => window.__visible('dismissed-send-popout')", timeout=5_000)
+    driver.js("(() => { window.__popoutTabbed = []; return true; })()")
+    for key in ("Tab",) * 4 + ("Shift+Tab",) * 4:
+        driver.page.keyboard.press(key)
+        driver.js("(() => { window.__popoutTabbed.push(document.activeElement.id); return true; })()")
+    driver.js(
+        "(() => { const p = document.getElementById('dismissed-send-popout').getBoundingClientRect(); "
+        "window.__dimHits = []; "
+        "for (let x = 6; x < innerWidth; x += 20) for (let y = 6; y < innerHeight; y += 20) { "
+        "if (x >= p.left && x <= p.right && y >= p.top && y <= p.bottom) continue; "
+        "const e = document.elementFromPoint(x, y); "
+        "const c = e && e.closest('button, a, input, select, textarea, label, [tabindex]:not([tabindex=\"-1\"])'); "
+        "if (c && !c.closest('#dismissed-send-popout')) window.__dimHits.push(c.id || c.tagName); } "
+        "return true; })()"
+    )
     driver.settle(300)
 
 
@@ -6072,6 +6092,24 @@ SCENES: tuple[Scene, ...] = (
                 "return b.top >= 0 && b.bottom <= innerHeight && b.left >= 0 && b.right <= innerWidth "
                 "&& document.activeElement === document.getElementById('dismissed-send-copy'); })()",
             ),
+            (
+                # `#351 settings-polish`: a modal, said so, with the page behind it inert.
+                "the pop-out is a modal, and the page behind it is inert while it is up",
+                "(() => { const p = document.getElementById('dismissed-send-popout'); "
+                "return p.getAttribute('aria-modal') === 'true' && p.closest('[inert]') === null "
+                "&& ['close-settings', 'fold-dismissed', 'dismissed-sends', 'fold-settings-all', 'dock']"
+                ".every((id) => document.getElementById(id).closest('[inert]') !== null); })()",
+            ),
+            (
+                "the Tab key goes round the pop-out's own four controls, both ways",
+                "JSON.stringify(window.__popoutTabbed) === JSON.stringify(['dismissed-send-restore', "
+                "'dismissed-send-close', 'dismissed-send-popout-text', 'dismissed-send-copy', "
+                "'dismissed-send-popout-text', 'dismissed-send-close', 'dismissed-send-restore', 'dismissed-send-copy'])",
+            ),
+            (
+                "no tap on the dim reaches a control behind it",
+                "Array.isArray(window.__dimHits) && window.__dimHits.length === 0",
+            ),
         ),
     ),
     Scene(
@@ -6959,9 +6997,11 @@ def check_state_controls() -> list[str]:
         # `#348 settings-dynamic-lists`. Pinned to the dark monospaced panel (`Math.max(...rgb) < 48`),
         # to the fixed resizable scrolling list (`s.resize === 'vertical'`) and its one-line rows
         # (`textOverflow`); to the pop-out's whole text (`t.length > 400`); and to the readout's
-        # fact-a-line detail (`split(`).
+        # fact-a-line detail (`split(`). `#351 settings-polish` pins the pop-out to being a modal
+        # (`aria-modal`), Tab kept round it (`__popoutTabbed`) and no tap through its dim (`__dimHits`).
         "65-settings-dismissed-list": ("Math.max(...rgb) < 48", "s.resize === 'vertical'", "textOverflow"),
-        "66-settings-dismissed-popout": ("t.length > 400", "dismissed-send-copy"),
+        "66-settings-dismissed-popout": ("t.length > 400", "dismissed-send-copy", "aria-modal", "__popoutTabbed",
+                                         "__dimHits"),
         "67-settings-connection-panel": ("Math.max(...rgb) < 48", "split("),
         # `#346 settings-collapsible`. Pinned to every section folded and hidden until found
         # (`'until-found'`), to no setting drawn (`!window.__visible(id)`), and to the browser's search

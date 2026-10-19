@@ -7372,17 +7372,24 @@ the connection status should be drawn the same way, "a dark terminal-like panel"
 - Recently dismissed is 11rem tall, scrolls inside itself, and can be dragged taller or shorter
   (`resize: vertical`). A row is where the message was going and how long ago, and **one line** of
   its text, cut with an ellipsis by the stylesheet; the whole text is still in the row, so find-in-page
-  and a screen reader have all of it.
+  has all of it. A screen reader is told the row's name instead (`#351 settings-polish`): where it was
+  going, how long ago, and the first line of the text, at most 120 characters of it.
 - A row is one button. It opens the pop-out: the whole message, **Copy** (the Clipboard API, falling
   back to a hidden textarea, and saying so when neither works), **Put back** (moved here from the
   row, where a button on every line made the list a column of controls) and **Close**. Escape and the
   phone's back gesture close it before they close Settings, as they close a menu; leaving Settings
   closes it; Close gives the focus back to the row. The list keeps its storage key and its limits.
+- The pop-out is a **modal** (`#351 settings-polish`). It dims the screen, and while it is up the
+  rest of the page is inert: a tap or click on the dim reaches nothing behind it, a screen reader
+  lists only the pop-out, and Tab and Shift+Tab go round its four controls. The page still scrolls
+  under it. **Put back** gives the focus to the row that took the place of the one put back, else to
+  the list, else to the line above it that now says nothing is dismissed.
 - Connection status puts each part of the connection detail on its own line, with how live updates
   reach the page (`#347 settings-prose`) last; the banner after a call keeps its one line.
 
 `65-settings-dismissed-list`, `66-settings-dismissed-popout` and `67-settings-connection-panel`
-photograph them at 393x852, 1280x800 and 1920x1080.
+photograph them at 393x852, 1280x800 and 1920x1080; `66-settings-dismissed-popout` also walks the real
+Tab key round the pop-out both ways and asks every point of the dim what a tap there would land on.
 
 **Connection status moved to the end and gained a word.** It is a readout — what the conversation
 is, what audio format it negotiated, why the last one closed — and it was standing at the top of the
