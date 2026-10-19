@@ -1,12 +1,13 @@
 ---
 title: 'message-cache-test-flakes: the message-cache integration tests fail intermittently on a busy host'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-19T09:35:55.346411929+00:00
-updated_at: 2026-10-19T09:35:55.346411929+00:00
+updated_at: 2026-10-19T09:41:26.905636218+00:00
+closed_at: 2026-10-19T09:41:26.905636108+00:00
 ---
 
 # Description
