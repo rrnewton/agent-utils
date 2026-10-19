@@ -1,12 +1,13 @@
 ---
 title: 'offline-cache-chips-flake: the offline-cache check sees Collapse all over Send under load'
-status: open
+status: closed
 priority: 3
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-15T15:52:38.638065192+00:00
-updated_at: 2026-10-15T15:52:38.638065192+00:00
+updated_at: 2026-10-19T10:29:57.207861117+00:00
+closed_at: 2026-10-19T10:29:57.207860987+00:00
 ---
 
 # Description
