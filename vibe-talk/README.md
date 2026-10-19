@@ -5545,7 +5545,10 @@ on a session that has started keeps the call:
   begun to be answered is never sent again: it may have acted, and its words are kept marked cut off.
   A relayed turn the bridge did not name is said "not read out"; a typed one is left to the reader
   to send again; the page's word on a send card goes again only to a session that took the record,
-  which says what the card was. Spoken words are never sent again as text.
+  which says what the card was. A turn already sent again once is not sent a third time when the
+  new session loses it too, however long after the reconnect: the call still reconnects, but the
+  relayed turn is said "not read out" and the typed one is left to the reader. Spoken words are
+  never sent again as text.
 * **It is said**: a **reconnected** line in the transcript says what happened and what the new
   session knows ("…a new session that has seen nothing above this line…" or "…which was sent what
   was said above…"); the line under the call starts "Reconnected after a lost turn:"; the status

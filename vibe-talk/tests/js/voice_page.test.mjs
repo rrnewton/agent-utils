@@ -71868,6 +71868,99 @@ test("`#352 voice-reconnect-on-bridge-error`: a fourth lost turn in one call end
   assert.equal(control.sockets.length, 2 + RECONNECTS_PER_CALL_MAX, "the control did not reconnect a fourth time, so the test above proves nothing");
 });
 
+/** The check that keeps a turn already sent again once from going a third time (`queueLostTurn`). */
+const RESENT_CHECK = '  else if (inFlight.resent) why = "it had been sent again once already";\n';
+
+test("`#352 voice-reconnect-on-bridge-error`: a turn sent again after a reconnect, which the new session loses too more than a minute later, goes no further — the call reconnects, but the relay is said not to have been read out, once, and the typed message is left to the reader (negative control: the page that sent it again every time)", async () => {
+  // The lost turn goes again once, as the README and the issue promise. On the deployed bridge, which
+  // greets and lists no replay, the turn sent again waits behind the owner's own exchange and the
+  // answer playing out, so its loss can come a minute or more after the first: the bound on
+  // reconnects does not stop it there, and the page itself must not send it a third time. Only the
+  // clock moves here, so that no timer of the minute muddies what went where.
+  /** The second session loses turn 1, the turn sent again, after the minute: its socket and the third's. */
+  const loseResentAfterTheMinute = async (page, next) => {
+    page.setClock(page.clock() + RECONNECT_MIN_GAP_MS + 1000);
+    loseTurn(next, 1);
+    return reconnectTo(page, next);
+  };
+  const relayLostTwice = async (script) => {
+    const page = newPage(new Map(), script);
+    const { socket, prompt, echo } = await relayInFlight(page);
+    loseTurn(socket, echo);
+    await page.settle();
+    const next = await reconnectTo(page, socket);
+    assert.deepEqual(promptsSent(next), [prompt], "the lost relay did not go again to the new session");
+    speech(next, "user", 1, prompt);
+    await page.settle();
+    const third = await loseResentAfterTheMinute(page, next);
+    return { page, prompt, sockets: [socket, next, third] };
+  };
+  const typedLostTwice = async (script) => {
+    const page = newPage(new Map(), script);
+    const socket = await startNeutralCall(page);
+    await page.settle();
+    await compose(page, "what changed overnight?");
+    await page.el("send-text").click();
+    await page.settle();
+    turnDone(socket, 1);
+    await page.settle();
+    speech(socket, "user", 2, "what changed overnight?");
+    await page.settle();
+    loseTurn(socket, 2);
+    const next = await reconnectTo(page, socket);
+    assert.deepEqual(promptsSent(next), ["what changed overnight?"], "the lost typed message did not go again to the new session");
+    speech(next, "user", 1, "what changed overnight?");
+    await page.settle();
+    const third = await loseResentAfterTheMinute(page, next);
+    return { page, sockets: [socket, next, third] };
+  };
+  /** How many times each socket was sent `text` as a prompt. */
+  const promptCounts = (sockets, text) => sockets.map((socket) => promptsSent(socket).filter((t) => t === text).length);
+
+  // A relayed turn: the second loss reconnects, the third session is sent nothing, and the messages
+  // are said not to have been read out, once, also after the hang-up.
+  const relay = await relayLostTwice(SCRIPT);
+  assert.deepEqual(relay.page.endPosts.map((r) => r.ended_by), ["reconnected", "reconnected"],
+    "the second lost turn, after the minute, did not reconnect");
+  assert.deepEqual(promptsSent(relay.sockets[2]), [], "a relayed turn sent again once went to a third session");
+  assert.deepEqual(promptCounts(relay.sockets, relay.prompt), [1, 1, 0]);
+  assert.match(relay.page.el("settings-detail").textContent,
+    /the turn the voice service lost does not go again: it had been sent again once already/);
+  const seams = unreadSeams(relay.page);
+  assert.equal(seams.length, 1, "the twice-lost messages were not said to be gone, exactly once");
+  assert.equal(seamDetail(seams[0]),
+    "1 new message, in build noise, went to the agent, but the voice service lost the turn, so it was never read out.");
+  assert.equal(seamDetail(reconnectedSeams(relay.page)[1]),
+    "The voice service lost a turn, so the call moved to a new session that has seen nothing above this line. If you were speaking, say it again.");
+  await relay.page.el("hang-up").click();
+  await relay.page.settle();
+  assert.equal(unreadSeams(relay.page).length, 1, "the twice-lost messages were reported again at the hang-up");
+  assert.deepEqual(relay.page.endPosts.map((r) => r.ended_by), ["reconnected", "reconnected", "hang_up"]);
+
+  // A typed message: the third session is sent nothing, the reader is asked to send it again, and it
+  // is still one row and one record.
+  const typed = await typedLostTwice(SCRIPT);
+  assert.deepEqual(typed.page.endPosts.map((r) => r.ended_by), ["reconnected", "reconnected"]);
+  assert.deepEqual(promptsSent(typed.sockets[2]), [], "a typed message sent again once went to a third session");
+  assert.deepEqual(promptCounts(typed.sockets, "what changed overnight?"), [1, 1, 0]);
+  assert.equal(seamDetail(reconnectedSeams(typed.page)[1]),
+    "The voice service lost a turn, so the call moved to a new session that has seen nothing above this line. Send your last message again.");
+  assert.deepEqual(unreadSeams(typed.page), [], "a typed message was reported as a channel message not read out");
+  assert.equal(youRowsSaying(typed.page, "what changed overnight?").length, 1, "the typed message is on screen twice");
+  assert.equal(storedTexts(typed.page).filter((t) => t === "you: what changed overnight?").length, 1,
+    storedTexts(typed.page).join("\n"));
+
+  // The negative control: without the check, each turn goes to the third session as well, and the
+  // relay is never said to be gone.
+  const relayControl = await relayLostTwice(brokenScript(RESENT_CHECK, ""));
+  assert.deepEqual(promptCounts(relayControl.sockets, relayControl.prompt), [1, 1, 1],
+    "the control did not send the relay a third time, so the test above proves nothing");
+  assert.deepEqual(unreadSeams(relayControl.page), []);
+  const typedControl = await typedLostTwice(brokenScript(RESENT_CHECK, ""));
+  assert.deepEqual(promptCounts(typedControl.sockets, "what changed overnight?"), [1, 1, 1],
+    "the control did not send the typed message a third time, so the test above proves nothing");
+});
+
 test("`#352 voice-reconnect-on-bridge-error`: a reconnect that cannot get a working session ends the call as reconnect_failed, opens nothing more, and says the lost messages were not read out exactly once (negative control: the page that kept the lost turn in flight)", async () => {
   /** Each way it can fail, given the page after the lost turn and its lost socket. */
   const ways = {
