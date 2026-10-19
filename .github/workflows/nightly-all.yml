@@ -92,7 +92,7 @@ jobs:
         run: npm ci --prefix vibe-talk/contract --no-audit --no-fund
 
       # The timeline's browser checks drive a real Chromium, so the runner needs the browser and
-      # the suite's dependencies before `validate-all` reaches them. Named as its own step so a
+      # the suite's dependencies before the contract reaches them. Named as its own step so a
       # download failure reads as a download failure rather than as a test failure.
       - name: browser for the timeline suite
         working-directory: py/tests/js/browser
@@ -119,11 +119,15 @@ jobs:
       # boxed validation.
       # Hosted runners also have fewer than eight CPUs, so the CPA planner's memory-cap check
       # (which needs a core budget of eight) is skipped as eight-cpu and is covered locally.
+      #
+      # `make validate-all` plus --keep-going: one failed step no longer aborts every independent
+      # one, so a red night names all of its failures rather than the first and "131 not
+      # launched". Steps that depend on a failed step are still skipped.
       - name: the entire portable current-toolchain contract
         env:
           BOX_FLAGS: --allow-cgroup-failure
           AGENT_UTILS_CROSS_ALLOW_SKIP: boxing,eight-cpu
-        run: make validate-all
+        run: python3 scripts/validate.py --all --keep-going
 
       # Same reasoning as the per-push workflow: the gate is a completely-broken detector, so the
       # value of the nightly run is the SERIES, and a series has to be kept to be a series.

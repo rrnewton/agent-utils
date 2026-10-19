@@ -5,6 +5,9 @@ description: Tool-owned Rust regression suites
 # with its dev-dependency features, so the next launcher call, from any step running beside the
 # suite, found its stamped binary replaced and ran `cargo clean` for that package, deleting the
 # test binaries of the suite still running: a test that re-executed itself got ENOENT.
+#
+# --no-fail-fast: a package has several test binaries, and by default cargo stops at the first
+# failing one, so a failure there hid the rest of that package's tests.
 
 resource_caps:
   cargo-target: 4
@@ -15,7 +18,7 @@ steps:
     desc: agentctl Rust tests
     cmd: >-
       host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
-      RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
+      RUST_TEST_THREADS=1 cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
       --target "$host_target" --target-dir rs/target/validation-tests -p agentctl ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-agentctl]
@@ -33,7 +36,7 @@ steps:
     desc: chat-subscription core Rust tests
     cmd: >-
       host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
-      RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
+      RUST_TEST_THREADS=1 cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
       --target "$host_target" --target-dir rs/target/validation-tests -p chat-subscription ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-agentctl]
@@ -46,7 +49,7 @@ steps:
     desc: chat-subscription plugin Rust tests
     cmd: >-
       host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
-      RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
+      RUST_TEST_THREADS=1 cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
       --target "$host_target" --target-dir rs/target/validation-tests -p chat-subscription-plugin ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-agentctl]
@@ -59,7 +62,7 @@ steps:
     desc: chat-subscription fake plugin Rust tests
     cmd: >-
       host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
-      RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
+      RUST_TEST_THREADS=1 cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
       --target "$host_target" --target-dir rs/target/validation-tests -p chat-subscription-fake ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-agentctl]
@@ -72,7 +75,7 @@ steps:
     desc: chat-subscription Slack provider Rust tests
     cmd: >-
       host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
-      RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
+      RUST_TEST_THREADS=1 cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
       --target "$host_target" --target-dir rs/target/validation-tests -p chat-subscription-slack ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-agentctl]
@@ -85,7 +88,7 @@ steps:
     desc: dagrun Rust tests, including boxed integration tests
     cmd: >-
       host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
-      RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
+      RUST_TEST_THREADS=1 cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
       --target "$host_target" --target-dir rs/target/validation-tests -p dagrun ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-dagrun]
@@ -99,7 +102,7 @@ steps:
     desc: herdr-run Rust tests
     cmd: >-
       host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
-      RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
+      RUST_TEST_THREADS=1 cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
       --target "$host_target" --target-dir rs/target/validation-tests -p herdr-run ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-herdr-run]
@@ -112,7 +115,7 @@ steps:
     desc: pr-landing-planner Rust tests
     cmd: >-
       host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
-      RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
+      RUST_TEST_THREADS=1 cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
       --target "$host_target" --target-dir rs/target/validation-tests -p pr-landing-planner ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-planner]
@@ -125,7 +128,7 @@ steps:
     desc: gh-paced Rust tests
     cmd: >-
       host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
-      RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
+      RUST_TEST_THREADS=1 cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
       --target "$host_target" --target-dir rs/target/validation-tests -p gh-paced ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests]
@@ -138,7 +141,7 @@ steps:
     desc: agent-usage Rust tests
     cmd: >-
       host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
-      RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
+      RUST_TEST_THREADS=1 cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
       --target "$host_target" --target-dir rs/target/validation-tests -p agent-usage ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests]
@@ -151,7 +154,7 @@ steps:
     desc: tick-hub Rust tests
     cmd: >-
       host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
-      RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
+      RUST_TEST_THREADS=1 cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
       --target "$host_target" --target-dir rs/target/validation-tests -p tick-hub ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-tick-hub]
@@ -164,7 +167,7 @@ steps:
     desc: wrkslots daemon Rust tests
     cmd: >-
       host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
-      RUST_TEST_THREADS=1 cargo test --release --manifest-path rs/Cargo.toml
+      RUST_TEST_THREADS=1 cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
       --target "$host_target" --target-dir rs/target/validation-tests -p wrkslotsd ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-wrkslots]
