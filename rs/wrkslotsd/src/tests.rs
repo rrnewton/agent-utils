@@ -3016,6 +3016,98 @@ fn hold_events_are_typed_generation_bound_and_released() {
 }
 
 #[test]
+fn coordinator_attested_unregistered_agent_removal_history_replays() {
+    // #341 wrkslots-orphan-retire: remove records a coordinator's attestation that an
+    // unregistered agent stopped as an ordinary active-state action with object evidence,
+    // reclaim-started keeps its exact key set (registered_liveness "unverifiable"), and the
+    // reclaim evidence gains a basis and a note. No new event kind and no new field, so a
+    // future tightening of this replay must keep accepting what the Python writer emits.
+    let scratch = Scratch::new();
+    let events = scratch.events();
+    let mut record = active_record_for("slot-a", "hold-demo", 1, "agent");
+    record["handoff"] = Value::Null;
+    let with_handoff = active_record_for("slot-a", "hold-demo", 1, "agent");
+    let mut tip = import_log(&events, vec![record.clone()], vec![]);
+    tip = append_event(
+        &events,
+        2,
+        &tip,
+        "active-state-recorded",
+        json!({
+            "action": "unregistered-agent-stop-attested",
+            "slot": "slot-a",
+            "previous_revision": 0,
+            "revision": 1,
+            "previous_record_sha256": canonical_sha256(&record).expect("record digest"),
+            "record": record.clone(),
+            "evidence": {
+                "basis": "coordinator-attested-unregistered-agent",
+                "generation": 1,
+                "agent": "hold-demo",
+                "owner": record["owner"].clone(),
+                "owner_state": "dead",
+                "owner_detail": "the recorded machine boot ended",
+                "actor": identity(10),
+                "coordinator_authorized": true,
+                "heartbeat_age_seconds": 601,
+                "heartbeat_ttl_seconds": 600,
+                "registered_liveness": "unverifiable",
+                "registered_liveness_detail":
+                    "unverifiable agent=hold-demo rc=2 reason=no-agentctl-record",
+                "note": "placeholder hold name; no process ever ran under it",
+            },
+        }),
+    );
+    tip = append_event(
+        &events,
+        3,
+        &tip,
+        "reclaim-started",
+        json!({
+            "slot": "slot-a",
+            "generation": 1,
+            "actor": identity(10),
+            "runner": identity(11),
+            "handoff_writer": null,
+            "coordinator_authorized": true,
+            "owner_state": "dead",
+            "registered_liveness": "unverifiable",
+            "heartbeat_age_seconds": 601,
+            "heartbeat_ttl_seconds": 600,
+            "validate_complete": false,
+            "live_validate_owner": false,
+            "salvage_archive_root": null,
+        }),
+    );
+    append_event(
+        &events,
+        4,
+        &tip,
+        "active-state-recorded",
+        json!({
+            "action": "reclaim-evidence-recorded",
+            "slot": "slot-a",
+            "previous_revision": 1,
+            "revision": 2,
+            "previous_record_sha256": canonical_sha256(&record).expect("record digest"),
+            "record": with_handoff,
+            "evidence": {
+                "actor": identity(10),
+                "coordinator_authorized": true,
+                "owner_state": "dead",
+                "heartbeat_age_seconds": 601,
+                "salvage": [],
+                "basis": "coordinator-attested-unregistered-agent",
+                "attestation_note": "placeholder hold name; no process ever ran under it",
+            },
+        }),
+    );
+    let summary = replay(&events).expect("attested removal history replays");
+    assert_eq!(summary.replay_count, 4);
+    assert_eq!((summary.active_revision, summary.active_count), (2, 1));
+}
+
+#[test]
 fn lifecycle_attempts_clear_only_after_matching_archive_and_active_removal() {
     let scratch = Scratch::new();
     let events = scratch.events();

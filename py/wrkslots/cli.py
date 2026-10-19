@@ -1376,6 +1376,28 @@ class _OwnerConsent:
 
 
 @dataclasses.dataclass(frozen=True)
+class _LivenessAnswer:
+    """The registered running command's answer about one agent row.
+
+    ``unregistered`` is true only for exit status 2 whose whole output is the
+    one bound line saying the authority has no record of the agent at all
+    (``_bound_unregistered_verdict``).
+    """
+
+    state: str
+    detail: str
+    unregistered: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class _AttestedStop:
+    """The coordinator's statement that an agent no authority records has stopped."""
+
+    note: str
+    liveness_detail: str
+
+
+@dataclasses.dataclass(frozen=True)
 class _OwnerRelease:
     """One ``owner-released`` event: a live owner gave its slot generation back.
 
@@ -17250,6 +17272,38 @@ def _liveness_output_diagnostic(stdout: str, stderr: str) -> str:
     return _liveness_batch_diagnostic("; ".join(parts)) if parts else "no output"
 
 
+#: The one ``reason=`` token with which a liveness command says it has no
+#: record of an agent at all. It is part of the liveness protocol, whatever
+#: command answers: see "Time-to-live and process evidence" in the user guide.
+UNREGISTERED_AGENT_REASON = "no-agentctl-record"
+
+
+def _bound_unregistered_verdict(stdout: str, stderr: str, agent: str) -> str | None:
+    """Return the one output line saying the authority has no record of ``agent``.
+
+    Exit status 2 alone means only that the authority cannot answer. The
+    attested-stop path in ``remove`` needs more: the authority's statement that
+    it has never recorded this agent name at all. The whole output must be one
+    non-empty line whose only ``agent=`` token names the agent, whose only
+    ``rc=`` token is ``rc=2``, and whose only ``reason=`` token is
+    ``reason=no-agentctl-record``. Anything else is an ordinary unverifiable.
+    """
+
+    lines = [line for line in (stdout + "\n" + stderr).splitlines() if line.strip()]
+    if len(lines) != 1:
+        return None
+    tokens = lines[0].split()
+    if [token for token in tokens if token.startswith("agent=")] != [f"agent={agent}"]:
+        return None
+    if [token for token in tokens if token.startswith("rc=")] != ["rc=2"]:
+        return None
+    if [token for token in tokens if token.startswith("reason=")] != [
+        f"reason={UNREGISTERED_AGENT_REASON}"
+    ]:
+        return None
+    return _liveness_batch_diagnostic(lines[0])
+
+
 def _registered_liveness_state(config: Config, record: ActiveRecord) -> tuple[str, str]:
     """Ask the registered liveness command about ``record``'s owner.
 
@@ -17257,6 +17311,13 @@ def _registered_liveness_state(config: Config, record: ActiveRecord) -> tuple[st
     remove-agent-batch item the command receives at most the item's remaining
     budget and raises Refusal when that runs out.
     """
+
+    answer = _registered_liveness_answer(config, record)
+    return answer.state, answer.detail
+
+
+def _registered_liveness_answer(config: Config, record: ActiveRecord) -> _LivenessAnswer:
+    """``_registered_liveness_state`` plus whether the answer is the bound no-record line."""
 
     env = _liveness_environment(config, record)
     what = "the registered liveness command"
@@ -17281,24 +17342,33 @@ def _registered_liveness_state(config: Config, record: ActiveRecord) -> tuple[st
                 command, seconds=seconds, what=what, env=env, errors="replace"
             )
     except OSError as exc:
-        return "unverifiable", f"registered liveness command could not run: {exc}"
+        return _LivenessAnswer(
+            "unverifiable", f"registered liveness command could not run: {exc}"
+        )
     detail = (completed.stderr or completed.stdout).strip().splitlines()
     first = detail[0] if detail else "no detail"
     if completed.returncode == 0:
-        return "dead", first
+        return _LivenessAnswer("dead", first)
     if completed.returncode == 1:
         verdict = _bound_alive_verdict(completed.stdout, completed.stderr, record.agent)
         if verdict is not None:
-            return "alive", verdict
-        return "unverifiable", (
+            return _LivenessAnswer("alive", verdict)
+        return _LivenessAnswer(
+            "unverifiable",
             "registered liveness command exited 1 without a single output line "
             f"binding agent={record.agent} to rc=1: "
-            + _liveness_output_diagnostic(completed.stdout, completed.stderr)
+            + _liveness_output_diagnostic(completed.stdout, completed.stderr),
         )
     if completed.returncode == 2:
-        return "unverifiable", first
-    return "unverifiable", (
-        f"registered liveness command returned unexpected rc {completed.returncode}: {first}"
+        unregistered = _bound_unregistered_verdict(
+            completed.stdout, completed.stderr, record.agent
+        )
+        if unregistered is not None:
+            return _LivenessAnswer("unverifiable", unregistered, unregistered=True)
+        return _LivenessAnswer("unverifiable", first)
+    return _LivenessAnswer(
+        "unverifiable",
+        f"registered liveness command returned unexpected rc {completed.returncode}: {first}",
     )
 
 
@@ -17309,7 +17379,20 @@ def _assert_registered_liveness(config: Config, record: ActiveRecord) -> None:
     _refuse_registered_liveness(state, detail)
 
 
-def _refuse_registered_liveness(state: str, detail: str) -> NoReturn:
+def _refuse_registered_liveness(
+    state: str, detail: str, *, attest_agent: str | None = None
+) -> NoReturn:
+    if attest_agent is not None:
+        raise Refusal(
+            f"registered liveness authority has no record of agent {attest_agent}: "
+            f"{detail}. state: REFUSED -- no checkout was salvaged or removed; an agent "
+            "the authority does not record is not proven stopped (and the authority speaks "
+            "only for its own registry: an agent registered elsewhere looks unregistered "
+            "here). remedy: if you are the coordinator and know this agent has stopped (an "
+            "in-process subagent whose task returned, or a placeholder name no process ever "
+            "ran under), rerun remove with --coordinator-authorized --attest-agent-stopped "
+            f"{attest_agent} --attest-note TEXT saying how you know"
+        )
     if state == "alive":
         raise Refusal(
             f"registered liveness authority reports owner alive: {detail}. state: "
@@ -22871,6 +22954,80 @@ def _owner_consent_was_recorded(
         ):
             return True
     return False
+
+
+# Coordinator-attested stop of an agent that no liveness authority records.
+#
+# The registered running command can only vouch for agents its registry knows.
+# A slot created for an in-process subagent, or held under a placeholder name,
+# names an agent the command has never recorded, so once its owner process has
+# died nothing could ever report it dead. The coordinator that created such an
+# agent is the only party that knows it stopped. remove accepts its explicit,
+# per-slot attestation in place of the authority's "dead" only when the
+# authority answered exactly that it has no record of the agent (rc 2, one
+# bound line with reason=no-agentctl-record), the exact recorded owner process
+# generation is proven dead, and the heartbeat time-to-live expired. Every
+# guard that protects work still runs. The basis is an active-state action
+# (not a record field and not a new event kind), so older clients and the
+# read-only wrkslotsd replay accept the history unchanged.
+ATTESTED_STOP_ACTION = "unregistered-agent-stop-attested"
+ATTESTED_STOP_BASIS = "coordinator-attested-unregistered-agent"
+_ATTEST_NOTE_LIMIT = 1024
+
+
+def _attested_stop_evidence(
+    record: ActiveRecord,
+    attested: _AttestedStop,
+    *,
+    coordinator: ProcessIdentity,
+    owner_detail: str,
+    age: float,
+) -> dict[str, object]:
+    return {
+        "basis": ATTESTED_STOP_BASIS,
+        "generation": record.generation,
+        "agent": record.agent,
+        "owner": _identity_to_obj(record.owner),
+        "owner_state": "dead",
+        "owner_detail": owner_detail,
+        "actor": _identity_to_obj(coordinator),
+        "coordinator_authorized": True,
+        "heartbeat_age_seconds": int(age),
+        "heartbeat_ttl_seconds": record.heartbeat_ttl_seconds,
+        "registered_liveness": "unverifiable",
+        "registered_liveness_detail": attested.liveness_detail,
+        "note": attested.note,
+    }
+
+
+def _recorded_attested_stop(
+    record: ActiveRecord, events: Sequence[Mapping[str, object]]
+) -> _AttestedStop | None:
+    """The attestation remove durably recorded for this exact generation and owner."""
+
+    found: _AttestedStop | None = None
+    for event in events:
+        if event.get("kind") != "active-state-recorded":
+            continue
+        payload = _as_mapping(event["payload"], "active-state-recorded payload")
+        if payload.get("action") != ATTESTED_STOP_ACTION or payload.get("slot") != record.slot:
+            continue
+        evidence = _as_mapping(payload.get("evidence"), "attested stop evidence")
+        if (
+            evidence.get("basis") == ATTESTED_STOP_BASIS
+            and evidence.get("generation") == record.generation
+            and evidence.get("agent") == record.agent
+            and evidence.get("coordinator_authorized") is True
+            and _json_equal(evidence.get("owner"), _identity_to_obj(record.owner))
+        ):
+            found = _AttestedStop(
+                note=_as_str(evidence.get("note"), "attested stop note"),
+                liveness_detail=_as_str(
+                    evidence.get("registered_liveness_detail"),
+                    "attested stop liveness detail",
+                ),
+            )
+    return found
 
 
 # Explicit owner release: the live owner gives one agent slot generation back.
@@ -35976,6 +36133,45 @@ def _cmd_remove_in_scope(
     )
     proof_manifest = getattr(args, "validation_proof_manifest", None)
     completed_record = getattr(args, "completed_record", None)
+    attest_agent: str | None = getattr(args, "attest_agent_stopped", None)
+    attest_note: str | None = getattr(args, "attest_note", None)
+    if (attest_agent is None) != (attest_note is None):
+        raise Refusal(
+            "--attest-agent-stopped and --attest-note must be supplied together. "
+            "state: REFUSED -- no checkout was salvaged or removed"
+        )
+    if attest_agent is not None:
+        assert attest_note is not None
+        _validate_name(attest_agent, "agent")
+        if (
+            not attest_note.strip()
+            or attest_note != " ".join(attest_note.split())
+            or len(attest_note) > _ATTEST_NOTE_LIMIT
+        ):
+            raise Refusal(
+                "--attest-note must be one non-empty line of at most "
+                f"{_ATTEST_NOTE_LIMIT} characters, without leading, trailing or "
+                "repeated whitespace. state: REFUSED -- no checkout was salvaged or removed"
+            )
+        if not args.coordinator_authorized:
+            raise Refusal(
+                "--attest-agent-stopped is the coordinator's statement and requires "
+                "--coordinator-authorized. state: REFUSED -- no checkout was salvaged or "
+                "removed"
+            )
+        if (
+            agent_batch is not None
+            or private_cleanup is not None
+            or validation_removal_proof is not None
+            or bool(args.validate_complete)
+            or proof_manifest is not None
+            or getattr(args, "_retirement_candidate", None) is not None
+        ):
+            raise Refusal(
+                "--attest-agent-stopped applies only to one explicit remove of an agent "
+                "slot; retire-pending, remove-agent-batch and validation removal never "
+                "accept it"
+            )
     if (proof_manifest is None) != (completed_record is None):
         raise Refusal(
             "--validation-proof-manifest and --completed-record must be supplied "
@@ -36074,6 +36270,14 @@ def _cmd_remove_in_scope(
         state = _load_active(config, require_repository=False)
         record = _find_record(state, args.slot)
         _expected_generation(record, args.expected_generation)
+        if attest_agent is not None and (
+            record.slot_type != "agent" or record.agent != attest_agent
+        ):
+            raise Refusal(
+                f"--attest-agent-stopped names agent {attest_agent}, but slot "
+                f"{record.slot} is a {record.slot_type} slot recorded for agent "
+                f"{record.agent}. state: REFUSED -- no checkout was salvaged or removed"
+            )
         retirement_candidate = getattr(args, "_retirement_candidate", None)
         if retirement_candidate is not None:
             if not isinstance(retirement_candidate, _RetirementCandidate):
@@ -36197,6 +36401,7 @@ def _cmd_remove_in_scope(
                 age=age,
             )
         consent_liveness: tuple[str, str] | None = None
+        attested_stop: _AttestedStop | None = None
         if live_validate_owner:
             if handoff_writer is None:
                 _assert_caller_process(coordinator, "validate owner")
@@ -36206,6 +36411,37 @@ def _cmd_remove_in_scope(
             # be yes by construction. Record its answer as evidence; do not
             # gate on it.
             consent_liveness = _registered_liveness_state(config, record)
+        elif record.slot_type == "agent":
+            answer = _registered_liveness_answer(config, record)
+            if answer.state != "dead":
+                # Only the authority's exact "no record of this agent" can be
+                # stood in for, and only for an owner generation proven dead.
+                # A registered agent the authority cannot verify (an active
+                # record that was never stopped, an incomplete rename, an
+                # occupied pane) keeps refusing: it may still be running.
+                attestable = (
+                    answer.unregistered
+                    and owner_state == "dead"
+                    and not owner_unrecorded
+                )
+                if not attestable:
+                    _refuse_registered_liveness(answer.state, answer.detail)
+                if attest_agent is None:
+                    _refuse_registered_liveness(
+                        answer.state, answer.detail, attest_agent=record.agent
+                    )
+                assert attest_note is not None
+                attested_stop = _AttestedStop(
+                    note=attest_note, liveness_detail=answer.detail
+                )
+                consent_liveness = (answer.state, answer.detail)
+            elif attest_agent is not None:
+                print(
+                    "NOTE: --attest-agent-stopped was not needed: the registered "
+                    "liveness authority reports the agent dead; no attestation was "
+                    "recorded",
+                    file=sys.stderr,
+                )
         else:
             _assert_owner_liveness(config, record)
         # A release stops this generation's heartbeat (heartbeat refuses while
@@ -36358,6 +36594,25 @@ def _cmd_remove_in_scope(
                 ),
                 require_repository=False,
             )
+        elif attested_stop is not None:
+            # Same reason as for consent: the coordinator's attestation is
+            # durable before any salvage or deletion, and recovery resumes
+            # only this exact attestation.
+            state = _replace_record(state, record)
+            _write_active_state(
+                config,
+                state,
+                action=ATTESTED_STOP_ACTION,
+                slot=record.slot,
+                evidence=_attested_stop_evidence(
+                    record,
+                    attested_stop,
+                    coordinator=coordinator,
+                    owner_detail=detail,
+                    age=age,
+                ),
+                require_repository=False,
+            )
         _write_event_file(
             config,
             record.machine,
@@ -36408,7 +36663,11 @@ def _cmd_remove_in_scope(
             # so its answer is required here. An owner that is still alive, or
             # consented while alive, can restore its own checkout first.
             owner_proven_dead = (
-                (owner_release is None and (owner_state == "dead" or owner_unrecorded))
+                (
+                    owner_release is None
+                    and attested_stop is None
+                    and (owner_state == "dead" or owner_unrecorded)
+                )
                 or (
                     owner_release is not None
                     and owner_state == "dead"
@@ -36429,7 +36688,14 @@ def _cmd_remove_in_scope(
                         if consent_liveness is None
                         else f" and registered liveness says {consent_liveness[0]}"
                     )
-                    + ", so have it restore its recorded branch and remote first"
+                    + (
+                        ", so have it restore its recorded branch and remote first"
+                        if attested_stop is None
+                        else "; a coordinator's attestation that an unregistered agent "
+                        "stopped is not the authority's 'dead', so restore the recorded "
+                        "branch and remote first, or remove without "
+                        "--archive-drifted-checkouts"
+                    )
                 )
             )
             salvage = _salvage_agent_slot(
@@ -36495,6 +36761,14 @@ def _cmd_remove_in_scope(
                             "basis": OWNER_RELEASE_BASIS,
                             "release_sequence": owner_release.sequence,
                             "handoff_sha256": owner_release.sha256,
+                        }
+                    ),
+                    **(
+                        {}
+                        if attested_stop is None
+                        else {
+                            "basis": ATTESTED_STOP_BASIS,
+                            "attestation_note": attested_stop.note,
                         }
                     ),
                 },
@@ -40303,9 +40577,39 @@ def _recover_finish(
             current, candidate, recovery_events
         ):
             owner_consent = candidate
+    attested_recovery = False
+    liveness_answered_dead = False
+    if (
+        owner_consent is None
+        and owner_release is None
+        and not live_validate_owner
+        and current.slot_type == "agent"
+        and owner_state == "dead"
+        and not validate_complete
+        and not _owner_record_is_absent(current)
+        and _recorded_attested_stop(current, _load_events(config, current.machine))
+        is not None
+    ):
+        # Resume a removal that began on a coordinator attestation only while
+        # the authority still answers exactly that it has no record of the
+        # agent. A later registration (alive, or any other unverifiable)
+        # refuses; a later "dead" needs no attestation and takes the ordinary
+        # path.
+        answer = _registered_liveness_answer(config, current)
+        if answer.state == "dead":
+            liveness_answered_dead = True
+        elif answer.unregistered:
+            attested_recovery = True
+        else:
+            _refuse_registered_liveness(answer.state, answer.detail)
     if live_validate_owner:
         _assert_recovery_processes(coordinator, processes, "validate owner")
-    elif owner_consent is None and owner_release is None:
+    elif (
+        owner_consent is None
+        and owner_release is None
+        and not attested_recovery
+        and not liveness_answered_dead
+    ):
         _assert_owner_liveness(
             config,
             current,
@@ -40341,6 +40645,14 @@ def _recover_finish(
                 f"slot {current.slot} removal archived recorded-checkout drift, which "
                 "requires a proven-dead owner, but the recorded owner is "
                 f"{owner_state}: {detail}; preserve it and do not resume deletion"
+            )
+        if attested_recovery:
+            raise Refusal(
+                f"slot {current.slot} removal archived recorded-checkout drift, which "
+                "requires the registered liveness authority's 'dead'; it now answers "
+                "only that it has no record of the agent, and a coordinator's "
+                "attestation does not archive drift. state: REFUSED -- preserve it and "
+                "do not resume deletion"
             )
         if owner_release is not None:
             # A release let recovery skip the registered liveness command above.
@@ -58845,7 +59157,20 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "exact owner ran 'wrkslots release' needs neither the owner's exit nor an expired "
             "heartbeat nor --coordinator-authorized while that release still applies; the "
             "handoff read and every process-use, path, Git, and salvage check still run, and "
-            "the basis is recorded as owner-released."
+            "the basis is recorded as owner-released. An agent slot whose exact owner process "
+            "generation is proven dead, whose heartbeat TTL has expired, and whose agent the "
+            "registered running command reports it has no record of at all "
+            "(reason=no-agentctl-record) can be removed on the coordinator's explicit "
+            "attestation (--coordinator-authorized --attest-agent-stopped AGENT --attest-note "
+            "TEXT), recorded in the event log before anything is salvaged; every other check "
+            "still runs."
+        ),
+        epilog=(
+            "examples:\n"
+            "  wrkslots remove slot01 --coordinator-pid $$ --expected-generation 3\n"
+            "  wrkslots remove slot01 --coordinator-pid $$ --expected-generation 1 \\\n"
+            "      --coordinator-authorized --attest-agent-stopped hold-slot01 \\\n"
+            "      --attest-note 'placeholder hold name; no process ever ran under it'"
         ),
         formatter_class=_HelpFormatter,
     )
@@ -58909,6 +59234,34 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help=(
             "exact canonical ignored/validate/runs/*.json completed record named by "
             "the validation removal proof"
+        ),
+    )
+    remove.add_argument(
+        "--attest-agent-stopped",
+        metavar="AGENT",
+        help=(
+            "the coordinator's statement that AGENT, the agent recorded on this slot, has "
+            "stopped. Used only when the registered liveness command answers that it has "
+            "no record of AGENT at all (exit 2 with the single output line token "
+            "reason=no-agentctl-record), the exact recorded owner process generation is "
+            "proven dead, and the heartbeat time-to-live has expired; then it stands in "
+            "for the command's 'dead'. Requires --coordinator-authorized and "
+            "--attest-note. Every other answer keeps its ordinary meaning, every "
+            "process-use, handoff, hold, Git and salvage check still runs, and "
+            "--archive-drifted-checkouts still needs the command's own 'dead'. Agent slots "
+            "only; retire-pending and remove-agent-batch never accept it (default: not "
+            "given, so such a slot is refused)"
+        ),
+    )
+    remove.add_argument(
+        "--attest-note",
+        metavar="TEXT",
+        help=(
+            "one line of at most 1024 characters saying how the coordinator knows the "
+            "agent stopped, for example 'in-process subagent; its task returned at "
+            "10:02Z'; recorded in the event log before anything is salvaged or removed. "
+            "Required with --attest-agent-stopped and meaningless without it (default: "
+            "not given)"
         ),
     )
     remove.add_argument(

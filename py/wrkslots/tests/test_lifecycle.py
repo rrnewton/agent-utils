@@ -31,6 +31,7 @@ import textwrap
 import threading
 import time
 import traceback
+import types
 import unicodedata
 from collections.abc import Callable, Iterator, Mapping, Sequence, Set as AbstractSet
 from dataclasses import replace
@@ -56526,3 +56527,32 @@ def test_archive_drifted_checkouts_refuses_rules_in_info_attributes(tmp_path: Pa
     assert tree.is_dir()
     assert git(tree, "rev-parse", "HEAD").stdout.strip() == head
     assert len(active_slots(project)) == 1
+
+
+# ---------------------------------------------- lifecycle cases kept in modules of their own
+#
+# A few groups of lifecycle cases live in modules of their own. They are named without the test_
+# prefix, so they are not test files that the validation manifest must list: every one of them
+# drives real removals and recoveries, which belong in this suite's isolated shards rather than in
+# the component shards. This module collects each one's tests, and the fixtures they use, by the
+# names it lists in COLLECTED. Each imports this module as wrkslots.tests.test_lifecycle; pytest
+# imports it as test_lifecycle, so it is registered under that name too, and both are one module.
+
+
+def _collect_lifecycle_cases(module: types.ModuleType) -> None:
+    collected = getattr(module, "COLLECTED", None)
+    if collected is None:
+        # The case module was imported first, and is importing this module: it is only partly
+        # initialized here. That happens only outside this suite (pytest imports this module
+        # first), where nothing collects the cases from this module anyway.
+        return
+    for name in collected:
+        if name in globals():
+            raise RuntimeError(f"{module.__name__}.{name} would replace a name of test_lifecycle")
+        globals()[name] = getattr(module, name)
+
+
+sys.modules.setdefault("wrkslots.tests.test_lifecycle", sys.modules[__name__])
+from wrkslots.tests import orphan_retire_cases  # noqa: E402
+
+_collect_lifecycle_cases(orphan_retire_cases)

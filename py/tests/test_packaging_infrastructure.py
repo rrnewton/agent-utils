@@ -906,9 +906,13 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # batch deletes, exact bytes, and two .git/info/attributes refusals) are mapped.
     # The two doctor-beside-an-absent-validate-batch cases of ccf4788d (a report
     # beside the batch, and a refused overlap the batch does not name) are mapped.
-    assert len(all_tests) == 2013
+    # The 22 orphan-retire cases of #341 wrkslots-orphan-retire, which
+    # test_lifecycle.py collects from orphan_retire_cases.py (13 removal,
+    # refusal and recovery cases with the real agentctl probe and nine verdict
+    # parser cases), are mapped.
+    assert len(all_tests) == 2035
     assert len(ordinary) == 336
-    assert len(mapped) == 1677
+    assert len(mapped) == 1699
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
