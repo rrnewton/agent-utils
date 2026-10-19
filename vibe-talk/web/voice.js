@@ -45049,7 +45049,12 @@ if (typeof window.ResizeObserver === "function") {
     const now = { list: area.clientHeight, dock: heightUnderLists() };
     const seen = sideUnderLists;
     const grew = seen !== null && seen.list > 0 && currentScreen === "main" ? now.dock - seen.dock : 0;
-    sideUnderLists = now;
+    // `#336 draft-return-thread-list`. Not a report from another screen, where the column is not drawn: back on
+    // the main screen the growth is reckoned from the column as the reader left it, so a send card that docked
+    // under the thread list while Settings or Help was up is the dock growing under them, as it is when it
+    // comes while they are on the list. Taken from the hidden column instead, it was no growth at all, and a
+    // reader who had left from the foot of the cards came back the card's height above it.
+    if (currentScreen === "main") sideUnderLists = now;
     if (sideColumnUp() && currentView === "discord" && columns.side.mode === "list") {
       if (!cardsOpening && grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) followFoot(area);
       return;

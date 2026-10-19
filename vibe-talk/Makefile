@@ -210,8 +210,10 @@ send-order-browser:
 # 360x780 and 375x667 a reader who saw only that draft's card, past the slack of the foot, at the foot
 # with no jump a second after Send or the draft settled elsewhere, in Main, All and the call's view, and
 # at 393x852 one who saw only it as the thread list docked it, on the way back once it had gone
-# (`#280`). Pass WEB_ROOT=dir for another copy of the page, SCREENSHOTS=dir to keep a PNG of each
-# placement.
+# (`#280`); and at 393x852 and 1280x800 a reader of the thread list to whom a draft came while Settings
+# or Help was up, back at the foot of its cards over the docked card if they left from it (`#336
+# draft-return-thread-list`). Pass WEB_ROOT=dir for another copy of the page, SCREENSHOTS=dir to keep a
+# PNG of each placement.
 approval-card-browser:
 	python3 tests/approval_card_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 

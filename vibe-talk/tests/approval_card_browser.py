@@ -136,6 +136,13 @@ uncovered and wholly on screen. This lays it out on three phones and measures:
      control pane was shown: Chromium laid the page out to blur that list, and the channel's list, short of
      the card that had gone, was clamped to a window the pane's 66px too tall. The reader was left 58px above
      the foot at 393x852, and 200px once the box took back its room, the jump offered.
+ 23. `#336 draft-return-thread-list`. With no card up, a reader of the thread list goes to Settings by its gear
+     or to Help by "?", a long draft arrives there and docks under it, and they come back by Back or Esc: one
+     who left from the foot of the cards is at their foot again over the card docked under them, Send on
+     screen, as one is whom the draft reaches on the list (point 11), and one who left 100px up the cards is
+     on the same card within a pixel, now and a second later. The right column's dock-growth keeper took its
+     last report from the column hidden with the main screen, and reckoned no growth: the reader from the
+     foot came back the card's height above it, 247px for the long draft.
 
 Runs: 393x852, 360x780 and 375x667, each with a one-row and a thirty-row transcript, with and
 without the first call's connection banner, and with a short and a 1,500-character draft, and points
@@ -143,8 +150,8 @@ without the first call's connection banner, and with a short and a 1,500-charact
 five ways through the thread list, at 393x852, and one case of each list at the other two); point 19 at
 393x852, eleven trips, and four at 375x667; point 22 at 393x852, ten trips, and four at 375x667; points 20
 and 21 at 393x852; the docked card alone at 667x375
-and 375x330; points 11 to 13, 15 and 16 at 393x852; and points 8, 11 to 15, 17 and 21 at 1280x800 with a
-mouse.
+and 375x330; points 11 to 13, 15, 16 and 23 at 393x852; and points 8, 11 to 15, 17, 21 and 23 at 1280x800
+with a mouse.
 
 It serves the checked-out assets and a small fake API from one loopback origin and routes the voice
 WebSocket to a Playwright mock playing the deployed `vibe-talk-v1` protocol (and, for point 9, the
@@ -1236,6 +1243,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi
                 listed = "; " + thread_list_case(page, url, voice, api, size, True, args.screenshots)
                 listed += "; " + thread_list_place_case(page, url, voice, api, size, True)
                 listed += "; " + thread_list_arrival_case(page, url, voice, api, size, True)
+                listed += "; " + thread_list_away_case(page, url, voice, api, size, True)
                 listed += "; " + room_back_case(page, url, voice, api, size, True)
                 listed += "; " + opened_card_case(page, url, voice, api, size)
             listed += "; " + card_alone_case(page, url, voice, api, size,
@@ -1822,6 +1830,79 @@ def thread_list_arrival_case(page: Page, url: str, voice: FakeVoice, api: FakeAp
 
 SIDE_UP_JS = ("(up) => { const a = document.getElementById('side-scroll');"
               " a.scrollTop = a.scrollHeight - a.clientHeight - up; }")
+
+
+# Point 23's trips, (the way there, the way back, px up the cards): the gear and Help's "?", Back and Esc, from the
+# foot of the cards and from 100px up them.
+AWAY_TRIPS: tuple[tuple[str, str, int], ...] = (
+    ("gear", "back", 0), ("help", "esc", 0), ("gear", "esc", 100), ("help", "back", 100),
+)
+
+
+def thread_list_away_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: tuple[int, int],
+                          phone: bool) -> str:
+    """Point 23: a draft arriving while Settings or Help is up, back to the thread list, finds a reader who left
+    from the foot of its cards at their foot over the card docked under them, and one who left up them on their
+    card (`#336 draft-return-thread-list`)."""
+    width, height = size
+    where = f"{width}x{height}, a draft arriving while Settings or Help is up"
+    mod = "Meta" if phone else "Control"
+    api.threaded = True
+    api.older_threads = 14
+    try:
+        open_call(page, url, voice, api, 30, False)
+        page.click("#view-switch")
+        page.wait_for_function("() => document.querySelectorAll('#discord-log > li[data-id]').length > 0",
+                               timeout=10_000)
+        page.wait_for_timeout(300)
+        view_key(page, mod, 3, None, "list")
+        for serial, (there, back, up) in enumerate(AWAY_TRIPS, start=231):
+            how = ("the gear" if there == "gear" else "Help's \"?\"") + (" and Back" if back == "back" else " and Esc")
+            page.evaluate(SIDE_UP_JS, up)
+            page.wait_for_timeout(400)
+            before = thread_list_measure(page)
+            check(before["layout"] == "list" and before["card"] is None and
+                  abs(float(str(before["sideGap"])) - up) <= 1 and float(str(before["sideRuns"])) > 300,
+                  f"{where}: the premise, the thread list's cards with no card under them and a reader {up}px up"
+                  f" them: {before}")
+            if there == "gear":
+                page.click("#open-settings")
+                page.wait_for_function("() => currentScreen === 'settings'", timeout=5000)
+            else:
+                page.keyboard.press("?")
+                page.wait_for_function("() => currentScreen === 'help'", timeout=5000)
+            page.wait_for_timeout(300)
+            propose(page, api, serial, LONG_DRAFT)
+            page.wait_for_timeout(400)
+            if back == "back":
+                page.click("#close-settings" if there == "gear" else "#close-help")
+            else:
+                page.keyboard.press("Escape")
+            page.wait_for_function("() => currentScreen === 'main'", timeout=5000)
+            for when in ("", " a second later"):
+                page.wait_for_timeout(1000 if when else 400)
+                after = thread_list_measure(page)
+                check(after["layout"] == "list" and after["place"] == "dock" and after["screen"] == "main",
+                      f"{where}: {how} did not come back to the thread list with the card docked under it: {after}")
+                if up == 0:
+                    check(float(str(after["sideGap"])) <= 1 and after["send"] is not None and
+                          inside(after["send"], float(str(after["innerHeight"])), float(str(after["innerWidth"]))),
+                          f"{where}: {how} left a reader who was at the foot of the cards"
+                          f" {float(str(after['sideGap'])):.0f}px above it{when}, Send on screen: {after['send']}")
+                else:
+                    first, now = before["first"], after["first"]
+                    check(isinstance(first, dict) and isinstance(now, dict) and first["id"] == now["id"] and
+                          abs(float(first["offset"]) - float(now["offset"])) <= 1,
+                          f"{where}: {how} moved a reader {up}px up the cards from {first} to {now}{when}")
+            api.settle()
+            page.locator("#post-confirm").wait_for(state="hidden", timeout=5000)
+            page.wait_for_timeout(1300)
+        check(not api.commits and not api.cancels, f"{where}: a trip posted or withdrew a draft")
+    finally:
+        api.threaded = False
+        api.older_threads = 0
+    return (f"{where}: a reader who left from the foot of the thread list's cards at it again over the card, Send on"
+            " screen, and one 100px up on their card, by the gear or Help and Back or Esc")
 
 
 def thread_list_cards_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: tuple[int, int]) -> str:
@@ -2740,6 +2821,7 @@ def walk_desk(chromium: BrowserType, args: argparse.Namespace, url: str, api: Fa
             line += "; " + thread_list_case(page, url, voice, api, DESK, False, args.screenshots)
             line += "; " + thread_list_place_case(page, url, voice, api, DESK, False)
             line += "; " + thread_list_arrival_case(page, url, voice, api, DESK, False)
+            line += "; " + thread_list_away_case(page, url, voice, api, DESK, False)
             line += "; " + thread_list_cards_case(page, url, voice, api, DESK)
             line += "; " + room_back_case(page, url, voice, api, DESK, False)
             line += "; " + two_columns_opened_case(page, url, voice, api, DESK)
