@@ -40,11 +40,12 @@ Who emits, and how:
   ``validation/timeline.dag.yaml``) and the loader below normalizes it;
   node:test TAP output normalizes through ``ingest-node-tap``.
 * **Rust/libtest and application (vibe-talk) cargo suites** — libtest's
-  stable output carries no per-case durations, so these emit through
-  ``ingest-libtest-json``, which timestamps the test binary's JSON event
-  stream as it arrives (serial runs give true per-case intervals). Their
-  validation gates remain gate-timed by dagrun's profile until they are
-  rewired through that wrapper; this module does not pretend otherwise.
+  stable output carries no per-case durations, so their gates run through
+  ``run-cargo`` below: it builds with ``cargo test --no-run``, executes each
+  test binary's JSON event stream (timestamped on arrival, so durations are
+  real per-case intervals), inventories each binary with ``--list``, and runs
+  doctests as their own cases. ``ingest-libtest-json`` remains for ad-hoc
+  streams.
 
 A record whose cases were produced by a nested alternate-environment rerun
 carries ``"nested": true``. The verifier checks every record's cases against
@@ -71,6 +72,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -113,6 +115,10 @@ class TimingReport:
     primary_cases: tuple[CaseRecord, ...] = ()
     nested_count: int = 0
     files: int = 0
+    #: Expected gates that left no primary record. Unlike a mismatched
+    #: record (a problem), a missing one means coverage could not be
+    #: confirmed — the PARTIAL shape cross coverage already uses.
+    missing_gates: tuple[str, ...] = ()
 
     @property
     def primary_count(self) -> int:
@@ -490,27 +496,71 @@ def _load_run_file(path: Path, problems: list[str]) -> _RunFile | None:
     return _RunFile(source, runner, gate_value, nested, inventory, tuple(cases))
 
 
-def verify_directory(directory: Path) -> TimingReport:
+def _load_tap_file(path: Path, problems: list[str]) -> _RunFile | None:
+    """Normalize one ``node-<gate>.tap`` file, checked against its TAP plan."""
+
+    source = path.name
+    try:
+        size = path.stat().st_size
+        text = path.read_text(encoding="utf-8") if size <= MAX_FILE_BYTES else ""
+    except (OSError, UnicodeError) as exc:
+        problems.append(f"{source}: unreadable TAP record: {exc}")
+        return None
+    if size > MAX_FILE_BYTES:
+        problems.append(f"{source}: TAP record is {size} bytes, over the {MAX_FILE_BYTES} bound")
+        return None
+    gate = source[len("node-") : -len(".tap")]
+    cases = cases_from_node_tap(text, gate=gate)
+    plan: int | None = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("1.."):
+            try:
+                plan = int(stripped[3:].split()[0])
+            except (ValueError, IndexError):
+                plan = None
+    if plan is not None and plan != len(cases):
+        problems.append(
+            f"{source}: TAP plan is {plan} case(s) but {len(cases)} result(s) were reported"
+        )
+    return _RunFile(
+        source, "node-test", gate, False, tuple(case.case_id for case in cases), tuple(cases)
+    )
+
+
+def verify_directory(
+    directory: Path, *, expected_gates: Sequence[str] = ()
+) -> TimingReport:
     """Verify exact per-record inventory equality and build the primary aggregate.
 
     Every record must account for its own collected inventory exactly once.
     Across primary records a ``(runner, gate, case_id)`` may appear only
     once; nested records are inventory-checked too but their cases are
-    counted separately and never enter the primary aggregate.
+    counted separately and never enter the primary aggregate. Every gate in
+    ``expected_gates`` must have left at least one primary record: an absent
+    record is a runner whose evidence silently vanished, not a small report.
     """
 
     problems: list[str] = []
     paths = sorted(directory.glob("*.json")) if directory.is_dir() else []
+    tap_paths = sorted(directory.glob("node-*.tap")) if directory.is_dir() else []
     if len(paths) > MAX_FILES:
         problems.append(f"{len(paths)} timing record files, over the {MAX_FILES} bound")
         paths = paths[:MAX_FILES]
     primary: dict[tuple[str, str, str], CaseRecord] = {}
     nested_count = 0
     loaded = 0
+    primary_gates: set[str] = set()
+    runs: list[_RunFile] = []
     for path in paths:
-        run = _load_run_file(path, problems)
-        if run is None:
-            continue
+        loaded_run = _load_run_file(path, problems)
+        if loaded_run is not None:
+            runs.append(loaded_run)
+    for path in tap_paths:
+        loaded_tap = _load_tap_file(path, problems)
+        if loaded_tap is not None:
+            runs.append(loaded_tap)
+    for run in runs:
         loaded += 1
         if len(set(run.inventory)) != len(run.inventory):
             problems.append(f"{run.source}: duplicate inventory entries in {run.gate}")
@@ -527,6 +577,7 @@ def verify_directory(directory: Path) -> TimingReport:
         if run.nested:
             nested_count += len(run.cases)
             continue
+        primary_gates.add(run.gate)
         for case in run.cases:
             key = (case.runner, case.gate, case.case_id)
             if key in primary:
@@ -536,8 +587,9 @@ def verify_directory(directory: Path) -> TimingReport:
                 )
                 continue
             primary[key] = case
+    missing_gates = tuple(sorted(set(expected_gates) - primary_gates))
     ordered = tuple(sorted(primary.values(), key=lambda case: (case.runner, case.gate, case.case_id)))
-    return TimingReport(problems, ordered, nested_count, loaded)
+    return TimingReport(problems, ordered, nested_count, loaded, missing_gates)
 
 
 def render_report(report: TimingReport, *, slowest: int = 20) -> list[str]:
@@ -553,10 +605,13 @@ def render_report(report: TimingReport, *, slowest: int = 20) -> list[str]:
     for runner in sorted(per_runner):
         cases = per_runner[runner]
         total = sum(case.duration_s or 0.0 for case in cases)
+        counts: dict[str, int] = {}
+        for case in cases:
+            counts[case.outcome] = counts.get(case.outcome, 0) + 1
         outcomes = ", ".join(
-            f"{outcome} {sum(1 for case in cases if case.outcome == outcome)}"
+            f"{outcome} {counts[outcome]}"
             for outcome in ("pass", "fail", "skip", "error")
-            if any(case.outcome == outcome for case in cases)
+            if outcome in counts
         )
         lines.append(f"  {runner}: {len(cases)} case(s), {total:.3f}s summed [{outcomes}]")
     ranked = sorted(
@@ -568,6 +623,201 @@ def render_report(report: TimingReport, *, slowest: int = 20) -> list[str]:
             f"  slowest {case.duration_s or 0.0:.3f}s {case.runner} {case.gate} {case.case_id}"
         )
     return lines
+
+
+# ---------------------------------------------------------------- cargo runner
+
+
+def _crate_name(package_id: object, fallback: str) -> str:
+    if not isinstance(package_id, str):
+        return fallback
+    if "#" in package_id:
+        fragment = package_id.rsplit("#", 1)[1]
+        name = fragment.split("@", 1)[0] if "@" in fragment else fallback
+        return name or fallback
+    return package_id.split(" ", 1)[0] or fallback
+
+
+def _stream_lines(process: subprocess.Popen[str]) -> Iterable[tuple[float, str]]:
+    assert process.stdout is not None
+    for line in process.stdout:
+        yield time.monotonic(), line.rstrip("\n")
+
+
+def _run_cargo(argv: Sequence[str], *, gate: str | None) -> int:
+    """Run ``cargo test`` with per-case timings; see the module docstring.
+
+    ``argv`` is the full cargo command after ``--``. Test-binary filters
+    after a second ``--`` are forwarded to every binary (and to ``--list``,
+    so the inventory is exactly what was selected to run).
+    """
+
+    if not argv or Path(argv[0]).name != "cargo" or list(argv[1:2]) != ["test"]:
+        print("case-timings run-cargo: expected `cargo test ...` after --", file=sys.stderr)
+        return 2
+    rest = list(argv[2:])
+    if "--" in rest:
+        split = rest.index("--")
+        cargo_args, test_args = rest[:split], rest[split + 1 :]
+    else:
+        cargo_args, test_args = rest, []
+    resolved_gate = gate if gate is not None else current_gate()
+
+    build = subprocess.Popen(
+        [argv[0], "test", *cargo_args, "--no-run", "--message-format", "json"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    artifacts: list[tuple[str, str, str]] = []
+    assert build.stdout is not None
+    for line in build.stdout:
+        try:
+            message: object = json.loads(line)
+        except json.JSONDecodeError:
+            print(line, end="", file=sys.stderr)
+            continue
+        if not isinstance(message, dict):
+            continue
+        compiler = message.get("message")
+        if isinstance(compiler, dict) and isinstance(compiler.get("rendered"), str):
+            print(compiler["rendered"], end="", file=sys.stderr)
+        executable = message.get("executable")
+        profile = message.get("profile")
+        target = message.get("target")
+        if (
+            isinstance(executable, str)
+            and isinstance(profile, dict)
+            and profile.get("test") is True
+            and isinstance(target, dict)
+            and isinstance(target.get("name"), str)
+        ):
+            target_name = target["name"]
+            assert isinstance(target_name, str)
+            artifacts.append(
+                (_crate_name(message.get("package_id"), target_name), target_name, executable)
+            )
+    build.wait()
+    if build.returncode != 0:
+        return build.returncode
+
+    cases: list[CaseRecord] = []
+    inventory: list[str] = []
+    failures: list[str] = []
+    status = 0
+    binary_env = dict(os.environ)
+    binary_env["RUSTC_BOOTSTRAP"] = "1"
+    for crate, target_name, executable in artifacts:
+        prefix = f"{crate}/{target_name}::"
+        listed = subprocess.run(
+            [executable, "--list", "--test", *test_args],
+            env=binary_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        listed_names = [
+            line[: -len(": test")]
+            for line in listed.stdout.splitlines()
+            if line.endswith(": test")
+        ]
+        inventory.extend(f"{prefix}{name}" for name in listed_names)
+        process = subprocess.Popen(
+            [executable, "-Z", "unstable-options", "--format", "json", "--test", *test_args],
+            env=binary_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        events: list[tuple[float, Mapping[str, object]]] = []
+        for arrived, line in _stream_lines(process):
+            stripped = line.strip()
+            parsed: object = None
+            if stripped.startswith("{"):
+                try:
+                    parsed = json.loads(stripped)
+                except json.JSONDecodeError:
+                    parsed = None
+            if isinstance(parsed, dict):
+                events.append((arrived, parsed))
+                if parsed.get("event") == "failed" and isinstance(parsed.get("stdout"), str):
+                    failures.append(f"{prefix}{parsed.get('name')}:\n{parsed['stdout']}")
+            elif line:
+                print(line)
+        process.wait()
+        if process.returncode != 0:
+            status = 1
+        if events:
+            for case in cases_from_libtest_events(events, gate=resolved_gate):
+                cases.append(
+                    CaseRecord(
+                        "libtest", resolved_gate, f"{prefix}{case.case_id}", case.outcome, case.duration_s
+                    )
+                )
+        elif listed_names:
+            # The binary rejected the JSON stream (older libtest): rerun it
+            # plainly and keep identities and outcomes without durations.
+            rerun = subprocess.run(
+                [executable, "--test", *test_args],
+                env=binary_env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            print(rerun.stdout, end="")
+            print(rerun.stderr, end="", file=sys.stderr)
+            if rerun.returncode != 0:
+                status = 1
+            for line in rerun.stdout.splitlines():
+                match = re.match(r"^test (.+) \.\.\. (ok|FAILED|ignored)$", line.strip())
+                if match is None:
+                    continue
+                outcome = {"ok": "pass", "FAILED": "fail", "ignored": "skip"}[match.group(2)]
+                cases.append(
+                    CaseRecord("libtest", resolved_gate, f"{prefix}{match.group(1)}", outcome, None)
+                )
+
+    doctest_list = subprocess.run(
+        [argv[0], "test", *cargo_args, "--doc", "--", "--list", *test_args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    doc_names = [
+        line[: -len(": test")]
+        for line in doctest_list.stdout.splitlines()
+        if line.endswith(": test")
+    ]
+    if doc_names:
+        inventory.extend(f"doc::{name}" for name in doc_names)
+        doctors = subprocess.run(
+            [argv[0], "test", *cargo_args, "--doc", "--", *test_args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        print(doctors.stdout, end="")
+        print(doctors.stderr, end="", file=sys.stderr)
+        if doctors.returncode != 0:
+            status = 1
+        for line in doctors.stdout.splitlines():
+            match = re.match(r"^test (.+) \.\.\. (ok|FAILED|ignored)$", line.strip())
+            if match is None:
+                continue
+            outcome = {"ok": "pass", "FAILED": "fail", "ignored": "skip"}[match.group(2)]
+            cases.append(
+                CaseRecord("libtest", resolved_gate, f"doc::{match.group(1)}", outcome, None)
+            )
+    for failure in failures:
+        print(failure, file=sys.stderr)
+    passed = sum(1 for case in cases if case.outcome == "pass")
+    failed = sum(1 for case in cases if case.outcome in {"fail", "error"})
+    print(
+        f"case-timings run-cargo: {len(cases)} case(s), {passed} passed, {failed} failed "
+        f"across {len(artifacts)} test binar(ies)"
+    )
+    emit_if_requested(runner="libtest", inventory=inventory, cases=cases, gate=resolved_gate)
+    return status
 
 
 # ---------------------------------------------------------------- CLI
@@ -658,6 +908,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     report = sub.add_parser("report", help="verify a timing directory and print the bounded report")
     report.add_argument("--dir", type=Path, required=True)
     report.add_argument("--slowest", type=int, default=20)
+    report.add_argument(
+        "--expected-gate",
+        action="append",
+        default=[],
+        help="gate that must have left a primary record (repeatable)",
+    )
+    cargo = sub.add_parser("run-cargo", help="run cargo test with per-case timings")
+    cargo.add_argument("--gate", default=None, help="owning validation gate")
+    cargo.add_argument("cargo_argv", nargs=argparse.REMAINDER, help="cargo test ... after --")
     for name, help_text in (
         ("ingest-junit", "normalize a JUnit XML file"),
         ("ingest-playwright", "normalize a Playwright JSON report file"),
@@ -675,13 +934,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command is not None:
             parser.error("--self-test does not take a subcommand")
         return _self_test()
+    if args.command == "run-cargo":
+        cargo_argv = list(args.cargo_argv)
+        if cargo_argv[:1] == ["--"]:
+            cargo_argv = cargo_argv[1:]
+        return _run_cargo(cargo_argv, gate=args.gate)
     if args.command == "report":
-        verified = verify_directory(args.dir)
+        verified = verify_directory(args.dir, expected_gates=args.expected_gate)
         for line in render_report(verified, slowest=args.slowest):
             print(line)
+        for gate in verified.missing_gates:
+            print(
+                f"case timings: expected timing gate {gate} left no primary timing record",
+                file=sys.stderr,
+            )
         for problem in verified.problems:
             print(f"case timings: {problem}", file=sys.stderr)
-        return 1 if verified.problems else 0
+        return 1 if verified.problems or verified.missing_gates else 0
     if args.command == "ingest-junit":
         runner = args.runner or "junit"
         return _ingest(

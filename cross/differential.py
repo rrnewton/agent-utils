@@ -494,9 +494,11 @@ def record_coverage(
         () if rep is None else tuple(rep.skipped),
     )
     _COVERAGE.append(coverage)
-    _emit_case_timings(tool, rep)
     directory = os.environ.get(COVERAGE_DIR_ENV)
     if not directory:
+        # Timings are emitted only after the coverage record is durable (or
+        # was never asked for): a timing failure must not destroy coverage.
+        _emit_case_timings(tool, rep)
         return coverage
     record: dict[str, object] = {
         "schema": 1,
@@ -528,6 +530,7 @@ def record_coverage(
             f"cross[{tool}]: cannot write the coverage record {COVERAGE_DIR_ENV}={directory} "
             f"asked for: {exc}"
         ) from exc
+    _emit_case_timings(tool, rep)
     return coverage
 
 

@@ -387,12 +387,12 @@ def test_validate_summary_reports_timing_problems(tmp_path: Path) -> None:
         inventory=["a"],
         cases=[_case("a")],
     )
-    lines, problems = validate.case_timing_report(tmp_path)
-    assert problems == []
+    lines, problems, missing = validate.case_timing_report(tmp_path)
+    assert problems == [] and missing == []
     assert any("case timings" in line for line in lines)
 
     (tmp_path / "broken.json").write_text("[]", encoding="utf-8")
-    _lines, problems = validate.case_timing_report(tmp_path)
+    _lines, problems, _missing = validate.case_timing_report(tmp_path)
     assert problems
 
 
@@ -441,3 +441,127 @@ def test_libtest_ingest_against_a_real_test_binary(tmp_path: Path) -> None:
     assert report.problems == []
     outcomes = {case.case_id: case.outcome for case in report.primary_cases}
     assert outcomes == {"alpha": "pass", "beta": "skip"}
+
+
+def test_expected_gate_without_a_record_is_a_problem(tmp_path: Path) -> None:
+    case_timings.write_records(
+        tmp_path, runner="pytest", gate="present", inventory=["a"], cases=[_case("a")]
+    )
+    report = case_timings.verify_directory(
+        tmp_path, expected_gates=["present", "absent"]
+    )
+    assert report.problems == []
+    assert report.missing_gates == ("absent",)
+    assert case_timings.verify_directory(tmp_path, expected_gates=["present"]).problems == []
+    # An empty directory proves nothing about an expected gate.
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert case_timings.verify_directory(empty, expected_gates=["g"]).missing_gates == ("g",)
+
+
+def test_node_tap_file_is_loaded_and_plan_checked(tmp_path: Path) -> None:
+    (tmp_path / "node-timeline.browser.benchmark.tap").write_text(
+        NODE_TAP, encoding="utf-8"
+    )
+    report = case_timings.verify_directory(
+        tmp_path, expected_gates=["timeline.browser.benchmark"]
+    )
+    assert report.problems == []
+    assert report.primary_count == 3
+    assert all(case.runner == "node-test" for case in report.primary_cases)
+
+    (tmp_path / "node-timeline.browser.benchmark.tap").write_text(
+        NODE_TAP.replace("1..3", "1..4"), encoding="utf-8"
+    )
+    report = case_timings.verify_directory(tmp_path)
+    assert any("TAP plan is 4" in problem for problem in report.problems)
+
+
+@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is required")
+def test_run_cargo_against_a_real_crate(tmp_path: Path) -> None:
+    crate = tmp_path / "probe"
+    (crate / "src").mkdir(parents=True)
+    (crate / "Cargo.toml").write_text(
+        '[package]\nname = "probe"\nversion = "0.1.0"\nedition = "2021"\n',
+        encoding="utf-8",
+    )
+    (crate / "src" / "lib.rs").write_text(
+        "/// ```\n/// assert_eq!(probe::add(1, 2), 3);\n/// ```\n"
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n"
+        "#[cfg(test)]\nmod tests {\n"
+        "    #[test] fn alpha() { assert_eq!(super::add(1, 1), 2); }\n"
+        "    #[test] #[ignore] fn beta() {}\n}\n",
+        encoding="utf-8",
+    )
+    timing_dir = tmp_path / "timings"
+    environment = os.environ.copy()
+    environment[case_timings.TIMING_DIR_ENV] = str(timing_dir)
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS / "case_timings.py"),
+            "run-cargo",
+            "--gate",
+            "rust.probe.test",
+            "--",
+            "cargo",
+            "test",
+            "--offline",
+            "--manifest-path",
+            str(crate / "Cargo.toml"),
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    report = case_timings.verify_directory(
+        timing_dir, expected_gates=["rust.probe.test"]
+    )
+    assert report.problems == []
+    outcomes = {case.case_id: case.outcome for case in report.primary_cases}
+    assert outcomes["probe/probe::tests::alpha"] == "pass"
+    assert outcomes["probe/probe::tests::beta"] == "skip"
+    assert any(case_id.startswith("doc::") and outcome == "pass" for case_id, outcome in outcomes.items())
+    timed = next(case for case in report.primary_cases if case.case_id.endswith("tests::alpha"))
+    assert timed.duration_s is not None and timed.duration_s >= 0
+
+
+def test_examples_harness_emits_a_verifiable_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = importlib.util.spec_from_file_location(
+        "_dagrun_examples_timing", SCRIPTS / "check_dagrun_examples.py"
+    )
+    assert spec is not None and spec.loader is not None
+    checker = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = checker
+    spec.loader.exec_module(checker)
+
+    example = tmp_path / "01-linear-chain.json"
+    example.write_text("{}", encoding="utf-8")
+    timing_dir = tmp_path / "timings"
+
+    def fake_run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setenv(case_timings.TIMING_DIR_ENV, str(timing_dir))
+    monkeypatch.setenv("DAGRUN_OUTER_RUN", "examples.run.python")
+    monkeypatch.setattr(checker, "_effective_validation_jobs", lambda: 4)
+    monkeypatch.setattr(checker, "_effective_memory_budget_bytes", lambda: 1 << 35)
+    monkeypatch.setattr(checker, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(checker, "_examples", lambda: [example])
+    monkeypatch.setattr(checker, "_engine", lambda _name: (["fake-dagrun"], {}))
+    monkeypatch.setattr(checker.subprocess, "run", fake_run)
+    monkeypatch.setattr(checker, "_profile_smoke", lambda *args, **kwargs: None)
+
+    assert checker.main(["--engine", "python"]) == 0
+    report = case_timings.verify_directory(
+        timing_dir, expected_gates=["examples.run.python"]
+    )
+    assert report.problems == []
+    assert {case.case_id for case in report.primary_cases} == {
+        "01-linear-chain.json",
+        "profile-smoke",
+    }

@@ -19,6 +19,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -106,21 +107,55 @@ def _mem_total_bytes() -> int | None:
     return None
 
 
-def _effective_memory_budget_bytes() -> int | None:
-    """This process's cgroup cap and host total, combined by the honest minimum."""
+def _ancestor_memory_cap_bytes(
+    *,
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+    proc_cgroup: Path = Path("/proc/self/cgroup"),
+) -> int | None:
+    """The tightest finite ``memory.max`` from this process's cgroup to the root.
 
-    python_root = str(REPO_ROOT / "py")
-    inserted = python_root not in sys.path
-    if inserted:
-        sys.path.insert(0, python_root)
+    This mirrors the engine's own delegated-ceiling scan (it walks ancestors
+    for the tightest cap): reading only the hierarchy root's ``memory.max``
+    misses a cap on an intermediate slice, so harness and engine could
+    classify the same runner oppositely.
+    """
+
     try:
-        from dagrun.sizing import cgroup_mem_max_bytes
+        relative: Path | None = None
+        for line in proc_cgroup.read_text(encoding="utf-8").splitlines():
+            parts = line.split(":", 2)
+            if len(parts) == 3 and parts[0] == "0":
+                relative = Path(parts[2].lstrip("/"))
+        if relative is None:
+            return None
+        current = cgroup_root / relative
+        tightest: int | None = None
+        for _depth in range(64):
+            try:
+                raw = (current / "memory.max").read_text(encoding="utf-8").strip()
+            except OSError:
+                raw = ""
+            if raw and raw != "max":
+                try:
+                    value = int(raw)
+                except ValueError:
+                    value = 0
+                if value > 0 and (tightest is None or value < tightest):
+                    tightest = value
+            if current == cgroup_root or current.parent == current:
+                return tightest
+            current = current.parent
+        return tightest
+    except OSError:
+        return None
 
-        cgroup_cap = cgroup_mem_max_bytes()
-    finally:
-        if inserted:
-            sys.path.remove(python_root)
-    return _memory_budget_bytes(cgroup_cap=cgroup_cap, mem_total=_mem_total_bytes())
+
+def _effective_memory_budget_bytes() -> int | None:
+    """This process's ancestor cgroup cap and host total, by the honest minimum."""
+
+    return _memory_budget_bytes(
+        cgroup_cap=_ancestor_memory_cap_bytes(), mem_total=_mem_total_bytes()
+    )
 
 
 def _expected_memory_refusal(example_name: str, budget: int | None) -> bool:
@@ -143,17 +178,22 @@ def _is_documented_memory_refusal(
     """Whether output is example 08's pre-spawn hard-cap refusal at ``budget``.
 
     The footprint in the message must be the example's full 16 GiB hard cap:
-    a smaller number would mean admission had been weakened to fit. The guest
-    step's ``[build]`` echo must be absent, so a failure after spawn cannot
-    masquerade as the documented refusal.
+    a smaller number would mean admission had been weakened to fit. The
+    budget the engine names may be smaller than the harness's ``--max-mem``
+    when an inherited delegated ceiling is tighter still, but never larger.
+    The engine's step-start marker must be absent, so a failure after spawn
+    cannot masquerade as the documented refusal.
     """
 
+    named = re.search(r"budget (\d+) bytes", combined)
     return (
         returncode == 2
         and "REFUSED" in combined
         and f"minimum runnable footprint {FIXED_MEMORY_BYTES} bytes" in combined
-        and f"budget {budget} bytes" in combined
-        and "[build]" not in combined
+        and named is not None
+        and int(named.group(1)) < FIXED_MEMORY_BYTES
+        and int(named.group(1)) <= budget
+        and "[build.dagrun]" not in combined
     )
 
 
@@ -343,13 +383,14 @@ def main(argv: list[str] | None = None) -> int:
             timing_cases.append(
                 case_timings.CaseRecord("examples", gate, str(relative), "fail", elapsed)
             )
-            _emit_timings(timing_cases, inventory)
+            # A failed run inventories only what was attempted (see packages).
+            _emit_timings(timing_cases, [case.case_id for case in timing_cases])
             return 1
         if completed.returncode != 0:
             timing_cases.append(
                 case_timings.CaseRecord("examples", gate, str(relative), "fail", elapsed)
             )
-            _emit_timings(timing_cases, inventory)
+            _emit_timings(timing_cases, [case.case_id for case in timing_cases])
             return completed.returncode
         timing_cases.append(
             case_timings.CaseRecord("examples", gate, str(relative), "pass", elapsed)

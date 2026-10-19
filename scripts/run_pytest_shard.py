@@ -74,8 +74,20 @@ class _TimingPlugin:
     """
 
     def __init__(self) -> None:
+        import case_timings
+
         self.inventory: list[str] = []
         self.results: dict[str, tuple[str, float]] = {}
+        # Captured before the session starts: below, sessionstart marks this
+        # process nested so any timing-capable runner a test spawns emits as
+        # an alternate-environment rerun instead of a second primary record.
+        self.nested = case_timings.is_nested()
+
+    def pytest_sessionstart(self, session: pytest.Session) -> None:
+        del session
+        import case_timings
+
+        os.environ[case_timings.TIMING_NESTED_ENV] = "1"
 
     def pytest_collection_finish(self, session: pytest.Session) -> None:
         self.inventory = [item.nodeid for item in session.items]
@@ -102,7 +114,11 @@ class _TimingPlugin:
             for nodeid, (outcome, duration) in sorted(self.results.items())
         ]
         case_timings.emit_if_requested(
-            runner="pytest", inventory=self.inventory, cases=cases, gate=gate
+            runner="pytest",
+            inventory=self.inventory,
+            cases=cases,
+            gate=gate,
+            nested=self.nested,
         )
 
 
@@ -134,6 +150,10 @@ class _ShardPlugin:
 
         if case_timings.requested_directory() is not None:
             self.timing = _TimingPlugin()
+
+    def pytest_sessionstart(self, session: pytest.Session) -> None:
+        if self.timing is not None:
+            self.timing.pytest_sessionstart(session)
 
     def pytest_collection_finish(self, session: pytest.Session) -> None:
         if self.timing is not None:

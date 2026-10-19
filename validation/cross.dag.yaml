@@ -20,7 +20,7 @@ steps:
   - group: dagrun
     job: cpu-footprint
     desc: CPU-footprint contract tests
-    cmd: python3 -m pytest -q cross/test_cpu_footprint.py
+    cmd: PYTHONPATH=scripts python3 -m pytest -p run_pytest_shard -q cross/test_cpu_footprint.py
     jobs_flag: ""
     labels: [validation-cross, component-dagrun]
     timeout: 120
