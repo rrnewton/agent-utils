@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-377-c888d2b372b",
+    "issue_id": "agent-utils-377",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Delivered by \"vibe-talk: a collapsed message's header fits on one line, with Reply and Done once it is opened\". In lists narrower than 32rem (a phone, or a column of a small desk window), a collapsed row's header is one line: the name, cut to a prefix with an ellipsis (its tooltip has the whole name), then the time, Thread and ⋯. Reply, Done/Unarchive and Not noise appear once the row is opened. Quote reply also appears when words of the row are selected. Enter, r, e and the swipe all still work. On every row the controls form one group at the end of the line and wrap together, so Done is never alone on a line. The Thread tag is the same size as Reply and keeps its thread colour. Wider lists keep every control. Checked by tests/compact_rows_browser.py at 393x852, 1280x800 and 1024x768 (two columns). Not verified: a collapsed row in the Pinned list (Pinned chip plus Thread) with a long name or a large system font can still put Thread and ⋯ together on a second line on a phone.",
+    "created_at": "2026-10-19T20:37:58.355393330Z",
+    "updated_at": "2026-10-19T20:37:58.355393330Z"
+  }
+]
