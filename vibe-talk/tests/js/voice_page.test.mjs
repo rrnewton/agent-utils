@@ -7671,7 +7671,7 @@ test("`#352 voice-reconnect-on-bridge-error`: EVERY WORDING THE RECONNECTED LINE
     assert.ok(spent <= SEAM_DETAIL_MAX_WORDS, `RECONNECT_SEAM_DETAILS.${key} spends ${spent} words behind a tap: "${text}"`);
     // Both things a seam has to say: what happened, and what it means for the agent's memory.
     assert.match(text, /^The voice service lost a turn, so the call moved to a new session/, key);
-    assert.match(text, key.startsWith("fresh_") ? /has seen nothing above this line/ : /was sent what was said above/, key);
+    assert.match(text, key.startsWith("fresh_") ? /has seen nothing above this line/ : /was sent this call's record/, key);
   }
 });
 
@@ -71659,7 +71659,7 @@ test("`#352 voice-reconnect-on-bridge-error`: a session that lists replay is han
   await page.settle();
   assert.equal(callRecap(page), "Reconnected after a lost turn: caught the agent up with 7 words from this call");
   assert.equal(seamDetail(reconnectedSeams(page)[0]),
-    "The voice service lost a turn, so the call moved to a new session, which was sent what was said above, and the messages went again.");
+    "The voice service lost a turn, so the call moved to a new session, which was sent this call's record, and the messages went again.");
   assert.match(page.el("settings-detail").textContent, /the conversation this call resumed from was not sent again/);
   assert.match(page.el("settings-detail").textContent, /the reconnected session took this call's record/);
   // How the call began is unchanged in Settings.
@@ -72104,7 +72104,7 @@ test("`#352 voice-reconnect-on-bridge-error`: a reconnected session is handed no
   }
 });
 
-test("`#352 voice-reconnect-on-bridge-error`: a reconnected session that refuses this call's record is said to have started fresh, under the call and in the transcript, and the call's start marker is not rewritten", async () => {
+test("`#352 voice-reconnect-on-bridge-error`: a reconnected session that refuses this call's record is said to have started fresh, under the call, in the transcript and in the stored record, and the call's start marker is not rewritten", async () => {
   const page = newPage();
   page.transcriptRecordsSupported = true;
   page.channels = [CHANNEL, OTHER_CHANNEL];
@@ -72125,6 +72125,10 @@ test("`#352 voice-reconnect-on-bridge-error`: a reconnected session that refuses
   assert.match(page.el("settings-detail").textContent, /the reconnected session refused this call's record: record too long/);
   assert.equal(seamDetail(reconnectedSeams(page)[0]),
     "The voice service lost a turn, so the call moved to a new session that has seen nothing above this line, and the messages went again.");
+  // After a reload the record is all there is: its last word on the reconnect must be what the live line says now.
+  const notes = page.storedTurns.get(callId).filter((t) => t.speaker === "note" && t.text.startsWith("Reconnected"));
+  assert.match(notes.at(-1)?.text ?? "", /has seen nothing above this line/,
+    `the stored record still says the new session was sent this call's record: ${JSON.stringify(notes)}`);
   assert.equal(JSON.stringify(page.storedTurns.get(callId)[0]), marker, "the call's start marker was rewritten");
   assert.match(page.el("resume-state").textContent, /took 11 words from earlier/);
 });

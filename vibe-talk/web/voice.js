@@ -17076,17 +17076,17 @@ const RECONNECT_RECORDS_WAIT_MS = 3000;
  */
 const RECONNECT_SEAM_DETAILS = {
   recap_relay:
-    "The voice service lost a turn, so the call moved to a new session, which was sent what was " +
-    "said above, and the messages went again.",
+    "The voice service lost a turn, so the call moved to a new session, which was sent this " +
+    "call's record, and the messages went again.",
   recap_typed:
-    "The voice service lost a turn, so the call moved to a new session, which was sent what was " +
-    "said above, and your message went again.",
+    "The voice service lost a turn, so the call moved to a new session, which was sent this " +
+    "call's record, and your message went again.",
   recap_none:
-    "The voice service lost a turn, so the call moved to a new session, which was sent what was " +
-    "said above. If you were speaking, say it again.",
+    "The voice service lost a turn, so the call moved to a new session, which was sent this " +
+    "call's record. If you were speaking, say it again.",
   recap_unsent:
-    "The voice service lost a turn, so the call moved to a new session, which was sent what was " +
-    "said above. Send your last message again.",
+    "The voice service lost a turn, so the call moved to a new session, which was sent this " +
+    "call's record. Send your last message again.",
   fresh_relay:
     "The voice service lost a turn, so the call moved to a new session that has seen nothing above " +
     "this line, and the messages went again.",
@@ -17443,7 +17443,8 @@ function noteReconnected(attempt) {
 
 /**
  * The reconnected session refused this call's record: the call's last "reconnected" line now says
- * that session has seen nothing above it.
+ * that session has seen nothing above it, and so does a second note in the stored record, whose
+ * first note said otherwise.
  */
 function reconnectedSessionRefused() {
   const rows = leftEl("transcript").children;
@@ -17458,6 +17459,7 @@ function reconnectedSessionRefused() {
     body.textContent = detail;
     summary.setAttribute("title", detail);
     followIfPinned(pinned);
+    recordTurn("note", `Reconnected, but the new session refused this call's record: ${detail}`);
     return;
   }
 }

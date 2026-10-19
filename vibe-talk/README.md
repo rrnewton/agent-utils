@@ -5240,9 +5240,9 @@ and it opens none. The page says "Caught the agent up with 412 words from earlie
 one and "Started fresh: the voice service refused the recap" on a refusal; with no answer it keeps
 saying it sent them. Answer promptly: the page files nothing of the call until the answer comes, for
 five seconds at most, so that the call's start marker can say what it was. A bridge that does not
-take the frame simply does not list it. The page sends `replay` only after a call's first
-`session_started`: a replacement session on the same socket is sent none, and the page says it
-started fresh.
+take the frame simply does not list it. The page sends `replay` only after the first
+`session_started` on each socket — a call's first, and a `#352` reconnect's new socket: a
+replacement session on the same socket is sent none, and the page says it started fresh.
 
 `vibe_talk::testing::FakeVoiceBridge` is a loopback bridge that does all of this, for either answer,
 and `tests/replay_bridge.rs` holds the server and the frame to it.
@@ -5503,7 +5503,7 @@ still reads:
 | `visibility` | `visible` or `hidden`: whether the page was in sight at the end |
 | `queued_audio_ms` | how much of the assistant's audio was still waiting to be played |
 | `last_text_ms`, `last_audio_end_ms`, `last_interrupt_ms` | how long before the end the page last sent a text turn, an `audio_end` and an `interrupt` — a bridge may take either of the last two for a cut — and absent for one it never sent. A hang-up's own goodbye is not counted |
-| `close_reason` | the voice SERVICE's own words — its close reason, or its `error` — with the token taken out, folded onto one line and cut to 120 characters; never anything said in the call. The server refuses one over 123 characters or carrying a control character |
+| `close_reason` | the voice SERVICE's own words — its close reason, or its `error` — with the token taken out, folded onto one line and cut to 120 characters; never anything said in the call. For `reconnect_failed` it is instead the page's own account of why no new session came ("its new voice socket did not open within 9 s"), which may quote the server's error. The server refuses one over 123 characters or carrying a control character |
 | `reconnects` | `#352`: how many times the page carried this call on a new session before this record, absent when it never did. `since_open_ms` and `turns` stay the whole call's. The server refuses a count over 1000 |
 
 Anything else — an unknown field or `ended_by`, a code out of range, an offset over a day, queued
@@ -5550,10 +5550,11 @@ on a session that has started keeps the call:
   relayed turn is said "not read out" and the typed one is left to the reader. Spoken words are
   never sent again as text.
 * **It is said**: a **reconnected** line in the transcript says what happened and what the new
-  session knows ("…a new session that has seen nothing above this line…" or "…which was sent what
-  was said above…"); the line under the call starts "Reconnected after a lost turn:"; the status
+  session knows ("…a new session that has seen nothing above this line…" or "…which was sent this
+  call's record…"); the line under the call starts "Reconnected after a lost turn:"; the status
   line says "Reconnecting after a lost turn…"; the connection details have the service's words;
-  and the stored record has the line as the page's own note. There is no red panel and no
+  and the stored record has the line as the page's own note, followed by a second note when the
+  new session then refuses the record, so a reload says what the live line came to say. There is no red panel and no
   "new conversation" line: the conversation goes on.
 * **Bounded**: a second request within a minute of the last reconnect (`RECONNECT_MIN_GAP_MS`), or
   one after three in a call (`RECONNECTS_PER_CALL_MAX`), ends the call as `reconnect_limit`; a
