@@ -605,18 +605,29 @@ impl SlackDriver {
             return Err("non-message subtype");
         }
         // The event stream's slack_message extension fills app_id with the
-        // app the delivery came through, not the author; only bot_id marks a
-        // bot-authored message (live finding 2026-10-14: the owner's own
-        // message arrived with app_id set and was dropped).
-        if message.bot_id.is_some() {
-            return Err("bot author");
-        }
+        // app the delivery came through, not the author (live finding
+        // 2026-10-14: the owner's own message arrived with app_id set and was
+        // dropped), so app_id never decides authorship.
+        //
+        // A bot_id does not decide it either when the user is an allowed
+        // sender. A person who posts through an app with their own user token
+        // gets that app's bot_id on the message while slack_user_id stays
+        // theirs (live finding 2026-10-19: three of the owner's thread replies
+        // arrived with slack_user_id U0C23P5291P and bot_id B0C6X0ASTSL and
+        // were dropped as bot-authored). The sender allowlist is the identity
+        // check. The bridge's own posts are written as its app's bot user, a
+        // different user ID, which is never an allowed sender, so they cannot
+        // come back as requests.
         let Some(user) = message
             .user_id
             .as_deref()
             .filter(|user| self.senders.contains(*user))
         else {
-            return Err("sender not allowed");
+            return Err(if message.bot_id.is_some() {
+                "bot author"
+            } else {
+                "sender not allowed"
+            });
         };
         let created = ids::ts_micros(&message.message_ts).ok_or("invalid message ts")?;
         if created < self.created_floor_micros {

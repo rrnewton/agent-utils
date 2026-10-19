@@ -99,9 +99,9 @@ fn fresh_lineage_checkpoints_then_delivers_owner_messages_and_thread_replies() {
     let fake = FakeTransport::new();
     fake.push_script(vec![
         owner_message(101, "1792000801.000100", None, "please &amp; thank you"),
-        // A stranger and a bot are checkpoints, not requests.
+        // A stranger and a bot user are checkpoints, not requests.
         event(102, json!({"channel_id": CHANNEL, "message_ts": "1792000802.000100", "slack_user_id": "U0STRANGER1", "text": "hi"})),
-        event(103, json!({"channel_id": CHANNEL, "message_ts": "1792000803.000100", "slack_user_id": OWNER, "bot_id": "B0BOT000001", "text": "[bot] reply"})),
+        event(103, json!({"channel_id": CHANNEL, "message_ts": "1792000803.000100", "slack_user_id": "U0BRIDGEBOT", "bot_id": "B0BOT000001", "text": "[bot] reply"})),
         // The owner replies inside the first message's thread.
         owner_message(104, "1792000804.000100", Some("1792000801.000100"), "follow-up"),
         // An edit notice is not a request.
@@ -329,4 +329,41 @@ fn configuration_is_validated() {
     .unwrap()
     .with_backend_configuration(configuration(json!({})));
     assert!(backend.subscribe(&wrong_sender).is_err());
+}
+
+#[test]
+fn authorship_is_the_sender_allowlist_not_the_bot_id() {
+    // Live finding 2026-10-19: the owner's thread replies arrived through another app with
+    // slack_user_id = the owner and a bot_id, and were dropped as bot-authored.
+    let fake = FakeTransport::new();
+    fake.push_script(vec![
+        // The owner posting through a third-party app with their own user token.
+        event(201, json!({"channel_id": CHANNEL, "message_ts": "1792000801.000200", "thread_ts": "1792000801.000100", "slack_user_id": OWNER, "bot_id": "B0C6X0ASTSL", "app_id": "A0C1WPP6FR6", "text": "github links please"})),
+        // The bridge's own reply: its app's bot user, never an allowed sender.
+        event(202, json!({"channel_id": CHANNEL, "message_ts": "1792000802.000200", "thread_ts": "1792000801.000100", "slack_user_id": "U0CA580U056", "bot_id": "B0OURBRIDGE", "app_id": "A0C98TMGER4", "text": "reply"})),
+        // An unknown bot.
+        event(203, json!({"channel_id": CHANNEL, "message_ts": "1792000803.000200", "bot_id": "B0STRANGERB", "text": "noise"})),
+        // The owner's plain message.
+        owner_message(204, "1792000804.000200", None, "plain"),
+        FakeStep::Line(r#"{"type":"HEARTBEAT","ts":1.0}"#.to_owned()),
+    ]);
+    let mut backend = make_backend(&fake);
+    let mut subscription = ChatSubscription::open(&mut backend, &request(None, json!({}))).unwrap();
+    let first = commit_next(&mut subscription);
+    assert_eq!(first.events(), [CommittableEvent::Checkpoint]);
+
+    let via_app = commit_next(&mut subscription);
+    let message = single_message(&via_app);
+    assert_eq!(message.sender_id().as_str(), OWNER);
+    assert_eq!(message.text(), "github links please");
+    assert!(message.is_thread_reply());
+
+    for expected in ["slack1:seq:202", "slack1:seq:203"] {
+        let skipped = commit_next(&mut subscription);
+        assert_eq!(skipped.cursor().as_str(), expected);
+        assert_eq!(skipped.events(), [CommittableEvent::Checkpoint]);
+    }
+
+    let plain = commit_next(&mut subscription);
+    assert_eq!(single_message(&plain).text(), "plain");
 }
