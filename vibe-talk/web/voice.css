@@ -7901,6 +7901,16 @@ textarea {
     margin-inline-start: 2.5rem;
   }
 
+  /* `#385 thread-line-overlap`. ...and so does the thread under it, its rows level with the card that
+     heads them. The line from the root runs down the gap beside the card, which is the gap beside its
+     rows too: with the rows at the column's own inset and the card 2.5rem in, the lane lay a few
+     pixels inside every row the line passed, on the agent's full-width boxes' left border. The owner,
+     2026-10-19: "why does it CROSS over my (now-full-width) text boxes?" The rows keep the rest of
+     the column's width, and the owner's own keep their inset from this edge. */
+  #screen-main[data-columns="two"] #side-pane {
+    margin-inline-start: 2.5rem;
+  }
+
   /*
    * `#373 two-column-full-width`. IN TWO COLUMNS A ROW SPANS ITS COLUMN, up to the divider. The owner,
    * 2026-10-19: "I asked a while ago for full-width messages from the coding agent in two-column mode.
@@ -7951,7 +7961,9 @@ textarea {
    * of the column's grid, so the list above it is shorter by the box and nothing else about either
    * column changes: neither is covered, and the top of the list stays where it was. Tinted as the
    * reply screen is, the one thing that says "this is Reply", with the hairline the lists' other
-   * edges have. The box spans the column, as its rows do (`#373 two-column-full-width`, below).
+   * edges have. The box spans the column, as its rows do (`#373 two-column-full-width`, below) —
+   * a thread's on the right from 2.5rem further in, beside the line from its root (`#385
+   * thread-line-overlap`), which never reaches down to the box.
    */
   #screen-main[data-columns="two"] > #column-reply {
     display: block;

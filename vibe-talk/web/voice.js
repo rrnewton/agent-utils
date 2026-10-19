@@ -41248,9 +41248,14 @@ function measureColumnLinks(pairs) {
   const left = { top: header ? leftTop : top, bottom: leftTop + (leftArea.clientHeight || 0) };
   const right = { top: header ? header.top : top, bottom: rightTop + (rightArea.clientHeight || 0) };
   const list = channelPane.list();
+  // Over a thread the gap ends at the card or at the thread's rows under it, whichever is further
+  // left: the line runs down beside both, and a lane inside the rows is drawn over them (`#385
+  // thread-line-overlap`). Rows with no box yet stand nowhere.
+  const rows = header ? leftEl("side-log").getBoundingClientRect() : null;
   const gap = {
     from: list ? list.getBoundingClientRect().right : 0,
-    to: header ? header.left : leftEl("side-cards").getBoundingClientRect().left,
+    to: header ? (rows && rows.width > 0 ? Math.min(header.left, rows.left) : header.left)
+      : leftEl("side-cards").getBoundingClientRect().left,
   };
   const ends = pairs.map((pair) => {
     const row = pair.row ? pair.row.getBoundingClientRect() : null;
