@@ -868,6 +868,7 @@ async fn pair_link(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let link = vibe_talk::pair_link::run(options).await?;
     println!("{}", link.link);
     println!("expires {}", link.expires_at);
+    eprintln!("{}", vibe_talk::pair_link::SEND_WARNING);
     Ok(())
 }
 

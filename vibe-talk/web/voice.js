@@ -43707,8 +43707,11 @@ async function saveToken() {
 // `#369 pairing-link`. What the page says when a pairing link does not work. One sentence for every
 // refusal, because the server gives one answer for all of them: a link that ran out, one already
 // opened, and one mistyped are the same to it, and the remedy is the same too.
+// The second sentence because a link someone else opened first looks exactly like this from here,
+// and the person who sent it is the one who can tell and act on it.
 const PAIRING_EXPIRED =
-  "This pairing link has expired or was already used. Ask for a new one.";
+  "This pairing link has expired or was already used. Ask for a new one. If you had not opened it " +
+  "before, tell whoever sent it: someone else may have.";
 
 /**
  * Trade the code from a pairing link for the write token, then sign in with it exactly as Save

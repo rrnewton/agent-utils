@@ -171,7 +171,7 @@ async fn a_wrong_or_malformed_code_is_refused_with_the_same_answer() {
 }
 
 #[tokio::test]
-async fn repeated_failures_are_answered_429_even_for_the_right_code() {
+async fn repeated_failures_are_answered_429_and_the_right_code_still_works() {
     let (state, _discord) = vibe_talk::testing::state();
     let router = router(state);
     let code = mint(&router, "{}").await;
@@ -186,15 +186,14 @@ async fn repeated_failures_are_answered_429_even_for_the_right_code() {
         &router,
         "/api/v1/pair/redeem",
         None,
-        &json!({ "code": code }).to_string(),
+        &json!({ "code": "guess" }).to_string(),
     )
     .await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{answer}");
     assert_eq!(headers["retry-after"], "60");
-    assert!(
-        answer.get("token").is_none(),
-        "a limited caller got the token"
-    );
+    // Behind a reverse proxy this address is everyone's: the person's own link still works.
+    let (status, answer) = redeem(&router, &code).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
 }
 
 // --- the CLI, against a real listener --------------------------------------------------------
@@ -302,6 +301,10 @@ async fn pair_link_prints_a_working_link_and_its_expiry_and_never_the_token() {
         .expect("RFC 3339");
     let ahead = expires.duration_since(jiff::Timestamp::now()).as_secs();
     assert!((100..=120).contains(&ahead), "--ttl 120: {ahead}");
+    assert!(
+        stderr.contains("read-token holders"),
+        "no reminder of where it is safe to send: {stderr}"
+    );
     assert_eq!(pairing.live(), 1);
     // And the link works, once.
     assert_eq!(redeem(&app, code).await.0, StatusCode::OK);
