@@ -1,12 +1,13 @@
 ---
 title: 'column-overscroll: let the right column scroll past its end so the newest card can sit mid-screen'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-15T19:03:00.285839259+00:00
-updated_at: 2026-10-15T19:03:00.285839259+00:00
+updated_at: 2026-10-19T10:29:31.876748108+00:00
+closed_at: 2026-10-19T10:29:31.876747998+00:00
 ---
 
 # Description
