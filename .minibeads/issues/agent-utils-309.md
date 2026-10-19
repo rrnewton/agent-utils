@@ -1,12 +1,13 @@
 ---
 title: 'validate-nested-git-policy: make audit predict which nested Git repositories validation removal deletes'
-status: open
+status: closed
 priority: 3
 issue_type: task
 labels:
 - wrkslots
 created_at: 2026-10-14T18:09:01.475981477+00:00
-updated_at: 2026-10-14T18:09:01.475981477+00:00
+updated_at: 2026-10-19T13:13:03.414968387+00:00
+closed_at: 2026-10-19T13:13:03.414968217+00:00
 ---
 
 # Description
