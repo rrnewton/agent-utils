@@ -106,7 +106,10 @@ jobs:
     # jobs below use older language versions; they are not a second definition of this contract.
     needs: plan
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # The nightly's budget. A workflow edit selects the complete graph, and the graph now keeps
+    # going past a failure (validate.py --keep-going), so a red run lasts as long as a green one;
+    # the complete graph alone has taken about fifty minutes on a hosted runner.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
         with:
@@ -170,8 +173,8 @@ jobs:
     needs: plan
     if: needs.plan.outputs.python == 'true'
     runs-on: ubuntu-latest
-    # With its test step (30 runs, 2026-09-21..25) this job took 12.4-19.1 min, median 16.2.
-    timeout-minutes: 35
+    # Parsing, startup and packaging on the declared minimum; the tests are python-minimum-tests.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -183,19 +186,92 @@ jobs:
         run: python -m compileall -q py
       - name: dependency-free startup contract
         run: make check-deps
-      # Every distribution declares requires-python >=3.10. Parsing a module and starting its
-      # entry points on 3.10 does not show that it behaves correctly there: the selected graph runs
-      # the tests only on 3.12.
-      # This step is expected to fail until https://github.com/rrnewton/agent-utils/issues/163 is
-      # fixed: 8 tests fail on 3.10 (one wrkslots argument-parsing defect, seven tests whose
-      # expected value comes from a version-dependent Path.glob). It is deliberately not skipped
-      # or marked continue-on-error. Until the issue is closed, a red job is expected; a failure
-      # outside those 8 tests is a new regression.
-      - name: tests on declared minimum Python
-        id: minimum-tests
-        run: cd py && python -m pytest -q
       - name: wheel and sdist contract on declared minimum Python
-        # Also runs when only the test step failed. Without this, the expected test failure above
-        # would stop the package contract that ran here before the tests were restored.
-        if: ${{ !cancelled() && (success() || steps.minimum-tests.outcome == 'failure') }}
         run: make check-python-packages
+
+  python-minimum-tests:
+    needs: plan
+    if: needs.plan.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    # Every distribution declares requires-python >=3.10, and the selected graph runs the tests
+    # only on 3.12. Run serially, the whole suite outgrew its 35 minutes by 2026-10-10 and was
+    # cancelled at about 92% in every run after that, so nothing said which tests fail here.
+    #
+    # Six family-preserving shards, partitioned by scripts/run_pytest_shard.py, the graph's own
+    # sharder. This lane differs from the graph on purpose: it re-runs the whole pytest tree on
+    # the minimum interpreter, bare, one process per shard, without the graph's namespace wrapper
+    # and markers for the lifecycle suite. A test that fails here and also fails when run the
+    # same way on 3.12 is environmental, not a 3.10 defect.
+    #
+    # fail-fast is off, so one red shard cannot cancel the others' reports. Each shard names a
+    # failing test the moment it fails (the component-test plugin), and its test step's own limit
+    # sits below the job's, so a slow shard still reaches the summary and upload steps.
+    #
+    # Tests that fail on 3.10 are tracked by minibeads issue #367 python-minimum-failures: until
+    # it is closed a red shard is expected, and a failure it does not list is a new regression.
+    # Not skipped, and not marked continue-on-error. `#361 python-minimum-timeout`.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+      - name: install minimum-runtime test tooling
+        run: python -m pip install --upgrade 'setuptools>=77' pytest pyyaml
+      - name: tests on declared minimum Python, shard ${{ matrix.shard }} of 6
+        working-directory: py
+        timeout-minutes: 22
+        # bash, so pipefail holds: the step fails when pytest does, while tee keeps the log for
+        # the summary step even if this step is stopped at its limit before pytest's report.
+        shell: bash
+        run: |
+          set -o pipefail
+          python ../scripts/run_pytest_shard.py --shard ${{ matrix.shard }}/6 -- \
+            -q -p run_component_tests --durations=20 \
+            --junitxml="$RUNNER_TEMP/py310-shard.xml" 2>&1 | tee "$RUNNER_TEMP/py310-shard.log"
+      - name: name this shard's failures in the job summary
+        if: ${{ !cancelled() }}
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          python - "$RUNNER_TEMP/py310-shard.xml" "$RUNNER_TEMP/py310-shard.log" >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          import os
+          import sys
+          import xml.etree.ElementTree as ET
+
+          report, log, shard = sys.argv[1], sys.argv[2], os.environ["SHARD"]
+          failed = []
+          if os.path.exists(report):
+              source = "JUnit report"
+              for case in ET.parse(report).getroot().iter("testcase"):
+                  if case.find("failure") is None and case.find("error") is None:
+                      continue
+                  properties = {p.get("name"): p.get("value") for p in case.iter("property")}
+                  failed.append(
+                      properties.get("nodeid") or f"{case.get('classname')}::{case.get('name')}"
+                  )
+          elif os.path.exists(log):
+              source = "log only: the shard stopped before pytest wrote its report"
+              prefix = "component-tests: FAILED "
+              with open(log, encoding="utf-8", errors="replace") as lines:
+                  failed = [line[len(prefix):].strip() for line in lines if line.startswith(prefix)]
+          else:
+              source = "no report and no log: the shard never started its tests"
+          failed = list(dict.fromkeys(failed))
+          print(f"### Python 3.10 shard {shard}: {len(failed)} failed ({source})")
+          print("".join(f"- `{nodeid}`\n" for nodeid in failed))
+          EOF
+      - name: keep this shard's report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: py310-shard-${{ matrix.shard }}
+          path: |
+            ${{ runner.temp }}/py310-shard.xml
+            ${{ runner.temp }}/py310-shard.log
+          if-no-files-found: ignore
+          retention-days: 30
