@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-335-cd2285e0dbe",
+    "issue_id": "agent-utils-335",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Closed: delivered in 'vibe-talk: wait for the browser's own rendering updates before the offline-cache check measures the chips over the composer'. The check measured too early; the page was not wrong. The page stands the chips on the thread's reply box and keeps their room beside it from a ResizeObserver on the chip row and from the list's scroll event, both run in the browser's next rendering update before it paints. Step 6c waited two requestAnimationFrame callbacks, but that walk installs page.clock, which makes requestAnimationFrame a 16 ms timer, and a loaded host ran two of them before it drew once: the check then saw the chips at the foot of the list and \"Collapse all\", on the upper of their two rows, over Send. Shown deterministically: measured in the same task as the forced chips and the scroll, before any rendering update, it fails with exactly this issue's message every time; measured inside the first rendering update, which is what is painted, nothing covers the box or Send, every time. The check now waits on rendering updates of the browser's own (a new ResizeObserver's first report), and still fails with the same message against a page whose chips never stand on the box. Under load (the desktop walk pinned with 64 bounded busy loops to 4 CPUs, about 40 s a run against 5 s idle): the old check failed 5 of 30 runs with this issue's message, the new one passed 30 of 30. With 32 loops on 8 CPUs the old check passed 30 of 30, so the failure needs a heavily loaded host, as the issue said. Not changed: PLACE_JS in the same walk also counts page.clock frames; it reads only positions a layout forces and has not been seen to fail. Unverified: only headless Chromium 149.",
+    "created_at": "2026-10-19T10:29:57.202097415Z",
+    "updated_at": "2026-10-19T10:29:57.202097415Z"
+  }
+]
