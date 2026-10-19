@@ -1,12 +1,13 @@
 ---
 title: 'page-live-reads-remainder: the shelved parts of the page''s live-read work'
-status: open
+status: closed
 priority: 3
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-15T15:52:38.627946597+00:00
-updated_at: 2026-10-15T15:52:38.627946597+00:00
+updated_at: 2026-10-19T09:08:17.439769803+00:00
+closed_at: 2026-10-19T09:08:17.439769663+00:00
 ---
 
 # Description
