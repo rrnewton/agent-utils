@@ -22,7 +22,10 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
+
+import case_timings
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -235,6 +238,14 @@ def _profile_smoke(
             raise RuntimeError("default profile store omitted the successful profile.smoke row")
 
 
+def _emit_timings(
+    cases: list[case_timings.CaseRecord], inventory: list[str]
+) -> None:
+    case_timings.emit_if_requested(
+        runner="examples", inventory=inventory, cases=cases
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engine", required=True, choices=("python", "rust"))
@@ -246,9 +257,14 @@ def main(argv: list[str] | None = None) -> int:
     command, environment = _engine(arguments.engine)
     memory_budget = _effective_memory_budget_bytes()
     examples = _examples()
+    gate = case_timings.current_gate()
+    inventory = [str(path.relative_to(REPO_ROOT)) for path in examples]
+    inventory.append("profile-smoke")
+    timing_cases: list[case_timings.CaseRecord] = []
     for path in examples:
         relative = path.relative_to(REPO_ROOT)
         print(f"examples[{arguments.engine}]: {relative}", flush=True)
+        started = time.monotonic()
         expected_width_refusal = (
             path.name == FIXED_WIDTH_EXAMPLE and validation_jobs < FIXED_WIDTH_JOBS
         )
@@ -276,6 +292,7 @@ def main(argv: list[str] | None = None) -> int:
             capture_output=expected_refusal,
             check=False,
         )
+        elapsed = time.monotonic() - started
         if expected_refusal:
             combined = completed.stdout + completed.stderr
             if expected_width_refusal and (
@@ -290,6 +307,9 @@ def main(argv: list[str] | None = None) -> int:
                     f"{validation_jobs} CPU(s) (fixed width {FIXED_WIDTH_JOBS})",
                     flush=True,
                 )
+                timing_cases.append(
+                    case_timings.CaseRecord("examples", gate, str(relative), "skip", elapsed)
+                )
                 continue
             if (
                 expected_memory_refusal
@@ -303,6 +323,9 @@ def main(argv: list[str] | None = None) -> int:
                     f"{memory_budget} byte(s) (fixed memory {FIXED_MEMORY_BYTES})",
                     flush=True,
                 )
+                timing_cases.append(
+                    case_timings.CaseRecord("examples", gate, str(relative), "skip", elapsed)
+                )
                 continue
             print(completed.stdout, end="", file=sys.stdout)
             print(completed.stderr, end="", file=sys.stderr)
@@ -315,14 +338,38 @@ def main(argv: list[str] | None = None) -> int:
                 f"examples[{arguments.engine}]: expected {expected}",
                 file=sys.stderr,
             )
+            timing_cases.append(
+                case_timings.CaseRecord("examples", gate, str(relative), "fail", elapsed)
+            )
+            _emit_timings(timing_cases, inventory)
             return 1
         if completed.returncode != 0:
+            timing_cases.append(
+                case_timings.CaseRecord("examples", gate, str(relative), "fail", elapsed)
+            )
+            _emit_timings(timing_cases, inventory)
             return completed.returncode
+        timing_cases.append(
+            case_timings.CaseRecord("examples", gate, str(relative), "pass", elapsed)
+        )
+    smoke_started = time.monotonic()
     try:
         _profile_smoke(command, environment, validation_jobs=validation_jobs)
     except RuntimeError as error:
+        timing_cases.append(
+            case_timings.CaseRecord(
+                "examples", gate, "profile-smoke", "fail", time.monotonic() - smoke_started
+            )
+        )
+        _emit_timings(timing_cases, inventory)
         print(f"examples[{arguments.engine}]: {error}", file=sys.stderr)
         return 1
+    timing_cases.append(
+        case_timings.CaseRecord(
+            "examples", gate, "profile-smoke", "pass", time.monotonic() - smoke_started
+        )
+    )
+    _emit_timings(timing_cases, inventory)
     print(f"examples[{arguments.engine}]: {len(examples)} validated")
     return 0
 

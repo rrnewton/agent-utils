@@ -347,19 +347,32 @@ class Report:
     yaml_isomorphic: int = 0
     scalar_parity: int = 0
     skipped: list[Skip] = field(default_factory=list)
+    #: (label, outcome, seconds) per check, for ``scripts/case_timings.py``.
+    #: A check's seconds run from the previous recorded verdict (or Report
+    #: creation) to its own; a skip ran nothing and records zero.
+    case_results: list[tuple[str, str, float]] = field(default_factory=list)
+    _last_tick: float = field(default_factory=time.monotonic)
 
-    def ok(self, _label: str) -> None:
+    def _record_case(self, label: str, outcome: str) -> None:
+        now = time.monotonic()
+        self.case_results.append((label, outcome, max(0.0, now - self._last_tick)))
+        self._last_tick = now
+
+    def ok(self, label: str) -> None:
         self.checks += 1
+        self._record_case(label, "pass")
 
     def bad(self, label: str, detail: str) -> None:
         self.checks += 1
         self.failures.append(f"{label}: {detail}")
+        self._record_case(label, "fail")
 
     def skip(self, label: str, kind: str, reason: str) -> None:
         """Record a check that did NOT run. It is not a pass and is not counted in ``checks``."""
         if kind not in SKIP_KINDS:
             raise ValueError(f"unknown skip kind {kind!r}; expected one of {sorted(SKIP_KINDS)}")
         self.skipped.append(Skip(label, kind, reason))
+        self.case_results.append((label, "skip", 0.0))
 
 
 def skip_kind_counts(skips: Sequence[Skip]) -> str:
@@ -418,6 +431,51 @@ class ToolCoverage:
 _COVERAGE: list[ToolCoverage] = []
 
 
+def _emit_case_timings(tool: str, rep: Report | None) -> None:
+    """Leave this tool's per-check timings beside the coverage records, when asked.
+
+    Tools whose differential keeps its own count (``rep is None``) have no
+    per-check labels to normalize and emit nothing; inventing case identities
+    for them would be worse than the gap. A repeated label within one tool
+    gets an occurrence suffix so case identity stays stable and unique.
+    """
+
+    if rep is None or not os.environ.get("AGENT_UTILS_CASE_TIMING_DIR"):
+        return
+    # Loaded by path: this harness runs with ``cross/`` (not ``scripts/``) as
+    # its import root, and its strict-typing gate models the same root.
+    import importlib.util
+
+    module_path = Path(__file__).resolve().parent.parent / "scripts" / "case_timings.py"
+    spec = importlib.util.spec_from_file_location("_agent_utils_case_timings", module_path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(
+            f"cross[{tool}]: cannot load scripts/case_timings.py for the timing "
+            "records asked for"
+        )
+    timings = importlib.util.module_from_spec(spec)
+    # Dataclasses resolve their module through sys.modules while executing.
+    sys.modules[spec.name] = timings
+    spec.loader.exec_module(timings)
+    gate: str = timings.current_gate()
+    seen: dict[str, int] = {}
+    cases: list[object] = []
+    inventory: list[str] = []
+    for label, outcome, duration in rep.case_results:
+        occurrence = seen.get(label, 0) + 1
+        seen[label] = occurrence
+        suffix = f"#{occurrence}" if occurrence > 1 else ""
+        case_id = f"{tool}/{label}{suffix}"
+        inventory.append(case_id)
+        cases.append(timings.CaseRecord("cross", gate, case_id, outcome, duration))
+    timings.emit_if_requested(
+        runner="cross",
+        inventory=inventory,
+        cases=cases,
+        gate=gate,
+    )
+
+
 def record_coverage(
     tool: str, verdict: str, rep: Report | None, allowed_skips: frozenset[str]
 ) -> ToolCoverage:
@@ -436,6 +494,7 @@ def record_coverage(
         () if rep is None else tuple(rep.skipped),
     )
     _COVERAGE.append(coverage)
+    _emit_case_timings(tool, rep)
     directory = os.environ.get(COVERAGE_DIR_ENV)
     if not directory:
         return coverage

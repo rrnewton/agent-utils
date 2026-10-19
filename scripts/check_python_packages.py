@@ -33,11 +33,14 @@ import subprocess
 import sys
 import tempfile
 import tarfile
+import time
 import venv
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
+
+import case_timings
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PY_ROOT = REPO_ROOT / "py"
@@ -1090,8 +1093,13 @@ def _smoke_wheel(
 def main(argv: list[str] | None = None) -> int:
     parser = _argument_parser()
     arguments = parser.parse_args(argv)
+    gate = case_timings.current_gate()
+    timing_cases: list[case_timings.CaseRecord] = []
+    timing_inventory: list[str] = []
+    current: tuple[str, float] | None = None
     try:
         projects = _select_projects(arguments.project)
+        timing_inventory = [project.distribution for project in projects]
         if arguments.list_projects:
             for project in PROJECTS:
                 alias = (
@@ -1125,6 +1133,7 @@ def main(argv: list[str] | None = None) -> int:
             smoke_root.mkdir()
 
             for project in projects:
+                current = (project.distribution, time.monotonic())
                 source = _copy_project(project, build_root)
                 source_wheel = _build_wheel(project, source, source_wheel_root)
                 source_result = _inspect_wheel(project, source_wheel)
@@ -1150,6 +1159,17 @@ def main(argv: list[str] | None = None) -> int:
                     f"check_python_packages: ok {project.distribution} {version} "
                     f"wheel + sdist ({', '.join(project.commands)})"
                 )
+                if current is not None:
+                    timing_cases.append(
+                        case_timings.CaseRecord(
+                            "packages",
+                            gate,
+                            current[0],
+                            "pass",
+                            time.monotonic() - current[1],
+                        )
+                    )
+                    current = None
     except (
         CheckError,
         OSError,
@@ -1159,8 +1179,21 @@ def main(argv: list[str] | None = None) -> int:
         tarfile.TarError,
         zipfile.BadZipFile,
     ) as exc:
+        if current is not None:
+            timing_cases.append(
+                case_timings.CaseRecord(
+                    "packages", gate, current[0], "fail", time.monotonic() - current[1]
+                )
+            )
+        if timing_inventory:
+            case_timings.emit_if_requested(
+                runner="packages", inventory=timing_inventory, cases=timing_cases, gate=gate
+            )
         print(f"check_python_packages: FAIL: {exc}", file=sys.stderr)
         return 1
+    case_timings.emit_if_requested(
+        runner="packages", inventory=timing_inventory, cases=timing_cases, gate=gate
+    )
     if len(projects) == len(PROJECTS):
         print(f"check_python_packages: all {len(PROJECTS)} distributions passed")
     else:

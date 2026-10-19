@@ -50,6 +50,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import NamedTuple
 
+import case_timings
 from run_component_tests import Manifest, components_for_paths, load_manifest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -533,18 +534,33 @@ def announce_partial(verdict: str, lines: Sequence[str], environ: Mapping[str, s
               file=sys.stderr)
 
 
+def case_timing_report(directory: Path) -> tuple[list[str], list[str]]:
+    """Verify the per-case timing records of one run and render the bounded report.
+
+    Returns the report lines and the inventory problems separately: a record
+    whose cases do not match its collected inventory exactly means per-case
+    counts from this run cannot be trusted, whatever the gates themselves did.
+    """
+
+    verified = case_timings.verify_directory(directory)
+    return case_timings.render_report(verified), verified.problems
+
+
 def run(
     selected: frozenset[str],
     components: frozenset[str],
     *,
     all_contract: bool,
     coverage_dir: Path | None = None,
+    timing_dir: Path | None = None,
     host: Mapping[str, str] | None = None,
 ) -> int:
     """Execute one flattened dagrun graph for the selected contract.
 
-    With `coverage_dir`, every cross differential node writes its verdict record there. `host`
-    is the validate.env settings, added to the graph's environment only.
+    With `coverage_dir`, every cross differential node writes its verdict record there. With
+    `timing_dir`, every timing-capable runner writes its normalized per-case record there
+    (see ``scripts/case_timings.py``). `host` is the validate.env settings, added to the
+    graph's environment only.
     """
 
     cpu_count = os.cpu_count() or 1
@@ -574,6 +590,8 @@ def run(
     env.update(host or {})
     if coverage_dir is not None:
         env[CROSS_COVERAGE_ENV] = str(coverage_dir)
+    if timing_dir is not None:
+        env[case_timings.TIMING_DIR_ENV] = str(timing_dir)
     done = subprocess.run(command, cwd=REPO_ROOT, check=False, env=env)
     if done.returncode != 0:
         print("\nvalidate: FAILED in flattened validation DAG", file=sys.stderr)
@@ -1288,11 +1306,34 @@ def main(argv: list[str] | None = None) -> int:
     all_contract = args.all or selected == ALL_GROUPS
     # Every selected cross node must leave a record; one that does not cannot be confirmed.
     expected = selected_cross_nodes(selected, components, all_contract=all_contract)
-    with tempfile.TemporaryDirectory(prefix="validate-cross-coverage-") as coverage:
-        code = run(selected, components, all_contract=all_contract, coverage_dir=Path(coverage), host=host)
+    with (
+        tempfile.TemporaryDirectory(prefix="validate-cross-coverage-") as coverage,
+        tempfile.TemporaryDirectory(prefix="validate-case-timings-") as timings,
+    ):
+        code = run(
+            selected,
+            components,
+            all_contract=all_contract,
+            coverage_dir=Path(coverage),
+            timing_dir=Path(timings),
+            host=host,
+        )
         if code != 0:
             return code
         coverage_state = cross_coverage_report(Path(coverage), expected)
+        timing_lines, timing_problems = case_timing_report(Path(timings))
+    print()
+    for line in timing_lines:
+        print(line)
+    if timing_problems:
+        for problem in timing_problems:
+            print(f"validate: case timings: {problem}", file=sys.stderr)
+        print(
+            "\nvalidate: FAILED - per-case timing records do not match their "
+            "collected inventories",
+            file=sys.stderr,
+        )
+        return 1
     if coverage_state.skipped or coverage_state.unreadable or coverage_state.missing:
         # Every selected node passed, but a cross node that declared itself partial passes with
         # checks that never ran. Say so here, where "OK" would otherwise be the last word.

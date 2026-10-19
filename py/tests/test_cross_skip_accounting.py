@@ -1673,12 +1673,14 @@ def _validate_with_one_cross_node(
         *,
         all_contract: bool,
         coverage_dir: Path,
+        timing_dir: Path,
         host: object = None,
     ) -> int:
         assert all_contract
         assert host == {}
         seen.append(coverage_dir)
         monkeypatch.setenv(COVERAGE_DIR_ENV, str(coverage_dir))
+        monkeypatch.setenv("AGENT_UTILS_CASE_TIMING_DIR", str(timing_dir))
         monkeypatch.setenv("DAGRUN_OUTER_RUN", "cross.dagrun.cpuset-differential")
         report = differential.Report()
         report.ok("ran")

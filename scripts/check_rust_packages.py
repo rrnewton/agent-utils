@@ -23,8 +23,11 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+
+import case_timings
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RS_ROOT = REPO_ROOT / "rs"
@@ -751,6 +754,10 @@ def _smoke(
 def main(argv: list[str] | None = None) -> int:
     parser = _argument_parser()
     arguments = parser.parse_args(argv)
+    gate = case_timings.current_gate()
+    timing_cases: list[case_timings.CaseRecord] = []
+    timing_inventory: list[str] = []
+    current: tuple[str, float] | None = None
     try:
         selected = _select_crates(arguments.crate)
         if arguments.list_crates:
@@ -758,6 +765,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(crate.name)
             return 0
         work, dependency_reasons = _crate_work(selected)
+        timing_inventory = [crate.name for crate in work]
         selected_names = {crate.name for crate in selected}
         _check_workspace_topology()
         _check_public_rustdoc(selected)
@@ -776,6 +784,7 @@ def main(argv: list[str] | None = None) -> int:
             smoke_root.mkdir()
             dependency_archives: dict[str, Path] = {}
             for crate in work:
+                current = (crate.name, time.monotonic())
                 version, bins, libraries = _metadata(crate)
                 if bins != set(crate.bins):
                     raise CheckError(
@@ -804,6 +813,17 @@ def main(argv: list[str] | None = None) -> int:
                         f"check_rust_packages: dependency archive ok {crate.name} "
                         f"{version} (required by {requesters}; smoke skipped)"
                     )
+                if current is not None:
+                    timing_cases.append(
+                        case_timings.CaseRecord(
+                            "packages",
+                            gate,
+                            current[0],
+                            "pass",
+                            time.monotonic() - current[1],
+                        )
+                    )
+                    current = None
     except (
         CheckError,
         json.JSONDecodeError,
@@ -812,8 +832,21 @@ def main(argv: list[str] | None = None) -> int:
         tarfile.TarError,
         UnicodeError,
     ) as error:
+        if current is not None:
+            timing_cases.append(
+                case_timings.CaseRecord(
+                    "packages", gate, current[0], "fail", time.monotonic() - current[1]
+                )
+            )
+        if timing_inventory:
+            case_timings.emit_if_requested(
+                runner="packages", inventory=timing_inventory, cases=timing_cases, gate=gate
+            )
         print(f"check_rust_packages: FAIL: {error}", file=sys.stderr)
         return 1
+    case_timings.emit_if_requested(
+        runner="packages", inventory=timing_inventory, cases=timing_cases, gate=gate
+    )
     if len(selected) == len(CRATES):
         print(f"check_rust_packages: all {len(CRATES)} crates passed")
     else:

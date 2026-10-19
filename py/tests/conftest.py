@@ -23,10 +23,11 @@ live agent or another checkout's validation holding the same pane (or the subage
 allocation lock) would otherwise stall an unrelated test. In-process code only; a test that runs
 agentctl as a subprocess still reaches the host root.
 
-A fifth removes ``AGENT_UTILS_CROSS_COVERAGE_DIR``. ``scripts/validate.py`` exports it to every
-node of the graph it runs, this suite included, and ``cross/differential.py`` writes one coverage
-record there per verdict. A test that drives the harness's ``main`` would otherwise leave records
-that the outer run summarises as a cross node of its own.
+A fifth removes ``AGENT_UTILS_CROSS_COVERAGE_DIR`` and the per-case timing variables.
+``scripts/validate.py`` exports them to every node of the graph it runs, this suite included, and
+``cross/differential.py`` writes one coverage record there per verdict while timing-capable
+runners write one normalized case record per invocation. A test that drives a harness's ``main``
+would otherwise leave records that the outer run summarises as a node of its own.
 """
 
 from __future__ import annotations
@@ -132,9 +133,14 @@ def _no_ambient_operator_build_width(monkeypatch: pytest.MonkeyPatch) -> None:
 def _no_ambient_cross_coverage_directory(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep verdicts reached in these tests out of an outer ``scripts/validate.py`` run's records.
 
-    Tests that are about the records set the variable themselves.
+    The per-case timing directory gets the same treatment for the same
+    reason: fixture runners spawned by a test must not pollute the outer
+    run's normalized inventory. Tests that are about the records set the
+    variables themselves.
     """
     monkeypatch.delenv("AGENT_UTILS_CROSS_COVERAGE_DIR", raising=False)
+    monkeypatch.delenv("AGENT_UTILS_CASE_TIMING_DIR", raising=False)
+    monkeypatch.delenv("AGENT_UTILS_CASE_TIMING_NESTED", raising=False)
 
 # New wrkslots projects created by these tests use plain worktrees; disk-image
 # slots have their own tests under wrkslots/tests.

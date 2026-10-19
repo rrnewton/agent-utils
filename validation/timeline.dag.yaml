@@ -45,9 +45,13 @@ steps:
     desc: drive timeline interactions in Chromium
     # This graph already supplies containment. Calling the tool Makefile here would start a
     # second dagrun `box`, which the scheduler correctly refuses as an unflattened nested run.
+    # The JSON reporter feeds the normalized per-case timing report
+    # (scripts/case_timings.py) when validate.py requests a timing directory;
+    # standalone, it lands in the suite's own ignored output directory.
     cmd: >-
       cd py/tests/js/browser &&
-      ../../../../scripts/with-node22 npx playwright test --reporter=line
+      PLAYWRIGHT_JSON_OUTPUT_FILE="${AGENT_UTILS_CASE_TIMING_DIR:-test-results}/playwright-${DAGRUN_OUTER_RUN:-timeline.browser.functional}.json"
+      ../../../../scripts/with-node22 npx playwright test --reporter=line,json
     jobs_flag: ""
     deps: [setup.browser-deps]
     labels: [validation-timeline, component-wrkviz]
