@@ -2981,6 +2981,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
             ? page.registeredChannelWritable
             : asked.writable === true,
           added: true,
+          // `#355 provider-grouped-channels`. The service named, as the server answers with its key.
+          ...(asked.provider ? { provider: String(asked.provider) } : {}),
         };
         page.channels = [...page.channels, created];
         return json(200, { channel: created, channels: page.channels });
@@ -51900,11 +51902,22 @@ test("...nor for a channel whose own chat service cannot, when another one can",
     page.channels = [team, space];
     page.providers = [provider("gchat", "Google Chat", true), provider("slack", "Slack", false)];
   });
+  // `#355 provider-grouped-channels`. With two services Settings lists one service's channels at a
+  // time, opening on the service of the channel being read: Google Chat's, the bar's first group. A
+  // channel of another service is reached by choosing its service first, as a reader would.
+  assert.equal(page.el("settings-service").value, "gchat");
+  assert.equal(page.el("settings-channel").value, space.id);
+  assert.equal(page.el("upstream-clear").hidden, false, "not offered for the channel whose service can");
+  assert.equal(page.el("upstream-clear-provider").textContent, "Google Chat");
+  page.el("settings-service").value = "slack";
+  await page.el("settings-service").dispatch("change");
+  await page.settle();
   assert.equal(page.el("settings-channel").value, team.id);
   assert.equal(page.el("upstream-clear").hidden, true, "offered for a channel whose service cannot");
-  page.el("settings-channel").value = space.id;
-  await page.el("settings-channel").dispatch("change");
+  page.el("settings-service").value = "gchat";
+  await page.el("settings-service").dispatch("change");
   await page.settle();
+  assert.equal(page.el("settings-channel").value, space.id);
   assert.equal(page.el("upstream-clear").hidden, false, "not offered for the channel whose service can");
   assert.equal(page.el("upstream-clear-provider").textContent, "Google Chat");
   assert.deepEqual(page.upstreamClearCalls, [`GET ${space.id}`]);
@@ -70444,4 +70457,160 @@ test("`#355 provider-grouped-channels`: Alt+↓ and Alt+↑ step through the cha
   assert.equal(await step("ArrowDown"), SPACE_B.id, "Alt+↓ at the last channel shown did not stop");
   assert.equal(await step("ArrowUp"), SPACE_A.id);
   assert.equal(await step("ArrowUp"), TEAM_B.id, "Alt+↑ did not cross back into the first group");
+});
+
+/** Two services in Settings: Slack registers and lists its channels, Google Chat adds by id. */
+async function servicesPage(arrange = null) {
+  const page = newPage();
+  twoServices(page);
+  page.providers = [
+    serviceOf("slack", "Slack", { channel_registration_supported: true, channel_discovery_supported: true,
+      upstream_clear_supported: true, threading_supported: true, live_poll_seconds: 15 }),
+    serviceOf("gchat", "Google Chat", { live_delivery: "push", live_poll_seconds: 0 }),
+  ];
+  page.channelRegistrationSupported = true;
+  page.channelDiscoverySupported = true;
+  if (arrange) arrange(page);
+  await signIn(page);
+  return page;
+}
+
+async function chooseService(page, key) {
+  page.el("settings-service").value = key;
+  await page.el("settings-service").dispatch("change");
+  await page.settle();
+}
+
+const settingsOptions = (page) => page.el("settings-channel").children.map((option) => String(option.value));
+
+test("`#355 provider-grouped-channels`: with one service, Settings has no Service picker and asks the server what it always asked", async () => {
+  const page = browsingPage();
+  page.chatProviderName = "Slack";
+  await signIn(page);
+  await page.el("open-settings").click();
+  await page.settle();
+  assert.equal(page.el("settings-service-row").hidden, true, "a Service picker for one service");
+  assert.equal(page.el("chat-provider-line").hidden, false);
+  assert.equal(page.el("chat-provider-settings").textContent, "Slack");
+  await page.el("open-browse-channels").click();
+  await page.settle();
+  assert.equal(page.directoryCalls[0].searchParams.get("provider"), null, "a one-service browse named a service");
+  await page.el("open-add-channel").click();
+  page.el("new-channel-id").value = "https://chat.example/room/7";
+  page.el("new-channel-label").value = "seventh";
+  await page.el("add-channel").click();
+  await page.settle();
+  assert.deepStrictEqual(page.addChannelCalls.at(-1), { source: "https://chat.example/room/7", label: "seventh" });
+});
+
+test("`#355 provider-grouped-channels`: with two services, Settings chooses the service first, opens on the one being read, and lists only its channels", async () => {
+  const page = await servicesPage();
+  await page.el("open-settings").click();
+  await page.settle();
+  assert.equal(page.el("settings-service-row").hidden, false);
+  assert.equal(page.el("chat-provider-line").hidden, true, "the one-service line stayed beside the Service picker");
+  assert.deepStrictEqual(page.el("settings-service").children.map((option) => [String(option.value), option.textContent]),
+    [["slack", "Slack"], ["gchat", "Google Chat"]], "the services are not in configuration order");
+  // The bar opened on Slack's first channel, so Settings opens on Slack.
+  assert.equal(page.el("settings-service").value, "slack");
+  assert.ok(!settingsOptions(page).includes(SPACE_A.id) && settingsOptions(page).includes(TEAM_A.id)
+    && settingsOptions(page).includes(TEAM_B.id), `Settings listed ${settingsOptions(page)}`);
+  assert.match(page.el("service-facts").textContent, /^Slack: New messages are checked for every 15 seconds\. Threads are shown\. Add a channel by pasting its link, or browse its channels\. Unread can be cleared in Slack itself\.$/);
+  await chooseService(page, "gchat");
+  assert.deepStrictEqual(settingsOptions(page).filter((id) => id !== "*"), [SPACE_A.id, SPACE_B.id]);
+  assert.equal(String(page.el("settings-channel").value), SPACE_A.id);
+  assert.match(page.el("service-facts").textContent, /^Google Chat: New messages arrive as they are sent\. No threads\. Add a channel by its ID\. Unread cannot be cleared in Google Chat from here\.$/);
+  assert.equal(page.el("open-browse-channels").hidden, true, "Browse offered for a service that cannot list channels");
+  assert.equal(page.el("new-channel-writable-row").hidden, false, "a direct service hid Let this app post here");
+  assert.equal(page.el("new-channel-id").placeholder, "the channel's ID");
+
+  // Help and back is the same visit: the service chosen stands.
+  await page.el("help-link-channel-alias").click();
+  await page.settle();
+  await page.el("close-help").click();
+  await page.settle();
+  assert.equal(page.screen(), "settings");
+  assert.equal(page.el("settings-service").value, "gchat", "the way back from Help undid the reader's choice");
+  // Leaving and opening Settings again goes back to the service of the channel being read.
+  await page.el("close-settings").click();
+  await page.settle();
+  page.el("discord-channel").value = SPACE_B.id;
+  await page.el("discord-channel").dispatch("change");
+  await page.settle();
+  await page.el("open-settings").click();
+  await page.settle();
+  assert.equal(page.el("settings-service").value, "gchat");
+  await chooseService(page, "slack");
+  await page.el("close-settings").click();
+  await page.settle();
+  await page.el("open-settings").click();
+  await page.settle();
+  assert.equal(page.el("settings-service").value, "gchat", "Settings did not open on the service of the channel being read");
+  assert.equal(String(page.el("settings-channel").value), SPACE_B.id, "Settings did not open on the channel being read");
+});
+
+test("`#355 provider-grouped-channels`: Add and Browse act on the service Settings shows, and the answer selects the new channel and its service", async () => {
+  const page = await servicesPage((page) => {
+    page.directory = [{ source: "slack:C0400CCCCC", name: "#design", channel_id: null }];
+  });
+  await page.el("open-settings").click();
+  await page.settle();
+  // Slack, which registers: a link, with its service.
+  await page.el("open-add-channel").click();
+  page.el("new-channel-id").value = "https://acme.slack.com/archives/C0400DDDDD";
+  page.el("new-channel-label").value = "added";
+  await page.el("add-channel").click();
+  await page.settle();
+  assert.deepStrictEqual(page.addChannelCalls.at(-1),
+    { source: "https://acme.slack.com/archives/C0400DDDDD", label: "added", provider: "slack" });
+  assert.equal(page.el("settings-service").value, "slack");
+  assert.equal(String(page.el("settings-channel").value), page.registeredChannelId);
+  // Browse asks for Slack's channels only, and its Add names Slack too.
+  await page.el("open-browse-channels").click();
+  await page.settle();
+  assert.equal(page.directoryCalls.at(-1).searchParams.get("provider"), "slack");
+  assert.equal(page.directoryCalls.at(-1).searchParams.get("limit"), "25");
+  assert.deepStrictEqual(directoryRows(page), ["#design | Add"]);
+  // Another service empties the list and closes the panel: they were Slack's.
+  await chooseService(page, "gchat");
+  assert.equal(page.el("browse-channel-fields").hidden, true);
+  assert.equal(page.el("channel-directory-list").children.length, 0, "Slack's channels stayed listed under Google Chat");
+  // Google Chat adds by id: an id, a writable choice and its service; the answer selects it.
+  await page.el("open-add-channel").click();
+  page.el("new-channel-id").value = "1110000000000000499";
+  page.el("new-channel-label").value = "by id";
+  page.el("new-channel-writable").checked = true;
+  page.channelRegistrationSupported = false;
+  await page.el("add-channel").click();
+  await page.settle();
+  assert.deepStrictEqual(page.addChannelCalls.at(-1),
+    { id: "1110000000000000499", label: "by id", writable: true, provider: "gchat" });
+  assert.equal(page.el("settings-service").value, "gchat");
+  assert.equal(String(page.el("settings-channel").value), "1110000000000000499");
+});
+
+test("`#355 provider-grouped-channels`: hidden channels are listed under their own service, and a service with no channels says how to add one", async () => {
+  const hiddenTeam = { id: "C0400EEEEE", label: "old team", writable: false, provider: "slack" };
+  const page = await servicesPage((page) => {
+    page.channels = [{ ...TEAM_A }];
+    page.hiddenChannels = [hiddenTeam];
+  });
+  await page.el("open-settings").click();
+  await page.settle();
+  const hiddenNames = () => page.el("hidden-channel-list").children.map((row) => row.children[0].textContent);
+  assert.deepStrictEqual(hiddenNames(page), ["old team"]);
+  assert.equal(page.el("hidden-channels").hidden, false);
+  await chooseService(page, "gchat");
+  assert.deepStrictEqual(hiddenNames(page), [], "Slack's hidden channel was offered under Google Chat");
+  assert.equal(page.el("hidden-channels").hidden, true);
+  assert.deepStrictEqual(settingsOptions(page), []);
+  assert.equal(page.el("remove-channel").hidden, true, "Remove offered with no channel");
+  assert.equal(page.el("channel-facts").textContent, "No Google Chat channels on your list yet. Add one.");
+  await chooseService(page, "slack");
+  // Slack's own channel, and its hidden one offered back; Show again puts it back under Slack.
+  const show = page.el("hidden-channel-list").children[0].children[1];
+  await show.click();
+  await page.settle();
+  assert.equal(page.el("settings-service").value, "slack");
+  assert.equal(String(page.el("settings-channel").value), hiddenTeam.id);
 });

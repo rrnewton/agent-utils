@@ -1546,7 +1546,20 @@
                     verbs. The fields belong to the verb and appear with it.
                   -->
                   <section class="settings-group" id="channel-settings" aria-labelledby="settings-channels-title">
-                    <p class="hint">Chat service: <span id="chat-provider-settings">Chat</span></p>
+                    <p id="chat-provider-line" class="hint">Chat service: <span id="chat-provider-settings">Chat</span></p>
+                    <!--
+                      `#355 provider-grouped-channels`. With two or more chat services, the service is
+                      chosen first: the channel picker below lists only its channels, the line under it
+                      says what that service does here, and Add, Browse and the hidden channels are that
+                      service's. Settings opens on the service of the channel being read. Hidden with one
+                      service, when the "Chat service" line above names it instead. Drawn by
+                      `fillServiceSelect` in web/voice.js.
+                    -->
+                    <div id="settings-service-row" hidden>
+                      <label for="settings-service">Service</label>
+                      <select id="settings-service" aria-describedby="service-facts"></select>
+                      <p id="service-facts" class="hint" aria-live="polite"></p>
+                    </div>
                     <label for="settings-channel">Channel</label>
                     <select id="settings-channel" aria-describedby="channel-facts"></select>
                     <!-- What this channel IS: the name in force, and where it came from. -->
@@ -2542,6 +2555,15 @@
                 many it reached. Rename and Remove name one channel, so they step aside; Add and
                 Browse stay. Who is who, which used to sit at the foot of this group, is under
                 <strong>Messages</strong>, for the channel you are reading.
+              </p>
+              <p class="hint">
+                <strong>Several chat services.</strong> Where this server reads more than one, the
+                group starts with a <strong>Service</strong> picker, open on the service of the
+                channel you are reading. The channel picker under it lists only that service's
+                channels, the line under the Service says what it does here (how new messages
+                arrive, threads, adding by link, browsing, clearing unread), and Add, Browse and the
+                hidden channels are that service's. The channel picker on the bar groups every
+                channel under its service's name.
               </p>
               <p class="hint">
                 <strong>Adding a channel</strong> needs the channel ID supplied by this deployment.
