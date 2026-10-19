@@ -31346,9 +31346,13 @@ function searchOlderFromField() {
 // `SEARCH_OLDER_MS`, ending at the end of the page that brings `SEARCH_OLDER_HITS` threads. Meanwhile
 // the control says "Searching replies… 2 of 5 · Stop", and a tap on it stops the read on the wire.
 //
-// WHAT IT FOUND is the threads whose cards the filters show now and did not when it started, said once
-// under the control until the search changes, with how far back the replies now reach. It says how it
-// ended whatever it found: stopped, at the start of the channel, out of time, or with nothing more.
+// WHAT IT FOUND is the threads whose cards the filters show now and did not when it started, among those
+// a page it read brought a message of: a thread arriving live meanwhile is shown, but is not the walk's
+// find, nor ends it. Said once under the control until the search changes, with how far back the replies
+// now reach. A reply it read that says every word, in a thread with no card — not in the threads loaded,
+// its first message older than All reaches — is said too, so that "back to" claims no more than was
+// searched. It says how it ended whatever it found: stopped, at the start of the channel, out of time,
+// or with nothing more.
 // Once All reaches the start of the channel no walk is offered, and a list the search empties says all
 // of it is loaded (`sideListState`). Any change to the search, a thread selected on the right, the
 // cards leaving the screen or another channel ends a walk where it is; one walk at a time on the page,
@@ -31486,8 +31490,27 @@ function foldRepliesPage(payload, newest, held, walk) {
   renderSideColumn();
 }
 
-/** What a cards' walk that has ended says under its control: see the head of this section. */
+/**
+ * What a cards' walk that has ended says under its control: see the head of this section. And after it,
+ * the matching replies it read in threads with no card (`repliesUnlisted`).
+ */
 function repliesWalkNote(walk, reason) {
+  const said = repliesEndNote(walk, reason);
+  const unlisted = repliesUnlisted(walk);
+  if (unlisted === 0) return said;
+  const more = olderThreadsToRead() ? ": Older threads… loads more" : "";
+  return `${said} ${unlisted} more thread${unlisted === 1 ? " with a matching reply is" : "s with a matching reply are"} ` +
+    `not among the threads loaded${more}.`;
+}
+
+/** How many threads with a reply cards' walk `walk` read saying every word have no card. */
+function repliesUnlisted(walk) {
+  const carded = new Set([...leftEl("side-cards").children].map((row) => String(row.getAttribute("data-id"))));
+  return [...walk.matched].filter((id) => !carded.has(id)).length;
+}
+
+/** How cards' walk `walk` ended, and what it found: see the head of this section. */
+function repliesEndNote(walk, reason) {
   const pages = `${walk.read} page${walk.read === 1 ? "" : "s"}`;
   const messages = `${walk.arrived} message${walk.arrived === 1 ? "" : "s"}`;
   const span = walk.read > 0 ? `${pages} (${messages})` : "All's newest page";
@@ -31526,6 +31549,10 @@ function searchReplies() {
     channel: String(el("discord-channel").value),
     // The cards found already, which nothing this walk reads is counted as having found.
     held: new Set(cardsFound()),
+    // The threads the pages it read brought a message of: only their cards are its finds.
+    brought: /** @type {Set<string>} */ (new Set()),
+    // The threads of the replies it read that say every word of the search.
+    matched: /** @type {Set<string>} */ (new Set()),
     // Where All goes on back from: its own cursor while it is live, else the one its newest page gives.
     cursor: /** @type {string | null} */ (cover && cover.live && cover.more === true ? cover.cursor || null : null),
     cursorRead: false,
@@ -31543,7 +31570,18 @@ function searchReplies() {
   repliesNote = null;
   renderRepliesSearch();
   const count = () => {
-    walk.found = cardsFound().filter((id) => !walk.held.has(id)).length;
+    walk.found = cardsFound().filter((id) => !walk.held.has(id) && walk.brought.has(id)).length;
+  };
+  const terms = searchTerms(searchQuery);
+  /** @param {VibeTalk.TimelineResponse} payload */
+  const note = (payload) => {
+    for (const message of payload.messages || []) {
+      const id = threadOf(message);
+      if (!id) continue;
+      walk.brought.add(id);
+      const words = `${message.author || ""} ${messageText(message)}`.toLowerCase();
+      if (!message.thread.is_root && terms.every((term) => words.includes(term))) walk.matched.add(id);
+    }
   };
   walk.promise = (async () => {
     let reason = "done";
@@ -31576,6 +31614,7 @@ function searchReplies() {
         if (!owed) last = Date.now() - began;
         if (!repliesWalkHolds(walk)) break;
         foldRepliesPage(payload, owed, held, walk);
+        note(payload);
         walk.cursor = payload.has_more === true ? payload.next_before || null : null;
         if (!owed) {
           walk.read += 1;

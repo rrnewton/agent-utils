@@ -6170,7 +6170,12 @@ device), its newest page is read first and not counted. Meanwhile the control sa
 replies… 2 of 5 · Stop"**. What it found is said under it until the search changes — *Found 3 threads
 in 3 pages (150 messages), back to Sep 30.* — and how it ended is always said, nothing found included:
 *Nothing more in 5 pages (250 messages), back to Sep 28.*, *Stopped before any older page was read.*,
-*Reached the start of this channel; no more threads match.* Once All reaches the start of the channel
+*Reached the start of this channel; no more threads match.* Only threads a page it read brought are
+counted as found: a new thread arriving live meanwhile is shown but neither counted nor ends the walk. A
+reply it read that says every word, in a thread with no card (not among the threads loaded, its first
+message older than All reaches), is said after it, so "back to" claims no more than was searched: *1
+more thread with a matching reply is not among the threads loaded: Older threads… loads more.* Once All
+reaches the start of the channel
 no walk is offered, and a list the search empties says *No threads match that search — all of this
 channel is loaded.* A change to the search, a thread selected on the right, the cards leaving the
 screen or another channel ends it where it is, and it and a column's walk end each other.

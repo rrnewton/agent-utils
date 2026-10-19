@@ -58632,6 +58632,62 @@ test("`#262 search-load-older`: with All never read, the cards' walk reads All's
   assert.match(page.el("side-replies-note").textContent, /^Found 3 threads in 3 pages \(12 messages\)/);
 });
 
+test("`#262 search-load-older`: a thread arriving live mid-walk whose first message matches is shown, but not counted as found by the cards' walk", async () => {
+  const { page, all } = await repliesPage({ said: engineSaid });
+  const stream = page.stream();
+  await search(page, "engine");
+  await page.settle();
+  page.olderHold = searchHold();
+  const hold = page.olderHold;
+  void repliesControl(page).click();
+  await page.settle();
+  const floor = all.length - 4;
+  // A new thread, its first message saying the word, on the server and then on the stream, which re-reads Main.
+  const live = "spaces/A/threads/live";
+  const root = message({ id: "8900000000000099999", content: "the engine is back",
+    timestamp: new Date(Date.UTC(2026, 7, 19, 13, 0, 0)).toISOString(),
+    thread: { id: live, root_message_id: "8900000000000099999", is_root: true, reply_count: 2, reply_count_exact: true } });
+  all.push(root);
+  await deliver(page, stream, sseMessage(root));
+  await page.settle();
+  assert.ok(shownCards(page).includes(live), "the live thread's card is not shown");
+  hold.open();
+  await settleWalk(page);
+  // Three pages, as without it: the live card neither ended the walk at two nor is in the count.
+  assert.deepStrictEqual(allReads(page).filter((before) => before !== null), [floor, floor - 4, floor - 8].map((i) => all[i].id),
+    "a live match ended the cards' walk early");
+  assert.equal(page.el("side-replies-note").textContent,
+    `Found 3 threads in 3 pages (12 messages), back to ${searchDay(page, all[floor - 12].timestamp)}.`);
+});
+
+test("`#262 search-load-older`: a matching reply whose thread has no card is said, not passed over in \"Nothing more\"", async () => {
+  const page = newPage();
+  const all = threadsHistory(page, { threads: 10, replies: 3 });
+  // Thread 0 is not in the list of threads, and its first message is older than any page the walk reads; one
+  // reply to it, much later, says the word, two pages behind All's newest.
+  const t0 = historyThread(0);
+  page.threads.splice(page.threads.findIndex((summary) => summary.id === t0), 1);
+  const reply = message({ id: "8900000000000099998", content: "the engine stalled in the old thread",
+    timestamp: new Date((Date.parse(all[29].timestamp) + Date.parse(all[30].timestamp)) / 2).toISOString(),
+    thread: { ...all[1].thread } });
+  all.splice(30, 0, reply);
+  page.enableAbort();
+  await signIn(page);
+  await showDiscord(page, page.messages);
+  await twoColumns(page);
+  await search(page, "engine");
+  await page.settle();
+  assert.ok(!cardRow(page, t0), "thread 0 has a card, so this proves nothing");
+  await repliesControl(page).click();
+  await settleWalk(page);
+  assert.equal(allReads(page).filter((before) => before !== null).length, SEARCH_OLDER_PAGES);
+  assert.ok(page.messages.includes(reply) && allReads(page).includes(all[33].id), "the walk did not read past the reply");
+  assert.deepStrictEqual(shownCards(page), []);
+  assert.equal(page.el("side-replies-note").textContent,
+    `Nothing more in 5 pages (20 messages), back to ${searchDay(page, all[17].timestamp)}. ` +
+    "1 more thread with a matching reply is not among the threads loaded.");
+});
+
 test("`#262 search-load-older`: a page of the cards' walk that fails ends it, said where every failed read is and on the status line", async () => {
   const { page } = await repliesPage({ threads: 12 });
   await search(page, "engine");
