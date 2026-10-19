@@ -53,8 +53,10 @@ it was chosen from — two columns, and All in one column, from a card and from 
 the bare 1, 2 and 3 change nothing.
 
 `cmd-e-done`: Ctrl+E, from the channel's message box with a draft typed in it, marks the selected message
-Done on the server and moves the selection on, the box keeping the focus and the draft and the browser's
-own Ctrl+E refused; in the Mac tab Cmd+E does the same, and Ctrl+E in the box is the box's and marks nothing.
+near the newest Done on the server and moves the selection on, the box keeping the focus and the draft and
+the browser's own Ctrl+E refused; a message selected at the top, out of sight once the box has the focus
+(the box is at the foot of the list, which goes there with it), is not marked: the first message showing
+is selected instead. In the Mac tab Cmd+E does the same, and Ctrl+E in the box is the box's.
 
 `#239 single-selection` adds real mouse moves (CDP `Input.dispatchMouseEvent`) to the keys, and after
 every step counts the rows the browser DRAWS lit, by computed style (the selected surface or a ring),
@@ -293,7 +295,8 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
             raw: object = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"null")
             if self.headers.get("Authorization") != f"Bearer {TOKEN}":
                 self.json(401, {"error": "unauthorized", "detail": "unknown token"})
-            elif path == f"/api/v1/channels/{CHANNEL['id']}/dismiss" and isinstance(raw, dict):
+            # Either channel: the Mac tab opens on the one Ctrl+K chose last, and Cmd+E marks Done there.
+            elif path in {f"/api/v1/channels/{one}/dismiss" for one in CHANNELS} and isinstance(raw, dict):
                 self.json(200, api.dismiss({str(key): value for key, value in raw.items()}))
             elif path == f"/api/v1/channels/{CHANNEL['id']}/upstream-read" and isinstance(raw, dict):
                 self.json(200, api.upstream_read({str(key): value for key, value in raw.items()}))
@@ -887,35 +890,51 @@ def keymap_keys(walk: Walk, api: FakeApi) -> None:
                       "Enter opened and closed the long message, -> entered its thread and <- and Esc came back to it")
 
 
-# `cmd-e-done`. The message box, the row the keys act on, and the row drawn lit.
+# `cmd-e-done`. The message box, the row the keys act on and whether any of it shows in the list, the row
+# drawn lit, and the status line.
 CMD_E_JS = """(id) => {
   const box = document.getElementById('channel-compose-text');
+  const area = document.getElementById('scroll-area').getBoundingClientRect();
   const row = document.querySelector(`#discord-log > li[data-id='${id}']`);
+  const at = row ? row.getBoundingClientRect() : null;
   const lit = document.querySelector('#discord-log > li[data-selected="true"]');
   return {focus: document.activeElement ? document.activeElement.id : null, value: box.value,
-          archived: row ? row.dataset.archived || null : null, lit: lit ? lit.dataset.id : null};
+          archived: row ? row.dataset.archived || null : null, lit: lit ? lit.dataset.id : null,
+          shown: Boolean(at) && at.bottom > area.top && at.top < area.bottom,
+          status: document.getElementById('status').textContent};
 }"""
 
 
 def cmd_e_keys(walk: Walk, api: FakeApi, mod: str, words: str) -> None:
     """`cmd-e-done`: Ctrl+E (Cmd+E) in the message box marks the selected message Done; the box keeps the draft.
 
+    The channel's box sits at the foot of its list, inside the list's scroller, so the browser scrolls the
+    list to its foot when the box takes the focus. The message marked is one near the foot, which is still
+    on screen then. One selected further up has gone out of sight by then, and the chord does to it what e
+    does to a message out of sight: it selects the first message showing and marks nothing.
+
     On a Mac, as `navigator.platform` emulates one, Ctrl+E in the box is the box's (the end of the line)
     and marks nothing. The browser's own Ctrl+E (Cmd+E) is refused whenever the page acts.
     """
-    # A message not Done yet, from the top: this check's server takes a Done, and nothing else.
+    # A message not Done yet, from the one above the newest up, so that the newest is an unread below it to
+    # move on to: this check's server takes a Done, and nothing else.
     walk.page.focus("#scroll-area")
-    row = ringed(walk, "Home", f"{words}: Home")
+    newest = ringed(walk, "End", f"{words}: End")
+    check(newest["archived"] != "true", f"{words}: the newest message is Done already: {newest}")
+    row = ringed(walk, "k", f"{words}: k")
     for _ in range(20):
         if row["archived"] != "true":
             break
-        row = ringed(walk, "j", f"{words}: j")
+        row = ringed(walk, "k", f"{words}: k")
     target = str(row["id"])
-    check(row["archived"] != "true", f"{words}: no message near the top is left to mark Done")
+    check(row["archived"] != "true", f"{words}: no message near the newest is left to mark Done")
     to_box = walk.key("c")
     check(to_box["focus"] == "channel-compose-text", f"{words}: c left the focus on {to_box['focus']!r}")
     for letter in "draft":
         press(walk.cdp, letter)
+    walk.settled()
+    typed = walk.page.evaluate(CMD_E_JS, target)
+    check(typed["shown"] is True, f"{words}: the message near the newest went out of sight as the box took the focus")
     if mod == "Meta":
         before = len(api.dismissals())
         press(walk.cdp, "Control+e")
@@ -931,20 +950,41 @@ def cmd_e_keys(walk: Walk, api: FakeApi, mod: str, words: str) -> None:
         if len(api.dismissals()) > before:
             break
         walk.page.wait_for_timeout(20)
-    check(api.dismissals()[before:] == [[target]],
-          f"{words}+E in the box did not mark {target} Done on the server: {api.dismissals()[before:]}")
     after = walk.page.evaluate(CMD_E_JS, target)
+    check(api.dismissals()[before:] == [[target]],
+          f"{words}+E in the box did not mark {target} Done on the server: {api.dismissals()[before:]} {after}")
     check(walk.last_key()["prevented"] is True, f"{words}+E in the box was left to the browser")
     check(after["archived"] == "true", f"the message {words}+E marked does not show as Done: {after}")
     check(after["focus"] == "channel-compose-text", f"{words}+E took the focus out of the box, to {after['focus']!r}")
     check(after["value"] == "draft", f"{words}+E touched the draft: {after['value']!r}")
     check(after["lit"] not in (None, target), f"{words}+E left the selection on {after['lit']!r}, not the next unread")
     walk.shot(f"cmd-e-{mod.lower()}")
+
+    # Out of sight: Esc leaves the box for the list with the draft kept, Home selects the top message, and
+    # c goes back to the box, the list going to its foot with it.
+    walk.key("Escape")
+    top = str(ringed(walk, "Home", f"{words}: Home")["id"])
+    walk.key("c")
+    gone = walk.page.evaluate(CMD_E_JS, top)
+    check(gone["focus"] == "channel-compose-text" and gone["shown"] is False,
+          f"{words}: the top message did not go out of sight as the box took the focus: {gone}")
+    before = len(api.dismissals())
+    press(walk.cdp, f"{mod}+e")
+    walk.settled()
+    walk.page.wait_for_timeout(200)
+    unseen = walk.page.evaluate(CMD_E_JS, top)
+    check(len(api.dismissals()) == before, f"{words}+E marked a message out of sight: {api.dismissals()[before:]}")
+    check(walk.last_key()["prevented"] is True, f"{words}+E on a message out of sight was left to the browser")
+    check(unseen["focus"] == "channel-compose-text" and unseen["value"] == "draft",
+          f"{words}+E on a message out of sight took the box's focus or draft: {unseen}")
+    check(unseen["lit"] not in (None, top) and unseen["status"] == "Selected the first message showing.",
+          f"{words}+E on a message out of sight did not select the first message showing: {unseen}")
     walk.page.evaluate("() => { const box = document.getElementById('channel-compose-text'); box.value = ''; "
                        "box.dispatchEvent(new Event('input')); }")
     walk.key("Escape")
     walk.notes.append(f"{words}+E in the message box marked {target} Done and moved the selection on to "
-                      f"{after['lit']}, the box keeping the focus and the draft" +
+                      f"{after['lit']}, the box keeping the focus and the draft; on a message out of sight it "
+                      "selected the first showing and marked nothing" +
                       (", and Ctrl+E there was the box's" if mod == "Meta" else ""))
 
 
