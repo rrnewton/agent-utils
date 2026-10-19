@@ -704,15 +704,72 @@ a.search-hit-link {
   margin: 0.15rem 0 0.35rem;
 }
 
-/* `#342 settings-server-hostname`. The host is the loudest line on Settings: it is the answer to
-   "which server is this?", asked before any switch is touched. */
+/* `#372 settings-header-layout`. The head of the screen is ONE ROW: the server line, then Expand all
+   and Open help at its end. It wraps rather than squeezes: the server line asks for 16rem, so on a
+   phone, where it and the two buttons do not fit one line, the buttons go under it together, still
+   at the row's end, and on a desk all three share the line. */
+.settings-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 0.75rem;
+  margin: 0 0 0.75rem;
+}
+
+/* The Server section, drawn as a line of the head rather than as a card: its label, then its host,
+   on one baseline. `min-width: 0` lets the host's ellipsis start inside it instead of the line
+   pushing the buttons off the screen. */
+#screen-settings #settings-server {
+  flex: 1 1 16rem;
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  background: none;
+  border: none;
+}
+
+#screen-settings #settings-server > h2 {
+  flex: 0 0 auto;
+  margin: 0;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+/* `#342 settings-server-hostname`, quietened by `#372 settings-header-layout`. The answer to "which
+   server is this?" is secondary information, not the loudest line on the screen: small, ordinary
+   type on one line, whole in its tooltip, and plain text a reader can select and copy. In two parts
+   (web/voice.js, `renderServerHost`): the name, cut with an ellipsis where the line is too short for
+   it, and the port after it, never cut, since the port is what tells two instances on one host apart
+   and a phone has no tooltip. The name leaves the port its room, `--port-width`, which the script
+   gives in `ch`: the type is monospaced, so a character is exactly that wide. An inline block and not
+   a flex row, whose items would be blocks, and copying the host would put a line break before its
+   port. */
 #screen-settings .settings-server-host {
-  margin: 0.1rem 0 0.5rem;
+  min-width: 0;
+  margin: 0;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 1.45rem;
-  font-weight: 700;
-  line-height: 1.25;
-  overflow-wrap: anywhere;
+  font-size: 0.85rem;
+  font-weight: 400;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+#screen-settings .settings-server-name {
+  display: inline-block;
+  max-width: calc(100% - var(--port-width, 0ch));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
+}
+
+.settings-head-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-inline-start: auto;
 }
 
 /* A group's own heading, inside a section: what a card's heading used to be, one step quieter. */
@@ -838,11 +895,6 @@ a.search-hit-link {
 .fold-body {
   margin: 0;
   padding: 0;
-}
-
-/* Expand all, at the head of the sections it opens and folds. */
-.settings-fold-all {
-  margin: 0 0 0.75rem;
 }
 
 /* `#347 settings-prose`. A heading whose one-line description is its tooltip says so to a mouse. */
@@ -6820,13 +6872,10 @@ textarea {
      24rem or more each: two at 900px, three at 1280, four at 1920, and no more than the 125rem the
      screen is held to. Each section is kept whole (`break-inside: avoid`) and the columns are balanced,
      so the sections pack under one another; they fill down a column and on into the next in the
-     markup's order, which is the Tab order. The server's address keeps the form's measure above them. */
+     markup's order, which is the Tab order. The row naming the server, with Expand all and Open help at
+     its end (`#372 settings-header-layout`), spans them above. */
   #screen-settings > .settings-column {
     max-width: 125rem;
-  }
-
-  #screen-settings #settings-server {
-    max-width: 34rem;
   }
 
   .settings-panes {

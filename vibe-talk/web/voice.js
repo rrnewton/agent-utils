@@ -260,7 +260,27 @@ function deploymentHost() {
   return origin.split("/")[0] || deploymentOrigin();
 }
 
-el("settings-server-host").textContent = deploymentHost();
+/**
+ * `#372 settings-header-layout`. The host on one line, whole in its tooltip, and in two parts: the name,
+ * cut with an ellipsis where the line is too short for it, and the port, never cut, since the port is
+ * what tells two instances on one host apart (`#342 settings-server-hostname`) and a phone has no
+ * tooltip to show it in. `[::1]:8443` splits at its last colon; `[::1]` has no port.
+ */
+function renderServerHost() {
+  const host = deploymentHost();
+  const [, name, port] = /^(.+?)(:\d+)?$/.exec(host) || ["", host, ""];
+  const namePart = document.createElement("span");
+  namePart.className = "settings-server-name";
+  namePart.textContent = name;
+  const portPart = document.createElement("span");
+  portPart.className = "settings-server-port";
+  portPart.textContent = port || "";
+  el("settings-server-host").replaceChildren(namePart, portPart);
+  el("settings-server-host").style.setProperty("--port-width", `${(port || "").length}ch`);
+  el("settings-server-host").title = host;
+}
+
+renderServerHost();
 
 // ONE status line. It used to be two — a word under the header and a sentence at the foot — which
 // is how the closed state managed to announce itself three times in three vocabularies. The
@@ -1475,7 +1495,7 @@ const HELP_TOPICS = [
  * paragraphs off the settings screen is only an improvement if the paragraph about the switch you
  * are looking at is still one tap away. Without it this would be a filing cabinet.
  *
- * A null slug opens the top, which is what the standing "Open help" button at the foot of Settings
+ * A null slug opens the top, which is what the standing "Open help" button at the head of Settings
  * wants: it is not about any one control.
  *
  * `scrollIntoView` is called defensively because the page's test fixture models the DOM the page is
@@ -1506,7 +1526,7 @@ function showHelp(slug) {
 //     screen reader, Enter and Space from the keyboard, a tap on a phone, with nothing written here
 //     to make it one.
 //   * FOLDED, EXCEPT THE ONE ASKED FOR. A settings group's ? opens its entry; "?" and Ctrl+? (Cmd+?)
-//     open Keyboard, the entry about the keys (`#224`); Open help at the foot of Settings is about
+//     open Keyboard, the entry about the keys (`#224`); Open help at the head of Settings is about
 //     nothing in particular and opens none, so the screen is a list of what there is to read.
 //   * ONE BUTTON AT THE TOP opens every entry, and once they are all open folds them all. It names
 //     what it will do, like every toggle on this page that is an act rather than a mode.

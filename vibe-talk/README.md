@@ -7660,8 +7660,8 @@ owner, 2026-10-18: "tile Settings' top-level panes into width-dependent columns,
 and packed, order and focus order unchanged; phone/narrow single column". The five sections that
 fold sit in one box, `.settings-panes`, which in the desktop block (`(min-width: 900px) and
 (pointer: fine)`) is laid out in CSS columns at least 24rem wide, as many as the window has room for
-(two at 900px, three at 1280, four at 1920, inside a 125rem cap), with the server's address and
-Expand all above it at the form's measure:
+(two at 900px, three at 1280, four at 1920, inside a 125rem cap), with the row naming the server,
+Expand all and Open help above it (`#372 settings-header-layout`, below):
 
 - **Whole**: a section never breaks across two columns (`break-inside: avoid`).
 - **Packed**: the columns are balanced, so the sections stack under one another with no gaps. That
@@ -7681,8 +7681,8 @@ columns, each section one box, the packing and the order in Chromium at 393x852,
 
 **Every section folds, and so does every group in it** (`#346 settings-collapsible`). The owner,
 2026-10-18: "every top-level section collapsible, collapsed by default; its H2 subsections collapsed
-too; find-in-page still finds hidden text". So Settings opens as the server's address, an **Expand
-all** button, and five section titles, each folded:
+too; find-in-page still finds hidden text". So Settings opens as the row naming the server, with
+**Expand all** and **Open help** at its end, and five section titles, each folded:
 
 - A section's title, and each group's heading inside it, is a button with a chevron (`aria-expanded`,
   `aria-controls`) over the body it opens. A section opens to its groups' headings, each still
@@ -7700,6 +7700,19 @@ all** button, and five section titles, each folded:
   manage, are hidden, and their folds do not count, though both buttons open or fold them with the
   rest. The Server section does not fold: it is one line, the answer to "which server is
   this?", which `#342 settings-server-hostname` put first.
+- **One quiet row heads the screen** (`#372 settings-header-layout`). The owner, 2026-10-19, of a
+  desktop window: "the machine URL doesn't need to be in a big font!! Expand all certainly doesn't
+  need its own line." The host had been the loudest line on the screen, in large bold type wrapping
+  in a card of its own, with Expand all alone on a row above the sections and Open help alone on a
+  row below them. Now the host is small, ordinary type on one line, whole in its tooltip and still
+  plain text to select and copy; where it does not fit, its name is cut with an ellipsis and its
+  port, which tells two instances on one host apart, is kept whole. Expand all and Open
+  help sit at the end of its row. On a phone, where the three do not fit one line, the two buttons go
+  under the host together. Reading order and Tab are the server, Expand all, Open help, then the
+  sections. The page suite checks the host's type and the row's markup, with negative controls, and
+  `make desktop-layout-browser` measures it in Chromium at 1280x800, 1920x1080 and a 393x852 phone,
+  under a host too long for the phone's line: one line, the buttons on the host's row on a desk and
+  under it on the phone, the Tab order, and Expand all still turning to Fold all in place.
 - `SETTINGS_FOLDS` in `web/voice.js` lists every fold, and the page suite holds it to the markup in
   both directions, with negative controls for a fold out of find's reach, a group that does not
   fold, and the old `[hidden]` rule.
@@ -7765,7 +7778,7 @@ also read as somewhere you configure one.
 entry is now a native `<details>` whose heading is its `<summary>`, all folded, so the screen reads
 as a list of headings, and the way in decides which one is open: a settings group's `?` opens its
 own entry and folds the rest, every time (entries opened on an earlier visit do not pile up); `?`
-and Ctrl+? (Cmd+?) open Keyboard, the list of keys; **Open help** at the foot of Settings opens
+and Ctrl+? (Cmd+?) open Keyboard, the list of keys; **Open help** at the head of Settings opens
 none. **Expand all** at the top opens every entry and then reads **Fold all**. Because the
 disclosure is the browser's own, a heading is a button to a screen reader and to Enter and Space,
 and the browser's find (Ctrl+F) still searches folded entries and opens the one it lands in where

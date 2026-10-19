@@ -662,6 +662,25 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#372 settings-header-layout` in the browser engine, at 1280x800, 1920x1080 and a 393x852 phone under a
+  # host too long for the phone's line: the host one quiet line (no larger than the page's text, ordinary
+  # weight, its name cut with an ellipsis and its port whole, whole in its tooltip and when copied), Expand
+  # all and Open help on its row on a desk and under it on the phone, above the sections, Tab going Back,
+  # Expand all, Open help, the first section, and Fold all in place. Measured on 2026-10-19: about 5s wall.
+  - group: check
+    job: desktop-layout-browser
+    desc: Settings' head one quiet row (two on a phone) in reading and Tab order, in current Chromium at 1280x800, 1920x1080 and 393x852
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/desktop_layout_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 5
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#277 thread-card-focus` in the browser engine, at 1280x800 over the right column's cards with a mouse
   # and the keys, and at 412x915 over the Threads list by touch: every card contracted, the one under the
   # mouse too; a click or a tap highlights one, shown whole and not entered, and every other card's edge

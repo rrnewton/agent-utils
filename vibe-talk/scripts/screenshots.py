@@ -3208,6 +3208,10 @@ POPOUT_FOOT_LEAD_PX = 40
 # foot (`1rem`), which the page cannot scroll past when Recently dismissed is near the end of Settings.
 POPOUT_FOOT_SLACK_PX = 16
 
+# The folds of the Messages section above Recently dismissed, in their order: opened by the foot scene
+# where the folded screen is too short to bring the group low (`#372 settings-header-layout`).
+DISMISSED_ABOVE_FOLDS = ("mark-own", "auto-read", "combining", "rich-headers", "identities")
+
 # Said by the pill while the pop-out stands at the foot: long enough to draw the pill at its widest, as a
 # long channel name or a long error does, so it reaches into the pop-out wherever the column puts it.
 POPOUT_FOOT_STATUS = (
@@ -3296,6 +3300,22 @@ def _act_settings_dismissed_popout(driver: Driver) -> None:
                          [judged, misses])
     driver.click("dismissed-send-close")
     driver.page.wait_for_function("() => !window.__visible('dismissed-send-popout')", timeout=5_000)
+    # `#372 settings-header-layout` made the head of Settings one short row, and on a 1920px desk the
+    # screen in four columns, folded, is then too short to bring the group low: it cannot scroll above its
+    # top, and the pop-out opened there fits above the foot. There the Messages groups above Recently
+    # dismissed are opened as well, one at a time, until the group can stand low; where it already can,
+    # as on a phone and a 1280px desk, nothing more is opened and the picture is as it was.
+    for slug in DISMISSED_ABOVE_FOLDS:
+        low = driver.js(
+            "(() => { const box = document.getElementById('screen-settings'); "
+            "const group = document.getElementById('dismissed-group').getBoundingClientRect(); "
+            f"return group.top + box.scrollTop >= box.getBoundingClientRect().bottom - {POPOUT_FOOT_LEAD_PX}; }})()"
+        )
+        if low:
+            break
+        driver.js(f"(() => {{ const b = document.getElementById('fold-{slug}'); "
+                  "if (b.getAttribute('aria-expanded') !== 'true') b.click(); return true; })()")
+        driver.settle(200)
     # The group low on the screen, and its row opened where it is: a click by the pointer would scroll it up.
     driver.js(
         "(() => { const box = document.getElementById('screen-settings'); "
@@ -6458,6 +6478,26 @@ SCENES: tuple[Scene, ...] = (
                 "the server's address is still the first thing, and Expand all is offered",
                 "window.__visible('settings-server-host') && window.__visible('fold-settings-all') "
                 "&& document.getElementById('fold-settings-all').textContent.trim() === 'Expand all'",
+            ),
+            (
+                # `#372 settings-header-layout`: quiet, one line, whole in its tooltip.
+                "the server's host is one line, no larger than the page's text, in ordinary weight, whole in its tooltip",
+                "(() => { const h = document.getElementById('settings-server-host'); const cs = getComputedStyle(h); "
+                "return parseFloat(cs.fontSize) <= parseFloat(getComputedStyle(document.body).fontSize) "
+                "&& Number(cs.fontWeight) <= 400 && cs.whiteSpace === 'nowrap' "
+                "&& getComputedStyle(h.querySelector('.settings-server-name')).textOverflow === 'ellipsis' "
+                "&& h.getBoundingClientRect().height < 2 * parseFloat(cs.fontSize) "
+                "&& h.title === h.textContent && h.textContent === location.host; })()",
+            ),
+            (
+                # `#372 settings-header-layout`: neither button has a row of its own.
+                "Expand all and Open help share a row above the sections: the host's on a desk, the one under it on a phone",
+                "(() => { const r = (id) => document.getElementById(id).getBoundingClientRect(); "
+                "const mid = (b) => (b.top + b.bottom) / 2; "
+                "const host = r('settings-server-host'), all = r('fold-settings-all'), help = r('open-help'), panes = r('settings-panes'); "
+                "const desk = matchMedia('(min-width: 900px) and (pointer: fine)').matches; "
+                "return Math.abs(mid(all) - mid(help)) < 2 && all.right <= help.left && help.bottom <= panes.top "
+                "&& (desk ? Math.abs(mid(host) - mid(all)) < 4 && host.right <= all.left : host.bottom <= all.top + 1); })()",
             ),
             (
                 "each folded title is a tap target at least 40px tall, with its chevron",

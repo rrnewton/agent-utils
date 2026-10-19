@@ -953,15 +953,25 @@
         -->
         <section id="screen-settings" class="screen" tabindex="-1" aria-label="Settings" hidden>
           <div class="settings-column">
-            <!-- `#342 settings-server-hostname`. Which server this is, FIRST and loud: the owner
-                 runs several and forgets which one a tab is talking to. Filled by
-                 `deploymentOrigin`'s sibling in web/voice.js from the address the page was
-                 opened at, port included, so two instances on one host still differ. -->
-            <section class="settings-section" id="settings-server" aria-labelledby="settings-server-title">
-              <h2 id="settings-server-title">Server</h2>
-              <p id="settings-server-host" class="settings-server-host"></p>
-            </section>
             <!--
+              `#372 settings-header-layout`. ONE QUIET ROW at the head of the screen: which server this is,
+              then Expand all and Open help at the row's end. The owner, 2026-10-19, of a desktop window:
+              "the machine URL doesn't need to be in a big font!! Expand all certainly doesn't need its own
+              line." The host had been the loudest line on the screen, in large bold type wrapping over two
+              lines in a card of its own, and the two buttons each stood alone on a row, one above the
+              sections and one below them: three rows spent on what one line says.
+
+              So the host is small, ordinary type on one line, cut with an ellipsis where it does not fit
+              and whole in its tooltip (web/voice.js gives it its `title`), and still plain text, to be
+              selected and copied. The buttons share its row; on a phone, where the three do not fit one
+              line, the two buttons go under the host together. The order is the reading order and Tab's:
+              the server, Expand all, Open help, then the sections.
+
+              `#342 settings-server-hostname`. Which server this is, still FIRST: the owner runs several
+              and forgets which one a tab is talking to. Filled by `deploymentOrigin`'s sibling in
+              web/voice.js from the address the page was opened at, port included, so two instances on one
+              host still differ.
+
               `#346 settings-collapsible`. The owner, 2026-10-18: "every top-level section collapsible,
               collapsed by default; its H2 subsections collapsed too; find-in-page still finds hidden
               text (use <details>/hidden=until-found)".
@@ -978,11 +988,18 @@
               Every fold starts folded, on every load (`SETTINGS_FOLDS` in web/voice.js), and stays as
               the reader leaves it while the page is open. The Server section does not fold: it is one
               line, the answer to "which server is this?", which `#342 settings-server-hostname` put
-              first and loud. Expand all opens every fold, and then folds them all.
+              first. Expand all opens every fold, and then folds them all.
             -->
-            <p class="settings-fold-all">
-              <button id="fold-settings-all" class="secondary" type="button">Expand all</button>
-            </p>
+            <div class="settings-head">
+              <section class="settings-section" id="settings-server" aria-labelledby="settings-server-title">
+                <h2 id="settings-server-title">Server</h2>
+                <p id="settings-server-host" class="settings-server-host"></p>
+              </section>
+              <div class="settings-head-actions">
+                <button id="fold-settings-all" class="secondary" type="button">Expand all</button>
+                <button id="open-help" class="secondary" type="button">Open help</button>
+              </div>
+            </div>
             <!--
               `#345 settings-multi-column`. The owner, 2026-10-18: "on wide desktop windows, tile Settings'
               top-level panes into width-dependent columns, each pane kept whole and packed, order and focus
@@ -995,7 +1012,7 @@
               one another with no gaps, and they fill down the first column and then the next, in the order
               they have here, which is the order Tab takes: nothing is reordered, only placed. On a phone, or a
               window narrower than 900px or without a fine pointer, the box is the one column it always was.
-              The server's address and Expand all stay above it, and Open help below.
+              The row naming the server, with Expand all and Open help, stays above it.
             -->
             <div class="settings-panes" id="settings-panes">
               <!--
@@ -1990,10 +2007,6 @@
                 </div>
               </section>
             </div>
-
-            <p class="hint">
-              <button id="open-help" class="secondary" type="button">Open help</button>
-            </p>
           </div>
         </section>
 

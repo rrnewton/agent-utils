@@ -5235,7 +5235,7 @@ test("the sign-in screen is compact and names the server receiving the token", (
   assert.equal(page.el("settings-server-url").textContent, "https://vibe.example");
 });
 
-test("settings names its server host prominently, first", () => {
+test("settings names its server host first", () => {
   const settings = HTML.slice(HTML.indexOf('id="screen-settings"'));
   const banner = settings.indexOf('id="settings-server-host"');
   assert.ok(banner !== -1, "settings has no server host banner");
@@ -5244,7 +5244,132 @@ test("settings names its server host prominently, first", () => {
     "the server host is not the first thing on the settings screen"
   );
   const page = newPage();
-  assert.equal(page.el("settings-server-host").textContent, "vibe.example");
+  assert.equal(page.el("settings-server-host").text(), "vibe.example");
+});
+
+// --- `#372 settings-header-layout` ----------------------------------------------------------------
+//
+// The owner, 2026-10-19, of Settings on a desktop window: "the machine URL doesn't need to be in a big
+// font!! Expand all certainly doesn't need its own line." The host was the loudest line on the screen,
+// in large bold type wrapping in a card of its own, and Expand all and Open help each stood alone on a
+// row. tests/desktop_layout_browser.py measures the same in Chromium.
+
+/** What is wrong with the server host's type against `#372`, as sentences; empty when nothing is. */
+function serverHostProblems(css) {
+  const problems = [];
+  const rule = cssRules(css, "#screen-settings .settings-server-host").join("\n");
+  const name = cssRules(css, "#screen-settings .settings-server-name").join("\n");
+  const size = /font-size:\s*([\d.]+)rem/.exec(rule);
+  if (!size || Number(size[1]) > 0.95) problems.push(`the host is drawn at ${size ? `${size[1]}rem` : "an unstated size"}, larger than the text around it`);
+  if (/font-weight:\s*(?:[5-9]00|bold)/.test(rule) || !/font-weight:\s*(?:400|normal)/.test(rule)) problems.push("the host is not in ordinary weight");
+  if (!/white-space:\s*nowrap/.test(rule) || /overflow-wrap:\s*anywhere/.test(rule)) problems.push("the host wraps rather than keeping to one line");
+  if (!/overflow:\s*hidden/.test(rule)) problems.push("the host's line lets what does not fit run out of it");
+  // Blocks (a flex row's items) would put a line break before the port in what is copied.
+  if (/display:\s*(?:flex|grid|block)/.test(rule + name)) problems.push("the host's parts are blocks, and its copy breaks before the port");
+  if (!/display:\s*inline-block/.test(name) || !/overflow:\s*hidden/.test(name) || !/text-overflow:\s*ellipsis/.test(name)) {
+    problems.push("a host name too long for its line is not cut with an ellipsis");
+  }
+  if (!/max-width:\s*calc\(100% - var\(--port-width/.test(name)) problems.push("the port can be cut, and it is what tells two instances on one host apart");
+  if (/user-select:\s*none/.test(rule + name)) problems.push("the host cannot be selected to copy");
+  return problems;
+}
+
+test("`#372 settings-header-layout`: the server host is quiet: small, ordinary weight, one line cut with an ellipsis, whole in its tooltip", () => {
+  assert.deepStrictEqual(serverHostProblems(CSS_CODE), []);
+  const page = newPage();
+  const host = page.el("settings-server-host");
+  assert.equal(host.title, "vibe.example", "the host's tooltip does not hold it whole");
+  assert.equal(host.text(), host.title);
+  assert.deepStrictEqual(host.children.map((part) => [part.className, part.textContent]),
+    [["settings-server-name", "vibe.example"], ["settings-server-port", ""]]);
+  // The negative controls: the host as it was, loud and wrapping; and a port the ellipsis can take.
+  const loud = CSS_CODE.replace(/(#screen-settings \.settings-server-host \{)[^}]*\}/,
+    "$1 font-size: 1.45rem; font-weight: 700; overflow-wrap: anywhere; }")
+    .replace(/(#screen-settings \.settings-server-name \{)[^}]*\}/, "$1 }");
+  assert.notEqual(loud, CSS_CODE, "the negative control changed nothing");
+  assert.deepStrictEqual(serverHostProblems(loud), [
+    "the host is drawn at 1.45rem, larger than the text around it",
+    "the host is not in ordinary weight",
+    "the host wraps rather than keeping to one line",
+    "the host's line lets what does not fit run out of it",
+    "a host name too long for its line is not cut with an ellipsis",
+    "the port can be cut, and it is what tells two instances on one host apart",
+  ]);
+  const flex = CSS_CODE.replace(/(#screen-settings \.settings-server-host \{)/, "$1\n  display: flex;");
+  assert.deepStrictEqual(serverHostProblems(flex), ["the host's parts are blocks, and its copy breaks before the port"]);
+});
+
+test("`#372 settings-header-layout`: the host's port is its own part, an IPv6 address's colons kept in the name", () => {
+  for (const [host, name, port] of [["vibe.example:8443", "vibe.example", ":8443"], ["[::1]:8443", "[::1]", ":8443"],
+    ["[::1]", "[::1]", ""], ["vibe.example", "vibe.example", ""]]) {
+    const page = newPage(new Map(), SCRIPT.replace("function deploymentHost() {", `function deploymentHost() {\n  return ${JSON.stringify(host)};`));
+    const parts = page.el("settings-server-host").children.map((part) => part.textContent);
+    assert.deepStrictEqual(parts, [name, port], `${host} split as ${JSON.stringify(parts)}`);
+    assert.equal(page.el("settings-server-host").title, host);
+    assert.equal(page.el("settings-server-host").style.getPropertyValue("--port-width"), `${port.length}ch`);
+  }
+});
+
+/**
+ * What is wrong with the head of Settings against `#372`, as sentences; empty when nothing is: the
+ * server line, Expand all and Open help in one row, in that order, before the sections, and neither
+ * button standing alone on a line of its own.
+ */
+function settingsHeadProblems(html, css) {
+  const problems = [];
+  const code = html.replace(/<!--[\s\S]*?-->/g, " ");
+  const settings = code.slice(code.indexOf('id="screen-settings"'), code.indexOf('id="screen-help"'));
+  const opens = settings.indexOf('<div class="settings-head">');
+  const panes = settings.indexOf('<div class="settings-panes"');
+  if (opens < 0 || panes < 0 || opens > panes) return ["there is no head row above the sections"];
+  const head = settings.slice(opens, panes);
+  const at = (id) => head.indexOf(`id="${id}"`);
+  for (const [id, name] of [["settings-server-host", "the server's host"], ["fold-settings-all", "Expand all"], ["open-help", "Open help"]]) {
+    if (at(id) < 0) problems.push(`${name} is not in the head row`);
+  }
+  if (!(at("settings-server-host") < at("fold-settings-all") && at("fold-settings-all") < at("open-help"))) {
+    problems.push("the head row is not the server, Expand all, then Open help");
+  }
+  for (const [id, name] of [["fold-settings-all", "Expand all"], ["open-help", "Open help"]]) {
+    if (new RegExp(`<p\\b[^>]*>\\s*<button id="${id}"`).test(settings)) problems.push(`${name} stands alone on a line of its own`);
+  }
+  if (/tabindex="[1-9]/.test(settings)) problems.push("a positive tabindex reorders the focus");
+  const row = cssRules(css, ".settings-head").join("\n");
+  if (!/display:\s*flex/.test(row)) problems.push("the head is not laid out as a row");
+  if (!/flex-wrap:\s*wrap/.test(row)) problems.push("the head cannot wrap on a phone, so it squeezes or overflows");
+  if (/flex-direction:\s*\w+-reverse|(?:^|[\s;{])order:/.test(row + cssRules(css, ".settings-head-actions").join("\n"))) {
+    problems.push("a rule reorders the head away from the reading order");
+  }
+  return problems;
+}
+
+test("`#372 settings-header-layout`: the server line, Expand all and Open help share one row above the sections, in reading order", () => {
+  assert.deepStrictEqual(settingsHeadProblems(HTML, CSS_CODE), []);
+});
+
+test("`#372 settings-header-layout`: the check refuses Expand all or Open help on a row of its own, and a reordered head (negative controls)", () => {
+  const help = '<button id="open-help" class="secondary" type="button">Open help</button>';
+  const expand = '<button id="fold-settings-all" class="secondary" type="button">Expand all</button>';
+  assert.ok(HTML.includes(help) && HTML.includes(expand), "the buttons' markup moved; update the negative controls");
+  // Open help back at the foot of the screen, in a paragraph of its own, as it was.
+  const foot = HTML.replace(help, "").replace(/(\n {10}<\/div>\n {8}<\/section>\n\n {8}<!-- -+ help screen -->)/,
+    `<p class="hint">\n  ${help}\n</p>$1`);
+  assert.ok(foot.includes(`<p class="hint">\n  ${help}`), "the negative control changed nothing");
+  assert.deepStrictEqual(settingsHeadProblems(foot, CSS_CODE), [
+    "Open help is not in the head row",
+    "the head row is not the server, Expand all, then Open help",
+    "Open help stands alone on a line of its own",
+  ]);
+  // Expand all on a line of its own under the server, as it was.
+  const alone = HTML.replace(expand, `</div><p class="settings-fold-all">${expand}</p><div>`);
+  assert.deepStrictEqual(settingsHeadProblems(alone, CSS_CODE), ["Expand all stands alone on a line of its own"]);
+  const swapped = HTML.replace(expand, "\u0000").replace(help, expand).replace("\u0000", help);
+  assert.deepStrictEqual(settingsHeadProblems(swapped, CSS_CODE), ["the head row is not the server, Expand all, then Open help"]);
+  const reversed = CSS_CODE.replace(/(\.settings-head \{)/, "$1\n  flex-direction: row-reverse;");
+  assert.deepStrictEqual(settingsHeadProblems(HTML, reversed), ["a rule reorders the head away from the reading order"]);
+  const rigid = CSS_CODE.replace(/(\.settings-head \{[^}]*?)flex-wrap:\s*wrap;/, "$1");
+  assert.notEqual(rigid, CSS_CODE, "the negative control changed nothing");
+  assert.deepStrictEqual(settingsHeadProblems(HTML, rigid), ["the head cannot wrap on a phone, so it squeezes or overflows"]);
 });
 
 test("a token the server accepts leads to the main interface", async () => {
@@ -60615,10 +60740,10 @@ test("`#345 settings-multi-column`: the check refuses columns on a phone, a pane
   const narrow = CSS_CODE.replace(/(#screen-settings > \.settings-column \{\s*)max-width:\s*125rem;/, "$1max-width: 34rem;");
   assert.notEqual(narrow, CSS_CODE, "the negative control changed nothing");
   assert.deepStrictEqual(columnProblems(HTML, narrow), ["the settings screen is still held to one pane's width on a desktop window"]);
-  // Storage and connection taken out of the box and put after it: out of the columns, and out of order.
+  // Storage and connection taken out of the box and put before it: out of the columns, and out of order.
   const storage = settingsSection("Storage and connection");
-  const out = HTML.replace(`${storage}</section>`, "").replace('<p class="hint">\n              <button id="open-help"',
-    `${storage}</section><p class="hint">\n              <button id="open-help"`);
+  const out = HTML.replace(`${storage}</section>`, "").replace('<div class="settings-panes" id="settings-panes">',
+    `${storage}</section><div class="settings-panes" id="settings-panes">`);
   assert.notEqual(out, HTML, "the negative control changed nothing");
   assert.deepStrictEqual(columnProblems(out, CSS_CODE),
     ["the panes box holds voice-agent, messages, channels, screen, not the five sections in their order"]);
