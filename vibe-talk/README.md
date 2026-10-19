@@ -1322,17 +1322,18 @@ listed twice; past ten files the rest are counted on one more line.
   that same cursor immediately while the interval remains its recovery path; see [Live
   push](#live-push). Each poll also brings the thread replies posted since the last one: see [Live
   thread replies](#live-thread-replies).
-  For the Meta CLI bridge, make the user-token subscription explicit for the whole conversation.
-  An ambient `slack.message tail` depends on the token's existing inbox subscriptions and may
-  produce no match; the channel-scoped subscription used by the service is:
+  When the hint source is a vendor CLI's tail command, make its user-token subscription explicit
+  for the whole conversation. An ambient inbox tail depends on the token's existing inbox
+  subscriptions and may produce no match; a channel-scoped subscription has this shape (the
+  client's name and exact flags are the vendor's):
 
   ```sh
-  meta slack.conversation tail --channel-id=C0123ABCD --event-types=message.created \
-    --catchup=oldest --include-iris-seq-id --quiet --output=json
+  vendor-cli conversation tail --channel-id=C0123ABCD --event-types=message.created \
+    --catchup=oldest --quiet --output=json
   ```
 
-  Its stream omits posts by other bots, edits, and deletes, so use it only as the hint command,
-  never as the message source. A later hint makes the authoritative forward read collect any
+  Such a stream may omit posts by other bots, edits, and deletes, so use it only as the hint
+  command, never as the message source. A later hint makes the authoritative forward read collect any
   missed, newer creates — including bot posts — and periodic reconciliation covers a stretch with
   no emitted hint. Neither forward path detects an edit or deletion of an already-cursored
   message; change hints do not imply otherwise.
@@ -4639,14 +4640,14 @@ The adapter intentionally fixes one channel on its own command line, so an event
 different allowlisted destination. Install one unit per channel when the upstream source cannot be
 split that way itself.
 
-The checked-in service is specifically a **Meta CLI tail** example, not a statement of the generic
-adapter's minimum resources or sandbox compatibility. On a devserver, Meta's managed runtime
-mounts its packaged client and settles above 512 tasks and 1 GiB; it also aborts when systemd gives
-it `NoNewPrivileges` or `PrivateTmp`. The example therefore leaves those two directives unset and
-allows 2 GiB and 2,048 tasks, matching the same host's established Meta-backed Slack shim. The
-Python adapter itself does not need that footprint. If the command after `--` is not Meta CLI,
-measure that command and restore the strongest sandbox and smallest limits it supports rather than
-copying Meta's exceptions without evidence.
+The checked-in service is specifically an example for **a vendor CLI tail command that runs
+inside a managed runtime**, not a statement of the generic adapter's minimum resources or sandbox
+compatibility. That runtime mounted its packaged client and settled above 512 tasks and 1 GiB; it
+also aborts when systemd gives it `NoNewPrivileges` or `PrivateTmp`. The example therefore leaves
+those two directives unset and allows 2 GiB and 2,048 tasks. The Python adapter itself does not need
+that footprint. If the command after `--` is a different event source, measure that command and
+restore the strongest sandbox and smallest limits it supports rather than copying the managed
+runtime's exceptions without evidence.
 
 ### Provider-adapter push
 

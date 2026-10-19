@@ -7,7 +7,7 @@
 - **Status:** draft for owner review, 2026-10-11. Baseline is HEAD `fbc8c497`. Repository files were not modified.
 - **Slug:** `agentctl-rust-only`. The 2026-10-07 audit proposed it first (`ai_docs/transient/2026-10-07-edition-audit/REPORT.md` §3.4 D1). It has not been filed yet.
 - **Inputs:** five area maps (core CLI, headless, MCP/foreign, chat, tests/distribution), all re-verified at HEAD. The audit's `REPORT.md` §3 and `CRITIQUE.md` were also used, and are superseded where noted below.
-- **Redactions:** `consumer-a`, `host-a` and `host-b` stand in for the real names.
+- **Redactions:** `consumer-a`, `host-a` and `host-b` stand in for the real names. "The private chat integration" stands in for one deployment's internal Google Chat plugin and helper, whose names and source location were redacted on 2026-10-19 (`#366 public-internal-names`).
 - **Effort scale:** S ≤ 1 agent-day, M 2–4, L 5–10, XL > 10.
 
 **What changed since the audit (verified at HEAD):**
@@ -38,7 +38,7 @@
    - The release binaries `agentctl`, `herdr-agent`, `herdr-subagents`, `herdr-chat` and `agentctl-google-chat` never execute Python.
    - Proof: the Rust contract suite and the provider crate's tests pass with `python3` and `python` on PATH replaced by guard stubs that fail the test if executed.
    - No Rust test writes a `#!/usr/bin/python3` fake. Today four do: `client.rs:3928,5084`; `client/tests/herdr_compatibility.rs:51`; `subagents/tests/dead_adoption.rs:416`.
-3. **Google Chat works from this repository alone**, through an in-repo plugin and a native outbound helper. It does not depend on the Meta-internal Iris plugin.
+3. **Google Chat works from this repository alone**, through an in-repo plugin and a native outbound helper. It does not depend on the private chat integration.
 4. **Python is archived.**
    - The code lives at `archived/agentctl-python/` with a DEPRECATED README.
    - Packaging carries `Development Status :: 7 - Inactive`, and the entry points print a one-line deprecation notice on stderr.
@@ -527,9 +527,9 @@ Rough total: 100–130 agent-days.
 ### M6 Chat (XL; M6a can start at M0)
 
 **Boundary.**
-- The chat agent owns the host. Plugin protocol v1 and helper wire v1 are not changed, because the Meta-internal integration depends on them.
-- Inside Meta, a Rust Iris subscription plugin and outbound helper (fbsource `fbcode/scripts/newton/agentctl-iris-plugin`, unlanded) serve Google Chat for Rust agentctl. They cannot be published.
-- The public provider uses the already-reserved capability `chat-subscription.google-chat.polling` (`plugins.rs:1470`; `scripts/check_rust_packages.py:328`). Discovery refuses duplicate capabilities, so check that the Iris manifest uses a different ID.
+- The chat agent owns the host. Plugin protocol v1 and helper wire v1 are not changed, because the private chat integration depends on them.
+- In one private deployment, the private chat integration's Rust subscription plugin and outbound helper (in a private repository, unlanded) serve Google Chat for Rust agentctl. They cannot be published.
+- The public provider uses the already-reserved capability `chat-subscription.google-chat.polling` (`plugins.rs:1470`; `scripts/check_rust_packages.py:328`). Discovery refuses duplicate capabilities, so check that the private chat integration's manifest uses a different ID.
 
 - **M6a provider crate (L):** CHAT-01 to CHAT-04, CHAT-15 (part), CHAT-24.
   - **Crate:** `rs/chat-subscription-google-chat`, package `agentctl-google-chat`.

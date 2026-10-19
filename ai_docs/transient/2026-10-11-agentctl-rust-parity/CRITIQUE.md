@@ -127,9 +127,9 @@
 - When the Python CLI runs `migrate` or `repair` (re-spawning the runner) or `reset`, the new runner is Python (`foreign/lib.py:2247-2257`). The Rust sidecar `runner.json` can also be lost.
 - The spec does not say what Rust does when the sidecar is missing.
 
-**B6. Meta-internal fit.**
-- M6b's new helper action `thread_history` is missing from the Iris helper, so `chat context` fails inside Meta unless Iris adds it.
-- The M6f translator hard-codes the public polling plugin. It should accept `--plugin`, so it can target an installed alternative such as Iris.
+**B6. Fit with the private chat integration.**
+- M6b's new helper action `thread_history` is missing from the private chat integration's helper, so `chat context` fails in that deployment unless the integration adds it.
+- The M6f translator hard-codes the public polling plugin. It should accept `--plugin`, so it can target an installed alternative such as the private chat integration. (Names redacted 2026-10-19, `#366 public-internal-names`; see SPEC.md.)
 
 **B7. M8 writes its fixture generator into `archived/agentctl-python/tools/`.** That directory only exists after M9.
 

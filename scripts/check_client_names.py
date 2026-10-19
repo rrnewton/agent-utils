@@ -22,6 +22,11 @@ Two safety properties, both covered by `--self-test`:
 
 See `#86 scrub-client-names`.
 
+The same scan refuses one company's internal tooling named in public text: its command-line client
+invoked by a dotted subcommand, the company named as an organisation, and its monorepo. A live-hint
+example, its test and two README passages once named all three; describe "a vendor CLI" and "a
+managed runtime" instead. See `#366 public-internal-names`.
+
 Usage:
     python3 scripts/check_client_names.py
     python3 scripts/check_client_names.py --self-test
@@ -51,6 +56,22 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 #: "not followed by a lowercase letter" into "not followed by a letter" and silently reinstates
 #: the CamelCase hole this trailing guard exists to close.
 FORBIDDEN = re.compile(r"\b(?i:DeepScry|Hermit)[sS]?(?![a-z])")
+
+#: One company's internal tooling, in the forms that reached public text: its command-line client
+#: invoked by a dotted subcommand (`meta chat.thread tail`), the company named as an organisation
+#: (`Meta's`, `Meta-internal`, `Meta CLI`), and its monorepo (`fbsource`, `fbcode`). The word on
+#: its own stays legal, case-sensitively: it is also a keyboard key (`Meta+Enter`, `Cmd (Meta)`),
+#: an HTML element (`<meta name=...>`) and the start of English words (`metadata`).
+INTERNAL = re.compile(
+    r"\bmeta\s+[a-z][a-z0-9_-]*\.[a-z]"
+    r"|\bMeta(?:['\u2019]s\b|-[a-z]|\s+CLI\b)"
+    r"|\b(?:fbsource|fbcode)\b"
+)
+
+
+def _named(line: str) -> bool:
+    """Whether a line names a client project or the internal tooling above."""
+    return bool(FORBIDDEN.search(line) or INTERNAL.search(line))
 
 #: Paths permitted to contain a client name, each because it DEFINES or TESTS the prohibition.
 #: This is the whole allowlist; a file that merely mentions a client does not belong here.
@@ -90,12 +111,12 @@ def _matches(path: Path) -> list[tuple[int, str]]:
         text = path.read_text(encoding="utf-8")
     except (UnicodeDecodeError, OSError):
         return []  # binary or unreadable: nothing a name can hide in as text
-    if not FORBIDDEN.search(text):
+    if not _named(text):
         return []
     return [
         (number, line.strip())
         for number, line in enumerate(text.splitlines(), 1)
-        if FORBIDDEN.search(line)
+        if _named(line)
     ]
 
 
@@ -139,6 +160,17 @@ def self_test() -> int:
     expect(bool(FORBIDDEN.search("Hermits")), "must catch the plural")
     expect(bool(FORBIDDEN.search("deepscry-bot")), "must catch a name before a hyphen")
 
+    # The internal-tooling forms, and the ordinary uses of the same word that must pass.
+    expect(_named("-- /opt/bin/meta chat.thread tail --id=1"), "must catch the CLI by subcommand")
+    expect(_named("these are Meta CLI budgets"), "must catch the CLI named in prose")
+    expect(_named("Meta's managed runtime aborts"), "must catch the company as an owner")
+    expect(_named("a Meta-specific example"), "must catch the company in a compound")
+    expect(_named("local fbsource only"), "must catch the monorepo")
+    expect(not _named('page.keyboard.press("Meta+Enter")'), "must pass the keyboard key")
+    expect(not _named("the same with Cmd (Meta), each"), "must pass the key named in prose")
+    expect(not _named('<meta name="viewport" content="width=device-width">'), "must pass HTML")
+    expect(not _named("metadata.json and meta mode"), "must pass ordinary English")
+
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
         (root / "scripts").mkdir()
@@ -167,7 +199,7 @@ def self_test() -> int:
     if failures:
         print(f"\n{len(failures)} self-test failure(s)", file=sys.stderr)
         return 1
-    print("check-client-names --self-test: PASSED (12 controls)")
+    print("check-client-names --self-test: PASSED (21 controls)")
     return 0
 
 
@@ -192,7 +224,8 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 "\n  agent-utils is a reusable library; the projects that consume it are not its\n"
                 "  subject. Describe the BEHAVIOUR instead of naming the client, or use a neutral\n"
-                "  label. See `#86 scrub-client-names`.",
+                "  label. See `#86 scrub-client-names`. Internal tooling is described the same\n"
+                "  way: a vendor CLI, a managed runtime, a private repository.",
                 file=sys.stderr,
             )
         for entry in stale:
