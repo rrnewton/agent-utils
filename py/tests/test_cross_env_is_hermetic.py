@@ -1210,6 +1210,47 @@ _PARSER_PROBES: tuple[tuple[str, ...], ...] = (
 )
 
 
+#: The probes above whose `--` comes before the command word: argparse releases read those two
+#: ways (see _root_terminator_ends_options).
+_ROOT_TERMINATOR_PROBES = frozenset({
+    ("--", "start", "worker"),
+    ("--", "start", "--help"),
+    ("--herdr-bin", "<HERDR>", "--", "start", "worker", "--herdr-bin", "herdr"),
+    ("--herdr-bin", "<HERDR>", "--", "start", "worker", "--herdr-bin=/usr/local/bin/herdr"),
+    ("--herdr-bin", "<HERDR>", "--", "start", "worker"),
+})
+
+
+def _root_terminator_ends_options(parser_name: str) -> bool:
+    """Whether this interpreter's argparse ends option parsing at a root `--` and drops it.
+
+    Newer argparse (Python 3.12.15 here) does. Older releases (3.10, and 3.12.3) read it
+    differently: agentctl's subcommand parser takes the `--` as the command, an invalid choice,
+    and herdr-agent's intermixed parse still reads the options after it, so `--help` prints help.
+    Under that reading such an invocation is a usage error or help, and exits before any client
+    exists, so the guard is safe either way; the tests pin whichever reading this interpreter has,
+    asked of a minimal parser of the same shape. `#236 root-terminator-parser`.
+    """
+    import argparse
+    import contextlib
+    import io
+
+    probe = argparse.ArgumentParser(prog="probe")
+    if parser_name == "agentctl":
+        probe.add_subparsers(dest="command").add_parser("start")
+        parse, arguments = probe.parse_args, ["--", "start"]
+    else:
+        probe.add_argument("command", nargs="?", choices=("start",))
+        probe.add_argument("text", nargs="?")
+        parse, arguments = probe.parse_intermixed_args, ["--", "start", "--help"]
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        try:
+            namespace = parse(arguments)
+        except SystemExit:
+            return False
+    return bool(namespace.command == "start")
+
+
 def _parsed_herdr(parse: object, arguments: list[str]) -> tuple[str | None, bool] | None:
     """The Herdr a parser selects and whether its command is Herdr-free; None if it exits."""
     import argparse
@@ -1298,7 +1339,12 @@ def test_the_parser_probes_include_invocations_that_select_the_installed_herdr(
         else legacy_cli._parser().parse_intermixed_args
     )
     assert arguments in _PARSER_PROBES
-    assert _parsed_herdr(parse, expanded) == ("herdr", False)
+    parsed = _parsed_herdr(parse, expanded)
+    if arguments in _ROOT_TERMINATOR_PROBES and not _root_terminator_ends_options(parser_name):
+        # The older reading of a root `--`: a usage error or help, before any client exists.
+        assert parsed is None
+    else:
+        assert parsed == ("herdr", False)
     assert herdr_agent.host_cli_refusal(root, expanded) is not None
 
 
@@ -1341,12 +1387,21 @@ def test_a_root_terminator_does_not_hide_a_subcommand_herdr_from_the_guard(
         "--registry", str(root / "registry"), "--herdr-bin", str(fixture),
         "--", "start", "worker", *suffix,
     ]
+    exited: list[object] = []
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         with contextlib.suppress(_ClientConstructed):
-            agentctl_cli.main(arguments)
+            try:
+                agentctl_cli.main(arguments)
+            except SystemExit as stopped:
+                exited.append(stopped.code)
 
-    assert constructed == [suffix[-1].removeprefix("--herdr-bin=")]
-    assert not herdr_agent._names_case_file(root, constructed[0])
+    if _root_terminator_ends_options("agentctl"):
+        assert exited == []
+        assert constructed == [suffix[-1].removeprefix("--herdr-bin=")]
+        assert not herdr_agent._names_case_file(root, constructed[0])
+    else:
+        # The older reading of a root `--`: a usage error, before any client exists.
+        assert (exited, constructed) == ([2], [])
     assert herdr_agent.host_cli_refusal(root, arguments) is not None
 
 
