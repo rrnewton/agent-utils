@@ -50917,12 +50917,12 @@ test("`#231 two-column-polish`: a live reply counts on its thread's card and on 
 
   // The controls. Without the count a live reply adds, the card and the root stay where the reads left
   // them; counting a replayed copy too counts it on the card.
-  const uncounted = await replies(brokenScript("  const fresh = !held && !replayed && thread !== null",
+  const uncounted = await replies(brokenScript("  const fresh = !held && !replayed && read === null && thread !== null",
     "  const fresh = false && thread !== null"));
   assert.match(uncounted.live.first, / · 3 replies$/, "the negative control counted the reply, so the check above proves nothing");
   assert.equal(uncounted.live.badge, "Thread(3)");
-  const replayCounted = await replies(brokenScript("  const fresh = !held && !replayed && thread !== null",
-    "  const fresh = !held && thread !== null"));
+  const replayCounted = await replies(brokenScript("  const fresh = !held && !replayed && read === null && thread !== null",
+    "  const fresh = !held && read === null && thread !== null"));
   assert.match(replayCounted.afterReplay, / · 5 replies$/,
     "the negative control did not count the replayed reply, so the check above proves nothing");
 });
@@ -69467,6 +69467,98 @@ for (const removal of ["after", "before", "tail"]) {
     assert.ok(shownIds(control.page).includes("200") && savedMessage(control.page, "200"));
   });
 }
+
+// --- `#328 removal-outside-window` -------------------------------------------------------------------
+//
+// Found in the final review of #316 late-counts-resurrect and #310 stale-live-read-flicker, older than
+// both. (1) A newest page keeps every held message older than its own oldest row, which it cannot speak
+// for: so a message the stream reported removed stayed, shown and saved, when it was older than the
+// page's window, though the README said the first newest page to land takes it out. (2) A reply the
+// stream left unplaced, taken out of the store by a newest page of Main, was put back by a reply's own
+// read of All (`reason=reply-place`) as a new reply, and counted again on its root.
+
+/** The line of `mergeIntoCanon` that drops a held message removed upstream below a newest page's window, for a negative control. */
+const REMOVED_BELOW_WINDOW = ["timeOf(item, timeField) < edge && !removed(item))", "timeOf(item, timeField) < edge)"];
+/** The thread the device's copy of message `id` is in, or null. */
+const threadOfSaved = (page, id) => {
+  const saved = savedMessage(page, id);
+  return saved && saved.thread ? saved.thread.id : null;
+};
+/** The rule that a reply's read of All counts no reply on its root, for a negative control. */
+const REPLY_PLACE_COUNTS_NOTHING = ["!held && !replayed && read === null && thread !== null", "!held && !replayed && thread !== null"];
+
+test("`#328 removal-outside-window`: a message the stream reports removed is taken out by the next newest page of its view even when it is older than that page reaches back to", async () => {
+  const run = async (script = SCRIPT) => {
+    // A backend whose deltas carry additions only, so the read behind a removal is a newest page.
+    const { page, server } = await forwardPage({ complete: false }, null, script);
+    assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "the premise is Main holding 200");
+    // From now on a newest page of Main carries its newest row and says there is more: 200 and 201 are
+    // below it.
+    server.newestLimit = 1;
+    server.remove("200");
+    const reads = page.timelineCalls.length;
+    await deliver(page, page.stream(), sseDelete("del-200", CHANNEL.id, "200"));
+    for (let i = 0; i < 4; i += 1) await page.settle();
+    assert.deepStrictEqual(readsSince(page, reads).map(([view, delta]) => [view, delta]), [["main", false]],
+      "the premise is the read behind the removal, a newest page of Main");
+    return page;
+  };
+  const page = await run();
+  assert.deepStrictEqual(shownIds(page), ["201", "203"], "a message reported removed stays on Main below the page's window");
+  assert.equal(savedMessage(page, "200"), null, "a message reported removed stays in the store below the page's window");
+  // And the poll after, a newest page again, does not bring it back.
+  page.setClock(page.clock() + DISCORD_POLL_MS);
+  await pollOnce(page);
+  assert.deepStrictEqual(shownIds(page), ["201", "203"]);
+  // THE CONTROL: below the window every held message stays, removed or not, until a read reaches it.
+  const control = await run(brokenScript(...REMOVED_BELOW_WINDOW));
+  assert.deepStrictEqual(shownIds(control), ["200", "201", "203"], "below the window the removed message went anyway, so this test cannot see it");
+  assert.notEqual(savedMessage(control, "200"), null);
+});
+
+test("`#328 removal-outside-window`: a reply the stream left unplaced, taken out by a newest page of Main, is placed by a reply's own read of All without counting twice on its root", async () => {
+  const run = async (script = SCRIPT) => {
+    const { page, server } = await heldAllReads(script);
+    // The bridge answers in the first discussion: the root says 2 replies, and the stream carries the
+    // reply with no thread record, so it is left unplaced, on Main (its placing read held).
+    const { first, pushed } = bridgeReply(page, server);
+    await pollOnce(page);
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    await deliver(page, page.stream(), sseMessage(pushed));
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    assert.ok(rowOf(page, "300"), "the premise is the bare reply on Main");
+    // The reader opens Reply on it, and types.
+    distinctReplies(page);
+    await replyButton(rowOf(page, "300")).click();
+    await page.el("reply-text").setValue("an answer to the bridge");
+    // Meanwhile a newest page of Main, which never carries a thread reply, takes it out of the store.
+    server.refuse = { status: 410, error: "cursor_expired" };
+    page.setClock(page.clock() + DISCORD_POLL_MS);
+    await pollOnce(page);
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    assert.equal(savedMessage(page, "300"), null, "the premise is the reply taken out by Main's newest page");
+    assert.equal(savedMessage(page, "201").thread.reply_count, 2, "the premise is the root counting the reply");
+    const reads = page.timelineCalls.length;
+    // Send: the reply's own read of All places it.
+    page.el("reply-send").click();
+    for (let i = 0; i < 6; i += 1) {
+      await page.settle();
+      page.expireTimers(50);
+    }
+    assert.deepStrictEqual(readsSince(page, reads), [["flat", false, "reply-place"]], "the premise is the reply's own read of All");
+    assert.deepStrictEqual(postedWhere(page), [["an answer to the bridge", first.id]], "the answer was not posted into the bridge's thread");
+    assert.ok(savedMessage(page, "300") && threadOfSaved(page, "300") === first.id,
+      "the reply's read of All did not put the bridge's reply back, in its thread");
+    return page;
+  };
+  const page = await run();
+  assert.equal(savedMessage(page, "201").thread.reply_count, 2, "the root counts the reply its read of All put back twice");
+  assert.equal(page.screen(), "main", "the premise is Main on screen after the send");
+  assert.equal(threadButton(rowOf(page, "201")).textContent, "2 replies", "Main's root says another count than its thread has");
+  // THE CONTROL: the reply's read of All counting what it puts back as a new reply: 3 for a thread of 2.
+  const control = await run(brokenScript(...REPLY_PLACE_COUNTS_NOTHING));
+  assert.equal(savedMessage(control, "201").thread.reply_count, 3, "the put-back reply was not counted again anyway, so this test cannot see it");
+});
 
 // --- `#310 stale-live-read-flicker`: a late live read never takes away what the stream drew after it ------
 //
