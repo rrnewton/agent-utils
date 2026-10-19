@@ -47216,7 +47216,9 @@ def test_process_census_preflight_omits_proven_terminal_generation(
     )
     assert census.processes == ()
     assert census.matches == ()
-    assert snapshots == 1
+    # The same-UID census closes with a second inventory, which the omitted
+    # generation does not reopen.
+    assert snapshots == (2 if lane == "same-uid" else 1)
 
 
 @pytest.mark.parametrize("lane", ("privileged", "same-uid"))
@@ -47281,7 +47283,13 @@ def test_process_census_preflight_discards_attempt_with_shared_bounds(
         census = capture()
         assert census.processes == ()
         assert census.matches == ()
-        assert calls == ["snapshot", "identity", "snapshot", "find", "maps", "mount"]
+        # An empty inventory leaves the same-UID census nothing to scan: it
+        # is already the closing one.
+        assert calls == (
+            ["snapshot", "identity", "snapshot"]
+            if lane == "same-uid"
+            else ["snapshot", "identity", "snapshot", "find", "maps", "mount"]
+        )
     else:
         with pytest.raises(wrkslots.Refusal, match="three liveness attempts" if scenario == "persistent" else "operation-wide time bound"):
             capture()
@@ -47397,7 +47405,10 @@ def test_process_census_preflight_keeps_vanished_identity_in_every_observer(
     else:
         census = capture()
         assert census.processes == processes
-        assert calls == ["snapshot", "find", "maps", "mount:123", "mount:124"]
+        assert calls == [
+            "snapshot", "find", "maps", "mount:123", "mount:124",
+            *(["snapshot"] if lane == "same-uid" else []),
+        ]
         if evidence.startswith("live"):
             with pytest.raises(wrkslots.Refusal, match="live process 124"):
                 census.assert_slot_unused(target, None, ignore_current_process=False)
@@ -48328,7 +48339,10 @@ def test_missing_path_census_discards_attempt_before_complete_reobservation(
 ) -> None:
     capture, calls = missing_path_census_control(monkeypatch, lane, "once")
     census = capture()
-    assert calls == ["snapshot", "find", "snapshot", "find", "grep", "mount"]
+    assert calls == [
+        "snapshot", "find", "snapshot", "find", "grep", "mount",
+        *(["snapshot"] if lane == "same-uid" else []),
+    ]
     assert len(census.processes) == 1
     assert census.matches == ()
     assert census.owner_cgroup_complete is (lane == "privileged")
@@ -49604,7 +49618,8 @@ def test_same_uid_path_census_keeps_vanished_process_without_retrying_host_snaps
     assert census == wrkslots._ProcessPathCensus(
         (vanished,), (), owner_cgroup_complete=False
     )
-    assert calls == ["snapshot", "find", "maps", "mount"]
+    # The second inventory is the closing one; no observer runs again.
+    assert calls == ["snapshot", "find", "maps", "mount", "snapshot"]
 
 
 def test_same_uid_path_census_retries_missing_evidence_for_still_live_process(

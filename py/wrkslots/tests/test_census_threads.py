@@ -451,7 +451,8 @@ def test_a_leader_that_exits_under_running_threads_discards_the_attempt(
 
         monkeypatch.setattr(cli, "_same_uid_process_observations", stale_then_fresh)
         census = cli._capture_same_uid_process_path_census((slot,), budget=_budget())
-    assert snapshots == [(child.pid,), (thread,)]
+    # The third inventory is the closing one: it adds no generation.
+    assert snapshots == [(child.pid,), (thread,), (thread,)]
     assert {(pid, slot_name) for pid, slot_name, _kind, _detail in census.matches} == {
         (thread, str(slot))
     }
@@ -533,7 +534,9 @@ def test_a_leader_that_exits_between_the_link_and_maps_readers_discards_the_atte
             census = cli._capture_process_path_census(
                 (slot,), budget=_budget(), include_owner_cgroups=False
             )
-    assert snapshots == [(os.getpid(), child.pid), (os.getpid(), thread)]
+    # The same-UID census ends with its closing inventory, which adds nothing.
+    closing = [(os.getpid(), thread)] if lane == "same-uid" else []
+    assert snapshots == [(os.getpid(), child.pid), (os.getpid(), thread), *closing]
     assert len(greps) == 2
     assert {(pid, kind) for pid, _slot, kind, _detail in census.matches} == {(thread, "map")}
 
@@ -586,7 +589,10 @@ def test_a_thread_that_executes_after_the_snapshot_discards_the_attempt(
             census = cli._capture_process_path_census(
                 (child.slot,), budget=_budget(), include_owner_cgroups=False
             )
-    assert snapshots == [(os.getpid(), child.thread), (os.getpid(), child.leader)]
+    closing = [(os.getpid(), child.leader)] if lane == "same-uid" else []
+    assert snapshots == [
+        (os.getpid(), child.thread), (os.getpid(), child.leader), *closing
+    ]
     assert {(pid, slot, kind, detail) for pid, slot, kind, detail in census.matches} == {
         (child.leader, str(child.slot), "link", str(child.slot))
     }

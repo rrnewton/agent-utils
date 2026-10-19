@@ -295,6 +295,7 @@
         "py/wrkslots/tests/test_census_cost.py",
         "py/wrkslots/tests/test_census_explicit_path.py",
         "py/wrkslots/tests/test_census_key_publication.py",
+        "py/wrkslots/tests/test_census_late_fork.py",
         "py/wrkslots/tests/test_census_state_bounds.py",
         "py/wrkslots/tests/test_census_subject_progress.py",
         "py/wrkslots/tests/test_census_threads.py",

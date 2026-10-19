@@ -889,7 +889,15 @@ class _RetirementDeferred(Refusal):
 
 
 class _ProcessEvidenceChanged(Refusal):
-    """A relevant PID generation changed while one liveness census ran."""
+    """A relevant PID generation changed while one liveness census ran.
+
+    ``found`` carries positive path matches that an observer had already
+    authenticated, each by its exact (pid, start_ticks) generation, before the
+    change discarded the rest of its work.  A census that retries keeps them:
+    evidence that a process used a path is never erased by a retry.
+    """
+
+    found: tuple[tuple[int, str, str, str], ...] = ()
 
 
 class _ValidationRunMayUseRow(Refusal):
@@ -53951,8 +53959,16 @@ def _recheck_thread_group_observations(
 def _preflight_process_observations(
     processes: Sequence[_AbsentProcessObservation],
     budget: _ReadOnlyCommandBudget,
+    *,
+    replaced_generations_are_gone: bool = False,
 ) -> tuple[_AbsentProcessObservation, ...]:
-    """Reject unstable identities and omit proven terminal generations."""
+    """Reject unstable identities and omit proven terminal generations.
+
+    A PID that now names another generation discards the attempt, unless
+    ``replaced_generations_are_gone``: a census whose closing inventory scans
+    every generation it has not scanned yet (the same-UID census) omits the
+    replaced one, which can hold nothing, and meets its successor there.
+    """
 
     retained: list[_AbsentProcessObservation] = []
     for process in processes:
@@ -53978,6 +53994,8 @@ def _preflight_process_observations(
             retained.append(process)
             continue
         if current.start_ticks != process.start_ticks:
+            if replaced_generations_are_gone:
+                continue
             raise _ProcessEvidenceChanged(
                 f"PID {process.pid} changed before process path census"
             )
@@ -54367,7 +54385,12 @@ def _same_uid_direct_path_processes(
     tuple[_AbsentProcessObservation, ...],
     tuple[_AbsentProcessObservation, ...],
 ]:
-    """Separate directly readable proc entries from privileged-fallback work."""
+    """Separate directly readable proc entries from privileged-fallback work.
+
+    A generation that is no longer current when its entries refuse this user
+    is omitted: it is gone, so it holds nothing, and the census's closing
+    inventory scans whatever process now has its PID.
+    """
 
     direct: list[_AbsentProcessObservation] = []
     indeterminate: list[_AbsentProcessObservation] = []
@@ -54383,9 +54406,7 @@ def _same_uid_direct_path_processes(
                 pass
         except PermissionError:
             if not _process_generation_is_current(process):
-                raise _ProcessEvidenceChanged(
-                    f"PID {process.pid} generation changed before same-UID path census"
-                )
+                continue
             indeterminate.append(process)
         except (FileNotFoundError, ProcessLookupError) as exc:
             # A short-lived, unrelated process can exit between the snapshot and
@@ -54476,24 +54497,30 @@ def _same_uid_batched_path_matches(
         patterns.append(text)
     pattern_input = ("\n".join(patterns) + "\n").encode("utf-8")
     maps_chunks: list[bytes] = []
-    for arguments in _argument_batches(("-F", "-H", "-f", "-", "--"), files, ()):
-        batch_pids = {
-            _pid_from_proc_evidence(Path(argument)) for argument in arguments[5:]
-        }
-        batch_processes = {
-            pid: observed_by_pid[pid] for pid in batch_pids if pid in observed_by_pid
-        }
-        returncode, stdout, stderr = _run_same_uid_command(
-            Path("/usr/bin/grep"),
-            arguments,
-            input_data=pattern_input,
-            budget=budget,
-        )
-        for process in _same_uid_indeterminate_processes(
-            "grep", returncode, stderr, batch_processes
-        ):
-            indeterminate[process.pid] = process
-        maps_chunks.append(stdout)
+    try:
+        for arguments in _argument_batches(("-F", "-H", "-f", "-", "--"), files, ()):
+            batch_pids = {
+                _pid_from_proc_evidence(Path(argument)) for argument in arguments[5:]
+            }
+            batch_processes = {
+                pid: observed_by_pid[pid] for pid in batch_pids if pid in observed_by_pid
+            }
+            returncode, stdout, stderr = _run_same_uid_command(
+                Path("/usr/bin/grep"),
+                arguments,
+                input_data=pattern_input,
+                budget=budget,
+            )
+            for process in _same_uid_indeterminate_processes(
+                "grep", returncode, stderr, batch_processes
+            ):
+                indeterminate[process.pid] = process
+            maps_chunks.append(stdout)
+    except _ProcessEvidenceChanged as exc:
+        # The link matches above were authenticated before the maps reader
+        # saw motion; the retry must not lose them.
+        exc.found = (*exc.found, *matches)
+        raise
     matches.extend(
         _parse_maps_path_matches(
             b"".join(maps_chunks), observed_by_pid, targets, census="same-UID"
@@ -54502,48 +54529,130 @@ def _same_uid_batched_path_matches(
     return tuple(matches), tuple(indeterminate.values())
 
 
+# The same-UID census's closing inventory is bounded by this many process
+# inventories in one operation, each followed by a scan of only the generations
+# it adds.  Measured 2026-10-19 on a shared development host running 1,136
+# processes of one user: 0 to 2 new same-user generations appeared in 50 to
+# 200 ms, and 2 to 16 in one second; one inventory took 0.40 s and a whole
+# census, closing inventory included, 2.7 to 3.6 s.  An inventory usually adds
+# nothing by the second or third; eight leaves room for a burst of builds.
+_SAME_UID_CENSUS_INVENTORIES = 8
+# Scans discarded for thread-group or path motion, as before: three.
+_SAME_UID_CENSUS_DISCARDED_SCANS = 3
+
+
+def _scan_same_uid_generations(
+    processes: Sequence[_AbsentProcessObservation],
+    targets: Mapping[Path, str],
+    budget: _ReadOnlyCommandBudget,
+    found: dict[tuple[int, str, str, str], None],
+) -> tuple[_AbsentProcessObservation, ...]:
+    """Run every observer over ``processes``; return the generations it scanned.
+
+    Positive matches go into ``found`` even when motion then discards the scan.
+    A generation that has exited or whose PID another process took is omitted:
+    it holds nothing, and the closing inventory meets any successor.
+    """
+
+    processes = _preflight_process_observations(
+        processes, budget, replaced_generations_are_gone=True
+    )
+    direct: tuple[tuple[int, str, str, str], ...] = ()
+    privileged: list[tuple[int, str, str, str]] = []
+    mounts: tuple[tuple[int, str, str, str], ...] = ()
+    try:
+        direct, indeterminate = _same_uid_batched_path_matches(
+            processes, targets, budget
+        )
+        privileged.extend(_absent_validate_find_matches(indeterminate, targets, budget))
+        privileged.extend(_absent_validate_maps_matches(indeterminate, targets, budget))
+        # Reject volatile path motion before spending the shared mountinfo
+        # input budget. An accepted scan still completes every observer.
+        mounts = _absent_validate_mount_matches(processes, targets, budget)
+        _recheck_thread_group_observations(processes, budget)
+    except _ProcessEvidenceChanged as exc:
+        found.update(dict.fromkeys((*exc.found, *mounts, *direct, *privileged)))
+        raise
+    found.update(dict.fromkeys((*mounts, *direct, *privileged)))
+    return processes
+
+
 def _capture_same_uid_process_path_census(
     slot_paths: Sequence[Path],
     *,
     budget: _ReadOnlyCommandBudget,
 ) -> _ProcessPathCensus:
-    """Capture one fresh snapshot for paths reachable by this filesystem UID."""
+    """Prove which same-UID process generations use ``slot_paths``, up to one closing inventory.
+
+    Threat model: cooperative processes of this filesystem UID, after the caller
+    has fenced the paths so that no process can newly reach them by name.  Such
+    a process can then hold a path only through what it already held (a working
+    directory or root, an open descriptor, a mapping, a mount) or what it
+    inherits from a holder by fork or clone.  A holder can fork after any one
+    snapshot of /proc, hand that reference to its child, and exit; a census
+    that probed only its snapshot would never see the child.
+
+    So the census enumerates /proc, scans every generation it has not scanned
+    yet, and enumerates again, until an inventory taken after every scan adds
+    no generation: that inventory is the acceptance boundary.  Each process
+    live there received a complete scan that found nothing, or its match is
+    reported, and a process born later descends from one of them, scanned
+    before it was born.  Generations are exact (pid, start_ticks) identities,
+    so a process that took an exited process's PID is a new generation and is
+    scanned alone; an exited or replaced generation needs no further evidence,
+    and ordinary churn never restarts the host-wide scan.  Positive matches
+    accumulate across rounds and discarded scans and are never erased; a match
+    whose generation changed while it was read refuses outright.  Inventories
+    are bounded (_SAME_UID_CENSUS_INVENTORIES), as is the time (``budget``):
+    a host where new generations keep appearing refuses rather than accepting.
+
+    Outside this model, and not detected: a holder that passes a descriptor
+    over a Unix socket (SCM_RIGHTS) or by pidfd_getfd to a process already
+    scanned and closes its own copy before its own scan; a thread of a live
+    leader that left its process's file table or file-system context with
+    unshare(CLONE_FILES or CLONE_FS); a process that takes this filesystem UID
+    only after the closing inventory; and processes of other UIDs, which the
+    all-process census covers.
+    """
 
     targets = {path: str(path) for path in slot_paths}
     if not targets:
         return _ProcessPathCensus((), (), owner_cgroup_complete=False)
-    for attempt in range(3):
+    handled: set[tuple[int, int]] = set()
+    scanned: list[_AbsentProcessObservation] = []
+    found: dict[tuple[int, str, str, str], None] = {}
+    discarded = 0
+    unscanned: tuple[_AbsentProcessObservation, ...] = ()
+    for _inventory in range(_SAME_UID_CENSUS_INVENTORIES):
         budget.remaining_seconds()
         try:
-            processes = _same_uid_process_observations(budget)
-            processes = _preflight_process_observations(processes, budget)
-            direct_matches, indeterminate = _same_uid_batched_path_matches(
-                processes, targets, budget
+            inventory = _same_uid_process_observations(budget)
+            unscanned = tuple(
+                process
+                for process in inventory
+                if (process.pid, process.start_ticks) not in handled
             )
-            privileged_matches = (
-                *_absent_validate_find_matches(indeterminate, targets, budget),
-                *_absent_validate_maps_matches(indeterminate, targets, budget),
+            if not unscanned:
+                return _ProcessPathCensus(
+                    tuple(scanned), tuple(found), owner_cgroup_complete=False
+                )
+            scanned.extend(
+                _scan_same_uid_generations(unscanned, targets, budget, found)
             )
-            # Reject volatile path motion before spending the shared mountinfo
-            # input budget. An accepted attempt still completes every observer.
-            matches = (
-                *_absent_validate_mount_matches(processes, targets, budget),
-                *direct_matches,
-                *privileged_matches,
-            )
-            _recheck_thread_group_observations(processes, budget)
         except _ProcessEvidenceChanged:
-            if attempt < 2:
+            discarded += 1
+            if discarded < _SAME_UID_CENSUS_DISCARDED_SCANS:
                 continue
             raise Refusal(
                 "same-UID process evidence changed during three liveness attempts"
             )
-        return _ProcessPathCensus(
-            processes, matches, owner_cgroup_complete=False
-        )
+        handled.update((process.pid, process.start_ticks) for process in unscanned)
+    sample = ", ".join(str(process.pid) for process in unscanned[:5])
     raise Refusal(
-        "same-UID liveness proof is indeterminate because relevant process "
-        "evidence changed during three attempts"
+        f"same-UID process census did not close: each of {_SAME_UID_CENSUS_INVENTORIES} "
+        "process inventories found generations no earlier scan had covered "
+        f"(most recently {len(unscanned)}, PIDs {sample}); retry when fewer "
+        "processes are starting"
     )
 
 
