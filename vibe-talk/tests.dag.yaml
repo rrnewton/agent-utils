@@ -666,10 +666,15 @@ steps:
   # host too long for the phone's line: the host one quiet line (no larger than the page's text, ordinary
   # weight, its name cut with an ellipsis and its port whole, whole in its tooltip and when copied), Expand
   # all and Open help on its row on a desk and under it on the phone, above the sections, Tab going Back,
-  # Expand all, Open help, the first section, and Fold all in place. Measured on 2026-10-19: about 5s wall.
+  # Expand all, Open help, the first section, and Fold all in place. `#373 two-column-full-width`: two
+  # columns at 1920x1080 and 2560x1080 over the agent's long replies and the owner's answer with no
+  # threads, every row of Main but the owner's across its column to the gutter by the divider, the owner's
+  # kept partial, the glass over no row and no strip kept for it, the right column's heading and empty
+  # line across it, one column still at its reading width; and a thread open on the right, its rows
+  # across that column. Measured on 2026-10-19: about 8s wall.
   - group: check
     job: desktop-layout-browser
-    desc: Settings' head one quiet row (two on a phone) in reading and Tab order, in current Chromium at 1280x800, 1920x1080 and 393x852
+    desc: Settings' head one quiet row (two on a phone) in reading and Tab order, and in two columns every row but the owner's across its column with the glass over none, in current Chromium at 1280x800, 1920x1080, 2560x1080 and 393x852
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/desktop_layout_browser.py
     jobs_flag: ""
@@ -677,7 +682,7 @@ steps:
     cpu_timeout: 45
     hint:
       resources: {browser: 1}
-      est_duration_s: 5
+      est_duration_s: 8
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 

@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""The head of Settings, laid out in real Chromium.
+"""The head of Settings, and two columns on a wide desk, laid out in real Chromium.
 
 `#372 settings-header-layout`. The owner, 2026-10-19, of Settings on a desktop window: "the machine URL
 doesn't need to be in a big font!! Expand all certainly doesn't need its own line." The server's host
 was the loudest line on the screen, in large bold type wrapping over two lines in a card of its own;
 Expand all stood alone on a row above the sections and Open help alone on a row below them.
+
+`#373 two-column-full-width`. The owner, the same day: "I asked a while ago for full-width messages
+from the coding agent in two-column mode. Why don't I have this? In this screenshot it shows wasted
+space." On a 2000px desk in two columns the agent's long reply stopped about 160px short of the right
+column, in a strip holding only the floating search glass, and the right column's empty thread list
+was held to the same narrow measure.
 
 The fake-DOM suite (tests/js/voice_page.test.mjs) pins the markup and the rules; it lays nothing out,
 so it cannot say where anything lands. This does. It serves the checked-out page and the small fake
@@ -19,6 +25,17 @@ API of tests/offline_cache_browser.py from one loopback origin, opened under a l
   under it; all of it above the sections, nothing wider than the screen -> Tab from Back goes to Expand
   all, Open help, then the first section, and the document order is the same -> Expand all still opens
   everything and reads Fold all, on the same row.
+
+  Two columns, at 1920x1080 and 2560x1080 with a mouse, over a channel ending in the agent's long boxed
+  replies and the owner's answer, with the thread list empty: every row of Main but the owner's spans
+  its column to within the list's own gutter, the agent's tiles wider than the reading width a single
+  column keeps, and the owner's rows keep their partial width, set in from the left (the owner,
+  correcting the first version: "MY messages are still partial width to make them visually distinct")
+  -> the glass sits at the left column's top right, by the divider, over
+  no row, and no strip as wide as it is left between the rows and the divider -> the right column's
+  heading and its "No threads" line span their column -> one column at the same desk still holds the
+  channel to its reading width. And at 1920x1080 over a channel with threads, a thread selected on the
+  right: its rows span the right column as Main's span the left.
 
 No horizontal overflow and no page error at any step. Pass --screenshots DIR to keep a PNG of each
 state for review; --web-root DIR to run the same walk against another copy of the page (an older one,
@@ -38,7 +55,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import offline_cache_browser as fixture
-from offline_cache_browser import TOKEN, FakeApi, Json, check, handler_for, said
+from offline_cache_browser import OWNER_ID, TOKEN, FakeApi, Json, check, handler_for, said
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType, Page
@@ -48,6 +65,16 @@ LONG_HOST = "build-host-0042-rack7-8422--dev-proxy.region-two.example.localhost"
 
 # (label, width, height, touch)
 SETTINGS_SIZES = (("laptop-1280", 1280, 800, False), ("desk-1920", 1920, 1080, False), ("phone-393", 393, 852, True))
+COLUMN_SIZES = (("desk-1920", 1920, 1080), ("wide-2560", 2560, 1080))
+THREAD_SIZE = ("desk-1920", 1920, 1080)
+
+# How much narrower than its column a row other than the owner's may be in two columns: the list's
+# gutter inside each edge (0.75rem), and a pixel of rounding. Such a row stops at the gutter alone.
+ROW_SLACK_PX = 2 * 12 + 1
+AGENT_SLACK_PX = 12 + 1
+# ...and how far in from the left the owner's own rows stand, at least: they keep their partial width
+# (the desk's inset, 6rem in a half of a desk), so they read as the owner's beside the others.
+OWNER_INSET_MIN_PX = 64
 
 LONG_REPLY = "\n".join([
     "Status",
@@ -73,7 +100,10 @@ LONG_REPLY = "\n".join([
 
 
 class LongReplyApi(FakeApi):
-    """A short exchange, then the agent's long boxed replies, and no threads at all."""
+    """A short exchange, then the agent's long boxed replies and the owner's answer, and no threads."""
+
+    def client_config(self, scope: str) -> Json:
+        return {**super().client_config(scope), "owner_author_id": OWNER_ID}
 
     def __init__(self) -> None:
         super().__init__()
@@ -121,6 +151,31 @@ HEAD_JS = """() => {
     };
 }"""
 
+COLUMNS_JS = """() => {
+    const box = (node) => { const r = node.getBoundingClientRect();
+        return {left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height}; };
+    const byId = (id) => box(document.getElementById(id));
+    const rows = (list) => [...document.querySelectorAll(`#${list} > li.discord-message`)]
+        .filter((row) => row.getClientRects().length > 0)
+        .map((row) => ({id: row.getAttribute('data-id'), who: row.getAttribute('data-who'), ...box(row)}));
+    const side = document.getElementById('side-column');
+    return {
+        drawn: side.getClientRects().length > 0,
+        left: byId('scroll-area'), right: side.getClientRects().length > 0 ? box(side) : null,
+        pane: byId('pane-discord'), glass: byId('search-toggle'),
+        heading: byId('side-heading'), state: byId('side-list-state'),
+        stateText: document.getElementById('side-list-state').textContent.trim(),
+        main: rows('discord-log'), thread: rows('side-log'),
+        paneCap: getComputedStyle(document.getElementById('pane-discord')).maxWidth,
+        readingWidth: (() => { const probe = document.createElement('div');
+            probe.style.width = 'var(--reading-width)'; probe.style.position = 'absolute';
+            document.getElementById('pane-discord').append(probe);
+            const width = probe.getBoundingClientRect().width; probe.remove(); return width; })(),
+        overflow: document.documentElement.scrollWidth - innerWidth,
+    };
+}"""
+
+
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
@@ -158,6 +213,12 @@ def main() -> int:
     with sync_playwright() as playwright:
         for label, width, height, touch in SETTINGS_SIZES:
             report.append(run(playwright.chromium, args, LongReplyApi(), label, width, height, touch, settings_walk))
+        for label, width, height in COLUMN_SIZES:
+            report.append(run(playwright.chromium, args, LongReplyApi(), label, width, height, False, columns_walk))
+        from two_column_browser import ColumnsApi
+
+        label, width, height = THREAD_SIZE
+        report.append(run(playwright.chromium, args, ColumnsApi(), label, width, height, False, thread_walk))
     for line in report:
         print(line)
     return 0
@@ -306,6 +367,112 @@ def settings_walk(desk: Desk) -> None:
     desk.shot("settings-expanded")
     desk.notes.append("Expand all read Fold all on the same row")
 
+
+def two_columns(desk: Desk, rows: int) -> None:
+    """Open the channel in All, then two columns."""
+    page = desk.page
+    page.click("#view-switch")
+    desk.wait_for(f"() => document.querySelectorAll('#discord-log > li[data-id]').length >= {rows}",
+                  "the channel did not open")
+    page.click("#column-toggle")
+    desk.wait_for("() => document.getElementById('side-column').getClientRects().length > 0",
+                  "the layout button did not draw two columns")
+    desk.settled()
+
+
+def columns_walk(desk: Desk) -> None:
+    """`#373 two-column-full-width`: Main's rows, the agent's long tiles first, span the left column."""
+    page = desk.page
+    two_columns(desk, 8)
+    desk.wait_for("() => document.getElementById('side-list-state').textContent.trim() !== ''",
+                  "the empty thread list says nothing")
+    # The agent's replies opened whole, so the boxes are the long ones the owner photographed.
+    if page.is_visible("#expand-all"):
+        page.click("#expand-all")
+    page.evaluate("() => { const s = document.getElementById('scroll-area'); s.scrollTop = s.scrollHeight; }")
+    page.wait_for_timeout(200)
+    desk.settled()
+    found = page.evaluate(COLUMNS_JS)
+    left, right = found["left"], found["right"]
+    desk.check(right is not None, "the right column is not drawn")
+    divider = right["left"]
+    column = divider - left["left"]
+    main = found["main"]
+    desk.check(len(main) >= 3, f"too few of Main's rows are on screen to measure: {main}")
+    others = [row for row in main if row["who"] != "me"]
+    short = [row for row in others if row["width"] < column - ROW_SLACK_PX or row["right"] < divider - AGENT_SLACK_PX]
+    desk.check(not short, f"rows of Main stop short of the {column:.0f}px column: "
+               + ", ".join(f"{row['who']} {row['id']} {row['left']:.0f}-{row['right']:.0f}" for row in short))
+    # The owner's own rows keep their partial width, set in from the left, their right edge with the others'.
+    mine = [row for row in main if row["who"] == "me"]
+    desk.check(bool(mine), f"no row of the owner's is on screen: {[row['who'] for row in main]}")
+    wide = [row for row in mine if row["left"] - left["left"] < 12 + OWNER_INSET_MIN_PX or row["right"] < divider - AGENT_SLACK_PX]
+    desk.check(not wide, "the owner's rows do not keep their partial width: "
+               + ", ".join(f"{row['id']} {row['left']:.0f}-{row['right']:.0f}" for row in wide))
+    agents = [row for row in main if row["who"] == "coder"]
+    desk.check(bool(agents), "no agent row is on screen")
+    gap = max(divider - row["right"] for row in agents)
+    desk.check(gap <= AGENT_SLACK_PX, f"the agent's tiles stop {gap:.0f}px short of the divider")
+    desk.check(min(row["width"] for row in agents) > found["readingWidth"] + 1,
+               f"the agent's tiles are no wider than one column's reading width ({found['readingWidth']:.0f}px)")
+
+    # The glass: at the left column's top right, by the divider, over no row, with no strip kept for it.
+    glass = found["glass"]
+    desk.check(divider - 24 <= glass["right"] <= divider, f"the glass is not at the divider: {glass} {divider}")
+    # What of a row is drawn: the list clips what is scrolled above its top edge.
+    over = [row["id"] for row in main if max(row["top"], left["top"]) < glass["bottom"] and row["bottom"] > glass["top"]
+            and row["left"] < glass["right"] and row["right"] > glass["left"]]
+    desk.check(not over, f"the glass covers rows {over}")
+    desk.check(glass["bottom"] <= left["top"] + 1, f"the glass is not on the line over the list: {glass} {left}")
+    desk.check(gap < glass["width"], "a strip as wide as the glass is left between the rows and the divider")
+
+    # The right column: its heading and its empty list's line span it.
+    heading, state = found["heading"], found["state"]
+    desk.check(heading["left"] <= divider + 2 and heading["right"] >= desk.width - 2,
+               f"the right column's heading does not span it: {heading}")
+    desk.check(found["stateText"].startswith("No threads"), f"the empty thread list says {found['stateText']!r}")
+    desk.check(state["width"] >= right["width"] - 2 * 12 - 2, f"the empty thread list's line does not span its column: {state}")
+    desk.check(found["overflow"] <= 0, "the page scrolls sideways in two columns")
+    desk.shot("two-columns")
+    desk.notes.append(f"two {column:.0f}px columns: the owner's rows {min(row['width'] for row in mine):.0f}px, "
+                      f"the agent's tiles {min(row['width'] for row in agents):.0f}px, "
+                      f"{gap:.0f}px from the divider, the glass over no row")
+
+    # One column at the same desk keeps its reading width.
+    page.click("#column-toggle")
+    desk.wait_for("() => document.getElementById('side-column').getClientRects().length === 0",
+                  "the layout button did not go back to one column")
+    desk.settled()
+    one = page.evaluate(COLUMNS_JS)
+    desk.check(one["paneCap"] != "none" and one["pane"]["width"] <= one["readingWidth"] + 1,
+               f"one column is no longer held to its reading width: {one['pane']} {one['paneCap']}")
+    desk.check(one["overflow"] <= 0, "the page scrolls sideways in one column")
+    desk.shot("one-column")
+    desk.notes.append(f"one column held to {one['pane']['width']:.0f}px")
+
+
+def thread_walk(desk: Desk) -> None:
+    """`#373 two-column-full-width`: a thread's rows span the right column too."""
+    from two_column_browser import RUNNER
+
+    page = desk.page
+    two_columns(desk, 11)
+    desk.wait_for("() => document.querySelectorAll('#side-cards > li').length === 3", "the threads are not listed")
+    page.click(f"#side-cards > li[data-id='{RUNNER}'] .side-card-open")
+    desk.wait_for("() => document.querySelectorAll('#side-log > li.discord-message').length >= 3",
+                  "the thread did not open on the right")
+    desk.settled()
+    found = page.evaluate(COLUMNS_JS)
+    right = found["right"]
+    desk.check(right is not None, "the right column is not drawn")
+    rows = found["thread"]
+    short = [row for row in rows if row["width"] < right["width"] - ROW_SLACK_PX]
+    desk.check(not short, f"rows of the thread stop short of the {right['width']:.0f}px column: "
+               + ", ".join(f"{row['who']} {row['id']} {row['left']:.0f}-{row['right']:.0f}" for row in short))
+    desk.check(found["overflow"] <= 0, "the page scrolls sideways with a thread open")
+    page.wait_for_timeout(300)  # the thread's 220 ms fade in under its card (`#298 thread-card-header`)
+    desk.shot("two-columns-thread")
+    desk.notes.append(f"{len(rows)} rows of the thread across the {right['width']:.0f}px right column")
 
 
 if __name__ == "__main__":

@@ -48879,6 +48879,94 @@ test("`#224 keyboard-shortcuts` x `#221 read-modes`: on the line of a collapsed 
 const TWO_COLUMN_QUERY = "(min-width: 1000px) and (pointer: fine)";
 const COLUMNS_STORAGE = "vibe-talk.voice.columns";
 
+// --- `#373 two-column-full-width` -----------------------------------------------------------------
+//
+// The owner, 2026-10-19: "I asked a while ago for full-width messages from the coding agent in
+// two-column mode. Why don't I have this? In this screenshot it shows wasted space." Each column held its
+// list to the one-column reading width, and the desk's speaker insets cut the agent's tile shorter again.
+// And, correcting the first version: "MY messages are still partial width to make them visually
+// distinct. The agents usually-long messages are full column. That's how we previously did it on narrow
+// phone columns." So every row but the owner's spans its column; the owner's keep their inset.
+// tests/desktop_layout_browser.py measures the rows in Chromium; this pins the rules that place them.
+
+/** The parts of the two columns that must span their column there, and not elsewhere. */
+const TWO_COLUMN_SPANS = ["#pane-discord", "> #connection-banner", "> #channel-freshness-anchor", "#side-heading", "#side-freshness", "#side-list", "#side-pane"];
+
+/**
+ * What is wrong with two columns' widths against `#373`, as sentences; empty when nothing is. A function
+ * of the stylesheet, so each negative control can hand it one broken.
+ */
+function twoColumnWidthProblems(css) {
+  const problems = [];
+  const two = (selector) => `#screen-main[data-columns="two"] ${selector}`;
+  const inside = (selector) => cssRules(mediaBodyOf(css, TWO_COLUMN_QUERY), selector).join("\n");
+  for (const part of TWO_COLUMN_SPANS) {
+    if (!/max-width:\s*none/.test(inside(two(part)))) problems.push(`${part.replace("> ", "")} is still held to the reading width in two columns`);
+  }
+  // The speakers: in two columns the agent's tile and other people's rows take the column, through
+  // properties whose fallbacks are a desk's insets, and the owner's rows keep the desk's inset.
+  const vars = inside('#screen-main[data-columns="two"]');
+  const value = (name) => (new RegExp(`${name}:\\s*([^;]+);`).exec(vars) || [])[1];
+  if (!/^0(?:px)?$/.test(value("--desk-agent-inset") || "")) problems.push("the agent's tile keeps a desk's inset in two columns");
+  if (!/^0(?:px)?$/.test(value("--desk-third-inset") || "")) problems.push("other people's rows keep a desk's inset in two columns");
+  const desk = (selector) => cssRules(mediaBodyOf(css, DESKTOP_QUERY), selector).join("\n");
+  const agent = desk('#discord-log li.discord-message[data-who="coder"]');
+  if (!/margin-right:\s*var\(--desk-agent-inset,\s*min\(15%,\s*6rem\)\)/.test(agent)) problems.push("the agent's desk inset is not read through --desk-agent-inset");
+  if (!/margin-inline:\s*var\(--desk-third-inset,\s*min\(7%,\s*3rem\)\)/.test(desk('#discord-log li.discord-message[data-who="human"]'))) {
+    problems.push("a third party's desk inset is not read through --desk-third-inset");
+  }
+  // The owner's rows keep their partial width: the desk's inset as a number, nothing in two columns
+  // overriding it, and nothing setting a property it could be read through.
+  const owner = desk('#discord-log li.discord-message[data-who="me"]');
+  const ownerTwo = [...mediaBodyOf(css, TWO_COLUMN_QUERY).matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+    .filter((rule) => /data-columns="two"/.test(rule[1]) && /data-who="me"|\.mine\b/.test(rule[1]) && /margin/.test(rule[2]));
+  if (!/margin-left:\s*min\(15%,\s*6rem\)/.test(owner) || ownerTwo.length > 0 || /--desk-owner-inset:/.test(css)) {
+    problems.push("the owner's rows lose their partial width in two columns");
+  }
+  // One column keeps its reading width: nothing else sets the properties, nor uncaps the lists.
+  const elsewhere = cssWithoutIn(css, TWO_COLUMN_QUERY);
+  if (/--desk-(?:agent|third)-inset:/.test(elsewhere)) problems.push("a speaker's two-column inset is set outside two columns");
+  if (!/max-width:\s*var\(--reading-width\)/.test(desk("#pane-discord"))) problems.push("one column lost its reading width");
+  // The things placed by the column follow it.
+  if (!/width:\s*calc\(50% - 1\.2rem\)/.test(inside(two("> #scroll-tools")))) problems.push("the chips over the left list keep the reading width");
+  if (!/--dock-inset:\s*0\.6rem/.test(inside('body:has(#screen-main[data-columns="two"]:not([hidden])) #dock'))) problems.push("the dock keeps the reading width's inset in two columns");
+  return problems;
+}
+
+test("`#373 two-column-full-width`: in two columns the lists span their columns, every row but the owner's across it; one column keeps its width", () => {
+  assert.deepStrictEqual(twoColumnWidthProblems(CSS_CODE), []);
+});
+
+test("`#373 two-column-full-width`: the check refuses a capped list, a desk inset in two columns, an owner's row across the column, and a wide single column (negative controls)", () => {
+  const capped = CSS_CODE.replace('#screen-main[data-columns="two"] #pane-discord,\n', "");
+  assert.notEqual(capped, CSS_CODE, "the negative control changed nothing");
+  assert.deepStrictEqual(twoColumnWidthProblems(capped), ["#pane-discord is still held to the reading width in two columns"]);
+  const inset = CSS_CODE.replace(/--desk-agent-inset:\s*0px;/, "");
+  assert.notEqual(inset, CSS_CODE, "the negative control changed nothing");
+  assert.deepStrictEqual(twoColumnWidthProblems(inset), ["the agent's tile keeps a desk's inset in two columns"]);
+  const literal = CSS_CODE.replace("margin-right: var(--desk-agent-inset, min(15%, 6rem));", "margin-right: min(15%, 6rem);");
+  assert.notEqual(literal, CSS_CODE, "the negative control changed nothing");
+  assert.deepStrictEqual(twoColumnWidthProblems(literal), ["the agent's desk inset is not read through --desk-agent-inset"]);
+  const third = CSS_CODE.replace(/--desk-third-inset:\s*0px;/, "--desk-third-inset: 0.75rem;");
+  assert.notEqual(third, CSS_CODE, "the negative control changed nothing");
+  assert.deepStrictEqual(twoColumnWidthProblems(third), ["other people's rows keep a desk's inset in two columns"]);
+  // The owner's rows across the column: by a two-column rule, or through a property, as the first version did.
+  const ownerInBlock = CSS_CODE.replace(/(#screen-main\[data-columns="two"\] \{\s*--desk-third-inset)/,
+    '#screen-main[data-columns="two"] #discord-log li.discord-message[data-who="me"] {\n    margin-left: 0;\n  }\n\n  $1');
+  assert.notEqual(ownerInBlock, CSS_CODE, "the negative control changed nothing");
+  assert.deepStrictEqual(twoColumnWidthProblems(ownerInBlock), ["the owner's rows lose their partial width in two columns"]);
+  const ownerVar = CSS_CODE.replace(/(--desk-third-inset:\s*0px;)/, "$1\n    --desk-owner-inset: 0px;")
+    .replace(/(#discord-log li\.discord-message\[data-who="me"\],\n\s*#pinned-log li\.discord-message\[data-who="me"\],\n\s*#reply-context li\.discord-message\[data-who="me"\],\n\s*#reply-target li\.discord-message\[data-who="me"\] \{\n\s*)margin-left: min\(15%, 6rem\);/,
+      "$1margin-left: var(--desk-owner-inset, min(15%, 6rem));");
+  assert.notEqual(ownerVar, CSS_CODE, "the negative control changed nothing");
+  assert.deepStrictEqual(twoColumnWidthProblems(ownerVar), ["the owner's rows lose their partial width in two columns"]);
+  const everywhere = `${CSS_CODE}\n:root { --desk-agent-inset: 0px; }\n`;
+  assert.deepStrictEqual(twoColumnWidthProblems(everywhere), ["a speaker's two-column inset is set outside two columns"]);
+  const chips = CSS_CODE.replace("width: calc(50% - 1.2rem);", "width: calc(min(var(--reading-width), 50%) - 1.2rem);");
+  assert.notEqual(chips, CSS_CODE, "the negative control changed nothing");
+  assert.deepStrictEqual(twoColumnWidthProblems(chips), ["the chips over the left list keep the reading width"]);
+});
+
 /** Whether the page has two columns on screen: asked for, and given a box by the stylesheet. */
 const inTwoColumns = (page) => page.el("screen-main").getAttribute("data-columns") === "two" &&
   page.el("side-column").getClientRects().length > 0;
@@ -51488,7 +51576,7 @@ test("`#298 thread-card-header`: the card at the top of a thread is in the right
   assert.match(heading, /align-items:\s*flex-start/);
   // In two columns it stands where the cards do, for the line from its root.
   for (const selector of ['#screen-main[data-columns="two"] .thread-card-header', '#screen-main[data-columns="two"] .side-cards']) {
-    assert.match(cssBlockIn(TWO_COLUMN_QUERY, selector), /margin-inline-start:\s*1\.25rem/, `${selector} is not inset for the links' lanes`);
+    assert.match(cssBlockIn(TWO_COLUMN_QUERY, selector), /margin-inline-start:\s*2\.5rem/, `${selector} is not inset for the links' lanes`);
   }
 });
 

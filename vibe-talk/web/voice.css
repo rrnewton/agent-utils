@@ -7271,7 +7271,13 @@ textarea {
 
   /* `#85 voice-desktop-review`. The channel's two principals, bounded exactly as the transcript's
      two speakers directly above — same numbers, because they are the same two people and a reader
-     switching views must not see the column change shape under them. */
+     switching views must not see the column change shape under them.
+
+     `#373 two-column-full-width`. The agent's inset and a third party's, here and in the stack rules
+     after them, are read through a custom property whose fallback is the number they always were,
+     `--desk-agent-inset` and `--desk-third-inset`. Nothing sets them in one column, so one column is
+     exactly as it was; two columns set them to nothing (the two-column block below), so those rows
+     span their column. The owner's inset is not one of them: the owner's rows keep it everywhere. */
   #side-log li.discord-message[data-who="me"],
   #discord-log li.discord-message[data-who="me"],
   #pinned-log li.discord-message[data-who="me"],
@@ -7288,7 +7294,7 @@ textarea {
     /* A desk has the room, and a full-bleed tile a metre wide is the "phone layout stretched
        sideways" the whole block exists to remove. The inset comes back. */
     margin-left: 0;
-    margin-right: min(15%, 6rem);
+    margin-right: var(--desk-agent-inset, min(15%, 6rem));
   }
 
   #side-log li.discord-message[data-who="human"],
@@ -7301,7 +7307,7 @@ textarea {
   #pinned-log li.discord-message[data-who="bot"],
   #reply-context li.discord-message[data-who="bot"],
   #reply-target li.discord-message[data-who="bot"] {
-    margin-inline: min(7%, 3rem);
+    margin-inline: var(--desk-third-inset, min(7%, 3rem));
   }
 
   /* `#204 reply-arrow`. A reply's gutter is a touch target wide everywhere, and the owner's own
@@ -7325,7 +7331,7 @@ textarea {
   #discord-log li.discord-message[data-who="coder"],
   #pinned-log li.discord-message[data-who="coder"] {
     --row-inset-left: 0px;
-    --row-inset-right: min(15cqw, 6rem);
+    --row-inset-right: var(--desk-agent-inset, min(15cqw, 6rem));
   }
 
   #side-log li.discord-message[data-who="human"],
@@ -7334,8 +7340,8 @@ textarea {
   #side-log li.discord-message[data-who="bot"],
   #discord-log li.discord-message[data-who="bot"],
   #pinned-log li.discord-message[data-who="bot"] {
-    --row-inset-left: min(7cqw, 3rem);
-    --row-inset-right: min(7cqw, 3rem);
+    --row-inset-left: var(--desk-third-inset, min(7cqw, 3rem));
+    --row-inset-right: var(--desk-third-inset, min(7cqw, 3rem));
   }
 
   #side-log li.discord-message[data-is-reply="true"][data-who],
@@ -7366,7 +7372,7 @@ textarea {
   #side-log li.discord-message[data-stack-under="third"][data-who],
   #discord-log li.discord-message[data-stack-under="third"][data-who],
   #reply-target li.discord-message[data-stack-under="third"][data-who] {
-    margin-left: calc(min(7%, 3rem) + var(--reply-gutter));
+    margin-left: calc(var(--desk-third-inset, min(7%, 3rem)) + var(--reply-gutter));
   }
 
   #side-log li.discord-message[data-stack-under="reply"][data-who],
@@ -7381,8 +7387,9 @@ textarea {
     margin-left: calc(max(var(--reply-gutter), min(15%, 6rem)) + var(--reply-gutter));
   }
 
-  /* `#228 reply-visible`. Inside the reading column the agent's tile has room beside it, and its
-     circle goes back to the corner, as every other row's is. */
+  /* `#228 reply-visible`. On a desk the agent's tile stands inside the list's gutter, never at the
+     window's edge, so it has room beside it, and its circle goes back to the corner, as every other
+     row's is. */
   #side-log li.discord-message[data-who="coder"]:not([data-is-reply="true"]):not([data-stack-under]) > .reply-marker,
   #discord-log li.discord-message[data-who="coder"]:not([data-is-reply="true"]):not([data-stack-under]) > .reply-marker {
     left: calc(-1px - var(--reply-marker-target) / 2);
@@ -7536,14 +7543,16 @@ textarea {
  * exactly as they were, and a window narrowed below 1000px falls back to one column by this block
  * ceasing to apply.
  *
- * WHY 1000px. Each column then gets about 490px, which after a row's insets holds about 45
+ * WHY 1000px. Each column then gets about 490px, which after a desk's speaker insets held about 45
  * characters: the narrowest reading width the width setting allows for the page's only column. Any
- * narrower and one of the two would be narrower than the page lets a reader make its one column. At
- * 1280px each holds about 60 characters, and at 1440px about 70, near the default 72.
+ * narrower and one of the two would be narrower than the page lets a reader make its one column.
+ * (Since `#373 two-column-full-width` every row there but the owner's spans its column, so it holds
+ * a little more, and a wider window gives each column more again.)
  *
- * The two columns are the window's two halves, each holding its list in the reading column centred
- * in it, a hairline between them. The width handle goes: the reading width is set in Settings, and
- * a handle at one column's edge would say it sized only that one. The dock, the chips and the line
+ * The two columns are the window's two halves, each holding its list across it (`#373
+ * two-column-full-width`, below; until then, in the reading column centred in it),
+ * a hairline between them. The width handle goes: the reading width is one column's, and a handle at
+ * one column's edge would say it sized only that one. The dock, the chips and the line
  * the pill and the search glass float on follow the left column, which is Main's; the right column
  * has a heading of its own above its list and its own jump to its newest message.
  *
@@ -7662,15 +7671,17 @@ textarea {
     opacity: 0.55;
   }
 
-  /* The chips over the foot of the LEFT list: the left half's centre, as wide as its column. */
+  /* The chips over the foot of the LEFT list: the left half's centre, as wide as its column, which
+     since `#373 two-column-full-width` is the whole half, less the gutter inside each edge. */
   #screen-main[data-columns="two"] > #scroll-tools {
     left: 25%;
-    width: calc(min(var(--reading-width), 50%) - 1.2rem);
+    width: calc(50% - 1.2rem);
   }
 
-  /* The dock spans the pair: from the left column's left edge to the right column's right edge. */
+  /* The dock spans the pair: from the left column's left edge to the right column's right edge, which
+     since `#373 two-column-full-width` are the window's, less the inset the controls always had. */
   body:has(#screen-main[data-columns="two"]:not([hidden])) #dock {
-    --dock-inset: max(0.6rem, calc(25% - var(--reading-width) / 2 + 0.6rem));
+    --dock-inset: 0.6rem;
   }
 
   /* The transient status speaks over the left column, where its chips are, not across the divider. */
@@ -7679,15 +7690,61 @@ textarea {
   }
 
   /* `#261 two-column-connectors`. In two columns the cards stand a little further from the divider than
-     the column's own inset, so that a few of the links' lanes fit in the gap beside their arrowheads. */
+     the column's own inset, so that a few of the links' lanes fit in the gap beside their arrowheads.
+     `#373 two-column-full-width`: 2.5rem, up from 1.25rem, now that Main's rows reach their gutter at
+     every width and the gap is only that: at 1.25rem the first of three lanes lay on the divider's own
+     hairline and read as the divider recoloured. */
   #screen-main[data-columns="two"] .side-cards {
-    margin-inline-start: 1.25rem;
+    margin-inline-start: 2.5rem;
   }
 
   /* `#298 thread-card-header`. ...and so does the card at the top of a thread, level with them: the
      line from its root arrives at its left edge where it arrived at its card's. */
   #screen-main[data-columns="two"] .thread-card-header {
-    margin-inline-start: 1.25rem;
+    margin-inline-start: 2.5rem;
+  }
+
+  /*
+   * `#373 two-column-full-width`. IN TWO COLUMNS A ROW SPANS ITS COLUMN, up to the divider. The owner,
+   * 2026-10-19: "I asked a while ago for full-width messages from the coding agent in two-column mode.
+   * Why don't I have this? In this screenshot it shows wasted space." Each column held its list to the
+   * one-column reading width, centred in its half, and the desk's speaker insets cut the agent's tile
+   * shorter again, so on a 2000px desk the agent's long reply stopped about 160px short of the divider,
+   * in a strip holding nothing but the search glass. Two columns are the reader's choice of a wider
+   * view, and a half of a desk is already a column, so its rows take all of it.
+   *
+   * So in two columns the lists, the right column's heading and the line saying how old its rows are,
+   * and the line the pill and the glass float on, span their halves; and every row but the owner's
+   * spans its column, the agent's long tiles and other people's alike. The owner's own rows keep their
+   * partial width, set in from the left, as on a phone, where the owner's row is the one inset and the
+   * agent's tile takes the whole width. The owner, correcting the first version of this: "MY messages
+   * are still partial width to make them visually distinct. The agents usually-long messages are full
+   * column. That's how we previously did it on narrow phone columns." The inset is the desk's own,
+   * `min(15%, 6rem)`, which in a half of a desk is its 6rem: a phone's 1.5rem would not tell a row
+   * 900px wide from its neighbours.
+   * The glass stays on the line over the head of the left list, at its right end, by the divider: the
+   * list starts below that line (`#324 live-pill-covers-row`), so it covers no row and reserves no strip
+   * beside them. One column, the thread list across the window, and a phone are untouched: none of this
+   * applies outside two columns, so a single column keeps its reading width.
+   */
+  #screen-main[data-columns="two"] {
+    --desk-third-inset: 0px;
+    --desk-agent-inset: 0px;
+  }
+
+  #screen-main[data-columns="two"] #pane-discord,
+  #screen-main[data-columns="two"] > #connection-banner,
+  #screen-main[data-columns="two"] > #channel-freshness-anchor,
+  #screen-main[data-columns="two"] #side-heading,
+  #screen-main[data-columns="two"] #side-freshness,
+  #screen-main[data-columns="two"] #side-list,
+  #screen-main[data-columns="two"] #side-pane {
+    max-width: none;
+  }
+
+  /* The right column's jump over its foot, as wide as its column as the left one's chips are. */
+  #screen-main[data-columns="two"] #side-tools {
+    width: calc(100% - 1.2rem);
   }
 
   /*
@@ -7697,7 +7754,7 @@ textarea {
    * of the column's grid, so the list above it is shorter by the box and nothing else about either
    * column changes: neither is covered, and the top of the list stays where it was. Tinted as the
    * reply screen is, the one thing that says "this is Reply", with the hairline the lists' other
-   * edges have. The box is held to the column's reading width, as on the reply screen (above).
+   * edges have. The box spans the column, as its rows do (`#373 two-column-full-width`, below).
    */
   #screen-main[data-columns="two"] > #column-reply {
     display: block;
@@ -7715,6 +7772,12 @@ textarea {
     padding: 0.6rem 0 0.75rem;
     border-top: 1px solid var(--edge);
     background: var(--reply-tint);
+  }
+
+  /* `#373 two-column-full-width`. ...and as wide as its column's rows, less the gutter inside each edge. */
+  #column-reply .reply-compose,
+  #side-reply .reply-compose {
+    width: calc(100% - 1.5rem);
   }
 
   /* The box a reply is written in, dragged taller or in a short window, never takes the list over it

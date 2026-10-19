@@ -8275,6 +8275,34 @@ pixels drawn, at 1280x800 and on a 412x915 phone, and `tests/thread_card_header_
 the top of a thread, its move up frame by frame, its line and its glide, at 1280x800 in both schemes and
 with reduced motion, and across the window from the thread list at 1280x800 and on a 412x915 phone.
 
+**In two columns every row but the owner's spans its column** (`#373 two-column-full-width`). The
+owner, 2026-10-19: "I asked a while ago for full-width messages from the coding agent in two-column
+mode. Why don't I have this? In this screenshot it shows wasted space." Each column used to hold its
+list to the one-column reading width, centred in its half, and the desk's speaker insets cut the
+agent's tile shorter again, so on a 2000px desk the agent's long reply stopped about 160px short of
+the divider, in a strip holding only the search glass. Now, in two columns only, both lists, the right
+column's heading and its line saying how old its rows are, and the line the freshness pill and the
+glass float on span their halves, and the agent's tiles and other people's rows span their column up
+to the list's gutter by the divider. The owner's own rows keep their partial width, set in from the
+left by the desk's inset (6rem in a half of a desk), as the phone does it: there the owner's row is
+the one inset and the agent's tile takes the whole width. The owner, correcting the first version:
+"MY messages are still partial width to make them visually distinct. The agents usually-long messages
+are full column. That's how we previously did it on narrow phone columns." The agent's and a third
+party's desk insets are read through `--desk-agent-inset` and `--desk-third-inset`, whose fallbacks
+are the desk's own numbers and which only two columns set. The glass stays at the left column's top
+right, by the divider, on the line over the head of the list, which starts below it, so it covers no
+row and keeps no strip. The chips over the left list, the right column's jump, a reply's box in a
+column, the connection notice and the dock follow the wider columns, and the cards stand 2.5rem from
+the divider, up from 1.25rem, so the links' lanes keep off the divider's hairline in the narrower gap.
+One column, the thread list across the window and a phone are unchanged, and one column keeps its
+reading width. The page suite pins the rules, with negative controls for an owner's row taken across
+the column, and `make desktop-layout-browser` checks it in Chromium at 1920x1080 and 2560x1080 over
+the agent's long replies and the owner's answer with an empty thread list (every row of Main but the
+owner's across its column to the gutter, the owner's set in at least 64px, the agent's tiles wider
+than one column's reading width, the glass over no row, the right column's heading and empty line
+across it, one column still at its reading width), and at 1920x1080 with a thread open on the right,
+its rows across that column.
+
 In All, every row of a thread somebody has answered carries a `.thread-strip` button on its left edge
 (`#299 all-thread-strip`): a bar in the thread's colour, five pixels wide (six under a finger) in a hit
 area of 16 (22), over a lane every row of All keeps so that a strip arriving with a first reply moves
