@@ -1,12 +1,13 @@
 ---
 title: 'settings-polish: follow-ups from the Settings batch (#345-#349) review'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-19T01:49:17.542496075+00:00
-updated_at: 2026-10-19T01:49:17.542496075+00:00
+updated_at: 2026-10-19T02:24:08.425738785+00:00
+closed_at: 2026-10-19T02:24:08.425738675+00:00
 ---
 
 # Description
