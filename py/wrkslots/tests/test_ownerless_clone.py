@@ -1459,7 +1459,11 @@ def test_a_clone_with_an_initialised_submodule_and_worktree_config_is_ready(
 ) -> None:
     project, remote, clone = make_clone(tmp_path)
     sub_remote = tmp_path / "sub.git"
-    subprocess.run(["git", "init", "-q", "--bare", str(sub_remote)], check=True)
+    # Born on main whatever init.defaultBranch says: only main is pushed, and a remote whose HEAD
+    # names an unborn branch gives the submodule nothing to check out.
+    subprocess.run(
+        ["git", "init", "-q", "--bare", "--initial-branch=main", str(sub_remote)], check=True
+    )
     sub_source = tmp_path / "sub-source"
     subprocess.run(["git", "clone", "-q", str(sub_remote), str(sub_source)], check=True,
                    capture_output=True)
@@ -1498,7 +1502,11 @@ def test_a_submodule_initialised_in_a_linked_worktree_is_ready(
 ) -> None:
     project, remote, clone = make_clone(tmp_path)
     sub_remote = tmp_path / "sub.git"
-    subprocess.run(["git", "init", "-q", "--bare", str(sub_remote)], check=True)
+    # Born on main whatever init.defaultBranch says: only main is pushed, and a remote whose HEAD
+    # names an unborn branch gives the submodule nothing to check out.
+    subprocess.run(
+        ["git", "init", "-q", "--bare", "--initial-branch=main", str(sub_remote)], check=True
+    )
     sub_source = tmp_path / "sub-source"
     subprocess.run(["git", "clone", "-q", str(sub_remote), str(sub_source)], check=True,
                    capture_output=True)
