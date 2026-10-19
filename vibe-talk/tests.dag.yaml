@@ -558,6 +558,25 @@ steps:
       resources: {browser: 1}
       est_duration_s: 12
       classification: latency-bound
+
+  # `#355 provider-grouped-channels` in the browser engine at 1280x800 and a 375x812 phone: with two chat
+  # services the bar's channel picker holds one <optgroup> per service in configuration order, Alt+Down
+  # and Alt+Up through CDP step across the groups in the order shown, a reload restores the channel
+  # inside its group, Ctrl+K and a choice read it, and on the phone the picker stays inside the window.
+  # The fake-DOM suite's <select> is a plain object, so only this proves a real picker's groups.
+  # Measured on 2026-10-19 outside dagrun on a host at load 296: about 3s wall, 1.7s CPU.
+  - group: check
+    job: provider-groups-browser
+    desc: the bar's channel picker grouped by chat service, stepped with Alt+Down/Up through CDP and restored after a reload, in current Chromium at 1280x800 and 375x812
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/provider_groups_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 6
+      classification: latency-bound
       rss_baseline_bytes: 1073741824
 
   # `#229 desktop-two-column` in the browser engine: the layout button draws Main and the right column

@@ -9693,8 +9693,10 @@ function stepChannel(event) {
   if (!channelOnScreen()) return false;
   const picker = el("discord-channel");
   if (picker.hidden || picker.disabled) return false;
-  const at = knownChannels.findIndex((channel) => String(channel.id) === String(picker.value));
-  const next = at < 0 ? null : knownChannels[at + (event.key === "ArrowDown" ? 1 : -1)];
+  // In the order shown, across service groups. `#355 provider-grouped-channels`.
+  const order = channelsInPickerOrder();
+  const at = order.findIndex((channel) => String(channel.id) === String(picker.value));
+  const next = at < 0 ? null : order[at + (event.key === "ArrowDown" ? 1 : -1)];
   // At either end the list stops, rather than wrapping round to a channel at the other end.
   if (!next) return true;
   picker.value = String(next.id);
@@ -41307,12 +41309,14 @@ function settleReplays(read, page) {
 // near `startCapture`. They are declared once now, where the long note about the send path already
 // lived; the relay below calls exactly the same function it was already getting.
 
-/** The label the channel select shows for a snowflake, or the snowflake itself. */
+/**
+ * The name the channel picker shows for a snowflake, or the snowflake itself for one no longer on
+ * the list (an outbox entry may outlive its channel). From the list, not the picker's children:
+ * those are service groups once there are several. `#355 provider-grouped-channels`.
+ */
 function channelLabel(channelId) {
-  const option = /** @type {HTMLOptionElement[]} */ ([...el("discord-channel").children]).find(
-    (child) => child.value === String(channelId)
-  );
-  return option ? option.textContent : String(channelId);
+  const channel = knownChannel(channelId);
+  return channel ? channelName(channel) : String(channelId);
 }
 
 /**
@@ -42055,6 +42059,64 @@ function providerOfChannel(id) {
   return (key && providerDescriptions.get(key)) || null;
 }
 
+// --- channels grouped by service -----------------------------------------------------------------
+//
+// `#355 provider-grouped-channels`. One server may read several chat services, and a flat list of
+// their channels hides which is which: two called "general" are one name. So a channel picker
+// groups its channels under a header per service, in the order the server configures them, once
+// two or more services have channels. With one, or with a server that describes no services, the
+// list is exactly the flat one it always was. The closed picker shows the channel's name alone;
+// the open list carries the headers, so the bar keeps its width on a phone.
+
+/** The header a group shows: the service's name, with its key where two services share it. */
+function serviceLabel(key) {
+  const described = providerDescriptions.get(key);
+  const name = described && typeof described.name === "string" && described.name.trim()
+    ? described.name.trim()
+    : String(key);
+  const shared = [...providerDescriptions.values()].filter(
+    (other) => other !== described && typeof other.name === "string" && other.name.trim() === name
+  ).length > 0;
+  return shared ? `${name} (${key})` : name;
+}
+
+/** The header of the group of channels whose service this server no longer describes. */
+const UNDESCRIBED_SERVICE = "Not connected";
+
+/**
+ * `channels` by service: one group per described service that has channels, in the server's
+ * order, then the channels of no described service (an added channel whose bridge is no longer
+ * configured), never dropped.
+ *
+ * @returns {{provider: string | null, label: string, channels: any[]}[]}
+ */
+function channelGroups(channels = knownChannels) {
+  const groups = [...providerDescriptions.keys()].map((key) => ({
+    provider: /** @type {string | null} */ (key),
+    label: serviceLabel(key),
+    channels: channels.filter((channel) => channel.provider === key),
+  }));
+  const rest = channels.filter(
+    (channel) => typeof channel.provider !== "string" || !providerDescriptions.has(channel.provider)
+  );
+  groups.push({ provider: null, label: UNDESCRIBED_SERVICE, channels: rest });
+  return groups.filter((group) => group.channels.length > 0);
+}
+
+/** Whether the pickers show service groups: two or more services have channels. */
+function channelsGrouped() {
+  return channelGroups().length >= 2;
+}
+
+/**
+ * The channels in the order the bar's picker shows them: grouped by service when it is, else the
+ * server's own order. Alt+↑ and Alt+↓ step through this order, and a picker with nothing to keep
+ * opens on its first.
+ */
+function channelsInPickerOrder() {
+  return channelsGrouped() ? channelGroups().flatMap((group) => group.channels) : knownChannels;
+}
+
 /**
  * Act on the selected channel's own provider: its threads, its read cursor, its live delivery.
  *
@@ -42172,18 +42234,32 @@ function fillChannelSelect(id) {
     option.textContent = "All channels";
     select.append(option);
   }
-  for (const channel of knownChannels) {
+  const optionFor = (channel) => {
     const option = document.createElement("option");
     option.value = channel.id;
     option.textContent = channelName(channel);
-    select.append(option);
+    return option;
+  };
+  // `#355 provider-grouped-channels`. The bar's picker groups its channels by service once two or
+  // more have channels; each group is an <optgroup>, so the open list has a header per service.
+  const grouped = id === "discord-channel" && channelsGrouped();
+  if (grouped) {
+    for (const group of channelGroups()) {
+      const header = document.createElement("optgroup");
+      header.label = group.label;
+      header.append(...group.channels.map(optionFor));
+      select.append(header);
+    }
+  } else {
+    for (const channel of knownChannels) select.append(optionFor(channel));
   }
+  const order = grouped ? channelsInPickerOrder() : knownChannels;
   if (all && chosen === ALL_CHANNELS) {
     select.value = ALL_CHANNELS;
   } else if (knownChannels.some((channel) => String(channel.id) === String(chosen))) {
     select.value = chosen;
-  } else if (knownChannels.length > 0) {
-    select.value = knownChannels[0].id;
+  } else if (order.length > 0) {
+    select.value = order[0].id;
   } else {
     select.value = "";
   }

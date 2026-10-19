@@ -39461,6 +39461,11 @@ test("where no provider promises one post per key, a lost send waits for the rea
   multi.replyResponse = errorResponse(502, "chat_error", SLOW_SEND);
   await signIn(multi);
   await showDiscord(multi, []);
+  // `#355 provider-grouped-channels`: the picker opens on the first channel it shows, which is Example
+  // Chat's, the service configured first; the team is chosen as a reader would.
+  multi.el("discord-channel").value = team.id;
+  await multi.el("discord-channel").dispatch("change");
+  await multi.settle();
   await sendChannel(multi, "to the team");
   multi.el("discord-channel").value = space.id;
   await multi.el("discord-channel").dispatch("change");
@@ -70327,4 +70332,116 @@ test("`#337 voice-relay-silent`: on the hosted protocol a relayed turn the agent
   await passTime(page, 2000 + 2 * RELAY_RECHECK_MS);
   assert.equal(relayed(page).length, 2, `an unanswered relayed turn held the rest past ${wait} ms`);
   assert.match(page.el("settings-detail").textContent, /a relayed turn drew no answer in \d+ s; the next was read out anyway/);
+});
+
+// --- `#355 provider-grouped-channels` ----------------------------------------------------------
+
+/** A chat service as client-config describes one. */
+const serviceOf = (key, name, more = {}) => ({ key, name, threading_supported: false, live_delivery: "poll",
+  live_poll_seconds: 30, channel_registration_supported: false, channel_discovery_supported: false,
+  upstream_read_mark_supported: false, self_author_id: null, owner_author_id: null, ...more });
+const SPACE_A = { id: "1110000000000000401", label: "space a", writable: true, alias: null, added: false, provider: "gchat" };
+const SPACE_B = { id: "1110000000000000402", label: "space b", writable: true, alias: null, added: false, provider: "gchat" };
+const TEAM_A = { id: "C0400AAAAA", label: "team a", writable: true, alias: null, added: false, provider: "slack" };
+const TEAM_B = { id: "C0400BBBBB", label: "team b", writable: true, alias: null, added: false, provider: "slack" };
+/** Two services, Slack configured first, and their channels as a server might interleave them. */
+const twoServices = (page) => {
+  page.channels = [{ ...SPACE_A }, { ...TEAM_A }, { ...SPACE_B }, { ...TEAM_B }];
+  page.providers = [serviceOf("slack", "Slack"), serviceOf("gchat", "Google Chat")];
+};
+
+/** What a channel picker holds: each service header with its channels' ids, or bare ids. */
+function pickerShape(page, id = "discord-channel") {
+  return page.el(id).children.map((child) => String(child.tagName).toLowerCase() === "optgroup"
+    ? { group: child.label, channels: child.children.map((option) => String(option.value)) }
+    : String(child.value));
+}
+
+test("`#355 provider-grouped-channels`: with two services, the bar's picker groups its channels under a header per service, in the server's order, and a cold start draws them before client-config answers", async () => {
+  const page = newPage();
+  twoServices(page);
+  await signIn(page);
+  const grouped = [
+    { group: "Slack", channels: [TEAM_A.id, TEAM_B.id] },
+    { group: "Google Chat", channels: [SPACE_A.id, SPACE_B.id] },
+  ];
+  assert.deepStrictEqual(pickerShape(page), grouped, "the bar's picker was not grouped by service in configuration order");
+  assert.equal(String(page.el("discord-channel").value), TEAM_A.id,
+    "with nothing stored, the picker opened on the server's first channel rather than the first one shown");
+  // The closed picker shows a channel's name alone; the header is the open list's.
+  const option = page.el("discord-channel").children[1].children[0];
+  assert.equal(option.textContent, "space a");
+  // Names still come from the list, now that the picker holds groups. An id no longer listed (an
+  // outbox entry may outlive its channel) is named by its id, as always.
+  const channelLabel = page.pure("channelLabel");
+  assert.equal(channelLabel(SPACE_B.id), "space b", "a channel inside a group lost its name");
+  assert.equal(channelLabel("1110000000000000999"), "1110000000000000999");
+
+  page.el("discord-channel").value = SPACE_B.id;
+  await page.el("discord-channel").dispatch("change");
+  await page.settle();
+  // A RELOAD over the same storage: the saved shell draws the groups before client-config answers.
+  const reloaded = newPage(page.storage, SCRIPT, (next) => twoServices(next));
+  assert.deepStrictEqual(pickerShape(reloaded), grouped, "a cold start drew the picker flat");
+  assert.equal(String(reloaded.el("discord-channel").value), SPACE_B.id, "the stored channel was not restored inside its group");
+  await reloaded.settle();
+  assert.deepStrictEqual(pickerShape(reloaded), grouped);
+  assert.equal(String(reloaded.el("discord-channel").value), SPACE_B.id);
+});
+
+test("`#355 provider-grouped-channels`: no headers while only one service has channels", async () => {
+  for (const [label, arrange] of [
+    ["one service", (page) => {
+      page.channels = [{ ...TEAM_A }, { ...TEAM_B }];
+      page.providers = [serviceOf("slack", "Slack")];
+    }],
+    ["two services, channels in one", (page) => {
+      page.channels = [{ ...TEAM_A }, { ...TEAM_B }];
+      page.providers = [serviceOf("slack", "Slack"), serviceOf("gchat", "Google Chat")];
+    }],
+    ["a server that describes no services", (page) => {
+      page.channels = [{ ...TEAM_A }, { ...SPACE_A }];
+    }],
+  ]) {
+    const page = newPage();
+    arrange(page);
+    await signIn(page);
+    assert.deepStrictEqual(pickerShape(page), page.channels.map((channel) => channel.id), `${label}: headers drawn`);
+    assert.equal(String(page.el("discord-channel").value), page.channels[0].id, label);
+  }
+});
+
+test("`#355 provider-grouped-channels`: services sharing a name are told apart by key, and channels of no described service come last, not dropped", async () => {
+  const page = newPage();
+  const home = { id: "C0500HOMEA", label: "home team", writable: true, alias: null, added: false, provider: "home" };
+  const stray = { id: "1110000000000000403", label: "old bridge room", writable: false, alias: null, added: true, provider: "gone" };
+  page.channels = [{ ...stray }, { ...home }, { ...TEAM_A }];
+  page.providers = [serviceOf("slack", "Slack"), serviceOf("home", "Slack")];
+  await signIn(page);
+  assert.deepStrictEqual(pickerShape(page), [
+    { group: "Slack (slack)", channels: [TEAM_A.id] },
+    { group: "Slack (home)", channels: [home.id] },
+    { group: "Not connected", channels: [stray.id] },
+  ]);
+});
+
+test("`#355 provider-grouped-channels`: Alt+↓ and Alt+↑ step through the channels in the order the grouped picker shows, across groups", async () => {
+  const page = newPage();
+  twoServices(page);
+  await signIn(page);
+  await showDiscord(page, tallChannel(5));
+  const picker = page.el("discord-channel");
+  assert.equal(String(picker.value), TEAM_A.id);
+  const step = async (key) => {
+    await press(page, focused(page) || page.el("scroll-area"), key, { altKey: true });
+    await page.settle();
+    return String(picker.value);
+  };
+  assert.equal(await step("ArrowDown"), TEAM_B.id);
+  // The server lists Slack's last channel last; the picker shows Google Chat's after it.
+  assert.equal(await step("ArrowDown"), SPACE_A.id, "Alt+↓ stopped at the last channel of the first group, in the server's order");
+  assert.equal(await step("ArrowDown"), SPACE_B.id);
+  assert.equal(await step("ArrowDown"), SPACE_B.id, "Alt+↓ at the last channel shown did not stop");
+  assert.equal(await step("ArrowUp"), SPACE_A.id);
+  assert.equal(await step("ArrowUp"), TEAM_B.id, "Alt+↑ did not cross back into the first group");
 });

@@ -2298,6 +2298,12 @@ How a deployment with several providers behaves:
   lists every provider (`providers`) and each channel's `provider` key. A channel read through a
   provider without threads is shown as a flat history even when another provider has threads.
   The top-level capability flags mean "at least one provider can".
+* **The channel picker groups channels by service** (`#355 provider-grouped-channels`) once two or
+  more services have channels: one header per service, in the order the `[[providers]]` entries are
+  written, and a last "Not connected" group for a channel whose provider is no longer configured.
+  The closed picker shows the channel's name; the open list shows the headers. Alt+Up and Alt+Down
+  step through the channels in the order shown, across groups. Where two services share a name, the
+  header adds the key (`Slack (work)`). With one service the list is flat, as before.
 * **Adding a channel from the app** asks each provider whether it recognises the pasted link. A
   provider that is certain wins (Slack recognises its own links and conversation ids). Otherwise,
   the only registration-managing bridge that might accept it is used. Otherwise the app asks you to
