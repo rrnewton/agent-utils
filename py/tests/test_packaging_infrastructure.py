@@ -914,9 +914,14 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # test_lifecycle.py collects from foreign_mount_ns_cases.py (three repairs of
     # one moved checkout, a removal and a rolled-back fence beside an emptied
     # sibling), are mapped.
-    assert len(all_tests) == 2040
-    assert len(ordinary) == 336
-    assert len(mapped) == 1704
+    # Its 29 loop-identity cases there (image identity, unmount, grow and
+    # remount decisions against a fake /sys and udev, the census of copied
+    # mounts and stale attachments, the root helper's reuse decisions, stray
+    # Git pointers and the discard flag) are mapped, except the one real
+    # second mount through sudo -n, which is ordinary.
+    assert len(all_tests) == 2069
+    assert len(ordinary) == 337
+    assert len(mapped) == 1732
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
@@ -983,6 +988,7 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
         "test_host_context_recover_rejects_invalid_handoff_before_mutation",
         "test_lock_conflict_refuses_without_state_change",
         "test_lock_conflict_under_json_format_prints_a_json_refusal",
+        "test_mounting_an_attached_image_again_reuses_its_loop_device",
         "test_ownerless_validate_batch_removes_terminal_frozen_checkout",
         "test_process_entering_after_final_scan_before_path_move_is_not_deleted",
         "test_process_path_census_reports_a_live_user_while_unrelated_processes_exit_during_it",

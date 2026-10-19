@@ -3859,10 +3859,25 @@ def _parse_sandbox_settings(raw: Mapping[str, object]) -> sandbox.SandboxSetting
         raise StateError(str(exc)) from exc
 
 
-#: Mount points and sources that are this project's own slot-image mounts. The
-#: process-use census ignores exactly these mount lines: a slot's own storage is
-#: not evidence that anything is using the slot.
+#: ``(mount point, MAJOR:MINOR)`` of this project's own slot-image mounts. The
+#: process-use census ignores exactly the mount lines with that device, mount
+#: root ``/`` and mount point, in any process's table: a slot's own storage, or
+#: a copy of that same mount another mount namespace keeps, is not evidence
+#: that anything is using the slot. Every process-level check (working
+#: directory, root, descriptors, mappings, owner cgroup) still runs.
 _OWNED_REPRESENTATION_MOUNTS: frozenset[tuple[Path, str]] = frozenset()
+#: ``(mount point, MAJOR:MINOR, /dev/loopN)`` of every second attachment of a
+#: doubly attached image: an independent, stale file system on the same image
+#: file. The census reports such a line as use, naming it, unless this command
+#: was told to discard that copy (``_DISCARDING_STALE_COPIES``).
+_STALE_REPRESENTATION_MOUNTS: frozenset[tuple[Path, str, str]] = frozenset()
+#: Mount points whose stale image copies this one command may discard: set
+#: only by a single-slot ``remove --discard-stale-image-copy`` (or the
+#: ``recover`` of one) for that slot.
+_DISCARDING_STALE_COPIES: frozenset[Path] = frozenset()
+#: How the census marks a stale copy in a mount reference, so the refusal says
+#: what it is rather than only ``mount=``.
+_STALE_COPY_MARK = " [stale-image-copy="
 
 
 def _activate_representation(config: Config) -> None:
@@ -3870,36 +3885,66 @@ def _activate_representation(config: Config) -> None:
 
     Runs whenever a configuration is loaded, so that after a reboot (or a crash
     between unmount and remount during relocation) every image-backed slot is
-    back at its recorded location before any lifecycle logic inspects it.
+    back at its recorded location before any lifecycle logic inspects it. A
+    slot that cannot be mounted does not stop the others; each is named.
     """
 
-    global _OWNED_REPRESENTATION_MOUNTS
+    global _OWNED_REPRESENTATION_MOUNTS, _STALE_REPRESENTATION_MOUNTS
     slotimage.register_layout(
         config.control, lambda slot_type, slot: _slot_directory(config, slot, slot_type)
     )
     if not slotimage.images_root(config.control).exists():
         _OWNED_REPRESENTATION_MOUNTS = frozenset()
+        _STALE_REPRESENTATION_MOUNTS = frozenset()
         return
     try:
-        for action in slotimage.ensure_all_mounted(config.control):
-            print(f"wrkslots: {action}", file=sys.stderr)
+        actions, failures = slotimage.ensure_all_mounted(config.control)
     except slotimage.ImageError as exc:
-        print(f"wrkslots: WARNING: slot image not mounted: {exc}", file=sys.stderr)
-    _OWNED_REPRESENTATION_MOUNTS = slotimage.owned_mounts(config.control)
+        actions, failures = [], [str(exc)]
+    for action in actions:
+        print(f"wrkslots: {action}", file=sys.stderr)
+    for failure in failures:
+        print(f"wrkslots: WARNING: slot image not mounted: {failure}", file=sys.stderr)
+    _refresh_owned_mounts(config)
+
+
+def _mountinfo_line_key(line: str) -> tuple[Path, str, str] | None:
+    """``(mount point, MAJOR:MINOR, mount root)`` of one mountinfo line, or None."""
+
+    left, separator, _right = line.partition(" - ")
+    if not separator:
+        return None
+    left_fields = left.split()
+    if len(left_fields) < 5:
+        return None
+    return _mountinfo_path(left_fields[4]), left_fields[2], str(_mountinfo_path(left_fields[3]))
 
 
 def _owned_mount_line(line: str) -> bool:
     if not _OWNED_REPRESENTATION_MOUNTS:
         return False
-    left, separator, right = line.partition(" - ")
-    if not separator:
-        return False
-    left_fields = left.split()
-    right_fields = right.split()
-    if len(left_fields) < 5 or len(right_fields) < 2:
-        return False
-    key = (_mountinfo_path(left_fields[4]), str(_mountinfo_path(right_fields[1])))
-    return key in _OWNED_REPRESENTATION_MOUNTS
+    key = _mountinfo_line_key(line)
+    # A bind of a subdirectory of the image (mount root other than "/") is not
+    # the slot's own mount, whatever device it shows.
+    return key is not None and key[2] == "/" and (key[0], key[1]) in _OWNED_REPRESENTATION_MOUNTS
+
+
+def _stale_mount_note(line: str) -> str | None:
+    """The census note for a stale second attachment of a slot's image, or None."""
+
+    if not _STALE_REPRESENTATION_MOUNTS:
+        return None
+    key = _mountinfo_line_key(line)
+    if key is None or key[2] != "/":
+        return None
+    for point, device, name in _STALE_REPRESENTATION_MOUNTS:
+        if (point, device) == (key[0], key[1]):
+            return (
+                f"{_STALE_COPY_MARK.strip()}{name}: a second, independent attachment of "
+                "this slot's own image, which salvage cannot read; see remove "
+                "--discard-stale-image-copy]"
+            )
+    return None
 
 
 #: Control-directory entries that hold slot storage rather than being slots:
@@ -3927,8 +3972,17 @@ def _slot_image_at(config: Config, path: Path) -> slotimage.SlotImage | None:
 
 
 def _refresh_owned_mounts(config: Config) -> None:
-    global _OWNED_REPRESENTATION_MOUNTS
-    _OWNED_REPRESENTATION_MOUNTS = slotimage.owned_mounts(config.control)
+    global _OWNED_REPRESENTATION_MOUNTS, _STALE_REPRESENTATION_MOUNTS
+    owned, stale = slotimage.owned_mounts(config.control)
+    discarded = {
+        (point, device)
+        for point, device, _name in stale
+        if point in _DISCARDING_STALE_COPIES
+    }
+    _OWNED_REPRESENTATION_MOUNTS = owned | frozenset(discarded)
+    _STALE_REPRESENTATION_MOUNTS = frozenset(
+        item for item in stale if (item[0], item[1]) not in discarded
+    )
 
 
 def _rename_slot_path(config: Config, source: Path, destination: Path) -> None:
@@ -8450,7 +8504,28 @@ def _registry_storage_inconsistencies(
         slot_present = slot_path.exists() or slot_path.is_symlink()
         slot_safe = slot_path.is_dir() and not slot_path.is_symlink()
         slot_inspectable = slot_safe
-        if not slot_safe:
+        unmounted = (
+            _unmounted_slot_image(config, record.slot, record.slot_type, slot_path)
+            if slot_safe
+            else None
+        )
+        if unmounted is not None:
+            # Row-scoped like every finding here: it refuses a command naming
+            # this slot and is only reported for others. No Git inspection runs
+            # against the empty mount point, so it is not misreported as a
+            # Git mismatch.
+            slot_inspectable = False
+            note(
+                "image-not-mounted",
+                "row",
+                unmounted,
+                "run 'wrkslots image mount' and resolve what it reports; do not repair Git "
+                "registrations while the image is not mounted",
+                slot=record.slot,
+                slot_type=record.slot_type,
+                machine=record.machine,
+            )
+        elif not slot_safe:
             kind = "unsafe-slot-directory" if slot_present else "row-without-directory"
             detail = (
                 f"active row points at an unsafe slot path {slot_path}"
@@ -18514,6 +18589,7 @@ def _parse_mountinfo_paths(
     for line in text.splitlines():
         if _owned_mount_line(line):
             continue
+        stale_note = _stale_mount_note(line)
         left, separator, right = line.partition(" - ")
         if not separator:
             raise Refusal(f"{label} is malformed")
@@ -18530,7 +18606,9 @@ def _parse_mountinfo_paths(
                 .removesuffix(" (deleted)")
             )
             if candidate.is_absolute():
-                references.append((candidate, raw))
+                references.append(
+                    (candidate, raw if stale_note is None or raw != left_fields[4] else f"{raw} {stale_note}")
+                )
     parsed = tuple(references)
     if cache is not None:
         cache[text] = parsed
@@ -18554,9 +18632,10 @@ def _read_process_mountinfo(pid_dir: Path) -> str | None:
 
 
 def _mountinfo_uses_slot(mountinfo: str, slot_path: Path, label: str) -> tuple[str, ...]:
-    for candidate, _raw in _parse_mountinfo_paths(mountinfo, label):
+    for candidate, raw in _parse_mountinfo_paths(mountinfo, label):
         if _path_is_within(candidate, slot_path):
-            return (f"mount={candidate}",)
+            mark = raw.find(_STALE_COPY_MARK)
+            return (f"mount={candidate}" + ("" if mark < 0 else raw[mark:]),)
     return ()
 
 
@@ -22671,6 +22750,9 @@ def _assert_slot_contents_values(
         if _path_is_absent(slot_path):
             raise _SlotDirectoryAbsent(slot_path)
         raise Refusal(f"slot directory is missing or unsafe: {slot_path}")
+    unmounted = _unmounted_slot_image(config, slot, slot_type, slot_path)
+    if unmounted is not None:
+        raise Refusal(unmounted)
     if layout == "flat":
         if len(checkouts) != 1:
             raise StateError(f"slot {slot} does not have exactly one checkout under flat layout")
@@ -22701,6 +22783,37 @@ def _assert_slot_contents_values(
             details.append(f"missing checkouts {', '.join(missing)}")
         raise Refusal(f"slot directory does not match its record: {'; '.join(details)}")
     return slot_path
+
+
+def _unmounted_slot_image(
+    config: Config, slot: str, slot_type: str, slot_path: Path
+) -> str | None:
+    """Why an image-backed slot's image is not mounted at ``slot_path``, or None.
+
+    ⚠️ AN UNMOUNTED IMAGE'S MOUNT POINT IS AN EMPTY DIRECTORY INSIDE THE
+    PROJECT. Git run there resolves to the enclosing repository, so every Git
+    check reports a mismatch, salvage would read a worktree with every file
+    deleted, and a Git repair would write into the mount point and make the
+    image unmountable. Nothing that inspects or changes the checkout may run
+    until the image is mounted again.
+    """
+
+    try:
+        image = slotimage.load(config.control, slot_type, slot)
+    except slotimage.ImageError as exc:
+        return f"cannot read the slot image record of {slot}: {exc}"
+    if image is None or image.phase != "ready":
+        return None
+    if Path(os.path.abspath(image.location)) != Path(os.path.abspath(slot_path)):
+        return None
+    state, detail = slotimage.mount_state(image.slot_image, image.location)
+    if state in ("kernel", "fuse"):
+        return None
+    return (
+        f"slot image {image.slot_image} is not mounted at {slot_path} ({detail}); no Git check, "
+        "salvage or repair runs against an unmounted image's mount point. remedy: run "
+        "'wrkslots image mount' and resolve what it reports"
+    )
 
 
 def _uncommitted_handoff_paths(
@@ -23090,6 +23203,175 @@ def _recorded_attested_stop(
                 ),
             )
     return found
+
+
+# Discarding a stale second attachment of a slot's image (#350
+# wrkslots-foreign-mount-ns).
+#
+# Before wrkslots stopped attaching an image twice, remounting a slot whose
+# mount another mount namespace still held put a second, independent ext4 file
+# system on the same image file. Salvage reads only the host's own file
+# system; the stale copy is invisible to it and to lsof, and when it is
+# released it writes its old metadata back into the image. Such a slot is
+# never removed silently. One explicit remove may discard the stale copy, on
+# the coordinator's authority, after every process whose mount table holds it
+# was shown to share this process's root (so the path checks of the census
+# see any use of it). The basis is recorded before salvage, as an active-state
+# action, so recovery can resume exactly that removal.
+STALE_COPY_DISCARD_ACTION = "stale-image-copy-discard-authorized"
+
+
+@dataclasses.dataclass(frozen=True)
+class _StaleCopyHolders:
+    """Processes whose mount tables hold one stale device, grouped by mount namespace."""
+
+    device: str
+    name: str
+    mount_point: str
+    holder_pids: tuple[int, ...]
+    mount_namespaces: tuple[str, ...]
+    foreign_root_pids: tuple[int, ...]
+
+    def to_obj(self) -> dict[str, object]:
+        return {
+            "device": self.device,
+            "name": self.name,
+            "mount_point": self.mount_point,
+            "attachment": "stale",
+            "holder_pids": list(self.holder_pids),
+            "mount_namespaces": list(self.mount_namespaces),
+        }
+
+
+def _stale_copy_holders(
+    stale: Sequence[tuple[Path, str, str]],
+    *,
+    proc_root: Path = Path("/proc"),
+) -> tuple[_StaleCopyHolders, ...]:
+    """Find every process whose mount table lists one of the ``stale`` devices.
+
+    One table is read per mount namespace (every process of a namespace shares
+    its mounts); the root of every process in a namespace that holds a copy is
+    then compared with this process's root. A process whose namespace or root
+    cannot be read counts as holding a copy under a foreign root, so it refuses.
+    """
+
+    wanted = {device for _point, device, _name in stale}
+    try:
+        own_root = os.stat("/")
+    except OSError as exc:
+        raise Refusal(f"cannot inspect this process's root: {exc}") from exc
+    namespaces: dict[str, list[int]] = {}
+    unreadable: list[int] = []
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            namespace = os.readlink(entry / "ns" / "mnt")
+        except FileNotFoundError:
+            continue
+        except OSError:
+            # Another user's process: its namespace link is unreadable, so its
+            # table is read on its own, as the process-use census does.
+            namespace = f"pid:{entry.name}"
+        namespaces.setdefault(namespace, []).append(int(entry.name))
+    holders: dict[str, tuple[list[int], list[str]]] = {device: ([], []) for device in wanted}
+    foreign: dict[str, list[int]] = {device: [] for device in wanted}
+    for namespace, pids in sorted(namespaces.items()):
+        table: str | None = None
+        denied: list[int] = []
+        for pid in pids:
+            try:
+                table = (proc_root / str(pid) / "mountinfo").read_text(
+                    encoding="utf-8", errors="surrogateescape"
+                )
+                break
+            except OSError as exc:
+                if exc.errno in (errno.ENOENT, errno.ESRCH, errno.EINVAL):
+                    continue  # exited, or a zombie: it holds no mount any more
+                denied.append(pid)
+        if table is None:
+            unreadable.extend(denied)
+            continue
+        listed = {
+            key[1]
+            for key in (_mountinfo_line_key(line) for line in table.splitlines())
+            if key is not None and key[1] in wanted
+        }
+        for device in sorted(listed):
+            holders[device][0].extend(pids)
+            holders[device][1].append(namespace)
+            for pid in pids:
+                try:
+                    root = os.stat(proc_root / str(pid) / "root")
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    foreign[device].append(pid)
+                    continue
+                if (root.st_dev, root.st_ino) != (own_root.st_dev, own_root.st_ino):
+                    foreign[device].append(pid)
+    if unreadable:
+        raise Refusal(
+            "cannot tell whether processes "
+            f"{', '.join(str(pid) for pid in sorted(unreadable)[:8])} hold the stale image "
+            "copy: their mount namespace or mount table is unreadable"
+        )
+    return tuple(
+        _StaleCopyHolders(
+            device=device,
+            name=name,
+            mount_point=str(point),
+            holder_pids=tuple(sorted(holders[device][0])),
+            mount_namespaces=tuple(holders[device][1]),
+            foreign_root_pids=tuple(sorted(foreign[device])),
+        )
+        for point, device, name in sorted(stale)
+    )
+
+
+def _slot_image_files(image: slotimage.SlotImage) -> tuple[tuple[Path, Path], ...]:
+    return ((image.slot_image, image.location), (image.state_image, image.state_mount))
+
+
+def _enable_stale_copy_discard(config: Config, image: slotimage.SlotImage) -> None:
+    """Let this command treat ``image``'s stale attachments as its own storage."""
+
+    global _DISCARDING_STALE_COPIES
+    _DISCARDING_STALE_COPIES = frozenset(
+        Path(os.path.abspath(point)) for _file, point in _slot_image_files(image)
+    )
+    slotimage.DISCARD_STALE_COPIES.clear()
+    slotimage.DISCARD_STALE_COPIES.update(file for file, _point in _slot_image_files(image))
+    _refresh_owned_mounts(config)
+
+
+def _stale_image_copies(
+    config: Config, image: slotimage.SlotImage
+) -> tuple[tuple[Path, str, str], ...]:
+    _owned, stale = slotimage.owned_mounts(config.control)
+    points = {Path(os.path.abspath(point)) for _file, point in _slot_image_files(image)}
+    return tuple(sorted(item for item in stale if item[0] in points))
+
+
+def _recorded_stale_copy_discard(
+    record: ActiveRecord, events: Sequence[Mapping[str, object]]
+) -> bool:
+    """Whether remove durably recorded --discard-stale-image-copy for this generation."""
+
+    for event in events:
+        if event.get("kind") != "active-state-recorded":
+            continue
+        payload = _as_mapping(event["payload"], "active-state-recorded payload")
+        if payload.get("action") != STALE_COPY_DISCARD_ACTION or payload.get("slot") != record.slot:
+            continue
+        evidence = _as_mapping(payload.get("evidence"), "stale image copy evidence")
+        if (
+            evidence.get("generation") == record.generation
+            and evidence.get("coordinator_authorized") is True
+        ):
+            return True
+    return False
 
 
 # Explicit owner release: the live owner gives one agent slot generation back.
@@ -33307,6 +33589,8 @@ def _slot_findings(
                         f"{release.sequence}) no longer applies: {void_reason}",
                     )
 
+    findings.extend(_image_attachment_findings(config))
+
     for path in _outstanding_journals(config):
         note("unfinished-journal", None, None, f"recovery required: {path.name}")
 
@@ -33336,6 +33620,86 @@ def _slot_findings(
             f"{len(mine)} active slot(s) against max_active_slots={cap} "
             f"(excess {len(mine) - cap})",
         )
+    return findings
+
+
+def _image_attachment_findings(config: Config) -> list[dict[str, object]]:
+    """Doctor findings for slot images attached twice or mounted unidentifiably."""
+
+    findings: list[dict[str, object]] = []
+    if not slotimage.images_root(config.control).exists():
+        return findings
+    try:
+        images = slotimage.all_images(config.control)
+        table = slotimage.verification_table()
+    except slotimage.ImageError as exc:
+        return [
+            {
+                "kind": "image-identity-unverifiable",
+                "scope": "operational",
+                "slot": None,
+                "slot_type": None,
+                "machine": config.machine,
+                "checkout": None,
+                "detail": f"cannot read slot image records or the mount table: {exc}",
+                "remedy": "repair the named record; diagnosis alone authorizes no mutation",
+            }
+        ]
+    evidence = slotimage.loop_evidence(table)
+    for image in images:
+        for image_file, mount_point in (
+            (image.slot_image, image.location),
+            (image.state_image, image.state_mount),
+        ):
+            attached = slotimage.image_attachments(
+                image_file, mount_point, table=table, evidence=evidence
+            )
+            if len(attached.devices) > 1:
+                findings.append(
+                    {
+                        "kind": "image-attached-twice",
+                        "scope": "row",
+                        "slot": image.slot,
+                        "slot_type": image.slot_type,
+                        "machine": config.machine,
+                        "checkout": None,
+                        "detail": (
+                            f"{image_file} is attached to "
+                            f"{', '.join(item.label for item in attached.devices)}: two "
+                            "independent file systems on one image file"
+                            + (
+                                ""
+                                if attached.host_device is None
+                                else f"; this host mounts {attached.host_device.label}"
+                            )
+                        ),
+                        "remedy": (
+                            "do not mount, unmount, grow or copy this image; a stale copy "
+                            "held by another mount namespace writes its old metadata back when "
+                            "it is released. To retire the slot, remove it with "
+                            "--coordinator-authorized --discard-stale-image-copy after "
+                            "checking nothing uses the stale copy"
+                        ),
+                    }
+                )
+            state, detail = slotimage.mount_state(image_file, mount_point, table)
+            if state == "unverifiable":
+                findings.append(
+                    {
+                        "kind": "image-identity-unverifiable",
+                        "scope": "row",
+                        "slot": image.slot,
+                        "slot_type": image.slot_type,
+                        "machine": config.machine,
+                        "checkout": None,
+                        "detail": f"{mount_point}: {detail}",
+                        "remedy": (
+                            "every command treats this mount as unknown and refuses to unmount, "
+                            "move or remove it; make udev or the mount itself readable, or "
+                            "unmount it by hand after checking what it is"
+                        ),
+                    }
+                )
     return findings
 
 
@@ -33789,6 +34153,14 @@ def _repair_registration_at_slot(
 ) -> Path:
     _moved, path = _checkout_at_slot(config, record, checkout, slot_path)
     _relative, repository = _stored_repository_path(config, checkout.repository)
+    image = _slot_image_at(config, slot_path)
+    if image is not None and image.phase == "ready":
+        state, detail = slotimage.mount_state(image.slot_image, image.location)
+        if state not in ("kernel", "fuse"):
+            raise Refusal(
+                f"slot image {image.slot_image} is not mounted at {slot_path} ({detail}); "
+                "refusing to repair Git registration through an unmounted image's mount point"
+            )
     vcs.repair_worktree(repository, path)
     _repair_nested_repositories(path, vcs)
     return path
@@ -36234,6 +36606,53 @@ def _cmd_remove_in_scope(
                 "slot; retire-pending, remove-agent-batch and validation removal never "
                 "accept it"
             )
+    discard_stale = bool(getattr(args, "discard_stale_image_copy", False))
+    stale_holders: tuple[_StaleCopyHolders, ...] = ()
+    stale_image: slotimage.SlotImage | None = None
+    if discard_stale:
+        if not args.coordinator_authorized:
+            raise Refusal(
+                "--discard-stale-image-copy is the coordinator's decision and requires "
+                "--coordinator-authorized. state: REFUSED -- no checkout was salvaged or removed"
+            )
+        if (
+            agent_batch is not None
+            or private_cleanup is not None
+            or validation_removal_proof is not None
+            or bool(args.validate_complete)
+            or proof_manifest is not None
+            or getattr(args, "_retirement_candidate", None) is not None
+        ):
+            raise Refusal(
+                "--discard-stale-image-copy applies only to one explicit remove of an "
+                "image-backed agent slot"
+            )
+        try:
+            stale_image = slotimage.load(config.control, "agent", args.slot)
+        except slotimage.ImageError as exc:
+            raise Refusal(f"cannot read the slot image record of {args.slot}: {exc}") from exc
+        if stale_image is None:
+            raise Refusal(
+                f"--discard-stale-image-copy: agent slot {args.slot} is not image-backed. "
+                "state: REFUSED -- no checkout was salvaged or removed"
+            )
+        stale = _stale_image_copies(config, stale_image)
+        if not stale:
+            raise Refusal(
+                f"--discard-stale-image-copy: no second attachment of slot {args.slot}'s "
+                "image was found, so there is nothing to discard; rerun remove without it. "
+                "state: REFUSED -- no checkout was salvaged or removed"
+            )
+        stale_holders = _stale_copy_holders(stale)
+        foreign_roots = sorted({pid for item in stale_holders for pid in item.foreign_root_pids})
+        if foreign_roots:
+            raise Refusal(
+                "--discard-stale-image-copy: processes "
+                f"{', '.join(str(pid) for pid in foreign_roots[:8])} hold the stale image copy "
+                "under a different root, where the census cannot see a use of it by path. "
+                "state: REFUSED -- no checkout was salvaged or removed. remedy: stop them, "
+                "or leave the slot for manual handling"
+            )
     if (proof_manifest is None) != (completed_record is None):
         raise Refusal(
             "--validation-proof-manifest and --completed-record must be supplied "
@@ -36537,6 +36956,28 @@ def _cmd_remove_in_scope(
                 "process evidence is unavailable, repair that evidence rather than treating the "
                 "slot as free"
             )
+        if stale_image is not None:
+            if record.slot_type != "agent":
+                raise Refusal(
+                    "--discard-stale-image-copy applies only to an agent slot. state: "
+                    "REFUSED -- no checkout was salvaged or removed"
+                )
+            if _stale_image_copies(config, stale_image) != tuple(
+                sorted(
+                    (Path(item.mount_point), item.device, item.name) for item in stale_holders
+                )
+            ):
+                raise Refusal(
+                    f"the stale attachments of slot {record.slot}'s image changed before the "
+                    "registry lock was taken; nothing was salvaged or removed; retry"
+                )
+            print(
+                f"WARNING: discarding the stale image copies of slot {record.slot} "
+                f"({', '.join(item.name for item in stale_holders)}): anything written only "
+                "through them is not salvaged; salvage reads this host's own file system",
+                file=sys.stderr,
+            )
+            _enable_stale_copy_discard(config, stale_image)
         slot_path = _assert_slot_contents(config, record)
         _assert_no_uncommitted_handoffs(config, record, slot_path, _GitVcs())
         _assert_handoff_read(config, record, slot_path)
@@ -36614,6 +37055,25 @@ def _cmd_remove_in_scope(
         _ensure_event_log(
             config, record.machine, require_repository=False
         )
+        if stale_image is not None:
+            # Durable before any salvage or deletion, beside whatever basis
+            # admitted the removal; recovery discards the copy again only for
+            # the generation this records.
+            state = _replace_record(state, record)
+            _write_active_state(
+                config,
+                state,
+                action=STALE_COPY_DISCARD_ACTION,
+                slot=record.slot,
+                evidence={
+                    "generation": record.generation,
+                    "actor": _identity_to_obj(coordinator),
+                    "coordinator_authorized": True,
+                    "image": str(stale_image.slot_image),
+                    "image_copies": [item.to_obj() for item in stale_holders],
+                },
+                require_repository=False,
+            )
         if owner_consent is not None:
             # Record the basis BEFORE any salvage or deletion so the removal
             # is attributable from the append-only history alone, and so an
@@ -36832,6 +37292,11 @@ def _cmd_remove_in_scope(
                             "basis": ATTESTED_STOP_BASIS,
                             "attestation_note": attested_stop.note,
                         }
+                    ),
+                    **(
+                        {}
+                        if stale_image is None
+                        else {"image_copies": [item.to_obj() for item in stale_holders]}
                     ),
                 },
                 require_repository=False,
@@ -40589,6 +41054,15 @@ def _recover_finish(
     current = next(item for item in state.slots if item.slot == record.slot)
     _assert_recovery_processes(coordinator, processes)
     _assert_not_held(config, current)
+    if current.slot_type == "agent" and _recorded_stale_copy_discard(
+        current, _load_events(config, current.machine)
+    ):
+        try:
+            recorded_image = slotimage.load(config.control, "agent", current.slot)
+        except slotimage.ImageError as exc:
+            raise Refusal(f"cannot read the slot image record of {current.slot}: {exc}") from exc
+        if recorded_image is not None:
+            _enable_stale_copy_discard(config, recorded_image)
     age, expired = _heartbeat_diagnosis(current)
     owner_state, detail = _process_state(current.owner)
     live_validate_owner = bool(
@@ -59313,6 +59787,21 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "--archive-drifted-checkouts still needs the command's own 'dead'. Agent slots "
             "only; retire-pending and remove-agent-batch never accept it (default: not "
             "given, so such a slot is refused)"
+        ),
+    )
+    remove.add_argument(
+        "--discard-stale-image-copy",
+        action="store_true",
+        help=(
+            "for an image-backed agent slot whose image is attached to a second loop device "
+            "(a stale, independent file system on the same image file, left by a mount another "
+            "mount namespace kept; doctor reports image-attached-twice), treat that stale copy "
+            "as the slot's own storage instead of as use. Refused unless every process whose "
+            "mount table holds the copy shares this process's root, so the census still sees "
+            "any use of it by path. Salvage reads only this host's own file system: anything "
+            "written only through the stale copy is lost. Requires --coordinator-authorized; "
+            "recorded in the event log before salvage; never accepted by retire-pending or "
+            "remove-agent-batch (default: off, a stale copy refuses removal)"
         ),
     )
     remove.add_argument(
