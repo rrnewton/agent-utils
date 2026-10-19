@@ -3707,6 +3707,71 @@ def _after_channel_settings_all(driver: Driver) -> None:
     driver.page.unroute("**/api/v1/channels/*/upstream-clear", _all_channels_clear)
 
 
+# `#355 provider-grouped-channels`. Two channels on a second service, Slack, beside the server's own.
+SERVICES_SLACK_CHANNELS = (
+    {"id": "C0SHOTTEAM1", "label": "team", "writable": True, "alias": None, "added": False, "provider": "slack"},
+    {"id": "C0SHOTREL01", "label": "release", "writable": True, "alias": None, "added": False, "provider": "slack"},
+)
+
+
+def _services_config(route: Route) -> None:
+    """The real server's client configuration, as a server reading two chat services answers it: its own
+    channel on a Google Chat bridge, configured first, and two channels on a Slack that registers, lists
+    and clears unread. The single fake provider answers only its own channel, which the bar opens on."""
+    body = cast(object, route.fetch().json())
+    if not isinstance(body, dict):
+        route.fulfill(status=502, content_type="application/json", body="{}")
+        return
+    channels = body.get("channels")
+    if not isinstance(channels, list) or not channels or not isinstance(channels[0], dict):
+        route.fulfill(status=502, content_type="application/json", body="{}")
+        return
+    own = str(channels[0].get("provider") or "discord")
+    channels[0]["provider"] = own
+    channels.extend(dict(channel) for channel in SERVICES_SLACK_CHANNELS)
+    common = {"upstream_read_mark_supported": False, "self_author_id": None, "owner_author_id": None}
+    body["providers"] = [
+        {"key": own, "name": "Google Chat", "threading_supported": True, "live_delivery": "push",
+         "live_poll_seconds": 0, "channel_registration_supported": False, "channel_discovery_supported": False,
+         **common},
+        {"key": "slack", "name": "Slack", "threading_supported": True, "live_delivery": "poll",
+         "live_poll_seconds": 30, "channel_registration_supported": True, "channel_discovery_supported": True,
+         "upstream_clear_supported": True, **common},
+    ]
+    body["chat_provider_name"] = "Google Chat and Slack"
+    route.fulfill(status=200, content_type="application/json", body=json.dumps(body))
+
+
+def _act_settings_services(driver: Driver) -> None:
+    """`#355 provider-grouped-channels`: Settings > Channels with two chat services, Slack chosen.
+
+    The Service row in place of the "Chat service" line, its facts line saying what Slack does here,
+    the channel picker listing only Slack's two channels under "All Slack channels", and Slack's Add
+    and Browse. The bar's picker holds a group per service, which the expectations read: a native
+    picker's open list is drawn by the system, outside the page, and no screenshot can show it.
+    """
+    driver.page.route("**/api/v1/client-config", _services_config)
+    driver.load(with_token=True)
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    driver.click("open-settings")
+    driver.page.wait_for_function("() => window.__visible('close-settings')", timeout=5_000)
+    _unfold(driver, "settings-service")
+    driver.page.select_option("#settings-service", "slack")
+    driver.page.wait_for_function(
+        "() => (document.getElementById('service-facts').textContent || '').startsWith('Slack:')", timeout=10_000
+    )
+    driver.js("(() => { if (window.__visible('status-line')) document.getElementById('dismiss-status').click(); return true; })()")
+    driver.js(
+        "(() => { document.getElementById('settings-channels').scrollIntoView({ block: 'start' }); return true; })()"
+    )
+    driver.settle(300)
+
+
+def _after_settings_services(driver: Driver) -> None:
+    """Put the server's own client configuration back for every later state."""
+    driver.page.unroute("**/api/v1/client-config", _services_config)
+
+
 def _act_settings_folded(driver: Driver) -> None:
     """`#346 settings-collapsible`: Settings as it opens, every section folded to its title."""
     driver.load(with_token=True)
@@ -6507,6 +6572,55 @@ SCENES: tuple[Scene, ...] = (
             ),
         ),
     ),
+    Scene(
+        name="72-settings-services",
+        what="Settings, Channels with two chat services: the Service row, Slack's facts, only Slack's channels, Slack's Add and Browse",
+        act=_act_settings_services,
+        after=_after_settings_services,
+        profiles=SETTINGS_PROFILES,
+        expect=(
+            ("the settings screen is up", "window.__visible('screen-settings')"),
+            (
+                # THE claim: the service is chosen first, in place of the one-service line.
+                "the Service row is shown in configuration order, on Slack, and the Chat service line is not",
+                "(() => { const s = document.getElementById('settings-service'); "
+                "return window.__visible('settings-service-row') && !window.__visible('chat-provider-line') "
+                "&& [...s.options].map((o) => o.textContent).join('|') === 'Google Chat|Slack' && s.value === 'slack'; })()",
+            ),
+            (
+                "the facts line says what Slack does here",
+                "document.getElementById('service-facts').textContent === 'Slack: New messages are checked for every "
+                "30 seconds. Threads are shown. Add a channel by pasting its link, or browse its channels. Unread can "
+                "be cleared in Slack itself.'",
+            ),
+            (
+                "the channel picker lists only Slack's channels, under All Slack channels",
+                "(() => { const s = document.getElementById('settings-channel'); "
+                "return [...s.options].map((o) => o.textContent).join('|') === 'All Slack channels|team|release'; })()",
+            ),
+            (
+                "Slack's Add a channel and Browse channels are offered",
+                "window.__visible('open-add-channel') && window.__visible('open-browse-channels')",
+            ),
+            (
+                "the bar's channel picker holds a group per service, in configuration order",
+                "[...document.querySelectorAll('#discord-channel > optgroup')].map((g) => g.label).join('|') "
+                "=== 'Google Chat|Slack'",
+            ),
+            (
+                "the Service row, the facts and the channel picker are on the screen at once",
+                "['settings-service', 'service-facts', 'settings-channel'].every((id) => { "
+                "const b = document.getElementById(id).getBoundingClientRect(); "
+                "const s = document.getElementById('screen-settings').getBoundingClientRect(); "
+                "return window.__visible(id) && b.top >= s.top - 1 && b.bottom <= s.bottom + 1; })",
+            ),
+            (
+                "nothing on the settings screen is wider than it",
+                "(() => { const s = document.getElementById('screen-settings'); "
+                "return s.scrollWidth <= s.clientWidth + 1; })()",
+            ),
+        ),
+    ),
     # LAST IN THE WALK, and not by accident: it empties the server's durable store on the way in,
     # so that the summary the state above cached is really regenerated and can really fail. Nothing
     # after it in this profile would miss what it deletes, and the next profile purges anyway.
@@ -7001,6 +7115,8 @@ def check_state_controls() -> list[str]:
         # `#345 settings-multi-column`.
         "70-settings-columns": SETTINGS_PROFILES,
         "71-settings-columns-folded": SETTINGS_PROFILES,
+        # `#355 provider-grouped-channels`.
+        "72-settings-services": SETTINGS_PROFILES,
     }
     for name, wanted_profiles in restricted.items():
         scene = next((s for s in SCENES if s.name == name), None)
@@ -7235,6 +7351,11 @@ def check_state_controls() -> list[str]:
         # and to the Tab order through the titles (`__tabbed`).
         "70-settings-columns": ("room", "getClientRects().length === 1", "rem + 2", "placed"),
         "71-settings-columns-folded": ("__tabbed", "placed"),
+        # `#355 provider-grouped-channels`. Pinned to the Service row in place of the one-service line
+        # (`chat-provider-line`), to Slack's facts (`Slack: New messages`), to the picker listing only
+        # Slack's channels (`All Slack channels|team|release`) and to the bar's groups (`optgroup`).
+        "72-settings-services": ("chat-provider-line", "Slack: New messages", "All Slack channels|team|release",
+                                 "optgroup"),
     }
     for name, needles in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)

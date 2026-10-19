@@ -16,8 +16,11 @@ stepped through as a real picker holds it. This does, with keys pressed through 
   Alt+Down from the list steps to the second Slack channel, then across into Google Chat's first,
   then its second, and stops there; Alt+Up crosses back -> a real reload: the picker grouped again
   and on the channel chosen, inside its group -> Ctrl+K focuses the picker, and a channel chosen
-  from it is read.
-  375x812, a phone: the same groups, the picker inside the window and nothing scrolling sideways.
+  from it is read -> Settings, its Channels section unfolded: the Service row, inside the window,
+  opens on the service of the channel being read and lists only its channels; choosing the other
+  service lists the other's, and its facts line names it.
+  375x812, a phone: the same groups, the picker inside the window and nothing scrolling sideways;
+  Settings' Service row and channel picker inside the window, nothing scrolling sideways there.
 
 It reuses keyboard_browser's fixture (its fake API, asset server and CDP keys), with four channels on
 two services. --web-root DIR runs it against another copy of the page; against one from before the
@@ -53,6 +56,24 @@ GROUPED = [
     {"group": "Google Chat", "channels": [SPACE_A["id"], SPACE_B["id"]]},
 ]
 FIRST_ROW = "#discord-log > li[data-id]"
+
+# Settings' Service row and channel picker as the browser draws them: what each holds, and their boxes
+# against the window and the Settings screen.
+SETTINGS_JS = """() => {
+  const box = (id) => { const r = document.getElementById(id).getBoundingClientRect();
+    return {left: r.left, right: r.right, top: r.top, bottom: r.bottom}; };
+  const screen = document.getElementById('screen-settings');
+  return {
+    row: document.getElementById('settings-service-row').checkVisibility(),
+    line: document.getElementById('chat-provider-line').checkVisibility(),
+    service: document.getElementById('settings-service').value,
+    services: [...document.getElementById('settings-service').options].map((o) => o.textContent),
+    channels: [...document.getElementById('settings-channel').options].map((o) => o.value),
+    facts: document.getElementById('service-facts').textContent,
+    boxes: ['settings-service', 'settings-channel', 'service-facts'].map(box),
+    width: window.innerWidth, sideways: screen.scrollWidth - screen.clientWidth,
+  };
+}"""
 
 
 def service(key: str, name: str) -> Json:
@@ -109,6 +130,41 @@ def on_channel(page: Page, channel: Json, why: str) -> Json:
     return found
 
 
+def settings(page: Page) -> Json:
+    found = page.evaluate(SETTINGS_JS)
+    assert isinstance(found, dict)
+    return found
+
+
+def settings_by_service(page: Page, reading: str, other: str, other_channels: list[str], where: str) -> None:
+    """Settings, Channels unfolded: the Service row opens on `reading`'s service, inside the window;
+    choosing `other` lists `other_channels` and its facts."""
+    page.click("#open-settings")
+    page.wait_for_selector("#close-settings", state="visible", timeout=10_000)
+    if page.get_attribute("#fold-settings-channels", "aria-expanded") != "true":
+        page.click("#fold-settings-channels")
+    page.wait_for_function("() => document.getElementById('settings-service').checkVisibility()", timeout=10_000)
+    page.evaluate("() => document.getElementById('settings-service').scrollIntoView({block: 'center'})")
+    found = settings(page)
+    check(found["row"] is True and found["line"] is False, f"{where}: the Service row is not shown in place of the line: {found}")
+    check(found["services"] == ["Slack", "Google Chat"], f"{where}: the services are {found['services']}")
+    check(found["service"] == reading, f"{where}: Settings opened on {found['service']!r}, not the service read ({reading})")
+    width = number(found, "width")
+    boxes = found["boxes"]
+    assert isinstance(boxes, list)
+    for name, one in zip(("the Service picker", "the channel picker", "the facts line"), boxes):
+        assert isinstance(one, dict)
+        check(float(one["left"]) >= 0 and float(one["right"]) <= width,
+              f"{where}: {name} leaves the window: {one['left']}..{one['right']} of {width}")
+    check(number(found, "sideways") <= 0, f"{where}: Settings scrolls sideways by {found['sideways']}px")
+    page.select_option("#settings-service", other)
+    page.wait_for_function("(key) => document.getElementById('service-facts').textContent.startsWith(key)",
+                           arg="Google Chat:" if other == "gchat" else "Slack:", timeout=10_000)
+    found = settings(page)
+    listed = [value for value in found["channels"] if value != "*"] if isinstance(found["channels"], list) else []
+    check(listed == other_channels, f"{where}: with {other} chosen Settings lists {listed}, not {other_channels}")
+
+
 def shot(page: Page, shots: Path | None, name: str) -> None:
     if shots is not None:
         page.screenshot(path=str(shots / f"provider-groups-{name}.png"))
@@ -159,9 +215,12 @@ def desk(context: BrowserContext, url: str, shots: Path | None) -> str:
     page.select_option("#discord-channel", str(TEAM_B["id"]))
     on_channel(page, TEAM_B, "chosen from Ctrl+K")
     shot(page, shots, "desk-chosen")
+    settings_by_service(page, "slack", "gchat", [str(SPACE_A["id"]), str(SPACE_B["id"])], "at 1280x800")
+    shot(page, shots, "desk-settings")
     return ("the picker held a Slack group then a Google Chat group from an interleaved list; Alt+Down "
             "crossed from Slack into Google Chat and stopped at the last, Alt+Up crossed back; a reload "
-            "kept the groups and the channel inside its group; Ctrl+K and a choice read that channel")
+            "kept the groups and the channel inside its group; Ctrl+K and a choice read that channel; "
+            "Settings opened on Slack, its Service row inside the window, and Google Chat listed its two")
 
 
 def phone(context: BrowserContext, url: str, shots: Path | None) -> str:
@@ -174,7 +233,10 @@ def phone(context: BrowserContext, url: str, shots: Path | None) -> str:
     check(left >= 0 and right <= width, f"on a phone the picker leaves the window: {left}..{right} of {width}")
     check(sideways <= 0, f"on a phone the page scrolls sideways by {sideways}px")
     shot(page, shots, "phone-grouped")
-    return "at 375x812 the same groups, the picker inside the window and nothing scrolling sideways"
+    settings_by_service(page, "slack", "gchat", [str(SPACE_A["id"]), str(SPACE_B["id"])], "at 375x812")
+    shot(page, shots, "phone-settings")
+    return ("at 375x812 the same groups, the picker inside the window and nothing scrolling sideways; "
+            "Settings' Service row, channel picker and facts inside the window, nothing scrolling sideways")
 
 
 def browse(playwright: Playwright, args: argparse.Namespace, url: str, width: int, height: int,
