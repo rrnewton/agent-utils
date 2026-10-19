@@ -125,6 +125,9 @@ fn muse_status_mode(line: &str) -> Option<&'static str> {
     match fields[3] {
         "YOLO" => Some("YOLO"),
         "Auto-review" => Some("Auto-review"),
+        // A launch whose flags override saved settings reports this instead of
+        // its approval mode (#382 muse-approval-never-ready).
+        "Launch overrides" => Some("Launch overrides"),
         _ => None,
     }
 }
@@ -426,6 +429,30 @@ mod tests {
         );
         assert!(!muse_idle_composer(&ambiguous));
         assert!(!muse_auto_review_idle_composer(&ambiguous));
+        let choice = screen.replace("❯\n", "❯ Yes, continue\n  No, exit\n");
+        assert!(!muse_idle_composer(&choice));
+    }
+
+    #[test]
+    fn muse_launch_overrides_footer_is_an_idle_composer() {
+        // Captured 2026-10-19 from a live Muse launched with extra harness
+        // arguments (`--approval-mode never` among them): the status footer
+        // reports `Launch overrides` where a settings-default launch reports
+        // its approval mode. This frame timed out `start` as launch_failed
+        // (#382 muse-approval-never-ready).
+        let screen = "Muse Code 1.4.0\n\
+                      ◆ prior answer\n\n\
+                      ────────────────\n❯\n────────────────\n  \
+                      watermelon-full-preview · xhigh · /work/project · Launch overrides\n";
+        assert!(muse_idle_composer(screen));
+        assert!(muse_verified_process_idle_composer(screen));
+        assert!(!muse_auto_review_idle_composer(screen));
+        assert_eq!(muse_verified_pane_status("working", screen), "idle");
+        let ambiguous = screen.replace(
+            "Launch overrides\n",
+            "Launch overrides\n  kiki · xhigh · /work/project · YOLO\n",
+        );
+        assert!(!muse_idle_composer(&ambiguous));
         let choice = screen.replace("❯\n", "❯ Yes, continue\n  No, exit\n");
         assert!(!muse_idle_composer(&choice));
     }

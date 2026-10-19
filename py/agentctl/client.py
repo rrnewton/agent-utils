@@ -215,7 +215,9 @@ def _muse_status_mode(line: str) -> str | None:
         return None
     if len(fields) == 3:
         return "standard"
-    return fields[3] if fields[3] in ("YOLO", "Auto-review") else None
+    # A launch whose flags override saved settings reports Launch overrides
+    # instead of its approval mode (#382 muse-approval-never-ready).
+    return fields[3] if fields[3] in ("YOLO", "Auto-review", "Launch overrides") else None
 
 
 def _muse_footer_modes(lines: list[str]) -> tuple[str, ...]:

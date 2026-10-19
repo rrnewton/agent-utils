@@ -259,6 +259,30 @@ def test_current_muse_yolo_footer_is_an_idle_composer() -> None:
     assert not client_module.muse_idle_composer(choice)
 
 
+def test_muse_launch_overrides_footer_is_an_idle_composer() -> None:
+    # Captured 2026-10-19 from a live Muse launched with extra harness
+    # arguments (--approval-mode never among them): the footer reports
+    # Launch overrides, and this frame timed out start as launch_failed
+    # (#382 muse-approval-never-ready).
+    screen = (
+        "Muse Code 1.4.0\n"
+        "◆ prior answer\n\n"
+        "────────────────\n❯\n"
+        "────────────────\n"
+        "  watermelon-full-preview · xhigh · /work/project · Launch overrides\n"
+    )
+    assert client_module.muse_idle_composer(screen)
+    assert muse_verified_process_idle_composer(screen)
+    assert not muse_auto_review_idle_composer(screen)
+    ambiguous = screen.replace(
+        "Launch overrides\n",
+        "Launch overrides\n  kiki · xhigh · /work/project · YOLO\n",
+    )
+    assert not client_module.muse_idle_composer(ambiguous)
+    choice = screen.replace("❯\n", "❯ Yes, continue\n  No, exit\n")
+    assert not client_module.muse_idle_composer(choice)
+
+
 def test_verified_headerless_muse_composer_distinguishes_buffered_input() -> None:
     divider = "─" * 40
     footer = "kiki · xhigh · /work/project · YOLO\n"
