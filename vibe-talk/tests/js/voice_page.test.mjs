@@ -34749,9 +34749,9 @@ test("Settings says why a channel is read only, by whose setting it is", async (
     return page.el("channel-facts").text();
   };
   assert.match(await facts("C0000POL01"), /Read only: Slack adds every channel in this app read only \(registered_channels_writable in the server's configuration\)\.$/);
-  assert.match(await facts("C0000POL02"), /Posting allowed: Slack lets every channel added in this app be posted to/);
+  assert.match(await facts("C0000POL02"), /Posting follows Slack's policy for channels added in this app, which lets them be posted to/);
   assert.match(await facts("C0000CFG01"), /Read only: the server's configuration file lists it read only\.$/);
-  assert.match(await facts("C0000ADD01"), /Read only: it was added read only, and keeps what was chosen then\.$/);
+  assert.match(await facts("C0000ADD01"), /Read only: it was added read only, as chosen or as the chat service answered then, and keeps that\.$/);
   assert.match(await facts("C0000GON01"), /Read only: the chat service it was added through is no longer configured to add channels on this server\.$/);
   assert.match(await facts("C0000OLD01"), /Added in this app\.$/, "an older server's channel grew a reason it did not send");
   assert.match(await facts("C0000CFG02"), /From the server's configuration file\.$/, "a writable channel was given a reason");

@@ -44275,12 +44275,12 @@ function writeSourceSentence(channel) {
   switch (channel.write_source) {
     case "provider_policy":
       return channel.writable
-        ? `Posting allowed: ${service} lets every channel added in this app be posted to (registered_channels_writable in the server's configuration).`
+        ? `Posting follows ${service}'s policy for channels added in this app, which lets them be posted to (registered_channels_writable in the server's configuration).`
         : `Read only: ${service} adds every channel in this app read only (registered_channels_writable in the server's configuration).`;
     case "configuration":
       return channel.writable ? "" : "Read only: the server's configuration file lists it read only.";
     case "added":
-      return channel.writable ? "" : "Read only: it was added read only, and keeps what was chosen then.";
+      return channel.writable ? "" : "Read only: it was added read only, as chosen or as the chat service answered then, and keeps that.";
     case "provider_gone":
       return "Read only: the chat service it was added through is no longer configured to add channels on this server.";
     default:

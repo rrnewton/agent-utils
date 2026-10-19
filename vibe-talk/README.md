@@ -1323,7 +1323,10 @@ provider has `channel_registration` on, every conversation added in the app foll
 was false may be posted to; lower it, and they are read only. A `[[channels]]` entry keeps its own
 `writable` either way. With `channel_registration` off the provider has no policy for them: a
 conversation registered while it was on is read only, as before, and one added by its id keeps
-whether "Let this app post here" was ticked. Nothing in the store changes; the policy is applied as
+whether "Let this app post here" was ticked. Turning `channel_registration` on later brings every
+conversation added in the app through that provider under the policy, one added by id while it was
+off included, because the store does not record how a channel was added (`#356
+provider-namespace-per-key` would). Nothing in the store changes; the policy is applied as
 the list is read. Settings says, under the channel picker, why a channel is read only: the
 configuration file, this policy, what was chosen when it was added, or a service no longer
 configured to add channels (`write_source` on each channel in `GET /api/v1/client-config`:
