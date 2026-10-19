@@ -175,13 +175,14 @@ that item moves it: for the whole space, and never backward. It is moved only on
 saved: a message already drawn Done by a Done still on its way to the server (**Done**, **e** or a
 swipe just before the send went) waits for it, and is not marked in the service at all if that Done
 fails or is put back meanwhile, since the service's marker cannot be moved back (`#311
-sent-read-waits-for-done`). A message whose Done was saved before the send went — here, on another
-device, or before a reload, even one **Hide read** has already left out — is marked in the service at
-once. The server does not ask the service again for a message it has already
-marked through, by a reply or by that item, nor for one before it, and the service's bridge keeps
-its own cursor forward too. The status line then says **Marked
-read here and in** *the service*. Slack has no such marker for vibe-talk to move (its **Clear unread
-in Slack** setting is separate and unchanged), and nor does a bot on Discord itself.
+sent-read-waits-for-done`). So it is with the reply's own Done: **Undo** pressed while that is being
+saved asks the service nothing, unless the server refuses the Undo (`#327 done-races-remaining`). A
+message whose Done was saved before the send went — here, on another device, or before a reload, even
+one **Hide read** has already left out — is marked in the service at once. The server does not ask the
+service again for a message it has already marked through, by a reply or by that item, nor for one
+before it, and the service's bridge keeps its own cursor forward too. The status line then says
+**Marked read here and in** *the service*. Slack has no such marker for vibe-talk to move (its **Clear
+unread in Slack** setting is separate and unchanged), and nor does a bot on Discord itself.
 
 **A reply never moves the service's marker past what vibe-talk holds of the channel.** On a channel
 that is one thread of a larger space — a registration narrowed to one conversation — the service's
@@ -332,7 +333,11 @@ service is asked anything (`#326 refused-undo-restores-done`). A refusal that ar
 **Done** or **Undo** of the same message is still on its way leaves that later act drawn, and the
 **Undo** chip, once pressed, does not come back when the Done it took back is saved, nor does a refused
 Undo take away the chip of a Done made while it was on its way. A Done or an Undo that fails in the
-page before its write is sent takes back exactly what it changed, and no wait on it is left hanging.
+page before its write is sent takes back exactly what it changed, and no wait on it is left hanging. A
+view drawn for the first time while a Done or an Undo is on its way draws it as made — a thread opened
+on the right just after a Done in All, two columns turned on meanwhile — and under **Hide read** on a
+chat service without threads a Done the server refuses brings its row back at once, where it stood,
+even if a to-do read landed meanwhile (`#327 done-races-remaining`).
 
 Known limits of the counts (`#222 unread-replies`):
 - A reply the page never held that is marked Done on another device still counts as new on its
@@ -7347,7 +7352,11 @@ not asked or did not take it.
 Shift+E used to be *Done through here*: this message and every one above it. One accidental press
 turned a detailed read history into everything read, so that act **has no key at all** now. It is
 only the ⋯ menu's **Through here** item under *Mark read*, with the Undo chip (and `z`) after it as
-before. *Clear the backlog* under Hide read has never had a key either.
+before. *Clear the backlog* under Hide read has never had a key either. Where it also moves the chat
+service's marker, it does so only once every message it covers is Done with its Done saved: a row drawn
+Done by a Done still on its way is waited for, as is an **Undo** pressed meanwhile, and if a Done it
+covers is refused or put back the marker is not moved, and the status line says so (`#327
+done-races-remaining`). No Chromium check presses **Through here**; the page suite covers it.
 
 `make -C vibe-talk keyboard-browser` presses Shift+E in Chromium on an opened long message and
 measures that only that message was written Done, then asked of the chat service once (`after_reply`),

@@ -25,6 +25,14 @@ It serves the checked-out page and small fake APIs from one loopback origin.
   the failure said. Then the same on another message with the Done saved -> the provider is asked once,
   after the Done is saved, and the status line says it is marked in the chat service.
 
+  `#327 done-races-remaining`: first of all, in All in one column, Done clicked on the canary thread's
+  root and held; two columns turned on with the layout button, their cards on the right and Main on the
+  left; and that thread opened on the right, for the first time in this page, from the root's Thread tag
+  -> the root is drawn Done on the right on every frame from the first it shows there, and still once the
+  Done is saved. (The page before this fix drew it as the thread's read did, not Done, and kept it so
+  once the Done was saved.) Then the cards again, and the runner's thread selected on the right for the
+  walk above.
+
 No page error at any step. Pass --web-root DIR to run it against another copy of the page -- the page
 before these fixes fails at the first switch, and at the first held Done -- and --screenshots DIR to
 keep a PNG of each stage.
@@ -45,9 +53,9 @@ from urllib.parse import parse_qs, urlsplit
 
 import offline_cache_browser as fixture
 from offline_cache_browser import CACHE_KEY, TOKEN, Json, check, handler_for
-from reply_in_column_browser import open_columns, place_row, reply_button
+from reply_in_column_browser import place_row, reply_button
 from reply_marks_read_browser import MarkerApi, drawn_read
-from two_column_browser import Desk
+from two_column_browser import CANARY, RUNNER, THREAD_ROWS, Desk
 from view_switch_browser import PHONE, SwitchApi
 
 if TYPE_CHECKING:
@@ -58,6 +66,9 @@ WIDTH, HEIGHT = 1280, 800
 MARKED = "212"
 # The Main messages the desk walk answers: the first while its Done is refused, the second saved.
 REFUSED, SAVED = "203", "205"
+# The canary thread's root on Main, marked Done with the Done held while its thread is opened on the right
+# for the first time. `#327 done-races-remaining`.
+OPENED = "215"
 # Where a pressed row's top is put, below the top of its column's list, in px.
 ROW_OFFSET_PX = 90
 # How long a mark would take to reach the server, had one been asked: everything else here is
@@ -149,6 +160,22 @@ WATCH_JS = """(id) => {
         const state = [document.getElementById('thread-select').value, row ? row.getAttribute('data-archived') : null];
         const last = seen[seen.length - 1];
         if (!last || last[0] !== state[0] || last[1] !== state[1]) seen.push(state);
+    };
+    new MutationObserver(look).observe(log, {childList: true, subtree: true, attributes: true, attributeFilter: ['data-archived']});
+    const frame = () => { look(); requestAnimationFrame(frame); };
+    requestAnimationFrame(frame);
+}"""
+
+
+# From now on, on every frame and on every change to the right column's list: how row `id` is drawn there
+# (its `data-archived`, or null while no row holds it). `#327 done-races-remaining`.
+SIDE_WATCH_JS = """(id) => {
+    const seen = window.__sideSeen = [];
+    const log = document.getElementById('side-log');
+    const look = () => {
+        const row = log.querySelector(`:scope > li[data-id="${id}"]`);
+        const state = row ? row.getAttribute('data-archived') : null;
+        if (!seen.length || seen[seen.length - 1] !== state) seen.push(state);
     };
     new MutationObserver(look).observe(log, {childList: true, subtree: true, attributes: true, attributeFilter: ['data-archived']});
     const frame = () => { look(); requestAnimationFrame(frame); };
@@ -338,7 +365,9 @@ def sends_walk(chromium: BrowserType, args: argparse.Namespace) -> str:
             page.on("pageerror", lambda error: errors.append(str(error)))
             desk = Desk(page, args.screenshots, f"done-sends-{WIDTH}", WIDTH, HEIGHT)
             page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
-            open_columns(desk)
+            open_all(desk)
+            held_open(desk, api)
+            open_runner(desk)
             held_send(desk, api, REFUSED, refuse=True)
             page.click("#dismiss-error")
             held_send(desk, api, SAVED, refuse=False)
@@ -409,6 +438,91 @@ def held_send(desk: Desk, api: HeldDoneApi, message_id: str, refuse: bool) -> No
     desk.check(drawn_read(desk, "left", message_id), f"{where}: the message is not drawn read")
     desk.shot(f"{message_id}-saved")
     desk.notes.append(f"{message_id}: the reply posted, the provider asked once, only after its held Done was saved")
+
+
+
+def open_all(desk: Desk) -> None:
+    """Signed in, on the channel, in All in one column."""
+    page = desk.page
+    page.fill("#api-token", TOKEN)
+    page.click("#save-token")
+    page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
+    page.click("#view-switch")
+    desk.wait_for("() => document.querySelectorAll('#discord-log > li[data-id]').length === 24",
+                  "the channel did not open in All")
+    desk.settled()
+
+
+def open_runner(desk: Desk) -> None:
+    """From a thread on the right back to the cards, and the runner's thread selected there."""
+    page = desk.page
+    page.click("#side-close")
+    desk.wait_for("() => document.querySelectorAll('#side-cards > li').length === 3"
+                  " && document.getElementById('side-cards').getClientRects().length > 0",
+                  "the X did not bring the cards back")
+    page.click(f"#side-cards > li[data-id='{RUNNER}'] .side-card-open")
+    desk.wait_for(f"() => document.querySelectorAll('#side-log > li[data-id]').length === {THREAD_ROWS[RUNNER]}",
+                  "the runner's card did not select its thread on the right")
+    desk.wait_for("() => document.querySelectorAll('#discord-log > li[data-id]').length === 11", "the left column is not Main")
+    page.mouse.move(WIDTH / 2, 5)
+    desk.settled()
+
+
+def held_open(desk: Desk, api: HeldDoneApi) -> None:
+    """`#327`: Done clicked on the canary root in All, held; two columns on; its thread opened on the right
+    for the first time."""
+    page = desk.page
+    where = f"the canary thread opened on the right while the Done of {OPENED}, made in All, is held"
+    api.refuse = False
+    page.evaluate(f"""() => document.querySelector("#discord-log > li[data-id='{OPENED}']").scrollIntoView({{block: 'center'}})""")
+    desk.settled()
+    desk.check(not drawn_read(desk, "left", OPENED), f"{where}: the premise is an unread root")
+    held = api.held
+    page.locator(f"#discord-log > li[data-id='{OPENED}'] .done-button").click()
+    for _ in range(200):
+        if api.held > held:
+            break
+        page.wait_for_timeout(25)
+    desk.check(api.held == held + 1, f"{where}: the Done did not reach the server")
+    page.click("#column-toggle")
+    desk.wait_for("() => document.getElementById('side-column').getClientRects().length > 0"
+                  " && document.querySelectorAll('#side-cards > li').length === 3"
+                  " && document.querySelectorAll('#discord-log > li[data-id]').length === 11",
+                  f"{where}: the layout button did not give two columns with the cards, Main on the left")
+    page.mouse.move(WIDTH / 2, 5)
+    desk.settled()
+    desk.check(page.evaluate(f"() => !document.querySelector(\"#side-log > li[data-id='{OPENED}']\")"),
+               f"{where}: the premise is the thread not on the right")
+    place_row(desk, "left", OPENED, top=ROW_OFFSET_PX)
+    page.evaluate(SIDE_WATCH_JS, OPENED)
+    desk.settled()
+    page.locator(f"#discord-log > li[data-id='{OPENED}'] .thread-badge").click()
+    desk.wait_for(f"() => document.querySelectorAll('#side-log > li[data-id]').length === {THREAD_ROWS[CANARY]}",
+                  f"{where}: the thread did not open on the right")
+    desk.settled()
+    desk.settled()
+    seen = page.evaluate("() => window.__sideSeen")
+    shown = [state for state in seen if state is not None] if isinstance(seen, list) else []
+    desk.check(bool(shown) and all(state == "true" for state in shown),
+               f"{where}: {OPENED} drawn {seen} on the right from the first frame it showed, not Done")
+    desk.shot(f"{OPENED}-opened-held")
+    api.release.set()
+    for _ in range(200):
+        if OPENED in api.done():
+            break
+        page.wait_for_timeout(25)
+    desk.check(OPENED in api.done(), f"{where}: the Done was not saved")
+    page.wait_for_timeout(QUIET_MS)
+    desk.settled()
+    seen = page.evaluate("() => window.__sideSeen")
+    shown = [state for state in seen if state is not None] if isinstance(seen, list) else []
+    desk.check(bool(shown) and all(state == "true" for state in shown),
+               f"{where}: {OPENED} drawn {seen} on the right once the Done was saved, not Done")
+    desk.check(drawn_read(desk, "right", OPENED) and drawn_read(desk, "left", OPENED),
+               f"{where}: {OPENED} is not drawn read in both columns once the Done was saved")
+    desk.shot(f"{OPENED}-opened-saved")
+    desk.notes.append(f"{OPENED}: drawn Done on the right from the first frame its thread showed there while its Done, made in All, was held,"
+                      " and once it was saved")
 
 
 if __name__ == "__main__":

@@ -32308,7 +32308,18 @@ async function markReadThroughHere(row, upstreamId) {
   const rows = [...(row.parentNode || el("discord-log")).children];
   const at = rows.indexOf(row);
   if (at < 0) return;
-  const ids = rows.slice(0, at + 1).flatMap(idsOf).filter((id) => !archivedIds.has(id));
+  const covered = rows.slice(0, at + 1).flatMap(idsOf);
+  const ids = covered.filter((id) => !archivedIds.has(id));
+  const channel = String(el("discord-channel").value);
+  // `#327 done-races-remaining`. What the chat service's marker would pass, beyond the rows on
+  // screen: a Done, or a put back, still on its way whose row is off the list — under Hide read a
+  // Done takes its row off at once, and no order the page holds in every view says where it stood.
+  // Every write on its way at the press is waited for: one above the boundary only delays the
+  // mark, or declines it for the reader to ask again, and never moves it wrongly. Taken now, at
+  // the press: by the time this act's own Done is saved, which is queued behind it, that write
+  // has been answered and is no longer on its way to be found.
+  const onTheirWay = [...doneSaving.keys()];
+  const waitingFor = [...new Set([...covered, ...onTheirWay])];
   // `#245 done-feedback`. Drawn on the row it was asked from: the boundary is the row the reader is on.
   if (ids.length) {
     flashDone(row);
@@ -32321,12 +32332,27 @@ async function markReadThroughHere(row, upstreamId) {
     }
   }
   let upstream = false;
+  const service = chatProviderName || "the chat service";
+  const count = `${ids.length} message${ids.length === 1 ? "" : "s"}`;
   if (upstreamReadMarkSupported && upstreamId) {
+    // `#327 done-races-remaining`. The chat service's marker, which cannot be moved back, is moved only
+    // once every message it covers is Done with its Done saved, as Shift+E and a sent reply wait
+    // (`doneSaved`): a Done still on its way of a row drawn Done already, which this leaves out of its own,
+    // and a put back made meanwhile (Undo, a row's own button) are waited for, and all of them looked at
+    // again by what the page holds (`doneHeldHere`). One refused or put back, the marker is not moved.
+    // The wait is for `waitingFor`: the rows covered, and a write on its way at the press for a
+    // message the marker would pass whose row Hide read had already taken off the list.
+    if (!(await doneSaved(waitingFor, () => String(el("discord-channel").value) === channel && doneHeldHere(waitingFor)))) {
+      if (String(el("discord-channel").value) === channel) {
+        const why = "a Done it covers was refused or undone";
+        setStatus(ids.length > 0 && doneHeldHere(ids) ? `Marked ${count} read here, not in ${service}: ${why}.`
+          : `Not marked read in ${service}: ${why}.`);
+      }
+      return;
+    }
     await markReadUpstream(upstreamId);
     upstream = true;
   }
-  const service = chatProviderName || "the chat service";
-  const count = `${ids.length} message${ids.length === 1 ? "" : "s"}`;
   // Short enough for one line on a phone: the status line cuts a long sentence off.
   setStatus(upstream ? `Marked ${count} read here and in ${service}.` : `Marked ${count} read.`);
 }
@@ -34527,6 +34553,21 @@ function noteArchived(payload, replace) {
   for (const id of payload.dismissed || []) {
     if (readSpeaksFor(payload, String(id))) archivedIds.add(String(id));
   }
+  // `#327 done-races-remaining`. A message the read does not speak for keeps the state of the act made
+  // here, which this copy holds only if it was there for it: a view drawn for the first time while a
+  // Done or a put back made in another view was on its way — a thread opened on the right while a Done
+  // made on Main was saved — held nothing for it, and drew it as the read did, not Done, and so it
+  // stayed once that Done was saved. The channel's store took the act at once (`markHeldDone`), so a
+  // copy takes its state for each such message from there. The walk visits every message this page has
+  // written Done or put back since it was loaded (`localReadWrites` only grows): a few hundred at most in
+  // a long session, against a read that has just drawn its page, so it is not bounded further.
+  if (threadingSupported && channelCanon.channel === String(el("discord-channel").value)) {
+    for (const id of localReadWrites.keys()) {
+      if (readSpeaksFor(payload, id)) continue;
+      if (channelCanon.dismissed.has(id)) archivedIds.add(id);
+      else archivedIds.delete(id);
+    }
+  }
 }
 
 /**
@@ -35106,6 +35147,59 @@ async function refreshAfterInboxChange() {
   }
 }
 
+/**
+ * `#327 done-races-remaining`. Under Hide read without threads a Done takes its row off the list at once
+ * (`refreshAfterInboxChange`), and nothing else holds that row: the list is the to-do read's, and no
+ * store keeps its messages. So a Done the server refused left the row off the list until the next read.
+ * `listed` is the list as the Done found it, and `taken` the messages the refusal took back; each row of
+ * `listed` holding one of those, whose messages are not all Done now, and none of which the list draws
+ * again already, goes back where it stood (never a row a read took off since, dealt with elsewhere):
+ * before the first row that stood below it and is drawn now, else after the last that stood above it,
+ * else among the rows by when its first message was sent. Drawn now is by message, not by element: a
+ * to-do read that landed while the Done was on its way (the poll) drew every row afresh, and none of
+ * `listed` is on the list itself. Such a read, the Done not yet taken, also listed the message again,
+ * and drew its row Done: that row is drawn again as it is now.
+ *
+ * @param {Element[]} listed
+ * @param {Set<string>} taken
+ */
+function putBackRowsOff(listed, taken) {
+  const list = el("discord-log");
+  const drawn = new Set([...list.children].flatMap(idsOf));
+  const back = listed.filter((row) => row.parentNode !== list && idsOf(row).some((id) => taken.has(id)) &&
+    !idsOf(row).some((id) => drawn.has(id)) && !idsOf(row).every((id) => archivedIds.has(id)));
+  /** The row on the list now that draws a message of `row`, which stood in `listed`, or undefined. */
+  const drawing = (/** @type {Element} */ row) => {
+    const ids = idsOf(row);
+    return [...list.children].find((one) => idsOf(one).some((id) => ids.includes(id)));
+  };
+  for (const row of back) {
+    const at = listed.indexOf(row);
+    let next = /** @type {Element | null | undefined} */ (undefined);
+    for (const below of listed.slice(at + 1)) {
+      next = drawing(below);
+      if (next) break;
+    }
+    if (!next) {
+      for (const above of listed.slice(0, at).reverse()) {
+        const found = drawing(above);
+        if (!found) continue;
+        const now = [...list.children];
+        next = now[now.indexOf(found) + 1] || null;
+        break;
+      }
+    }
+    if (next === undefined) {
+      const sent = timeOf(rowMessages(row)[0], "timestamp");
+      next = [...list.children].find((one) => timeOf(rowMessages(one)[0], "timestamp") > sent) || null;
+    }
+    list.insertBefore(row, next);
+  }
+  const stale = [...list.children].some((one) => idsOf(one).length > 0 &&
+    (one.getAttribute("data-archived") === "true") !== idsOf(one).every((id) => archivedIds.has(id)));
+  if (stale) renderChannelRows();
+}
+
 // Keep writes ordered while every visible result happens immediately. This prevents a quick run
 // of Done taps from occupying every provider-adapter worker even against an older server.
 /** @type {Promise<unknown>} */
@@ -35206,13 +35300,24 @@ function settleInboxWrite(ids, done, saved, sent = true) {
  * id: settled, saved or not, once its write has settled and what a failure takes back is taken back.
  * `dismissMessages` marks a message Done here at once, before its write is even sent, so being Done
  * here does not say the Done is saved; what may follow only a saved Done waits on this (`doneSaved`).
+ * `#327 done-races-remaining`: a put back on its way too (`restoreMessages`), since a Done looked at
+ * while one is on its way may yet stand — a put back the server refuses takes it back to Done — or not.
  *
  * @type {Map<string, Promise<void>>}
  */
 const doneSaving = new Map();
 
 /**
- * Note `ids`' Done as on its way (`doneSaving`), and answer what to call once it has settled.
+ * Note `ids`' Done, or put back, as on its way (`doneSaving`), and answer what to call once it has
+ * settled.
+ *
+ * It takes the place of a Done, or put back, of the same message still on its way, and is waited for
+ * in its stead: so its wait ends only once each one it took the place of has settled as well, however
+ * soon it settles itself (`#327 done-races-remaining`). As first written it ended at once, and an Undo
+ * that slipped in the page before its write, pressed while the Done it undid was on its way, left
+ * nothing here for that Done: a sent reply, Through here and Shift+E asked the chat service at once,
+ * before that Done was answered, and so whatever the server then did with it. A Done naming a message
+ * whose earlier Done is still on its way (Clear the backlog, a row half Done) that slipped did the same.
  *
  * @param {string[]} ids
  * @returns {() => void}
@@ -35221,10 +35326,16 @@ function noteDoneSaving(ids) {
   let settle = () => {};
   /** @type {Promise<void>} */
   const saving = new Promise((resolve) => { settle = resolve; });
+  // What this takes the place of: none, or acts made before it, so no wait here is ever on itself.
+  const before = [...new Set(ids.map((id) => doneSaving.get(id)).filter(Boolean))];
   for (const id of ids) doneSaving.set(id, saving);
-  return () => {
+  const end = () => {
     for (const id of ids) if (doneSaving.get(id) === saving) doneSaving.delete(id);
     settle();
+  };
+  return () => {
+    if (before.length === 0) end();
+    else Promise.all(before).then(end);
   };
 }
 
@@ -35232,6 +35343,7 @@ function noteDoneSaving(ids) {
  * Whether every one of `ids` is Done here with its Done saved: a Done of any of them still on its way
  * to the server waited for first (`doneSaving`), then the ids looked at again, since a Done that
  * failed has put them back, as has a put back (Undo, `e`) made meanwhile. `#295 shift-e-read-collapse`.
+ * A put back still on its way is waited for too, and settles it either way (`#327 done-races-remaining`).
  * `done` is that look: by default the column worked on once the wait is over; a confirmed send's
  * (`markAnsweredDone`, `#311 sent-read-waits-for-done`) looks at what the page holds (`doneHeldHere`).
  *
@@ -35305,6 +35417,10 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
   let move = null;
   /** Whether the Done's write was queued, and the move's behind it (`settleInboxWrite`). */
   let sent = false;
+  // `#327 done-races-remaining`. Under Hide read without threads the rows this takes off the list are
+  // held nowhere else: kept as they stood, for a refusal to put back (`putBackRowsOff`).
+  /** @type {Element[] | null} */
+  let listed = null;
   let payload;
   /** The ids of the batches the server has taken, when there are several. */
   const landed = [];
@@ -35318,6 +35434,7 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
     const staged = bump ? stageBookmark(bump.channel, bump.to) : null;
     move = staged;
     if (staged) inOtherColumn(renderScrollTools);
+    listed = todoMode && !threadingSupported ? [...el("discord-log").children] : null;
     await refreshAfterInboxChange();
     renderTodoControls();
     setStatus(`Saving ${requested.length} local change${requested.length === 1 ? "" : "s"}…`);
@@ -35358,6 +35475,10 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
     inColumn(column, () => {
       for (const id of added) if (back.has(id)) archivedIds.delete(id);
       mirrorArchived(mirrored.filter((id) => back.has(id)), false);
+      // ...and the rows it took off under Hide read without threads, while that list is still on screen.
+      if (listed && todoMode && !threadingSupported && String(el("discord-channel").value) === String(channel)) {
+        putBackRowsOff(listed, back);
+      }
       guardQuietly(refreshAfterInboxChange)();
     });
     // ...and in every view held, from the store the lines above took it back in; in the left column
@@ -35425,6 +35546,9 @@ async function restoreMessages(ids) {
   for (const id of restored) {
     archivedIds.delete(id);
   }
+  // On its way from now on, for what waits on a Done of these messages to be saved (`doneSaved`,
+  // `#327 done-races-remaining`): settled once the write has been answered and a refusal taken back.
+  const saving = noteDoneSaving(restored);
   // `#229 desktop-two-column`. Put back in the other column as well.
   const column = activeColumn;
   // What the lines in the `try` change, for a refusal to take back: from the notes above on, a slip
@@ -35469,6 +35593,8 @@ async function restoreMessages(ids) {
     settleInboxWrite(restored, false, new Set(restored));
     settleHeldDone(held, true);
     settled = true;
+    // Saved: what waits on it need not wait for the read below as well.
+    saving();
     if (todoMode && !threadingSupported) {
       await loadTodo({ keepPosition: true, ownAct: true, readAs: "mutation" });
     }
@@ -35504,6 +35630,9 @@ async function restoreMessages(ids) {
     renderTodoControls();
     if (landed.length > 0) error.landed = landed.length;
     throw error;
+  } finally {
+    // Refused, once taken back, so what waits on it finds the messages as the server holds them.
+    saving();
   }
   const count = restored.length;
   setStatus(`${count} message${count === 1 ? "" : "s"} back in the list.`);
@@ -38182,7 +38311,9 @@ async function markAnsweredDone(channel, id) {
   await inColumn(found ? found.column : columns.main, () => toggleArchived(ids, found ? found.row : null));
   // `#240 reading-bookmark`. Send said where the way back is, and the Done's own words took the line.
   if (bookmarkAnchor(channel)) setStatus("b goes back to your bookmark.");
-  return true;
+  // `#327 done-races-remaining`. Its own Done is saved, but Undo may have been pressed while it was:
+  // a put back still on its way waited for, the message is looked at again as for a Done made before.
+  return doneSaved(ids, () => String(el("discord-channel").value) === channel && doneHeldHere(ids));
 }
 
 /**
