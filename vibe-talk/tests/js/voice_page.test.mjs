@@ -18024,6 +18024,86 @@ test("the list follows the channel being READ, and Settings' channel picker does
   assert.deepStrictEqual(listedNames(before), ["mallory"], "the negative control lists the read channel's cast anyway");
 });
 
+/** Two channels, each with its own one-person cast: alice in CHANNEL, mallory in OTHER_CHANNEL. */
+function twoCasts(page) {
+  page.channels = [{ ...CHANNEL }, { ...OTHER_CHANNEL }];
+  serveByChannel(page, {
+    [CHANNEL.id]: [message({ id: "3000000000000000001", channel_id: CHANNEL.id, author: "alice", author_id: "10", author_is_bot: false })],
+    [OTHER_CHANNEL.id]: [message({ id: "3000000000000000002", channel_id: OTHER_CHANNEL.id, author: "mallory", author_id: "30", author_is_bot: false })],
+  });
+}
+
+/** Choose `bucket` for the first account in the list of who is who, as the reader does. */
+async function chooseIdentity(page, bucket) {
+  const select = page.el("identity-list").descendants().find((node) => node.tagName === "select");
+  select.value = bucket;
+  await select.dispatch("change");
+}
+
+test("`#351 settings-polish`: who is who's line about a choice goes when the channel being read changes, and stays while it does not", async () => {
+  const page = newPage();
+  twoCasts(page);
+  await signIn(page);
+  await showDiscord(page, []);
+  await readChannel(page, OTHER_CHANNEL.id);
+  await readChannel(page, CHANNEL.id);
+  await page.el("open-settings").click();
+  await chooseIdentity(page, "coder");
+  assert.match(page.el("identity-state").textContent, /^Saved\./);
+  // The same channel, Settings left and opened again: still the report about the list on screen.
+  await page.el("close-settings").click();
+  await page.el("open-settings").click();
+  assert.match(page.el("identity-state").textContent, /^Saved\./, "the line went with the list unchanged");
+  // Another channel read: its list, and no report about the last one's.
+  await page.el("close-settings").click();
+  await readChannel(page, OTHER_CHANNEL.id);
+  await page.el("open-settings").click();
+  assert.deepStrictEqual(listedNames(page), ["mallory"]);
+  assert.equal(page.el("identity-state").textContent, "", "the line still reports a choice made in another channel's list");
+  // The channel being read removed from under the list, in Settings: the list goes to the channel read
+  // now, and the line about a choice made in the removed one's goes with it.
+  await chooseIdentity(page, "bot");
+  assert.match(page.el("identity-state").textContent, /^Saved\./);
+  await settingsChannel(page, OTHER_CHANNEL.id);
+  await page.el("remove-channel").click();
+  await page.settle();
+  assert.equal(page.el("discord-channel").value, CHANNEL.id);
+  assert.deepStrictEqual(listedNames(page), ["alice"], "the list stayed on the channel removed from under it");
+  assert.equal(page.el("identity-state").textContent, "", "the line outlived the list it was about");
+  // The negative control: a list that never clears the line.
+  const blind = newPage(new Map(), brokenScript('    el("identity-state").textContent = "";\n    identityListChannel = String(channelId);\n',
+    "    identityListChannel = String(channelId);\n"));
+  twoCasts(blind);
+  await signIn(blind);
+  await showDiscord(blind, []);
+  await readChannel(blind, OTHER_CHANNEL.id);
+  await readChannel(blind, CHANNEL.id);
+  await blind.el("open-settings").click();
+  await chooseIdentity(blind, "coder");
+  await blind.el("close-settings").click();
+  await readChannel(blind, OTHER_CHANNEL.id);
+  await blind.el("open-settings").click();
+  assert.match(blind.el("identity-state").textContent, /^Saved\./, "the negative control cleared the line anyway, so the check above proves nothing");
+});
+
+test("`#351 settings-polish`: with two columns open, who is who stays on the channel being read whichever column learns an author", async () => {
+  // Both columns read one channel: the bar's picker, which is not one of the elements the right column
+  // stands in for (COLUMN_IDS), so the list cannot follow a column to another channel. This pins that:
+  // with a thread drawn in the right column, its authors are listed under the line naming the channel read.
+  assert.ok(!/^\s*"discord-channel":/m.test(SCRIPT_CODE.slice(SCRIPT_CODE.indexOf("const COLUMN_IDS = {"),
+    SCRIPT_CODE.indexOf("};", SCRIPT_CODE.indexOf("const COLUMN_IDS = {")))), "the right column has a channel picker of its own");
+  const { page, data } = await twoColumnServer((page, data) => {
+    const answer = data.messages.find((one) => one.id === "204");
+    Object.assign(answer, { author: "zed", author_id: "4000000000000000044", author_is_bot: false });
+  });
+  await openerOf(cardRow(page, data.threads[1].id)).click();
+  await page.settle();
+  assert.equal(page.el("side-pane").hidden, false, "the thread is not open in the right column");
+  await page.el("open-settings").click();
+  assert.ok(listedNames(page).includes("zed"), `an author of the right column's thread is not listed: ${listedNames(page)}`);
+  assert.match(page.el("identity-list").children[0].textContent, /^In lead team, the channel you are reading:$/);
+});
+
 test("a channel nobody has spoken in yet says WHICH channel is empty rather than showing a blank panel", async () => {
   const page = newPage();
   page.channels = [{ ...CHANNEL }, { ...OTHER_CHANNEL }];

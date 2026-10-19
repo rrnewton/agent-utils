@@ -25666,6 +25666,9 @@ function bucketFor(authorId, isBot, channelId) {
   return "bot";
 }
 
+/** The channel the list of who is who was last drawn for (`renderIdentityRows`), or null before it was. */
+let identityListChannel = null;
+
 /**
  * The Settings panel: one row per account seen IN THE CHANNEL BEING READ, saying what it is and
  * letting that be changed.
@@ -25681,11 +25684,20 @@ function bucketFor(authorId, isBot, channelId) {
  * and a list of who spoke cannot follow "all". So it is a group of Messages, about the channel whose
  * messages it decides how to draw. Still one channel's census: a bot that only speaks somewhere else
  * cannot spoil the guess here.
+ *
+ * `#351 settings-polish`. The line under the list (`#identity-state`) says what a choice just made in
+ * it did, and the choice was made in one channel's list: under another channel's it reads as a report
+ * about rows nobody has touched. It went when Settings' picker moved the list; the list follows the
+ * channel being read now, so it goes when that channel changes (`identityListChannel`).
  */
 function renderIdentityRows() {
   const host = el("identity-list");
   const channelId = el("discord-channel").value;
   const seen = seenIn(channelId);
+  if (String(channelId) !== identityListChannel) {
+    el("identity-state").textContent = "";
+    identityListChannel = String(channelId);
+  }
   const ids = Object.keys(seen).sort((a, b) => {
     const left = seen[a];
     const right = seen[b];
@@ -42115,7 +42127,12 @@ function fillChannelSelect(id) {
   } else {
     select.value = "";
   }
-  if (id === "discord-channel") rememberActiveChannel();
+  if (id === "discord-channel") {
+    rememberActiveChannel();
+    // `#351 settings-polish`. A list redrawn onto another channel than the one it showed (the channel
+    // being read removed from under it, in Settings) moves who is who to the channel read now.
+    if (String(select.value) !== String(chosen)) renderIdentityRows();
+  }
 }
 
 /**
