@@ -1,6 +1,6 @@
 ---
 title: 'late-fork-census: close the post-snapshot inheritance race'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -10,7 +10,8 @@ labels:
 depends_on:
   agent-utils-21: parent-child
 created_at: 2026-09-25T14:23:59.002187886+00:00
-updated_at: 2026-09-25T14:23:59.002187886+00:00
+updated_at: 2026-10-19T13:13:03.338425888+00:00
+closed_at: 2026-10-19T13:13:03.338425788+00:00
 ---
 
 # Description
