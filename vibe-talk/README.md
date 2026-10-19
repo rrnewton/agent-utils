@@ -687,6 +687,15 @@ on prepares every visible message in the background. A tap on a row that is not 
 prepare request for that row alone and starts reading it, and the rest of the screen keeps
 preparing behind it.
 
+A prepared URL is never played after its ticket has ended (`#290 speech-ticket-refresh`). The
+prepare answer says how long its tickets last (`expires_in_seconds`, ten minutes), and the page
+counts that from just before it sent the request, on its monotonic clock, so the time the server
+took to answer shortens how long the URL is used and never stretches it past the ticket. Each row
+keeps its own deadline, because rows are prepared at different times. A row past it is a row with
+nothing ready: the screen's preparation asks for it again, and a tap prepares it again once and,
+if that fails, reads it by the authenticated route instead of playing a URL the server no longer
+accepts.
+
 On the server, preparation first looks at messages fetched for the page in the last 30 seconds,
 kept in memory (`src/read_ahead.rs`, apart from the voice catch-up's windows in `src/recent.rs`).
 It fetches only what is missing:
