@@ -1,12 +1,13 @@
 ---
 title: 'speech-ticket-refresh: never play a prepared read-aloud URL after its server ticket has expired'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-14T14:48:59.064823163+00:00
-updated_at: 2026-10-14T14:48:59.064823163+00:00
+updated_at: 2026-10-19T10:06:02.406936506+00:00
+closed_at: 2026-10-19T10:06:02.406936406+00:00
 ---
 
 # Description
