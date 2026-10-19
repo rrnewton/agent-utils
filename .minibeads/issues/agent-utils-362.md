@@ -1,12 +1,13 @@
 ---
 title: 'ci-failure-masking: the first failure in a validation run hides every other failure'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - validation
 created_at: 2026-10-19T09:35:54.849757746+00:00
-updated_at: 2026-10-19T09:35:54.849757746+00:00
+updated_at: 2026-10-19T10:39:39.414065440+00:00
+closed_at: 2026-10-19T10:39:39.414065320+00:00
 ---
 
 # Description
