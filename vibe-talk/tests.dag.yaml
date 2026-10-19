@@ -631,6 +631,26 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#371 channel-search-hash` in the browser engine at 1280x800: one Slack service whose channels are
+  # written `#name`; the bar's picker lists them without the '#', so typing `team` into the focused
+  # picker through CDP chooses `#team-builds`, and the channel browser counts the seconds of a slow
+  # first read, then finds `#team-builds-archive` for `Builds` and `#eng-ops` for `#ops`. The fake-DOM
+  # suite's <select> has no type-ahead, so only this proves typing reaches the channel. Its fake holds
+  # the first directory read for 2.5 s. Measured on 2026-10-19 outside dagrun: about 6s wall.
+  - group: check
+    job: channel-search-browser
+    desc: a Slack channel found by typing its name without the '#' into the real channel picker and the channel browser's search, and a slow first read counting its seconds, in current Chromium at 1280x800
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/channel_search_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 8
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#229 desktop-two-column` in the browser engine: the layout button draws Main and the right column
   # side by side inside the window at 1440x900 and 1280x800, neither under 440px, the view picker
   # saying so and the width handle gone; `#281 view-keys`: the thread list chosen from the picker is the

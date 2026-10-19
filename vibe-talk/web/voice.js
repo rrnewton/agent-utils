@@ -43661,8 +43661,26 @@ const channelDirectory = {
   failed: false,
   generation: 0,
   searchTimer: null,
+  /** `#371 channel-search-hash`. The timer that says how long the read on its way has taken. */
+  ticker: null,
   adding: new Set(),
 };
+
+/** How often the line under the search says how long a read has taken, and after how long it explains why. */
+const DIRECTORY_TICK_MS = 1000;
+const DIRECTORY_SLOW_MS = 3000;
+
+/**
+ * A channel's name in a picker: its name without a leading '#'. `#371 channel-search-hash`.
+ *
+ * A native <select> finds an option by the first letters of its text as they are typed, so a Slack
+ * channel listed as `#team-builds` was never reached by typing `team`. The '#' says only that it is
+ * a Slack channel, which the picker's service header (or Settings' Service row) says already.
+ * Everywhere else a channel keeps its name as written.
+ */
+function pickerName(name) {
+  return name.replace(/^#+\s*/, "") || name;
+}
 
 function knownChannel(id) {
   return knownChannels.find((channel) => String(channel.id) === String(id)) || null;
@@ -43731,7 +43749,7 @@ function fillChannelSelect(id) {
   const optionFor = (channel) => {
     const option = document.createElement("option");
     option.value = channel.id;
-    option.textContent = channelName(channel);
+    option.textContent = pickerName(channelName(channel));
     return option;
   };
   // `#355 provider-grouped-channels`. The bar's picker groups its channels by service once two or
@@ -43962,11 +43980,30 @@ async function loadChannelDirectory(more) {
   }
   renderChannelDirectory();
   const said = el("channel-directory-state");
-  said.textContent = more
+  const asking = more
     ? "Loading more channels…"
     : channelDirectory.query
       ? `Searching for "${channelDirectory.query}"…`
       : "Loading channels…";
+  said.textContent = asking;
+  // `#371 channel-search-hash`. A service may take seconds to list its channels (Slack lists every
+  // conversation the app is in before it can answer one search), so the line says how long this read
+  // has taken, and once it is slow, why the next will not be. The server keeps the listing for two
+  // minutes, so the searches after it answer at once.
+  if (channelDirectory.ticker !== null) clearTimeout(channelDirectory.ticker);
+  const startedAt = Date.now();
+  const tick = () => {
+    channelDirectory.ticker = null;
+    if (generation !== channelDirectory.generation || !channelDirectory.loading) return;
+    const waited = Date.now() - startedAt;
+    const seconds = Math.max(1, Math.round(waited / 1000));
+    const why = waited >= DIRECTORY_SLOW_MS
+      ? ` ${sentenceStart(settingsServiceName())} can take a while to list its channels; what it lists is kept for two minutes.`
+      : "";
+    said.textContent = `${asking} ${seconds} s so far.${why}`;
+    channelDirectory.ticker = setTimeout(tick, DIRECTORY_TICK_MS);
+  };
+  channelDirectory.ticker = setTimeout(tick, DIRECTORY_TICK_MS);
   let path = `/api/v1/channel-directory?limit=${DIRECTORY_PAGE_SIZE}`;
   if (channelDirectory.query) path += `&q=${encodeURIComponent(channelDirectory.query)}`;
   if (cursor) path += `&cursor=${encodeURIComponent(cursor)}`;
@@ -43977,6 +44014,7 @@ async function loadChannelDirectory(more) {
     payload = await api(path);
   } catch (error) {
     if (generation !== channelDirectory.generation) return;
+    stopDirectoryTicker();
     channelDirectory.loading = false;
     channelDirectory.failed = true;
     renderChannelDirectory();
@@ -43986,6 +44024,7 @@ async function loadChannelDirectory(more) {
     return;
   }
   if (generation !== channelDirectory.generation) return;
+  stopDirectoryTicker();
   channelDirectory.loading = false;
   const entries = Array.isArray(payload && payload.entries) ? payload.entries : [];
   channelDirectory.entries = more ? [...channelDirectory.entries, ...entries] : entries;
@@ -43996,6 +44035,12 @@ async function loadChannelDirectory(more) {
   channelDirectory.truncated = payload !== null && payload.truncated === true;
   renderChannelDirectory();
   said.textContent = directorySummary();
+}
+
+/** Stop saying how long the directory read has taken: it answered. */
+function stopDirectoryTicker() {
+  if (channelDirectory.ticker !== null) clearTimeout(channelDirectory.ticker);
+  channelDirectory.ticker = null;
 }
 
 /** Whether a failed read is one that trying again cannot fix. */

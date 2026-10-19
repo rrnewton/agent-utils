@@ -1893,6 +1893,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     directoryCalls: [],
     /** Failures the next directory reads answer with, one each, as `{status, error, detail}`. */
     directoryFailures: [],
+    /** `#371 channel-search-hash`. While set, a promise every directory read waits for before it answers. */
+    directoryHold: null,
     /** Make adding answer 409, the way the server does for a source it already reads. */
     addChannelConflict: false,
     /** Whether the provider can move its own read cursor. Default false, like production. */
@@ -2980,6 +2982,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       if (String(path).startsWith("/api/v1/channel-directory")) {
         const url = new URL(path, "http://fixture.test");
         page.directoryCalls.push(url);
+        if (page.directoryHold) await page.directoryHold;
         const failure = page.directoryFailures.shift();
         if (failure) {
           return json(failure.status, { error: failure.error, detail: failure.detail });
@@ -4284,6 +4287,12 @@ const TUNING_BANDS = {
   DIRECTORY_SEARCH_DELAY_MS: [100, 1000,
     "the pause that ends a search: shorter asks the server once per keystroke, longer makes the " +
     "list feel as if it ignored what was typed (#19 channel-browser)"],
+  DIRECTORY_TICK_MS: [500, 2000,
+    "how often a slow directory read says how long it has taken: more often redraws the line for " +
+    "nothing a reader can see, less often makes a count of seconds skip (#371 channel-search-hash)"],
+  DIRECTORY_SLOW_MS: [2000, 10000,
+    "when a directory read is slow enough to say why: sooner explains an ordinary wait, later leaves " +
+    "a reader of a slow service staring at a count with no reason (#371 channel-search-hash)"],
   DIRECTORY_PAGE_SIZE: [10, 50,
     "channels per page: fewer is a Show more tap every screenful, more than the server's own " +
     "limit of 50 is refused outright"],
@@ -34662,6 +34671,64 @@ test("channel browser: lists what the server sees and marks what is already here
   assert.equal(page.directoryCalls.length, 1);
   assert.equal(page.directoryCalls[0].searchParams.get("limit"), "25");
   assert.equal(page.directoryCalls[0].searchParams.get("q"), null);
+});
+
+test("channel browser: a slow read says how long it has taken, then why, and stops saying it once answered", async () => {
+  // `#371 channel-search-hash`. Slack lists every conversation the app is in before it can answer a
+  // search; on a real workspace that took six seconds, with nothing on screen but "Searching…".
+  const page = browsingPage();
+  await openBrowser(page);
+  let answer;
+  page.directoryHold = new Promise((resolve) => {
+    answer = resolve;
+  });
+  const search = page.el("channel-directory-search");
+  await search.setValue("release");
+  await search.dispatch("keydown", { key: "Enter" });
+  const said = () => page.el("channel-directory-state").text();
+  assert.equal(said(), 'Searching for "release"…');
+  page.setClock(page.clock() + 1000);
+  assert.equal(page.expireTimers(1000), 1, "nothing counts the wait");
+  assert.equal(said(), 'Searching for "release"… 1 s so far.');
+  page.setClock(page.clock() + 2000);
+  page.expireTimers(1000);
+  assert.equal(
+    said(),
+    'Searching for "release"… 3 s so far. Discord can take a while to list its channels; what it lists is kept for two minutes.'
+  );
+  page.directoryHold = null;
+  answer();
+  await page.settle();
+  assert.equal(said(), "1 channel shown.");
+  assert.equal(page.expireTimers(1000), 0, "the count went on after the answer");
+  assert.deepEqual(directoryRows(page), ["Release Train | Add"]);
+});
+
+test("channel pickers list a channel without its leading '#', so typing its name reaches it", async () => {
+  // `#371 channel-search-hash`. A native picker finds an option by the first letters of its text, so
+  // `#team-builds` was never reached by typing `team`. Elsewhere the name stays as written.
+  const page = newPage();
+  const builds = { id: "C0000BLD01", label: "#team-builds", writable: false };
+  const general = { id: "C0000GEN01", label: "general", writable: false };
+  const odd = { id: "C0000ODD01", label: "#", writable: false };
+  page.channels = [builds, general, odd];
+  page.channelPage = async (path) => {
+    const selected = page.channels.find((channel) => String(path).includes(channel.id));
+    return json(200, { channel: selected, messages: [] });
+  };
+  await signIn(page);
+  await showDiscord(page, []);
+  assert.deepStrictEqual(optionText(page, "discord-channel"), ["team-builds", "general", "#"]);
+  await page.el("open-settings").click();
+  await page.settle();
+  assert.deepStrictEqual(
+    optionText(page, "settings-channel").filter((text) => text !== "All channels"),
+    ["team-builds", "general", "#"]
+  );
+  page.el("settings-channel").value = builds.id;
+  await page.el("settings-channel").dispatch("change");
+  await page.settle();
+  assert.match(page.el("channel-facts").text(), /The configured label is "#team-builds"\./);
 });
 
 test("channel browser: search waits for typing to pause, then asks the server", async () => {

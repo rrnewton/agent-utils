@@ -7664,6 +7664,15 @@ before. `72-settings-services` photographs the box on Slack beside a Google Chat
 375px phone, the bar's groups, Alt+Up and Alt+Down across them, a reload, and the Service row inside
 the window.
 
+**The channel pickers list a channel without its leading `#`** (`#371 channel-search-hash`). A native
+picker finds an option by the first letters of its text as they are typed, so a Slack channel listed
+as `#team-builds` was never reached by typing `team`. The '#' says only that it is a Slack channel,
+which the service's header or the Service row already says; everywhere else the name keeps it. The
+channel browser's search ignores a leading '#' and case at every service (see "Browse channels"
+above), and while a read is on its way the line under the box counts its seconds, and after three
+says the service can take a while to list its channels. `make channel-search-browser` types `team`
+into the real picker and `Builds` and `#ops` into the browser's search in Chromium.
+
 **On a wide desktop window the sections tile into columns** (`#345 settings-multi-column`). The
 owner, 2026-10-18: "tile Settings' top-level panes into width-dependent columns, each pane kept whole
 and packed, order and focus order unchanged; phone/narrow single column". The five sections that
