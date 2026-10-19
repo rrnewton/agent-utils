@@ -29608,9 +29608,9 @@ function readWithBrowserSpeech(parts, id, ticket) {
  * Where each visible message can be PLAYED from, resolved before the reader taps anything.
  *
  * Message id -> `{url, until}`: a URL that streams that message's audio, and when its ticket may have
- * ended. The server minted these when read-aloud was switched on: it resolved every id on screen
- * against one Discord window, normalised each for speech, and warmed the voice lookup. What a tap
- * then costs is opening this URL.
+ * ended, on two clocks (`speechDeadlineNow`). The server minted these when read-aloud was switched
+ * on: it resolved every id on screen against one Discord window, normalised each for speech, and
+ * warmed the voice lookup. What a tap then costs is opening this URL.
  *
  * THE URL CARRIES ITS OWN AUTHORITY, which is the only reason any of this works: an `<audio src>`
  * cannot send an `Authorization` header, and without an `<audio src>` the browser will not stream —
@@ -29618,9 +29618,13 @@ function readWithBrowserSpeech(parts, id, ticket) {
  *
  * AND THAT AUTHORITY ENDS. `#290 speech-ticket-refresh`: a ticket lives `expires_in_seconds` from when
  * the server minted it, and a URL played after that is a 404 and "that message could not be played".
- * So each entry keeps its own deadline, `until`, on the monotonic clock (`speechTimingNow`): when the
- * request that minted it was SENT, plus that lifetime, so the server's work and the answer's journey
- * shorten how long the URL is used and never stretch it past its ticket. Per entry, because rows are
+ * So each entry keeps its own deadline, `until`: when the request that minted it was SENT, plus that
+ * lifetime, so the server's work and the answer's journey shorten how long the URL is used and never
+ * stretch it past its ticket. On BOTH clocks, and past either is past: the monotonic one cannot be
+ * moved back by a clock change, but on a phone it stops while the device sleeps (`performance.now()`
+ * does on iOS, and on Android's CLOCK_MONOTONIC), while the server's ticket keeps ageing; the wall
+ * clock goes on through sleep. A wall clock set back only loosens its own check, which the monotonic
+ * one still holds; one set forward only prepares a row early. Per entry, because rows are
  * prepared at different times — the screen's batch, a tap's own row (`prepareSpeechFor`). An entry
  * past its deadline is read as missing (`preparedEntry`).
  *
@@ -29640,7 +29644,8 @@ const preparedSpeech = new Map();
 function preparedEntry(id) {
   const entry = preparedSpeech.get(String(id));
   if (!entry) return null;
-  if (speechTimingNow() < entry.until) return entry;
+  const now = speechDeadlineNow();
+  if (now.mono < entry.until.mono && now.wall < entry.until.wall) return entry;
   preparedSpeech.delete(String(id));
   return null;
 }
@@ -29720,7 +29725,7 @@ async function requestPreparedSpeech(channel, ids) {
   }
   // Before the requests go: the tickets may be minted the moment they arrive, and counting from the
   // answer would let a URL outlive its ticket by however long the answer took. `#290`.
-  const requestedAt = speechTimingNow();
+  const requestedAt = speechDeadlineNow();
   const batches = await Promise.all([...groups].map(([threadId, messageIds]) => api(
     `/api/v1/channels/${encodeURIComponent(channel)}/speech/prepare`,
     { method: "POST", body: { ids: messageIds, speed: readSpeed === null ? null : readSpeed / 100,
@@ -29728,7 +29733,8 @@ async function requestPreparedSpeech(channel, ids) {
   )));
   for (const batch of batches) {
     // A batch that says no lifetime gives URLs that are never played: none is not forever.
-    const until = requestedAt + (Number(batch && batch.expires_in_seconds) || 0) * 1000;
+    const lifetimeMs = (Number(batch && batch.expires_in_seconds) || 0) * 1000;
+    const until = { mono: requestedAt.mono + lifetimeMs, wall: requestedAt.wall + lifetimeMs };
     for (const entry of (batch && batch.prepared) || []) {
       preparedSpeech.set(String(entry.message_id), { url: entry.url, until });
     }
@@ -29896,13 +29902,23 @@ async function fetchSpeech(channel, id) {
 }
 
 /**
- * Report only clocks for a prepared read. The ticket already authorizes this one observation. Also the
- * clock a prepared URL's deadline is kept on (`preparedSpeech`): monotonic where the browser has one.
+ * Report only clocks for a prepared read. The ticket already authorizes this one observation. Also one
+ * of the two clocks a prepared URL's deadline is kept on (`speechDeadlineNow`): monotonic where the
+ * browser has one.
  */
 function speechTimingNow() {
   return typeof performance !== "undefined" && typeof performance.now === "function"
     ? performance.now()
     : Date.now();
+}
+
+/**
+ * Now on both clocks a prepared URL's deadline is kept on (`preparedSpeech`): the monotonic one,
+ * which no clock change moves, and the wall clock, which goes on while a phone sleeps.
+ * `#290 speech-ticket-refresh`.
+ */
+function speechDeadlineNow() {
+  return { mono: speechTimingNow(), wall: Date.now() };
 }
 
 function speechElapsedMs(start, end) {

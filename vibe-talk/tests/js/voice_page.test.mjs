@@ -2677,6 +2677,16 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     clockMs = ms;
   };
   page.clock = () => clockMs;
+  // `performance.now()`, counted from the page's start, as a browser's is. It stands still while the
+  // device sleeps (`page.sleep`): on a phone it does, while the wall clock and the server go on.
+  // `#290 speech-ticket-refresh`.
+  const pageStartMs = clockMs;
+  let sleptMs = 0;
+  page.sleep = (ms) => {
+    clockMs += ms;
+    sleptMs += ms;
+  };
+  const performance = { now: () => clockMs - pageStartMs - sleptMs };
 
   // The window's own listeners — today only `online`, the browser's word that the connection is
   // back, which `#195 send-resilience` resumes held sends on.
@@ -2773,6 +2783,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     localStorage,
     sessionStorage,
     Date: FixedDate,
+    performance,
     getSelection: () => page.selection,
     window: {
       AudioContext: function () { return new FakeAudioContext(page); },
@@ -10562,9 +10573,35 @@ test("`#290 speech-ticket-refresh`: a prepared URL is played until the last mill
   assert.match(at.url, new RegExp(`^/api/v1/speech/ticket-for-${ID}-again\\?selection=tap-`), `the URL whose ticket had ended was played: ${at.url}`);
   assert.equal(at.spoke, 0, "a refresh that worked fell back to the slower route");
   // The control: the deadline counted from the answer. Five seconds later than the ticket's, the dead URL is played.
-  const fromAnswer = await tap(brokenScript("    const until = requestedAt + ", "    const until = speechTimingNow() + "), true);
+  const fromAnswer = await tap(brokenScript("    const until = { mono: requestedAt.mono + lifetimeMs, wall: requestedAt.wall + lifetimeMs };",
+    "    const answeredAt = speechDeadlineNow();\n    const until = { mono: answeredAt.mono + lifetimeMs, wall: answeredAt.wall + lifetimeMs };"), true);
   assert.match(fromAnswer.url, new RegExp(`ticket-for-${ID}\\?selection=`),
     "the negative control, counting from the answer, did not play the dead URL, so the check above proves nothing");
+});
+
+test("`#290 speech-ticket-refresh`: a phone that slept through the ticket's end prepares the row again, though the monotonic clock stood still while it slept (negative control: the deadline kept on that clock alone)", async () => {
+  const ID = "1000000000000000001";
+  const tap = async (script) => {
+    const page = newPage(new Map(), script);
+    await signIn(page);
+    const rows = await inReadingMode(page, [message({ id: ID })]);
+    const before = page.prepareCalls.length;
+    // A minute of reading, then the phone is locked for a quarter of an hour, and unlocked.
+    page.setClock(page.clock() + 60_000);
+    page.sleep(15 * 60_000);
+    page.speechTicketSuffix = "-again";
+    await rows[0].dispatch("click", {});
+    await page.settle();
+    return { page, again: preparedAgain(page, before, ID), url: page.players[0] && page.players[0].url };
+  };
+  const slept = await tap(SCRIPT);
+  assert.equal(slept.again, 1, `the tap after the phone slept prepared its row ${slept.again} times, not once`);
+  assert.match(slept.url, new RegExp(`^/api/v1/speech/ticket-for-${ID}-again\\?selection=tap-`),
+    `the URL whose ticket ended while the phone slept was played: ${slept.url}`);
+  assert.deepEqual(slept.page.speakCalls, [], "a refresh that worked fell back to the slower route");
+  const control = await tap(brokenScript("now.mono < entry.until.mono && now.wall < entry.until.wall", "now.mono < entry.until.mono"));
+  assert.match(control.url, new RegExp(`ticket-for-${ID}\\?selection=`),
+    "the negative control, on the monotonic clock alone, did not play the dead URL, so the check above proves nothing");
 });
 
 test("`#290 speech-ticket-refresh`: a tap after the ticket has ended, when preparing the row again fails, reads it by the authenticated route and never plays the dead URL", async () => {
