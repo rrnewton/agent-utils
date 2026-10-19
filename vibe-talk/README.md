@@ -7361,7 +7361,10 @@ and asks the server for that service's channels alone; the hidden channels are t
 service with no channel on the list says how to add one. Another service closes any open panel and
 empties the browse list. Settings opens on the service of the channel being read, and coming back
 from Help keeps the service chosen. With one service none of this shows and every request is as
-before.
+before. `72-settings-services` photographs the box on Slack beside a Google Chat channel at 393x852,
+1280x800 and 1920x1080, and `make provider-groups-browser` checks in real Chromium, at a desk and a
+375px phone, the bar's groups, Alt+Up and Alt+Down across them, a reload, and the Service row inside
+the window.
 
 **On a wide desktop window the sections tile into columns** (`#345 settings-multi-column`). The
 owner, 2026-10-18: "tile Settings' top-level panes into width-dependent columns, each pane kept whole
