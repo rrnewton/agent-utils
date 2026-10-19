@@ -34,10 +34,34 @@ command's own output, exit status, stdin and terminal pass through unchanged.
 
 ## Install
 
+Build it in the agent-utils checkout. agent-utils' own tools find this build
+there, so no install step is needed for them:
+
 ```bash
 cargo build --release --manifest-path rs/Cargo.toml -p gh-paced
-install -m 0755 rs/target/release/gh-paced ~/bin/gh-paced
 ```
+
+To call it by name elsewhere, copy `rs/target/release/gh-paced` into any
+directory on your `PATH`.
+
+## How agent-utils tools choose their gh
+
+Every agent-utils tool that calls GitHub (for example wrkviz's pull metadata,
+dagrun's github-artifacts backend and pr-landing-planner) picks its command in
+this order, first match wins:
+
+1. `$AGENT_UTILS_GH`, an explicit command (for example `gh` to run unpaced, or
+   your own wrapper);
+2. gh-paced built in the agent-utils checkout the tool runs from
+   (`rs/target/release/gh-paced` or `rs/target/<host>/release/gh-paced`), then
+   a `gh-paced` on `PATH`. It wraps the real gh: `$GH_PACED_REAL_GH`, else the
+   first `gh` on `PATH` that is not itself a gh-paced wrapper script. The
+   account is `$GH_PACED_ACCOUNT`, else the real gh's signed-in login
+   (`gh config get user -h github.com`); with neither, the tool refuses rather
+   than run GitHub unpaced;
+3. `gh` on `PATH`.
+
+No home-directory location is assumed, and nothing is built on demand.
 
 ## Use
 
@@ -47,10 +71,10 @@ Call it directly, naming the account whose budgets apply:
 gh-paced --account octocat -- pr view 12 --json state
 ```
 
-Or make your `gh` wrapper script hand every call to it:
+Or make your own `gh` wrapper script hand every call to it:
 
 ```bash
-exec ~/bin/gh-paced --account octocat --real-gh /usr/bin/gh -- "$@"
+exec gh-paced --account octocat --real-gh /usr/bin/gh -- "$@"
 ```
 
 Check the budgets at any time. This reads local files only and never contacts

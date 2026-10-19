@@ -7,7 +7,7 @@ passes through this module or into a record.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
@@ -19,6 +19,7 @@ from typing import Protocol
 from urllib.parse import urlsplit
 
 from wrkviz.archive import JsonValue, read_json, write_json_if_changed
+from wrkviz.gh_resolve import GhResolveError, resolve_gh
 
 
 SCHEMA_VERSION = 1
@@ -292,16 +293,19 @@ def _validate_api_url(url: str) -> str:
 class GhApiTransport:
     """GitHub transport through the ``gh`` command line, never a direct connection.
 
-    Every request runs ``gh api``, so it uses whatever ``gh`` is on PATH,
-    including a rate-limiting wrapper, and that ``gh``'s own login. This module
-    used to open its own HTTPS connection with a token from the environment,
-    which spent the account's API budget where such a wrapper could neither see
-    nor pace it. ``gh`` supplies the credential, so an ``Authorization`` header
-    is refused rather than forwarded.
+    Every request runs ``gh api`` through the command :func:`resolve_gh`
+    chooses (the gh-paced pacing wrapper when built or installed, else
+    ``gh`` on PATH), with that gh's own login. This module used to open its own HTTPS
+    connection with a token from the environment, which spent the account's
+    API budget where a pacing wrapper could neither see nor pace it. ``gh``
+    supplies the credential, so an ``Authorization`` header is refused rather
+    than forwarded. ``gh`` overrides the resolver with an explicit command.
     """
 
-    def __init__(self, gh: str = "gh") -> None:
-        self.gh = gh
+    def __init__(self, gh: str | Sequence[str] | None = None) -> None:
+        self.gh: list[str] | None = [gh] if isinstance(gh, str) else (
+            list(gh) if gh is not None else None
+        )
 
     def get(
         self, *, url: str, headers: Mapping[str, str], timeout_seconds: float
@@ -309,7 +313,11 @@ class GhApiTransport:
         """Fetch one bounded response from the exact GitHub pull endpoint."""
 
         path = _validate_api_url(url)
-        argv = [self.gh, "api", "--include", "--method", "GET"]
+        try:
+            command = self.gh if self.gh is not None else resolve_gh()
+        except GhResolveError as error:
+            raise GitHubMetadataError(str(error)) from error
+        argv = [*command, "api", "--include", "--method", "GET"]
         for name, value in headers.items():
             if name.lower() == "authorization":
                 raise GitHubMetadataError(

@@ -340,7 +340,7 @@ def _build_host(ns: argparse.Namespace) -> tuple[VcsHost, str, str]:
         git_dir=ns.git_dir if isinstance(ns.git_dir, str) else ".",
         remote=ns.remote if isinstance(ns.remote, str) else "origin",
         net_wrapper=wrapper,
-        gh_cmd=ns.gh_cmd if isinstance(ns.gh_cmd, str) else "gh",
+        gh_cmd=ns.gh_cmd if isinstance(ns.gh_cmd, str) and ns.gh_cmd else None,
     )
     repo = ns.repo if isinstance(ns.repo, str) else DEFAULT_REPO
     base = ns.base if isinstance(ns.base, str) else DEFAULT_BASE
@@ -411,7 +411,14 @@ def _add_collect_flags(sp: argparse.ArgumentParser) -> None:
         default="",
         help="optional command prefix for gh and git fetch (empty = none)",
     )
-    sp.add_argument("--gh-cmd", default="gh", help="gh executable or wrapper command")
+    sp.add_argument(
+        "--gh-cmd",
+        default=None,
+        help=(
+            "gh executable or wrapper command (default: $AGENT_UTILS_GH, else the gh-paced "
+            "pacing wrapper when built or installed, else gh on PATH)"
+        ),
+    )
     sp.add_argument(
         "--conflict-detector",
         choices=["merge-tree", "file-overlap"],

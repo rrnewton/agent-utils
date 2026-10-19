@@ -26,12 +26,19 @@ when the total gets close anyway.
 
 ## Installing and wiring it in
 
-Build it and copy the binary somewhere on your PATH:
+Build it in the agent-utils checkout, and copy `rs/target/release/gh-paced`
+into a directory on your `PATH` if you want to call it by name elsewhere:
 
 ```bash
 cargo build --release --manifest-path rs/Cargo.toml -p gh-paced
-install -m 0755 rs/target/release/gh-paced ~/bin/gh-paced
 ```
+
+agent-utils' own tools that call GitHub find this build without an install
+step. Their order is: `$AGENT_UTILS_GH` if set; else gh-paced built in their
+checkout, then a `gh-paced` on `PATH`, wrapping `$GH_PACED_REAL_GH` or the
+first `gh` on `PATH` that is not a gh-paced wrapper, with the account from
+`$GH_PACED_ACCOUNT` or the real gh's signed-in login; else `gh` on `PATH`. The
+quickstart (`gh-paced quickstart`) lists it step by step.
 
 gh-paced needs to know two things: which account's budget applies, and where the
 real `gh` is.
@@ -47,8 +54,8 @@ last step:
 
 ```bash
 #!/bin/bash
-# ~/bin/gh: select the account, then pace every call.
-GH_PACED="$HOME/bin/gh-paced"
+# A gh wrapper: select the account, then pace every call.
+GH_PACED=/opt/tools/bin/gh-paced   # wherever you installed it
 [ -x "$GH_PACED" ] || { echo "gh: $GH_PACED is missing; refusing to call GitHub unpaced" >&2; exit 127; }
 exec "$GH_PACED" --account octocat --real-gh /usr/bin/gh -- "$@"
 ```

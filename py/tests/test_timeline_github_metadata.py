@@ -250,7 +250,11 @@ def test_default_fetch_runs_gh_api_and_parses_its_included_response(
         b'Etag: "fresh"\r\n\r\n' + body
     )
     gh, calls = _fake_gh(tmp_path, output)
-    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+    # Only the stand-in gh is reachable: no gh-paced on PATH or built in this checkout,
+    # so the resolver's last branch, gh on PATH, is the one exercised.
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.delenv("AGENT_UTILS_GH", raising=False)
+    monkeypatch.setattr("wrkviz.gh_resolve.source_root", lambda: None)
     monkeypatch.setenv("GH_TOKEN", "must-not-be-read")
 
     result = fetch_pull_request(_key(), cached=_record(), fetched_at="2026-08-05T12:00:00Z")
@@ -262,6 +266,35 @@ def test_default_fetch_runs_gh_api_and_parses_its_included_response(
     assert argv[-1] == "repos/sched-ext/scx/pulls/3668"
     assert "If-None-Match: W/\"cached\"" in argv
     assert not any("must-not-be-read" in arg or "Authorization" in arg for arg in argv)
+
+
+def test_default_fetch_goes_through_gh_paced_when_it_is_installed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The resolver's gh-paced branch: the stand-in gh-paced receives the account,
+    # the real gh and then gh api's own arguments.
+    body = _api_body()
+    output = b"HTTP/2.0 200 OK\nEtag: \"fresh\"\r\n\r\n" + body
+    paced_dir = tmp_path / "paced"
+    paced_dir.mkdir()
+    paced, calls = _fake_gh(paced_dir, output)
+    paced.rename(paced_dir / "gh-paced")
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    (real_dir / "gh").write_text(f"#!{sys.executable}\nprint('example-user')\n")
+    (real_dir / "gh").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{paced_dir}{os.pathsep}{real_dir}")
+    monkeypatch.delenv("AGENT_UTILS_GH", raising=False)
+    monkeypatch.delenv("GH_PACED_ACCOUNT", raising=False)
+    monkeypatch.delenv("GH_PACED_REAL_GH", raising=False)
+    monkeypatch.setattr("wrkviz.gh_resolve.source_root", lambda: None)
+
+    result = fetch_pull_request(_key(), fetched_at="2026-08-05T12:00:00Z")
+
+    assert result.metadata.etag == '"fresh"'
+    argv = json.loads(calls.read_text())
+    assert argv[:5] == ["--account", "example-user", "--real-gh", str((real_dir / "gh").resolve()), "--"]
+    assert argv[5:9] == ["api", "--include", "--method", "GET"]
 
 
 def test_gh_transport_returns_a_not_modified_response(tmp_path: Path) -> None:

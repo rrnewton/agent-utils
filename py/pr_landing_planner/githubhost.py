@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 
 from pr_landing_planner.classify import parse_rollup
+from pr_landing_planner.gh_resolve import GhResolveError, resolve_gh
 from pr_landing_planner.landing_context import (
     ALLOWED_RETIREMENT_PERMISSIONS,
     retirement_record,
@@ -466,12 +467,26 @@ class GitHubHost:
         git_dir: str = ".",
         remote: str = "origin",
         net_wrapper: Sequence[str] = (),
-        gh_cmd: str = "gh",
+        gh_cmd: str | None = None,
     ) -> None:
         self._git_dir = git_dir
         self._remote = remote
         self._wrapper = tuple(net_wrapper)
-        self._gh = gh_cmd
+        self._gh_cmd = gh_cmd
+        self._gh_prefix: list[str] | None = None
+
+    def _gh(self) -> list[str]:
+        """The GitHub CLI command: ``gh_cmd`` when given, else gh_resolve's choice
+        (the gh-paced pacing wrapper when built or installed, else ``gh`` on PATH)."""
+        if self._gh_prefix is None:
+            if self._gh_cmd is not None:
+                self._gh_prefix = [self._gh_cmd]
+            else:
+                try:
+                    self._gh_prefix = resolve_gh()
+                except GhResolveError as error:
+                    raise HostCommandError(["gh"], 2, str(error)) from error
+        return self._gh_prefix
 
     def _net(self, cmd: Sequence[str]) -> list[str]:
         return [*self._wrapper, *cmd]
@@ -480,7 +495,7 @@ class GitHubHost:
         proc = _run(
             self._net(
                 [
-                    self._gh,
+                    *self._gh(),
                     "api",
                     f"repos/{repo}/collaborators/{author}/permission",
                 ]
@@ -548,7 +563,7 @@ class GitHubHost:
         proc = _run(
             self._net(
                 [
-                    self._gh, "pr", "list",
+                    *self._gh(), "pr", "list",
                     "--repo", repo,
                     "--state", "open",
                     "--limit", str(_PR_LIST_LIMIT),
@@ -609,7 +624,7 @@ class GitHubHost:
             proc = _run(
                 self._net(
                     [
-                        self._gh,
+                        *self._gh(),
                         "api",
                         "--paginate",
                         "--slurp",
@@ -641,7 +656,7 @@ class GitHubHost:
             proc = _run(
                 self._net(
                     [
-                        self._gh,
+                        *self._gh(),
                         "api",
                         "graphql",
                         "--paginate",
@@ -668,7 +683,7 @@ class GitHubHost:
                 proc = _run(
                     self._net(
                         [
-                            self._gh, "pr", "view", str(number),
+                            *self._gh(), "pr", "view", str(number),
                             "--repo", repo,
                             "--json",
                             "number,headRefOid,reviewDecision,statusCheckRollup",

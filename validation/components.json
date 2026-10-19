@@ -206,7 +206,10 @@
         ".github/",
         "Makefile",
         "common/bin/",
+        "common/gh_resolve/",
         "cross/differential.py",
+        "py/dagrun/gh_resolve.py",
+        "py/pr_landing_planner/gh_resolve.py",
         "py/pyproject.toml",
         "py/tests/js/browser/",
         "py/tests/test_cli_smoke_no_optional_deps.py",
@@ -216,6 +219,7 @@
         "py/tests/test_packaging_infrastructure.py",
         "py/tests/test_repo_dispatch_wiring.py",
         "py/tests/test_validation_graph_contract.py",
+        "py/wrkviz/gh_resolve.py",
         "rs/bin/cargo-runner",
         "scripts/agent-log-archive/",
         "scripts/check_client_names.py",
@@ -241,6 +245,8 @@
       "test_files": [
         "py/tests/test_agent_log_archive_fetcher.py",
         "py/tests/test_engine_resolver_source_pin.py",
+        "py/tests/test_gh_resolve.py",
+        "py/tests/test_gh_resolve_copies.py",
         "py/tests/test_pid_namespace_init.py",
         "py/tests/test_rebase_delta_guard.py"
       ]

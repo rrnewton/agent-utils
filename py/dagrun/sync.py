@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from dagrun import summary as summarylib
+from dagrun.gh_resolve import GhResolveError, resolve_gh
 from dagrun.perflog import _profile_file_lock
 from dagrun.summary import (
     DEFAULT_MAX_BUCKETS,
@@ -377,10 +378,18 @@ class GitHubArtifactsBackend:
         """Return the local upload-staging path for one identity's summary."""
         return self.staging_dir / summary_object_name(machine_id, container_class)
 
+    def _gh_command(self) -> list[str]:
+        """The GitHub CLI command (gh_resolve: the gh-paced pacing wrapper, else gh on PATH)."""
+        try:
+            return resolve_gh()
+        except GhResolveError as exc:
+            raise SyncError(f"github-artifacts backend: {exc}") from exc
+
     def _gh(self, args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        command = self._gh_command()
         try:
             return subprocess.run(
-                ["gh", *args],
+                [*command, *args],
                 capture_output=True,
                 text=True,
                 timeout=self.timeout,
@@ -392,10 +401,11 @@ class GitHubArtifactsBackend:
     def _gh_download(self, api_path: str, dest: Path) -> None:
         """Fetch a BINARY GitHub API response (an artifact zip, which comes as a redirect to raw
         bytes) straight to ``dest`` — captured as bytes, not text, so the zip is not corrupted."""
+        command = self._gh_command()
         try:
             with open(dest, "wb") as out:
                 proc = subprocess.run(
-                    ["gh", "api", api_path],
+                    [*command, "api", api_path],
                     stdout=out,
                     stderr=subprocess.PIPE,
                     timeout=self.timeout,
