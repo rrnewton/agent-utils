@@ -8681,8 +8681,15 @@ function bringIntoView(pane, row, from = 1) {
  * browser drops the focus to the body when the focused row is removed, and the ring would vanish
  * under the reader at every refresh. A message that has gone (Done under Hide read) hands the
  * selection to the row now where it was: the next one, or the last at the end of the list.
+ *
+ * `#284 redraw-keeps-pane`. With the focus on nothing, it comes back only in the pane in use, the one
+ * the reader is in. In two columns the focus can be lost while the reader is in the right one — a
+ * click there on something that takes no focus, or a control that hides itself — and a live message
+ * then redraws Main: given Main's row, the focus took the keys with it, and Esc no longer closed the
+ * right column's thread. The other pane keeps its selection, unfocused, for when the reader goes back.
  */
 function keepSelection() {
+  const active = activePane();
   for (const pane of KEY_PANES) {
     const held = pane.row;
     const list = pane.list();
@@ -8691,14 +8698,15 @@ function keepSelection() {
     releaseRow(pane);
     const mark = markOf(pane);
     if (!mark || !mark.drawn) continue;
-    const lost = document.activeElement === held || focusLost();
+    const had = document.activeElement === held;
+    const lost = had || focusLost();
     const row = paneRowFor(pane, mark.id) || (lost ? nearRow(pane, mark.index) : null);
     if (!row) continue;
     pane.row = row;
     // Not `markRow`: a redraw of both columns must not make whichever came last the one in use.
     setMark(pane, row, true);
     row.setAttribute("tabindex", "0");
-    if (lost) row.focus({ preventScroll: true });
+    if (had || (lost && pane === active)) row.focus({ preventScroll: true });
   }
   // The new row of the selected message is lit, the old one having gone with the redraw. A selection
   // handed on here was nobody's choice, and glides nothing: only the pointer resting on a selection arms

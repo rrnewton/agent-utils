@@ -775,9 +775,12 @@ steps:
   # the X, Esc and <- back to the list; the card opened on the right, then real Ctrl+1 and a thread from the
   # picker: the first Esc back to Main; nothing moving under reduced motion; and on a 412x915 phone by
   # touch, two lines and a 44px X. Measured on 2026-10-14: about 30s wall, most of it the glide's waits.
+  # `#284 redraw-keeps-pane`: and a redraw of Main, the channel's re-read brought forward on the page's
+  # clock, leaving the keys in the right column, after its replies button and with the focus lost to the
+  # body, so a real Esc still closes its thread.
   - group: check
     job: thread-card-header-browser
-    desc: a thread under its card at the top — on the right, joined to its root by one line a resting mouse glides Main along, and across the window from the thread list — the card moving up from its place in the list, its long text opened over the list with nothing moving, in current Chromium at 1280x800 in both schemes and with reduced motion, and at 412x915 by touch
+    desc: a thread under its card at the top — on the right, joined to its root by one line a resting mouse glides Main along, and across the window from the thread list — the card moving up from its place in the list, its long text opened over the list with nothing moving, a redraw of Main leaving the keys on the right, in current Chromium at 1280x800 in both schemes and with reduced motion, and at 412x915 by touch
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/thread_card_header_browser.py
     jobs_flag: ""

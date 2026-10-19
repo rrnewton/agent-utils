@@ -51,6 +51,15 @@ Esc after two columns went (`#281 view-keys`): two columns again (real Ctrl+4) -
 card opened over its thread on the right -> real Ctrl+1: one column, the card closed with its column ->
 the picker: a thread across the window -> Esc: back to Main at once, no Esc spent on a card out of sight.
 
+A redraw of Main leaves the keys where the reader is (`#284 redraw-keeps-pane`), at the desk with the
+page's clock installed, so the channel's own re-read can be brought forward: two columns over the cards
+-> the mouse over Main's newest message, which selects it and takes the focus -> the summarised card's
+replies button: its thread on the right -> a new message in the channel and the re-read brought
+forward: Main drawn again, the selected message's row replaced -> real Esc: the right column's thread
+closes. Then the same with the focus lost first, by a click on the card at the top where it takes no
+focus, its age: the focus on the body -> the re-read: Main drawn again, the focus still on the body and
+not given to Main -> real Esc: the right column's thread closes.
+
 On a 412x915 phone by touch, in the dark scheme and the light: the thread list from the view picker
 -> a card's replies button: the card moves up to the top of the screen and heads the thread, two
 lines of it, its X a thumb's size -> the thread scrolled: the card does not move -> the X: the list.
@@ -79,10 +88,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import offline_cache_browser as fixture
-from offline_cache_browser import Json, check, handler_for, larger_root_font
+from offline_cache_browser import Json, check, handler_for, larger_root_font, said
 from offline_cache_browser import TOKEN
 from thread_card_focus_browser import COLOURED, COLOURED_PIXEL, PIXELS_JS, chroma, open_two_columns
-from two_column_browser import REPLICA, RUNNER, THREAD_ROWS, ColumnsApi, Desk
+from two_column_browser import FILLER, REPLICA, RUNNER, THREAD_ROWS, ColumnsApi, Desk
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType
@@ -95,6 +104,7 @@ SIZES = (
     ("desk-1280-dark", 1280, 800, "dark", "desk", 100),
     ("desk-1280-light", 1280, 800, "light", "desk", 100),
     ("desk-1280-reduced", 1280, 800, "dark", "reduced", 100),
+    ("desk-1280-redraw", 1280, 800, "dark", "redraw", 100),
     ("phone-412-dark", 412, 915, "dark", "phone", 100),
     ("phone-412-light", 412, 915, "light", "phone", 100),
     ("phone-360-font-130", 360, 800, "dark", "type", 130),
@@ -306,8 +316,13 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             page.on("pageerror", lambda error: errors.append(str(error)))
             desk = Desk(page, args.screenshots, label, width, height)
             larger_root_font(page, root_percent)
+            if kind == "redraw":
+                # The channel re-reads itself every 45 s; the walk brings that forward on this clock.
+                page.clock.install()
             page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
-            if kind == "desk":
+            if kind == "redraw":
+                redraw_walk(desk, api)
+            elif kind == "desk":
                 desk_walk(desk)
                 list_walk(desk)
                 esc_walk(desk)
@@ -783,6 +798,57 @@ def esc_walk(desk: Desk) -> None:
                   seconds=3)
     desk.notes.append("the card at the top of the right column opened, then Ctrl+1 and a thread from the picker: the first "
                       "Esc went back to Main")
+
+
+# --- a redraw of Main while the reader is in the right column (#284) -------------------------------------
+
+# How long the page waits between its re-reads of the channel (web/voice.js `DISCORD_POLL_MS`), and a little.
+POLL_PAST_MS = 46_000
+
+# What holds the focus: "body", a row by its list and id, or the element by its id.
+FOCUS_JS = """() => {
+    const held = document.activeElement;
+    if (!held || held === document.body) return 'body';
+    const row = held.closest('li[data-id]');
+    return row ? `${row.parentElement.id}:${row.getAttribute('data-id')}` : `#${held.id || held.tagName}`;
+}"""
+
+
+def redraw_walk(desk: Desk, api: ColumnsApi) -> None:
+    """`#284 redraw-keeps-pane`: the keys stay in the right column through a redraw of Main, with the
+    focus where the replies button left it and with the focus lost to the body."""
+    page = desk.page
+    open_two_columns(desk)
+    for index, lose in enumerate((False, True)):
+        where = "with the focus lost to the body" if lose else "after the replies button"
+        newest = str(223 + index)
+        row = f"#discord-log > li[data-id='{newest}']"
+        page.hover(row)
+        desk.wait_for(f'() => document.activeElement === document.querySelector("{row}")',
+                      f"{where}: the mouse over Main's newest message did not select it")
+        open_card(desk, RUNNER)
+        if lose:
+            page.click("#side-thread-card-age")
+            desk.settled()
+            desk.check(page.evaluate(FOCUS_JS) == "body",
+                       f"{where}: a click on the card's age left the focus on {page.evaluate(FOCUS_JS)}, not the body")
+        before = str(page.evaluate(FOCUS_JS))
+        page.evaluate(f'() => {{ document.querySelector("{row}").dataset.beforeRedraw = "yes"; }}')
+        with api.lock:
+            api.messages.append(said(24 + index, f"Message {224 + index}, new in the channel. {FILLER}", "human"))
+        page.clock.fast_forward(POLL_PAST_MS)
+        desk.wait_for(f"() => Boolean(document.querySelector(\"#discord-log > li[data-id='{224 + index}']\"))",
+                      f"{where}: the channel's re-read did not draw the new message in Main")
+        desk.settled()
+        desk.check(bool(page.evaluate(f'() => document.querySelector("{row}").dataset.beforeRedraw !== "yes"')),
+                   f"{where}: Main's selected row was not drawn again, so this proves nothing")
+        after = str(page.evaluate(FOCUS_JS))
+        desk.check(not after.startswith("discord-log:"), f"{where}: a redraw of Main gave the focus to {after}, from {before}")
+        page.keyboard.press("Escape")
+        desk.wait_for("() => !document.getElementById('side-list').hidden && document.getElementById('side-pane').hidden",
+                      f"{where}: after a redraw of Main, Esc did not close the right column's thread (the focus on {after})",
+                      seconds=3)
+        desk.notes.append(f"{where}, a redraw of Main left the focus on {after} and Esc closed the right column's thread")
 
 
 # --- reduced motion ----------------------------------------------------------------------------------------
