@@ -740,6 +740,15 @@
                   <p id="side-compose-state" class="hint" role="status" aria-live="polite"></p>
                 </div>
               </div>
+              <!--
+                `#338 column-overscroll`. Blank room past the foot, under the cards or the thread: the
+                owner, "let the mouse wheel (and keyboard paging) scroll PAST the end into blank space, up
+                to the point where the last card's top sits at half the column's height". No height until
+                a reader at the foot goes on down, when web/voice.js gives it the height that brings the
+                last card's top to the middle (`openOverscroll`). web/voice.css draws it at a desk only.
+                Nothing to read or press, so hidden from assistive technology.
+              -->
+              <div id="side-overscroll" aria-hidden="true"></div>
             </div>
             <!-- `#277 reply-in-column`. The right column's place for a reply opened in it: see #column-reply. -->
             <div id="side-reply" role="group" aria-label="Reply" hidden></div>
