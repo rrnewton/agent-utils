@@ -15,8 +15,10 @@ loopback origin, over a channel taller than the window with three threads, one s
 desk size, with a mouse:
 
   sign in and open the channel, in All -> the layout button is drawn in the dock and pressed: two
-  columns side by side, inside the window, neither overlapping the other, each at least 440px wide;
-  the view picker saying "Two columns" and the reading-width handle gone -> `#281 view-keys`: the
+  columns side by side, inside the window, neither overlapping the other, each at least 440px wide,
+  the agent's and other people's rows spanning their column and the owner's alone inset
+  (`two-column-agent-fullwidth`, in Main and in a thread, and the agent's inset again at 900px); the
+  view picker saying "Two columns" and the reading-width handle gone -> `#281 view-keys`: the
   picker chooses there, where `#231 two-column-polish` greyed it: the thread list chosen from it is the
   right column alone, across the window, its heading clear of the search glass and the left column
   out of sight; a real Ctrl+2 is one column in All, and a real Ctrl+4 two columns again; the right
@@ -116,7 +118,8 @@ class ColumnsApi(FakeApi):
         reply_of = {index: thread_id for thread_id, indices in replies.items() for index in indices}
         self.messages = []
         for index in range(24):
-            who = "human" if index % 3 == 1 else "coder"
+            # `two-column-agent-fullwidth`: one of the owner's own in Main and one in the runner thread.
+            who = "me" if index in (13, 23) else "human" if index % 3 == 1 else "coder"
             if index in plan:
                 thread_id, count = plan[index]
                 text = LONG_FIRST if thread_id == REPLICA else f"Message {200 + index}. Thread starts here. {FILLER}"
@@ -172,6 +175,21 @@ CARDS_JS = """() => [...document.querySelectorAll('#side-cards > li')].map((row)
             clamped: text.scrollHeight > text.clientHeight + 2, lines: Math.round(text.clientHeight /
             parseFloat(getComputedStyle(text).lineHeight))};
 })"""
+
+# Each speaker's row in a list, plain rows only (not replies, not stacked): its speaker, its margins,
+# and its width beside the list's own content width.
+SPEAKERS_JS = """(list) => {
+    const node = document.getElementById(list);
+    const style = getComputedStyle(node);
+    const inner = node.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+    return [...node.querySelectorAll(':scope > li.discord-message[data-who]')]
+        .filter((row) => row.getAttribute('data-is-reply') !== 'true' && !row.hasAttribute('data-stack-under')
+                         && row.getClientRects().length > 0)
+        .map((row) => { const s = getComputedStyle(row);
+            return {id: row.getAttribute('data-id'), who: row.getAttribute('data-who'),
+                    left: parseFloat(s.marginLeft), right: parseFloat(s.marginRight),
+                    width: row.getBoundingClientRect().width, inner}; });
+}"""
 
 ROWS_JS = """(list) => [...document.querySelectorAll(`#${list} > li[data-id]`)].map((row) => row.getAttribute('data-id'))"""
 
@@ -316,6 +334,29 @@ class Layout:
         return bool(part["greyed"]), str(part["value"])
 
 
+def speaker_widths(desk: Desk, list_id: str, where: str, two: bool) -> str:
+    """`two-column-agent-fullwidth`. In two columns the agent's rows and third parties' span their
+    column and the owner's alone keep their inset on the left; in one column on a desk the agent's
+    keep their inset on the right, as they always have."""
+    rows: list[Json] = desk.page.evaluate(SPEAKERS_JS, list_id)
+    seen = {str(row["who"]) for row in rows}
+    desk.check({"me", "coder"} <= seen, f"{where}: the list has no row of the owner's or the agent's to measure: {seen}")
+    for row in rows:
+        left, right = float(str(row["left"])), float(str(row["right"]))
+        width, inner = float(str(row["width"])), float(str(row["inner"]))
+        if row["who"] == "me":
+            desk.check(left >= 24 and abs(right) < 0.5, f"{where}: the owner's row {row['id']} lost its inset: {row}")
+        elif two:
+            desk.check(abs(left) < 0.5 and abs(right) < 0.5 and abs(width - inner) < 1,
+                       f"{where}: the {row['who']} row {row['id']} does not span its column: {row}")
+        elif row["who"] == "coder":
+            desk.check(right >= 24, f"{where}: the agent's row {row['id']} lost its inset in one column: {row}")
+    agent = next(row for row in rows if row["who"] == "coder")
+    mine = next(row for row in rows if row["who"] == "me")
+    return (f"{where}: the agent's rows {float(str(agent['width'])):.0f}px of {float(str(agent['inner'])):.0f}, "
+            f"the owner's {float(str(mine['width'])):.0f}px")
+
+
 def scroll_top(page: Page, element_id: str) -> float:
     return float(page.evaluate(f"() => document.getElementById('{element_id}').scrollTop"))
 
@@ -356,6 +397,7 @@ def columns_walk(desk: Desk) -> None:
     desk.check(desk.rows("discord-log") == [str(200 + i) for i in range(24) if i not in (4, 6, 8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 21)],
                f"the left column is not Main: {desk.rows('discord-log')}")
     desk.notes.append(f"two columns side by side, {left['width']:.0f}px and {right['width']:.0f}px, the picker saying so")
+    desk.notes.append(speaker_widths(desk, "discord-log", "Main in two columns", two=True))
 
     # `#281 view-keys`. The picker chooses in two columns: its four views first, in the keys' order. The
     # thread list chosen from it is the right column on its own, across the window, the same cards, its
@@ -460,6 +502,7 @@ def columns_walk(desk: Desk) -> None:
     desk.check(desk.rows("side-log") == ["202", "204", "206", "208", "211", "213", "217", "219", "221"],
                f"the right column is not the thread: {desk.rows('side-log')}")
     desk.check(page.is_visible("#side-close"), "the X is not drawn")
+    desk.notes.append(speaker_widths(desk, "side-log", "the thread on the right", two=True))
     said = page.text_content("#side-thread-card .side-card-text") or ""
     desk.check(said == "runner-wedged: The overnight runner hung twice and was restarted by hand.",
                f"the card at the top of the thread says {said!r}")
@@ -514,6 +557,7 @@ def columns_walk(desk: Desk) -> None:
     desk.check(not greyed and value == "flat", f"the view picker does not say All in one column: {greyed} {value}")
     desk.check(not narrow.drawn("toggle"), "the layout button is drawn at 900px")
     desk.check(narrow.drawn("grip"), "the reading-width handle did not come back")
+    desk.notes.append(speaker_widths(desk, "discord-log", "one column at 900px", two=False))
     page.set_viewport_size({"width": desk.width, "height": desk.height})
     # The stylesheet draws the right column the moment the window is wide again; the page decides two
     # columns at the next frame, and its picker saying so is what says it has.

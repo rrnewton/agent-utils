@@ -7537,6 +7537,27 @@ textarea {
     margin-inline-start: 1.25rem;
   }
 
+  /* `two-column-agent-fullwidth`. In two columns every speaker but the owner spans its column: half a
+     window is no longer the "full-bleed tile a metre wide" the desk's inset exists to prevent, and at
+     1280px a 6rem inset took a sixth of the agent's line. The owner's own rows keep their inset and
+     colour, so the two sides of the conversation still read apart; third parties keep their tint. A
+     reply keeps its gutter, and a stack under a third party hangs one gutter in from its parent's edge,
+     now the column's. One column, a phone and a narrow window are as they were. */
+  #screen-main[data-columns="two"] :is(#discord-log, #side-log, #pinned-log) li.discord-message:not([data-who="me"]) {
+    margin-right: 0;
+    --row-inset-right: 0px;
+  }
+
+  #screen-main[data-columns="two"] :is(#discord-log, #side-log, #pinned-log)
+    li.discord-message:is([data-who="human"], [data-who="bot"]):not([data-is-reply="true"]):not([data-stack-under]) {
+    margin-left: 0;
+    --row-inset-left: 0px;
+  }
+
+  #screen-main[data-columns="two"] :is(#discord-log, #side-log) li.discord-message[data-stack-under="third"][data-who] {
+    margin-left: var(--reply-gutter);
+  }
+
   /*
    * `#277 reply-in-column`. A reply opened in either column is written at that column's foot, under
    * its list, in the reply screen's own box (#reply-compose, moved here while it is open): the owner,
