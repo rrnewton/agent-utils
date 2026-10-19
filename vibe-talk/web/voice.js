@@ -20755,12 +20755,13 @@ async function changeChannelView(view, threadId = null, summary = null, origin =
     // a desk, Ctrl+4 from 40px up All, a long draft opened by More, left Main 326px above its foot, where
     // an earlier visit had left it, Send off screen.
     if (keepPlace && !keepReaderPlace(place) && place.cardSeen) scrollToNewest();
-    catchUpHeldView();
+    // Drawn from the store, where what it shows changed since: then nothing below draws it again.
+    const caughtUp = catchUpHeldView();
     // What was read, dealt with or answered elsewhere since the held rows were drawn: in a thread
     // just left, above all, whose replies Main's chips count (`#222 unread-replies`). A message marked
     // Done, or put back, in another view meanwhile is in this view's copy already, not yet on its
     // rows (`#306 done-stale-across-views`).
-    if (held.readMode !== readMode || rowsMissDone()) renderCachedTimeline();
+    if (!caughtUp && (held.readMode !== readMode || rowsMissDone())) renderCachedTimeline();
     else syncUnreadReplies();
     renderChannelFreshness();
     // A thread read behind its held rows for replies they lack is entered at its newest, where those
@@ -20886,10 +20887,45 @@ function allReachesThread(id, summary) {
 }
 
 /**
+ * Whether `held` and `arriving` say the same, field for field, whatever order their fields are in.
+ * `sameMessage` compares JSON, which depends on that order, and a copy put together here — the
+ * stream's, given the thread record, the reactions or the edit mark the store's copy had
+ * (`foldLiveMessage`) — has those fields last. `#333 page-live-reads-remainder`.
+ *
+ * @param {any} held
+ * @param {any} arriving
+ * @returns {boolean}
+ */
+function sameWords(held, arriving) {
+  if (held === arriving) return true;
+  if (typeof held !== "object" || typeof arriving !== "object" || held === null || arriving === null) return false;
+  if (Array.isArray(held) || Array.isArray(arriving)) {
+    return Array.isArray(held) && Array.isArray(arriving) && held.length === arriving.length &&
+      held.every((one, at) => sameWords(one, arriving[at]));
+  }
+  const fields = (/** @type {any} */ item) => Object.keys(item).filter((key) => item[key] !== undefined);
+  const mine = fields(held);
+  return mine.length === fields(arriving).length &&
+    mine.every((key) => arriving[key] !== undefined && sameWords(held[key], arriving[key]));
+}
+
+/**
  * A held view missed what the stream delivered while it was hidden; the store did not. True when
  * that changed the rows on screen.
+ *
+ * ...or what another view's read brought. `#333 page-live-reads-remainder`. The rows are compared
+ * word for word, not only by which messages they are (`sameWords`): a read of one view that brings
+ * an edited copy of a message another held view shows — an agent's placeholder edited into its
+ * answer, read in its thread — left that view drawing the old words when it was shown again, or in
+ * the other column, until its own next read, up to a poll later. `#306 done-stale-across-views`
+ * closed the same gap for Done. A copy that says the same, in another object or with its fields in
+ * another order, draws nothing. The cards of the thread list are compared by id alone, as before:
+ * a count or a time that changed on one card would rebuild them all, and its own read draws them.
+ *
+ * `words` false compares ids alone, as before: for a read overtaken by a read of the same view
+ * queued behind it, which is what draws that view (`discordQueuedLoads`).
  */
-function catchUpHeldView() {
+function catchUpHeldView(words = true) {
   const projected = threadingSupported ? projectView() : null;
   if (!projected) return false;
   const cover = channelCanon.views.get(viewKey());
@@ -20902,7 +20938,9 @@ function catchUpHeldView() {
   const threads = channelView === "threads";
   const held = threads ? timelineThreads : timelineMessages;
   const ids = (items) => items.map((item) => String(item.id)).join("\n");
-  if (ids(projected) === ids(held)) return false;
+  const unchanged = ids(projected) === ids(held) &&
+    (!words || threads || projected.every((item, at) => item === held[at] || sameWords(held[at], item)));
+  if (unchanged) return false;
   if (threads) {
     timelineThreads = projected;
     el("thread-list").replaceChildren(...threadCards(projected));
@@ -23624,7 +23662,8 @@ async function loadTimeline(options) {
           // the store has it, so that view is current from its next showing.
           canon.views.get(viewKey(view, thread)).landedHidden = true;
           if (context === channelContextKey()) {
-            catchUpHeldView();
+            // Words and all, unless that read is queued behind this one: it draws them.
+            catchUpHeldView(!discordQueuedLoads.has(steps.column));
             renderChannelFreshness();
           } else if (view === "flat") {
             catchUpFromAll();
@@ -23762,7 +23801,8 @@ function foldLateTimelinePage(payload, read) {
     // the runs of read messages are decided by it.
     const landing = entryLandingMark();
     noteArchived(payload, false);
-    catchUpHeldView();
+    // Words and all, unless a read of this view is queued behind this one: it draws them.
+    catchUpHeldView(!discordQueuedLoads.has(activeColumn));
     renderChannelFreshness();
     if (entryReadOwed === read.context) entryReadOwed = null;
     if (landing) keepEntryLanding(landing);

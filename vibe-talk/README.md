@@ -339,6 +339,12 @@ on the right just after a Done in All, two columns turned on meanwhile — and u
 chat service without threads a Done the server refuses brings its row back at once, where it stood,
 even if a to-do read landed meanwhile (`#327 done-races-remaining`).
 
+So it is with what a message says. A view shown again, and the other column, draw the words a read of
+another view brought: an agent's placeholder edited into its answer and read in its thread is the
+answer on Main too, as Main is shown again or beside the thread, with no read of Main's own. A copy
+that says the same, in a new object or with its fields in another order, draws nothing again. The
+thread list's cards still wait for their own read (`#333 page-live-reads-remainder`).
+
 Known limits of the counts (`#222 unread-replies`):
 - A reply the page never held that is marked Done on another device still counts as new on its
   message until a read of All or of the thread brings it: Main's refresh names Done replies by id,

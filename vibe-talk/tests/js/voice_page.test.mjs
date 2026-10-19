@@ -33180,6 +33180,126 @@ test("retry retains its original channel, thread and reply target after navigati
   });
 });
 
+// --- `#333 page-live-reads-remainder`: a view shown again shows the words another view's read brought --
+//
+// The one part of the shelved page-live-reads work still worth having on its own (`queue-prep` survey):
+// a held view compared its rows with the store by id alone (`catchUpHeldView`), so when a read of one
+// view brought an edited copy of a message another held view shows — an agent's placeholder edited into
+// its answer, read in its thread — that view went on drawing the old words when shown again, and the
+// other column did too, until its own next read, up to a poll later. #306 done-stale-across-views closed
+// the same gap for Done. Now the rows are compared word for word, and a copy that says the same draws
+// nothing.
+
+/** The line of `catchUpHeldView` that compares the rows' words, put back to ids alone for a negative control. */
+const HELD_COMPARES_IDS = ["(!words || threads || projected.every((item, at) => item === held[at] || sameWords(held[at], item)))",
+  "true"];
+/** ...and compared as JSON, in the order the fields came in (`sameMessage`), for another. */
+const HELD_COMPARES_JSON = ["item === held[at] || sameWords(held[at], item)", "item === held[at] || sameMessage(held[at], item)"];
+
+/**
+ * The channel of `threadData` on a server with a change record, read in All, then Main and the thread of
+ * root 201 each picked once, so each holds rows of its own; then `change` made on the server and the thread
+ * read again by its poll, which brings it. Answers the page, the server, Main's rows as they were drawn
+ * before, and the reads made from the change on.
+ */
+async function threadReadBrings(change, script = SCRIPT) {
+  const page = newPage(new Map(), script);
+  const data = threadData();
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  page.messages = data.messages;
+  const server = forwardTimeline(page);
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await pickThread(page, "main");
+  await reReadChannel(page);
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "the premise is Main on screen");
+  const drawn = [...page.el("discord-log").children];
+  await pickThread(page, "thread:spaces/A/threads/one & two");
+  assert.deepStrictEqual(shownIds(page), ["201", "202"], "the premise is the thread on screen");
+  const reads = page.timelineCalls.length;
+  change(server, page);
+  await reReadChannel(page);
+  for (let i = 0; i < 2; i += 1) await page.settle();
+  assert.deepStrictEqual(readViewsSince(page, reads), ["thread"], "the premise is one read, of the thread");
+  return { page, server, drawn, reads };
+}
+
+test("`#333 page-live-reads-remainder`: Main shown again draws the words a read of a thread brought for its root, with no read of its own", async () => {
+  const edited = "first thread root, edited into its answer";
+  const run = async (script = SCRIPT) => {
+    const { page, reads } = await threadReadBrings((server) => server.edit("201", { content: edited }), script);
+    assert.equal(rowText(page, "201"), edited, "the premise is the thread drawing the edit its read brought");
+    await pickThread(page, "main");
+    assert.deepStrictEqual(readViewsSince(page, reads), ["thread"], "Main was read to draw what the store held already");
+    return page;
+  };
+  const page = await run();
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"]);
+  assert.equal(rowText(page, "201"), edited, "Main shown again drew the root's old words");
+  // THE CONTROL: rows compared by id alone, Main draws the old words until its own next read.
+  const control = await run(brokenScript(...HELD_COMPARES_IDS));
+  assert.equal(rowText(control, "201"), "first thread root", "compared by id alone Main drew the edit, so this test cannot see it");
+});
+
+test("`#333 page-live-reads-remainder`: Main shown again keeps its very rows when a read of a thread brought its root's words again in a new object, its fields in another order", async () => {
+  const run = async (script = SCRIPT) => {
+    const { page, drawn, reads } = await threadReadBrings((server, p) => {
+      // The same words, served afresh with their fields the other way round, and changed on the server,
+      // so the thread's read carries them.
+      const at = p.messages.findIndex((m) => String(m.id) === "201");
+      p.messages[at] = Object.fromEntries(Object.entries(p.messages[at]).reverse());
+      server.edit("201", {});
+    }, script);
+    await pickThread(page, "main");
+    assert.deepStrictEqual(readViewsSince(page, reads), ["thread"]);
+    return { page, drawn };
+  };
+  const { page, drawn } = await run();
+  assert.deepStrictEqual(shownIds(page), ["200", "201", "203"]);
+  assert.equal(rowText(page, "201"), "first thread root");
+  assert.ok(page.el("discord-log").children.every((li, at) => li === drawn[at]),
+    "Main shown again was drawn afresh for a root that says what it said");
+  // THE CONTROL: compared as JSON, the fields' order alone draws Main again.
+  const control = await run(brokenScript(...HELD_COMPARES_JSON));
+  assert.ok(!control.page.el("discord-log").children.every((li, at) => li === control.drawn[at]),
+    "compared as JSON Main kept its rows, so this test cannot see a redraw");
+});
+
+test("`#333 page-live-reads-remainder`: in two columns, a read of the thread on the right that brings its root's edit draws it in Main on the left, with no read of Main", async () => {
+  const edited = "first thread root, edited into its answer";
+  const run = async (script = SCRIPT) => {
+    const { page, server } = await twoColumnServer(null, script);
+    assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "the premise is Main on the left");
+    await threadBadge(channelRow(page, "201")).click();
+    for (let i = 0; i < 3; i += 1) await page.settle();
+    assert.deepStrictEqual(sideIds(page), ["201", "202"], "the premise is the thread opened on the right");
+    // The poll reads Main, then the thread on the right; the root is edited between the two, so only the
+    // thread's read brings the edit.
+    const serve = page.timeline;
+    let reads = null;
+    page.timeline = async (path, options) => {
+      const response = await serve(path, options);
+      if (viewOf(path) !== "main" || reads !== null) return response;
+      const body = await response.text();
+      server.edit("201", { content: edited });
+      reads = page.timelineCalls.length;
+      return { ...response, text: async () => body };
+    };
+    page.expireTimers(DISCORD_POLL_MS);
+    for (let i = 0; i < 4; i += 1) await page.settle();
+    assert.ok(reads !== null, "the premise is the poll's read of Main");
+    assert.deepStrictEqual(readViewsSince(page, reads), ["thread"], "the premise is one read since the edit, of the thread on the right");
+    assert.equal(bodyOf(sideRow(page, "201")).text(), edited, "the premise is the right column drawing the edit its read brought");
+    return page;
+  };
+  const page = await run();
+  assert.equal(rowText(page, "201"), edited, "Main on the left drew the root's old words beside its edit on the right");
+  // THE CONTROL: rows compared by id alone, the left column keeps the old words.
+  const control = await run(brokenScript(...HELD_COMPARES_IDS));
+  assert.equal(rowText(control, "201"), "first thread root", "compared by id alone Main drew the edit, so this test cannot see it");
+});
+
 // --- a reply goes where the message it answers lives -----------------------------------------------
 //
 // `#185 reply-new-thread`. Answering a thread reply posts into that thread; answering a message on
@@ -46645,7 +46765,7 @@ test("...and a landing left to the read behind held rows is paid by that read wh
     "    if (landing) keepEntryLanding(landing);\n  } else if")), { open: "true", atTheHead: false },
   "the overtaken read landed without paying the landing; the control proves nothing");
   // ...nor on the page's read messages drawn unread: the landing goes to the oldest of them instead.
-  assert.deepStrictEqual(await run(brokenScript("    noteArchived(payload, false);\n    catchUpHeldView();", "    catchUpHeldView();")),
+  assert.deepStrictEqual(await run(brokenScript("    noteArchived(payload, false);\n    // Words and all", "    // Words and all")),
     { open: "true", atTheHead: false }, "the overtaken read found the answer without what it says is read; the control proves nothing");
 });
 
@@ -46692,7 +46812,8 @@ test("...but not a landing made on an earlier visit, when the thread comes back 
   // Negative control: the landing left standing when the view changes, and the thread's rows come back
   // as they were left, the very row the landing was made on among them.
   const control = brokenScriptEach(["  entryLanding = null;\n  if (view === \"thread\")", "  if (view === \"thread\")"],
-    ["if (held.readMode !== readMode || rowsMissDone()) renderCachedTimeline();", "if (held.readMode !== readMode) renderCachedTimeline();"]);
+    ["if (!caughtUp && (held.readMode !== readMode || rowsMissDone())) renderCachedTimeline();",
+      "if (!caughtUp && held.readMode !== readMode) renderCachedTimeline();"]);
   assert.equal((await run(control)).collapsed, "false", "the first visit's landing did not hold without the reset; the control proves nothing");
 });
 
@@ -66982,8 +67103,8 @@ const DONE_FOLLOWS = ["    followDoneEverywhere(requested, column);\n    // Befo
 /** ...the same in `restoreMessages`. */
 const UNDO_FOLLOWS = ["    followDoneEverywhere(restored, column);\n    if (lastDismissal", "    if (lastDismissal"];
 /** The check that draws a held view's rows again as it is shown, where they say otherwise than its copy. */
-const HELD_REDRAWS = ["if (held.readMode !== readMode || rowsMissDone()) renderCachedTimeline();",
-  "if (held.readMode !== readMode) renderCachedTimeline();"];
+const HELD_REDRAWS = ["if (!caughtUp && (held.readMode !== readMode || rowsMissDone())) renderCachedTimeline();",
+  "if (!caughtUp && held.readMode !== readMode) renderCachedTimeline();"];
 
 /**
  * The channel of `threadData` opened in All, then Main read for itself as its poll reads it, so that
