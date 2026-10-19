@@ -209,6 +209,17 @@ impl ChatRouter {
             );
         }
         router.replace_routes(&config.channels);
+        for entry in router.entries() {
+            if let Some(first) = router.namespace_owner_before(&entry.key) {
+                tracing::warn!(
+                    provider = %entry.key,
+                    shares_with = %first.key,
+                    "two chat providers share one API base; channels for the later one can be \
+                     listed in the configuration file, but not added from the app (#356 \
+                     provider-namespace-per-key)"
+                );
+            }
+        }
         Ok(router)
     }
 
@@ -235,6 +246,148 @@ impl ChatRouter {
     #[must_use]
     pub fn entry(&self, key: &str) -> Option<&ProviderEntry> {
         self.entries.iter().find(|entry| entry.key == key)
+    }
+
+    fn position(&self, key: &str) -> Option<usize> {
+        self.entries.iter().position(|entry| entry.key == key)
+    }
+
+    /// The configured provider key written in front of `source` with a colon, and the reference
+    /// after it (`gchat:spaces/AAA`). A prefix naming no configured provider is part of the
+    /// reference (`https:`), so the whole source comes back with no key. The one parser of
+    /// `key:reference`, for registration and for the add route's own checks.
+    /// `#355 provider-grouped-channels`.
+    #[must_use]
+    pub fn split_key<'s>(&self, source: &'s str) -> (Option<&str>, &'s str) {
+        if let Some((key, rest)) = source.split_once(KEY_SEPARATOR) {
+            if let Some(entry) = self.entry(key) {
+                return (Some(entry.key.as_str()), rest.trim());
+            }
+        }
+        (None, source)
+    }
+
+    /// The key of the provider registration would hand `source` to, or `None` when registration
+    /// would refuse it: the same choice [`ChatClient::register_channel`] makes, for a check that
+    /// must run before anything is created upstream. `#355 provider-grouped-channels`.
+    #[must_use]
+    pub fn registrar_key(&self, source: &str) -> Option<&str> {
+        self.select_registrar(source)
+            .ok()
+            .map(|(index, _)| self.entries[index].key.as_str())
+    }
+
+    /// The provider configured before `key` with the same namespace, when there is one: a second
+    /// account of one service at the same API base. A channel added from the app is stored under
+    /// its namespace, and [`ChatRouter::key_for_namespace`] maps that back to the FIRST provider
+    /// with it, so a channel added for `key` would move to that provider as soon as the routes
+    /// are re-derived. `#355 provider-grouped-channels`; storing the key beside the channel is
+    /// `#356 provider-namespace-per-key`.
+    #[must_use]
+    pub fn namespace_owner_before(&self, key: &str) -> Option<&ProviderEntry> {
+        let entry = self.entry(key)?;
+        self.entries
+            .iter()
+            .find(|other| other.namespace == entry.namespace)
+            .filter(|first| first.key != key)
+    }
+
+    /// Route `channel` to the provider under `key` before the allowlist holds it, so that the add
+    /// route's probe reaches it: a direct addition, which no registration bound. Refused when
+    /// another provider holds the channel. The next [`ChatRouter::replace_routes`] drops a binding
+    /// the allowlist does not hold, so a refused addition leaves none behind.
+    /// `#355 provider-grouped-channels`.
+    ///
+    /// # Errors
+    ///
+    /// [`ChatError::Refused`] when no provider is configured under `key`, or another provider
+    /// already owns `channel`.
+    pub fn bind_key(&self, channel: &ChannelId, key: &str) -> Result<(), ChatError> {
+        let index = self.position(key).ok_or_else(|| {
+            ChatError::Refused(format!(
+                "no chat provider is configured under the key {key}"
+            ))
+        })?;
+        self.bind(channel, index)
+    }
+
+    /// One page of the channels the provider under `key` can see, and only that provider's.
+    /// `#355 provider-grouped-channels`.
+    ///
+    /// The cursor is the router's own (`p<index>.`), so one from another provider's walk is
+    /// refused rather than handed to this provider as garbage, and the walk ends with this
+    /// provider's last page instead of moving on to the next provider.
+    ///
+    /// # Errors
+    ///
+    /// [`ChatError::Refused`] when no provider is configured under `key`, it cannot list its
+    /// channels, or the cursor is not one this walk issued; otherwise the provider's own failure.
+    pub async fn discover_channels_of(
+        &self,
+        key: &str,
+        request: &crate::directory::DirectoryRequest,
+    ) -> Result<crate::directory::DirectoryPage, ChatError> {
+        let index = self.position(key).ok_or_else(|| {
+            ChatError::Refused(format!(
+                "no chat provider is configured under the key {key}"
+            ))
+        })?;
+        if !self.entries[index].client.supports_channel_discovery() {
+            return Err(ChatError::Refused(format!(
+                "{} cannot list its channels through this chat connector",
+                self.entries[index].client.provider_name()
+            )));
+        }
+        let inner = match request.cursor.as_deref() {
+            None => None,
+            Some(cursor) => {
+                decode_cursor(cursor)
+                    .filter(|(at, _)| *at == index)
+                    .ok_or_else(|| {
+                        ChatError::Refused(
+                            "that directory cursor is not one this server issued for that service"
+                                .to_owned(),
+                        )
+                    })?
+                    .1
+            }
+        };
+        self.discover_page(index, inner, request).await
+    }
+
+    /// One page from the provider at `index`, its entries' sources as registration should be
+    /// handed them, and a cursor for its next page, or none after its last.
+    async fn discover_page(
+        &self,
+        index: usize,
+        inner: Option<String>,
+        request: &crate::directory::DirectoryRequest,
+    ) -> Result<crate::directory::DirectoryPage, ChatError> {
+        let inner_request = crate::directory::DirectoryRequest {
+            query: request.query.clone(),
+            cursor: inner,
+            limit: request.limit,
+        };
+        let page = self.entries[index]
+            .client
+            .discover_channels(&inner_request)
+            .await?;
+        let entries = page
+            .entries
+            .into_iter()
+            .map(|mut entry| {
+                entry.source = self.qualify_source(index, entry.source);
+                entry
+            })
+            .collect();
+        Ok(crate::directory::DirectoryPage {
+            entries,
+            next_cursor: page
+                .next_cursor
+                .as_deref()
+                .map(|inner| encode_cursor(index, Some(inner))),
+            truncated: page.truncated,
+        })
     }
 
     /// Whether this deployment has more than one provider.
@@ -367,9 +520,9 @@ impl ChatRouter {
 
     /// Which provider should register `source`, and the reference to hand it.
     fn select_registrar<'s>(&self, source: &'s str) -> Result<(usize, &'s str), ChatError> {
-        if let Some((key, rest)) = source.split_once(KEY_SEPARATOR) {
-            if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
-                return Ok((index, rest.trim()));
+        if let (Some(key), rest) = self.split_key(source) {
+            if let Some(index) = self.position(key) {
+                return Ok((index, rest));
             }
         }
         if self.entries.len() == 1 {
@@ -793,35 +946,14 @@ impl ChatClient for ChatRouter {
                     )
                 })?,
         };
-        let inner_request = crate::directory::DirectoryRequest {
-            query: request.query.clone(),
-            cursor: inner,
-            limit: request.limit,
-        };
-        let page = self.entries[index]
-            .client
-            .discover_channels(&inner_request)
-            .await?;
-        let next_cursor = match page.next_cursor.as_deref() {
-            Some(inner) => Some(encode_cursor(index, Some(inner))),
-            None => indices
+        let mut page = self.discover_page(index, inner, request).await?;
+        if page.next_cursor.is_none() {
+            page.next_cursor = indices
                 .iter()
                 .find(|candidate| **candidate > index)
-                .map(|next| encode_cursor(*next, None)),
-        };
-        let entries = page
-            .entries
-            .into_iter()
-            .map(|mut entry| {
-                entry.source = self.qualify_source(index, entry.source);
-                entry
-            })
-            .collect();
-        Ok(crate::directory::DirectoryPage {
-            entries,
-            next_cursor,
-            truncated: page.truncated,
-        })
+                .map(|next| encode_cursor(*next, None));
+        }
+        Ok(page)
     }
 
     fn supports_upstream_read_mark(&self) -> bool {
@@ -1291,6 +1423,119 @@ mod tests {
             })
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn one_providers_walk_asks_only_that_provider_and_ends_with_its_last_page() {
+        let Pair {
+            router,
+            gchat,
+            slack,
+        } = pair();
+        let entry = |source: &str, name: &str| DirectoryEntry {
+            source: source.to_owned(),
+            name: name.to_owned(),
+            registered_channel_id: None,
+        };
+        gchat.enable_channel_registration(&ChannelId("9".to_owned()), false, false);
+        gchat.enable_channel_directory(vec![entry("spaces/A", "Alpha")], false);
+        slack.enable_channel_registration(&ChannelId("C1".to_owned()), false, false);
+        slack.enable_channel_directory(
+            vec![entry("C0123ABCDE", "#team"), entry("C0999ZZZZZ", "#other")],
+            false,
+        );
+        let ask = |cursor: Option<String>| DirectoryRequest {
+            query: None,
+            cursor,
+            limit: 1,
+        };
+        let first = router
+            .discover_channels_of("slack", &ask(None))
+            .await
+            .expect("first page");
+        assert_eq!(first.entries[0].source, "C0123ABCDE");
+        let second = router
+            .discover_channels_of("slack", &ask(first.next_cursor.clone()))
+            .await
+            .expect("second page");
+        assert_eq!(second.entries[0].source, "C0999ZZZZZ");
+        assert_eq!(
+            second.next_cursor, None,
+            "the walk moved on to another provider"
+        );
+        assert!(gchat.directory_calls().is_empty());
+        // Slack's cursor is no cursor for the bridge, and an unknown key is refused.
+        assert!(router
+            .discover_channels_of("gchat", &ask(first.next_cursor))
+            .await
+            .is_err());
+        assert!(router
+            .discover_channels_of("teams", &ask(None))
+            .await
+            .is_err());
+        assert!(gchat.directory_calls().is_empty());
+    }
+
+    #[test]
+    fn a_key_in_front_of_a_reference_is_split_off_only_when_it_is_configured() {
+        let Pair { router, .. } = pair();
+        assert_eq!(
+            router.split_key("slack:C0123ABCDE"),
+            (Some("slack"), "C0123ABCDE")
+        );
+        assert_eq!(
+            router.split_key("https://chat.example/room/1"),
+            (None, "https://chat.example/room/1")
+        );
+        assert_eq!(router.split_key("teams:x"), (None, "teams:x"));
+        assert_eq!(router.registrar_key("C0999ZZZZZ"), Some("slack"));
+        assert_eq!(router.registrar_key("gchat:C0999ZZZZZ"), Some("gchat"));
+    }
+
+    #[test]
+    fn a_channel_is_bound_to_a_named_provider_unless_another_holds_it() {
+        let Pair { router, .. } = pair();
+        let fresh = ChannelId("901".to_owned());
+        router.bind_key(&fresh, "gchat").expect("bind");
+        assert_eq!(router.key_for(&fresh).as_deref(), Some("gchat"));
+        let taken = ChannelId("C0123ABCDE".to_owned());
+        assert!(router.bind_key(&taken, "gchat").is_err());
+        assert_eq!(router.key_for(&taken).as_deref(), Some("slack"));
+        assert!(router.bind_key(&fresh, "teams").is_err());
+        // The allowlist is what routes: a binding it does not hold goes with the next redraw.
+        router.replace_routes(&[channel("C0123ABCDE", "slack")]);
+        assert_eq!(router.key_for(&fresh), None);
+    }
+
+    #[test]
+    fn only_the_later_of_two_providers_sharing_a_namespace_is_shadowed() {
+        let entry = |key: &str, namespace: &str| ProviderEntry {
+            key: key.to_owned(),
+            namespace: namespace.to_owned(),
+            client: Arc::new(Named {
+                inner: Arc::new(FakeDiscord::new()),
+                name: "Slack",
+                claim: slack_claim,
+            }),
+            live_poll_seconds: 0,
+        };
+        let router = ChatRouter::new(
+            vec![
+                entry("work", "slack:api"),
+                entry("other", "bridge"),
+                entry("home", "slack:api"),
+            ],
+            None,
+        );
+        assert!(router.namespace_owner_before("work").is_none());
+        assert!(router.namespace_owner_before("other").is_none());
+        assert_eq!(
+            router
+                .namespace_owner_before("home")
+                .map(|first| first.key.as_str()),
+            Some("work")
+        );
+        assert!(router.namespace_owner_before("teams").is_none());
     }
 
     #[test]

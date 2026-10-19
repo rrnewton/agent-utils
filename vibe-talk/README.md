@@ -2304,7 +2304,26 @@ How a deployment with several providers behaves:
   put the provider's key and a colon in front of the link, for example `gchat:https://…`. The
   provider that registered a channel is recorded with it, so it stays with that provider across a
   restart.
-* **The channel browser** lists each discovery-capable provider in turn.
+* **The add request may name its service** (`#355 provider-grouped-channels`): `provider` in the
+  body of `POST /api/v1/channels` is a provider key, and that service's own answer decides between
+  registering a link (`source`) and adding a channel id (`id`, with `writable`). A Slack with
+  `channel_registration = false` takes its own conversation ids that way. An id with no service
+  named goes to the `[discord]` section's provider, and is refused (`provider_required`) when there
+  is none. A channel added by id records its provider too, so it keeps it across a restart. An
+  unknown key is `unknown_provider`.
+* **Two accounts of one service** at the same `api_base` (two Slack workspaces, or two Discord
+  bots) both work for channels listed in the file. Adding a channel from the app is refused for the
+  later one (`provider_namespace_shared`): channels added in the app are recorded by API base, so
+  the channel would come back under the first account. The server warns about such a pair at start.
+  `#356 provider-namespace-per-key` is the fix.
+* **The channel browser** lists each discovery-capable provider in turn, or only one with
+  `provider=<key>` (`#355 provider-grouped-channels`), which is what Settings asks for: its entries
+  then carry that `provider`, its cursor is refused by any other service's walk, and the walk ends
+  with that service's last page. An entry is marked `tracked` when its channel is on the list under
+  the service that listed it.
+* **Summaries share one budget.** `[summaries]` and its rate limit serve every service's channels,
+  so more services means more channels sharing it; interactive summaries still go before
+  background thread names.
 * **Live updates are per provider.** Each provider with `live_poll_seconds` set is polled on its
   own interval. An adapter may push events for the others through `ingest.token`, or send a
   content-free hint that wakes a polled provider's existing cursor. Pushed events for a polled
@@ -4117,8 +4136,8 @@ own adapter-only token; every other route uses the read/write tokens described a
 | GET | `/healthz` | none | liveness |
 | GET | `/api/v1/channels` | read | configured channels |
 | GET | `/api/v1/activity?hours=&per_channel_limit=` | read | every listed channel's last few hours in one read, the newest message named: the route behind `recent_activity` — see "The eight tools" |
-| POST | `/api/v1/channels` | **write** | direct mode: `{id,label,writable}`; managed mode: `{source,label}` — validate and add a tracked channel |
-| GET | `/api/v1/channel-directory?q=&limit=&cursor=` | **write** | managed mode: one page of the channels the bridge can see, each marked `tracked` when already a channel here |
+| POST | `/api/v1/channels` | **write** | direct mode: `{id,label,writable}`; managed mode: `{source,label}` — validate and add a tracked channel; with several services, `provider` names the service, whose own mode decides — see "Several chat providers in one server" |
+| GET | `/api/v1/channel-directory?q=&limit=&cursor=&provider=` | **write** | managed mode: one page of the channels the bridge can see, each marked `tracked` when already a channel here; `provider` lists only that service's |
 | DELETE | `/api/v1/channels/{id}` | **write** | take a channel off the list: one added in the app is forgotten (managed mode also unregisters it upstream); one from the configuration file is hidden — see "Taking a channel off the list" |
 | DELETE | `/api/v1/channels/{id}/hidden` | **write** | show a hidden configured channel again; `unknown_channel` for anything the file does not name |
 | GET | `/api/v1/client-config` | read | what the web app needs at startup, including the caller's own `token_scope`; a write-scope caller also gets `hidden_channels`, and `message_cache` (the status `PUT /api/v1/message-cache` answers) when the configuration has a `[message_cache]` table |
