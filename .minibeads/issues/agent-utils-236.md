@@ -1,10 +1,11 @@
 ---
 title: 'root-terminator-parser: reconcile CLI guard probes with Python 3.12'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 created_at: 2026-10-11T18:32:25.075320367+00:00
-updated_at: 2026-10-11T18:32:49.784126639+00:00
+updated_at: 2026-10-19T09:38:13.674220910+00:00
+closed_at: 2026-10-19T09:38:13.674220790+00:00
 ---
 
 # Description
