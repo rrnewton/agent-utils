@@ -67,7 +67,11 @@ the thread list with a finger and its keyboard's Search key:
   older reads held: "Searching replies… 1 of 5 · Stop" -> let go: three of All's older pages read, the three
   threads' cards found, each saying "in replies", under a note between the control and the cards saying so
   -> the oldest found thread opened shows its matching reply, marked. Before the cards' walk, there was no
-  control and nothing was found.
+  control and nothing was found. And over sixteen threads at 1280x800, the word also in the first message of
+  the oldest ten: the reader scrolled into the ten cards the search shows, the browser's own scroll anchoring
+  turned off (`overflow-anchor: none`), as in a browser that has none, the cards' walk ends with three more
+  found and its note at their head, and the card the reader was on has not moved, nor the left column, and
+  the search is still typed.
 
 Pass --screenshots DIR to keep a PNG of each state (the list, a selected thread, the links, the
 selection's link off screen and after its glide, at each size) for review; --web-root DIR to run the
@@ -229,6 +233,7 @@ def main() -> int:
             report.append(search_older(playwright.chromium, args, label, width, height, touch))
         for label, width, height, touch in REPLIES_SIZES:
             report.append(search_replies(playwright.chromium, args, label, width, height, touch))
+        report.append(search_replies(playwright.chromium, args, *PLACE_SIZE, place=True))
     for line in report:
         print(line)
     return 0
@@ -1116,16 +1121,21 @@ class RepliesApi(FakeApi):
     """Eight threads of ten messages, three hours apart, read ten at a time on every view, so a step back in All
     really reads older replies; `older_gate` holds every read of an older page."""
 
-    def __init__(self) -> None:
+    def __init__(self, threads: int = REPLIES_THREADS, hits: tuple[int, ...] = REPLIES_HITS,
+                 roots_said: range = range(0)) -> None:
         super().__init__()
         self.older_gate = threading.Event()
         self.older_gate.set()
         self.messages = []
         self.threads = []
-        for index in range(REPLIES_THREADS * (REPLIES_EACH + 1)):
+        for index in range(threads * (REPLIES_EACH + 1)):
             root = index - index % (REPLIES_EACH + 1)
-            words = (f"The {REPLIES_TERM} build is stuck on the old runner image, reply {index}." if index in REPLIES_HITS
-                     else f"Thread message {200 + index}. {FILLER}")
+            if index in hits:
+                words = f"The {REPLIES_TERM} build is stuck on the old runner image, reply {index}."
+            elif index == root and index // (REPLIES_EACH + 1) in roots_said:
+                words = f"Thread message {200 + index}: the {REPLIES_TERM} runner again. {FILLER}"
+            else:
+                words = f"Thread message {200 + index}. {FILLER}"
             row = said(index, words, "human" if index % 3 == 1 else "coder")
             row["timestamp"] = (fixture.EPOCH + timedelta(hours=3 * index)).isoformat().replace("+00:00", "Z")
             row["thread"] = thread_record(replies_thread(index), root, REPLIES_EACH, is_root=index == root)
@@ -1194,9 +1204,10 @@ REPLIES_JS = """() => {
 
 
 def search_replies(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int,
-                   touch: bool) -> str:
-    """One reader searching the threads' older replies from the cards, against a fresh fake API and browser."""
-    api = RepliesApi()
+                   touch: bool, place: bool = False) -> str:
+    """One reader searching the threads' older replies from the cards, against a fresh fake API and browser:
+    `replies_walk`, or with `place` `replies_place`."""
+    api = RepliesApi(PLACE_THREADS, PLACE_HITS, PLACE_ROOTS) if place else RepliesApi()
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api))
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1220,7 +1231,10 @@ def search_replies(chromium: BrowserType, args: argparse.Namespace, label: str, 
             page.on("pageerror", lambda error: errors.append(str(error)))
             desk = Desk(page, args.screenshots, label, width, height)
             page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
-            replies_walk(desk, api, touch)
+            if place:
+                replies_place(desk)
+            else:
+                replies_walk(desk, api, touch)
             check(not errors, f"{label}: the page threw: {errors}")
             context.close()
             return f"{version} at {width}x{height}: " + "; ".join(desk.notes)
@@ -1329,6 +1343,90 @@ def replies_walk(desk: Desk, api: RepliesApi, touch: bool) -> None:
     desk.shot("4-thread-reply")
     desk.notes.append(f"{'Enter over the thread list' if touch else 'the cards control in two columns'} found 3 threads "
                       f"by their older replies: {said_text}")
+
+
+# `#262 search-load-older`: the cards' walk never moves the reader. Sixteen threads, the word in the first
+# message of the oldest ten, so the search shows ten cards and the right column scrolls, and in one older reply
+# of each of threads 11, 12 and 13, one, two and three pages behind All's newest page.
+PLACE_SIZE = ("search-replies-place-1280", 1280, 800, False)
+PLACE_THREADS = 16
+PLACE_ROOTS = range(10)
+PLACE_HITS = (133, 125, 112)
+
+# Where card `ID` stands in the window, the right and left columns' scroll, and the search as typed.
+PLACE_JS = """() => {
+    const card = document.querySelector("#side-cards > li[data-id='ID']");
+    return {top: card ? card.getBoundingClientRect().top : null,
+            right: document.getElementById('side-scroll').scrollTop,
+            left: document.getElementById('scroll-area').scrollTop,
+            field: document.getElementById('search-field').value,
+            open: Boolean(document.getElementById('search-field').getClientRects().length)};
+}"""
+
+
+def replies_place(desk: Desk) -> None:
+    """Scrolled into the cards the search shows, the cards' walk ends with three more found and a note at their
+    head, and the card the reader was on has not moved, nor the left column, nor the search."""
+    page = desk.page
+    page.fill("#api-token", TOKEN)
+    page.click("#save-token")
+    page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
+    page.click("#view-switch")
+    desk.wait_for(f"() => document.querySelectorAll('#discord-log > li[data-id]').length === {OLDER_PAGE}",
+                  "the channel did not open on All's newest page")
+    page.click("#column-toggle")
+    desk.wait_for("() => document.getElementById('thread-select').value === 'columns'",
+                  "pressing the layout button did not give two columns")
+    desk.wait_for(f"() => document.querySelectorAll('#side-cards > li[data-id]').length === {PLACE_THREADS}",
+                  "the cards did not come up, one per thread")
+    page.click("#search-toggle")
+    page.fill("#search-field", REPLIES_TERM)
+    page.wait_for_timeout(400)
+    desk.settled()
+    found = measured_replies(page)
+    roots = sorted(f"spaces/A/threads/r{t}" for t in PLACE_ROOTS)
+    cards = found["cards"]
+    shown = sorted(str(card) for card in cards) if isinstance(cards, list) else []
+    desk.check(shown == roots, f"the search showed the cards {cards}")
+    desk.check(found["chip"] is not None, "the cards offer no way to search their threads' older replies")
+    tall = page.evaluate("() => { const a = document.getElementById('side-scroll'); return a.scrollHeight - a.clientHeight; }")
+    desk.check(tall > 200, f"the cards the search shows scroll only {tall}px, so this proves nothing")
+    # Chromium's own scroll anchoring off, as in a browser that has none: the page must hold the place itself.
+    page.evaluate("() => { document.getElementById('side-scroll').style.overflowAnchor = 'none'; }")
+    # The reader scrolls the cards to put thread 4's card 200px under the head of the right column.
+    anchor = "spaces/A/threads/r4"
+    page.evaluate(f"""() => {{
+        const area = document.getElementById('side-scroll');
+        const card = document.querySelector("#side-cards > li[data-id='{anchor}']");
+        area.scrollTop += card.getBoundingClientRect().top - area.getBoundingClientRect().top - 200;
+    }}""")
+    desk.settled()
+    page.wait_for_timeout(200)
+    script = PLACE_JS.replace("ID", anchor)
+    before = page.evaluate(script)
+    desk.check(float(before["right"]) > 0, "the cards were not scrolled")
+    # The control is at the head of the cards, out of sight: pressed as the keys would, without scrolling to it.
+    page.evaluate("() => document.getElementById('side-search-replies').click()")
+    desk.wait_for("() => document.getElementById('side-search-replies').textContent.startsWith('Search replies before ') && "
+                  "!document.getElementById('side-replies-note').hidden",
+                  "the cards' walk did not end with a note", seconds=20)
+    desk.settled()
+    page.wait_for_timeout(300)
+    found = measured_replies(page)
+    cards = found["cards"]
+    shown = sorted(str(card) for card in cards) if isinstance(cards, list) else []
+    wanted = sorted(roots + [f"spaces/A/threads/r{t}" for t in (11, 12, 13)])
+    desk.check(shown == wanted, f"the cards' walk showed {shown}, not {wanted}")
+    said_text = str(found["said"])
+    desk.check(said_text.startswith("Found 3 threads in 4 pages (40 messages), back to "), f"the note says {said_text!r}")
+    after = page.evaluate(script)
+    moved = float(after["top"]) - float(before["top"])
+    desk.check(abs(moved) <= 1.5, f"the cards' walk moved the card the reader was on by {moved:.1f}px")
+    desk.check(abs(float(after["left"]) - float(before["left"])) <= 1, f"the cards' walk scrolled the left column: {before} {after}")
+    desk.check(after["field"] == REPLIES_TERM and after["open"], f"the cards' walk lost the search: {after}")
+    desk.shot("place")
+    desk.notes.append(f"scrolled into the cards, the cards' walk found 3 more threads and the reader's card moved "
+                      f"{moved:.1f}px: {said_text}")
 
 
 if __name__ == "__main__":
