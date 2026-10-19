@@ -134,7 +134,8 @@ def pytest_configure(config: pytest.Config) -> None:
     config.pluginmanager.register(_TimingPlugin(), name="case-timings")
 
 
-@dataclass
+# eq=False keeps object identity for equality and hashing: pytest may hold its plugins in a set.
+@dataclass(eq=False)
 class _ShardPlugin:
     index: int
     count: int
@@ -471,6 +472,12 @@ def _self_test() -> int:
     locked.chmod(0)
     _remove_temp_root(cleanup_root)
     assert not cleanup_root.exists()
+    # Some pytest releases keep registered plugins in a set, so the plugin must hash, and by
+    # identity: two plugins with the same fields are still two plugins. A dataclass's generated
+    # equality removes its hash. `#235 pytest-plugin-identity`.
+    plugin, twin = _ShardPlugin(index=0, count=1), _ShardPlugin(index=0, count=1)
+    assert len({plugin, twin, plugin}) == 2
+    assert plugin != twin
     _self_test_sigterm_cleanup()
     print("run_pytest_shard --self-test: PASSED")
     return 0
