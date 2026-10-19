@@ -7352,7 +7352,10 @@ all** button, and five section titles, each folded:
   beside it that Tab reaches between the heading and the controls.
 - Everything is folded on every load, and stays as the reader leaves it while the page is open
   (through Help and back, or out of Settings and in). Expand all opens every fold and then reads
-  Fold all. The Server section does not fold: it is one line, the answer to "which server is
+  Fold all. Which of the two it offers is decided by the folds on the page only (`#351
+  settings-polish`): Provider, with no console to link to, and the message cache, with none to
+  manage, are hidden, and their folds do not count, though both buttons open or fold them with the
+  rest. The Server section does not fold: it is one line, the answer to "which server is
   this?", which `#342 settings-server-hostname` put first.
 - `SETTINGS_FOLDS` in `web/voice.js` lists every fold, and the page suite holds it to the markup in
   both directions, with negative controls for a fold out of find's reach, a group that does not

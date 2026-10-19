@@ -1318,9 +1318,33 @@ function setFold(slug, open) {
   renderSettingsFoldAll();
 }
 
-/** Expand all while any fold is folded, Fold all once none is, as Help's button does (`#246`). */
+/**
+ * Whether the fold `slug` is on the page: no element around it is hidden, the folds around it aside
+ * (one inside a folded section is a fold Expand all opens), up to Settings, which is hidden whenever
+ * another screen shows.
+ *
+ * `#351 settings-polish`. Two groups are hidden where there is nothing to show — Provider without a
+ * console to link to, the message cache without one to manage — and their folds were counted all the
+ * same: with every fold the reader can see open, the button still offered to expand them all.
+ */
+function foldShown(slug) {
+  for (let at = /** @type {HTMLElement | null} */ (el(`fold-${slug}`).parentNode);
+    at && at.id !== "screen-settings"; at = /** @type {HTMLElement | null} */ (at.parentNode)) {
+    if (at.hidden === true && !/^fold-.+-body$/.test(at.id)) return false;
+  }
+  return true;
+}
+
+/** The folds on the page now (`foldShown`): the ones Expand all and Fold all are about. */
+const shownFolds = () => SETTINGS_FOLDS.filter(foldShown);
+
+/**
+ * Expand all while any fold on the page is folded, Fold all once none is, as Help's button does
+ * (`#246`). Redrawn by every fold, and by a group shown or hidden (`renderAgentLink`,
+ * `renderServerCache`), which can bring a folded fold into sight or take one out of it.
+ */
 function renderSettingsFoldAll() {
-  el("fold-settings-all").textContent = SETTINGS_FOLDS.some((slug) => !foldOpen(slug)) ? "Expand all" : "Fold all";
+  el("fold-settings-all").textContent = shownFolds().some((slug) => !foldOpen(slug)) ? "Expand all" : "Fold all";
 }
 
 /**
@@ -1345,7 +1369,9 @@ for (const slug of SETTINGS_FOLDS) {
   el(`fold-${slug}-body`).addEventListener("beforematch", () => setFold(slug, true));
 }
 el("fold-settings-all").addEventListener("click", () => {
-  const open = SETTINGS_FOLDS.some((slug) => !foldOpen(slug));
+  // Decided by the folds on the page, as the button's words are; done to every fold, so a group shown
+  // later opens or stays folded with the rest.
+  const open = shownFolds().some((slug) => !foldOpen(slug));
   for (const slug of SETTINGS_FOLDS) setFold(slug, open);
   if (!open) closeDismissedSend(false);
 });
@@ -34753,6 +34779,8 @@ function renderServerCache(note = "") {
   const shown = serverCache !== null && tokenScope === "write";
   el("message-cache-group").hidden = !shown;
   el("help-message-cache").hidden = !shown;
+  // `#351 settings-polish`. As in `renderAgentLink`: the group's fold counts for Expand all only shown.
+  renderSettingsFoldAll();
   if (!shown) {
     serverCacheAsking = null;
     el("message-cache-confirm").hidden = true;
@@ -43290,6 +43318,8 @@ function renderAgentLink() {
   const url = conversationalVoice.settings_url;
   const id = conversationalVoice.instance_id;
   el("agent-settings").hidden = !url;
+  // `#351 settings-polish`. A fold shown or hidden with it changes what Expand all is about.
+  renderSettingsFoldAll();
   if (!url) {
     return;
   }

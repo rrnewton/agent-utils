@@ -59316,6 +59316,43 @@ test("`#346 settings-collapsible`: Expand all opens every fold and then reads Fo
   assert.equal(all.textContent, "Expand all");
 });
 
+test("`#351 settings-polish`: Expand all and Fold all count only the folds on the page, not a hidden group's", async () => {
+  const page = newPage();
+  page.agentSettingsUrl = null;
+  await signIn(page);
+  await page.el("open-settings").click();
+  // Neither Provider (no console to link to) nor the message cache (none to manage) is shown here.
+  assert.equal(page.el("agent-settings").hidden, true);
+  assert.equal(page.el("message-cache-group").hidden, true);
+  const hidden = ["provider", "message-cache"];
+  const all = page.el("fold-settings-all");
+  // Every fold the reader can see, opened by hand: nothing is left to expand.
+  for (const slug of scriptFolds(SCRIPT_CODE).filter((one) => !hidden.includes(one))) await page.el(`fold-${slug}`).click();
+  assert.equal(all.textContent, "Fold all", "with every fold on the page open, the button still offers to expand them all");
+  // A group shown folded, as Provider is once the server names a console, is something to expand again.
+  page.agentSettingsUrl = "https://voice.example/agents/1";
+  page.el("api-token").value = "write-token-aaaaaaaaaaaaaaaa";
+  await page.el("save-token").click();
+  await page.settle();
+  assert.equal(page.el("agent-settings").hidden, false, "the server's console link did not show Provider");
+  assert.equal(all.textContent, "Expand all", "a folded group come into sight is not counted");
+  await all.click();
+  assert.equal(settingsFoldState(page, "provider"), true);
+  assert.equal(all.textContent, "Fold all");
+  // Fold all folds every fold, a hidden group's too, so one shown later is folded with the rest.
+  await all.click();
+  for (const slug of scriptFolds(SCRIPT_CODE)) assert.equal(settingsFoldState(page, slug), false, `Fold all left ${slug} open`);
+  // The negative control: a button that counts every fold, shown or not.
+  const blind = newPage(new Map(), brokenScript(
+    'el("fold-settings-all").textContent = shownFolds().some(', 'el("fold-settings-all").textContent = SETTINGS_FOLDS.some('));
+  blind.agentSettingsUrl = null;
+  await signIn(blind);
+  await blind.el("open-settings").click();
+  for (const slug of scriptFolds(SCRIPT_CODE).filter((one) => !hidden.includes(one))) await blind.el(`fold-${slug}`).click();
+  assert.equal(blind.el("fold-settings-all").textContent, "Expand all",
+    "the negative control counted only the folds on the page anyway, so the check above proves nothing");
+});
+
 // --- `#345 settings-multi-column` -----------------------------------------------------------------
 //
 // The owner, 2026-10-18: "on wide desktop windows, tile Settings' top-level panes into width-dependent
