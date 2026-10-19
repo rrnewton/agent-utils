@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
-"""Validate every shipped DAG example under one selected implementation."""
+"""Validate every shipped DAG example under one selected implementation.
+
+Two examples state a fixed resource contract that a smaller runner cannot
+honestly satisfy. Example 05 fixes its guest width at eight jobs; example 08
+models a clean-build worker under a 16 GiB hard memory cap. On a runner below
+either contract this harness does not skip the example, shrink its contract,
+or report capacity it does not have. It runs the example and requires the
+engine's documented pre-spawn refusal instead: a refusal that names the
+contract and the runner's real budget, with evidence the guest never started.
+The low-memory path for example 08 therefore *proves an expected pre-spawn
+refusal*; it does not execute the example. At or above the contract both
+examples execute at full strength, unchanged.
+"""
 
 from __future__ import annotations
 
@@ -18,6 +30,12 @@ VALIDATION_JOBS_ENV = "AGENT_UTILS_VALIDATION_JOBS"
 DEFAULT_VALIDATION_JOBS = 8
 FIXED_WIDTH_EXAMPLE = "05-inner-jobs.json"
 FIXED_WIDTH_JOBS = 8
+#: Example 08's documented contract: a clean-build worker under a 16 GiB hard
+#: cap. The same value is the example step's ``hard_mem_max_bytes`` and the
+#: outer validation gate's delegated envelope; the graph-contract tests pin
+#: all three together so the small-runner path cannot quietly shrink any one.
+FIXED_MEMORY_EXAMPLE = "08-dagrun-clean-build-sweep.yaml"
+FIXED_MEMORY_BYTES = 17179869184
 
 
 def _effective_validation_jobs() -> int:
@@ -58,6 +76,80 @@ def _validation_jobs(
             f"{VALIDATION_JOBS_ENV} must be a positive integer, got {raw!r}"
         )
     return min(jobs, effective, DEFAULT_VALIDATION_JOBS)
+
+
+def _memory_budget_bytes(*, cgroup_cap: int | None, mem_total: int | None) -> int | None:
+    """The honest memory budget: the smaller of the signals that could be read.
+
+    ``MemAvailable`` is deliberately not a signal here. It moves with whatever
+    else the host is doing, so a busy large runner would flap between executing
+    example 08 and expecting its refusal. Total memory and a finite cgroup cap
+    are properties of the runner, which is what the contract is stated against.
+    """
+
+    signals = [value for value in (cgroup_cap, mem_total) if value is not None and value > 0]
+    return min(signals) if signals else None
+
+
+def _mem_total_bytes() -> int | None:
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _effective_memory_budget_bytes() -> int | None:
+    """This process's cgroup cap and host total, combined by the honest minimum."""
+
+    python_root = str(REPO_ROOT / "py")
+    inserted = python_root not in sys.path
+    if inserted:
+        sys.path.insert(0, python_root)
+    try:
+        from dagrun.sizing import cgroup_mem_max_bytes
+
+        cgroup_cap = cgroup_mem_max_bytes()
+    finally:
+        if inserted:
+            sys.path.remove(python_root)
+    return _memory_budget_bytes(cgroup_cap=cgroup_cap, mem_total=_mem_total_bytes())
+
+
+def _expected_memory_refusal(example_name: str, budget: int | None) -> bool:
+    """Whether this runner is provably below example 08's fixed memory contract.
+
+    An unreadable budget is not a small budget: with no signal the example
+    runs, because a refusal the harness cannot predict cannot be required.
+    """
+
+    return (
+        example_name == FIXED_MEMORY_EXAMPLE
+        and budget is not None
+        and budget < FIXED_MEMORY_BYTES
+    )
+
+
+def _is_documented_memory_refusal(
+    returncode: int, combined: str, *, budget: int
+) -> bool:
+    """Whether output is example 08's pre-spawn hard-cap refusal at ``budget``.
+
+    The footprint in the message must be the example's full 16 GiB hard cap:
+    a smaller number would mean admission had been weakened to fit. The guest
+    step's ``[build]`` echo must be absent, so a failure after spawn cannot
+    masquerade as the documented refusal.
+    """
+
+    return (
+        returncode == 2
+        and "REFUSED" in combined
+        and f"minimum runnable footprint {FIXED_MEMORY_BYTES} bytes" in combined
+        and f"budget {budget} bytes" in combined
+        and "[build]" not in combined
+    )
 
 
 def _examples() -> list[Path]:
@@ -152,13 +244,16 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as error:
         parser.error(str(error))
     command, environment = _engine(arguments.engine)
+    memory_budget = _effective_memory_budget_bytes()
     examples = _examples()
     for path in examples:
         relative = path.relative_to(REPO_ROOT)
         print(f"examples[{arguments.engine}]: {relative}", flush=True)
-        expected_refusal = (
+        expected_width_refusal = (
             path.name == FIXED_WIDTH_EXAMPLE and validation_jobs < FIXED_WIDTH_JOBS
         )
+        expected_memory_refusal = _expected_memory_refusal(path.name, memory_budget)
+        expected_refusal = expected_width_refusal or expected_memory_refusal
         completed = subprocess.run(
             [
                 *command,
@@ -169,6 +264,11 @@ def main(argv: list[str] | None = None) -> int:
                 "--no-profile",
                 "--max-cpus",
                 str(validation_jobs),
+                *(
+                    ["--max-mem", str(memory_budget)]
+                    if expected_memory_refusal and memory_budget is not None
+                    else []
+                ),
             ],
             cwd=REPO_ROOT,
             env=environment,
@@ -178,7 +278,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         if expected_refusal:
             combined = completed.stdout + completed.stderr
-            if (
+            if expected_width_refusal and (
                 completed.returncode == 2
                 and "cannot lower guest parallelism" in combined
                 and "build.app (preferred_inner_jobs=8)" in combined
@@ -191,11 +291,28 @@ def main(argv: list[str] | None = None) -> int:
                     flush=True,
                 )
                 continue
+            if (
+                expected_memory_refusal
+                and memory_budget is not None
+                and _is_documented_memory_refusal(
+                    completed.returncode, combined, budget=memory_budget
+                )
+            ):
+                print(
+                    f"examples[{arguments.engine}]: {relative} correctly refused at "
+                    f"{memory_budget} byte(s) (fixed memory {FIXED_MEMORY_BYTES})",
+                    flush=True,
+                )
+                continue
             print(completed.stdout, end="", file=sys.stdout)
             print(completed.stderr, end="", file=sys.stderr)
+            expected = (
+                f"documented fixed-width refusal at {validation_jobs} CPU(s)"
+                if expected_width_refusal
+                else f"documented fixed-memory refusal at {memory_budget} byte(s)"
+            )
             print(
-                f"examples[{arguments.engine}]: expected documented fixed-width refusal at "
-                f"{validation_jobs} CPU(s)",
+                f"examples[{arguments.engine}]: expected {expected}",
                 file=sys.stderr,
             )
             return 1

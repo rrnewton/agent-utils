@@ -339,6 +339,204 @@ def test_example_checker_strips_its_width_control_from_nested_engines(
     assert "AGENT_UTILS_VALIDATION_JOBS" not in environment
 
 
+def test_fixed_memory_example_has_the_documented_small_runner_refusal(
+    tmp_path: Path,
+) -> None:
+    checker = _example_checker()
+    sweep_root = tmp_path / "sweep"
+    sweep_root.mkdir()
+    environment = os.environ.copy()
+    python_path = str(REPO_ROOT / "py")
+    inherited = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        os.pathsep.join((python_path, inherited)) if inherited else python_path
+    )
+    environment["DAGRUN_CARGO_SWEEP_ROOT"] = str(sweep_root)
+    budget = 1 << 30
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "dagrun",
+            "run",
+            "--dag",
+            "examples/08-dagrun-clean-build-sweep.yaml",
+            "--max-cpus",
+            "4",
+            "--max-mem",
+            str(budget),
+            "--unsafe-no-cgroups",
+            "--no-profile",
+            "--no-profile-feedback",
+        ],
+        cwd=REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    combined = completed.stdout + completed.stderr
+    assert checker._is_documented_memory_refusal(
+        completed.returncode, combined, budget=budget
+    )
+    # The refusal is pre-spawn: the guest never created a build target directory.
+    assert list(sweep_root.iterdir()) == []
+
+
+@pytest.mark.parametrize("engine", ["python", "rust"])
+def test_example_checker_accepts_the_documented_memory_refusal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, engine: str
+) -> None:
+    checker = _example_checker()
+    example = tmp_path / "08-dagrun-clean-build-sweep.yaml"
+    example.write_text("{}", encoding="utf-8")
+    calls: list[tuple[list[str], dict[str, object]]] = []
+    # A realistic 16 GiB total-memory runner reports a little under the binary
+    # 16 GiB hard cap once firmware and kernel reservations are subtracted.
+    budget = checker.FIXED_MEMORY_BYTES - (512 << 20)
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(
+            argv,
+            2,
+            stdout="",
+            stderr=(
+                f"dagrun: --max-mem {budget}: REFUSED — minimum runnable footprint "
+                f"{checker.FIXED_MEMORY_BYTES} bytes cannot fit safely within "
+                f"budget {budget} bytes"
+            ),
+        )
+
+    monkeypatch.setattr(checker, "_effective_validation_jobs", lambda: 4)
+    monkeypatch.setattr(checker, "_effective_memory_budget_bytes", lambda: budget)
+    monkeypatch.setattr(checker, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(checker, "_examples", lambda: [example])
+    monkeypatch.setattr(checker, "_engine", lambda _name: (["fake-dagrun"], {}))
+    monkeypatch.setattr(checker.subprocess, "run", fake_run)
+    monkeypatch.setattr(checker, "_profile_smoke", lambda *args, **kwargs: None)
+
+    assert checker.main(["--engine", engine]) == 0
+    assert calls[0][0][-4:] == [
+        "--max-cpus",
+        "4",
+        "--max-mem",
+        str(budget),
+    ]
+    assert calls[0][1]["capture_output"] is True
+
+
+def test_example_checker_runs_fixed_memory_example_at_full_strength(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    checker = _example_checker()
+    example = tmp_path / "08-dagrun-clean-build-sweep.yaml"
+    example.write_text("{}", encoding="utf-8")
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(checker, "_effective_validation_jobs", lambda: 4)
+    monkeypatch.setattr(
+        checker, "_effective_memory_budget_bytes", lambda: checker.FIXED_MEMORY_BYTES
+    )
+    monkeypatch.setattr(checker, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(checker, "_examples", lambda: [example])
+    monkeypatch.setattr(checker, "_engine", lambda _name: (["fake-dagrun"], {}))
+    monkeypatch.setattr(checker.subprocess, "run", fake_run)
+    monkeypatch.setattr(checker, "_profile_smoke", lambda *args, **kwargs: None)
+
+    assert checker.main(["--engine", "python"]) == 0
+    assert "--max-mem" not in calls[0][0]
+    assert calls[0][1]["capture_output"] is False
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "stderr"),
+    [
+        # The guest started before failing: not a pre-spawn refusal.
+        (
+            2,
+            '[build] root="${DAGRUN_CARGO_SWEEP_ROOT:-}"\n',
+            "REFUSED — minimum runnable footprint 17179869184 bytes cannot fit "
+            "safely within budget 1073741824 bytes",
+        ),
+        # A quiet success on a too-small runner would be a silent skip.
+        (0, "", ""),
+        # A refusal for some other graph (smaller footprint) is not this contract.
+        (
+            2,
+            "",
+            "REFUSED — minimum runnable footprint 4294967296 bytes cannot fit "
+            "safely within budget 1073741824 bytes",
+        ),
+    ],
+)
+def test_example_checker_rejects_non_refusal_memory_outcomes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    returncode: int,
+    stdout: str,
+    stderr: str,
+) -> None:
+    checker = _example_checker()
+    example = tmp_path / "08-dagrun-clean-build-sweep.yaml"
+    example.write_text("{}", encoding="utf-8")
+
+    def fake_run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr=stderr)
+
+    monkeypatch.setattr(checker, "_effective_validation_jobs", lambda: 4)
+    monkeypatch.setattr(checker, "_effective_memory_budget_bytes", lambda: 1 << 30)
+    monkeypatch.setattr(checker, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(checker, "_examples", lambda: [example])
+    monkeypatch.setattr(checker, "_engine", lambda _name: (["fake-dagrun"], {}))
+    monkeypatch.setattr(checker.subprocess, "run", fake_run)
+
+    assert checker.main(["--engine", "python"]) == 1
+
+
+def test_example_checker_memory_budget_uses_the_smaller_honest_signal() -> None:
+    checker = _example_checker()
+    gib = 1 << 30
+    assert checker._memory_budget_bytes(cgroup_cap=8 * gib, mem_total=16 * gib) == 8 * gib
+    assert checker._memory_budget_bytes(cgroup_cap=32 * gib, mem_total=16 * gib) == 16 * gib
+    assert checker._memory_budget_bytes(cgroup_cap=None, mem_total=16 * gib) == 16 * gib
+    assert checker._memory_budget_bytes(cgroup_cap=8 * gib, mem_total=None) == 8 * gib
+    assert checker._memory_budget_bytes(cgroup_cap=None, mem_total=None) is None
+    # An unknown budget must not be treated as a small one: without a signal the
+    # checker runs the example rather than claiming a refusal it cannot prove.
+    assert not checker._expected_memory_refusal("08-dagrun-clean-build-sweep.yaml", None)
+    assert checker._expected_memory_refusal(
+        "08-dagrun-clean-build-sweep.yaml", checker.FIXED_MEMORY_BYTES - 1
+    )
+    assert not checker._expected_memory_refusal(
+        "08-dagrun-clean-build-sweep.yaml", checker.FIXED_MEMORY_BYTES
+    )
+    assert not checker._expected_memory_refusal("05-inner-jobs.json", 1)
+
+
+def test_fixed_memory_contract_matches_example_and_gate_hints() -> None:
+    checker = _example_checker()
+    example = dag_from_path(REPO_ROOT / "examples" / checker.FIXED_MEMORY_EXAMPLE)
+    assert {step.hint.hard_mem_max_bytes for step in example.steps} == {
+        checker.FIXED_MEMORY_BYTES
+    }
+
+    config = dag_from_path(REPO_ROOT / "validation.dag.yaml")
+    example_steps = [
+        step for step in config.steps if "scripts/check_dagrun_examples.py" in step.cmd
+    ]
+    # The gate still advertises (and must be delegated) the full hard cap: the
+    # small-runner path documents a refusal, it does not shrink the envelope.
+    assert {step.hint.hard_mem_max_bytes for step in example_steps} == {
+        checker.FIXED_MEMORY_BYTES
+    }
+
+
 def _selected_tags_for_paths(paths: list[str]) -> set[str]:
     config = dag_from_path(REPO_ROOT / "validation.dag.yaml")
     groups, _because, components, _component_because = selection_for(paths)
