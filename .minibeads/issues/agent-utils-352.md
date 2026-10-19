@@ -1,13 +1,14 @@
 ---
 title: 'voice-reconnect-on-bridge-error: keep a call when the voice bridge loses a turn and asks the page to reconnect'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 - voice
 created_at: 2026-10-19T06:02:48.130859443+00:00
-updated_at: 2026-10-19T06:02:48.130859443+00:00
+updated_at: 2026-10-19T08:30:37.272674841+00:00
+closed_at: 2026-10-19T08:30:37.272674731+00:00
 ---
 
 # Description
@@ -53,3 +54,11 @@ Related: #353 relay-echo-as-owner, #354 live-relay-check, #268 voice-call-drops,
 - An unanswered relayed turn at call end is reported "not read out", on both protocols. Its control: an answered one is not.
 - The hosted protocol is unchanged: its error frames still end the call.
 - A loopback Chromium walk with a fake bridge that sends this error passes, and fails against the page before the change.
+
+# Notes
+
+[opus 5.5] Delivered on branch vt/voice-reconnect in "vibe-talk: a relayed turn the call ended before answering is said not to have been read out" (both protocols), "vibe-talk: pull the vibe-talk-v1 call socket's wiring out of the start, unchanged", "vibe-talk: record a call carried on a new session, or ended for lack of one" (reconnected, reconnect_limit, reconnect_failed and a reconnects count), "vibe-talk: when the voice bridge loses a turn and asks to reconnect, carry the call on a new session", "vibe-talk: check a lost turn's reconnect in Chromium against a bridge that sends the error", and "vibe-talk: a lost turn already sent again once is not sent a third time" (a review found a turn sent again could go once more when the new session lost it over a minute later). The bound is one automatic reconnect per rolling minute and at most three per call; the device's Resuming switch is honoured; a reconnect also happens with the page hidden. The plan's review corrections are all applied: the turn in flight is let go before it is queued again, so a later end counts its messages once; the microphone graph is rebuilt on the new socket before anything is sent; the deployed shape (a greeting, no replay) is the main path of the page tests and the walk; the reconnected line says what the new session knows; every failure of the new socket before its session starts ends the call as reconnect_failed, a suspension excepted; the lost socket is let go inside the error's own handler, before the close a bridge sends after it; the page's word on a card goes again only to a session that took the record; the old turn's health is reset; output before the echo does not count as the lost turn's answer.
+
+Not verified here: no run against a real bridge from this lane. On the bridge it was seen on, which lists no replay, a reconnected session starts with no context, and says so. Follow-ups: #357 voice-reconnect-on-server-close; a recap that also carries the conversation an earlier resume handed the first session (the details say it was not sent again); a structured reconnect field on the error frame (not asked of the bridge owner now).
+
+[opus 5.5 coordinator / claude worker] Review rounds 2 and 3 added "vibe-talk: a reconnected session that refuses the record is said so in the stored record too" (a reload no longer contradicts the live line; the recap wording is "was sent this call's record") and "vibe-talk: in a typed call a reconnect's greeting is waited for before the lost turn goes again" (sent into the greeting, a typed call's lost relay could be let go unread and its echo drawn as the reader's words). Left open, each needing a bridge that breaks the protocol or a rare shape: a relayed turn whose turn_complete carries no answer at all is let go with no "not read out" (older than this issue); PCM after the echo followed by "turn N never started" for that same turn neither resends nor reports; a reconnect's socket that opens but never starts a session keeps "Reconnecting…" up until Hang up; in a typed reconnect whose promised greeting never comes, messages stay queued until Hang up, with "The voice service is not responding." shown; PCM counts as an answer only after the bridge's echo, so a bridge that never echoes gets a cautious "not read out" on a hang-up mid-answer.
