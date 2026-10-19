@@ -1135,7 +1135,7 @@ steps:
     job: unit
     desc: the Rust suites, and the page suites through their harnesses
     labels: [validation-vibe-talk]
-    cmd: cd vibe-talk && cargo test --release --locked
+    cmd: cd vibe-talk && python3 ../scripts/case_timings.py run-cargo -- cargo test --release --locked
     jobs_flag: ""
     jobs_env: CARGO_BUILD_JOBS
     deps: [build.release]

@@ -534,16 +534,60 @@ def announce_partial(verdict: str, lines: Sequence[str], environ: Mapping[str, s
               file=sys.stderr)
 
 
-def case_timing_report(directory: Path) -> tuple[list[str], list[str]]:
+#: Cross tools whose differential reports through ``Report`` and therefore
+#: emits per-check timings. The remaining tools (herdr-agent, agentctl) keep
+#: their own counts and emit no per-check record; expecting one would be a
+#: false inventory. Kept beside the selector so the boundary is explicit.
+TIMING_CROSS_TOOLS = frozenset(
+    {"dagrun", "cpuset-alloc", "tick-hub", "pr-landing-planner", "herdr-run"}
+)
+
+#: Command fragments that mark a gate as timing-capable. A selected gate
+#: whose command carries one must leave a primary timing record; a missing
+#: record is reported like a missing cross coverage record, not absorbed
+#: into a smaller report.
+TIMING_COMMAND_MARKERS = (
+    "run_component_tests.py --component",
+    "run_pytest_shard.py --shard",
+    "-p run_pytest_shard",
+    "check_dagrun_examples.py",
+    "check_python_packages.py --project",
+    "check_rust_packages.py --crate",
+    "case_timings.py run-cargo",
+    "playwright test",
+    "--test-reporter=tap",
+)
+
+
+def _is_timing_gate(command: str) -> bool:
+    if "cross/differential.py" in command:
+        tokens = command.split()
+        tools = [
+            tokens[index + 1]
+            for index, token in enumerate(tokens[:-1])
+            if token == "--tool"
+        ]
+        return any(tool in TIMING_CROSS_TOOLS for tool in tools)
+    return any(marker in command for marker in TIMING_COMMAND_MARKERS)
+
+
+def case_timing_report(
+    directory: Path, expected_gates: Sequence[str] = ()
+) -> tuple[list[str], list[str], list[str]]:
     """Verify the per-case timing records of one run and render the bounded report.
 
-    Returns the report lines and the inventory problems separately: a record
-    whose cases do not match its collected inventory exactly means per-case
-    counts from this run cannot be trusted, whatever the gates themselves did.
+    Returns the report lines, the inventory problems, and the expected gates
+    that left no record, separately: a mismatched record means per-case
+    counts from this run cannot be trusted (a failure), while a missing one
+    means coverage could not be confirmed (PARTIAL, like cross coverage).
     """
 
-    verified = case_timings.verify_directory(directory)
-    return case_timings.render_report(verified), verified.problems
+    verified = case_timings.verify_directory(directory, expected_gates=expected_gates)
+    return (
+        case_timings.render_report(verified),
+        verified.problems,
+        list(verified.missing_gates),
+    )
 
 
 def run(
@@ -592,6 +636,9 @@ def run(
         env[CROSS_COVERAGE_ENV] = str(coverage_dir)
     if timing_dir is not None:
         env[case_timings.TIMING_DIR_ENV] = str(timing_dir)
+        # An ambient nested marker would classify the whole run as an
+        # alternate-environment rerun and empty the primary report.
+        env.pop(case_timings.TIMING_NESTED_ENV, None)
     done = subprocess.run(command, cwd=REPO_ROOT, check=False, env=env)
     if done.returncode != 0:
         print("\nvalidate: FAILED in flattened validation DAG", file=sys.stderr)
@@ -714,6 +761,25 @@ def selected_cross_nodes(
         if tag in chosen
         and isinstance(command := step.get("cmd"), str)
         and "cross/differential.py" in command
+    ]
+
+
+def selected_timing_gates(
+    selected: frozenset[str], components: frozenset[str], *, all_contract: bool
+) -> list[str]:
+    """Tags of the selected timing-capable nodes, in graph order.
+
+    Each of them emits a normalized per-case record when it runs, so after a
+    passing run a missing record means that gate's cases cannot be confirmed.
+    """
+
+    steps, chosen = selected_graph(selected, components, all_contract=all_contract)
+    return [
+        tag
+        for tag, step in steps.items()
+        if tag in chosen
+        and isinstance(command := step.get("cmd"), str)
+        and _is_timing_gate(command)
     ]
 
 
@@ -1306,6 +1372,9 @@ def main(argv: list[str] | None = None) -> int:
     all_contract = args.all or selected == ALL_GROUPS
     # Every selected cross node must leave a record; one that does not cannot be confirmed.
     expected = selected_cross_nodes(selected, components, all_contract=all_contract)
+    expected_timing = selected_timing_gates(
+        selected, components, all_contract=all_contract
+    )
     with (
         tempfile.TemporaryDirectory(prefix="validate-cross-coverage-") as coverage,
         tempfile.TemporaryDirectory(prefix="validate-case-timings-") as timings,
@@ -1321,23 +1390,41 @@ def main(argv: list[str] | None = None) -> int:
         if code != 0:
             return code
         coverage_state = cross_coverage_report(Path(coverage), expected)
-        timing_lines, timing_problems = case_timing_report(Path(timings))
+        timing_lines, timing_problems, timing_missing = case_timing_report(
+            Path(timings), expected_timing
+        )
     print()
     for line in timing_lines:
         print(line)
     if timing_problems:
-        for problem in timing_problems:
+        for problem in timing_problems[:50]:
             print(f"validate: case timings: {problem}", file=sys.stderr)
+        if len(timing_problems) > 50:
+            print(
+                f"validate: case timings: ... and {len(timing_problems) - 50} more",
+                file=sys.stderr,
+            )
         print(
             "\nvalidate: FAILED - per-case timing records do not match their "
             "collected inventories",
             file=sys.stderr,
         )
         return 1
-    if coverage_state.skipped or coverage_state.unreadable or coverage_state.missing:
+    if timing_missing:
+        for gate in timing_missing:
+            print(
+                f"  {gate}: no primary timing record, so its per-case coverage "
+                "could not be confirmed"
+            )
+    if (
+        coverage_state.skipped
+        or coverage_state.unreadable
+        or coverage_state.missing
+        or timing_missing
+    ):
         # Every selected node passed, but a cross node that declared itself partial passes with
         # checks that never ran. Say so here, where "OK" would otherwise be the last word.
-        unconfirmed = coverage_state.unreadable or coverage_state.missing
+        unconfirmed = coverage_state.unreadable or coverage_state.missing or timing_missing
         state = "PARTIAL or could not be confirmed" if unconfirmed else "PARTIAL"
         print(f"\nvalidate: cross-language coverage was {state}:")
         for line in coverage_state.lines:
@@ -1354,6 +1441,11 @@ def main(argv: list[str] | None = None) -> int:
             reasons.append(
                 f"{len(coverage_state.missing)} selected cross node(s) left no readable "
                 "coverage record"
+            )
+        if timing_missing:
+            reasons.append(
+                f"{len(timing_missing)} selected timing gate(s) left no primary "
+                "timing record"
             )
         verdict = f"validate: PARTIAL - every selected node passed, but {'; '.join(reasons)}"
         announce_partial(verdict, coverage_state.lines, os.environ)

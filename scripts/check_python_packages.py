@@ -1188,9 +1188,14 @@ def main(argv: list[str] | None = None) -> int:
                     "packages", gate, current[0], "fail", time.monotonic() - current[1]
                 )
             )
-        if timing_inventory:
+        if timing_cases:
+            # A failed run's record inventories only what was attempted, so
+            # the record stays verifiable standalone; the gate is already red.
             case_timings.emit_if_requested(
-                runner="packages", inventory=timing_inventory, cases=timing_cases, gate=gate
+                runner="packages",
+                inventory=[case.case_id for case in timing_cases],
+                cases=timing_cases,
+                gate=gate,
             )
         print(f"check_python_packages: FAIL: {exc}", file=sys.stderr)
         return 1

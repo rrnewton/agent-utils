@@ -20,7 +20,7 @@ from dagrun.scheduler import cap_config_max_cpus
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from validate import GROUP_LABELS, selection_for  # noqa: E402
+from validate import GROUP_LABELS, selected_timing_gates, selection_for  # noqa: E402
 from dagrun.cli import _select_steps_by_labels  # noqa: E402
 
 
@@ -460,7 +460,7 @@ def test_example_checker_runs_fixed_memory_example_at_full_strength(
         # The guest started before failing: not a pre-spawn refusal.
         (
             2,
-            '[build] root="${DAGRUN_CARGO_SWEEP_ROOT:-}"\n',
+            "[build.dagrun] START clean release build of the dagrun binary\n",
             "REFUSED — minimum runnable footprint 17179869184 bytes cannot fit "
             "safely within budget 1073741824 bytes",
         ),
@@ -517,6 +517,79 @@ def test_example_checker_memory_budget_uses_the_smaller_honest_signal() -> None:
         "08-dagrun-clean-build-sweep.yaml", checker.FIXED_MEMORY_BYTES
     )
     assert not checker._expected_memory_refusal("05-inner-jobs.json", 1)
+
+
+def test_example_checker_memory_refusal_matcher_bounds_the_named_budget() -> None:
+    checker = _example_checker()
+    refusal = (
+        "dagrun: --max-mem 1073741824: REFUSED — minimum runnable footprint "
+        "17179869184 bytes cannot fit safely within budget {budget} bytes"
+    )
+    # The engine may name a tighter inherited ceiling than the harness passed.
+    assert checker._is_documented_memory_refusal(
+        2, refusal.format(budget=1 << 29), budget=1 << 30
+    )
+    # A named budget above what the harness passed is not this run's refusal.
+    assert not checker._is_documented_memory_refusal(
+        2, refusal.format(budget=1 << 31), budget=1 << 30
+    )
+    # A named budget at the hard cap would have admitted the step.
+    assert not checker._is_documented_memory_refusal(
+        2, refusal.format(budget=checker.FIXED_MEMORY_BYTES), budget=1 << 34
+    )
+
+
+def test_example_checker_ancestor_cap_walk_finds_the_tightest_slice(
+    tmp_path: Path,
+) -> None:
+    checker = _example_checker()
+    root = tmp_path / "cgroup"
+    leaf = root / "user.slice" / "runner.scope" / "step"
+    leaf.mkdir(parents=True)
+    (root / "memory.max").write_text("max\n", encoding="utf-8")
+    (root / "user.slice" / "memory.max").write_text(
+        f"{12 << 30}\n", encoding="utf-8"
+    )
+    (root / "user.slice" / "runner.scope" / "memory.max").write_text(
+        "max\n", encoding="utf-8"
+    )
+    (leaf / "memory.max").write_text(f"{16 << 30}\n", encoding="utf-8")
+    proc = tmp_path / "cgroup-proc"
+    proc.write_text("0::/user.slice/runner.scope/step\n", encoding="utf-8")
+
+    assert (
+        checker._ancestor_memory_cap_bytes(cgroup_root=root, proc_cgroup=proc)
+        == 12 << 30
+    )
+    proc.write_text("0::/\n", encoding="utf-8")
+    assert checker._ancestor_memory_cap_bytes(cgroup_root=root, proc_cgroup=proc) is None
+
+
+def test_timing_gates_cover_every_runner_family() -> None:
+    gates = set(selected_timing_gates(frozenset(), frozenset(), all_contract=True))
+    # One representative per runner family in #27 cross-runner-test-timing.
+    assert {
+        "python.dagrun.shard-0",  # pytest shards
+        "python-lifecycle.namespace.shard-0",  # lifecycle shards
+        "python.repository-infrastructure.validation-graph",  # separate suites
+        "rust.dagrun.test",  # Rust/libtest via run-cargo
+        "vibe-talk.test.unit",  # application cargo suites
+        "timeline.browser.functional",  # JavaScript/browser (Playwright)
+        "timeline.browser.benchmark",  # JavaScript/browser (node:test)
+        "cross.dagrun.differential",  # cross-language
+        "cross.dagrun.cpu-footprint",  # cross pytest
+        "packages.python.dagrun",  # Python packages
+        "rust-packages.rust.dagrun",  # Rust packages
+        "examples.run.python",  # examples, Python engine
+        "examples.run.rust",  # examples, Rust engine
+    } <= gates
+    # These differentials keep their own counts and emit no per-check record;
+    # expecting one would fail every green run.
+    assert "cross.agentctl.differential" not in gates
+    assert "cross.agentctl.herdr-agent-differential" not in gates
+    # Self-tests of the runners themselves are not case inventories.
+    assert "repository.hygiene.pytest-sharder" not in gates
+    assert "repository.hygiene.component-manifest" not in gates
 
 
 def test_fixed_memory_contract_matches_example_and_gate_hints() -> None:

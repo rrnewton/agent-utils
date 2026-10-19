@@ -49,7 +49,7 @@ steps:
     # (scripts/case_timings.py) when validate.py requests a timing directory;
     # standalone, it lands in the suite's own ignored output directory.
     cmd: >-
-      cd py/tests/js/browser &&
+      cd py/tests/js/browser && mkdir -p "${AGENT_UTILS_CASE_TIMING_DIR:-test-results}" &&
       PLAYWRIGHT_JSON_OUTPUT_FILE="${AGENT_UTILS_CASE_TIMING_DIR:-test-results}/playwright-${DAGRUN_OUTER_RUN:-timeline.browser.functional}.json"
       ../../../../scripts/with-node22 npx playwright test --reporter=line,json
     jobs_flag: ""
@@ -67,9 +67,14 @@ steps:
   - group: browser
     job: benchmark-instrument
     desc: prove the real-site benchmark records every advertised metric
+    # The TAP reporter destination feeds the normalized per-case timing
+    # report (scripts/case_timings.py) when validate.py requests a directory.
     cmd: >-
-      cd py/tests/js/browser &&
-      ../../../../scripts/with-node22 node --test benchmark-site.test.cjs
+      cd py/tests/js/browser && mkdir -p "${AGENT_UTILS_CASE_TIMING_DIR:-test-results}" &&
+      ../../../../scripts/with-node22 node --test --test-reporter=spec
+      --test-reporter-destination=stdout --test-reporter=tap
+      --test-reporter-destination="${AGENT_UTILS_CASE_TIMING_DIR:-test-results}/node-${DAGRUN_OUTER_RUN:-timeline.browser.benchmark-instrument}.tap"
+      benchmark-site.test.cjs
     jobs_flag: ""
     deps: [setup.browser-deps]
     labels: [validation-timeline, component-wrkviz]
@@ -86,8 +91,11 @@ steps:
     job: benchmark
     desc: enforce timeline pan and zoom redraw budgets
     cmd: >-
-      cd py/tests/js/browser &&
-      ../../../../scripts/with-node22 node --test benchmark-budget.test.cjs &&
+      cd py/tests/js/browser && mkdir -p "${AGENT_UTILS_CASE_TIMING_DIR:-test-results}" &&
+      ../../../../scripts/with-node22 node --test --test-reporter=spec
+      --test-reporter-destination=stdout --test-reporter=tap
+      --test-reporter-destination="${AGENT_UTILS_CASE_TIMING_DIR:-test-results}/node-${DAGRUN_OUTER_RUN:-timeline.browser.benchmark}.tap"
+      benchmark-budget.test.cjs &&
       printf '\n' && cat benchmark-report.txt
     jobs_flag: ""
     deps: [setup.browser-deps]
