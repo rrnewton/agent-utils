@@ -1,10 +1,11 @@
 ---
 title: 'search-load-older: searching can load older pages in every layout, including two columns'
-status: open
+status: closed
 priority: 2
 issue_type: task
 created_at: 2026-10-12T22:20:16.640696840+00:00
-updated_at: 2026-10-12T22:20:16.640696840+00:00
+updated_at: 2026-10-19T10:22:29.160925081+00:00
+closed_at: 2026-10-19T10:22:29.160924400+00:00
 ---
 
 # Description
