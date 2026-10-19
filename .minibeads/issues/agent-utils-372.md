@@ -1,12 +1,13 @@
 ---
 title: 'settings-header-layout: the server line, Expand all and Open help share one quiet row at the head of Settings'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-19T14:44:35.378228772+00:00
-updated_at: 2026-10-19T14:44:35.378228772+00:00
+updated_at: 2026-10-19T15:20:04.195725784+00:00
+closed_at: 2026-10-19T15:20:04.195725323+00:00
 ---
 
 # Description
