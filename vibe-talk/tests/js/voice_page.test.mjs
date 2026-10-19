@@ -51046,6 +51046,67 @@ test("`#298 thread-card-header`: every way into a thread on the right puts its c
   assert.equal(page.el("side-title").hidden, false);
 });
 
+test("`#284 redraw-keeps-pane`: in two columns, with the focus lost while the reader is in the right column, a redraw of Main leaves the keys there — Esc still closes the right column's thread — and a redraw of the right column gives its own row the focus back", async () => {
+  const FIX = "    if (had || (lost && pane === active)) row.focus({ preventScroll: true });\n";
+  const run = async (script, redraw) => {
+    const { page, server, data } = await twoColumnServer(null, script);
+    const [first] = data.threads;
+    // A selection drawn in Main, the focus on it, as the mouse over a message leaves it.
+    await mouseTo(page, rowWithId(page, "200"), 200, 40);
+    assert.deepStrictEqual(litRows(page), ["discord-log:200"], "the premise: Main's message is not selected");
+    assert.equal(selectedId(page), "200", "the premise: the focus is not on Main's message");
+    // Into a thread on the right by its card's replies button, which gives the keys to that column
+    // (`#298 thread-card-header`); then a click on the card at its top where it takes no focus, its age,
+    // and Chromium puts the focus on the body.
+    await openerOf(cardRow(page, first.id)).click();
+    await page.settle();
+    assert.equal(page.el("side-pane").hidden, false, "the premise: the thread did not open on the right");
+    await page.documentEvent("pointerdown", { target: page.el("side-thread-card-age"), pointerType: "mouse" });
+    await page.loseFocus();
+    assert.equal(focused(page), null, `the premise: ${focusName(page)} holds the focus`);
+    const before = rowWithId(page, "200");
+    if (redraw === "main") {
+      // A live message in Main, which draws Main again.
+      await deliver(page, page.stream(), sseMessage(server.post(message({ id: "209", content: "a new message in Main" }))));
+      assert.ok(rowWithId(page, "209"), "the premise: the live message was not drawn in Main");
+      assert.notEqual(rowWithId(page, "200"), before, "the premise: Main was not drawn again, so this proves nothing");
+    }
+    const held = focused(page);
+    const where = held === null ? "nothing" : nodeWithinFixture(page.el("scroll-area"), held) ? "Main" : "elsewhere";
+    // Main's selection is kept on its message's new row, for when the reader goes back there.
+    const kept = rowWithId(page, "200").getAttribute("tabindex") === "0";
+    await pressHere(page, "Escape");
+    await page.settle();
+    return { where, kept, closed: cardsUp(page) };
+  };
+  // The premise: with nothing redrawn, Esc with the focus on nothing acts in the right column.
+  const still = await run(SCRIPT, null);
+  assert.equal(still.closed, true, "with nothing redrawn Esc did not close the right column's thread, so this proves nothing");
+  const redrawn = await run(SCRIPT, "main");
+  assert.equal(redrawn.where, "nothing", `a redraw of Main gave the focus to ${redrawn.where}, a pane the reader was not in`);
+  assert.equal(redrawn.closed, true, "after a redraw of Main, Esc no longer closed the right column's thread");
+  assert.equal(redrawn.kept, true, "a redraw of Main beside the reader lost Main's selection");
+  // The control: the focus given back in whichever pane was redrawn, as before. Main takes it, and with it
+  // the keys, and Esc there leaves the right column's thread open.
+  const anywhere = await run(brokenScript(FIX, "    if (lost) row.focus({ preventScroll: true });\n"), "main");
+  assert.equal(anywhere.where, "Main", "the negative control did not give Main the focus, so the check above proves nothing");
+  assert.equal(anywhere.closed, false, "the negative control closed the thread anyway, so the check above proves nothing");
+
+  // In the right column, the focus lost and the column drawn again under the reader — a live reply in its
+  // thread — the same message's new row takes it back there, as a redraw of the one column always did.
+  const { page, server, data } = await twoColumnServer();
+  const thread = data.messages[1].thread;
+  await openerOf(cardRow(page, data.threads[0].id)).click();
+  await page.settle();
+  await mouseTo(page, sideRow(page, "202"), 900, 120);
+  assert.equal(selectedId(page), "202", "the premise: the right column's reply is not selected");
+  const old = sideRow(page, "202");
+  await page.loseFocus();
+  await deliver(page, page.stream(), sseMessage(server.post(message({ id: "205", content: "a second answer", thread: { ...thread, is_root: false } }))));
+  assert.notEqual(sideRow(page, "202"), old, "the premise: the right column was not drawn again, so this proves nothing");
+  assert.equal(focused(page), sideRow(page, "202"), `a redraw of the right column under its reader left the focus on ${focusName(page)}`);
+});
+
 test("`#298 thread-card-header`: the card at the top counts the thread's replies and unread as they change — a live reply, a Done — and a pass that changes nothing writes nothing to it", async () => {
   const run = async (script) => {
     const page = newPage(new Map(), script);
