@@ -120,7 +120,7 @@
 //! refused.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -134,8 +134,8 @@ use super::observe::{self, PageRead, Shape, TimelineRead};
 use super::orphans::{self, Summaries};
 use super::shadow::{self, Ask, Decision, Miss, Upstream, View};
 use super::{
-    Account, CacheStats, ChanKey, Counts, MessageCache, Observation, Read, RouteSnapshot, Scope,
-    Stamp,
+    lock, Account, CacheStats, ChanKey, Counts, MessageCache, Observation, Read, RouteSnapshot,
+    Scope, Stamp,
 };
 use crate::chat::{ChatClient, ChatError, RecentRead};
 use crate::config::{Config, ProviderKind, RecentView};
@@ -200,6 +200,16 @@ struct State {
     identities: Mutex<Identities>,
     /// What the shadow has counted, and how far its evaluations have got.
     shadow: Arc<ShadowProgress>,
+    /// Whether reads may be answered from the cache (`[message_cache] serve`): set by
+    /// [`super::lifecycle::start`] from the configuration, and by a test that installs a cache
+    /// itself. `false` is "fill and measure, answer nothing". `#384 cache-serve`.
+    serve: AtomicBool,
+    /// When an adapter last pushed a change for each provider, by the cache's clock: whether
+    /// that provider's feed may vouch for what it has not reported ([`Sink::fed_since_for`]).
+    pushed: Mutex<HashMap<String, i64>>,
+    /// The background refreshes of served answers now running, one per read: a second serve of
+    /// the same read starts no second upstream read. `#384 cache-serve`.
+    refreshing: Mutex<HashSet<RefreshKey>>,
 }
 
 /// What the shadow has counted since the process started, and how many of its evaluations have
@@ -344,6 +354,33 @@ struct Route {
     /// for it. Nothing ever delivers a deletion or an edit of the channel, whatever its provider's
     /// shape, so the feed vouches for none of its messages ([`shadow::Facts::fed_since_ms`]).
     polled: bool,
+}
+
+/// One served read, for coalescing its background refresh ([`Sink::claim_refresh`]): the
+/// channel, and the read in words the caller chooses (its view or window and its size). A
+/// refresh of a different size is a different read. `#384 cache-serve`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RefreshKey {
+    /// The channel read.
+    pub channel: ChannelId,
+    /// Which read of it: never logged, compared for equality only.
+    pub read: String,
+}
+
+/// A running background refresh's claim ([`Sink::claim_refresh`]): dropped, the read may be
+/// refreshed again. `#384 cache-serve`.
+#[derive(Debug)]
+pub struct RefreshClaim {
+    state: Weak<State>,
+    key: RefreshKey,
+}
+
+impl Drop for RefreshClaim {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.upgrade() {
+            lock(&state.refreshing).remove(&self.key);
+        }
+    }
 }
 
 /// When a read whose finds the live hub publishes began ([`Fill::read_start`]): the channel as the
@@ -770,8 +807,8 @@ impl ShadowTask {
                             extra_rows = comparison.extra,
                             missing_rows = comparison.missing,
                             content_differs = comparison.differs,
-                            "the message cache would have served messages its provider no \
-                             longer lists; nothing is served from it yet"
+                            "the message cache's answer held messages its provider no \
+                             longer lists"
                         );
                     }
                 }
@@ -813,6 +850,52 @@ impl Sink {
     /// [`super::lifecycle::start`].
     pub(crate) fn attach_lifecycle(&self, lifecycle: Arc<Lifecycle>) {
         let _ = self.lifecycle.set(lifecycle);
+    }
+
+    /// Say whether reads may be answered from the cache (`[message_cache] serve`): set by
+    /// [`super::lifecycle::start`] from the configuration, and by a test that installs a cache
+    /// itself. `#384 cache-serve`.
+    pub fn set_serve(&self, serve: bool) {
+        self.state.serve.store(serve, Ordering::SeqCst);
+    }
+
+    /// Whether reads may be answered from the cache. A cache must also be open behind the sink;
+    /// [`Sink::try_serve`] checks both. `#384 cache-serve`.
+    #[must_use]
+    pub fn serve_enabled(&self) -> bool {
+        self.state.serve.load(Ordering::SeqCst)
+    }
+
+    /// Since when every change `route`'s channel's live feed offered has reached the file, for
+    /// the shadow's facts — now judged per provider (`#384 cache-serve`, requirement (g) of
+    /// `#297 cache-coverage-races`). A polled channel's feed vouches for nothing, as before. Any
+    /// other channel's vouches only while an adapter is actually pushing for its provider: the
+    /// latest push recorded for the provider (any of its channels) no more than
+    /// [`shadow::FED_PUSH_RECENT_MS`] ago by the cache's clock. `[ingest]` merely being enabled
+    /// proves nothing: an adapter that never connects delivers no deletion.
+    fn fed_since_for(&self, route: &Route, cache: &MessageCache) -> Option<i64> {
+        if route.polled {
+            return None;
+        }
+        let last = lock(&self.state.pushed).get(&route.key).copied()?;
+        (cache
+            .now_ms()
+            .saturating_sub(last)
+            <= shadow::FED_PUSH_RECENT_MS)
+            .then(|| cache.fed_since_ms())
+    }
+
+    /// Claim the background refresh of one served read, or `None` when one is already running:
+    /// a page reloaded twice starts one upstream read, not two. The claim is given up when the
+    /// returned guard is dropped. `#384 cache-serve`.
+    #[must_use]
+    pub fn claim_refresh(&self, key: RefreshKey) -> Option<RefreshClaim> {
+        lock(&self.state.refreshing)
+            .insert(key.clone())
+            .then(|| RefreshClaim {
+                state: Arc::downgrade(&self.state),
+                key,
+            })
     }
 
     /// What opens, switches and erases the cache file, once the server has started it.
@@ -1042,6 +1125,14 @@ impl Sink {
         read: Option<ReadStart>,
     ) {
         if let Some(mut fill) = self.begin(&FillGrant::server(producer), channel) {
+            // An adapter pushed for this provider just now: what lets its feed vouch for a
+            // channel of the provider (`Sink::fed_since_for`). The poller's publishes are its
+            // own reads and prove no adapter. Noted under the feed lock like the offer, and as
+            // briefly: one map entry, never a wait.
+            if producer == ServerFill::Ingest {
+                lock(&self.state.pushed)
+                    .insert(fill.chan.provider_key.clone(), fill.observed_ms);
+            }
             if let Some(read) = read {
                 fill.observed_ms = fill.observed_ms.min(read.observed_ms);
                 if read.chan == fill.chan {
@@ -1102,13 +1193,14 @@ impl Sink {
             return None;
         };
         let runtime = tokio::runtime::Handle::try_current().ok()?;
-        let chan = ChanKey::new(route.key, channel.as_str());
         let live_fed = live_fed();
         // Both noted now, before the request's own read starts: the time the rule decides at, and
         // the offers the barrier waits for, none of them the request's own.
         let asked_ms = cache.now_ms();
         // A polled channel's feed never delivers a deletion or an edit: it vouches for nothing.
-        let fed_since_ms = (!route.polled).then(|| cache.fed_since_ms());
+        // Any other channel's vouches only while an adapter is pushing for its provider.
+        let fed_since_ms = self.fed_since_for(&route, &cache);
+        let chan = ChanKey::new(route.key, channel.as_str());
         let target = cache.enqueued_seq();
         let weak = Arc::downgrade(&cache);
         drop(cache);

@@ -223,6 +223,13 @@ pub(crate) fn shadow_view(
     let Some((chan_id, dropped_ms)) = chan_row(&snapshot, chan)? else {
         return Ok(View::default());
     };
+    // Read here, in the snapshot, for whichever query asked: a served page answers it as of
+    // the rows it is served with, never as of some later fill.
+    let has_threads: bool = snapshot.query_row(
+        "SELECT EXISTS (SELECT 1 FROM thread WHERE chan = ?1)",
+        params![chan_id],
+        |row| row.get(0),
+    )?;
     let view = match query {
         Query::Newest { scope, limit } => {
             let key = scope.key();
@@ -234,6 +241,7 @@ pub(crate) fn shadow_view(
                 coverage: coverage_by_id(&snapshot, chan_id, &key)?,
                 rows: newest(&snapshot, chan, &key, *limit)?,
                 home: None,
+                has_threads,
                 dropped_ms,
             }
         }
@@ -259,6 +267,7 @@ pub(crate) fn shadow_view(
                     *limit,
                 )?,
                 home: None,
+                has_threads,
                 dropped_ms,
             }
         }

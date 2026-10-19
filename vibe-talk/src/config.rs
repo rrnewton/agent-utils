@@ -215,6 +215,10 @@ pub struct MessageCacheConfig {
     /// Whether the cache may be opened at all. `false` is the shipped default, and on a build
     /// that opens the cache it means "erase any cache file this server made".
     pub enabled: bool,
+    /// Whether reads may be answered from the cache: a newest timeline page at once, refreshed
+    /// in the background, and a fresh newest window. `false` is the shipped default: the cache
+    /// fills and is measured, and answers nothing. `#384 cache-serve`.
+    pub serve: bool,
     /// Where the cache file lives. `None` means beside `[storage] path`, named after the store
     /// and this host.
     pub path: Option<PathBuf>,
@@ -235,6 +239,7 @@ impl Default for MessageCacheConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            serve: false,
             path: None,
             max_days: DEFAULT_MESSAGE_CACHE_MAX_DAYS,
             max_megabytes: DEFAULT_MESSAGE_CACHE_MAX_MEGABYTES,
@@ -1048,6 +1053,7 @@ struct FileConfig {
 #[serde(deny_unknown_fields)]
 struct FileMessageCache {
     enabled: Option<bool>,
+    serve: Option<bool>,
     path: Option<String>,
     max_days: Option<i64>,
     max_megabytes: Option<i64>,
@@ -1638,6 +1644,7 @@ fn message_cache_config(
     }
     Ok(MessageCacheConfig {
         enabled,
+        serve: file.serve.unwrap_or(defaults.serve),
         path,
         max_days,
         max_megabytes,
@@ -4549,6 +4556,7 @@ provider = "slack"
             [
                 "[message_cache]",
                 "enabled",
+                "serve",
                 "path",
                 "max_days",
                 "max_megabytes",
@@ -4738,6 +4746,7 @@ provider = "slack"
         assert_eq!(cfg.message_cache, Some(MessageCacheConfig::default()));
         let defaults = MessageCacheConfig::default();
         assert!(!defaults.enabled, "shipped off");
+        assert!(!defaults.serve, "#384 cache-serve: serving shipped off");
         assert_eq!(defaults.max_days, 90);
         assert_eq!(defaults.max_megabytes, 256);
         assert_eq!(defaults.backfill, CacheBackfill::Adaptive);
@@ -4746,7 +4755,7 @@ provider = "slack"
 
         let text = format!(
             "{FULL}\n[storage]\npath = \"/data/state.sqlite3\"\n\
-             [message_cache]\nenabled = true\nmax_days = 14\nmax_megabytes = 64\n\
+             [message_cache]\nenabled = true\nserve = true\nmax_days = 14\nmax_megabytes = 64\n\
              backfill = \"off\"\ntimeline_fallback_ms = 2500\n\
              path = \"/data/cache/c.sqlite3\"\n\
              [[message_cache.channel]]\nid = \"111\"\nmax_days = 1\n"
@@ -4754,6 +4763,7 @@ provider = "slack"
         let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid");
         let cache = cfg.message_cache.expect("present");
         assert!(cache.enabled);
+        assert!(cache.serve, "#384 cache-serve");
         assert_eq!(cache.max_days, 14);
         assert_eq!(cache.max_megabytes, 64);
         assert_eq!(cache.backfill, CacheBackfill::Off);

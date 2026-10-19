@@ -575,6 +575,10 @@ pub async fn start_with(config: &Config, sink: &Sink, clock: Arc<dyn Clock>) -> 
         memo: Mutex::new(Memo::default()),
     });
     sink.attach_lifecycle(Arc::clone(&lifecycle));
+    // `#384 cache-serve`: the configuration's word on answering from the cache. It takes effect
+    // only with a cache open behind the sink; the owner's switch and `enabled` still decide
+    // that, so this neither opens nor keeps anything by itself.
+    sink.set_serve(table.as_ref().is_some_and(|table| table.serve));
     let Some(files) = files else {
         if let Some(table) = &table {
             tracing::info!(
@@ -657,8 +661,9 @@ pub async fn start_with(config: &Config, sink: &Sink, clock: Arc<dyn Clock>) -> 
                     path = %files.cache.display(),
                     max_days = table.as_ref().map_or(0, |t| t.max_days),
                     max_megabytes = table.as_ref().map_or(0, |t| t.max_megabytes),
+                    serve = table.as_ref().is_some_and(|t| t.serve),
                     "the message cache is open; it is filled from what write-scope and \
-                     server-owned reads see, and nothing is served from it yet"
+                     server-owned reads see"
                 );
                 Started::Opened
             }

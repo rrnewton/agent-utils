@@ -356,7 +356,8 @@ enabled = true
 # [message_cache]
 # A DISPOSABLE COPY OF CHANNEL MESSAGES ON THIS SERVER'S DISK: erasing it loses nothing the
 # provider cannot give again (#208 persistent-cache). This build FILLS it from what write-scope
-# and server-owned reads see, and answers nothing from it yet. A read-token request never writes
+# and server-owned reads see. It answers reads from it only with serve = true below (#384
+# cache-serve). A read-token request never writes
 # to it. It is a SEPARATE SQLite file, created 0600, in a directory that must belong to this
 # account and be 0700. It is NOT encrypted. It needs [storage] path, because the owner's off
 # switch is kept beside the store, in <storage path>.message-cache.json.
@@ -377,6 +378,9 @@ enabled = true
 # BEFORE ROLLING BACK to an older build, set enabled = false and deploy, so that this build erases
 # the file. No older build ever erases one, and builds from before summary-keep refuse this table.
 # enabled = false
+# serve = false                     # true: answer a newest page load and a fresh newest window
+#                                   # from the cache at once, refreshing from the provider in the
+#                                   # background (#384 cache-serve). Needs enabled = true
 # path = "/srv/vibe-talk-cache/vibe-talk.message-cache-web1.sqlite3"
 #                                   # Absolute, and never [storage] path itself. The default is
 #                                   # beside the store: <store stem>.message-cache-<host>.sqlite3.

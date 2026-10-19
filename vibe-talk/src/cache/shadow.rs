@@ -95,6 +95,12 @@ pub const REVALIDATED_BRIDGE_MS: i64 = 24 * 60 * 60 * 1000;
 pub const REVALIDATED_ADDITIONS_ONLY_MS: i64 = 2 * 60 * 60 * 1000;
 /// How long an evaluation waits for what was queued before the ask to be applied.
 pub const BARRIER: Duration = Duration::from_millis(100);
+/// How recently an adapter must have pushed a change for a provider for that provider's feed to
+/// vouch for what it has not reported (`#384 cache-serve`, requirement (g) of `#297
+/// cache-coverage-races`). The ingest protocol has no heartbeat, so a push for any of the
+/// provider's channels is the sign of life; an hour of silence is taken as no adapter, and the
+/// channel is left to the freshness rules alone.
+pub const FED_PUSH_RECENT_MS: i64 = 60 * 60 * 1000;
 
 /// Who asked: each caller the later milestone would answer from the cache, counted apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -325,6 +331,32 @@ pub fn query(ask: &Ask, shape: Shape, recent_via_flat: bool) -> Option<Query> {
     })
 }
 
+/// Whether a serving build may answer `ask` of a channel of `shape` from the cache at all,
+/// before the rule is consulted (`#384 cache-serve`). An ineligible ask is still shadowed and
+/// counted; it is simply never the answer. In this milestone:
+///
+/// - a newest **window**, except on Slack: a Slack window upstream carries thread replies the
+///   cache holds only in their threads, so it may be answered from Main plus those threads'
+///   scopes or not at all (requirement (c) of `#297 cache-coverage-races`), and M9 does not;
+/// - a newest **timeline page** of Main, or of Flat on a bridge: the page-load path. One
+///   thread's page carries its root and summary, which rows alone cannot rebuild, and its rows
+///   on Slack may be replies Flat's memory dated (requirement (e)); the thread list is never a
+///   scope's listing;
+/// - nothing else: a message by id, a summary's message, a page and a count keep their
+///   upstream answers (and their shadow counts) for a later milestone.
+#[must_use]
+pub fn serve_eligible(ask: &Ask, shape: Shape) -> bool {
+    match ask {
+        Ask::Window { .. } => shape != Shape::Slack,
+        Ask::Timeline { view, .. } => match view {
+            TimelineView::Main => true,
+            TimelineView::Flat => shape == Shape::Bridge,
+            TimelineView::Thread | TimelineView::Threads => false,
+        },
+        Ask::Message { .. } | Ask::Page { .. } | Ask::Count { .. } => false,
+    }
+}
+
 /// The scope a newest page of `view` would be answered from, if the cache would ever answer it.
 fn timeline_scope(shape: Shape, view: TimelineView, thread: Option<&str>) -> Option<Scope> {
     match (shape, view) {
@@ -357,6 +389,9 @@ pub struct View {
     pub rows: Vec<CachedMessage>,
     /// The message's home scope, for a query of one message the cache holds.
     pub home: Option<Scope>,
+    /// Whether the file holds any thread of the channel: what a served newest page answers for
+    /// `has_threads`. `#384 cache-serve`.
+    pub has_threads: bool,
     /// The latest local time an offer for the channel was dropped, as the file records it.
     pub dropped_ms: Option<i64>,
 }
@@ -937,6 +972,7 @@ fn differences<'a>(
 struct Tally {
     asked: AtomicU64,
     would_serve: AtomicU64,
+    served: AtomicU64,
     needs_existence_check: AtomicU64,
     misses: [AtomicU64; 7],
     late: AtomicU64,
@@ -983,6 +1019,13 @@ impl Tallies {
         bump(counter, 1);
     }
 
+    /// Count one answer actually served from the cache for `consumer` (`#384 cache-serve`): a
+    /// subset of `would_serve`, counted when the answer is handed back, so the two can be told
+    /// apart on a server with serving on.
+    pub fn served(&self, consumer: Consumer) {
+        bump(&self.tally(consumer).served, 1);
+    }
+
     /// Count one comparison for `consumer`.
     pub fn compared(&self, consumer: Consumer, comparison: &Comparison) {
         let tally = self.tally(consumer);
@@ -1007,6 +1050,7 @@ impl Tallies {
                     consumer: consumer.label(),
                     asked: read(&tally.asked),
                     would_serve: read(&tally.would_serve),
+                    served: read(&tally.served),
                     needs_existence_check: read(&tally.needs_existence_check),
                     misses: MissCounts {
                         off: miss(Miss::Off),
@@ -1039,6 +1083,8 @@ pub struct ConsumerCounts {
     pub asked: u64,
     /// Those the cache would have answered.
     pub would_serve: u64,
+    /// Of those, the ones it did answer (`[message_cache] serve`). `#384 cache-serve`.
+    pub served: u64,
     /// Those it would have answered after one existence check upstream.
     pub needs_existence_check: u64,
     /// Those it would not have, by reason.
@@ -1065,6 +1111,7 @@ impl ConsumerCounts {
             consumer: "all",
             asked: self.asked + other.asked,
             would_serve: self.would_serve + other.would_serve,
+            served: self.served + other.served,
             needs_existence_check: self.needs_existence_check + other.needs_existence_check,
             misses: MissCounts {
                 off: self.misses.off + other.misses.off,
