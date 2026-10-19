@@ -21,6 +21,11 @@ steps:
       # Example 08 explicitly models a 16 GiB clean-build worker. The parent must delegate that
       # advertised envelope rather than letting an inner scheduler plan against memory it cannot
       # physically use. An explicit hard cap avoids multiplying this contract by 1.25.
+      # On a cgroup-capable runner whose honest budget (the smaller of its finite cgroup cap and
+      # total memory, so about 16 GiB total after reservations) is below that cap, the harness
+      # does not execute example 08: it passes the real budget as --max-mem and requires each
+      # engine's documented pre-spawn REFUSED at the full 16 GiB footprint. The envelope here is
+      # not shrunk to fit; hard-cap admission is the behavior under test on that path.
       hard_mem_max_bytes: 17179869184
 
   - group: run

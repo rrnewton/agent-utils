@@ -254,6 +254,15 @@ DAGRUN_CARGO_SWEEP_ROOT="$study_root/targets" dagrun sweep \
   --output-dir "$study_root/profiles"
 ```
 
+The step pins a 16 GiB hard memory cap: that envelope is the contract being modeled, not a
+suggestion. Repository validation runs this example at full strength on runners whose memory
+budget — the smaller of a finite cgroup cap and total memory — reaches 16 GiB. On a smaller
+cgroup-capable runner (about 16 GiB total is already below the binary 16 GiB cap once kernel
+reservations are subtracted) validation does not execute it and does not shrink the cap: the
+harness passes the runner's real budget as `--max-mem` and requires the engine's documented
+pre-spawn `REFUSED`, naming the full 16 GiB footprint, with the guest never started. That
+low-memory path proves hard-cap admission; it is not a silent skip and not an execution.
+
 A zero target completes the mandatory automatic topology pass and starts no refinement pass. The
 aggregate rows and `scaling_model_*.json` describe speedup, CPU work, and memory by width. Each
 sample also writes `profiles/traces/<run_id>.csv`, whose interval effective-core and thread-count
