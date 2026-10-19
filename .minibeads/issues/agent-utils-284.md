@@ -1,12 +1,13 @@
 ---
 title: 'redraw-keeps-pane: a redraw must not move the keys to a pane the reader was not in'
-status: open
+status: closed
 priority: 3
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-14T03:02:06.725677672+00:00
-updated_at: 2026-10-14T03:02:06.725677672+00:00
+updated_at: 2026-10-19T09:55:21.162609561+00:00
+closed_at: 2026-10-19T09:55:21.162609401+00:00
 ---
 
 # Description
