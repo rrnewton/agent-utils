@@ -71,6 +71,10 @@ and can be added later by asking the coordinator. Each tool has a skill under
 [`skills/`](skills/README.md), plus `quickstart`, `--help`, and `userguide`
 commands that stay authoritative for its usage.
 
+[RELATED_WORK.md](RELATED_WORK.md) links each tool's comparison with public
+systems and compares the suite as a whole with other agent orchestrators by
+what runs where: on a development server, on a laptop, or on a vendor's servers.
+
 ## Implementations
 
 Paired tools share their core command contracts; installation-specific
