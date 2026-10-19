@@ -1,6 +1,6 @@
 ---
 title: 'cross-runner-test-timing: add common per-case timing telemetry'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
@@ -9,7 +9,8 @@ labels:
 depends_on:
   agent-utils-21: parent-child
 created_at: 2026-09-25T11:45:20.424065054+00:00
-updated_at: 2026-09-25T11:45:20.424065054+00:00
+updated_at: 2026-10-19T12:20:38.537240036+00:00
+closed_at: 2026-10-19T12:20:38.537239915+00:00
 ---
 
 # Description
