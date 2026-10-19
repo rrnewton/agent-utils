@@ -1,12 +1,13 @@
 ---
 title: 'package-step-cpu-budget: the Python package steps run on the 10 CPU-second default and time out on a hosted runner'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - validation
 created_at: 2026-10-19T09:35:55.616000892+00:00
-updated_at: 2026-10-19T09:35:55.616000892+00:00
+updated_at: 2026-10-19T09:43:57.368854363+00:00
+closed_at: 2026-10-19T09:43:57.368854213+00:00
 ---
 
 # Description
