@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-336-ccef9f0dad2",
+    "issue_id": "agent-utils-336",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Closed: delivered in 'vibe-talk: keep the thread list's reader at the foot when a draft docks under it while Settings or Help is up'. The right column's dock-growth keeper, which keeps a reader at the foot of the cards when the send card docks under them on the list, took its last report from the column hidden with the main screen, measured at nothing, and reckoned no growth from it, so a reader who left from the foot came back the card's height above it (247px for a long draft, 164px for a short one, at 393x852 and 1280x800 by every way there and back). It now keeps no report made while another screen is up, and judges the card that docked while the reader was away exactly as one that came while they were on the list: from the foot they are at the foot again over the card, from up the cards on their card. Measured: approval_card_browser.py point 23 (gear or \"?\", a long draft arriving there, back by Back or Esc, at 393x852 by touch and 1280x800 with a mouse) passes, and fails against the page without the fix with \"the gear and Back left a reader who was at the foot of the cards 247px above it\" at both sizes; a new page-suite test and its negative control; the #269 review's trips probe (gear, \"?\", the browser's Back; a draft kept, arriving or settled while away; 0 and 100px up) at both sizes brings every arriving case at the foot back to the foot, and the kept and settled cases are as before. Unverified: only headless Chromium 149.",
+    "created_at": "2026-10-19T10:29:46.952634602Z",
+    "updated_at": "2026-10-19T10:29:46.952634602Z"
+  }
+]

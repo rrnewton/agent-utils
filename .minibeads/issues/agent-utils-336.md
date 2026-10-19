@@ -1,12 +1,13 @@
 ---
 title: 'draft-return-thread-list: back from Settings with a new draft, the thread list reader is left above the foot'
-status: open
+status: closed
 priority: 3
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-15T15:52:38.645914593+00:00
-updated_at: 2026-10-15T15:52:38.645914593+00:00
+updated_at: 2026-10-19T10:29:46.955818655+00:00
+closed_at: 2026-10-19T10:29:46.955818514+00:00
 ---
 
 # Description
