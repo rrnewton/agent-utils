@@ -514,3 +514,16 @@ def test_distinct_cli_smokes_live_in_the_canonical_graph() -> None:
     }
     for tag, command_fragment in expected_commands.items():
         assert command_fragment in by_tag[tag].cmd
+
+
+# ---- `#365 package-step-cpu-budget` -------------------------------------------------------------
+
+
+def test_every_package_build_declares_a_cpu_budget_above_the_small_step_default() -> None:
+    from dagrun.model import DEFAULT_SMALL_CPU_TIMEOUT
+
+    config = dag_from_path(REPO_ROOT / "validation.dag.yaml")
+    packages = [step for step in config.steps if step.tag.startswith("packages.python.")]
+    assert len(packages) == 8
+    for step in packages:
+        assert step.cpu_timeout > DEFAULT_SMALL_CPU_TIMEOUT, step.tag

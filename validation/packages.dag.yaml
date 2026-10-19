@@ -3,6 +3,10 @@ description: Tool-owned offline Python build-and-install smoke checks
 resource_caps:
   python-package: 4
 
+# Each step builds a wheel and an sdist and smoke-installs them in a fresh environment: about 6
+# CPU-seconds on a fast workstation and more than 10 on a hosted runner, where dagrun's default
+# 10 s budget for a step that declares none failed `wrkviz` with CPU-TIMEOUT. 120 bounds a hang,
+# not a slow build; the 600 s wall limit stays the outer bound.
 steps:
   - group: python
     job: agentctl
@@ -11,6 +15,7 @@ steps:
     jobs_flag: ""
     labels: [validation-packages, validation-python-packages, component-agentctl]
     timeout: 600
+    cpu_timeout: 120
     hint: &python_package_hint
       resources: {python-package: 1}
       est_duration_s: 8
@@ -25,6 +30,7 @@ steps:
     jobs_flag: ""
     labels: [validation-packages, validation-python-packages, component-dagrun]
     timeout: 600
+    cpu_timeout: 120
     hint: *python_package_hint
 
   - group: python
@@ -34,6 +40,7 @@ steps:
     jobs_flag: ""
     labels: [validation-packages, validation-python-packages, component-experiment-runner]
     timeout: 600
+    cpu_timeout: 120
     hint: *python_package_hint
 
   - group: python
@@ -43,6 +50,7 @@ steps:
     jobs_flag: ""
     labels: [validation-packages, validation-python-packages, component-herdr-run]
     timeout: 600
+    cpu_timeout: 120
     hint: *python_package_hint
 
   - group: python
@@ -52,6 +60,7 @@ steps:
     jobs_flag: ""
     labels: [validation-packages, validation-python-packages, component-planner]
     timeout: 600
+    cpu_timeout: 120
     hint: *python_package_hint
 
   - group: python
@@ -61,6 +70,7 @@ steps:
     jobs_flag: ""
     labels: [validation-packages, validation-python-packages, component-tick-hub]
     timeout: 600
+    cpu_timeout: 120
     hint: *python_package_hint
 
   - group: python
@@ -70,6 +80,7 @@ steps:
     jobs_flag: ""
     labels: [validation-packages, validation-python-packages, component-wrkslots]
     timeout: 600
+    cpu_timeout: 120
     hint: *python_package_hint
 
   - group: python
@@ -79,4 +90,5 @@ steps:
     jobs_flag: ""
     labels: [validation-packages, validation-python-packages, component-wrkviz]
     timeout: 600
+    cpu_timeout: 120
     hint: *python_package_hint
