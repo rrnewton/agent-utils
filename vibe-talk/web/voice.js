@@ -43998,7 +43998,7 @@ async function loadChannelDirectory(more) {
     const waited = Date.now() - startedAt;
     const seconds = Math.max(1, Math.round(waited / 1000));
     const why = waited >= DIRECTORY_SLOW_MS
-      ? ` ${sentenceStart(settingsServiceName())} can take a while to list its channels; what it lists is kept for two minutes.`
+      ? ` ${sentenceStart(settingsServiceName())} can take a while to list its channels; the same search again within two minutes answers at once.`
       : "";
     said.textContent = `${asking} ${seconds} s so far.${why}`;
     channelDirectory.ticker = setTimeout(tick, DIRECTORY_TICK_MS);
@@ -44929,6 +44929,14 @@ function showChannelPanel(which) {
     const open = panel === which;
     el(panel).hidden = !open;
     el(opener).setAttribute("aria-expanded", open ? "true" : "false");
+  }
+  // `#371 channel-search-hash`. A directory read still on its way when the list is closed is given up
+  // on: its count stops, and its answer is not drawn into a list nobody is looking at. Opening the list
+  // again reads it again (the server answers from what it kept).
+  if (which !== "browse-channel-fields" && channelDirectory.loading) {
+    stopDirectoryTicker();
+    channelDirectory.generation += 1;
+    channelDirectory.loading = false;
   }
 }
 

@@ -3274,7 +3274,8 @@ channel-search-hash`): Slack lists every conversation the app is in before it ca
 which can take several seconds, so the searches typed after the first walk the listing Slack gave
 it, and a bridge's answer to the same search, cursor and page size is given again. Every change to
 the list of channels here (an addition, a removal, a channel hidden or shown again) forgets what was
-kept, and whether an entry is already on the list is always decided afresh from the list.
+kept, and whether an entry is already on the list is always decided afresh from the list. A
+service keeps at most 256 answers, the oldest going first, and never a failure.
 
 A compatible provider bridge may separately implement `POST /channels/{id}/read` and opt in with
 `discord.upstream_read_marks = true`. The web app then offers **Mark read in** *the service* under each

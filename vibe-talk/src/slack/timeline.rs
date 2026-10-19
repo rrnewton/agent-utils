@@ -1435,18 +1435,18 @@ impl HttpSlackClient {
             if !position.c.is_empty() {
                 params.push(("cursor", position.c.clone()));
             }
-            let value = match self.directory_pages.get(&position.c) {
-                Some(kept) => kept,
-                None => {
-                    let value = self.call("users.conversations", &params).await?;
-                    self.directory_pages.put(position.c.clone(), value.clone());
-                    value
-                }
+            let (value, fresh) = match self.directory_pages.get(&position.c) {
+                Some(kept) => (kept, false),
+                None => (self.call("users.conversations", &params).await?, true),
             };
             let channels = value
                 .get("channels")
                 .and_then(Value::as_array)
                 .ok_or_else(|| shape("users.conversations answer has no \"channels\" array"))?;
+            // Kept only once it is a listing: a malformed answer is asked again next time.
+            if fresh {
+                self.directory_pages.put(position.c.clone(), value.clone());
+            }
             let next = value
                 .get("response_metadata")
                 .and_then(|metadata| metadata.get("next_cursor"))

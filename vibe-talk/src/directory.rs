@@ -69,6 +69,10 @@ pub fn name_filter(query: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_owned())
 }
 
+/// Most answers one service's listing keeps; the oldest goes first. A bridge keeps one per search,
+/// so this bounds what a client typing many searches within [`DIRECTORY_KEEP`] can make it hold.
+pub const MAX_KEPT: usize = 256;
+
 /// How long a service's channel listing is kept: searches typed one after another while it is
 /// kept answer from it, without asking the service again. `#371 channel-search-hash`.
 pub const DIRECTORY_KEEP: Duration = Duration::from_secs(120);
@@ -97,7 +101,7 @@ impl<K, V> Default for Kept<K, V> {
     }
 }
 
-impl<K: Eq + Hash, V: Clone> Kept<K, V> {
+impl<K: Eq + Hash + Clone, V: Clone> Kept<K, V> {
     /// Keep answers for `keep`; `Duration::ZERO` keeps nothing.
     #[must_use]
     pub fn new(keep: Duration) -> Self {
@@ -122,6 +126,16 @@ impl<K: Eq + Hash, V: Clone> Kept<K, V> {
         if let Ok(mut answers) = self.answers.lock() {
             let keep = self.keep;
             answers.retain(|_, (at, _)| at.elapsed() < keep);
+            while answers.len() >= MAX_KEPT {
+                let Some(oldest) = answers
+                    .iter()
+                    .min_by_key(|(_, (at, _))| *at)
+                    .map(|(key, _)| key.clone())
+                else {
+                    break;
+                };
+                answers.remove(&oldest);
+            }
             answers.insert(key, (Instant::now(), value));
         }
     }
@@ -249,6 +263,24 @@ mod tests {
         nothing.put("a", 1);
         assert_eq!(nothing.get(&"a"), None);
         assert_eq!(Kept::<u8, u8>::default().keep, DIRECTORY_KEEP);
+    }
+
+    #[test]
+    fn kept_answers_are_bounded_and_the_oldest_goes_first() {
+        let kept: Kept<usize, usize> = Kept::default();
+        for n in 0..=MAX_KEPT {
+            kept.put(n, n);
+            // Distinct instants, so "oldest" is well defined.
+            std::thread::sleep(Duration::from_micros(50));
+        }
+        assert_eq!(kept.answers.lock().map(|a| a.len()).unwrap_or(0), MAX_KEPT);
+        assert_eq!(
+            kept.get(&0),
+            None,
+            "the oldest answer was kept past the bound"
+        );
+        assert_eq!(kept.get(&MAX_KEPT), Some(MAX_KEPT));
+        assert_eq!(kept.get(&1), Some(1));
     }
 
     #[test]

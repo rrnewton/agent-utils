@@ -34694,7 +34694,7 @@ test("channel browser: a slow read says how long it has taken, then why, and sto
   page.expireTimers(1000);
   assert.equal(
     said(),
-    'Searching for "release"… 3 s so far. Discord can take a while to list its channels; what it lists is kept for two minutes.'
+    'Searching for "release"… 3 s so far. Discord can take a while to list its channels; the same search again within two minutes answers at once.'
   );
   page.directoryHold = null;
   answer();
@@ -34702,6 +34702,22 @@ test("channel browser: a slow read says how long it has taken, then why, and sto
   assert.equal(said(), "1 channel shown.");
   assert.equal(page.expireTimers(1000), 0, "the count went on after the answer");
   assert.deepEqual(directoryRows(page), ["Release Train | Add"]);
+
+  // Closed while a read is on its way: the count stops, and the late answer is not drawn.
+  page.directoryHold = new Promise((resolve) => {
+    answer = resolve;
+  });
+  await search.setValue("room");
+  await search.dispatch("keydown", { key: "Enter" });
+  assert.equal(said(), 'Searching for "room"…');
+  await page.el("close-browse-channels").click();
+  await page.settle();
+  assert.equal(page.el("browse-channel-fields").hidden, true, "the list did not close");
+  assert.equal(page.expireTimers(1000), 0, "a closed list went on counting");
+  page.directoryHold = null;
+  answer();
+  await page.settle();
+  assert.deepEqual(directoryRows(page), [], "a closed list drew the answer it gave up on");
 });
 
 test("channel pickers list a channel without its leading '#', so typing its name reaches it", async () => {

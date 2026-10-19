@@ -1251,6 +1251,75 @@ async fn discovery_keeps_slacks_listing_for_searches_that_follow() {
     assert_eq!(listings(), before + 4, "a stale listing was used");
 }
 
+/// `#371 channel-search-hash`: an answer that fills part-way through a Slack page resumes inside it,
+/// and walking the kept listing gives every conversation once, as walking Slack itself does.
+#[tokio::test]
+async fn paging_through_the_kept_listing_gives_every_conversation_once() {
+    let fake = Fake::start(directory_fixture(), 4).await;
+    let client = fake.client();
+    let listings =
+        || fake.with(|state| state.calls.get("users.conversations").copied().unwrap_or(0));
+    let walk = || async {
+        let mut request = DirectoryRequest {
+            query: None,
+            cursor: None,
+            limit: 3,
+        };
+        let mut names = Vec::new();
+        loop {
+            let page = client.discover_channels(&request).await.expect("page");
+            names.extend(page.entries.into_iter().map(|entry| entry.source));
+            request.cursor = page.next_cursor;
+            if request.cursor.is_none() {
+                break names;
+            }
+        }
+    };
+    let first = walk().await;
+    let read = listings();
+    assert_eq!(first.len(), 21, "{first:?}");
+    let again = walk().await;
+    assert_eq!(
+        again, first,
+        "the kept listing repeated or skipped a conversation"
+    );
+    assert_eq!(
+        listings(),
+        read,
+        "walking the kept listing asked Slack again"
+    );
+}
+
+/// A failed listing is not kept: the next search asks Slack again.
+#[tokio::test]
+async fn a_failed_listing_is_not_kept() {
+    let fake = Fake::start(directory_fixture(), 50).await;
+    let client = fake.client();
+    let request = DirectoryRequest {
+        query: None,
+        cursor: None,
+        limit: 50,
+    };
+    fake.with(|state| {
+        state.fail.insert(
+            "users.conversations".to_owned(),
+            "internal_error".to_owned(),
+        );
+    });
+    assert!(client.discover_channels(&request).await.is_err());
+    fake.with(|state| state.fail.clear());
+    assert_eq!(
+        client
+            .discover_channels(&request)
+            .await
+            .expect("page")
+            .entries
+            .len(),
+        21,
+        "a failure was kept"
+    );
+}
+
 #[tokio::test]
 async fn identity_comes_from_auth_test_and_is_remembered() {
     let (state, _) = linear(1);
