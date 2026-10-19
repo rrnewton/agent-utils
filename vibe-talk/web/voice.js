@@ -31110,9 +31110,17 @@ function searchWalkNote(walk, reason) {
   const messages = `${walk.arrived} message${walk.arrived === 1 ? "" : "s"}`;
   const day = oldestLoadedDay();
   const back = day === null ? "" : `, back to ${searchDayWords(day)}`;
-  if (reason === "stopped") return walk.found > 0 ? `Stopped. Found ${walk.found} in ${pages} (${messages}).` : "";
   // Nothing matching anywhere in the list: the empty sentence says how far back that is.
   const emptied = listEmptied();
+  if (reason === "stopped") {
+    if (walk.found > 0) return `Stopped. Found ${walk.found} in ${pages} (${messages}).`;
+    // Never silent over matches: what it read, or that it read nothing. `#262`, round two.
+    if (emptied) return "";
+    if (walk.read === 0) return "Stopped before any older page was read.";
+    return `Stopped. Nothing more in ${walk.read} page${walk.read === 1 ? "" : "s"} (${messages})${back}.`;
+  }
+  // A list saying older history exists, with no place to go on from: nothing could be read.
+  if (reason === "nowhere") return "Nothing older can be searched: the chat service gave no way further back.";
   if (reason === "start") {
     if (walk.found > 0) return `Reached the start of ${channelViewWords()}. Found ${walk.found}.`;
     return emptied ? "" : `Reached the start of ${channelViewWords()}; nothing older matches.`;
@@ -31151,6 +31159,8 @@ function searchOlder() {
     ticket: replyJumpTicket,
     held: new Set([...el("discord-log").children].flatMap(idsOf)),
     pages: 0,
+    // The steps that landed, Main's own newest page among them (`walkCursorOwed`): what a stopped walk read.
+    read: 0,
     cursorRead: false,
     found: 0,
     arrived: 0,
@@ -31182,7 +31192,11 @@ function searchOlder() {
           reason = "start";
           break;
         }
-        if (!discordOlderCursor && !walkCursorOwed() && olderStep === null) break;
+        if (!discordOlderCursor && !walkCursorOwed() && olderStep === null) {
+          // Older history said to exist, and no cursor to reach it by: said, never a page that was not read.
+          if (walk.pages === 0 && !walk.cursorRead) reason = "nowhere";
+          break;
+        }
         if (walk.pages > 0 && Date.now() - walk.started + last > SEARCH_OLDER_MS) {
           reason = "budget";
           break;
@@ -31211,6 +31225,8 @@ function searchOlder() {
           steps.resume();
         }
         if (!owed) last = Date.now() - began;
+        // A step Stop aborted ends quietly, and brought nothing.
+        if (!(walk.controller && walk.controller.signal.aborted)) walk.read += 1;
         if (!searchWalkHolds(walk, column) || walk.stopping) break;
         countSearchWalk(walk);
         if (walk.found >= SEARCH_OLDER_HITS) break;
