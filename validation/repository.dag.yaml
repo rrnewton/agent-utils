@@ -42,6 +42,18 @@ steps:
       hard_mem_max_bytes: 268435456
 
   - group: hygiene
+    job: case-timings
+    desc: normalized per-case timing adapters and inventory verifier can fail
+    cmd: python3 scripts/case_timings.py --self-test
+    jobs_flag: ""
+    labels: [validation-hygiene]
+    timeout: 60
+    hint:
+      est_duration_s: 1
+      classification: light
+      rss_baseline_bytes: 134217728
+
+  - group: hygiene
     job: validation-selector
     desc: prove validation routing fails safe
     cmd: python3 scripts/validate.py --self-test

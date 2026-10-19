@@ -483,9 +483,15 @@ def _parse_shard(value: str) -> str:
 
 
 def _pytest_command(pytest_args: Sequence[str], shard: str | None) -> list[str]:
-    base_args = ["-p", FAILURE_IDENTITY_PLUGIN, *pytest_args]
+    # ``run_pytest_shard`` doubles as the per-case timing plugin. A direct
+    # run loads it with ``-p`` and its ``pytest_configure`` registers the
+    # collector from ``scripts/case_timings.py``; a sharded run's worker is
+    # that module run as a script and its shard plugin carries the collector
+    # itself, so the ``-p`` load must not also reach it.
     if shard is None:
+        base_args = ["-p", FAILURE_IDENTITY_PLUGIN, "-p", "run_pytest_shard", *pytest_args]
         return [sys.executable, "-c", _PYTEST_WITH_SCRIPTS, str(SCRIPTS_ROOT), *base_args]
+    base_args = ["-p", FAILURE_IDENTITY_PLUGIN, *pytest_args]
     return [
         sys.executable,
         str(SCRIPTS_ROOT / "run_pytest_shard.py"),

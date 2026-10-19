@@ -222,6 +222,7 @@
         "py/wrkviz/gh_resolve.py",
         "rs/bin/cargo-runner",
         "scripts/agent-log-archive/",
+        "scripts/case_timings.py",
         "scripts/check_client_names.py",
         "scripts/check_deps.py",
         "scripts/check_documented_defaults.py",
@@ -244,6 +245,7 @@
       "reverse_dependencies": [],
       "test_files": [
         "py/tests/test_agent_log_archive_fetcher.py",
+        "py/tests/test_case_timings.py",
         "py/tests/test_engine_resolver_source_pin.py",
         "py/tests/test_gh_resolve.py",
         "py/tests/test_gh_resolve_copies.py",

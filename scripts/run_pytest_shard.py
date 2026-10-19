@@ -64,10 +64,88 @@ def _assign(nodeids: Sequence[str], count: int) -> tuple[tuple[str, ...], ...]:
     return tuple(tuple(sorted(shard)) for shard in shards)
 
 
+class _TimingPlugin:
+    """Collect per-case timings for ``scripts/case_timings.py`` when asked.
+
+    Registered by ``pytest_configure`` below whenever a timing directory is
+    requested, whether this module drives the run as the shard worker or is
+    loaded with ``-p`` by ``scripts/run_component_tests.py``. The inventory
+    is the post-shard collection; durations sum each case's stage reports.
+    """
+
+    def __init__(self) -> None:
+        self.inventory: list[str] = []
+        self.results: dict[str, tuple[str, float]] = {}
+
+    def pytest_collection_finish(self, session: pytest.Session) -> None:
+        self.inventory = [item.nodeid for item in session.items]
+
+    def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
+        outcome, duration = self.results.get(report.nodeid, ("", 0.0))
+        duration += max(0.0, report.duration)
+        if report.failed:
+            outcome = "fail" if report.when == "call" else "error"
+        elif report.skipped:
+            if outcome not in {"fail", "error", "pass"}:
+                outcome = "skip"
+        elif report.passed and report.when == "call" and outcome not in {"fail", "error"}:
+            outcome = "pass"
+        self.results[report.nodeid] = (outcome, duration)
+
+    def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
+        del session, exitstatus
+        import case_timings
+
+        gate = case_timings.current_gate()
+        cases = [
+            case_timings.CaseRecord("pytest", gate, nodeid, outcome or "error", duration)
+            for nodeid, (outcome, duration) in sorted(self.results.items())
+        ]
+        case_timings.emit_if_requested(
+            runner="pytest", inventory=self.inventory, cases=cases, gate=gate
+        )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Register the timing collector once, only when a directory was requested."""
+
+    import case_timings
+
+    if case_timings.requested_directory() is None:
+        return
+    if config.pluginmanager.hasplugin("case-timings"):
+        return
+    config.pluginmanager.register(_TimingPlugin(), name="case-timings")
+
+
 @dataclass
 class _ShardPlugin:
     index: int
     count: int
+    # The shard worker is this module run as a script, so the module-level
+    # ``pytest_configure`` above never fires in it; the timing collector rides
+    # on the shard plugin itself instead. Non-shard runs load this module
+    # with ``-p`` and take the ``pytest_configure`` path, so exactly one
+    # collector is active per launch mode.
+    timing: _TimingPlugin | None = None
+
+    def __post_init__(self) -> None:
+        import case_timings
+
+        if case_timings.requested_directory() is not None:
+            self.timing = _TimingPlugin()
+
+    def pytest_collection_finish(self, session: pytest.Session) -> None:
+        if self.timing is not None:
+            self.timing.pytest_collection_finish(session)
+
+    def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
+        if self.timing is not None:
+            self.timing.pytest_runtest_logreport(report)
+
+    def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
+        if self.timing is not None:
+            self.timing.pytest_sessionfinish(session, exitstatus)
 
     def pytest_collection_modifyitems(
         self,
