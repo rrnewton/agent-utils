@@ -4999,6 +4999,15 @@ call cut it short. So does a stream reset during a call, which says the gap cann
 re-read and complete, but whether the call heard what fell into the gap cannot be known. Turning
 Arriving messages during a call off lets go of what was waiting, and the connection details count it.
 
+**Never the owner's words** (`#353 relay-echo-as-owner`). A relayed turn is the page speaking on the
+channel's behalf, so it is not drawn in the transcript or filed under "you" — and neither is its
+echo. A `vibe-talk-v1` bridge echoes every prompt back as a user transcript; the echo of a relayed
+turn, or of the page's own word on a send card, used to be drawn as a "you" row and stored as the
+owner's turn, so the record, and the recap a resumed or reconnected session is handed, said he had
+read the channel's messages aloud. The echo is now matched to the turn on the wire, however long
+that turn waited to go, and answers for that one prompt: the owner saying the same words again
+still shows. The hosted vendor's protocol is unchanged.
+
 **Two controls over one value.** The bar carries **Read new**, a button that cycles
 off → gist → full → off, because the strip has room for a `.bar-button` and not for a
 `.bar-select`; Settings carries the same three as a named `<select>`, where there is room to say
