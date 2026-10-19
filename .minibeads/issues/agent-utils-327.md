@@ -1,12 +1,13 @@
 ---
 title: 'done-races-remaining: four smaller Done races left after #306 and #311'
-status: open
+status: closed
 priority: 3
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-15T13:11:36.510172499+00:00
-updated_at: 2026-10-15T13:11:36.510172499+00:00
+updated_at: 2026-10-19T09:02:56.900794837+00:00
+closed_at: 2026-10-19T09:02:56.900794707+00:00
 ---
 
 # Description
