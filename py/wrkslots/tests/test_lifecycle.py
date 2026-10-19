@@ -56553,6 +56553,8 @@ def _collect_lifecycle_cases(module: types.ModuleType) -> None:
 
 
 sys.modules.setdefault("wrkslots.tests.test_lifecycle", sys.modules[__name__])
+from wrkslots.tests import foreign_mount_ns_cases  # noqa: E402
 from wrkslots.tests import orphan_retire_cases  # noqa: E402
 
+_collect_lifecycle_cases(foreign_mount_ns_cases)
 _collect_lifecycle_cases(orphan_retire_cases)

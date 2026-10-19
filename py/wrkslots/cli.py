@@ -16156,7 +16156,69 @@ class _GitVcs:
         self._run(repository, ["branch", "-D", "--", branch])
 
     def repair_worktree(self, repository: Path, checkout: Path) -> None:
-        self._run(repository, ["worktree", "repair", str(checkout)])
+        """Point the one linked worktree at ``checkout`` back at its current path.
+
+        ⚠️ NEVER ``git worktree repair``. Run in the main worktree, it rewrites
+        the ``.git`` file of EVERY linked worktree whose directory exists,
+        whatever path it is given. An image-backed slot whose image is not
+        mounted leaves its registered directory empty, so the repair after one
+        slot's path fence wrote a host-side ``.git`` into the empty mount points
+        of unmounted siblings: their images could no longer be mounted, and Git
+        saw each of those worktrees with every file deleted (#350
+        wrkslots-foreign-mount-ns). This writes only this checkout's own link,
+        ``<admin>/gitdir``, after checking that ``<checkout>/.git`` names an
+        administrative directory of exactly this repository.
+        """
+
+        git_file = checkout / ".git"
+        if git_file.is_symlink() or not git_file.is_file():
+            raise Refusal(f"checkout has no safe .git file to repair: {git_file}")
+        raw = _read_bounded_regular_file(
+            git_file, "checkout .git file", _WORKTREE_GITDIR_BYTES_LIMIT
+        )
+        try:
+            value = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise Refusal(f"checkout .git file is not UTF-8: {git_file}") from exc
+        prefix = "gitdir: "
+        line = value.removesuffix("\n")
+        if not line.startswith(prefix) or "\n" in line or "\0" in line:
+            raise Refusal(f"checkout has an invalid .git file: {git_file}")
+        named = Path(line.removeprefix(prefix))
+        try:
+            admin = (named if named.is_absolute() else checkout / named).resolve(strict=True)
+        except OSError as exc:
+            raise Refusal(
+                f"checkout .git file names an unavailable Git directory: {git_file}: {exc}"
+            ) from exc
+        common = self.common_directory(repository).resolve()
+        if admin.parent != common / "worktrees" or not admin.is_dir():
+            raise Refusal(
+                f"checkout .git file {git_file} names {admin}, which is not a linked-worktree "
+                f"directory of {repository}; refusing to repair it"
+            )
+        commondir = admin / "commondir"
+        if commondir.exists() or commondir.is_symlink():
+            try:
+                named_common = _read_bounded_regular_file(
+                    commondir, "linked-worktree commondir", _WORKTREE_GITDIR_BYTES_LIMIT
+                ).decode("utf-8").strip()
+            except UnicodeDecodeError as exc:
+                raise Refusal(f"linked-worktree commondir is not UTF-8: {commondir}") from exc
+            if (admin / named_common).resolve() != common:
+                raise Refusal(
+                    f"linked-worktree directory {admin} belongs to another repository; "
+                    "refusing to repair it"
+                )
+        desired = f"{os.path.realpath(git_file)}\n".encode("utf-8")
+        link = admin / "gitdir"
+        current: bytes | None = None
+        if link.exists() or link.is_symlink():
+            current = _read_bounded_regular_file(
+                link, "linked-worktree gitdir", _WORKTREE_GITDIR_BYTES_LIMIT
+            )
+        if current != desired:
+            _atomic_write_bytes(link, desired)
         if checkout.absolute() not in self.listed_worktrees(repository):
             raise Refusal(f"Git did not repair worktree registration for {checkout}")
 
