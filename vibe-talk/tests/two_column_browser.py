@@ -78,7 +78,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import offline_cache_browser as fixture
-from offline_cache_browser import TOKEN, FakeApi, Json, check, handler_for, said, thread_of
+from offline_cache_browser import OWNER_ID, TOKEN, FakeApi, Json, check, handler_for, said, thread_of
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType, Page
@@ -145,6 +145,10 @@ class ColumnsApi(FakeApi):
             summary(REPLICA, 9, 14, {}),
             summary(CANARY, 15, 18, {"display_name": "canary-rollback", "summary": None}),
         ]
+
+    def client_config(self, scope: str) -> Json:
+        # Who the owner is, so 213 and 223 are drawn as the owner's (`two-column-agent-fullwidth`).
+        return {**super().client_config(scope), "owner_author_id": OWNER_ID}
 
 
 # The two columns' boxes and the things drawn in them, measured in the page.
