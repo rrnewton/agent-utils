@@ -1,6 +1,6 @@
 ---
 title: 'pidfd-process-ownership: make agent cleanup generation-safe'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - safety
 - process-lifecycle
 created_at: 2026-09-25T14:07:45.137142234+00:00
-updated_at: 2026-09-25T14:07:45.137142234+00:00
+updated_at: 2026-10-19T13:13:03.217035974+00:00
+closed_at: 2026-10-19T13:13:03.217035824+00:00
 ---
 
 # Description
