@@ -958,12 +958,27 @@ WIDTH_JS = """() => {
 # sitting on a thread's "Reply in this thread" box. Run with every chip forced up — the worst case —
 # this scrolls the thread to its end and returns what covers the composer: empty when no chip meets
 # the text box or Send, and both sit inside the list rather than below its foot.
+#
+# `#335 offline-cache-chips-flake`. It waits on RENDERING UPDATES OF THE BROWSER'S OWN, not on frames
+# counted in the page. The page stands the chips on the box (`--composer-top`) and keeps their room
+# beside it (`--scroll-tools-clearance`) from a ResizeObserver on the chip row and from the list's scroll
+# event, both of which the browser runs in its next rendering update, before it paints. `page.clock` has
+# made requestAnimationFrame a 16ms timer, and a loaded host ran two of those before it drew once: the
+# check then measured the forced chips where the page had not yet stood them, and failed with "Collapse
+# all" over Send. Measured in that same task, before any rendering update, it fails so every time; measured
+# inside the first rendering update, which is what is painted, nothing covers either. A new
+# ResizeObserver's first report comes in the browser's next rendering update, after the page's own
+# observers and scroll listeners have had it, whatever the page's clock says.
 COMPOSER_JS = """async () => {
     const area = document.getElementById('scroll-area');
-    const frames = () => new Promise((settled) => requestAnimationFrame(() => requestAnimationFrame(settled)));
-    await frames();
+    const drawn = () => new Promise((settled) => {
+        const watch = new ResizeObserver(() => { watch.disconnect(); settled(); });
+        watch.observe(document.documentElement);
+    });
+    await drawn();
     area.scrollTop = area.scrollHeight;
-    await frames();
+    await drawn();
+    await drawn();
     const box = (e) => e.getBoundingClientRect();
     const meets = (a, b) => a.top < b.bottom && b.top < a.bottom && a.left < b.right && b.left < a.right;
     const chips = [...document.querySelectorAll('#scroll-tools .chip')].filter((c) => c.getClientRects().length > 0);
