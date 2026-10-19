@@ -1,12 +1,13 @@
 ---
 title: 'hide-empty-messages: a Settings switch, on by default, that leaves empty messages out everywhere'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-19T22:07:19.914469516+00:00
-updated_at: 2026-10-19T22:07:19.914469516+00:00
+updated_at: 2026-10-19T22:47:51.118112702+00:00
+closed_at: 2026-10-19T22:47:51.118112561+00:00
 ---
 
 # Description

@@ -1,12 +1,13 @@
 ---
 title: 'thread-line-overlap: the line from a thread''s root never crosses the thread''s message boxes'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-19T22:07:13.981059130+00:00
-updated_at: 2026-10-19T22:07:13.981059130+00:00
+updated_at: 2026-10-19T22:47:51.114157448+00:00
+closed_at: 2026-10-19T22:47:51.114157308+00:00
 ---
 
 # Description
