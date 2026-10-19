@@ -10,13 +10,13 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser system-bots-browser edited-mark-browser rich-headers-browser read-aloud-browser post-confirm-browser approval-card-browser voice-call-drops-browser voice-reconnect-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser search-chord-browser two-column-browser bookmark-browser reply-continuity-browser reply-in-column-browser reply-marks-read-browser done-sync-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser composer-grow-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser thread-card-header-browser all-thread-strip-browser scroll-stability-browser copy-message-browser fold-steps-browser back-gesture-browser live-pill-browser stale-live-read-browser
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser system-bots-browser edited-mark-browser rich-headers-browser read-aloud-browser post-confirm-browser approval-card-browser voice-call-drops-browser voice-reconnect-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser search-chord-browser two-column-browser bookmark-browser reply-continuity-browser reply-in-column-browser reply-marks-read-browser done-sync-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test live-relay-check-self-test live-relay-check container-smoke filter-place-browser search-dates-browser voice-composer-browser composer-grow-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser thread-card-header-browser all-thread-strip-browser scroll-stability-browser copy-message-browser fold-steps-browser back-gesture-browser live-pill-browser stale-live-read-browser
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
 # UNBOXED, and deliberately the default: it needs Rust, Node, and the repository's Python typing
 # tools, but no cgroup delegation. `validate-boxed` is the bounded version where cgroups exist.
-validate: fmt check scripts-check contract-check typecheck test dag-check voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test
+validate: fmt check scripts-check contract-check typecheck test dag-check voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test live-relay-check-self-test
 
 # The complete portable suite, run through dagrun: per-step wall and CPU timeouts, memory caps,
 # and process-tree teardown inside nested cgroups. Container-runtime and alternate-toolchain
@@ -531,6 +531,19 @@ android-speech-self-test:
 # deployment does not have to discover a broken supervisor against a real provider event stream.
 live-hint-adapter-self-test:
 	python3 scripts/live-hint-adapter.py --self-test
+
+# `#354 live-relay-check`: the verdict logic of the opt-in live check of relays during a call, on
+# synthetic frame logs. No browser, server or bridge.
+live-relay-check-self-test:
+	python3 scripts/live-relay-check.py --self-test
+
+# The live check itself, against the bridge you name: never part of an automated suite, since it
+# makes real calls. BRIDGE=ws://... or wss://... (tools= is refused), or BRIDGE=fake for the
+# in-process stand-in. The page is compiled into the binary, so it builds that first.
+live-relay-check:
+	@test -n "$(BRIDGE)" || { echo "BRIDGE=ws://... (or wss://..., or fake) is required" >&2; exit 2; }
+	cargo build --release --locked
+	python3 scripts/live-relay-check.py --bridge "$(BRIDGE)" $(LIVE_RELAY_ARGS)
 
 # The LAUNCHER -- run.sh, the script the owner types -- as opposed to the image it starts, which
 # the `container` CI job covers separately. Not part of `validate` because it needs a container

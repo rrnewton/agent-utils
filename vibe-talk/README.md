@@ -5503,6 +5503,80 @@ its text, and closing the call when the backend is slow to confirm the cut. An a
   conversation it was said in, marked "(cut off — the app closed before this turn ended)", before
   the record is read back. One page never files another live page's copy, nor its own.
 
+### Repeatable live relay check
+
+`scripts/live-relay-check.py` is the opt-in live check of channel messages relayed into a call
+(`#354 live-relay-check`) against any `vibe-talk-v1` bridge — the protocol above. The page suite and
+the loopback walks prove the page against fakes; what a real bridge does with a relayed prompt, and
+with an interrupt followed by a relay, is only seen on a real call. It needs a live bridge, may
+consume provider time, and is never part of an automated suite:
+
+```bash
+cargo build --release --locked          # the page is compiled into the binary it tests
+scripts/live-relay-check.py --bridge 'wss://voice.example.test/session'
+```
+
+`--bridge` is required: a `ws://` or `wss://` address, or `fake`. There is no default, and an
+address that asks for agent tools (`tools=`) is refused, so a test call can never read or post in a
+real chat. Run it only against a bridge nobody else is in a call on: it makes at most `--max-calls`
+calls (3), one at a time, each hung up within `--call-budget` (110 s). Everything it starts listens
+on loopback, and it stops only the processes it started.
+
+It runs the binary under test (`--binary`, by default this checkout's `target/release/vibe-talk`) on
+a free loopback port with a generated config: a fake chat API speaking the Discord REST protocol,
+which refuses every post and pushes each new message to `POST /api/v1/live/events` as an adapter
+does; the websocket backend at the page's own `/ws`; and a loopback front that sends `/ws` to the
+bridge, rewritten to the bridge's own path and host. Headless Chromium signs in on its fake
+microphone with channel A in view, B watched and C taken off the list, sets Arriving messages
+during a call to read in full, and makes three calls:
+
+* **Call 1**: (a) a message in A while idle, (b) one in B, (d) one in C, the negative control. Then
+  the bridge's own voice is asked to say a story request, and its audio is kept.
+* **Call 2**: the browser plays that audio as its microphone and asks for a long answer out loud;
+  (c) arrives in B 8 s into the answer and (e) in A 4 s later (`--mid-answer-delay`,
+  `--second-delivery-gap`). `--long-turn typed` asks by typing instead, and says so in the verdict.
+* **Call 3**, (f) interrupt then relay: the microphone says the request and then, `--barge-in-gap-s`
+  (5 s) after it ends, its first `--barge-in-s` (1 s) again, so the bridge's barge-in cuts the answer.
+  A message arrives in B `--interrupt-relay-delay` (1 s) after the interrupted turn. A bridge can lose
+  the next turn here and send an `error` asking the client to reconnect. A longer delay measures
+  whether a settle after an interrupt avoids that.
+
+Each case is judged over the whole run's frames, and its verdict says where the evidence points
+(page, server, bridge or agent, harness):
+
+| Case | PASS |
+|---|---|
+| a, b, c, e | relayed exactly once in its call and never again, and read out by the agent in one turn after the relay; or not relayed, with a notice naming its channel. (c, e) also nothing cut into the long answer |
+| d | never relayed, and never said |
+| f | read out exactly once: directly, or after the bridge lost the turn, on the new session the page reconnected to — the call still live, the page saying it reconnected, and the server holding the `reconnected` record of the replaced socket. A second lost turn within the minute may end the call, if the page says the message was not read out |
+
+FAIL is a silent drop, a second relay or read-out, a relay in a later call, a cut into the long
+answer, or for (f) a call that ended at the bridge's error. A lost turn is put down to the bridge on
+every verdict, PASS included. ERROR is a case the harness could not test (the push refused, no
+spoken request heard, no interrupt to relay after, the call budget spent). The exit code is 0 when
+all pass, 1 on a FAIL, 2 on an ERROR.
+
+`--replay` turns on the server's replay and the page's Resuming switch, so a reconnected session
+that lists `replay` is handed the call's record; the run waits for the server's startup ask of the
+bridge to say yes. Without it the reconnected session starts fresh, as on a bridge that lists no
+`replay`.
+
+Each run keeps `debug/live-relay-check/<UTC>-<binary>/`: `results.json`, `frames.jsonl` (every frame
+the page sent, in full, and every frame it received; binary frames as sizes), the server's log and
+screenshots. The frames and the generated config and tokens are private to the user (0600), because
+the frames hold the prompts the page sent.
+
+`--bridge fake` runs the whole check against an in-process stand-in with no network: it greets,
+takes loud microphone audio for a spoken request, cuts an answer on a barge-in, and echoes and
+answers prompts. `--fake-fault` makes it misbehave, to check the verdicts: `ignore-relay` answers a
+relay without reading it; `story-says-markers` says every marker in its story;
+`never-start-after-interrupt` echoes the first prompt after a cut answer, never answers it, and after
+`--fake-watchdog-s` (2 s) sends "turn N never started after an interrupt; reconnect";
+`never-start-twice` also loses the reconnected session's first prompt. `--self-test` checks the
+verdict logic alone on synthetic frame logs, with no browser, server or bridge, and runs in the
+ordinary `make validate` (`make -C vibe-talk live-relay-check-self-test`). `make -C vibe-talk live-relay-check BRIDGE=…` builds the release binary
+and runs the check; `LIVE_RELAY_ARGS` passes it more options.
+
 ## Signed conversation URLs
 
 Turning on **Enable Authentication** on an ElevenLabs agent closes the public `talk-to` link. From
