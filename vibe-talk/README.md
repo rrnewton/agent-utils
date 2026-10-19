@@ -7277,7 +7277,7 @@ the groups sit as rows inside a handful of sections, and each section is the car
 |---|---|
 | **Voice agent** | Sending (ask before the agent sends — first, where it is looked for), Instructions, Resuming, Arriving messages during a call, Reading full messages in channel view, Canned prompts, Microphone, and the provider's console link |
 | **Messages** | Your own messages, Mark-read automatically, Combining messages, Rich headers, Who is who, Recently dismissed |
-| **Channels** | the per-channel box: rename, remove, add, browse, clear unread upstream — for one channel, or for all of them (`#349 channel-settings-all`) |
+| **Channels** | the per-channel box: rename, remove, add, browse, clear unread upstream — for one channel, or for all of them (`#349 channel-settings-all`); with several chat services, a Service picker first (`#355 provider-grouped-channels`) |
 | **Screen and keys** | Text size, Reading width, Control bar, Typing, Keyboard |
 | **Storage and connection** | Stored conversations, Saved messages on this server (the message cache's switch, its Erase and what it holds; shown only to the write token, and only when client-config carries `message_cache` — `#208 persistent-cache`), Token, Connection status |
 
@@ -7344,6 +7344,21 @@ in this browser and keep applying. It follows the channel being **read**, which 
 and is still one channel's census, so a bot that only speaks somewhere else cannot spoil the guess.
 `64-channel-settings-all` photographs the box on All channels, Clear unread Mixed across two
 channels, at 393x852, 1280x800 and 1920x1080.
+
+**Several chat services: the service first** (`#355 provider-grouped-channels`). The owner,
+2026-10-18: "under the Channels setting ... drop-down for Service=Slack/etc and then within that a
+list of subscribed channels". Where client-config describes two or more providers, the channel box
+starts with a **Service** picker in their configuration order, in place of the "Chat service" line.
+Under it, a line says what that service does here: how new messages arrive, whether it has threads,
+whether a channel is added by link (and browsed) or by id, and whether unread can be cleared there.
+The channel picker lists only that service's channels; **Add a channel** sends that service's key
+with the link or the id, and the form asks for whichever the service takes, with "Let this app post
+here" for an id; **Browse channels** is offered only where the service registers and lists channels,
+and asks the server for that service's channels alone; the hidden channels are that service's. A
+service with no channel on the list says how to add one. Another service closes any open panel and
+empties the browse list. Settings opens on the service of the channel being read, and coming back
+from Help keeps the service chosen. With one service none of this shows and every request is as
+before.
 
 **On a wide desktop window the sections tile into columns** (`#345 settings-multi-column`). The
 owner, 2026-10-18: "tile Settings' top-level panes into width-dependent columns, each pane kept whole

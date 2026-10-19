@@ -143,7 +143,7 @@ const ALL_CHANNELS = "*";
 /**
  * @overload
  * @param {"bar-placement" | "discord-channel" | "relay-to-agent" | "settings-audio-source"
- *   | "settings-channel" | "thread-select" | "upstream-clear-mode"} id
+ *   | "settings-channel" | "settings-service" | "thread-select" | "upstream-clear-mode"} id
  * @returns {HTMLSelectElement}
  */
 /**
@@ -1228,6 +1228,9 @@ function showScreen(name) {
   // at a desk and 8px on a phone: a reader 40px above the foot read as 94px up, past `SCROLLBACK_PX`, and
   // was offered the jump, whose own room under the box then held it there.
   if (main) renderJumpNewest();
+  // `#355 provider-grouped-channels`. Settings opens on the service of the channel being read; not on
+  // the way back from Help, which is the same visit, where the reader's choice stands.
+  if (name === "settings" && previous !== "settings" && previous !== "help") pointSettingsAtReading();
   // `#232 upstream-mark-read`. The server may have pushed since the box was last drawn.
   if (name === "settings" && previous !== "settings") refreshUpstreamClear();
   // `#303 voice-post-prefix`. Another device may have saved or reset the tag since sign-in.
@@ -18705,6 +18708,8 @@ function hydrateFromCache() {
   if (shell.self_author_id) noteSelfAuthor(shell.self_author_id);
   ownerAuthorId = shell.owner_author_id || null;
   fillChannelSelect("discord-channel");
+  // `#355 provider-grouped-channels`. Settings by service, from the saved shell as from client-config.
+  fillServiceSelect();
   fillChannelSelect("settings-channel");
   const provider = providerOfChannel(el("discord-channel").value);
   if (provider) threadingSupported = provider.threading_supported === true;
@@ -42117,6 +42122,187 @@ function channelsInPickerOrder() {
   return channelsGrouped() ? channelGroups().flatMap((group) => group.channels) : knownChannels;
 }
 
+// --- Settings, one service at a time -------------------------------------------------------------
+//
+// `#355 provider-grouped-channels`. The owner: "under the Channels setting ... drop-down for
+// Service=Slack/etc and then within that a list of subscribed channels". With two or more services,
+// Settings > Channels starts with a Service picker; the channel picker lists that service's channels,
+// a line says what the service does here, and Add, Browse and the hidden channels act on it. Settings
+// opens on the service of the channel being read. With one service none of this shows, and every
+// request is what it was.
+
+/** The service Settings is showing, by key, or null with one service. */
+let settingsService = null;
+
+/** Whether Settings chooses a service first: the server describes two or more. */
+function servicesInSettings() {
+  return providerDescriptions.size >= 2;
+}
+
+/** The description of the service Settings is showing, or null with one service. */
+function settingsServiceDescription() {
+  return servicesInSettings() && settingsService !== null ? providerDescriptions.get(settingsService) || null : null;
+}
+
+/** The service Settings is showing, as a noun phrase: its name, or the one service's. */
+function settingsServiceName() {
+  return settingsServiceDescription() ? serviceLabel(/** @type {string} */ (settingsService)) : chatServiceName();
+}
+
+/** The channels Settings' picker lists: the chosen service's, or every one with one service. */
+function settingsChannels() {
+  return settingsServiceDescription() ? knownChannels.filter((channel) => channel.provider === settingsService) : knownChannels;
+}
+
+/** The service Settings opens on with none chosen yet: the channel being read's, else the first with channels. */
+function defaultSettingsService() {
+  const reading = knownChannel(el("discord-channel").value);
+  if (reading && providerDescriptions.has(reading.provider)) return reading.provider;
+  const keys = [...providerDescriptions.keys()];
+  return keys.find((key) => knownChannels.some((channel) => channel.provider === key)) || keys[0] || null;
+}
+
+/** Whether the service Settings is showing takes a link or reference to add a channel, rather than an id. */
+function addsByLink() {
+  const chosen = settingsServiceDescription();
+  return chosen ? chosen.channel_registration_supported === true : channelRegistrationSupported;
+}
+
+/** Whether Browse is offered: the service can list its channels and add one by reference. */
+function browseOffered() {
+  const chosen = settingsServiceDescription();
+  return chosen
+    ? chosen.channel_registration_supported === true && chosen.channel_discovery_supported === true
+    : channelDiscoverySupported;
+}
+
+/** What the chosen service does here, as one line under the Service picker. */
+function serviceFacts(provider) {
+  const name = serviceLabel(provider.key);
+  const seconds = Number(provider.live_poll_seconds) || 0;
+  const arrive = provider.live_delivery === "push"
+    ? "New messages arrive as they are sent."
+    : provider.live_delivery === "poll" && seconds > 0
+      ? `New messages are checked for every ${seconds} seconds.`
+      : "New messages show when a channel is read again.";
+  const threads = provider.threading_supported === true ? "Threads are shown." : "No threads.";
+  const adding = provider.channel_registration_supported === true
+    ? `Add a channel by pasting its link${provider.channel_discovery_supported === true ? ", or browse its channels" : ""}.`
+    : "Add a channel by its ID.";
+  const clear = provider.upstream_clear_supported === true
+    ? `Unread can be cleared in ${name} itself.`
+    : `Unread cannot be cleared in ${name} from here.`;
+  return `${name}: ${arrive} ${threads} ${adding} ${clear}`;
+}
+
+/**
+ * Draw the Service picker: one entry per service, in the server's order, shown with two or more,
+ * when it takes the place of the "Chat service" line.
+ */
+function fillServiceSelect() {
+  const shown = servicesInSettings();
+  el("settings-service-row").hidden = !shown;
+  el("chat-provider-line").hidden = shown;
+  const select = el("settings-service");
+  if (!shown) {
+    settingsService = null;
+    select.replaceChildren();
+    return;
+  }
+  if (settingsService === null || !providerDescriptions.has(settingsService)) settingsService = defaultSettingsService();
+  select.replaceChildren(...[...providerDescriptions.keys()].map((key) => {
+    const option = document.createElement("option");
+    option.value = key;
+    option.textContent = serviceLabel(key);
+    return option;
+  }));
+  select.value = settingsService;
+  const chosen = settingsServiceDescription();
+  el("service-facts").textContent = chosen ? serviceFacts(chosen) : "";
+}
+
+/**
+ * Show the service `key` in Settings, and the channel `channelId` in it when it is one of its own.
+ * Another service than the one showing closes any open panel and empties the browse list: both
+ * belonged to the service they were opened for.
+ */
+function chooseSettingsService(key, channelId = null) {
+  if (!servicesInSettings() || !providerDescriptions.has(key)) return;
+  if (key !== settingsService) {
+    settingsService = key;
+    showChannelPanel(null);
+    resetChannelDirectory();
+  }
+  fillServiceSelect();
+  fillChannelSelect("settings-channel");
+  if (channelId !== null && settingsChannels().some((channel) => String(channel.id) === String(channelId))) {
+    el("settings-channel").value = String(channelId);
+  }
+  renderAddChannelForm();
+  renderHiddenChannels();
+  renderChannelBox();
+}
+
+/** Point Settings at the channel `channelId`: its service, then it. */
+function pointSettingsAt(channelId) {
+  const listed = knownChannel(channelId) || hiddenChannels.find((channel) => String(channel.id) === String(channelId));
+  if (listed && settingsServiceDescription() && providerDescriptions.has(listed.provider)) {
+    chooseSettingsService(listed.provider, channelId);
+  } else {
+    el("settings-channel").value = String(channelId);
+  }
+}
+
+/**
+ * Settings, opened, shows the service of the channel being read, and that channel when it is
+ * another service than the one showing. Not on the way back from Help, which is the same visit.
+ */
+function pointSettingsAtReading() {
+  if (!settingsServiceDescription()) return;
+  const reading = knownChannel(el("discord-channel").value);
+  if (!reading || reading.provider === settingsService) return;
+  chooseSettingsService(reading.provider, reading.id);
+}
+
+/**
+ * The add form as the service Settings shows takes a channel: a link or reference, or an id. With
+ * several services an id is not always a snowflake (a Slack that does not register channels takes
+ * its own ids), so the field asks for "the channel's ID" there.
+ */
+function renderAddChannelForm() {
+  const byLink = addsByLink();
+  const service = settingsServiceName();
+  const anyId = !byLink && settingsServiceDescription() !== null;
+  el("open-browse-channels").hidden = !browseOffered();
+  el("new-channel-help").textContent = byLink
+    ? `Paste a channel link or reference from ${service}. The channel is checked before it is added.`
+    : `Enter the channel ID supplied by this deployment. The chat connector must already have access to the channel in ${service}.`;
+  el("new-channel-id-label").textContent = byLink ? "Channel link or provider reference" : "Channel ID";
+  el("new-channel-id").inputMode = byLink ? "url" : anyId ? "text" : "numeric";
+  el("new-channel-id").maxLength = byLink ? 2048 : anyId ? 64 : 20;
+  el("new-channel-id").placeholder = byLink ? "paste a channel link or reference" : anyId ? "the channel's ID" : "17 to 20 digits";
+  el("new-channel-writable-row").hidden = byLink;
+  if (byLink) el("new-channel-writable").checked = false;
+}
+
+/** Empty the browse list, and drop any answer still on its way: it was for the service that was showing. */
+function resetChannelDirectory() {
+  channelDirectory.generation += 1;
+  if (channelDirectory.searchTimer !== null) {
+    clearTimeout(channelDirectory.searchTimer);
+    channelDirectory.searchTimer = null;
+  }
+  channelDirectory.query = "";
+  channelDirectory.entries = [];
+  channelDirectory.nextCursor = null;
+  channelDirectory.truncated = false;
+  channelDirectory.loading = false;
+  channelDirectory.failed = false;
+  el("channel-directory-search").value = "";
+  el("channel-directory-state").textContent = "";
+  renderChannelDirectory();
+}
+
 /**
  * Act on the selected channel's own provider: its threads, its read cursor, its live delivery.
  *
@@ -42251,12 +42437,13 @@ function fillChannelSelect(id) {
       select.append(header);
     }
   } else {
-    for (const channel of knownChannels) select.append(optionFor(channel));
+    // `#355 provider-grouped-channels`. Settings' picker lists the chosen service's channels only.
+    for (const channel of id === "settings-channel" ? settingsChannels() : knownChannels) select.append(optionFor(channel));
   }
-  const order = grouped ? channelsInPickerOrder() : knownChannels;
+  const order = grouped ? channelsInPickerOrder() : id === "settings-channel" ? settingsChannels() : knownChannels;
   if (all && chosen === ALL_CHANNELS) {
     select.value = ALL_CHANNELS;
-  } else if (knownChannels.some((channel) => String(channel.id) === String(chosen))) {
+  } else if (order.some((channel) => String(channel.id) === String(chosen))) {
     select.value = chosen;
   } else if (order.length > 0) {
     select.value = order[0].id;
@@ -42290,7 +42477,11 @@ function renderRemoveChannel(channel) {
  * back under his name for it.
  */
 function renderHiddenChannels() {
-  const rows = hiddenChannels.map((channel) => {
+  // `#355 provider-grouped-channels`. With several services, the chosen service's hidden channels.
+  const shown = settingsServiceDescription()
+    ? hiddenChannels.filter((channel) => channel.provider === settingsService)
+    : hiddenChannels;
+  const rows = shown.map((channel) => {
     const row = document.createElement("li");
     const name = document.createElement("span");
     name.className = "directory-name";
@@ -42313,6 +42504,7 @@ function adoptChannelList(payload) {
   if (payload && Array.isArray(payload.channels)) knownChannels = payload.channels;
   if (payload && Array.isArray(payload.hidden_channels)) hiddenChannels = payload.hidden_channels;
   saveCacheChannels();
+  fillServiceSelect();
   fillChannelSelect("discord-channel");
   fillChannelSelect("settings-channel");
   renderHiddenChannels();
@@ -42332,7 +42524,7 @@ async function showChannelAgain(channel) {
   }
   const previousChannel = el("discord-channel").value;
   adoptChannelList(payload);
-  el("settings-channel").value = String(channel.id);
+  pointSettingsAt(channel.id);
   renderChannelBox();
   said.textContent = `Shown again. "${channelName(channel)}" is back in the picker.`;
   if (el("discord-channel").value !== previousChannel) await changeSelectedChannel();
@@ -42343,19 +42535,23 @@ async function addChannel() {
   const id = el("new-channel-id").value.trim();
   const label = el("new-channel-label").value.trim();
   const said = el("add-channel-state");
+  const byLink = addsByLink();
   if (!id || !label) {
-    said.textContent = channelRegistrationSupported
+    said.textContent = byLink
       ? "Both the channel reference and a name are needed."
       : "Both the id and a name are needed.";
     return;
   }
-  said.textContent = channelRegistrationSupported
+  said.textContent = byLink
     ? "Registering and checking that it can be read…"
     : "Checking that the bot can read it…";
   let payload = null;
-  const body = channelRegistrationSupported
+  /** @type {Record<string, unknown>} */
+  const body = byLink
     ? { source: id, label }
     : { id, label, writable: el("new-channel-writable").checked };
+  // `#355 provider-grouped-channels`. With several services, the one Settings is showing.
+  if (settingsServiceDescription()) body.provider = settingsService;
   try {
     payload = await api("/api/v1/channels", {
       method: "POST",
@@ -42372,7 +42568,7 @@ async function addChannel() {
   // precisely so the two pickers and the editor cannot disagree about what exists.
   adoptChannelList(payload);
   const addedId = String((payload.channel && payload.channel.id) || id);
-  el("settings-channel").value = addedId;
+  pointSettingsAt(addedId);
   renderChannelBox();
   el("new-channel-id").value = "";
   el("new-channel-label").value = "";
@@ -42462,6 +42658,8 @@ async function loadChannelDirectory(more) {
   let path = `/api/v1/channel-directory?limit=${DIRECTORY_PAGE_SIZE}`;
   if (channelDirectory.query) path += `&q=${encodeURIComponent(channelDirectory.query)}`;
   if (cursor) path += `&cursor=${encodeURIComponent(cursor)}`;
+  // `#355 provider-grouped-channels`. With several services, only the one Settings is showing.
+  if (settingsServiceDescription()) path += `&provider=${encodeURIComponent(/** @type {string} */ (settingsService))}`;
   let payload = null;
   try {
     payload = await api(path);
@@ -42497,7 +42695,7 @@ function directoryFailureIsFinal(error) {
 function directoryFailureSentence(error) {
   if (error.code === "channel_directory_denied") {
     return (
-      `${sentenceStart(chatServiceName())} does not allow this app to list channels. ` +
+      `${sentenceStart(settingsServiceName())} does not allow this app to list channels. ` +
       "A channel can still be added by pasting its link under Add a channel."
     );
   }
@@ -42519,7 +42717,7 @@ function directorySummary() {
   if (count === 0) {
     return channelDirectory.query
       ? `No channels match "${channelDirectory.query}".`
-      : `No channels are available in ${chatServiceName()} yet.`;
+      : `No channels are available in ${settingsServiceName()} yet.`;
   }
   const shown = `${count} ${count === 1 ? "channel" : "channels"} shown`;
   if (channelDirectory.nextCursor) return `${shown}. More are available.`;
@@ -42571,9 +42769,13 @@ async function addDirectoryChannel(entry) {
   said.textContent = `Adding "${entry.name}" and checking that it can be read…`;
   let payload = null;
   try {
+    /** @type {Record<string, unknown>} */
+    const body = { source: entry.source, label };
+    // `#355 provider-grouped-channels`. Added to the service it was listed for.
+    if (settingsServiceDescription()) body.provider = settingsService;
     payload = await api("/api/v1/channels", {
       method: "POST",
-      body: { source: entry.source, label },
+      body,
     });
   } catch (error) {
     channelDirectory.adding.delete(entry.source);
@@ -42588,6 +42790,7 @@ async function addDirectoryChannel(entry) {
   adoptChannelList(payload);
   entry.tracked = true;
   entry.channel_id = payload.channel && payload.channel.id ? String(payload.channel.id) : null;
+  if (entry.channel_id) pointSettingsAt(entry.channel_id);
   renderChannelDirectory();
   // Named from the answer, for the reason `addChannel` gives.
   const added = channelName(payload.channel || { label });
@@ -42651,6 +42854,16 @@ function renderChannelBox() {
 /** Whether Settings' channel box is on All channels. `#349 channel-settings-all`. */
 const allChannelsChosen = () => el("settings-channel").value === ALL_CHANNELS;
 
+/** `#355 provider-grouped-channels`. What Settings says for a service with no channel on the list. */
+function emptyServiceSentence() {
+  const ways = ["Add one"];
+  if (browseOffered()) ways.push("browse");
+  if (hiddenChannels.some((channel) => channel.provider === settingsService)) ways.push("show a hidden one again below");
+  const last = ways.pop();
+  const said = ways.length ? `${ways.join(", ")}, or ${last}` : last;
+  return `No ${settingsServiceName()} channels on your list yet. ${said}.`;
+}
+
 /** What the editor says about the channel it is pointed at, including the label underneath. */
 function renderAliasEditor() {
   // `#349 channel-settings-all`. Rename names one channel, so it steps aside for All channels, as
@@ -42667,7 +42880,7 @@ function renderAliasEditor() {
   const channel = knownChannel(el("settings-channel").value);
   if (!channel) {
     el("channel-alias").value = "";
-    el("channel-facts").textContent = EMPTY_CHANNEL_LIST;
+    el("channel-facts").textContent = settingsServiceDescription() ? emptyServiceSentence() : EMPTY_CHANNEL_LIST;
     el("alias-state").textContent = "";
     renderRemoveChannel(null);
     return;
@@ -43551,29 +43764,18 @@ function applyClientConfig(config) {
   channelRegistrationSupported = config.channel_registration_supported === true;
   channelDiscoverySupported =
     channelRegistrationSupported && config.channel_discovery_supported === true;
-  el("open-browse-channels").hidden = !channelDiscoverySupported;
-  el("new-channel-help").textContent = channelRegistrationSupported
-    ? `Paste a channel link or reference from ${chatServiceName()}. The channel is checked before it is added.`
-    : `Enter the channel ID supplied by this deployment. The chat connector must already have access to the channel in ${chatServiceName()}.`;
-  el("new-channel-id-label").textContent = channelRegistrationSupported
-    ? "Channel link or provider reference"
-    : "Channel ID";
-  el("new-channel-id").inputMode = channelRegistrationSupported ? "url" : "numeric";
-  el("new-channel-id").maxLength = channelRegistrationSupported ? 2048 : 20;
-  el("new-channel-id").placeholder = channelRegistrationSupported
-    ? "paste a channel link or reference"
-    : "17 to 20 digits";
-  el("new-channel-writable-row").hidden = channelRegistrationSupported;
-  if (channelRegistrationSupported) {
-    el("new-channel-writable").checked = false;
-  }
   // `#232 upstream-mark-read`. Read per channel, by `upstreamClearOffered`, in the channel box —
   // and, with the token's scope, by Settings' picker as it is filled, which offers All channels only
   // where one channel can take Clear unread (`#351 settings-polish`). So both before the pickers.
   deploymentCapabilities.upstreamClear = config.upstream_clear_supported === true;
   tokenScope = ["read", "write"].includes(config.token_scope) ? config.token_scope : null;
   fillChannelSelect("discord-channel");
+  // `#355 provider-grouped-channels`. The Service picker before Settings' channel picker, which lists
+  // that service's channels; the hidden list and the add form are that service's too.
+  fillServiceSelect();
   fillChannelSelect("settings-channel");
+  renderHiddenChannels();
+  renderAddChannelForm();
   // The picker has only just been given a value, and both halves of the box are scoped by it —
   // the render at load ran against an empty picker and listed nothing whatever was stored.
   renderChannelBox();
@@ -44402,6 +44604,8 @@ el("discord-channel").addEventListener("change", channelPicked);
 // Changing channel closes whatever was open: the panels belong to the channel that was chosen
 // when they were opened, and carrying a half-typed name across to a different one is worse than
 // losing it.
+// `#355 provider-grouped-channels`. Another service: its channels, its facts, its Add, Browse and hidden list.
+el("settings-service").addEventListener("change", () => chooseSettingsService(el("settings-service").value));
 el("settings-channel").addEventListener("change", () => {
   showChannelPanel(null);
   // Everything in this box is about the channel the picker is on, or about all of them
