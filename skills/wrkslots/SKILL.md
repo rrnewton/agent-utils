@@ -122,7 +122,10 @@ For image-backed slots, `image-not-mounted` means the slot's image is not mounte
 run `wrkslots image mount` and fix what it reports; never repair Git registrations through the
 empty mount point. `image-attached-twice` means two loop devices hold one image (two independent
 file systems); do not mount, unmount, grow or copy it, and retire the slot only with
-`remove --coordinator-authorized --discard-stale-image-copy`. `image-identity-unverifiable` means a
+`remove --coordinator-authorized --discard-stale-image-copy` (an interrupted removal of it: `recover
+--coordinator-authorized --discard-stale-image-copy`, which rechecks every holder and records the
+decision; a removal that recorded the flag itself resumes with plain `recover`, only for the devices
+it recorded). `image-identity-unverifiable` means a
 loop mount sits at a slot's location that wrkslots cannot identify; it refuses to unmount, move or
 remove it. A mount copied into another process's private mount namespace is the slot's own storage,
 not use; a process working inside it still blocks removal.

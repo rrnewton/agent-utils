@@ -3869,12 +3869,15 @@ _OWNED_REPRESENTATION_MOUNTS: frozenset[tuple[Path, str]] = frozenset()
 #: ``(mount point, MAJOR:MINOR, /dev/loopN)`` of every second attachment of a
 #: doubly attached image: an independent, stale file system on the same image
 #: file. The census reports such a line as use, naming it, unless this command
-#: was told to discard that copy (``_DISCARDING_STALE_COPIES``).
+#: was told to discard that copy (``_DISCARDING_STALE_IMAGES``).
 _STALE_REPRESENTATION_MOUNTS: frozenset[tuple[Path, str, str]] = frozenset()
-#: Mount points whose stale image copies this one command may discard: set
-#: only by a single-slot ``remove --discard-stale-image-copy`` (or the
-#: ``recover`` of one) for that slot.
-_DISCARDING_STALE_COPIES: frozenset[Path] = frozenset()
+#: ``(slot type, slot)`` of the one image whose stale copies this command may
+#: discard: set only by a single-slot ``remove --discard-stale-image-copy``, or
+#: by the ``recover`` of a removal that recorded that decision or is given it.
+#: Kept by slot, not by mount point: the removal's path fence relocates the
+#: image, and the decision follows it (``_refresh_owned_mounts`` reads the
+#: image's current record).
+_DISCARDING_STALE_IMAGES: frozenset[tuple[str, str]] = frozenset()
 #: How the census marks a stale copy in a mount reference, so the refusal says
 #: what it is rather than only ``mount=``.
 _STALE_COPY_MARK = " [stale-image-copy="
@@ -3941,8 +3944,8 @@ def _stale_mount_note(line: str) -> str | None:
         if (point, device) == (key[0], key[1]):
             return (
                 f"{_STALE_COPY_MARK.strip()}{name}: a second, independent attachment of "
-                "this slot's own image, which salvage cannot read; see remove "
-                "--discard-stale-image-copy]"
+                "this slot's own image, which salvage cannot read; see remove (or, for "
+                "an interrupted removal, recover) --discard-stale-image-copy]"
             )
     return None
 
@@ -3974,10 +3977,20 @@ def _slot_image_at(config: Config, path: Path) -> slotimage.SlotImage | None:
 def _refresh_owned_mounts(config: Config) -> None:
     global _OWNED_REPRESENTATION_MOUNTS, _STALE_REPRESENTATION_MOUNTS
     owned, stale = slotimage.owned_mounts(config.control)
+    discarding: set[Path] = set()
+    for slot_type, slot in _DISCARDING_STALE_IMAGES:
+        try:
+            image = slotimage.load(config.control, slot_type, slot)
+        except slotimage.ImageError:
+            image = None
+        if image is not None:
+            discarding.update(
+                Path(os.path.abspath(point)) for _file, point in _slot_image_files(image)
+            )
     discarded = {
         (point, device)
         for point, device, _name in stale
-        if point in _DISCARDING_STALE_COPIES
+        if point in discarding
     }
     _OWNED_REPRESENTATION_MOUNTS = owned | frozenset(discarded)
     _STALE_REPRESENTATION_MOUNTS = frozenset(
@@ -7187,7 +7200,9 @@ def _write_active_state(
     slot: str,
     evidence: Mapping[str, object] | None = None,
     require_repository: bool = True,
-) -> None:
+) -> dict[str, object]:
+    """Record one slot's active-state change and return the event that records it."""
+
     _ensure_event_log(
         config, state.machine, require_repository=require_repository
     )
@@ -7214,7 +7229,7 @@ def _write_active_state(
             "active state mutation must affect only its named slot; "
             f"expected {slot!r}, changed {sorted(changed)!r}"
         )
-    _write_event_file(
+    event = _write_event_file(
         config,
         state.machine,
         "active-state-recorded",
@@ -7235,6 +7250,7 @@ def _write_active_state(
         },
     )
     _atomic_write_json(_active_path(config, state.machine), _active_to_obj(state))
+    return event
 
 
 def _write_active_rows_removed(
@@ -23337,10 +23353,8 @@ def _slot_image_files(image: slotimage.SlotImage) -> tuple[tuple[Path, Path], ..
 def _enable_stale_copy_discard(config: Config, image: slotimage.SlotImage) -> None:
     """Let this command treat ``image``'s stale attachments as its own storage."""
 
-    global _DISCARDING_STALE_COPIES
-    _DISCARDING_STALE_COPIES = frozenset(
-        Path(os.path.abspath(point)) for _file, point in _slot_image_files(image)
-    )
+    global _DISCARDING_STALE_IMAGES
+    _DISCARDING_STALE_IMAGES = frozenset({(image.slot_type, image.slot)})
     slotimage.DISCARD_STALE_COPIES.clear()
     slotimage.DISCARD_STALE_COPIES.update(file for file, _point in _slot_image_files(image))
     _refresh_owned_mounts(config)
@@ -23355,10 +23369,36 @@ def _stale_image_copies(
 
 
 def _recorded_stale_copy_discard(
-    record: ActiveRecord, events: Sequence[Mapping[str, object]]
-) -> bool:
-    """Whether remove durably recorded --discard-stale-image-copy for this generation."""
+    record: ActiveRecord,
+    events: Sequence[Mapping[str, object]],
+    *,
+    archive_id: str,
+) -> Mapping[str, object] | None:
+    """The --discard-stale-image-copy decision recorded for exactly this interrupted removal.
 
+    A decision counts only when it is bound to the removal whose finish
+    journal (``archive_id``) is being recovered: a recovery recorded it naming
+    that journal's archive id, or remove recorded it and named its sequence in
+    the checkout-evidence-refreshed event it writes just before that journal
+    (the latest such event of this slot generation, since no later removal
+    can begin while the journal stands). A discard recorded by an earlier
+    remove that refused before writing its journal is never honoured for a
+    later removal given without the flag. Returns the evidence, or None.
+    """
+
+    bound_sequence: object = None
+    for event in events:
+        if event.get("kind") != "active-state-recorded":
+            continue
+        payload = _as_mapping(event["payload"], "active-state-recorded payload")
+        if payload.get("action") != "checkout-evidence-refreshed" or payload.get("slot") != record.slot:
+            continue
+        refreshed = payload.get("record")
+        if not isinstance(refreshed, Mapping) or refreshed.get("generation") != record.generation:
+            continue
+        evidence = _as_mapping(payload.get("evidence", {}), "checkout evidence refresh evidence")
+        bound_sequence = evidence.get("stale_copy_discard_sequence")
+    found: Mapping[str, object] | None = None
     for event in events:
         if event.get("kind") != "active-state-recorded":
             continue
@@ -23367,11 +23407,138 @@ def _recorded_stale_copy_discard(
             continue
         evidence = _as_mapping(payload.get("evidence"), "stale image copy evidence")
         if (
-            evidence.get("generation") == record.generation
-            and evidence.get("coordinator_authorized") is True
+            evidence.get("generation") != record.generation
+            or evidence.get("coordinator_authorized") is not True
         ):
-            return True
-    return False
+            continue
+        if evidence.get("archive_id") == archive_id or (
+            isinstance(bound_sequence, int)
+            and not isinstance(bound_sequence, bool)
+            and event.get("sequence") == bound_sequence
+        ):
+            found = evidence
+    return found
+
+
+def _recorded_stale_devices(evidence: Mapping[str, object]) -> frozenset[str]:
+    """The ``MAJOR:MINOR`` of every stale copy a recorded discard decision names."""
+
+    devices: set[str] = set()
+    for index, item in enumerate(
+        _as_list(evidence.get("image_copies", []), "stale image copy evidence.image_copies")
+    ):
+        copy = _as_mapping(item, f"stale image copy evidence.image_copies[{index}]")
+        devices.add(_as_str(copy.get("device"), f"stale image copy {index} device"))
+    return frozenset(devices)
+
+
+def _resume_stale_copy_discard(
+    config: Config,
+    state: ActiveState,
+    record: ActiveRecord,
+    journal: Mapping[str, object],
+    coordinator: ProcessIdentity,
+    *,
+    requested: bool,
+) -> ActiveState:
+    """Let this recovery discard the stale copies of the slot's image, or leave them to refuse.
+
+    A recovery discards a stale second attachment only on the coordinator's
+    decision, given to the removal it resumes: recorded by that removal
+    (_recorded_stale_copy_discard), or given now with ``recover
+    --coordinator-authorized --discard-stale-image-copy``. Either way the
+    conditions are established again from current state: every current
+    stale device must be one that decision named (a decision given now names
+    the ones seen now), and every process whose mount table holds one must
+    share this process's root, so the census still sees any use of it by
+    path. A decision given now is recorded, naming this journal's archive id,
+    before anything is deleted. Without a decision nothing is enabled: the
+    use check and the unmount refuse the stale copy, naming the remedy.
+    Returns the active state, advanced when a decision was recorded.
+    """
+
+    def refuse(reason: str) -> Refusal:
+        return Refusal(
+            f"--discard-stale-image-copy: {reason}. state: REFUSED -- the interrupted removal "
+            f"of slot {record.slot} stays recorded"
+        )
+
+    if record.slot_type != "agent":
+        if requested:
+            raise refuse("it applies only to the removal of an image-backed agent slot")
+        return state
+    try:
+        image = slotimage.load(config.control, "agent", record.slot)
+    except slotimage.ImageError as exc:
+        raise Refusal(f"cannot read the slot image record of {record.slot}: {exc}") from exc
+    if image is None:
+        if requested:
+            raise refuse(f"agent slot {record.slot} is not image-backed")
+        return state
+    stale = _stale_image_copies(config, image)
+    if not stale:
+        if requested:
+            raise refuse(
+                f"no second attachment of slot {record.slot}'s image was found, so there is "
+                "nothing to discard; rerun recover without it"
+            )
+        return state
+    archive_id = _as_str(journal["archive_id"], "finish journal.archive_id")
+    recorded = (
+        None
+        if requested
+        else _recorded_stale_copy_discard(
+            record, _load_events(config, record.machine), archive_id=archive_id
+        )
+    )
+    if recorded is None and not requested:
+        return state
+    if recorded is not None:
+        named = _recorded_stale_devices(recorded)
+        unnamed = sorted(name for _point, device, name in stale if device not in named)
+        if unnamed:
+            raise Refusal(
+                f"stale image copies {', '.join(unnamed)} of slot {record.slot} are not among "
+                "those the interrupted removal was told to discard "
+                f"({', '.join(sorted(named)) or 'none'}). state: REFUSED -- the interrupted "
+                "removal stays recorded. remedy: inspect them, then rerun recover with "
+                "--coordinator-authorized --discard-stale-image-copy to decide again"
+            )
+    holders = _stale_copy_holders(stale)
+    foreign_roots = sorted({pid for item in holders for pid in item.foreign_root_pids})
+    if foreign_roots:
+        raise refuse(
+            f"processes {', '.join(str(pid) for pid in foreign_roots[:8])} hold the stale image "
+            "copy under a different root, where the census cannot see a use of it by path; "
+            "stop them, or leave the slot for manual handling"
+        )
+    if requested:
+        state = _replace_record(state, record)
+        _write_active_state(
+            config,
+            state,
+            action=STALE_COPY_DISCARD_ACTION,
+            slot=record.slot,
+            evidence={
+                "generation": record.generation,
+                "actor": _identity_to_obj(coordinator),
+                "coordinator_authorized": True,
+                "archive_id": archive_id,
+                "phase": _as_str(journal["phase"], "finish journal.phase"),
+                "image": str(image.slot_image),
+                "image_copies": [item.to_obj() for item in holders],
+                "salvage": list(_as_list(journal.get("salvage", []), "finish journal.salvage")),
+            },
+            require_repository=False,
+        )
+    print(
+        f"WARNING: discarding the stale image copies of slot {record.slot} "
+        f"({', '.join(item.name for item in holders)}): anything written only through them "
+        "is not salvaged; salvage read this host's own file system",
+        file=sys.stderr,
+    )
+    _enable_stale_copy_discard(config, image)
+    return state
 
 
 # Explicit owner release: the live owner gives one agent slot generation back.
@@ -33678,7 +33845,8 @@ def _image_attachment_findings(config: Config) -> list[dict[str, object]]:
                             "held by another mount namespace writes its old metadata back when "
                             "it is released. To retire the slot, remove it with "
                             "--coordinator-authorized --discard-stale-image-copy after "
-                            "checking nothing uses the stale copy"
+                            "checking nothing uses the stale copy (an interrupted removal of "
+                            "it: recover --coordinator-authorized --discard-stale-image-copy)"
                         ),
                     }
                 )
@@ -34168,6 +34336,27 @@ def _repair_registration_at_slot(
 
 def _remove_fenced_directory(config: Config, fenced_slot: Path) -> None:
     if fenced_slot.exists():
+        image = _slot_image_at(config, fenced_slot)
+        if image is not None:
+            # Destroying the image unmounts both of its images. With a stale
+            # second attachment that this command was not told to discard,
+            # the root helper refuses that unmount halfway (state image done,
+            # slot image not); say so first, with the remedy, and leave both.
+            _refresh_owned_mounts(config)
+            points = {
+                Path(os.path.abspath(point)) for _file, point in _slot_image_files(image)
+            }
+            stale = sorted(
+                name for point, _device, name in _STALE_REPRESENTATION_MOUNTS if point in points
+            )
+            if stale:
+                raise Refusal(
+                    f"slot {image.slot}'s image is also attached to {', '.join(stale)}: a "
+                    "second, stale file system on the same image file, which this command "
+                    "was not told to discard; the image was kept. remedy: once nothing uses "
+                    "the stale copy, run 'wrkslots recover --coordinator-pid PID "
+                    "--coordinator-authorized --discard-stale-image-copy'"
+                )
         try:
             _remove_slot_directory(config, fenced_slot)
         except OSError as exc:
@@ -36162,6 +36351,13 @@ def _begin_finish(
         state,
         action="checkout-evidence-refreshed",
         slot=record.slot,
+        # The last event before the finish journal: it names this removal's
+        # stale-copy discard decision, if any, for recovery.
+        evidence=(
+            None
+            if finish.stale_copy_discard_sequence is None
+            else {"stale_copy_discard_sequence": finish.stale_copy_discard_sequence}
+        ),
         require_repository=False,
     )
     boundary_states, _boundary_archives = _validate_global_state(
@@ -36688,6 +36884,7 @@ def _cmd_remove_in_scope(
     discard_stale = bool(getattr(args, "discard_stale_image_copy", False))
     stale_holders: tuple[_StaleCopyHolders, ...] = ()
     stale_image: slotimage.SlotImage | None = None
+    stale_copy_discard_sequence: int | None = None
     if discard_stale:
         if not args.coordinator_authorized:
             raise Refusal(
@@ -37136,22 +37333,28 @@ def _cmd_remove_in_scope(
         )
         if stale_image is not None:
             # Durable before any salvage or deletion, beside whatever basis
-            # admitted the removal; recovery discards the copy again only for
-            # the generation this records.
+            # admitted the removal. Its sequence is written into the evidence
+            # of the event recorded just before this removal's finish journal,
+            # so recovery honours it only for this removal
+            # (_recorded_stale_copy_discard), and only for these devices.
             state = _replace_record(state, record)
-            _write_active_state(
-                config,
-                state,
-                action=STALE_COPY_DISCARD_ACTION,
-                slot=record.slot,
-                evidence={
-                    "generation": record.generation,
-                    "actor": _identity_to_obj(coordinator),
-                    "coordinator_authorized": True,
-                    "image": str(stale_image.slot_image),
-                    "image_copies": [item.to_obj() for item in stale_holders],
-                },
-                require_repository=False,
+            stale_copy_discard_sequence = _as_int(
+                _write_active_state(
+                    config,
+                    state,
+                    action=STALE_COPY_DISCARD_ACTION,
+                    slot=record.slot,
+                    evidence={
+                        "generation": record.generation,
+                        "actor": _identity_to_obj(coordinator),
+                        "coordinator_authorized": True,
+                        "image": str(stale_image.slot_image),
+                        "image_copies": [item.to_obj() for item in stale_holders],
+                    },
+                    require_repository=False,
+                )["sequence"],
+                "stale image copy discard event sequence",
+                minimum=1,
             )
         if owner_consent is not None:
             # Record the basis BEFORE any salvage or deletion so the removal
@@ -37395,6 +37598,7 @@ def _cmd_remove_in_scope(
             live_use_recheck=live_use_recheck,
             owner_consented=owner_consent is not None or owner_release is not None,
             agent_batch=agent_batch,
+            stale_copy_discard_sequence=stale_copy_discard_sequence,
         )
         prepared_private_finish = _begin_finish(
             config,
@@ -41016,6 +41220,7 @@ def _recover_finish(
     *,
     processes: _RecoveryProcesses | None = None,
     live_use_recheck: _LiveUseRecheckBudget | None = None,
+    discard_stale_image_copy: bool = False,
 ) -> None:
     _exact_keys(
         raw, _FINISH_JOURNAL_REQUIRED, _FINISH_JOURNAL_OPTIONAL, "finish journal"
@@ -41124,6 +41329,12 @@ def _recover_finish(
         config, raw, record, (state,), (archive,)
     )
     if already_archived:
+        if discard_stale_image_copy:
+            raise Refusal(
+                f"--discard-stale-image-copy: the removal of slot {record.slot} already "
+                "completed and archived it, so there is nothing to discard; rerun recover "
+                "without it. state: REFUSED -- the journal stays recorded"
+            )
         _assert_physical_slot_removed(config, record, _GitVcs(), raw)
         _atomic_write_json(_archive_path(config), _archive_to_obj(archive))
         _remove_handoff_sidecar_after_archive(config, record)
@@ -41133,15 +41344,6 @@ def _recover_finish(
     current = next(item for item in state.slots if item.slot == record.slot)
     _assert_recovery_processes(coordinator, processes)
     _assert_not_held(config, current)
-    if current.slot_type == "agent" and _recorded_stale_copy_discard(
-        current, _load_events(config, current.machine)
-    ):
-        try:
-            recorded_image = slotimage.load(config.control, "agent", current.slot)
-        except slotimage.ImageError as exc:
-            raise Refusal(f"cannot read the slot image record of {current.slot}: {exc}") from exc
-        if recorded_image is not None:
-            _enable_stale_copy_discard(config, recorded_image)
     age, expired = _heartbeat_diagnosis(current)
     owner_state, detail = _process_state(current.owner)
     live_validate_owner = bool(
@@ -41273,6 +41475,17 @@ def _recover_finish(
             # A release let recovery skip the registered liveness command above.
             _assert_registered_liveness(config, current)
     owner_waived = owner_consent is not None or owner_release is not None
+    # Every condition for resuming the removal holds; only now may a stale
+    # copy of the slot's image be discarded, and a decision given now be
+    # recorded, before the path work below unmounts and destroys the image.
+    state = _resume_stale_copy_discard(
+        config,
+        state,
+        current,
+        raw,
+        coordinator,
+        requested=discard_stale_image_copy,
+    )
     journal = dict(raw)
     phase = _as_str(journal["phase"], "finish journal.phase")
     selected_live_use_recheck = live_use_recheck or _LiveUseRecheckBudget()
@@ -55093,6 +55306,11 @@ class _FinishContext:
     # remove --archive-nested-cache-repositories; journaled so a recovery
     # judges the remaining caches the same way.
     archive_nested: bool = False
+    # The event sequence of this removal's --discard-stale-image-copy
+    # decision. Recorded as evidence of the checkout-evidence-refreshed event
+    # written just before the finish journal, which binds the decision to
+    # that journal for recovery (_recorded_stale_copy_discard).
+    stale_copy_discard_sequence: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -58061,6 +58279,18 @@ def _cmd_recover(
                 "--slot selects an interrupted mutation and cannot be combined "
                 "with validation cleanup flags"
             )
+        discard_stale = bool(getattr(args, "discard_stale_image_copy", False))
+        if discard_stale:
+            if not args.coordinator_authorized:
+                raise Refusal(
+                    "--discard-stale-image-copy is the coordinator's decision and requires "
+                    "--coordinator-authorized. state: REFUSED -- nothing was recovered"
+                )
+            if requested_ownerless:
+                raise Refusal(
+                    "--discard-stale-image-copy applies only to an interrupted removal and "
+                    "cannot be combined with validation cleanup flags"
+                )
         if requested_ownerless:
             _require_coordinator_authorized(args, "ownerless validation cleanup")
             if args.abort_import:
@@ -58160,6 +58390,12 @@ def _cmd_recover(
                     # service that does not descend from the coordinator, so
                     # check the same handoff every other recovery checks.
                     # Without a handoff this is still direct ancestry.
+                    if discard_stale:
+                        raise Refusal(
+                            "--discard-stale-image-copy applies only to an interrupted "
+                            "removal of an image-backed agent slot, not to a private "
+                            "validation seal"
+                        )
                     _assert_recovery_processes(coordinator, processes)
                     _recover_validate_batch_seal_journal(
                         config,
@@ -58183,6 +58419,11 @@ def _cmd_recover(
                 )
             path, raw = _load_journal(config, selected_path=selected_path)
         kind_hint = _as_str(raw.get("kind"), "journal.kind")
+        if discard_stale and kind_hint != "finish":
+            raise Refusal(
+                "--discard-stale-image-copy applies only to an interrupted removal of an "
+                f"image-backed agent slot; the recorded journal is {kind_hint!r}"
+            )
         if args.abort_import and kind_hint != "import-existing":
             raise Refusal(
                 f"--abort-import applies only to import-existing journals; the "
@@ -58320,6 +58561,7 @@ def _cmd_recover(
                     coordinator,
                     processes=processes,
                     live_use_recheck=live_use_recheck,
+                    discard_stale_image_copy=discard_stale,
                 )
             except Refusal as exc:
                 _restore_interrupted_private_finish_after_refusal(
@@ -60565,6 +60807,21 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--discard-partial",
         action="store_true",
         help="discard an incomplete temp write only when its prior durable file is valid",
+    )
+    recover.add_argument(
+        "--discard-stale-image-copy",
+        action="store_true",
+        help=(
+            "resume an interrupted removal of an image-backed agent slot whose image is "
+            "also attached to a second, stale loop device (a copy another mount namespace "
+            "kept), discarding that stale copy: anything written only through it is not "
+            "salvaged. The coordinator's decision: requires --coordinator-authorized, and "
+            "is refused unless such a copy exists and every process whose mount table "
+            "holds it shares this process's root. Recorded in the event log, naming the "
+            "journal and every copy, before the image is destroyed. A removal that was "
+            "itself given remove --discard-stale-image-copy resumes without it, for the "
+            "devices it recorded (default: off, a stale copy refuses recovery)"
+        ),
     )
     recover.add_argument(
         "--legacy-validate-checkout",

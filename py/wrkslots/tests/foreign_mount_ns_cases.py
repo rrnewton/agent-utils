@@ -969,8 +969,11 @@ def test_stale_copy_holders_reads_another_users_table_on_its_own(
 #
 # The live shape: a flat image-backed slot whose removal was interrupted after `git worktree
 # remove` finished (journal phase "fenced", the checkout listed as removed). The fenced
-# directory is still the image's mount point, empty and with no .git file. Recovery must not
-# repair Git registration for a checkout Git already removed.
+# directory is still the image's mount point, empty and with no .git file, and the slot image is
+# attached twice: the host's device mounted there, and a stale one a copy in another mount
+# namespace keeps. Recovery must not repair Git registration for a checkout Git already removed,
+# and may discard the stale copy only on a coordinator's decision bound to this removal, after
+# checking again which devices are stale and that every holder shares this process's root.
 
 
 def _interrupted_after_git_removal(tmp_path: Path) -> tuple[Path, dict[str, object], Path]:
@@ -1269,6 +1272,266 @@ def test_recover_still_repairs_an_image_root_that_holds_its_checkout(tmp_path: P
 
     assert recovered.returncode == 0, recovered.stdout + recovered.stderr
     assert t.active_slots(project) == [] and _journals(project) == []
+
+
+def _discard_events(project: Path) -> list[dict[str, object]]:
+    import json
+
+    found: list[dict[str, object]] = []
+    for path in sorted((t.control_directory(project) / "EVENTS.testhost").glob("*.json")):
+        event = json.loads(path.read_text(encoding="utf-8"))
+        payload = event["payload"]
+        if (
+            event["kind"] == "active-state-recorded"
+            and payload["action"] == cli.STALE_COPY_DISCARD_ACTION
+        ):
+            found.append(payload["evidence"])
+    return found
+
+
+def _copy_field(evidence: dict[str, object], field: str) -> list[object]:
+    """One field of every stale copy a recorded discard decision names."""
+
+    return [
+        cli._as_mapping(item, "image copy")[field]
+        for item in cli._as_list(evidence["image_copies"], "image copies")
+    ]
+
+
+def _holder(proc: Path, pid: int, point: Path, *, root: Path, device: str = "54") -> None:
+    """A process in another mount namespace whose table holds the stale device at ``point``."""
+
+    _fake_process(
+        proc, pid, namespace=f"mnt:[{4026536000 + pid}]",
+        mountinfo=_line(f"7:{device}", point, source=f"/dev/loop{device}") + "\n",
+        root=root, cwd=Path("/"),
+    )
+
+
+def _image_slot_interrupted_after_git_removal(
+    tmp_path: Path,
+    *,
+    stale_at_remove: str = "",
+    discard_at_remove: bool = False,
+    proc: Path | None = None,
+) -> tuple[Path, dict[str, object], Path, Path]:
+    """The live shape; returns (project, journal, fenced mount point, fake host log).
+
+    The slot is created as plain worktrees and then given an image record at its location,
+    as if its image were mounted there; every later command runs against the fake image host.
+    """
+
+    log = tmp_path / "fake-images.log"
+    project, _slot = _image_slot(tmp_path)
+    interrupted = _fake_images(
+        project, log, "remove", "slot01", "--coordinator-pid", str(os.getpid()),
+        "--expected-generation", "1", "--coordinator-authorized",
+        *(["--discard-stale-image-copy"] if discard_at_remove else []),
+        stale=stale_at_remove, proc=proc,
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-remove-worktree"},
+    )
+    assert interrupted.returncode == 86, interrupted.stdout + interrupted.stderr
+    journal = _the_journal(project)
+    assert journal["phase"] == "fenced" and journal["removed"]
+    fenced = project / str(journal["fenced"])
+    assert fenced.is_dir() and list(fenced.iterdir()) == []
+    image = slotimage.read_record(
+        slotimage.image_directory(t.control_directory(project), "agent", "slot01")
+    )
+    assert image.location == Path(os.path.abspath(fenced))
+    return project, journal, fenced, log
+
+
+def test_recover_discards_a_stale_copy_only_on_the_coordinators_decision(tmp_path: Path) -> None:
+    project, journal, fenced, log = _image_slot_interrupted_after_git_removal(tmp_path)
+    image_directory = slotimage.image_directory(t.control_directory(project), "agent", "slot01")
+    proc = tmp_path / "proc"
+    _holder(proc, 41, fenced, root=Path("/"))
+
+    plain = _recover(project, log, proc=proc)
+    assert plain.returncode == 3, plain.stdout + plain.stderr
+    assert "no safe .git file" not in plain.stderr
+    assert "also attached to /dev/loop54" in plain.stderr
+    assert "--coordinator-authorized --discard-stale-image-copy" in plain.stderr
+    assert len(_journals(project)) == 1 and (image_directory / "slot.img").exists()
+    assert not any(entry[:2] == ["privileged", "umount"] for entry in _logged(log))
+
+    unauthorized = _fake_images(
+        project, log, "recover", "--coordinator-pid", str(os.getpid()),
+        "--discard-stale-image-copy", stale="54", proc=proc,
+    )
+    assert unauthorized.returncode == 3
+    assert "requires --coordinator-authorized" in unauthorized.stderr
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    foreign = tmp_path / "proc-foreign"
+    _holder(foreign, 42, fenced, root=elsewhere)
+    refused = _recover(
+        project, log, "--coordinator-authorized", "--discard-stale-image-copy", proc=foreign
+    )
+    assert refused.returncode == 3, refused.stdout + refused.stderr
+    assert "processes 42 hold the stale image copy under a different root" in refused.stderr
+    assert _discard_events(project) == [] and len(_journals(project)) == 1
+
+    nothing = _recover(
+        project, log, "--coordinator-authorized", "--discard-stale-image-copy", stale="",
+        proc=proc,
+    )
+    assert nothing.returncode == 3
+    assert "nothing to discard; rerun recover without it" in nothing.stderr
+
+    decided = _recover(
+        project, log, "--coordinator-authorized", "--discard-stale-image-copy", proc=proc
+    )
+    assert decided.returncode == 0, decided.stdout + decided.stderr
+    assert "WARNING: discarding the stale image copies of slot slot01 (/dev/loop54)" in decided.stderr
+    privileged = [entry for entry in _logged(log) if entry[0] == "privileged"]
+    assert ["privileged", "umount", str(image_directory / "slot.img"), str(fenced), "--discard-stale-copies"] in privileged
+    assert ["release", str(fenced)] in _logged(log)
+    assert not fenced.exists() and not image_directory.exists()
+    assert t.active_slots(project) == [] and _journals(project) == []
+    [evidence] = _discard_events(project)
+    assert evidence["archive_id"] == journal["archive_id"]
+    assert evidence["coordinator_authorized"] is True
+    assert _copy_field(evidence, "device") == ["7:54"]
+    assert _copy_field(evidence, "holder_pids") == [[41]]
+
+
+def test_recover_honours_a_recorded_discard_only_for_its_devices_and_roots(tmp_path: Path) -> None:
+    proc = tmp_path / "proc"
+    _holder(proc, 41, tmp_path / "anywhere", root=Path("/"))
+    project, _journal, fenced, log = _image_slot_interrupted_after_git_removal(
+        tmp_path, stale_at_remove="54", discard_at_remove=True, proc=proc,
+    )
+    [recorded] = _discard_events(project)
+    assert _copy_field(recorded, "device") == ["7:54"]
+    assert "archive_id" not in recorded
+
+    other_device = tmp_path / "proc-55"
+    _holder(other_device, 43, fenced, root=Path("/"), device="55")
+    changed = _recover(project, log, stale="55", proc=other_device)
+    assert changed.returncode == 3, changed.stdout + changed.stderr
+    assert "/dev/loop55 of slot slot01 are not among those the interrupted removal" in changed.stderr
+    assert len(_journals(project)) == 1
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    foreign = tmp_path / "proc-foreign"
+    _holder(foreign, 42, fenced, root=elsewhere)
+    hidden = _recover(project, log, proc=foreign)
+    assert hidden.returncode == 3, hidden.stdout + hidden.stderr
+    assert "processes 42 hold the stale image copy under a different root" in hidden.stderr
+    assert len(_journals(project)) == 1
+
+    resumed = _recover(project, log, proc=proc)
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+    image_directory = slotimage.image_directory(t.control_directory(project), "agent", "slot01")
+    assert [
+        "privileged", "umount", str(image_directory / "slot.img"), str(fenced),
+        "--discard-stale-copies",
+    ] in _logged(log)
+    assert t.active_slots(project) == [] and _journals(project) == []
+    assert len(_discard_events(project)) == 1
+
+
+def test_recover_never_honours_a_discard_another_removal_recorded(tmp_path: Path) -> None:
+    """A discard recorded by a removal that refused before its journal binds no later removal."""
+
+    log = tmp_path / "fake-images.log"
+    project, _slot = _image_slot(tmp_path)
+    base = ("remove", "slot01", "--coordinator-pid", str(os.getpid()), "--expected-generation", "1",
+            "--coordinator-authorized")
+    refused = _fake_images(
+        project, log, *base, "--discard-stale-image-copy", stale="54",
+        patch="""
+        def refuse(*args, **kwargs):
+            raise cli.Refusal("injected salvage refusal")
+        cli._salvage_agent_slot = refuse
+        """,
+    )
+    assert refused.returncode == 3 and "injected salvage refusal" in refused.stderr
+    assert len(_discard_events(project)) == 1 and _journals(project) == []
+
+    # The copy went away; a later removal without the flag is interrupted after Git removal.
+    plain = _fake_images(
+        project, log, *base, env={"WRKSLOTS_TEST_INTERRUPT": "after-remove-worktree"}
+    )
+    assert plain.returncode == 86, plain.stdout + plain.stderr
+
+    # A stale copy is attached again: the earlier decision does not cover this removal.
+    recovered = _recover(project, log)
+    assert recovered.returncode == 3, recovered.stdout + recovered.stderr
+    assert "also attached to /dev/loop54" in recovered.stderr
+    assert len(_journals(project)) == 1
+    assert not any("--discard-stale-copies" in entry for entry in _logged(log))
+
+
+def test_a_recorded_discard_binds_only_its_own_removal() -> None:
+    record = types.SimpleNamespace(slot="s1", generation=1)
+
+    def discard(sequence: int, **evidence: object) -> dict[str, object]:
+        return {
+            "kind": "active-state-recorded", "sequence": sequence,
+            "payload": {
+                "action": cli.STALE_COPY_DISCARD_ACTION, "slot": "s1",
+                "evidence": {"generation": 1, "coordinator_authorized": True, **evidence},
+            },
+        }
+
+    def refreshed(sequence: int, names: object = None, generation: int = 1) -> dict[str, object]:
+        """The event remove writes just before its finish journal."""
+
+        return {
+            "kind": "active-state-recorded", "sequence": sequence,
+            "payload": {
+                "action": "checkout-evidence-refreshed", "slot": "s1",
+                "record": {"slot": "s1", "generation": generation},
+                "evidence": {} if names is None else {"stale_copy_discard_sequence": names},
+            },
+        }
+
+    def bound(*events: dict[str, object], archive_id: str = "m:s1:1:t") -> object:
+        return cli._recorded_stale_copy_discard(record, events, archive_id=archive_id)  # type: ignore[arg-type]
+
+    assert bound(discard(1), refreshed(2, names=1)) is not None
+    # An earlier removal recorded the discard, refused before its journal, and a later
+    # removal without the flag wrote the journal being recovered.
+    assert bound(discard(1), refreshed(2, names=1), refreshed(5)) is None
+    assert bound(discard(1), refreshed(2)) is None
+    # The refresh names another event, or belongs to another generation.
+    assert bound(discard(1), discard(3), refreshed(4, names=3)) == discard(3)["payload"]["evidence"]  # type: ignore[index]
+    assert bound(discard(1), refreshed(2, names=1, generation=2)) is None
+    assert bound(discard(1), refreshed(2, names=True)) is None
+    # A recovery's decision names the journal it was given for.
+    assert bound(refreshed(1), discard(2, archive_id="m:s1:1:t")) is not None
+    assert bound(refreshed(1), discard(2, archive_id="m:s1:1:other")) is None
+    unauthorized = discard(1)
+    unauthorized["payload"]["evidence"]["coordinator_authorized"] = False  # type: ignore[index]
+    assert bound(unauthorized, refreshed(2, names=1)) is None
+
+
+def test_remove_keeps_its_discard_decision_through_its_own_path_fence(tmp_path: Path) -> None:
+    """The fence relocates the image; a stale copy that stays attached is still discarded."""
+
+    project, _slot = _image_slot(tmp_path)
+    log = tmp_path / "fake-images.log"
+    proc = tmp_path / "proc"
+    _holder(proc, 41, tmp_path / "anywhere", root=Path("/"))
+
+    removed = _fake_images(
+        project, log, "remove", "slot01", "--coordinator-pid", str(os.getpid()),
+        "--expected-generation", "1", "--coordinator-authorized", "--discard-stale-image-copy",
+        stale="54", proc=proc,
+    )
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    image_directory = slotimage.image_directory(t.control_directory(project), "agent", "slot01")
+    assert not image_directory.exists() and t.active_slots(project) == []
+    assert any(
+        entry[:2] == ["privileged", "umount"] and entry[-1] == "--discard-stale-copies"
+        for entry in _logged(log)
+    )
 
 
 #: What test_lifecycle.py collects from this module: its tests and the fixtures they use.

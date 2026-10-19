@@ -1919,6 +1919,30 @@ repeats them as `image_copies`. Anything written only through the stale copy is 
 image is attached twice while this host mounts neither device cannot be salvaged, so it refuses:
 release one of the copies (stop the processes holding it) first.
 
+**An interrupted removal of an image-backed slot.** A removal interrupted after `git worktree remove`
+leaves its finish journal in phase `fenced`. For a flat image-backed slot the fenced directory is
+then still the image's mount point, empty and with no `.git` file. `recover` recognises that Git
+removal finished, either because the journal lists the checkout as removed (refused if Git still
+registers it) or because the mounted image root holds nothing but `lost+found` and Git lists the
+checkout at neither its fenced nor its canonical path. It runs no Git repair for that checkout and
+goes on to unmount and destroy the image and archive the slot. When the image is also attached to a
+stale second device there, recovery refuses before unmounting anything, naming the device, unless
+the coordinator decides to discard the stale copy:
+
+```sh
+wrkslots recover --coordinator-pid $$ --coordinator-authorized --discard-stale-image-copy
+```
+
+Recovery establishes the conditions again: such a copy must exist (otherwise it refuses and plain
+`recover` is the command), and every process whose mount table holds it must share this process's
+root. It records `stale-image-copy-discard-authorized` naming the journal's archive id, the stale
+devices with their holders, and the journal's salvage receipts, before anything is unmounted. A
+removal that was itself given `--discard-stale-image-copy` resumes with plain `recover`, but only
+while every stale device is one that removal recorded and the holder check passes again. The
+decision is bound to that removal: the event remove writes just before its finish journal names
+the decision's event, so a discard recorded by an earlier removal that refused before writing its
+journal never carries over to a later removal given without the flag.
+
 **A stray `.git` in an unmounted mount point.** Older versions repaired a moved checkout with
 `git worktree repair`, which rewrites every linked worktree's `.git` and so wrote into the empty
 mount points of unmounted image slots of the same repository; wrkslots now rewrites only the moved

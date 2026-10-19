@@ -922,9 +922,13 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # Its 4 cases of a removal whose Git removal already finished (the journal
     # names the checkout, or a mounted image root was left empty before it
     # could; and the two negative controls) are mapped.
-    assert len(all_tests) == 2073
+    # Its 5 stale-copy discard cases (recover --discard-stale-image-copy and its
+    # refusals, a recorded decision honoured only for its own removal, devices
+    # and roots, the binding parser, and a decision kept through the fence)
+    # are mapped.
+    assert len(all_tests) == 2078
     assert len(ordinary) == 337
-    assert len(mapped) == 1736
+    assert len(mapped) == 1741
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
