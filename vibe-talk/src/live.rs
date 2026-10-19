@@ -771,12 +771,12 @@ impl LiveHub {
         // what a correction says was in the cache's queue before the correction was checked.
         if offer_to_cache {
             if let Some(sink) = self.cache.get() {
-            let producer = if deduplicate {
-                crate::cache::ServerFill::Ingest
-            } else {
-                crate::cache::ServerFill::Poller
-            };
-            sink.offer_push(channel, &live, producer, read);
+                let producer = if deduplicate {
+                    crate::cache::ServerFill::Ingest
+                } else {
+                    crate::cache::ServerFill::Poller
+                };
+                sink.offer_push(channel, &live, producer, read);
             }
         }
         feed.tail.push_back(live.clone());

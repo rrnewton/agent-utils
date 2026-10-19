@@ -787,7 +787,7 @@ Two things are worth knowing before you begin, because they shape everything els
 | Digest (`/digest`) | **works**, extractive and deterministic (no model call). This is the whole-channel digest, not the per-message summary below. |
 | **Per-message summaries and thread names, from one Messages API call** (`[summaries.llm]`) | **written, tested against a local mock Messages API only; never yet run against a live model provider.** One plain HTTP request per summary or thread name, with no agent harness and no tools, in the Anthropic API's dialect or Google Vertex's. See [Summaries](#summaries). |
 | Per-message summaries, from the ElevenLabs agent | **written, unit- and integration-tested offline, NEVER RUN AGAINST LIVE ELEVENLABS — and it is what runs when `[summaries.llm]` is absent.** Asks the configured conversational agent in text over its own WebSocket, on a pooled conversation recycled every eight summaries. The frames were read out of the vendor's SDK; the offline tests drive the real socket client against this repository's own mock, which was written from the same reading, so the two agree with each other and not yet with ElevenLabs. The extractive truncating summariser that used to be the default has been **deleted**, so there is nothing to fall back to: a deployment without ElevenLabs credentials still starts, and shows every long message as a **failed** summary — a red row — instead of handing you its opening lines and calling that a summary. |
-| Message cache on the server's disk (`[message_cache]`) | **off by default; when an operator turns it on, it is filled and serves nothing yet.** It is filled from write-scope and server-owned reads, and is never filled by the read token. The owner can turn it off or erase it in Settings. It counts what it would have served. It has been tested against temporary files and in-memory providers only. The acceptance run on a real deployment, a day of fills with no writer drops, has not been done yet. See [The message cache](#the-message-cache). |
+| Message cache on the server's disk (`[message_cache]`) | **off by default; when an operator turns it on, it is filled, and it answers reads only with `serve = true` as well.** It is filled from write-scope and server-owned reads, and is never filled by the read token. The owner can turn it off or erase it in Settings. It counts what it served and what it would have served, checked against the provider. It has been tested against temporary files and in-memory providers only. The acceptance run on a real deployment, a day of fills with no writer drops, has not been done yet. See [The message cache](#the-message-cache). |
 | Semantic random access (`resolve`) | **works**, lexical ranking behind a `Ranker` trait |
 | Device speech for the message view's Read control | **prototype.** Uses browser-reported local voices without ElevenLabs credentials. Playback, cancellation, and failures have automated browser coverage; physical-phone audio and background playback remain device checks. |
 | Main, All, a selected thread from the bar's picker, and bottom composer | **works.** Native thread endpoints have loopback HTTP tests; a compatible Google Chat bridge has been exercised with real read-only traffic. Browser interaction and layout were checked at two phone sizes. Posting tests use local fakes. |
@@ -2381,7 +2381,7 @@ model provider or a real gateway.
 | Replay transport | `replay.transport` | `VIBE_TALK_REPLAY_TRANSPORT` | `contextual_update` (default) or `client_data` |
 | Config file path | — | `VIBE_TALK_CONFIG` | or `--config` |
 | Config overlays | — | `VIBE_TALK_CONFIG_OVERLAY` | or `--config-overlay`, repeatable; TOML laid over the config file table by table, see [One config file, two hosts](#one-config-file-two-hosts) |
-| Message cache | `[message_cache]` | — | **filled from what write-scope and server-owned reads see, and never served from yet** (`#208 persistent-cache`). At startup, `enabled = true` registers the file in the sidecar `<storage path>.message-cache.json` and then opens it; `enabled = false`, or the owner's off recorded in that sidecar, erases every cache file this server made; an absent table opens nothing, warns at every start while a file from an earlier configuration is present, and erases it once the table has been absent for seven days. Keys: `enabled` (default `false`), `path` (absolute; default beside `[storage] path`, never equal to it), `max_days` (default `90`, 1 to 365), `max_megabytes` (default `256`, 16 to 4096, counting the `-wal` and `-shm` files), `backfill` (`adaptive`, the default, or `off`; no effect yet), `timeline_fallback_ms` (default `10000`, 1000 to 60000; no effect yet), and `[[message_cache.channel]]` entries of `id` and `max_days` for a channel kept for a different time. `0` is refused, not read as unlimited; an unknown key is refused; `enabled = true` needs `[storage] path`, where the cache's off switch is kept. An absent table is not the same as `enabled = false`. Turning it on, the preflight, rollback and what erases it: see [The message cache](#the-message-cache) |
+| Message cache | `[message_cache]` | — | **filled from what write-scope and server-owned reads see; reads are answered from it only with `serve = true`** (`#208 persistent-cache`, `#384 cache-serve`). At startup, `enabled = true` registers the file in the sidecar `<storage path>.message-cache.json` and then opens it; `enabled = false`, or the owner's off recorded in that sidecar, erases every cache file this server made; an absent table opens nothing, warns at every start while a file from an earlier configuration is present, and erases it once the table has been absent for seven days. Keys: `enabled` (default `false`), `serve` (default `false`: answer a newest timeline page and a fresh newest window from the cache at once, refreshing from the provider in the background; needs `enabled = true`), `path` (absolute; default beside `[storage] path`, never equal to it), `max_days` (default `90`, 1 to 365), `max_megabytes` (default `256`, 16 to 4096, counting the `-wal` and `-shm` files), `backfill` (`adaptive`, the default, or `off`; no effect yet), `timeline_fallback_ms` (default `10000`, 1000 to 60000; no effect yet), and `[[message_cache.channel]]` entries of `id` and `max_days` for a channel kept for a different time. `0` is refused, not read as unlimited; an unknown key is refused; `enabled = true` needs `[storage] path`, where the cache's off switch is kept. An absent table is not the same as `enabled = false`. Turning it on, the preflight, rollback and what erases it: see [The message cache](#the-message-cache) |
 
 Environment wins over file. An empty environment variable is treated as unset, so a runtime that
 renders unset variables as `""` cannot blank out a configured value. An unknown key in the file is
@@ -3772,14 +3772,15 @@ between a question and its answer. A copy of recent messages on the server's own
 later work answers from: a page drawn while the provider is down, and counts and search over
 history the provider will not walk quickly.
 
-**What this build does.** `#208 persistent-cache`, milestone `cache-fill`. Once an operator turns
-it on, the server keeps a copy of the messages its own reads see, in a SQLite file of its own. It
-applies the deletions and edits it learns of, and erases what it may no longer hold. **Nothing is
-answered from it yet.** Every route and every tool reads the provider exactly as before, whether
-the cache is on or off. For each read that a later build will answer from the cache, the server
-counts what the cache would have answered, and whether that would have matched the provider. So
-serving can be judged from numbers before anything is served (see "What the cache would have
-served" below).
+**What this build does.** `#208 persistent-cache`, milestones `cache-fill` and `cache-serve`
+(`#384 cache-serve`). Once an operator turns it on, the server keeps a copy of the messages its
+own reads see, in a SQLite file of its own. It applies the deletions and edits it learns of, and
+erases what it may no longer hold. By default **nothing is answered from it**: every route and
+every tool reads the provider exactly as before, and for each read the cache could answer the
+server counts what it would have answered and whether that would have matched the provider, so
+serving can be judged from numbers first. With `serve = true` in the table as well, two reads
+are answered from the cache at once (see "What answering from it does" below), each still
+checked against the provider by a read behind it.
 
 **Off unless an operator turns it on.** With no `[message_cache]` table, no cache file is opened
 and the server behaves as it did before the cache existed. With `enabled = false`, no cache file is
@@ -3851,9 +3852,12 @@ It is **not encrypted**. Anyone who can read this account's files can read it, a
 
 ### Turning it on for a host
 
-**Enabling it only fills the file and measures what it would have served:** nothing is answered
-from it in this build. #297 cache-coverage-races closed the races found so far that would have let
-it claim more than it holds, and lists the ones a build that answers from it must still settle.
+**Enabling it fills the file and measures what it would have served.** Answering from it is the
+separate `serve = true`, off by default: turn it on only once the shadow counts for the host's
+providers show serves agreeing with the provider, with no `extra_rows`. #297
+cache-coverage-races closed the races found so far that would have let it claim more than it
+holds; the ones a serving build had still to settle, and how this one settles or refuses them,
+are in this section below and in detail in the design note for `#384 cache-serve`.
 
 1. **Deploy this build first, without the table, and let it run.** A build from before
    `summary-keep` refuses to start with a `[message_cache]` table at all (an unknown section). The
@@ -3878,8 +3882,9 @@ it claim more than it holds, and lists the ones a build that answers from it mus
    provider keeps each conversation. A conversation kept upstream for a day gets its own entry:
    `[[message_cache.channel]]` with `id` and `max_days = 1`.
 4. **Restart, and read the startup line:** `the message cache is open; it is filled from what
-   write-scope and server-owned reads see, and nothing is served from it yet`, with the path,
-   `max_days` and `max_megabytes`. A cache that cannot open leaves the server running without one.
+   write-scope and server-owned reads see`, with the path, `max_days`, `max_megabytes` and
+   `serve` (whether reads are answered from it: `false` unless the table says `serve = true`).
+   A cache that cannot open leaves the server running without one.
    The log says why, and so does the status, as a code (see "Diagnostics and logs" below).
 
 Every key, with its default and range, is in the "Message cache" row of the table under
@@ -4127,23 +4132,54 @@ it either, though it brings the very text a push brought since and so proves tha
   messages and nothing else; the replies it reads apart are rows only, and claim nothing of their
   thread, since each thread is read from where the poller last stood in it.
 
+### What answering from it does
+
+With `serve = true`, two write-scope reads (the page's are write-scope) may be answered from the
+cache at once instead of waiting for the provider (`#384 cache-serve`):
+
+* **The page's newest timeline page** (the Main view, and the Flat view on a bridge; never a step
+  back, a delta, the thread list, or one thread's page). The reader sees the newest messages the
+  cache holds, stamped and marked as upstream ones, with `as_of` set to the newest of them, a
+  generic forward cursor for what changes next, and no backward cursor, which the page reads as
+  "more above: unknown". However old the copy is, it is provisional only until its refresh lands.
+* **A channel's newest window** (`/messages` and its callers: the digest, the to-do list,
+  bankruptcy, read-aloud's window), only while what it holds is as fresh as the window re-use
+  the server already practises, and never on Slack, whose windows carry thread replies the cache
+  holds only in their threads.
+
+Each serve starts one background refresh: the same read upstream, under the caller's grant. Its
+answer is compared with what was served (the counts below), offered to the cache as any read is,
+and then each served message it proves changed — edited, or deleted — is corrected on the page
+by a live update or deletion, the cache's own held copy being the arbiter. A refresh that fails
+is logged with counts only and leaves the served answer standing until the next read.
+
+A read is served only when the rule that has been measured since `cache-fill` decides for it on
+what the cache holds at that moment: the stretch complete and vouched for, nothing in doubt,
+no text held only as a push brought it. A channel in doubt — a change left out, an erase in
+flight, access in question — is never served. A provider's live feed vouches for what it has
+not reported only while an adapter has actually pushed for that provider within the last hour;
+`[ingest]` merely being on no longer counts. Everything not served goes upstream exactly as
+before, the read token's reads included: read scope is not served in this build, because its
+refresh would have no grant to fill under.
+
 ### What the cache would have served
 
-Some reads are ones a later build will answer from the cache: `/messages` and its callers (the
-digest, the to-do list, bankruptcy, and read-aloud's window), a message by id, the message a
-summary is of, `/page`, `/count`, and the page's newest timeline, as a stand-in for a provider that
-failed. In this build each of those is **shadowed**:
+Each read named above, and the ones still only measured — a message by id, the message a
+summary is of, `/page`, `/count` — is **shadowed** whether or not it is served:
 
-1. while the read goes upstream, the cache is asked the same question, on the blocking pool;
-2. the rule a serving build would apply decides whether the cache would have answered;
+1. while the read (or a served answer's refresh) goes upstream, the cache is asked the same
+   question, on the blocking pool;
+2. the serving rule decides whether the cache would answer (with serving on, the page and
+   window questions are decided on the request's path, within 300 ms, or the request goes
+   upstream as before);
 3. once upstream has answered, the two answers are compared.
 
-The shadow never delays a response and never writes. Read-scope requests are shadowed as well, and
-those write nothing either. Counts are kept per consumer, in memory, from the moment the process
-starts:
+The shadow never writes. Read-scope requests are shadowed as well, and those write nothing
+either. Counts are kept per consumer, in memory, from the moment the process starts:
 
-* `asked`, `would_serve`, and `needs_existence_check`: answered, but only after one call upstream
-  to confirm the message still exists, as for Slack messages not re-checked within two hours;
+* `asked`, `would_serve`, `served` (of those, the ones actually answered from the cache), and
+  `needs_existence_check`: answered, but only after one call upstream to confirm the message
+  still exists, as for Slack messages not re-checked within two hours;
 * `misses` by reason: `off`, `blocked`, `suspect`, `gap`, `incomplete`, `stale_head` and
   `barrier`;
 * `late`: an evaluation that read what a newer read had already written, so it gives no verdict;
@@ -4160,13 +4196,15 @@ the cache would never answer, such as Slack's Flat view, is not counted at all. 
 would hold a message only as a push brought it, possibly cut short, counts as a `gap` until a read
 brings that message whole.
 
-A Slack window upstream carries thread replies (`#307 slack-reply-live`), and the cache answers a
-window from the channel's own messages. Where it would have served one, the replies upstream
-listed in the stretch both answers cover count as missing rows: a serving build has to answer
-those windows from the threads too, or not at all, as #297 cache-coverage-races records.
+A Slack window upstream carries thread replies (`#307 slack-reply-live`), and the cache holds
+them only in their threads. Where it would have served one, the replies upstream listed in the
+stretch both answers cover count as missing rows. This build does not serve Slack windows at
+all, as #297 cache-coverage-races requires of a serving build until it answers them from the
+threads too; a Slack Main timeline page is the conversation's own history and may be served.
 
-`backfill` and `timeline_fallback_ms` are read and checked, and do nothing in this build. There is
-no backfill yet, and nothing is answered from the cache when a timeline read is slow.
+`backfill` and `timeline_fallback_ms` are read and checked, and do nothing in this build. There
+is no backfill yet; with `serve = true` a slow timeline read is not waited out at all, it is
+the refresh behind an answered page.
 
 ### Diagnostics and logs
 
@@ -4205,7 +4243,7 @@ path:
   "providers": [ { "provider": "slack", "verification": "verified" } ],
   "blocked": 0,               // channels and threads not answered for while access is in doubt
   "shadow": [
-    { "consumer": "messages", "asked": 410, "would_serve": 120, "needs_existence_check": 0,
+    { "consumer": "messages", "asked": 410, "would_serve": 120, "served": 0, "needs_existence_check": 0,
       "misses": { "off": 0, "blocked": 0, "suspect": 0, "gap": 30, "incomplete": 0,
                   "stale_head": 260, "barrier": 0 },
       "late": 0, "compared": 120, "agreed": 118, "missing_rows": 2, "extra_rows": 0,
@@ -9638,7 +9676,7 @@ Beyond the security list above:
   service to fall back on. `summaries.model` is still recorded in the cache key and read by
   nothing, which is the last vestige of a selector that no longer exists.
 * Nothing is answered from channel content on disk. The message cache, once an operator turns it
-  on, keeps a copy but answers nothing yet (see "The message cache"). Two short-lived copies are
+  on, keeps a copy and answers from it only with `serve = true` (see "The message cache"). Two short-lived copies are
   kept in memory for reading: read-aloud preparation reuses messages the page fetched in the last
   30 seconds (`#191 read-aloud-first-lag`), and the voice catch-up answers from each channel's
   newest window when the provider is slow (`#210 voice-catchup-speed`; see "The eight tools").

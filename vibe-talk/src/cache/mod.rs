@@ -1,8 +1,10 @@
 //! The message cache: a disposable on-disk copy of channel messages. `#208 persistent-cache`.
 //!
-//! **Filled, not served yet** (milestone `cache-fill`). A server opens a cache only when its
-//! configuration's `[message_cache]` table says `enabled = true` and the owner has not turned it
-//! off ([`lifecycle`]). The cache then sits behind the server's one [`Sink`], which fills it from:
+//! **Filled, and served from only on request** (milestones `cache-fill` and `cache-serve`,
+//! `#384 cache-serve`). A server opens a cache only when its configuration's `[message_cache]`
+//! table says `enabled = true` and the owner has not turned it off ([`lifecycle`]); reads are
+//! answered from it only when the table also says `serve = true`, and then only the reads and
+//! by the rule of [`shadow`]. The cache sits behind the server's one [`Sink`], which fills it from:
 //!
 //! - what write-scope and server-owned reads see. The read sites offer it under a [`FillGrant`],
 //!   which a read-scope caller never has ([`grant`]), and each read claims only what it proves
@@ -17,11 +19,14 @@
 //! ([`orphans`]). The owner's switch, the purge and every erase of the whole file are in
 //! [`lifecycle`] and [`marker`].
 //!
-//! Nothing reads the cache back to answer anyone: what a caller is answered is exactly what it was
-//! before the cache existed. Instead, each read a later milestone will answer from the cache is
-//! shadowed ([`shadow`]). What the cache would have served is counted in memory, beside the
-//! upstream answer, and reported in diagnostics. For operators, see the README's section "The
-//! message cache".
+//! With `serve` off (the default), nothing reads the cache back to answer anyone: what a
+//! caller is answered is exactly what it was before the cache existed, and each read serving
+//! could answer is shadowed instead ([`shadow`]). With it on, a write-scope newest timeline
+//! page or newest window the shadow's rule serves is answered from the cache at once and
+//! refreshed upstream in the background; the refresh is compared with what was served and
+//! corrects it by live event. Either way, what the cache answers or would have answered is
+//! counted in memory beside the upstream answer, and reported in diagnostics. For operators,
+//! see the README's section "The message cache".
 //!
 //! # A separate file, never tables in the store
 //!

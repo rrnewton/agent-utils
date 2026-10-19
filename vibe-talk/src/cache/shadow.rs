@@ -1,17 +1,22 @@
-//! What the message cache would have served, measured beside the reads that go upstream. `#208
-//! persistent-cache`, milestone `cache-fill`.
+//! What the message cache serves, or would have served, measured beside the reads that go
+//! upstream. `#208 persistent-cache`, milestones `cache-fill` and `cache-serve` (`#384
+//! cache-serve`).
 //!
-//! Nothing is answered from the cache yet; a later milestone serves from it, by the rules of plan
-//! section 5.4. Until then, every read that milestone could answer is SHADOWED: while the read goes
-//! upstream, the cache is asked what it holds for the same question, the rule decides whether the
-//! cache would have answered, and once upstream has answered, the two are compared. Counts only,
-//! in memory, from the moment the process starts.
+//! Every read the cache could answer is evaluated by the rules below: the cache is asked what
+//! it holds for the same question, the rule decides whether it would answer, and once upstream
+//! has answered, the two are compared. Counts only, in memory, from the moment the process
+//! starts. With `[message_cache] serve` off that is all that happens — a shadow. With it on, two
+//! families of write-scope reads are answered from the snapshot the evaluation read (see
+//! [`serve_eligible`]), upstream is read behind the answer, and the comparison then checks the
+//! answer that was actually handed back, counted `served` beside `would_serve`.
 //!
-//! This module is the pure part: the rules, per consumer, and the comparison. The evaluation runs
-//! off the request's path ([`super::Sink::shadow`]): its reads on the blocking pool while upstream
-//! is answering, its decision and comparison in a detached task once upstream has. It never delays
-//! a response and never writes, whoever asked: a read-scope caller is shadowed as much as any
-//! other, since the later milestone serves read scope too, and leaves the file exactly as it was.
+//! This module is the pure part: the rules, per consumer, and the comparison. The evaluation
+//! runs off the request's path ([`super::Sink::shadow`]): its reads on the blocking pool while
+//! upstream is answering, its decision and comparison in a detached task once upstream has. The
+//! one exception is serving ([`super::Sink::try_serve`]), which awaits the same evaluation on
+//! the request's path, briefly, because the answer depends on it. Neither writes, whoever
+//! asked: a read-scope caller is shadowed as much as any other, and leaves the file exactly as
+//! it was; serving its reads is for a later milestone.
 //!
 //! # The rules
 //!
@@ -21,7 +26,7 @@
 //! | `message_by_id`, `summary` | the message is held whole (not as a push brought it: see `gap`) and not in doubt (an offer dropped for its channel since it was seen may have been its edit or deletion, whatever its feed carries), and the barrier passed, and: on a bridge, whose feed carries deletions, the coverage of its home scope was revalidated within [`REVALIDATED_BRIDGE_MS`], or the channel is fed by an adapter's pushes (the live poller publishes creations alone) and the message was seen, or that coverage revalidated, since the feed's changes have reached the file: since this process's file could take them and the route list first reached it (a deletion made before then, while the server was down or the list unknown, reached nothing; a channel put back on the list, or added to it, is in doubt until read again, since nothing of it reached the file while it was off); on Slack and Discord, whose feeds carry only additions, within [`REVALIDATED_ADDITIONS_ONLY_MS`], and otherwise it would take one existence check upstream first (`needs_existence_check`) |
 //! | `page` | the span asked for lies inside complete coverage (up to the page's last row, when it is full), the band is vouched for as for `messages`, no row of it is in doubt or held only as a push brought it, and the barrier passed; an open-ended page needs a fresh head, not in doubt, as well |
 //! | `count` | complete coverage spans `[since, head − 120 s]` (so never on Slack, whose coverage is never complete), the band is vouched for as for `messages`, the head and the claims counted are as fresh as for `messages`, nothing counted is in doubt or held only as a push brought it (the comparison checks the text too), and the barrier passed |
-//! | `timeline_fallback` | coverage holds `limit` rows down from the head, the band is vouched for as for `messages` (so a row pushed or posted above the head is never served), nothing served is in doubt or held only as a push brought it, and the barrier passed: what a newest page answered from the cache would be, were upstream to fail. Slack's Flat view never |
+//! | `timeline_fallback` | coverage holds `limit` rows down from the head, the band is vouched for as for `messages` (so a row pushed or posted above the head is never served), nothing served is in doubt or held only as a push brought it, and the barrier passed: a newest page answered from the cache at once, however old its head, because the read behind it corrects it. Slack's Flat view never |
 //!
 //! # What a miss says
 //!
@@ -124,7 +129,8 @@ pub enum Consumer {
     Page,
     /// `/count` and MCP `count_messages`.
     Count,
-    /// `/timeline`'s newest page, as a page answered from the cache if upstream failed.
+    /// `/timeline`'s newest page, as a page answered from the cache at once and refreshed
+    /// behind. Kept under its shadow-era name in the report.
     TimelineFallback,
 }
 

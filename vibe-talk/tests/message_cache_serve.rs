@@ -22,9 +22,7 @@ use vibe_talk::discord::fake::FakeDiscord;
 use vibe_talk::live::LiveKind;
 use vibe_talk::model::{ChannelId, MessageId};
 use vibe_talk::state::AppState;
-use vibe_talk::testing::{
-    self, ManualClock, TempDir, TimelineChat, READ_CHANNEL, WRITE_TOKEN,
-};
+use vibe_talk::testing::{self, ManualClock, TempDir, TimelineChat, READ_CHANNEL, WRITE_TOKEN};
 
 /// 2026-08-18T12:00:00Z: where the fixtures' messages are written, a minute apart.
 const T0: i64 = 1_787_054_400_000;
@@ -203,7 +201,13 @@ async fn a_reload_behind_a_provider_that_has_not_answered_shows_the_held_message
     );
     assert_eq!(
         texts(&body),
-        ["message 7", "message 8", "message 9", "message 10", "message 11"],
+        [
+            "message 7",
+            "message 8",
+            "message 9",
+            "message 10",
+            "message 11"
+        ],
         "the newest five messages the cache holds"
     );
     assert!(
@@ -247,7 +251,13 @@ async fn an_edit_and_a_deletion_the_refresh_finds_correct_what_was_served() {
         .expect("the request ran");
     assert_eq!(
         texts(&body),
-        ["message 7", "message 8", "message 9", "message 10", "message 11"],
+        [
+            "message 7",
+            "message 8",
+            "message 9",
+            "message 10",
+            "message 11"
+        ],
         "the provisional page is the cache as it stood, edit and deletion unknown to it"
     );
 
@@ -300,7 +310,13 @@ async fn an_edit_and_a_deletion_the_refresh_finds_correct_what_was_served() {
     .await;
     assert_eq!(
         texts(&body),
-        ["message 6", "message 7", "message 8", "message 10, corrected", "message 11"]
+        [
+            "message 6",
+            "message 7",
+            "message 8",
+            "message 10, corrected",
+            "message 11"
+        ]
     );
 }
 
@@ -325,7 +341,13 @@ async fn a_channel_in_doubt_is_not_served() {
     let body = request.await.expect("the request ran");
     assert_eq!(
         texts(&body),
-        ["message 7", "message 8", "message 9", "message 10", "message 11"],
+        [
+            "message 7",
+            "message 8",
+            "message 9",
+            "message 10",
+            "message 11"
+        ],
         "answered by the provider, once it answered"
     );
     settled(&d.state).await;
@@ -346,7 +368,12 @@ async fn a_fresh_window_is_served_and_checked_against_upstream() {
     let held = d.chat.hold_next_recent();
     let state = d.state.clone();
     let request = tokio::spawn(async move {
-        ok(&state, &path(READ_CHANNEL, "/messages?limit=5"), WRITE_TOKEN).await
+        ok(
+            &state,
+            &path(READ_CHANNEL, "/messages?limit=5"),
+            WRITE_TOKEN,
+        )
+        .await
     });
     let body = tokio::time::timeout(AT_ONCE, request)
         .await
@@ -354,7 +381,13 @@ async fn a_fresh_window_is_served_and_checked_against_upstream() {
         .expect("the request ran");
     assert_eq!(
         texts(&body),
-        ["message 7", "message 8", "message 9", "message 10", "message 11"]
+        [
+            "message 7",
+            "message 8",
+            "message 9",
+            "message 10",
+            "message 11"
+        ]
     );
 
     held.entered
@@ -394,7 +427,13 @@ async fn with_serving_off_a_reload_waits_for_the_provider() {
     let body = request.await.expect("the request ran");
     assert_eq!(
         texts(&body),
-        ["message 7", "message 8", "message 9", "message 10", "message 11"]
+        [
+            "message 7",
+            "message 8",
+            "message 9",
+            "message 10",
+            "message 11"
+        ]
     );
     settled(&d.state).await;
     assert_eq!(counts(&d.state, "timeline_fallback").served, 0);

@@ -96,14 +96,25 @@
 //! are on the server's list under no provider at all ([`super::orphans`]). With no cache, there is
 //! no task, and no summary is ever deleted on the cache's account.
 //!
-//! # What it would have served
+//! # What it serves, and what it would have served
 //!
-//! Nothing is served from the cache yet. While a read that a later milestone could answer from it
-//! goes upstream, [`Sink::shadow`] asks the cache what it holds for the same question, off the
-//! request's path, and once upstream has answered compares the two ([`super::shadow`]). Whoever
-//! asked, read scope included: an evaluation reads and counts in memory, and writes nothing. With
-//! no cache open, nothing is read; the ask is counted, as `off`, only when the configuration has a
-//! `[message_cache]` table, and costs nothing otherwise.
+//! While a read the cache could answer goes upstream, [`Sink::shadow`] asks the cache what it
+//! holds for the same question, off the request's path, and once upstream has answered compares
+//! the two ([`super::shadow`]). Whoever asked, read scope included: an evaluation reads and
+//! counts in memory, and writes nothing. With no cache open, nothing is read; the ask is
+//! counted, as `off`, only when the configuration has a `[message_cache]` table, and costs
+//! nothing otherwise.
+//!
+//! With `[message_cache] serve` on, the newest window and the newest timeline page ask through
+//! [`Sink::try_serve`] instead: the same evaluation, awaited on the request's path for at most
+//! [`SERVE_WAIT`], and answered from its snapshot when the rule serves and the caller holds the
+//! write scope (its read sites decide that). The read it stood in for runs upstream behind
+//! the answer — one at a time per read, under [`Sink::claim_refresh`] — and its answer is
+//! handed to the evaluation for the same comparison, then corrects what was served.
+//!
+//! A provider's feed vouches for a channel only while an adapter is actually pushing for that
+//! provider ([`Sink::fed_since_for`]): the sink notes the latest push per provider as it
+//! offers it, here under the live hub's feed lock.
 //!
 //! # What it says about itself
 //!
@@ -947,10 +958,7 @@ impl Sink {
             return None;
         }
         let last = lock(&self.state.pushed).get(&route.key).copied()?;
-        (cache
-            .now_ms()
-            .saturating_sub(last)
-            <= shadow::FED_PUSH_RECENT_MS)
+        (cache.now_ms().saturating_sub(last) <= shadow::FED_PUSH_RECENT_MS)
             .then(|| cache.fed_since_ms())
     }
 
@@ -1199,8 +1207,7 @@ impl Sink {
             // own reads and prove no adapter. Noted under the feed lock like the offer, and as
             // briefly: one map entry, never a wait.
             if producer == ServerFill::Ingest {
-                lock(&self.state.pushed)
-                    .insert(fill.chan.provider_key.clone(), fill.observed_ms);
+                lock(&self.state.pushed).insert(fill.chan.provider_key.clone(), fill.observed_ms);
             }
             if let Some(read) = read {
                 fill.observed_ms = fill.observed_ms.min(read.observed_ms);
@@ -1340,7 +1347,10 @@ impl Sink {
         let Some(task) = shadowed.task.as_mut() else {
             return ServeOutcome::NotServed(Some(shadowed));
         };
-        if tokio::time::timeout(SERVE_WAIT, task.evaluate()).await.is_err() {
+        if tokio::time::timeout(SERVE_WAIT, task.evaluate())
+            .await
+            .is_err()
+        {
             return ServeOutcome::NotServed(Some(shadowed));
         }
         let decision = match task.evaluated.as_ref().map(|evaluated| &evaluated.read) {
@@ -1368,9 +1378,7 @@ impl Sink {
         let view = match task.evaluated.as_ref().map(|evaluated| &evaluated.read) {
             Some(Read::Served(view)) => view.clone(),
             _ => {
-                return ServeOutcome::NotServed(Some(Shadowed {
-                    task: Some(task),
-                }));
+                return ServeOutcome::NotServed(Some(Shadowed { task: Some(task) }));
             }
         };
         self.state.shadow.tallies.served(ask.consumer());
@@ -1533,6 +1541,7 @@ impl Sink {
             blocked = report.blocked,
             shadow_asked = shadow.asked,
             shadow_would_serve = shadow.would_serve,
+            shadow_served = shadow.served,
             shadow_needs_existence_check = shadow.needs_existence_check,
             shadow_late = shadow.late,
             shadow_compared = shadow.compared,

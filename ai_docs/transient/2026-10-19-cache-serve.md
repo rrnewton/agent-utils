@@ -66,8 +66,9 @@ which the page already handles for other providers:
 - `next_after` is a generic forward cursor from the served page (what the
   server mints whenever a backend issues none), never a backend cursor the
   cache cannot know.
-- `next_before` is absent and `has_more` is true unless the cache's coverage
-  proves the scope's start: the page already reads that as "more above:
+- `next_before` is absent and `has_more` is true, always: the cache's
+  coverage is clipped at its age limit, so it can never prove the scope's
+  start, and the page already reads a missing cursor as "more above:
   unknown". Stepping back from a provisional page waits for the next full
   read; everything else (reading, replying, live updates) works at once.
 

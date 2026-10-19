@@ -472,7 +472,9 @@ fn may_serve(state: &AppState, caller: crate::auth::Scope) -> bool {
 /// unstamped copy for the refresh's corrections, which compare like with like.
 fn served_messages(view: &View) -> (Vec<Message>, Option<String>) {
     let messages = view.rows.iter().map(|row| row.message.clone()).collect();
-    let as_of = view.head.map(|head| crate::clock::iso_from_ms(head.head_ms));
+    let as_of = view
+        .head
+        .map(|head| crate::clock::iso_from_ms(head.head_ms));
     (messages, as_of)
 }
 
@@ -546,11 +548,7 @@ fn spawn_timeline_refresh(
         // Before the read is offered, as in `timeline`, so the comparison knows its own writes.
         pending.compare(Upstream::of(&page.messages, page.has_more));
         if let Some(fill) = fill {
-            fill.offer_timeline(
-                &request,
-                crate::cache::observe::TimelineRead::Newest,
-                &page,
-            );
+            fill.offer_timeline(&request, crate::cache::observe::TimelineRead::Newest, &page);
         }
         publish_serve_corrections(&state, &channel, served).await;
         // What the page is about to draw is what it will ask to hear, as in `timeline`.
@@ -569,9 +567,12 @@ fn spawn_timeline_refresh(
                 );
             }
         }
-        state
-            .read_ahead
-            .remember(&channel, request.thread_id.as_deref(), &page.messages, fetch_began);
+        state.read_ahead.remember(
+            &channel,
+            request.thread_id.as_deref(),
+            &page.messages,
+            fetch_began,
+        );
     }));
 }
 
@@ -1296,13 +1297,12 @@ pub async fn timeline(
     };
     // Only a newest page: what a page answered from the cache stands in for while upstream is
     // read behind it. A step back, and what changed since a cursor, are never answered from it.
-    let newest_ask = (timeline_read == crate::cache::observe::TimelineRead::Newest).then(|| {
-        Ask::Timeline {
+    let newest_ask =
+        (timeline_read == crate::cache::observe::TimelineRead::Newest).then(|| Ask::Timeline {
             view: request.view,
             thread: request.thread_id.clone(),
             limit: usize::from(request.limit.max(1)),
-        }
-    });
+        });
     // `#384 cache-serve`: as in `read_window`, the newest page's evaluation is awaited where
     // its shadow was begun, and a page it serves is handed back at once — provisional, its
     // `as_of` the head it was served from, no backward cursor a backend never issued — with
