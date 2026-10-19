@@ -13,4 +13,4 @@ closed_at: 2026-10-02T21:37:45.408829213+00:00
 
 # Description
 
-[opus 5.5] The devbig014 Slack instance polls each channel every 30 s through meta slack.message list. meta slack.message tail (with --catchup oldest) delivered no events for the owner's user token, so push through the ingest route is not possible yet. Find out what subscription the user-token tail needs, then push events (or change-hints) instead of polling.
+[opus 5.5] The owner's Slack instance polls each channel every 30 s through a vendor CLI's message list command. The CLI's message tail command (with oldest catch-up) delivered no events for the owner's user token, so push through the ingest route is not possible yet. Find out what subscription the user-token tail needs, then push events (or change-hints) instead of polling.
