@@ -244,23 +244,30 @@ jobs:
           import xml.etree.ElementTree as ET
 
           report, log, shard = sys.argv[1], sys.argv[2], os.environ["SHARD"]
-          failed = []
+          failed = None
           if os.path.exists(report):
-              source = "JUnit report"
-              for case in ET.parse(report).getroot().iter("testcase"):
-                  if case.find("failure") is None and case.find("error") is None:
-                      continue
-                  properties = {p.get("name"): p.get("value") for p in case.iter("property")}
-                  failed.append(
-                      properties.get("nodeid") or f"{case.get('classname')}::{case.get('name')}"
-                  )
-          elif os.path.exists(log):
+              try:
+                  root = ET.parse(report).getroot()
+              except ET.ParseError:
+                  root = None  # a shard killed mid-write: fall through to the log
+              if root is not None:
+                  source = "JUnit report"
+                  failed = []
+                  for case in root.iter("testcase"):
+                      if case.find("failure") is None and case.find("error") is None:
+                          continue
+                      properties = {p.get("name"): p.get("value") for p in case.iter("property")}
+                      failed.append(
+                          properties.get("nodeid") or f"{case.get('classname')}::{case.get('name')}"
+                      )
+          if failed is None and os.path.exists(log):
               source = "log only: the shard stopped before pytest wrote its report"
               prefix = "component-tests: FAILED "
               with open(log, encoding="utf-8", errors="replace") as lines:
                   failed = [line[len(prefix):].strip() for line in lines if line.startswith(prefix)]
-          else:
+          if failed is None:
               source = "no report and no log: the shard never started its tests"
+              failed = []
           failed = list(dict.fromkeys(failed))
           print(f"### Python 3.10 shard {shard}: {len(failed)} failed ({source})")
           print("".join(f"- `{nodeid}`\n" for nodeid in failed))

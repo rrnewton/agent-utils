@@ -960,6 +960,12 @@ def test_a_shard_summary_names_its_failures_from_the_report_or_else_the_log(
     assert "- `tests.test_b::test_three`" in finished
     assert "test_fine" not in finished
 
+    # A shard killed mid-write leaves a truncated report; the log still names its failures.
+    report.write_text('<testsuites><testsuite><testcase classname="tests.test_b"', encoding="utf-8")
+    truncated = _summarize(tmp_path, report, log)
+    assert "shard 3: 1 failed (log only" in truncated
+    assert "- `tests/test_a.py::test_one (call)`" in truncated
+
 
 # ---- `#365 package-step-cpu-budget` -------------------------------------------------------------
 
