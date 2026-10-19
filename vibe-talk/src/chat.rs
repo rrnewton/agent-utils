@@ -888,6 +888,11 @@ pub trait ChatClient: Send + Sync {
         ))
     }
 
+    /// Forget any channel listing this provider keeps, because this server's list of channels
+    /// changed. `#371 channel-search-hash`; see [`crate::directory::Kept`]. Nothing by default:
+    /// a provider that keeps nothing has nothing to forget.
+    fn forget_channel_directory(&self) {}
+
     /// Whether this provider can move its own read cursor forward.
     ///
     /// False by default so existing providers and test doubles do not acquire a write capability

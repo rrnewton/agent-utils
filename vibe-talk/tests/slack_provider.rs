@@ -1184,6 +1184,73 @@ async fn discovery_finds_a_channel_with_or_without_its_hash_in_any_case() {
     assert_eq!(names("#eng-OPS").await, ["#eng-ops"]);
 }
 
+/// `#371 channel-search-hash`: searches typed one after another walk the listing Slack gave the
+/// first, until it is two minutes old or the list of channels here changes.
+#[tokio::test]
+async fn discovery_keeps_slacks_listing_for_searches_that_follow() {
+    let fake = Fake::start(directory_fixture(), 50).await;
+    let listings =
+        || fake.with(|state| state.calls.get("users.conversations").copied().unwrap_or(0));
+    let client = fake.client();
+    let count = |query: &'static str| {
+        let request = DirectoryRequest {
+            query: Some(query.to_owned()),
+            cursor: None,
+            limit: 50,
+        };
+        let client = &client;
+        async move {
+            client
+                .discover_channels(&request)
+                .await
+                .expect("page")
+                .entries
+                .len()
+        }
+    };
+    assert_eq!(count("team").await, 10);
+    assert_eq!(listings(), 1);
+    assert_eq!(count("#team-1").await, 1);
+    assert_eq!(count("TEAM-2").await, 1);
+    assert_eq!(listings(), 1, "a search that followed asked Slack again");
+    client.forget_channel_directory();
+    assert_eq!(count("team").await, 10);
+    assert_eq!(
+        listings(),
+        2,
+        "the list of channels changed, yet the old listing was used"
+    );
+
+    // Kept for no time, every search asks; kept briefly, it asks again once that time is up.
+    let every = fake.client().with_directory_keep(Duration::ZERO);
+    let before = listings();
+    for query in ["ops", "ops"] {
+        every
+            .discover_channels(&DirectoryRequest {
+                query: Some(query.to_owned()),
+                cursor: None,
+                limit: 50,
+            })
+            .await
+            .expect("page");
+    }
+    assert_eq!(listings(), before + 2);
+    let brief = fake.client().with_directory_keep(Duration::from_millis(50));
+    let ask = || {
+        brief.discover_channels(&DirectoryRequest {
+            query: None,
+            cursor: None,
+            limit: 50,
+        })
+    };
+    ask().await.expect("page");
+    ask().await.expect("page");
+    assert_eq!(listings(), before + 3);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    ask().await.expect("page");
+    assert_eq!(listings(), before + 4, "a stale listing was used");
+}
+
 #[tokio::test]
 async fn identity_comes_from_auth_test_and_is_remembered() {
     let (state, _) = linear(1);

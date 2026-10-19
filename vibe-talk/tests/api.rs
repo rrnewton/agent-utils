@@ -4418,6 +4418,50 @@ async fn the_channel_directory_marks_tracked_channels_and_pages_through_the_back
     assert_eq!(calls[2].limit, vibe_talk::directory::DEFAULT_LIMIT);
 }
 
+/// `#371 channel-search-hash`: a service may keep its channel listing for a while, and is told to
+/// forget it whenever the list of channels here changes: an addition, a hide, a removal.
+#[tokio::test]
+async fn every_change_to_the_list_makes_the_services_forget_their_kept_listings() {
+    let (harness, _store) = directory_harness();
+    let forgotten = || harness.discord.directory_forgotten();
+    let before = forgotten();
+    let (status, body) = call(
+        &harness,
+        "POST",
+        "/api/v1/channels",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({"source": "room/release", "label": "release"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let added = forgotten();
+    assert!(added > before, "an addition left the kept listing standing");
+    let (status, body) = call(
+        &harness,
+        "DELETE",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}"),
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let hidden = forgotten();
+    assert!(hidden > added, "a hide left the kept listing standing");
+    let (status, body) = call(
+        &harness,
+        "DELETE",
+        "/api/v1/channels/3333333333333333777",
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        forgotten() > hidden,
+        "a removal left the kept listing standing"
+    );
+}
+
 /// `#371 channel-search-hash`: a search finds a channel with or without the `#` it is written with,
 /// in any case, and a search of nothing but `#` lists everything.
 #[tokio::test]

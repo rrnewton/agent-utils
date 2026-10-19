@@ -977,6 +977,10 @@ impl crate::chat::ChatClient for CountingChat {
         self.inner.supports_channel_discovery()
     }
 
+    fn forget_channel_directory(&self) {
+        self.inner.forget_channel_directory();
+    }
+
     async fn discover_channels(
         &self,
         request: &crate::directory::DirectoryRequest,

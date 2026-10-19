@@ -1072,7 +1072,14 @@ pub struct HttpDiscordClient {
     /// lets one channel's 429 stop the *next* request on that channel before it is sent, and a
     /// global 429 stop all of them. See [`super::ratelimit`].
     limiter: RateLimiter,
+    /// The bridge's channel-directory pages, by search, cursor and size, so the same search asked
+    /// again while it is kept answers at once. `#371 channel-search-hash`.
+    directory_pages: crate::directory::Kept<DirectoryKey, crate::directory::DirectoryPage>,
 }
+
+/// What one channel-directory page was asked for: the search (as the bridge is sent it), the
+/// cursor and the size.
+type DirectoryKey = (Option<String>, Option<String>, u16);
 
 impl HttpDiscordClient {
     /// Build a client from the Discord section of the configuration.
@@ -1110,6 +1117,7 @@ impl HttpDiscordClient {
                 ChatError::Transport(e.to_string()).with_provider(&config.provider_name)
             })?;
         Ok(Self {
+            directory_pages: crate::directory::Kept::default(),
             provider_name: config.provider_name.clone(),
             thread_api: config.thread_api,
             thread_inventory: threading::InventoryCache::default(),
@@ -1376,6 +1384,10 @@ impl ChatClient for HttpDiscordClient {
         self.channel_registration
     }
 
+    fn forget_channel_directory(&self) {
+        self.directory_pages.forget();
+    }
+
     async fn discover_channels(
         &self,
         request: &crate::directory::DirectoryRequest,
@@ -1387,10 +1399,23 @@ impl ChatClient for HttpDiscordClient {
                         .to_owned(),
                 ));
             }
+            let key = (
+                request
+                    .query
+                    .as_deref()
+                    .and_then(crate::directory::name_filter),
+                request.cursor.clone(),
+                request.limit,
+            );
+            if let Some(kept) = self.directory_pages.get(&key) {
+                return Ok(kept);
+            }
             let value = self
                 .send(channel_directory_request(&self.api_base, request)?)
                 .await?;
-            crate::directory::parse_directory_page(&value, request.limit)
+            let page = crate::directory::parse_directory_page(&value, request.limit)?;
+            self.directory_pages.put(key, page.clone());
+            Ok(page)
         }
         .await
         .map_err(|error| error.with_provider(self.provider_name()))
@@ -1903,6 +1928,50 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn the_same_directory_search_is_answered_from_what_the_bridge_said_until_forgotten() {
+        // `#371 channel-search-hash`. The loopback bridge answers once and is gone, so any second
+        // request to it fails: an answer after that came from what was kept.
+        let (base, server) = answer_once(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 120\r\nconnection: close\r\n\r\n{\"entries\":[{\"source\":\"room/1\",\"name\":\"team-builds\",\"registered_channel_id\":null}],\"next_cursor\":null,\"truncated\":false}",
+        )
+        .await;
+        let mut client = bridge_client(base, false);
+        client.channel_registration = true;
+        let asked = |query: &str| crate::directory::DirectoryRequest {
+            query: Some(query.to_owned()),
+            cursor: None,
+            limit: 10,
+        };
+        let first = client
+            .discover_channels(&asked("#Team"))
+            .await
+            .expect("the bridge answers");
+        assert_eq!(first.entries[0].name, "team-builds");
+        let request = server.await.expect("mock server");
+        assert!(
+            request.starts_with("GET /channel-directory?query=Team&limit=10 "),
+            "{request}"
+        );
+        assert_eq!(
+            client
+                .discover_channels(&asked("Team"))
+                .await
+                .expect("kept"),
+            first,
+            "the same search, with or without its hash, asked the bridge again"
+        );
+        assert!(
+            client.discover_channels(&asked("builds")).await.is_err(),
+            "another search was answered from a kept one"
+        );
+        client.forget_channel_directory();
+        assert!(
+            client.discover_channels(&asked("Team")).await.is_err(),
+            "a forgotten answer was given"
+        );
+    }
+
     #[test]
     fn a_bridge_is_asked_for_the_name_without_the_hash_it_is_written_with() {
         // `#371 channel-search-hash`. The case is the bridge's to match, as its contract says.
@@ -2095,6 +2164,7 @@ mod tests {
         });
 
         let client = HttpDiscordClient {
+            directory_pages: crate::directory::Kept::default(),
             thread_api: crate::threads::ThreadApi::Off,
             thread_inventory: threading::InventoryCache::default(),
             provider_name: "Discord".to_owned(),
@@ -2125,6 +2195,7 @@ mod tests {
 
     fn bridge_client(api_base: String, upstream_read_marks: bool) -> HttpDiscordClient {
         HttpDiscordClient {
+            directory_pages: crate::directory::Kept::default(),
             thread_api: crate::threads::ThreadApi::Off,
             thread_inventory: threading::InventoryCache::default(),
             provider_name: "Google Chat".to_owned(),
@@ -2327,6 +2398,7 @@ mod tests {
         });
 
         let client = HttpDiscordClient {
+            directory_pages: crate::directory::Kept::default(),
             thread_api: crate::threads::ThreadApi::Off,
             thread_inventory: threading::InventoryCache::default(),
             provider_name: "Google Chat".to_owned(),
@@ -2396,6 +2468,7 @@ mod tests {
         });
 
         let client = HttpDiscordClient {
+            directory_pages: crate::directory::Kept::default(),
             thread_api: crate::threads::ThreadApi::Off,
             thread_inventory: threading::InventoryCache::default(),
             provider_name: "Google Chat".to_owned(),
@@ -2454,6 +2527,7 @@ mod tests {
         });
 
         let client = HttpDiscordClient {
+            directory_pages: crate::directory::Kept::default(),
             thread_api: crate::threads::ThreadApi::Off,
             thread_inventory: threading::InventoryCache::default(),
             provider_name: "Google Chat".to_owned(),
@@ -2516,6 +2590,7 @@ mod tests {
             });
 
             let client = HttpDiscordClient {
+                directory_pages: crate::directory::Kept::default(),
                 thread_api: crate::threads::ThreadApi::Off,
                 thread_inventory: threading::InventoryCache::default(),
                 provider_name: "Google Chat".to_owned(),
@@ -2571,6 +2646,7 @@ mod tests {
         });
 
         let client = HttpDiscordClient {
+            directory_pages: crate::directory::Kept::default(),
             thread_api: crate::threads::ThreadApi::Off,
             thread_inventory: threading::InventoryCache::default(),
             provider_name: "Google Chat".to_owned(),
@@ -2652,6 +2728,7 @@ mod tests {
         });
 
         let client = HttpDiscordClient {
+            directory_pages: crate::directory::Kept::default(),
             thread_api: crate::threads::ThreadApi::Off,
             thread_inventory: threading::InventoryCache::default(),
             provider_name: "Google Chat".to_owned(),
@@ -3184,6 +3261,7 @@ mod tests {
         });
         let (base, server) = answer_once(json_response(&body.to_string())).await;
         let client = HttpDiscordClient {
+            directory_pages: crate::directory::Kept::default(),
             range_reads: true,
             ..bridge_client(base, false)
         };

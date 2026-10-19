@@ -993,6 +993,12 @@ impl ChatClient for ChatRouter {
         !self.discovery_indices().is_empty()
     }
 
+    fn forget_channel_directory(&self) {
+        for entry in &self.entries {
+            entry.client.forget_channel_directory();
+        }
+    }
+
     async fn discover_channels(
         &self,
         request: &crate::directory::DirectoryRequest,

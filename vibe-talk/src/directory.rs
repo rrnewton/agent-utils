@@ -5,6 +5,11 @@
 //! bridge: a source is an opaque string that is handed back, unchanged, to channel registration,
 //! and a cursor is an opaque token that is handed back, unchanged, for the next page.
 
+use std::collections::HashMap;
+use std::hash::Hash;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use serde::Serialize;
 
 use crate::chat::ChatError;
@@ -62,6 +67,71 @@ pub struct DirectoryPage {
 pub fn name_filter(query: &str) -> Option<String> {
     let name = query.trim().trim_start_matches('#').trim();
     (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// How long a service's channel listing is kept: searches typed one after another while it is
+/// kept answer from it, without asking the service again. `#371 channel-search-hash`.
+pub const DIRECTORY_KEEP: Duration = Duration::from_secs(120);
+
+/// What a service answered for its channel listing, kept for a while by what was asked.
+///
+/// A service's listing changes when its account joins or leaves a channel, which is rare, and
+/// reading it can take seconds (Slack lists every conversation the app is in before one search
+/// can be answered). So each answer is kept for [`DIRECTORY_KEEP`], and all of them are forgotten
+/// whenever this server's own list of channels changes
+/// ([`crate::chat::ChatClient::forget_channel_directory`]). Only answers are kept, never a failure.
+/// Whether an entry is already on the list is decided afresh for every request, from the list, so
+/// a kept listing never says "Already added" wrongly.
+#[derive(Debug)]
+pub struct Kept<K, V> {
+    keep: Duration,
+    answers: Mutex<HashMap<K, (Instant, V)>>,
+}
+
+impl<K, V> Default for Kept<K, V> {
+    fn default() -> Self {
+        Self {
+            keep: DIRECTORY_KEEP,
+            answers: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl<K: Eq + Hash, V: Clone> Kept<K, V> {
+    /// Keep answers for `keep`; `Duration::ZERO` keeps nothing.
+    #[must_use]
+    pub fn new(keep: Duration) -> Self {
+        Self {
+            keep,
+            answers: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The answer kept for `key`, while it is still fresh.
+    pub fn get(&self, key: &K) -> Option<V> {
+        let answers = self.answers.lock().ok()?;
+        let (at, value) = answers.get(key)?;
+        (at.elapsed() < self.keep).then(|| value.clone())
+    }
+
+    /// Keep `value` as the answer for `key`, dropping any that have gone stale.
+    pub fn put(&self, key: K, value: V) {
+        if self.keep.is_zero() {
+            return;
+        }
+        if let Ok(mut answers) = self.answers.lock() {
+            let keep = self.keep;
+            answers.retain(|_, (at, _)| at.elapsed() < keep);
+            answers.insert(key, (Instant::now(), value));
+        }
+    }
+
+    /// Forget every kept answer.
+    pub fn forget(&self) {
+        if let Ok(mut answers) = self.answers.lock() {
+            answers.clear();
+        }
+    }
 }
 
 fn shape(detail: &str) -> ChatError {
@@ -162,6 +232,24 @@ pub fn parse_directory_page(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_kept_answer_is_given_until_it_is_stale_or_forgotten() {
+        let kept: Kept<&str, u32> = Kept::new(Duration::from_millis(40));
+        assert_eq!(kept.get(&"a"), None);
+        kept.put("a", 1);
+        assert_eq!(kept.get(&"a"), Some(1));
+        assert_eq!(kept.get(&"b"), None);
+        kept.forget();
+        assert_eq!(kept.get(&"a"), None);
+        kept.put("a", 2);
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(kept.get(&"a"), None, "a stale answer was given");
+        let nothing: Kept<&str, u32> = Kept::new(Duration::ZERO);
+        nothing.put("a", 1);
+        assert_eq!(nothing.get(&"a"), None);
+        assert_eq!(Kept::<u8, u8>::default().keep, DIRECTORY_KEEP);
+    }
 
     #[test]
     fn a_search_finds_a_name_with_or_without_its_hash() {

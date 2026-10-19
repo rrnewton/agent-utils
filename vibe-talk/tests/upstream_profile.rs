@@ -369,6 +369,9 @@ impl ChatClient for Recorder {
         self.note("supports_channel_discovery");
         true
     }
+    fn forget_channel_directory(&self) {
+        self.note("forget_channel_directory");
+    }
     async fn discover_channels(
         &self,
         _request: &DirectoryRequest,
@@ -705,6 +708,8 @@ async fn every_method_reaches_the_wrapped_clients_own_override_and_each_upstream
         .expect("directory");
     assert!(directory.truncated);
     ran("discover_channels");
+    client.forget_channel_directory();
+    ran("forget_channel_directory");
     assert!(client.supports_upstream_read_mark());
     ran("supports_upstream_read_mark");
     assert_eq!(client.identity().await.expect("identity").id, "U1");

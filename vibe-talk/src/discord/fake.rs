@@ -96,6 +96,8 @@ struct State {
     /// Whether the directory claims to have stopped early.
     directory_truncated: bool,
     directory_calls: Vec<DirectoryRequest>,
+    /// Times the server said its list of channels changed. `#371 channel-search-hash`.
+    directory_forgotten: usize,
     upstream_read_marks_enabled: bool,
     upstream_read_marks: Vec<(ChannelId, MessageId)>,
     /// `#300 reply-marks-read`: queued failures for the owner's mark, and an optional gate a test
@@ -235,6 +237,12 @@ impl FakeDiscord {
     #[must_use]
     pub fn directory_calls(&self) -> Vec<DirectoryRequest> {
         self.lock().directory_calls.clone()
+    }
+
+    /// Times [`ChatClient::forget_channel_directory`] was called.
+    #[must_use]
+    pub fn directory_forgotten(&self) -> usize {
+        self.lock().directory_forgotten
     }
 
     /// Delay each managed registration response, allowing concurrency tests to force overlap.
@@ -683,6 +691,10 @@ impl ChatClient for FakeDiscord {
     fn supports_channel_discovery(&self) -> bool {
         let state = self.lock();
         state.channel_registration_enabled && state.directory.is_some()
+    }
+
+    fn forget_channel_directory(&self) {
+        self.lock().directory_forgotten += 1;
     }
 
     async fn discover_channels(

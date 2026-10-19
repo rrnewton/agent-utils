@@ -155,6 +155,9 @@ pub struct HttpSlackClient {
     /// Where each Web API request is timed, by method and outcome, when the client was built with
     /// one. `#208 persistent-cache`; see [`crate::upstream_profile`].
     shim_profile: Option<Arc<ProviderProfile>>,
+    /// The `users.conversations` pages the channel browser read, by cursor, so searches typed one
+    /// after another walk the same listing without asking Slack again. `#371 channel-search-hash`.
+    pub(super) directory_pages: crate::directory::Kept<String, Value>,
 }
 
 impl HttpSlackClient {
@@ -213,6 +216,7 @@ impl HttpSlackClient {
             live_threads: Mutex::new(HashMap::new()),
             post_limit: config.post_limit(),
             shim_profile: None,
+            directory_pages: crate::directory::Kept::default(),
         })
     }
 
@@ -243,6 +247,16 @@ impl HttpSlackClient {
     #[must_use]
     pub fn with_flat_reconcile(mut self, period: Duration) -> Self {
         self.flat_reconcile = period;
+        self
+    }
+
+    /// How long the channel browser keeps Slack's listing of the app's conversations: two minutes
+    /// unless set ([`crate::directory::DIRECTORY_KEEP`]), and forgotten whenever the list of
+    /// channels here changes. `Duration::ZERO` reads it again for every search.
+    /// `#371 channel-search-hash`.
+    #[must_use]
+    pub fn with_directory_keep(mut self, keep: Duration) -> Self {
+        self.directory_pages = crate::directory::Kept::new(keep);
         self
     }
 
@@ -946,6 +960,10 @@ impl ChatClient for HttpSlackClient {
 
     fn supports_channel_discovery(&self) -> bool {
         self.channel_discovery
+    }
+
+    fn forget_channel_directory(&self) {
+        self.directory_pages.forget();
     }
 
     async fn discover_channels(

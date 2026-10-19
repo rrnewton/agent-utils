@@ -311,6 +311,9 @@ impl AppState {
     pub fn refresh_routes(&self) {
         let channels = self.all_channels();
         self.providers.replace_routes(&channels);
+        // The list changed (an addition, a removal, a channel hidden or shown again), so a kept
+        // channel listing may be out of date. `#371 channel-search-hash`.
+        self.providers.forget_channel_directory();
         self.message_cache
             .set_routes(&channels, &self.providers, &self.config);
     }

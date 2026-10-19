@@ -1435,7 +1435,14 @@ impl HttpSlackClient {
             if !position.c.is_empty() {
                 params.push(("cursor", position.c.clone()));
             }
-            let value = self.call("users.conversations", &params).await?;
+            let value = match self.directory_pages.get(&position.c) {
+                Some(kept) => kept,
+                None => {
+                    let value = self.call("users.conversations", &params).await?;
+                    self.directory_pages.put(position.c.clone(), value.clone());
+                    value
+                }
+            };
             let channels = value
                 .get("channels")
                 .and_then(Value::as_array)

@@ -3269,6 +3269,12 @@ answers the first read with one of those statuses. Every string the bridge retur
 A leading `#` in a search is optional (`#371 channel-search-hash`): `#team` searches for `team`, at
 every service, so the bridge is never sent it, and Slack, which writes every channel `#name`, finds
 `#team-builds` for `team`, `Team` or `#team` alike. A search of nothing but `#` lists everything.
+Each service's listing is kept on the server for two minutes, per service (`#371
+channel-search-hash`): Slack lists every conversation the app is in before it can answer one search,
+which can take several seconds, so the searches typed after the first walk the listing Slack gave
+it, and a bridge's answer to the same search, cursor and page size is given again. Every change to
+the list of channels here (an addition, a removal, a channel hidden or shown again) forgets what was
+kept, and whether an entry is already on the list is always decided afresh from the list.
 
 A compatible provider bridge may separately implement `POST /channels/{id}/read` and opt in with
 `discord.upstream_read_marks = true`. The web app then offers **Mark read in** *the service* under each
