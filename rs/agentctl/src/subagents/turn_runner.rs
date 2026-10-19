@@ -11,8 +11,14 @@
 //! window or Herdr tab) is never touched; the receipt names it.
 //!
 //! The proof needs `/proc` to show every process, so it is refused inside a nested PID
-//! namespace. It relies on start ticks rather than a boot identity, which
-//! the runtime does not record.
+//! namespace. A process recorded with a boot identity that differs from the current boot is
+//! gone whatever its PID names now; one recorded without (a legacy record) is judged by its
+//! start ticks alone. The runner's boot identity lives in `runner-identity.json` beside the row,
+//! and applies only while that sidecar matches the row. A recorded harness tree keeps the worker
+//! alive while its per-turn cgroup has processes or any process carries the turn's generation
+//! in its environment, even after the harness leader has exited. The Python runtime applies the
+//! same rules before it archives; both editions load the corpus in
+//! `testdata/headless-ownership`.
 
 use super::*;
 
@@ -34,6 +40,15 @@ const MAX_PROCESS_ID: i64 = (1 << 31) - 1;
 const STARTUP_GRACE_SECONDS: i64 = 20;
 /// Linux process states that `/proc/PID/stat` can report.
 const PROCESS_STATES: [&str; 12] = ["R", "S", "D", "Z", "T", "t", "X", "x", "K", "W", "P", "I"];
+/// States of a process that has exited and awaits, or is undergoing, its reap.
+const EXITED_STATES: [&str; 3] = ["Z", "X", "x"];
+/// The environment entry the runtime gives every process of one turn's harness tree.
+const GENERATION_ENV: &str = "AGENTCTL_HARNESS_GENERATION";
+const HARNESS_SCHEMA: &str = "agentctl-headless-harness/v1";
+const RUNNER_SCHEMA: &str = "agentctl-headless-runner/v1";
+const CGROUP_PREFIX: &str = "agentctl-harness-";
+const MAX_BOOT_ID_BYTES: u64 = 128;
+const MAX_ENVIRON_BYTES: u64 = 16 * 1024 * 1024;
 
 #[cfg(not(test))]
 fn proc_root() -> PathBuf {
@@ -94,11 +109,21 @@ struct Evidence {
     presentation: Value,
 }
 
-/// One process the runtime recorded, with the start tick it recorded, if any.
+/// One process the runtime recorded, with the start tick and boot it recorded, if any.
 struct RecordedProcess {
     label: String,
     pid: i64,
     started_at: Option<String>,
+    boot_id: Option<String>,
+    /// The harness tree a schema-1 `active-harness.json` records beside its leader.
+    tree: Option<HarnessTree>,
+}
+
+/// Membership proofs for one turn's harness tree that outlive its leader.
+struct HarnessTree {
+    generation: String,
+    cgroup: Option<PathBuf>,
+    leader_start: u64,
 }
 
 enum ProcessState {
@@ -218,6 +243,45 @@ fn initial_pid_namespace(proc: &Path) -> std::result::Result<(), String> {
     }
 }
 
+/// A canonical lower-case Linux boot UUID, as `/proc/sys/kernel/random/boot_id` spells it.
+fn canonical_boot(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+            }
+        })
+}
+
+/// The current boot identity, read only when a record carries one to compare.
+fn current_boot(proc: &Path) -> std::result::Result<String, String> {
+    let path = proc.join("sys/kernel/random/boot_id");
+    let raw = read_regular(&path, MAX_BOOT_ID_BYTES)
+        .map_err(|error| format!("cannot read the boot identity {}: {error}", path.display()))?
+        .ok_or_else(|| format!("the boot identity {} does not exist", path.display()))?;
+    let value = std::str::from_utf8(&raw).unwrap_or("").trim().to_owned();
+    if canonical_boot(&value) {
+        Ok(value)
+    } else {
+        Err(format!("the boot identity {} is malformed", path.display()))
+    }
+}
+
+/// An optional recorded boot identity: absent or null, or a canonical UUID.
+fn recorded_boot(
+    value: Option<&Value>,
+    path: &Path,
+    key: &str,
+) -> std::result::Result<Option<String>, String> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(boot)) if canonical_boot(boot) => Ok(Some(boot.clone())),
+        Some(_) => Err(format!("{} has an invalid {key}", path.display())),
+    }
+}
+
 fn canonical_ticks(value: &str) -> Option<u64> {
     value
         .parse::<u64>()
@@ -231,13 +295,21 @@ fn process_id(value: &Value) -> Option<i64> {
         .filter(|pid| (1..=MAX_PROCESS_ID).contains(pid))
 }
 
-/// Check one recorded process: `Ok(None)` when it is gone or its PID was reused.
+/// Check one recorded process: `Ok(None)` when it is gone, its PID was reused, or it was
+/// recorded during an earlier boot.
 fn recorded_process_alive(
     proc: &Path,
     process: &RecordedProcess,
 ) -> std::result::Result<Option<String>, String> {
+    if let Some(boot) = process.boot_id.as_deref() {
+        if boot != current_boot(proc)? {
+            return Ok(None);
+        }
+    }
     match process_state(proc, process.pid)? {
         ProcessState::Gone => Ok(None),
+        // An exited process awaiting (or undergoing) its reap can no longer act.
+        ProcessState::Running { state, .. } if EXITED_STATES.contains(&state.as_str()) => Ok(None),
         ProcessState::Running { starttime, state } => match process.started_at.as_deref() {
             None => Err(format!(
                 "{} (pid {}) exists and has no recorded start time, so it may still be that process",
@@ -286,6 +358,163 @@ fn presentation(row: &Value) -> Value {
     })
 }
 
+/// A process that still belongs to a recorded harness tree, if any: the tree's per-turn cgroup
+/// still has processes, or a live process at least as young as the leader carries the turn's
+/// generation in its environment. Processes whose records cannot be read are not members.
+fn harness_tree_alive(
+    proc: &Path,
+    tree: &HarnessTree,
+) -> std::result::Result<Option<String>, String> {
+    if let Some(cgroup) = &tree.cgroup {
+        if fs::symlink_metadata(cgroup).is_ok_and(|metadata| metadata.is_dir()) {
+            let events_path = cgroup.join("cgroup.events");
+            let events = read_regular(&events_path, MAX_RUNTIME_FILE_BYTES)
+                .map_err(|error| format!("cannot read {}: {error}", events_path.display()))?
+                .ok_or_else(|| format!("{} does not exist", events_path.display()))?;
+            let populated = String::from_utf8_lossy(&events).lines().find_map(|line| {
+                line.strip_prefix("populated ")
+                    .map(str::trim)
+                    .map(str::to_owned)
+            });
+            match populated.as_deref() {
+                Some("1") => {
+                    return Ok(Some(format!(
+                        "its harness cgroup {} still has processes",
+                        cgroup.display()
+                    )))
+                }
+                Some("0") => {}
+                _ => return Err(format!("{} is malformed", events_path.display())),
+            }
+        }
+    }
+    let needle = format!("{GENERATION_ENV}={}", tree.generation);
+    let entries =
+        fs::read_dir(proc).map_err(|error| format!("cannot list {}: {error}", proc.display()))?;
+    let mut pids: Vec<i64> = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<i64>().ok())
+        })
+        .filter(|pid| (1..=MAX_PROCESS_ID).contains(pid))
+        .collect();
+    pids.sort_unstable();
+    for pid in pids {
+        let Ok(ProcessState::Running { starttime, state }) = process_state(proc, pid) else {
+            continue;
+        };
+        if EXITED_STATES.contains(&state.as_str()) || starttime < tree.leader_start {
+            continue;
+        }
+        let Ok(Some(environ)) =
+            read_regular(&proc.join(format!("{pid}/environ")), MAX_ENVIRON_BYTES)
+        else {
+            continue;
+        };
+        if environ
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == needle.as_bytes())
+        {
+            return Ok(Some(format!(
+                "pid {pid} of its harness tree (generation {}) is still running",
+                tree.generation
+            )));
+        }
+    }
+    Ok(None)
+}
+
+/// The harness tree a schema-1 `active-harness.json` records, validated as strictly as the
+/// runtime that writes it; `None` for a legacy record.
+fn harness_tree(identity: &Value, path: &Path) -> std::result::Result<Option<HarnessTree>, String> {
+    let Some(schema) = identity.get("schema") else {
+        return Ok(None);
+    };
+    let bad = |detail: &str| format!("{} {detail}", path.display());
+    if schema != HARNESS_SCHEMA {
+        return Err(bad("has an unsupported schema"));
+    }
+    let generation = identity
+        .get("generation")
+        .and_then(Value::as_str)
+        .filter(|generation| {
+            generation.len() == 32
+                && generation
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(|| bad("has no valid generation"))?
+        .to_owned();
+    if recorded_boot(identity.get("boot_id"), path, "boot_id")?.is_none() {
+        return Err(bad("has no valid boot_id"));
+    }
+    recorded_boot(identity.get("runner_boot_id"), path, "runner_boot_id")?;
+    identity
+        .get("process_group")
+        .and_then(process_id)
+        .ok_or_else(|| bad("has no valid process_group"))?;
+    let cgroup = match (
+        identity.get("containment").and_then(Value::as_str),
+        identity.get("cgroup"),
+    ) {
+        (Some("process"), None | Some(Value::Null)) => None,
+        (Some("cgroup"), Some(Value::String(cgroup))) => {
+            let cgroup = PathBuf::from(cgroup);
+            let expected = format!("{CGROUP_PREFIX}{generation}");
+            if !cgroup.is_absolute()
+                || cgroup
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+                || cgroup.file_name().and_then(|name| name.to_str()) != Some(expected.as_str())
+            {
+                return Err(bad(
+                    "records a cgroup that is not this generation's directory",
+                ));
+            }
+            Some(cgroup)
+        }
+        _ => return Err(bad("has no valid containment")),
+    };
+    let leader_start = identity
+        .get("started_at")
+        .and_then(Value::as_str)
+        .and_then(canonical_ticks)
+        .unwrap_or(0);
+    Ok(Some(HarnessTree {
+        generation,
+        cgroup,
+        leader_start,
+    }))
+}
+
+/// The boot identity the runtime recorded for the row's runner, in the sidecar beside the
+/// row; `None` unless the sidecar names exactly this row and runner.
+fn runner_boot_id(state: &Path, row: &Value, pid: i64, started_at: Option<&str>) -> Option<String> {
+    let raw = read_regular(&state.join("runner-identity.json"), MAX_RUNTIME_FILE_BYTES)
+        .ok()
+        .flatten()?;
+    let sidecar: Value = serde_json::from_slice(&raw).ok()?;
+    let recorded_start = match sidecar.get("runner_started_at") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value.as_str()),
+        Some(_) => return None,
+    };
+    let matches = sidecar.get("schema").and_then(Value::as_str) == Some(RUNNER_SCHEMA)
+        && sidecar.get("name").and_then(Value::as_str) == row.get("name").and_then(Value::as_str)
+        && sidecar.get("created_at").and_then(Value::as_str)
+            == row.get("created_at").and_then(Value::as_str)
+        && sidecar.get("runner_pid").and_then(Value::as_i64) == Some(pid)
+        && recorded_start == started_at;
+    sidecar
+        .get("runner_boot_id")
+        .and_then(Value::as_str)
+        .filter(|boot| matches && canonical_boot(boot))
+        .map(str::to_owned)
+}
+
 /// Read `state/NAME/runner.pid`, the PID a runner writes before it records itself.
 fn runner_pid_file(state: &Path) -> std::result::Result<Option<i64>, String> {
     let path = state.join("runner.pid");
@@ -301,10 +530,12 @@ fn runner_pid_file(state: &Path) -> std::result::Result<Option<i64>, String> {
     .transpose()
 }
 
-/// Processes recorded beside the row: a running harness and staged replacement runners.
+/// Processes recorded beside the row: a running harness (with its tree) and staged
+/// replacement runners, in file-name order.
 fn side_processes(state: &Path) -> std::result::Result<Vec<RecordedProcess>, String> {
     let mut processes = Vec::new();
     let mut files = vec![(state.join("active-harness.json"), "its harness".to_owned())];
+    let mut staged = Vec::new();
     match fs::read_dir(state) {
         Ok(entries) => {
             for entry in entries {
@@ -313,13 +544,19 @@ fn side_processes(state: &Path) -> std::result::Result<Vec<RecordedProcess>, Str
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
                 if name.starts_with("MIGRATION_STAGED_") && name.ends_with(".json") {
-                    files.push((entry.path(), "a staged replacement runner".to_owned()));
+                    staged.push(entry.path());
                 }
             }
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(processes),
         Err(error) => return Err(format!("cannot list {}: {error}", state.display())),
     }
+    staged.sort();
+    files.extend(
+        staged
+            .into_iter()
+            .map(|path| (path, "a staged replacement runner".to_owned())),
+    );
     for (path, label) in files {
         let Some(raw) = read_regular(&path, MAX_RUNTIME_FILE_BYTES)
             .map_err(|error| format!("cannot read {}: {error}", path.display()))?
@@ -338,10 +575,36 @@ fn side_processes(state: &Path) -> std::result::Result<Vec<RecordedProcess>, Str
             Some(Value::String(started_at)) => Some(started_at.clone()),
             Some(_) => return Err(format!("{} has an invalid started_at", path.display())),
         };
+        let boot_id = recorded_boot(identity.get("boot_id"), &path, "boot_id")?;
+        let tree = if label == "its harness" {
+            // The runtime refuses a harness record without its leader's start tick or its
+            // runner's identity.
+            if started_at.is_none() {
+                return Err(format!("{} has no started_at", path.display()));
+            }
+            identity
+                .get("runner_pid")
+                .and_then(process_id)
+                .ok_or_else(|| format!("{} has no valid runner_pid", path.display()))?;
+            if !matches!(
+                identity.get("runner_started_at"),
+                None | Some(Value::Null | Value::String(_))
+            ) {
+                return Err(format!(
+                    "{} has an invalid runner_started_at",
+                    path.display()
+                ));
+            }
+            harness_tree(&identity, &path)?
+        } else {
+            None
+        };
         processes.push(RecordedProcess {
             label,
             pid,
             started_at,
+            boot_id,
+            tree,
         });
     }
     Ok(processes)
@@ -491,10 +754,13 @@ fn inspect_runtime_inner(
         evidence.runner_started_at.clone_from(&started_at);
         evidence.runner_pid = runner_pid;
         if let Some(pid) = runner_pid {
+            let boot_id = runner_boot_id(&state, row, pid, started_at.as_deref());
             processes.push(RecordedProcess {
                 label: "its runner".to_owned(),
                 pid,
                 started_at,
+                boot_id,
+                tree: None,
             });
         }
     }
@@ -504,6 +770,8 @@ fn inspect_runtime_inner(
                 label: "the runner named in runner.pid".to_owned(),
                 pid,
                 started_at: None,
+                boot_id: None,
+                tree: None,
             });
         }
     }
@@ -514,6 +782,14 @@ fn inspect_runtime_inner(
             return Ok((lock, Liveness::Alive(alive)));
         }
         gone.push(format!("{} (pid {})", process.label, process.pid));
+        if let (Some(tree), Some(boot)) = (&process.tree, &process.boot_id) {
+            // A tree recorded during an earlier boot cannot have members now.
+            if *boot == current_boot(proc)? {
+                if let Some(member) = harness_tree_alive(proc, tree)? {
+                    return Ok((lock, Liveness::Alive(member)));
+                }
+            }
+        }
     }
     if let Some(row) = row {
         if evidence.runner_pid.is_none() {
@@ -538,6 +814,16 @@ fn inspect_runtime_inner(
         )
     };
     Ok((lock, Liveness::Dead(evidence)))
+}
+
+/// The proof's verdict and detail, for the corpus shared with the Python edition.
+#[cfg(test)]
+pub(super) fn verdict(record: &AgentRecord, proc: &Path) -> (&'static str, String) {
+    match inspect_runtime(record, proc).1 {
+        Liveness::Dead(evidence) => ("dead", evidence.detail),
+        Liveness::Alive(reason) => ("alive", reason),
+        Liveness::Inconclusive(reason) => ("inconclusive", reason),
+    }
 }
 
 /// Refuse while a row without a runner PID may belong to a runner that is still starting: its

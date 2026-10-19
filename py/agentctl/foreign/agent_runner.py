@@ -905,6 +905,7 @@ def main() -> int:
     name = sys.argv[1]
     stage_token = os.environ.get("SUBAGENTS_MIGRATION_STAGE")
     signal.signal(signal.SIGTERM, _handle_sigterm)
+    import faulthandler; faulthandler.register(signal.SIGUSR1, all_threads=True)  # DEBUG-ONLY
     # An inherited SIG_IGN would make the kernel reap exited children at once,
     # freeing a harness leader's number while its leftovers are still swept.
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
@@ -929,6 +930,9 @@ def main() -> int:
             if lib.staged_runner_activate_path(name, stage_token).exists():
                 lib.acknowledge_staged_runner_activation(name, stage_token)
                 stage_token = None
+                # The migration committed this runner to the registry; keep
+                # runner.pid naming the same process for retirement proofs.
+                lib.runner_pid_path(name).write_text(f"{os.getpid()}\n")
                 break
             if not lib.staged_runner_path(name, stage_token).exists():
                 _exit_reason(name, "staged marker removed before activation acknowledgement")

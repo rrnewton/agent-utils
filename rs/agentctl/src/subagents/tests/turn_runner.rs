@@ -1,5 +1,5 @@
 use super::*;
-use crate::subagents::turn_runner::with_proc_root;
+use crate::subagents::turn_runner::{verdict, with_proc_root};
 use std::os::unix::fs::symlink;
 
 const RUNNER: i64 = 4242;
@@ -598,4 +598,80 @@ fn real_process_liveness_decides_retirement() {
         "{failure}"
     );
     assert_eq!(stop().unwrap()["turn_runner_dead"], true);
+}
+
+/// The corpus the Python runtime's `recorded_liveness` also loads: both editions must reach each
+/// verdict from the same runtime records and procfs state.
+#[test]
+fn shared_corpus_verdicts_match_the_python_edition() {
+    let corpus: Value = serde_json::from_str(include_str!(
+        "../../../testdata/headless-ownership/cases.json"
+    ))
+    .unwrap();
+    let boot = corpus["boot"].as_str().unwrap();
+    let other_boot = corpus["other_boot"].as_str().unwrap();
+    let cases = corpus["cases"].as_array().unwrap();
+    assert!(cases.len() >= 30);
+    for case in cases {
+        let name = case["name"].as_str().unwrap();
+        let worker = Worker::new();
+        if !case.get("boot").is_some_and(Value::is_null) {
+            fs::create_dir_all(worker.proc.join("sys/kernel/random")).unwrap();
+            fs::write(
+                worker.proc.join("sys/kernel/random/boot_id"),
+                format!("{boot}\n"),
+            )
+            .unwrap();
+        }
+        for entry in case["processes"].as_array().unwrap() {
+            let pid = entry["pid"].as_i64().unwrap();
+            let start = entry["start"].as_u64().unwrap();
+            let state = entry["state"].as_str().unwrap();
+            let directory = worker.proc.join(pid.to_string());
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(
+                directory.join("stat"),
+                format!("{pid} (corpus (proc)) {state} 1 {pid} {pid} 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 {start} 1000 10\n"),
+            )
+            .unwrap();
+            if let Some(environ) = entry.get("environ").and_then(Value::as_array) {
+                let mut bytes = Vec::new();
+                for item in environ {
+                    bytes.extend_from_slice(item.as_str().unwrap().as_bytes());
+                    bytes.push(0);
+                }
+                fs::write(directory.join("environ"), bytes).unwrap();
+            }
+        }
+        let cgroup_root = worker.fixture.root.join("cgroup");
+        fs::create_dir_all(&cgroup_root).unwrap();
+        for (directory, events) in case["cgroups"].as_object().unwrap() {
+            fs::create_dir_all(cgroup_root.join(directory)).unwrap();
+            fs::write(
+                cgroup_root.join(directory).join("cgroup.events"),
+                events.as_str().unwrap(),
+            )
+            .unwrap();
+        }
+        if case.get("row").is_some_and(Value::is_null) {
+            worker.write_registry(json!([]));
+        }
+        for (file, content) in case["files"].as_object().unwrap() {
+            let text = content
+                .as_str()
+                .map_or_else(|| content.to_string(), str::to_owned)
+                .replace("$OTHER_BOOT", other_boot)
+                .replace("$BOOT", boot)
+                .replace("$CGROUP", &cgroup_root.to_string_lossy());
+            fs::write(worker.state().join(file), text).unwrap();
+        }
+        let record = worker.fixture.manager().read_record("worker").unwrap();
+        let (verdict, detail) = verdict(&record, &worker.proc);
+        assert_eq!(
+            verdict,
+            case["expect"].as_str().unwrap(),
+            "{name}: {}: {detail}",
+            case["why"].as_str().unwrap()
+        );
+    }
 }

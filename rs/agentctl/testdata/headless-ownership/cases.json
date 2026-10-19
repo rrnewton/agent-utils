@@ -1,0 +1,769 @@
+{
+  "schema": "agentctl-headless-ownership-corpus/v1",
+  "description": "Shared by both agentctl editions: the Python runtime's recorded_liveness and the Rust turn-runner retirement proof must reach each verdict from the same runtime records and procfs state. Placeholders: $BOOT (the current boot), $OTHER_BOOT, $CGROUP (a test directory standing in for the cgroup v2 parent). The registry has one row for 'worker' (runner pid 4242, start tick 555) unless a case sets row to null.",
+  "boot": "11111111-2222-4333-8444-555555555555",
+  "other_boot": "99999999-8888-4777-8666-555555555555",
+  "cases": [
+    {
+      "name": "no-live-process",
+      "why": "the recorded runner no longer exists",
+      "files": {},
+      "processes": [],
+      "cgroups": {},
+      "expect": "dead"
+    },
+    {
+      "name": "runner-alive",
+      "why": "the row's runner pid still has its recorded start tick",
+      "files": {},
+      "processes": [
+        {
+          "pid": 4242,
+          "start": 555,
+          "state": "S"
+        }
+      ],
+      "cgroups": {},
+      "expect": "alive"
+    },
+    {
+      "name": "runner-pid-reused",
+      "why": "the runner pid now names a newer process",
+      "files": {},
+      "processes": [
+        {
+          "pid": 4242,
+          "start": 999,
+          "state": "S"
+        }
+      ],
+      "cgroups": {},
+      "expect": "dead"
+    },
+    {
+      "name": "runner-exited-unreaped",
+      "why": "an exited runner awaiting its reap can no longer act",
+      "files": {},
+      "processes": [
+        {
+          "pid": 4242,
+          "start": 555,
+          "state": "Z"
+        }
+      ],
+      "cgroups": {},
+      "expect": "dead"
+    },
+    {
+      "name": "runner-without-start-exited",
+      "why": "an exited process needs no start tick to be judged gone",
+      "files": {
+        "runner.pid": "5000\n"
+      },
+      "processes": [
+        {
+          "pid": 5000,
+          "start": 1,
+          "state": "Z"
+        }
+      ],
+      "cgroups": {},
+      "expect": "dead"
+    },
+    {
+      "name": "runner-earlier-boot",
+      "why": "adversarial reboot reuse: same pid and start tick, but the sidecar binds the runner to an earlier boot",
+      "files": {
+        "runner-identity.json": {
+          "schema": "agentctl-headless-runner/v1",
+          "name": "worker",
+          "created_at": "2026-10-01T00:00:00+00:00",
+          "runner_pid": 4242,
+          "runner_started_at": "555",
+          "runner_boot_id": "$OTHER_BOOT"
+        }
+      },
+      "processes": [
+        {
+          "pid": 4242,
+          "start": 555,
+          "state": "S"
+        }
+      ],
+      "cgroups": {},
+      "expect": "dead"
+    },
+    {
+      "name": "runner-current-boot",
+      "why": "the sidecar binds the live runner to this boot",
+      "files": {
+        "runner-identity.json": {
+          "schema": "agentctl-headless-runner/v1",
+          "name": "worker",
+          "created_at": "2026-10-01T00:00:00+00:00",
+          "runner_pid": 4242,
+          "runner_started_at": "555",
+          "runner_boot_id": "$BOOT"
+        }
+      },
+      "processes": [
+        {
+          "pid": 4242,
+          "start": 555,
+          "state": "S"
+        }
+      ],
+      "cgroups": {},
+      "expect": "alive"
+    },
+    {
+      "name": "runner-sidecar-for-another-row",
+      "why": "a sidecar that does not match the row is ignored, so the start tick decides",
+      "files": {
+        "runner-identity.json": {
+          "schema": "agentctl-headless-runner/v1",
+          "name": "worker",
+          "created_at": "2026-09-01T00:00:00+00:00",
+          "runner_pid": 4242,
+          "runner_started_at": "555",
+          "runner_boot_id": "$OTHER_BOOT"
+        }
+      },
+      "processes": [
+        {
+          "pid": 4242,
+          "start": 555,
+          "state": "S"
+        }
+      ],
+      "cgroups": {},
+      "expect": "alive"
+    },
+    {
+      "name": "runner-sidecar-for-another-runner",
+      "why": "a sidecar naming an older runner pid is ignored",
+      "files": {
+        "runner-identity.json": {
+          "schema": "agentctl-headless-runner/v1",
+          "name": "worker",
+          "created_at": "2026-10-01T00:00:00+00:00",
+          "runner_pid": 4241,
+          "runner_started_at": "555",
+          "runner_boot_id": "$OTHER_BOOT"
+        }
+      },
+      "processes": [
+        {
+          "pid": 4242,
+          "start": 555,
+          "state": "S"
+        }
+      ],
+      "cgroups": {},
+      "expect": "alive"
+    },
+    {
+      "name": "harness-leader-alive",
+      "why": "the recorded harness leader is still running",
+      "files": {
+        "active-harness.json": {
+          "schema": "agentctl-headless-harness/v1",
+          "runner_pid": 4242,
+          "runner_started_at": "555",
+          "runner_boot_id": "$BOOT",
+          "pid": 6000,
+          "started_at": "700",
+          "boot_id": "$BOOT",
+          "process_group": 6000,
+          "generation": "0123456789abcdef0123456789abcdef",
+          "containment": "process",
+          "recorded_at": "2026-10-01T00:00:01+00:00"
+        }
+      },
+      "processes": [
+        {
+          "pid": 6000,
+          "start": 700,
+          "state": "S"
+        }
+      ],
+      "cgroups": {},
+      "expect": "alive"
+    },
+    {
+      "name": "harness-earlier-boot",
+      "why": "a harness tree recorded during an earlier boot is gone, members and all",
+      "files": {
+        "active-harness.json": {
+          "schema": "agentctl-headless-harness/v1",
+          "runner_pid": 4242,
+          "runner_started_at": "555",
+          "runner_boot_id": "$BOOT",
+          "pid": 6000,
+          "started_at": "700",
+          "boot_id": "$OTHER_BOOT",
+          "process_group": 6000,
+          "generation": "0123456789abcdef0123456789abcdef",
+          "containment": "process",
+          "recorded_at": "2026-10-01T00:00:01+00:00"
+        }
+      },
+      "processes": [
+        {
+          "pid": 6000,
+          "start": 700,
+          "state": "S"
+        },
+        {
+          "pid": 6100,
+          "start": 800,
+          "state": "S",
+          "environ": [
+            "AGENTCTL_HARNESS_GENERATION=0123456789abcdef0123456789abcdef"
+          ]
+        }
+      ],
+      "cgroups": {},
+      "expect": "dead"
+    },
+    {
+      "name": "leader-dead-child-alive",
+      "why": "leader-dead/child-live: a younger process still carries the turn's generation",
+      "files": {
+        "active-harness.json": {
+          "schema": "agentctl-headless-harness/v1",
+          "runner_pid": 4242,
+          "runner_started_at": "555",
+          "runner_boot_id": "$BOOT",
+          "pid": 6000,
+          "started_at": "700",
+          "boot_id": "$BOOT",
+          "process_group": 6000,
+          "generation": "0123456789abcdef0123456789abcdef",
+          "containment": "process",
+          "recorded_at": "2026-10-01T00:00:01+00:00"
+        }
+      },
+      "processes": [
+        {
+          "pid": 6100,
+          "start": 800,
+          "state": "S",
+          "environ": [
+            "HOME=/home/user",
+            "AGENTCTL_HARNESS_GENERATION=0123456789abcdef0123456789abcdef"
+          ]
+        }
+      ],
+      "cgroups": {},
+      "expect": "alive"
+    },
+    {
+      "name": "leader-dead-session-member-without-generation",
+      "why": "a same-session process without the generation proves nothing once the leader is gone",
+      "files": {
+        "active-harness.json": {
+          "schema": "agentctl-headless-harness/v1",
+          "runner_pid": 4242,
+          "runner_started_at": "555",
+          "runner_boot_id": "$BOOT",
+          "pid": 6000,
+          "started_at": "700",
+          "boot_id": "$BOOT",
+          "process_group": 6000,
+          "generation": "0123456789abcdef0123456789abcdef",
+          "containment": "process",
+          "recorded_at": "2026-10-01T00:00:01+00:00"
+        }
+      },
+      "processes": [
+        {
+          "pid": 6100,
+          "start": 800,
+          "state": "S",
+          "environ": [
+            "HOME=/home/user"
+          ]
+        }
+      ],
+      "cgroups": {},
+      "expect": "dead"
+    },
+    {
+      "name": "generation-holder-older-than-leader",
+      "why": "a process older than the leader cannot belong to its tree",
+      "files": {
+        "active-harness.json": {
+          "schema": "agentctl-headless-harness/v1",
+          "runner_pid": 4242,
+          "runner_started_at": "555",
+          "runner_boot_id": "$BOOT",
+          "pid": 6000,
+          "started_at": "700",
+          "boot_id": "$BOOT",
+          "process_group": 6000,
+          "generation": "0123456789abcdef0123456789abcdef",
+          "containment": "process",
+          "recorded_at": "2026-10-01T00:00:01+00:00"
+        }
+      },
+      "processes": [
+        {
+          "pid": 6100,
+          "start": 600,
+          "state": "S",
+          "environ": [
+            "AGENTCTL_HARNESS_GENERATION=0123456789abcdef0123456789abcdef"
+          ]
+        }
+      ],
+      "cgroups": {},
+      "expect": "dead"
+    },
+    {
+      "name": "generation-holder-exited",
+      "why": "an exited (zombie) generation holder is not running",
+      "files": {
+        "active-harness.json": {
+          "schema": "agentctl-headless-harness/v1",
+          "runner_pid": 4242,
+          "runner_started_at": "555",
+          "runner_boot_id": "$BOOT",
+          "pid": 6000,
+          "started_at": "700",
+          "boot_id": "$BOOT",
+          "process_group": 6000,
+          "generation": "0123456789abcdef0123456789abcdef",
+          "containment": "process",
+          "recorded_at": "2026-10-01T00:00:01+00:00"
+        }
+      },
+      "processes": [
+        {
+          "pid": 6100,
+          "start": 800,
+          "state": "Z",
+          "environ": [
+            "AGENTCTL_HARNESS_GENERATION=0123456789abcdef0123456789abcdef"
+          ]
+        }
+      ],
+      "cgroups": {},
+      "expect": "dead"
+    },
+    {
+      "name": "generation-prefix-is-not-membership",
+      "why": "only the exact environment entry proves membership",
+      "files": {
+        "active-harness.json": {
+          "schema": "agentctl-headless-harness/v1",
+          "runner_pid": 4242,
+          "runner_started_at": "555",
+          "runner_boot_id": "$BOOT",
+          "pid": 6000,
+          "started_at": "700",
+          "boot_id": "$BOOT",
+          "process_group": 6000,
+          "generation": "0123456789abcdef0123456789abcdef",
+          "containment": "process",
+          "recorded_at": "2026-10-01T00:00:01+00:00"
+        }
+      },
+      "processes": [
+        {
+          "pid": 6100,
+          "start": 800,
+          "state": "S",
+          "environ": [
+            "AGENTCTL_HARNESS_GENERATION=0123456789abcdef0123456789abcdef0"
+          ]
+        }
+      ],
+      "cgroups": {},
+      "expect": "dead"
+    },
+    {
+      "name": "cgroup-populated",
+      "why": "the per-turn cgroup still has processes",
+      "files": {
+        "active-harness.json": {
+          "schema": "agentctl-headless-harness/v1",
+          "runner_pid": 4242,
+          "runner_started_at": "555",
+          "runner_boot_id": "$BOOT",
+          "pid": 6000,
+          "started_at": "700",
+          "boot_id": "$BOOT",
+          "process_group": 6000,
+          "generation": "0123456789abcdef0123456789abcdef",
+          "containment": "cgroup",
+          "recorded_at": "2026-10-01T00:00:01+00:00",
+          "cgroup": "$CGROUP/agentctl-harness-0123456789abcdef0123456789abcdef"
+        }
+      },
+      "processes": [],
+      "cgroups": {
+        "agentctl-harness-0123456789abcdef0123456789abcdef": "populated 1\nfrozen 0\n"
+      },
+      "expect": "alive"
+    },
+    {
+      "name": "cgroup-empty",
+      "why": "the per-turn cgroup is empty",
+      "files": {
+        "active-harness.json": {
+          "schema": "agentctl-headless-harness/v1",
+          "runner_pid": 4242,
+          "runner_started_at": "555",
+          "runner_boot_id": "$BOOT",
+          "pid": 6000,
+          "started_at": "700",
+          "boot_id": "$BOOT",
+          "process_group": 6000,
+          "generation": "0123456789abcdef0123456789abcdef",
+          "containment": "cgroup",
+          "recorded_at": "2026-10-01T00:00:01+00:00",
+          "cgroup": "$CGROUP/agentctl-harness-0123456789abcdef0123456789abcdef"
+        }
+      },
+      "processes": [],
+      "cgroups": {
+        "agentctl-harness-0123456789abcdef0123456789abcdef": "populated 0\nfrozen 0\n"
+      },
+      "expect": "dead"
+    },
+    {
+      "name": "cgroup-removed",
+      "why": "the per-turn cgroup no longer exists",
+      "files": {
+        "active-harness.json": {
+          "schema": "agentctl-headless-harness/v1",
+          "runner_pid": 4242,
+          "runner_started_at": "555",
+          "runner_boot_id": "$BOOT",
+          "pid": 6000,
+          "started_at": "700",
+          "boot_id": "$BOOT",
+          "process_group": 6000,
+          "generation": "0123456789abcdef0123456789abcdef",
+          "containment": "cgroup",
+          "recorded_at": "2026-10-01T00:00:01+00:00",
+          "cgroup": "$CGROUP/agentctl-harness-0123456789abcdef0123456789abcdef"
+        }
+      },
+      "processes": [],
+      "cgroups": {},
+      "expect": "dead"
+    },
+    {
+      "name": "cgroup-events-malformed",
+      "why": "unreadable cgroup evidence is not a death certificate",
+      "files": {
+        "active-harness.json": {
+          "schema": "agentctl-headless-harness/v1",
+          "runner_pid": 4242,
+          "runner_started_at": "555",
+          "runner_boot_id": "$BOOT",
+          "pid": 6000,
+          "started_at": "700",
+          "boot_id": "$BOOT",
+          "process_group": 6000,
+          "generation": "0123456789abcdef0123456789abcdef",
+          "containment": "cgroup",
+          "recorded_at": "2026-10-01T00:00:01+00:00",
+          "cgroup": "$CGROUP/agentctl-harness-0123456789abcdef0123456789abcdef"
+        }
+      },
+      "processes": [],
+      "cgroups": {
+        "agentctl-harness-0123456789abcdef0123456789abcdef": "frozen 0\n"
+      },
+      "expect": "inconclusive"
+    },
+    {
+      "name": "harness-bad-generation",
+      "why": "a malformed schema-1 harness record refuses",
+      "files": {
+        "active-harness.json": {
+          "schema": "agentctl-headless-harness/v1",
+          "runner_pid": 4242,
+          "runner_started_at": "555",
+          "runner_boot_id": "$BOOT",
+          "pid": 6000,
+          "started_at": "700",
+          "boot_id": "$BOOT",
+          "process_group": 6000,
+          "generation": "short",
+          "containment": "process",
+          "recorded_at": "2026-10-01T00:00:01+00:00"
+        }
+      },
+      "processes": [],
+      "cgroups": {},
+      "expect": "inconclusive"
+    },
+    {
+      "name": "harness-foreign-cgroup",
+      "why": "a cgroup path that is not this generation's directory refuses",
+      "files": {
+        "active-harness.json": {
+          "schema": "agentctl-headless-harness/v1",
+          "runner_pid": 4242,
+          "runner_started_at": "555",
+          "runner_boot_id": "$BOOT",
+          "pid": 6000,
+          "started_at": "700",
+          "boot_id": "$BOOT",
+          "process_group": 6000,
+          "generation": "0123456789abcdef0123456789abcdef",
+          "containment": "cgroup",
+          "recorded_at": "2026-10-01T00:00:01+00:00",
+          "cgroup": "$CGROUP/system.slice"
+        }
+      },
+      "processes": [],
+      "cgroups": {},
+      "expect": "inconclusive"
+    },
+    {
+      "name": "harness-without-boot",
+      "why": "a schema-1 harness record must carry its boot identity",
+      "files": {
+        "active-harness.json": {
+          "schema": "agentctl-headless-harness/v1",
+          "runner_pid": 4242,
+          "runner_started_at": "555",
+          "runner_boot_id": "$BOOT",
+          "pid": 6000,
+          "started_at": "700",
+          "boot_id": null,
+          "process_group": 6000,
+          "generation": "0123456789abcdef0123456789abcdef",
+          "containment": "process",
+          "recorded_at": "2026-10-01T00:00:01+00:00"
+        }
+      },
+      "processes": [],
+      "cgroups": {},
+      "expect": "inconclusive"
+    },
+    {
+      "name": "harness-without-runner",
+      "why": "a harness record without its runner's identity refuses",
+      "files": {
+        "active-harness.json": {
+          "pid": 6000,
+          "started_at": "700"
+        }
+      },
+      "processes": [],
+      "cgroups": {},
+      "expect": "inconclusive"
+    },
+    {
+      "name": "legacy-harness-gone",
+      "why": "a legacy harness record whose leader is gone",
+      "files": {
+        "active-harness.json": {
+          "runner_pid": 4242,
+          "runner_started_at": "555",
+          "pid": 6000,
+          "started_at": "700"
+        }
+      },
+      "processes": [],
+      "cgroups": {},
+      "expect": "dead"
+    },
+    {
+      "name": "legacy-harness-alive",
+      "why": "a legacy harness record whose leader still runs",
+      "files": {
+        "active-harness.json": {
+          "runner_pid": 4242,
+          "runner_started_at": "555",
+          "pid": 6000,
+          "started_at": "700"
+        }
+      },
+      "processes": [
+        {
+          "pid": 6000,
+          "start": 700,
+          "state": "S"
+        }
+      ],
+      "cgroups": {},
+      "expect": "alive"
+    },
+    {
+      "name": "staged-earlier-boot",
+      "why": "a staged runner recorded during an earlier boot is gone",
+      "files": {
+        "MIGRATION_STAGED_abc.json": {
+          "pid": 7000,
+          "started_at": "88",
+          "boot_id": "$OTHER_BOOT",
+          "recorded_at": "2026-10-01T00:00:02+00:00"
+        }
+      },
+      "processes": [
+        {
+          "pid": 7000,
+          "start": 88,
+          "state": "S"
+        }
+      ],
+      "cgroups": {},
+      "expect": "dead"
+    },
+    {
+      "name": "staged-alive",
+      "why": "a staged replacement runner a failed migration left running",
+      "files": {
+        "MIGRATION_STAGED_abc.json": {
+          "pid": 7000,
+          "started_at": "88",
+          "boot_id": "$BOOT",
+          "recorded_at": "2026-10-01T00:00:02+00:00"
+        }
+      },
+      "processes": [
+        {
+          "pid": 7000,
+          "start": 88,
+          "state": "S"
+        }
+      ],
+      "cgroups": {},
+      "expect": "alive"
+    },
+    {
+      "name": "staged-malformed-boot",
+      "why": "a staged record with a malformed boot identity refuses",
+      "files": {
+        "MIGRATION_STAGED_abc.json": {
+          "pid": 7000,
+          "started_at": "88",
+          "boot_id": "not-a-boot",
+          "recorded_at": "2026-10-01T00:00:02+00:00"
+        }
+      },
+      "processes": [],
+      "cgroups": {},
+      "expect": "inconclusive"
+    },
+    {
+      "name": "malformed-staged-beside-live-runner",
+      "why": "records are all read before any is judged",
+      "files": {
+        "MIGRATION_STAGED_abc.json": {
+          "pid": 7000,
+          "started_at": "88",
+          "boot_id": "not-a-boot",
+          "recorded_at": "2026-10-01T00:00:02+00:00"
+        }
+      },
+      "processes": [
+        {
+          "pid": 4242,
+          "start": 555,
+          "state": "S"
+        }
+      ],
+      "cgroups": {},
+      "expect": "inconclusive"
+    },
+    {
+      "name": "staged-order-is-by-name",
+      "why": "the first staged runner that may live decides, in file-name order",
+      "files": {
+        "MIGRATION_STAGED_b.json": {
+          "pid": 7001,
+          "started_at": null,
+          "boot_id": "$BOOT",
+          "recorded_at": "2026-10-01T00:00:02+00:00"
+        },
+        "MIGRATION_STAGED_a.json": {
+          "pid": 7000,
+          "started_at": "88",
+          "boot_id": "$BOOT",
+          "recorded_at": "2026-10-01T00:00:02+00:00"
+        }
+      },
+      "processes": [
+        {
+          "pid": 7000,
+          "start": 88,
+          "state": "S"
+        },
+        {
+          "pid": 7001,
+          "start": 1,
+          "state": "S"
+        }
+      ],
+      "cgroups": {},
+      "expect": "alive"
+    },
+    {
+      "name": "runner-pid-file-without-start",
+      "why": "a live pid in runner.pid has no start tick to prove it is another process",
+      "files": {
+        "runner.pid": "5000\n"
+      },
+      "processes": [
+        {
+          "pid": 5000,
+          "start": 1,
+          "state": "S"
+        }
+      ],
+      "cgroups": {},
+      "expect": "inconclusive"
+    },
+    {
+      "name": "boot-unreadable-when-needed",
+      "why": "a recorded boot cannot be compared when the current one is unreadable",
+      "boot": null,
+      "files": {
+        "runner-identity.json": {
+          "schema": "agentctl-headless-runner/v1",
+          "name": "worker",
+          "created_at": "2026-10-01T00:00:00+00:00",
+          "runner_pid": 4242,
+          "runner_started_at": "555",
+          "runner_boot_id": "$OTHER_BOOT"
+        }
+      },
+      "processes": [],
+      "cgroups": {},
+      "expect": "inconclusive"
+    },
+    {
+      "name": "boot-unneeded-for-legacy",
+      "why": "a legacy record needs no boot identity",
+      "boot": null,
+      "files": {},
+      "processes": [],
+      "cgroups": {},
+      "expect": "dead"
+    },
+    {
+      "name": "no-row-staged-gone",
+      "why": "without a registry row, side records still decide",
+      "row": null,
+      "files": {
+        "MIGRATION_STAGED_abc.json": {
+          "pid": 7000,
+          "started_at": "88",
+          "boot_id": "$BOOT",
+          "recorded_at": "2026-10-01T00:00:02+00:00"
+        }
+      },
+      "processes": [],
+      "cgroups": {},
+      "expect": "dead"
+    }
+  ]
+}

@@ -866,14 +866,20 @@ def kill_harness_tree(
             leader.send(signal.SIGSTOP)
         census_deadline = started + bound / 2
         report.converged = False
+        # Inside a runner that adopts its tree's orphans, walking down from the
+        # anchors finds the whole tree. Anywhere else an orphan may have been
+        # adopted outside it, and only a procfs scan by generation reaches it.
+        scan = not runner_is_self or not _SUBREAPER
         while True:
             # Stop the world: every round pins and stops the members it finds;
             # stopped processes cannot fork, so an empty round is a fixed point.
+            first = True
             while True:
                 if not _census_round(record, leader, leader_unreaped, runner_pid, runner_is_self,
-                                     runner_handle, members, report):
+                                     runner_handle, members, report, scan=scan and first):
                     report.converged = True
                     break
+                first = False
                 if time.monotonic() >= census_deadline:
                     report.converged = False
                     break
@@ -891,7 +897,8 @@ def kill_harness_tree(
             # Anything forked after the last census (a non-converged tree)
             # is still proven by its generation or parent; go round again.
             before = len(members)
-            _census_round(record, None, False, runner_pid, runner_is_self, runner_handle, members, report)
+            _census_round(record, None, False, runner_pid, runner_is_self, runner_handle, members, report,
+                          scan=scan)
             if len(members) == before or time.monotonic() >= deadline:
                 break
         report.remaining.extend(_describe(handle) for handle in members.values() if not handle.exited())
@@ -915,6 +922,65 @@ def kill_harness_tree(
             leader.close()
         if runner_handle is not None:
             runner_handle.close()
+
+
+def recorded_process_alive(label: str, identity: ProcessIdentity) -> Optional[str]:
+    """Read-only proof for one recorded process: None when it is provably gone.
+
+    Returns a description when it may still run; raises
+    ``runner_identity_unknown`` when the evidence cannot be read or trusted.
+    The other edition's retirement proof applies the same rules; the shared
+    corpus under ``rs/agentctl/testdata/headless-ownership`` pins both.
+    """
+    if identity.boot_id is not None:
+        if not valid_boot_id(identity.boot_id):
+            raise AgentOperationError("runner_identity_unknown", f"{label} has a malformed boot identity")
+        if identity.boot_id != current_boot_id():
+            return None
+    current = read_stat(identity.pid)
+    if current is None or current.state in _DEAD_STATES:
+        # Gone, or exited and awaiting its reap: it can no longer act.
+        return None
+    if identity.started_at is None:
+        raise AgentOperationError(
+            "runner_identity_unknown",
+            f"{label} (pid {identity.pid}) exists and has no recorded start time, so it may still be that process",
+        )
+    if _TICKS.fullmatch(identity.started_at) is None:
+        raise AgentOperationError("runner_identity_unknown",
+                                  f"{label} has an unreadable start time {identity.started_at!r}")
+    if int(identity.started_at) != current.starttime:
+        return None
+    return f"{label} (pid {identity.pid}, start tick {current.starttime}, state {current.state}) is still running"
+
+
+def tree_alive(record: HarnessRecord) -> Optional[str]:
+    """Read-only: describe a live member of a recorded harness tree, or None.
+
+    Used where the tree must not be forgotten (archiving). Only the per-turn
+    cgroup and the generation prove membership without a live leader.
+    """
+    if record.legacy or record.leader.boot_id != current_boot_id():
+        return None
+    if record.cgroup is not None and record.cgroup.is_dir():
+        try:
+            populated = _cgroup_events(record.cgroup).get("populated")
+        except OSError as exc:
+            raise AgentOperationError(
+                "harness_identity_unknown", f"cannot read {record.cgroup}/cgroup.events: {exc}") from exc
+        if populated == "1":
+            return f"its harness cgroup {record.cgroup} still has processes"
+        if populated != "0":
+            raise AgentOperationError("harness_identity_unknown", f"{record.cgroup}/cgroup.events is malformed")
+    generation = record.generation
+    if generation is None:
+        return None
+    minimum = _minimum_start(record)
+    for stat in _scan_processes():
+        if (stat.state not in _DEAD_STATES and stat.starttime >= minimum
+                and carries_generation(stat.pid, generation)):
+            return f"pid {stat.pid} of its harness tree (generation {generation}) is still running"
+    return None
 
 
 def _minimum_start(record: HarnessRecord) -> int:
@@ -950,8 +1016,16 @@ def _census_round(
     report: CleanupReport,
     *,
     stop: bool = True,
+    scan: bool = False,
 ) -> int:
-    """Pin (and by default SIGSTOP) every not-yet-seen proven member; return how many."""
+    """Pin (and by default SIGSTOP) every not-yet-seen proven member; return how many.
+
+    Candidates come from walking children down from the anchors (the runner,
+    the leader, every pinned member). ``scan`` adds every process procfs
+    shows, which only the generation can prove; it is needed when an orphan
+    may have been adopted outside the runner (the runner is gone or is not a
+    child subreaper), or when this kernel lists no children.
+    """
     me = os.getpid()
     minimum = _minimum_start(record)
 
@@ -963,42 +1037,84 @@ def _census_round(
             return _SUBREAPER
         return runner_handle is not None and not runner_handle.exited()
 
+    def parent_present(ppid: int) -> bool:
+        if ppid == runner_pid:
+            return runner_present()
+        if leader is not None and ppid == leader.pid:
+            return leader_present()
+        handle = next((value for key, value in members.items() if key[0] == ppid), None)
+        return handle is not None and not handle.exited()
+
     found = 0
     unproven: set[int] = set()
-    for stat in _scan_processes():
+    seen: set[int] = set()
+
+    def consider(stat: ProcessStat) -> bool:
+        """Pin one candidate if a proof holds; True when it is (now) a member."""
+        nonlocal found
+        if (stat.pid, stat.starttime) in members:
+            return True
         if stat.pid == me or stat.state in _DEAD_STATES:
-            continue
+            return False
         if leader is not None and stat.pid == leader.pid and stat.starttime == leader.starttime:
-            continue
+            return False
         if stat.pid == runner_pid and (runner_is_self or (
                 record.runner.started_at is not None and str(stat.starttime) == record.runner.started_at)):
-            continue
-        if (stat.pid, stat.starttime) in members:
-            continue
+            return False
         reason: Optional[str] = None
         if leader_present() and stat.session == record.process_group:
             reason = "session"
-        elif runner_present() and stat.ppid == runner_pid:
-            reason = "runner-child"
+        elif parent_present(stat.ppid):
+            reason = "child"
         elif (record.generation is not None and stat.starttime >= minimum and _same_user(stat.pid)
               and carries_generation(stat.pid, record.generation)):
             reason = "generation"
         if reason is None:
             if stat.session == record.process_group and not leader_present():
                 unproven.add(stat.pid)
-            continue
-        handle = _pin_member(stat, reason, record, runner_pid)
+            return False
+        handle = _pin_member(stat, reason, record)
         if handle is None:
-            continue
+            return False
         # The session and parent proofs hold only while their anchor still
         # holds its number; check after the member's own re-check.
-        if (reason == "session" and not leader_present()) or (reason == "runner-child" and not runner_present()):
+        if (reason == "session" and not leader_present()) or (reason == "child" and not parent_present(stat.ppid)):
             handle.close()
-            continue
+            return False
         members[(stat.pid, stat.starttime)] = handle
         if stop:
             handle.send(signal.SIGSTOP)
         found += 1
+        return True
+
+    anchors: list[int] = [key[0] for key in members]
+    if runner_present():
+        anchors.append(runner_pid)
+    if leader is not None and leader_present():
+        anchors.append(leader.pid)
+    walked: set[int] = set()
+    complete_walk = True
+    while anchors:
+        parent = anchors.pop()
+        if parent in walked:
+            continue
+        walked.add(parent)
+        children = _children_of(parent)
+        if children is None:
+            complete_walk = False
+            continue
+        for child in children:
+            if child in seen:
+                continue
+            seen.add(child)
+            stat = _quiet_stat(child)
+            if stat is not None and consider(stat):
+                anchors.append(child)
+    if scan or not complete_walk:
+        for stat in _scan_processes():
+            if stat.pid not in seen:
+                seen.add(stat.pid)
+                consider(stat)
     for pid in sorted(unproven):
         entry = f"pid {pid} (the exited leader's session, without this turn's generation)"
         if entry not in report.unproven:
@@ -1006,7 +1122,32 @@ def _census_round(
     return found
 
 
-def _pin_member(stat: ProcessStat, reason: str, record: HarnessRecord, runner_pid: int) -> Optional[PinnedProcess]:
+def _children_of(pid: int) -> Optional[list[int]]:
+    """The children procfs lists for every thread of one process; None when unknowable."""
+    tasks = PROC / str(pid) / "task"
+    children: list[int] = []
+    try:
+        for task in os.listdir(tasks):
+            text = (tasks / task / "children").read_text()
+            children.extend(int(item) for item in text.split() if item.isdigit())
+    except FileNotFoundError:
+        # The process is gone (no task directory), or this kernel lacks the
+        # children file (CONFIG_PROC_CHILDREN); only the latter is unknowable.
+        return [] if not (PROC / "self" / "task").is_dir() or _children_supported() else None
+    except OSError:
+        return None
+    return children
+
+
+def _children_supported() -> bool:
+    try:
+        return any((PROC / "self" / "task" / task / "children").exists()
+                   for task in os.listdir(PROC / "self" / "task"))
+    except OSError:
+        return False
+
+
+def _pin_member(stat: ProcessStat, reason: str, record: HarnessRecord) -> Optional[PinnedProcess]:
     try:
         descriptor = _open_pidfd(stat.pid)
     except OSError:
@@ -1021,7 +1162,7 @@ def _pin_member(stat: ProcessStat, reason: str, record: HarnessRecord, runner_pi
         and after.state not in _DEAD_STATES
         and (
             (reason == "session" and after.session == record.process_group)
-            or (reason == "runner-child" and after.ppid == runner_pid)
+            or (reason == "child" and after.ppid == stat.ppid)
             or (reason == "generation" and record.generation is not None
                 and carries_generation(stat.pid, record.generation))
         )
