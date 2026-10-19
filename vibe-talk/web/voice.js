@@ -15705,17 +15705,8 @@ async function openConversation(options) {
   session.lastTranscriptKey = null;
   session.liveTurns = new Map();
   session.anonTurn = 0;
-  session.v1Ready = false;
-  session.capturePaused = false;
-  session.audioSegmentActive = false;
-  session.waitingForGreeting = false;
-  session.waitingForAudioEnd = false;
-  session.typedTurnInFlight = false;
-  session.replyArriving = false;
-  closeSpokenTurn();
-  session.lastCompletedTurn = null;
+  resetVibeTalkTurnState();
   session.pendingPrompts = [];
-  session.turnInFlight = null;
   session.playEndMs = 0;
   session.answerPlayEndMs = 0;
   session.echoCancellation = false;
@@ -15779,6 +15770,19 @@ async function openConversation(options) {
   session.socket = socket;
   session.muted = false;
   renderControls();
+  wireCallSocket(socket, socketUrl, resume, chat);
+}
+
+/**
+ * The call's socket, opened on `socketUrl`, given its handlers: the deadline for it to open, what
+ * opening it starts, every frame it delivers, an error on it, and its close.
+ *
+ * @param {WebSocket} socket the call's socket, already `session.socket`
+ * @param {string} socketUrl the address it was opened on, for the reason a start failed
+ * @param {any} resume what `fetchResume` answered for this call, null for nothing
+ * @param {boolean} chat whether the conversation is typed
+ */
+function wireCallSocket(socket, socketUrl, resume, chat) {
   // `#209 voice-socket-open`. Whether THIS socket ever opened: a close before it did is a start
   // that never reached the voice service, whatever the close code says.
   let opened = false;
@@ -17235,25 +17239,8 @@ function teardown() {
   clearNoReply();
   session.health = null;
   session.muted = false;
-  session.v1Ready = false;
-  if (session.captureResumeTimer !== null) {
-    clearTimeout(session.captureResumeTimer);
-    session.captureResumeTimer = null;
-  }
-  session.capturePaused = false;
-  session.audioSegmentActive = false;
-  session.waitingForGreeting = false;
-  session.waitingForAudioEnd = false;
-  session.typedTurnInFlight = false;
-  session.replyArriving = false;
-  closeSpokenTurn();
-  session.lastCompletedTurn = null;
+  resetVibeTalkTurnState();
   session.pendingPrompts = [];
-  session.turnInFlight = null;
-  if (session.playbackWaitTimer !== null) {
-    clearTimeout(session.playbackWaitTimer);
-    session.playbackWaitTimer = null;
-  }
   session.playEndMs = 0;
   session.answerPlayEndMs = 0;
   session.echoCancellation = false;
@@ -17288,6 +17275,33 @@ function teardown() {
     setStatus(`${said ? `${said}. ` : ""}Your message did not go — it is still in the box.`);
   }
   renderControls();
+}
+
+/**
+ * The `vibe-talk-v1` session's turn-by-turn state, back to a session that has not started: no turn
+ * open, completed or on the wire, no segment, nothing waited for, and no timer of the hand-off or
+ * of an answer playing out. What is queued to be said (`pendingPrompts`) is the caller's to keep or
+ * let go.
+ */
+function resetVibeTalkTurnState() {
+  session.v1Ready = false;
+  if (session.captureResumeTimer !== null) {
+    clearTimeout(session.captureResumeTimer);
+    session.captureResumeTimer = null;
+  }
+  session.capturePaused = false;
+  session.audioSegmentActive = false;
+  session.waitingForGreeting = false;
+  session.waitingForAudioEnd = false;
+  session.typedTurnInFlight = false;
+  session.replyArriving = false;
+  closeSpokenTurn();
+  session.lastCompletedTurn = null;
+  session.turnInFlight = null;
+  if (session.playbackWaitTimer !== null) {
+    clearTimeout(session.playbackWaitTimer);
+    session.playbackWaitTimer = null;
+  }
 }
 
 /** Hang up: the reader's control, and the only way this page ends a call that is working. */
