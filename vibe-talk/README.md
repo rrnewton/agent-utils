@@ -4592,7 +4592,7 @@ truth includes whether it went. The line opens by outcome:
   text is only the parts that went, and where a part's answer was lost the bracket says that part
   may have been posted;
 - `may have been sent to {channel} (NOT confirmed): {text}` — the chat service's answer was lost or
-  the request was abandoned on its way, so nobody knows. This is the send the agent was told at the
+  the post was stopped on its way, so nobody knows. This is the send the agent was told at the
   time it could not confirm, and whose card says "Not confirmed"; a recap that called it sent would
   have the resumed agent tell you it went.
 
@@ -8685,7 +8685,11 @@ saying "Sent to lead team", "Partly sent to …" or "Not confirmed: …", when, 
 what it answered, and Open in channel. It is drawn from the commit's answer, or from the server's
 send memory when that answer was lost, when the send settled after hang-up, or when it was a direct
 send; a server that takes records files it in the stored transcript from its own copy, so a reload
-draws the same card. A yes that sent nothing is a seam, as before.
+draws the same card. A yes that sent nothing is a seam, as before. The server files what a send did
+once the chat service has answered for it, whether or not anyone still waits for that answer: a
+post that lands after the page stopped waiting, or after a client hung up mid-call, is filed as
+sent, not as "Not confirmed", and one given up before anything was posted is not filed at all
+(`#283 send-settle-in-task`).
 
 **A yes that sends shows no turn of its own** (`#269 approval-card-inline`): the frozen card says
 "approved by voice", and that is the answer. While the owner's turn could still become a yes to the
