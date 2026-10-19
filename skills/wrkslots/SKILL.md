@@ -125,7 +125,10 @@ file systems); do not mount, unmount, grow or copy it, and retire the slot only 
 `remove --coordinator-authorized --discard-stale-image-copy` (an interrupted removal of it: `recover
 --coordinator-authorized --discard-stale-image-copy`, which rechecks every holder and records the
 decision; a removal that recorded the flag itself resumes with plain `recover`, only for the devices
-it recorded). `image-identity-unverifiable` means a
+it recorded). The discard refuses while any process works in the stale copy (found by device,
+wherever it reaches it), a holder is under another root, or the copy is mounted anywhere but on the
+slot's own mount-point entry.
+`image-identity-unverifiable` means a
 loop mount sits at a slot's location that wrkslots cannot identify; it refuses to unmount, move or
 remove it. A mount copied into another process's private mount namespace is the slot's own storage,
 not use; a process working inside it still blocks removal.

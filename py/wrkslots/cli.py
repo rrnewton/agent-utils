@@ -3878,6 +3878,12 @@ _STALE_REPRESENTATION_MOUNTS: frozenset[tuple[Path, str, str]] = frozenset()
 #: image, and the decision follows it (``_refresh_owned_mounts`` reads the
 #: image's current record).
 _DISCARDING_STALE_IMAGES: frozenset[tuple[str, str]] = frozenset()
+#: The entries of the stale attachments this command discards, in the form of
+#: ``_STALE_REPRESENTATION_MOUNTS``. While it is not empty, every process-use
+#: census of this command also looks for a process working in one of them by
+#: device (``_assert_discarded_copies_unused``), wherever that process reaches
+#: it: the path checks see a use only under the slot's recorded location.
+_DISCARDED_STALE_MOUNTS: frozenset[tuple[Path, str, str]] = frozenset()
 #: How the census marks a stale copy in a mount reference, so the refusal says
 #: what it is rather than only ``mount=``.
 _STALE_COPY_MARK = " [stale-image-copy="
@@ -3892,13 +3898,14 @@ def _activate_representation(config: Config) -> None:
     slot that cannot be mounted does not stop the others; each is named.
     """
 
-    global _OWNED_REPRESENTATION_MOUNTS, _STALE_REPRESENTATION_MOUNTS
+    global _OWNED_REPRESENTATION_MOUNTS, _STALE_REPRESENTATION_MOUNTS, _DISCARDED_STALE_MOUNTS
     slotimage.register_layout(
         config.control, lambda slot_type, slot: _slot_directory(config, slot, slot_type)
     )
     if not slotimage.images_root(config.control).exists():
         _OWNED_REPRESENTATION_MOUNTS = frozenset()
         _STALE_REPRESENTATION_MOUNTS = frozenset()
+        _DISCARDED_STALE_MOUNTS = frozenset()
         return
     try:
         actions, failures = slotimage.ensure_all_mounted(config.control)
@@ -3975,7 +3982,7 @@ def _slot_image_at(config: Config, path: Path) -> slotimage.SlotImage | None:
 
 
 def _refresh_owned_mounts(config: Config) -> None:
-    global _OWNED_REPRESENTATION_MOUNTS, _STALE_REPRESENTATION_MOUNTS
+    global _OWNED_REPRESENTATION_MOUNTS, _STALE_REPRESENTATION_MOUNTS, _DISCARDED_STALE_MOUNTS
     owned, stale = slotimage.owned_mounts(config.control)
     discarding: set[Path] = set()
     for slot_type, slot in _DISCARDING_STALE_IMAGES:
@@ -3995,6 +4002,9 @@ def _refresh_owned_mounts(config: Config) -> None:
     _OWNED_REPRESENTATION_MOUNTS = owned | frozenset(discarded)
     _STALE_REPRESENTATION_MOUNTS = frozenset(
         item for item in stale if (item[0], item[1]) not in discarded
+    )
+    _DISCARDED_STALE_MOUNTS = frozenset(
+        item for item in stale if (item[0], item[1]) in discarded
     )
 
 
@@ -19379,6 +19389,9 @@ def _assert_slot_unused(
     before_image_fence: bool = False,
     strict_lsof_warnings: bool = False,
 ) -> None:
+    # A stale image copy this command discards is invisible to the path checks
+    # below wherever a process reaches it other than under the slot's path.
+    _assert_discarded_copies_unused()
     while True:
         observation = _observe_slot_use_once(
             slot_path,
@@ -23230,16 +23243,36 @@ def _recorded_attested_stop(
 # system; the stale copy is invisible to it and to lsof, and when it is
 # released it writes its old metadata back into the image. Such a slot is
 # never removed silently. One explicit remove may discard the stale copy, on
-# the coordinator's authority, after every process whose mount table holds it
-# was shown to share this process's root (so the path checks of the census
-# see any use of it). The basis is recorded before salvage, as an active-state
-# action, so recovery can resume exactly that removal.
+# the coordinator's authority, and only while all of this holds:
+#
+# * every process whose mount table holds the copy shares this process's root;
+# * no process works in the copy. This is checked by device, not by path: a
+#   namespace can show the copy at a second path as well (a bind of the home
+#   directory shows the same directory under its underlying path), and the
+#   path checks of the census and lsof on the host's own device never look
+#   there;
+# * every mount of the copy sits on the slot's own mount-point directory entry,
+#   under its recorded path or under another path to that same entry. Replacing
+#   that entry is how the copies are released; a copy mounted on any other
+#   entry would outlive the release, keep its device bound, and be what the
+#   next mount of the image reused.
+#
+# The basis is recorded before salvage, as an active-state action, so
+# recovery can resume exactly that removal. Every process-use census of the
+# discarding command checks all of it again (_assert_discarded_copies_unused),
+# so a use begun after the decision still refuses before the path fence and
+# before anything is deleted.
 STALE_COPY_DISCARD_ACTION = "stale-image-copy-discard-authorized"
 
 
 @dataclasses.dataclass(frozen=True)
 class _StaleCopyHolders:
-    """Processes whose mount tables hold one stale device, grouped by mount namespace."""
+    """Processes that hold or use one stale device; holders grouped by mount namespace.
+
+    ``elsewhere`` names each mount of the device that is not shown to sit on
+    the slot's own mount-point entry, and ``uses`` each process found working
+    in the stale file system (both at most a few, for the refusal).
+    """
 
     device: str
     name: str
@@ -23247,6 +23280,8 @@ class _StaleCopyHolders:
     holder_pids: tuple[int, ...]
     mount_namespaces: tuple[str, ...]
     foreign_root_pids: tuple[int, ...]
+    elsewhere: tuple[str, ...] = ()
+    uses: tuple[str, ...] = ()
 
     def to_obj(self) -> dict[str, object]:
         return {
@@ -23259,24 +23294,222 @@ class _StaleCopyHolders:
         }
 
 
+def _stale_copy_blocker(holders: Sequence[_StaleCopyHolders]) -> tuple[str, str] | None:
+    """``(reason, remedy)`` when the stale copies in ``holders`` may not be discarded now."""
+
+    foreign_roots = sorted({pid for item in holders for pid in item.foreign_root_pids})
+    if foreign_roots:
+        return (
+            f"processes {', '.join(str(pid) for pid in foreign_roots[:8])} hold the stale image "
+            "copy under a different root, where the census cannot see a use of it by path",
+            "stop them, or leave the slot for manual handling",
+        )
+    for item in holders:
+        if item.uses:
+            return (
+                f"{item.uses[0]} is on the stale image copy {item.name} ({item.device}): a "
+                "process is working in it, and discarding the copy would destroy that work",
+                "stop that process, or leave the slot for manual handling",
+            )
+    for item in holders:
+        if item.elsewhere:
+            return (
+                f"the stale image copy {item.name} ({item.device}) is mounted at "
+                f"{item.elsewhere[0]}, which is not shown to be the slot's own mount point "
+                f"{item.mount_point}; replacing that mount point cannot release a copy mounted "
+                "there, and a copy left bound is what the next mount of the image would reuse",
+                "stop the processes of that mount namespace, or leave the slot for manual "
+                "handling",
+            )
+    return None
+
+
+def _on_mount_point_entry(
+    proc_root: Path, pid: int, point: Path, own: Path, own_parent: tuple[int, int] | None
+) -> bool:
+    """Whether ``point``, a mount point in PID's mount namespace, is the directory entry ``own``.
+
+    A directory has exactly one entry, so ``point`` is that entry when its name
+    is ``own``'s and its parent directory, walked from PID's root in PID's
+    namespace one component at a time without following a symbolic link, is
+    ``own``'s parent here by device and inode. A bind of a directory above the
+    slot (the home directory under its underlying path) passes; a mount on any
+    other directory, or a path that cannot be walked, does not.
+    """
+
+    parts = point.parent.parts[1:]
+    if (
+        own_parent is None
+        or not point.is_absolute()
+        or point.name != own.name
+        or any(part in (".", "..") for part in parts)
+    ):
+        return False
+    try:
+        descriptor = os.open(
+            proc_root / str(pid) / "root", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC
+        )
+    except OSError:
+        return False
+    try:
+        for part in parts:
+            following = os.open(
+                part,
+                os.O_PATH | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = following
+        info = os.fstat(descriptor)
+    except OSError:
+        return False
+    finally:
+        os.close(descriptor)
+    return (info.st_dev, info.st_ino) == own_parent
+
+
+def _stale_copy_device(path: Path) -> str:
+    """``MAJOR:MINOR`` of the file system holding what ``path`` (a /proc link) refers to.
+
+    stat follows a /proc link to the object itself, however the process
+    reached it, so the answer does not depend on any path rendering.
+    """
+
+    return slotimage.device_text(os.stat(path).st_dev)
+
+
+def _proc_link_text(path: Path) -> str:
+    try:
+        return os.readlink(path)
+    except OSError:
+        return "?"
+
+
+def _stale_copy_uses(
+    devices: Iterable[str],
+    holders: AbstractSet[int],
+    *,
+    proc_root: Path,
+) -> tuple[dict[str, list[str]], list[int]]:
+    """Find processes working in a stale copy, by the device of what they use.
+
+    For every process, and every surviving thread of an exited leader: the
+    devices of its working directory, root and executable and of each open
+    descriptor (``_stale_copy_device``), and the device field of each mapping.
+    Returns the uses found per device (at most eight each), and the holders
+    (processes whose mount table holds a stale device) any of whose entries
+    could not be read, since such a process may work in the copy unseen.
+    Another process's unreadable entries are skipped, as lsof run as this user
+    skips them: without the copy in its mount table it could reach it only
+    through a directory or descriptor kept from a mount that is gone.
+    """
+
+    wanted = frozenset(devices)
+    uses: dict[str, list[str]] = {device: [] for device in wanted}
+    unreadable: set[int] = set()
+
+    def failed(pid: int, exc: OSError) -> None:
+        if exc.errno in (errno.ENOENT, errno.ESRCH):
+            return  # exited meanwhile, or no such entry (a kernel thread has no executable)
+        if pid in holders:
+            unreadable.add(pid)
+
+    def found(device: str, walked: Path, what: str) -> None:
+        if len(uses[device]) < 8:
+            uses[device].append(f"{_walked_process_label(walked)} ({what})")
+
+    def inspect(walked: Path, pid: int) -> None:
+        for name in ("cwd", "root", "exe"):
+            try:
+                device = _stale_copy_device(walked / name)
+            except OSError as exc:
+                failed(pid, exc)
+                continue
+            if device in wanted:
+                found(device, walked, f"{name}={_proc_link_text(walked / name)}")
+        try:
+            descriptors = sorted((walked / "fd").iterdir(), key=lambda item: item.name)
+        except OSError as exc:
+            failed(pid, exc)
+            descriptors = []
+        for descriptor in descriptors:
+            try:
+                device = _stale_copy_device(descriptor)
+            except OSError as exc:
+                failed(pid, exc)
+                continue
+            if device in wanted:
+                found(device, walked, f"fd/{descriptor.name}={_proc_link_text(descriptor)}")
+        try:
+            maps = (walked / "maps").read_text(encoding="utf-8", errors="surrogateescape")
+        except OSError as exc:
+            failed(pid, exc)
+            maps = ""
+        for line in maps.splitlines():
+            fields = line.split(maxsplit=5)
+            if len(fields) < 5:
+                continue
+            major, separator, minor = fields[3].partition(":")
+            try:
+                device = f"{int(major, 16)}:{int(minor, 16)}"
+            except ValueError:
+                continue
+            if separator and device in wanted:
+                found(device, walked, f"map={fields[5] if len(fields) == 6 else fields[4]}")
+                break
+
+    try:
+        entries = sorted(
+            (path for path in proc_root.iterdir() if path.name.isdigit()),
+            key=lambda path: int(path.name),
+        )
+    except OSError as exc:
+        raise Refusal(f"cannot inspect live processes: {exc}") from exc
+    for entry in entries:
+        pid = int(entry.name)
+        inspect(entry, pid)
+        try:
+            threads = _walked_zombie_leader_threads(entry)
+        except Refusal:
+            if pid in holders:
+                unreadable.add(pid)
+            threads = ()
+        for thread in threads:
+            inspect(thread, pid)
+    return uses, sorted(unreadable)
+
+
 def _stale_copy_holders(
     stale: Sequence[tuple[Path, str, str]],
     *,
     proc_root: Path = Path("/proc"),
 ) -> tuple[_StaleCopyHolders, ...]:
-    """Find every process whose mount table lists one of the ``stale`` devices.
+    """Find every process that holds or uses one of the ``stale`` devices.
 
-    One table is read per mount namespace (every process of a namespace shares
-    its mounts); the root of every process in a namespace that holds a copy is
-    then compared with this process's root. A process whose namespace or root
-    cannot be read counts as holding a copy under a foreign root, so it refuses.
+    ``stale`` holds ``(the slot's mount point, MAJOR:MINOR, /dev/loopN)``. One
+    table is read per mount namespace (every process of a namespace shares its
+    mounts). For each namespace whose table lists a stale device, the root of
+    each of its processes is compared with this process's root, and each line
+    that mounts the device is checked to sit on the slot's own mount-point
+    entry (``_on_mount_point_entry``). Then every process is checked for use
+    of a stale device (``_stale_copy_uses``). A process whose namespace or
+    table cannot be read, or a holder whose entries cannot be read, refuses; a
+    holder whose root cannot be read counts as one under a foreign root.
     """
 
-    wanted = {device for _point, device, _name in stale}
+    wanted = {device: point for point, device, _name in stale}
     try:
         own_root = os.stat("/")
     except OSError as exc:
         raise Refusal(f"cannot inspect this process's root: {exc}") from exc
+    own_parents: dict[str, tuple[int, int] | None] = {}
+    for device, point in wanted.items():
+        try:
+            parent = os.stat(point.parent)
+        except OSError:
+            own_parents[device] = None  # no mount of the device is shown to be on it
+        else:
+            own_parents[device] = (parent.st_dev, parent.st_ino)
     namespaces: dict[str, list[int]] = {}
     unreadable: list[int] = []
     for entry in proc_root.iterdir():
@@ -23293,6 +23526,7 @@ def _stale_copy_holders(
         namespaces.setdefault(namespace, []).append(int(entry.name))
     holders: dict[str, tuple[list[int], list[str]]] = {device: ([], []) for device in wanted}
     foreign: dict[str, list[int]] = {device: [] for device in wanted}
+    elsewhere: dict[str, list[str]] = {device: [] for device in wanted}
     for namespace, pids in sorted(namespaces.items()):
         table: str | None = None
         denied: list[int] = []
@@ -23309,29 +23543,55 @@ def _stale_copy_holders(
         if table is None:
             unreadable.extend(denied)
             continue
-        listed = {
-            key[1]
+        lines = [
+            key
             for key in (_mountinfo_line_key(line) for line in table.splitlines())
             if key is not None and key[1] in wanted
-        }
-        for device in sorted(listed):
+        ]
+        if not lines:
+            continue
+        same_root: list[int] = []
+        foreign_here: list[int] = []
+        for pid in sorted(pids):
+            try:
+                root = os.stat(proc_root / str(pid) / "root")
+            except FileNotFoundError:
+                continue
+            except OSError:
+                foreign_here.append(pid)
+                continue
+            if (root.st_dev, root.st_ino) == (own_root.st_dev, own_root.st_ino):
+                same_root.append(pid)
+            else:
+                foreign_here.append(pid)
+        for device in sorted({key[1] for key in lines}):
             holders[device][0].extend(pids)
             holders[device][1].append(namespace)
-            for pid in pids:
-                try:
-                    root = os.stat(proc_root / str(pid) / "root")
-                except FileNotFoundError:
-                    continue
-                except OSError:
-                    foreign[device].append(pid)
-                    continue
-                if (root.st_dev, root.st_ino) != (own_root.st_dev, own_root.st_ino):
-                    foreign[device].append(pid)
+            foreign[device].extend(foreign_here)
+        if not same_root:
+            continue  # each of its processes already refuses as one under a foreign root
+        for point, device, _mount_root in lines:
+            if not _on_mount_point_entry(
+                proc_root, same_root[0], point, wanted[device], own_parents[device]
+            ) and len(elsewhere[device]) < 8:
+                elsewhere[device].append(f"{point} (mount namespace {namespace})")
     if unreadable:
         raise Refusal(
             "cannot tell whether processes "
             f"{', '.join(str(pid) for pid in sorted(unreadable)[:8])} hold the stale image "
             "copy: their mount namespace or mount table is unreadable"
+        )
+    uses, unreadable_holders = _stale_copy_uses(
+        wanted,
+        {pid for pids, _namespaces in holders.values() for pid in pids},
+        proc_root=proc_root,
+    )
+    if unreadable_holders:
+        raise Refusal(
+            "cannot tell whether processes "
+            f"{', '.join(str(pid) for pid in unreadable_holders[:8])}, which hold the stale "
+            "image copy in their mount table, work in it: their working directory, root, "
+            "executable, descriptors or mappings are unreadable"
         )
     return tuple(
         _StaleCopyHolders(
@@ -23341,9 +23601,29 @@ def _stale_copy_holders(
             holder_pids=tuple(sorted(holders[device][0])),
             mount_namespaces=tuple(holders[device][1]),
             foreign_root_pids=tuple(sorted(foreign[device])),
+            elsewhere=tuple(elsewhere[device]),
+            uses=tuple(uses[device]),
         )
         for point, device, name in sorted(stale)
     )
+
+
+def _assert_discarded_copies_unused() -> None:
+    """Refuse while the stale copies this command discards may not be discarded any more.
+
+    Runs at the start of every process-use census while a discard is in effect
+    (``_DISCARDED_STALE_MOUNTS``), so a process that began to work in a stale
+    copy, or a mount of it made elsewhere, after the decision still stops the
+    removal before its path fence moves the image and before anything is
+    deleted.
+    """
+
+    if not _DISCARDED_STALE_MOUNTS:
+        return
+    blocker = _stale_copy_blocker(_stale_copy_holders(sorted(_DISCARDED_STALE_MOUNTS)))
+    if blocker is not None:
+        reason, remedy = blocker
+        raise Refusal(f"--discard-stale-image-copy: {reason}. remedy: {remedy}")
 
 
 def _slot_image_files(image: slotimage.SlotImage) -> tuple[tuple[Path, Path], ...]:
@@ -23449,12 +23729,14 @@ def _resume_stale_copy_discard(
     --coordinator-authorized --discard-stale-image-copy``. Either way the
     conditions are established again from current state: every current
     stale device must be one that decision named (a decision given now names
-    the ones seen now), and every process whose mount table holds one must
-    share this process's root, so the census still sees any use of it by
-    path. A decision given now is recorded, naming this journal's archive id,
-    before anything is deleted. Without a decision nothing is enabled: the
-    use check and the unmount refuse the stale copy, naming the remedy.
-    Returns the active state, advanced when a decision was recorded.
+    the ones seen now), every process whose mount table holds one must share
+    this process's root, no process may be working in one (found by device,
+    wherever it reaches it), and every mount of one must sit on the slot's own
+    mount-point entry (see _stale_copy_holders). A decision given now is
+    recorded, naming this journal's archive id, before anything is deleted.
+    Without a decision nothing is enabled: the use check and the unmount
+    refuse the stale copy, naming the remedy. Returns the active state,
+    advanced when a decision was recorded.
     """
 
     def refuse(reason: str) -> Refusal:
@@ -23505,13 +23787,10 @@ def _resume_stale_copy_discard(
                 "--coordinator-authorized --discard-stale-image-copy to decide again"
             )
     holders = _stale_copy_holders(stale)
-    foreign_roots = sorted({pid for item in holders for pid in item.foreign_root_pids})
-    if foreign_roots:
-        raise refuse(
-            f"processes {', '.join(str(pid) for pid in foreign_roots[:8])} hold the stale image "
-            "copy under a different root, where the census cannot see a use of it by path; "
-            "stop them, or leave the slot for manual handling"
-        )
+    blocker = _stale_copy_blocker(holders)
+    if blocker is not None:
+        reason, remedy = blocker
+        raise refuse(f"{reason}; {remedy}")
     if requested:
         state = _replace_record(state, record)
         _write_active_state(
@@ -36920,14 +37199,12 @@ def _cmd_remove_in_scope(
                 "state: REFUSED -- no checkout was salvaged or removed"
             )
         stale_holders = _stale_copy_holders(stale)
-        foreign_roots = sorted({pid for item in stale_holders for pid in item.foreign_root_pids})
-        if foreign_roots:
+        blocker = _stale_copy_blocker(stale_holders)
+        if blocker is not None:
+            reason, remedy = blocker
             raise Refusal(
-                "--discard-stale-image-copy: processes "
-                f"{', '.join(str(pid) for pid in foreign_roots[:8])} hold the stale image copy "
-                "under a different root, where the census cannot see a use of it by path. "
-                "state: REFUSED -- no checkout was salvaged or removed. remedy: stop them, "
-                "or leave the slot for manual handling"
+                f"--discard-stale-image-copy: {reason}. state: REFUSED -- no checkout was "
+                f"salvaged or removed. remedy: {remedy}"
             )
     if (proof_manifest is None) != (completed_record is None):
         raise Refusal(
@@ -60118,11 +60395,15 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "(a stale, independent file system on the same image file, left by a mount another "
             "mount namespace kept; doctor reports image-attached-twice), treat that stale copy "
             "as the slot's own storage instead of as use. Refused unless every process whose "
-            "mount table holds the copy shares this process's root, so the census still sees "
-            "any use of it by path. Salvage reads only this host's own file system: anything "
-            "written only through the stale copy is lost. Requires --coordinator-authorized; "
-            "recorded in the event log before salvage; never accepted by retire-pending or "
-            "remove-agent-batch (default: off, a stale copy refuses removal)"
+            "mount table holds the copy shares this process's root, no process works in the "
+            "copy (its working directory, root, executable, an open file or a mapping on the "
+            "stale device, found by device wherever the process reaches it), and every mount "
+            "of the copy sits on the slot's own mount-point entry, which the removal replaces "
+            "to release it; every process-use check of the removal checks this again. Salvage "
+            "reads only this host's own file system: anything written only through the stale "
+            "copy is lost. Requires --coordinator-authorized; recorded in the event log before "
+            "salvage; never accepted by retire-pending or remove-agent-batch (default: off, a "
+            "stale copy refuses removal)"
         ),
     )
     remove.add_argument(
@@ -60816,9 +61097,11 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "also attached to a second, stale loop device (a copy another mount namespace "
             "kept), discarding that stale copy: anything written only through it is not "
             "salvaged. The coordinator's decision: requires --coordinator-authorized, and "
-            "is refused unless such a copy exists and every process whose mount table "
-            "holds it shares this process's root. Recorded in the event log, naming the "
-            "journal and every copy, before the image is destroyed. A removal that was "
+            "is refused unless such a copy exists, every process whose mount table holds it "
+            "shares this process's root, no process works in it (found by device), and every "
+            "mount of it sits on the slot's own mount-point entry, as for remove. Recorded in "
+            "the event log, naming the journal and every copy, before the image is destroyed. "
+            "A removal that was "
             "itself given remove --discard-stale-image-copy resumes without it, for the "
             "devices it recorded (default: off, a stale copy refuses recovery)"
         ),

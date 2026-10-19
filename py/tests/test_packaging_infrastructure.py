@@ -926,9 +926,12 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # refusals, a recorded decision honoured only for its own removal, devices
     # and roots, the binding parser, and a decision kept through the fence)
     # are mapped.
-    assert len(all_tests) == 2078
+    # Its 6 cases of a discard that sees work in the stale copy wherever it is
+    # reached (by device, by mount-point entry, through remove and recover, and
+    # again in the discarding census) are mapped.
+    assert len(all_tests) == 2084
     assert len(ordinary) == 337
-    assert len(mapped) == 1741
+    assert len(mapped) == 1747
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {

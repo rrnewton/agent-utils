@@ -15,6 +15,7 @@ COLLECTED. This module is deliberately not a test file of its own.
 from __future__ import annotations
 
 import dataclasses
+import errno
 import fcntl
 import os
 import shutil
@@ -1046,9 +1047,11 @@ def test_recover_refuses_a_removed_checkout_git_still_registers(tmp_path: Path) 
 # recorded location (device 7:46, state image 7:47) until unmounted, and FAKE_STALE_DEVICE
 # names a second, stale attachment of the slot image that the root helper's umount refuses
 # without --discard-stale-copies. Releasing the copies of a mount point detaches it, as the
-# kernel does once the directory entry is replaced. Content lives on the host, so a relocation
-# is a rename, and `git worktree remove` of the image root leaves the mount point behind, empty.
-# Every privileged call and release is logged to FAKE_IMAGE_LOG.
+# kernel does once the directory entry is replaced; a relocation that discards the copy releases
+# it so. Content lives on the host, so a relocation is otherwise a rename, and `git worktree
+# remove` of the image root leaves the mount point behind, empty.
+# FAKE_STALE_VIEW names a directory whose files count as being on the stale device for the
+# census's device checks. Every privileged call and release is logged to FAKE_IMAGE_LOG.
 _FAKE_IMAGE_HOST = r'''
 import dataclasses, functools, json, os, sys
 from pathlib import Path
@@ -1132,6 +1135,8 @@ def owned_mounts(control):
 def relocate(image, destination):
     if stale_attached[0] and image.slot_image not in slotimage.DISCARD_STALE_COPIES:
         raise refusal(image.slot_image)
+    if stale_attached[0]:
+        release(image.location)  # its unmount releases the copies of the old mount point
     note("relocate", image.location, destination)
     destination = Path(os.path.abspath(destination))
     os.rename(image.location, destination)
@@ -1158,10 +1163,20 @@ slotimage.release_mount_point_copies = release
 slotimage.owned_mounts = owned_mounts
 slotimage.relocate = relocate
 slotimage.resolve_backend = lambda preference: "kernel"
-if os.environ.get("FAKE_PROC"):
-    cli._stale_copy_holders = functools.partial(
-        cli._stale_copy_holders, proc_root=Path(os.environ["FAKE_PROC"])
-    )
+cli._stale_copy_holders = functools.partial(
+    cli._stale_copy_holders, proc_root=Path(os.environ["FAKE_PROC"])
+)
+STALE_VIEW = os.path.realpath(os.environ["FAKE_STALE_VIEW"]) if os.environ.get("FAKE_STALE_VIEW") else ""
+if STALE_VIEW:
+    real_device = cli._stale_copy_device
+
+    def stale_copy_device(path):
+        target = os.path.realpath(path)
+        if target == STALE_VIEW or target.startswith(STALE_VIEW + os.sep):
+            return f"7:{STALE}"
+        return real_device(path)
+
+    cli._stale_copy_device = stale_copy_device
 '''
 
 
@@ -1174,19 +1189,24 @@ def _fake_images(
     patch: str = "",
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run one wrkslots command against the fake image host (see _FAKE_IMAGE_HOST)."""
+    """Run one wrkslots command against the fake image host (see _FAKE_IMAGE_HOST).
+
+    Without ``proc``, the holder census reads an empty fake /proc: never this host's own, whose
+    loop devices are unrelated to the test.
+    """
 
     import sys
     import textwrap
 
+    if proc is None:
+        proc = log.with_name(log.name + ".no-processes")
+        proc.mkdir(exist_ok=True)
     launcher = (
         _FAKE_IMAGE_HOST
         + textwrap.dedent(patch)
         + "\nraise SystemExit(cli.main(sys.argv[1:]))\n"
     )
-    extra = {"FAKE_IMAGE_LOG": str(log), "FAKE_STALE_DEVICE": stale}
-    if proc is not None:
-        extra["FAKE_PROC"] = str(proc)
+    extra = {"FAKE_IMAGE_LOG": str(log), "FAKE_STALE_DEVICE": stale, "FAKE_PROC": str(proc)}
     return subprocess.run(
         [sys.executable, "-c", launcher, "--project-root", str(project), *args],
         text=True,
@@ -1219,10 +1239,17 @@ def _image_slot(tmp_path: Path) -> tuple[Path, Path]:
     return project, slot
 
 
-def _recover(project: Path, log: Path, *flags: str, stale: str = "54", proc: Path | None = None) -> subprocess.CompletedProcess[str]:
+def _recover(
+    project: Path,
+    log: Path,
+    *flags: str,
+    stale: str = "54",
+    proc: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     return _fake_images(
         project, log, "recover", "--coordinator-pid", str(os.getpid()), *flags,
-        stale=stale, proc=proc,
+        stale=stale, proc=proc, env=env,
     )
 
 
@@ -1298,13 +1325,27 @@ def _copy_field(evidence: dict[str, object], field: str) -> list[object]:
     ]
 
 
-def _holder(proc: Path, pid: int, point: Path, *, root: Path, device: str = "54") -> None:
-    """A process in another mount namespace whose table holds the stale device at ``point``."""
+def _holder(
+    proc: Path,
+    pid: int,
+    *points: Path,
+    root: Path,
+    device: str = "54",
+    namespace: int | None = None,
+    cwd: Path = Path("/proc"),
+) -> None:
+    """A process in another mount namespace whose table holds the stale device at ``points``.
+
+    Each mount point is written as the kernel renders it, with no symbolic link in it.
+    """
 
     _fake_process(
-        proc, pid, namespace=f"mnt:[{4026536000 + pid}]",
-        mountinfo=_line(f"7:{device}", point, source=f"/dev/loop{device}") + "\n",
-        root=root, cwd=Path("/"),
+        proc, pid, namespace=f"mnt:[{4026536000 + (pid if namespace is None else namespace)}]",
+        mountinfo="".join(
+            _line(f"7:{device}", point.resolve(), source=f"/dev/loop{device}") + "\n"
+            for point in points
+        ),
+        root=root, cwd=cwd,
     )
 
 
@@ -1399,11 +1440,15 @@ def test_recover_discards_a_stale_copy_only_on_the_coordinators_decision(tmp_pat
 
 
 def test_recover_honours_a_recorded_discard_only_for_its_devices_and_roots(tmp_path: Path) -> None:
-    proc = tmp_path / "proc"
-    _holder(proc, 41, tmp_path / "anywhere", root=Path("/"))
+    proc_at_remove = tmp_path / "proc-at-remove"
+    canonical = tmp_path / "project" / "worktrees" / "slots" / "slot01"
+    _holder(proc_at_remove, 41, canonical, root=Path("/"))
     project, _journal, fenced, log = _image_slot_interrupted_after_git_removal(
-        tmp_path, stale_at_remove="54", discard_at_remove=True, proc=proc,
+        tmp_path, stale_at_remove="54", discard_at_remove=True, proc=proc_at_remove,
     )
+    assert project / "worktrees" / "slots" / "slot01" == canonical
+    proc = tmp_path / "proc"
+    _holder(proc, 41, fenced, root=Path("/"))
     [recorded] = _discard_events(project)
     assert _copy_field(recorded, "device") == ["7:54"]
     assert "archive_id" not in recorded
@@ -1512,12 +1557,15 @@ def test_a_recorded_discard_binds_only_its_own_removal() -> None:
 
 
 def test_remove_keeps_its_discard_decision_through_its_own_path_fence(tmp_path: Path) -> None:
-    """The fence relocates the image; a stale copy that stays attached is still discarded."""
+    """The fence relocates the image; the decision follows it, and the copy is discarded.
 
-    project, _slot = _image_slot(tmp_path)
+    The copy sits on the slot's own mount point, as a copy of the slot's mount does.
+    """
+
+    project, slot = _image_slot(tmp_path)
     log = tmp_path / "fake-images.log"
     proc = tmp_path / "proc"
-    _holder(proc, 41, tmp_path / "anywhere", root=Path("/"))
+    _holder(proc, 41, slot, root=Path("/"))
 
     removed = _fake_images(
         project, log, "remove", "slot01", "--coordinator-pid", str(os.getpid()),
@@ -1532,6 +1580,253 @@ def test_remove_keeps_its_discard_decision_through_its_own_path_fence(tmp_path: 
         entry[:2] == ["privileged", "umount"] and entry[-1] == "--discard-stale-copies"
         for entry in _logged(log)
     )
+
+
+# ----------------------------------- a discard sees work in the stale copy wherever it is reached
+#
+# Review round 3, finding B1: the holder census only compared roots, and the process-use census
+# looks for use by path under the slot's recorded location. A namespace can show the stale copy
+# at a second path too (here, on this host, a bind of the home directory shows it under its
+# underlying data path), and a process working there was invisible to both. A discard now looks
+# for work in the copy by device, and requires every mount of the copy to sit on the slot's own
+# mount-point entry, which replacing that entry releases.
+
+
+def _stale_view(path: Path, monkeypatch: pytest.MonkeyPatch, device: str = "7:54") -> None:
+    """Count every file under ``path`` as one on ``device`` for the census's device checks."""
+
+    real = cli._stale_copy_device
+    view = os.path.realpath(path)
+
+    def stale_copy_device(link: Path) -> str:
+        target = os.path.realpath(link)
+        if target == view or target.startswith(view + os.sep):
+            return device
+        return real(link)
+
+    monkeypatch.setattr(cli, "_stale_copy_device", stale_copy_device)
+
+
+def test_stale_copy_holders_find_work_in_the_copy_by_device_wherever_it_is_reached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slot = tmp_path / "slots" / "s1"
+    slot.mkdir(parents=True)
+    underlying = tmp_path / "underlying" / "s1"
+    (underlying / "src").mkdir(parents=True)
+    (underlying / "src" / "file").write_text("x", encoding="utf-8")
+    _stale_view(underlying, monkeypatch)
+    proc = tmp_path / "proc"
+    stale = [(slot, "7:54", "/dev/loop54")]
+
+    # Negative control: an idle copy on the slot's own mount point may be discarded.
+    _holder(proc, 70, slot, root=Path("/"))
+    [idle] = cli._stale_copy_holders(stale, proc_root=proc)
+    assert idle.holder_pids == (70,) and idle.uses == () and idle.elsewhere == ()
+    assert cli._stale_copy_blocker([idle]) is None
+
+    # The live shape: one namespace lists the copy at the slot and at a second path, and a
+    # process of it works there. While the copy is discarded, the census's path checks see
+    # nothing: its mount line at the slot is the slot's storage, and nothing else names the slot.
+    _holder(proc, 77, slot, underlying, root=Path("/"), cwd=underlying / "src")
+    monkeypatch.setattr(cli, "_OWNED_REPRESENTATION_MOUNTS", frozenset({(slot.resolve(), "7:54")}))
+    monkeypatch.setattr(cli, "_STALE_REPRESENTATION_MOUNTS", frozenset())
+    assert cli._process_uses_slot(proc / "77", slot.resolve()) == []
+    [found] = cli._stale_copy_holders(stale, proc_root=proc)
+    assert found.uses == (f"process 77 (cwd={underlying / 'src'})",)
+    assert found.elsewhere == (f"{underlying.resolve()} (mount namespace mnt:[4026536077])",)
+    reason, remedy = cli._stale_copy_blocker([found]) or ("", "")
+    assert reason.startswith(f"process 77 (cwd={underlying / 'src'}) is on the stale image copy")
+    assert remedy.startswith("stop that process")
+
+    # An open file or a mapping on the stale device is work in it too, even in a process whose
+    # own mount table does not hold the copy.
+    shutil.rmtree(proc / "77")
+    holding = _fake_process(
+        proc, 78, namespace="mnt:[2]", mountinfo="", root=Path("/"), cwd=Path("/proc")
+    )
+    (holding / "fd" / "3").symlink_to(underlying / "src" / "file")
+    mapping = _fake_process(
+        proc, 79, namespace="mnt:[3]", mountinfo="", root=Path("/"), cwd=Path("/proc")
+    )
+    (mapping / "maps").write_text(
+        f"7f00-7f01 r--p 00000000 07:36 12 {underlying / 'src' / 'file'}\n", encoding="utf-8"
+    )
+    [found] = cli._stale_copy_holders(stale, proc_root=proc)
+    assert found.holder_pids == (70,) and found.elsewhere == ()
+    assert found.uses == (
+        f"process 78 (fd/3={underlying / 'src' / 'file'})",
+        f"process 79 (map={underlying / 'src' / 'file'})",
+    )
+
+
+def test_stale_copy_holders_refuse_a_holder_whose_work_cannot_be_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A holder's unreadable entries refuse; another process's are skipped, as lsof skips them."""
+
+    slot = tmp_path / "slots" / "s1"
+    slot.mkdir(parents=True)
+    proc = tmp_path / "proc"
+    _holder(proc, 80, slot, root=Path("/"))
+    _fake_process(proc, 81, namespace="mnt:[9]", mountinfo="", root=Path("/"), cwd=Path("/proc"))
+    real = cli._stale_copy_device
+    denied = {str(proc / "81" / "cwd")}
+
+    def stale_copy_device(link: Path) -> str:
+        if str(link) in denied:
+            raise PermissionError(errno.EACCES, "Permission denied", str(link))
+        return real(link)
+
+    monkeypatch.setattr(cli, "_stale_copy_device", stale_copy_device)
+    [holders] = cli._stale_copy_holders([(slot, "7:54", "/dev/loop54")], proc_root=proc)
+    assert holders.holder_pids == (80,) and holders.uses == ()
+
+    denied.add(str(proc / "80" / "cwd"))
+    with pytest.raises(cli.Refusal, match="processes 80, which hold the stale image copy"):
+        cli._stale_copy_holders([(slot, "7:54", "/dev/loop54")], proc_root=proc)
+
+
+def test_a_mount_point_entry_is_recognised_under_another_path_only_when_it_is_the_same(
+    tmp_path: Path,
+) -> None:
+    slots = tmp_path / "slots"
+    own = slots / "s1"
+    own.mkdir(parents=True)
+    (tmp_path / "elsewhere" / "s1").mkdir(parents=True)
+    (tmp_path / "link").symlink_to(slots)
+    parent = os.stat(slots)
+    identity = (parent.st_dev, parent.st_ino)
+    proc = tmp_path / "proc"
+    _fake_process(proc, 90, namespace="mnt:[1]", mountinfo="", root=Path("/"), cwd=Path("/proc"))
+    # A process whose root is tmp_path renders the same entry as /slots/s1: another path to it,
+    # as a bind of a directory above the slot gives.
+    _fake_process(proc, 91, namespace="mnt:[2]", mountinfo="", root=tmp_path, cwd=Path("/proc"))
+
+    def entry(pid: int, point: Path) -> bool:
+        return cli._on_mount_point_entry(proc, pid, point, own, identity)
+
+    assert entry(90, own.resolve())
+    assert entry(91, Path("/slots/s1"))
+    # Negative controls: another directory, another name, a path through a symbolic link, a
+    # process whose root cannot be read, and a parent that could not be inspected here.
+    assert not entry(90, (tmp_path / "elsewhere" / "s1").resolve())
+    assert not entry(90, slots.resolve() / "s2")
+    assert not entry(90, tmp_path.resolve() / "link" / "s1")
+    assert not entry(92, own.resolve())
+    assert not cli._on_mount_point_entry(proc, 90, own.resolve(), own, None)
+
+
+def _underlying_copy(tmp_path: Path, name: str) -> Path:
+    """Where the stale copy also shows in the holder's namespace: a second path, with work in it."""
+
+    underlying = tmp_path / "underlying-data" / name
+    (underlying / "src").mkdir(parents=True)
+    return underlying
+
+
+def test_remove_refuses_to_discard_a_copy_worked_in_or_mounted_off_its_mount_point(
+    tmp_path: Path,
+) -> None:
+    project, slot = _image_slot(tmp_path)
+    log = tmp_path / "fake-images.log"
+    underlying = _underlying_copy(tmp_path, slot.name)
+    proc = tmp_path / "proc"
+    _holder(proc, 41, slot, underlying, root=Path("/"))
+    _holder(proc, 42, slot, underlying, root=Path("/"), namespace=41, cwd=underlying / "src")
+    command = (
+        "remove", "slot01", "--coordinator-pid", str(os.getpid()), "--expected-generation", "1",
+        "--coordinator-authorized", "--discard-stale-image-copy",
+    )
+    view = {"FAKE_STALE_VIEW": str(underlying)}
+    image_directory = slotimage.image_directory(t.control_directory(project), "agent", "slot01")
+
+    worked = _fake_images(project, log, *command, stale="54", proc=proc, env=view)
+
+    assert worked.returncode == 3, worked.stdout + worked.stderr
+    assert (
+        f"--discard-stale-image-copy: process 42 (cwd={underlying / 'src'}) is on the stale "
+        "image copy /dev/loop54 (7:54)"
+    ) in worked.stderr
+    assert "no checkout was salvaged or removed" in worked.stderr
+    assert not any(entry[:2] == ["privileged", "umount"] for entry in _logged(log))
+    assert _discard_events(project) == [] and len(t.active_slots(project)) == 1
+    assert (image_directory / "slot.img").exists() and (slot / ".git").is_file()
+
+    # The worker stopped; the copy is still mounted at the second path, which replacing the
+    # slot's own mount point cannot release.
+    shutil.rmtree(proc / "42")
+    elsewhere = _fake_images(project, log, *command, stale="54", proc=proc, env=view)
+
+    assert elsewhere.returncode == 3, elsewhere.stdout + elsewhere.stderr
+    assert (
+        f"is mounted at {underlying.resolve()} (mount namespace mnt:[4026536041]), which is not "
+        "shown to be the slot's own mount point"
+    ) in elsewhere.stderr
+    assert not any(entry[:2] == ["privileged", "umount"] for entry in _logged(log))
+    assert _discard_events(project) == [] and len(t.active_slots(project)) == 1
+
+
+def test_recover_refuses_to_discard_a_copy_a_process_works_in_at_another_path(
+    tmp_path: Path,
+) -> None:
+    project, journal, fenced, log = _image_slot_interrupted_after_git_removal(tmp_path)
+    underlying = _underlying_copy(tmp_path, fenced.name)
+    proc = tmp_path / "proc"
+    _holder(proc, 41, fenced, underlying, root=Path("/"))
+    _holder(proc, 42, fenced, underlying, root=Path("/"), namespace=41, cwd=underlying / "src")
+    before = len(_logged(log))
+
+    refused = _recover(
+        project, log, "--coordinator-authorized", "--discard-stale-image-copy", proc=proc,
+        env={"FAKE_STALE_VIEW": str(underlying)},
+    )
+
+    assert refused.returncode == 3, refused.stdout + refused.stderr
+    assert f"process 42 (cwd={underlying / 'src'}) is on the stale image copy" in refused.stderr
+    assert "the interrupted removal of slot slot01 stays recorded" in refused.stderr
+    assert not any(entry[:2] == ["privileged", "umount"] for entry in _logged(log)[before:])
+    assert _discard_events(project) == [] and _journals(project) != []
+    assert _the_journal(project)["archive_id"] == journal["archive_id"]
+
+
+def test_a_discarding_census_refuses_work_begun_in_the_copy_after_the_decision(
+    tmp_path: Path,
+) -> None:
+    """The process-use census of the discarding command checks the stale copy again."""
+
+    project, slot = _image_slot(tmp_path)
+    log = tmp_path / "fake-images.log"
+    underlying = _underlying_copy(tmp_path, slot.name)
+    proc = tmp_path / "proc"
+    _holder(proc, 41, slot, root=Path("/"))
+    late = tmp_path / "late"
+    _holder(late, 42, slot, root=Path("/"), namespace=41, cwd=underlying / "src")
+
+    removed = _fake_images(
+        project, log, "remove", "slot01", "--coordinator-pid", str(os.getpid()),
+        "--expected-generation", "1", "--coordinator-authorized", "--discard-stale-image-copy",
+        stale="54", proc=proc, env={"FAKE_STALE_VIEW": str(underlying), "LATE": str(late / "42")},
+        patch="""
+        real_enable = cli._enable_stale_copy_discard
+
+        def enable(config, image):
+            real_enable(config, image)
+            # A process begins to work in the stale copy once the decision is taken.
+            os.rename(os.environ["LATE"], os.path.join(os.environ["FAKE_PROC"], "42"))
+
+        cli._enable_stale_copy_discard = enable
+        """,
+    )
+
+    assert removed.returncode == 3, removed.stdout + removed.stderr
+    assert (proc / "42").is_dir()
+    assert (
+        f"--discard-stale-image-copy: process 42 (cwd={underlying / 'src'}) is on the stale image "
+        "copy /dev/loop54 (7:54)"
+    ) in removed.stderr
+    assert not any(entry[:2] == ["privileged", "umount"] for entry in _logged(log))
+    assert len(t.active_slots(project)) == 1 and (slot / ".git").is_file()
 
 
 #: What test_lifecycle.py collects from this module: its tests and the fixtures they use.

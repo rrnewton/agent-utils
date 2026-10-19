@@ -1911,13 +1911,27 @@ wrkslots remove SLOT --coordinator-pid $$ --expected-generation N \
     --coordinator-authorized --discard-stale-image-copy
 ```
 
-This first finds every process whose mount table holds the stale device and refuses unless each
-shares this process's root (only then can the census see a use of the stale copy by path). The
-removal records an `active-state-recorded` event with action `stale-image-copy-discard-authorized`
-(the stale devices, their holder PIDs and mount namespaces) before salvage, and the reclaim evidence
-repeats them as `image_copies`. Anything written only through the stale copy is lost. A slot whose
-image is attached twice while this host mounts neither device cannot be salvaged, so it refuses:
-release one of the copies (stop the processes holding it) first.
+This refuses unless nothing can be working in the stale copy:
+
+- every process whose mount table holds the stale device shares this process's root;
+- no process has its working directory, root, executable, an open file or a mapping on the stale
+  device. This is found by device, not by path: a namespace can show the copy at a second path too
+  (a bind of the home directory shows it under its underlying data path), where neither the path
+  checks of the census nor lsof on this host's own device look. A holder whose entries this user
+  cannot read refuses; another process's unreadable entries are skipped, as lsof skips them;
+- every mount of the stale copy sits on the slot's own mount-point directory entry: its recorded
+  path, or another path to the same entry (the same name in the same parent directory, by device
+  and inode, walked from the holder's root without following a symbolic link). Replacing that entry
+  is how the copies are released, so a copy mounted anywhere else would survive the removal.
+
+Every process-use census of the removal checks all three again, so work begun in the stale copy
+after the decision still refuses before the path fence moves the image and before anything is
+deleted. The removal records an `active-state-recorded` event with action
+`stale-image-copy-discard-authorized` (the stale devices, their holder PIDs and mount namespaces)
+before salvage, and the reclaim evidence repeats them as `image_copies`. Anything written only
+through the stale copy is lost. A slot whose image is attached twice while this host mounts neither
+device cannot be salvaged, so it refuses: release one of the copies (stop the processes holding it)
+first.
 
 **An interrupted removal of an image-backed slot.** A removal interrupted after `git worktree remove`
 leaves its finish journal in phase `fenced`. For a flat image-backed slot the fenced directory is
@@ -1934,14 +1948,14 @@ wrkslots recover --coordinator-pid $$ --coordinator-authorized --discard-stale-i
 ```
 
 Recovery establishes the conditions again: such a copy must exist (otherwise it refuses and plain
-`recover` is the command), and every process whose mount table holds it must share this process's
-root. It records `stale-image-copy-discard-authorized` naming the journal's archive id, the stale
-devices with their holders, and the journal's salvage receipts, before anything is unmounted. A
-removal that was itself given `--discard-stale-image-copy` resumes with plain `recover`, but only
-while every stale device is one that removal recorded and the holder check passes again. The
-decision is bound to that removal: the event remove writes just before its finish journal names
-the decision's event, so a discard recorded by an earlier removal that refused before writing its
-journal never carries over to a later removal given without the flag.
+`recover` is the command), and the three conditions of `remove` above must hold. It records
+`stale-image-copy-discard-authorized` naming the journal's archive id, the stale devices with their
+holders, and the journal's salvage receipts, before anything is unmounted. A removal that was
+itself given `--discard-stale-image-copy` resumes with plain `recover`, but only while every stale
+device is one that removal recorded and those conditions hold again. The decision is bound to that
+removal: the event remove writes just before its finish journal names the decision's event, so a
+discard recorded by an earlier removal that refused before writing its journal never carries over
+to a later removal given without the flag.
 
 **A stray `.git` in an unmounted mount point.** Older versions repaired a moved checkout with
 `git worktree repair`, which rewrites every linked worktree's `.git` and so wrote into the empty
