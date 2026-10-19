@@ -205,6 +205,10 @@ pub async fn hidden_channels(state: &AppState) -> Vec<ChannelInfo> {
 /// alias matching case-insensitively (surrounding whitespace ignored) stands in for its id. This
 /// only picks a channel from the allowlist; it never admits one. A name two channels share
 /// names neither, so an ambiguous name resolves to nothing rather than to a guess.
+///
+/// With several services the model is told each channel as `team on Slack`
+/// (`#355 provider-grouped-channels`), so that is accepted too, when no channel is called the whole
+/// of it: the name before the last " on ", among the channels of the service named after it.
 pub async fn channel_named(state: &AppState, name: &str) -> Option<ChannelId> {
     let name = name.trim();
     let channels = channels(state).await;
@@ -214,15 +218,27 @@ pub async fn channel_named(state: &AppState, name: &str) -> Option<ChannelId> {
     if name.is_empty() {
         return None;
     }
-    let same = |candidate: &str| candidate.trim().to_lowercase() == name.to_lowercase();
-    let mut named = channels
-        .iter()
-        .filter(|c| same(&c.label) || c.alias.as_deref().is_some_and(same));
-    let found = named.next()?;
-    if named.next().is_some() {
-        return None;
+    let called = |channel: &ChannelInfo, name: &str| {
+        let same = |candidate: &str| candidate.trim().to_lowercase() == name.to_lowercase();
+        same(&channel.label) || channel.alias.as_deref().is_some_and(same)
+    };
+    let only =
+        |mut found: Vec<&ChannelInfo>| (found.len() == 1).then(|| found.remove(0).id.clone());
+    let named: Vec<&ChannelInfo> = channels.iter().filter(|c| called(c, name)).collect();
+    if !named.is_empty() {
+        return only(named);
     }
-    Some(found.id.clone())
+    let lower = name.to_lowercase();
+    let (channel_name, service) = lower.rsplit_once(" on ")?;
+    let services = state.providers.service_names();
+    let keys = services.keys_named(service);
+    only(
+        channels
+            .iter()
+            .filter(|c| c.provider.as_deref().is_some_and(|key| keys.contains(&key)))
+            .filter(|c| called(c, channel_name))
+            .collect(),
+    )
 }
 
 /// The operator's local channel names, by channel id. `#39 channel-alias`.

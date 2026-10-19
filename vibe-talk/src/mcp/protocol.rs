@@ -138,23 +138,27 @@ pub async fn tools_for(state: &AppState, scope: Scope) -> Vec<Value> {
     // client that lists again after the owner changed it sees the change. `#264
     // voice-send-approval`.
     let approval = crate::send_approval::current(state).await;
-    tool_manifest(&ops::channels(state).await, approval)
-        .into_iter()
-        .filter(|t| t.mcp_exposed)
-        .filter(|t| !t.mutates || scope >= Scope::Write)
-        .map(|t| {
-            json!({
-                "name": t.name,
-                "description": t.description,
-                "inputSchema": t.arguments,
-                "annotations": {
-                    "readOnlyHint": !t.mutates,
-                    "destructiveHint": false,
-                    "openWorldHint": true,
-                },
-            })
+    crate::mcp::tool_manifest_with_services(
+        &ops::channels(state).await,
+        &state.providers.service_names(),
+        approval,
+    )
+    .into_iter()
+    .filter(|t| t.mcp_exposed)
+    .filter(|t| !t.mutates || scope >= Scope::Write)
+    .map(|t| {
+        json!({
+            "name": t.name,
+            "description": t.description,
+            "inputSchema": t.arguments,
+            "annotations": {
+                "readOnlyHint": !t.mutates,
+                "destructiveHint": false,
+                "openWorldHint": true,
+            },
         })
-        .collect()
+    })
+    .collect()
 }
 
 /// Handle one JSON-RPC message.
@@ -593,9 +597,11 @@ async fn channel_choices(state: &AppState) -> String {
     if channels.is_empty() {
         return NO_CHANNELS.to_owned();
     }
+    // Each with its service where there are several. `#355 provider-grouped-channels`.
+    let services = state.providers.service_names();
     let listed = channels
         .iter()
-        .map(|c| format!("{} (id {})", c.display_name(), c.id))
+        .map(|c| services.describe(c))
         .collect::<Vec<_>>()
         .join(", ");
     format!("Pass channel_id as one of these ids: {listed}")
@@ -607,13 +613,15 @@ async fn list_channels_text(state: &AppState) -> String {
         return NO_CHANNELS.to_owned();
     }
     let mut out = String::from("Channels this server can reach:\n");
+    // `#355 provider-grouped-channels`: with several services, each channel's is named, as
+    // `team on Slack (id C0123)`, so two channels with one name are not one name to the model.
+    let services = state.providers.service_names();
     for channel in channels {
         out.push_str(&format!(
-            "- {} (id {}) — {}\n",
+            "- {} — {}\n",
             // The operator's own name for it when he set one. `#39 channel-alias`: the whole
             // point is that the name he SAYS is the name the model was handed.
-            channel.display_name(),
-            channel.id,
+            services.describe(&channel),
             if channel.writable {
                 "readable and postable"
             } else {
