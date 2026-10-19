@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import functools
 import datetime
 import fcntl
 import json
@@ -3156,6 +3157,51 @@ def _restore_migration_record(
         return True
 
 
+def _rollback_step(errors: list[str], label: str, step: Callable[[], object]) -> bool:
+    """Run one rollback step; its failure is reported, never raised over the original error."""
+    try:
+        step()
+    except Exception as exc:  # noqa: BLE001 - every rollback step must run and report
+        errors.append(f"{label} failed: {getattr(exc, 'message', exc)}")
+        return False
+    return True
+
+
+def _current_or(name: str, fallback: AgentRecord, errors: list[str]) -> AgentRecord:
+    """Read the current row during a rollback, falling back without raising."""
+    try:
+        return read_registry().get(name) or fallback
+    except Exception as exc:  # noqa: BLE001 - a rollback reports, it does not raise
+        errors.append(f"reading the restored registry row failed: {getattr(exc, 'message', exc)}")
+        return fallback
+
+
+def _runner_state(rec: AgentRecord) -> str:
+    """Describe a source runner for a rollback message without raising."""
+    try:
+        return "alive" if runner_identity_alive(rec) else "not alive"
+    except AgentOperationError as exc:
+        return f"of unknown state ({exc.message})"
+
+
+def _stop_staged_runner(name: str, identity: RunnerIdentity) -> bool:
+    """Stop a staged replacement runner, and first any harness tree it recorded."""
+    with _harness_lock(name):
+        stopped = False
+        record = read_active_harness(name)
+        if (record is not None and not record.legacy
+                and (record.runner.pid, record.runner.started_at) == (identity.pid, identity.started_at)):
+            report = ownership.kill_harness_tree(record)
+            if not report.complete:
+                raise AgentOperationError(
+                    "harness_cleanup_incomplete",
+                    f"staged runner pid {identity.pid}'s harness: {report.describe()}",
+                )
+            remove_active_harness(name, record)
+            stopped = report.killed > 0
+        return terminate_runner_identity(identity, name=name) or stopped
+
+
 def _migrate_legacy_tmux_source(name: str, old: AgentRecord, to_backend: str) -> MigrationResult:
     """Migrate a pre-pause-handshake tmux runner with restart-on-failure safety."""
     assert old.runner_pid is not None
@@ -3233,19 +3279,25 @@ def _migrate_legacy_tmux_source(name: str, old: AgentRecord, to_backend: str) ->
     except Exception as exc:
         cleanup_errors: list[str] = []
         if staged_identity is not None:
-            terminate_runner_identity(staged_identity)
+            _rollback_step(cleanup_errors, f"stopping staged runner pid {staged_identity.pid}",
+                           functools.partial(_stop_staged_runner, name, staged_identity))
         if new_target is not None:
-            try:
-                kill_window(dataclasses.replace(old, backend=to_backend, tmux_target=new_target))
-            except Exception as cleanup_exc:
-                cleanup_errors.append(f"destination cleanup failed: {cleanup_exc}")
+            _rollback_step(cleanup_errors, "destination cleanup", functools.partial(
+                kill_window, dataclasses.replace(old, backend=to_backend, tmux_target=new_target)))
         try:
             _restore_migration_record(name, old, staged_identity, to_backend, new_target)
         except Exception as restore_exc:
+            # The registry no longer describes the source; restarting a runner
+            # or clearing markers against it could strand both. Stop here and
+            # report every step that did and did not run.
             raise AgentOperationError(
-                "legacy_migration_rollback_failed", f"destination failed ({exc}); source registry restoration failed: {restore_exc}"
+                "legacy_migration_rollback_failed",
+                f"destination failed ({exc}); source registry restoration failed: {restore_exc}; "
+                "markers were kept and the tmux runner was not restarted"
+                + "".join(f"; {item}" for item in cleanup_errors),
             ) from exc
-        clear_migration_markers(name, token)
+        _rollback_step(cleanup_errors, "clearing migration markers",
+                       functools.partial(clear_migration_markers, name, token))
         try:
             restored = _restore_legacy_tmux_runner(name, old)
         except Exception as restore_exc:
@@ -3497,13 +3549,12 @@ def _convert_headless_to_tui(name: str, old: AgentRecord) -> MigrationResult:
                 rollback_errors.append(f"headless source restoration failed: {restore_exc}")
             else:
                 rollback_errors.append(f"headless source restored as pid {restored.pid}")
-                resume_source = read_registry().get(name) or old
-        try:
-            _resume_source_intake(name, resume_source)
-        except AgentOperationError as resume_exc:
-            rollback_errors.append(f"intake resume proof failed: {resume_exc.message}")
-        else:
+                resume_source = _current_or(name, old, rollback_errors)
+        resume_errors: list[str] = []
+        if _rollback_step(resume_errors, "intake resume proof",
+                          functools.partial(_resume_source_intake, name, resume_source)):
             rollback_errors.append(f"source intake resumed for pid {resume_source.runner_pid}")
+        rollback_errors.extend(resume_errors)
         if rollback_errors:
             raise AgentOperationError(
                 "tui_conversion_rollback",
@@ -3580,13 +3631,12 @@ def _convert_legacy_tmux_headless_to_tui(name: str, old: AgentRecord) -> Migrati
             resume_source = old
         else:
             cleanup_errors.append(f"tmux source restored as pid {restored.pid}")
-            resume_source = read_registry().get(name) or old
-        try:
-            _resume_source_intake(name, resume_source)
-        except AgentOperationError as resume_exc:
-            cleanup_errors.append(f"intake resume proof failed: {resume_exc.message}")
-        else:
+            resume_source = _current_or(name, old, cleanup_errors)
+        resume_errors: list[str] = []
+        if _rollback_step(resume_errors, "intake resume proof",
+                          functools.partial(_resume_source_intake, name, resume_source)):
             cleanup_errors.append(f"source intake resumed for pid {resume_source.runner_pid}")
+        cleanup_errors.extend(resume_errors)
         raise AgentOperationError(
             "legacy_tui_conversion_rolled_back",
             f"legacy source was stopped and TUI destination was not committed ({exc}); "
@@ -3727,20 +3777,22 @@ def migrate_agent(
     except Exception as exc:
         rollback_errors: list[str] = []
         if staged_identity is not None:
-            terminate_runner_identity(staged_identity)
+            _rollback_step(rollback_errors, f"stopping staged runner pid {staged_identity.pid}",
+                           functools.partial(_stop_staged_runner, valid_name, staged_identity))
         if new_target is not None:
-            try:
-                kill_window(dataclasses.replace(old_rec, backend=to_backend, tmux_target=new_target))
-            except Exception as cleanup_exc:
-                rollback_errors.append(f"destination cleanup failed: {cleanup_exc}")
+            _rollback_step(rollback_errors, "destination cleanup", functools.partial(
+                kill_window, dataclasses.replace(old_rec, backend=to_backend, tmux_target=new_target)))
         try:
             restored = _restore_migration_record(valid_name, old_rec, staged_identity, to_backend, new_target)
         except Exception as restore_exc:
             raise AgentOperationError(
-                "migration_rollback_failed", f"destination failed ({exc}); source registry restoration failed: {restore_exc}; intake remains paused"
+                "migration_rollback_failed",
+                f"destination failed ({exc}); source registry restoration failed: {restore_exc}; "
+                "intake remains paused" + "".join(f"; {item}" for item in rollback_errors),
             ) from exc
-        clear_migration_markers(valid_name, token)
-        source_state = "alive" if runner_identity_alive(old_rec) else "not alive"
+        _rollback_step(rollback_errors, "clearing migration markers",
+                       functools.partial(clear_migration_markers, valid_name, token))
+        source_state = _runner_state(old_rec)
         if rollback_errors:
             raise AgentOperationError(
                 "migration_rollback_failed",
@@ -3753,7 +3805,15 @@ def migrate_agent(
             f"{old_identity.pid} is {source_state}, its window is retained and its registry identity is restored",
         ) from exc
 
-    if not terminate_runner(old_rec):
+    try:
+        source_stopped = terminate_runner(old_rec)
+    except AgentOperationError as exc:
+        raise AgentOperationError(
+            "migration_source_cleanup_failed",
+            f"destination runner pid {staged_identity.pid} was committed, but source runner pid "
+            f"{old_identity.pid} could not be stopped ({exc.message}); intake remains paused on the source",
+        ) from exc
+    if not source_stopped:
         raise AgentOperationError(
             "migration_source_cleanup_failed",
             f"destination runner pid {staged_identity.pid} was committed, but source runner pid "

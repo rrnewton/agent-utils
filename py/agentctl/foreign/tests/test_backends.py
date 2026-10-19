@@ -1187,7 +1187,8 @@ def test_activation_timeout_restores_source_registry_after_commit(
     monkeypatch.setattr(lib, "wait_for_staged_runner", lambda _name, _token: destination)
     monkeypatch.setattr(lib, "launch_window", lambda *_args: "wZ:t1")
     monkeypatch.setattr(lib, "terminate_runner", lambda _rec: True)
-    monkeypatch.setattr(lib, "terminate_runner_identity", lambda identity: stopped.append(identity.pid))
+    monkeypatch.setattr(lib, "terminate_runner_identity",
+                        lambda identity, *_args, **_kwargs: stopped.append(identity.pid))
     monkeypatch.setattr(lib, "kill_window", lambda rec: killed.append(rec.tmux_target))
     def activation(_name: str, _token: str) -> bool:
         with lib.registry_lock() as agents:
@@ -1746,3 +1747,201 @@ def test_runner_boot_identity_lives_beside_the_row_and_applies_only_to_it(
     with lib.registry_lock():
         pass
     assert not (lib.STATE / name / "runner-identity.json").exists()
+
+
+# --------------------------------------------------------------------------- #
+# Migration rollback: no cleanup failure may mask the original failure
+# --------------------------------------------------------------------------- #
+
+
+def _migration_source(name: str, cwd: Path) -> tuple[int, str | None]:
+    lib.ensure_agent_dirs(name)
+    old_pid, old_start = os.getpid(), lib.pid_start_time(os.getpid())
+    with lib.registry_lock() as agents:
+        agents[name] = lib.AgentRecord(
+            name=name, harness="codex", backend="tmux", tmux_target=f"subagents:{name}", cwd=str(cwd),
+            model=None, session_id="session-kept", status="idle", runner_pid=old_pid,
+            runner_started_at=old_start, next_seq=1, created_at=lib.now_iso(), last_turn_at=lib.now_iso(),
+            runner_boot_id=ownership.current_boot_id(),
+        )
+    return old_pid, old_start
+
+
+_ROLLBACK_FAILURES = ("staged", "window", "markers", "source-probe")
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("failing", [*_ROLLBACK_FAILURES, "all"])
+def test_migration_rollback_reports_each_failed_step_and_keeps_the_original_failure(
+    fake_backend_state: Path, monkeypatch: pytest.MonkeyPatch, legacy: bool, failing: str,
+) -> None:
+    name = "rollback-steps"
+    cwd = fake_backend_state / "cwd"
+    cwd.mkdir(parents=True)
+    old_pid, old_start = _migration_source(name, cwd)
+    destination = lib.RunnerIdentity(999_996, "destination-start", ownership.current_boot_id())
+    failures = set(_ROLLBACK_FAILURES) if failing == "all" else {failing}
+    rolling_back: list[bool] = []
+    real_alive = lib.runner_identity_alive
+    real_clear = lib.clear_migration_markers
+
+    def stop_staged(identity: lib.RunnerIdentity, *_args: object, **_kwargs: object) -> bool:
+        if "staged" in failures:
+            raise lib.AgentOperationError("runner_stop_incomplete", "staged runner is still present")
+        return True
+
+    def close_window(rec: lib.AgentRecord) -> None:
+        if "window" in failures and rec.backend == "herdr":
+            raise RuntimeError("tab close refused")
+
+    def clear(name_: str, token: str) -> None:
+        if "markers" in failures and rolling_back:
+            raise OSError("read-only file system")
+        real_clear(name_, token)
+
+    def alive(rec: lib.AgentRecord) -> bool:
+        if "source-probe" in failures and rolling_back:
+            raise lib.AgentOperationError("runner_identity_unknown", "procfs is unreadable")
+        return real_alive(rec)
+
+    def activation(_name: str, _token: str) -> bool:
+        rolling_back.append(True)
+        return False
+
+    monkeypatch.setattr(lib, "backend_available", lambda _backend: True)
+    monkeypatch.setattr(lib, "wait_for_pause_ack", lambda _name, _old: not legacy)
+    monkeypatch.setattr(lib, "wait_for_staged_runner", lambda _name, _token: destination)
+    monkeypatch.setattr(lib, "launch_window", lambda *_args: "wZ:t1")
+    monkeypatch.setattr(lib, "terminate_runner", lambda _rec: True)
+    monkeypatch.setattr(lib, "terminate_runner_identity", stop_staged)
+    monkeypatch.setattr(lib, "kill_window", close_window)
+    monkeypatch.setattr(lib, "clear_migration_markers", clear)
+    monkeypatch.setattr(lib, "runner_identity_alive", alive)
+    monkeypatch.setattr(lib, "wait_for_staged_runner_activation", activation)
+    monkeypatch.setattr(lib, "_restore_legacy_tmux_runner",
+                        lambda _name, _old: lib.RunnerIdentity(old_pid, old_start))
+
+    with pytest.raises(lib.AgentOperationError) as caught:
+        lib.migrate_agent(name)
+
+    message = caught.value.message
+    assert "did not acknowledge activation" in message, message
+    assert caught.value.__cause__ is not None
+    expected_labels = {
+        "staged": "stopping staged runner pid 999996 failed: staged runner is still present",
+        "window": "destination cleanup failed: tab close refused",
+        "markers": "clearing migration markers failed: read-only file system",
+    }
+    for step, label in expected_labels.items():
+        assert (label in message) == (step in failures), (step, message)
+    reported = failures & set(expected_labels)
+    if legacy:
+        assert caught.value.code == ("legacy_migration_rollback_failed" if reported
+                                     else "legacy_migration_destination_failed")
+    else:
+        assert caught.value.code == ("migration_rollback_failed" if reported
+                                     else "migration_activation_rolled_back")
+        if "source-probe" in failures:
+            assert "of unknown state (procfs is unreadable)" in message
+    restored = lib.read_registry()[name]
+    assert (restored.backend, restored.tmux_target, restored.runner_pid, restored.runner_started_at,
+            restored.runner_boot_id) == ("tmux", f"subagents:{name}", old_pid, old_start,
+                                         ownership.current_boot_id())
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_unrestorable_registry_still_reports_the_steps_that_ran(
+    fake_backend_state: Path, monkeypatch: pytest.MonkeyPatch, legacy: bool,
+) -> None:
+    name = "rollback-registry"
+    cwd = fake_backend_state / "cwd"
+    cwd.mkdir(parents=True)
+    _migration_source(name, cwd)
+    destination = lib.RunnerIdentity(999_995, "destination-start", ownership.current_boot_id())
+    monkeypatch.setattr(lib, "backend_available", lambda _backend: True)
+    monkeypatch.setattr(lib, "wait_for_pause_ack", lambda _name, _old: not legacy)
+    monkeypatch.setattr(lib, "wait_for_staged_runner", lambda _name, _token: destination)
+    monkeypatch.setattr(lib, "launch_window", lambda *_args: "wZ:t2")
+    monkeypatch.setattr(lib, "terminate_runner", lambda _rec: True)
+
+    def refuse_stop(_identity: lib.RunnerIdentity, *_args: object, **_kwargs: object) -> bool:
+        raise lib.AgentOperationError("runner_stop_incomplete", "staged runner is still present")
+
+    def changed(*_args: object) -> bool:
+        raise lib.AgentOperationError("migration_source_changed", "registry identity changed")
+
+    monkeypatch.setattr(lib, "terminate_runner_identity", refuse_stop)
+    monkeypatch.setattr(lib, "kill_window", lambda _rec: None)
+    monkeypatch.setattr(lib, "wait_for_staged_runner_activation", lambda _name, _token: False)
+    monkeypatch.setattr(lib, "_restore_migration_record", changed)
+    with pytest.raises(lib.AgentOperationError) as caught:
+        lib.migrate_agent(name)
+    assert caught.value.code == ("legacy_migration_rollback_failed" if legacy else "migration_rollback_failed")
+    message = caught.value.message
+    assert "did not acknowledge activation" in message
+    assert "source registry restoration failed: registry identity changed" in message
+    assert "stopping staged runner pid 999995 failed: staged runner is still present" in message
+
+
+def test_tui_conversion_rollback_reports_an_unexpected_intake_failure(
+    fake_backend_state: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "convert-tui-intake"
+    cwd = fake_backend_state / "cwd"
+    cwd.mkdir(parents=True)
+    lib.ensure_agent_dirs(name)
+    with lib.registry_lock() as agents:
+        agents[name] = _headless_conversion_source(name, cwd)
+    probe = lib.TuiProbe(True, True, "idle", 999_994)
+    monkeypatch.setattr(lib, "backend_available", lambda backend: True)
+    monkeypatch.setattr(lib, "wait_for_pause_ack", lambda name, old: True)
+    monkeypatch.setattr(
+        lib, "_launch_herdr_tui",
+        lambda name, cwd, model, *, session_id=None, bypass_permissions=None: ("wT:t7", "wT:p7", probe),
+    )
+    monkeypatch.setattr(lib, "_confirm_resumed_tui", lambda rec: (_ for _ in ()).throw(
+        lib.AgentOperationError("no_reply", "health check failed")))
+    monkeypatch.setattr(lib, "kill_window", lambda rec: None)
+    monkeypatch.setattr(lib, "_resume_source_intake",
+                        lambda name, rec: (_ for _ in ()).throw(OSError("marker directory vanished")))
+    with pytest.raises(lib.AgentOperationError) as caught:
+        lib.migrate_agent(name, to_backend="herdr", to_mode="tui")
+    assert caught.value.code == "tui_conversion_rollback"
+    assert "health check failed" in caught.value.message
+    assert "intake resume proof failed: marker directory vanished" in caught.value.message
+
+
+def test_migration_rollback_stops_the_staged_runner_only_through_its_pidfd(
+    fake_backend_state: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real staged runner stand-in is stopped; a stale record of it never is."""
+    name = "rollback-real"
+    cwd = fake_backend_state / "cwd"
+    cwd.mkdir(parents=True)
+    old_pid, old_start = _migration_source(name, cwd)
+    staged = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        boot = ownership.current_boot_id()
+        exact = lib.RunnerIdentity(staged.pid, lib.pid_start_time(staged.pid), boot)
+        stale_start = str(int(lib.pid_start_time(bystander.pid) or "0") - 1)
+        stale = lib.RunnerIdentity(bystander.pid, stale_start, boot)
+        monkeypatch.setattr(lib, "backend_available", lambda _backend: True)
+        monkeypatch.setattr(lib, "wait_for_pause_ack", lambda _name, _old: True)
+        monkeypatch.setattr(lib, "launch_window", lambda *_args: "wZ:t3")
+        monkeypatch.setattr(lib, "kill_window", lambda _rec: None)
+        monkeypatch.setattr(lib, "wait_for_staged_runner_activation", lambda _name, _token: False)
+        for identity in (stale, exact):
+            monkeypatch.setattr(lib, "wait_for_staged_runner", lambda _name, _token, identity=identity: identity)
+            with pytest.raises(lib.AgentOperationError) as caught:
+                lib.migrate_agent(name)
+            assert caught.value.code == "migration_activation_rolled_back", caught.value.message
+            restored = lib.read_registry()[name]
+            assert (restored.runner_pid, restored.runner_started_at) == (old_pid, old_start)
+        assert staged.wait(timeout=5) == -signal.SIGTERM
+        assert bystander.poll() is None
+    finally:
+        for process in (staged, bystander):
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
