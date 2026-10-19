@@ -1,12 +1,13 @@
 ---
 title: 'wrkslots-orphan-retire: a slot whose owner died and whose agent was never registered can never be removed'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-10-15T19:55:46.624149558+00:00
-updated_at: 2026-10-15T19:55:46.624149558+00:00
+updated_at: 2026-10-18T22:13:08.694675677+00:00
+closed_at: 2026-10-18T22:13:08.694675517+00:00
 ---
 
 # Description
