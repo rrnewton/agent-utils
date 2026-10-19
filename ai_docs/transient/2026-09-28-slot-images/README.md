@@ -313,7 +313,7 @@ claude ran the write probe (registry, image and worktree slots writable; primary
 sibling directory, and `~/work` read-only; the Herdr socket and the agentctl registry reachable)
 and launched a codex worker with `agentctl start --slot wt1 --slot-isolation root` from inside its
 box. The worker wrote only its slot. Codex's folder-trust question had to be answered once by a
-human, and the first attempt with `--slot-isolation userns` failed as expected (the Meta codex
+human, and the first attempt with `--slot-isolation userns` failed as expected (the vendor codex
 launcher's setuid step).
 
 ## Verification

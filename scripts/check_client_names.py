@@ -58,13 +58,20 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 FORBIDDEN = re.compile(r"\b(?i:DeepScry|Hermit)[sS]?(?![a-z])")
 
 #: One company's internal tooling, in the forms that reached public text: its command-line client
-#: invoked by a dotted subcommand (`meta chat.thread tail`), the company named as an organisation
-#: (`Meta's`, `Meta-internal`, `Meta CLI`), and its monorepo (`fbsource`, `fbcode`). The word on
+#: invoked by a dotted subcommand (`meta chat.thread tail`) or named by product (`the meta slack
+#: CLI`), the company named as an organisation (`Meta's`, `Meta-internal`, `Meta CLI`, `the Meta
+#: codex launcher`), and its monorepo (`fbsource`, `fbcode`). The word on
 #: its own stays legal, case-sensitively: it is also a keyboard key (`Meta+Enter`, `Cmd (Meta)`),
-#: an HTML element (`<meta name=...>`) and the start of English words (`metadata`).
+#: an HTML element (`<meta name=...>`) and the start of English words (`metadata`). A login banner
+#: a log fetcher matches verbatim (`Meta authorized users only. ...`) is functional text, not
+#: tool naming, and stays legal because no tool noun follows the company name.
 INTERNAL = re.compile(
-    r"\bmeta\s+[a-z][a-z0-9_-]*\.[a-z]"
-    r"|\bMeta(?:['\u2019]s\b|-[a-z]|\s+CLI\b)"
+    # The lowercase CLI forms stay on one line ([ \t]+): over whole text, `\s+` would join a
+    # code identifier at end of line (`= meta`) to the next line's attribute access.
+    r"\bmeta[ \t]+[a-z][a-z0-9_-]*\.[a-z]"
+    r"|\bmeta[ \t]+[a-z][a-z0-9_-]*[ \t]+CLI\b"
+    # The prose company forms may wrap over a line break, as wrapped paragraphs do.
+    r"|\bMeta(?:['\u2019]s\b|-[a-z]|\s+CLI\b|\s+(?:[a-z][a-z0-9_-]*\s+)?(?:launcher|client|runtime|tool)\b)"
     r"|\b(?:fbsource|fbcode)\b"
 )
 
@@ -113,11 +120,15 @@ def _matches(path: Path) -> list[tuple[int, str]]:
         return []  # binary or unreadable: nothing a name can hide in as text
     if not _named(text):
         return []
-    return [
-        (number, line.strip())
-        for number, line in enumerate(text.splitlines(), 1)
-        if _named(line)
-    ]
+    # Match over the whole text, not line by line: a multi-word form wrapped across a line
+    # break (`the Meta codex\nlauncher`) matches no single line and would pass silently.
+    lines = text.splitlines()
+    found: set[tuple[int, str]] = set()
+    for pattern in (FORBIDDEN, INTERNAL):
+        for match in pattern.finditer(text):
+            number = text.count("\n", 0, match.start()) + 1
+            found.add((number, lines[number - 1].strip()))
+    return sorted(found)
 
 
 def violations(names: list[str], root: Path) -> tuple[list[str], list[str]]:
@@ -162,6 +173,8 @@ def self_test() -> int:
 
     # The internal-tooling forms, and the ordinary uses of the same word that must pass.
     expect(_named("-- /opt/bin/meta chat.thread tail --id=1"), "must catch the CLI by subcommand")
+    expect(_named("what the meta slack CLI exposes"), "must catch the lowercase product CLI")
+    expect(_named("the Meta codex launcher's setuid step"), "must catch the company before a tool")
     expect(_named("these are Meta CLI budgets"), "must catch the CLI named in prose")
     expect(_named("Meta's managed runtime aborts"), "must catch the company as an owner")
     expect(_named("a Meta-specific example"), "must catch the company in a compound")
@@ -170,16 +183,31 @@ def self_test() -> int:
     expect(not _named("the same with Cmd (Meta), each"), "must pass the key named in prose")
     expect(not _named('<meta name="viewport" content="width=device-width">'), "must pass HTML")
     expect(not _named("metadata.json and meta mode"), "must pass ordinary English")
+    expect(
+        not _named("Meta authorized users only. Usage is subject to monitoring and recording."),
+        "must pass a login banner a log fetcher matches verbatim",
+    )
+    expect(
+        not _named("metas[agent_id] = meta\n        snapshots.append(snapshot)"),
+        "must pass code whose lines end and start with lookalikes",
+    )
 
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
         (root / "scripts").mkdir()
         (root / "clean.md").write_text("nothing to see\n", encoding="utf-8")
         (root / "dirty.md").write_text("built for Hermit\n", encoding="utf-8")
+        (root / "wrapped.md").write_text("the Meta codex\nlauncher refused\n", encoding="utf-8")
         (root / "scripts/check_client_names.py").write_text("DeepScry|Hermit\n", encoding="utf-8")
 
-        hits, stale = violations(["clean.md", "dirty.md", "scripts/check_client_names.py"], root)
-        expect(len(hits) == 1 and hits[0].startswith("dirty.md:1:"), f"one unexempt hit, got {hits}")
+        hits, stale = violations(
+            ["clean.md", "dirty.md", "wrapped.md", "scripts/check_client_names.py"], root
+        )
+        expect(len(hits) == 2 and hits[0].startswith("dirty.md:1:"), f"two unexempt hits, got {hits}")
+        expect(
+            any(h.startswith("wrapped.md:1:") for h in hits),
+            f"a form wrapped over a line break must be reported, got {hits}",
+        )
         expect(
             not any(h.startswith("scripts/check_client_names.py") for h in hits),
             "an allowlisted path must not be reported as a violation",
@@ -199,7 +227,7 @@ def self_test() -> int:
     if failures:
         print(f"\n{len(failures)} self-test failure(s)", file=sys.stderr)
         return 1
-    print("check-client-names --self-test: PASSED (21 controls)")
+    print("check-client-names --self-test: PASSED (26 controls)")
     return 0
 
 

@@ -10,4 +10,4 @@ closed_at: 2026-10-12T23:04:36.320985127+00:00
 
 # Description
 
-Owner 2026-10-12: Google Chat cannot clear thread unreads (no supported API); the company is moving to Slack, so dig deeper on Slack: channel read marker (conversations.mark), thread read state, what the meta slack CLI and the vibe-talk Slack shim expose, and whether thread replies can be marked read.
+Owner 2026-10-12: Google Chat cannot clear thread unreads (no supported API); the company is moving to Slack, so dig deeper on Slack: channel read marker (conversations.mark), thread read state, what a vendor CLI for Slack and the vibe-talk Slack shim expose, and whether thread replies can be marked read.
