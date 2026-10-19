@@ -177,7 +177,8 @@ const ALL_CHANNELS = "*";
  *   | "restore-voice-system-prompt" | "save-alias" | "save-token" | "save-voice-instructions"
  *   | "save-voice-post-prefix" | "save-voice-system-prompt"
  *   | "search-in-all" | "search-toggle" | "send-text" | "side-clear-backlog" | "side-close" | "side-jump-newest"
- *   | "side-more-threads" | "side-older" | "side-send" | "side-thread-card-text" | "side-unread-only" | "speaker"
+ *   | "side-more-threads" | "side-older" | "side-search-replies" | "side-send" | "side-thread-card-text"
+ *   | "side-unread-only" | "speaker"
  *   | "summarise" | "talk"
  *   | "thread-back" | "thread-card-text"
  *   | "todo-filter" | "undo-dismiss" | "undo-send-dismiss" | "upstream-clear-push"
@@ -31040,10 +31041,14 @@ function endSearchWalk(column) {
   return walk.promise;
 }
 
-/** End the walk in either column: something else is about to read older pages, or move the reader. */
+/**
+ * End the walk in either column, and the cards' (`endRepliesWalk`): something else is about to read
+ * older pages, or move the reader.
+ */
 function endSearchWalks() {
   endSearchWalk(columns.main);
   endSearchWalk(columns.side);
+  endRepliesWalk();
 }
 
 /**
@@ -31107,8 +31112,10 @@ function searchOlder() {
   // `#229 desktop-two-column`. The column the walk is in, which its work after every wait is done in.
   const steps = columnSteps();
   // One at a time on the page: a walk in the other column ends, and is waited for, so two reads never
-  // overlap. A filter change's walk back gives way, and the tap is the reader's act in the list.
-  const other = endSearchWalk(column === columns.main ? columns.side : columns.main);
+  // overlap; so does the cards' (`searchReplies`). A filter change's walk back gives way, and the tap is
+  // the reader's act in the list.
+  const others = [endSearchWalk(column === columns.main ? columns.side : columns.main), endRepliesWalk()]
+    .filter((one) => one !== null);
   endFilterWalk();
   readerActed();
   const area = el("scroll-area");
@@ -31143,9 +31150,9 @@ function searchOlder() {
   walk.promise = (async () => {
     let reason = "done";
     try {
-      if (other) {
+      if (others.length > 0) {
         steps.pause();
-        await other.catch(() => {});
+        await Promise.all(others.map((one) => one.catch(() => {})));
         steps.resume();
       }
       let last = 0;
@@ -31258,12 +31265,331 @@ function olderControlPressed() {
  * Enter in the search field: search further back in the column holding the keys while the right
  * column shows a thread, else the left; nothing where its step back does not offer that. Whether a
  * walk began.
+ *
+ * Over the cards, their threads' older replies (`searchReplies`) instead: across the window as the
+ * thread list, where Main behind it is out of sight; and in two columns with the keys in the cards, or
+ * where Main has nothing older to search.
  */
 function searchOlderFromField() {
+  if (sideCardsShown()) {
+    const left = columnsShown && inColumn(columns.main, () => searchOffered() && columns.main.searchWalk === null);
+    const cards = !left || lastPane === sidePane;
+    // The cards' walk under way is not the left column's to end.
+    if (cards && repliesWalk !== null) return false;
+    if (cards && repliesSearchOffered()) {
+      guardQuietly(searchReplies)();
+      return true;
+    }
+    if (!left) return false;
+  }
   const column = sideShowing() && lastPane === sidePane ? columns.side : columns.main;
   if (!inColumn(column, () => searchOffered() && column.searchWalk === null)) return false;
   guardQuietly(() => inColumn(column, searchOlder))();
   return true;
+}
+
+// --- searching the threads' replies further back ----------------------------------------------------
+//
+// `#262 search-load-older`, the cards' half. The owner's search found nothing in two columns, and the
+// walk above was not enough to find it there: their left column is Main, which holds a thread's first
+// message and none of its replies, and the cards on the right were searched by the replies the page
+// already held (`filterSideCards`) with no way to read any further back. Measured in the page suite, a
+// word said only in older replies was found nowhere in two columns, nor over the thread list, however
+// far back Main was walked, where one column on All walks back and finds every one.
+//
+// So WHILE A SEARCH IS TYPED OVER THE CARDS — in two columns, or the thread list on its own at any
+// width, a phone's included — the head of the cards says "Search replies before Oct 3": the day All's
+// pages reach back to, every reply since then being held. A tap on it, or Enter in the search field
+// where the cards have the keys (`searchOlderFromField`), reads All's older pages, which hold every
+// thread's replies, into the channel's store, drawing them in no list; the cards are searched again by
+// the replies held, a card found by them says "in replies" (`markReplyMatch`), and its thread opened
+// shows what was found. Where All has no cursor of its own — never drawn, or saved on this device —
+// its newest page is read first, behind the rows as a read of All behind Main is, and is not counted.
+// The bounds are the walk's above, in threads: at most `SEARCH_OLDER_PAGES` pages, within
+// `SEARCH_OLDER_MS`, ending at the end of the page that brings `SEARCH_OLDER_HITS` threads. Meanwhile
+// the control says "Searching replies… 2 of 5 · Stop", and a tap on it stops the read on the wire.
+//
+// WHAT IT FOUND is the threads whose cards the filters show now and did not when it started, said once
+// under the control until the search changes, with how far back the replies now reach. It says how it
+// ended whatever it found: stopped, at the start of the channel, out of time, or with nothing more.
+// Once All reaches the start of the channel no walk is offered, and a list the search empties says all
+// of it is loaded (`sideListState`). Any change to the search, a thread selected on the right, the
+// cards leaving the screen or another channel ends a walk where it is; one walk at a time on the page,
+// with the columns' (`searchOlder`), each ending the other.
+//
+// THE PAGE ONLY. It reads All's older pages as a step back in All does; nothing on the server is new.
+
+/** The cards' walk back through All's older pages for the search, while one is under way, or null. */
+let repliesWalk = null;
+
+/** What the last cards' walk found, under its control, until the search changes, or null. */
+let repliesNote = /** @type {{key: string, text: string} | null} */ (null);
+
+/** Everything the cards' walk depends on: a change in either ends it, and clears its note. */
+const repliesKey = () => JSON.stringify([String(el("discord-channel").value), searchOpen ? searchTerms(searchQuery) : []]);
+
+/** All's cover in the selected channel's store, or null where no page of All has covered it. */
+function allCover() {
+  if (channelCanon.channel !== String(el("discord-channel").value)) return null;
+  return channelCanon.views.get(viewKey("flat")) || null;
+}
+
+/** Whether All reaches the start of the channel, so that the store holds every reply it has. */
+const allLoaded = () => {
+  const cover = allCover();
+  return Boolean(cover && cover.more === false);
+};
+
+/** Whether the right column's cards are on screen: two columns with no thread on the right, or the thread list. */
+const sideCardsShown = () => cardsOnScreen() === leftEl("side-cards");
+
+/** Whether the cards offer to search their threads' older replies: see the head of this section. */
+function repliesSearchOffered() {
+  return threadingSupported && sideCardsShown() && searchOpen && searchTerms(searchQuery).length > 0 &&
+    channelCanon.channel === String(el("discord-channel").value) && !channelCanon.scope && !allLoaded();
+}
+
+/** The day All's pages reach back to, as `dayKeyOf` says it, or null where that is not known. */
+function repliesDay() {
+  const cover = allCover();
+  return cover && cover.more !== false && Number.isFinite(cover.floor) ? dayKeyOf(new Date(cover.floor)) : null;
+}
+
+/** The cards the search and Unread only show now, by thread id. */
+const cardsFound = () => /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children]).filter(rowShown)
+  .map((row) => String(row.getAttribute("data-id")));
+
+/** Whether cards' walk `walk` is still the reader's: the same search, the same store, the cards still up. */
+function repliesWalkHolds(walk) {
+  return !walk.ended && repliesWalk === walk && repliesKey() === walk.key && channelCanon === walk.canon &&
+    sideColumnUp() && columns.side.mode === "list";
+}
+
+/** End the cards' walk where it is, saying nothing of it; its read on the wire is aborted. Its promise, or null. */
+function endRepliesWalk() {
+  const walk = repliesWalk;
+  if (!walk) return null;
+  walk.ended = true;
+  repliesWalk = null;
+  if (walk.controller) walk.controller.abort();
+  renderRepliesSearch();
+  return walk.promise;
+}
+
+/**
+ * The control at the head of the cards and the note under it, as the walk, the search and All's reach
+ * say: hidden where nothing is offered and nothing is under way. A walk that a change has made nobody's
+ * ends first. The reader's place in the cards is kept as either comes or goes (`keepingCardPlace`).
+ */
+function renderRepliesSearch() {
+  if (repliesWalk && !repliesWalkHolds(repliesWalk)) {
+    endRepliesWalk();
+    return;
+  }
+  const walk = repliesWalk;
+  if (repliesNote && repliesNote.key !== repliesKey()) repliesNote = null;
+  const button = /** @type {HTMLButtonElement} */ (leftEl("side-search-replies"));
+  const note = leftEl("side-replies-note");
+  const offered = walk !== null || repliesSearchOffered();
+  let label = button.textContent;
+  if (walk) {
+    label = walk.stopping ? "Stopping…" : `Searching replies… ${Math.max(1, walk.pages)} of ${SEARCH_OLDER_PAGES} · Stop`;
+  } else if (offered) {
+    const day = repliesDay();
+    label = day === null ? "Search thread replies" : `Search replies before ${searchDayWords(day)}`;
+  }
+  const said = repliesNote ? repliesNote.text : "";
+  const draw = () => {
+    if (button.hidden === offered) button.hidden = !offered;
+    setTextIfChanged(note, said);
+    if (note.hidden !== (said === "")) note.hidden = said === "";
+  };
+  if (button.hidden === offered || note.textContent !== said || note.hidden !== (said === "")) keepingCardPlace(draw);
+  setTextIfChanged(button, label);
+  const disabled = walk ? walk.stopping : false;
+  if (button.disabled !== disabled) button.disabled = disabled;
+  const name = offered && !walk ? `${label}: older pages of the whole channel, replies and all, a few at a time.` : "";
+  if ((button.getAttribute("aria-label") || "") !== name) {
+    if (name) button.setAttribute("aria-label", name);
+    else button.removeAttribute("aria-label");
+  }
+}
+
+/**
+ * One page of the cards' walk into the channel's store, as one of All's own goes in: an older page as a
+ * step back in All folds one (`applyTimelinePage`), All's cover reaching back with it and keeping its
+ * cursor for All's own step back where this page is where that cover now ends; All's newest page, read
+ * for a cursor, as a read of All behind Main is (`foldLateTimelinePage`), from the store's copies as it
+ * was sent (`held`). Main's counts follow the replies it brings, and the cards are drawn and searched
+ * again from the store.
+ *
+ * @param {VibeTalk.TimelineResponse} payload
+ * @param {boolean} newest
+ * @param {Map<string, any> | null} held
+ * @param {{channel: string, canon: any}} walk
+ */
+function foldRepliesPage(payload, newest, held, walk) {
+  if (channelCanon !== walk.canon || String(el("discord-channel").value) !== walk.channel) return;
+  if (newest) {
+    const number = sentNumberOf(payload);
+    const read = { context: JSON.stringify([walk.channel, "flat", null]), channel: walk.channel, view: "flat",
+      thread: null, canon: walk.canon, held };
+    if (!newerPage(channelCanon, "flat", number)) foldLateTimelinePage(payload, read);
+    else if (placeFromPage(payload, walk.canon, number, held)) followPlacement();
+  } else {
+    foldTimelinePage(payload, true, "flat", null);
+    const cover = channelCanon.views.get(viewKey("flat"));
+    const edge = timeOf((payload.messages || [])[0], "timestamp");
+    if (cover && cover.more === true && Number.isFinite(edge) && cover.floor === edge) {
+      cover.cursor = payload.next_before || null;
+    }
+    inColumn(columns.main, syncUnreadReplies);
+    saveChannelScope();
+  }
+  renderSideColumn();
+}
+
+/** What a cards' walk that has ended says under its control: see the head of this section. */
+function repliesWalkNote(walk, reason) {
+  const pages = `${walk.read} page${walk.read === 1 ? "" : "s"}`;
+  const messages = `${walk.arrived} message${walk.arrived === 1 ? "" : "s"}`;
+  const span = walk.read > 0 ? `${pages} (${messages})` : "All's newest page";
+  const threads = `${walk.found} thread${walk.found === 1 ? "" : "s"}`;
+  const day = repliesDay();
+  const back = day === null ? "" : `, back to ${searchDayWords(day)}`;
+  if (reason === "stopped") {
+    if (walk.read === 0 && walk.found === 0) return "Stopped before any older page was read.";
+    return walk.found > 0 ? `Stopped. Found ${threads} in ${span}.` : `Stopped. Nothing more in ${span}${back}.`;
+  }
+  if (reason === "start") {
+    return walk.found > 0 ? `Reached the start of this channel. Found ${threads}.` : "Reached the start of this channel; no more threads match.";
+  }
+  // A page saying older history exists, with no place to go on from.
+  const stuck = reason === "nowhere" ? " The chat service gave no way further back." : "";
+  if (walk.found === 0) return `Nothing more in ${span}${back}.${stuck}`;
+  // Within, not in: the walk stopped because the next page would have ended past the budget.
+  if (reason === "budget") return `Found ${threads} within ${Math.round(SEARCH_OLDER_MS / 1000)} s (${pages}, ${messages})${back}.`;
+  return `Found ${threads} in ${span}${back}.${stuck}`;
+}
+
+/**
+ * Search the cards' threads' older replies: read All's older pages into the store until the bounds at
+ * the head of this section stop it, and say what it found. Does nothing where the cards do not offer it.
+ */
+function searchReplies() {
+  if (!repliesSearchOffered() || repliesWalk !== null) return Promise.resolve();
+  // One at a time on the page: a column's walk ends, and is waited for, so two reads never overlap. A
+  // filter change's walk back gives way.
+  const others = [endSearchWalk(columns.main), endSearchWalk(columns.side)].filter((one) => one !== null);
+  endFilterWalk();
+  const cover = allCover();
+  const walk = {
+    key: repliesKey(),
+    canon: channelCanon,
+    channel: String(el("discord-channel").value),
+    // The cards found already, which nothing this walk reads is counted as having found.
+    held: new Set(cardsFound()),
+    // Where All goes on back from: its own cursor while it is live, else the one its newest page gives.
+    cursor: /** @type {string | null} */ (cover && cover.live && cover.more === true ? cover.cursor || null : null),
+    cursorRead: false,
+    pages: 0,
+    read: 0,
+    found: 0,
+    arrived: 0,
+    started: Date.now(),
+    controller: typeof AbortController === "function" ? new AbortController() : null,
+    stopping: false,
+    ended: false,
+    promise: /** @type {Promise<void> | null} */ (null),
+  };
+  repliesWalk = walk;
+  repliesNote = null;
+  renderRepliesSearch();
+  const count = () => {
+    walk.found = cardsFound().filter((id) => !walk.held.has(id)).length;
+  };
+  walk.promise = (async () => {
+    let reason = "done";
+    try {
+      if (others.length > 0) await Promise.all(others.map((one) => one.catch(() => {})));
+      let last = 0;
+      while (walk.pages < SEARCH_OLDER_PAGES) {
+        if (!repliesWalkHolds(walk) || walk.stopping) break;
+        if (allLoaded()) {
+          reason = "start";
+          break;
+        }
+        if (walk.pages > 0 && Date.now() - walk.started + last > SEARCH_OLDER_MS) {
+          reason = "budget";
+          break;
+        }
+        const owed = walk.cursor === null;
+        if (owed && walk.cursorRead) {
+          reason = "nowhere";
+          break;
+        }
+        walk.cursorRead = walk.cursorRead || owed;
+        if (!owed) walk.pages += 1;
+        renderRepliesSearch();
+        const held = owed ? heldNow(channelCanon) : null;
+        const path = `/api/v1/channels/${encodeURIComponent(walk.channel)}/timeline?view=flat&limit=${DISCORD_PAGE_LIMIT}` +
+          `${owed ? "" : `&before=${encodeURIComponent(String(walk.cursor))}`}&reason=search`;
+        const began = Date.now();
+        const payload = await readTimeline(path, walk.controller ? { signal: walk.controller.signal } : undefined);
+        if (!owed) last = Date.now() - began;
+        if (!repliesWalkHolds(walk)) break;
+        foldRepliesPage(payload, owed, held, walk);
+        walk.cursor = payload.has_more === true ? payload.next_before || null : null;
+        if (!owed) {
+          walk.read += 1;
+          walk.arrived += (payload.messages || []).length;
+        }
+        count();
+        if (walk.stopping || walk.found >= SEARCH_OLDER_HITS) break;
+      }
+      if (walk.stopping) reason = "stopped";
+      else if (reason === "done" && allLoaded()) reason = "start";
+    } catch (error) {
+      if (walk.ended || walk.stopping || (walk.controller && walk.controller.signal.aborted)) {
+        reason = walk.stopping ? "stopped" : "done";
+      } else {
+        reason = "failed";
+        // The failure itself is reported where every failed read is; this says the search stopped.
+        setStatus("Could not search further back — try again.");
+        throw error;
+      }
+    } finally {
+      if (repliesWalk === walk) {
+        // A walk another search, another list or another channel has taken over from says nothing there.
+        const holds = reason !== "failed" && repliesWalkHolds(walk);
+        if (holds) count();
+        repliesWalk = null;
+        const text = holds ? repliesWalkNote(walk, reason) : "";
+        repliesNote = text ? { key: walk.key, text } : null;
+        renderRepliesSearch();
+      }
+    }
+  })();
+  return walk.promise;
+}
+
+/** Stop the cards' walk at the end of the read on the wire, which is aborted; its control says "Stopping…". */
+function stopRepliesWalk() {
+  const walk = repliesWalk;
+  if (!walk || walk.stopping) return;
+  walk.stopping = true;
+  if (walk.controller) walk.controller.abort();
+  renderRepliesSearch();
+}
+
+/** The cards' control pressed: Stop while a walk is under way (not in its first moments), else a walk. */
+function repliesControlPressed() {
+  const walk = repliesWalk;
+  if (walk) {
+    if (Date.now() - walk.started >= SEARCH_OLDER_TAP_MS) stopRepliesWalk();
+    return undefined;
+  }
+  return searchReplies();
 }
 
 /**
@@ -37631,6 +37957,8 @@ function leaveColumns(next = "one", left = null) {
   // `#262 search-load-older`. The right column's walk for the search ends: its list is put aside, held.
   endSearchWalk(columns.side);
   columnsShown = false;
+  // ...and the cards' walk, unless the cards stay, across the window as the thread list.
+  if (next !== "list") endRepliesWalk();
   // `#298 thread-card-header`. The card at the top of the right column's thread, opened over its list,
   // goes with the column: Cmd-1, Cmd-2, Cmd-3, Cmd-\ or a window narrowed under two columns leave
   // nothing open out of sight, for the next Esc to be spent on. Two columns come back to it closed.
@@ -37731,6 +38059,9 @@ function leaveThreadList(next = "one") {
   const held = listHeldPlace;
   listHeldPlace = null;
   threadListShown = false;
+  // `#262 search-load-older`. The cards' walk for the search ends with the list, unless two columns
+  // keep the cards beside Main.
+  if (next !== "two") endRepliesWalk();
   placePostCard();
   const followed = inColumn(columns.main, () => {
     const holds = held !== null && currentScreen === "main" && currentView === "discord" &&
@@ -37768,6 +38099,9 @@ function renderSideMode() {
   // is not on screen. A thread selected again decides it afresh (`renderJumpNewest`).
   if (!thread && !leftEl("side-jump-newest").hidden) leftEl("side-jump-newest").hidden = true;
   renderSideUnreadToggle();
+  // `#262 search-load-older`. A thread selected over the cards ends their walk for the search, aborting
+  // its read; the cards back are offered it again (`renderSideCards`).
+  if (thread) renderRepliesSearch();
   renderSideColumn();
   // What the links join, and what the glide follows, is the card at the top over a thread and the
   // cards in the list otherwise: a change of what the column shows is a new selection for both.
@@ -38065,7 +38399,8 @@ function placeOpenedCards() {
  * The owner asked whether the search should reach a thread's replies too. What is cheap is done: the
  * replies the page already holds for each thread are searched with the card's own words — each term
  * in one or the other — and a card found only with its replies says so, "in replies", beside its
- * facts (`markReplyMatch`). Nothing is read for it: a reply the page does not hold is not found.
+ * facts (`markReplyMatch`). Nothing is read as the search is typed: a reply the page does not hold is
+ * found once the cards' own walk further back has read it (`searchReplies`, `#262 search-load-older`).
  */
 function filterSideCards() {
   const terms = searchOpen ? searchTerms(searchQuery) : [];
@@ -38097,6 +38432,8 @@ function filterSideCards() {
   if (leftEl("side-list-state").hidden !== (state === "")) leftEl("side-list-state").hidden = state === "";
   sideCardCount = { cards: rows.length, shown };
   if (threadListOnScreen()) sayCardCount();
+  // `#262 search-load-older`. The way to their threads' older replies, as the search and All's reach say.
+  renderRepliesSearch();
   // `#261 two-column-connectors`. The cards shown are what the links go to.
   scheduleColumnLinks();
 }
@@ -38153,7 +38490,10 @@ function sideListState(cards, unread, shown) {
   if (cards === 0) return "No threads in this channel yet.";
   if (shown > 0) return "";
   if (sideUnreadOnly && unread === 0) return "No unread threads.";
-  return sideUnreadOnly ? "No unread threads match that search." : "No threads match that search.";
+  // `#262 search-load-older`. How far back the search has looked, where that is the whole channel: until
+  // then the way further back under this line says the day (`renderRepliesSearch`).
+  const whole = allLoaded() ? " — all of this channel is loaded" : "";
+  return sideUnreadOnly ? `No unread threads match that search${whole}.` : `No threads match that search${whole}.`;
 }
 
 /** The device's choice of the cards with unread replies only: "on", or anything else for every card. */
@@ -38894,6 +39234,9 @@ function closeSideThread() {
 function resetSideColumn(reopen = false) {
   endSearchWalk(columns.side);
   columns.side.searchNote = null;
+  // `#262 search-load-older`. And the cards' walk, and what the last one found: they were this channel's.
+  endRepliesWalk();
+  repliesNote = null;
   inColumn(columns.side, () => {
     dropReplyArrowTap();
     gathered = null;
@@ -44133,6 +44476,8 @@ for (const id of ["thread-card", "side-thread-card", "pane-discord", "side-pane"
 }
 // `#281 view-keys`. The next page of older threads, read where the cards are.
 el("side-more-threads").addEventListener("click", guardQuietly(loadOlderThreads));
+// `#262 search-load-older`. The cards' own way further back for the search, and Stop while it walks.
+leftEl("side-search-replies").addEventListener("click", guardQuietly(repliesControlPressed));
 leftEl("side-unread-only").addEventListener("click", () => setSideUnreadOnly(!sideUnreadOnly));
 inColumn(columns.side, () => {
   el("channel-compose-text").addEventListener("input", inThisColumn(rememberChannelDraft));

@@ -6024,8 +6024,28 @@ matches offers **"Search All — thread replies too"**, which opens All with the
 the moment two columns come back (their left column is Main by the layout); in two
 columns the cards on the right are found by what the thread's first message says (where the card shows
 its summary) and by the replies the page has loaded, and the thread selected there walks its own older
-replies. A walk reads only the routes a scroll up reads: no server route is new. Finding a reply the
-page has never loaded, in two columns, needs a server search, which waits on the persistent cache.
+replies. A walk reads only the routes a scroll up reads: no server route is new.
+
+**The cards walk back for their threads' replies.** That was still not enough: a word said only in
+older replies was found nowhere in two columns, nor over the thread list, however far back Main was
+walked, where one column on All walks back and finds every one (the page suite holds both, and
+`tests/two_column_browser.py` lays it out in Chromium). So while a search is typed over the cards — in
+two columns, or the thread list on its own at any width, a phone's included — the head of the cards
+says **"Search replies before Oct 3"**: the day All's pages reach back to, every reply since then being
+held. A press, or **Enter** in the search field where the cards have the keys (over the thread list; in
+two columns with the keys in the cards, or once Main has nothing older), reads All's older pages,
+which hold every thread's replies, into the page's store without drawing them in any list, by the same
+bounds as a column's walk — five pages, fifteen seconds, ending at the page that brings three threads —
+and the cards are searched again: a card found by its replies says *in replies*, and its thread opened
+on the right shows the reply. Where All has no cursor of its own (never shown, or saved on this
+device), its newest page is read first and not counted. Meanwhile the control says **"Searching
+replies… 2 of 5 · Stop"**. What it found is said under it until the search changes — *Found 3 threads
+in 3 pages (150 messages), back to Sep 30.* — and how it ended is always said, nothing found included:
+*Nothing more in 5 pages (250 messages), back to Sep 28.*, *Stopped before any older page was read.*,
+*Reached the start of this channel; no more threads match.* Once All reaches the start of the channel
+no walk is offered, and a list the search empties says *No threads match that search — all of this
+channel is loaded.* A change to the search, a thread selected on the right, the cards leaving the
+screen or another channel ends it where it is, and it and a column's walk end each other.
 
 ### Nothing moves the list but the reader
 

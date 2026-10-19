@@ -676,6 +676,15 @@
               -->
               <div id="side-list">
                 <p id="side-list-state" class="hint" role="status" aria-live="polite"></p>
+                <!--
+                  `#262 search-load-older`. While a search is typed over the cards, "Search replies
+                  before Oct 3": the day All's pages reach back to. A tap reads a few of All's older pages,
+                  which hold every thread's replies, and the cards are searched again by them; what the
+                  last walk found is said under it, until the search changes. A status, written once when
+                  a walk ends.
+                -->
+                <button id="side-search-replies" class="chip" type="button" hidden>Search thread replies</button>
+                <p id="side-replies-note" class="hint search-older-note" role="status" hidden></p>
                 <button id="side-more-threads" class="secondary" type="button" hidden>Older threads…</button>
                 <ul id="side-cards" class="side-cards" aria-label="Threads in this channel"></ul>
               </div>
@@ -2307,9 +2316,13 @@
                 the top of the list loads nothing by itself: this button, or <kbd>Enter</kbd>, is the
                 way back, so a search cannot read a channel's whole history unasked. Main holds a thread's first message and none of its replies: in
                 one column, a search nothing on Main matches offers <em>Search All — thread replies
-                too</em>; in two columns, the cards on the right are found by what the thread's first
-                message says and by the replies this page has loaded, and the thread selected there
-                searches its own older replies.
+                too</em>. In two columns, and over the thread list, a card is found by what its
+                thread's first message says and by the replies this page has loaded, and the head of the
+                cards says <em>Search replies before Oct 3</em>, the day the replies reach back to: press
+                it, or <kbd>Enter</kbd> where the cards have the keys, and it reads older pages of the
+                whole channel in the same way, a card found by them saying <em>in replies</em>; once all
+                of the channel is loaded, the cards say so. The thread selected on the right searches its
+                own older replies.
               </p>
               <p class="hint">
                 <strong>Days.</strong> A line above the first message of each day says which day it
