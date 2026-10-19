@@ -4130,7 +4130,7 @@ own adapter-only token; every other route uses the read/write tokens described a
 | GET | `/api/v1/voice-agent` | read | the versioned voice-agent prompt and which MCP tools this credential may call — see "Conversational voice providers" |
 | POST | `/api/v1/voice-timing` | **write** | one call's content-free startup phase offsets, logged as `voice_startup` |
 | POST | `/api/v1/voice-health` | **write** | a content-free "the voice service is not responding" record, logged as `voice_unresponsive` or `voice_recovered`, or that a turn was heard with no text, `voice_text_missing` — see "When the voice service stops answering" |
-| POST | `/api/v1/voice-end` | **write** | how a call that opened ended, on either protocol — `hang_up`, `error_frame`, `server_closed`, `connection_lost` or `suspended` — with the voice service's own capped reason, as one line, `voice_call_ended` — see "How a call ended" |
+| POST | `/api/v1/voice-end` | **write** | how a call that opened ended, on either protocol — `hang_up`, `error_frame`, `server_closed`, `connection_lost`, `suspended`, `reconnect_limit` or `reconnect_failed`, or a socket the page replaced, `reconnected` — with the voice service's own capped reason, as one line, `voice_call_ended` — see "How a call ended" |
 | GET | `/api/v1/signed-url` | **write** | compatibility endpoint that mints an ElevenLabs signed URL |
 | GET | `/api/v1/channels/{id}/messages?limit=` | read | full scrollback, oldest first; an optional `as_of` when the provider served a copy it could not bring up to date (`#208 persistent-cache`) |
 | GET | `/api/v1/channels/{id}/messages/{message_id}?thread_id=` | read | one message in full; `thread_id` names the thread a reply is in, and without it a reply is still found in the thread this server knows it to be in — from the reads it holds, a pin or the bookmark — at the cost of one read of that thread (`#319 slack-reply-by-id`) |
@@ -5331,11 +5331,16 @@ minute later), and in the transcript's seam:
 | `server_closed` | "The voice service ended the call 1 min 15 s in — you did not hang up." with the reason the server gave, if any |
 | `connection_lost` | "The connection to … failed 22 s into the call: it was cut without a goodbye — by the network, the phone or the voice service, not by Hang up." — a close without a closing handshake (1006), or one after a socket error |
 | `suspended` | "Paused — the app was in the background.", as before, with **Resume** |
+| `reconnected` | not an end: the voice service lost a turn and asked to reconnect, and the page carried the call on a new session (`#352 voice-reconnect-on-bridge-error`, below). The transcript says so; nothing in red |
+| `reconnect_limit` | "The voice service lost a turn again less than a minute after the page reconnected, so the call has ended: …", or "… lost a turn a fourth time in this call …", with the server's words |
+| `reconnect_failed` | "The voice service lost a turn and the page could not reconnect: …", with why |
 
-Each call that opened is recorded once, when it ends, to `POST /api/v1/voice-end`, for example
-`{"protocol":"vibe-talk-v1","chat":false,"ended_by":"connection_lost","close_code":1006,
-"since_open_ms":22000,"turns":2}`. `close_code` is the code the browser reported, 1000–4999, and is
-absent when the page closed the socket itself.
+Each socket of a call that opened is recorded once, when it ends, to `POST /api/v1/voice-end`, for
+example `{"protocol":"vibe-talk-v1","chat":false,"ended_by":"connection_lost","close_code":1006,
+"since_open_ms":22000,"turns":2}`. A call is one socket unless the page reconnected it: a reconnect
+ends a socket, recorded as `reconnected`, and not the call, whose own end is recorded later.
+`close_code` is the code the browser reported, 1000–4999, and is absent when the page closed the
+socket itself.
 
 `#330 voice-long-turn-drop`. A long spoken answer was cut and the call ended, and this record could
 not say why — nor did a call on the hosted vendor's protocol leave one at all. Now every call that
@@ -5349,6 +5354,7 @@ still reads:
 | `queued_audio_ms` | how much of the assistant's audio was still waiting to be played |
 | `last_text_ms`, `last_audio_end_ms`, `last_interrupt_ms` | how long before the end the page last sent a text turn, an `audio_end` and an `interrupt` — a bridge may take either of the last two for a cut — and absent for one it never sent. A hang-up's own goodbye is not counted |
 | `close_reason` | the voice SERVICE's own words — its close reason, or its `error` — with the token taken out, folded onto one line and cut to 120 characters; never anything said in the call. The server refuses one over 123 characters or carrying a control character |
+| `reconnects` | `#352`: how many times the page carried this call on a new session before this record, absent when it never did. `since_open_ms` and `turns` stay the whole call's. The server refuses a count over 1000 |
 
 Anything else — an unknown field or `ended_by`, a code out of range, an offset over a day, queued
 audio over an hour — is refused with 400 `invalid_end` and logs nothing. It has its own budget of 30
@@ -5357,8 +5363,9 @@ minute), so it cannot crowd out the health record. It logs one line, INFO for a 
 anything else, `-` for each field not sent and the service's reason last, quoted, so it cannot pass
 for a field: `voice_call_ended protocol=vibe-talk-v1 chat=false ended_by=server_closed
 close_code=1011 since_open_ms=95000 turns=4 visibility=visible queued_audio_ms=41000
-last_text_ms=2000 last_audio_end_ms=1900 last_interrupt_ms=- close_reason="interrupt boundary timed
-out; reconnect"`. A start that never opened is the startup record's (above), not this.
+last_text_ms=2000 last_audio_end_ms=1900 last_interrupt_ms=- reconnects=- close_reason="interrupt
+boundary timed out; reconnect"`. A reader of these lines that counts calls counts the lines that
+are not `reconnected`. A start that never opened is the startup record's (above), not this.
 
 A socket the page has finished with no longer speaks for any call. Its close can arrive seconds
 after the page's `quit` — a server that waits out an interrupt before closing takes that long — and

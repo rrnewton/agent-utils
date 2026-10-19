@@ -466,6 +466,10 @@ async fn a_call_end_record_is_accepted_from_the_write_token_only_for_every_docum
         "server_closed",
         "connection_lost",
         "suspended",
+        // `#352 voice-reconnect-on-bridge-error`.
+        "reconnected",
+        "reconnect_limit",
+        "reconnect_failed",
     ] {
         let mut report = end_report();
         report["ended_by"] = ended_by.into();
@@ -509,6 +513,7 @@ fn full_end_report() -> Value {
         "last_text_ms": 2_000,
         "last_audio_end_ms": 1_900,
         "last_interrupt_ms": 30_000,
+        "reconnects": 1,
         "close_reason": "interrupt boundary timed out; reconnect",
     })
 }
@@ -573,6 +578,14 @@ async fn a_call_end_record_carries_the_services_reason_and_what_decides_who_ende
             "an offset longer than a day is not a measurement",
             with("last_audio_end_ms", json!(86_400_001)),
         ),
+        (
+            "more reconnects than a call could make is not a count",
+            with("reconnects", json!(1_001)),
+        ),
+        (
+            "a count of reconnects is a whole number",
+            with("reconnects", json!(-1)),
+        ),
     ] {
         let (status, body) = send(
             &router,
@@ -611,6 +624,10 @@ async fn anything_but_the_closed_call_end_record_is_refused_rather_than_logged()
         (
             "an unknown cause is refused, not echoed",
             with("ended_by", json!("timer")),
+        ),
+        (
+            "a cause near a documented one is still unknown",
+            with("ended_by", json!("reconnect")),
         ),
         (
             "an unknown protocol is refused, not echoed",
