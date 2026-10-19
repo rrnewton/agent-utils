@@ -9,6 +9,7 @@ from __future__ import annotations
 import io
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -1362,7 +1363,7 @@ def test_a_failed_stdout_write_leaves_nothing_for_shutdown_to_retry(unbuffered: 
     )
 
 
-def test_a_stderr_nobody_reads_does_not_change_the_exit_status() -> None:
+def test_a_stderr_nobody_reads_does_not_change_the_exit_status(tmp_path: Path) -> None:
     import subprocess
 
     reader, writer = os.pipe()
@@ -1370,6 +1371,8 @@ def test_a_stderr_nobody_reads_does_not_change_the_exit_status() -> None:
     try:
         completed = subprocess.run(
             [sys.executable, "-m", "herdr_run", "check", "curl x"],
+            # Outside any checkout: an enclosing project's .herdr-run.yaml may allow curl.
+            cwd=tmp_path,
             env=_clean_environment(),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
