@@ -16579,9 +16579,11 @@ def test_validate_complete_removes_nested_git_metadata_in_configured_cache(
     made = create(project, slot_type="validate", branch=None)
     assert made.returncode == 0, made.stderr
     tree = checkout(project, slot_type="validate")
-    nested_git = tree / "target" / "install-build" / "dependency" / ".git"
-    nested_git.mkdir(parents=True)
-    (nested_git / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    # A repository a build made, which Git can open.  One it cannot open (a
+    # lone HEAD file) is judged not disposable: test_validate_nested_git_policy.py.
+    dependency = tree / "target" / "install-build" / "dependency"
+    dependency.mkdir(parents=True)
+    git(dependency, "init", "-q")
     mark_owner_dead_in_current_cgroup(project)
     set_liveness(project, "dead")
 
@@ -17872,9 +17874,11 @@ def test_validate_batch_removes_nested_git_metadata_in_configured_cache(
     project, _repository, _remote = make_project(tmp_path, cache_globs=("target",))
     prepare_dead_validate_slots(project, ("nested-cache",))
     tree = checkout(project, slot="nested-cache", slot_type="validate")
-    nested_git = tree / "target" / "install-build" / "dependency" / ".git"
-    nested_git.mkdir(parents=True)
-    (nested_git / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    # A repository a build made, which Git can open (see
+    # test_validate_nested_git_policy.py for one it cannot).
+    dependency = tree / "target" / "install-build" / "dependency"
+    dependency.mkdir(parents=True)
+    git(dependency, "init", "-q")
     stub_validate_batch_censuses(monkeypatch)
 
     rc = wrkslots.main(
