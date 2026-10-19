@@ -723,6 +723,10 @@ says (`chars`, in the prepare answer) at the voice's speaking rate, measured fro
 that arrived whole. It uses the CSS Custom Highlight API and changes nothing in the drawn body; a
 browser without the API lights the block alone.
 
+Under Previous and Next the strip draws the read as a **timeline of its blocks**
+(`#380 read-aloud-timeline`), each as wide as what it says: the blocks heard tinted, the one being
+read filled. A tap on one reads from there.
+
 On the server, preparation first looks at messages fetched for the page in the last 30 seconds,
 kept in memory (`src/read_ahead.rs`, apart from the voice catch-up's windows in `src/recent.rs`).
 It fetches only what is missing:

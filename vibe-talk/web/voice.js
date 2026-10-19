@@ -30716,9 +30716,47 @@ function renderReadSteer() {
   if (!strip) return;
   const position = readingPosition();
   strip.hidden = position === "";
+  renderReadTimeline();
   if (position === "") return;
   el("read-steer-count").textContent = position;
   el("read-next").disabled = nowPlaying.segment + 1 >= nowPlaying.segments.length;
+}
+
+/**
+ * `#380 read-aloud-timeline`. The read as a line of its blocks: one button a block, as wide as what
+ * it says (`chars`, else all alike), the ones heard tinted, the one being read filled. A tap on one
+ * reads from there, as a tap on the block itself does. Built once a read, then only marked.
+ */
+let readTimelineOf = null;
+
+function renderReadTimeline() {
+  const line = el("read-timeline");
+  if (!line) return;
+  const playing = nowPlaying;
+  if (playing === null || !playing.segments || playing.segments.length < 2) {
+    if (readTimelineOf !== null) line.replaceChildren();
+    readTimelineOf = null;
+    return;
+  }
+  if (readTimelineOf !== playing.segments) {
+    readTimelineOf = playing.segments;
+    line.replaceChildren(...playing.segments.map((segment, index) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "read-timeline-block";
+      const listed = segment.block === null ? null
+        : playing.blocks && playing.blocks[segment.part] && playing.blocks[segment.part][segment.block];
+      const weight = Math.max(1, Number(listed && listed.chars) || 1);
+      button.setAttribute("style", `--block-weight: ${weight}`);
+      button.setAttribute("aria-label", `Read from block ${index + 1} of ${playing.segments.length}`);
+      button.addEventListener("click", () => { jumpReading(index); });
+      return button;
+    }));
+  }
+  [...line.children].forEach((button, index) => {
+    button.setAttribute("aria-current", index === playing.segment ? "true" : "false");
+    button.toggleAttribute("data-heard", index < playing.segment);
+  });
 }
 
 /**

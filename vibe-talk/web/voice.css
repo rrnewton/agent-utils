@@ -5921,6 +5921,45 @@ a.search-hit-link {
   display: none;
 }
 
+/* `#380 read-aloud-timeline`. A second line of the strip: the read's blocks, each as wide as it is
+   long, with a gap between. Tall enough to tap, though a block of a few words is narrow. */
+#read-steer {
+  flex-wrap: wrap;
+  justify-content: center;
+  border-radius: 1.4rem;
+}
+
+#read-timeline {
+  pointer-events: auto;
+  display: flex;
+  flex: 1 0 100%;
+  gap: 0.2rem;
+  min-height: 1.5rem;
+  padding: 0 0.3rem 0.1rem;
+}
+
+#read-timeline:empty {
+  display: none;
+}
+
+.read-timeline-block {
+  flex: var(--block-weight, 1) 1 0;
+  min-width: 0.4rem;
+  min-height: 1.5rem;
+  padding: 0;
+  border: 1px solid var(--warn);
+  border-radius: 0.3rem;
+  background: transparent;
+}
+
+.read-timeline-block[data-heard] {
+  background: color-mix(in srgb, var(--warn) 35%, var(--panel));
+}
+
+.read-timeline-block[aria-current="true"] {
+  background: var(--warn);
+}
+
 .read-steer-button {
   pointer-events: auto;
   min-height: 2.75rem;

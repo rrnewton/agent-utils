@@ -598,6 +598,20 @@ def main() -> int:
                          "the read before the jump was left open")
                 shot("3-jumped")
 
+                # 3b. The timeline: a tap on its fifth block reads from the quote. `#380`.
+                count = page.evaluate("() => document.getElementById('read-timeline').children.length")
+                check(count == len(LONG_BLOCKS), f"the timeline shows {count} blocks, not {len(LONG_BLOCKS)}")
+                press(page, "#read-timeline > button:nth-child(5)", True)
+                wait_position(page, "5 of 7")
+                check(lit_element(page).startswith("blockquote:"), f"the timeline's tap lit {lit_element(page)!r}")
+                current = page.evaluate(
+                    "() => [...document.querySelectorAll('#read-timeline > button')]"
+                    ".findIndex((b) => b.getAttribute('aria-current') === 'true')")
+                check(current == 4, f"the timeline marks block {current}, not the fifth")
+                press(page, "#read-timeline > button:nth-child(6)", True)
+                wait_position(page, "6 of 7")
+                shot("3b-timeline")
+
                 # 4. Previous and Next.
                 press(page, "#read-prev", True)
                 wait_position(page, "5 of 7")
@@ -675,7 +689,7 @@ def main() -> int:
               f" (worst {worst}); generating {AHEAD_PACE:g}x faster than it speaks, worst {ahead_worst} ms;"
               f" control with first audio {round(CONTROL_FIRST_AUDIO_SECONDS * 1000)} ms, worst {control_worst} ms."
               " The first block's three sentences were lit in turn; highlight, k of n, tap-to-jump,"
-              " Previous/Next and the media keys all move the read.")
+              " the timeline, Previous/Next and the media keys all move the read.")
         return 0
     finally:
         api.stopping.set()

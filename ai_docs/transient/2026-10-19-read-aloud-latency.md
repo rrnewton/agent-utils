@@ -138,3 +138,9 @@ length is exact once its audio has all arrived; before that (always, on a speaki
 the block's spoken characters times the voice's rate, 0.068 s a character until a block of this
 voice of 40 characters or more has arrived whole and been measured. The error is confined to one
 block: every block starts its light on its first sentence when its audio starts.
+
+## Timeline (`#380 read-aloud-timeline`)
+
+The steering strip draws the read as a line of its blocks, each as wide as its spoken characters,
+the heard ones tinted and the current one filled; a tap on one is a jump, so it costs what any jump
+costs: the interrupt of the block playing and the next block's first audio plus the cushion.

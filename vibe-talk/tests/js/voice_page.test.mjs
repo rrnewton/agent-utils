@@ -11210,6 +11210,32 @@ test("a block of one sentence lights no sentence, and a browser without the high
   assert.equal(plain.page.el("read-steer-count").text(), "1 of 3");
 });
 
+// --- `#380 read-aloud-timeline`: the read as a line of its blocks ----------------------------------
+
+test("THE TIMELINE shows the read's blocks as wide as they are long, marks where the read is, and jumps", async () => {
+  const { page, rows } = await blockedRead({ kinds: [{ kind: "paragraph", spoken: true, chars: 30 },
+    { kind: "item", spoken: true, chars: 10 }, { kind: "item", spoken: true, chars: 20 }] });
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  const line = () => page.el("read-timeline").children;
+  assert.equal(line().length, 3, "the timeline does not show the read's three blocks");
+  assert.deepEqual(line().map((button) => button.getAttribute("style")),
+    ["--block-weight: 30", "--block-weight: 10", "--block-weight: 20"], "the blocks are not as wide as they are long");
+  assert.deepEqual(line().map((button) => button.getAttribute("aria-current")), ["true", "false", "false"]);
+
+  await line()[2].click();
+  await page.settle();
+  assert.equal(blockOf(page.audioStreams.at(-1).url), "2", "a tap on the third block did not read from it");
+  assert.equal(page.el("read-steer-count").text(), "3 of 3");
+  assert.deepEqual(line().map((button) => button.getAttribute("aria-current")), ["false", "false", "true"]);
+  assert.deepEqual(line().map((button) => button.getAttribute("data-heard") !== null), [true, true, false],
+    "the blocks before the one being read are not marked as passed");
+
+  await page.el("read-aloud").click();
+  await page.settle();
+  assert.equal(line().length, 0, "the timeline outlived the read");
+});
+
 // --- `#290 speech-ticket-refresh`: a prepared URL is never played after its ticket has ended ----------
 //
 // The server's tickets last `expires_in_seconds` (ten minutes) from when it minted them, and a tap that

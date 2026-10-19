@@ -148,6 +148,10 @@
         <button id="read-prev" class="read-steer-button" type="button" aria-label="Previous block">Previous</button>
         <span id="read-steer-count" aria-live="polite"></span>
         <button id="read-next" class="read-steer-button" type="button" aria-label="Next block">Next</button>
+        <!-- `#380 read-aloud-timeline`. The read as a line of its blocks, each as wide as it is long:
+             those heard, the one being read, those to come. A tap on one reads from there. Filled
+             by web/voice.js, one button a block. -->
+        <div id="read-timeline" role="group" aria-label="Blocks of the message"></div>
       </div>
 
       <div id="screens">
