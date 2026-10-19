@@ -33633,6 +33633,26 @@ def test_agent_remove_verifies_an_existing_local_archive_before_the_lock(
 
 
 @pytest.mark.skipif(shutil.which("flock") is None, reason="needs flock(1)")
+def _settle_racy_indexes(*repositories: Path) -> None:
+    """Rewrite each index once, a second after the checkout wrote it, so none stays racy.
+
+    Git compares an index entry's file time with the index file's own time at
+    whole seconds. A checkout writes its files and its index within one second,
+    so every entry is racily clean, and each status that refreshes the index
+    rewrites it until one runs in a later second. When removal's first
+    refreshing status still fell in the checkout's second and the derivation
+    before the lock crossed into the next one, a later status rewrote a
+    submodule's index again: its fingerprint then differed under the lock and
+    its facts were derived there anew. That is right for a changed index, but
+    it made a test of the unchanged case depend on where a second boundary fell
+    (it failed under load on main as on any branch).
+    """
+
+    time.sleep(1.1)
+    for repository in repositories:
+        git(repository, "status", "--porcelain")
+
+
 def test_agent_remove_derives_submodule_salvage_facts_before_the_lock(
     tmp_path: Path,
 ) -> None:
@@ -33651,6 +33671,7 @@ def test_agent_remove_derives_submodule_salvage_facts_before_the_lock(
     made = create(project)
     assert made.returncode == 0, made.stderr
     tree = checkout(project)
+    _settle_racy_indexes(tree, tree / "component", tree / "component" / "leaf")
     mark_owner_dead(project)
     set_liveness(project, "dead")
     lock = project / "worktrees" / "ACTIVE.global.lock"
