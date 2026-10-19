@@ -1,12 +1,13 @@
 ---
 title: 'wrkviz-transcript-container: store the extracted transcript projections as seekable multi-member gzip'
-status: open
+status: closed
 priority: 3
 issue_type: feature
 labels:
 - wrkviz
 created_at: 2026-10-15T15:30:49.679967984+00:00
-updated_at: 2026-10-15T15:30:49.679967984+00:00
+updated_at: 2026-10-19T08:39:34.807388535+00:00
+closed_at: 2026-10-19T08:39:34.807388375+00:00
 ---
 
 # Description
