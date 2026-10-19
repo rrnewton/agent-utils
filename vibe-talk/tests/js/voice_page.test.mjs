@@ -45485,7 +45485,8 @@ test("an agent's heading is drawn in the row's header as text, and the words it 
   // After the time and before the row's buttons, and built of nothing but spans of text.
   const meta = metaOf(rows[0]).children.map((node) => node.className);
   assert.ok(meta.indexOf("rh-head") > meta.indexOf("msg-time"), `the header is not after the time: ${meta}`);
-  assert.ok(meta.indexOf("rh-head") < meta.indexOf("reply-button"), `the header is not before Reply: ${meta}`);
+  // The buttons are held together after it (`#377 compact-collapsed-rows`).
+  assert.ok(meta.indexOf("rh-head") < meta.indexOf("row-acts"), `the header is not before Reply: ${meta}`);
   for (const node of headOf(rows[0]).descendants()) assert.equal(node.tagName, "span");
   // The body is NOT cut: the restated words stay in it, in a span the stylesheet hides.
   assert.equal(
@@ -45799,6 +45800,110 @@ test("a pinned message shows its reactions in the Pinned list, and redraws when 
   await pollOnce(page);
   assert.deepStrictEqual(chipsOf(page.el("pinned-log").children[1]), ["👀 1", "✅ 1", "👍 1"],
     "the Pinned list kept the reactions it was first drawn with");
+});
+
+// --- a collapsed row on one line (#377 compact-collapsed-rows) ------------------------------------
+//
+// The owner, 2026-10-19: a collapsed message's header took two lines on a phone. Where the list is
+// narrow, a collapsed row's header holds the name (cut to a prefix where it must be), the time, the
+// Thread tag and ⋯; Reply and Done appear once it is opened. tests/compact_rows_browser.py measures the
+// lines the engine draws; these pin the rules and the name's tooltip the fixture can see.
+
+/** The body of the one `@container` block for `query`, brace-matched, with comments gone. */
+function containerBody(query) {
+  const at = CSS_CODE.indexOf(`@container ${query}`);
+  assert.ok(at >= 0, `web/voice.css has no "@container ${query}" block`);
+  let depth = 0;
+  for (let i = CSS_CODE.indexOf("{", at); i < CSS_CODE.length; i += 1) {
+    if (CSS_CODE[i] === "{") depth += 1;
+    else if (CSS_CODE[i] === "}" && --depth === 0) return CSS_CODE.slice(CSS_CODE.indexOf("{", at) + 1, i);
+  }
+  return assert.fail(`the "@container ${query}" block is never closed`);
+}
+
+/**
+ * The declaration blocks whose WHOLE selector is `selector`, whitespace aside. `cssRules` splits a
+ * selector list on its commas, which cuts an `:is(a, b)` apart; these rules are written with one.
+ */
+const wholeRules = (text, selector) => [...text.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+  .filter((rule) => rule[1].replace(/\s+/g, " ").trim() === selector)
+  .map((rule) => rule[2]);
+
+const COMPACT_QUERY = "rows (max-width: 31.99rem)";
+const ROW_ACTS = ":is(.reply-button:not([data-quote]), .not-noise-button, .done-button)";
+
+test("`#377 compact-collapsed-rows`: a narrow list takes Reply and Done off a collapsed row only, never an open one", () => {
+  const body = containerBody(COMPACT_QUERY);
+  const lists = ":is(#side-log, #discord-log, #pinned-log)";
+  const selector = `${lists} li.discord-message[data-collapsed="true"] .row-acts > ${ROW_ACTS}`;
+  const hidden = wholeRules(body, selector).join("\n");
+  assert.match(hidden, /display:\s*none/, "a collapsed row in a narrow list still draws Reply and Done");
+  // `display: none` rather than clipping: out of the accessibility tree, as they are off the screen.
+  assert.doesNotMatch(hidden, /clip|opacity|visibility/, "the acts are hidden from the eye but left to a screen reader");
+  // The negative control: no rule anywhere hides Reply or Done on a row that is not collapsed, or on
+  // every row.
+  for (const block of CSS_CODE.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    const rule = block[1].trim();
+    if (!/display:\s*none/.test(block[2]) || !/reply-button|done-button/.test(rule)) continue;
+    assert.match(rule, /\[data-collapsed="true"\]/, `"${rule}" hides Reply or Done on a row that is not collapsed`);
+  }
+  // Wide lists keep every control: nothing outside the narrow query takes them off a collapsed row.
+  assert.equal(wholeRules(CSS_CODE.replace(body, ""), selector).length, 0, "a wide list takes Reply and Done off a collapsed row too");
+  // The controls move as one: pushed to the end of the line, wrapping among themselves only when they
+  // are wider than the whole line.
+  const acts = cssBlock(".row-acts");
+  assert.match(acts, /margin-left:\s*auto/);
+  assert.match(acts, /flex-wrap:\s*wrap/);
+  assert.match(acts, /justify-content:\s*flex-end/);
+});
+
+test("`#377 compact-collapsed-rows`: the name gives way on the header line, and the Thread tag is the size of Reply", () => {
+  const name = cssRules(CSS_CODE, "#discord-log li.discord-message > .meta > .msg-author").join("\n");
+  assert.match(name, /flex:\s*1 1 3em/, "the name asks the line for more than three letters, so a long one pushes the controls onto a line of their own");
+  assert.match(name, /min-width:\s*0/);
+  assert.match(name, /max-width:\s*max-content/, "the name grows past its own width, away from the time");
+  assert.match(name, /text-overflow:\s*ellipsis/, "a cut name has no ellipsis");
+  assert.match(name, /white-space:\s*nowrap/);
+  const tag = cssRules(CSS_CODE, ".thread-badge").join("\n");
+  const reply = cssBlock(".reply-button");
+  for (const property of ["padding", "font-size", "min-height"]) {
+    const of = (block) => [...block.matchAll(new RegExp(`(?:^|[;\\s])${property}:\\s*([^;]+);`, "g"))].map((m) => m[1].trim()).pop();
+    assert.equal(of(tag), of(reply), `the Thread tag's ${property} is not Reply's`);
+  }
+});
+
+test("`#377 compact-collapsed-rows`: a row's name carries the whole of itself as its tooltip", async () => {
+  const page = newPage();
+  await signIn(page);
+  const long = "Bartholomew Featherstonehaugh-Ravensworth";
+  const rows = await showDiscord(page, [
+    message({ id: "100", author: long, author_id: "1000000000000000006", author_is_bot: false, content: "a person" }),
+    message({ id: "101", author: "relay", author_id: "1000000000000000008", author_is_bot: true, content: "a bot" }),
+  ]);
+  const nameOf = (li) => metaOf(li).children.find((node) => String(node.className).split(" ").includes("msg-author"));
+  const [person, bot] = rows.map(nameOf);
+  assert.equal(person.textContent, long);
+  assert.equal(person.getAttribute("title"), long, "the whole name is nowhere a pointer can find it once it is cut");
+  assert.equal(bot.getAttribute("title"), `${bot.textContent}`, "a bot's tooltip is not the name its row says");
+  assert.match(bot.getAttribute("title"), /\(bot\)$/);
+});
+
+test("`#377 compact-collapsed-rows`: a row's controls are held together, in their order, after its name and time", async () => {
+  const page = newPage();
+  await signIn(page);
+  const [li] = await showDiscord(page, [message({ id: "100", content: "a message" })]);
+  const meta = metaOf(li);
+  const kids = meta.children.map((node) => String(node.className).split(" ")[0]);
+  assert.ok(kids.indexOf("row-acts") > kids.indexOf("msg-time"), `the controls are not after the time: ${kids}`);
+  const acts = meta.children.find((node) => node.className === "row-acts");
+  const inside = acts.children.map((node) => String(node.className).split(" ")[0]);
+  for (const name of ["draft-marker", "reply-button", "row-more", "not-noise-button", "done-button"]) {
+    assert.ok(inside.includes(name), `${name} is not among the row's controls: ${inside}`);
+  }
+  assert.deepEqual(inside.filter((name) => ["reply-button", "row-more", "done-button"].includes(name)),
+    ["reply-button", "row-more", "done-button"], "the controls are out of their order");
+  // Reply's own record of itself still finds it (`#228 reply-visible`).
+  assert.equal(li.replyButton, acts.children.find((node) => node.className === "reply-button"));
 });
 
 // --- edited messages (#320 slack-edited-mark) ------------------------------------------------------
@@ -58434,7 +58539,7 @@ test("`#267 quote-reply`: where Quote reply would wrap the header line, the butt
   // wraps it, a line taller, as a long author's name and a reply count do on a phone.
   let measured = 0;
   for (const li of [first, second]) {
-    const meta = replyButton(li).parentNode;
+    const meta = metaOf(li);
     const drawn = meta.getBoundingClientRect.bind(meta);
     meta.getBoundingClientRect = () => {
       measured += 1;

@@ -1317,7 +1317,7 @@ def columns_measure(page: Page) -> dict[str, object]:
 def press_reply(page: Page, list_id: str, message_id: str, mount: str, where: str) -> None:
     """A real click on the row's Reply, and the reply's box open at the foot of `mount`."""
     found = page.evaluate(f"""() => {{
-        const b = document.querySelector("#{list_id} > li[data-id='{message_id}'] > .meta > .reply-button");
+        const b = document.querySelector("#{list_id} > li[data-id='{message_id}'] > .meta .reply-button");
         if (!b) return null;
         b.scrollIntoView({{block: 'center'}});
         const r = b.getBoundingClientRect();

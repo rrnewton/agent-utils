@@ -5960,6 +5960,26 @@ read, where the read question is kept by its four unread replies and says **4 un
 replies**, on one line and in the accent, and a real tap on that count opens the thread at the first
 of them. Pass `SCREENSHOTS=/tmp/shots` to keep a PNG of each step.
 
+### A folded message's header is one line
+
+`#377 compact-collapsed-rows`. On a phone, and wherever a list is narrower than about 32rem (the two
+columns of a smaller desk window), a folded message's header is one line: the author's name, the time,
+**Thread(N)** and **⋯**. **Reply** and **Done** (or **Unarchive**, or **Not noise**) belong to a message
+you have opened, and appear when it is. A swipe still marks a folded message Done. From the keyboard,
+Enter opens the selected message, and `r` and `e` press its Reply and Done whether it is open or not. A
+list wide enough for everything keeps every control on every row.
+
+On every row, a name too long for the line is cut to a prefix and an ellipsis rather than pushing the
+controls onto another line; a pointer resting on it shows the whole name, and so does the details sheet
+a press-and-hold opens. The controls stay together at the right: where they do not fit beside the name
+and the time, they move to the line under them as one, so Done is never left on a line of its own.
+**Thread(N)** is a button of that line, the height and type size of Reply beside it, in its thread's
+colour.
+
+`make compact-rows-browser` checks this in Chromium at 393x852 and 1280x800, in one column and in two,
+and at 1024x768 in two. `SCREENSHOTS=dir` keeps a PNG of each state and `REPORT=1` prints every header
+it measures.
+
 ### A folded message says how much it is hiding
 
 `#244 elision-word-count`. A long message arrives folded to its first three lines, and those lines
