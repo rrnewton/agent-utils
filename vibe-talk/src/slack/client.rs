@@ -176,7 +176,7 @@ impl HttpSlackClient {
                     .with_provider(&config.provider_name),
             );
         }
-        let client = reqwest::Client::builder()
+        let client = crate::egress::client_builder()
             .user_agent(concat!(
                 "vibe-talk (https://github.com/rrnewton/agent-utils, ",
                 env!("CARGO_PKG_VERSION"),

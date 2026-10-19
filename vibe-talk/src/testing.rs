@@ -2,6 +2,9 @@
 //!
 //! This is test support, not product code: it builds a server whose Discord is
 //! [`crate::discord::fake::FakeDiscord`]. The binary never calls it.
+//!
+//! Using it confines every HTTP client the process builds afterwards to loopback: see
+//! [`crate::egress`].
 
 use std::collections::BTreeMap;
 use std::io;
@@ -28,6 +31,9 @@ pub const WRITE_CHANNEL: &str = "2222222222";
 /// TOML for a server with one read-only and one writable channel.
 #[must_use]
 pub fn config_toml() -> String {
+    // Its legacy `[discord]` section names no `api_base`, so a client built from it would name the
+    // public Discord API.
+    crate::egress::confine_to_loopback();
     format!(
         r#"
 [server]
@@ -79,6 +85,7 @@ pub fn config_toml_without_elevenlabs() -> String {
 /// Panics if the embedded test configuration stops being valid, which is itself a test failure.
 #[must_use]
 pub fn config() -> Config {
+    crate::egress::confine_to_loopback();
     Config::from_toml_and_env(&config_toml(), &BTreeMap::new()).expect("test config is valid")
 }
 
@@ -218,6 +225,7 @@ fn state_pieces_with(
     Arc<FakeElevenLabs>,
     Arc<dyn crate::store::StateStore>,
 ) {
+    crate::egress::confine_to_loopback();
     let fake = Arc::new(FakeDiscord::new());
     fake.register_channel(&crate::model::ChannelId(READ_CHANNEL.to_owned()));
     fake.register_channel(&crate::model::ChannelId(WRITE_CHANNEL.to_owned()));

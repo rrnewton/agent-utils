@@ -3,7 +3,10 @@
 //!
 //! A Slack deployment reported its Slack checks under `discord.token` and `discord.channel` while
 //! their titles said Slack, and named the token's account by a handle that, in a workspace whose
-//! handles are numbers, named nobody. Against the loopback Slack fake and the in-memory Discord.
+//! handles are numbers, named nobody. Against the loopback Slack fake and the in-memory Discord;
+//! the both-providers case builds a real Discord client from the legacy `[discord]` section, which
+//! names the public Discord API, and the test harness keeps that client on loopback
+//! (`#359 provider-diagnostics-ids`, see `vibe_talk::egress`).
 
 mod slack_fake;
 
@@ -178,6 +181,12 @@ async fn with_both_providers_each_check_is_named_for_its_own() {
     let body = report(&state).await;
     assert_eq!(check(&body, "slack.token")["subject"], "slack");
     assert_eq!(check(&body, "discord.token")["subject"], "discord");
+    // The Discord client names the public API and is held on loopback: unreachable on every
+    // host, never the public API's answer to a test token, which ended the channel probe early.
+    let discord_token = check(&body, "discord.token")["summary"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(discord_token.contains("never reached"), "{body:#}");
     assert_eq!(check(&body, "slack.channel")["subject"], TEAM);
     let discord_channels = body["checks"]
         .as_array()
