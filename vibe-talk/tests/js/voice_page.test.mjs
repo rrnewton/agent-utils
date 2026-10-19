@@ -23317,8 +23317,9 @@ test("Shift+E asks the chat service nothing after a Done that failed, and the fa
   assert.equal(channelRow(page, "3").getAttribute("data-archived"), "false", "a Done that failed left the row Done");
   assert.equal(page.el("error").hidden, false, "a Done that failed said nothing");
   assert.doesNotMatch(page.el("status").textContent, /^Marked read/, "a Done that failed was said as a read");
-  // THE CONTROL: with the failure swallowed, the service is asked all the same.
-  const { page: control } = await readCollapseMarked(brokenScript(DONE_UNLESS_DONE,
+  // THE CONTROL: with the failure swallowed and no look again after its own Done (`#370
+  // shift-e-undo-marker`), the service is asked all the same.
+  const { page: control } = await readCollapseMarked(brokenScript(`${DONE_UNLESS_DONE}  if (!(await doneSaved(ids))) return;\n`,
     "  if (!wasDone) await markRowDone(ids, row).catch(() => {});\n"), refuse);
   await control.settle();
   assert.equal(control.upstreamReadCalls.length, 1,
@@ -23330,7 +23331,7 @@ test("Shift+E asks the chat service nothing after a Done that failed, and the fa
 // take that for a saved Done: the chat service's marker, once moved, cannot be moved back.
 
 /** The line in `readAndCollapse` that waits for a Done still being saved, taken out for a negative control. */
-const WAITS_FOR_SAVE = "  if (wasDone && !(await doneSaved(ids))) return;\n";
+const WAITS_FOR_SAVE = "  if (!(await doneSaved(ids))) return;\n";
 
 /**
  * Message 3 opened and its Done made by `first`, Shift+E or e, held on its way to the server; Shift+E
@@ -69124,6 +69125,63 @@ test("`#327 done-races-remaining`: an Undo that slips in the page before its wri
     assert.deepStrictEqual(control.asked, [control.id],
       `${ask}: with the wait ended alone the chat service was not asked for the refused Done, so this test cannot see it`);
   }
+});
+
+// Found in the same review, the same race as `#327 done-races-remaining` part (3) but for Shift+E's own
+// Done, and older than that lane (`#370 shift-e-undo-marker`): `readAndCollapse` on a message not Done
+// yet marked it Done and then asked the chat service without looking again, so an Undo pressed while
+// that Done was on its way, the Undo itself saved, still moved the marker for a message put back.
+// Shift+E now looks again once its Done is saved, as a sent reply does since `#327`.
+
+/** The line that looks again after Shift+E's own Done, as first written (only for a Done made before): for negative controls. */
+const SHIFT_E_LOOKS_AGAIN = ["  if (!(await doneSaved(ids))) return;\n", "  if (wasDone && !(await doneSaved(ids))) return;\n"];
+
+/**
+ * The chat service's marker supported: message 3 selected and opened (`openThree`), Shift+E pressed
+ * with its Done held on its way; with `undo`, the Undo chip pressed meanwhile; then the Done answered
+ * saved, and every write let settle. Answers the page and the server floor's asks.
+ */
+async function shiftEWithHeldDone(undo, script = SCRIPT) {
+  let asked = null;
+  const arrange = (p) => { p.upstreamReadMarkSupported = true; asked = serverFloor(p); };
+  const { page } = await openThree(script, arrange);
+  let release = null;
+  page.inboxWriteHook = async (kind) => (kind === "dismiss" && release === null
+    ? new Promise((resolve) => { release = () => resolve(null); }) : null);
+  const pressing = pressHere(page, "E", { shiftKey: true });
+  await page.settle();
+  assert.ok(release, "the premise is Shift+E's Done on its way");
+  // Not awaited yet: the Undo's write is queued behind the Done still on its way.
+  const undoing = undo ? page.el("undo-dismiss").click().catch(() => {}) : null;
+  for (let i = 0; i < 3; i += 1) await page.settle();
+  release();
+  await pressing;
+  if (undoing) await undoing;
+  for (let i = 0; i < 6; i += 1) await page.settle();
+  page.inboxWriteHook = null;
+  return { page, asked };
+}
+
+test("`#370 shift-e-undo-marker`: an Undo pressed while Shift+E's own Done is on its way, the Undo saved, leaves the chat service unasked; with no Undo it is asked once, after the Done is saved", async () => {
+  const undone = await shiftEWithHeldDone(true);
+  assert.deepStrictEqual(undone.page.restoreCalls, [{ messages: ["3"] }], "the premise is the Undo written");
+  assert.equal(undone.page.dealtWith.has("3"), false, "the premise is the message put back on the server");
+  assert.equal(rowWithId(undone.page, "3").getAttribute("data-archived"), "false", "the premise is the message drawn put back");
+  assert.deepStrictEqual(undone.page.upstreamReadCalls, [], "the chat service was asked for a message put back meanwhile");
+  assert.deepStrictEqual(undone.asked, [], "the server's floor was asked for a message put back meanwhile");
+
+  const kept = await shiftEWithHeldDone(false);
+  assert.deepStrictEqual(kept.page.restoreCalls, [], "the premise is no Undo written");
+  assert.equal(kept.page.dealtWith.has("3"), true, "the premise is the Done saved");
+  assert.deepStrictEqual(kept.asked, ["3"], "the chat service was not asked once, after Shift+E's Done was saved");
+
+  // THE CONTROL: Shift+E looked again only for a Done made before it, as first written: the Undo
+  // saved, the chat service is still asked for the message put back.
+  const control = await shiftEWithHeldDone(true, brokenScript(...SHIFT_E_LOOKS_AGAIN));
+  assert.deepStrictEqual(control.page.restoreCalls, [{ messages: ["3"] }], "the premise is the Undo written");
+  assert.equal(control.page.dealtWith.has("3"), false, "the premise is the message put back on the server");
+  assert.deepStrictEqual(control.asked, ["3"],
+    "with the look again missing the chat service was not asked for the message put back, so this test cannot see it");
 });
 
 // --- `#315 removed-reply-target`: a reply to a message removed upstream -----------------------------

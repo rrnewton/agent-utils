@@ -9373,7 +9373,9 @@ function readCollapseFromKeyboard(target) {
  * marked. Shift+E pressed again meanwhile, or after `e` or the Done button, waits for that Done to be
  * saved before it asks the service anything, and asks, and says, nothing once it has failed
  * (`doneSaved`): the service's marker cannot be moved back, and the failure is said by the act it
- * failed for.
+ * failed for. Its own Done is looked at the same way once saved (`#370 shift-e-undo-marker`, as a
+ * sent reply's is since `#327 done-races-remaining`): an Undo pressed while it was on its way, the
+ * Undo itself saved, leaves the service unasked for a message put back.
  *
  * The status line says where the message was marked, and that it was collapsed, once the service has
  * answered; nothing over another channel the reader has gone to meanwhile.
@@ -9383,7 +9385,7 @@ async function readAndCollapse(pane, row, ids) {
   const folded = foldForRead(pane, row);
   const wasDone = ids.every((id) => archivedIds.has(id));
   if (!wasDone) await markRowDone(ids, row);
-  if (wasDone && !(await doneSaved(ids))) return;
+  if (!(await doneSaved(ids))) return;
   const mark = await markReadInService(channel, ids[ids.length - 1]);
   if (channel !== String(el("discord-channel").value)) return;
   const also = folded ? ", and collapsed" : "";
