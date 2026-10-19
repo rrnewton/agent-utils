@@ -1386,6 +1386,9 @@ impl crate::cache::Clock for ManualClock {
     }
 }
 
+/// How long [`install_message_cache`] waits for the cache a test closed to let go of its file.
+pub const PREVIOUS_CACHE_WAIT: Duration = Duration::from_secs(10);
+
 /// Open a message cache in `dir`, read by `clock` and indexed by the page's own rendering for
 /// `state`'s providers, and put it behind `state`'s sink, WITHOUT arming it. `#208
 /// persistent-cache`. For a test of the startup guard, which arms it (or does not) through
@@ -1393,25 +1396,39 @@ impl crate::cache::Clock for ManualClock {
 ///
 /// # Panics
 ///
-/// Panics if the cache cannot be opened, which is a broken test environment.
+/// Panics if the cache cannot be opened, which is a broken test environment, or if a cache a test
+/// closed still holds the file after [`PREVIOUS_CACHE_WAIT`].
 #[must_use]
 pub fn install_message_cache(
     state: &AppState,
     dir: &std::path::Path,
     clock: Arc<ManualClock>,
 ) -> Arc<crate::cache::MessageCache> {
-    let cache = Arc::new(
-        crate::cache::MessageCache::open(crate::cache::CacheOptions {
-            // A directory of its own: the cache refuses one that other accounts can enter, which
-            // a system temporary directory's children are.
-            path: dir.join("message-cache").join("message-cache.sqlite3"),
-            store_path: None,
-            limits: crate::cache::Limits::default(),
-            search_text: Arc::new(crate::render::SearchText::from_config(&state.config)),
-            clock,
-        })
-        .expect("a message cache opens in a test directory"),
-    );
+    let search_text = Arc::new(crate::render::SearchText::from_config(&state.config));
+    let options = || crate::cache::CacheOptions {
+        // A directory of its own: the cache refuses one that other accounts can enter, which a
+        // system temporary directory's children are.
+        path: dir.join("message-cache").join("message-cache.sqlite3"),
+        store_path: None,
+        limits: crate::cache::Limits::default(),
+        search_text: search_text.clone(),
+        clock: clock.clone(),
+    };
+    // A test's restart is in-process. Work the last server left running -- a shadow evaluation
+    // still reading beside a request it served, on the blocking pool -- can hold that server's
+    // cache, and with it the file's lock, for a moment after the test closed it; a real restart's
+    // new process finds the lock its old one released on exit. So the next start waits for that
+    // last handle to go, up to PREVIOUS_CACHE_WAIT, and then refuses as a server would.
+    // `#364 message-cache-test-flakes`.
+    let began = std::time::Instant::now();
+    let cache = loop {
+        match crate::cache::MessageCache::open(options()) {
+            Err(crate::cache::CacheError::Locked(_)) if began.elapsed() < PREVIOUS_CACHE_WAIT => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            opened => break Arc::new(opened.expect("a message cache opens in a test directory")),
+        }
+    };
     // As `main` does, for a state built field by field; a no-op for one this module built.
     state
         .message_cache

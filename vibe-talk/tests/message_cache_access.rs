@@ -380,6 +380,28 @@ impl Deployment {
     }
 }
 
+/// A test's restart waits for the cache it closed to let go of its file. Work the last server
+/// left on the blocking pool (a shadow evaluation still reading) can hold that cache a moment
+/// longer, and a restart that refused the file then failed the test, never the server.
+/// `#364 message-cache-test-flakes`.
+#[tokio::test]
+async fn a_restart_waits_for_the_cache_it_closed_to_let_go_of_its_file() {
+    let dir = TempDir::new("cache-access-restart-waits");
+    let clock = ManualClock::at(T0 + HOUR);
+    let d = filled(&dir, &clock).await;
+    let lingering = d.cache();
+    d.close();
+    let letting_go = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        drop(lingering);
+    });
+    let d = upstream(10, "UA1", "UB1");
+    let state = testing::with_message_cache(d.state.clone(), dir.path(), clock.clone()).await;
+    letting_go.join().expect("the last handle let go");
+    let cache = state.message_cache.cache().expect("installed");
+    assert_eq!(total(&cache), 20, "the same file, opened again");
+}
+
 fn first_chan() -> ChanKey {
     ChanKey::new(FIRST, READ_CHANNEL)
 }
@@ -618,6 +640,21 @@ async fn settle_tasks() {
         .expect("the blocking pool runs");
     for _ in 0..50 {
         tokio::task::yield_now().await;
+    }
+}
+
+/// [`settle_tasks`] until `done`, for up to [`WAIT`] of real time. A provider's account check
+/// reads the file on the blocking pool, which a busy host can hold back past one settle's fixed
+/// 50 ms. The paused clock does not move meanwhile: a blocking task in flight keeps it still.
+/// `#364 message-cache-test-flakes`.
+async fn settle_until(what: &str, done: impl Fn() -> bool) {
+    let began = std::time::Instant::now();
+    loop {
+        settle_tasks().await;
+        if done() {
+            return;
+        }
+        assert!(began.elapsed() < WAIT, "never settled: {what}");
     }
 }
 
@@ -1310,11 +1347,10 @@ async fn a_revoked_credential_erases_at_once_and_a_refusal_lasting_a_day_erases(
     d.second.heal();
     d.second.answer(Ok(account("UB1")));
     tokio::time::advance(SUSPENDED_RECHECK + PAST).await;
-    settle_tasks().await;
-    assert_eq!(
-        d.state.message_cache.verification(SECOND),
-        Verification::Verified
-    );
+    settle_until("the second provider is verified again", || {
+        d.state.message_cache.verification(SECOND) == Verification::Verified
+    })
+    .await;
     assert!(stored_account(&cache, SECOND)
         .expect("recorded again")
         .is("UB1", None));
@@ -1458,19 +1494,7 @@ async fn a_deletion_reaches_the_file_before_the_account_is_checked_and_an_edit_m
     assert_eq!(held(&cache, &first_chan()), 8);
     assert!(suspect(&cache));
     clock.advance(MINUTE);
-    let (status, _) = call(
-        &d.state,
-        "GET",
-        &format!(
-            "/api/v1/channels/{READ_CHANNEL}/messages/{}",
-            ids[5].as_str()
-        ),
-        WRITE_TOKEN,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(d.state.message_cache.shadow_settled(WAIT).await);
-    let counted = shadowed(&d.state, "message_by_id");
+    let counted = by_id(&d, &ids[5], StatusCode::OK).await;
     assert_eq!(
         (counted.asked, counted.would_serve, counted.content_differs),
         (1, 0, 0),
@@ -1537,24 +1561,36 @@ async fn a_deletion_reaches_the_file_while_the_provider_is_suspended() {
 
 /// What the shadow has counted for `message_by_id` once a write-token read of `message` by id has
 /// answered `expected` upstream.
+/// A write-scope lookup of `message` in the read-only channel, then what the shadow has counted
+/// for lookups by id.
+///
+/// The lookup's read of the channel is held at the provider until the shadow evaluation beside it
+/// has read the cache. Unheld, a busy host could run the evaluation only after this read's own
+/// write had reached the file, and an evaluation that reads the request's own write is counted
+/// `late`, with no verdict. `#364 message-cache-test-flakes`.
 async fn by_id(
-    state: &AppState,
+    d: &Deployment,
     message: &MessageId,
     expected: StatusCode,
 ) -> vibe_talk::cache::shadow::ConsumerCounts {
-    let (status, _) = call(
-        state,
-        "GET",
-        &format!(
+    let held = d.first.inner.hold_next_recent();
+    let request = {
+        let state = d.state.clone();
+        let uri = format!(
             "/api/v1/channels/{READ_CHANNEL}/messages/{}",
             message.as_str()
-        ),
-        WRITE_TOKEN,
-    )
-    .await;
-    assert_eq!(status, expected);
-    assert!(state.message_cache.shadow_settled(WAIT).await);
-    shadowed(state, "message_by_id")
+        );
+        tokio::spawn(async move { call(&state, "GET", &uri, WRITE_TOKEN).await.0 })
+    };
+    held.entered.await.expect("the lookup reached the provider");
+    assert!(
+        d.state.message_cache.shadow_read(WAIT).await,
+        "the evaluation read the cache"
+    );
+    held.release.send(()).expect("the lookup is waiting");
+    assert_eq!(request.await.expect("the lookup ran"), expected);
+    assert!(d.state.message_cache.shadow_settled(WAIT).await);
+    shadowed(&d.state, "message_by_id")
 }
 
 /// The next start of a filled cache, its provider slow to say which account it is. The message is
@@ -1598,7 +1634,7 @@ async fn a_deletion_left_out_while_the_account_was_unchecked_is_never_vouched_fo
         suspect(&cache),
         "nothing re-read the deleted message's stretch"
     );
-    let counted = by_id(&d.state, &ids[3], StatusCode::NOT_FOUND).await;
+    let counted = by_id(&d, &ids[3], StatusCode::NOT_FOUND).await;
     assert_eq!(
         (
             counted.would_serve,
@@ -1669,7 +1705,7 @@ async fn a_threads_listing_never_vouches_for_a_main_message_whose_edit_was_left_
         suspect(&cache),
         "a thread's listing lifted the doubt about a Main message"
     );
-    let counted = by_id(&d.state, &ids[2], StatusCode::OK).await;
+    let counted = by_id(&d, &ids[2], StatusCode::OK).await;
     assert_eq!(
         (
             counted.would_serve,
@@ -1715,7 +1751,7 @@ async fn a_left_out_edit_is_still_distrusted_after_a_restart() {
     assert_eq!(text_of(&cache, &ids[2]).as_deref(), Some("a message"));
     assert!(suspect(&cache), "the restart forgot what was left out");
     clock.advance(MINUTE);
-    let counted = by_id(&d.state, &ids[2], StatusCode::OK).await;
+    let counted = by_id(&d, &ids[2], StatusCode::OK).await;
     assert_eq!(
         (
             counted.would_serve,
