@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-275-c3cb34beaf7",
+    "issue_id": "agent-utils-275",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] #352 voice-reconnect-on-bridge-error covers one narrow case of healing a call: on vibe-talk-v1, an error frame that asks the client to reconnect, during a call whose session started, carries the call on a new session (at most once a rolling minute and three times a call), handing it the call's record where the session takes one and Resuming is on. Drops, closes (see #357), the hosted protocol, and a redial after a hang-up are not covered and remain this issue's.",
+    "created_at": "2026-10-19T08:30:37.276339024Z",
+    "updated_at": "2026-10-19T08:30:37.276339024Z"
+  }
+]
