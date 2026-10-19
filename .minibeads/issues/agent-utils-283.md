@@ -1,12 +1,13 @@
 ---
 title: 'send-settle-in-task: record a send''s outcome even when its caller has gone'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-14T03:02:06.722525898+00:00
-updated_at: 2026-10-14T03:02:06.722525898+00:00
+updated_at: 2026-10-19T09:07:33.427601105+00:00
+closed_at: 2026-10-19T09:07:33.427600945+00:00
 ---
 
 # Description
