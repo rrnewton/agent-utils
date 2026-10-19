@@ -1,12 +1,13 @@
 ---
 title: 'read-aloud-latency: the first tap on a message waits tens of seconds before it is heard while the page prepares every thread on screen at once'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-19T17:03:15.059755423+00:00
-updated_at: 2026-10-19T17:03:15.059755423+00:00
+updated_at: 2026-10-19T17:55:21.168441498+00:00
+closed_at: 2026-10-19T17:55:21.168441368+00:00
 ---
 
 # Description
