@@ -58926,8 +58926,10 @@ test("`#349 channel-settings-all`: a channel whose service cannot clear unread i
   await settingsChannel(page, "*");
   assert.deepStrictEqual(page.upstreamClearCalls, [`GET ${space.id}`, `GET ${other.id}`], "the box asked about a channel that cannot");
   assert.equal(page.el("upstream-clear-provider").textContent, "Google Chat");
-  assert.equal(page.el("upstream-clear-state").textContent,
-    "Off in all 2 channels. 1 other channel's chat service cannot clear unread.");
+  // `#355 provider-grouped-channels`. With two services All channels is the chosen service's, Google
+  // Chat's here (the service of the channel being read), so the Slack channel, which cannot clear
+  // unread, is not among the channels it reaches, and is neither asked about nor counted as left out.
+  assert.equal(page.el("upstream-clear-state").textContent, "Off in all 2 channels.");
   // The server refuses every write now: nothing is said to be saved that was not.
   page.upstreamClearFailure = { status: 503, error: "store_unavailable", detail: "the store is not writable" };
   page.el("upstream-clear-mode").value = "dry_run";
@@ -70613,4 +70615,43 @@ test("`#355 provider-grouped-channels`: hidden channels are listed under their o
   await page.settle();
   assert.equal(page.el("settings-service").value, "slack");
   assert.equal(String(page.el("settings-channel").value), hiddenTeam.id);
+});
+
+test("`#355 provider-grouped-channels`: with two services, All channels for Clear unread is the chosen service's, and a Save never reaches another service's channels", async () => {
+  const space3 = { id: "1110000000000000405", label: "space c", writable: true, alias: null, added: false, provider: "gchat" };
+  const page = await servicesPage((page) => {
+    page.channels = [{ ...SPACE_A }, { ...TEAM_A }, { ...SPACE_B }, { ...TEAM_B }, space3];
+    page.providers[1] = { ...page.providers[1], upstream_clear_supported: true };
+  });
+  await page.el("open-settings").click();
+  await page.settle();
+  assert.equal(page.el("settings-service").value, "slack");
+  assert.deepStrictEqual(pickerChoices(page),
+    [["*", "All Slack channels"], [TEAM_A.id, "team a"], [TEAM_B.id, "team b"]]);
+  await settingsChannel(page, "*");
+  assert.equal(page.el("channel-facts").textContent, "All 2 Slack channels on your list.");
+  await page.settle();
+  assert.deepStrictEqual([...new Set(page.upstreamClearCalls.filter((call) => call.startsWith("GET")))].sort(),
+    [`GET ${TEAM_A.id}`, `GET ${TEAM_B.id}`], "All Slack channels read another service's setting");
+  page.el("upstream-clear-mode").value = "on";
+  await page.el("upstream-clear-mode").dispatch("change");
+  await page.el("upstream-clear-save").click();
+  await page.settle();
+  assert.deepStrictEqual(page.upstreamClearCalls.filter((call) => call.startsWith("PUT")).map((call) => call.split(" ")[1]).sort(),
+    [TEAM_A.id, TEAM_B.id], "a Save on All Slack channels reached another service's channels");
+  // Google Chat's three, on the same terms.
+  await chooseService(page, "gchat");
+  assert.deepStrictEqual(pickerChoices(page).map(([value, words]) => value === "*" ? words : value),
+    ["All Google Chat channels", SPACE_A.id, SPACE_B.id, space3.id]);
+});
+
+test("`#355 provider-grouped-channels`: All channels is not offered for a service whose channels cannot take Clear unread, though another service's can", async () => {
+  const page = await servicesPage();
+  await page.el("open-settings").click();
+  await page.settle();
+  await chooseService(page, "gchat");
+  assert.ok(!pickerChoices(page).some(([value]) => value === "*"),
+    "All channels offered for a service none of whose channels can clear unread");
+  await chooseService(page, "slack");
+  assert.equal(pickerChoices(page)[0][1], "All Slack channels");
 });

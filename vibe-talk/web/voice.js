@@ -42413,11 +42413,13 @@ function fillChannelSelect(id) {
   // `#351 settings-polish`: and only where one of them, at least, can take Clear unread with this
   // token. All channels is for that one setting, and Rename and Remove step aside for it, so with none
   // that can (no chat service that clears unread, or a read token) it was a choice that left nothing to do.
-  const all = id === "settings-channel" && knownChannels.length >= 2 && upstreamClearAllChannels().length > 0;
+  // `#355 provider-grouped-channels`: with several services, all of the chosen service's channels,
+  // "All Slack channels", offered on the same terms within that service.
+  const all = id === "settings-channel" && settingsChannels().length >= 2 && upstreamClearAllChannels().length > 0;
   if (all) {
     const option = document.createElement("option");
     option.value = ALL_CHANNELS;
-    option.textContent = "All channels";
+    option.textContent = settingsServiceDescription() ? `All ${settingsServiceName()} channels` : "All channels";
     select.append(option);
   }
   const optionFor = (channel) => {
@@ -42872,7 +42874,11 @@ function renderAliasEditor() {
   el("rename-channel").hidden = all;
   if (all) {
     el("channel-alias").value = "";
-    el("channel-facts").textContent = `All ${knownChannels.length} channels on your list.`;
+    // `#355 provider-grouped-channels`: the chosen service's, with several.
+    const count = settingsChannels().length;
+    el("channel-facts").textContent = settingsServiceDescription()
+      ? `All ${count} ${settingsServiceName()} channels on your list.`
+      : `All ${count} channels on your list.`;
     el("alias-state").textContent = "";
     renderRemoveChannel(null);
     return;
@@ -43407,9 +43413,12 @@ async function pushUpstreamClearNow() {
 /** The modes, as the status line names them. */
 const UPSTREAM_CLEAR_MODE_WORDS = { on: "On", dry_run: "Dry run", off: "Off" };
 
-/** The channels All channels reaches: those whose chat service can clear unread, for this token. */
+/**
+ * The channels All channels reaches: those whose chat service can clear unread, for this token. With
+ * several services, only the chosen service's: `#355 provider-grouped-channels`.
+ */
 function upstreamClearAllChannels() {
-  return knownChannels.map((channel) => String(channel.id)).filter((id) => upstreamClearOffered(id));
+  return settingsChannels().map((channel) => String(channel.id)).filter((id) => upstreamClearOffered(id));
 }
 
 /**
@@ -43429,7 +43438,7 @@ function upstreamClearAllCommon() {
 function upstreamClearAllSentence() {
   const held = upstreamClearAll;
   if (!held) return "";
-  const others = knownChannels.length - held.ids.length;
+  const others = settingsChannels().length - held.ids.length;
   const tail = others === 0 ? ""
     : others === 1 ? " 1 other channel's chat service cannot clear unread."
       : ` ${others} other channels' chat services cannot clear unread.`;
