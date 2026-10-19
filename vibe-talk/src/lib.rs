@@ -58,6 +58,7 @@ pub mod conversation;
 pub mod diagnostics;
 pub mod directory;
 pub mod discord;
+pub mod egress;
 pub mod elevenlabs;
 pub mod heading;
 pub mod http;

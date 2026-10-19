@@ -355,7 +355,7 @@ impl HttpElevenLabsClient {
     ///
     /// Returns [`SignedUrlError::Transport`] when the underlying HTTP client cannot be built.
     pub fn new() -> Result<Self, SignedUrlError> {
-        let client = reqwest::Client::builder()
+        let client = crate::egress::client_builder()
             .user_agent(concat!(
                 "vibe-talk (https://github.com/rrnewton/agent-utils, ",
                 env!("CARGO_PKG_VERSION"),

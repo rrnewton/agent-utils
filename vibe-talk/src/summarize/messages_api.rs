@@ -701,7 +701,7 @@ fn stamp(
 /// when they are configured. Redirects are not followed: a credential header must not be carried
 /// anywhere the operator did not name.
 fn build_client(config: &LlmConfig) -> Result<reqwest::Client, SummaryError> {
-    let mut builder = reqwest::Client::builder()
+    let mut builder = crate::egress::client_builder()
         .user_agent(concat!("vibe-talk/", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::none());
     if let Some(path) = &config.ca_bundle_file {
