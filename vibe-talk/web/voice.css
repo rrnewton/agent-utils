@@ -5167,15 +5167,28 @@ a.search-hit-link {
    way to more matches on a phone, so it gets the 44px target the floating chips have, drawn as nothing
    (`#jump-newest::after`): the chip stays its height, and a tap a few pixels off it still lands. */
 #side-older,
-#load-older {
+#load-older,
+#side-search-replies {
   position: relative;
 }
 
 #side-older::after,
-#load-older::after {
+#load-older::after,
+#side-search-replies::after {
   content: "";
   position: absolute;
   inset: min(0px, calc((100% - 2.75rem) / 2));
+}
+
+/* The cards' own way further back, "Search replies before Oct 3", at their head under the line that says
+   none matches, as the step back stands at the head of a list of messages. */
+#side-search-replies {
+  display: block;
+  margin: 0.2rem auto 0.4rem;
+}
+
+#side-search-replies[disabled] {
+  opacity: 0.7;
 }
 
 /* What the last walk found, directly under the control, in the hint's quiet type. */

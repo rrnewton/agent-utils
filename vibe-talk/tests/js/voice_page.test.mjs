@@ -50062,13 +50062,14 @@ test("`#259 thread-list-unread-filter`: with nothing unread it says so, and with
   await searched.el("search-field").setValue("thread 2");
   await searched.settle();
   assert.deepStrictEqual(shownCardIds(searched), [], "a read thread the search matches was kept under Unread only");
-  assert.equal(searched.el("side-list-state").textContent, "No unread threads match that search.");
+  // `#262 search-load-older`: All holds the whole channel here, so the search has looked at every reply.
+  assert.equal(searched.el("side-list-state").textContent, "No unread threads match that search — all of this channel is loaded.");
   await searched.el("side-unread-only").click();
   await searched.settle();
   assert.deepStrictEqual(shownCardIds(searched), ["spaces/A/threads/t2"]);
   await searched.el("search-field").setValue("nothing like this");
   await searched.settle();
-  assert.equal(searched.el("side-list-state").textContent, "No threads match that search.");
+  assert.equal(searched.el("side-list-state").textContent, "No threads match that search — all of this channel is loaded.");
 });
 
 test("`#259 thread-list-unread-filter` x `#243 filter-keeps-selection`: the card selected stays where it was as Unread only goes on and off", async () => {
@@ -58282,6 +58283,371 @@ test("`#262 search-load-older`: Main drawn from All reads its own newest page fi
   assert.deepStrictEqual(reads, [["main", false], ...Array(SEARCH_OLDER_PAGES).fill(["main", true])],
     "the walk did not read Main's newest page and then five older ones");
   assert.match(page.el("search-empty").textContent, /^Nothing in the \d+ messages loaded so far/);
+});
+
+// --- searching the threads' replies further back ------------------------------------------------------
+//
+// `#262 search-load-older`, again. In two columns the left column is Main, which holds no thread replies,
+// and the cards on the right were searched only by the replies the page already held, with no way to read
+// any further back: a word said only in an older reply was found nowhere in two columns, or in the thread
+// list, however far back Main was walked, where one column on All walks back and finds it. So the cards
+// have a walk of their own, back through All's older pages, which hold every reply.
+
+/**
+ * `#262 search-load-older`. A channel of `threads` threads one after another, oldest first: each its first
+ * message, then `replies` replies, every message an hour after the one before; reply `r` (from 1) of thread
+ * `t` (from 0) says `said(t, r)`. Main is the first messages, All everything, each thread its own; each
+ * pages back `size` messages at a time, and the thread list is every thread at once, so each has its card
+ * from the start while the page holds only the replies All's pages brought. Older reads are kept and held as
+ * by `searchHistory`, and take `page.olderTakes` milliseconds of the page's clock. Returns every message,
+ * oldest first; the thread summaries are `page.threads`.
+ */
+function threadsHistory(page, { threads = 6, replies = 6, size = 4, said = (t, r) => `thread ${t} reply ${r}` } = {}) {
+  const newest = Date.UTC(2026, 7, 19, 12, 0, 0);
+  const total = threads * (replies + 1);
+  const all = [];
+  const summaries = [];
+  for (let t = 0; t < threads; t += 1) {
+    const id = `spaces/A/threads/t${t}`;
+    const first = t * (replies + 1);
+    const record = { id, root_message_id: String(8900000000000000000n + BigInt(first)), is_root: true,
+      reply_count: replies, reply_count_exact: true };
+    for (let r = 0; r <= replies; r += 1) {
+      const i = first + r;
+      all.push(message({ id: String(8900000000000000000n + BigInt(i)), content: r === 0 ? `thread ${t} starts` : said(t, r),
+        timestamp: new Date(newest - (total - 1 - i) * 3600000).toISOString(),
+        thread: r === 0 ? record : { ...record, is_root: false } }));
+    }
+    summaries.push({ id, root: all[first], title: `Thread ${t}`, reply_count: replies, reply_count_exact: true,
+      updated_at: all[all.length - 1].timestamp });
+  }
+  page.threadingSupported = true;
+  page.messages = all;
+  page.threads = summaries;
+  page.pagesServed = [];
+  page.olderOptions = [];
+  page.olderHold = null;
+  page.olderTakes = 0;
+  page.timeline = async (path, options) => {
+    const url = new URL(path, "http://fixture.test");
+    const view = url.searchParams.get("view");
+    const before = url.searchParams.get("before");
+    const thread = url.searchParams.get("thread_id");
+    page.pagesServed.push(String(path));
+    if (view === "threads") return json(200, timelineAnswer({ view, has_threads: true, threads: summaries }));
+    const rows = view === "thread" ? all.filter((m) => m.thread.id === thread)
+      : view === "main" ? all.filter((m) => m.thread.is_root) : all;
+    if (before) {
+      page.olderOptions.push(options || {});
+      const hold = page.olderHold;
+      page.olderHold = null;
+      const signal = options && options.signal;
+      if (hold) {
+        await new Promise((resolve, reject) => {
+          hold.promise.then(resolve);
+          if (signal) signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })));
+        });
+      }
+      if (signal && signal.aborted) throw Object.assign(new Error("aborted"), { name: "AbortError" });
+      page.setClock(page.clock() + page.olderTakes);
+    }
+    const end = before ? rows.findIndex((m) => m.id === before) : rows.length;
+    const start = Math.max(0, end - size);
+    const messages = rows.slice(start, end);
+    return json(200, timelineAnswer({ view, has_threads: true, messages, has_more: start > 0,
+      next_before: start > 0 ? rows[start].id : null,
+      thread: view === "thread" ? summaries.find((s) => s.id === thread) : null,
+      dismissed: messages.map((m) => String(m.id)).filter((held) => page.dealtWith.has(held)) }));
+  };
+  return all;
+}
+
+/** A thread's id in `threadsHistory`. */
+const historyThread = (t) => `spaces/A/threads/t${t}`;
+
+/** Where `threadsHistory` has message `i` of `replies` replies a thread. */
+const historyIndex = (t, r, replies = 6) => t * (replies + 1) + r;
+
+/** The cards the filters let through, by thread id. */
+const shownCards = (page) => page.el("side-cards").children.filter((li) => !li.hidden && !li.hasClass("search-hidden"))
+  .map((li) => li.getAttribute("data-id"));
+
+/** The older reads of All so far, as `[view, before]`. */
+const allReads = (page) => page.pagesServed.map((path) => new URL(path, "http://fixture.test").searchParams)
+  .filter((query) => query.get("view") === "flat").map((query) => query.get("before"));
+
+/** The control at the head of the cards that searches their threads' older replies, or null. */
+const repliesControl = (page) => page.el("side-search-replies");
+
+/** A page signed in on `threadsHistory`'s channel, in All (where it opens), then in two columns. */
+async function repliesPage(options = {}, columns = true) {
+  const page = newPage();
+  const all = threadsHistory(page, options);
+  page.enableAbort();
+  await signIn(page);
+  await showDiscord(page, page.messages);
+  if (columns) await twoColumns(page);
+  return { page, all };
+}
+
+/** Three replies saying "engine", each in its own thread, one, two and three pages behind All's newest. */
+const ENGINE_REPLIES = new Set([historyIndex(5, 1), historyIndex(4, 3), historyIndex(3, 6)]);
+const engineSaid = (t, r) => (ENGINE_REPLIES.has(historyIndex(t, r)) ? `the engine stalled again, ${t}.${r}` : `thread ${t} reply ${r}`);
+
+test("`#262 search-load-older`: one column on All walks back to three older replies, and two columns find them too, from the cards' own walk", async () => {
+  // One column, on All, as the owner had it: the walk back finds the three replies.
+  const one = await repliesPage({ said: engineSaid }, false);
+  await search(one.page, "engine");
+  await one.page.settle();
+  assert.deepStrictEqual(matchedIds(one.page), [], "the fixture already held a match");
+  await one.page.el("load-older").click();
+  await settleWalk(one.page);
+  assert.deepStrictEqual(matchedIds(one.page), [...ENGINE_REPLIES].sort((a, b) => a - b).map((i) => one.all[i].id),
+    "one column on All did not find the three older replies");
+
+  // Two columns: Main on the left holds none of them, however far back it is walked.
+  const { page, all } = await repliesPage({ said: engineSaid });
+  await search(page, "engine");
+  await page.settle();
+  assert.deepStrictEqual(matchedIds(page), []);
+  assert.match(page.el("search-empty").textContent, / Thread replies are not in Main\.$/);
+  assert.deepStrictEqual(shownCards(page), [], "a card was found before any older reply was read");
+  assert.equal(page.el("side-list-state").textContent, "No threads match that search.");
+  // The cards offer to search their threads' older replies, from where All reaches back to.
+  const control = repliesControl(page);
+  assert.ok(control && !control.hidden, "two columns offer no way to search the threads' older replies");
+  const floor = all.length - 4;
+  assert.equal(control.textContent, `Search replies before ${searchDay(page, all[floor].timestamp)}`);
+  assert.match(control.getAttribute("aria-label"), /^Search replies before .+: older pages of the whole channel, replies and all, a few at a time\.$/);
+  await control.click();
+  await settleWalk(page);
+  // It read All's older pages from All's own cursor, and stopped at the end of the page bringing the third.
+  assert.deepStrictEqual(allReads(page).filter((before) => before !== null),
+    [floor, floor - 4, floor - 8].map((i) => all[i].id), "the walk did not read All back three pages from its cursor");
+  assert.deepStrictEqual(shownCards(page).sort(), [3, 4, 5].map(historyThread), "the cards did not find the three threads");
+  for (const t of [3, 4, 5]) assert.equal(replyHint(page, historyThread(t)), "in replies");
+  const back = searchDay(page, all[floor - 12].timestamp);
+  assert.equal(page.el("side-replies-note").hidden, false);
+  assert.equal(page.el("side-replies-note").textContent, `Found 3 threads in 3 pages (12 messages), back to ${back}.`);
+  assert.equal(control.textContent, `Search replies before ${back}`, "the control does not say how far back the next walk starts");
+  assert.equal(page.el("side-list-state").hidden, true);
+  assert.match(HTML_CODE, /<button id="side-search-replies" class="chip" type="button" hidden>/);
+  assert.match(HTML_CODE, /<p id="side-replies-note" class="hint search-older-note" role="status" hidden><\/p>/);
+  // A thumb's target, as the step back has; and Help says where it is.
+  assert.match(cssBlock("#side-search-replies::after"), /content:\s*""/);
+  assert.match(HTML_CODE, /the head of the\s+cards says <em>Search replies before Oct 3<\/em>/);
+  // A found thread opens on the right with its matching reply shown and marked.
+  await openerOf(cardRow(page, historyThread(3))).click();
+  await page.settle();
+  assert.deepStrictEqual(matchedIds(page, "side-log"), [all[historyIndex(3, 6)].id], "the found thread did not show its matching reply");
+});
+
+test("`#262 search-load-older`: the cards' walk reads at most five pages, and a second press walks on from where it stopped", async () => {
+  const { page, all } = await repliesPage({ replies: 5 });
+  await search(page, "engine");
+  await page.settle();
+  await repliesControl(page).click();
+  await settleWalk(page);
+  const older = () => allReads(page).filter((before) => before !== null);
+  assert.equal(older().length, SEARCH_OLDER_PAGES, "the cards' walk was not bounded");
+  const back = searchDay(page, all[all.length - 4 - 20].timestamp);
+  assert.equal(page.el("side-replies-note").textContent, `Nothing more in 5 pages (20 messages), back to ${back}.`);
+  await repliesControl(page).click();
+  await settleWalk(page);
+  assert.equal(older().length, SEARCH_OLDER_PAGES + 3, "the second press did not walk on to the start");
+  assert.equal(page.el("side-replies-note").textContent, "Reached the start of this channel; no more threads match.");
+  assert.equal(repliesControl(page).hidden, true, "the walk was offered past the start of the channel");
+  assert.equal(page.el("side-list-state").textContent, "No threads match that search — all of this channel is loaded.");
+  // Another word: the note goes with the search it spoke for, and the state still says how far back.
+  await page.el("search-field").setValue("nothing like this");
+  await page.settle();
+  assert.equal(page.el("side-replies-note").hidden, true, "the last walk's note outlived its search");
+  assert.equal(page.el("side-list-state").textContent, "No threads match that search — all of this channel is loaded.");
+  assert.equal(repliesControl(page).hidden, true);
+});
+
+test("`#262 search-load-older`: the cards' walk at the start of the channel says what it found there", async () => {
+  const { page } = await repliesPage({ threads: 3, replies: 2, said: (t, r) => (t === 0 && r === 1 ? "engine" : `reply ${t}.${r}`) });
+  await search(page, "engine");
+  await page.settle();
+  await repliesControl(page).click();
+  await settleWalk(page);
+  assert.deepStrictEqual(shownCards(page), [historyThread(0)]);
+  assert.equal(page.el("side-replies-note").textContent, "Reached the start of this channel. Found 1 thread.");
+  assert.equal(repliesControl(page).hidden, true);
+});
+
+test("`#262 search-load-older`: the cards' walk starts no page its last page's time says would end past fifteen seconds", async () => {
+  const { page, all } = await repliesPage({ said: (t, r) => (historyIndex(t, r) === historyIndex(4, 3) ? "engine" : `reply ${t}.${r}`) });
+  page.olderTakes = 6000;
+  await search(page, "engine");
+  await page.settle();
+  await repliesControl(page).click();
+  await settleWalk(page);
+  assert.equal(allReads(page).filter((before) => before !== null).length, 2, "a page that would end past the budget was started");
+  assert.equal(page.el("side-replies-note").textContent,
+    `Found 1 thread within 15 s (2 pages, 8 messages), back to ${searchDay(page, all[all.length - 12].timestamp)}.`);
+});
+
+test("`#262 search-load-older`: Stop aborts the cards' read on the wire, and a walk stopped with nothing found says so", async () => {
+  const { page } = await repliesPage();
+  await search(page, "engine");
+  await page.settle();
+  page.olderHold = searchHold();
+  const hold = page.olderHold;
+  void repliesControl(page).click();
+  await page.settle();
+  assert.equal(repliesControl(page).textContent, "Searching replies… 1 of 5 · Stop");
+  // A second tap at once is the same tap again.
+  await repliesControl(page).click();
+  await page.settle();
+  assert.equal(page.olderOptions[0].signal.aborted, false, "a second tap in the walk's first moments stopped it");
+  page.setClock(page.clock() + SEARCH_OLDER_TAP_MS);
+  await repliesControl(page).click();
+  await page.settle();
+  assert.equal(page.olderOptions[0].signal.aborted, true, "Stop left the read on the wire");
+  hold.open();
+  await settleWalk(page);
+  assert.equal(page.olderOptions.length, 1, "the walk read on after Stop");
+  assert.equal(page.el("side-replies-note").hidden, false, "a walk stopped with nothing found said nothing");
+  assert.equal(page.el("side-replies-note").textContent, "Stopped before any older page was read.");
+  assert.equal(page.el("error").hidden, true, "Stop was reported as a failure");
+  assert.match(repliesControl(page).textContent, /^Search replies before /);
+});
+
+test("`#262 search-load-older`: a change to the search, a thread opened on the right, or leaving two columns ends the cards' walk where it is", async () => {
+  for (const end of ["typed", "thread", "narrow", "closed"]) {
+    const { page } = await repliesPage();
+    await search(page, "engine");
+    await page.settle();
+    page.olderHold = searchHold();
+    const hold = page.olderHold;
+    void repliesControl(page).click();
+    await page.settle();
+    if (end === "typed") await page.el("search-field").setValue("engine room");
+    else if (end === "thread") await openerOf(cardRow(page, historyThread(5))).click();
+    else if (end === "narrow") await page.setDesk(false);
+    else await page.el("search-toggle").click();
+    await page.settle();
+    assert.equal(page.olderOptions[0].signal.aborted, true, `${end}: the cards' read on the wire went on`);
+    hold.open();
+    await settleWalk(page);
+    assert.equal(page.olderOptions.length, 1, `${end}: the walk read on`);
+    assert.equal(page.el("side-replies-note").hidden, true, `${end}: the ended walk wrote its note`);
+    assert.equal(page.el("error").hidden, true, `${end}: the ended walk was reported as a failure`);
+  }
+});
+
+test("`#262 search-load-older`: one walk at a time: Main's walk ends the cards', and the cards' ends Main's", async () => {
+  const { page } = await repliesPage({ threads: 40 });
+  await search(page, "engine");
+  await page.settle();
+  // The cards' walk, then Main's: the cards' read is aborted, and Main's waits for it to be off the wire.
+  page.olderHold = searchHold();
+  let hold = page.olderHold;
+  void repliesControl(page).click();
+  await page.settle();
+  void page.el("load-older").click();
+  await page.settle();
+  assert.equal(page.olderOptions[0].signal.aborted, true, "Main's walk left the cards' read on the wire");
+  hold.open();
+  await settleWalk(page);
+  assert.match(repliesControl(page).textContent, /^Search replies before /);
+  const reads = page.pagesServed.map((path) => new URL(path, "http://fixture.test").searchParams)
+    .filter((query) => query.get("before") !== null).map((query) => query.get("view"));
+  assert.equal(reads[0], "flat");
+  assert.ok(reads.slice(1).length > 0 && reads.slice(1).every((view) => view === "main"), `Main's walk did not read Main: ${reads}`);
+  // Main's walk, then the cards': Main's read is aborted.
+  page.olderHold = searchHold();
+  hold = page.olderHold;
+  const from = page.olderOptions.length;
+  void page.el("load-older").click();
+  await page.settle();
+  void repliesControl(page).click();
+  await page.settle();
+  assert.equal(page.olderOptions[from].signal.aborted, true, "the cards' walk left Main's read on the wire");
+  hold.open();
+  await settleWalk(page);
+  assert.equal(page.el("search-older-note").hidden, true, "Main's ended walk wrote its note");
+  assert.ok(page.el("side-replies-note").textContent !== "", "the cards' walk did not run once Main's had ended");
+});
+
+test("`#262 search-load-older`: over the thread list on a phone, Enter in the search field walks the cards' replies, not Main behind them", async () => {
+  const { page, all } = await repliesPage({ said: engineSaid }, false);
+  await pickThread(page, "threads");
+  assert.equal(page.el("screen-main").getAttribute("data-columns"), "list");
+  await search(page, "engine");
+  await page.settle();
+  assert.match(repliesControl(page).textContent, /^Search replies before /);
+  const from = page.pagesServed.length;
+  await press(page, page.el("search-field"), "Enter");
+  await settleWalk(page);
+  const views = page.pagesServed.slice(from).map((path) => new URL(path, "http://fixture.test").searchParams)
+    .filter((query) => query.get("before") !== null).map((query) => query.get("view"));
+  assert.deepStrictEqual(views, ["flat", "flat", "flat"], "Enter over the thread list did not walk All's replies");
+  assert.deepStrictEqual(shownCards(page).sort(), [3, 4, 5].map(historyThread));
+  assert.match(page.el("side-replies-note").textContent, /^Found 3 threads in 3 pages \(12 messages\), back to /);
+  assert.equal(page.el("search-older-note").hidden, true, "Main, behind the list, was walked");
+  void all;
+});
+
+test("`#262 search-load-older`: in two columns Enter walks the cards' replies when the keys are in them, or when Main has nothing older", async () => {
+  const { page } = await repliesPage({ said: engineSaid });
+  await search(page, "engine");
+  await page.settle();
+  // The keys in the left column, which offers its own walk: Enter walks Main, as before.
+  let from = page.pagesServed.length;
+  await press(page, page.el("search-field"), "Enter");
+  await settleWalk(page);
+  const views = () => page.pagesServed.slice(from).map((path) => new URL(path, "http://fixture.test").searchParams)
+    .filter((query) => query.get("before") !== null).map((query) => query.get("view"));
+  assert.ok(views().length > 0 && views().every((view) => view === "main"), `Enter with the keys in Main did not walk Main: ${views()}`);
+  // Main is all loaded now: Enter walks the cards'.
+  assert.equal(page.el("load-older").hidden, true, "Main still has older messages, so this proves nothing");
+  from = page.pagesServed.length;
+  await press(page, page.el("search-field"), "Enter");
+  await settleWalk(page);
+  assert.deepStrictEqual(views(), ["flat", "flat", "flat"], "Enter did not walk the cards' replies once Main had nothing older");
+  assert.deepStrictEqual(shownCards(page).sort(), [3, 4, 5].map(historyThread));
+});
+
+test("`#262 search-load-older`: with All never read, the cards' walk reads All's newest page first, which is not counted as one of the five", async () => {
+  const store = new Map([["vibe-talk.voice.columns", "two"]]);
+  const page = newPage(store);
+  threadsHistory(page, { said: engineSaid });
+  page.wideDesk = true;
+  page.enableAbort();
+  await signIn(page);
+  await showDiscord(page, page.messages);
+  assert.ok(inTwoColumns(page), "the page did not open in two columns");
+  // Every read of All so far is the counts' newest page, if any, which gave no cursor to walk back on.
+  await search(page, "engine");
+  await page.settle();
+  const from = page.pagesServed.length;
+  await repliesControl(page).click();
+  await settleWalk(page);
+  const reads = page.pagesServed.slice(from).map((path) => new URL(path, "http://fixture.test").searchParams)
+    .filter((query) => query.get("view") === "flat").map((query) => query.get("before") !== null);
+  assert.deepStrictEqual(reads, [false, true, true, true], "the walk did not read All's newest page and then three older ones");
+  assert.match(page.el("side-replies-note").textContent, /^Found 3 threads in 3 pages \(12 messages\)/);
+});
+
+test("`#262 search-load-older`: a page of the cards' walk that fails ends it, said where every failed read is and on the status line", async () => {
+  const { page } = await repliesPage({ threads: 12 });
+  await search(page, "engine");
+  await page.settle();
+  const serve = page.timeline;
+  let reads = 0;
+  page.timeline = async (path, options) => {
+    if (/[?&]before=/.test(String(path)) && ++reads === 2) return json(502, { error: "chat_error", detail: "the provider returned HTTP 502" });
+    return serve(path, options);
+  };
+  await repliesControl(page).click();
+  await settleWalk(page);
+  assert.equal(reads, 2, "the walk read on after a page failed");
+  assert.equal(page.el("error").hidden, false, "the failed page was not reported");
+  assert.equal(page.el("status").textContent, "Could not search further back — try again.");
+  assert.match(repliesControl(page).textContent, /^Search replies before /);
 });
 
 test("`#262 search-load-older`: Main's walk stopped with nothing more found says so, rather than nothing", async () => {
