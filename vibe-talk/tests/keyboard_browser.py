@@ -52,6 +52,10 @@ its thread across the window and Esc comes back to the list; Esc on the list its
 it was chosen from — two columns, and All in one column, from a card and from the list's own scroller;
 the bare 1, 2 and 3 change nothing.
 
+`cmd-e-done`: Ctrl+E, from the channel's message box with a draft typed in it, marks the selected message
+Done on the server and moves the selection on, the box keeping the focus and the draft and the browser's
+own Ctrl+E refused; in the Mac tab Cmd+E does the same, and Ctrl+E in the box is the box's and marks nothing.
+
 `#239 single-selection` adds real mouse moves (CDP `Input.dispatchMouseEvent`) to the keys, and after
 every step counts the rows the browser DRAWS lit, by computed style (the selected surface or a ring),
 which must be exactly one, holding the focus: a mouse move over a message takes the selection from the
@@ -883,6 +887,67 @@ def keymap_keys(walk: Walk, api: FakeApi) -> None:
                       "Enter opened and closed the long message, -> entered its thread and <- and Esc came back to it")
 
 
+# `cmd-e-done`. The message box, the row the keys act on, and the row drawn lit.
+CMD_E_JS = """(id) => {
+  const box = document.getElementById('channel-compose-text');
+  const row = document.querySelector(`#discord-log > li[data-id='${id}']`);
+  const lit = document.querySelector('#discord-log > li[data-selected="true"]');
+  return {focus: document.activeElement ? document.activeElement.id : null, value: box.value,
+          archived: row ? row.dataset.archived || null : null, lit: lit ? lit.dataset.id : null};
+}"""
+
+
+def cmd_e_keys(walk: Walk, api: FakeApi, mod: str, words: str) -> None:
+    """`cmd-e-done`: Ctrl+E (Cmd+E) in the message box marks the selected message Done; the box keeps the draft.
+
+    On a Mac, as `navigator.platform` emulates one, Ctrl+E in the box is the box's (the end of the line)
+    and marks nothing. The browser's own Ctrl+E (Cmd+E) is refused whenever the page acts.
+    """
+    # A message not Done yet, from the top: this check's server takes a Done, and nothing else.
+    walk.page.focus("#scroll-area")
+    row = ringed(walk, "Home", f"{words}: Home")
+    for _ in range(20):
+        if row["archived"] != "true":
+            break
+        row = ringed(walk, "j", f"{words}: j")
+    target = str(row["id"])
+    check(row["archived"] != "true", f"{words}: no message near the top is left to mark Done")
+    to_box = walk.key("c")
+    check(to_box["focus"] == "channel-compose-text", f"{words}: c left the focus on {to_box['focus']!r}")
+    for letter in "draft":
+        press(walk.cdp, letter)
+    if mod == "Meta":
+        before = len(api.dismissals())
+        press(walk.cdp, "Control+e")
+        walk.settled()
+        field = walk.page.evaluate(CMD_E_JS, target)
+        check(walk.last_key()["prevented"] is False, f"{words}: Ctrl+E in the box on a Mac was taken from the field")
+        check(field["archived"] != "true" and len(api.dismissals()) == before,
+              f"{words}: Ctrl+E in the box on a Mac marked the message Done: {field}")
+    before = len(api.dismissals())
+    press(walk.cdp, f"{mod}+e")
+    walk.settled()
+    for _ in range(100):
+        if len(api.dismissals()) > before:
+            break
+        walk.page.wait_for_timeout(20)
+    check(api.dismissals()[before:] == [[target]],
+          f"{words}+E in the box did not mark {target} Done on the server: {api.dismissals()[before:]}")
+    after = walk.page.evaluate(CMD_E_JS, target)
+    check(walk.last_key()["prevented"] is True, f"{words}+E in the box was left to the browser")
+    check(after["archived"] == "true", f"the message {words}+E marked does not show as Done: {after}")
+    check(after["focus"] == "channel-compose-text", f"{words}+E took the focus out of the box, to {after['focus']!r}")
+    check(after["value"] == "draft", f"{words}+E touched the draft: {after['value']!r}")
+    check(after["lit"] not in (None, target), f"{words}+E left the selection on {after['lit']!r}, not the next unread")
+    walk.shot(f"cmd-e-{mod.lower()}")
+    walk.page.evaluate("() => { const box = document.getElementById('channel-compose-text'); box.value = ''; "
+                       "box.dispatchEvent(new Event('input')); }")
+    walk.key("Escape")
+    walk.notes.append(f"{words}+E in the message box marked {target} Done and moved the selection on to "
+                      f"{after['lit']}, the box keeping the focus and the draft" +
+                      (", and Ctrl+E there was the box's" if mod == "Meta" else ""))
+
+
 # `#295 shift-e-read-collapse`. Every message row's Done and fold, the list's scroll, the row's place on
 # screen and the status line: what Shift+E may change, and what it must leave alone.
 SHIFT_E_JS = """(id) => {
@@ -1519,6 +1584,7 @@ def main() -> int:
             settings_tab_order(walk)
             composer_keys(walk)
             keymap_keys(walk, api)
+            cmd_e_keys(walk, api, "Control", "Ctrl")
             single_selection(walk, api)
             picker_and_help_keys(walk)
             two_columns_single(walk)
@@ -1540,6 +1606,7 @@ def main() -> int:
             mac.evaluate(RECORD_KEYS_JS)
             mac_walk = Walk(mac, mac_cdp, args.screenshots)
             mac_walk.step = walk.step
+            cmd_e_keys(mac_walk, api, "Meta", "Cmd")
             view_keys(mac_walk, "Meta", "Cmd")
             walk.notes.extend(mac_walk.notes)
 

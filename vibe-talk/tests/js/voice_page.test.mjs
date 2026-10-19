@@ -26216,7 +26216,7 @@ test("THE LIST OF KEYS IS THE KEYMAP: every binding's words and meaning, in the 
     }
     for (const words of ["↓ or j", "↑ or k", "Enter or o", "Esc", "PgUp", "Shift+E", `${mod}+1`, `${mod}+2`, `${mod}+3`,
       `${mod}+4`, `${mod}+S`, `${mod}+,`, `${mod}+K`, `${mod}+/`, `${mod}+?`, `${mod}+Home`, `${alt}+↓`, "Shift+P",
-      "Shift+L"]) {
+      "Shift+L", `e or ${mod}+E`, `${mod}+E does it from a message box or the search too`]) {
       assert.ok(list.includes(words), `${platform}: the list of keys does not name ${words}`);
     }
     // `#281 view-keys`. The bare digits are gone from it, and it says so, and where a browser may keep the chords.
@@ -26257,7 +26257,7 @@ test("aria-keyshortcuts names each control's key, from the same table, and drops
     [page.el("thread-back"), "Escape ArrowLeft"],
     [page.el("todo-filter"), "H"],
     [page.el("discord-channel"), "Alt+ArrowDown Alt+ArrowUp Control+K Meta+K"],
-    [doneButton(row), "E"],
+    [doneButton(row), "E Control+E Meta+E"],
     [replyButton(row), "R"],
     [foldButton(row), "Enter O"],
     [rowMoreButton(row), "."],
@@ -26273,9 +26273,121 @@ test("aria-keyshortcuts names each control's key, from the same table, and drops
   assert.equal(page.el("search-toggle").getAttribute("title"), "Search messages (Ctrl+/)");
   assert.equal(page.el("channel-compose-text").getAttribute("aria-keyshortcuts"), "Control+S Meta+S");
   assert.equal(page.el("todo-filter").getAttribute("aria-keyshortcuts"), null, "a key turned off is still announced");
-  assert.equal(doneButton(page.el("discord-log").children[3]).getAttribute("aria-keyshortcuts"), null,
-    "a row's Done still announces a key the switch turned off");
+  assert.equal(doneButton(page.el("discord-log").children[3]).getAttribute("aria-keyshortcuts"), "Control+E Meta+E",
+    "a row's Done still announces a key the switch turned off, or lost the chord the switch leaves on");
   assert.equal(foldButton(page.el("discord-log").children[3]).getAttribute("aria-keyshortcuts"), "Enter");
+});
+
+// --- `cmd-e-done` -------------------------------------------------------------------------------
+//
+// The owner, 2026-10-19: "I like the single keystroke e for marking messages as done. BUT if I have a
+// text box highlighted it won't work ... I want Cmd-e to also work." Ctrl+E (Cmd+E) is e from anywhere:
+// in a message box or the search it marks the message the keys act on, and the box keeps the focus and
+// what is typed in it. tests/keyboard_browser.py presses it in a real Chromium.
+
+/** A channel at its top on `platform`, `store` holding the reader's settings, with the first message selected by ↓. */
+async function cmdEPage(platform = "Linux x86_64", store = new Map()) {
+  const page = newPage(store, SCRIPT, (p) => p.setPlatform(platform));
+  await signIn(page);
+  await showDiscord(page, tallChannel(30));
+  page.el("scroll-area").scrollTop = 0;
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  assert.equal(selectedId(page), "1", "↓ did not select the first message");
+  return page;
+}
+
+test("`cmd-e-done`: Ctrl+E or Cmd+E in a message box marks the selected message Done, and the box keeps the focus and the draft", async () => {
+  const page = await cmdEPage();
+  const box = page.el("channel-compose-text");
+  box.focus();
+  await box.setValue("half a thought");
+  // A bare e there is typed, as it always was.
+  let event = await press(page, box, "e", { code: "KeyE" });
+  assert.equal(event.defaulted, true, "a bare e in the message box was taken from it");
+  assert.equal(page.dismissCalls.length, 0, "a bare e in the message box marked a message Done");
+  for (const [fields, id, next] of [[{ ctrlKey: true }, "1", "2"], [{ metaKey: true }, "2", "3"]]) {
+    const what = fields.ctrlKey ? "Ctrl+E" : "Cmd+E";
+    event = await press(page, box, "e", { code: "KeyE", ...fields });
+    assert.equal(event.defaulted, false, `${what} in the box was left to the browser (Chrome's own find or address bar)`);
+    assert.deepStrictEqual(page.dismissCalls.at(-1).messages, [id], `${what} did not mark message ${id} Done`);
+    assert.equal(channelRow(page, id).getAttribute("data-archived"), "true");
+    assert.equal(focused(page), box, `${what} took the focus out of the box, to ${focusName(page)}`);
+    assert.equal(box.value, "half a thought", `${what} touched the draft`);
+    assert.deepStrictEqual(litIds(page), [next], `after ${what} the selection is not on the next unread, ${next}`);
+  }
+  // A held chord is one Done; its repeats are taken all the same, each being the browser's own chord too.
+  const calls = page.dismissCalls.length;
+  event = await press(page, box, "e", { code: "KeyE", ctrlKey: true, repeat: true });
+  assert.equal(page.dismissCalls.length, calls, "a held Ctrl+E marked another message Done");
+  assert.equal(event.defaulted, false, "a held Ctrl+E's repeat was left to the browser");
+  // Off the box it is e too, the focus going with the selection as e's does.
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  const from = selectedId(page);
+  event = await pressHere(page, "e", { code: "KeyE", ctrlKey: true });
+  assert.equal(event.defaulted, false);
+  assert.deepStrictEqual(page.dismissCalls.at(-1).messages, [from], "Ctrl+E on the list did not mark the selected message");
+  assert.notEqual(selectedId(page), from, "Ctrl+E on the list left the focus on the message it marked");
+});
+
+test("`cmd-e-done`: with no message to act on, Ctrl+E in the box is left to the browser", async () => {
+  const page = await keyboardPage();
+  const box = page.el("channel-compose-text");
+  const event = await press(page, box, "e", { code: "KeyE", ctrlKey: true });
+  assert.equal(event.defaulted, true, "Ctrl+E with no message selected was taken anyway");
+  assert.equal(page.dismissCalls.length, 0);
+  assert.equal(focused(page), box);
+  const held = await press(page, box, "e", { code: "KeyE", ctrlKey: true, repeat: true });
+  assert.equal(held.defaulted, true, "a held Ctrl+E with no message selected was taken anyway");
+});
+
+test("`cmd-e-done`: ON A MAC, Ctrl+E in the box is the box's (the end of the line) and Cmd+E marks Done", async () => {
+  const page = await cmdEPage("MacIntel");
+  const box = page.el("channel-compose-text");
+  box.focus();
+  await box.setValue("to the end of this line");
+  let event = await press(page, box, "e", { code: "KeyE", ctrlKey: true });
+  assert.equal(event.defaulted, true, "Ctrl+E in the box on a Mac was taken from the field");
+  assert.equal(page.dismissCalls.length, 0, "Ctrl+E in the box on a Mac marked a message Done");
+  event = await press(page, box, "e", { code: "KeyE", metaKey: true });
+  assert.equal(event.defaulted, false, "Cmd+E in the box on a Mac was left to the browser");
+  assert.deepStrictEqual(page.dismissCalls.map((call) => call.messages), [["1"]]);
+  assert.equal(focused(page), box);
+  // Off a field, Ctrl+E is e on a Mac too.
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  event = await pressHere(page, "e", { code: "KeyE", ctrlKey: true });
+  assert.equal(event.defaulted, false, "Ctrl+E on the list on a Mac was left to the browser");
+  assert.equal(page.dismissCalls.length, 2, "Ctrl+E on the list on a Mac marked nothing");
+});
+
+test("`cmd-e-done`: the chord works in the search field, and with the single-key shortcuts turned off", async () => {
+  const page = await cmdEPage("Linux x86_64", new Map([["vibe-talk.voice.single-keys", "0"]]));
+  // The switch is off: a bare e on the list does nothing, and the chord still acts.
+  let event = await pressHere(page, "e", { code: "KeyE" });
+  assert.equal(page.dismissCalls.length, 0, "a bare e marked Done with the single-key shortcuts off");
+  const box = page.el("channel-compose-text");
+  event = await press(page, box, "e", { code: "KeyE", ctrlKey: true });
+  assert.equal(event.defaulted, false, "Ctrl+E did nothing with the single-key shortcuts off");
+  assert.deepStrictEqual(page.dismissCalls.map((call) => call.messages), [["1"]]);
+  await page.el("search-toggle").click();
+  const field = page.el("search-field");
+  assert.equal(field.hidden, false, "the search did not open");
+  event = await press(page, field, "e", { code: "KeyE", ctrlKey: true });
+  assert.equal(event.defaulted, false, "Ctrl+E in the search field was left to the browser");
+  assert.deepStrictEqual(page.dismissCalls.at(-1).messages, ["2"], "Ctrl+E in the search did not mark the selected message");
+  assert.equal(focused(page), field, `Ctrl+E took the focus out of the search, to ${focusName(page)}`);
+});
+
+test("`cmd-e-done`: a selected message scrolled out of sight is not marked from the box; the first showing is selected instead", async () => {
+  const page = await cmdEPage();
+  const area = page.el("scroll-area");
+  scrollToBottom(area);
+  const box = page.el("channel-compose-text");
+  const event = await press(page, box, "e", { code: "KeyE", ctrlKey: true });
+  assert.equal(event.defaulted, false);
+  assert.equal(page.dismissCalls.length, 0, "Ctrl+E marked a message out of sight Done");
+  assert.equal(focused(page), box, `Ctrl+E took the focus out of the box, to ${focusName(page)}`);
+  assert.equal(litIds(page).length, 1, "nothing is selected after Ctrl+E on a message out of sight");
+  assert.notEqual(litIds(page)[0], "1", "the selection stayed on the message out of sight");
 });
 
 test("THE SINGLE-KEY SWITCH turns off every key that types a character, and keeps the arrows, Esc, Enter and the chords", async () => {

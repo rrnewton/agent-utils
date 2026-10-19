@@ -7330,7 +7330,7 @@ from, so it cannot name a key the page does not answer.
 | `[`, `]` | In two columns, the keys to the left column (Main) or the right one (the thread, or its list) |
 | Esc | Back (see above). In a message box with text in it, the first Esc leaves the box and keeps the draft; on the channel or thread picker, back to the messages |
 | Home, End | The top of the list or its newest message, and select it |
-| `e` | Done or not Done; marked Done, the ring moves on to the next unread below |
+| `e`, or Ctrl+E (Cmd+E) | Done or not Done; marked Done, the ring moves on to the next unread below. The chord does it from a message box or the search too, where `e` is typed: on the message the keys act on, the box keeping the focus and the draft (on a Mac, Ctrl+E in a box is the box's own end of line, so there it is Cmd+E) |
 | Shift+E | Read and collapse: the selected message marked Done, as `e` marks it, and read in the chat service too where it can be, as a sent reply marks what it answers; then folded, the ring staying on it — under Collapse read, on the "… read messages …" line of a run it joins; under Hide read, on the next message, as it goes. Never puts a message back |
 | `z` | Undo the last Done |
 | Shift+B | Put the bookmark just above the selected message; on the message right under it, take it away |

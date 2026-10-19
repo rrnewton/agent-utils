@@ -8284,8 +8284,9 @@ function onComposerKey(event, send) {
 //   * A key that types a character (a letter, a digit, a mark) never fires while the reader types in
 //     a field or works a picker or a slider, nor with Ctrl, Cmd or Alt held, which leaves every browser
 //     chord alone. Escape and the Ctrl/Cmd chords do fire in a field: a field is where the reader is
-//     when they want the search, Settings or the ends of the list, and the search's Ctrl+/ (Cmd+/) is
-//     heard before any element's own listener (`onEverywhereKey`). Nothing fires while an input method
+//     when they want the search, Settings or the ends of the list, or to mark a message Done (Ctrl+E,
+//     `cmd-e-done`), and the search's Ctrl+/ (Cmd+/) is heard before any element's own listener
+//     (`onEverywhereKey`). Nothing fires while an input method
 //     composes, and a phone keyboard, which reports keyCode 229 and types only into fields, never
 //     reaches the table. A chord takes Ctrl or Cmd on every platform (the owner asked for Ctrl+S on
 //     his Mac, then for the search and now for the message box), except in a text field on a Mac, where Ctrl and a letter macOS edits text with
@@ -9249,8 +9250,11 @@ function keyContext(target) {
  *
  * The line of a collapsed run of read messages (`#221 read-modes`) stands for every message in the
  * run, so no key about ONE message acts on it; only Enter and o, which open the run (`runLine`).
+ *
+ * `stay` leaves the focus where it is, as for a chord pressed in a message box: the first message
+ * showing is selected and drawn, and the box keeps the reader's typing.
  */
-function rowForAct(target, runLine = false) {
+function rowForAct(target, runLine = false, stay = false) {
   const { pane, row } = keyContext(target);
   if (!pane || !row) return { pane, row: null, took: false };
   // A card of the right column is a thread, not a message: only Enter and o act on it, and highlight
@@ -9263,7 +9267,7 @@ function rowForAct(target, runLine = false) {
   if (rowInView(pane, row)) return { pane, row, took: false };
   const first = firstRowInView(pane);
   if (first) {
-    selectRow(pane, first, false);
+    takeRow(pane, first, !stay);
     setStatus("Selected the first message showing.");
   }
   return { pane, row: null, took: Boolean(first) };
@@ -9291,16 +9295,28 @@ function nextUnreadFromKeyboard(target) {
 /**
  * After a Done made from the keyboard: on to the unread message `nextId` it chose before the act,
  * else back on the message itself, else (it has gone, under Hide read) the row now where it was.
- * The rows are already the new ones: the list is redrawn before the write goes out.
+ * The rows are already the new ones: the list is redrawn before the write goes out. `stay` moves
+ * the selection without the focus, as `rowForAct` says.
  */
-function landAfterDone(pane, nextId, ownId, at) {
+function landAfterDone(pane, nextId, ownId, at, stay = false) {
   const row = (nextId && paneRowFor(pane, nextId)) || paneRowFor(pane, ownId) || nearRow(pane, at);
-  if (row) selectRow(pane, row);
+  if (!row) return;
+  takeRow(pane, row, !stay);
+  bringIntoView(pane, row);
 }
 
-/** e: Done or not Done, the act of the row's Done button; marked Done, on to the next unread below (question 2). */
+/**
+ * e, and Ctrl+E (Cmd+E): Done or not Done, the act of the row's Done button; marked Done, on to the
+ * next unread below (question 2).
+ *
+ * The chord is e for a reader typing (`cmd-e-done`): in a message box or the search, where e is a
+ * letter, it acts on the message the keys act on, the selected one of the column of the box, and moves
+ * the selection on without taking the focus from the box. False when there is no message to act on,
+ * so that the chord is left to the browser.
+ */
 function doneFromKeyboard(target) {
-  const { pane, row, took } = rowForAct(target);
+  const stay = isTextField(target);
+  const { pane, row, took } = rowForAct(target, false, stay);
   if (!pane || !row) return took;
   const ids = idsOf(row);
   if (ids.length === 0) return false;
@@ -9309,7 +9325,7 @@ function doneFromKeyboard(target) {
   const at = rows.indexOf(row);
   const next = marking ? unreadAfter(rows, at) : null;
   guardQuietly(() => toggleArchived(ids, row))();
-  landAfterDone(pane, next && next.getAttribute("data-id"), ids[0], at);
+  landAfterDone(pane, next && next.getAttribute("data-id"), ids[0], at, stay);
   return true;
 }
 
@@ -10383,10 +10399,16 @@ const KEYMAP = [
     run: () => bookmarkJumpFromKeyboard(),
   },
   {
-    group: KEYS_MESSAGE, chords: [{ key: "e" }],
-    does: "Done, or not Done. Marked Done, on to the next unread below",
+    // `cmd-e-done`. The chord fires in a field, where e is typed. It repeats so that a held chord's
+    // repeats are taken too, each being the browser's own Ctrl+E (Cmd+E) as well; a repeat marks nothing.
+    // Not `everywhere`, as the search's chord is (`onEverywhereKey`): that listener refuses the chord's
+    // default before anything is done, and this one is the browser's while there is no message to mark;
+    // and it is heard here, after `macFieldEditKey`, so Ctrl+E in a field on a Mac stays the field's.
+    group: KEYS_MESSAGE, chords: [{ key: "e" }, { key: "e", mod: true }], repeats: true,
+    does: () => `Done, or not Done. Marked Done, on to the next unread below. ${modKeyName()}+E does it from a ` +
+      "message box or the search too, where e is typed, with single keys on or off; the box keeps what you are typing",
     rowControls: ["done-button"],
-    run: (event, target) => doneFromKeyboard(target),
+    run: (event, target) => (event.repeat ? modHeld(event) && keyContext(target).row !== null : doneFromKeyboard(target)),
   },
   // `#295 shift-e-read-collapse`. No row button: the Done button only marks and the fold only folds,
   // and this does both. Done through here, which this key was, has no key at all now.
