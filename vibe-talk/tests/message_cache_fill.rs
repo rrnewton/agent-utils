@@ -2666,13 +2666,16 @@ async fn a_short_flat_page_never_vouches_for_an_older_message_whose_pushed_edit_
         cache.is_suspect(&read_chan()),
         "nothing re-read the older message"
     );
-    let (status, _) = call(
+    // At read scope, as every other lookup this file counts: a write-scope lookup's own write
+    // could reach the file before a busy host ran the evaluation beside it, which is then counted
+    // `late`, with no verdict. `#364 message-cache-test-flakes`.
+    let status = call_as(
         &state,
-        "GET",
         &format!(
             "/api/v1/channels/{READ_CHANNEL}/messages/{}",
             ids[1].as_str()
         ),
+        testing::READ_TOKEN,
     )
     .await;
     assert_eq!(status, StatusCode::OK);
