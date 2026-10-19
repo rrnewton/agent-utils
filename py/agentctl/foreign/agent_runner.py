@@ -37,9 +37,12 @@ from typing import Iterator, Optional
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from agentctl.foreign import lib
+from agentctl.foreign import lib, ownership
 
 _STOP_REQUESTED = False
+# After the harness leader exits, how long its leftovers may keep the output
+# pipes open before the watchdog sweeps them (the leader is not yet reaped).
+_LEFTOVER_GRACE_S = 1.0
 _AGY_SESSION_RE = re.compile(r"Stream completed for ([0-9a-fA-F-]{36})")
 _AGY_RESOLVED_MODEL_RE = re.compile(
     r'Propagating selected model override to backend: label="([^"]+)"'
@@ -81,66 +84,127 @@ def _handle_sigterm(_signum: int, _frame: Optional[FrameType]) -> None:
     _STOP_REQUESTED = True
 
 
+def _runner_identity() -> lib.RunnerIdentity:
+    pid = os.getpid()
+    return lib.RunnerIdentity(pid, lib.pid_start_time(pid), ownership.current_boot_id())
+
+
+def _kill_harness(proc: subprocess.Popen[str]) -> None:
+    """Kill a harness's whole tree through exact handles (a plain kill for test doubles)."""
+    if isinstance(proc, ownership.OwnedHarnessProcess):
+        proc.kill_tree()
+    else:
+        proc.kill()
+
+
 @contextlib.contextmanager
 def _owned_harness(name: str, proc: subprocess.Popen[str]) -> Iterator[threading.Event]:
-    """Keep process ownership visible while a watchdog handles stop and timeout."""
-    timed_out, finished = threading.Event(), threading.Event()
-    path = lib.agent_dir(name) / "active-harness.json"
+    """Keep process ownership visible while a watchdog handles stop and timeout.
 
-    def kill_group() -> None:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+    The watchdog also sweeps what an exited leader left behind when those
+    leftovers keep the output pipes open, before the leader is reaped. The
+    ownership record is removed only once the tree is proven gone; otherwise
+    it stays for the next spawn, ``stop`` or ``gc`` to finish.
+    """
+    timed_out, finished = threading.Event(), threading.Event()
+    owned = proc if isinstance(proc, ownership.OwnedHarnessProcess) else None
 
     def watch() -> None:
         deadline = time.monotonic() + lib.TURN_TIMEOUT_S
+        exited_at: Optional[float] = None
+        swept = False
         while not finished.wait(0.05):
             # STOP permits the active turn to finish during the caller's grace
             # period; SIGTERM requests interruption after that period expires.
             if _STOP_REQUESTED:
-                kill_group()
+                _kill_harness(proc)
                 return
             if time.monotonic() >= deadline:
                 timed_out.set()
-                kill_group()
+                _kill_harness(proc)
                 return
+            if owned is None or swept:
+                continue
+            if exited_at is None and owned.leader_exited():
+                exited_at = time.monotonic()
+            if exited_at is not None and time.monotonic() - exited_at >= _LEFTOVER_GRACE_S:
+                owned.sweep_after_exit()
+                swept = True
 
     watcher = threading.Thread(target=watch, daemon=True)
     watcher.start()
     try:
         yield timed_out
     except BaseException:
-        kill_group()
-        proc.wait()
+        _kill_harness(proc)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=ownership.KILL_WAIT_S)
         raise
     finally:
         finished.set()
         watcher.join(timeout=1)
-        path.unlink(missing_ok=True)
-        lib._sync_directory(path.parent)
+        if owned is not None:
+            _finish_ownership(name, owned)
 
 
-def _spawn_harness(name: str, argv: list[str], cwd: str, *, stdin: bool = False) -> subprocess.Popen[str]:
+def _finish_ownership(name: str, proc: ownership.OwnedHarnessProcess) -> None:
+    """Remove the turn's ownership record only once its tree is proven gone."""
+    record = proc.ownership
+    complete = proc.finish()
+    report = proc.cleanup
+    if report is not None and report.killed:
+        _append(name, f"===HARNESS CLEANUP {lib.now_iso()} {report.describe()}===")
+    if record is None:
+        return
+    if complete:
+        lib.remove_active_harness(name, record)
+        return
+    detail = "the harness leader was not reaped" if report is None else report.describe()
+    _append(name, f"===HARNESS CLEANUP INCOMPLETE {lib.now_iso()} {detail}; "
+                  f"ownership kept in {lib.active_harness_path(name)}===")
+
+
+def _clear_previous_harness(name: str) -> None:
+    """Finish a previous turn's cleanup before another harness may start."""
+    record = lib.read_active_harness(name)
+    if record is None:
+        return
+    if record.legacy:
+        rec = lib.read_registry().get(name)
+        if rec is not None:
+            # Raises harness_identity_legacy while that leader is alive.
+            lib.terminate_active_harness(rec)
+        return
+    report = ownership.kill_harness_tree(record)
+    if not report.complete:
+        raise lib.AgentOperationError(
+            "harness_cleanup_incomplete",
+            f"the previous harness tree is still present ({report.describe()}); not starting another",
+        )
+    lib.remove_active_harness(name, record)
+
+
+def _spawn_harness(name: str, argv: list[str], cwd: str, *, stdin: bool = False) -> ownership.OwnedHarnessProcess:
+    """Start one turn's harness, owned from before its first instruction runs."""
     with lib._harness_lock(name):
         if _STOP_REQUESTED or lib.stop_path(name).exists():
             raise InterruptedError("worker was stopped before harness launch")
-        proc = subprocess.Popen(argv, cwd=cwd,
-                                stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, start_new_session=True)
+        _clear_previous_harness(name)
+        recorded: list[ownership.HarnessRecord] = []
+
+        def record(value: ownership.HarnessRecord) -> None:
+            lib.record_active_harness(name, value)
+            recorded.append(value)
+
         try:
-            lib.record_active_harness(name,
-                lib.RunnerIdentity(os.getpid(), lib.pid_start_time(os.getpid())),
-                lib.RunnerIdentity(proc.pid, lib.pid_start_time(proc.pid)))
+            return ownership.spawn_owned_harness(
+                argv, cwd=cwd, stdin=stdin, runner=_runner_identity(), record=record,
+                on_cgroup_fallback=lambda note: print(f"[subagents] {note}", file=sys.stderr, flush=True),
+            )
         except BaseException:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            proc.wait()
+            for value in recorded:
+                lib.remove_active_harness(name, value)
             raise
-    return proc
 
 
 def _append(name: str, text: str) -> None:
@@ -201,9 +265,8 @@ def _record_session_id(name: str, session_id: str) -> None:
 
 
 def _record_runner_pid(name: str, stage_token: Optional[str] = None) -> None:
-    pid = os.getpid()
-    started_at = lib.pid_start_time(pid)
-    identity = lib.RunnerIdentity(pid=pid, started_at=started_at)
+    identity = _runner_identity()
+    pid = identity.pid
     if stage_token is not None:
         lib.write_staged_runner(name, stage_token, identity)
         return
@@ -213,7 +276,8 @@ def _record_runner_pid(name: str, stage_token: Optional[str] = None) -> None:
         if rec is None:
             lib.die(f"runner started for unknown agent {name!r} (no registry row)")
         rec.runner_pid = pid
-        rec.runner_started_at = started_at
+        rec.runner_started_at = identity.started_at
+        rec.runner_boot_id = identity.boot_id
         rec.status = "idle"
 
 
@@ -637,28 +701,19 @@ def _run_muse_turn(name: str, rec: lib.AgentRecord, msg: lib.Message) -> None:
                     break
                 if len(encoded) > _MUSE_MAX_EVENT_BYTES:
                     protocol_error = f"Muse JSONL event exceeds {_MUSE_MAX_EVENT_BYTES} bytes"
-                    try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                    _kill_harness(proc)
                     break
                 transcript_bytes += len(encoded)
                 if transcript_bytes > _MUSE_MAX_TRANSCRIPT_BYTES:
                     protocol_error = (
                         f"Muse turn transcript exceeds {_MUSE_MAX_TRANSCRIPT_BYTES} bytes"
                     )
-                    try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                    _kill_harness(proc)
                     break
                 event_count += 1
                 if event_count > _MUSE_MAX_EVENTS:
                     protocol_error = f"Muse turn exceeds {_MUSE_MAX_EVENTS} events"
-                    try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                    _kill_harness(proc)
                     break
                 transcript.write(line)
                 transcript.flush()
@@ -721,10 +776,7 @@ def _run_muse_turn(name: str, rec: lib.AgentRecord, msg: lib.Message) -> None:
                         break
                     terminal, answer = str(terminal_value), text_value
         if protocol_error is not None and proc.poll() is None:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            _kill_harness(proc)
         rc = proc.wait()
         stderr_reader.join()
     stderr_tail = "".join(stderr_chunks).strip()[-8000:]
@@ -853,6 +905,14 @@ def main() -> int:
     name = sys.argv[1]
     stage_token = os.environ.get("SUBAGENTS_MIGRATION_STAGE")
     signal.signal(signal.SIGTERM, _handle_sigterm)
+    # An inherited SIG_IGN would make the kernel reap exited children at once,
+    # freeing a harness leader's number while its leftovers are still swept.
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    # Orphans of a harness tree (including double-forked setsid escapees)
+    # become this runner's children, so the tree stays reachable.
+    if not ownership.set_child_subreaper():
+        print("[subagents] runner could not become a child subreaper; "
+              "orphaned harness descendants are reachable only by generation", file=sys.stderr, flush=True)
     lib.ensure_agent_dirs(name)
     if stage_token is None:
         old = lib.read_registry().get(name)
@@ -892,6 +952,7 @@ def main() -> int:
             continue
         pending = lib.next_pending_message(name)
         if pending is None:
+            ownership.reap_adopted_children()
             time.sleep(0.5)
             continue
         _consume(name, pending)

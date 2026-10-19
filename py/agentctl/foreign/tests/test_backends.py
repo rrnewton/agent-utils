@@ -6,12 +6,13 @@ import shlex
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Iterator
 
 import pytest
 
-from agentctl.foreign import agent_keeper, agent_runner, lib
+from agentctl.foreign import agent_keeper, agent_runner, lib, ownership
 from agentctl.client import AgentPaneInfo
 from agentctl.errors import HerdrUnavailable
 
@@ -416,15 +417,43 @@ def test_unknown_runner_identity_never_authorizes_a_signal(
     assert signals == []
 
 
-def test_unbound_runner_identity_preserves_legacy_signaling(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    signals: list[tuple[int, int]] = []
-    monkeypatch.setattr(os, "kill", lambda pid, signum: signals.append((pid, signum)))
-    monkeypatch.setattr(lib, "pid_alive", lambda _pid: True)
-    monkeypatch.setattr(lib, "pid_start_time", lambda _pid: "current")
-    assert lib.terminate_runner_identity(lib.RunnerIdentity(4242, None), grace=0)
-    assert signals == [(4242, signal.SIGTERM), (4242, signal.SIGKILL)]
+def test_unbound_runner_identity_is_never_signalled(tmp_path: Path) -> None:
+    """Legacy policy: a runner without a start time cannot be bound to a generation."""
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        with pytest.raises(lib.AgentOperationError) as caught:
+            lib.terminate_runner_identity(lib.RunnerIdentity(process.pid, None), grace=0)
+        assert caught.value.code == "runner_identity_unproven"
+        assert process.poll() is None
+    finally:
+        process.kill()
+        process.wait(timeout=5)
+
+
+def test_legacy_runner_identity_needs_its_command_line_as_proof(tmp_path: Path) -> None:
+    """Legacy policy: no boot identity, so the pinned process must be this worker's runner."""
+    fake_runner = tmp_path / "agent_runner.py"
+    fake_runner.write_text("import time\ntime.sleep(30)\n")
+    process = subprocess.Popen([sys.executable, str(fake_runner), "worker"])
+    try:
+        deadline = time.monotonic() + 5
+        while b"worker" not in Path(f"/proc/{process.pid}/cmdline").read_bytes() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        legacy = lib.RunnerIdentity(process.pid, lib.pid_start_time(process.pid))
+        with pytest.raises(lib.AgentOperationError) as unnamed:
+            lib.terminate_runner_identity(legacy, grace=0)
+        assert unnamed.value.code == "runner_identity_unproven"
+        assert process.poll() is None
+        with pytest.raises(lib.AgentOperationError) as caught:
+            lib.terminate_runner_identity(legacy, grace=0, name="another-worker")
+        assert caught.value.code == "runner_identity_unproven"
+        assert process.poll() is None
+        assert lib.terminate_runner_identity(legacy, grace=0.5, name="worker")
+        assert process.wait(timeout=5) == -signal.SIGTERM
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
 
 
 class _FakeSharedAgentClient:
@@ -1646,3 +1675,74 @@ def test_shared_tui_runner_timeout_is_normalized_by_shared_client(
     client = lib._shared_tui_client()
     with pytest.raises(HerdrUnavailable, match="timed out"):
         client.panes()
+
+
+# --------------------------------------------------------------------------- #
+# Same-boot identity: the runner-identity sidecar
+# --------------------------------------------------------------------------- #
+
+
+def _write_row(name: str, cwd: Path, pid: int, start: str | None) -> dict[str, object]:
+    row: dict[str, object] = {
+        "name": name, "harness": "codex", "backend": "tmux", "tmux_target": f"subagents:{name}",
+        "cwd": str(cwd), "model": None, "session_id": None, "status": "idle", "runner_pid": pid,
+        "runner_started_at": start, "next_seq": 1, "created_at": "2026-10-19T00:00:00+00:00",
+        "last_turn_at": None, "mode": "headless",
+    }
+    lib.REGISTRY.parent.mkdir(parents=True, exist_ok=True)
+    lib.REGISTRY.write_text(json.dumps([row]))
+    return row
+
+
+def test_runner_recorded_during_an_earlier_boot_is_dead_and_never_signalled(
+    fake_backend_state: Path,
+) -> None:
+    """Adversarial: after a reboot the recorded pid and start tick name an unrelated process."""
+    name = "earlier-boot"
+    cwd = fake_backend_state / "cwd"
+    cwd.mkdir(parents=True)
+    lib.ensure_agent_dirs(name)
+    bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        start = lib.pid_start_time(bystander.pid)
+        row = _write_row(name, cwd, bystander.pid, start)
+        (lib.STATE / name / "runner-identity.json").write_text(json.dumps({
+            "schema": "agentctl-headless-runner/v1", "name": name, "created_at": row["created_at"],
+            "runner_pid": bystander.pid, "runner_started_at": start,
+            "runner_boot_id": "00000000-0000-4000-8000-000000000000",
+        }))
+        rec = lib.read_registry()[name]
+        assert not lib.runner_identity_alive(rec)
+        assert not lib.terminate_runner(rec, grace=0)
+        time.sleep(0.05)
+        assert bystander.poll() is None
+    finally:
+        bystander.kill()
+        bystander.wait(timeout=5)
+
+
+def test_runner_boot_identity_lives_beside_the_row_and_applies_only_to_it(
+    fake_backend_state: Path,
+) -> None:
+    name = "sidecar"
+    cwd = fake_backend_state / "cwd"
+    cwd.mkdir(parents=True)
+    lib.ensure_agent_dirs(name)
+    boot = ownership.current_boot_id()
+    with lib.registry_lock() as agents:
+        agents[name] = lib.AgentRecord(
+            name=name, harness="codex", backend="tmux", tmux_target=f"subagents:{name}", cwd=str(cwd),
+            model=None, session_id=None, status="idle", runner_pid=os.getpid(),
+            runner_started_at=lib.pid_start_time(os.getpid()), next_seq=1, created_at=lib.now_iso(),
+            last_turn_at=None, runner_boot_id=boot,
+        )
+    rows = json.loads(lib.REGISTRY.read_text())
+    assert "runner_boot_id" not in rows[0] and len(rows[0]) == 17
+    assert lib.read_registry()[name].runner_boot_id == boot
+    # An older writer rewrites the row with another runner; the sidecar no longer applies.
+    rows[0]["runner_pid"] = 4_000_001
+    lib.REGISTRY.write_text(json.dumps(rows))
+    assert lib.read_registry()[name].runner_boot_id is None
+    with lib.registry_lock():
+        pass
+    assert not (lib.STATE / name / "runner-identity.json").exists()
