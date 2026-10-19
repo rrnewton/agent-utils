@@ -4746,15 +4746,17 @@ pub async fn channel_directory(
         DirectoryRequest, DEFAULT_LIMIT, MAX_LIMIT, MAX_QUERY_CHARS, MAX_TOKEN_BYTES,
     };
 
-    let scope = match named_provider(query.provider.as_deref()) {
-        None => None,
-        Some(key) => Some(
-            state
-                .providers
-                .entry(key)
-                .ok_or_else(|| unknown_provider(&state))?,
-        ),
-    };
+    // With one service the field is not read, as in the add request.
+    let scope =
+        match named_provider(query.provider.as_deref()).filter(|_| state.providers.is_multi()) {
+            None => None,
+            Some(key) => Some(
+                state
+                    .providers
+                    .entry(key)
+                    .ok_or_else(|| unknown_provider(&state))?,
+            ),
+        };
     let (can_list, service) = match scope {
         Some(entry) => (
             entry.client.supports_channel_discovery(),
@@ -5072,7 +5074,10 @@ pub async fn add_channel(
         ));
     }
 
-    let named = match named_provider(request.provider.as_deref()) {
+    let multi = state.providers.is_multi();
+    // The service named, among several; with one, every answer is that one's, named or not, and
+    // the field is not read at all, so a one-service server answers as it always did.
+    let named = match named_provider(request.provider.as_deref()).filter(|_| multi) {
         None => None,
         Some(key) => Some(
             state
@@ -5081,9 +5086,6 @@ pub async fn add_channel(
                 .ok_or_else(|| unknown_provider(&state))?,
         ),
     };
-    let multi = state.providers.is_multi();
-    // The service named, among several; with one, every answer is that one's, named or not.
-    let named = named.filter(|_| multi);
     let managed = match named {
         Some(entry) => entry.client.supports_channel_registration(),
         None => state.chat.supports_channel_registration(),
@@ -5225,32 +5227,27 @@ pub async fn add_channel(
     };
     let registration_provider = registration_provider.as_deref();
     // A direct id is a Discord snowflake, unless the named service is certain the id is its own
-    // (a Slack channel id, for a Slack that does not register channels).
+    // (a Slack channel id, for a Slack that does not register channels). Only a bare id: a service
+    // is certain of its own links too, and a link is not an id.
     let direct_id = |id: &str| {
         id.chars().all(|c| c.is_ascii_digit())
-            || named.is_some_and(|entry| entry.client.claims_source(id) == SourceClaim::Certain)
+            || (id.chars().all(|c| c.is_ascii_alphanumeric())
+                && named
+                    .is_some_and(|entry| entry.client.claims_source(id) == SourceClaim::Certain))
     };
     if id.is_empty() || (!managed && !direct_id(id)) {
+        let wanted = if named.is_some() {
+            "its own channel id, not a link,"
+        } else {
+            "a numeric channel id"
+        };
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "invalid_channel_id",
             format!(
-                "{service} requires a numeric channel id through this chat adapter. Ask the deployment operator for the channel ID."
+                "{service} requires {wanted} through this chat adapter. Ask the deployment operator for the channel ID."
             ),
         ));
-    }
-    if registered.is_none() && multi {
-        let Some(key) = provider_key.as_deref() else {
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "provider_required",
-                format!(
-                    "this server reads {}, and none of them is the default; say which service the channel is on",
-                    state.chat.provider_name()
-                ),
-            ));
-        };
-        refuse_shared_namespace(&state, key)?;
     }
     if let Some(configured) = hidden_configured(&state, id) {
         // The same as a hidden source above: a direct id, or a link that resolved to one. The
@@ -5287,6 +5284,22 @@ pub async fn add_channel(
             )
         };
         return Err(ApiError::new(StatusCode::CONFLICT, code, detail));
+    }
+    // After the file's own channels, which belong to their configured provider whatever this
+    // request names: showing a hidden one again needs no service, and is not an addition from the
+    // app that a second account must be refused.
+    if registered.is_none() && multi {
+        let Some(key) = provider_key.as_deref() else {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "provider_required",
+                format!(
+                    "this server reads {}, and none of them is the default; say which service the channel is on",
+                    state.chat.provider_name()
+                ),
+            ));
+        };
+        refuse_shared_namespace(&state, key)?;
     }
     let existing = state.added_channels.read().ok().and_then(|added| {
         added

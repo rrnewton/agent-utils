@@ -2313,10 +2313,13 @@ How a deployment with several providers behaves:
 * **The add request may name its service** (`#355 provider-grouped-channels`): `provider` in the
   body of `POST /api/v1/channels` is a provider key, and that service's own answer decides between
   registering a link (`source`) and adding a channel id (`id`, with `writable`). A Slack with
-  `channel_registration = false` takes its own conversation ids that way. An id with no service
-  named goes to the `[discord]` section's provider, and is refused (`provider_required`) when there
-  is none. A channel added by id records its provider too, so it keeps it across a restart. An
-  unknown key is `unknown_provider`.
+  `channel_registration = false` takes its own conversation ids that way, but not its links. With no
+  service named, the request is answered as before: a link goes to whichever service registers it,
+  and where no service registers channels an id goes to the `[discord]` section's provider, and is
+  refused (`provider_required`) when there is none. Showing a hidden channel of the file again needs
+  no service. A channel added by id records its provider too, so it keeps it across a restart. An
+  unknown key is `unknown_provider`. With one service the field is not read, here or in the channel
+  browser.
 * **Two accounts of one service** at the same `api_base` (two Slack workspaces, or two Discord
   bots) both work for channels listed in the file. Adding a channel from the app is refused for the
   later one (`provider_namespace_shared`): channels added in the app are recorded by API base, so

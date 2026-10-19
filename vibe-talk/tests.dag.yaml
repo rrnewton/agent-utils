@@ -558,6 +558,7 @@ steps:
       resources: {browser: 1}
       est_duration_s: 12
       classification: latency-bound
+      rss_baseline_bytes: 1073741824
 
   # `#355 provider-grouped-channels` in the browser engine at 1280x800 and a 375x812 phone: with two chat
   # services the bar's channel picker holds one <optgroup> per service in configuration order, Alt+Down

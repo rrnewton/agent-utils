@@ -1269,3 +1269,129 @@ async fn the_voice_agent_hears_each_channels_service_and_may_say_it_back() {
     .await;
     assert!(digest.contains("from slack"), "{digest}");
 }
+
+fn slack_ids_and_links(source: &str) -> SourceClaim {
+    if source.starts_with('C') || source.contains("slack.com/archives/") {
+        SourceClaim::Certain
+    } else {
+        SourceClaim::Never
+    }
+}
+
+#[tokio::test]
+async fn a_named_service_takes_its_own_ids_directly_but_not_its_links() {
+    // A Slack that does not register channels is certain of its links as well as its ids; only a
+    // bare id is a channel id. The fake would answer for the link, so only the refusal keeps the
+    // whole address from being stored as a channel id.
+    let bot = Arc::new(FakeDiscord::new());
+    let slack = Arc::new(FakeDiscord::new());
+    let link = format!("https://example.slack.com/archives/{ADDED_SLACK_CHANNEL}");
+    slack.register_channel(&ChannelId(link.clone()));
+    let (state, _) = served_by(
+        &bot_and_slack_config(),
+        None,
+        vec![
+            Arc::new(Direct::new(&bot, "Discord", digits)),
+            Arc::new(Direct::new(&slack, "Slack", slack_ids_and_links)),
+        ],
+    );
+    let (status, refused) = call(
+        &state,
+        "POST",
+        "/api/v1/channels",
+        WRITE_TOKEN,
+        Some(json!({"id": link, "label": "by link", "provider": "slack"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(refused["error"], "invalid_channel_id");
+    let detail = refused["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("Slack") && detail.contains("not a link"),
+        "{detail}"
+    );
+    assert!(state.channel(&link).is_none());
+}
+
+#[tokio::test]
+async fn a_hidden_channel_of_the_file_comes_back_by_id_with_no_service_named() {
+    // No default service, so an id from the app must name its service; but a channel of the file
+    // already has one, and showing it again is not an addition.
+    let bot = Arc::new(FakeDiscord::new());
+    let slack = Arc::new(FakeDiscord::new());
+    bot.register_channel(&ChannelId(BOT_CHANNEL.to_owned()));
+    let (state, _) = served_by(
+        &bot_and_slack_config(),
+        None,
+        vec![
+            Arc::new(Direct::new(&bot, "Discord", digits)),
+            Arc::new(Direct::new(&slack, "Slack", slack_ids)),
+        ],
+    );
+    let (status, body) = call(
+        &state,
+        "DELETE",
+        &format!("/api/v1/channels/{BOT_CHANNEL}"),
+        WRITE_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        state.channel(BOT_CHANNEL).is_none(),
+        "the channel was not hidden"
+    );
+    let (status, body) = call(
+        &state,
+        "POST",
+        "/api/v1/channels",
+        WRITE_TOKEN,
+        Some(json!({"id": BOT_CHANNEL, "label": "bot home"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let shown = state.channel(BOT_CHANNEL).expect("shown again");
+    assert_eq!(shown.provider.as_deref(), Some("bot"));
+}
+
+#[tokio::test]
+async fn with_one_service_the_provider_field_is_not_read() {
+    // The negative control for the field: a one-service server answers as it always did, whatever
+    // an API client puts in `provider`.
+    let (state, discord) = vibe_talk::testing::state();
+    let added = ChannelId(ADDED_BOT_CHANNEL.to_owned());
+    discord.register_channel(&added);
+    let (status, body) = call(
+        &state,
+        "POST",
+        "/api/v1/channels",
+        WRITE_TOKEN,
+        Some(json!({"id": ADDED_BOT_CHANNEL, "label": "by id", "provider": "teams"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(state.channel(ADDED_BOT_CHANNEL).is_some());
+
+    let (state, discord) = vibe_talk::testing::state();
+    discord.enable_channel_registration(&added, true, false);
+    discord.enable_channel_directory(vec![listed(ADDED_BOT_CHANNEL, "#added")], false);
+    let (status, plain) = call(
+        &state,
+        "GET",
+        "/api/v1/channel-directory?limit=5",
+        WRITE_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{plain}");
+    let (status, named) = call(
+        &state,
+        "GET",
+        "/api/v1/channel-directory?limit=5&provider=teams",
+        WRITE_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{named}");
+    assert_eq!(named, plain);
+}
