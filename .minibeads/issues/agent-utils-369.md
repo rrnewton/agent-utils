@@ -1,13 +1,14 @@
 ---
 title: 'pairing-link: a one-time, short-lived link that signs a phone in'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 labels:
 - vibe-talk
 - pairing-link
 created_at: 2026-10-19T11:56:36.697212188+00:00
-updated_at: 2026-10-19T11:56:36.697212188+00:00
+updated_at: 2026-10-19T13:06:57.832159072+00:00
+closed_at: 2026-10-19T13:06:57.832158932+00:00
 ---
 
 # Description
