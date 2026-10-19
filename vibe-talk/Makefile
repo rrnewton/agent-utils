@@ -523,6 +523,18 @@ done-sync-browser:
 thread-button-browser:
 	python3 tests/thread_button_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
+# `#377 compact-collapsed-rows` in a real Chromium at 393x852 (touch) and 1280x800 (mouse), in All: a
+# collapsed row's header is one line -- the name cut with an ellipsis where it must be, the time, a
+# Thread tag the size of Reply in its thread's colour, and ⋯ -- with Reply and Done (or Unarchive) only
+# once the row is opened, every control then together at the right; opened by a tap and by Enter,
+# folded again, and swiped Done while collapsed. At the desk a wide list keeps every control on one
+# line, in one column and in two at 1280x800, and two columns at 1024x768 follow the phone's rule.
+# Pass WEB_ROOT=dir to run it against another copy of the page, SCREENSHOTS=dir to keep a PNG of each
+# state, and REPORT=1 to print every header measured and go on past a failed check.
+.PHONY: compact-rows-browser
+compact-rows-browser:
+	python3 tests/compact_rows_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS)) $(if $(REPORT),--report)
+
 # `#245 done-feedback` in a real Chromium: at 1280x800 in both schemes, a selected unread message ringed
 # solid in the accent and a selected read one dashed in grey on the same lit surface, each at 3:1 or
 # more against it; e draws the moment on the row it left and lets it go; the Undo chip names the

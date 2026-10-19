@@ -291,7 +291,7 @@ HEADERS_JS = """async (list) => {
         for (const word of words(restated)) {
             if (!header.has(word)) problems.push(`${id}: "${word}" is in neither the header nor the body`);
         }
-        const reply = row.querySelector(':scope > .meta > .reply-button').getBoundingClientRect();
+        const reply = row.querySelector(':scope > .meta .reply-button').getBoundingClientRect();
         const time = row.querySelector(':scope > .meta > .msg-time');
         const stamp = time.getBoundingClientRect();
         if (time.tagName !== 'TIME' || !time.dateTime) problems.push(`${id}: the time is not a <time> with its instant`);

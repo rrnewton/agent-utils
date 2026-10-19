@@ -26920,6 +26920,13 @@ function renderChannelRows() {
       // `#376 read-aloud-blocks`: and how far through, "reading 2 of 5", in a read of several parts.
       named.textContent = isReading ? readingLabel() : authorLabel(row);
       named.hidden = !isReading && (who === "me" || who === "coder");
+      // `#377 compact-collapsed-rows`. Where the header line has no room for the whole name it shows a
+      // prefix and an ellipsis (web/voice.css); the whole name is here, for a pointer resting on it.
+      const whole = isReading ? "" : authorLabel(row);
+      if ((named.getAttribute("title") || "") !== whole) {
+        if (whole) named.setAttribute("title", whole);
+        else named.removeAttribute("title");
+      }
     }
     // The block being read, lit again on a row the poll has just rebuilt. `#376`.
     markReadingBlock(row);
@@ -29003,8 +29010,8 @@ function drawReplyLabel(button) {
 }
 
 /**
- * Where everything on a row's header line stands: the line's height, and the top of each thing on it
- * measured from the line's own top. Empty where the engine lays nothing out.
+ * Where everything on a row's header line stands: the line's height, the top of each thing on it
+ * measured from the line's own top, and the author's width. Empty where the engine lays nothing out.
  */
 function headerLayout(meta) {
   if (!meta || typeof meta.getBoundingClientRect !== "function") return [];
@@ -29013,7 +29020,12 @@ function headerLayout(meta) {
   const tops = [];
   for (let at = 0; at < kids.length; at += 1) {
     const kid = kids[at];
-    if (typeof kid.getBoundingClientRect === "function") tops.push(kid.getBoundingClientRect().top - line.top);
+    if (typeof kid.getBoundingClientRect !== "function") continue;
+    const box = kid.getBoundingClientRect();
+    tops.push(box.top - line.top);
+    // `#377 compact-collapsed-rows`. The name gives way on a full line, so a longer label can cut it
+    // without moving anything up or down: its width is part of where it stands.
+    if (String(kid.className || "").split(" ").includes("msg-author")) tops.push(box.width);
   }
   return [line.height, ...tops];
 }
@@ -29025,15 +29037,21 @@ function headerLayout(meta) {
  * `drawReplyLabel` to finish.
  */
 function quoteLabelFits(button, plain, full) {
-  const meta = button.parentNode;
+  // The header line itself, not the row's controls that Reply is held among (`#377`).
+  const held = button.parentNode;
+  const meta = held && String(held.className || "") === "row-acts" ? held.parentNode : held;
   if (!meta || typeof button.getBoundingClientRect !== "function") return true;
   button.removeAttribute("data-quote");
   button.style.width = "";
   button.textContent = plain;
   const before = headerLayout(meta);
-  button.quoteWidth = `${button.getBoundingClientRect().width}px`;
+  const plainWidth = button.getBoundingClientRect().width;
+  button.quoteWidth = `${plainWidth}px`;
   button.setAttribute("data-quote", "true");
   button.textContent = full;
+  // `#377 compact-collapsed-rows`. A collapsed row in a narrow list draws no Reply until words of it
+  // are selected, and then draws it whole: there is no plain label in place to keep the line as it was.
+  if (!(plainWidth > 0)) return true;
   const after = headerLayout(meta);
   return before.length === after.length && before.every((value, at) => Math.abs(value - after[at]) <= 0.5);
 }
@@ -32016,8 +32034,15 @@ function discordNode(messages) {
   // with them quoted. The same screen and the same routing: only the box's first lines differ.
   reply.addEventListener("click", inThisColumn(() => openReply(messages, li, takeQuote(reply))));
   sayRowShortcut(reply, "reply-button");
+  // `#377 compact-collapsed-rows`. The row's controls, held together at the end of the header line:
+  // where the line has no room for them beside the name and the time they move to the next line as
+  // one, never leaving Done alone on a line of its own; and where the list is narrow, a collapsed row
+  // shows only its Thread tag and ⋯ among them (web/voice.css).
+  const acts = document.createElement("span");
+  acts.className = "row-acts";
+  meta.append(acts);
   // `#193 compose-draft-loss`. Beside it, the reply still being written to this message, if any.
-  meta.append(draftMarker(messages, li), reply);
+  acts.append(draftMarker(messages, li), reply);
   // `#277 reply-in-column`. Drawn again while a reply to it is open at the foot of this column, it is
   // still edged as the message being answered.
   if (replyingTo(messages[0])) markReplying(li, true);
@@ -32025,7 +32050,7 @@ function discordNode(messages) {
   // replies each row has (`renderReplyCounts`) finds the button without walking the row's text.
   li.replyButton = reply;
   // A row of the Pinned filter offers the way into its message's thread whatever view is under it.
-  addThreadDecoration(meta, message, li, drawingPinnedRows);
+  addThreadDecoration(acts, message, li, drawingPinnedRows);
   // A provider write, distinct from the reversible local Done/archive below. Most providers do
   // not expose this operation, so the server advertises it explicitly and the control stays out
   // of the interface unless the selected provider supports it.
@@ -32170,7 +32195,7 @@ function discordNode(messages) {
   readGroup.append(readCaption, readThrough, upstreamRead);
   menu.append(copy, pinItem, bookmarkItem, readGroup);
   more.append(moreButton, menu);
-  meta.append(more);
+  acts.append(more);
   // `#50 todo-view`. The non-gestural way to say "dealt with", and the one a keyboard can reach.
   // On EVERY channel row rather than only on rows built while the mode is on: the mode is a
   // filter over the same list, and a control that exists in one rendering and not another is a
@@ -32209,8 +32234,7 @@ function discordNode(messages) {
   rescue.textContent = "Not noise";
   rescue.hidden = !messages.every(isNoise);
   rescue.addEventListener("click", inThisColumn(() => guardQuietly(() => markNotNoise(ids))()));
-  meta.append(rescue);
-  meta.append(done);
+  acts.append(rescue, done);
   // `#84 reply-aware-dismissal`. THE SWIPE `#50` deferred, and it drives the same act the Done button does
   // rather than a second notion of "dealt with": one dismissal, recorded on the server, reachable
   // by gesture OR by a control a keyboard can get to. That ordering was `#50`'s condition for the

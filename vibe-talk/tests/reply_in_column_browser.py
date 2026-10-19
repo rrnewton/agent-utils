@@ -375,7 +375,7 @@ def measure(desk: Desk, column: str, message_id: str) -> Found:
 
 def reply_button(desk: Desk, column: str, message_id: str) -> dict[str, float]:
     found = desk.page.evaluate(f"""() => {{
-        const b = document.querySelector("#{list_of(column)} > li[data-id='{message_id}'] > .meta > .reply-button");
+        const b = document.querySelector("#{list_of(column)} > li[data-id='{message_id}'] > .meta .reply-button");
         if (!b) return null;
         const r = b.getBoundingClientRect();
         return {{x: r.left + r.width / 2, y: r.top + r.height / 2, text: b.textContent}};
@@ -406,7 +406,7 @@ def drag_words(desk: Desk, column: str, message_id: str) -> str:
     desk.page.mouse.move(float(ends["x2"]), y, steps=6)
     desk.page.mouse.up()
     desk.wait_for(f"""() => {{
-        const b = document.querySelector("#{list_of(column)} > li[data-id='{message_id}'] > .meta > .reply-button");
+        const b = document.querySelector("#{list_of(column)} > li[data-id='{message_id}'] > .meta .reply-button");
         return b && b.textContent.startsWith('Quote');
     }}""", f"{column} {message_id}: words dragged over did not make Reply Quote reply")
     return str(desk.page.evaluate("() => String(getSelection())"))
@@ -906,7 +906,7 @@ def one_column_run(desk: Desk) -> None:
     message_id = str(page.evaluate("""() => {
         const area = document.getElementById('scroll-area').getBoundingClientRect();
         const row = [...document.querySelectorAll('#discord-log > li[data-id]')].find((li) => {
-            const b = li.querySelector(':scope > .meta > .reply-button');
+            const b = li.querySelector(':scope > .meta .reply-button');
             if (!b) return false;
             const r = b.getBoundingClientRect();
             return r.top > area.top + 60 && r.bottom < area.bottom - 120;

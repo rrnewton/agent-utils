@@ -3018,7 +3018,9 @@ def _act_failed_send_and_draft(driver: Driver) -> None:
         "(() => { const rows = document.querySelectorAll('#discord-log > li'); "
         "rows[rows.length - 1].id = 'draft-probe'; return true; })()"
     )
-    driver.page.click("#draft-probe .reply-button")
+    # `#377 compact-collapsed-rows`. A collapsed row on a phone draws no Reply until it is opened: pressed
+    # as r presses it, so the row stays as the reader left it, collapsed, with its Draft on the header.
+    driver.js("(() => { document.querySelector('#draft-probe .reply-button').click(); return true; })()")
     driver.page.wait_for_function("() => window.__visible('screen-reply')", timeout=5_000)
     driver.page.fill("#reply-text", DRAFT_REPLY_TEXT)
     driver.click("close-reply")
@@ -5429,7 +5431,7 @@ SCENES: tuple[Scene, ...] = (
                 # A label four characters longer must not push the row's controls onto a new line.
                 "Reply (2) leaves the row's controls on one line",
                 f"(() => {{ const row = window.__replyRow({json.dumps(REPLY_MARKER_PARENT)}); "
-                "const tops = [...row.querySelectorAll(':scope > .meta > button, :scope > .meta > .row-more')]"
+                "const tops = [...row.querySelectorAll(':scope > .meta > .row-acts > button, :scope > .meta > .row-acts > .row-more')]"
                 ".filter((n) => n.getClientRects().length > 0).map((n) => n.getBoundingClientRect().top); "
                 "return tops.length >= 3 && Math.max(...tops) - Math.min(...tops) < 4; })()",
             ),
@@ -5693,7 +5695,8 @@ SCENES: tuple[Scene, ...] = (
     ),
     Scene(
         name="49-failed-send-and-draft",
-        what="a refused send in the outbox with Retry, Edit and Dismiss, and Draft beside Reply on the newest message",
+        what="a refused send in the outbox with Retry, Edit and Dismiss, and Draft beside Reply on the newest message "
+        "(on a phone, where that message is collapsed, Draft on its header line with no Reply drawn)",
         act=_act_failed_send_and_draft,
         profiles=("android-412", "laptop-1280"),
         expect=(
@@ -5714,14 +5717,22 @@ SCENES: tuple[Scene, ...] = (
                 ".every((b) => b.getBoundingClientRect().height >= 40)",
             ),
             (
-                # THE claim the page suite cannot make: the mark is drawn, beside Reply, on its line.
-                "the newest message says Draft directly left of its Reply, on the same line, on screen",
+                # THE claim the page suite cannot make: the mark is drawn, beside Reply, on its line -- or, on
+                # a collapsed row whose list is too narrow to draw its Reply (`#377 compact-collapsed-rows`),
+                # on the header line beside its time.
+                "the newest message says Draft directly left of its Reply, on the same line, on screen "
+                "(or on a collapsed row's header line where no Reply is drawn)",
                 "(() => { const m = document.querySelector('#draft-probe .draft-marker'); "
                 "if (!m || m.hidden || !m.getClientRects().length) return false; "
                 "const reply = m.nextElementSibling; if (!reply || !reply.classList.contains('reply-button')) return false; "
-                "const r = m.getBoundingClientRect(); const p = reply.getBoundingClientRect(); "
+                "const r = m.getBoundingClientRect(); "
+                "const p = reply.getClientRects().length ? reply.getBoundingClientRect() "
+                ": document.querySelector('#draft-probe .msg-time').getBoundingClientRect(); "
+                "if (!reply.getClientRects().length && document.getElementById('draft-probe')"
+                ".getAttribute('data-collapsed') !== 'true') return false; "
                 "const area = document.getElementById('scroll-area').getBoundingClientRect(); "
-                "return m.getAttribute('aria-label') === 'Draft reply' && r.right <= p.left "
+                "return m.getAttribute('aria-label') === 'Draft reply' "
+                "&& (reply.getClientRects().length ? r.right <= p.left : r.left >= p.right) "
                 "&& Math.abs((r.top + r.bottom) / 2 - (p.top + p.bottom) / 2) < 3 "
                 "&& r.top >= area.top && r.bottom <= area.bottom; })()",
             ),

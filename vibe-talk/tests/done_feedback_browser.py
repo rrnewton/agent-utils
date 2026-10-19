@@ -535,7 +535,12 @@ def walk_chip(walk: Walk, width: int) -> str:
       return row ? row.getAttribute('data-id') : null; }""")
     check(isinstance(row, str), f"at {width}px no unread message is on screen to mark Done")
     assert isinstance(row, str)
-    page.locator(f'#discord-log > li[data-id="{row}"] .done-button').click()
+    done = page.locator(f'#discord-log > li[data-id="{row}"] .done-button')
+    if done.is_visible():
+        done.click()
+    else:
+        # A collapsed row on a phone draws no Done (`#377 compact-collapsed-rows`): pressed as e presses it.
+        done.dispatch_event("click")
     page.wait_for_selector("#undo-dismiss", state="visible", timeout=5_000)
     page.wait_for_timeout(300)
     laid = chip_layout(page, width)
