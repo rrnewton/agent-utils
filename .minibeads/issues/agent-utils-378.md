@@ -1,12 +1,13 @@
 ---
 title: 'live-reactions: a reaction added in the native app shows in vibe-talk within seconds'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-19T19:00:32.911813941+00:00
-updated_at: 2026-10-19T19:00:32.911813941+00:00
+updated_at: 2026-10-19T19:53:21.093852917+00:00
+closed_at: 2026-10-19T19:53:21.093852507+00:00
 ---
 
 # Description
