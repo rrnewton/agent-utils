@@ -876,6 +876,91 @@ def test_the_rust_suites_run_past_a_failing_test_binary() -> None:
     assert all("--no-fail-fast" in shlex.split(step.cmd) for step in rust_tests)
 
 
+# ---- `#361 python-minimum-timeout` --------------------------------------------------------------
+
+PY310_SHARDS = 6
+
+
+def test_the_minimum_python_tests_run_as_shards_that_each_report() -> None:
+    workflow = _workflow("cross-dagrun.yml")
+    # A workflow edit runs the complete graph, which keeps going past a failure: as long red as
+    # green, and close to the old 60 minutes.
+    assert _job(workflow, "validate")["timeout-minutes"] == 90
+    short = _job(workflow, "python-minimum")
+    assert "make check-python-packages" in _runs(short)
+    assert not any("-m pytest" in run or "run_pytest_shard" in run for run in _runs(short))
+
+    tests = _job(workflow, "python-minimum-tests")
+    strategy = tests["strategy"]
+    assert isinstance(strategy, dict)
+    assert strategy["fail-fast"] is False
+    assert strategy["matrix"] == {"shard": list(range(PY310_SHARDS))}
+    steps = _steps(tests)
+    [pytest_step] = [step for step in steps if "run_pytest_shard.py" in str(step.get("run", ""))]
+    command = str(pytest_step["run"])
+    assert f"--shard ${{{{ matrix.shard }}}}/{PY310_SHARDS} " in command
+    assert "-p run_component_tests" in command  # names a failure the moment it happens
+    assert "set -o pipefail" in command and pytest_step["shell"] == "bash"
+    # A slow shard is stopped by its step's own limit, so the steps after it still report.
+    step_limit, job_limit = pytest_step["timeout-minutes"], tests["timeout-minutes"]
+    assert isinstance(step_limit, int) and isinstance(job_limit, int)
+    assert step_limit < job_limit
+    later = steps[steps.index(pytest_step) + 1:]
+    assert later and all(step.get("if") == "${{ !cancelled() }}" for step in later)
+
+
+def _shard_summary_program() -> str:
+    tests = _job(_workflow("cross-dagrun.yml"), "python-minimum-tests")
+    [run] = [run for run in _runs(tests) if "GITHUB_STEP_SUMMARY" in run]
+    lines = run.splitlines()
+    start = next(index for index, line in enumerate(lines) if line.endswith("<<'EOF'"))
+    end = max(index for index, line in enumerate(lines) if line == "EOF")
+    return "\n".join(lines[start + 1:end]) + "\n"
+
+
+def _summarize(tmp_path: Path, report: Path, log: Path) -> str:
+    program = tmp_path / "summary.py"
+    program.write_text(_shard_summary_program(), encoding="utf-8")
+    done = subprocess.run(
+        [sys.executable, str(program), str(report), str(log)],
+        env={**os.environ, "SHARD": "3"}, capture_output=True, text=True, check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    return done.stdout
+
+
+def test_a_shard_summary_names_its_failures_from_the_report_or_else_the_log(
+    tmp_path: Path,
+) -> None:
+    report, log = tmp_path / "shard.xml", tmp_path / "shard.log"
+    assert "shard 3: 0 failed (no report and no log" in _summarize(tmp_path, report, log)
+
+    log.write_text(
+        "....F\ncomponent-tests: FAILED tests/test_a.py::test_one (call)\n"
+        "component-tests: FAILED tests/test_a.py::test_one (call)\n.",
+        encoding="utf-8",
+    )
+    stopped = _summarize(tmp_path, report, log)
+    assert "shard 3: 1 failed (log only" in stopped
+    assert "- `tests/test_a.py::test_one (call)`" in stopped
+
+    report.write_text(
+        '<?xml version="1.0"?><testsuites><testsuite>'
+        '<testcase classname="tests.test_b" name="test_two"><properties>'
+        '<property name="nodeid" value="tests/test_b.py::test_two[x]"/></properties>'
+        '<failure message="boom"/></testcase>'
+        '<testcase classname="tests.test_b" name="test_three"><error message="e"/></testcase>'
+        '<testcase classname="tests.test_b" name="test_fine"/>'
+        "</testsuite></testsuites>",
+        encoding="utf-8",
+    )
+    finished = _summarize(tmp_path, report, log)
+    assert "shard 3: 2 failed (JUnit report)" in finished
+    assert "- `tests/test_b.py::test_two[x]`" in finished
+    assert "- `tests.test_b::test_three`" in finished
+    assert "test_fine" not in finished
+
+
 # ---- `#365 package-step-cpu-budget` -------------------------------------------------------------
 
 
