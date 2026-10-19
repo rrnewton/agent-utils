@@ -1,12 +1,13 @@
 ---
 title: 'muse-approval-never-ready: a Muse launched with --approval-mode never never reaches a verified idle composer'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - agentctl
 created_at: 2026-10-19T21:53:26.643339249+00:00
-updated_at: 2026-10-19T21:53:26.643339249+00:00
+updated_at: 2026-10-19T22:29:16.677717147+00:00
+closed_at: 2026-10-19T22:29:16.677717067+00:00
 ---
 
 # Description

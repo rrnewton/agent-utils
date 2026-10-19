@@ -1,12 +1,13 @@
 ---
 title: 'agent-watch: tell the coordinator when an agent is stuck at a prompt, idle without a verdict, stalled, or dead'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - agentctl
 created_at: 2026-10-19T21:53:26.640782828+00:00
-updated_at: 2026-10-19T21:53:26.640782828+00:00
+updated_at: 2026-10-19T22:29:16.677516915+00:00
+closed_at: 2026-10-19T22:29:16.677516785+00:00
 ---
 
 # Description
