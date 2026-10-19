@@ -51,13 +51,15 @@
 //! lost, a send can finish after the owner hung up, and a direct send has no commit at all. So the
 //! gate also keeps a short SEND MEMORY: each send is entered when it starts — at [`PostGate::take`]
 //! for a commit, at [`PostGate::begin_direct`] for a direct send — and, once it settles, is
-//! numbered in the order sends settled (`send_seq`) and published on the proposal long poll. A send
-//! abandoned on its way is filed as unconfirmed, as a direct send's repeat memory already did. The
-//! memory lives [`SEND_MEMORY_TTL`] after a send settles, holds at most [`SEND_MEMORY`], and is
-//! never written to disk; forgetting the stored conversations empties it.
+//! numbered in the order sends settled (`send_seq`) and published on the proposal long poll. The
+//! task that posts a send settles it, so a caller that goes away mid-post changes nothing that is
+//! filed (`#283 send-settle-in-task`); a post stopped on its way is filed as unconfirmed, as a
+//! direct send's repeat memory already did. The memory lives [`SEND_MEMORY_TTL`] after a send
+//! settles, holds at most [`SEND_MEMORY`], and is never written to disk; forgetting the stored
+//! conversations empties it.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::watch;
@@ -354,18 +356,21 @@ impl SendReport {
 /// A send in the send memory, on its way. Settle it with what it posted, or forget it when it
 /// certainly posted nothing. `#270 voice-transcript-markers`.
 ///
-/// Dropped unsettled — the request abandoned while the post was on the wire — it is filed as
-/// unconfirmed, because that is exactly what it is: the page still draws a card saying the channel
-/// may have it.
+/// Dropped unsettled — the post stopped while it was on the wire — it is filed as unconfirmed,
+/// because that is exactly what it is: the page still draws a card saying the channel may have it.
+///
+/// It holds its gate, so the task that posts the send can own it and settle it when the provider
+/// answers, whether or not the request that asked for the post is still there. `#283
+/// send-settle-in-task`; see [`crate::ops::reply_settled`].
 #[derive(Debug)]
 #[must_use = "a send that is never settled is filed as unconfirmed"]
-pub struct SendTicket<'a> {
-    gate: &'a PostGate,
+pub struct SendTicket {
+    gate: Arc<PostGate>,
     serial: u64,
     done: bool,
 }
 
-impl SendTicket<'_> {
+impl SendTicket {
     /// The send's number: the proposal's, or the direct send's.
     #[must_use]
     pub fn serial(&self) -> u64 {
@@ -386,7 +391,7 @@ impl SendTicket<'_> {
     }
 }
 
-impl Drop for SendTicket<'_> {
+impl Drop for SendTicket {
     fn drop(&mut self) {
         if !self.done {
             self.gate.abandon_send(self.serial);
@@ -459,17 +464,18 @@ impl DirectSend {
 
 /// A direct send on its way, from [`PostGate::begin_direct`]. Finish it with what happened.
 ///
-/// Dropped unfinished — the request abandoned while the post was on the wire, as a client that
-/// hangs up mid-call does — it is remembered as [`DirectOutcome::Unconfirmed`], because that is
-/// exactly what it is, and the send memory files it as unconfirmed too.
+/// Dropped unfinished — the post stopped while it was on the wire — it is remembered as
+/// [`DirectOutcome::Unconfirmed`], because that is exactly what it is, and the send memory files it
+/// as unconfirmed too. A client that hangs up mid-call does not drop it: the post's own task holds
+/// it (`#283 send-settle-in-task`).
 #[derive(Debug)]
 #[must_use = "a direct send that is never finished is remembered as unconfirmed"]
-pub struct DirectTicket<'a> {
-    send: SendTicket<'a>,
+pub struct DirectTicket {
+    send: SendTicket,
     finished: bool,
 }
 
-impl DirectTicket<'_> {
+impl DirectTicket {
     /// The number this send's log lines carry.
     #[must_use]
     pub fn serial(&self) -> u64 {
@@ -481,7 +487,7 @@ impl DirectTicket<'_> {
     /// publishes nothing. Returns the `send_seq` a report was published under.
     pub fn finish(mut self, report: Option<SendReport>) -> Option<u64> {
         self.finished = true;
-        let gate = self.send.gate;
+        let gate = Arc::clone(&self.send.gate);
         let serial = self.send.serial;
         gate.end_direct(serial, report.as_ref().map(SendReport::direct_outcome));
         // Moved out, so the ticket's own drop does not run for it.
@@ -503,12 +509,39 @@ impl DirectTicket<'_> {
     }
 }
 
-impl Drop for DirectTicket<'_> {
+impl Drop for DirectTicket {
     fn drop(&mut self) {
         if !self.finished {
             self.send
                 .gate
                 .end_direct(self.send.serial, Some(DirectOutcome::Unconfirmed));
+        }
+    }
+}
+
+/// A send on its way, by either door: a confirmed proposal's, or a direct send's. What the task
+/// posting it settles. `#283 send-settle-in-task`.
+#[derive(Debug)]
+#[must_use = "a send that is never finished is filed as unconfirmed"]
+pub enum AnyTicket {
+    /// A confirmed proposal, from [`PostGate::take`].
+    Commit(SendTicket),
+    /// A post the voice agent sent at once, from [`PostGate::begin_direct`].
+    Direct(DirectTicket),
+}
+
+impl AnyTicket {
+    /// Record what happened, as [`DirectTicket::finish`] does: `Some` when something was posted or
+    /// may have been, `None` when certainly nothing was. Returns the `send_seq` a report was
+    /// published under.
+    pub fn finish(self, report: Option<SendReport>) -> Option<u64> {
+        match (self, report) {
+            (Self::Commit(ticket), Some(report)) => ticket.settle(report),
+            (Self::Commit(ticket), None) => {
+                ticket.forget();
+                None
+            }
+            (Self::Direct(ticket), report) => ticket.finish(report),
         }
     }
 }
@@ -908,11 +941,11 @@ impl PostGate {
     ///
     /// The earlier send, as a [`Repeat`].
     pub fn begin_direct(
-        &self,
+        self: &Arc<Self>,
         binding: Binding,
         origin: SendOrigin,
         channel_name: String,
-    ) -> Result<DirectTicket<'_>, Repeat> {
+    ) -> Result<DirectTicket, Repeat> {
         let now = Instant::now();
         let mut inner = self.lock();
         inner.direct.retain(|send| !send.lapsed(now));
@@ -949,7 +982,7 @@ impl PostGate {
         drop(inner);
         Ok(DirectTicket {
             send: SendTicket {
-                gate: self,
+                gate: Arc::clone(self),
                 serial,
                 done: false,
             },
@@ -1001,12 +1034,12 @@ impl PostGate {
     /// log line can name its serial and channel. Boxed, because the refusal is the common case
     /// and should not carry a whole proposal's width on the stack.
     pub fn take(
-        &self,
+        self: &Arc<Self>,
         handle: &str,
         restated: &Binding,
         how: SendHow,
         channel_name: String,
-    ) -> Result<(Proposal, SendTicket<'_>), TakeRefused> {
+    ) -> Result<(Proposal, SendTicket), TakeRefused> {
         let now = Instant::now();
         let mut inner = self.lock();
         let lapsed = inner.expire(now);
@@ -1049,7 +1082,7 @@ impl PostGate {
         drop(inner);
         self.notify();
         let ticket = SendTicket {
-            gate: self,
+            gate: Arc::clone(self),
             serial: proposal.serial,
             done: false,
         };
@@ -1149,8 +1182,8 @@ mod tests {
     use super::*;
 
     /// A gate whose sends number from one, so a test can name them.
-    fn numbered_from_zero() -> PostGate {
-        PostGate::with_ttl_and_numbering(PROPOSAL_TTL, 0)
+    fn numbered_from_zero() -> Arc<PostGate> {
+        Arc::new(PostGate::with_ttl_and_numbering(PROPOSAL_TTL, 0))
     }
 
     fn binding(text: &str) -> Binding {
@@ -1164,7 +1197,7 @@ mod tests {
     /// [`PostGate::take`] as the tests before the send memory knew it: the proposal, with the send
     /// forgotten so it publishes nothing and wakes nobody.
     fn take(
-        gate: &PostGate,
+        gate: &Arc<PostGate>,
         handle: &str,
         restated: &Binding,
     ) -> Result<Proposal, (Refusal, Option<Box<Proposal>>)> {
@@ -1175,7 +1208,7 @@ mod tests {
             })
     }
 
-    fn direct<'a>(gate: &'a PostGate, binding: Binding) -> Result<DirectTicket<'a>, Repeat> {
+    fn direct(gate: &Arc<PostGate>, binding: Binding) -> Result<DirectTicket, Repeat> {
         gate.begin_direct(binding, SendOrigin::Mcp, "lead team".to_owned())
     }
 
@@ -1237,7 +1270,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn an_expired_proposal_is_refused_as_expired() {
-        let gate = PostGate::with_ttl_and_numbering(Duration::from_secs(5), 0);
+        let gate = Arc::new(PostGate::with_ttl_and_numbering(Duration::from_secs(5), 0));
         let (proposal, _) = gate.propose(binding("late"));
         tokio::time::advance(Duration::from_secs(5)).await;
         assert!(gate.pending().is_none());
@@ -1250,7 +1283,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_commit_that_is_first_to_notice_the_expiry_refuses_it_and_wakes_watchers() {
         // Nothing reads `pending` first here, so the lapse is found inside `take` itself.
-        let gate = PostGate::with_ttl_and_numbering(Duration::from_secs(5), 0);
+        let gate = Arc::new(PostGate::with_ttl_and_numbering(Duration::from_secs(5), 0));
         let (proposal, _) = gate.propose(binding("late"));
         let changes = gate.changed.subscribe();
         tokio::time::advance(Duration::from_secs(5)).await;
@@ -1559,7 +1592,7 @@ mod tests {
     #[tokio::test]
     async fn a_new_gate_numbers_its_sends_above_the_clock_so_a_restart_never_numbers_lower() {
         let before = u64::try_from(crate::store::now_ms()).expect("after 1970");
-        let first = PostGate::new();
+        let first = Arc::new(PostGate::new());
         assert!(first.sends_through() >= before);
         direct(&first, binding("one"))
             .expect("first")
@@ -1567,7 +1600,7 @@ mod tests {
         let read_through = first.sends_through();
         // The next process: every send it numbers is past a cursor the last one handed out.
         tokio::time::sleep(Duration::from_millis(2)).await;
-        let next = PostGate::new();
+        let next = Arc::new(PostGate::new());
         direct(&next, binding("two"))
             .expect("first")
             .finish(Some(report(SendOutcome::Sent, false)));
@@ -1647,7 +1680,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_long_poll_wakes_for_a_settled_send_only_when_it_reads_the_send_memory() {
-        let gate = std::sync::Arc::new(numbered_from_zero());
+        let gate = numbered_from_zero();
         // Not reading the send memory: a settle does not end the wait.
         let blind = {
             let gate = gate.clone();
@@ -1724,7 +1757,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_commits_of_one_handle_post_at_most_once() {
-        let gate = std::sync::Arc::new(numbered_from_zero());
+        let gate = numbered_from_zero();
         let (proposal, _) = gate.propose(binding("once"));
         let mut tasks = Vec::new();
         for _ in 0..16 {

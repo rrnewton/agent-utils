@@ -250,15 +250,13 @@ pub async fn voice_post(
                     }
                 };
             let serial = ticket.serial();
-            let result = ops::reply(state, channel_id, text, reply_to).await;
             // Remembered when anything may have reached the channel, so the same words are not
             // posted over it, and filed in the send memory for the page to draw; forgotten when
-            // certainly nothing did.
-            ticket.finish(send_report(
-                state,
-                &binding,
-                result.as_ref().map(|(_, _, parts)| parts.as_slice()),
-            ));
+            // certainly nothing did. By the task that posts it, so a client that hangs up mid-call
+            // changes neither (`#283 send-settle-in-task`).
+            let (result, _send_seq) =
+                ops::reply_settled(state, &binding, crate::post_gate::AnyTicket::Direct(ticket))
+                    .await;
             match result {
                 Ok((channel, _first, parts)) => {
                     crate::access::post_gate(

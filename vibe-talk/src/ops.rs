@@ -2579,25 +2579,8 @@ pub async fn commit_proposal(
             }
         };
     let binding = &proposal.binding;
-    let result = reply(
-        state,
-        &binding.channel_id,
-        &binding.text,
-        binding.reply_to.as_deref(),
-    )
-    .await;
-    let report = crate::send_approval::send_report(
-        state,
-        binding,
-        result.as_ref().map(|(_, _, parts)| parts.as_slice()),
-    );
-    let send_seq = match report {
-        Some(report) => ticket.settle(report),
-        None => {
-            ticket.forget();
-            None
-        }
-    };
+    let (result, send_seq) =
+        reply_settled(state, binding, crate::post_gate::AnyTicket::Commit(ticket)).await;
     match result {
         Ok((channel, posted, parts)) => {
             log_gate_step("committed", &proposal, None, Some(confirmed_by));
@@ -2923,6 +2906,152 @@ pub async fn reply_scoped(
     thread_id: Option<&str>,
     idempotency_key: Option<&str>,
 ) -> Result<(ChannelInfo, Message, Vec<Message>), OpError> {
+    let post = Post {
+        channel_id,
+        text,
+        reply_to,
+        thread_id,
+        idempotency_key,
+    };
+    post_settled(state, post, None).await.0
+}
+
+/// [`reply`] for a send the post gate keeps in its send memory (`#270 voice-transcript-markers`):
+/// a confirmed proposal's, or one the voice agent sent at once. `binding` is what to post, and
+/// `ticket` the send's place in the memory. Returns the post's answer, and the `send_seq` the send
+/// was filed under — `None` when nothing was filed.
+///
+/// `#283 send-settle-in-task`. The send is settled by the task that posts it ([`post_parts`]),
+/// once the provider has answered for the last part tried, and not by the request: a caller that
+/// goes away while the post is on its way — the page stops waiting, a client hangs up mid-call —
+/// no longer files a post that then lands as not confirmed. Whoever is still waiting, the outcome
+/// is filed exactly once. Until that task holds the ticket nothing of the post has been sent, so a
+/// send refused before it is posted, or given up while it waits for its destination's turn, is
+/// forgotten, as a send that certainly posted nothing is.
+///
+/// # Errors
+///
+/// As [`reply`], in the first half of the answer.
+pub async fn reply_settled(
+    state: &AppState,
+    binding: &crate::post_gate::Binding,
+    ticket: crate::post_gate::AnyTicket,
+) -> (
+    Result<(ChannelInfo, Message, Vec<Message>), OpError>,
+    Option<u64>,
+) {
+    let post = Post {
+        channel_id: &binding.channel_id,
+        text: &binding.text,
+        reply_to: binding.reply_to.as_deref(),
+        thread_id: None,
+        idempotency_key: None,
+    };
+    let settle = Settle {
+        ticket,
+        binding: binding.clone(),
+    };
+    post_settled(state, post, Some(settle)).await
+}
+
+/// What [`reply_scoped`] was asked to post, and where.
+struct Post<'a> {
+    channel_id: &'a str,
+    text: &'a str,
+    reply_to: Option<&'a str>,
+    thread_id: Option<&'a str>,
+    idempotency_key: Option<&'a str>,
+}
+
+/// A send in the post gate's send memory, and the words it was asked to post, for the task posting
+/// it to file what became of it. `#283 send-settle-in-task`.
+struct Settle {
+    ticket: crate::post_gate::AnyTicket,
+    binding: crate::post_gate::Binding,
+}
+
+impl Settle {
+    /// File what the post did; the `send_seq` it was filed under, `None` when nothing was.
+    fn file(
+        self,
+        state: &AppState,
+        result: &Result<(ChannelInfo, Message, Vec<Message>), OpError>,
+    ) -> Option<u64> {
+        let report = crate::send_approval::send_report(
+            state,
+            &self.binding,
+            result.as_ref().map(|(_, _, parts)| parts.as_slice()),
+        );
+        self.ticket.finish(report)
+    }
+}
+
+/// A send not yet handed to the task that posts it. Nothing of it has been sent, so dropped — the
+/// post refused, or its caller gone while it waited for its turn — it is forgotten.
+struct Unposted(Option<Settle>);
+
+impl Drop for Unposted {
+    fn drop(&mut self) {
+        if let Some(settle) = self.0.take() {
+            settle.ticket.finish(None);
+        }
+    }
+}
+
+/// The body of [`reply_scoped`] and [`reply_settled`]: `settle`, when given, is filed by the task
+/// that posts, and its `send_seq` comes back beside the answer.
+async fn post_settled(
+    state: &AppState,
+    post: Post<'_>,
+    settle: Option<Settle>,
+) -> (
+    Result<(ChannelInfo, Message, Vec<Message>), OpError>,
+    Option<u64>,
+) {
+    let mut unposted = Unposted(settle);
+    let (posting, turn) = match ready_to_post(state, post).await {
+        Ok(ready) => ready,
+        Err(refused) => return (Err(refused), None),
+    };
+    // Posting is not this request's own. axum drops a handler the moment its caller closes the
+    // connection — the page stops waiting after `OUTGOING_TIMEOUT_MS`, signs out, or loses its
+    // connection behind a proxy — and with it whatever it holds. Were the turn and the provider
+    // call held here, the next post to this destination (the page's retry of this very message,
+    // and then the one written after it) would go at once, while the provider was still working
+    // on this one, and could land first. So a task of its own owns the turn and the provider
+    // calls, and holds the destination until the provider has answered for the last part it tried
+    // or the provider client's own request timeout has given up on it; a caller that has gone is
+    // simply not told. It owns the send's place in the send memory too, and files what it posted
+    // there, so a caller that has gone changes nothing that is recorded (`#283
+    // send-settle-in-task`).
+    let settle = unposted.0.take();
+    match tokio::spawn(post_parts(state.clone(), posting, turn, settle)).await {
+        Ok(answer) => answer,
+        Err(stopped) if stopped.is_panic() => std::panic::resume_unwind(stopped.into_panic()),
+        // Only a runtime shutting down cancels it; whatever it had sent may have landed, and the
+        // send it held was filed as unconfirmed as it was dropped.
+        Err(stopped) => (
+            Err(OpError::Chat(ChatError::Transport(format!(
+                "the post was stopped before the provider answered: {stopped}"
+            )))),
+            None,
+        ),
+    }
+}
+
+/// Everything [`post_settled`] checks before anything is sent — the allowlist, the write policy,
+/// the thread and the key, emptiness — and the post cut in parts, with its destination's turn.
+async fn ready_to_post(
+    state: &AppState,
+    post: Post<'_>,
+) -> Result<(Posting, crate::post_lanes::Turn), OpError> {
+    let Post {
+        channel_id,
+        text,
+        reply_to,
+        thread_id,
+        idempotency_key,
+    } = post;
     let info = allowed(state, channel_id).await?;
     if !info.writable {
         return Err(OpError::ChannelNotWritable);
@@ -2954,15 +3083,6 @@ pub async fn reply_scoped(
     // for it is this request's own: a caller that goes away while it waits gives up its place, and
     // nothing of its post has been sent. See `crate::post_lanes`.
     let turn = state.post_lanes.turn(info.id.as_str(), thread_id).await;
-    // Posting is not this request's own. axum drops a handler the moment its caller closes the
-    // connection — the page stops waiting after `OUTGOING_TIMEOUT_MS`, signs out, or loses its
-    // connection behind a proxy — and with it whatever it holds. Were the turn and the provider
-    // call held here, the next post to this destination (the page's retry of this very message,
-    // and then the one written after it) would go at once, while the provider was still working
-    // on this one, and could land first. So a task of its own owns the turn and the provider
-    // calls, and holds the destination until the provider has answered for the last part it tried
-    // or the provider client's own request timeout has given up on it; a caller that has gone is
-    // simply not told.
     let posting = Posting {
         info,
         text: text.to_owned(),
@@ -2972,14 +3092,7 @@ pub async fn reply_scoped(
         thread_id: thread_id.map(str::to_owned),
         limit,
     };
-    match tokio::spawn(post_parts(state.clone(), posting, turn)).await {
-        Ok(result) => result,
-        Err(stopped) if stopped.is_panic() => std::panic::resume_unwind(stopped.into_panic()),
-        // Only a runtime shutting down cancels it; whatever it had sent may have landed.
-        Err(stopped) => Err(OpError::Chat(ChatError::Transport(format!(
-            "the post was stopped before the provider answered: {stopped}"
-        )))),
-    }
+    Ok((posting, turn))
 }
 
 /// One post, cut in parts and ready to go: everything [`post_parts`] needs, owned, so the task that
@@ -2994,12 +3107,28 @@ struct Posting {
     limit: crate::chat::PostLimit,
 }
 
-/// Post every part of `posting` in order, holding the destination's `_turn` until the provider has
-/// answered for the last part tried. The body of [`reply_scoped`], run as a task of its own.
+/// Post every part of `posting` in order, holding the destination's `turn` until the provider has
+/// answered for the last part tried and `settle`, when there is one, has filed what was posted.
+/// Run as a task of its own; see [`post_settled`].
 async fn post_parts(
     state: AppState,
     posting: Posting,
-    _turn: crate::post_lanes::Turn,
+    turn: crate::post_lanes::Turn,
+    settle: Option<Settle>,
+) -> (
+    Result<(ChannelInfo, Message, Vec<Message>), OpError>,
+    Option<u64>,
+) {
+    let result = post_each(&state, posting).await;
+    let send_seq = settle.and_then(|settle| settle.file(&state, &result));
+    drop(turn);
+    (result, send_seq)
+}
+
+/// Post every part of `posting` in order: the parts posted, or how far it got.
+async fn post_each(
+    state: &AppState,
+    posting: Posting,
 ) -> Result<(ChannelInfo, Message, Vec<Message>), OpError> {
     let Posting {
         info,
@@ -3048,7 +3177,7 @@ async fn post_parts(
         };
         match sent {
             Ok(mut one) => {
-                stamp(&state, std::slice::from_mut(&mut one));
+                stamp(state, std::slice::from_mut(&mut one));
                 // Remember that WE posted this, before anything can observe it. `#44 live-push`:
                 // the poller will see it in a few seconds, and relaying it into the live
                 // conversation would make the agent hear its own reply as new information.
