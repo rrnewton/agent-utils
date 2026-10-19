@@ -25,6 +25,10 @@ page out in Chromium and measures the box, Send and the list they are in, with a
   which takes the focus from the box to the checkbox. The box grows and the reader stays at the foot
   with Send and Grow on screen and no jump to the newest offered, in the channel's box (ten lines and
   eighty), the call's and the right column's, and in the second desk below by a click and by Space.
+  And from 30 or 40px above the foot, past the 24px that counts as the foot but with Send and Grow on
+  screen: the checkbox just ticked stays where it was and the reader as far above the foot, at
+  1280x800 by a click and by Space, at 1920x1080 by a click, and in the second desk by Space. With
+  the checkbox given the focus and then scrolled out of view up the list, Space moves nothing.
 
   A second desk whose browser does not size a field by its text (`CSS.supports` answering no for
   `field-sizing`, and `field-sizing: fixed` forced): the box grows through the height the page writes,
@@ -383,24 +387,35 @@ def typing_at_the_foot(desk: Desk, rest: Json) -> None:
     desk.notes.append(f"{desk.label}: a reader at the foot typing fourteen lines stayed at the foot, Send on screen")
 
 
-def tick_after_paste(desk: Desk, parts: tuple[str, ...], text: str, by: str = "click") -> None:
+def tick_after_paste(desk: Desk, parts: tuple[str, ...], text: str, by: str = "click", up: int = 0) -> None:
     """The owner's order: paste with Grow off, the list at its foot, see the box tiny, then tick Grow.
 
     The focus leaves the box for the checkbox as it is ticked (`by` "click" on its label, or "space" on
     the checkbox), so nothing that follows the reader's typing can be what keeps them at the foot: the
     box grows and the reader stays at the foot, Send, Grow and the box all on screen, no jump to the
     newest offered; and clicking back into the box moves nothing.
+
+    `up` px above the foot instead, past the 24px that still counts as the foot but with Send and Grow
+    on screen (at 1280x800 the label shows up to about 47px up): the checkbox just ticked stays where it
+    was, under the pointer, and so does the room under it, Send and Grow on screen.
     """
     _composer, box, _send, grow, list_id = parts
     lines = text.count("\n") + 1
     where = f"{desk.label}, #{box}, Grow ticked by {by} after a {lines}-line paste"
+    if up:
+        where += f", {up}px above the foot"
     desk.tick(grow, False)
     desk.clear(box)
     desk.paste(box, text)
     to_the_foot(desk, list_id)
+    if up:
+        desk.page.evaluate("([id, up]) => { const list = document.getElementById(id); "
+                           "list.scrollTop = list.scrollHeight - list.clientHeight - up; }", [list_id, up])
     before = desk.geometry(parts)
-    check(number(before, "gap") <= 2 and send_on_screen(before), f"{where}: the premise, at the foot with Send on "
-                                                                  f"screen before Grow is ticked, does not hold: {before}")
+    check(abs(number(before, "gap") - up) <= 2 and send_on_screen(before)
+          and number(before, "label", "bottom") <= number(before, "list", "bottom") + 0.5,
+          f"{where}: the premise, {up}px above the foot with Send and Grow on screen before Grow is ticked, does "
+          f"not hold: {before}")
     if by == "space":
         desk.page.focus(f"#{grow}")
         kb.press(desk.cdp, " ")
@@ -409,10 +424,17 @@ def tick_after_paste(desk: Desk, parts: tuple[str, ...], text: str, by: str = "c
     desk.page.wait_for_function("(id) => document.getElementById(id).checked", arg=grow, timeout=5000)
     check(desk.page.evaluate("() => document.activeElement && document.activeElement.id") == grow,
           f"{where}: the premise, the focus on the checkbox just ticked, does not hold")
+    # Where the reader is to be left: at the foot, or as far above it as they were.
+    gap = number(before, "gap") if up else 0
     after = desk.geometry(parts)
     check(number(after, "box", "height") > number(before, "box", "height") + 2 * number(after, "line"),
           f"{where}: the box did not grow: {after}")
-    check(number(after, "gap") <= 2, f"{where}: the reader is left {number(after, 'gap'):.0f}px above the foot: {after}")
+    check(abs(number(after, "gap") - gap) <= 2,
+          f"{where}: the reader is left {number(after, 'gap'):.0f}px above the foot, not {gap:.0f}px: {after}")
+    if up:
+        check(abs(number(after, "label", "top") - number(before, "label", "top")) <= 2,
+              f"{where}: the Grow checkbox just ticked moved from {number(before, 'label', 'top'):.0f}px to "
+              f"{number(after, 'label', 'top'):.0f}px: {after}")
     check(send_on_screen(after), f"{where}: Send is not wholly on screen inside the list: {after}")
     check(number(after, "label", "bottom") <= min(number(after, "list", "bottom"), number(after, "innerHeight")) + 0.5,
           f"{where}: the Grow checkbox just ticked left the screen: {after}")
@@ -420,15 +442,46 @@ def tick_after_paste(desk: Desk, parts: tuple[str, ...], text: str, by: str = "c
           f"{where}: the top of the box is above the list: {after}")
     chip = JUMP_CHIPS[list_id]
     check(desk.page.evaluate("(id) => document.getElementById(id).hidden", chip) is True,
-          f"{where}: the jump to the newest message (#{chip}) is offered at the foot")
-    desk.shot(f"tick-after-paste-{box}-{lines}-{by}")
+          f"{where}: the jump to the newest message (#{chip}) is offered {number(after, 'gap'):.0f}px above the foot")
+    desk.shot(f"tick-after-paste-{box}-{lines}-{by}" + (f"-{up}up" if up else ""))
     desk.page.click(f"#{box}")
     back = desk.geometry(parts)
-    check(number(back, "gap") <= 2 and send_on_screen(back), f"{where}: clicking back into the box left the reader "
-                                                              f"{number(back, 'gap'):.0f}px above the foot: {back}")
+    check(abs(number(back, "gap") - gap) <= 2 and send_on_screen(back),
+          f"{where}: clicking back into the box left the reader {number(back, 'gap'):.0f}px above the foot: {back}")
     desk.clear(box)
+    kept = "with the checkbox kept under the pointer" if up else "with the reader kept at the foot"
     desk.notes.append(f"{where}: grown from {number(before, 'box', 'height'):.0f}px to "
-                      f"{number(after, 'box', 'height'):.0f}px with the reader kept at the foot, Send and Grow on screen")
+                      f"{number(after, 'box', 'height'):.0f}px {kept}, Send and Grow on screen")
+
+
+def space_from_up_the_list(desk: Desk) -> None:
+    """The checkbox given the focus, then scrolled out of view up the list, and Space pressed: nothing moves.
+
+    What keeps a checkbox just ticked under the pointer is for a checkbox on screen; one the reader has
+    scrolled away from moves no list, as a box growing out of sight moves none.
+    """
+    box, grow, list_id = CHANNEL_PARTS[1], CHANNEL_PARTS[3], CHANNEL_PARTS[4]
+    where = f"{desk.label}, Grow ticked by Space with the checkbox scrolled out of view up the list"
+    desk.tick(grow, False)
+    desk.clear(box)
+    desk.paste(box, TEN)
+    to_the_foot(desk, list_id)
+    desk.page.focus(f"#{grow}")
+    desk.page.evaluate("(id) => { document.getElementById(id).scrollTop -= 300; }", list_id)
+    before = desk.geometry()
+    place = desk.page.evaluate("(id) => document.getElementById(id).scrollTop", list_id)
+    check(number(before, "label", "top") >= number(before, "list", "bottom")
+          and desk.page.evaluate("() => document.activeElement && document.activeElement.id") == grow,
+          f"{where}: the premise, the focus on a checkbox out of view, does not hold: {before}")
+    kb.press(desk.cdp, " ")
+    desk.page.wait_for_function("(id) => document.getElementById(id).checked", arg=grow, timeout=5000)
+    after = desk.geometry()
+    check(number(after, "box", "height") > number(before, "box", "height") + 2 * number(after, "line"),
+          f"{where}: the box did not grow: {after}")
+    moved = desk.page.evaluate("(id) => document.getElementById(id).scrollTop", list_id) - place
+    check(abs(moved) <= 1, f"{where}: the list moved {moved:.0f}px")
+    desk.clear(box)
+    desk.notes.append(f"{where}: the box grew out of sight and the list stayed where the reader had it")
 
 
 def call_tick_after_paste(desk: Desk) -> None:
@@ -559,6 +612,9 @@ def desk_walk(browser: Browser, url: str, args: argparse.Namespace, posts: list[
     typing_at_the_foot(desk, rest)
     tick_after_paste(desk, CHANNEL_PARTS, TEN)
     tick_after_paste(desk, CHANNEL_PARTS, LONG)
+    tick_after_paste(desk, CHANNEL_PARTS, TEN, up=30)
+    tick_after_paste(desk, CHANNEL_PARTS, TEN, by="space", up=40)
+    space_from_up_the_list(desk)
     reload_with_a_long_draft(desk, url)
     call_box_with_recap(desk)
     call_tick_after_paste(desk)
@@ -566,6 +622,7 @@ def desk_walk(browser: Browser, url: str, args: argparse.Namespace, posts: list[
     page.set_viewport_size({"width": 1920, "height": 1080})
     desk.label = "1920x1080"
     channel_box(desk, posts)
+    tick_after_paste(desk, CHANNEL_PARTS, TEN, up=30)
     two_columns(desk)
     context.close()
     return desk.notes
@@ -595,6 +652,7 @@ def fallback_walk(browser: Browser, url: str, args: argparse.Namespace, posts: l
     typing_at_the_foot(desk, rest)
     tick_after_paste(desk, CHANNEL_PARTS, TEN)
     tick_after_paste(desk, CHANNEL_PARTS, LONG, by="space")
+    tick_after_paste(desk, CHANNEL_PARTS, TEN, by="space", up=30)
     desk.tick(grow, False)
     off = desk.geometry()
     check(off["growHeight"] == "", f"without field-sizing, Grow off left a height on the box: {off}")

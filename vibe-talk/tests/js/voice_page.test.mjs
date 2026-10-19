@@ -20764,6 +20764,9 @@ test("`#340 composer-grow-box`: A READER AT THE FOOT WHO PASTES AND THEN TICKS G
   const box = page.el("channel-compose-text");
   const grow = page.el("channel-compose-grow");
   grow.getClientRects = () => [{ top: 0, bottom: 24 }];
+  // On a desk the checkbox is drawn on Send's row, so it stands where Send does. (The layout tree leaves
+  // its label out: the word Grow would take a line of its own here, under Send.)
+  grow.getBoundingClientRect = () => page.el("channel-send").getBoundingClientRect();
   // What the stylesheet does with a long draft: the box at rest is three lines, and ticked it grows to its cap.
   box.height = () => (screen.hasAttribute("data-composer-grow") ? 400 : 80);
   const gap = () => area.scrollHeight - area.scrollTop - area.clientHeight;
@@ -20778,14 +20781,54 @@ test("`#340 composer-grow-box`: A READER AT THE FOOT WHO PASTES AND THEN TICKS G
   await grow.setChecked(true);
   page.resized(box);
   assert.ok(atBottomOf(area), `ticking Grow after a paste left the reader ${gap()}px above the foot`);
-  // From up the list, Grow off and on again moves nothing.
+  // From up the list, the checkbox scrolled out of view with the focus still on it, Space unticks and
+  // ticks it again: nothing moves.
   await grow.setChecked(false);
   page.resized(box);
   area.scrollTop = 0;
   await area.dispatch("scroll");
+  assert.ok(grow.getBoundingClientRect().top > area.clientHeight, "the premise: the checkbox is out of view below the list");
   await grow.setChecked(true);
   page.resized(box);
   assert.equal(area.scrollTop, 0, "ticking Grow moved a reader up the list");
+});
+
+test("`#340 composer-grow-box`: A READER A LITTLE ABOVE THE FOOT, past its slack, WHO TICKS Grow after a paste keeps the checkbox where it was as the box grows, and the room under it, so Send and Grow stay on screen", async () => {
+  const page = newPage(new Map(), SCRIPT, (p) => p.enableResizeObserver());
+  await signIn(page);
+  await showDiscord(page, tallChannel(30));
+  const screen = page.el("screen-main");
+  const area = page.el("scroll-area");
+  const box = page.el("channel-compose-text");
+  const grow = page.el("channel-compose-grow");
+  grow.getClientRects = () => [{ top: 0, bottom: 24 }];
+  grow.getBoundingClientRect = () => page.el("channel-send").getBoundingClientRect();
+  box.height = () => (screen.hasAttribute("data-composer-grow") ? 400 : 80);
+  // What a browser draws under Send's row: the composer's padding and the list's, which at 1280x800
+  // let the Grow label show for a reader up to about 47px above the foot. Past the slack that counts
+  // as the foot, then, Send and Grow can still be on screen, and the click lands there.
+  page.el("channel-compose-state").height = () => 50;
+  const gap = () => area.scrollHeight - area.scrollTop - area.clientHeight;
+  box.focus();
+  await box.setValue("line\n".repeat(40));
+  page.resized(box);
+  for (const up of [BOTTOM_SLACK_PX + 6, BOTTOM_SLACK_PX + 16]) {
+    const where = `${up}px above the foot`;
+    assert.equal(grow.checked, false, `the premise: Grow is off (${where})`);
+    area.scrollTop = area.scrollHeight - area.clientHeight - up;
+    await area.dispatch("scroll");
+    assert.ok(gap() === up && !atBottomOf(area), `the premise: the reader is ${up}px above the foot, not at it: ${gap()}`);
+    const seen = grow.getBoundingClientRect();
+    assert.ok(seen.top >= 0 && seen.bottom <= area.clientHeight, `the premise: the checkbox is on screen (${where})`);
+    grow.focus();
+    await grow.setChecked(true);
+    page.resized(box);
+    assert.equal(grow.getBoundingClientRect().top, seen.top,
+      `ticking Grow ${where} moved the checkbox just ticked from ${seen.top} to ${grow.getBoundingClientRect().top}`);
+    assert.equal(gap(), up, `ticking Grow ${where} left the reader ${gap()}px above the foot`);
+    await grow.setChecked(false);
+    page.resized(box);
+  }
 });
 
 // --- the keyboard (#224 keyboard-shortcuts) -------------------------------------------------------

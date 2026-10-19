@@ -7702,7 +7702,8 @@ function writingToAgent() {
 //   * AND AS GROW IS TICKED: the owner pastes, sees the box tiny, then ticks Grow, and the box that
 //     grows then is not the one with the focus, which the click or Space has put on the checkbox. A
 //     reader at the foot of a list is kept at its foot as Grow changes the boxes in it
-//     (`applyComposerGrow`); one up the list is not moved.
+//     (`applyComposerGrow`); one a little above it, the checkbox on screen, has the checkbox kept
+//     where it was, under the pointer, and Send with it; one who scrolled it away is not moved.
 
 const COMPOSER_GROW_KEY = "vibe-talk.voice.composer-grow";
 
@@ -7734,6 +7735,12 @@ function storedComposerGrow() {
  * put back at its foot once the boxes in it are drawn at their new height, so a draft pasted before
  * Grow was ticked grows with Send in view; `keepGrowingBoxInView` cannot do it, since the focus is on
  * the checkbox now, not the box. Both lists, as the one choice grows the boxes in both.
+ *
+ * A reader a little above the foot, past its slack, can still have Send and Grow on screen (at
+ * 1280x800 the label shows up to about 47px above it), and the box growing above the checkbox would
+ * push both off. So the checkbox just ticked, if any of it was on screen in its list, is kept where it
+ * was, under the pointer, by scrolling its list as far as the redraw moved it, and with it the room
+ * under Send. A checkbox the reader had scrolled away before pressing Space moves nothing.
  */
 function applyComposerGrow(on) {
   try {
@@ -7742,8 +7749,29 @@ function applyComposerGrow(on) {
     // A browser that refuses storage still honours the choice for this session.
   }
   const footed = ["scroll-area", "side-scroll"].map((id) => leftEl(id)).filter((area) => atBottom(area));
+  const ticked = growTickedInView();
   renderComposerGrow(on);
   for (const area of footed) area.scrollTop = area.scrollHeight;
+  if (ticked && !footed.includes(ticked.area)) {
+    ticked.area.scrollTop += ticked.grow.getBoundingClientRect().top - ticked.top;
+  }
+}
+
+/**
+ * The Grow checkbox with the focus, which a click or Space has just ticked, if any of it is on screen
+ * in its list: with that list, and where in the window it is.
+ *
+ * @returns {{ grow: HTMLElement, area: HTMLElement, top: number } | null}
+ */
+function growTickedInView() {
+  const grow = /** @type {HTMLElement | null} */ (document.activeElement);
+  const at = grow ? COMPOSER_GROW_IDS.indexOf(grow.id) : -1;
+  if (!grow || at < 0) return null;
+  const area = growingBoxList(leftEl(COMPOSER_GROW_BOXES[at]));
+  const rect = grow.getBoundingClientRect();
+  const top = area.getBoundingClientRect().top;
+  if (rect.bottom <= top || rect.top >= top + (area.clientHeight || 0)) return null;
+  return { grow, area, top: rect.top };
 }
 
 /**

@@ -6774,8 +6774,10 @@ the call's box and the right column's box. Ticked, the box grows with what you t
 about 60% of the window's height; beyond that it scrolls inside, so Send stays on screen. While you
 type in a growing box, its Send is kept in view in the list; a box that grows without the focus (a
 draft put back) moves nothing under you. Tick Grow after pasting, at the foot of the list, and the
-box grows with you kept at the foot, Send and the checkbox on screen; up the list, ticking it moves
-nothing. An empty box rests at the height it always had.
+box grows with you kept at the foot, Send and the checkbox on screen; a little above the foot, the
+checkbox stays where it was under the pointer, and Send with it, as the box grows above them. With
+the checkbox scrolled out of view (given the focus, then Space), ticking it moves nothing. An empty
+box rests at the height it always had.
 
 - **Off by default.** One choice for all three boxes, stored on this device under
   `vibe-talk.voice.composer-grow` (`1` on, `0` off; absent means off and is not written down).
@@ -6792,7 +6794,7 @@ nothing. An empty box rests at the height it always had.
 and a short 1280x600 window, with the checkbox off and on, with the browser's own sizing turned off,
 in the right column, in the call's box with its recap line (`#331 resume-on-websocket`) shown
 above it, after a reload with a long draft, with Grow ticked by a click or Space after a paste at
-the foot of the list, and on a 393x852 phone.
+the foot of the list, 30 or 40px above it, and from up the list, and on a 393x852 phone.
 
 ### The keyboard: scrolling, search and Settings
 
