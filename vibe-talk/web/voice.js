@@ -42062,7 +42062,10 @@ function fillChannelSelect(id) {
   select.replaceChildren();
   // `#349 channel-settings-all`. Settings' picker opens with All channels where there is more than
   // one: Clear unread set for every channel at once. Never the reading picker's: a view reads one.
-  const all = id === "settings-channel" && knownChannels.length >= 2;
+  // `#351 settings-polish`: and only where one of them, at least, can take Clear unread with this
+  // token. All channels is for that one setting, and Rename and Remove step aside for it, so with none
+  // that can (no chat service that clears unread, or a read token) it was a choice that left nothing to do.
+  const all = id === "settings-channel" && knownChannels.length >= 2 && upstreamClearAllChannels().length > 0;
   if (all) {
     const option = document.createElement("option");
     option.value = ALL_CHANNELS;
@@ -43381,6 +43384,11 @@ function applyClientConfig(config) {
   if (channelRegistrationSupported) {
     el("new-channel-writable").checked = false;
   }
+  // `#232 upstream-mark-read`. Read per channel, by `upstreamClearOffered`, in the channel box —
+  // and, with the token's scope, by Settings' picker as it is filled, which offers All channels only
+  // where one channel can take Clear unread (`#351 settings-polish`). So both before the pickers.
+  deploymentCapabilities.upstreamClear = config.upstream_clear_supported === true;
+  tokenScope = ["read", "write"].includes(config.token_scope) ? config.token_scope : null;
   fillChannelSelect("discord-channel");
   fillChannelSelect("settings-channel");
   // The picker has only just been given a value, and both halves of the box are scoped by it —
@@ -43398,8 +43406,6 @@ function applyClientConfig(config) {
       : "off";
   upstreamReadMarkSupported = config.upstream_read_mark_supported === true;
   deploymentCapabilities.upstreamReadMark = upstreamReadMarkSupported;
-  // `#232 upstream-mark-read`. Read per channel, by `upstreamClearOffered`, in the channel box.
-  deploymentCapabilities.upstreamClear = config.upstream_clear_supported === true;
   // `#195 send-resilience`. Read per channel, by `channelPostsOnce`, when a send fails.
   deploymentCapabilities.idempotentPosts = config.idempotent_posts_supported === true;
   // `#252 thread-button-state`. Read per channel, by `channelRepliesInThread`, on the reply screen.
@@ -43413,9 +43419,8 @@ function applyClientConfig(config) {
   // The picker already holds a channel; the flags above are the deployment's, and that channel's
   // own provider may answer differently.
   applyChannelProvider();
-  tokenScope = ["read", "write"].includes(config.token_scope) ? config.token_scope : null;
-  // The channel box was drawn above, before the scope was known; the clear-unread control is
-  // offered only to a token that may change it.
+  // The clear-unread control is offered only to a token that may change it (`tokenScope`, above), on
+  // a channel whose provider can, which `applyChannelProvider` has just settled.
   renderUpstreamClear();
   // `#46 conversation-replay`. What the SERVER permits, which is not the same as what the reader
   // has asked for — and the screen has to be able to say which of the two is stopping it.

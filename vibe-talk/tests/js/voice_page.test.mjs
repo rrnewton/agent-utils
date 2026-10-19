@@ -58630,6 +58630,55 @@ test("`#349 channel-settings-all`: the picker opens with All channels where ther
   assert.deepStrictEqual(pickerChoices(one), [[CHANNEL.id, "lead team"]]);
 });
 
+test("`#351 settings-polish`: All channels is offered only where a channel can take Clear unread with this token", async () => {
+  const offersAll = (page) => pickerChoices(page).some(([value]) => value === "*");
+  // A chat service that cannot clear unread: two channels, and nothing All channels could set.
+  const unable = newPage();
+  unable.channels = [{ ...CHANNEL }, { ...OTHER_CHANNEL }];
+  await signIn(unable);
+  await unable.el("open-settings").click();
+  await unable.settle();
+  assert.deepStrictEqual(pickerChoices(unable), [[CHANNEL.id, "lead team"], [OTHER_CHANNEL.id, "build noise"]],
+    "All channels is offered where no channel's chat service can clear unread");
+  // Providers, none of whose channels can.
+  const provider = (key, name) => ({
+    key, name, threading_supported: false, live_delivery: "push", live_poll_seconds: 0,
+    channel_registration_supported: false, channel_discovery_supported: false, upstream_read_mark_supported: false,
+    self_author_id: null, owner_author_id: null,
+  });
+  const neither = await clearingPage((page) => {
+    page.channels = [{ id: "C0123ABCDE", label: "slack team", writable: true, provider: "slack" },
+      { id: "C0123ABCDF", label: "other team", writable: true, provider: "slack" }];
+    page.providers = [provider("slack", "Slack")];
+  });
+  assert.equal(offersAll(neither), false, "All channels is offered where no provider can clear unread");
+  // A read token, where the chat service can: it may change no channel's setting.
+  const reader = await allChannelsPage({}, (page) => { page.tokenScope = "read"; });
+  assert.equal(offersAll(reader), false, "All channels is offered to a read token");
+  // ...and the same channels with a write token offer it, read from the first answer the server gives.
+  const writer = await allChannelsPage();
+  assert.equal(offersAll(writer), true, "All channels is not offered where both channels can clear unread");
+  // Signed in again with a read token while on All channels: it goes, and the box is about one channel.
+  await settingsChannel(writer, "*");
+  writer.tokenScope = "read";
+  writer.el("api-token").value = "read-token-bbbbbbbbbbbbbbbbbbbb";
+  await writer.el("save-token").click();
+  await writer.settle();
+  if (writer.screen() !== "settings") await writer.el("open-settings").click();
+  await writer.settle();
+  assert.equal(offersAll(writer), false, "All channels outlived the write token");
+  assert.equal(writer.el("settings-channel").value, CHANNEL.id);
+  assert.equal(writer.el("rename-channel").hidden, false, "the box stayed on All channels' acts");
+  assert.match(writer.el("channel-facts").textContent, /"lead team"/);
+  // The negative control: a picker that offers it wherever there are two channels.
+  const blind = newPage(new Map(), brokenScript(" && upstreamClearAllChannels().length > 0;", ";"));
+  blind.channels = [{ ...CHANNEL }, { ...OTHER_CHANNEL }];
+  await signIn(blind);
+  await blind.el("open-settings").click();
+  await blind.settle();
+  assert.equal(offersAll(blind), true, "the negative control left All channels out anyway, so the check above proves nothing");
+});
+
 test("`#349 channel-settings-all`: with All channels, Rename and Remove step aside, Add and Browse stay, and the line says how many", async () => {
   const page = await allChannelsPage({}, (page) => { page.channelDiscoverySupported = true; });
   await settingsChannel(page, "*");
