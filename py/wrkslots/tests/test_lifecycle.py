@@ -14374,8 +14374,8 @@ def test_submodule_remote_identity_accepts_same_repository_across_transport(
             "git@github.com:someone-else/agent-utils.git",
         ),
         (
-            "https://github.com/rrnewton/agent-utils.git",
-            "git@github.com:rrnewton/different.git",
+            "https://github.com/example-user/agent-utils.git",
+            "git@github.com:example-user/different.git",
         ),
         (
             "https://github.com/rrnewton/agent-utils.git",
@@ -49808,7 +49808,7 @@ def test_stale_row_for_another_slot_does_not_refuse_this_command(
 ) -> None:
     """A row whose directory is gone must not refuse a command naming a different slot.
 
-    Measured on devbig014 2026-09-03: 47 of 92 registered rows had lost their
+    Measured on a shared host 2026-09-03: 47 of 92 registered rows had lost their
     directories and 13 commands gated on the whole registry, so `wrkslots adopt
     demos-calib` died reporting `lander-3`. The reported name was simply the
     first record the loop reached, so repairing that one directory would have

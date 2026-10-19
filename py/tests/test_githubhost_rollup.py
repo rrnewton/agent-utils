@@ -448,7 +448,7 @@ def test_repository_triage_role_is_authority_despite_read_base_permission() -> N
         ("write", "different-actor", False, "release-authority", "release-authority", 1, "", True),
         ("write", "release-authority", True, "release-authority", "release-authority", 1, "", True),
         ("write", "release-authority", False, "different-actor", "release-authority", 1, "write", False),
-        ("write", "devbig014", False, "departed", "devbig014", 1, "write", False),
+        ("write", "host-a", False, "departed", "host-a", 1, "write", False),
         ("write", "release-authority", False, "departed", None, 0, "", False),
     ],
 )

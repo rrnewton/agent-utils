@@ -10151,7 +10151,7 @@ def _assert_registry_storage_consistent(
     # to a slot it had never touched, so the agent investigated its own state and
     # found nothing wrong. Two lanes did exactly that.
     #
-    # Measured 2026-09-03 on devbig014: 47 of 92 registered rows fail this check
+    # Measured 2026-09-03 on a shared host: 47 of 92 registered rows fail this check
     # and 11 call sites gate on it. A precondition that half the population fails
     # is not gating work, it is stopping arbitrary work -- nobody clears 47 rows
     # incidentally. `wrkslots adopt demos-calib` reported `lander-3`, which is not
@@ -10233,7 +10233,7 @@ def _assert_registry_storage_consistent(
     # MISSING HERE. That earlier fix scoped one of this function's three checks
     # and left two global, so the defect it describes survived in a second
     # shape: a Git-registered path inside the managed root with no row refused
-    # every mutating command for every lane. Measured 2026-09-04 on devbig014,
+    # every mutating command for every lane. Measured 2026-09-04 on a shared host,
     # one such directory -- `lander-2-pr2799-final` -- refused `adopt`, `hold`
     # and `finish` for FIVE unrelated agents, each of which read a message
     # naming a slot it had never touched, investigated its own state, found

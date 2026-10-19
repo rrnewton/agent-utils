@@ -10,7 +10,7 @@ server itself, every pane it creates inherits that confinement and the whole too
 elaborate way to get the same 403 — silently, because nothing about the pane would look different.
 So :meth:`HerdrClient.ensure_server` always launches through ``systemd-run --user``, which reparents
 the server onto the user manager outside the jail. Control CALLS do not need that (the server's unix
-socket is reachable from inside; measured on devbig014 2026-08-06), and default to going direct.
+socket is reachable from inside; measured on a development host 2026-08-06), and default to going direct.
 
 Every executable and the account home are resolved lazily, at the first call that needs them, in
 one fixed order (Herdr, then ``systemd-run``, then the account home), so a subcommand that never
@@ -60,7 +60,7 @@ CONTROL_TIMEOUT_SECONDS = 30.0
 
 #: Tokio runtime workers for the server. Herdr is a static musl binary, and musl's mallocng has one
 #: global allocator lock; tokio's default of one worker per core turns that lock into a convoy on a
-#: many-core host. Measured on devbig014 (316 cores, 260 panes) 2026-08-10: uncapped the server sat
+#: many-core host. Measured on a 316-core host (260 panes) 2026-08-10: uncapped the server sat
 #: at >1000% CPU with ~98% of cycles in the kernel's futex spinlock and every control call timing
 #: out; capped at 16 the same session served ``pane list`` in 0.03s. This bounds only the runtime
 #: workers -- the per-pane blocking threads are separate and still scale with pane count.

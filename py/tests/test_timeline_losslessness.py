@@ -73,7 +73,7 @@ def _root_bytes(*, extra: bytes = b"") -> bytes:
                         "session_id": ROOT,
                         "timestamp": _iso(1_000),
                         "cwd": "/home/private/customer/project",
-                        "git": {"repository_url": "git@github.com:rrnewton/dev-widget.git"},
+                        "git": {"repository_url": "git@github.com:example-user/dev-widget.git"},
                         "source": "cli",
                     },
                 ),

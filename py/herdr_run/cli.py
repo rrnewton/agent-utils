@@ -1127,7 +1127,7 @@ def _cmd_reap(config: Config, environ: Mapping[str, str]) -> int:
 
     ``occupancy`` measures that gap instead of only naming it: herdr's live pane list, which is what
     the cap counts, split by whether a surviving run record names each pane. Measured 2026-10-02 on
-    devbig030, the cap was held by live panes with no record while ``reap`` listed only records,
+    a 316-core host, the cap was held by live panes with no record while ``reap`` listed only records,
     so its output could not say what was holding the cap.
 
     ``replaceable`` says whether that matters: the cap replaces an idle unsplit tab before it

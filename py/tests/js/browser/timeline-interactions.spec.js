@@ -1609,7 +1609,7 @@ test("a delayed lifetime shard refreshes a detail view after the modal closes", 
 
 test("the header identifies the project, execution host, and archive timezone", async function ({ page }) {
   const heading = page.locator("#site-title");
-  await expect(heading).toHaveText("Agent Timeline: dev-widget, devbig014");
+  await expect(heading).toHaveText("Agent Timeline: dev-widget, host-a");
   await expect(heading.getByRole("link", { name: "dev-widget" })).toHaveAttribute(
     "href",
     "https://github.com/example-org/dev-widget"
@@ -1618,7 +1618,7 @@ test("the header identifies the project, execution host, and archive timezone", 
     "rel",
     "noopener noreferrer"
   );
-  await expect(page).toHaveTitle("Agent Timeline: dev-widget, devbig014");
+  await expect(page).toHaveTitle("Agent Timeline: dev-widget, host-a");
   await expect(page.locator("#dataset-meta")).toContainText(
     "display America/New_York (explicit)"
   );
@@ -1627,7 +1627,7 @@ test("the header identifies the project, execution host, and archive timezone", 
   await details.locator("summary").click();
   await expect(details).toHaveAttribute("open", "");
   await expect(page.locator("#site-identity-list")).toContainText(
-    "devbig014.example.com"
+    "host-a.example.com"
   );
   await expect(page.locator("#site-identity-list")).toContainText(
     "from session metadata"

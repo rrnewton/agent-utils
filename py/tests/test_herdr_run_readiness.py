@@ -19,7 +19,7 @@ from herdr_run.readiness import assess_process, assess_prompt, infer_prompt_tail
 
 
 def test_parses_the_real_bashrc_prompt_from_this_fleet() -> None:
-    """The exact PS1 in use on devbig014 — a two-line prompt ending in a colour-reset escape."""
+    """A real two-line PS1 that ends in a colour-reset escape."""
     rc = (
         '# PS1="commented out, must be ignored"\n'
         'PS1="\\[\\033[0;34m\\][\\[\\033[0;31m\\]\\u\\[\\033[0;31m\\]@\\[\\033[0;31m\\]\\h '
@@ -70,28 +70,28 @@ def test_inference_abstains_when_no_rc_file_is_readable() -> None:
 
 def test_prompt_clean_on_bare_prompt() -> None:
     """`herdr pane read` strips trailing spaces, so an idle "$ " prompt renders as the line "$"."""
-    signal = assess_prompt("[newton@devbig014 ~/work/dev-widget]\n$\n", "$ ")
+    signal = assess_prompt("[user@host ~/work/dev-widget]\n$\n", "$ ")
     assert signal.verdict == "clean"
 
 
 def test_prompt_dirty_on_half_typed_command() -> None:
     """The case the process signal CANNOT see: shell idle, but a human left text on the line."""
-    signal = assess_prompt("[newton@host ~]\n$ echo I-WAS-HALF-TYPED\n", "$ ")
+    signal = assess_prompt("[user@host ~]\n$ echo I-WAS-HALF-TYPED\n", "$ ")
     assert signal.verdict == "dirty"
     assert "I-WAS-HALF-TYPED" in signal.reason
 
 
 def test_prompt_clean_for_single_line_prompt() -> None:
-    assert assess_prompt("[newton@host ~]$\n", "$ ").verdict == "clean"
+    assert assess_prompt("[user@host ~]$\n", "$ ").verdict == "clean"
 
 
 def test_prompt_dirty_for_single_line_prompt_with_text() -> None:
-    assert assess_prompt("[newton@host ~]$ git status\n", "$ ").verdict == "dirty"
+    assert assess_prompt("[user@host ~]$ git status\n", "$ ").verdict == "dirty"
 
 
 def test_prompt_abstains_without_a_tail() -> None:
     """No inferable prompt must ABSTAIN, never guess in either direction."""
-    signal = assess_prompt("[newton@host ~]$\n", None)
+    signal = assess_prompt("[user@host ~]$\n", None)
     assert signal.verdict == "abstain"
 
 
@@ -104,7 +104,7 @@ def test_prompt_abstains_on_empty_pane() -> None:
 
 
 def test_prompt_ignores_blank_trailing_lines() -> None:
-    assert assess_prompt("[newton@host ~]\n$\n\n\n", "$ ").verdict == "clean"
+    assert assess_prompt("[user@host ~]\n$\n\n\n", "$ ").verdict == "clean"
 
 
 # --- process signal ----------------------------------------------------------------------------

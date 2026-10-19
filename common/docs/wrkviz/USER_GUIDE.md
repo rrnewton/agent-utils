@@ -179,7 +179,7 @@ unrelated work, use a source-native message boundary instead:
 
 ```bash
 wrkviz ingest-orc \
-  --source-root ~/agent_logs_archive/devbig014 \
+  --source-root ~/agent_logs_archive/host-a \
   --root-session ORIGINAL_UUID \
   --continuation-session NEXT_UUID \
   --continuation-session '{"session_id":"REUSED_UUID","start_message_id":"MESSAGE_UUID"}' \
@@ -215,7 +215,7 @@ continuations, timezone, and site identity:
       "provider": "codex",
       "source_hosts": ["build014.example.com"],
       "source": {
-        "sessions_root": "../devbig014/.codex/sessions",
+        "sessions_root": "../host-a/.codex/sessions",
         "root_session": "ROOT_UUID",
         "continuation_sessions": ["NEXT_ROOT_UUID"]
       }
@@ -225,7 +225,7 @@ continuations, timezone, and site identity:
       "provider": "claude",
       "source_hosts": ["build176.example.com"],
       "source": {
-        "session_file": "../devbig176/.claude/projects/PROJECT/SESSION.jsonl"
+        "session_file": "../host-c/.claude/projects/PROJECT/SESSION.jsonl"
       }
     },
     {
@@ -242,7 +242,7 @@ continuations, timezone, and site identity:
         }
       ],
       "source": {
-        "source_root": "../devbig014",
+        "source_root": "../host-a",
         "root_session": "ORC_SESSION_UUID",
         "continuation_sessions": [
           "NEXT_ORC_SESSION_UUID",
@@ -1318,7 +1318,7 @@ Read that first, decide, and only then override — with the session id the refu
 ```bash
 wrkviz ingest-orc \
   --output ../summary/widget --team orc-example-014 \
-  --source-root ../raw/devbig014 --root-session SESSION_UUID \
+  --source-root ../raw/host-a --root-session SESSION_UUID \
   --accept-orc-prefix-rewrite SESSION_UUID
 ```
 

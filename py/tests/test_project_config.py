@@ -76,7 +76,7 @@ def _manifest(output: str = "../summary/widget") -> dict[str, object]:
                 "provider": "codex",
                 "source_hosts": ["codex.example.com"],
                 "source": {
-                    "sessions_root": "../raw/devbig014/.codex/sessions",
+                    "sessions_root": "../raw/host-a/.codex/sessions",
                     "root_session": "codex-root",
                     "continuation_sessions": ["codex-next", "codex-last"],
                 },
@@ -86,7 +86,7 @@ def _manifest(output: str = "../summary/widget") -> dict[str, object]:
                 "provider": "claude",
                 "timezone": "UTC",
                 "source": {
-                    "session_file": "../raw/devbig176/.claude/projects/p/root.jsonl"
+                    "session_file": "../raw/host-c/.claude/projects/p/root.jsonl"
                 },
             },
             {
@@ -104,7 +104,7 @@ def _manifest(output: str = "../summary/widget") -> dict[str, object]:
                     }
                 ],
                 "source": {
-                    "source_root": "../raw/devbig014",
+                    "source_root": "../raw/host-a",
                     "root_session": "orc-root",
                     "continuation_sessions": [
                         "orc-next",
@@ -170,7 +170,7 @@ def test_load_project_config_resolves_paths_and_provider_schema(tmp_path: Path) 
     codex, claude, orc = config.teams
     assert isinstance(codex.source, CodexProjectSource)
     assert codex.source.sessions_root == (
-        tmp_path / "raw" / "devbig014" / ".codex" / "sessions"
+        tmp_path / "raw" / "host-a" / ".codex" / "sessions"
     ).resolve()
     assert codex.source.continuation_sessions == ("codex-next", "codex-last")
     assert codex.date_window is not None
@@ -1150,7 +1150,7 @@ def test_project_prefix_rewrite_override_reaches_only_the_named_team_and_session
             "provider": "orc",
             "projects": [],
             "source": {
-                "source_root": "../raw/devbig015",
+                "source_root": "../raw/host-b",
                 "root_session": "orc-other-root",
             },
         }

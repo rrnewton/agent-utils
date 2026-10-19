@@ -1165,7 +1165,7 @@ def test_build_embeds_standalone_site_identity(tmp_path: Path) -> None:
                 "session_metadata",
             ),
         ),
-        (HostIdentity("devbig014", "explicit"),),
+        (HostIdentity("host-a", "explicit"),),
         team.display_timezone,
         "explicit",
     )

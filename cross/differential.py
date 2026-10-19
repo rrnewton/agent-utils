@@ -11824,7 +11824,7 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
 
         for label, event_author in (
             ("departed-issuer", "departed-reviewer"),
-            ("hostname-issuer", "devbig014"),
+            ("hostname-issuer", "host-a"),
         ):
             named = dict(review_fixture)
             named_pr = dict(review_pr)
@@ -11925,7 +11925,7 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
             {
                 "kind": "issue-comment",
                 "identity": "comment-5545346256",
-                "author": "rrnewton",
+                "author": "example-user",
                 "state": "ACTIVE",
                 "head_sha": "",
                 "created_at": "2026-09-04T19:14:42Z",
@@ -11942,7 +11942,7 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
             {
                 "kind": "issue-comment",
                 "identity": "comment-5552679512",
-                "author": "rrnewton",
+                "author": "example-user",
                 "state": "ACTIVE",
                 "head_sha": "",
                 "created_at": "2026-09-05T15:03:48Z",
@@ -11960,7 +11960,7 @@ def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
             {
                 "kind": "issue-comment",
                 "identity": "comment-5552753110",
-                "author": "rrnewton",
+                "author": "example-user",
                 "state": "ACTIVE",
                 "head_sha": "",
                 "created_at": "2026-09-05T15:16:26Z",

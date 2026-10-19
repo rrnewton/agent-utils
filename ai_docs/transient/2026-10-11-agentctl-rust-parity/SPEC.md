@@ -528,7 +528,7 @@ Rough total: 100–130 agent-days.
 
 **Boundary.**
 - The chat agent owns the host. Plugin protocol v1 and helper wire v1 are not changed, because the Meta-internal integration depends on them.
-- Inside Meta, a Rust Iris subscription plugin and outbound helper (fbsource `fbcode/scripts/newton/agentctl-iris-plugin`, unlanded) serve Google Chat for Rust agentctl. They cannot be published.
+- A private Rust subscription plugin and outbound helper, kept outside this repository, serve Google Chat for Rust agentctl. They cannot be published.
 - The public provider uses the already-reserved capability `chat-subscription.google-chat.polling` (`plugins.rs:1470`; `scripts/check_rust_packages.py:328`). Discovery refuses duplicate capabilities, so check that the Iris manifest uses a different ID.
 
 - **M6a provider crate (L):** CHAT-01 to CHAT-04, CHAT-15 (part), CHAT-24.

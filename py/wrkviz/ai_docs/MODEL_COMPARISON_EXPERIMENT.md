@@ -256,7 +256,7 @@ Every arm copied and ingested the same source snapshot:
 
 The root session was `019fcfe7-0f68-7301-8aab-c2f90a7026c7`. The display
 timezone was `America/New_York`; the declared primary project and host were
-`dev-consumer-a` and `devbig014`.
+`dev-consumer-a` and `host-a`.
 
 | Attempt | Artifact directory |
 |---|---|

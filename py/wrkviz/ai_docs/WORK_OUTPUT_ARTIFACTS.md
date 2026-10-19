@@ -99,7 +99,7 @@ leading `cd` to a project.
 
 A source host is the machine where the recorded team ran, not the ingest machine and
 not `github.com`. Store a user-facing alias plus its provenance. Imported backups
-must accept explicit metadata such as `--source-host devbig014`; guessing from a
+must accept explicit metadata such as `--source-host host-a`; guessing from a
 backup-directory name is not reliable. Provider metadata may supply a host when it
 actually records one. Never substitute `socket.gethostname()` while importing a
 snapshot from another machine.
@@ -248,7 +248,7 @@ Build site identity from the same project/host catalogs. Rank the primary projec
 An explicit setting always wins, especially for a superproject with active
 submodules. Keep all contributing projects and source hosts even when one is
 primary. Render one project and one host as, for example,
-`Agent Timeline: dev-consumer-a, devbig014`, with the project name linked. Render
+`Agent Timeline: dev-consumer-a, host-a`, with the project name linked. Render
 `multi-repo` or `multi-host` when necessary and expose the complete, evidenced list
 in a tooltip/menu. A project may have several teams and hosts; a team may touch
 several projects. Do not encode either relationship as a single field on `TeamData`.

@@ -60,7 +60,7 @@
 //! the tab is GONE. There is nothing to close, and it holds none of `max_panes`, because the cap
 //! counts herdr's live pane list rather than run records. GONE needs a listing that succeeded: a
 //! listing that failed is UNKNOWN, since "herdr did not answer" must never read as "every pane is
-//! gone". Measured 2026-10-02 on devbig030: 15 of the 32 records `reap` reported were such closed
+//! gone". Measured 2026-10-02 on a 316-core host: 15 of the 32 records `reap` reported were such closed
 //! tabs, reported as UNKNOWN, and read as capacity nobody could reclaim while the cap was in fact
 //! held by live panes with no surviving record.
 //!

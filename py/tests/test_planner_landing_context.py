@@ -641,7 +641,7 @@ def test_retirement_uses_event_author_permission_and_ignores_claimed_identity() 
             replace(snapshot, events=(replace(event, author=""),))
         )
     hostname_author = replace(
-        snapshot, events=(replace(event, author="devbig014"),)
+        snapshot, events=(replace(event, author="host-a"),)
     )
     assert review_evidence_digest(hostname_author) != write_digest
     for claimed_identity in (

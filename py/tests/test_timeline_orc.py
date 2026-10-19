@@ -2304,7 +2304,7 @@ def test_classifies_orc_inputs_from_user_source_and_extra(tmp_path: Path) -> Non
                 {
                     "GChat": {
                         "message_name": "spaces/x/messages/owner",
-                        "sender_unixname": "newton",
+                        "sender_unixname": "example-user",
                         "sender_name": "users/owner-id",
                         "is_owner": True,
                     }
@@ -2456,7 +2456,7 @@ def test_classifies_orc_inputs_from_user_source_and_extra(tmp_path: Path) -> Non
 
     owner = events["orc-block-gchat-owner"]
     assert owner.kind == "user_prompt"
-    assert owner.author == "newton"
+    assert owner.author == "example-user"
     assert owner.author_kind == "owner_human"
     assert owner.ingress_kind == "gchat"
     assert owner.source_native_id == "spaces/x/messages/owner"

@@ -26,17 +26,17 @@ def test_structured_codex_metadata_infers_projects_without_prompt_scanning() -> 
     projects, hosts = infer_structured_identity(
         (
             {
-                "cwd": "/home/newton/work/dev-widget",
+                "cwd": "/home/user/work/dev-widget",
                 "git": {
                     "repository_url": "https://github.com/example-org/dev-widget.git"
                 },
             },
             {
-                "cwd": "/home/newton/work/agent-utils",
+                "cwd": "/home/user/work/agent-utils",
                 "git": {
                     "repository_url": "git@github.com:example-org/agent-utils.git"
                 },
-                "hostname": "devbig014.example.com",
+                "hostname": "host-a.example.com",
             },
         )
     )
@@ -45,7 +45,7 @@ def test_structured_codex_metadata_infers_projects_without_prompt_scanning() -> 
         ("dev-widget", True),
         ("agent-utils", False),
     ]
-    assert [item.hostname for item in hosts] == ["devbig014.example.com"]
+    assert [item.hostname for item in hosts] == ["host-a.example.com"]
     assert all(item.source == "session_metadata" for item in projects)
     assert all(item.source == "session_metadata" for item in hosts)
 
@@ -61,7 +61,7 @@ def test_identity_merge_accumulates_distinct_projects_and_hosts() -> None:
                 "session_metadata",
             ),
         ),
-        (HostIdentity("devbig014.example.com", "explicit"),),
+        (HostIdentity("host-a.example.com", "explicit"),),
         "America/New_York",
         "explicit",
     )
@@ -75,7 +75,7 @@ def test_identity_merge_accumulates_distinct_projects_and_hosts() -> None:
     )
     explicit, explicit_hosts = parse_identity_overrides(
         ("Widget=https://github.com/example-org/widget.git",),
-        ("devbig015",),
+        ("host-b",),
     )
 
     merged = merge_site_identity(
@@ -96,8 +96,8 @@ def test_identity_merge_accumulates_distinct_projects_and_hosts() -> None:
     ]
     assert [item.label for item in merged.projects if item.primary] == ["Widget"]
     assert [item.hostname for item in merged.hosts] == [
-        "devbig014.example.com",
-        "devbig015",
+        "host-a.example.com",
+        "host-b",
     ]
 
 
@@ -112,7 +112,7 @@ def test_site_identity_json_round_trip() -> None:
                 "explicit",
             ),
         ),
-        (HostIdentity("devbig014", "explicit"),),
+        (HostIdentity("host-a", "explicit"),),
         "America/New_York",
         "explicit",
     )

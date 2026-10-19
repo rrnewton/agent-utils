@@ -1222,7 +1222,7 @@ mod tests {
             .unwrap_err()
             .contains("lacks a GitHub event author"));
         let mut hostname_author = snapshot.clone();
-        hostname_author.events[0].author = "devbig014".into();
+        hostname_author.events[0].author = "host-a".into();
         assert_ne!(
             review_evidence_digest(&hostname_author).unwrap(),
             write_digest

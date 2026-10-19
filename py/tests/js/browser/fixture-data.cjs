@@ -317,7 +317,7 @@ const timeline = {
         source: "session_metadata"
       }
     ],
-    hosts: [{ hostname: "devbig014.example.com", source: "explicit" }]
+    hosts: [{ hostname: "host-a.example.com", source: "explicit" }]
   }],
   agents: agents,
   phases: phases,

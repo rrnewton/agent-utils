@@ -34,7 +34,7 @@ pub const ALLOW_ANY_PROGRAM: &str = "*";
 ///
 /// Every agent that ever runs a command leaves a tab behind and nothing else closes it, so without a
 /// ceiling the workspace grows for as long as agents are coined. The number is not arbitrary:
-/// measured on devbig014 2026-08-10, a session with 260 panes drove the Herdr server to >1000% CPU
+/// measured on a 316-core host 2026-08-10, a session with 260 panes drove the Herdr server to >1000% CPU
 /// with every control call timing out. 32 keeps an eightfold margin below that while being far
 /// more tabs than one project's agents legitimately need, and the cap is per workspace, so several
 /// projects on one server each want headroom of their own.
