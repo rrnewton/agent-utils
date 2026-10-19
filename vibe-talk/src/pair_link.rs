@@ -132,8 +132,9 @@ pub async fn run(options: Options) -> anyhow::Result<PairLink> {
     let server = local_address(config.bind);
     let client = reqwest::Client::builder()
         // The server is on this host. A proxy from the environment would carry the write token
-        // somewhere else, so none is used.
+        // somewhere else, so none is used, and a redirect is an answer, never followed.
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(15))
         .build()
         .context("building the HTTP client")?;
