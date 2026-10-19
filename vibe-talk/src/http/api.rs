@@ -1307,10 +1307,19 @@ pub async fn redeem_pairing(State(state): State<AppState>, request: Request) -> 
         Err(_) => String::new(),
     };
     match state.pairing.redeem(&code, client) {
-        crate::pairing::Redeemed::Granted => Json(PairRedeemResponse {
-            token: state.config.auth.write_token.expose().to_owned(),
-        })
-        .into_response(),
+        crate::pairing::Redeemed::Granted => {
+            let mut response = Json(PairRedeemResponse {
+                token: state.config.auth.write_token.expose().to_owned(),
+            })
+            .into_response();
+            // Said here as well as by the access layer's rule for every `/api/` answer, because
+            // this one carries the write token and must never depend on a rule elsewhere.
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            response
+        }
         crate::pairing::Redeemed::Refused => ApiError::new(
             StatusCode::GONE,
             "pairing_link_invalid",

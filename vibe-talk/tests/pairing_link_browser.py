@@ -10,7 +10,9 @@ inside the script; what it cannot show is a real browser's address bar and stora
   address no longer carries the code, and no request named it in a URL -> one redemption, the code
   in its body and no bearer token -> the token is stored under
   the page's own key -> the main screen is up -> a SECOND fresh browser opening the same link is
-  told it expired or was already used, on the sign-in screen, with nothing stored.
+  told it expired or was already used, on the sign-in screen, with nothing stored. A second link
+  opened in a tab already showing the app (a fragment navigation, which runs no script afresh) is
+  offered too, with its code out of the address.
 
 It serves the checked-out assets and a small fake API from one loopback origin, at a phone's size.
 Pass --web-root DIR to run the same check against another copy of the page; against one from
@@ -32,6 +34,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 TOKEN = "write-token-browser-pairing-link-check"
 CODE = "Pq3x_Zr-7AbCdEfGhIjKlMnOpQrStUvWxYz01234567"
+SECOND_CODE = "Zz9y_Xw-8VuTsRqPoNmLkJiHgFeDcBa98765432100"
 CHANNEL = {"id": "1110000000000000001", "label": "lead team", "writable": True, "alias": None,
            "added": False}
 QUESTION = {"id": "1110000000000000300", "channel_id": CHANNEL["id"], "author": "ci-bot",
@@ -232,6 +235,17 @@ def main() -> int:
                         page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
                         stored = page.evaluate(f"() => localStorage.getItem({json.dumps(TOKEN_KEY)})")
                         check(stored == TOKEN, f"the redeemed token was not stored under {TOKEN_KEY}: {stored!r}")
+                        # A second link opened in the same tab: a fragment navigation, which runs no
+                        # script afresh. It is offered all the same, and its code leaves the address.
+                        page.goto(f"{base}#pair={SECOND_CODE}")
+                        page.wait_for_selector("#pair-confirm", state="visible", timeout=10_000)
+                        address = page.evaluate("() => location.href")
+                        check(SECOND_CODE not in address,
+                              f"a link opened in a tab already showing the app kept its code: {address!r}")
+                        if args.shots:
+                            page.screenshot(path=str(args.shots / "first-second-link.png"))
+                        page.tap("#pair-dismiss")
+                        page.wait_for_selector("#pair-confirm", state="hidden", timeout=5_000)
                     else:
                         page.wait_for_function(
                             "() => /expired or was already used/.test(document.getElementById('error').textContent)",
@@ -258,7 +272,7 @@ def main() -> int:
     for body, authorization in api.redemptions:
         check(body == {"code": CODE}, f"the redemption did not carry the code in its body: {body!r}")
         check(authorization is None, f"a redemption carried a bearer token: {authorization!r}")
-    named = [path for path in api.paths if CODE in path]
+    named = [path for path in api.paths if CODE in path or SECOND_CODE in path]
     check(not named, f"a request put the code in its URL: {named}")
     print(f"{browser_version} at 390x844: the pairing link signed a fresh browser in with one redemption, "
           f"the code in its body and out of the address; the same link in a second browser said {message!r}")

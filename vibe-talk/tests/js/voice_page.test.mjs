@@ -2736,6 +2736,12 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   page.setAddress = ({ pathname = "/", search = "", hash = "" }) => {
     Object.assign(context.window.location, { pathname, search, hash });
   };
+  /** `#369 pairing-link`. A link opened in this tab that differs only by its fragment. */
+  page.navigateToFragment = async (hash) => {
+    context.window.location.hash = hash;
+    for (const fn of windowListeners.get("hashchange") || []) await fn({ type: "hashchange" });
+    await page.settle();
+  };
   // `#267 quote-reply`. The text the reader has selected: nothing, until a test selects some.
   page.selection = new FakeSelection();
   /**
@@ -5351,6 +5357,38 @@ test("a pairing link refused for too many attempts says to wait, and a stale lin
   assert.equal(page.screen(), "main", "a failed link signed the phone out");
   assert.equal(store.get("vibe-talk.token"), "write-token-aaaaaaaaaaaaaaaa");
   assert.match(page.el("error").textContent, /Too many pairing attempts.*Wait a minute/);
+});
+
+test("a second pairing link opened in a tab already showing the app is offered too", async () => {
+  const store = new Map();
+  const page = newPage(store, SCRIPT, (p) => p.enableHistory());
+  await page.settle();
+  assert.equal(page.el("pair-offer").hidden, true);
+  page.pairRedeem = async () => json(200, { token: "write-token-from-pairing-00" });
+  const asked = page.requests.length;
+  await page.navigateToFragment(`#pair=${PAIR_CODE}`);
+  assert.equal(page.el("pair-offer").hidden, false, "the new link was not offered");
+  assert.ok(page.history.addresses.length > 0 && !page.history.addresses.some((a) => a.includes(PAIR_CODE)),
+    "the fragment was not taken out of the address");
+  assert.equal(page.requests.length, asked, "a fragment change made a request before the tap");
+  await confirmPairing(page);
+  assert.equal(store.get("vibe-talk.token"), "write-token-from-pairing-00");
+  assert.equal(page.screen(), "main");
+});
+
+test("both buttons are disabled while a redemption is in flight", async () => {
+  let answer = null;
+  const { page } = pairingPage(new Map(), (p) => {
+    p.pairRedeem = () => new Promise((resolve) => { answer = resolve; });
+  });
+  await page.settle();
+  page.el("pair-confirm").click();
+  await page.settle();
+  assert.equal(page.el("pair-confirm").disabled, true);
+  assert.equal(page.el("pair-dismiss").disabled, true, "Not now could hide an offer about to sign in");
+  answer(json(200, { token: "write-token-from-pairing-00" }));
+  await page.settle();
+  assert.equal(page.screen(), "main");
 });
 
 test("Not now leaves the link unspent and a signed-in phone signed in", async () => {

@@ -33,14 +33,17 @@ pub const NOTICE: &str = concat!(
 ///
 /// The author's words are preserved: this removes only characters that cannot be spoken or
 /// displayed, and it *marks* a forged fence rather than deleting it, so the tampering stays
-/// visible in the text a human reads.
+/// visible in the text a human reads. The one exception is a pairing code, which is replaced
+/// (see [`crate::pairing::redact_codes`]).
 #[must_use]
 pub fn neutralize(content: &str) -> String {
     let stripped: String = content
         .chars()
         .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
         .collect();
-    stripped.replace(FENCE, "[fence-marker-removed]")
+    // `#369 pairing-link`. A pairing link in channel text redeems once for the write token; no
+    // model is ever handed one — a summariser's vendor, the voice agent, a thread namer.
+    crate::pairing::redact_codes_in(&stripped.replace(FENCE, "[fence-marker-removed]"))
 }
 
 /// Wrap an arbitrary block of third-party text in the notice and the fence.
@@ -158,6 +161,16 @@ mod tests {
             reactions: None,
             heading: None,
             mentions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn no_model_is_handed_a_pairing_code() {
+        let code = "Pq3x_Zr-7AbCdEfGhIjKlMnOpQrStUvWxYz01234567";
+        let text = format!("your link: https://h.example/#pair={code}");
+        for framed in [neutralize(&text), fenced(&text)] {
+            assert!(!framed.contains(&code[..8]), "{framed}");
+            assert!(framed.contains("#pair=[redacted]"), "{framed}");
         }
     }
 

@@ -30,7 +30,7 @@ vibe-talk — a chat bridge for a voice agent
 
 USAGE:
     vibe-talk [--config PATH] [--config-overlay PATH]... [--fake-discord] [--skip-startup-probe]
-    vibe-talk pair-link [--config PATH] [--base-url URL] [--ttl SECONDS]
+    vibe-talk pair-link [--config PATH] [--config-overlay PATH]... [--base-url URL] [--ttl SECONDS]
 
 COMMANDS:
     (none)                run the server

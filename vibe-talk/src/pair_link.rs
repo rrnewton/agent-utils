@@ -124,7 +124,11 @@ pub async fn run(options: Options) -> anyhow::Result<PairLink> {
             anyhow::bail!("--ttl must be between 1 and {max} seconds, not {ttl}");
         }
     }
-    let config = Config::discover(options.config, options.overlays)?;
+    let config = Config::discover(options.config, options.overlays).context(
+        "pair-link reads the server's whole configuration, as the server does: run it with the \
+         server's --config and with the server's environment (for example, from a systemd \
+         EnvironmentFile: set -a; . /path/to/vibe-talk.env; set +a)",
+    )?;
     let base = options
         .base_url
         .or_else(|| config.public_base_url.clone())

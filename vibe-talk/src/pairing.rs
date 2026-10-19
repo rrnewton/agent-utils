@@ -26,9 +26,18 @@
 //! What it does NOT do: it hands out the one write token the server has, so a redeemed link is as
 //! good as the token itself, for as long as the token is. Revoking a paired phone means rotating
 //! `VIBE_TALK_WRITE_TOKEN`, as it always did. And the link is only as private as the place it is
-//! sent: pasted into a channel this server bridges, it can be read by any read-scope caller —
-//! the hosted voice agent included — who can then redeem it first. The person is then told the
-//! link was already used, and the redemption is logged at WARN with the client's address.
+//! sent. This server keeps it from its own read-scope callers — [`redact_codes`] takes it out of
+//! every answer to the read token ([`crate::http::redact_layer`]) and out of everything handed to a
+//! model ([`crate::untrusted::neutralize`]) — but anyone else who can read the chat can use it
+//! first. The person is then told the link was already used, and the redemption is logged at WARN
+//! with the client's address.
+//!
+//! **A partly leaked code cannot be finished by guessing.** A live code is granted even to an
+//! address over its failure limit (behind a proxy that address is everyone's), so the per-address
+//! limit alone would not stop someone holding most of a code from trying the rest. Two things do:
+//! [`redact_codes`] takes out ANY run of code characters after `pair=`, so a preview cut inside a
+//! code shows none of it; and [`GLOBAL_FAILURE_LIMIT`] failures in one window, from all clients
+//! together, burn every live code.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -54,8 +63,15 @@ pub const FAILURE_WINDOW: Duration = Duration::from_secs(60);
 /// refused as limited (fail closed) until an older window lapses, so the table cannot be grown
 /// without bound by a caller with many addresses.
 pub const MAX_TRACKED_ADDRESSES: usize = 4096;
+/// Failed redemptions in one [`FAILURE_WINDOW`], from every client together, that burn every live
+/// code. Far above what a person mistyping produces, far below what finishing even a 2-character
+/// remainder of a leaked code by guessing needs (4096 tries).
+pub const GLOBAL_FAILURE_LIMIT: u32 = 100;
 /// Random bytes in a code: 256 bits, base64url without padding, 43 characters.
 const CODE_BYTES: usize = 32;
+/// What follows a code's marker once [`redact_codes`] has taken the code out.
+pub const REDACTED: &str = "[redacted]";
+const MARKER: &[u8] = b"pair=";
 
 /// A freshly minted code, the one time the code itself exists on the server.
 #[derive(Debug)]
@@ -141,6 +157,8 @@ struct Failures {
 struct Table {
     live: Vec<Live>,
     failures: HashMap<Client, Failures>,
+    /// Every client's failures in the current window, for [`GLOBAL_FAILURE_LIMIT`].
+    all_failures: Option<Failures>,
 }
 
 /// The live codes, as hashes, and the failure counts. One per server, in [`crate::state::AppState`].
@@ -291,6 +309,29 @@ impl Pairing {
             failures = count,
             "pairing redeem refused: no live code matched"
         );
+        let all = table
+            .all_failures
+            .take()
+            .filter(|all| now.saturating_duration_since(all.since) < FAILURE_WINDOW)
+            .unwrap_or(Failures {
+                since: now,
+                count: 0,
+            });
+        let all = Failures {
+            count: all.count + 1,
+            ..all
+        };
+        if all.count >= GLOBAL_FAILURE_LIMIT {
+            let burned = table.live.len();
+            table.live.clear();
+            tracing::warn!(
+                burned,
+                "{GLOBAL_FAILURE_LIMIT} failed pairing redemptions within a minute: every live \
+                 pairing code is burned; mint a new one"
+            );
+        } else {
+            table.all_failures = Some(all);
+        }
         Redeemed::Refused
     }
 
@@ -339,6 +380,73 @@ fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 #[must_use]
 pub fn hash_prefix(hash: &[u8; 32]) -> String {
     hash[..4].iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+const fn is_code_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
+}
+
+/// `text` with every run of code characters after `pair=` replaced by [`REDACTED`], however
+/// short the run. A pairing link is `…#pair=CODE`, and a code cut short by a preview is still most
+/// of a code; text that merely resembles one loses a few characters, which is the right side to
+/// err on.
+#[must_use]
+pub fn redact_codes(text: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len());
+    let mut at = 0;
+    while at < text.len() {
+        if text[at..].starts_with(MARKER) {
+            let start = at + MARKER.len();
+            let run = text[start..]
+                .iter()
+                .take_while(|byte| is_code_byte(**byte))
+                .count();
+            if run > 0 {
+                out.extend_from_slice(MARKER);
+                out.extend_from_slice(REDACTED.as_bytes());
+                at = start + run;
+                continue;
+            }
+        }
+        out.push(text[at]);
+        at += 1;
+    }
+    out
+}
+
+/// [`redact_codes`] over a string. Only ASCII is replaced, so the result is still UTF-8.
+#[must_use]
+pub fn redact_codes_in(text: &str) -> String {
+    if !text.contains("pair=") {
+        return text.to_owned();
+    }
+    String::from_utf8(redact_codes(text.as_bytes())).unwrap_or_default()
+}
+
+/// Where a code that the next bytes could continue begins at the end of `text`, or `text.len()`
+/// when there is none: a tail that is a prefix of `pair=`, or `pair=` followed only by code
+/// characters, however many. A stream must hold such a tail back until it knows where the run ends.
+#[must_use]
+pub fn unfinished_code_start(text: &[u8]) -> usize {
+    // `pair=` and a run of code characters to the very end.
+    let run = text
+        .iter()
+        .rev()
+        .take_while(|byte| is_code_byte(**byte))
+        .count();
+    let before_run = text.len() - run;
+    if text[..before_run].ends_with(MARKER) {
+        return before_run - MARKER.len();
+    }
+    // A prefix of the marker at the very end. `p`, `a`, `i` and `r` are code characters, so such a
+    // tail sits inside the run just measured; `=` cannot, so a tail ending in it is the whole marker,
+    // handled above.
+    for start in text.len().saturating_sub(MARKER.len() - 1)..text.len() {
+        if MARKER.starts_with(&text[start..]) {
+            return start;
+        }
+    }
+    text.len()
 }
 
 /// [`hash_prefix`] of a code, for tests that look for it in the log.
@@ -502,6 +610,67 @@ mod tests {
         let mapped = Client::of(Some("::ffff:192.0.2.7".parse().expect("ip")));
         assert_eq!(mapped, HERE);
         assert_eq!(Client::of(None), Client::Unknown);
+    }
+
+    #[test]
+    fn a_code_is_redacted_however_short_the_run_after_its_marker() {
+        let code = "Pq3x_Zr-7AbCdEfGhIjKlMnOpQrStUvWxYz01234567";
+        for (text, want) in [
+            (
+                format!("open https://h.example/#pair={code} now"),
+                "open https://h.example/#pair=[redacted] now".to_owned(),
+            ),
+            (
+                format!("<https://h/%23pair={code}|link>"),
+                "<https://h/%23pair=[redacted]|link>".to_owned(),
+            ),
+            // A preview cut inside the code: 41 characters and an ellipsis.
+            (
+                format!("https://h/#pair={}…", &code[..41]),
+                "https://h/#pair=[redacted]…".to_owned(),
+            ),
+            ("pair=x".to_owned(), "pair=[redacted]".to_owned()),
+            ("pair= and #pair=".to_owned(), "pair= and #pair=".to_owned()),
+            (
+                "naïve text, no marker".to_owned(),
+                "naïve text, no marker".to_owned(),
+            ),
+        ] {
+            assert_eq!(redact_codes_in(&text), want);
+        }
+    }
+
+    #[test]
+    fn a_tail_that_the_next_bytes_could_turn_into_a_code_is_found() {
+        assert_eq!(unfinished_code_start(b"data: done\n\n"), 12);
+        assert_eq!(unfinished_code_start(b"see #pai"), 5);
+        assert_eq!(unfinished_code_start(b"see #pair="), 5);
+        assert_eq!(unfinished_code_start(b"see #pair=Pq3x"), 5);
+        let long = format!("see #pair={}", "A".repeat(200));
+        assert_eq!(unfinished_code_start(long.as_bytes()), 5);
+        assert_eq!(unfinished_code_start(b"see #pair=[redacted]"), 20);
+        assert_eq!(unfinished_code_start(b"stop"), 3);
+    }
+
+    #[test]
+    fn a_hundred_failures_from_everyone_burn_every_live_code() {
+        let now = Instant::now();
+        let pairing = Pairing::with_failure_limit(u32::MAX);
+        let minted = pairing.mint_at(None, now, wall()).expect("mint");
+        for n in 0..GLOBAL_FAILURE_LIMIT - 1 {
+            let client = Client::of(Some(IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + n))));
+            assert_eq!(pairing.redeem_at("guess", client, now), Redeemed::Refused);
+        }
+        let other = pairing.mint_at(None, now, wall()).expect("mint");
+        assert_eq!(pairing.redeem_at("guess", HERE, now), Redeemed::Refused);
+        assert_eq!(
+            pairing.redeem_at(&minted.code, HERE, now),
+            Redeemed::Refused
+        );
+        assert_eq!(pairing.redeem_at(&other.code, HERE, now), Redeemed::Refused);
+        // A new code works; the count started again.
+        let fresh = pairing.mint_at(None, now, wall()).expect("mint");
+        assert_eq!(pairing.redeem_at(&fresh.code, HERE, now), Redeemed::Granted);
     }
 
     #[test]

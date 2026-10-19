@@ -484,3 +484,31 @@ async fn a_link_in_a_bridged_channel_never_reaches_a_read_scope_caller() {
     // And the code is still live for the person it was sent to.
     assert_eq!(redeem(&router, &code).await.0, StatusCode::OK);
 }
+
+#[tokio::test]
+async fn a_read_scope_answer_still_travels_compressed_and_whole() {
+    // The redaction rewrites the body inside the compression layer; a compressed read must still
+    // arrive whole. (An unfused redacted body once panicked when compression polled it after its end.)
+    let (state, _discord) = vibe_talk::testing::state();
+    let router = router(state);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/client-config")
+                .header("authorization", format!("Bearer {READ_TOKEN}"))
+                .header("accept-encoding", "gzip")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-encoding"], "gzip");
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    assert_eq!(&bytes[..2], &[0x1f, 0x8b], "not a gzip stream");
+}

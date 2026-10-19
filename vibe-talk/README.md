@@ -965,6 +965,10 @@ only for **five minutes** (at most ten).
    vibe-talk pair-link            # add --config PATH if the server was started with one
    ```
 
+   It reads the server's whole configuration, so run it as the server runs: the same `--config`,
+   and the same environment. A server whose secrets come from a systemd `EnvironmentFile` needs
+   them here too, for example `set -a; . /path/to/vibe-talk.env; set +a; vibe-talk pair-link`.
+
    It prints exactly two lines on standard output, the link and when it expires; send the person
    the link, and tell them it works once, for the next five minutes: open it on the phone and tap
    **Sign this device in**. If they are told it expired or was already used, run it again and send
@@ -997,18 +1001,24 @@ What the server and the page do, so it can be judged:
   and each counts against the client's address: after ten in a minute, that address's further
   failures get `429` for the rest of the minute. A live code is still granted, because **behind a
   reverse proxy every client has the proxy's address** and one person's failures must not lock
-  everyone out of pairing. An IPv6 client is counted by its /64. The 256-bit code is what stops
-  guessing; the limit only caps how fast anyone can fail.
-* **A read-scope caller is never sent a code.** Every answer under `/api/` and `/mcp` to the read
-  token, live streams included, has the code after any `pair=` replaced with `[redacted]` as it
-  leaves the server, whichever route produced it: a message, its rendered HTML, an MCP tool's text,
-  a summary. The write token's own reader is sent the text as it is.
+  everyone out of pairing. An IPv6 client is counted by its /64. A hundred failures in a minute
+  from all clients together burn every live code, so even a code partly seen somewhere cannot be
+  finished by guessing from many addresses; mint a new one. The 256-bit code is what stops
+  guessing outright.
+* **A read-scope caller is never sent a code, and no model is handed one.** Every answer under
+  `/api/` and `/mcp` to the read token, live streams included, has the run of code characters after
+  any `pair=` replaced with `[redacted]` as it leaves the server, whichever route produced it: a
+  message, its rendered HTML, a thread's title, an MCP tool's text, a summary. Any run, however
+  short, so a preview that cuts a code off shows none of it. Such answers carry no
+  `Content-Length`; the connection frames them. Channel text handed to a model (a summariser's
+  vendor, the voice agent's tools, a thread namer) is redacted the same way before it leaves. The
+  write token's own reader is sent the text as it is.
 * The page takes the code out of its own address with `history.replaceState` before it makes any
   request, so it is not left in the address bar, the session history or a bookmark. A fragment is
   never sent to a server, so the code reaches no access log; it travels only in the body of the one
   redemption. The page redeems only when the person taps **Sign this device in**, never on load, so
   a link scanner that runs pages cannot spend the link or receive the token. **Not now** leaves it
-  unspent.
+  unspent. A second link opened in a tab already showing the app is offered the same way.
 * The log names each code by the first eight hex digits of its hash when it is minted, redeemed
   or expires. Neither a code nor a token is logged.
 * A redeemed link is as good as the write token itself, for as long as that token is. Signing a

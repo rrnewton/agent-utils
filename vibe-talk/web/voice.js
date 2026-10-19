@@ -44049,7 +44049,10 @@ async function pairFromLink() {
   if (code === null) return false;
   clearError();
   setStatus("Pairing this device…");
+  // Both, until the server answers: a second tap would be refused as used, and Not now would hide
+  // an offer whose answer is about to sign the browser in anyway.
   el("pair-confirm").disabled = true;
+  el("pair-dismiss").disabled = true;
   let response = null;
   try {
     response = await fetch("/api/v1/pair/redeem", {
@@ -44061,6 +44064,7 @@ async function pairFromLink() {
   } catch (_error) {
     // The code was not spent: the offer stays, to be tapped again once the connection is back.
     el("pair-confirm").disabled = false;
+    el("pair-dismiss").disabled = false;
     showError("Could not reach vibe-talk to pair this device. Check the connection and tap again.");
     setStatus("pairing failed");
     return false;
@@ -44091,6 +44095,7 @@ function offerPairing() {
   showScreen("signin");
   el("pair-offer").hidden = false;
   el("pair-confirm").disabled = false;
+  el("pair-dismiss").disabled = false;
   el("pair-confirm").focus();
 }
 
@@ -44143,6 +44148,15 @@ el("save-token").addEventListener("click", guardQuietly(saveToken));
 el("forget-token").addEventListener("click", forgetToken);
 el("pair-confirm").addEventListener("click", guardQuietly(pairFromLink));
 el("pair-dismiss").addEventListener("click", declinePairing);
+// A second link opened in a tab already showing the app is a navigation within the page: the
+// script does not run again, so the fragment is taken here, as at load, and offered.
+window.addEventListener("hashchange", () => {
+  const code = takePairingCode();
+  if (code === null) return;
+  pairingCode = code;
+  clearError();
+  offerPairing();
+});
 
 // The checkboxes are the live truth `start()` reads, so they are what gets restored on load.
 const restoredMicSettings = storedMicSettings();
