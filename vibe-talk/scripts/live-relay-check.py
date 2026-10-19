@@ -74,6 +74,7 @@ import sys
 import threading
 import time
 import traceback
+import unicodedata
 import urllib.error
 import urllib.request
 import wave
@@ -221,15 +222,22 @@ class Bridge:
 def asks_for_tools(value: str) -> bool:
     """Whether an address asks the bridge for agent tools, however the key is cased or percent-encoded.
 
-    Every query key is decoded and case-folded, and the whole address is also searched with its escapes
-    undone until none are left, so `Tools=`, `%74ools=` and a key hidden in a fragment are refused alike.
+    The whole address is searched with its escapes undone until none are left, and every query key is
+    decoded; each is folded to compatibility form and lower case and stripped of everything but letters
+    and digits, so `Tools=`, `%74ools=`, `tools[]=`, `tools =`, a soft hyphen or fullwidth letters,
+    and a key hidden in a fragment are refused alike.
     """
+    def folded(text: str) -> str:
+        return "".join(char for char in unicodedata.normalize("NFKC", text).casefold() if char.isalnum() or char == "=")
+
     decoded = value
     while (undone := unquote(decoded)) != decoded:
         decoded = undone
-    if "tools=" in decoded.casefold():
+    if "tools=" in folded(decoded):
         return True
-    return any(key.casefold() == "tools" for key in parse_qs(urlsplit(value).query, keep_blank_values=True))
+    keys = parse_qs(urlsplit(value).query, keep_blank_values=True)
+    # `tools[]`, `tools.0` and the like are `tools` to many query parsers: any key that starts so is refused.
+    return any(folded(key).startswith("tools") for key in keys)
 
 
 def parse_bridge(value: str) -> Bridge:
@@ -2830,7 +2838,9 @@ def self_test() -> int:
     # The safety rules and the plumbing.
     for refused in ["ws://127.0.0.1:9100/ws?mode=voice&tools=chat", "ws://example.invalid/x?Tools=chat",
                     "ws://example.invalid/x?mode=a&%74ools=x", "ws://example.invalid/x?%2574OOLS=x",
-                    "ws://example.invalid/x?mode=a&tools", "http://127.0.0.1:9100/ws", "127.0.0.1:9100"]:
+                    "ws://example.invalid/x?mode=a&tools", "ws://example.invalid/x?tools[]=chat", "ws://example.invalid/x?tools.0=chat",
+                    "ws://example.invalid/x?tools%20=x", "ws://example.invalid/x?t%C2%ADools=x",
+                    "ws://example.invalid/x?\uff54ools=x", "http://127.0.0.1:9100/ws", "127.0.0.1:9100"]:
         try:
             parse_bridge(refused)
             check(f"{refused!r} is refused", False, "accepted")
