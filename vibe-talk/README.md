@@ -8734,7 +8734,12 @@ tap Don't send to stop", and that tap stops the send, however recently the card 
 list is cards, with no box of its own to stand on, and the channel's messages and box are behind it,
 out of sight, where the card would wait unseen. So it stands under the cards, as wide as their
 column, just above the control bar, and a reader at the foot of the cards stays at their foot as it
-comes, as when the dock grows under them; a reader up the cards stays on theirs. Ctrl+1 to Ctrl+4
+comes, as when the dock grows under them; a reader up the cards stays on theirs. The same holds for a
+card that comes while Settings or Help is up (`#336 draft-return-thread-list`): back on the thread
+list, a reader who left from the foot of the cards is at their foot over it, and one who left up them
+is on their card. The right column's keeper of that growth reckons it from the column as the reader
+left it, not from the column hidden with the main screen, which counted the card as no growth and
+left them the card's height above the foot. Ctrl+1 to Ctrl+4
 (Cmd on a Mac) only move it: a view key pressed while a card is up, its buttons included, never
 sends it, withdraws it or hides it. Ctrl+3 docks it under the cards, which open at their foot above
 it; Ctrl+1, Ctrl+2 and, in a window wide enough for two columns, Ctrl+4 put it back at the foot of

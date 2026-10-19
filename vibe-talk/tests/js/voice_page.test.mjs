@@ -70862,7 +70862,7 @@ async function draftOverThreads(script, docked, { proposed = true, arrange = nul
     let base = area.clientHeight;
     Object.defineProperty(area, "clientHeight", {
       configurable: true,
-      get: () => base - (isDocked() ? card.offsetHeight : 0),
+      get: () => Math.max(0, base - (isDocked() ? card.offsetHeight : 0)),
       set: (value) => {
         base = Number(value) || 0;
       },
@@ -71041,6 +71041,72 @@ test("`#269 approval-card-inline` x `#281 view-keys`: a draft arriving under the
   const behind = await run(brokenScript(
     "  if (threadListOnScreen()) {\n    focusList(sidePane);\n    return;\n  }\n", ""));
   assert.deepStrictEqual(behind, { ...real, keysOnCards: false });
+});
+
+test("`#336 draft-return-thread-list` x `#280 scroll-stability`: A DRAFT ARRIVING WHILE SETTINGS OR HELP IS UP finds a reader who left the thread list from the foot of its cards at their foot again on the way back, over the card docked under them, as one is whom it reaches on the list; one who left up the cards is on their card", async () => {
+  // From the final review of #269 approval-card-inline, in Chromium at 393x852 and 1280x800: at the foot of
+  // the thread list's cards, to Settings or Help, a draft arriving there, and back, the reader was the card's
+  // height above the foot (247px for a long draft). The right column's dock-growth keeper took its last
+  // report from the column hidden with the main screen, measured at nothing, and reckoned no growth from it.
+  // The fixture measures a hidden column at nothing as a browser does, and keeps its place while hidden and
+  // clamps it as it is shown (`clampedAsShownLikeChromium`).
+  const DOCKED = 60;
+  const run = async (script) => {
+    const { page, main, side, isDocked, settled } = await draftOverThreads(script, DOCKED, { proposed: false });
+    clampedAsShownLikeChromium(page, side);
+    await press(page, main, "3", { metaKey: true });
+    await settled();
+    assert.equal(page.el("screen-main").getAttribute("data-columns"), "list", "Cmd-3 did not show the thread list");
+    assert.ok(side.scrollHeight > side.clientHeight + 200, "the premise: the cards run past the column's foot");
+    const shown = side.clientHeight;
+    const gap = () => side.scrollHeight - side.scrollTop - side.clientHeight;
+    const routes = {
+      settings: [() => page.el("open-settings").click(), () => page.el("close-settings").click()],
+      help: [() => press(page, side, "?", { shiftKey: true }), () => press(page, focused(page) || side, "Escape")],
+    };
+    const result = {};
+    let serial = 80;
+    for (const [name, [open, close]] of Object.entries(routes)) {
+      for (const up of [0, 100]) {
+        side.scrollTop = side.scrollHeight - side.clientHeight - up;
+        await side.dispatch("scroll");
+        await settled();
+        assert.equal(gap(), up, `the premise: the reader is ${up}px up the cards`);
+        const before = cardOnScreen(page);
+        await open();
+        await page.settle();
+        assert.notEqual(page.screen(), "main", `the premise: ${name} is up`);
+        side.clientHeight = 0;
+        page.resized(side);
+        page.expireTimers(0);
+        page.propose(proposal({ serial, handle: `hAnDlE-away-draft-00${serial}`, text: LONG_CARD_DRAFT }));
+        serial += 1;
+        await watchTurns(page);
+        assert.ok(isDocked(), `the premise: the draft docked under ${name}`);
+        page.expireTimers(2000);
+        await close();
+        await page.settle();
+        side.clientHeight = shown;
+        await settled();
+        result[`${name}${up}`] = page.screen() === "main" && isDocked() &&
+          (up === 0 ? gap() === 0 : cardOnScreen(page) === before);
+        page.lapseProposal();
+        await watchTurns(page);
+        page.expireTimers(sourceConstant("POST_ROOM_KEEP_MS"));
+        await settled();
+        assert.ok(!isDocked(), "the premise: the draft was taken down before the next trip");
+      }
+    }
+    return result;
+  };
+  const real = await run(SCRIPT);
+  assert.deepStrictEqual(real, { settings0: true, settings100: true, help0: true, help100: true });
+
+  // THE CONTROL: the keeper's report from the hidden column kept. The reader who left from the foot comes back
+  // the card's height above it; the one up the cards is on their card all the same.
+  const hiddenKept = await run(brokenScript("    if (currentScreen === \"main\") sideUnderLists = now;\n",
+    "    sideUnderLists = now;\n"));
+  assert.deepStrictEqual(hiddenKept, { ...real, settings0: false, help0: false });
 });
 
 // `#269 approval-card-inline` x `#281 view-keys` x `#280 scroll-stability`. The card moving between the
