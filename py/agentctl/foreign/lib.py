@@ -25,7 +25,7 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Iterator, NoReturn, Optional, cast
 
@@ -42,7 +42,9 @@ from agentctl.agent import send as shared_agent_send  # noqa: E402
 from agentctl.agent import status as shared_agent_status  # noqa: E402
 from agentctl.client import HerdrClient as SharedHerdrClient  # noqa: E402
 from agentctl.errors import HerdrRunError as SharedHerdrError  # noqa: E402
-from agentctl.procstat import parse_process_stat  # noqa: E402
+from agentctl.procstat import ProcessStat, parse_process_stat  # noqa: E402
+from agentctl.foreign import ownership  # noqa: E402
+from agentctl.foreign.ownership import AgentOperationError as AgentOperationError  # noqa: E402
 
 STATE: Path = BASE / "state"
 ARCHIVE: Path = STATE / "_archive"
@@ -121,15 +123,6 @@ STARTUP_GRACE_S: int = 20
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _HERDR_TAB_ID_RE = re.compile(r"^w[^:]+:t[0-9]+$")
-
-
-class AgentOperationError(Exception):
-    """Structured error for callers that need JSON-friendly failures."""
-
-    def __init__(self, code: str, message: str) -> None:
-        super().__init__(message)
-        self.code = code
-        self.message = message
 
 
 def _configured_codex_bypass_permissions() -> bool:
@@ -432,12 +425,17 @@ class AgentRecord:
     # Literal non-secret Muse options. Profiles reject credential-shaped
     # arguments before these durable launch settings are recorded.
     harness_args: tuple[str, ...] = ()
+    # Boot identity of runner_pid/runner_started_at. Never part of the row:
+    # older writers rewrite rows from their own schema, so it lives in the
+    # runner-identity.json sidecar and applies only while the row matches it.
+    # None marks a legacy identity (see the legacy policy in ownership.pin).
+    runner_boot_id: Optional[str] = None
 
     @staticmethod
     def from_dict(d: dict[str, object]) -> "AgentRecord":
         """Load a worker record, restoring omitted presentation fields from preserved identity metadata."""
         fields = {f.name for f in dataclasses.fields(AgentRecord)}
-        missing = fields - set(d) - {"runner_started_at", "backend", "mode", "presentation_pane", "codex_bypass_permissions", "harness_args"}
+        missing = fields - set(d) - {"runner_started_at", "backend", "mode", "presentation_pane", "codex_bypass_permissions", "harness_args", "runner_boot_id"}
         if missing:
             die(f"registry row for {d.get('name')!r} missing keys: {sorted(missing)}")
         preserved = _load_presentation_identity(d)
@@ -463,6 +461,8 @@ class AgentRecord:
             not isinstance(item, str) or not item or "\0" in item for item in raw_harness_args
         ):
             die("registry row has invalid harness_args")
+        runner_pid = None if d["runner_pid"] is None else int(str(d["runner_pid"]))
+        runner_started_at = None if d.get("runner_started_at") is None else str(d["runner_started_at"])
         return AgentRecord(
             name=str(d["name"]),
             harness=str(d["harness"]),
@@ -472,10 +472,8 @@ class AgentRecord:
             model=(None if d["model"] is None else str(d["model"])),
             session_id=(None if d["session_id"] is None else str(d["session_id"])),
             status=str(d["status"]),
-            runner_pid=(None if d["runner_pid"] is None else int(str(d["runner_pid"]))),
-            runner_started_at=(
-                None if d.get("runner_started_at") is None else str(d["runner_started_at"])
-            ),
+            runner_pid=runner_pid,
+            runner_started_at=runner_started_at,
             next_seq=int(str(d["next_seq"])),
             created_at=str(d["created_at"]),
             last_turn_at=(None if d["last_turn_at"] is None else str(d["last_turn_at"])),
@@ -483,11 +481,22 @@ class AgentRecord:
             presentation_pane=presentation_pane,
             codex_bypass_permissions=bypass,
             harness_args=tuple(raw_harness_args),
+            runner_boot_id=_load_runner_boot_id(
+                str(d["name"]), str(d["created_at"]), runner_pid, runner_started_at
+            ),
         )
 
     def to_dict(self) -> dict[str, object]:
-        """Serialize this record into a JSON-compatible dictionary."""
-        return dataclasses.asdict(self)
+        """Serialize the registry row; the boot identity lives in its sidecar."""
+        row = dataclasses.asdict(self)
+        del row["runner_boot_id"]
+        return row
+
+    def runner_identity(self) -> Optional["RunnerIdentity"]:
+        """The recorded runner as a boot-bound identity, or None before it starts."""
+        if self.runner_pid is None:
+            return None
+        return RunnerIdentity(self.runner_pid, self.runner_started_at, self.runner_boot_id)
 
 
 @dataclasses.dataclass
@@ -611,11 +620,9 @@ class MigrationResult:
     transcript: str
 
 
-@dataclasses.dataclass(frozen=True)
-class RunnerIdentity:
-    """A process ID paired with its kernel start time to distinguish PID reuse."""
-    pid: int
-    started_at: Optional[str]
+# A process ID paired with its kernel start time and boot identity, so neither
+# PID reuse nor a reboot can make a record name an unrelated process.
+RunnerIdentity = ownership.ProcessIdentity
 
 
 @dataclasses.dataclass(frozen=True)
@@ -637,6 +644,58 @@ class PresentationIdentity:
 def presentation_identity_path(name: str) -> Path:
     """Return the durable sidecar path used to recover a worker presentation identity."""
     return STATE / name / "presentation.json"
+
+
+def runner_identity_path(name: str) -> Path:
+    """Return the sidecar binding the registry row's runner identity to a boot."""
+    return STATE / name / "runner-identity.json"
+
+
+def _load_runner_boot_id(
+    name: str, created_at: str, runner_pid: Optional[int], runner_started_at: Optional[str],
+) -> Optional[str]:
+    """Return the boot identity recorded for exactly this row's runner, if any.
+
+    A missing, unreadable, or non-matching sidecar leaves the identity legacy,
+    which is the stricter policy for signalling, never a looser one.
+    """
+    if runner_pid is None:
+        return None
+    try:
+        raw = json.loads(runner_identity_path(name).read_text())
+    except (OSError, ValueError):
+        return None
+    if (
+        not isinstance(raw, dict)
+        or raw.get("schema") != ownership.RUNNER_SCHEMA
+        or raw.get("name") != name
+        or raw.get("created_at") != created_at
+        or raw.get("runner_pid") != runner_pid
+        or raw.get("runner_started_at") != runner_started_at
+    ):
+        return None
+    boot_id = raw.get("runner_boot_id")
+    return boot_id if isinstance(boot_id, str) and ownership.valid_boot_id(boot_id) else None
+
+
+def _save_runner_identity(rec: "AgentRecord") -> None:
+    """Mirror the row's runner boot identity into its sidecar, or remove a stale one."""
+    path = runner_identity_path(rec.name)
+    if rec.runner_pid is None or rec.runner_boot_id is None:
+        path.unlink(missing_ok=True)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema": ownership.RUNNER_SCHEMA,
+        "name": rec.name,
+        "created_at": rec.created_at,
+        "runner_pid": rec.runner_pid,
+        "runner_started_at": rec.runner_started_at,
+        "runner_boot_id": rec.runner_boot_id,
+    }
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(payload) + "\n")
+    os.replace(tmp, path)
 
 
 def _load_presentation_identity(row: dict[str, object]) -> Optional[PresentationIdentity]:
@@ -779,6 +838,7 @@ def _save_unlocked(agents: dict[str, AgentRecord]) -> None:
     for rec in agents.values():
         _save_presentation_identity(rec)
         _save_codex_permission_policy(rec)
+        _save_runner_identity(rec)
     payload = [agents[name].to_dict() for name in sorted(agents)]
     tmp = REGISTRY.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload, indent=2) + "\n")
@@ -896,43 +956,90 @@ def _harness_lock(name: str) -> Iterator[None]:
         os.close(fd)
 
 
-def record_active_harness(name: str, runner: RunnerIdentity, harness: RunnerIdentity) -> None:
-    """Record an owned harness process group for bounded stop and orphan cleanup."""
-    if harness.started_at is None or runner.started_at is None:
+def active_harness_path(name: str) -> Path:
+    """Return the durable ownership record of a worker's running harness tree."""
+    return agent_dir(name) / "active-harness.json"
+
+
+def record_active_harness(name: str, record: ownership.HarnessRecord) -> None:
+    """Durably record one turn's harness tree before the harness may exec."""
+    if (record.leader.started_at is None or record.runner.started_at is None
+            or record.leader.boot_id is None or record.generation is None):
         raise AgentOperationError("harness_identity_unknown", "cannot establish active harness process identity")
-    _write_durable_json(agent_dir(name) / "active-harness.json", {
-        "runner_pid": runner.pid, "runner_started_at": runner.started_at,
-        "pid": harness.pid, "started_at": harness.started_at,
-    })
+    _write_durable_json(active_harness_path(name), record.document(now_iso()))
+
+
+def read_active_harness(name: str) -> Optional[ownership.HarnessRecord]:
+    """Return the recorded harness ownership, None when no harness is recorded."""
+    try:
+        value: object = json.loads(active_harness_path(name).read_text())
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise AgentOperationError("harness_identity_unknown", f"cannot read active harness identity: {exc}") from exc
+    return ownership.parse_harness_record(value)
+
+
+def remove_active_harness(name: str, record: ownership.HarnessRecord) -> None:
+    """Remove the ownership record only while it still names this generation."""
+    path = active_harness_path(name)
+    try:
+        current = read_active_harness(name)
+    except AgentOperationError:
+        return
+    if current is None or current != record:
+        return
+    path.unlink(missing_ok=True)
+    _sync_directory(path.parent)
+
+
+def _owned_by(rec: AgentRecord, record: ownership.HarnessRecord) -> bool:
+    if record.runner.pid != rec.runner_pid:
+        return False
+    return rec.runner_started_at is None or record.runner.started_at == rec.runner_started_at
 
 
 def terminate_active_harness(rec: AgentRecord) -> bool:
-    """Best-effort kill of a harness group after checking its recorded leader."""
-    path = agent_dir(rec.name) / "active-harness.json"
-    try:
-        value = json.loads(path.read_text())
-    except FileNotFoundError:
+    """Kill this worker's recorded harness tree through exact handles only.
+
+    Returns True when a process was signalled. A tree that is still present
+    after the bounded wait keeps its record and raises
+    ``harness_cleanup_incomplete``; a legacy record follows the legacy policy.
+    """
+    record = read_active_harness(rec.name)
+    if record is None or not _owned_by(rec, record):
         return False
-    except (OSError, ValueError) as exc:
-        raise AgentOperationError("harness_identity_unknown", f"cannot read active harness identity: {exc}") from exc
-    if not isinstance(value, dict) or value.get("runner_pid") != rec.runner_pid:
+    if record.legacy:
+        return _resolve_legacy_harness(rec.name, record)
+    report = ownership.kill_harness_tree(record)
+    if not report.complete:
+        raise AgentOperationError(
+            "harness_cleanup_incomplete",
+            f"harness pid {record.leader.pid} of {rec.name!r}: {report.describe()}; "
+            f"its ownership record {active_harness_path(rec.name)} is kept for a later attempt",
+        )
+    remove_active_harness(rec.name, record)
+    return report.killed > 0
+
+
+def _resolve_legacy_harness(name: str, record: ownership.HarnessRecord) -> bool:
+    """Legacy policy: never signal a record without a boot identity or generation.
+
+    A record whose leader is provably gone is stale and removed. Otherwise the
+    caller must let the legacy runner's own watchdog clean its group, or an
+    operator must inspect the process.
+    """
+    path = active_harness_path(name)
+    leader = ownership.read_stat(record.leader.pid)
+    if leader is None or str(leader.starttime) != record.leader.started_at or leader.state in ("Z", "X", "x"):
+        path.unlink(missing_ok=True)
         return False
-    if rec.runner_started_at is not None and value.get("runner_started_at") != rec.runner_started_at:
-        return False
-    pid, started_at = value.get("pid"), value.get("started_at")
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1 or not isinstance(started_at, str):
-        raise AgentOperationError("harness_identity_unknown", "malformed active harness identity")
-    if pid_start_time(pid) != started_at:
-        return False
-    try:
-        if os.getpgid(pid) != pid:
-            raise AgentOperationError("harness_identity_changed", "active harness no longer owns its process group")
-        # killpg remains a numeric-PGID operation; the checks narrow but cannot
-        # eliminate reuse between this observation and the syscall.
-        os.killpg(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        return False
-    return True
+    raise AgentOperationError(
+        "harness_identity_legacy",
+        f"harness pid {record.leader.pid} of {name!r} was recorded by an older runner without a boot "
+        "identity or generation, so it is not signalled; stop its runner, whose own watchdog owns that "
+        f"group, or inspect pid {record.leader.pid} and stop it by hand, then remove {path}",
+    )
 
 
 def transcript_path(name: str) -> Path:
@@ -1016,7 +1123,8 @@ def write_staged_runner(name: str, token: str, identity: RunnerIdentity) -> None
     path = staged_runner_path(name, token)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(
-        json.dumps({"pid": identity.pid, "started_at": identity.started_at, "recorded_at": now_iso()})
+        json.dumps({"pid": identity.pid, "started_at": identity.started_at,
+                    "boot_id": identity.boot_id, "recorded_at": now_iso()})
         + "\n"
     )
     os.replace(tmp, path)
@@ -1028,14 +1136,23 @@ def read_staged_runner(name: str, token: str) -> Optional[RunnerIdentity]:
         raw = json.loads(staged_runner_path(name, token).read_text())
         pid = int(raw["pid"])
         started_at = raw.get("started_at")
+        boot_id = raw.get("boot_id")
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+    if boot_id is not None and not ownership.valid_boot_id(boot_id):
+        return None
+    if boot_id is not None and boot_id != ownership.current_boot_id():
         return None
     current_start = pid_start_time(pid)
     if current_start is None:
         return None
     if started_at is not None and started_at != current_start:
         return None
-    return RunnerIdentity(pid=pid, started_at=None if started_at is None else str(started_at))
+    return RunnerIdentity(
+        pid=pid,
+        started_at=None if started_at is None else str(started_at),
+        boot_id=None if boot_id is None else str(boot_id),
+    )
 
 
 def clear_migration_markers(name: str, token: str) -> None:
@@ -1278,16 +1395,16 @@ def _shared_tui_target(rec: AgentRecord) -> SharedAgentTarget:
 
 
 def pid_alive(pid: Optional[int]) -> bool:
-    """Check whether a process ID currently exists without sending it a signal."""
+    """Check whether a process ID currently exists, from procfs alone.
+
+    Unreadable evidence counts as present: it is not a death certificate.
+    """
     if pid is None:
         return False
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
+        return pid_start_time(pid) is not None
+    except AgentOperationError:
         return True
-    return True
 
 
 def pid_start_time(pid: int) -> Optional[str]:
@@ -1296,28 +1413,18 @@ def pid_start_time(pid: int) -> Optional[str]:
     Unreadable or malformed procfs evidence is not a death certificate and must
     not authorize later process signaling.
     """
-    stat = Path(f"/proc/{pid}/stat")
-    try:
-        raw = stat.read_bytes()
-    except (FileNotFoundError, ProcessLookupError):
-        return None
-    except OSError as exc:
-        raise AgentOperationError(
-            "runner_identity_unknown",
-            f"cannot read runner process {pid} identity: {exc}",
-        ) from exc
-    parsed = parse_process_stat(raw)
-    if parsed is None or parsed.pid != pid:
-        raise AgentOperationError(
-            "runner_identity_unknown",
-            f"cannot parse runner process {pid} identity",
-        )
-    return str(parsed.starttime)
+    parsed = ownership.read_stat(pid)
+    return None if parsed is None else str(parsed.starttime)
 
 
 def runner_identity_alive(rec: AgentRecord) -> bool:
-    """True only when the registry's runner PID still names the same process."""
+    """True only when the registry's runner PID still names the same process.
+
+    A runner recorded during an earlier boot is dead whatever its PID names now.
+    """
     if rec.runner_pid is None:
+        return False
+    if rec.runner_boot_id is not None and rec.runner_boot_id != ownership.current_boot_id():
         return False
     current = pid_start_time(rec.runner_pid)
     if current is None:
@@ -1353,19 +1460,21 @@ def wait_for_staged_runner(name: str, token: str) -> Optional[RunnerIdentity]:
 
 def wait_for_restarted_runner(name: str, previous: RunnerIdentity) -> Optional[RunnerIdentity]:
     """Wait for a normal replacement runner to publish a new registry identity."""
+    def replaced(rec: Optional[AgentRecord]) -> Optional[RunnerIdentity]:
+        identity = None if rec is None else rec.runner_identity()
+        if rec is None or identity is None:
+            return None
+        if (identity.pid, identity.started_at) == (previous.pid, previous.started_at):
+            return None
+        return identity if runner_identity_alive(rec) else None
+
     deadline = time.monotonic() + MIGRATION_READY_TIMEOUT_S
     while time.monotonic() < deadline:
-        rec = read_registry().get(name)
-        if rec is not None and rec.runner_pid is not None:
-            identity = RunnerIdentity(rec.runner_pid, rec.runner_started_at)
-            if identity != previous and runner_identity_alive(rec):
-                return identity
+        identity = replaced(read_registry().get(name))
+        if identity is not None:
+            return identity
         time.sleep(0.05)
-    rec = read_registry().get(name)
-    if rec is None or rec.runner_pid is None:
-        return None
-    identity = RunnerIdentity(rec.runner_pid, rec.runner_started_at)
-    return identity if identity != previous and runner_identity_alive(rec) else None
+    return replaced(read_registry().get(name))
 
 
 def _pid_is_descendant(pid: int, ancestor: int) -> bool:
@@ -1931,47 +2040,62 @@ def break_runner_pane_to_window(rec: AgentRecord) -> Optional[str]:
     return pane_id
 
 
-def terminate_runner_identity(identity: RunnerIdentity, grace: float = 2.0) -> bool:
-    """Best-effort stop of a recorded PID with start-time checks around shutdown."""
-    current_start = pid_start_time(identity.pid)
-    if current_start is None:
-        return False
-    if identity.started_at is not None and current_start != identity.started_at:
-        return False
-    # These compatibility signals use a numeric PID. The surrounding checks
-    # narrow but cannot eliminate reuse between an observation and a syscall.
-    try:
-        os.kill(identity.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return False
-    deadline = time.monotonic() + grace
-    while time.monotonic() < deadline:
-        if not pid_alive(identity.pid):
-            return True
-        time.sleep(0.1)
-    if not pid_alive(identity.pid):
-        return True
-    final_start = pid_start_time(identity.pid)
-    if final_start is None or (
-        identity.started_at is not None and final_start != identity.started_at
-    ):
-        return True
-    try:
-        os.kill(identity.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        return True
-    return True
+def _runner_cmdline_proof(name: Optional[str]) -> Optional[Callable[[int, ProcessStat], bool]]:
+    """Legacy policy: a runner identity without a boot identity is signalled only
+    when its command line proves it is this worker's runner."""
+    if name is None:
+        return None
+
+    def proof(pid: int, _stat: ProcessStat) -> bool:
+        try:
+            raw = (ownership.PROC / str(pid) / "cmdline").read_bytes()
+        except OSError:
+            return False
+        argv = [os.fsdecode(item) for item in raw.split(b"\0") if item]
+        return (
+            len(argv) >= 2
+            and argv[-1] == name
+            and any(Path(item).name == RUNNER.name for item in argv[:-1])
+        )
+
+    return proof
+
+
+def terminate_runner_identity(
+    identity: RunnerIdentity, grace: float = 2.0, *, name: Optional[str] = None,
+) -> bool:
+    """Stop one recorded runner through a pidfd: SIGTERM, then SIGKILL after ``grace``.
+
+    Returns False when it was already gone. An identity that cannot be pinned
+    (legacy without proof, no start time, no pidfds) raises without a signal.
+    """
+    return ownership.stop_process(
+        identity, grace=grace, legacy_proof=_runner_cmdline_proof(name),
+        label=f"runner pid {identity.pid}",
+    )
 
 
 def terminate_runner(rec: AgentRecord, grace: float = 2.0) -> bool:
-    """Best-effort stop of the process recorded for a worker."""
+    """Stop a worker's harness tree and then its runner, through exact handles."""
     # Spawn and identity publication use this same lock, so even a zero-grace
     # stop observes the detached child before killing its runner.
     with _harness_lock(rec.name):
-        harness_stopped = terminate_active_harness(rec)
-        if rec.runner_pid is None or not runner_identity_alive(rec):
+        identity = rec.runner_identity()
+        runner_alive = identity is not None and runner_identity_alive(rec)
+        record = read_active_harness(rec.name)
+        # A legacy runner's own watchdog owns its legacy harness group: stop
+        # that runner first and only then apply the legacy record policy.
+        defer = record is not None and record.legacy and runner_alive and _owned_by(rec, record)
+        harness_stopped = False if defer else terminate_active_harness(rec)
+        if identity is None or not runner_alive:
             return harness_stopped
-        return terminate_runner_identity(RunnerIdentity(rec.runner_pid, rec.runner_started_at), grace)
+        stopped = terminate_runner_identity(identity, grace, name=rec.name)
+        if defer:
+            deadline = time.monotonic() + ownership.KILL_WAIT_S
+            while active_harness_path(rec.name).exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            terminate_active_harness(rec)
+        return stopped or harness_stopped
 
 
 # --------------------------------------------------------------------------- #
@@ -2078,7 +2202,14 @@ def gc() -> list[str]:
                             )
                             write_event("herdr_workspace_lost", name, preview=last_message_preview(name))
                             continue
-                        notes.append(_reap_workspace_loss(rec, workspace_id))
+                        try:
+                            notes.append(_reap_workspace_loss(rec, workspace_id))
+                        except AgentOperationError as exc:
+                            notes.append(
+                                f"{name} degraded: Herdr workspace {workspace_id} is gone but its harness "
+                                f"could not be cleaned ({exc.message}); preserving state"
+                            )
+                            continue
                         del agents[name]
                         continue
             if rec.mode == TUI_MODE:
@@ -2124,7 +2255,14 @@ def gc() -> list[str]:
                 reason = "runner pid missing after startup grace"
             else:
                 reason = f"runner pid {rec.runner_pid} not alive or reused"
-            terminate_active_harness(rec)
+            try:
+                terminate_active_harness(rec)
+            except AgentOperationError as exc:
+                # Archiving would discard the only record that proves which
+                # processes are this worker's; keep it for a later attempt.
+                notes.append(f"{name} degraded: {reason}, but its harness could not be cleaned "
+                             f"({exc.message}); preserving state")
+                continue
             if win:
                 kill_window(rec)
             dest = archive_state(name)
@@ -3013,6 +3151,7 @@ def _restore_migration_record(
         current.tmux_target = old.tmux_target
         current.runner_pid = old.runner_pid
         current.runner_started_at = old.runner_started_at
+        current.runner_boot_id = old.runner_boot_id
         # Preserve sequence allocation and other metadata written while activation waited.
         return True
 
@@ -3083,6 +3222,7 @@ def _migrate_legacy_tmux_source(name: str, old: AgentRecord, to_backend: str) ->
             current.tmux_target = new_target
             current.runner_pid = staged_identity.pid
             current.runner_started_at = staged_identity.started_at
+            current.runner_boot_id = staged_identity.boot_id
             staged_runner_activate_path(name, token).write_text(now_iso() + "\n")
             session_id = current.session_id
         if not wait_for_staged_runner_activation(name, token):
@@ -3331,6 +3471,7 @@ def _convert_headless_to_tui(name: str, old: AgentRecord) -> MigrationResult:
             presentation_pane=pane_id,
             runner_pid=probe.pid,
             runner_started_at=None if probe.pid is None else pid_start_time(probe.pid),
+            runner_boot_id=None,
             status="idle",
         )
         _confirm_resumed_tui(destination)
@@ -3420,6 +3561,7 @@ def _convert_legacy_tmux_headless_to_tui(name: str, old: AgentRecord) -> Migrati
             presentation_pane=pane_id,
             runner_pid=probe.pid,
             runner_started_at=None if probe.pid is None else pid_start_time(probe.pid),
+            runner_boot_id=None,
             status="idle",
         )
         _confirm_resumed_tui(destination)
@@ -3574,6 +3716,7 @@ def migrate_agent(
             current.tmux_target = new_target
             current.runner_pid = staged_identity.pid
             current.runner_started_at = staged_identity.started_at
+            current.runner_boot_id = staged_identity.boot_id
             staged_runner_activate_path(valid_name, token).write_text(now_iso() + "\n")
             session_id = current.session_id
         if not wait_for_staged_runner_activation(valid_name, token):

@@ -14,7 +14,7 @@ from typing import Iterator
 
 import pytest
 
-from agentctl.foreign import agent_runner, lib
+from agentctl.foreign import agent_runner, lib, ownership
 
 
 @pytest.mark.parametrize("bypass_permissions", [False, True])
@@ -628,6 +628,7 @@ def _runner_process(base: Path, name: str, executable: Path, *, stage: str | Non
     env = os.environ.copy()
     env.pop("HERDR_SUBAGENTS_POLICY", None)
     env.pop("SUBAGENTS_MIGRATION_STAGE", None)
+    env.pop(ownership.CGROUP_MODE_ENV, None)
     env.update(HERDR_SUBAGENTS_HOME=str(base), CODEX_BIN=str(executable), AGY_BIN=str(executable))
     if stage is not None:
         env["SUBAGENTS_MIGRATION_STAGE"] = stage
@@ -636,10 +637,22 @@ def _runner_process(base: Path, name: str, executable: Path, *, stage: str | Non
 
 
 def _process_running(pid: int) -> bool:
+    # A zombie (Z) has exited; X is a zombie being released by its reaper.
     try:
-        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] not in ("Z", "X", "x")
     except (FileNotFoundError, ProcessLookupError):
         return False
+
+
+def _kill_started(pid: int, starttime: str | None) -> None:
+    """Teardown: kill a process this test started, only through an exact pidfd."""
+    if starttime is None:
+        return
+    pinned = ownership.pin(ownership.ProcessIdentity(pid, starttime, ownership.current_boot_id()))
+    if pinned.process is not None:
+        with pinned.process as process:
+            process.send(signal.SIGKILL)
+            process.wait(5)
 
 
 @pytest.mark.parametrize("harness", ["codex", "agy"])
@@ -662,10 +675,12 @@ def test_stop_busy_runner_terminates_owned_harness_group(fake_runner_state: Path
     lib.enqueue_message(rec.name, "bounded owned-process test", model=None)
     runner = _runner_process(fake_runner_state, rec.name, executable)
     pids: list[int] = []
+    started: dict[int, str | None] = {}
     try:
         ready = Path(str(executable) + ".ready")
         _wait_for(ready, runner)
         pids = json.loads(ready.read_text())
+        started = {pid: lib.pid_start_time(pid) for pid in pids}
         _wait_for(lib.agent_dir(rec.name) / "active-harness.json", runner)
         if stop == "signal":
             runner.terminate()
@@ -680,9 +695,8 @@ def test_stop_busy_runner_terminates_owned_harness_group(fake_runner_state: Path
         if runner.poll() is None:
             runner.kill()
         runner.communicate(timeout=5)
-        if pids:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(pids[0], signal.SIGKILL)
+        for pid, starttime in started.items():
+            _kill_started(pid, starttime)
 
 
 def test_stop_waits_for_harness_identity_publication(fake_runner_state: Path) -> None:
@@ -700,10 +714,10 @@ def test_stop_waits_for_harness_identity_publication(fake_runner_state: Path) ->
         f"sys.path.insert(0,{str(Path(agent_runner.__file__).resolve().parents[2])!r})\n"
         "from agentctl.foreign import agent_runner,lib\n"
         "record=lib.record_active_harness\n"
-        "def delayed(name,runner,harness):\n"
-        f"    Path({str(barrier)!r}).write_text(str(harness.pid))\n"
+        "def delayed(name,value):\n"
+        f"    Path({str(barrier)!r}).write_text(str(value.leader.pid))\n"
         f"    while not Path({str(release)!r}).exists(): time.sleep(0.01)\n"
-        "    record(name,runner,harness)\n"
+        "    record(name,value)\n"
         "lib.record_active_harness=delayed\n"
         "raise SystemExit(agent_runner.main())\n"
     )
@@ -714,11 +728,13 @@ def test_stop_waits_for_harness_identity_publication(fake_runner_state: Path) ->
     runner = subprocess.Popen([sys.executable, str(launcher), rec.name], env=env, text=True,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     child_pid: int | None = None
+    child_start: str | None = None
     stopper: threading.Thread | None = None
     stopped: list[bool] = []
     try:
         _wait_for(barrier, runner)
         child_pid = int(barrier.read_text())
+        child_start = lib.pid_start_time(child_pid)
         current = lib.read_registry()[rec.name]
         stopper = threading.Thread(target=lambda: stopped.append(lib.terminate_runner(current, grace=0)))
         stopper.start()
@@ -738,32 +754,44 @@ def test_stop_waits_for_harness_identity_publication(fake_runner_state: Path) ->
             runner.kill()
         runner.communicate(timeout=5)
         if child_pid is not None:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(child_pid, signal.SIGKILL)
+            _kill_started(child_pid, child_start)
 
 
 @pytest.mark.parametrize("cleanup", ["down", "gc", "restart"])
 def test_crashed_runner_owned_harness_is_cleaned_before_state_reuse(
     fake_runner_state: Path, monkeypatch: pytest.MonkeyPatch, cleanup: str,
 ) -> None:
+    """Leader-dead/child-live after a runner crash, cleaned from another process.
+
+    The harness leader carries the runner's parent-death signal and dies with
+    it; its child survives and is reached only through the turn's generation.
+    """
     rec = _install_agy_agent(fake_runner_state, "orphan")
     with lib.registry_lock() as agents:
         agents[rec.name].harness = "codex"
     executable = fake_runner_state / "orphan-harness"
     executable.write_text(f"#!{sys.executable}\n" +
-        "import os,sys,time\nfrom pathlib import Path\nsys.stdin.read()\n"
-        "Path(sys.argv[0]+'.ready').write_text(str(os.getpid()))\ntime.sleep(60)\n")
+        "import json,os,subprocess,sys,time\nfrom pathlib import Path\nsys.stdin.read()\n"
+        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'])\n"
+        "temporary=Path(sys.argv[0]+'.ready.tmp')\n"
+        "temporary.write_text(json.dumps([os.getpid(),child.pid]))\n"
+        "os.replace(temporary,Path(sys.argv[0]+'.ready'))\ntime.sleep(60)\n")
     executable.chmod(0o755)
     seq = lib.enqueue_message(rec.name, "crash recovery", model=None)
     runner = _runner_process(fake_runner_state, rec.name, executable)
     replacement: subprocess.Popen[str] | None = None
-    child_pid: int | None = None
+    started: dict[int, str | None] = {}
     try:
         ready = Path(str(executable) + ".ready")
         _wait_for(ready, runner)
-        child_pid = int(ready.read_text())
+        leader_pid, child_pid = json.loads(ready.read_text())
+        started = {pid: lib.pid_start_time(pid) for pid in (leader_pid, child_pid)}
         runner.kill()
         runner.communicate(timeout=5)
+        deadline = time.monotonic() + 3
+        while _process_running(leader_pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not _process_running(leader_pid)
         assert _process_running(child_pid)
         if cleanup == "down":
             lib.bring_down_agent(rec.name, grace=0, force=True)
@@ -787,31 +815,113 @@ def test_crashed_runner_owned_harness_is_cleaned_before_state_reuse(
         if runner.poll() is None:
             runner.kill()
         runner.communicate(timeout=5)
+        for pid, starttime in started.items():
+            _kill_started(pid, starttime)
+
+
+def test_turn_end_sweeps_leftovers_that_hold_the_output_pipe(fake_runner_state: Path) -> None:
+    """A leader that exits leaving a background child must not wedge the turn."""
+    rec = _install_agy_agent(fake_runner_state, "leftover")
+    with lib.registry_lock() as agents:
+        agents[rec.name].harness = "codex"
+    executable = fake_runner_state / "leaky-harness"
+    executable.write_text(f"#!{sys.executable}\n" +
+        "import os,subprocess,sys\nfrom pathlib import Path\nsys.stdin.read()\n"
+        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'])\n"
+        "Path(sys.argv[0]+'.child').write_text(str(child.pid))\n"
+        "Path(sys.argv[sys.argv.index('-o')+1]).write_text('done, with a leftover')\n")
+    executable.chmod(0o755)
+    seq = lib.enqueue_message(rec.name, "leave a background process", model=None)
+    runner = _runner_process(fake_runner_state, rec.name, executable)
+    child_pid: int | None = None
+    child_start: str | None = None
+    try:
+        child_file = Path(str(executable) + ".child")
+        _wait_for(child_file, runner)
+        child_pid = int(child_file.read_text())
+        child_start = lib.pid_start_time(child_pid)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and f"===TURN-DONE {seq} " not in lib.transcript_path(rec.name).read_text():
+            time.sleep(0.05)
+        transcript = lib.transcript_path(rec.name).read_text()
+        assert f"===TURN-DONE {seq} rc=0 " in transcript, transcript[-2000:]
+        assert "===HARNESS CLEANUP " in transcript
+        assert lib.last_message_path(rec.name).read_text() == "done, with a leftover"
+        assert not _process_running(child_pid)
+        assert not lib.active_harness_path(rec.name).exists()
+    finally:
+        if runner.poll() is None:
+            lib.terminate_runner(lib.read_registry()[rec.name], grace=0)
+        runner.communicate(timeout=10)
         if child_pid is not None:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(child_pid, signal.SIGKILL)
+            _kill_started(child_pid, child_start)
 
 
-@pytest.mark.parametrize("changed", ["runner_pid", "runner_started_at", "started_at", "process_group"])
-def test_harness_cleanup_refuses_changed_ownership(
+@pytest.mark.parametrize("changed", ["runner_pid", "runner_started_at"])
+def test_harness_cleanup_ignores_another_runners_record(
     fake_runner_state: Path, monkeypatch: pytest.MonkeyPatch, changed: str,
 ) -> None:
     rec = _install_agy_agent(fake_runner_state, "ownership")
     rec.runner_pid, rec.runner_started_at = 22, "runner-start"
-    ownership: dict[str, object] = {
+    ownership_record: dict[str, object] = {
         "runner_pid": 22, "runner_started_at": "runner-start", "pid": 33, "started_at": "child-start",
     }
-    if changed != "process_group":
-        ownership[changed] = 23 if changed == "runner_pid" else "different-start"
-    (lib.agent_dir(rec.name) / "active-harness.json").write_text(json.dumps(ownership))
-    monkeypatch.setattr(lib, "pid_start_time", lambda _pid: "child-start")
-    monkeypatch.setattr(os, "getpgid", lambda pid: pid + 1 if changed == "process_group" else pid)
-    monkeypatch.setattr(os, "killpg", lambda *_args: pytest.fail("changed ownership was signaled"))
-    if changed == "process_group":
-        with pytest.raises(lib.AgentOperationError, match="no longer owns"):
+    ownership_record[changed] = 23 if changed == "runner_pid" else "different-start"
+    path = lib.agent_dir(rec.name) / "active-harness.json"
+    path.write_text(json.dumps(ownership_record))
+    monkeypatch.setattr(signal, "pidfd_send_signal", lambda *_args: pytest.fail("another runner's record was signalled"))
+    monkeypatch.setattr(os, "killpg", lambda *_args: pytest.fail("another runner's record was signalled"))
+    assert not lib.terminate_active_harness(rec)
+    assert path.exists()
+
+
+def test_legacy_harness_record_is_never_signalled(fake_runner_state: Path) -> None:
+    """Legacy policy: no boot identity or generation, so no signal, live or not."""
+    rec = _install_agy_agent(fake_runner_state, "legacy")
+    leader = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+    try:
+        start = lib.pid_start_time(leader.pid)
+        rec.runner_pid, rec.runner_started_at = 4_000_000, "1"
+        path = lib.agent_dir(rec.name) / "active-harness.json"
+        path.write_text(json.dumps({
+            "runner_pid": rec.runner_pid, "runner_started_at": "1", "pid": leader.pid, "started_at": start,
+        }))
+        with pytest.raises(lib.AgentOperationError) as caught:
             lib.terminate_active_harness(rec)
-    else:
+        assert caught.value.code == "harness_identity_legacy"
+        assert f"pid {leader.pid}" in caught.value.message
+        time.sleep(0.05)
+        assert leader.poll() is None and path.exists()
+        leader.kill()
+        leader.wait(timeout=5)
         assert not lib.terminate_active_harness(rec)
+        assert not path.exists()
+    finally:
+        if leader.poll() is None:
+            leader.kill()
+        leader.wait(timeout=5)
+
+
+def test_harness_that_left_its_session_is_refused(fake_runner_state: Path) -> None:
+    rec = _install_agy_agent(fake_runner_state, "moved")
+    stranger = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        boot = ownership.current_boot_id()
+        rec.runner_pid, rec.runner_started_at = os.getpid(), "1"
+        record = ownership.HarnessRecord(
+            runner=ownership.ProcessIdentity(os.getpid(), "1", boot),
+            leader=ownership.ProcessIdentity(stranger.pid, lib.pid_start_time(stranger.pid), boot),
+            process_group=stranger.pid, generation="ab" * 16, containment=ownership.CONTAINMENT_PROCESS,
+        )
+        (lib.agent_dir(rec.name) / "active-harness.json").write_text(json.dumps(record.document("now")))
+        with pytest.raises(lib.AgentOperationError) as caught:
+            lib.terminate_active_harness(rec)
+        assert caught.value.code == "harness_identity_changed"
+        time.sleep(0.05)
+        assert stranger.poll() is None
+    finally:
+        stranger.kill()
+        stranger.wait(timeout=5)
 
 
 def test_stop_marker_preserves_active_turn_grace_period(fake_runner_state: Path) -> None:

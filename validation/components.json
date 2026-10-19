@@ -26,6 +26,7 @@
         "py/agentctl/foreign/tests/test_agent_runner.py",
         "py/agentctl/foreign/tests/test_backends.py",
         "py/agentctl/foreign/tests/test_mcp_server.py",
+        "py/agentctl/foreign/tests/test_ownership.py",
         "py/tests/test_agentctl_adopt.py",
         "py/tests/test_agentctl_chat_ack.py",
         "py/tests/test_agentctl_chat_atomic.py",
