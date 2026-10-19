@@ -19,10 +19,9 @@ def test_partial_metadata_failure_still_rebuilds_successes(
         archive: Path,
         team_slug: str,
         *,
-        token: str | None,
         timeout_seconds: float,
     ) -> PullMetadataReport:
-        del token, timeout_seconds
+        del timeout_seconds
         return PullMetadataReport(
             references=2,
             distinct_pulls=2,
@@ -55,37 +54,32 @@ def test_partial_metadata_failure_still_rebuilds_successes(
     assert builds == [(tmp_path, "test-team", 45)]
 
 
-def test_named_token_environment_variable_must_exist(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_the_token_option_is_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.delenv("MISSING_TIMELINE_GITHUB_TOKEN", raising=False)
+    # gh supplies the credential; wrkviz reads no token (2026-10-19).
     called = False
 
-    def fake_enrich(
-        archive: Path,
-        team_slug: str,
-        *,
-        token: str | None,
-        timeout_seconds: float,
-    ) -> PullMetadataReport:
-        del archive, team_slug, token, timeout_seconds
+    def fake_enrich(archive: Path, team_slug: str, *, timeout_seconds: float) -> PullMetadataReport:
         nonlocal called
         called = True
-        raise AssertionError("metadata fetch must not start without the requested token")
+        raise AssertionError("metadata fetch must not start")
 
     monkeypatch.setattr(timeline_cli, "enrich_pull_request_metadata", fake_enrich)
 
-    result = timeline_cli.main(
-        [
-            "github-metadata",
-            "--output",
-            str(tmp_path),
-            "--team",
-            "test-team",
-            "--github-token-env",
-            "MISSING_TIMELINE_GITHUB_TOKEN",
-        ]
-    )
+    with pytest.raises(SystemExit) as raised:
+        timeline_cli.main(
+            [
+                "github-metadata",
+                "--output",
+                str(tmp_path),
+                "--team",
+                "test-team",
+                "--github-token-env",
+                "SOME_TOKEN",
+            ]
+        )
 
-    assert result == 2
+    assert raised.value.code == 2
+    assert "--github-token-env" in capsys.readouterr().err
     assert not called

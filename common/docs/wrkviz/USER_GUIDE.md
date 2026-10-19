@@ -805,9 +805,9 @@ wrkviz github-metadata \
 ```
 
 This scans only evidenced pull links, conditionally fetches their title, state, branches, author,
-and a bounded body excerpt, then rebuilds the detail JSON. Public repositories need no token. For
-private repositories, set `GH_TOKEN` or `GITHUB_TOKEN`, or name another environment variable with
-`--github-token-env`; credentials are request-only and never enter the cache. ETags make unchanged
+and a bounded body excerpt, then rebuilds the detail JSON. Each request runs `gh api`, so it uses
+the `gh` on PATH (including a rate-limiting wrapper) and that `gh`'s login; wrkviz reads no token and
+opens no connection of its own, and nothing about the credential enters the cache. ETags make unchanged
 reruns byte-stable. `refresh --github-metadata` performs the same optional step after its normal
 build. Successful records are saved individually, so a rate limit or unavailable repository cannot
 discard metadata already fetched.

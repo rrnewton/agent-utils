@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import json
+import os
 from pathlib import Path
+import sys
 
 import pytest
 
 from wrkviz.github_metadata import (
+    GhApiTransport,
     GitHubMetadataError,
     HttpResponse,
     MAX_API_RESPONSE_BYTES,
@@ -16,7 +19,6 @@ from wrkviz.github_metadata import (
     PullRequestKey,
     PullRequestMetadata,
     PullRequestMetadataCache,
-    StandardLibraryHttpTransport,
     fetch_pull_request,
     load_pull_request_metadata_cache,
     save_pull_request_metadata_cache,
@@ -145,14 +147,13 @@ def test_fetch_parses_fields_bounds_body_and_uses_github_endpoint() -> None:
     ]
 
 
-def test_conditional_fetch_sends_etag_and_token_but_never_stores_token() -> None:
+def test_conditional_fetch_sends_the_cached_etag() -> None:
     cached = _record()
     transport = FakeTransport(HttpResponse(status=304, headers={}, body=b""))
 
     result = fetch_pull_request(
         _key(),
         cached=cached,
-        token="github-secret",
         fetched_at="2026-08-05T12:00:00Z",
         transport=transport,
     )
@@ -161,8 +162,7 @@ def test_conditional_fetch_sends_etag_and_token_but_never_stores_token() -> None
     assert result.metadata is cached
     headers = transport.calls[0][1]
     assert headers["If-None-Match"] == 'W/"cached"'
-    assert headers["Authorization"] == "Bearer github-secret"
-    assert "github-secret" not in json.dumps(result.metadata.to_json_obj())
+    assert "Authorization" not in headers
 
 
 def test_not_modified_without_cache_is_rejected() -> None:
@@ -185,8 +185,8 @@ def test_fetch_rejects_oversized_injected_response() -> None:
         fetch_pull_request(_key(), transport=transport)
 
 
-def test_standard_transport_rejects_non_github_url_before_network_access() -> None:
-    transport = StandardLibraryHttpTransport()
+def test_gh_transport_rejects_non_github_url_before_running_gh() -> None:
+    transport = GhApiTransport(gh="/nonexistent/gh")
 
     with pytest.raises(ValueError, match="api.github.com"):
         transport.get(
@@ -196,8 +196,8 @@ def test_standard_transport_rejects_non_github_url_before_network_access() -> No
         )
 
 
-def test_standard_transport_rejects_an_unrelated_github_api_endpoint() -> None:
-    transport = StandardLibraryHttpTransport()
+def test_gh_transport_rejects_an_unrelated_github_api_endpoint() -> None:
+    transport = GhApiTransport(gh="/nonexistent/gh")
 
     with pytest.raises(ValueError, match="api.github.com"):
         transport.get(
@@ -221,13 +221,69 @@ def test_invalid_pull_request_key_is_rejected(repository: str, number: int) -> N
         PullRequestKey(repository, number)
 
 
-def test_bearer_token_cannot_inject_an_http_header() -> None:
-    transport = FakeTransport(HttpResponse(status=200, headers={}, body=_api_body()))
+def _fake_gh(tmp_path: Path, output: bytes, exit_code: int = 0) -> tuple[Path, Path]:
+    """A gh stand-in that records its argv and prints a canned --include response."""
 
-    with pytest.raises(ValueError, match="bearer token"):
-        fetch_pull_request(_key(), token="secret\r\nX-Evil: yes", transport=transport)
+    calls = tmp_path / "gh-argv.json"
+    canned = tmp_path / "gh-output"
+    canned.write_bytes(output)
+    gh = tmp_path / "gh"
+    gh.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        f"open({str(calls)!r}, 'w').write(json.dumps(sys.argv[1:]))\n"
+        f"sys.stdout.buffer.write(open({str(canned)!r}, 'rb').read())\n"
+        f"sys.exit({exit_code})\n"
+    )
+    gh.chmod(0o755)
+    return gh, calls
 
-    assert transport.calls == []
+
+def test_default_fetch_runs_gh_api_and_parses_its_included_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Every request goes through `gh api` (the gh on PATH, which may be a
+    # rate-limiting wrapper), never a connection of this module's own.
+    body = _api_body()
+    output = (
+        b"HTTP/2.0 200 OK\nContent-Type: application/json\r\n"
+        b'Etag: "fresh"\r\n\r\n' + body
+    )
+    gh, calls = _fake_gh(tmp_path, output)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("GH_TOKEN", "must-not-be-read")
+
+    result = fetch_pull_request(_key(), cached=_record(), fetched_at="2026-08-05T12:00:00Z")
+
+    assert not result.not_modified
+    assert result.metadata.etag == '"fresh"'
+    argv = json.loads(calls.read_text())
+    assert argv[:4] == ["api", "--include", "--method", "GET"]
+    assert argv[-1] == "repos/sched-ext/scx/pulls/3668"
+    assert "If-None-Match: W/\"cached\"" in argv
+    assert not any("must-not-be-read" in arg or "Authorization" in arg for arg in argv)
+
+
+def test_gh_transport_returns_a_not_modified_response(tmp_path: Path) -> None:
+    gh, _ = _fake_gh(tmp_path, b"HTTP/2.0 304 Not Modified\nEtag: W/\"cached\"\r\n\r\n", 1)
+    cached = _record()
+
+    result = fetch_pull_request(_key(), cached=cached, transport=GhApiTransport(gh=str(gh)))
+
+    assert result.not_modified
+    assert result.metadata is cached
+
+
+def test_gh_transport_refuses_a_bearer_token_and_a_failed_gh(tmp_path: Path) -> None:
+    gh, calls = _fake_gh(tmp_path, b"", 1)
+    transport = GhApiTransport(gh=str(gh))
+    url = _key().api_url
+
+    with pytest.raises(GitHubMetadataError, match="refusing to forward a bearer token"):
+        transport.get(url=url, headers={"Authorization": "Bearer x"}, timeout_seconds=5.0)
+    assert not calls.exists()
+    with pytest.raises(GitHubMetadataError, match="gh api failed"):
+        transport.get(url=url, headers={}, timeout_seconds=5.0)
 
 
 @pytest.mark.parametrize("timeout", [0.0, -1.0, float("inf"), float("nan")])

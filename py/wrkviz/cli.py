@@ -450,11 +450,6 @@ def _add_summary(parser: argparse.ArgumentParser) -> None:
 
 def _add_github_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
-        "--github-token-env",
-        default="",
-        help="environment variable containing an optional GitHub token; the token is never stored",
-    )
-    parser.add_argument(
         "--github-timeout",
         type=float,
         default=15.0,
@@ -1382,18 +1377,6 @@ def _usage_line(label: str, usage: TokenUsage, unknown_receipts: int) -> str:
     )
 
 
-def _github_token(ns: argparse.Namespace) -> str | None:
-    requested = str(ns.github_token_env).strip()
-    if requested:
-        value = os.environ.get(requested)
-        if not value:
-            raise ValueError(
-                f"GitHub token environment variable {requested!r} is unset or empty"
-            )
-        return value
-    return os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or None
-
-
 def _print_github_metadata(report: PullMetadataReport) -> None:
     print(
         f"github metadata: {report.references} evidenced references / "
@@ -2221,7 +2204,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             github_report = enrich_pull_request_metadata(
                 archive,
                 team_slug,
-                token=_github_token(ns),
                 timeout_seconds=float(ns.github_timeout),
             )
             _print_github_metadata(github_report)

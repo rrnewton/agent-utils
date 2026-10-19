@@ -103,7 +103,6 @@ def enrich_pull_request_metadata(
     archive: Path,
     team_slug: str,
     *,
-    token: str | None = None,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     transport: HttpTransport | None = None,
     fetched_at: str | None = None,
@@ -121,7 +120,6 @@ def enrich_pull_request_metadata(
             result = fetch_pull_request(
                 key,
                 cached=cache.get(key),
-                token=token,
                 fetched_at=fetched_at,
                 timeout_seconds=timeout_seconds,
                 transport=transport,

@@ -1,8 +1,8 @@
 """Strict, bounded cache records for GitHub pull-request metadata.
 
-The cache deliberately stores presentation metadata only.  Authentication is
-accepted by :func:`fetch_pull_request` for a single request and is never part of
-the record or its JSON representation.
+The cache deliberately stores presentation metadata only.  Requests go through
+``gh api`` (:class:`GhApiTransport`), which supplies the credential, so no token
+passes through this module or into a record.
 """
 
 from __future__ import annotations
@@ -10,11 +10,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import http.client
 import json
 import math
 from pathlib import Path
 import re
+import subprocess
 from typing import Protocol
 from urllib.parse import urlsplit
 
@@ -289,8 +289,19 @@ def _validate_api_url(url: str) -> str:
     return parsed.path
 
 
-class StandardLibraryHttpTransport:
-    """Direct HTTPS transport with a hard response-size limit."""
+class GhApiTransport:
+    """GitHub transport through the ``gh`` command line, never a direct connection.
+
+    Every request runs ``gh api``, so it uses whatever ``gh`` is on PATH,
+    including a rate-limiting wrapper, and that ``gh``'s own login. This module
+    used to open its own HTTPS connection with a token from the environment,
+    which spent the account's API budget where such a wrapper could neither see
+    nor pace it. ``gh`` supplies the credential, so an ``Authorization`` header
+    is refused rather than forwarded.
+    """
+
+    def __init__(self, gh: str = "gh") -> None:
+        self.gh = gh
 
     def get(
         self, *, url: str, headers: Mapping[str, str], timeout_seconds: float
@@ -298,26 +309,61 @@ class StandardLibraryHttpTransport:
         """Fetch one bounded response from the exact GitHub pull endpoint."""
 
         path = _validate_api_url(url)
-        connection = http.client.HTTPSConnection(
-            "api.github.com", timeout=timeout_seconds
-        )
-        try:
-            try:
-                connection.request("GET", path, headers=dict(headers))
-                response = connection.getresponse()
-                body = response.read(MAX_API_RESPONSE_BYTES + 1)
-                if len(body) > MAX_API_RESPONSE_BYTES:
-                    raise GitHubMetadataError("GitHub API response exceeds size limit")
-                response_headers = {
-                    name.lower(): value for name, value in response.getheaders()
-                }
-                return HttpResponse(
-                    status=response.status, headers=response_headers, body=body
+        argv = [self.gh, "api", "--include", "--method", "GET"]
+        for name, value in headers.items():
+            if name.lower() == "authorization":
+                raise GitHubMetadataError(
+                    "gh supplies the GitHub credential; refusing to forward a bearer token"
                 )
-            except http.client.HTTPException as error:
-                raise GitHubMetadataError("GitHub API HTTP protocol failure") from error
-        finally:
-            connection.close()
+            argv += ["-H", f"{name}: {value}"]
+        argv.append(path.lstrip("/"))
+        try:
+            completed = subprocess.run(
+                argv, capture_output=True, timeout=timeout_seconds, check=False
+            )
+        except subprocess.TimeoutExpired as error:
+            raise GitHubMetadataError("gh api timed out") from error
+        except OSError as error:
+            raise GitHubMetadataError(f"gh api could not run: {error}") from error
+        if len(completed.stdout) > MAX_API_RESPONSE_BYTES + 64 * 1024:
+            raise GitHubMetadataError("GitHub API response exceeds size limit")
+        response = _parse_included_response(completed.stdout)
+        if response is None:
+            detail = completed.stderr.decode("utf-8", errors="replace").strip()[:300]
+            raise GitHubMetadataError(
+                f"gh api failed (exit {completed.returncode}): {detail or 'no response'}"
+            )
+        if len(response.body) > MAX_API_RESPONSE_BYTES:
+            raise GitHubMetadataError("GitHub API response exceeds size limit")
+        return response
+
+
+_STATUS_LINE = re.compile(rb"HTTP/[0-9.]+ ([1-5][0-9][0-9])(?: .*)?\Z")
+
+
+def _parse_included_response(output: bytes) -> HttpResponse | None:
+    """Split ``gh api --include`` output into status, headers and body."""
+
+    lines = output.split(b"\n")
+    if not lines:
+        return None
+    status = _STATUS_LINE.fullmatch(lines[0].rstrip(b"\r"))
+    if status is None:
+        return None
+    response_headers: dict[str, str] = {}
+    offset = len(lines[0]) + 1
+    for line in lines[1:]:
+        offset += len(line) + 1
+        text = line.rstrip(b"\r")
+        if not text:
+            break
+        name, separator, value = text.decode("latin-1").partition(":")
+        if not separator:
+            return None
+        response_headers[name.strip().lower()] = value.strip()
+    return HttpResponse(
+        status=int(status.group(1)), headers=response_headers, body=output[offset:]
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,7 +382,6 @@ def fetch_pull_request(
     key: PullRequestKey,
     *,
     cached: PullRequestMetadata | None = None,
-    token: str | None = None,
     fetched_at: str | None = None,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     transport: HttpTransport | None = None,
@@ -344,8 +389,7 @@ def fetch_pull_request(
     """Fetch one PR, conditionally using a cached ETag when available.
 
     A 304 response returns the cached record unchanged, including ``fetched_at``,
-    so a conditional rerun is byte-idempotent.  The optional bearer token is
-    placed solely in the request headers and is not retained by the result.
+    so a conditional rerun is byte-idempotent.
     """
 
     if cached is not None and cached.key != key:
@@ -363,14 +407,10 @@ def fetch_pull_request(
     }
     if cached is not None and cached.etag is not None:
         headers["If-None-Match"] = cached.etag
-    if token is not None:
-        headers["Authorization"] = "Bearer " + _valid_header_value(
-            token, "GitHub bearer token", 4_096
-        )
 
     url = key.api_url
     _validate_api_url(url)
-    client = transport if transport is not None else StandardLibraryHttpTransport()
+    client = transport if transport is not None else GhApiTransport()
     response = client.get(url=url, headers=headers, timeout_seconds=timeout_seconds)
     if len(response.body) > MAX_API_RESPONSE_BYTES:
         raise GitHubMetadataError("GitHub API response exceeds size limit")
@@ -489,6 +529,7 @@ def _exact_keys(value: Mapping[str, object], expected: set[str], where: str) -> 
 
 __all__ = [
     "DEFAULT_TIMEOUT_SECONDS",
+    "GhApiTransport",
     "GitHubHttpError",
     "GitHubMetadataError",
     "HttpResponse",
@@ -499,7 +540,6 @@ __all__ = [
     "PullRequestKey",
     "PullRequestMetadata",
     "PullRequestMetadataCache",
-    "StandardLibraryHttpTransport",
     "fetch_pull_request",
     "load_pull_request_metadata_cache",
     "save_pull_request_metadata_cache",
