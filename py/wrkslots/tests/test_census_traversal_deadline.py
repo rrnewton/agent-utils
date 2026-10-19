@@ -13,8 +13,22 @@ from pathlib import Path
 import pytest
 
 from wrkslots import cli
-from wrkslots.tests.test_census_binding_deadline import _assert_reaped, _child_pids
+from wrkslots.tests.test_census_binding_deadline import (
+    _assert_reaped,
+    _child_pids,
+    _open_descriptors,
+)
 from wrkslots.tests.test_census_subject_progress import CensusFixture, FinalStatClock, _fixture
+
+
+def _close_if_still(owned: dict[int, int]) -> None:
+    """Close each descriptor that still names the pipe it was opened as, and nothing else."""
+    for end, inode in owned.items():
+        try:
+            if os.fstat(end).st_ino == inode:
+                os.close(end)
+        except OSError:
+            pass
 
 
 @dataclass
@@ -75,7 +89,7 @@ def _events(path: Path) -> list[dict[str, object]]:
 
 
 def test_default_budget_blocked_traversal_terminates_on_every_attempt_and_retries(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest,
 ) -> None:
     fixture = _fixture(tmp_path, {"subject": (1,)})
     (fixture.planned["subject"][0].path / "artifact-000000").write_bytes(b"allocated")
@@ -97,7 +111,13 @@ def test_default_budget_blocked_traversal_terminates_on_every_attempt_and_retrie
             time.sleep(10)
         return fd
 
-    before_fds = set(os.listdir("/proc/self/fd"))
+    # A pipe this test owns, open before the snapshot and checked after the last census: if a
+    # census closed a descriptor it does not own, this one goes with the others, and the failure
+    # says so instead of reading as another test's leak.
+    sentinel = os.pipe()
+    owned = {end: os.fstat(end).st_ino for end in sentinel}
+    request.addfinalizer(lambda: _close_if_still(owned))
+    before_fds = _open_descriptors()
     with monkeypatch.context() as blocked:
         blocked.setattr(os, "open", blocked_open)
         for attempt in range(2):
@@ -123,6 +143,9 @@ def test_default_budget_blocked_traversal_terminates_on_every_attempt_and_retrie
     assert healthy["subject"].status == "complete"
     assert healthy["subject"].bytes == fixture.expected_bytes("subject")
     assert len(_events(log)) == 2
+    for end, inode in owned.items():
+        # A census that closed a descriptor it did not open makes this raise, or names another pipe.
+        assert os.fstat(end).st_ino == inode
     assert set(os.listdir("/proc/self/fd")) == before_fds
     _assert_reaped(children)
 
@@ -147,7 +170,7 @@ def test_killed_file_stat_keeps_all_three_debits_and_completed_directory_metric(
             time.sleep(10)
         return original_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
 
-    before_fds = set(os.listdir("/proc/self/fd"))
+    before_fds = _open_descriptors()
     with monkeypatch.context() as blocked:
         blocked.setattr(os, "stat", blocked_stat)
         began = time.perf_counter()
@@ -199,7 +222,7 @@ def test_worker_rejects_oversized_real_child_result_and_reaps(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     children = _child_pids(monkeypatch)
-    before_fds = set(os.listdir("/proc/self/fd"))
+    before_fds = _open_descriptors()
     with pytest.raises(cli.Refusal, match="result is oversized"):
         cli._run_audit_cache_worker(
             "test oversized result", lambda: {"padding": "x" * 512},
@@ -214,7 +237,7 @@ def test_worker_rejects_result_when_decoding_finishes_after_deadline(
 ) -> None:
     children = _child_pids(monkeypatch)
     original_loads = json.loads
-    before_fds = set(os.listdir("/proc/self/fd"))
+    before_fds = _open_descriptors()
     with mmap.mmap(-1, 1) as clock, monkeypatch.context() as patched:
         patched.setattr(time, "monotonic", lambda: float(clock[0]))
 
@@ -237,7 +260,7 @@ def test_worker_accepts_timely_bounded_real_child_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     children = _child_pids(monkeypatch)
-    before_fds = set(os.listdir("/proc/self/fd"))
+    before_fds = _open_descriptors()
     observed = cli._run_audit_cache_worker(
         "test positive result", lambda: {"answer": 7},
         deadline=time.monotonic() + 5, result_limit=64,

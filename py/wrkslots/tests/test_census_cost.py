@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from wrkslots import cli
+from wrkslots.tests.test_census_binding_deadline import _open_descriptors
 
 
 def _config(tmp_path: Path, *, batch: bool = False) -> cli.Config:
@@ -1308,7 +1309,7 @@ def test_cache_census_closes_bound_parent_on_prewrite_exception(
         checkout_mount_id=checkout_identity[2],
     )
     state_path = tmp_path / "fd-cleanup-state.json"
-    before = len(tuple(Path("/proc/self/fd").iterdir()))
+    before = len(_open_descriptors())
     monkeypatch.setattr(
         cli,
         "_audit_cache_root_identity",
@@ -1383,7 +1384,7 @@ def test_cache_census_closes_bound_parent_when_key_setup_raises_unexpectedly(
     identity = cli._open_directory_identity(checkout, "checkout")
     directory = cli.CacheDirectory(cache, checkout, *identity)
     state_path = tmp_path / "key-failure-state.json"
-    before = len(tuple(Path("/proc/self/fd").iterdir()))
+    before = len(_open_descriptors())
     monkeypatch.setattr(
         cli,
         "_audit_cache_state_key",
@@ -1421,7 +1422,7 @@ def test_cache_relative_opener_closes_new_fd_on_identity_exception(
     directory = cli.CacheDirectory(cache, checkout, *checkout_identity)
     root_identity = cli._audit_cache_root_identity(config, directory)
     assert root_identity is not None
-    before = set(os.listdir("/proc/self/fd"))
+    before = _open_descriptors()
     if failure == "fstat":
         original_fstat = os.fstat
         calls = 0
