@@ -245,6 +245,9 @@ def parser() -> argparse.ArgumentParser:
          "agentctl install-units --dest ~/.config/systemd/user --dry-run"),
         ("watch", "Check and repair Herdr, configured units and timers, and slot images (Rust edition only; this "
          "edition refuses).", "agentctl watch --once --check-only"),
+        ("watch-agents", "Watch every registered agent and tell the coordinator when one is at a prompt, idle "
+         "without a verdict, stalled, or dead (Rust edition only; this edition refuses).",
+         "agentctl watch-agents --coordinator coordinator --once --check-only"),
     ):
         command(rust_only, purpose, example)
     for name, purpose in (
@@ -312,7 +315,7 @@ def _goal_command(args: argparse.Namespace) -> list[str] | None:
 
 
 #: Commands only the Rust edition implements; this edition refuses them with exit status 2.
-_RUST_ONLY = ("restore", "install-units", "watch")
+_RUST_ONLY = ("restore", "install-units", "watch", "watch-agents")
 
 
 def main(argv: Sequence[str] | None = None) -> int:

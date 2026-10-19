@@ -644,6 +644,73 @@ pass listing unrepaired findings it has not reported in the last hour.
 `--once` runs a single pass and exits 0 when every check passed, 1 otherwise;
 `--check-only` repairs, remounts, and sends nothing.
 
+### Watch agents for prompts, stalls, and silence (Rust edition)
+
+`agentctl watch` keeps the coordinator's environment alive. `agentctl
+watch-agents` keeps an eye on the agents themselves, so an agent that sits at a
+harness approval prompt for hours is found in minutes:
+
+```sh
+agentctl watch-agents --coordinator coordinator --once --check-only
+agentctl watch-agents --coordinator coordinator
+```
+
+Every `--interval` seconds (default 60) it lists the registry and reads each
+running agent except the coordinator — paused and agentcloud agents are
+skipped, and a `launch_failed` record, which `start` already reported, is left
+alone. It reports an agent to the coordinator when a condition holds past its
+threshold:
+
+| condition | threshold | meaning |
+|---|---|---|
+| `approval-prompt` | `--approval-minutes` (default 5) | a harness approval, permission, or trust prompt at the bottom of the screen |
+| `idle-no-verdict` | `--idle-minutes` (default 15) | idle or done, work was delivered and drained, and no line starts with a `--done-marker` (default `DONE:` or `BLOCKED:`) near the bottom of the screen |
+| `stalled` | `--stall-minutes` (default 30) | marked working, timed from the last screen change |
+| `dead` | `--dead-minutes` (default 5) | the record says running but the harness cannot be reached |
+
+An agent that was never sent work, or that still has prompts queued, is never
+reported idle. When every watched agent is unreachable at once the terminal
+server is the problem, and the pass says so instead of calling every harness
+dead; repairing that is `agentctl watch`'s job.
+
+The watcher never answers a prompt and never types into any agent except the
+coordinator. A condition past its threshold becomes **one notice per episode**:
+notices from one pass ride in a single message, messages are at least
+`--min-notice-interval` seconds apart (default 300), and the message goes
+through the same durable queue as `agentctl send`, so a coordinator that is
+busy simply keeps it queued. The notice names the agent, the condition, and
+the proving line or probe error, and points at `agentctl status NAME` and
+`agentctl read NAME`. Episode memory — when each condition was first seen,
+whether it was reported, and notices still owed — is kept in
+`agent-watch-state.json` in `--state-dir` (default
+`$XDG_STATE_HOME/agentctl/agent-watch`), next to the last pass's
+`agent-watch.json`, so restarting the watcher never reports an episode twice.
+`--once` runs a single pass, prints it as JSON, and exits 0 when no episode
+has been reported, 1 otherwise; `--check-only` sends nothing.
+
+Run it beside `agent-watch.service` under its own user unit. This unit is a
+sample: `install-units` does not write it, and nothing here installs it.
+
+```ini
+[Unit]
+Description=Tell the coordinator when an agent is at a prompt, idle, stalled, or dead
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/path/to/agentctl --registry /path/to/project/.agentctl --herdr-bin /path/to/herdr watch-agents --coordinator coordinator
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target
+```
+
+Save it as `~/.config/systemd/user/agent-watch-agents.service`, adjust the
+paths, the registry, and the coordinator's name, then
+`systemctl --user daemon-reload` and
+`systemctl --user enable --now agent-watch-agents.service`.
+
 ### Adopt an existing Herdr agent
 
 An agent that is already running in Herdr can join the same named registry

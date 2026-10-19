@@ -110,6 +110,11 @@ enum Commands {
         after_help = "Examples:\n  agentctl --registry ~/project/.agentctl watch --once\n  agentctl --registry ~/project/.agentctl watch --interval 60\n\nConfiguration is REGISTRY/restore.json (herdr_unit, units, timers [{unit, max_age_seconds}],\ncoordinator). health.json goes to --state-dir (default $XDG_STATE_HOME/agentctl/watch). With --once,\nexit 0 when every check passed and 1 otherwise. Without it the watch runs until stopped."
     )]
     Watch(Watch),
+    /// Watch every registered agent and tell the coordinator when one needs a human: at a harness approval or permission prompt, idle without a verdict, stalled with no new output, or dead. One notice per episode, queued durably for the coordinator; never answers a prompt and never types into any other agent
+    #[command(
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl watch-agents --coordinator coordinator --once --check-only\n  agentctl --registry ~/project/.agentctl watch-agents --coordinator coordinator --approval-minutes 5 --idle-minutes 15 --stall-minutes 30\n\nEach pass lists the registry, reads every running agent except the coordinator (paused and agentcloud agents are skipped), and\nclassifies it. A condition that holds past its threshold is reported once, as one message queued for the coordinator through\nthe same durable path as `agentctl send`, so a busy coordinator loses nothing. A verdict is a line starting with one of\n--done-marker near the bottom of the agent's screen; an agent that was never sent work, or still has prompts queued, is never\nreported idle. Episode memory lives in --state-dir (default $XDG_STATE_HOME/agentctl/agent-watch) and survives restarts, so an\nepisode is never reported twice. With --once, exit 0 when no episode has been reported and 1 otherwise. Without it the watch\nruns until stopped; see the sample user unit in `agentctl userguide`."
+    )]
+    WatchAgents(WatchAgents),
     /// Compare every registry record with live Herdr state and report each mismatch. Read-only unless --repair-labels. Exit 0 when clean, 1 with findings
     #[command(after_help = "Example: agentctl doctor")]
     Doctor(Doctor),
@@ -241,6 +246,43 @@ struct Watch {
     #[arg(long)]
     check_only: bool,
     /// Directory for health.json (default: $XDG_STATE_HOME/agentctl/watch)
+    #[arg(long, value_name = "DIR")]
+    state_dir: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct WatchAgents {
+    /// Registered name of the coordinator that receives notices (default: coordinator)
+    #[arg(long, default_value = "coordinator", value_name = "NAME")]
+    coordinator: String,
+    /// Seconds between passes, from 10 to 3600 (default: 60)
+    #[arg(long, default_value = "60", value_parser = clap::value_parser!(u64).range(10..=3600), value_name = "SECONDS")]
+    interval: u64,
+    /// Run one pass, print it as JSON, and exit
+    #[arg(long)]
+    once: bool,
+    /// Report only: send no notice to the coordinator
+    #[arg(long)]
+    check_only: bool,
+    /// Minutes an approval or permission prompt may hold before it is reported, from 1 to 1440 (default: 5)
+    #[arg(long, default_value = "5", value_parser = watch_minutes, value_name = "MINUTES")]
+    approval_minutes: u64,
+    /// Minutes an agent may sit idle without a verdict before it is reported, from 1 to 1440 (default: 15)
+    #[arg(long, default_value = "15", value_parser = watch_minutes, value_name = "MINUTES")]
+    idle_minutes: u64,
+    /// Minutes a working agent may show no new output before it is reported stalled, from 1 to 1440 (default: 30)
+    #[arg(long, default_value = "30", value_parser = watch_minutes, value_name = "MINUTES")]
+    stall_minutes: u64,
+    /// Minutes a running record's harness may be unreachable before it is reported dead, from 1 to 1440 (default: 5)
+    #[arg(long, default_value = "5", value_parser = watch_minutes, value_name = "MINUTES")]
+    dead_minutes: u64,
+    /// Line prefix that counts as a verdict; repeatable (default: DONE: and BLOCKED:)
+    #[arg(long = "done-marker", value_name = "PREFIX")]
+    done_markers: Vec<String>,
+    /// Minimum seconds between two messages to the coordinator; notices batch and wait, from 0 to 86400 (default: 300)
+    #[arg(long, default_value = "300", value_parser = clap::value_parser!(u64).range(0..=86400), value_name = "SECONDS")]
+    min_notice_interval: u64,
+    /// Directory for agent-watch-state.json and agent-watch.json (default: $XDG_STATE_HOME/agentctl/agent-watch)
     #[arg(long, value_name = "DIR")]
     state_dir: Option<PathBuf>,
 }
@@ -976,6 +1018,13 @@ fn positive_seconds(value: &str) -> Result<f64, String> {
     }
     Ok(value)
 }
+fn watch_minutes(value: &str) -> Result<u64, String> {
+    let value: u64 = value.parse().map_err(|_| "expected a number of minutes")?;
+    if !(1..=1440).contains(&value) {
+        return Err("minutes must be between 1 and 1440".to_owned());
+    }
+    Ok(value)
+}
 fn startup_seconds(value: &str) -> Result<f64, String> {
     let value = seconds(value)?;
     if value <= 0.0 || value > 300.0 {
@@ -1300,6 +1349,42 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             )?;
             write_json(&health).map_err(Failure::Output)?;
             return Ok(if health["ok"] == true { 0 } else { 1 });
+        }
+        Commands::WatchAgents(value) => {
+            let client = HerdrClient::with_executable("direct", &args.herdr_bin)
+                .map_err(AgentError::from)?;
+            let markers = if value.done_markers.is_empty() {
+                vec!["DONE:".to_owned(), "BLOCKED:".to_owned()]
+            } else {
+                value.done_markers
+            };
+            let options = crate::agent_watch::WatchAgentsOptions {
+                coordinator: value.coordinator.clone(),
+                interval: Duration::from_secs(value.interval),
+                once: value.once,
+                check_only: value.check_only,
+                approval: Duration::from_secs(value.approval_minutes * 60),
+                idle: Duration::from_secs(value.idle_minutes * 60),
+                stall: Duration::from_secs(value.stall_minutes * 60),
+                dead: Duration::from_secs(value.dead_minutes * 60),
+                markers,
+                min_notice_interval: Duration::from_secs(value.min_notice_interval),
+                state_dir: value.state_dir,
+            };
+            let mut probe = crate::agent_watch::ManagedProbe::new(
+                &client,
+                &args.registry,
+                &options.coordinator,
+            );
+            let mut notifier = crate::agent_watch::ManagedNotifier::new(&client, &args.registry);
+            let report = crate::agent_watch::watch_agents(
+                &mut probe,
+                &mut notifier,
+                &crate::agent_watch::SystemClock,
+                &options,
+            )?;
+            write_json(&report).map_err(Failure::Output)?;
+            return Ok(if report["ok"] == true { 0 } else { 1 });
         }
         Commands::InstallUnits(value) => {
             let absolute = |path: &Path| {
@@ -1728,7 +1813,8 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         | Commands::CodexGoal(_)
         | Commands::Restore(_)
         | Commands::InstallUnits(_)
-        | Commands::Watch(_) => {
+        | Commands::Watch(_)
+        | Commands::WatchAgents(_) => {
             unreachable!()
         }
     };
