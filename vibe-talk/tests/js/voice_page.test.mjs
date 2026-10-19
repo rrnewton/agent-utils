@@ -70190,6 +70190,9 @@ test("`#330 voice-long-turn-drop`: a relayed message held by the owner's own ope
   turnDone(socket, 1);
   await page.settle();
   assert.equal(timesRelayed(socket, "the deploy finished"), 1);
+  // Read out: since `#352 voice-reconnect-on-bridge-error`, a relayed turn the call ends before any
+  // of its answer arrives is reported as not read out.
+  speech(socket, "assistant", 2, "In lead team, ci-bot said the deploy finished.", true);
   await page.el("hang-up").click();
   await page.settle();
   assert.deepEqual(unreadSeams(page), [], "a message that was read out was reported as not read out");
@@ -70229,6 +70232,8 @@ test("`#330 voice-long-turn-drop`: a relayed message held by a trickle of the ow
   turnDone(socket, 1);
   await page.settle();
   assert.equal(timesRelayed(socket, "the release is out"), 1);
+  // Read out, as `#352 voice-reconnect-on-bridge-error` requires of a turn not reported.
+  speech(socket, "assistant", 2, "In lead team, ci-bot said the release is out.", true);
   await page.el("hang-up").click();
   await page.settle();
   assert.deepEqual(unreadSeams(page), [], "the trickle's message was only ever reported as not read out");
@@ -70785,6 +70790,8 @@ test("`#337 voice-relay-silent`: while the call is idle a message is read out at
   const { page, socket, closedAt } = await run(SCRIPT);
   assert.equal(closedAt, "audio_end", "an idle call held the message past its burst window");
   assert.equal(timesRelayed(socket, "the tag is cut"), 1);
+  // Read out, as `#352 voice-reconnect-on-bridge-error` requires of a turn not reported.
+  speech(socket, "assistant", 2, "In lead team, ci-bot said the tag is cut.", true);
   await page.el("hang-up").click();
   await page.settle();
   assert.deepEqual(unreadSeams(page), [], "a message that was read out was reported as not read out");
@@ -71322,4 +71329,131 @@ test("`#355 provider-grouped-channels`: a channel of no service the server descr
   await page.settle();
   assert.equal(page.el("settings-service").value, "");
   assert.equal(String(page.el("settings-channel").value), stray.id);
+});
+
+// --- #352 voice-reconnect-on-bridge-error -----------------------------------------------------------
+//
+// Seen live: the owner's turn was cut by the bridge's own barge-in, the page relayed two waiting
+// channel messages a second later, the bridge echoed the prompt and never started its turn, and ten
+// seconds later sent `error` "turn 4 never started after an interrupt; reconnect". The call ended
+// there, and nothing said the two messages were gone: the prompt that carried them had left the
+// queue, and the "not read out" report counted only what was still queued.
+
+/**
+ * A neutral call reading every new message out in full, with one message in another watched channel
+ * relayed as a turn: its prompt is on the wire and the bridge has echoed it back as user turn 2, as a
+ * `vibe-talk-v1` bridge echoes every prompt, and nothing of an answer has arrived. Returns the socket
+ * and the prompt.
+ *
+ * @param {{before?: (socket: any) => void}} [options] `before` runs between the prompt and its echo
+ */
+async function relayInFlight(page, { before = null } = {}) {
+  page.channels = [CHANNEL, OTHER_CHANNEL];
+  const socket = await startNeutralCall(page);
+  await page.settle();
+  await setReadNew(page, "full");
+  await deliver(page, page.watchStream(),
+    sseWatch(message({ id: "3520", channel_id: OTHER_CHANNEL.id, author: "codex", content: "the release is tagged" }), "w.1"));
+  await releaseRelay(page, socket, 1);
+  const [prompt] = relayedPrompts(socket);
+  assert.ok(prompt, "the message was never relayed, so nothing is in flight");
+  if (before) before(socket);
+  speech(socket, "user", 2, prompt);
+  await page.settle();
+  return { socket, prompt };
+}
+
+const UNANSWERED_SEAM =
+  "1 new message, in build noise, went to the agent, but the call ended before it answered, so it was never read out.";
+
+test("`#352 voice-reconnect-on-bridge-error`: a relayed turn the call ended before answering is said not to have been read out, after a hang-up or the voice service's error (negative controls: an answered turn, late output of the turn before it, and the page that counted only what was queued)", async () => {
+  const endings = {
+    "a hang-up": async (page) => {
+      await page.el("hang-up").click();
+    },
+    "the voice service's error": async (_page, socket) => {
+      socket.onmessage({ data: JSON.stringify({ type: "error", message: "backend handler ended" }) });
+    },
+  };
+  for (const [how, end] of Object.entries(endings)) {
+    const page = newPage();
+    const { socket } = await relayInFlight(page);
+    await end(page, socket);
+    await page.settle();
+    const seams = unreadSeams(page);
+    assert.equal(seams.length, 1, `${how}: a relayed turn the agent never answered went without a word`);
+    assert.equal(seamDetail(seams[0]), UNANSWERED_SEAM, `${how}: ${seamDetail(seams[0])}`);
+    assert.match(page.el("settings-detail").textContent,
+      /1 new message in build noise was not read out: the call ended before the agent answered/);
+    // Above the line that ends the call, which is where it happened.
+    const lines = page.el("transcript").children.filter((li) => li.className === "seam");
+    assert.ok(lines.indexOf(seams[0]) < lines.length - 1, `${how}: the report came after the call's own end`);
+  }
+  // Answered, even in part and cut by the hang-up, it was read out.
+  const answered = newPage();
+  const call = await relayInFlight(answered);
+  speech(call.socket, "assistant", 2, "In build noise, codex said", false);
+  await answered.el("hang-up").click();
+  await answered.settle();
+  assert.deepEqual(unreadSeams(answered), [], "a relayed turn the agent began to read out was reported as not read out");
+  // Output of the turn before it, arriving late — PCM before the echo, a transcript numbered for the
+  // completed turn — is no answer to it.
+  const late = newPage();
+  const tail = await relayInFlight(late, {
+    before: (socket) => {
+      socket.onmessage({ data: late.pcmFrame(24000, SPEECH) });
+      speech(socket, "assistant", 1, "and that was the last of it", true);
+    },
+  });
+  assert.ok(tail.prompt);
+  await late.el("hang-up").click();
+  await late.settle();
+  assert.equal(unreadSeams(late).length, 1, "the late tail of the turn before was taken for the relayed turn's answer");
+  // The negative control: the page that counted only what was still queued drops it in silence.
+  const control = newPage(new Map(), brokenScript(
+    "    ...(inFlight && inFlight.kind === \"relay\" && !inFlight.answered ? inFlight.relays : []),\n", ""));
+  await relayInFlight(control);
+  await control.el("hang-up").click();
+  await control.settle();
+  assert.deepEqual(unreadSeams(control), [], "the control reported it, so the test above proves nothing");
+});
+
+test("`#352 voice-reconnect-on-bridge-error`: a typed turn in flight when the call ends is no channel message, and nothing is said not to have been read out", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  await page.settle();
+  await compose(page, "what changed overnight?");
+  await page.el("send-text").click();
+  await page.settle();
+  if (controlFrames(socket).at(-1) === "audio_end") turnDone(socket, 1);
+  await page.settle();
+  assert.deepEqual(promptsSent(socket), ["what changed overnight?"], "the typed turn never went");
+  speech(socket, "user", 2, "what changed overnight?");
+  await page.el("hang-up").click();
+  await page.settle();
+  assert.deepEqual(unreadSeams(page), [], "a typed turn was reported as channel messages not read out");
+});
+
+test("`#352 voice-reconnect-on-bridge-error`: on the hosted protocol too, a relayed turn the call ended before any of its answer arrived is said not to have been read out (control: one the agent began to answer)", async () => {
+  for (const answered of [false, true]) {
+    const page = newPage();
+    await startTalking(page);
+    page.messages = [];
+    await page.el("view-switch").click();
+    await page.settle();
+    await setReadNew(page, "full");
+    await deliver(page, page.watchStream(), sseWatch(message({ id: "3521", content: "the canary is green" }), "w.1"));
+    await speakRelay(page);
+    assert.equal(relayed(page).length, 1, "the message was never relayed");
+    if (answered) assistantSays(page, "In lead team, ci-bot said the canary is green.");
+    await page.el("hang-up").click();
+    await page.settle();
+    const seams = unreadSeams(page);
+    if (answered) {
+      assert.deepEqual(seams, [], "a relayed turn the agent answered was reported as not read out");
+    } else {
+      assert.equal(seams.length, 1, "a relayed turn the agent never answered went without a word");
+      assert.match(seamDetail(seams[0]), /^1 new message, in lead team, went to the agent, but the call ended before it answered/);
+    }
+  }
 });
