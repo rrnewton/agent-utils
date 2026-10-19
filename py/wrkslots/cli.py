@@ -1171,6 +1171,10 @@ class CacheDirectory:
     checkout_device: int
     checkout_inode: int
     checkout_mount_id: int
+    # How audit's cache census treats a nested .git: "refuse", or
+    # "validation-complete" for a validation row, judged as completed
+    # validation removal judges it (see _NESTED_GIT_REFUSE).
+    nested_git: str = "refuse"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -28986,7 +28990,12 @@ def _allocated_open_directory(
         raise Refusal(f"cannot measure cache directory {path}: {exc}") from exc
 
 
-def _allocated_cache_bytes(config: Config, cache: CacheDirectory) -> int:
+def _allocated_cache_bytes(
+    config: Config,
+    cache: CacheDirectory,
+    *,
+    disposable_git: Mapping[Path, tuple[int, int]] | None = None,
+) -> int:
     path = cache.path
     opened = _open_cache_directory(config, cache)
     if opened is None:
@@ -28995,7 +29004,9 @@ def _allocated_cache_bytes(config: Config, cache: CacheDirectory) -> int:
     try:
         device = os.fstat(cache_fd).st_dev
         mount_id = _fd_mount_id(cache_fd, str(path))
-        return _allocated_open_directory(cache_fd, path, device, mount_id)
+        return _allocated_open_directory(
+            cache_fd, path, device, mount_id, disposable_git=disposable_git
+        )
     finally:
         os.close(cache_fd)
         os.close(parent_fd)
@@ -29803,11 +29814,14 @@ def _audit_cache_root_identity(
 def _audit_cache_root_key(
     cache: CacheDirectory, identity: Sequence[int]
 ) -> str:
-    value = {
+    value: dict[str, object] = {
         "path": str(cache.path),
         "checkout_root": str(cache.checkout_root),
         "identity": list(identity),
     }
+    if cache.nested_git != _NESTED_GIT_REFUSE:
+        # Progress made under one nested-Git policy never resumes under another.
+        value["nested_git"] = cache.nested_git
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -30419,6 +30433,8 @@ def _resume_audit_cache_root_unbounded(
 ) -> bool:
     """Advance one exact root without turning an incomplete count into zero."""
 
+    if cache.nested_git not in {_NESTED_GIT_REFUSE, _NESTED_GIT_VALIDATION_COMPLETE}:
+        raise StateError(f"cache census has unknown nested-Git policy {cache.nested_git!r}")
     while budget.remaining > 0 and time.monotonic() < deadline:
         phase = _as_str(root.get("phase"), "cache census phase")
         if phase not in {"measure", "verify", "finalize"}:
@@ -30687,11 +30703,14 @@ def _resume_audit_cache_root_unbounded(
                     budget.debit()
                     if name in {".", ".."}:
                         continue
-                    if name == ".git":
+                    if name == ".git" and cache.nested_git != _NESTED_GIT_VALIDATION_COMPLETE:
                         raise Refusal(
                             f"cache directory contains nested Git metadata: "
                             f"{cache.path / relative / name}"
                         )
+                    # A validation row's nested .git is measured like any
+                    # entry and judged once the root is verified and final
+                    # (_judge_audited_nested_repositories).
                     try:
                         _audit_cache_check_deadline(deadline)
                         child = os.stat(name, dir_fd=fd, follow_symlinks=False)
@@ -30747,6 +30766,60 @@ def _resume_audit_cache_root_unbounded(
         finally:
             os.close(fd)
     return False
+
+
+def _judge_audited_nested_repositories(
+    cache: CacheDirectory,
+    root: Mapping[str, object],
+    *,
+    deadline: float,
+) -> str | None:
+    """Judge a verified validation cache's nested repositories as removal would.
+
+    Completed validation removal judges every ``.git`` its deletion of the
+    cache reaches, in the order its traversal reaches them (names sorted, depth
+    first), and refuses at the first that is not disposable.  This runs the same
+    judgment over the entries the census just verified and finalized, in the
+    same order, and returns that refusal's message; None when every one is
+    disposable.  A judgment the wall allowance cuts short is a timeout, never
+    a verdict.
+    """
+
+    if cache.nested_git != _NESTED_GIT_VALIDATION_COMPLETE:
+        return None
+    relatives = sorted(
+        {
+            _audit_cache_relative(
+                _as_mapping(item, "cache census verified item").get("path"),
+                "cache census verified path",
+            )
+            for field in ("verified_directories", "verified_entries")
+            for item in _as_list(root.get(field), f"cache census {field}")
+        }
+        - {"."},
+        key=lambda relative: Path(relative).parts,
+    )
+    budget = _NestedGitBudget(
+        min(_NESTED_GIT_REMOVAL_SECONDS, max(0.0, deadline - time.monotonic()))
+    )
+    for relative in relatives:
+        if Path(relative).name != ".git":
+            continue
+        _audit_cache_check_deadline(deadline)
+        try:
+            _judge_nested_git_repository(
+                cache.path / relative,
+                (cache.checkout_root,),
+                budget=budget,
+                validation_complete=True,
+            )
+        except Refusal as exc:
+            if time.monotonic() >= deadline:
+                raise _AuditCacheTimeout(
+                    "cache census nested-Git judgment exhausted the fixed wall allowance"
+                ) from exc
+            return str(exc)
+    return None
 
 
 def _audit_cache_census_bound(
@@ -30915,7 +30988,15 @@ def _audit_cache_census_bound(
                     deadline=deadline,
                     finalize=finalize,
                 )
-            if root.get("status") == "complete":
+            nested_refusal = (
+                _judge_audited_nested_repositories(cache, root, deadline=deadline)
+                if root.get("status") == "complete"
+                else None
+            )
+            if nested_refusal is not None:
+                # The verified root stays staged; only its publication refuses.
+                root_results[key] = _AuditCacheMeasurement(None, "error", nested_refusal)
+            elif root.get("status") == "complete":
                 root_results[key] = _AuditCacheMeasurement(
                     _as_int(root.get("bytes"), "cache census bytes"), "complete"
                 )
@@ -31339,13 +31420,14 @@ def _clear_bound_cache_directory(
     return original, mount_id, size
 
 
-# Nested Git repositories inside an agent slot's configured caches.
+# Nested Git repositories inside a slot's configured caches.
 #
-# A cache traversal refuses every entry named ``.git`` unless the caller
-# allows all of them (a completed validation) or has judged that exact entry
-# disposable here first.  Judgment happens only on the destructive step of an
-# otherwise authorized agent removal, before any cache is deleted, and asks Git
-# itself: no path name is ever treated as evidence.
+# A cache traversal refuses every entry named ``.git`` unless the caller has
+# judged that exact entry disposable here first (only the deletion of a whole
+# authorized validation payload allows all of them).  Judgment happens on the
+# destructive step of an otherwise authorized agent removal or completed
+# validation removal, before any cache is deleted, and in audit of a validation
+# row, and asks Git itself: no path name is ever treated as evidence.
 _NESTED_GIT_COMMAND_SECONDS = 120.0
 # One allowance of time spent inside the Git commands a single removal runs to
 # judge and re-judge nested repositories, so a slot full of clones cannot hold
@@ -31414,8 +31496,19 @@ _NESTED_GIT_SCOPE = (
     "repository under any other name and a filesystem image with repositories "
     "inside it. A judged repository was deleted with material no ref, reflog or "
     "commit reaches: dangling blobs and trees, hooks, .git/info files other than "
-    "exclude, and Git LFS objects."
+    "exclude, and Git LFS objects. In a completed validation's caches a repository "
+    "was judged only on whether deleting it reaches outside its cache "
+    "(contents_judged: false); its commits and files were deleted unexamined."
 )
+# How a cache traversal treats a nested ``.git`` entry.  Refuse: every one
+# refuses (clean-caches, agent removal before its judgment, validation removal
+# without --validate-complete).  Validation-complete: each is judged as
+# completed validation removal judges it (_judge_nested_git_repository with
+# validation_complete), and audit applies the same judgment to validation rows.
+_NESTED_GIT_REFUSE = "refuse"
+_NESTED_GIT_VALIDATION_COMPLETE = "validation-complete"
+# Present, as false, only on a repository judged for a completed validation.
+_NESTED_GIT_CONTENTS_JUDGED_KEY = "contents_judged"
 # Remote settings that route a transfer through a program this check cannot
 # inspect, so a remote-tracking ref may not reflect what the remote's URL holds.
 _NESTED_GIT_REMOTE_PROGRAMS = (
@@ -31495,6 +31588,8 @@ class _DisposableNestedRepository:
 
     With ``salvage`` it held such commits or changes, and they were kept in
     the verified bundle that ``salvage`` names before it was judged disposable.
+    Without ``contents_judged`` it lay in a completed validation's cache, where
+    only whether deleting it reaches outside the cache was judged.
     """
 
     path: Path
@@ -31504,6 +31599,7 @@ class _DisposableNestedRepository:
     ignored_entries: int
     ignored_sample: tuple[str, ...]
     salvage: _NestedSalvage | None = None
+    contents_judged: bool = True
 
 
 def _assert_judged_git_metadata(
@@ -31674,6 +31770,7 @@ def _judge_nested_git_repository(
     display: Path | None = None,
     budget: _NestedGitBudget | None = None,
     salvage: _NestedSalvageTarget | None = None,
+    validation_complete: bool = False,
 ) -> _DisposableNestedRepository:
     """Judge one nested repository; every failure, of any exception type, refuses.
 
@@ -31681,7 +31778,9 @@ def _judge_nested_git_repository(
     RuntimeError escaping judgment would leave the slot fenced and the finish
     journal in place.  Converting here keeps every judgment failure on the
     rollback path.  ``salvage`` is remove --archive-nested-cache-repositories
-    (see _salvage_nested_git_repository).
+    (see _salvage_nested_git_repository).  ``validation_complete`` judges a
+    repository in a completed validation's cache, as that removal and audit of
+    a validation row both do.
     """
 
     try:
@@ -31691,6 +31790,7 @@ def _judge_nested_git_repository(
             display=display,
             budget=_NestedGitBudget() if budget is None else budget,
             salvage=salvage,
+            validation_complete=validation_complete,
         )
     except Refusal:
         raise
@@ -31708,6 +31808,7 @@ def _judge_nested_git_repository_unchecked(
     display: Path | None,
     budget: _NestedGitBudget,
     salvage: _NestedSalvageTarget | None = None,
+    validation_complete: bool = False,
 ) -> _DisposableNestedRepository:
     """Prove that the repository at ``dotgit`` holds nothing that exists only here.
 
@@ -31749,6 +31850,17 @@ def _judge_nested_git_repository_unchecked(
     check above and below still runs first, and then the repository is kept
     in a verified local bundle (_salvage_nested_git_repository) before it is
     judged disposable.  A failure to make or verify that bundle refuses.
+
+    With ``validation_complete`` the repository lies in a completed
+    validation's cache, which that removal deletes whatever it holds (the rest
+    of the checkout goes with ``git worktree remove --force``), so its commits,
+    stash, index and files are not examined and no remote is consulted.  Only
+    the checks that decide whether deleting it reaches outside the cache run,
+    with the same refusals: ``.git`` is a real directory that Git reports as
+    both the repository and common directory (no ``.git`` file, link or
+    commondir), its config and config.worktree set no core.worktree and no
+    include, and it registers no linked worktree and holds no submodule
+    repository.  A repository Git cannot open refuses as well.
     """
 
     def refuse(condition: str) -> Refusal:
@@ -31886,6 +31998,10 @@ def _judge_nested_git_repository_unchecked(
 
     def detail(completed: subprocess.CompletedProcess[bytes]) -> str:
         text = (completed.stderr or completed.stdout).decode(errors="replace").strip()
+        if display is not None and text:
+            # Git names the fenced path; name the canonical one, as the
+            # message does, so removal and audit word a refusal alike.
+            text = text.replace(str(dotgit.parent), str(display.parent))
         return text.splitlines()[0][:300] if text else f"exit {completed.returncode}"
 
     def output(
@@ -31936,21 +32052,26 @@ def _judge_nested_git_repository_unchecked(
                     f"repository config sets {key}, which could load configuration "
                     "this check does not inspect"
                 )
-            if lowered.startswith("filter."):
-                raise refuse(
-                    f"repository config defines content filter {key}, which Git "
-                    "status could execute"
-                )
             if lowered == "core.worktree":
                 raise refuse(
                     "repository config sets core.worktree, so its worktree may lie "
                     "outside this cache"
+                )
+            if validation_complete:
+                # The rest protect the content proof, which is not made here.
+                continue
+            if lowered.startswith("filter."):
+                raise refuse(
+                    f"repository config defines content filter {key}, which Git "
+                    "status could execute"
                 )
             if lowered.startswith("url."):
                 raise refuse(
                     f"repository config sets {key}, which rewrites remote URLs, so a "
                     "remote's configured URL may not be where its refs came from"
                 )
+        if validation_complete:
+            continue
         bare = run(["config", "--file", str(config_path), "--type=bool", "--get", "core.bare"])
         if bare.returncode == 0 and bare.stdout.strip() == b"true":
             raise refuse(
@@ -31967,6 +32088,8 @@ def _judge_nested_git_repository_unchecked(
         ("remotes", "remotes defined in legacy .git/remotes files, which this check does not read"),
         ("branches", "remotes defined in legacy .git/branches files, which this check does not read"),
     ):
+        if validation_complete and subdirectory in {"remotes", "branches"}:
+            continue
         try:
             held = sorted(os.listdir(dotgit / subdirectory))
         except FileNotFoundError:
@@ -31975,6 +32098,19 @@ def _judge_nested_git_repository_unchecked(
             raise refuse(f"cannot inspect .git/{subdirectory}: {exc}") from exc
         if held:
             raise refuse(f"repository has {what}: {', '.join(held[:5])}")
+    if validation_complete:
+        # Deleting it reaches nothing outside the cache, and a completed
+        # validation's cache contents are disposable: name HEAD for the record.
+        completed_head = run(["rev-parse", "-q", "--verify", "HEAD^{commit}"])
+        return _DisposableNestedRepository(
+            dotgit,
+            (metadata.st_dev, metadata.st_ino),
+            completed_head.stdout.decode().strip() if completed_head.returncode == 0 else None,
+            None,
+            0,
+            (),
+            contents_judged=False,
+        )
     for alternates in ("objects/info/alternates", "objects/info/http-alternates"):
         borrowed = read_optional(alternates)
         if borrowed is not None and borrowed.strip():
@@ -32696,6 +32832,7 @@ def _judge_cache_nested_repositories(
     canonical_slot: Path,
     budget: _NestedGitBudget,
     salvage: _NestedSalvageTarget | None = None,
+    validation_complete: bool = False,
 ) -> tuple[_DisposableNestedRepository, ...]:
     """Judge every nested repository a removal of ``cache`` would reach, in order."""
 
@@ -32709,6 +32846,7 @@ def _judge_cache_nested_repositories(
                     display=canonical_slot / dotgit.relative_to(fenced_slot),
                     budget=budget,
                     salvage=salvage,
+                    validation_complete=validation_complete,
                 )
             )
         return tuple(judged)
@@ -32748,6 +32886,8 @@ def _nested_git_evidence_item(
                 "salvage_reason": repository.salvage.reason,
             }
         )
+    if not repository.contents_judged:
+        item[_NESTED_GIT_CONTENTS_JUDGED_KEY] = False
     return item
 
 
@@ -32761,12 +32901,19 @@ def _nested_git_evidence_from_obj(value: object, label: str) -> list[dict[str, o
         _exact_keys(
             item,
             _NESTED_GIT_EVIDENCE_KEYS,
-            _NESTED_GIT_SALVAGE_EVIDENCE_KEYS,
+            _NESTED_GIT_SALVAGE_EVIDENCE_KEYS | {_NESTED_GIT_CONTENTS_JUDGED_KEY},
             item_label,
         )
         salvage_keys = _NESTED_GIT_SALVAGE_EVIDENCE_KEYS & set(item)
         if salvage_keys and salvage_keys != _NESTED_GIT_SALVAGE_EVIDENCE_KEYS:
             raise StateError(f"{item_label} records an incomplete salvage bundle")
+        if _NESTED_GIT_CONTENTS_JUDGED_KEY in item and (
+            item[_NESTED_GIT_CONTENTS_JUDGED_KEY] is not False or salvage_keys
+        ):
+            raise StateError(
+                f"{item_label}.{_NESTED_GIT_CONTENTS_JUDGED_KEY} must be false and "
+                "only on a repository that was not salvaged"
+            )
         for key in sorted(salvage_keys):
             if key == "salvage_commit" and item[key] is None:
                 continue
@@ -33168,11 +33315,25 @@ def _audit_record(
         cache_error: str | None = None
         cache_status = "complete"
         try:
+            caches = _cache_directories(config, record.checkouts, vcs=selected_vcs)
+            disposable_git: dict[Path, tuple[int, int]] = {}
+            if record.slot_type == "validate":
+                # As completed validation removal judges them (see _cmd_audit).
+                own_slot = _slot_directory(config, record.slot, record.slot_type)
+                nested_budget = _NestedGitBudget()
+                for cache in caches:
+                    for nested in _judge_cache_nested_repositories(
+                        config,
+                        cache,
+                        fenced_slot=own_slot,
+                        canonical_slot=own_slot,
+                        budget=nested_budget,
+                        validation_complete=True,
+                    ):
+                        disposable_git[nested.path] = nested.identity
             cache_bytes = sum(
-                _allocated_cache_bytes(config, cache)
-                for cache in _cache_directories(
-                    config, record.checkouts, vcs=selected_vcs
-                )
+                _allocated_cache_bytes(config, cache, disposable_git=disposable_git)
+                for cache in caches
             )
         except Refusal as exc:
             cache_bytes = None
@@ -33483,10 +33644,16 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         record_cache_subjects: dict[tuple[str, str, int], str] = {}
         unregistered_cache_subjects: dict[tuple[str, str], str] = {}
         plan_targets: list[tuple[str, Sequence[Checkout] | CacheSlot]] = []
+        # A validation row is judged by completed validation removal, which is
+        # what remove --validate-complete and remove-validate-batch perform:
+        # its nested repositories are judged as that removal judges them.
+        validation_subjects: set[str] = set()
         for record in records:
             subject = f"record:{record.machine}:{record.slot}:{record.generation}"
             record_cache_subjects[(record.machine, record.slot, record.generation)] = subject
             plan_targets.append((subject, record.checkouts))
+            if record.slot_type == "validate":
+                validation_subjects.add(subject)
         for slot_type, slot in sorted(on_disk - registered):
             subject = f"unregistered:{slot_type}:{slot}"
             unregistered_cache_subjects[(slot_type, slot)] = subject
@@ -33526,6 +33693,11 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                 cache_planned[subject] = ()
                 cache_errors[subject] = str(exc)
                 plan_exhausted += isinstance(exc, _CachePlanExhausted)
+            if subject in validation_subjects:
+                cache_planned[subject] = tuple(
+                    dataclasses.replace(cache, nested_git=_NESTED_GIT_VALIDATION_COMPLETE)
+                    for cache in cache_planned[subject]
+                )
             plan_work.consumed += share.work.consumed
             plan_seconds = max(0.0, plan_seconds - share.spent)
         metrics.finish(
@@ -36086,6 +36258,11 @@ def _finish_remove_paths(
             raise StateError("flat-layout removal has more than one remaining checkout")
         deleted_nested: list[dict[str, object]] = []
         deleting_nested: list[dict[str, object]] = []
+        # A completed validation's caches are disposable, but a nested
+        # repository whose deletion reaches outside its cache is not; audit
+        # judges a validation row's caches the same way.  Without
+        # --validate-complete every nested .git still refuses.
+        validation_complete = record.slot_type == "validate" and finish.validate_complete
         try:
             # A refusal from here on rolls the fence back, so a
             # remove-agent-batch item budget bounds this work again.
@@ -36187,7 +36364,7 @@ def _finish_remove_paths(
                 if finish.archive_nested and record.slot_type == "agent"
                 else None
             )
-            if record.slot_type == "agent":
+            if record.slot_type == "agent" or validation_complete:
                 # Every guard above has passed.  Judge each nested repository
                 # in every cache before the first deletion, so a refusal
                 # leaves all of them in place.
@@ -36200,6 +36377,7 @@ def _finish_remove_paths(
                             canonical_slot=canonical_slot,
                             budget=nested_budget,
                             salvage=nested_salvage,
+                            validation_complete=validation_complete,
                         )
                         if not judged:
                             continue
@@ -36255,6 +36433,7 @@ def _finish_remove_paths(
                             canonical_slot=canonical_slot,
                             budget=nested_budget,
                             salvage=nested_salvage,
+                            validation_complete=validation_complete,
                         )
                         if rejudged != judged_here:
                             raise Refusal(
@@ -36277,9 +36456,6 @@ def _finish_remove_paths(
                     _remove_cache_directory(
                         config,
                         cache,
-                        allow_git_metadata=(
-                            record.slot_type == "validate" and finish.validate_complete
-                        ),
                         disposable_git=disposable_git or None,
                     )
                     deleted_nested.extend(deleting_nested)
@@ -36292,7 +36468,11 @@ def _finish_remove_paths(
                     + (
                         f"kept-in={item['salvage_bundle']}"
                         if "salvage_bundle" in item
-                        else f"contained-by={item['remote_ref']}"
+                        else (
+                            "contents-not-judged"
+                            if item.get(_NESTED_GIT_CONTENTS_JUDGED_KEY) is False
+                            else f"contained-by={item['remote_ref']}"
+                        )
                     )
                     for item in items
                 )
@@ -36309,7 +36489,14 @@ def _finish_remove_paths(
                 if deleting_nested
                 else ""
             )
-            if already:
+            if already and validation_complete:
+                already += (
+                    "; they lay in a completed validation's caches, which hold "
+                    "nothing to keep, so only whether deleting each reached "
+                    "outside its cache was judged and none of their contents "
+                    "can be restored from this removal"
+                )
+            elif already:
                 already += (
                     "; each listed head is in the listed remote-tracking ref, and "
                     "every other commit of those repositories was in one of their "
@@ -38003,6 +38190,13 @@ def _print_nested_git_evidence(evidence: Sequence[Mapping[str, object]]) -> None
                 f"salvage-commit={item['salvage_commit']} "
                 f"ignored-entries={item['ignored_entries']} "
                 f"reason={item['salvage_reason']}"
+            )
+            continue
+        if item.get(_NESTED_GIT_CONTENTS_JUDGED_KEY) is False:
+            print(
+                f"removed nested Git repository {item['path']} with its completed "
+                f"validation's cache head={item['head']} (it reached nothing outside "
+                "the cache; its contents were not judged)"
             )
             continue
         print(
@@ -60441,7 +60635,10 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help=(
             "remove a completed validate slot immediately when the current caller is its exact "
             "owner, or after owner death without waiting for TTL; process-use, path, and Git "
-            "checks remain"
+            "checks remain. A nested Git repository in a configured cache is deleted whatever "
+            "it holds unless deleting it reaches outside the cache (core.worktree, an include, "
+            "a .git file or link, linked worktrees, submodule repositories), which refuses; "
+            "audit judges validation rows the same way"
         ),
     )
     remove.add_argument(
@@ -60575,7 +60772,9 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "without preventing other requested slots from being considered. Sealing prevents "
             "later entry by ordinary processes under another UID. The post-fence scan detects "
             "existing or cooperative use under the same UID; it is not isolation from a "
-            "same-UID process deliberately racing cleanup. Exit status is 0 only when "
+            "same-UID process deliberately racing cleanup. A nested Git repository in a "
+            "configured cache is deleted whatever it holds unless deleting it reaches "
+            "outside the cache, which retains the slot. Exit status is 0 only when "
             "every requested slot was removed, 1 when any slot was retained (including "
             "a batch that removed nothing), and 3 when the whole batch was refused."
         ),

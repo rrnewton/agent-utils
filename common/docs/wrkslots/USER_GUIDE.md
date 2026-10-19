@@ -276,6 +276,14 @@ fresh sweep fits can finish at an unchanged budget,
 even when measurement and verification together require several invocations. Partial
 finalization restarts for the whole subject; previous calls' final checks are never reused.
 
+A `.git` entry inside a configured cache refuses the census with `cache directory contains nested
+Git metadata: <path>`, except in a validation row's caches. There the census measures it like any
+other entry and, once the root's final sweep has passed, judges each nested repository exactly as
+completed validation removal does (see "Nested Git repositories in a completed validation's
+caches"), in the order that removal reaches them. The row is `DELETABLE` only if every one is
+disposable; otherwise `cache_error` is the removal's own refusal for the first that is not, and a
+judgment cut short by the wall allowance leaves the row partial rather than giving a verdict.
+
 The state is keyed by active-registry revision and cache-root identity. Persisted progress
 is authenticated by a sibling 0600 key; missing, malformed, too deeply nested, obsolete, or
 altered state restarts the bounded census. Both writer and reader enforce a 64 MiB state
@@ -625,6 +633,22 @@ metadata under a selected cache root refuse cleanup. In report-only mode, malfor
 uninspectable unregistered directories remain visible as `BLOCKED` rows. With `--only`, unselected
 rows are intentionally omitted from output and their cache trees are not traversed; global event,
 active-record path, and complete bounded journal/provenance checks still run.
+
+### Nested Git repositories in a completed validation's caches
+
+Completed validation removal (`remove --validate-complete` and `remove-validate-batch`) deletes a
+nested repository in a configured cache whatever it holds: commits, a stash, uncommitted or
+untracked files are not examined, because the rest of the checkout goes with
+`git worktree remove --force`. It still judges each repository, before deleting anything, on
+whether deleting it reaches outside the cache, and refuses with the same message as an agent
+removal (`cache directory contains nested Git metadata: <path>: not provably disposable: <condition>`)
+when `.git` is a file or a symbolic link, Git cannot open the repository or reports another
+repository or common directory, its config or config.worktree sets `core.worktree` or an include,
+or it registers linked worktrees or holds submodule repositories under `.git/modules`. It judges
+every cache again just before deleting, and the deletion checks that each `.git` is the directory
+it judged. The slot-removed event lists each deleted repository with `contents_judged: false`.
+Removal of a validation slot without `--validate-complete` still refuses any nested `.git`. Audit
+judges a validation row's caches the same way, so it predicts this removal.
 
 ## Handoffs and retirement
 
