@@ -1,12 +1,13 @@
 ---
 title: 'removal-outside-window: a reported removal of a message older than the newest page''s window does not stick'
-status: open
+status: closed
 priority: 3
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-15T13:11:36.513662710+00:00
-updated_at: 2026-10-15T13:11:36.513662710+00:00
+updated_at: 2026-10-19T09:16:21.178705029+00:00
+closed_at: 2026-10-19T09:16:21.178704889+00:00
 ---
 
 # Description
