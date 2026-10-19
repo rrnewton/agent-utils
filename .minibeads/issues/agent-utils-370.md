@@ -1,12 +1,13 @@
 ---
 title: 'shift-e-undo-marker: Shift+E asks the chat service even when its own Done was undone while saving'
-status: open
+status: closed
 priority: 3
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-19T12:15:02.803941364+00:00
-updated_at: 2026-10-19T12:15:02.803941364+00:00
+updated_at: 2026-10-19T12:18:29.178642351+00:00
+closed_at: 2026-10-19T12:18:29.178642181+00:00
 ---
 
 # Description
