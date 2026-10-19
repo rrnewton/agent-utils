@@ -6,5 +6,13 @@
     "body": "[opus 5.5] Phase 1 (page only) landed: 'Search before <day>' walks up to 5 older pages (15 s budget, stops after 3 new matches) in both layouts, Enter starts it, Stop cancels; Hide read steps aside while filtering; scrolling no longer auto-loads under a filter (it loaded the whole history); Main offers 'Search All — thread replies too'. Server-side search over older history (Phase 2) is planned through #208 persistent-cache M8 (FTS index), so this stays open for that.",
     "created_at": "2026-10-13T11:52:47.878414620Z",
     "updated_at": "2026-10-13T11:52:47.878414620Z"
+  },
+  {
+    "id": "agent-utils-262-c7aac0bd2ca",
+    "issue_id": "agent-utils-262",
+    "author": "opus-5.5",
+    "body": "[opus 5.5] Round two delivered, so this closes. Round one's per-column walk was not enough in two columns: the left column is Main, which holds no thread replies, and the cards were searched only by the replies the page already held, so a word said only in older replies was found nowhere in two columns or over the thread list, while one column on All found it. Now the cards have their own walk: 'Search replies before <day>' (or Enter where the cards have the keys) reads All's older pages into the page's store, under the same bounds (5 pages, 15 s, stops at 3 threads). Found cards say 'in replies', every ending is said, and a column's walk stopped over matches now says what it read. One column, two columns, the right column's thread and the thread list on a phone can all search further back. Unverified: on a real Google Chat or Slack space; checked only against the page suite's and Chromium's fake servers. Server-side search over history the page has never read stays with #208 persistent-cache (M8 index), not here.",
+    "created_at": "2026-10-19T10:22:29.157971118Z",
+    "updated_at": "2026-10-19T10:22:29.157971118Z"
   }
 ]
