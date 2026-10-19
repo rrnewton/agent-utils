@@ -342,6 +342,25 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#352 voice-reconnect-on-bridge-error` in the browser engine: a fake vibe-talk-v1 bridge loses a
+  # turn after an interrupt and a relayed message, and asks the page to reconnect. The call stays up on
+  # a second session (a greeting and no replay, the lost socket closed at once; then a bridge that lists
+  # replay), the message goes again once, and the page says so; a second lost turn within the minute,
+  # and any other error, still end the call. Measured on 2026-10-19: about 21s wall.
+  - group: check
+    job: voice-reconnect-browser
+    desc: a voice bridge that loses a turn and asks to reconnect — the call carried on a new session, the lost relay sent again once, the bound and a non-reconnect error still ending it — in current Chromium
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/voice_reconnect_browser.py
+    jobs_flag: ""
+    timeout: 120
+    cpu_timeout: 90
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 21
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#269 approval-card-inline` in the browser engine: the send card as the next message, in the list
   # on the call's view and the channel and docked on Settings, Send's centre at least 0.62 of the way
   # down a 393x852, 360x780 and 375x667 phone in every run (one and thirty rows, banner up or gone,
