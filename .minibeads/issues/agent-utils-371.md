@@ -1,12 +1,13 @@
 ---
 title: 'channel-search-hash: find a channel by name in any case, with or without its leading ''#'', and answer searches while typing at once'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-19T13:03:37.344908907+00:00
-updated_at: 2026-10-19T13:03:37.344908907+00:00
+updated_at: 2026-10-19T13:33:54.180823565+00:00
+closed_at: 2026-10-19T13:33:54.180823194+00:00
 ---
 
 # Description
