@@ -2725,6 +2725,17 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   page.setPlatform = (platform) => {
     navigator.platform = platform;
   };
+  /**
+   * `#369 pairing-link`. The redemption route: every body the page sends it, and its answer, which
+   * is the server's one refusal until a test says otherwise.
+   */
+  page.pairRedeems = [];
+  page.pairRedeem = async () =>
+    json(410, { error: "pairing_link_invalid", detail: "this pairing link has expired or was already used; ask for a new one" });
+  /** `#369 pairing-link`. The address the page loads at, from `arrange`: the page reads it first. */
+  page.setAddress = ({ pathname = "/", search = "", hash = "" }) => {
+    Object.assign(context.window.location, { pathname, search, hash });
+  };
   // `#267 quote-reply`. The text the reader has selected: nothing, until a test selects some.
   page.selection = new FakeSelection();
   /**
@@ -2869,6 +2880,10 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       }
       if (String(path).startsWith("/api/v1/voice-session")) {
         return page.mint(path, options);
+      }
+      if (String(path) === "/api/v1/pair/redeem") {
+        page.pairRedeems.push({ body: JSON.parse(options.body), headers: { ...options.headers } });
+        return page.pairRedeem(path, options);
       }
       if (String(path) === "/api/v1/voice-timing") {
         page.timingPosts.push(JSON.parse(options.body));
@@ -5245,6 +5260,72 @@ test("a token the server REFUSES sends you back to sign in, and says which thing
   assert.equal(page.screen(), "signin");
   assert.match(page.el("error").textContent, /refused that token/);
   assert.match(page.el("error").textContent, /unknown token/);
+});
+
+// --- `#369 pairing-link` -------------------------------------------------------------------------
+
+const PAIR_CODE = "Pq3x_Zr-7AbCdEfGhIjKlMnOpQrStUvWxYz012345678";
+
+/** A page opened at a pairing link, recording what the address was when the code came out of it. */
+function pairingPage(store = new Map(), arrangeMore = null) {
+  const seen = {};
+  const page = newPage(store, SCRIPT, (p) => {
+    p.enableHistory();
+    p.setAddress({ pathname: "/", search: "?from=chat", hash: `#pair=${PAIR_CODE}` });
+    const replace = p.history.replaceState.bind(p.history);
+    p.history.replaceState = (state, unused, address) => {
+      if (seen.requestsBefore === undefined) {
+        seen.requestsBefore = p.requests.length;
+        seen.address = address;
+      }
+      replace(state, unused, address);
+    };
+    if (arrangeMore) arrangeMore(p);
+  });
+  return { page, seen };
+}
+
+test("a pairing link's code leaves the address before the page makes any request", async () => {
+  const { page, seen } = pairingPage();
+  await page.settle();
+  assert.equal(seen.requestsBefore, 0, "the page made a request while the code was still in the address");
+  assert.equal(seen.address, "/?from=chat", "the fragment, and only the fragment, is gone");
+  assert.ok(!page.history.addresses.some((address) => address.includes(PAIR_CODE)), "the code went into history");
+  assert.ok(!page.requests.some((request) => request.includes(PAIR_CODE)), "the code went into a URL");
+});
+
+test("a pairing link signs the browser in with the token it redeems for, as Save does", async () => {
+  const store = new Map();
+  const { page } = pairingPage(store, (p) => {
+    p.pairRedeem = async () => json(200, { token: "write-token-from-pairing-00" });
+  });
+  await page.settle();
+  assert.deepStrictEqual(page.pairRedeems.map((one) => one.body), [{ code: PAIR_CODE }]);
+  assert.ok(!("Authorization" in page.pairRedeems[0].headers), "the redemption carried a bearer token");
+  assert.equal(store.get("vibe-talk.token"), "write-token-from-pairing-00");
+  assert.equal(page.screen(), "main", "pairing did not continue signed in");
+  assert.ok(page.requests.indexOf("POST /api/v1/pair/redeem") < page.requests.findIndex((r) => r.startsWith("GET /api/v1/client-config")),
+    "the page asked for its configuration before it had the token");
+});
+
+test("an expired or used pairing link says so plainly, and to ask for a new one", async () => {
+  const store = new Map();
+  const { page } = pairingPage(store);
+  await page.settle();
+  assert.equal(page.screen(), "signin");
+  assert.equal(store.get("vibe-talk.token"), undefined, "a refused link stored something");
+  assert.match(page.el("error").textContent, /expired or was already used\. Ask for a new one/);
+});
+
+test("a pairing link refused for too many attempts says to wait, and a stale link leaves a signed-in phone signed in", async () => {
+  const store = new Map([["vibe-talk.token", "write-token-aaaaaaaaaaaaaaaa"]]);
+  const { page } = pairingPage(store, (p) => {
+    p.pairRedeem = async () => json(429, { error: "too_many_attempts", detail: "wait" });
+  });
+  await page.settle();
+  assert.equal(page.screen(), "main", "a failed link signed the phone out");
+  assert.equal(store.get("vibe-talk.token"), "write-token-aaaaaaaaaaaaaaaa");
+  assert.match(page.el("error").textContent, /Too many pairing attempts.*Wait a minute/);
 });
 
 test("a READ token is told it is the wrong SCOPE, not that it was refused", async () => {

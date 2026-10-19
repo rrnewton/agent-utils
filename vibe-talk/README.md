@@ -935,6 +935,64 @@ are not wiring up a voice agent, that constraint does not apply to you.
 it, which is the point — run it against `http://127.0.0.1:8080` first and against the public URL
 second, and any disagreement is something your ingress did. See **Checking a deployment** below.
 
+### 4. Sign the person's phone in
+
+See [Pairing a phone](#pairing-a-phone): one command prints a link to send them.
+
+## Pairing a phone
+
+`#369 pairing-link`. For an agent that has set a server up for a person and now has to get them
+signed in on their phone. Typing a 24-character token on a phone is error-prone, and pasting the
+token itself into a chat leaves a permanent credential in that chat's history. A **pairing link**
+is the app's address with a single-use code in its fragment, `https://host/#pair=CODE`. Opening it
+signs that browser in with the write token, exactly as pasting the token into the sign-in form
+would, and then the link is dead: it works **once**, and only for **five minutes** (at most ten).
+
+1. Make sure the server is running on this host, and that it is reachable from the phone at some
+   address: see [From zero](#from-zero). A link to `127.0.0.1` is no use to a phone.
+2. Tell vibe-talk that address, once, in the configuration file:
+
+   ```toml
+   [server]
+   public_url = "https://vibe.example"   # also accepted as public_base_url, or VIBE_TALK_PUBLIC_BASE_URL
+   ```
+
+   Or skip this and pass `--base-url https://vibe.example` in the next step.
+3. On the server's host, run:
+
+   ```sh
+   vibe-talk pair-link            # add --config PATH if the server was started with one
+   ```
+
+   It reads the write token from the same configuration file and environment the server reads,
+   asks the running server for a code on the configuration's bind address, and prints exactly two
+   lines, the link and its expiry. It never prints the token. `--ttl SECONDS` (1 to 600) changes how
+   long the link works; the default is 300.
+4. **Give the person the link in chat**, and tell them it works once, for the next five minutes:
+   they open it on their phone, and the app comes up signed in. If it has expired or was already
+   used, the page says so and asks for a new one; run step 3 again.
+
+What it does, so it can be judged:
+
+* `POST /api/v1/pair` (write token) mints the code: 32 bytes from the system CSPRNG, base64url.
+  The server keeps only its SHA-256, in memory, with its expiry; a restart burns every live code.
+  Up to 32 codes may be live at once.
+* `POST /api/v1/pair/redeem` with `{"code": "..."}` (no token) answers `{"token": "..."}` once for
+  a live code and burns it. Every refusal, whether the code is unknown, expired, used or malformed,
+  is the same `410 pairing_link_invalid`, and each counts against the client's address: after ten
+  in a minute the address gets `429` for the rest of that minute, before its code is even looked
+  at. An IPv6 client is counted by its /64. **Behind a reverse proxy every client has the proxy's
+  address**, so the limit is shared by everyone coming through it; the 256-bit code is what
+  actually stops guessing, and the limit only caps how fast anyone can try.
+* The page takes the code out of its own address with `history.replaceState` before it makes any
+  request, so it is not left in the address bar, the history or a bookmark. A fragment is never
+  sent to a server, so the code reaches no access log; it travels only in the body of the one
+  redemption.
+* The log names each code by the first eight hex digits of its hash when it is minted, redeemed
+  or expires. Neither a code nor a token is logged.
+* A redeemed link is as good as the write token itself, for as long as that token is. Signing a
+  phone out for good means rotating `VIBE_TALK_WRITE_TOKEN`, as it always has.
+
 ## Running it
 
 Locally, without touching Discord at all:
@@ -2167,7 +2225,7 @@ model provider or a real gateway.
 | Setting | File | Environment | Notes |
 |---|---|---|---|
 | Bind address | `server.bind` | `VIBE_TALK_BIND` | `0.0.0.0:8080` in a container |
-| Public URL | `server.public_base_url` | `VIBE_TALK_PUBLIC_BASE_URL` | informational |
+| Public URL | `server.public_url` (or `server.public_base_url`) | `VIBE_TALK_PUBLIC_BASE_URL` | the address a phone opens the app at; `vibe-talk pair-link` builds its link on it. See [Pairing a phone](#pairing-a-phone) |
 | Time zone | `server.timezone` | `VIBE_TALK_TIMEZONE` | IANA name, default `UTC`; an unknown one refuses to start |
 | App name | `server.app_name` / `server.short_name` | `VIBE_TALK_APP_NAME` / `VIBE_TALK_APP_SHORT_NAME` | what the installed app is called, default `vibe-talk`: the manifest's `name`, the page's title and sign-in heading. `short_name`, the label under the icon, defaults to `app_name`. At most 64 characters, not blank, no whitespace at either end and no control characters, or the server refuses to start. Give each deployment its own, so two installed on one phone are told apart; see [Installing the reader](#installing-the-reader) |
 | Fetch size | `chat.default_fetch_limit` / `chat.max_fetch_limit` | — | messages a read returns by default and at most, default `50` / `100`; older files set them under `[discord]`, and setting one in both places is refused |

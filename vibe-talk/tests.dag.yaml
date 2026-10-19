@@ -191,6 +191,24 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 536870912
 
+  # `#369 pairing-link` in the browser engine: a fresh phone-sized browser opens a pairing link, the
+  # code leaves the address and is redeemed once in a request body without a bearer token, the token is
+  # stored and the main screen comes up; a second fresh browser opening the same link is told it expired
+  # or was already used. Measured on 2026-10-19: about 3s wall.
+  - group: check
+    job: pairing-link-browser
+    desc: a pairing link signs a fresh browser in once and leaves no code in the address, in current Chromium
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/pairing_link_browser.py
+    jobs_flag: ""
+    timeout: 60
+    cpu_timeout: 30
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 4
+      classification: latency-bound
+      rss_baseline_bytes: 536870912
+
   # `#18 offline-message-cache` in the browser engine: saved rows drawn across a real reload before
   # the network answers, one newest-page read, local view switches, a real fetch failure, sign-out
   # clearing, empty Cache Storage and no service worker. `#32 freshness-pill-overlap`: refreshing,

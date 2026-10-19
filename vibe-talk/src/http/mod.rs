@@ -34,7 +34,8 @@
 //!   BEFORE routing, so an unknown path or an unserved method does not tell an anonymous caller
 //!   which routes exist or which methods they serve. The two live-ingest
 //!   routes and the two ticket routes, which carry their own credentials, are exempt for their own
-//!   method only.
+//!   method only. So is the pairing-code redemption, whose code is its credential
+//!   (`#369 pairing-link`).
 //! * Every request — routed or not, authorized or not — leaves exactly ONE line in the access
 //!   log at INFO. See [`crate::access`] for why that is load-bearing rather than nice to have.
 //!   **The one line for `/stream` is written at ATTACH, with `millis=0`**, because the middleware
@@ -179,6 +180,12 @@ fn routes(state: AppState) -> Router {
         // not an HTTP failure. See `api::diagnostics`.
         .route("/api/v1/diagnostics", get(api::diagnostics))
         .route("/api/v1/signed-url", get(api::signed_url))
+        // `#369 pairing-link`. WRITE scope to mint a single-use code, because the code redeems for
+        // the write token. Redeeming takes NO bearer token: the code in the body is the
+        // credential, every refusal is one 410, and failures are limited per client address. See
+        // `crate::pairing`.
+        .route("/api/v1/pair", post(api::mint_pairing))
+        .route("/api/v1/pair/redeem", post(api::redeem_pairing))
         .route("/api/v1/voice-session", get(api::voice_session))
         // `#14 voice-agent-prompt`. READ scope: the prompt is public text from this repository and
         // the tool list is filtered to the caller's own scope, so it discloses nothing the same

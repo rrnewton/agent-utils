@@ -1885,3 +1885,71 @@ async fn transcript_records_log_names_and_numbers_and_never_a_word() {
         "message text reached the INFO log:\n{everything}"
     );
 }
+
+/// `#369 pairing-link`. Mint, redeem and refusal each leave a line naming the code by a short
+/// hash prefix; neither a code nor a token ever appears.
+#[tokio::test]
+async fn neither_a_pairing_code_nor_the_token_it_redeems_for_reaches_the_log() {
+    let capture = LogCapture::info_only();
+    let harness = harness();
+    let mint = |harness: &Harness| {
+        let router = harness.router.clone();
+        async move {
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/pair")
+                        .header("authorization", format!("Bearer {WRITE_TOKEN}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .expect("request"),
+                )
+                .await
+                .expect("router responds");
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes();
+            let answer: Value = serde_json::from_slice(&bytes).expect("json");
+            answer["code"].as_str().expect("code").to_owned()
+        }
+    };
+    let used = mint(&harness).await;
+    let unused = mint(&harness).await;
+    let redeem = json!({ "code": used });
+    assert_eq!(
+        call(
+            &harness,
+            "POST",
+            "/api/v1/pair/redeem",
+            None,
+            Some(redeem.clone())
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&harness, "POST", "/api/v1/pair/redeem", None, Some(redeem)).await,
+        StatusCode::GONE
+    );
+    let text = capture.text();
+    let prefix = vibe_talk::pairing::code_hash_prefix(&used);
+    assert!(
+        text.contains("pairing code minted")
+            && text.contains("pairing code redeemed")
+            && text.contains("pairing redeem refused")
+            && text.contains(&prefix),
+        "the log recorded nothing, so this test would pass on a server that logs nothing: {text}"
+    );
+    for secret in [used.as_str(), unused.as_str(), WRITE_TOKEN, READ_TOKEN] {
+        let leak = &secret[..12];
+        assert!(
+            !text.contains(leak),
+            "a secret prefix ({leak}) reached the log: {text}"
+        );
+    }
+}

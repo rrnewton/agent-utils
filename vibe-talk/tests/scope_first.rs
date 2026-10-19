@@ -41,6 +41,9 @@ enum Auth {
     Ticket,
     /// The separate live-ingestion token.
     Ingest,
+    /// A pairing code in the body, because the device redeeming it has no token yet. `#369
+    /// pairing-link`. Every refusal is one 410, whatever was sent.
+    Pairing,
 }
 
 /// What a route reads from the request beyond its path.
@@ -79,7 +82,7 @@ const DEFAULT_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
 /// Every route the router serves, and who may call it.
 fn inventory() -> Vec<Route> {
-    use Auth::{Ingest, Public, Read, Ticket, Write};
+    use Auth::{Ingest, Pairing, Public, Read, Ticket, Write};
     use Input::{Bytes, Json, Nothing, OwnJson, Query};
     let limit = Query("?limit=5", "?limit=soon");
     vec![
@@ -117,6 +120,14 @@ fn inventory() -> Vec<Route> {
         ),
         route("GET", "/api/v1/diagnostics", Read, Nothing),
         route("GET", "/api/v1/signed-url", Write, Nothing),
+        // `#369 pairing-link`.
+        route("POST", "/api/v1/pair", Write, Json(r#"{"ttl_seconds":60}"#)),
+        route(
+            "POST",
+            "/api/v1/pair/redeem",
+            Pairing,
+            OwnJson(r#"{"code":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#),
+        ),
         route("GET", "/api/v1/voice-session", Write, Nothing),
         route("GET", "/api/v1/voice-agent", Read, Nothing),
         route(
@@ -543,7 +554,7 @@ fn the_inventory_is_every_route_the_router_serves() {
         let bearer = matches!(route.auth, Auth::Read | Auth::Write);
         if route.path.starts_with("/api/") && !bearer {
             assert!(
-                matches!(route.auth, Auth::Ticket | Auth::Ingest),
+                matches!(route.auth, Auth::Ticket | Auth::Ingest | Auth::Pairing),
                 "{} {} is under /api/ without a credential",
                 route.method,
                 route.path
@@ -564,6 +575,12 @@ fn harness() -> Harness {
     );
     let (state, _chat, _voice) = vibe_talk::testing::state_from_toml(&text);
     let tickets = std::sync::Arc::clone(&state.speech_tickets);
+    // Every refused redemption here counts against one client, and this file sends far more than
+    // the shipped limit allows: the limit's own answer is `tests/pairing.rs`'s business.
+    let state = vibe_talk::state::AppState {
+        pairing: std::sync::Arc::new(vibe_talk::pairing::Pairing::with_failure_limit(u32::MAX)),
+        ..state
+    };
     Harness {
         router: router(state),
         tickets,
@@ -764,6 +781,13 @@ fn refused_callers(auth: Auth) -> Vec<(Option<&'static str>, StatusCode)> {
             (None, StatusCode::NOT_FOUND),
             (Some(WRITE_TOKEN), StatusCode::NOT_FOUND),
         ],
+        // Any bearer token or none: only a live code counts, and none is live here.
+        Auth::Pairing => vec![
+            (None, StatusCode::GONE),
+            (Some(WRONG_TOKEN), StatusCode::GONE),
+            (Some(READ_TOKEN), StatusCode::GONE),
+            (Some(WRITE_TOKEN), StatusCode::GONE),
+        ],
     }
 }
 
@@ -774,7 +798,8 @@ fn authorized_tokens(auth: Auth) -> Vec<Option<&'static str>> {
         Auth::Write => vec![Some(WRITE_TOKEN)],
         Auth::Ingest => vec![Some(INGEST_TOKEN)],
         Auth::Ticket => vec![None, Some(WRITE_TOKEN)],
-        Auth::Public => Vec::new(),
+        // The code is the credential, and no header grants a redemption.
+        Auth::Pairing | Auth::Public => Vec::new(),
     }
 }
 

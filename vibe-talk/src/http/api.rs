@@ -1219,6 +1219,111 @@ pub async fn voice_timing(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// The body of `POST /api/v1/pair`. Every field is optional, so `{}` mints a default code.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PairRequest {
+    /// How long the code lives, in seconds: 1 to 600, default 300.
+    #[serde(default)]
+    pub ttl_seconds: Option<u64>,
+}
+
+/// What `POST /api/v1/pair` answers: the code, once, and when it stops working.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PairResponse {
+    /// The single-use code. The link is the page's address with `#pair=` and this appended.
+    pub code: String,
+    /// When the code expires, RFC 3339 in UTC.
+    pub expires_at: String,
+}
+
+/// What `POST /api/v1/pair/redeem` answers to a live, unused code.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PairRedeemResponse {
+    /// The write token, which the page stores as its sign-in form would.
+    pub token: String,
+}
+
+/// The largest redeem body read. A code is 43 characters; anything this size is not a redemption.
+pub const PAIR_REDEEM_BODY_BYTES: usize = 1024;
+
+/// `POST /api/v1/pair` — mint a single-use pairing code. `#369 pairing-link`.
+///
+/// WRITE scope, because the code redeems for the write token: a read-scope caller minting one
+/// would be a way to turn the read token into the write token. See [`crate::pairing`].
+pub async fn mint_pairing(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Json(request): Json<PairRequest>,
+) -> Result<Json<PairResponse>, ApiError> {
+    let ttl = request.ttl_seconds.map(std::time::Duration::from_secs);
+    let minted = state.pairing.mint(ttl).map_err(|error| match error {
+        crate::pairing::MintError::BadTtl => {
+            ApiError::new(StatusCode::BAD_REQUEST, "invalid_ttl", error.to_string())
+        }
+        crate::pairing::MintError::TooMany => ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too_many_pairing_codes",
+            error.to_string(),
+        ),
+    })?;
+    Ok(Json(PairResponse {
+        code: minted.code,
+        expires_at: minted.expires_at.to_string(),
+    }))
+}
+
+/// `POST /api/v1/pair/redeem` — trade a live pairing code for the write token, once.
+/// `#369 pairing-link`.
+///
+/// No bearer token: the code in the body is the credential, and the bearer layer exempts this one
+/// method on this one path. Every refusal is the SAME answer — a malformed body, an unknown code,
+/// an expired one and a used one all get 410 — so the route says nothing about which codes exist,
+/// and each counts against the client's failure limit, which answers 429 before the code is looked
+/// at. The client is the connection's peer address; see [`crate::pairing::Client`].
+pub async fn redeem_pairing(State(state): State<AppState>, request: Request) -> Response {
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|info| info.0.ip());
+    let client = crate::pairing::Client::of(peer);
+    #[derive(Deserialize)]
+    struct Redeem {
+        code: String,
+    }
+    let code = match axum::body::to_bytes(request.into_body(), PAIR_REDEEM_BODY_BYTES).await {
+        Ok(body) => serde_json::from_slice::<Redeem>(&body)
+            .map(|redeem| redeem.code)
+            .unwrap_or_default(),
+        Err(_) => String::new(),
+    };
+    match state.pairing.redeem(&code, client) {
+        crate::pairing::Redeemed::Granted => Json(PairRedeemResponse {
+            token: state.config.auth.write_token.expose().to_owned(),
+        })
+        .into_response(),
+        crate::pairing::Redeemed::Refused => ApiError::new(
+            StatusCode::GONE,
+            "pairing_link_invalid",
+            "this pairing link has expired or was already used; ask for a new one",
+        )
+        .into_response(),
+        crate::pairing::Redeemed::Limited => {
+            let mut response = ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too_many_attempts",
+                "too many pairing attempts from this address; wait a minute, then ask for a new link",
+            )
+            .into_response();
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("60"),
+            );
+            response
+        }
+    }
+}
+
 /// `POST /api/v1/voice-health` — the page's verdict that the voice service stopped answering.
 ///
 /// The body is closed (see [`crate::voice_health::HealthReport`]): two closed enums, a flag and

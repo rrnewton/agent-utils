@@ -25,6 +25,31 @@
 
 // The older page at / shared this key, so a browser signed in to either one holds its token here.
 const TOKEN_KEY = "vibe-talk.token";
+
+// `#369 pairing-link`. A pairing link is the app's address with `#pair=CODE`: a single-use code,
+// good for a few minutes, that the server trades once for the write token. The code is a
+// credential for as long as it lives, so it comes out of the address FIRST — before any request
+// this page makes, and before anything could copy the address — with `replaceState`, which leaves
+// no history entry holding it. The fragment, never the query: a browser never sends a fragment to
+// any server, so the code reaches no log but the one request that redeems it, in its body.
+const pairingCode = takePairingCode();
+
+/** The code in `#pair=`, with the fragment already gone from the address; null when there is none. */
+function takePairingCode() {
+  const location = window.location;
+  const hash = location && typeof location.hash === "string" ? location.hash : "";
+  const part = hash.replace(/^#/, "").split("&").find((one) => one.startsWith("pair="));
+  if (part === undefined) return null;
+  const history = window.history;
+  if (history && typeof history.replaceState === "function") {
+    history.replaceState(history.state, "", `${location.pathname || "/"}${location.search || ""}`);
+  }
+  try {
+    return decodeURIComponent(part.slice("pair=".length));
+  } catch (_error) {
+    return "";
+  }
+}
 // The key this page used before the service was renamed. It is READ and never written: a browser
 // that signed in to the old name still holds the token under here, on the same origin, and the
 // rename is why the page is suddenly asking for it again. Without this the first load after a
@@ -43679,6 +43704,68 @@ async function saveToken() {
   await signIn();
 }
 
+// `#369 pairing-link`. What the page says when a pairing link does not work. One sentence for every
+// refusal, because the server gives one answer for all of them: a link that ran out, one already
+// opened, and one mistyped are the same to it, and the remedy is the same too.
+const PAIRING_EXPIRED =
+  "This pairing link has expired or was already used. Ask for a new one.";
+
+/**
+ * Trade the code from a pairing link for the write token, then sign in with it exactly as Save
+ * does. `#369 pairing-link`.
+ *
+ * The request carries NO bearer token, even on a browser that has one: the code is the credential.
+ * A failure is said plainly and leaves whatever this browser already held alone, so a stale link
+ * opened on a phone that was signed in leaves it signed in.
+ */
+async function pairFromLink(code) {
+  clearError();
+  setStatus("Pairing this device…");
+  let response = null;
+  try {
+    response = await fetch("/api/v1/pair/redeem", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code }),
+      cache: "no-store",
+    });
+  } catch (_error) {
+    return pairingFailed(
+      "Could not reach vibe-talk to pair this device. Check the connection, then ask for a new link."
+    );
+  }
+  let payload = null;
+  try {
+    payload = JSON.parse(await response.text());
+  } catch (_error) {
+    payload = null;
+  }
+  if (response.ok && payload && typeof payload.token === "string" && payload.token) {
+    el("api-token").value = payload.token;
+    await saveToken();
+    return true;
+  }
+  return pairingFailed(
+    response.status === 429
+      ? "Too many pairing attempts from this network. Wait a minute, then ask for a new link."
+      : PAIRING_EXPIRED
+  );
+}
+
+/** Say why pairing failed, and carry on as this browser would have without the link. */
+async function pairingFailed(sentence) {
+  setStatus("pairing failed");
+  if (token()) {
+    // Signed in before: still signed in. The sentence goes up after, because signing in clears
+    // the error panel on its way to the main screen.
+    await signIn();
+  } else {
+    showScreen("signin");
+  }
+  showError(sentence);
+  return false;
+}
+
 function forgetToken() {
   clearError();
   // Before the token goes, not after: the stream holds a bearer credential open, and a signed-out
@@ -44875,7 +44962,11 @@ renderControls();
 // ...and up where the reader left it: on the channel, in their view, at their message. The view's
 // one read waits for the proof, and for the live stream it starts (`payReopenRead`).
 // `#189 restore-ui-state`.
-if (token()) {
+if (pairingCode !== null) {
+  // `#369 pairing-link`. The link decides: it signs this browser in, or says why it could not.
+  showScreen("signin");
+  guardQuietly(pairFromLink)(pairingCode);
+} else if (token()) {
   if (hydrateFromCache()) {
     showScreen("main");
     reopenSavedView();
