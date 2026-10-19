@@ -447,7 +447,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
         return 2
     operation, _least, _most = _OPERATIONS[values[0]]
     try:
-        operation(*values[1:])  # type: ignore[operator]
+        operation(*values[1:])
     except (HelperError, OSError) as exc:
         print(f"wrkslots image helper: {exc}", file=sys.stderr)
         return 1
