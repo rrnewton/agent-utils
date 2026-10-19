@@ -29940,6 +29940,7 @@ function stopReading() {
   // and a jump to another block of it is still that read.
   if (!readJumping) releaseMediaSession();
   renderReadSteer();
+  clearReadingSentence();
   if (speechTimer !== null && speechTimer !== undefined) clearTimeout(speechTimer);
   for (const player of players || [audio]) {
     try {
@@ -30172,6 +30173,9 @@ function streamingPlayer(url, context, clock = readClock()) {
   let announced = false;
   let spoke = false;
   let drained = false;
+  // Where this part's audio begins and ends on the audio clock, as far as it has arrived.
+  let firstAt = null;
+  let lastEnd = 0;
   let lead = STREAM_START_LEAD_SECONDS;
 
   const silence = () => {
@@ -30233,6 +30237,8 @@ function streamingPlayer(url, context, clock = readClock()) {
       }
     }
     clock.playAt = playAt + buffer.duration;
+    if (firstAt === null) firstAt = playAt;
+    lastEnd = clock.playAt;
     sounding.add(node);
     node.onended = () => {
       sounding.delete(node);
@@ -30361,6 +30367,13 @@ function streamingPlayer(url, context, clock = readClock()) {
     url,
     /** This player can tell when speech begins, and says so with a `speech` event. */
     hearsSpeech: true,
+    /**
+     * `#379 read-aloud-sentences`. Where this part plays on the audio clock: when its first sample
+     * is due (null before any is), when what has arrived ends, and whether that is all of it.
+     */
+    timeline() {
+      return { startsAt: firstAt, endsAt: lastEnd, finished: finished && waiting.length === 0 };
+    },
     addEventListener(type, fn) {
       if (!listeners.has(type)) listeners.set(type, []);
       listeners.get(type).push(fn);
@@ -30510,6 +30523,160 @@ function markReadingBlock(row) {
   if (!block) return;
   block.element.setAttribute(READING_BLOCK_ATTRIBUTE, "current");
   row.setAttribute("data-reading-marked", "");
+}
+
+// --- the sentence being read: `#379 read-aloud-sentences` -----------------------------------------
+//
+// Inside the block being read, the sentence being said is lit too. NOT by another request per
+// sentence: on a voice that speaks as it generates, every request boundary is a pause as long as
+// the voice's first audio (`#376`), and a pause at every full stop would be worse than none. The
+// block's audio is one stream, so the sentence is found by its share of the block's characters
+// against how far through the block's audio the reader is: exact at the block's edges, and drifting
+// only as far as one block's sentences are not all said at the same speed. How long the block is
+// comes from its audio once all of it has arrived; until then, from how many characters it says at
+// the speaking rate the voice was last measured at.
+//
+// Lit with the CSS Custom Highlight API, which marks a range of text without touching the body the
+// server rendered. A browser without it lights the block alone, as before.
+
+/** The highlight's name; web/voice.css styles `::highlight(read-aloud-sentence)`. */
+const SENTENCE_HIGHLIGHT = "read-aloud-sentence";
+/** Seconds of speech per character said, until a block of this voice has been measured (`#47`). */
+const READ_SECONDS_PER_CHAR = 0.068;
+/** How often the sentence is looked for again while a block plays. */
+const SENTENCE_STEP_MS = 150;
+/** The speaking rate the last block that arrived whole was said at, seconds per character. */
+let learnedSecondsPerChar = null;
+let sentenceTimer = null;
+/** The sentence lit now, as "row part block index", so an unchanged one is not set again. */
+let litSentence = "";
+
+function sentenceHighlightSupported() {
+  return typeof CSS !== "undefined" && CSS !== null && Boolean(CSS.highlights) &&
+    typeof Highlight === "function" && typeof document.createRange === "function";
+}
+
+/**
+ * The block of `segment` arrived whole: learn how fast this voice says a character. Only from a
+ * block long enough to say something about it.
+ */
+function learnSpeakingRate(player, segment, blocks) {
+  if (!player || typeof player.timeline !== "function" || !segment || segment.block === null) return;
+  const listed = blocks[segment.part] && blocks[segment.part][segment.block];
+  const chars = listed && Number(listed.chars);
+  const timeline = player.timeline();
+  if (!chars || chars < 40 || !timeline.finished || timeline.startsAt === null) return;
+  learnedSecondsPerChar = (timeline.endsAt - timeline.startsAt) / chars;
+}
+
+/**
+ * The sentences `element` shows, in order, each as `{from, to, length}`: where it begins and ends
+ * as `[text node, offset]`, and how many characters it is. The text of a nested list is not the
+ * element's own. A sentence ends at `.`, `!`, `?` or `…` (and any closing quote or bracket) that is
+ * followed by a space or the end.
+ */
+function sentencesOf(element) {
+  const pieces = [];
+  let text = "";
+  const walk = (node) => {
+    for (const kid of node.childNodes || []) {
+      if (kid.nodeType === 3) {
+        pieces.push({ node: kid, at: text.length });
+        text += kid.textContent;
+        continue;
+      }
+      const tag = String(kid.tagName || "").toLowerCase();
+      if (tag === "ul" || tag === "ol") continue;
+      walk(kid);
+    }
+  };
+  walk(element);
+  const place = (offset) => {
+    let piece = pieces[0];
+    for (const candidate of pieces) {
+      if (candidate.at > offset) break;
+      piece = candidate;
+    }
+    return [piece.node, Math.min(offset - piece.at, piece.node.textContent.length)];
+  };
+  const found = [];
+  let start = 0;
+  const close = (end) => {
+    while (start < end && /\s/.test(text[start])) start += 1;
+    let last = end;
+    while (last > start && /\s/.test(text[last - 1])) last -= 1;
+    if (last > start) found.push({ from: place(start), to: place(last), length: last - start });
+    start = end;
+  };
+  for (let at = 0; at < text.length; at += 1) {
+    if (!/[.!?…]/.test(text[at])) continue;
+    let end = at + 1;
+    while (end < text.length && /[.!?…"'”’)\]]/.test(text[end])) end += 1;
+    if (end === text.length || /\s/.test(text[end])) {
+      close(end);
+      at = end - 1;
+    }
+  }
+  close(text.length);
+  return found;
+}
+
+/** Take the sentence light off, and stop looking for the next one. */
+function clearReadingSentence() {
+  if (sentenceTimer !== null) clearTimeout(sentenceTimer);
+  sentenceTimer = null;
+  litSentence = "";
+  if (sentenceHighlightSupported()) CSS.highlights.delete(SENTENCE_HIGHLIGHT);
+}
+
+/** Light the sentence being said in the block being read, and look again shortly. */
+function showReadingSentence() {
+  if (!sentenceHighlightSupported()) return;
+  if (sentenceTimer !== null) clearTimeout(sentenceTimer);
+  sentenceTimer = null;
+  const playing = nowPlaying;
+  if (playing === null || !playing.segments || playing.segments.length < 2) {
+    clearReadingSentence();
+    return;
+  }
+  sentenceTimer = setTimeout(showReadingSentence, SENTENCE_STEP_MS);
+  const segment = playing.segments[playing.segment];
+  const player = playing.players[playing.segment];
+  const row = [...el("discord-log").children].find((li) => li.getAttribute("data-id") === playing.id);
+  const drawn = row && segment && segment.block !== null ? preparedBlocksOf(row, segment.part) : null;
+  const block = drawn ? drawn[segment.block] : null;
+  const timeline = player && typeof player.timeline === "function" ? player.timeline() : null;
+  const sentences = block ? sentencesOf(block.element) : [];
+  if (sentences.length < 2 || !timeline || timeline.startsAt === null || readAloudContext === null) {
+    if (litSentence !== "") CSS.highlights.delete(SENTENCE_HIGHLIGHT);
+    litSentence = "";
+    return;
+  }
+  const listed = playing.blocks[segment.part] && playing.blocks[segment.part][segment.block];
+  const chars = Number(listed && listed.chars) || sentences.reduce((sum, one) => sum + one.length, 0);
+  const pace = readSpeed === null ? 1 : readSpeed / 100;
+  const perChar = learnedSecondsPerChar === null ? READ_SECONDS_PER_CHAR / pace : learnedSecondsPerChar;
+  const arrived = timeline.endsAt - timeline.startsAt;
+  const length = timeline.finished ? arrived : Math.max(arrived, chars * perChar);
+  const through = Math.min(1, Math.max(0, (readAloudContext.currentTime - timeline.startsAt) / length));
+  const total = sentences.reduce((sum, one) => sum + one.length, 0);
+  let reached = 0;
+  let index = sentences.length - 1;
+  for (let at = 0; at < sentences.length; at += 1) {
+    reached += sentences[at].length;
+    if (reached > through * total) {
+      index = at;
+      break;
+    }
+  }
+  const key = `${playing.id} ${segment.part} ${segment.block} ${index}`;
+  if (key === litSentence) return;
+  const range = document.createRange();
+  const { from, to } = sentences[index];
+  range.setStart(from[0], from[1]);
+  range.setEnd(to[0], to[1]);
+  CSS.highlights.set(SENTENCE_HIGHLIGHT, new Highlight(range));
+  litSentence = key;
 }
 
 /** "2 of 5" for a read of several parts; "" for a read of one, or none. */
@@ -30865,6 +31032,9 @@ async function readAloud(ids, from = null) {
   const first = from === null ? 0 : Math.max(0, segments.findIndex((segment) =>
     segment.part === from.part && (from.block === null || segment.block === null || segment.block >= from.block)));
   const clock = readClock();
+  // The blocks the read was prepared in travel with it, so a pace change that forgets what was
+  // prepared does not take the light off the read in progress.
+  const blocks = ready.map((entry) => (entry && entry.blocks) || null);
   const players = [];
   const started = sources.map(() => false);
   const requestBegan = sources.map(() => null);
@@ -30938,6 +31108,7 @@ async function readAloud(ids, from = null) {
     // it ends, so the boundary is as long as the next part's audio is late, and no longer.
     audio.addEventListener("drained", () => {
       if (ticket !== readingTicket || nowPlaying === null || nowPlaying.id !== id) return;
+      learnSpeakingRate(audio, segments[at], blocks);
       if (at + 1 < sources.length) startNext(at + 1);
     });
     audio.addEventListener("speech", (inMs) => {
@@ -30993,15 +31164,16 @@ async function readAloud(ids, from = null) {
     sources.forEach((_source, at) => addPlayer(at));
   }
   // The same array the players are added to, so a stop reaches a part requested later.
-  // The blocks the read was prepared in travel with it, so a pace change that forgets what was
-  // prepared does not take the light off the read in progress.
-  const blocks = ready.map((entry) => (entry && entry.blocks) || null);
   nowPlaying = { id, audio: players[first], urls: objectUrls, players, parts, segments, segment: first, blocks };
   setReadState("ready");
   eachColumn(renderChannelRows);
   renderReadSteer();
-  if (segments.length > 1) claimMediaSession();
-  else releaseMediaSession();
+  if (segments.length > 1) {
+    claimMediaSession();
+    showReadingSentence();
+  } else {
+    releaseMediaSession();
+  }
   await startPlayer(first);
 }
 

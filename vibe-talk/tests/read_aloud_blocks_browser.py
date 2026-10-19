@@ -2,7 +2,8 @@
 """Walk a long message block by block in real Chromium, against a voice that speaks at speaking pace.
 
 `#376 read-aloud-blocks`. A message of several blocks (paragraphs, list items, a quote, a code block)
-is read one block at a time: the block being read is lit, the row says "reading k of n", a tap on
+is read one block at a time: the block being read is lit, and inside it the sentence being said
+(`#379 read-aloud-sentences`); the row says "reading k of n", a tap on
 another block of it jumps there, Previous and Next and the Media Session's previoustrack, nexttrack,
 pause and play move through it, and the boundaries between blocks are heard without a gap.
 
@@ -68,7 +69,12 @@ LONG_CONTENT = str(FIXTURE["content"])
 LONG_HTML = str(FIXTURE["html"])
 _KINDS = FIXTURE["blocks"]
 LONG_BLOCKS = [str(kind) for kind in _KINDS] if isinstance(_KINDS, list) else []
-BLOCK_SECONDS = 1.0
+_TEXTS = FIXTURE["texts"]
+LONG_TEXTS = [str(text) for text in _TEXTS] if isinstance(_TEXTS, list) else []
+# `#379 read-aloud-sentences`. Each block's audio is as long as what it says at this rate, the rate
+# the page assumes until it has measured the voice, so the sentence it lights can be checked.
+SECONDS_PER_CHAR = 0.068
+FIRST_SENTENCES = ["Where the overnight run got to.", "Three things finished.", "One is still going."]
 SHORT_SECONDS = 1.2
 
 # Each block's first audio after its turn begins: about what a warm deployed read shows. The control's
@@ -224,7 +230,8 @@ class FakeApi:
         for i in ids:
             if i == LONG:
                 out.append({"message_id": i, "url": f"/api/v1/speech/ticket-{i}",
-                            "blocks": [{"kind": kind, "spoken": True} for kind in LONG_BLOCKS]})
+                            "blocks": [{"kind": kind, "spoken": True, "chars": len(text)}
+                                       for kind, text in zip(LONG_BLOCKS, LONG_TEXTS)]})
             elif i == SHORT:
                 out.append({"message_id": i, "url": f"/api/v1/speech/ticket-{i}"})
         return {"prepared": out, "expires_in_seconds": 600}
@@ -305,7 +312,8 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
             if message_id == LONG and (block is None or not 0 <= block < len(LONG_BLOCKS)):
                 self.json(404, {"error": "unknown_speech_block", "detail": "no such block"})
                 return
-            seconds = BLOCK_SECONDS if message_id == LONG else SHORT_SECONDS
+            seconds = (max(0.6, len(LONG_TEXTS[block or 0]) * SECONDS_PER_CHAR) if message_id == LONG
+                       else SHORT_SECONDS)
             read = Read(message_id, selection, block, time.monotonic())
             with api.lock:
                 api.reads.append(read)
@@ -495,7 +503,7 @@ def main() -> int:
                     "() => document.getElementById('read-steer').hidden ? ''"
                     " : document.getElementById('read-steer-count').textContent"))
 
-            def wait_position(page: Page, wanted: str, seconds: float = 6) -> None:
+            def wait_position(page: Page, wanted: str, seconds: float = 10) -> None:
                 wait_for(lambda: position(page) == wanted, seconds,
                          f"the read never reached {wanted}; it shows {position(page)!r}")
 
@@ -536,16 +544,31 @@ def main() -> int:
                 # 1. A tap reads the message from its first block, lit and counted.
                 press(page, f"{row} .body", True)
                 wait_position(page, "1 of 7")
-                check(lit_element(page) == "p:Where the overnight run got to.",
+                check(lit_element(page).startswith("p:Where the overnight run got to."),
                       f"the first block is not the one lit: {lit_element(page)!r}")
                 check(author_line(page) == "reading 1 of 7", f"the row does not count the read: {author_line(page)!r}")
                 shot("1-first-block")
+
+                # 1b. Inside it, the sentence being said is lit, each in turn. `#379`.
+                sentences: list[str] = []
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline and position(page) == "1 of 7":
+                    said = str(page.evaluate(
+                        "() => { const lit = CSS.highlights.get('read-aloud-sentence');"
+                        " return lit ? [...lit][0].toString() : ''; }"))
+                    if said and (not sentences or sentences[-1] != said):
+                        sentences.append(said)
+                        if len(sentences) == 2:
+                            shot("1b-second-sentence")
+                    time.sleep(0.05)
+                check(sentences == FIRST_SENTENCES,
+                      f"the sentences lit in the first block were {sentences}, not {FIRST_SENTENCES}")
 
                 # 2. It carries on through the blocks by itself, the light moving with the voice, and
                 # the boundaries are heard without a gap.
                 wait_position(page, "2 of 7")
                 check(lit_element(page) == "li:the retry budget landed", f"block 2 lit: {lit_element(page)!r}")
-                wait_position(page, "4 of 7", 8)
+                wait_position(page, "4 of 7", 15)
                 check(lit_element(page) == "li:waiting on review",
                       f"the nested item is not the one lit: {lit_element(page)!r}")
                 shot("2-nested-item")
@@ -635,7 +658,7 @@ def main() -> int:
                 wait_position(page, "1 of 7")
                 box = page.locator("#read-steer").bounding_box()
                 check(box is not None and box["width"] > 0, "the steering strip is not drawn on a desk")
-                wait_position(page, "4 of 7", 8)
+                wait_position(page, "4 of 7", 15)
                 ahead_gaps = gaps_of(page)
                 ahead_worst = max(ahead_gaps, default=0)
                 check(ahead_worst <= GAP_AHEAD_MOST_MS,
@@ -651,7 +674,8 @@ def main() -> int:
               f" first audio {round(FIRST_AUDIO_SECONDS * 1000)} ms: at speaking pace {pace_boundaries} ms"
               f" (worst {worst}); generating {AHEAD_PACE:g}x faster than it speaks, worst {ahead_worst} ms;"
               f" control with first audio {round(CONTROL_FIRST_AUDIO_SECONDS * 1000)} ms, worst {control_worst} ms."
-              " Highlight, k of n, tap-to-jump, Previous/Next and the media keys all move the read.")
+              " The first block's three sentences were lit in turn; highlight, k of n, tap-to-jump,"
+              " Previous/Next and the media keys all move the read.")
         return 0
     finally:
         api.stopping.set()

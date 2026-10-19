@@ -1121,10 +1121,20 @@ async fn a_message_of_several_blocks_is_prepared_and_played_block_by_block() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let prepared: Value = serde_json::from_slice(&bytes).expect("prepared");
-    let blocks = &prepared["prepared"][0]["blocks"];
+    let blocks: Vec<Value> = prepared["prepared"][0]["blocks"]
+        .as_array()
+        .expect("blocks")
+        .iter()
+        .map(|block| json!({"kind": block["kind"], "spoken": block["spoken"]}))
+        .collect();
+    // `#379 read-aloud-sentences`: and how much each says, which the page times sentences by.
     assert_eq!(
-        blocks,
-        &json!([
+        prepared["prepared"][0]["blocks"][4]["chars"],
+        "nothing failed".len()
+    );
+    assert_eq!(
+        Value::Array(blocks),
+        json!([
             {"kind": "paragraph", "spoken": true},
             {"kind": "item", "spoken": true},
             {"kind": "item", "spoken": true},

@@ -129,9 +129,12 @@ current one plays: a second voice session used only for the block after next, or
 accepts the next prompt before the current turn ends. Neither is done here; the first doubles the
 provider sessions read-aloud holds, and the second is not in the `vibe-talk-v1` protocol.
 
-### Sentences, next
+## Sentences (`#379 read-aloud-sentences`)
 
-Sentence highlighting inside the current block (`read-aloud-sentences`) should not add requests:
-another boundary per sentence would add the same per-turn pause at every sentence. It can light the
-sentence by its share of the block's characters against the block's own audio time, which drifts
-only within one block.
+Sentence highlighting inside the current block adds no requests and so no pauses: another boundary
+per sentence would add the per-turn pause above at every full stop. The page lights the sentence
+whose share of the block's characters the reader has reached in the block's audio. The block's
+length is exact once its audio has all arrived; before that (always, on a speaking-pace voice) it is
+the block's spoken characters times the voice's rate, 0.068 s a character until a block of this
+voice of 40 characters or more has arrived whole and been measured. The error is confined to one
+block: every block starts its light on its first sentence when its audio starts.

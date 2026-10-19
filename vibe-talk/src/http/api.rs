@@ -4418,6 +4418,9 @@ pub struct PreparedBlock {
     pub kind: crate::render::BlockKind,
     /// Whether it says anything. A block of nothing speakable is drawn and never played.
     pub spoken: bool,
+    /// How many characters it says. `#379 read-aloud-sentences`: the page times the sentence it
+    /// lights against the block's audio by this, until the block's audio has all arrived.
+    pub chars: usize,
 }
 
 /// Everything the page needs to make a tap instant.
@@ -4538,6 +4541,7 @@ pub async fn prepare_speech(
             .map(|(kind, said)| PreparedBlock {
                 kind: *kind,
                 spoken: !said.trim().is_empty(),
+                chars: said.trim().chars().count(),
             })
             .collect();
         let ticket = state.speech_tickets.mint(crate::speech_tickets::Prepared {

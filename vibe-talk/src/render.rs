@@ -3714,7 +3714,7 @@ mod read_aloud_blocks {
         assert_eq!(
             sources,
             [
-                "Where the overnight run got to.",
+                "Where the overnight run got to. Three things finished. One is still going.",
                 // An item's own words, without the bullet and without the list nested in it.
                 "the retry budget landed",
                 "the cache rewrite is a draft",

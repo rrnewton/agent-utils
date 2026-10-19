@@ -1,7 +1,7 @@
 {
-  "about": "#376 read-aloud-blocks: one message, its rendering, and the blocks the server and the page find in it. Read by tests/read_aloud_blocks_browser.py, the page suite, and src/render.rs's tests, which hold `html` to what the server renders.",
-  "content": "Where the overnight run got to.\n\n- the retry budget landed\n- the cache rewrite is a draft\n  - waiting on review\n\n> nothing failed outright\n\n```\nqueued 41m\n```\n\nThat is everything.",
-  "html": "<p>Where the overnight run got to.</p>\n<ul>\n<li>the retry budget landed</li>\n<li>the cache rewrite is a draft\n<ul>\n<li>waiting on review</li>\n</ul>\n</li>\n</ul>\n<blockquote>\n<p>nothing failed outright</p>\n</blockquote>\n<pre><code>queued 41m\n</code></pre>\n<p>That is everything.</p>\n",
+  "about": "#376 read-aloud-blocks and #379 read-aloud-sentences: one message, its rendering, the blocks the server and the page find in it, and the words each block shows. Read by tests/read_aloud_blocks_browser.py, the page suite, and src/render.rs's tests, which hold `html` to what the server renders.",
+  "content": "Where the overnight run got to. Three things finished. One is still going.\n\n- the retry budget landed\n- the cache rewrite is a draft\n  - waiting on review\n\n> nothing failed outright\n\n```\nqueued 41m\n```\n\nThat is everything.",
+  "html": "<p>Where the overnight run got to. Three things finished. One is still going.</p>\n<ul>\n<li>the retry budget landed</li>\n<li>the cache rewrite is a draft\n<ul>\n<li>waiting on review</li>\n</ul>\n</li>\n</ul>\n<blockquote>\n<p>nothing failed outright</p>\n</blockquote>\n<pre><code>queued 41m\n</code></pre>\n<p>That is everything.</p>\n",
   "blocks": [
     "paragraph",
     "item",
@@ -19,5 +19,14 @@
     "blockquote",
     "pre",
     "p"
+  ],
+  "texts": [
+    "Where the overnight run got to. Three things finished. One is still going.",
+    "the retry budget landed",
+    "the cache rewrite is a draft",
+    "waiting on review",
+    "nothing failed outright",
+    "queued 41m",
+    "That is everything."
   ]
 }

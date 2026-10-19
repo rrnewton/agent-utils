@@ -3838,6 +3838,20 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
    * sets, the states it reports and its metadata, kept for the test; and a `Blob` to make the
    * keeper's silence from.
    */
+  /**
+   * `#379 read-aloud-sentences`. The CSS Custom Highlight API: `CSS.highlights`, `Highlight`, and a
+   * `document.createRange` whose ranges keep where they start and end, for the test to read.
+   */
+  page.enableHighlights = () => {
+    const highlights = new Map();
+    context.CSS = { highlights };
+    context.Highlight = class { constructor(...ranges) { this.ranges = ranges; } };
+    document.createRange = () => ({
+      setStart(node, offset) { this.start = [node, offset]; },
+      setEnd(node, offset) { this.end = [node, offset]; },
+    });
+    return highlights;
+  };
   page.enableMediaSession = () => {
     const session = { handlers: {}, states: [], metadata: null };
     session.setActionHandler = (action, fn) => { session.handlers[action] = fn; };
@@ -4944,6 +4958,9 @@ const TUNING_BANDS = {
     "how many automatic reconnects one call may make: one ends a long call at the bridge's second " +
     "lost turn however far apart; past five a bridge that loses a turn every minute keeps the call " +
     "limping on new sessions for as long as the reader stays"],
+  SENTENCE_STEP_MS: [50, 400,
+    "how often the sentence being read aloud is looked for again (`#379 read-aloud-sentences`): " +
+    "slower lights a sentence a word or more after the voice reaches it; faster redraws for nothing"],
   RECONNECT_RECORDS_WAIT_MS: [1000, 10000,
     "how long a reconnect waits for the call's turns to reach the server before it reads the record " +
     "it hands the new session: shorter builds the record without the turn just said; longer holds " +
@@ -11102,6 +11119,95 @@ test("the blocks of a message heard to its end archive it once, after the last b
   await page.settle();
   assert.deepEqual(page.dismissCalls, [{ messages: [BLOCKED_ID] }]);
   assert.equal(page.el("read-steer").hidden, true);
+});
+
+// --- `#379 read-aloud-sentences`: the sentence being said, inside the block being read ------------
+
+/** A page reading a message whose first block is three sentences, with the highlight API or not. */
+async function sentencedRead(withHighlights = true) {
+  const page = newPage();
+  page.enableStreamedAudio();
+  page.enableAbort();
+  const highlights = withHighlights ? page.enableHighlights() : null;
+  page.speechBlocks[BLOCKED_ID] = [{ kind: "paragraph", spoken: true, chars: 40 },
+    { kind: "item", spoken: true, chars: 1 }, { kind: "item", spoken: true, chars: 1 }];
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: BLOCKED_ID,
+    content: "One two three. Four five six! Seven eight?\n\n- a\n- b",
+    content_html: "<p>One two three. Four five six! Seven eight?</p>\n<ul>\n<li>a</li>\n<li>b</li>\n</ul>\n" })]);
+  return { page, rows, highlights };
+}
+
+/** The words the sentence highlight covers, or "" when there is none. */
+function litSentence(highlights) {
+  const lit = highlights.get("read-aloud-sentence");
+  if (!lit) return "";
+  const [range] = lit.ranges;
+  assert.equal(range.start[0], range.end[0], "the fixture's sentences are each in one text node");
+  return range.start[0].textContent.slice(range.start[1], range.end[1]);
+}
+
+test("THE SENTENCE BEING SAID is lit inside the block being read, by its share of the block's audio", async () => {
+  // No request per sentence: each would be a pause as long as the voice's first audio.
+  const { page, rows, highlights } = await sentencedRead();
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  const stream = page.audioStreams[0];
+  // A fifth of a second has arrived, due half a second from now: the block's length is still the
+  // estimate from what it says, 40 characters at 0.068 s, 2.72 s.
+  stream.controller.bytes(joined(wavHeader(1000, 1), pcm(...new Array(200).fill(0x2000))));
+  await page.settle();
+  page.audio.currentTime = 0.5;
+  assert.equal(page.expireTimers(150), 1, "nothing looked for the sentence being said");
+  await page.settle();
+  assert.equal(litSentence(highlights), "One two three.");
+  page.audio.currentTime = 0.5 + 1.36;
+  page.expireTimers(150);
+  await page.settle();
+  assert.equal(litSentence(highlights), "Four five six!", "the estimate did not move the light on");
+  // All of it arrives, before the first part has run out: one second long. Its length is now the
+  // audio's own.
+  page.audio.currentTime = 0.6;
+  stream.controller.bytes(pcm(...new Array(800).fill(0x2000)));
+  await page.settle();
+  stream.controller.drop();
+  await page.settle();
+  page.audio.currentTime = 0.5 + 0.95;
+  page.expireTimers(150);
+  await page.settle();
+  assert.equal(litSentence(highlights), "Seven eight?");
+  page.audio.currentTime = 0.5 + 0.2;
+  page.expireTimers(150);
+  await page.settle();
+  assert.equal(litSentence(highlights), "One two three.", "the light did not follow the audio back");
+  // The block itself is still lit, and the sentence goes with the read.
+  assert.equal(litBlock(page.el("discord-log").children[0]), "p:One two three. Four five six! Seven eight?");
+  await page.el("read-aloud").click();
+  await page.settle();
+  assert.equal(highlights.has("read-aloud-sentence"), false, "the sentence stayed lit after the read stopped");
+  assert.equal(page.expireTimers(150), 0, "the page kept looking for a sentence with nothing being read");
+});
+
+test("a block of one sentence lights no sentence, and a browser without the highlight API looks for none", async () => {
+  const { page, rows, highlights } = await sentencedRead();
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  await page.el("read-next").click();
+  await page.settle();
+  page.audioStreams.at(-1).controller.bytes(joined(wavHeader(1000, 1), pcm(...new Array(200).fill(0x2000))));
+  await page.settle();
+  page.expireTimers(150);
+  await page.settle();
+  assert.equal(litSentence(highlights), "", "a one-sentence block lit a sentence as well as itself");
+
+  // THE CONTROL: without the API, the read goes on block by block and nothing looks for sentences.
+  const plain = await sentencedRead(false);
+  await plain.rows[0].dispatch("click", {});
+  await plain.page.settle();
+  plain.page.audioStreams[0].controller.bytes(joined(wavHeader(1000, 1), pcm(...new Array(200).fill(0x2000))));
+  await plain.page.settle();
+  assert.equal(plain.page.expireTimers(150), 0, "the page looked for a sentence it cannot light");
+  assert.equal(plain.page.el("read-steer-count").text(), "1 of 3");
 });
 
 // --- `#290 speech-ticket-refresh`: a prepared URL is never played after its ticket has ended ----------

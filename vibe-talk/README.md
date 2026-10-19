@@ -714,6 +714,15 @@ as it generates pauses at each boundary for as long as its own first audio takes
 `make -C vibe-talk read-aloud-blocks-browser` walks a long message in a real Chromium and measures
 every boundary on the audio clock.
 
+Inside the block being read, the **sentence being said** is lit too (`#379 read-aloud-sentences`),
+underlined as well as coloured. Not by another request per sentence, which would pause at every
+full stop on a voice that speaks as it generates: the block's audio is one stream, and the sentence
+is the one whose share of the block's characters the reader has reached in the block's audio. The
+block's length is its audio's once all of it has arrived, and until then how many characters it
+says (`chars`, in the prepare answer) at the voice's speaking rate, measured from the last block
+that arrived whole. It uses the CSS Custom Highlight API and changes nothing in the drawn body; a
+browser without the API lights the block alone.
+
 On the server, preparation first looks at messages fetched for the page in the last 30 seconds,
 kept in memory (`src/read_ahead.rs`, apart from the voice catch-up's windows in `src/recent.rs`).
 It fetches only what is missing:

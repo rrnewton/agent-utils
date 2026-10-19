@@ -5949,6 +5949,13 @@ a.search-hit-link {
   box-shadow: 0 0 0 0.2rem color-mix(in srgb, var(--warn) 45%, var(--theirs));
 }
 
+/* `#379 read-aloud-sentences`. The sentence being said, inside the block being read: stronger again,
+   and underlined, so it is found by more than its colour. */
+::highlight(read-aloud-sentence) {
+  background-color: color-mix(in srgb, var(--warn) 75%, var(--theirs));
+  text-decoration: underline 0.12em var(--warn);
+}
+
 /* An item's nested lists are blocks of their own, and are not lit with it: the row's colour. */
 .md li[data-reading-block="current"] > :is(ul, ol) {
   background: color-mix(in srgb, var(--warn) 22%, var(--theirs));
