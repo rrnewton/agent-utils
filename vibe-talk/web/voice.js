@@ -542,8 +542,10 @@ const session = {
   // `turn_complete`: what it said and carried, the turn the protocol had completed before it went
   // (`after`), whether the bridge has echoed it back as a user transcript and under which turn
   // number (`echoed`, `turn`), and whether any of its answer has arrived (`answered`). A relayed turn
-  // the call ends before answering is said not to have been read out (`endCallRelay`).
-  /** @type {{text: string, kind: "typed" | "notice" | "relay", relays: {channel: string}[], after: number | null, echoed: boolean, turn: number | null, answered: boolean} | null} */
+  // the call ends before answering is said not to have been read out (`endCallRelay`). `resent`: it is
+  // a lost turn already sent again once, so a session that loses it too does not get it again
+  // (`queueLostTurn`).
+  /** @type {{text: string, kind: "typed" | "notice" | "relay", relays: {channel: string}[], resent: boolean, after: number | null, echoed: boolean, turn: number | null, answered: boolean} | null} */
   turnInFlight: null,
   // `#330 voice-long-turn-drop`. This page sent `interrupt` to make way for a typed message and the
   // turn it cut has not completed yet: that turn's late audio is not played.
@@ -7198,8 +7200,8 @@ function advanceVibeTalkInput() {
   // (`noteTurnInFlightEcho`, `#353 relay-echo-as-owner`).
   if (next.resent && next.kind === "typed") noteTypedTurn(next.text);
   session.turnInFlight = {
-    text: next.text, kind: next.kind, relays: next.relays || [], after: session.lastCompletedTurn,
-    echoed: false, turn: null, answered: false,
+    text: next.text, kind: next.kind, relays: next.relays || [], resent: next.resent === true,
+    after: session.lastCompletedTurn, echoed: false, turn: null, answered: false,
   };
   sendVibeTalkFrame({ type: "prompt", text: next.text });
   setStatus("Waiting for the assistant…");
@@ -17206,8 +17208,11 @@ function reconnectCall(said, now) {
  * Decide what of the lost session's turn goes to the new session, and queue it. A text turn goes
  * again only when the bridge named it as the turn that never started and none of its answer arrived:
  * a turn that began may have acted, a tool call with nothing said, and sent twice it would act twice.
- * Spoken words are never sent again as text. The turn in flight is let go here, whatever is decided,
- * so it is counted once if the call then ends.
+ * And it goes again once: a turn already sent again, which the new session lost too, is not sent a
+ * third time, however long after the last reconnect that came. Its relayed messages are said not to
+ * have been read out, and a typed message is left to the reader to send again. Spoken words are
+ * never sent again as text. The turn in flight is let go here, whatever is decided, so it is counted
+ * once if the call then ends.
  *
  * @param {ReconnectAttempt} attempt
  * @param {string} said the error's words
@@ -17221,6 +17226,7 @@ function queueLostTurn(attempt, said) {
   const sent = inFlight.turn !== null ? inFlight.turn : (inFlight.after ?? 0) + 1;
   let why = "";
   if (inFlight.answered) why = "some of its answer had arrived";
+  else if (inFlight.resent) why = "it had been sent again once already";
   else if (lostTurn === null) why = "the voice service did not say it never started";
   else if (lostTurn !== sent) why = `the voice service named turn ${lostTurn}, not the page's turn ${sent}`;
   if (!why && inFlight.kind === "notice") {
@@ -42472,7 +42478,8 @@ function missedDuringCall(message, arrival) {
  *     arrived (`#352 voice-reconnect-on-bridge-error`): a voice service that lost the turn, or a
  *     hang-up while the agent was still taking it in.
  *   * `lost`: they went to the agent as a turn the voice service lost, and the reconnect that
- *     followed could not send them again: the service did not say the turn never started.
+ *     followed could not send them again: the service did not say the turn never started, or the
+ *     turn was one already sent again once after an earlier reconnect.
  *   * `gap`: a stream fell further behind than it could replay, so what was posted meanwhile is
  *     unknown. The channel itself is re-read and complete; only the reading-out may have missed it.
  *
