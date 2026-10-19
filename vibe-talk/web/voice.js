@@ -536,6 +536,13 @@ const session = {
   // voice-relay-silent`).
   /** @type {{text: string, kind: "typed" | "notice" | "relay", relays: {channel: string}[]}[]} */
   pendingPrompts: [],
+  // `#352 voice-reconnect-on-bridge-error`. The text turn on the wire, from its `prompt` until its
+  // `turn_complete`: what it said and carried, the turn the protocol had completed before it went
+  // (`after`), whether the bridge has echoed it back as a user transcript and under which turn
+  // number (`echoed`, `turn`), and whether any of its answer has arrived (`answered`). A relayed turn
+  // the call ends before answering is said not to have been read out (`endCallRelay`).
+  /** @type {{text: string, kind: "typed" | "notice" | "relay", relays: {channel: string}[], after: number | null, echoed: boolean, turn: number | null, answered: boolean} | null} */
+  turnInFlight: null,
   // `#330 voice-long-turn-drop`. This page sent `interrupt` to make way for a typed message and the
   // turn it cut has not completed yet: that turn's late audio is not played.
   interruptPending: false,
@@ -7112,6 +7119,10 @@ function advanceVibeTalkInput() {
   }
   const next = session.pendingPrompts.shift();
   session.typedTurnInFlight = true;
+  session.turnInFlight = {
+    text: next.text, kind: next.kind, relays: next.relays || [], after: session.lastCompletedTurn,
+    echoed: false, turn: null, answered: false,
+  };
   sendVibeTalkFrame({ type: "prompt", text: next.text });
   setStatus("Waiting for the assistant…");
   armNoReply();
@@ -7362,13 +7373,57 @@ function closeSpokenTurn(turn = null) {
  * would be reported as no reply, and one that stalled after its next transcript never would.
  *
  * @param {number | null} [turn] the turn the output belongs to, when the frame says
+ * @param {boolean} [text] whether it is assistant text rather than PCM
  */
-function noteReplyArriving(turn = null) {
+function noteReplyArriving(turn = null, text = false) {
   session.replyArriving = true;
   noteSpokenTurnActivity(turn);
+  noteTurnInFlightAnswer(turn, text);
   if (session.chat && !session.typedTurnInFlight && session.pendingPrompts.length > 0) {
     armNoReply();
   }
+}
+
+/**
+ * `#352 voice-reconnect-on-bridge-error`. Output that may answer the text turn in flight arrived. An
+ * assistant transcript numbered for a turn the protocol completed before the prompt went, or before
+ * the turn the bridge echoed it under, is the late tail of that earlier turn, not this one's answer.
+ * PCM carries no turn number, so it counts only once the bridge has echoed the prompt: a bridge
+ * accepts a prompt and echoes it before it answers, and audio before that may be the last of an
+ * interrupted turn.
+ *
+ * @param {number | null} turn the turn the output belongs to, when the frame says
+ * @param {boolean} text whether it is assistant text rather than PCM
+ */
+function noteTurnInFlightAnswer(turn, text) {
+  const inFlight = session.turnInFlight;
+  if (!inFlight || inFlight.answered) return;
+  if (text) {
+    if (turn !== null && inFlight.after !== null && turn <= inFlight.after) return;
+    if (turn !== null && inFlight.turn !== null && turn < inFlight.turn) return;
+  } else if (!inFlight.echoed) {
+    return;
+  }
+  inFlight.answered = true;
+}
+
+/**
+ * `#352 voice-reconnect-on-bridge-error`. A user transcript arrived: the bridge's echo of the text
+ * turn in flight, the first time its words come back whole and final. It names the turn the bridge
+ * gave the prompt, which is the turn a bridge that loses it names in its error.
+ *
+ * @param {string} said
+ * @param {boolean} final
+ * @param {number | null} turn
+ * @returns {boolean} whether it was that echo
+ */
+function noteTurnInFlightEcho(said, final, turn) {
+  const inFlight = session.turnInFlight;
+  if (!inFlight || inFlight.echoed || !final || said.trim() !== inFlight.text.trim()) return false;
+  if (turn !== null && inFlight.after !== null && turn <= inFlight.after) return false;
+  inFlight.echoed = true;
+  inFlight.turn = turn;
+  return true;
 }
 
 /**
@@ -15624,6 +15679,7 @@ async function openConversation(options) {
   closeSpokenTurn();
   session.lastCompletedTurn = null;
   session.pendingPrompts = [];
+  session.turnInFlight = null;
   session.playEndMs = 0;
   session.answerPlayEndMs = 0;
   session.echoCancellation = false;
@@ -16872,8 +16928,10 @@ function handleVibeTalk(message) {
       const turnNumber = typeof message.turn === "number" ? message.turn : null;
       if (who === "assistant" && said.trim()) {
         noteAgentText();
-        noteReplyArriving(turnNumber);
+        noteReplyArriving(turnNumber, true);
       } else if (said.trim()) {
+        // `#352 voice-reconnect-on-bridge-error`. Or the bridge echoing the page's own prompt back.
+        noteTurnInFlightEcho(said, final, turnNumber);
         // The owner is speaking: a spoken turn is open, whether or not anything answers it yet. A
         // final transcript says he has finished, and the turn is the agent's to answer.
         noteOwnerWords(turnNumber, final);
@@ -16985,6 +17043,7 @@ function vibeTalkTurnComplete() {
   }
   if (session.typedTurnInFlight) {
     session.typedTurnInFlight = false;
+    session.turnInFlight = null;
     if (session.pendingPrompts.length > 0) {
       advanceVibeTalkInput();
     } else if (session.chat) {
@@ -17154,6 +17213,7 @@ function teardown() {
   closeSpokenTurn();
   session.lastCompletedTurn = null;
   session.pendingPrompts = [];
+  session.turnInFlight = null;
   if (session.playbackWaitTimer !== null) {
     clearTimeout(session.playbackWaitTimer);
     session.playbackWaitTimer = null;
@@ -41478,7 +41538,7 @@ function flushRelay() {
   if (!sent) reportUnrelayed(held, "ended");
   // On the hosted protocol nothing else says when this turn's answer is over. `#337`.
   if (sent && session.protocol !== "vibe-talk-v1") {
-    relayAnswerAwaited = { sentAt: Date.now(), outputAt: 0, audioEndsAt: 0 };
+    relayAnswerAwaited = { sentAt: Date.now(), outputAt: 0, audioEndsAt: 0, held };
   }
   // The rest of a burst too large for one turn waits behind this one's answer (`relayWait`).
   if (relayPending.length && relayTimer === null) relayTimer = setTimeout(flushRelay, RELAY_COALESCE_MS);
@@ -41548,7 +41608,10 @@ const RELAY_ANSWER_SETTLE_MS = 1500;
  * ANSWER_PLAYED_GRACE_MS. A relayed turn that draws no answer at all holds the next no longer than
  * RELAY_ANSWER_WAIT_MS, and the connection details say so.
  *
- * @type {{sentAt: number, outputAt: number, audioEndsAt: number} | null}
+ * `held` are the messages it carried: one the call ends before any of its answer has arrived is said
+ * not to have been read out (`endCallRelay`, `#352 voice-reconnect-on-bridge-error`).
+ *
+ * @type {{sentAt: number, outputAt: number, audioEndsAt: number, held: {channel: string}[]} | null}
  */
 let relayAnswerAwaited = null;
 
@@ -41750,11 +41813,14 @@ function missedDuringCall(message, arrival) {
  *
  *   * `ended`: they were waiting — behind an answer, or for the burst to gather — when the call
  *     ended, and go nowhere now: not into the next call, which would be stale news.
+ *   * `unanswered`: they went to the agent as a turn, and the call ended before any of its answer
+ *     arrived (`#352 voice-reconnect-on-bridge-error`): a voice service that lost the turn, or a
+ *     hang-up while the agent was still taking it in.
  *   * `gap`: a stream fell further behind than it could replay, so what was posted meanwhile is
  *     unknown. The channel itself is re-read and complete; only the reading-out may have missed it.
  *
- * @param {{channel: string}[]} items the messages, for `ended`
- * @param {"ended" | "gap"} why
+ * @param {{channel: string}[]} items the messages, for `ended` and `unanswered`
+ * @param {"ended" | "unanswered" | "gap"} why
  */
 function reportUnrelayed(items, why) {
   let detail;
@@ -41766,10 +41832,18 @@ function reportUnrelayed(items, why) {
     if (!items.length) return;
     const channels = [...new Set(items.map((item) => channelLabel(item.channel)))];
     const where = channels.length === 1 ? channels[0] : `${channels[0]} and ${channels.length - 1} other channel${channels.length === 2 ? "" : "s"}`;
-    detail = `${relayCount(items.length)}, in ${where}, ${items.length === 1 ? "was" : "were"} still waiting when the ` +
-      `call ended, so the agent never read ${items.length === 1 ? "it" : "them"} out.`;
-    addDetail(`${relayCount(items.length)} in ${channels.join(", ")} ${items.length === 1 ? "was" : "were"} not read out: ` +
-      "the call ended first");
+    const one = items.length === 1;
+    if (why === "unanswered") {
+      detail = `${relayCount(items.length)}, in ${where}, went to the agent, but the call ended before it ` +
+        `answered, so ${one ? "it was" : "they were"} never read out.`;
+      addDetail(`${relayCount(items.length)} in ${channels.join(", ")} ${one ? "was" : "were"} not read out: ` +
+        "the call ended before the agent answered");
+    } else {
+      detail = `${relayCount(items.length)}, in ${where}, ${one ? "was" : "were"} still waiting when the ` +
+        `call ended, so the agent never read ${one ? "it" : "them"} out.`;
+      addDetail(`${relayCount(items.length)} in ${channels.join(", ")} ${one ? "was" : "were"} not read out: ` +
+        "the call ended first");
+    }
   }
   transcriptSeam("not read out", detail);
 }
@@ -41788,8 +41862,21 @@ function beginCallRelay() {
 /**
  * The call is over. What was still waiting to be read out is said not to have been, and the
  * stream of every channel stops: nothing but a call reads it. `#337 voice-relay-silent`.
+ *
+ * `#352 voice-reconnect-on-bridge-error`. And so is a relayed turn that went to the agent and drew
+ * none of its answer before the call ended: the turn on the wire, on `vibe-talk-v1`
+ * (`session.turnInFlight`), or the last relayed turn on the hosted protocol (`relayAnswerAwaited`).
+ * A voice service that lost the turn and then ended the session took those messages with it, and
+ * the report counted only what was still queued, so nothing said they were gone.
  */
 function endCallRelay() {
+  const inFlight = session.turnInFlight;
+  const hosted = relayAnswerAwaited;
+  const unanswered = [
+    ...(inFlight && inFlight.kind === "relay" && !inFlight.answered ? inFlight.relays : []),
+    ...(hosted && !hosted.outputAt ? hosted.held : []),
+  ];
+  if (relayCallOpenedAt && unanswered.length) reportUnrelayed(unanswered, "unanswered");
   const queued = session.pendingPrompts.flatMap((prompt) => (prompt.kind === "relay" ? prompt.relays : []));
   const unsent = [...queued, ...relayPending];
   if (relayCallOpenedAt && unsent.length) reportUnrelayed(unsent, "ended");

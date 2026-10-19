@@ -4983,7 +4983,10 @@ the next for 20 seconds (`RELAY_ANSWER_WAIT_MS`), and the connection details say
 **Never dropped in silence** (`#337`). A message still waiting when the call ends — behind an
 answer, or for its burst to gather — goes nowhere, not into the next call, and the transcript says
 so with a **not read out** line naming how many and in which channels, as do the connection
-details. So does a stream reset during a call, which says the gap cannot be filled: the channel is
+details. So does a relayed turn that went to the agent and drew none of its answer before the call
+ended (`#352 voice-reconnect-on-bridge-error`): a voice service that lost the turn, or a hang-up
+while the agent was still taking it in. An answer that had begun counts as read out, even if the
+call cut it short. So does a stream reset during a call, which says the gap cannot be filled: the channel is
 re-read and complete, but whether the call heard what fell into the gap cannot be known. Turning
 Arriving messages during a call off lets go of what was waiting, and the connection details count it.
 
