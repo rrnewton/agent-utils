@@ -1,12 +1,13 @@
 ---
 title: 'provider-diagnostics-ids: a test reaches the real Discord API, so it fails wherever that API answers; keep every test client on loopback'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-19T09:35:54.187373887+00:00
-updated_at: 2026-10-19T09:35:54.187373887+00:00
+updated_at: 2026-10-19T09:39:48.619042149+00:00
+closed_at: 2026-10-19T09:39:48.619042029+00:00
 ---
 
 # Description
