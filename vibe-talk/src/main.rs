@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use vibe_talk::agent_backend::NoAgentBackend;
 use vibe_talk::chat::ChatClient;
-use vibe_talk::config::{Config, ReadAloudBackend, ENV_CONFIG_OVERLAY, ENV_CONFIG_PATH};
+use vibe_talk::config::{Config, ReadAloudBackend};
 use vibe_talk::discord::fake::FakeDiscord;
 use vibe_talk::elevenlabs::http::HttpElevenLabsClient;
 use vibe_talk::elevenlabs::SignedUrlProvider;
@@ -30,6 +30,13 @@ vibe-talk — a chat bridge for a voice agent
 
 USAGE:
     vibe-talk [--config PATH] [--config-overlay PATH]... [--fake-discord] [--skip-startup-probe]
+    vibe-talk pair-link [--config PATH] [--base-url URL] [--ttl SECONDS]
+
+COMMANDS:
+    (none)                run the server
+    pair-link             print a one-time link, good for five minutes, that signs a phone in to
+                          the server running on this host. Never prints the token. See
+                          `vibe-talk pair-link --help`
 
 OPTIONS:
     --config PATH         configuration file (default: $VIBE_TALK_CONFIG, else ./vibe-talk.toml)
@@ -303,6 +310,10 @@ async fn keep_summaries_across_the_policy_change(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let mut argv = std::env::args().skip(1);
+    if argv.next().as_deref() == Some("pair-link") {
+        return pair_link(argv).await;
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -316,42 +327,8 @@ async fn main() -> anyhow::Result<()> {
 
     // An explicitly named file must exist. A defaulted one need not: a container is often given
     // everything through the environment, and that is a supported deployment rather than an error.
-    // It is announced loudly either way, because silently running on a different configuration
-    // than the operator believes is the failure mode worth preventing.
-    let explicit = args.config.is_some();
-    let config_path = args
-        .config
-        .or_else(|| std::env::var_os(ENV_CONFIG_PATH).map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("vibe-talk.toml"));
-    // Overlays: the flags in order, then the environment's. Every one is named in the log, because
-    // a setting that came from a file the operator forgot about is the hardest kind to find.
-    let mut overlays = args.overlays;
-    if let Some(listed) = std::env::var_os(ENV_CONFIG_OVERLAY) {
-        overlays.extend(std::env::split_paths(&listed).filter(|path| !path.as_os_str().is_empty()));
-    }
-    for overlay in &overlays {
-        if !overlay.exists() {
-            anyhow::bail!("configuration overlay {} does not exist", overlay.display());
-        }
-        tracing::info!(path = %overlay.display(), "laying a configuration overlay over the base");
-    }
-    let config = if config_path.exists() {
-        tracing::info!(path = %config_path.display(), "reading configuration file");
-        Config::load_layered(Some(&config_path), &overlays)
-            .with_context(|| format!("loading configuration from {}", config_path.display()))?
-    } else if explicit {
-        anyhow::bail!(
-            "configuration file {} does not exist",
-            config_path.display()
-        );
-    } else {
-        tracing::warn!(
-            path = %config_path.display(),
-            "no configuration file found; taking the ENTIRE configuration from the environment"
-        );
-        Config::load_layered(None, &overlays)
-            .context("assembling configuration from the environment alone")?
-    };
+    // It is announced loudly either way; see `Config::discover`.
+    let config = Config::discover(args.config, args.overlays)?;
 
     let providers: Arc<ChatRouter> = if args.fake_discord {
         tracing::warn!(
@@ -730,6 +707,7 @@ async fn main() -> anyhow::Result<()> {
         channel_registration_lock: Arc::new(tokio::sync::Mutex::new(())),
         voice_health_budget: Arc::new(vibe_talk::voice_health::LogBudget::new()),
         voice_end_budget: Arc::new(vibe_talk::voice_health::LogBudget::new()),
+        pairing: Arc::new(vibe_talk::pairing::Pairing::new()),
         headings: Arc::new(vibe_talk::heading::HeadingTags::new()),
         speech_tickets: Arc::new(vibe_talk::speech_tickets::SpeechTickets::new()),
         read_ahead: Arc::new(vibe_talk::read_ahead::ReadAhead::new()),
@@ -830,6 +808,17 @@ async fn main() -> anyhow::Result<()> {
             &state.message_cache,
         )));
     }
+    // `#369 pairing-link`. An unused pairing code's expiry is logged within half a minute of it.
+    {
+        let pairing = Arc::clone(&state.pairing);
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                every.tick().await;
+                pairing.sweep();
+            }
+        });
+    }
     let app = vibe_talk::http::router(state);
 
     let listener = tokio::net::TcpListener::bind(bind)
@@ -842,11 +831,15 @@ async fn main() -> anyhow::Result<()> {
         let _ = shutdown_tx.send(true);
     });
     let mut server_shutdown = shutdown_rx.clone();
-    let server = axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            wait_for_shutdown(&mut server_shutdown).await;
-        })
-        .into_future();
+    // With the peer address, which the pairing redemption counts failures by (`#369 pairing-link`).
+    let server = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        wait_for_shutdown(&mut server_shutdown).await;
+    })
+    .into_future();
     match run_with_shutdown_deadline(server, shutdown_rx, GRACEFUL_SHUTDOWN_TIMEOUT).await {
         Some(result) => result.context("serving")?,
         None => tracing::warn!(
@@ -854,6 +847,27 @@ async fn main() -> anyhow::Result<()> {
             "graceful shutdown deadline reached; closing remaining streaming connections"
         ),
     }
+    Ok(())
+}
+
+/// `vibe-talk pair-link`. `#369 pairing-link`.
+///
+/// Standard output carries the link and its expiry and NOTHING else, so an agent can paste it
+/// whole; the log goes to standard error, and only warnings unless `RUST_LOG` asks for more.
+async fn pair_link(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .init();
+    let Some(options) = vibe_talk::pair_link::parse(args)? else {
+        return Ok(());
+    };
+    let link = vibe_talk::pair_link::run(options).await?;
+    println!("{}", link.link);
+    println!("expires {}", link.expires_at);
     Ok(())
 }
 

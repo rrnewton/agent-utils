@@ -67,6 +67,8 @@ pub mod mcp;
 pub mod model;
 pub mod noise;
 pub mod ops;
+pub mod pair_link;
+pub mod pairing;
 pub mod post_gate;
 pub mod post_lanes;
 pub mod post_prefix;

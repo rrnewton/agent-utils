@@ -11,10 +11,11 @@
 # Environment: VIBE_TALK_BIND
 bind = "0.0.0.0:8080"
 
-# The URL this server is reachable at from outside, when you know it. Recorded so the deployment is
-# self-describing; nothing depends on it yet.
+# The URL a phone opens the app at, when you know it. `vibe-talk pair-link` builds its one-time
+# sign-in link on it (see "Pairing a phone" in the README); without it, pass --base-url. Also
+# accepted as public_base_url; naming both is refused.
 # Environment: VIBE_TALK_PUBLIC_BASE_URL
-# public_base_url = "https://vibetalk.dev"
+# public_url = "https://vibetalk.dev"
 
 # YOUR time zone, as an IANA name. Message times are converted into it once, here on the server,
 # and handed onward already formatted and labelled ("09:51:25 EDT") so the voice agent can read one

@@ -157,6 +157,9 @@ pub struct AppState {
     /// with. The server installs a cache behind it at startup when its configuration enables one
     /// ([`crate::cache::lifecycle::start`]); with none behind it, every fill is refused.
     pub message_cache: Arc<crate::cache::Sink>,
+    /// The live pairing codes, as hashes, and the failed redemptions per client. `#369
+    /// pairing-link`; see [`crate::pairing`]. In memory only: a restart burns every code.
+    pub pairing: Arc<crate::pairing::Pairing>,
 }
 
 fn added_channel_info(row: &AddedChannel, providers: &ChatRouter) -> ChannelInfo {

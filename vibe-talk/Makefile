@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser offline-cache-browser reactions-browser system-bots-browser edited-mark-browser rich-headers-browser read-aloud-browser post-confirm-browser approval-card-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser search-chord-browser two-column-browser bookmark-browser reply-continuity-browser reply-in-column-browser reply-marks-read-browser done-sync-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser composer-grow-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser thread-card-header-browser all-thread-strip-browser scroll-stability-browser copy-message-browser fold-steps-browser back-gesture-browser live-pill-browser stale-live-read-browser provider-groups-browser
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser pairing-link-browser offline-cache-browser reactions-browser system-bots-browser edited-mark-browser rich-headers-browser read-aloud-browser post-confirm-browser approval-card-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser search-chord-browser two-column-browser bookmark-browser reply-continuity-browser reply-in-column-browser reply-marks-read-browser done-sync-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser composer-grow-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser thread-card-header-browser all-thread-strip-browser scroll-stability-browser copy-message-browser fold-steps-browser back-gesture-browser live-pill-browser stale-live-read-browser provider-groups-browser
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -114,6 +114,12 @@ pwa-installability:
 # Pass WEB_ROOT=dir to run it against another copy of the page.
 enter-to-send-browser:
 	python3 tests/enter_to_send_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT))
+
+# `#369 pairing-link` in a real Chromium at a phone's size: a pairing link signs a fresh browser in
+# once, its code out of the address before any request; the same link in a second browser is refused.
+# Pass WEB_ROOT=dir to run it against another copy of the page.
+pairing-link-browser:
+	python3 tests/pairing_link_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT))
 
 # `#18 offline-message-cache` in a real Chromium at a phone's size: localStorage across a real
 # reload, a real fetch failure, the Cache Storage and service-worker registries, and the pill's

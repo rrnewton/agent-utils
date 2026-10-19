@@ -278,6 +278,7 @@ fn state_pieces_with(
         channel_registration_lock: Arc::new(tokio::sync::Mutex::new(())),
         voice_health_budget: Arc::new(crate::voice_health::LogBudget::new()),
         voice_end_budget: Arc::new(crate::voice_health::LogBudget::new()),
+        pairing: Arc::new(crate::pairing::Pairing::new()),
         headings: Arc::new(crate::heading::HeadingTags::new()),
         speech_tickets: Arc::new(crate::speech_tickets::SpeechTickets::new()),
         read_ahead: Arc::new(crate::read_ahead::ReadAhead::new()),

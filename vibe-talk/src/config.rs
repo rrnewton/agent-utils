@@ -140,7 +140,8 @@ impl std::fmt::Debug for Secret {
 pub struct Config {
     /// Address to bind the HTTP listener to.
     pub bind: SocketAddr,
-    /// Externally reachable base URL, when the deployment knows it.
+    /// Externally reachable base URL, when the deployment knows it: `[server] public_base_url`,
+    /// or `public_url`, or `VIBE_TALK_PUBLIC_BASE_URL`. `vibe-talk pair-link` builds its link on it.
     pub public_base_url: Option<String>,
     /// The zone every message timestamp is rendered into before anything speaks it.
     ///
@@ -1076,6 +1077,9 @@ struct FileReplay {
 #[serde(deny_unknown_fields)]
 struct FileServer {
     bind: Option<String>,
+    // `public_url` is the same setting under the name `vibe-talk pair-link` documents
+    // (`#369 pairing-link`); naming both is refused as a duplicate.
+    #[serde(alias = "public_url")]
     public_base_url: Option<String>,
     timezone: Option<String>,
     app_name: Option<String>,
@@ -2245,6 +2249,54 @@ fn merge_table(base: &mut toml::Table, overlay: toml::Table, path: &mut Vec<Stri
 }
 
 impl Config {
+    /// Find and load the configuration the way the server does, so `vibe-talk pair-link` reads the
+    /// same file and environment as the server it asks (`#369 pairing-link`).
+    ///
+    /// The file is `explicit` (`--config`), else `$VIBE_TALK_CONFIG`, else `./vibe-talk.toml`. An
+    /// explicitly named file must exist; a defaulted one need not, because a container is often
+    /// given everything through the environment. Overlays are `overlays` (`--config-overlay`, in
+    /// order) and then `$VIBE_TALK_CONFIG_OVERLAY`'s, and each must exist. Every choice is logged,
+    /// because running on a different configuration than the operator believes is the failure
+    /// worth preventing.
+    ///
+    /// # Errors
+    ///
+    /// A named file or overlay that does not exist, and anything [`Config::load_layered`] refuses.
+    pub fn discover(explicit: Option<PathBuf>, mut overlays: Vec<PathBuf>) -> anyhow::Result<Self> {
+        use anyhow::Context as _;
+        let named = explicit.is_some();
+        let config_path = explicit
+            .or_else(|| std::env::var_os(ENV_CONFIG_PATH).map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("vibe-talk.toml"));
+        if let Some(listed) = std::env::var_os(ENV_CONFIG_OVERLAY) {
+            overlays
+                .extend(std::env::split_paths(&listed).filter(|path| !path.as_os_str().is_empty()));
+        }
+        for overlay in &overlays {
+            if !overlay.exists() {
+                anyhow::bail!("configuration overlay {} does not exist", overlay.display());
+            }
+            tracing::info!(path = %overlay.display(), "laying a configuration overlay over the base");
+        }
+        if config_path.exists() {
+            tracing::info!(path = %config_path.display(), "reading configuration file");
+            Self::load_layered(Some(&config_path), &overlays)
+                .with_context(|| format!("loading configuration from {}", config_path.display()))
+        } else if named {
+            anyhow::bail!(
+                "configuration file {} does not exist",
+                config_path.display()
+            );
+        } else {
+            tracing::warn!(
+                path = %config_path.display(),
+                "no configuration file found; taking the ENTIRE configuration from the environment"
+            );
+            Self::load_layered(None, &overlays)
+                .context("assembling configuration from the environment alone")
+        }
+    }
+
     /// [`Config::load`], with overlay files laid over the base before anything is resolved.
     ///
     /// `base` is `None` for a deployment configured from the environment alone. See
