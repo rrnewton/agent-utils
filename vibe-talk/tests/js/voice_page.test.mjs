@@ -4861,6 +4861,19 @@ const TUNING_BANDS = {
     "triple-click's) takes in nothing drawn. Under fifty, a row's header and buttons between the " +
     "words and the next row's first word use it up and the triple-click is no quote; past two " +
     "thousand, a drag across many rows walks the whole list at every move of the mouse"],
+  // `#352 voice-reconnect-on-bridge-error`.
+  RECONNECT_MIN_GAP_MS: [30000, 600000,
+    "how soon after one automatic reconnect a second lost turn ends the call: shorter lets a bridge " +
+    "that keeps losing turns reconnect in a loop behind the reader's back; longer ends calls the " +
+    "bridge would have carried on after a rare second loss"],
+  RECONNECTS_PER_CALL_MAX: [2, 5,
+    "how many automatic reconnects one call may make: one ends a long call at the bridge's second " +
+    "lost turn however far apart; past five a bridge that loses a turn every minute keeps the call " +
+    "limping on new sessions for as long as the reader stays"],
+  RECONNECT_RECORDS_WAIT_MS: [1000, 10000,
+    "how long a reconnect waits for the call's turns to reach the server before it reads the record " +
+    "it hands the new session: shorter builds the record without the turn just said; longer holds " +
+    "the reconnect, and the reader's call, on a slow store"],
 };
 test("every number this page is tuned by stays inside a band that says what would be wrong", () => {
   for (const [name, [low, high, why]] of Object.entries(TUNING_BANDS)) {
@@ -7536,6 +7549,23 @@ test("EVERY seam is the same size, so the essay cannot come back through the oth
         return page;
       },
     ],
+    // `#352 voice-reconnect-on-bridge-error`: the voice service lost a turn and the call moved to a
+    // new session. Every wording it can show is held to the band by its own test, from its table.
+    [
+      "reconnected",
+      async () => {
+        const page = newPage();
+        const socket = await startNeutralCall(page);
+        await page.settle();
+        socket.onmessage({ data: JSON.stringify({ type: "error", message: "turn 1 never started after an interrupt; reconnect" }) });
+        for (let step = 0; step < 40 && page.sockets.length < 2; step += 1) await page.settle();
+        const next = page.sockets.at(-1);
+        next.onopen();
+        next.onmessage({ data: JSON.stringify({ type: "session_started", greeting: false }) });
+        await page.settle();
+        return page;
+      },
+    ],
   ];
 
   for (const [label, drive] of sites) {
@@ -7627,6 +7657,22 @@ test("EVERY WORDING A SEAM CAN SHOW IS INSIDE THE BAND, INCLUDING THE ONES NO SI
       `${SEAM_DETAIL_MIN_WORDS}, so ${shortest - SEAM_DETAIL_MIN_WORDS} words could be cut out of ` +
       "every one of them with this band still green — raise the floor or shorten nothing"
   );
+});
+
+test("`#352 voice-reconnect-on-bridge-error`: EVERY WORDING THE RECONNECTED LINE CAN SHOW is inside the band, and says what the new session knows", () => {
+  const table = sourceStringTable("RECONNECT_SEAM_DETAILS");
+  const handed = ["recap", "fresh"];
+  const resent = ["relay", "typed", "none", "unsent"];
+  assert.deepStrictEqual(Object.keys(table).sort(), handed.flatMap((h) => resent.map((r) => `${h}_${r}`)).sort(),
+    "the reconnected line has no wording for some outcome, or one for an outcome that cannot happen");
+  for (const [key, text] of Object.entries(table)) {
+    const spent = words(text);
+    assert.ok(spent >= SEAM_DETAIL_MIN_WORDS, `RECONNECT_SEAM_DETAILS.${key} explains nothing in ${spent} words: "${text}"`);
+    assert.ok(spent <= SEAM_DETAIL_MAX_WORDS, `RECONNECT_SEAM_DETAILS.${key} spends ${spent} words behind a tap: "${text}"`);
+    // Both things a seam has to say: what happened, and what it means for the agent's memory.
+    assert.match(text, /^The voice service lost a turn, so the call moved to a new session/, key);
+    assert.match(text, key.startsWith("fresh_") ? /has seen nothing above this line/ : /was sent what was said above/, key);
+  }
 });
 
 test("the voice on this page is the ASSISTANT, not one more 'agent'", async () => {
@@ -71347,20 +71393,32 @@ test("`#355 provider-grouped-channels`: a channel of no service the server descr
  *
  * @param {{before?: (socket: any) => void}} [options] `before` runs between the prompt and its echo
  */
-async function relayInFlight(page, { before = null } = {}) {
+async function relayInFlight(page, { before = null, start = startNeutralCall, owner = null } = {}) {
   page.channels = [CHANNEL, OTHER_CHANNEL];
-  const socket = await startNeutralCall(page);
+  const socket = await start(page);
   await page.settle();
   await setReadNew(page, "full");
+  // The owner's own exchange first, when asked for: turn 1, and the hand-off after it.
+  let segment = 1;
+  if (owner) {
+    speech(socket, "user", 1, owner, true);
+    speech(socket, "assistant", 1, "Not yet.", true);
+    turnDone(socket, 1);
+    await page.settle();
+    page.expireTimers(CAPTURE_RESUME_MS);
+    await page.settle();
+    segment = 2;
+  }
   await deliver(page, page.watchStream(),
     sseWatch(message({ id: "3520", channel_id: OTHER_CHANNEL.id, author: "codex", content: "the release is tagged" }), "w.1"));
-  await releaseRelay(page, socket, 1);
+  await releaseRelay(page, socket, segment);
   const [prompt] = relayedPrompts(socket);
   assert.ok(prompt, "the message was never relayed, so nothing is in flight");
   if (before) before(socket);
-  speech(socket, "user", 2, prompt);
+  const echo = segment + 1;
+  speech(socket, "user", echo, prompt);
   await page.settle();
-  return { socket, prompt };
+  return { socket, prompt, echo };
 }
 
 const UNANSWERED_SEAM =
@@ -71456,4 +71514,625 @@ test("`#352 voice-reconnect-on-bridge-error`: on the hosted protocol too, a rela
       assert.match(seamDetail(seams[0]), /^1 new message, in lead team, went to the agent, but the call ended before it answered/);
     }
   }
+});
+
+// The reconnect itself. A `vibe-talk-v1` error that asks the client to reconnect, once the session has
+// started, carries the call on a new session; nothing else does, and not for ever.
+
+const RECONNECT_MIN_GAP_MS = optionalSourceConstant("RECONNECT_MIN_GAP_MS") ?? 60000;
+const RECONNECTS_PER_CALL_MAX = optionalSourceConstant("RECONNECTS_PER_CALL_MAX") ?? 3;
+const RECONNECT_RECORDS_WAIT_MS = optionalSourceConstant("RECONNECT_RECORDS_WAIT_MS") ?? 3000;
+
+/** The bridge's words when its watchdog finds turn `n` never started after an interrupt. */
+const lostTurnWords = (n) => `turn ${n} never started after an interrupt; reconnect`;
+
+/** The bridge loses turn `n` and asks the page to reconnect, as the live bridge words it. */
+const loseTurn = (socket, n) =>
+  socket.onmessage({ data: JSON.stringify({ type: "error", message: lostTurnWords(n) }) });
+
+/** The transcript's "reconnected" lines. */
+const reconnectedSeams = (page) =>
+  page.el("transcript").children.filter((li) => li.className === "seam" && li.getAttribute("data-reconnected") !== null);
+
+/** The "you" rows on screen whose words are `text`. */
+const youRowsSaying = (page, text) =>
+  session_lines(page).filter((li) => li.className === "mine" && li.text().includes(text));
+
+/**
+ * After `lost`'s session lost a turn, let the reconnect reach its new socket — the mint, the record
+ * and the socket — then open it and start its session with `started`'s fields. Returns the new socket.
+ */
+async function reconnectTo(page, lost, started = { greeting: false }) {
+  for (let step = 0; step < 40 && page.sockets.at(-1) === lost; step += 1) await page.settle();
+  assert.notEqual(page.sockets.at(-1), lost, "the reconnect opened no new socket");
+  const socket = page.sockets.at(-1);
+  socket.onopen();
+  socket.onmessage({ data: JSON.stringify({ type: "session_started", ...started }) });
+  await page.settle();
+  return socket;
+}
+
+/** The JSON frames the page sent on `socket`, by type, binary ones as "binary". */
+const allFrames = (socket) =>
+  socket.sent.map((frame) => (typeof frame === "string" ? JSON.parse(frame).type : "binary"));
+
+test("`#352 voice-reconnect-on-bridge-error`: the bridge losing a turn keeps the call — a new session on a new socket, the deployed bridge's greeting, the lost relay sent again once after it, and the transcript says the new session saw nothing above (negative control: the page that ended every error's call)", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    const { socket, prompt, echo } = await relayInFlight(page);
+    loseTurn(socket, echo);
+    await page.settle();
+    return { page, socket, prompt, echo };
+  };
+  const { page, socket, prompt, echo } = await run(SCRIPT);
+  assert.deepEqual(controlFrames(socket).slice(-2), ["audio_end", "quit"], "the lost session was not said goodbye to");
+  const sentToLost = socket.sent.length;
+  assert.equal(page.el("error").hidden, true, `the call was reported as ended: ${page.el("error").textContent}`);
+  assert.equal(page.el("hang-up").hidden, false, "Hang up went away, so the call is over");
+  assert.match(page.el("status").textContent, /^Reconnecting after a lost turn/);
+
+  // The deployed bridge's session: a greeting, and no `replay` listed.
+  const next = await reconnectTo(page, socket, { greeting: true });
+  assert.equal(sessionsAsked(page), 2, "the reconnect did not ask the server for a fresh voice session");
+  assert.equal(page.sockets.length, 2);
+  assert.deepEqual(replayFrames(next), [], "a session that lists no replay was sent a record");
+  assert.deepEqual(controlFrames(next), ["audio_start"], "the greeting's session was sent something before its greeting");
+  speech(next, "assistant", 1, "Hello again.", true);
+  next.onmessage({ data: page.pcmFrame(24000, SPEECH) });
+  turnDone(next, 1);
+  await passTime(page, CAPTURE_RESUME_MS + 2000);
+  assert.equal(controlFrames(next).at(-1), "audio_end", "the lost turn did not close the segment after the greeting");
+  turnDone(next, 2);
+  await page.settle();
+  assert.deepEqual(promptsSent(next), [prompt], "the lost relay was not sent again, exactly once, to the new session");
+  assert.equal(socket.sent.length, sentToLost, "the lost session was sent something after its goodbye");
+  assert.equal(relayedPrompts(socket).length + relayedPrompts(next).length, 2);
+  // The new session's echo of it is not a second row of anything.
+  const rows = youRowsSaying(page, "the release is tagged").length;
+  speech(next, "user", 3, prompt);
+  await page.settle();
+  assert.equal(youRowsSaying(page, "the release is tagged").length, rows, "the resent relay's echo was drawn again");
+  speech(next, "assistant", 3, "In build noise, codex said the release is tagged.", true);
+  turnDone(next, 3);
+  await page.settle();
+  assert.equal(controlFrames(next).at(-1), "audio_start", "the microphone's segment did not open after the answer");
+  assert.equal(session_lines(page).filter((li) => li.text().includes("Hello again.")).length, 1, "the greeting was drawn twice");
+  assert.deepEqual(unreadSeams(page), [], "a message the new session read out was reported as not read out");
+
+  // Said: in the transcript, under the call, in the connection details, and in the record.
+  const [seamLine] = reconnectedSeams(page);
+  assert.ok(seamLine, "the transcript does not say the call moved to a new session");
+  assert.equal(seamLabel(seamLine), "reconnected");
+  assert.equal(seamDetail(seamLine),
+    "The voice service lost a turn, so the call moved to a new session that has seen nothing above this line, and the messages went again.");
+  assert.equal(callRecap(page), "Reconnected after a lost turn: started fresh, as this voice session takes no recap");
+  assert.equal(page.el("call-recap").getAttribute("data-reconnected"), "");
+  assert.match(page.el("settings-detail").textContent, new RegExp(`reconnected after the voice service lost a turn: ${lostTurnWords(echo)}`));
+  await page.settle();
+  assert.ok(storedTexts(page).some((t) => t.startsWith("note: Reconnected: The voice service lost a turn")),
+    storedTexts(page).join("\n"));
+  assert.equal(page.endPosts.length, 1);
+  assert.equal(page.endPosts[0].ended_by, "reconnected");
+  assert.equal(page.endPosts[0].close_reason, lostTurnWords(echo));
+  assert.ok(!("reconnects" in page.endPosts[0]), "a call's first socket said it came after a reconnect");
+  await page.el("hang-up").click();
+  await page.settle();
+  assert.deepEqual(page.endPosts.map((r) => [r.ended_by, r.reconnects]), [["reconnected", undefined], ["hang_up", 1]]);
+
+  // The negative control: the page before this change ends the call at the error.
+  const control = await run(brokenScript("      if (reconnectAsked(said)) {\n", "      if (false) {\n"));
+  assert.deepEqual(control.page.endPosts.map((r) => r.ended_by), ["error_frame"]);
+  assert.equal(sessionsAsked(control.page), 1);
+  assert.equal(control.page.el("error").hidden, false);
+});
+
+test("`#352 voice-reconnect-on-bridge-error`: a session that lists replay is handed THIS call's record first, then the lost turn at once with no segment before it, and the line under the call says the agent was caught up", async () => {
+  const page = newPage();
+  page.transcriptRecordsSupported = true;
+  page.channels = [CHANNEL, OTHER_CHANNEL];
+  await withEarlierConversation(page, { resume: true });
+  const { socket, prompt, echo } = await relayInFlight(page, {
+    start: (p) => startV1Call(p, ["replay"]),
+    owner: "is the release tagged yet",
+  });
+  socket.onmessage({ data: JSON.stringify({ type: "replay_ack", accepted: true }) });
+  await page.settle();
+  const callId = [...page.storedTurns.keys()].find((id) => id !== "conv_earlier");
+  assert.ok(callId, "the call filed nothing, so there is no record of it to hand over");
+  const fetchedAtStart = page.replayCalls.length;
+  loseTurn(socket, echo);
+  const next = await reconnectTo(page, socket, { greeting: false, capabilities: ["replay"] });
+  assert.equal(page.replayCalls.length, fetchedAtStart + 1, "the reconnect did not read this call's record");
+  assert.match(page.replayCalls.at(-1), new RegExp(`/conversations/${callId}/replay$`),
+    "the new session was handed some other conversation than this call");
+  const frames = framesSent(next);
+  assert.equal(frames[0] && frames[0].type, "replay", `the record was not the first frame: ${frames.map((f) => f.type)}`);
+  assert.match(frames[0].text, /is the release tagged yet/, "the record does not hold what was said in this call");
+  assert.doesNotMatch(frames[0].text, /the mac runner stalled/, "the conversation the call resumed from went again");
+  assert.equal(frames[1] && frames[1].type, "prompt", `the lost turn did not go next: ${frames.map((f) => f.type)}`);
+  assert.equal(frames[1].text, prompt);
+  assert.ok(!frames.some((f) => f.type === "audio_start"), "an empty segment went before the lost turn");
+  assert.match(callRecap(page), /^Reconnected after a lost turn: sent the agent \d+ words from this call$/);
+  next.onmessage({ data: JSON.stringify({ type: "replay_ack", accepted: true }) });
+  await page.settle();
+  assert.match(callRecap(page), /^Reconnected after a lost turn: caught the agent up with \d+ words from this call$/);
+  assert.equal(seamDetail(reconnectedSeams(page)[0]),
+    "The voice service lost a turn, so the call moved to a new session, which was sent what was said above, and the messages went again.");
+  assert.match(page.el("settings-detail").textContent, /the conversation this call resumed from was not sent again/);
+  assert.match(page.el("settings-detail").textContent, /the reconnected session took this call's record/);
+  // How the call began is unchanged in Settings.
+  assert.match(page.el("resume-state").textContent, /took 11 words from earlier/);
+  speech(next, "assistant", 1, "In build noise, codex said the release is tagged.", true);
+  turnDone(next, 1);
+  await page.settle();
+  assert.equal(controlFrames(next).at(-1), "audio_start", "the microphone's segment did not open after the lost turn's answer");
+  page.expireTimers(CAPTURE_RESUME_MS);
+  speakInto(page);
+  assert.ok(next.sent.some((frame) => typeof frame !== "string"), "the microphone does not reach the new session");
+});
+
+test("`#352 voice-reconnect-on-bridge-error`: a typed message the bridge lost goes again once, with one row and one record (negative control: the page that let its echo through)", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    const socket = await startNeutralCall(page);
+    await page.settle();
+    await compose(page, "what changed overnight?");
+    await page.el("send-text").click();
+    await page.settle();
+    turnDone(socket, 1);
+    await page.settle();
+    speech(socket, "user", 2, "what changed overnight?");
+    await page.settle();
+    loseTurn(socket, 2);
+    const next = await reconnectTo(page, socket);
+    speech(next, "user", 1, "what changed overnight?");
+    await page.settle();
+    return { page, socket, next };
+  };
+  const { page, next } = await run(SCRIPT);
+  assert.deepEqual(promptsSent(next), ["what changed overnight?"], "the typed message did not go again, once");
+  assert.equal(youRowsSaying(page, "what changed overnight?").length, 1, "the typed message is on screen twice");
+  assert.equal(storedTexts(page).filter((t) => t === "you: what changed overnight?").length, 1, storedTexts(page).join("\n"));
+  assert.equal(seamDetail(reconnectedSeams(page)[0]),
+    "The voice service lost a turn, so the call moved to a new session that has seen nothing above this line, and your message went again.");
+  const control = await run(brokenScript("  if (next.resent) noteTypedTurn(next.text);\n", ""));
+  assert.equal(youRowsSaying(control.page, "what changed overnight?").length, 2,
+    "the control drew the echo once, so the test above proves nothing");
+});
+
+test("`#352 voice-reconnect-on-bridge-error`: a turn the agent had begun to answer is not sent again, its answer is marked cut off, and its messages count as read out", async () => {
+  const page = newPage();
+  const { socket, echo } = await relayInFlight(page);
+  speech(socket, "assistant", echo, "In build noise, codex said", false);
+  loseTurn(socket, echo);
+  const next = await reconnectTo(page, socket);
+  assert.deepEqual(promptsSent(next), [], "a turn the agent had begun to answer was sent again");
+  assert.deepEqual(controlFrames(next), ["audio_start"]);
+  const cut = session_lines(page).find((li) => li.text().includes("In build noise, codex said"));
+  assert.ok(cut && /cut off/.test(cut.text()), "the answer the lost session began is not marked cut off");
+  assert.deepEqual(unreadSeams(page), [], "messages the agent began to read out were reported as not read out");
+  assert.match(page.el("settings-detail").textContent, /the turn the voice service lost does not go again: some of its answer had arrived/);
+  assert.equal(seamDetail(reconnectedSeams(page)[0]),
+    "The voice service lost a turn, so the call moved to a new session that has seen nothing above this line. If you were speaking, say it again.");
+});
+
+test("`#352 voice-reconnect-on-bridge-error`: a reconnect for a turn the bridge does not name, or names otherwise, sends nothing again, and the relayed messages are said not to have been read out", async () => {
+  for (const words of ["the backend was reset; reconnect", "turn 9 never started after an interrupt; reconnect"]) {
+    const page = newPage();
+    const { socket } = await relayInFlight(page);
+    socket.onmessage({ data: JSON.stringify({ type: "error", message: words }) });
+    const next = await reconnectTo(page, socket);
+    assert.deepEqual(promptsSent(next), [], `${words}: a turn the bridge did not name was sent again`);
+    const seams = unreadSeams(page);
+    assert.equal(seams.length, 1, `${words}: the lost messages went without a word`);
+    assert.equal(seamDetail(seams[0]),
+      "1 new message, in build noise, went to the agent, but the voice service lost the turn, so it was never read out.");
+    await page.el("hang-up").click();
+    await page.settle();
+    assert.equal(unreadSeams(page).length, 1, `${words}: the lost messages were reported twice`);
+  }
+});
+
+test("`#352 voice-reconnect-on-bridge-error`: a message arriving during the reconnect waits for the new session and is read out once, after the lost turn", async () => {
+  const page = newPage();
+  const { socket, prompt, echo } = await relayInFlight(page);
+  loseTurn(socket, echo);
+  await page.settle();
+  await deliver(page, page.watchStream(),
+    sseWatch(message({ id: "3522", channel_id: OTHER_CHANNEL.id, author: "codex", content: "the canary is green" }), "w.2"));
+  await passTime(page, RELAY_COALESCE_MS + RELAY_RECHECK_MS * 2);
+  assert.doesNotMatch(page.el("status").textContent, /will be read out/, "the relay talked over the reconnect");
+  assert.deepEqual(unreadSeams(page), [], "a message arriving during the reconnect was dropped");
+  const next = await reconnectTo(page, socket);
+  assert.deepEqual(promptsSent(next), [prompt], "the lost turn did not go first");
+  speech(next, "assistant", 1, "In build noise, codex said the release is tagged.", true);
+  turnDone(next, 1);
+  await passTime(page, CAPTURE_RESUME_MS + RELAY_COALESCE_MS + RELAY_RECHECK_MS * 2);
+  if (controlFrames(next).at(-1) === "audio_end") turnDone(next, 2);
+  await page.settle();
+  assert.equal(timesRelayed(next, "the canary is green"), 1, relayedPrompts(next).join("\n---\n"));
+  assert.equal(timesRelayed(next, "the release is tagged"), 1);
+  assert.equal(timesRelayed(socket, "the canary is green"), 0);
+  // The ledger still refuses a stream's second copy of it.
+  await deliver(page, page.watchStream(),
+    sseWatch(message({ id: "3522", channel_id: OTHER_CHANNEL.id, author: "codex", content: "the canary is green" }), "w.3"));
+  await passTime(page, RELAY_COALESCE_MS * 2);
+  assert.equal(timesRelayed(next, "the canary is green"), 1, "a message relayed during the reconnect was taken again");
+  assert.deepEqual(unreadSeams(page), []);
+});
+
+test("`#352 voice-reconnect-on-bridge-error`: negative controls — any other error still ends the call, as does a reconnect-asking error before the session started, and the hosted protocol never reconnects", async () => {
+  // Another error, on a session that started.
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  await page.settle();
+  socket.onmessage({ data: JSON.stringify({ type: "error", message: "backend handler ended" }) });
+  await page.settle();
+  assert.deepEqual(controlFrames(socket).slice(-2), ["audio_end", "quit"]);
+  assert.equal(page.el("error").hidden, false, "the call ended without a word");
+  assert.deepEqual(page.endPosts.map((r) => r.ended_by), ["error_frame"]);
+  assert.equal(sessionsAsked(page), 1, "an error that did not ask to reconnect asked for a second session");
+  assert.equal(page.sockets.length, 1);
+  assert.deepEqual(reconnectedSeams(page), []);
+
+  // Asking to reconnect before the session started: there is no session to carry on from.
+  const early = newPage();
+  await signIn(early);
+  await early.settle();
+  const unstarted = await startV1Call(early, undefined, { started: false });
+  unstarted.onmessage({ data: JSON.stringify({ type: "error", message: lostTurnWords(1) }) });
+  await early.settle();
+  for (let step = 0; step < 10; step += 1) await early.settle();
+  assert.deepEqual(early.endPosts.map((r) => r.ended_by), ["error_frame"]);
+  assert.equal(sessionsAsked(early), 1, "a session that never started was reconnected");
+  assert.equal(early.sockets.length, 1);
+
+  // The hosted vendor's protocol has no such error, and nothing on it reconnects.
+  const hosted = newPage();
+  const vendor = await startTalking(hosted);
+  vendor.onmessage({ data: JSON.stringify({ type: "error", message: lostTurnWords(4) }) });
+  for (let step = 0; step < 10; step += 1) await hosted.settle();
+  assert.equal(sessionsAsked(hosted), 1, "the hosted protocol was reconnected");
+  assert.equal(hosted.sockets.length, 1);
+  assert.deepEqual(hosted.endPosts, []);
+  assert.equal(state(hosted), "live");
+});
+
+/**
+ * A neutral call whose owner spoke turn 1, after which its session lost turn 2 and the page
+ * reconnected it to a new session that started with no greeting. Returns the new socket.
+ */
+async function reconnectedOnce(page) {
+  const socket = await startNeutralCall(page);
+  await page.settle();
+  speech(socket, "user", 1, "anything new in lead team", true);
+  turnDone(socket, 1);
+  await page.settle();
+  loseTurn(socket, 2);
+  return reconnectTo(page, socket);
+}
+
+test("`#352 voice-reconnect-on-bridge-error`: a second lost turn within a minute of the reconnect ends the call as reconnect_limit, and at a minute it reconnects again (negative control: the page with no gap)", async () => {
+  const run = async (script, gap) => {
+    const page = newPage(new Map(), script);
+    const second = await reconnectedOnce(page);
+    await passTime(page, gap);
+    loseTurn(second, 1);
+    for (let step = 0; step < 40; step += 1) await page.settle();
+    return { page, second };
+  };
+  const { page, second } = await run(SCRIPT, RECONNECT_MIN_GAP_MS - 1000);
+  assert.equal(page.sockets.length, 2, "a second lost turn within the minute opened a third socket");
+  assert.deepEqual(page.endPosts.map((r) => [r.ended_by, r.reconnects]), [["reconnected", undefined], ["reconnect_limit", 1]]);
+  assert.match(page.el("error").textContent,
+    /^The voice service lost a turn again less than a minute after the page reconnected, so the call has ended: turn 1 never started/);
+  assert.deepEqual(controlFrames(second).slice(-2), ["audio_end", "quit"]);
+  assert.match(page.el("settings-detail").textContent, /into the call: a second lost turn within a minute of reconnecting/);
+  assert.equal(page.el("hang-up").hidden, true, "the call did not end");
+  // At the minute, it is a new request.
+  const later = await run(SCRIPT, RECONNECT_MIN_GAP_MS);
+  assert.equal(later.page.sockets.length, 3, "a lost turn a minute after the reconnect was not reconnected");
+  assert.deepEqual(later.page.endPosts.map((r) => [r.ended_by, r.reconnects]), [["reconnected", undefined], ["reconnected", 1]]);
+  // The negative control: the page that let a bridge reconnect as often as it lost turns.
+  const control = await run(brokenScript("now - session.lastReconnectAt < RECONNECT_MIN_GAP_MS", "now - session.lastReconnectAt < 0"),
+    RECONNECT_MIN_GAP_MS - 1000);
+  assert.equal(control.page.sockets.length, 3, "the control did not reconnect inside the minute, so the test above proves nothing");
+});
+
+test("`#352 voice-reconnect-on-bridge-error`: a fourth lost turn in one call ends it as reconnect_limit, however far apart (negative control: the page with no cap)", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    let socket = await reconnectedOnce(page);
+    for (let lost = 0; lost < 3; lost += 1) {
+      await passTime(page, RECONNECT_MIN_GAP_MS + 1000);
+      const before = page.sockets.length;
+      loseTurn(socket, 1);
+      for (let step = 0; step < 40 && page.sockets.length === before; step += 1) await page.settle();
+      if (page.sockets.length === before) break;
+      socket = page.sockets.at(-1);
+      socket.onopen();
+      socket.onmessage({ data: JSON.stringify({ type: "session_started", greeting: false }) });
+      await page.settle();
+    }
+    return page;
+  };
+  const page = await run(SCRIPT);
+  assert.equal(page.sockets.length, 1 + RECONNECTS_PER_CALL_MAX, "a call was reconnected more times than the cap");
+  assert.deepEqual(page.endPosts.map((r) => [r.ended_by, r.reconnects]),
+    [["reconnected", undefined], ["reconnected", 1], ["reconnected", 2], ["reconnect_limit", 3]]);
+  assert.match(page.el("error").textContent,
+    /^The voice service lost a turn again after the page had reconnected this call 3 times, so the call has ended/);
+  const control = await run(brokenScript("  if (session.reconnects >= RECONNECTS_PER_CALL_MAX) {\n", "  if (false) {\n"));
+  assert.equal(control.sockets.length, 2 + RECONNECTS_PER_CALL_MAX, "the control did not reconnect a fourth time, so the test above proves nothing");
+});
+
+test("`#352 voice-reconnect-on-bridge-error`: a reconnect that cannot get a working session ends the call as reconnect_failed, opens nothing more, and says the lost messages were not read out exactly once (negative control: the page that kept the lost turn in flight)", async () => {
+  /** Each way it can fail, given the page after the lost turn and its lost socket. */
+  const ways = {
+    "the server refuses a second session": async (page) => {
+      page.setFetch(async () => errorResponse(503, "voice_unavailable", "the voice service is down"));
+    },
+    "the new socket never opens": async (page, lost) => {
+      for (let step = 0; step < 40 && page.sockets.at(-1) === lost; step += 1) await page.settle();
+      page.expireTimers(SOCKET_OPEN_TIMEOUT_MS);
+    },
+    "the new session errs before it starts": async (page, lost) => {
+      for (let step = 0; step < 40 && page.sockets.at(-1) === lost; step += 1) await page.settle();
+      const next = page.sockets.at(-1);
+      next.onopen();
+      next.onmessage({ data: JSON.stringify({ type: "error", message: "backend unavailable" }) });
+    },
+    "the new socket is refused": async (page, lost) => {
+      for (let step = 0; step < 40 && page.sockets.at(-1) === lost; step += 1) await page.settle();
+      const next = page.sockets.at(-1);
+      next.onerror();
+      next.onclose({ code: 1006, reason: "" });
+    },
+    "the new socket opens and closes before its session starts": async (page, lost) => {
+      for (let step = 0; step < 40 && page.sockets.at(-1) === lost; step += 1) await page.settle();
+      const next = page.sockets.at(-1);
+      next.onopen();
+      next.onclose({ code: 1011, reason: "backend unavailable" });
+    },
+  };
+  const run = async (script, how) => {
+    const page = newPage(new Map(), script);
+    const { socket, echo } = await relayInFlight(page);
+    if (how === "the server refuses a second session") await ways[how](page, socket);
+    loseTurn(socket, echo);
+    if (how !== "the server refuses a second session") await ways[how](page, socket);
+    for (let step = 0; step < 20; step += 1) await page.settle();
+    return page;
+  };
+  for (const how of Object.keys(ways)) {
+    const page = await run(SCRIPT, how);
+    const opened = how === "the server refuses a second session" ? 1 : 2;
+    assert.equal(page.sockets.length, opened, `${how}: a further socket was opened`);
+    assert.deepEqual(page.endPosts.map((r) => [r.ended_by, r.reconnects]), [["reconnected", undefined], ["reconnect_failed", 1]], how);
+    assert.match(page.el("error").textContent, /^The voice service lost a turn and the page could not reconnect: /, how);
+    assert.equal(page.el("retry-start").hidden, true, `${how}: a failed reconnect offered Try again, as a start that never connected does`);
+    assert.equal(page.el("hang-up").hidden, true, `${how}: the call did not end`);
+    const seams = unreadSeams(page);
+    assert.equal(seams.length, 1, `${how}: the lost messages were reported ${seams.length} times`);
+    assert.match(seamDetail(seams[0]), /^1 new message, in build noise, was still waiting when the call ended/, how);
+    assert.ok(!page.endPosts.some((r) => r.ended_by === "server_closed" || r.ended_by === "error_frame"), how);
+  }
+  // The negative control: the page that left the lost turn in flight as it queued it again counts it twice.
+  const control = await run(brokenScriptEach(
+    ["  const inFlight = session.turnInFlight;\n  session.turnInFlight = null;\n  if (!inFlight) return;\n",
+      "  const inFlight = session.turnInFlight;\n  if (!inFlight) return;\n"],
+    ["  session.turnInFlight = null;\n  if (session.playbackWaitTimer !== null) {\n",
+      "  if (session.playbackWaitTimer !== null) {\n"]
+  ), "the server refuses a second session");
+  assert.equal(unreadSeams(control).length, 2, "the control reported the messages once, so the test above proves nothing");
+});
+
+test("`#352 voice-reconnect-on-bridge-error`: Hang up while a reconnect waits for its session opens nothing more, and the lost messages are said not to have been read out", async () => {
+  const page = newPage();
+  const { socket, echo } = await relayInFlight(page);
+  const held = heldMint(page, v1Minted);
+  loseTurn(socket, echo);
+  await page.settle();
+  assert.equal(held.asked, 1, "the reconnect did not ask for a session");
+  assert.equal(page.el("hang-up").hidden, false);
+  await page.el("hang-up").click();
+  await page.settle();
+  held.release();
+  for (let step = 0; step < 20; step += 1) await page.settle();
+  assert.equal(page.sockets.length, 1, "a socket was opened for a call that had been hung up");
+  assert.deepEqual(page.endPosts.map((r) => [r.ended_by, r.reconnects]), [["reconnected", undefined], ["hang_up", 1]]);
+  assert.equal(unreadSeams(page).length, 1);
+  assert.equal(page.el("error").hidden, true, page.el("error").textContent);
+});
+
+test("`#352 voice-reconnect-on-bridge-error`: the bridge closing the lost session's socket straight after its error does not end the call (negative control: the page that let the socket go only later)", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    const { socket, echo } = await relayInFlight(page);
+    loseTurn(socket, echo);
+    if (socket.onclose) socket.onclose({ code: 1011, reason: "interrupt boundary timed out; reconnect" });
+    for (let step = 0; step < 20; step += 1) await page.settle();
+    return page;
+  };
+  const page = await run(SCRIPT);
+  assert.equal(page.el("error").hidden, true, page.el("error").textContent);
+  assert.deepEqual(page.endPosts.map((r) => r.ended_by), ["reconnected"]);
+  assert.equal(page.sockets.length, 2, "the reconnect did not go ahead");
+  const control = await run(brokenScript(
+    "    lost.onclose = (event) => {\n      addDetail(`closed with code ${event.code}${event.reason ? `: ${event.reason}` : \"\"}`);\n    };\n", ""));
+  assert.ok(control.endPosts.some((r) => r.ended_by === "server_closed"),
+    `the control's call did not end at the close, so the test above proves nothing: ${control.endPosts.map((r) => r.ended_by)}`);
+});
+
+test("`#352 voice-reconnect-on-bridge-error`: a reconnected session is handed nothing when it lists no replay, when Resuming is off on this device or the server, or when this call's record cannot be read — and the line says which; how the call began is unchanged in Settings", async () => {
+  /** A replay-capable call with an earlier conversation, that loses a turn; `arrange` sets up the case. */
+  const run = async (arrange, started) => {
+    const page = newPage();
+    page.transcriptRecordsSupported = true;
+    page.channels = [CHANNEL, OTHER_CHANNEL];
+    await withEarlierConversation(page, { resume: true });
+    const { socket, prompt, echo } = await relayInFlight(page, {
+      start: (p) => startV1Call(p, ["replay"]), owner: "is the release tagged yet",
+    });
+    socket.onmessage({ data: JSON.stringify({ type: "replay_ack", accepted: true }) });
+    await page.settle();
+    const resumeState = page.el("resume-state").textContent;
+    const fetched = page.replayCalls.length;
+    await arrange(page);
+    loseTurn(socket, echo);
+    const next = await reconnectTo(page, socket, started);
+    return { page, next, prompt, resumeState, fetched };
+  };
+  const cases = [
+    ["a session that lists no replay", async () => {}, { greeting: false },
+      "Reconnected after a lost turn: started fresh, as this voice session takes no recap", true],
+    ["Resuming switched off on this device", async (page) => {
+      await page.el("resume-toggle").setChecked(false);
+    }, { greeting: false, capabilities: ["replay"] }, "Reconnected after a lost turn: started fresh, as resuming is off", false],
+    ["this call's record cannot be read", async (page) => {
+      page.replayStatus = 500;
+    }, { greeting: false, capabilities: ["replay"] },
+    "Reconnected after a lost turn: started fresh, as this call's record could not be read", true],
+  ];
+  for (const [label, arrange, started, line, asks] of cases) {
+    const { page, next, prompt, resumeState, fetched } = await run(arrange, started);
+    assert.deepEqual(replayFrames(next), [], `${label}: a record went`);
+    assert.equal(callRecap(page), line, label);
+    assert.equal(page.replayCalls.length, fetched + (asks ? 1 : 0), `${label}: the record was ${asks ? "not " : ""}asked for`);
+    assert.deepEqual(promptsSent(next), [prompt], `${label}: the lost turn was not sent again`);
+    assert.equal(seamDetail(reconnectedSeams(page)[0]),
+      "The voice service lost a turn, so the call moved to a new session that has seen nothing above this line, and the messages went again.",
+      label);
+    if (label !== "Resuming switched off on this device") {
+      assert.equal(page.el("resume-state").textContent, resumeState, `${label}: Settings changed what it says about how the call began`);
+    }
+  }
+});
+
+test("`#352 voice-reconnect-on-bridge-error`: a reconnected session that refuses this call's record is said to have started fresh, under the call and in the transcript, and the call's start marker is not rewritten", async () => {
+  const page = newPage();
+  page.transcriptRecordsSupported = true;
+  page.channels = [CHANNEL, OTHER_CHANNEL];
+  await withEarlierConversation(page, { resume: true });
+  const { socket, echo } = await relayInFlight(page, {
+    start: (p) => startV1Call(p, ["replay"]), owner: "is the release tagged yet",
+  });
+  socket.onmessage({ data: JSON.stringify({ type: "replay_ack", accepted: true }) });
+  await page.settle();
+  const callId = [...page.storedTurns.keys()].find((id) => id !== "conv_earlier");
+  const marker = JSON.stringify(page.storedTurns.get(callId)[0]);
+  loseTurn(socket, echo);
+  const next = await reconnectTo(page, socket, { greeting: false, capabilities: ["replay"] });
+  assert.equal(replayFrames(next).length, 1);
+  next.onmessage({ data: JSON.stringify({ type: "replay_ack", accepted: false, reason: "record too long" }) });
+  await page.settle();
+  assert.equal(callRecap(page), "Reconnected after a lost turn: started fresh, as the voice service refused the recap");
+  assert.match(page.el("settings-detail").textContent, /the reconnected session refused this call's record: record too long/);
+  assert.equal(seamDetail(reconnectedSeams(page)[0]),
+    "The voice service lost a turn, so the call moved to a new session that has seen nothing above this line, and the messages went again.");
+  assert.equal(JSON.stringify(page.storedTurns.get(callId)[0]), marker, "the call's start marker was rewritten");
+  assert.match(page.el("resume-state").textContent, /took 11 words from earlier/);
+});
+
+test("`#352 voice-reconnect-on-bridge-error`: a yes heard by the reconnected session does not send a draft read back to the lost one, and a tap still does", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  await page.settle();
+  speech(socket, "user", 1, "tell lead team I'm on it, rebasing now", true);
+  page.propose(spokenDraft());
+  await page.settle();
+  speech(socket, "assistant", 1, "To lead team: on it, rebasing now. Send it?", true);
+  turnDone(socket, 1);
+  await page.settle();
+  loseTurn(socket, 2);
+  const next = await reconnectTo(page, socket);
+  speech(next, "assistant", 1, "To lead team: on it, rebasing now. Send it?", true);
+  turnDone(next, 1);
+  speech(next, "user", 2, "yes", true);
+  await settleSpokenYes(page);
+  assert.deepEqual(page.proposalCommits, [], "a yes to the reconnected session sent a draft read back to the lost one");
+  assert.match(page.el("status").textContent, /^Not sent — the voice session restarted after that draft was made\./);
+  page.expireTimers(2000);
+  await page.el("post-confirm-send").click();
+  await page.settle();
+  assert.equal(page.proposalCommits.length, 1, "a tap on Send did not send the draft");
+});
+
+test("`#352 voice-reconnect-on-bridge-error`: the microphone goes to the new session only, once it has started, and is never asked for again", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  await page.settle();
+  speech(socket, "user", 1, "anything new in lead team", true);
+  turnDone(socket, 1);
+  await page.settle();
+  page.expireTimers(CAPTURE_RESUME_MS);
+  speakInto(page);
+  const lostBinary = socket.sent.filter((frame) => typeof frame !== "string").length;
+  assert.ok(lostBinary > 0, "the microphone never reached the first session");
+  loseTurn(socket, 2);
+  await page.settle();
+  const graph = page.processors.at(-1);
+  assert.equal(graph.onaudioprocess, null, "the lost session's capture graph still sends");
+  const next = await reconnectTo(page, socket);
+  assert.equal(page.processors.length, 2, "no capture graph was built for the new session");
+  speakInto(page);
+  assert.equal(socket.sent.filter((frame) => typeof frame !== "string").length, lostBinary, "audio reached the lost session");
+  assert.ok(next.sent.some((frame) => typeof frame !== "string"), "the microphone does not reach the new session");
+  const firstBinary = allFrames(next).indexOf("binary");
+  assert.ok(firstBinary > allFrames(next).indexOf("audio_start"), "audio reached the new session before its segment opened");
+  assert.equal(page.micRequests.length, 1, "the reconnect asked for the microphone again");
+  assert.ok(page.tracks.every((track) => track.stops === 0), "the reconnect stopped the microphone");
+});
+
+test("`#352 voice-reconnect-on-bridge-error`: a typed call reconnects too, and opens no microphone segment on the new session", async () => {
+  const page = newPage();
+  const socket = await startTypedNeutralCall(page, false, "what changed overnight?");
+  await page.settle();
+  assert.deepEqual(promptsSent(socket), ["what changed overnight?"]);
+  speech(socket, "user", 1, "what changed overnight?");
+  loseTurn(socket, 1);
+  const next = await reconnectTo(page, socket);
+  assert.deepEqual(promptsSent(next), ["what changed overnight?"]);
+  assert.ok(!controlFrames(next).includes("audio_start"), "a typed call's new session was sent audio_start");
+  assert.equal(page.micRequests.length, 0, "a typed call's reconnect opened the microphone");
+  assert.match(page.el("status").textContent, /Waiting for the assistant|Reconnected — type a message/);
+});
+
+test("`#352 voice-reconnect-on-bridge-error`: the page's word on a send card that the bridge lost goes again only to a session that took this call's record", async () => {
+  /** A call where the card was sent by a tap, and the page's word on it is the turn the bridge lost. */
+  const run = async (capabilities, ack) => {
+    const page = newPage();
+    page.transcriptRecordsSupported = true;
+    await withEarlierConversation(page, { resume: true });
+    const socket = await startV1Call(page, ["replay"]);
+    socket.onmessage({ data: JSON.stringify({ type: "replay_ack", accepted: true }) });
+    speech(socket, "user", 1, "tell lead team I'm on it, rebasing now", true);
+    page.propose(spokenDraft());
+    await page.settle();
+    speech(socket, "assistant", 1, "To lead team: on it, rebasing now. Send it?", true);
+    turnDone(socket, 1);
+    await page.settle();
+    page.expireTimers(2000);
+    await page.el("post-confirm-send").click();
+    await passTime(page, CAPTURE_RESUME_MS + 2000);
+    if (controlFrames(socket).at(-1) === "audio_end") turnDone(socket, 2);
+    await page.settle();
+    const notices = promptsSent(socket);
+    assert.equal(notices.length, 1, `the page's word on the tap never went: ${notices}`);
+    speech(socket, "user", 3, notices[0]);
+    loseTurn(socket, 3);
+    const next = await reconnectTo(page, socket, { greeting: false, ...(capabilities ? { capabilities } : {}) });
+    if (ack !== null) next.onmessage({ data: JSON.stringify({ type: "replay_ack", accepted: ack }) });
+    await passTime(page, CAPTURE_RESUME_MS + 6000);
+    if (controlFrames(next).at(-1) === "audio_end") turnDone(next, 1);
+    await page.settle();
+    return { page, next, notice: notices[0] };
+  };
+  const taken = await run(["replay"], true);
+  assert.deepEqual(promptsSent(taken.next), [taken.notice], "the word on the card did not go to a session that took the record");
+  const refused = await run(["replay"], false);
+  assert.deepEqual(promptsSent(refused.next), [], "the word on the card went to a session that refused the record");
+  assert.match(refused.page.el("settings-detail").textContent, /the page's word on the card was not repeated to the new session/);
+  const unlisted = await run(null, null);
+  assert.deepEqual(promptsSent(unlisted.next), [], "the word on the card went to a session handed no record");
 });

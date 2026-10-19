@@ -4646,6 +4646,15 @@ voice providers](#conversational-voice-providers)); what matters here is when it
   has been said since the recap went, the seam above the call and its start marker turn to "no
   recap sent" as well; once anything has been said below it, a turn still being spoken included,
   both keep what the first session was sent.
+* **A reconnected session is sent this call's record** (`#352 voice-reconnect-on-bridge-error`; see
+  "How a call ended"). When the voice service loses a turn and the page carries the call on a new
+  session, that session is handed what was said in this call so far — not the conversation the call
+  itself resumed from, which the connection details say was not sent again — under the same rules:
+  only where the server offers replay, this device's Resuming switch is on, and the session lists
+  `replay`. Otherwise it starts fresh, and the line under the call and the transcript say so. Its
+  `replay_ack` changes only what the call says now, never the call's start marker or what Settings
+  says about how the call began. On a bridge that lists no `replay`, as the one this was seen on,
+  the new session starts with no context.
 
 The privacy note below applies unchanged: on this backend the earlier conversation goes to the
 bridge, and on to whatever model it uses.
@@ -5168,7 +5177,10 @@ queued), and answers with exactly one `{"type":"turn_complete","turn":N,"interru
 next prompt on the same socket is turn N+1. When nothing is running, `interrupt` is ignored.
 Either way, every accepted prompt receives exactly one `turn_complete`, so a client that waits for
 it knows no later frame belongs to the interrupted turn. An `error` frame promises no following
-`turn_complete`, so a client should treat it as the end of the session. A server that predates
+`turn_complete`, so a client should treat it as the end of the session. An `error` whose message
+ends in "; reconnect" — "turn 4 never started after an interrupt; reconnect" — says the session is
+lost and asks the client to carry the conversation on a new one; the page does so, within a bound
+(`#352 voice-reconnect-on-bridge-error`; see "How a call ended"). A server that predates
 `interrupt` answers it with an `error` frame. A client should still bound its wait for a prompt's
 first output rather than trust every server to answer: read-aloud abandons a session that returns
 no audio within 15 seconds of a prompt and repeats the read once on a fresh one. A turn that a
@@ -5445,9 +5457,10 @@ What this cannot tell you:
 
 **How a call ended** (`#268 voice-call-drops`). Calls once ended on their own while the only record
 of why was the voice bridge's log, which saw the page say goodbye and could not see what made it.
-The page ends a call in exactly two ways, and only these send `audio_end` and `quit`: the reader's
-**Hang up**, and an `error` frame, which the protocol says ends the server's session. Everything
-else that ends a call is the far side or the network, and the page says which, how far into the
+The page ends a call in exactly two ways: the reader's **Hang up**, and an `error` frame, which the
+protocol says ends the server's session. Only these, and the goodbye a reconnect says to the session
+it replaces (below), send `audio_end` and `quit`. Everything else that ends a call is the far side or
+the network, and the page says which, how far into the
 call, and that the reader did not hang up — in red, kept until the reader starts a new call or
 dismisses it rather than taken away after twelve seconds like other errors (a driver looks back a
 minute later), and in the transcript's seam:
@@ -5460,7 +5473,7 @@ minute later), and in the transcript's seam:
 | `connection_lost` | "The connection to … failed 22 s into the call: it was cut without a goodbye — by the network, the phone or the voice service, not by Hang up." — a close without a closing handshake (1006), or one after a socket error |
 | `suspended` | "Paused — the app was in the background.", as before, with **Resume** |
 | `reconnected` | not an end: the voice service lost a turn and asked to reconnect, and the page carried the call on a new session (`#352 voice-reconnect-on-bridge-error`, below). The transcript says so; nothing in red |
-| `reconnect_limit` | "The voice service lost a turn again less than a minute after the page reconnected, so the call has ended: …", or "… lost a turn a fourth time in this call …", with the server's words |
+| `reconnect_limit` | "The voice service lost a turn again less than a minute after the page reconnected, so the call has ended: …", or "… lost a turn again after the page had reconnected this call 3 times …", with the server's words |
 | `reconnect_failed` | "The voice service lost a turn and the page could not reconnect: …", with why |
 
 Each socket of a call that opened is recorded once, when it ends, to `POST /api/v1/voice-end`, for
@@ -5499,6 +5512,48 @@ A socket the page has finished with no longer speaks for any call. Its close can
 after the page's `quit` — a server that waits out an interrupt before closing takes that long — and
 it used to tear down whatever call the reader had started since. Now it only adds its close code to
 the connection details; nothing else it delivers is judged or acted on.
+
+**A lost turn is reconnected, not the end of the call** (`#352 voice-reconnect-on-bridge-error`).
+Seen live: the bridge's own barge-in cut the owner's turn, the page relayed two channel messages a
+second later, and the bridge echoed the prompt, never started its turn, and ten seconds later sent
+`error` "turn 4 never started after an interrupt; reconnect". The call ended there, and nothing said
+the two messages were gone. Now, on `vibe-talk-v1` only, an `error` whose words end in "; reconnect"
+on a session that has started keeps the call:
+
+* **The old session is let go at once**: the page says goodbye (`audio_end`, `quit`, neither counted
+  as the last frames sent), records that socket as `reconnected`, and stops listening to it before
+  anything else, so the close a bridge sends straight after its error changes nothing.
+* **The call is kept**: the microphone (no second permission prompt), the audio, Mute and Sound, the
+  conversation it is filed under, and every channel message still to be read out; a message arriving
+  meanwhile waits for the new session. The page asks the server for a fresh session — a new signed
+  address, never the old one — and builds the microphone's graph again on its socket.
+* **The new session is handed this call's record** where it takes one (see [Resuming on the
+  websocket backend](#resuming-on-the-websocket-backend)), and otherwise starts fresh.
+* **What the bridge lost goes again, once**, and only a text turn the bridge named as never started
+  with nothing of an answer to it arrived — a relayed turn's messages, or a typed message, whose echo
+  is not drawn a second time. It goes first, with no microphone segment before it, unless the new
+  session greets, in which case it waits for the greeting as any text turn does. A turn that had
+  begun to be answered is never sent again: it may have acted, and its words are kept marked cut off.
+  A relayed turn the bridge did not name is said "not read out"; a typed one is left to the reader
+  to send again; the page's word on a send card goes again only to a session that took the record,
+  which says what the card was. Spoken words are never sent again as text.
+* **It is said**: a **reconnected** line in the transcript says what happened and what the new
+  session knows ("…a new session that has seen nothing above this line…" or "…which was sent what
+  was said above…"); the line under the call starts "Reconnected after a lost turn:"; the status
+  line says "Reconnecting after a lost turn…"; the connection details have the service's words;
+  and the stored record has the line as the page's own note. There is no red panel and no
+  "new conversation" line: the conversation goes on.
+* **Bounded**: a second request within a minute of the last reconnect (`RECONNECT_MIN_GAP_MS`), or
+  one after three in a call (`RECONNECTS_PER_CALL_MAX`), ends the call as `reconnect_limit`; a
+  reconnect that cannot get a working session — the server refuses one, its socket is refused or
+  does not open in 9 seconds, or its session errs or closes before it starts — ends it as
+  `reconnect_failed`. A close while the page is in the background is still a suspension. A reconnect
+  waits at most 3 seconds (`RECONNECT_RECORDS_WAIT_MS`) for the call's turns to reach the server
+  before it reads the record it hands over. Hang up during a reconnect opens nothing more.
+* **Nothing else reconnects**: not a hang-up, a drop, any other error, an error before the session
+  started, nor the hosted vendor's protocol. A server's close whose reason ends "; reconnect" (code
+  1011, "interrupt boundary timed out; reconnect") is the same family and is left for a follow-up.
+  It does happen with the page in the background: the call and its microphone are already live.
 
 A healthy call does not end itself. Nothing the page times — the 9-second open deadline (which only
 applies to a socket that has not opened), the spoken yes's settle window, the hold below and its
@@ -7646,6 +7701,12 @@ a tap, and it runs the ordinary start path — which mints a **fresh** signed UR
 "expired credential" case is closed by construction rather than by handling: this page has never
 reused one. The clause under the button says so, because "Resume" is the honest word for what the
 reader wants and a dishonest word for what the agent gets.
+
+One narrow exception (`#352 voice-reconnect-on-bridge-error`): a `vibe-talk-v1` bridge's `error`
+that asks the client to reconnect, during a call whose session has started. The call never ended
+from the reader's side, the microphone was never closed, and the bridge asked; the page carries the
+call on a new session, minted fresh like any other, at most once a minute and three times a call,
+and says so. See "How a call ended".
 
 The suspension test is a **heuristic** and is documented as one: a close within 2.5 s of the page
 coming back still counts as part of the suspension, because iOS commonly delivers it on the way
