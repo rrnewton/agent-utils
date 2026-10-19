@@ -1,12 +1,13 @@
 ---
 title: 'read-aloud-timeline: show a read as a line of its blocks, and let a tap on one read from there'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-19T19:41:59.587169310+00:00
-updated_at: 2026-10-19T19:41:59.587169310+00:00
+updated_at: 2026-10-19T20:18:46.960677660+00:00
+closed_at: 2026-10-19T20:18:46.960677530+00:00
 ---
 
 # Description
