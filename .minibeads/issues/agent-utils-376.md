@@ -1,12 +1,13 @@
 ---
 title: 'read-aloud-blocks: read a long message block by block, showing which block is playing and letting the reader move between blocks'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-19T17:03:15.063483579+00:00
-updated_at: 2026-10-19T17:03:15.063483579+00:00
+updated_at: 2026-10-19T19:05:31.544010761+00:00
+closed_at: 2026-10-19T19:05:31.544010610+00:00
 ---
 
 # Description
