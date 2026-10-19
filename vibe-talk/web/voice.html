@@ -2627,8 +2627,10 @@
               <p class="hint">
                 The line above each new call keeps it afterwards: <em>412-word recap sent</em>,
                 <em>no recap sent</em> when resuming is on but nothing went (the line says why),
-                <em>recap refused</em> when the voice service turned it down, or
-                <em>recap unsupported</em> where the voice service has no way to take one.
+                <em>recap refused</em> when the voice service turned it down within five seconds of
+                the recap going (a refusal later than that leaves it reading <em>recap sent</em>, as
+                the conversation was saved by then), or <em>recap unsupported</em> where the voice
+                service has no way to take one.
               </p>
             </details>
 

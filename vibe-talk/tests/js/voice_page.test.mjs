@@ -69082,6 +69082,45 @@ test("`#331 resume-on-websocket`: Help says the switch can be disabled and why, 
   assert.match(block, /Started fresh/);
 });
 
+/**
+ * `#351 settings-polish`. What Help's Resuming entry leaves out about a refused recap, as sentences: a
+ * refusal counts only within the wait the conversation's first record gives it (REPLAY_ANSWER_WAIT_MS,
+ * said in words), and a later one leaves the line above the call reading "recap sent".
+ */
+function lateRefusalProblems(entry, waitMs) {
+  const problems = [];
+  const text = entry.replace(/\s+/g, " ");
+  const seconds = waitMs / 1000;
+  const said = ["no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"][seconds] ?? String(seconds);
+  if (!new RegExp(`<em>recap refused</em> when the voice service turned it down within ${said} seconds? of the recap going`).test(text)) {
+    problems.push(`a refusal is not said to count only within ${said} seconds of the recap`);
+  }
+  if (!/a refusal later than that leaves it reading <em>recap sent<\/em>/.test(text)) {
+    problems.push("a later refusal is not said to leave the line reading recap sent");
+  }
+  return problems;
+}
+
+test("`#351 settings-polish`: Help says a refusal later than the record waits for leaves the line above the call reading recap sent", () => {
+  const waitMs = optionalSourceConstant("REPLAY_ANSWER_WAIT_MS");
+  assert.ok(waitMs > 0, "web/voice.js states no wait for the bridge's answer to the record");
+  assert.deepStrictEqual(lateRefusalProblems(helpEntry("resuming"), waitMs), []);
+  // ...which is what the README says, so the two cannot drift apart without one of them failing here.
+  const readme = readFileSync(join(WEB, "..", "README.md"), "utf8").replace(/\s+/g, " ");
+  assert.match(readme, /five seconds at most from when the recap went/);
+  assert.match(readme, /Only an answer later than that leaves both saying the recap was sent/);
+  // The negative controls: the entry as it was, and one whose wait is not the script's.
+  const old = helpEntry("resuming").replace(/<em>recap refused<\/em> when the voice service turned it down[\s\S]*?\), or/,
+    "<em>recap refused</em> when the voice service turned it down, or");
+  assert.notEqual(old, helpEntry("resuming"), "the negative control changed nothing");
+  assert.deepStrictEqual(lateRefusalProblems(old, waitMs), [
+    `a refusal is not said to count only within five seconds of the recap`,
+    "a later refusal is not said to leave the line reading recap sent",
+  ]);
+  assert.deepStrictEqual(lateRefusalProblems(helpEntry("resuming"), 10000),
+    ["a refusal is not said to count only within ten seconds of the recap"]);
+});
+
 test("`#331 resume-on-websocket`: the line under a call heads the call's box, outside the transcript, and gives way to a send card", () => {
   const code = HTML.replace(/<!--[\s\S]*?-->/g, " ");
   // Not between the transcript, a send card and the box (`#269 approval-card-inline`): inside the box.
