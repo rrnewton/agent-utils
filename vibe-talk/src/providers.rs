@@ -396,6 +396,34 @@ impl ChatRouter {
         self.entries.len() > 1
     }
 
+    /// What the voice agent calls each provider; empty with one. `#355 provider-grouped-channels`.
+    #[must_use]
+    pub fn service_names(&self) -> ServiceNames {
+        if !self.is_multi() {
+            return ServiceNames::default();
+        }
+        let names = self
+            .entries
+            .iter()
+            .map(|entry| {
+                let name = entry.client.provider_name();
+                let shared = self
+                    .entries
+                    .iter()
+                    .filter(|other| other.client.provider_name() == name)
+                    .count()
+                    > 1;
+                let spoken = if shared {
+                    format!("{name} ({})", entry.key)
+                } else {
+                    name.to_owned()
+                };
+                (entry.key.clone(), spoken)
+            })
+            .collect();
+        ServiceNames(names)
+    }
+
     /// The provider key for a stored registration namespace; `None` means the default provider.
     ///
     /// A namespace no configured provider has (the deployment changed bridges since the channel
@@ -582,6 +610,50 @@ impl ChatRouter {
             .enumerate()
             .filter(|(_, entry)| entry.client.supports_channel_discovery())
             .map(|(index, _)| index)
+            .collect()
+    }
+}
+
+/// What the voice agent calls each provider, by key, in a deployment with several: the provider's
+/// own name, or its name and key where two share a name (`Slack (work)`). Empty with one provider,
+/// so nothing a model reads changes there. `#355 provider-grouped-channels`: two channels called
+/// "general" on two services are told apart by it, and a model may say either back.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServiceNames(BTreeMap<String, String>);
+
+impl ServiceNames {
+    /// The service `channel` is read through, when there is one to name.
+    #[must_use]
+    pub fn of_channel(&self, channel: &ChannelInfo) -> Option<&str> {
+        channel
+            .provider
+            .as_deref()
+            .and_then(|key| self.0.get(key))
+            .map(String::as_str)
+    }
+
+    /// `team on Slack (id C0123)`, or `team (id C0123)` where there is no service to name. The
+    /// `(id …)` part is what a model is told to pass back, and stays last for it.
+    #[must_use]
+    pub fn describe(&self, channel: &ChannelInfo) -> String {
+        match self.of_channel(channel) {
+            Some(service) => format!(
+                "{} on {service} (id {})",
+                channel.display_name(),
+                channel.id
+            ),
+            None => format!("{} (id {})", channel.display_name(), channel.id),
+        }
+    }
+
+    /// The provider keys whose name is `spoken`, compared without case.
+    #[must_use]
+    pub fn keys_named(&self, spoken: &str) -> Vec<&str> {
+        let spoken = spoken.trim().to_lowercase();
+        self.0
+            .iter()
+            .filter(|(_, name)| name.to_lowercase() == spoken)
+            .map(|(key, _)| key.as_str())
             .collect()
     }
 }
@@ -1553,6 +1625,42 @@ mod tests {
             router.self_author_id(),
             None,
             "several providers have no single self"
+        );
+    }
+
+    #[test]
+    fn the_voice_agent_hears_each_channels_service_only_where_there_are_several() {
+        let Pair { router, .. } = pair();
+        let names = router.service_names();
+        let team = channel("C0123ABCDE", "slack");
+        assert_eq!(names.describe(&team), "C0123ABCDE on Slack (id C0123ABCDE)");
+        assert_eq!(names.keys_named(" slack "), ["slack"]);
+        let stray = ChannelInfo {
+            provider: None,
+            ..channel("777", "gchat")
+        };
+        assert_eq!(names.describe(&stray), "777 (id 777)");
+        // One provider: nothing changes.
+        let single = ChatRouter::single(Arc::new(FakeDiscord::new()), "ns", 0);
+        assert_eq!(
+            single.service_names().describe(&channel("1", "discord")),
+            "1 (id 1)"
+        );
+        // Two services with one name are told apart by key.
+        let entry = |key: &str| ProviderEntry {
+            key: key.to_owned(),
+            namespace: key.to_owned(),
+            client: Arc::new(Named {
+                inner: Arc::new(FakeDiscord::new()),
+                name: "Slack",
+                claim: slack_claim,
+            }),
+            live_poll_seconds: 0,
+        };
+        let twins = ChatRouter::new(vec![entry("work"), entry("home")], None);
+        assert_eq!(
+            twins.service_names().describe(&channel("C1", "home")),
+            "C1 on Slack (home) (id C1)"
         );
     }
 

@@ -740,7 +740,11 @@ pub async fn agent_tools(
     _scope: ReadScope,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let approval = crate::send_approval::current(&state).await;
-    let manifest = crate::mcp::tool_manifest(&ops::channels(&state).await, approval);
+    let manifest = crate::mcp::tool_manifest_with_services(
+        &ops::channels(&state).await,
+        &state.providers.service_names(),
+        approval,
+    );
     Ok(Json(serde_json::json!({ "tools": manifest })))
 }
 
@@ -1179,7 +1183,11 @@ pub async fn voice_agent(
     // One read of the setting for both, so the prompt and `post_reply`'s confirmation flag cannot
     // straddle a change made between two reads. `#264 voice-send-approval`.
     let approval = crate::send_approval::current(&state).await;
-    let manifest = crate::mcp::tool_manifest(&ops::channels(&state).await, approval);
+    let manifest = crate::mcp::tool_manifest_with_services(
+        &ops::channels(&state).await,
+        &state.providers.service_names(),
+        approval,
+    );
     // `#272 voice-agent-instructions`: the owner's words go into the prompt here, which is how a
     // bridge that fetches this as each call opens carries them.
     let owner = crate::voice_prompt::current(&state).await;

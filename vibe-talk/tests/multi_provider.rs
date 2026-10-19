@@ -1197,3 +1197,75 @@ async fn a_channel_listed_under_its_service_key_is_already_added() {
         assert_eq!(page["entries"][1]["tracked"], false, "{path}");
     }
 }
+
+/// The text of one MCP tool call, as the voice agent reads it.
+async fn tool_text(state: &AppState, tool: &str, arguments: Value) -> String {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("authorization", format!("Bearer {WRITE_TOKEN}"))
+        .header("accept", "application/json, text/event-stream")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {"name": tool, "arguments": arguments},
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let response = vibe_talk::http::router(state.clone())
+        .oneshot(request)
+        .await
+        .expect("router responds");
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).expect("json-rpc answer");
+    body["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no text in {body}"))
+        .to_owned()
+}
+
+#[tokio::test]
+async fn the_voice_agent_hears_each_channels_service_and_may_say_it_back() {
+    let Deployment { state, slack, .. } = deployment(None);
+    let listing = tool_text(&state, "list_channels", json!({})).await;
+    assert!(
+        listing.contains("- slack team on Slack (id C0123ABCDE) — readable and postable"),
+        "{listing}"
+    );
+    assert!(
+        listing.contains("- build noise on Discord (id 1111111111) — read-only"),
+        "{listing}"
+    );
+    let (status, tools) = call(&state, "GET", "/api/v1/agent-tools", WRITE_TOKEN, None).await;
+    assert_eq!(status, StatusCode::OK, "{tools}");
+    assert!(
+        tools
+            .to_string()
+            .contains("slack team on Slack (id C0123ABCDE)"),
+        "the manifest's channel choices name no service"
+    );
+    // An unknown channel is answered with the choices, each with its service.
+    let refused = tool_text(&state, "digest_channel", json!({"channel_id": "nowhere"})).await;
+    assert!(
+        refused.contains("lead team on Discord (id 2222222222)"),
+        "{refused}"
+    );
+    // The model may say a channel back the way it was told it.
+    slack.seed(&ChannelId(SLACK_CHANNEL.to_owned()), "grace", "from slack");
+    let digest = tool_text(
+        &state,
+        "digest_channel",
+        json!({"channel_id": "Slack Team on slack"}),
+    )
+    .await;
+    assert!(digest.contains("from slack"), "{digest}");
+}

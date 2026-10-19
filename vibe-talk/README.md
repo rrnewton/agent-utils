@@ -2321,6 +2321,11 @@ How a deployment with several providers behaves:
   then carry that `provider`, its cursor is refused by any other service's walk, and the walk ends
   with that service's last page. An entry is marked `tracked` when its channel is on the list under
   the service that listed it.
+* **The voice agent hears each channel's service** (`#355 provider-grouped-channels`):
+  `list_channels`, every channel argument's choices and the unknown-channel answer read
+  `team on Slack (id C0123)`, with the key added where two services share a name
+  (`Slack (work)`). A model may pass `team on Slack` back as a channel. With one service nothing
+  changes.
 * **Summaries share one budget.** `[summaries]` and its rate limit serve every service's channels,
   so more services means more channels sharing it; interactive summaries still go before
   background thread names.

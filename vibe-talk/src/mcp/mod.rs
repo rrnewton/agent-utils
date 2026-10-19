@@ -82,13 +82,31 @@ pub fn tool_manifest(
     channels: &[ChannelInfo],
     approval: crate::send_approval::Approval,
 ) -> Vec<ToolDescriptor> {
+    tool_manifest_with_services(
+        channels,
+        &crate::providers::ServiceNames::default(),
+        approval,
+    )
+}
+
+/// [`tool_manifest`], naming each channel's chat service where the deployment has several
+/// (`team on Slack (id C0123)`). `#355 provider-grouped-channels`: two channels called "general"
+/// on two services are otherwise the same name to a model. With one service, `services` is empty
+/// and the manifest is exactly [`tool_manifest`]'s. For the callers that serve the manifest:
+/// `tools/list`, the agent-tools route and the voice-agent profile.
+#[must_use]
+pub fn tool_manifest_with_services(
+    channels: &[ChannelInfo],
+    services: &crate::providers::ServiceNames,
+    approval: crate::send_approval::Approval,
+) -> Vec<ToolDescriptor> {
     // `display_name`, not `label`: where the operator has given a channel his own name under
     // `#39 channel-alias`, that is the name he will say out loud, so it has to be the name the
     // model was given. The alias is ours and local — it is read here on the way out, and nothing
     // about it is ever sent to Discord.
     let directory = channels
         .iter()
-        .map(|c| format!("{} (id {})", c.display_name(), c.id))
+        .map(|c| services.describe(c))
         .collect::<Vec<_>>()
         .join(", ");
     let names = channels
@@ -99,7 +117,7 @@ pub fn tool_manifest(
     let writable = channels
         .iter()
         .filter(|c| c.writable)
-        .map(|c| format!("{} (id {})", c.display_name(), c.id))
+        .map(|c| services.describe(c))
         .collect::<Vec<_>>()
         .join(", ");
     // Every channel tool's `channel_id` says where its value comes from and what the choices
