@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser pairing-link-browser offline-cache-browser reactions-browser system-bots-browser edited-mark-browser rich-headers-browser read-aloud-browser post-confirm-browser approval-card-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser search-chord-browser two-column-browser bookmark-browser reply-continuity-browser reply-in-column-browser reply-marks-read-browser done-sync-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser composer-grow-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser thread-card-header-browser all-thread-strip-browser scroll-stability-browser copy-message-browser fold-steps-browser back-gesture-browser live-pill-browser stale-live-read-browser provider-groups-browser
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser pairing-link-browser offline-cache-browser reactions-browser system-bots-browser edited-mark-browser rich-headers-browser read-aloud-browser post-confirm-browser approval-card-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser search-chord-browser two-column-browser bookmark-browser reply-continuity-browser reply-in-column-browser reply-marks-read-browser done-sync-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser composer-grow-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser thread-card-header-browser all-thread-strip-browser scroll-stability-browser copy-message-browser fold-steps-browser back-gesture-browser live-pill-browser stale-live-read-browser provider-groups-browser voice-reconnect-browser
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -177,6 +177,17 @@ post-confirm-browser:
 # Pass WEB_ROOT=dir to run it against another copy of the page.
 voice-call-drops-browser:
 	python3 tests/voice_call_drops_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT))
+
+# `#352 voice-reconnect-on-bridge-error` in a real Chromium: a fake vibe-talk-v1 bridge loses a turn
+# after an interrupt and a relayed message, and sends "turn N never started after an interrupt;
+# reconnect". The call stays up on a second session -- the deployed shape (a greeting, no replay) with
+# the bridge closing the lost socket at once, and a bridge that lists replay, handed this call's record
+# first -- the relayed message goes again once, the microphone reaches only the new session, and the
+# page says so; a second lost turn within the minute ends the call as reconnect_limit, and any other
+# error still ends it as error_frame. Pass WEB_ROOT=dir to run it against another copy of the page, and
+# SCREENSHOTS=dir to keep PNGs.
+voice-reconnect-browser:
+	python3 tests/voice_reconnect_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#277 send-order` in a real Chromium against the real server binary, which posts through its real
 # provider client to a mock Google Chat bridge on loopback that fails A at once: B waits behind A,
