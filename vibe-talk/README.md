@@ -8448,7 +8448,7 @@ anything is written and only what changed written; nothing is drawn or measured 
 phone, or while the page is hidden (`#226 page-energy-profile`), and over a thread only its one link.
 A thread on the right opens under its own card at the top of the column (`#298 thread-card-header`):
 the card's words, age, counts and colour, a fixed height outside the scroller so nothing it says moves
-the list, its text opened over the list where the clamp cuts it, and the X on it; its link goes from
+the list, and the X on it; its link goes from
 its root on Main to that card, from a collapsed run's line when the root is in one and up from Main's
 top when the root is older than Main holds, and a mouse resting on the card glides Main to the root.
 Opened from its card while that card is on screen, the card moves up from the list to the top — a
@@ -8456,7 +8456,12 @@ FLIP of a transform alone, 220 ms, the thread fading in under it and the link dr
 moves, nothing laid out again so the thread is already at its place — and does not move at all where
 the reader asks for reduced motion (the stylesheet's `--card-flight`). A thread opened across the
 window (one column, the thread list's Cmd-3, a phone) is headed by the same card, from the same code
-(`paintThreadCard`), its × going back to where the thread was opened from. Thread(N), the unread count, N replies, the view picker and a card's replies button select a thread
+(`paintThreadCard`), its × going back to where the thread was opened from. A tap or click anywhere on
+that card but its × folds it to a thin bar of its own fill and edge, 14px with a 24px press target, and
+a tap on the bar opens it again (`#388 thread-header-collapse`): one choice for every thread, kept on
+the device, the card's text the button the keys reach (Enter or Space, `aria-expanded`), and the
+thread under it scrolled by as much as its top moved, so no row on screen moves and a reader on the
+newest line stays on it; in two columns the link from the root meets the bar's left edge. Thread(N), the unread count, N replies, the view picker and a card's replies button select a thread
 there, and a plain tap on a message still only folds it. Search, Links and the read mode apply to both columns; Pinned stands
 in for the left column's list. The poll reads Main and the selected thread (two views, one delta
 each), a live reply in that thread is read once as the thread, and a refresh that brings nothing
@@ -8467,7 +8472,9 @@ its state is swapped in around that work (`COLUMN_IDS`, `COLUMN_STATE` and `inCo
 `tests/thread_card_focus_browser.py` the highlight and the grey, by computed colour and by the
 pixels drawn, at 1280x800 and on a 412x915 phone, and `tests/thread_card_header_browser.py` the card at
 the top of a thread, its move up frame by frame, its line and its glide, at 1280x800 in both schemes and
-with reduced motion, and across the window from the thread list at 1280x800 and on a 412x915 phone.
+with reduced motion, and across the window from the thread list at 1280x800 and on a 412x915 phone;
+`tests/thread_header_collapse_browser.py` the card folded to a bar and opened again, at 393x852 by touch
+and 1280x800 with a mouse and the keys, in both schemes.
 
 **In two columns every row but the owner's spans its column** (`#373 two-column-full-width`). The
 owner, 2026-10-19: "I asked a while ago for full-width messages from the coding agent in two-column

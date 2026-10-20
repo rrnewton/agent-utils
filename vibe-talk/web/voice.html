@@ -666,9 +666,9 @@
                 colour, how long since it moved, its replies and how many are unread, and the X at the
                 end of that line. It stands in the heading, outside the scroller, so it never scrolls
                 away and nothing the scroller keeps its reader by has to allow for it; and it is a fixed
-                height, its text clamped as a card's is, so words arriving later move nothing. The
-                text, when the clamp cuts it, opens over the list below rather than pushing it down.
-                web/voice.js fills it (`paintThreadCard`), and draws the line from the thread's first
+                height, its text clamped as a card's is, so words arriving later move nothing. A press
+                on it folds it to a thin bar in its colours, and opens it again (`#388
+                thread-header-collapse`). web/voice.js fills it (`paintThreadCard`), and draws the line from the thread's first
                 message on the left to it (`columnLinkPairs`).
               -->
               <div id="side-thread-card" class="side-card-row thread-card-header" hidden>

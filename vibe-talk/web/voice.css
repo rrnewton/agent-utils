@@ -171,8 +171,6 @@
      other card's edge and every other link between the columns. Half `--muted` and half `--edge`, so
      it is plainly grey, quieter than any thread's colour, and still a line on the panel. */
   --thread-grey: #626975;
-  /* `#298 thread-card-header`. Under the card at the top of a thread opened over its list. */
-  --card-shadow: 0 6px 18px rgb(0 0 0 / 0.28);
 }
 
 @media (prefers-color-scheme: light) {
@@ -208,7 +206,6 @@
     --read-ring: #7f8896;
     /* Half the light scheme's `--muted` and half its `--edge`. */
     --thread-grey: #9ba1ac;
-    --card-shadow: 0 6px 18px rgb(0 0 0 / 0.14);
   }
 }
 
@@ -1087,8 +1084,7 @@ a.search-hit-link {
 
 /* `#298 thread-card-header`. Over a thread across the window the heading is the thread's card, drawn
    by the rules of the card at the top of the right column (`.thread-card-header`, with the cards' own
-   below), in the reading column as the thread list's cards are. It holds the card at its top, so a
-   card opened past it grows downward, over the list, rather than out of both its edges. */
+   below), in the reading column as the thread list's cards are. */
 #thread-heading {
   display: flex;
   align-items: flex-start;
@@ -8287,18 +8283,12 @@ textarea {
   padding-inline-end: 0.3rem;
   border-color: hsl(var(--thread-hue, 210) 55% 50%);
   background: color-mix(in srgb, hsl(var(--thread-hue, 210) 55% 50%) 14%, var(--panel));
-  cursor: auto;
 }
 
 /* `#252 thread-button-state`: a thread nobody has answered spends no colour, here as on its tag. */
 .side-card-row.thread-card-header[data-thread-state="start"] {
   border-color: var(--thread-grey);
   background: color-mix(in srgb, var(--thread-grey) 14%, var(--panel));
-}
-
-/* Its text is a button only where the clamp cuts it, which it then opens. */
-.thread-card-header:not([data-clamped]) > .side-card {
-  cursor: auto;
 }
 
 /* "3 replies · 2 unread", said rather than pressed: the thread is open. Its unread in the accent, as
@@ -8334,38 +8324,52 @@ textarea {
   }
 }
 
-/* Opened, where the clamp cut its text: all of it, over the list. The heading keeps its height (the
-   script holds it while the card is open), so the card grows out of it downward and neither the list
-   nor anything in it moves; a very long text scrolls inside the card. Over the list, its line under
-   the heading and the links between the columns. */
-.thread-card-header[data-expanded] {
-  position: relative;
-  z-index: 3;
-  box-shadow: var(--card-shadow);
-}
-
-.thread-card-header[data-expanded] > .side-card > .side-card-text {
-  display: block;
-  -webkit-line-clamp: none;
-  line-clamp: none;
-  overflow-y: auto;
-  height: auto;
-  min-height: calc(3 * 1.35em);
-  max-height: 60vh;
-}
-
 /* On a phone, over a thread across the window, two lines of it rather than three: the card is the
    screen's heading there, and a third line is a line less of the thread. Still a fixed height. */
 @media (max-width: 599.98px) {
-  #thread-card:not([data-expanded]) > .side-card > .side-card-text {
+  #thread-card > .side-card > .side-card-text {
     -webkit-line-clamp: 2;
     line-clamp: 2;
     height: calc(2 * 1.35em);
   }
+}
 
-  #thread-card[data-expanded] > .side-card > .side-card-text {
-    min-height: calc(2 * 1.35em);
-  }
+/*
+ * `#388 thread-header-collapse`. FOLDED TO A BAR by a press on it (web/voice.js, `threadCardPressed`),
+ * the owner's "thin colored bar. Just enough vertical height that you can see the inside color as well
+ * as the border color and so it's wide enough to tap on": the card's own edge and tint, 14px from edge
+ * to edge, and nothing in it but its text's button, which the keys reach and which says the card is
+ * folded. That button is the bar's press target, out of sight and 6px past the bar above and below,
+ * so 24px of the heading's height is the bar to a thumb, inside the room the heading pads it with.
+ * Where it stands is where the card's left edge was, so the line from the root meets the bar there.
+ */
+.side-card-row.thread-card-header[data-folded] {
+  display: block;
+  position: relative;
+  box-sizing: border-box;
+  height: 14px;
+  padding: 0;
+}
+
+.thread-card-header[data-folded] > :not(.side-card) {
+  display: none;
+}
+
+.thread-card-header[data-folded] > .side-card {
+  position: absolute;
+  inset: -6px 0;
+  width: auto;
+  padding: 0;
+  border-radius: 0;
+}
+
+.thread-card-header[data-folded] > .side-card > .side-card-text {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 /*
@@ -8399,7 +8403,7 @@ textarea {
   }
 }
 
-/* Over the list it flies across, as an opened card is. */
+/* Over the list it flies across. */
 .thread-card-header[data-flying] {
   position: relative;
   z-index: 3;
