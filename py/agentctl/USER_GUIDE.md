@@ -416,7 +416,25 @@ the queue item delivered only after the same literal prompt has moved out of
 the composer into Muse's transcript. A redraw or error that leaves the draft in
 the composer is not acceptance. Failure
 after either input boundary remains `possibly_submitted`; it is never replayed
-automatically.
+automatically. Every refusal before the paste (a draft or menu in the editor, a
+prompt containing NUL or an escape character, a changed process) leaves the
+message pending, exit 75.
+Each screen is read between two checks of the pinned process, which is what
+identifies it as Muse's once Muse 1.4 has scrolled its `Muse Code X.Y.Z` header
+away. A long paste that Muse collapses to `[Pasted Content N chars]` counts as
+the draft only when N is the prompt's exact length in code points, with CRLF
+counted once. Of the text Muse prints at the end of its status footer after
+three or more spaces, only its two known notices, `Paste again to expand for
+editing` and `Hook · ...`, are ignored; anything else there, or Muse's progress
+line (`◇ Thinking (3s · esc to interrupt)`) as the last line above the editor,
+keeps the pane working.
+An owned session takes input at any one status-footer mode: `Auto-review`,
+`YOLO`, the three-field standard footer, or `Launch overrides`, which Muse shows
+when launch arguments such as `--trust-workspace` or `--approval-mode` override
+saved settings. Its approval mode is the one its launch profile chose. The
+footer mode does not limit where a misrouted prompt lands, since a program that
+takes over the pane between a check and a write is not the one whose footer was
+read; the process checks around every effect are the defense against that.
 Requested reasoning effort is launch intent, not proof of the provider's
 resolved effort. In deployments where an `ultra` gate is closed, Muse can
 visibly resolve the request to `xhigh`. `start` and `status` preserve that
@@ -746,9 +764,11 @@ agentctl adopt reviewer --pane w1:p2 --workspace project \
 Muse can be adopted with `--harness muse` when Herdr reports that exact live
 harness. Adoption requires the foreground process and terminal to be pinned,
 along with the recorded shell generation and the identity assertions below.
-Delivery uses the same verified composer, process checks, and Auto-review
-policy as an owned Muse session. Adoption does not report a new agent, change
-its label, or take ownership of its runtime.
+Delivery uses the same verified composer and process checks as an owned Muse
+session, but an adopted pane, which someone else launched, takes input only
+while its status footer reads `Auto-review`; any other footer leaves the message
+pending. Adoption does not report a new agent, change its label, or take
+ownership of its runtime.
 
 Use the pane ID, working directory, harness, workspace ID, and workspace label
 reported by those read-only Herdr commands; do not infer them from a tab title.

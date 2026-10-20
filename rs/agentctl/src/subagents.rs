@@ -23,10 +23,11 @@ use sha2::{Digest, Sha256};
 
 use crate::agent::{self, AgentApi, AgentError, DrainOptions, QueueResult, Target};
 use crate::client::{
-    muse_auto_review_idle_composer, muse_prompt_in_composer, muse_prompt_is_exact_composer,
-    muse_prompt_transcript_count, muse_startup_metadata, muse_trust_prompt,
-    muse_verified_pane_status, AgentIdentity, AgentPaneInfo, CustomProcessIdentity, HerdrClient,
-    Pane, PaneShellProof, ProcessLiveness,
+    muse_auto_review_idle_composer, muse_startup_metadata, muse_trust_prompt,
+    muse_verified_pane_status, muse_verified_process_idle_composer,
+    muse_verified_process_paste_in_composer, muse_verified_process_paste_is_exact_composer,
+    muse_verified_process_prompt_transcript_count, AgentIdentity, AgentPaneInfo,
+    CustomProcessIdentity, HerdrClient, Pane, PaneShellProof, ProcessLiveness,
 };
 use crate::error::{AdapterError, AdapterErrorKind};
 use crate::submission::{GuardedInput, GuardedPrompt, Submission, SubmitTimeouts};
@@ -2067,6 +2068,66 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
             && matches!(self.record.adapter.as_str(), "herdr-pane" | "herdr-foreign")
     }
 
+    /// Prove that a pinned Muse pane may take a literal paste now, and return the screen that
+    /// the paste must change.
+    ///
+    /// The pane must show Muse's empty editor with exactly one status footer, read between two
+    /// checks of the pinned process. Muse 1.4 scrolls its versioned header away, so the process
+    /// pin, not the header, says the screen is Muse's. Any footer mode will do for a session agentctl launched, since its approval mode
+    /// is what the owner's launch profile chose: `YOLO`, `Auto-review`, the three-field standard
+    /// footer, or `Launch overrides` (#382 muse-approval-never-ready). An adopted pane was
+    /// launched by someone else, so it keeps taking input only at its `Auto-review` editor. The
+    /// mode never limits where a misroute lands: a program that replaces the pinned one between
+    /// a check and a write is not the one whose footer was read, so the process checks around
+    /// every effect, not the footer, are the misroute defense (#395 muse-launch-overrides-input).
+    ///
+    /// Nothing has been typed when this returns, so every refusal is `NotStaged`: the prompt
+    /// stays pending instead of being quarantined as possibly submitted.
+    fn muse_paste_baseline(
+        &self,
+        pane_id: &str,
+        text: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<String> {
+        let baseline = || {
+            if text.contains(['\0', '\u{1b}']) {
+                return Err(AdapterError::unavailable(
+                    "Muse pane prompts cannot contain NUL or terminal escape characters",
+                ));
+            }
+            let info = self.pane_info_with_runtime(pane_id, runtime)?;
+            if info.status != "idle" {
+                return Err(AdapterError::unavailable(format!(
+                    "custom pane {pane_id} is not at a verified idle Muse composer (status {})",
+                    info.status
+                )));
+            }
+            self.verify_muse_process_with_runtime(pane_id, runtime)?;
+            let before = self
+                .client
+                .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
+            self.verify_muse_process_with_runtime(pane_id, runtime)?;
+            if !muse_verified_process_idle_composer(&before) {
+                return Err(AdapterError::unavailable(format!(
+                    "pane {pane_id} does not show an empty Muse editor with one status footer"
+                )));
+            }
+            if self.record.adapter == "herdr-foreign" && !muse_auto_review_idle_composer(&before) {
+                return Err(AdapterError::unavailable(
+                    "an adopted Muse pane takes input only at its Auto-review editor",
+                ));
+            }
+            Ok(before)
+        };
+        baseline().map_err(|error| {
+            if error.kind() == AdapterErrorKind::NotStaged {
+                error
+            } else {
+                AdapterError::not_staged(format!("{error}; nothing was typed"))
+            }
+        })
+    }
+
     fn verify_muse_process(&self, pane_id: &str) -> crate::error::Result<()> {
         self.verify_muse_process_with_runtime(pane_id, &agent::SystemRuntime::default())
     }
@@ -3247,9 +3308,9 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                 let screen = self.client.read(pane_id, "visible", Some(200))?;
                 self.verify_muse_process(pane_id)?;
                 if screen != submission.staged_screen
-                    && muse_prompt_transcript_count(&screen, &submission.text)
+                    && muse_verified_process_prompt_transcript_count(&screen, &submission.text)
                         > submission.prior_transcript_count
-                    && !muse_prompt_in_composer(&screen, &submission.text)
+                    && !muse_verified_process_paste_in_composer(&screen, &submission.text)
                 {
                     *self
                         .custom_submission
@@ -3331,9 +3392,9 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                         .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
                 self.verify_muse_process_with_runtime(pane_id, runtime)?;
                 if screen != submission.staged_screen
-                    && muse_prompt_transcript_count(&screen, &submission.text)
+                    && muse_verified_process_prompt_transcript_count(&screen, &submission.text)
                         > submission.prior_transcript_count
-                    && !muse_prompt_in_composer(&screen, &submission.text)
+                    && !muse_verified_process_paste_in_composer(&screen, &submission.text)
                 {
                     *self
                         .custom_submission
@@ -3505,23 +3566,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         if !self.uses_muse_composer() {
             return guarded.native_prompt(pane_id, text);
         }
-        if text.contains(['\0', '\u{1b}']) {
-            return Err(crate::error::AdapterError::unavailable(
-                "Muse pane prompts cannot contain NUL or terminal escape characters",
-            ));
-        }
-        let info = self.pane_info(pane_id)?;
-        if info.status != "idle" {
-            return Err(crate::error::AdapterError::unavailable(format!(
-                "custom pane {pane_id} is not at a verified idle Muse composer"
-            )));
-        }
-        let before = self.client.read(pane_id, "visible", Some(200))?;
-        if !muse_auto_review_idle_composer(&before) {
-            return Err(AdapterError::unavailable(
-                "Muse input requires the legacy reviewed Auto-review composer; current YOLO input remains pending until Herdr provides an effect-coupled process-generation guard",
-            ));
-        }
+        let before = self.muse_paste_baseline(pane_id, text, &runtime)?;
         guarded.send_text(
             pane_id,
             &format!("{BRACKETED_PASTE_START}{text}{BRACKETED_PASTE_END}"),
@@ -3531,7 +3576,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             self.verify_muse_process(pane_id)?;
             let screen = self.client.read(pane_id, "visible", Some(200))?;
             self.verify_muse_process(pane_id)?;
-            if screen != before && muse_prompt_is_exact_composer(&screen, text) {
+            if screen != before && muse_verified_process_paste_is_exact_composer(&screen, text) {
                 break screen;
             }
             if Instant::now() >= deadline {
@@ -3549,7 +3594,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             .custom_submission
             .lock()
             .expect("custom submission lock poisoned") = Some(CustomPaneSubmission {
-            prior_transcript_count: muse_prompt_transcript_count(&staged, text),
+            prior_transcript_count: muse_verified_process_prompt_transcript_count(&staged, text),
             staged_screen: staged,
             text: text.to_owned(),
         });
@@ -3706,25 +3751,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
         if !self.uses_muse_composer() {
             return guarded.native_prompt(pane_id, text);
         }
-        if text.contains(['\0', '\u{1b}']) {
-            return Err(crate::error::AdapterError::unavailable(
-                "Muse pane prompts cannot contain NUL or terminal escape characters",
-            ));
-        }
-        let info = self.pane_info_with_runtime(pane_id, runtime)?;
-        if info.status != "idle" {
-            return Err(crate::error::AdapterError::unavailable(format!(
-                "custom pane {pane_id} is not at a verified idle Muse composer"
-            )));
-        }
-        let before = self
-            .client
-            .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
-        if !muse_auto_review_idle_composer(&before) {
-            return Err(AdapterError::unavailable(
-                "Muse input requires the legacy reviewed Auto-review composer; current YOLO input remains pending until Herdr provides an effect-coupled process-generation guard",
-            ));
-        }
+        let before = self.muse_paste_baseline(pane_id, text, runtime)?;
         guarded.send_text(
             pane_id,
             &format!("{BRACKETED_PASTE_START}{text}{BRACKETED_PASTE_END}"),
@@ -3741,7 +3768,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 .client
                 .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
             self.verify_muse_process_with_runtime(pane_id, runtime)?;
-            if screen != before && muse_prompt_is_exact_composer(&screen, text) {
+            if screen != before && muse_verified_process_paste_is_exact_composer(&screen, text) {
                 break screen;
             }
             if Instant::now() >= deadline {
@@ -3759,7 +3786,7 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
             .custom_submission
             .lock()
             .expect("custom submission lock poisoned") = Some(CustomPaneSubmission {
-            prior_transcript_count: muse_prompt_transcript_count(&staged, text),
+            prior_transcript_count: muse_verified_process_prompt_transcript_count(&staged, text),
             staged_screen: staged,
             text: text.to_owned(),
         });

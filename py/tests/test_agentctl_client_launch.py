@@ -30,6 +30,8 @@ from agentctl.client import (
     muse_verified_process_composer,
     muse_verified_process_goal_paused,
     muse_verified_process_idle_composer,
+    muse_verified_process_paste_in_composer,
+    muse_verified_process_paste_is_exact_composer,
     muse_verified_process_prompt_in_composer,
     muse_verified_process_prompt_is_exact_composer,
     muse_verified_process_prompt_transcript_count,
@@ -281,6 +283,129 @@ def test_muse_launch_overrides_footer_is_an_idle_composer() -> None:
     assert not client_module.muse_idle_composer(ambiguous)
     choice = screen.replace("❯\n", "❯ Yes, continue\n  No, exit\n")
     assert not client_module.muse_idle_composer(choice)
+
+
+_MUSE_FRAMES = Path(__file__).resolve().parents[2] / "rs/agentctl/testdata/muse-frames.json"
+
+
+def _captured_muse() -> tuple[dict[str, str], dict[str, str]]:
+    """The captured frames of rs/agentctl/testdata/muse-frames.json and the exact texts pasted."""
+    corpus = json.loads(_MUSE_FRAMES.read_text(encoding="utf-8"))
+    return corpus["frames"], corpus["briefs"]
+
+
+def test_captured_launch_overrides_frames_carry_the_delivery_proofs() -> None:
+    # Muse 1.4.12 launched with --trust-workspace --approval-mode never (#395
+    # muse-launch-overrides-input): an empty editor, then a 3214-character brief that Muse
+    # collapses to a placeholder, then the submitted turn.
+    frames, briefs = _captured_muse()
+    brief = briefs["long"]
+    idle = frames["launch-overrides-idle"]
+    assert client_module.muse_idle_composer(idle)
+    assert muse_verified_process_idle_composer(idle)
+    assert not muse_auto_review_idle_composer(idle)
+    # The same editor under the Auto-review footer.
+    auto_review = idle.replace("· Launch overrides", "· Auto-review")
+    assert muse_auto_review_idle_composer(auto_review)
+    assert muse_verified_process_idle_composer(auto_review)
+
+    staged = frames["launch-overrides-placeholder"]
+    assert "[Pasted Content 3214 chars]" in staged
+    assert client_module._muse_paste_length(brief) == 3214
+    assert muse_verified_process_paste_is_exact_composer(staged, brief)
+    assert muse_verified_process_paste_in_composer(staged, brief)
+    # The literal-text proofs cannot see a collapsed paste.
+    assert not muse_prompt_is_exact_composer(staged, brief)
+    # The count must be exact.
+    assert not muse_verified_process_paste_is_exact_composer(staged, brief[1:])
+    assert not muse_verified_process_paste_is_exact_composer(staged, brief + "x")
+    assert not muse_verified_process_idle_composer(staged)
+    assert muse_verified_process_composer(staged)
+    assert muse_verified_process_prompt_transcript_count(staged, brief) == 0
+
+    # Right after Enter a hook notice shares the footer line, and the turn ends at Muse's
+    # progress marker instead of an answer.
+    submitted = frames["launch-overrides-submitted"]
+    assert "Launch overrides   Hook · UserPromptSubmit" in submitted
+    assert "◈ Thinking (3s · esc to interrupt)" in submitted
+    assert muse_verified_process_prompt_transcript_count(submitted, brief) == 1
+    assert not muse_verified_process_paste_in_composer(submitted, brief)
+    # The empty editor below Muse's progress line is a running turn, never idle input.
+    assert not client_module.muse_idle_composer(submitted)
+    assert not muse_verified_process_idle_composer(submitted)
+    assert client_module.muse_verified_process_turn_running(submitted)
+    assert not muse_auto_review_idle_composer(
+        submitted.replace("· Launch overrides", "· Auto-review"),
+    )
+    double_checking = submitted.replace(
+        "◈ Thinking (3s · esc to interrupt)", "◈ Double checking (1s · esc to interrupt)",
+    )
+    assert not muse_verified_process_idle_composer(double_checking)
+    # A finished answer below the turn leaves the editor idle again.
+    assert client_module.muse_idle_composer(
+        submitted.replace("◈ Thinking (3s · esc to interrupt)", "◆ RECEIVED 40"),
+    )
+    assert muse_verified_process_prompt_transcript_count(
+        submitted.replace("◈ Thinking", "Still thinking"), brief,
+    ) == 0
+
+    answered = frames["launch-overrides-answered"]
+    assert muse_prompt_transcript_count(answered, brief) == 1
+    assert muse_verified_process_prompt_transcript_count(answered, brief) == 1
+    assert not muse_verified_process_paste_in_composer(answered, brief)
+    assert client_module.muse_idle_composer(answered)
+
+
+def test_captured_headerless_frames_count_pastes_in_code_points() -> None:
+    # After a few turns Muse 1.4 has scrolled its versioned header out of the frame, so only
+    # the verified-process proofs, which rely on the pinned process instead, can apply.
+    frames, briefs = _captured_muse()
+    staged = frames["headerless-placeholder"]
+    brief = briefs["headerless"]
+    assert "Muse Code 1." not in staged
+    empty = staged.replace("❯ [Pasted Content 2939 chars]", "❯")
+    assert not client_module.muse_idle_composer(empty)
+    assert muse_verified_process_idle_composer(empty)
+    assert muse_verified_process_paste_is_exact_composer(staged, brief)
+
+    # Read while Muse's paste hint shared the footer line.
+    hinted = frames["headerless-placeholder-paste-hint"]
+    hint_brief = briefs["paste-hint"]
+    assert "Launch overrides             Paste again to expand for editing" in hinted
+    assert muse_verified_process_paste_is_exact_composer(hinted, hint_brief)
+    assert muse_verified_process_composer(hinted)
+    assert not muse_verified_process_idle_composer(hinted)
+    # Only a known notice after a gap of three spaces is set apart, and the footer still needs
+    # one mode; any other text keeps the line no footer at all.
+    footer = "watermelon-full-preview · xhigh · ~/work/project · Launch overrides"
+    for line in (
+        f"{footer}  Paste again to expand for editing",
+        f"{footer}X   Paste again to expand for editing",
+        f"{footer}   Goal (paused)",
+        f"{footer}   Paste again to expand",
+        f"{footer}   Hook",
+        "m · high · /my   dir · Auto-review   Paste again to expand for editing",
+        "   Paste again to expand for editing",
+    ):
+        assert client_module._muse_status_mode(line.strip()) is None, line
+    assert client_module._muse_status_mode(
+        "model · high · /work · YOLO\u3000\t Hook · UserPromptSubmit"
+    ) == "YOLO"
+
+    # 3175 code points, 3824 bytes and 3234 UTF-16 units with one CRLF: Muse shows 3174.
+    unicode = briefs["unicode-crlf"]
+    assert len(unicode) == 3175 and unicode.count("\r\n") == 1
+    staged = frames["headerless-unicode-placeholder"]
+    assert "[Pasted Content 3174 chars]" in staged
+    assert muse_verified_process_paste_is_exact_composer(staged, unicode)
+    assert muse_verified_process_paste_is_exact_composer(staged, unicode.replace("\r\n", "\n"))
+    assert not muse_verified_process_paste_is_exact_composer(
+        staged, unicode.replace("\r\n", "\n\n"),
+    )
+    answered = frames["headerless-unicode-answered"]
+    assert muse_prompt_transcript_count(answered, unicode) == 0
+    assert muse_verified_process_prompt_transcript_count(answered, unicode) == 1
+    assert not muse_verified_process_paste_in_composer(answered, unicode)
 
 
 def test_verified_headerless_muse_composer_distinguishes_buffered_input() -> None:

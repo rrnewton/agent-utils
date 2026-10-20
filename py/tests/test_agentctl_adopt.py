@@ -22,7 +22,7 @@ from agentctl.client import (
     AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, PaneShellProof,
 )
 from agentctl.errors import (
-    AgentDeliveryError, AgentPossiblySubmitted, HerdrRunError, HerdrUnavailable,
+    AgentDeliveryError, AgentPending, AgentPossiblySubmitted, HerdrRunError, HerdrUnavailable,
     RecoveryAction, _with_recovery,
 )
 from agentctl.sessions import Sessions
@@ -1670,8 +1670,11 @@ def test_suggestion13_foreign_muse_retains_current_composer_permission_policy(
     fake.transcripts[pane] = ["quoted prior model · high · /work · Auto-review"]
     sessions.adopt("foreign", pane_id=pane, expected_workspace="subagents",
                    expected_cwd=str(tmp_path), harness="muse")
-    with pytest.raises(AgentPossiblySubmitted, match="Auto-review|YOLO"):
+    # The refusal comes before any input, so the prompt stays pending (#395
+    # muse-launch-overrides-input), never quarantined as possibly submitted.
+    with pytest.raises(AgentPending, match="Auto-review") as raised:
         sessions.send_session("foreign", "must remain untyped", ready_timeout=0)
+    assert raised.value.exit_code == 75
     assert pastes == [] and fake.keys_sent == [] and fake.submitted == []
     assert sessions.get("foreign").adapter == "herdr-foreign"
 

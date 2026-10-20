@@ -1642,15 +1642,20 @@ def _muse_adoption(harness: Harness, report: Report) -> None:
             "foreign Muse bypassed staged input or changed runtime ownership")
         _change(case, {"custom_permission": "YOLO", "custom_submitted": False,
                        "custom_draft": ""})
+        # Refused before any input, so the prompt stays pending (#395
+        # muse-launch-overrides-input) rather than quarantined as possibly submitted.
         _pair(harness, report, case, f"primary/adopt/muse/{label}/yolo-refusal", (
             "send", "foreign", "must not bypass Auto-review", "--message-id", "foreign-yolo",
             "--ready-timeout", "0", *_COMMON,
-        ), 76)
+        ), 75)
         report.require(f"primary/adopt/muse/{label}/yolo-no-input", all(
             _submission_count(root, "must not bypass Auto-review") == 0
-            and (root / "registry/foreign/queue/failed/foreign-yolo.json").is_file()
+            and (root / "registry/foreign/queue/inbox/foreign-yolo.json").is_file()
+            and not (root / "registry/foreign/queue/failed/foreign-yolo.json").exists()
             for root in (case.python_root, case.rust_root)),
             "foreign Muse delivery ignored Auto-review policy")
+        for root in (case.python_root, case.rust_root):
+            (root / "registry/foreign/queue/inbox/foreign-yolo.json").unlink()
         _change(case, {"custom_permission": "Auto-review",
                        "fixture_shell_pid": harness.replacement_shell.pid})
         outcomes = harness.invoke(case, ("send", "foreign", "must not cross shell generation",

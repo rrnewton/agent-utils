@@ -139,16 +139,35 @@ def muse_trust_prompt(screen: str) -> bool:
     )
 
 
+def _muse_turn_running(transcript: str) -> bool:
+    """Whether the transcript ends in Muse's progress line, so a turn is still running.
+
+    Muse 1.4 keeps its editor empty and drawn while it works, with ``◇ Thinking (3s · esc to
+    interrupt)`` or ``◈ Double checking (1s · esc to interrupt)`` as the last transcript line, so
+    that line, not the editor, says whether a turn is running.
+    """
+    last = next(
+        (line.strip() for line in reversed(transcript.splitlines()) if line.strip()), "",
+    )
+    return any(
+        last == marker or last.startswith(marker + " ") for marker in ("◇", "◈")
+    ) and last.endswith("esc to interrupt)")
+
+
+def _muse_editor_idle(regions: tuple[str, str] | None) -> bool:
+    """An empty editor below a transcript that does not end in Muse's progress line."""
+    return (regions is not None and regions[1].strip() in ("❯", "›")
+            and not _muse_turn_running(regions[0]))
+
+
 def muse_idle_composer(screen: str) -> bool:
     """Recognize Muse's idle composer without mistaking a choice prompt for it."""
-    regions = _muse_composer_regions(screen, require_header=True)
-    return regions is not None and regions[1].strip() in ("❯", "›")
+    return _muse_editor_idle(_muse_composer_regions(screen, require_header=True))
 
 
 def muse_auto_review_idle_composer(screen: str) -> bool:
     """Require the Auto-review footer on the active empty composer."""
-    regions = _muse_composer_regions(screen, require_header=True)
-    if regions is None or regions[1].strip() not in ("❯", "›"):
+    if not _muse_editor_idle(_muse_composer_regions(screen, require_header=True)):
         return False
     lines = screen.splitlines()
     dividers = [
@@ -161,8 +180,13 @@ def muse_auto_review_idle_composer(screen: str) -> bool:
 
 def muse_verified_process_idle_composer(screen: str) -> bool:
     """Recognize an idle editor after exact live-Muse process verification."""
+    return _muse_editor_idle(_muse_composer_regions(screen, require_header=False))
+
+
+def muse_verified_process_turn_running(screen: str) -> bool:
+    """Recognize Muse's progress line above the editor after live-Muse process verification."""
     regions = _muse_composer_regions(screen, require_header=False)
-    return regions is not None and regions[1].strip() in ("❯", "›")
+    return regions is not None and _muse_turn_running(regions[0])
 
 
 def muse_verified_process_composer(screen: str) -> bool:
@@ -208,7 +232,48 @@ def _muse_composer_regions(
 
 
 def _muse_status_mode(line: str) -> str | None:
-    """Return the explicit mode from one structurally valid Muse footer."""
+    """Return the explicit mode from one structurally valid Muse footer.
+
+    Muse right-aligns transient notices on the footer line itself, after a gap of three or more
+    spaces: ``Paste again to expand for editing`` for a few seconds after a paste, and
+    ``Hook · UserPromptSubmit · ...`` after a submission. A line that is no footer as a whole is
+    read again without one of those notices; any other text keeps it no footer, so an unknown
+    status never passes for an idle editor.
+    """
+    mode = _muse_status_fields_mode(line)
+    if mode is None:
+        footer = _muse_without_notice(line)
+        if footer is not None:
+            mode = _muse_status_fields_mode(footer)
+    return mode
+
+
+# The notice Muse 1.4 right-aligns on its footer line for a few seconds after a paste, and how
+# the one it draws there after a submission starts.
+_MUSE_PASTE_NOTICE = "Paste again to expand for editing"
+_MUSE_HOOK_NOTICE = "Hook · "
+
+
+def _muse_without_notice(line: str) -> str | None:
+    """``line`` before its first run of three whitespace characters, when the rest of the line
+    is one of the notices Muse 1.4 was seen to draw there."""
+    start: int | None = None
+    for index, character in enumerate(line):
+        if character.isspace():
+            if start is None:
+                start = index
+            continue
+        if start is not None and index - start >= 3:
+            notice = line[index:]
+            if notice == _MUSE_PASTE_NOTICE or notice.startswith(_MUSE_HOOK_NOTICE):
+                return line[:start]
+            return None
+        start = None
+    return None
+
+
+def _muse_status_fields_mode(line: str) -> str | None:
+    """Return the mode of a line that is exactly one Muse footer."""
     fields = [field.strip() for field in line.split("·")]
     if (len(fields) not in (3, 4) or not all(fields)
             or _MUSE_EFFORT.fullmatch(fields[1]) is None):
@@ -310,6 +375,49 @@ def muse_verified_process_prompt_is_exact_composer(screen: str, text: str) -> bo
     )
 
 
+# Muse's answer marker, its two prompt markers, and the progress markers Muse 1.4 draws below a
+# submitted turn while it works (``◇ Thinking (0s · esc to interrupt)``, ``◈ Double checking``).
+_MUSE_TURN_END_MARKERS = ("◆", "❯", "›", "◇", "◈")
+# Muse 1.4 collapses a long paste into this one editor line, counting the pasted characters.
+_MUSE_PASTE_PLACEHOLDER = re.compile(r"\[Pasted Content ([0-9]+) chars\]")
+
+
+def _muse_paste_length(text: str) -> int:
+    """The character count Muse shows for a paste of ``text``: code points, CRLF as one."""
+    return len(text.replace("\r\n", "\n"))
+
+
+def _muse_editor_holds_paste(editor: str, text: str) -> bool:
+    """Whether the editor is exactly Muse's collapsed placeholder for a paste of ``text``."""
+    segments = _muse_editor_segments(editor)
+    if segments is None or len(segments) != 1:
+        return False
+    match = _MUSE_PASTE_PLACEHOLDER.fullmatch(segments[0])
+    return match is not None and int(match.group(1)) == _muse_paste_length(text)
+
+
+def muse_verified_process_paste_is_exact_composer(screen: str, text: str) -> bool:
+    """Require the whole editor to be this paste after pinning the live Muse process.
+
+    The editor shows the literal text, or, for a long paste, only Muse's placeholder with the
+    paste's exact character count. Delivery proves the editor empty before its one paste.
+    """
+    regions = _muse_composer_regions(screen, require_header=False)
+    return regions is not None and (
+        _muse_editor_matches(regions[1], text, exact=True)
+        or _muse_editor_holds_paste(regions[1], text)
+    )
+
+
+def muse_verified_process_paste_in_composer(screen: str, text: str) -> bool:
+    """Detect this paste retained in the editor, as text or as its placeholder."""
+    regions = _muse_composer_regions(screen, require_header=False)
+    return regions is not None and (
+        _muse_editor_matches(regions[1], text, exact=False)
+        or _muse_editor_holds_paste(regions[1], text)
+    )
+
+
 def _muse_prompt_transcript_count(transcript: str, text: str) -> int:
     """Count complete marker-delimited user turns, never prompt prefixes."""
     if not " ".join(text.split()):
@@ -330,7 +438,7 @@ def _muse_prompt_transcript_count(transcript: str, text: str) -> int:
             next_line = lines[end].strip()
             if any(
                 next_line == marker or next_line.startswith(marker + " ")
-                for marker in ("◆", "❯", "›")
+                for marker in _MUSE_TURN_END_MARKERS
             ) or re.fullmatch(r"(?:Working|Thinking)(?:\.\.\.|\u2026)", next_line):
                 break
             end += 1

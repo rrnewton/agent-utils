@@ -61,30 +61,80 @@ fn verified_muse_yolo_composer_reports_idle_staged_and_paused() {
 }
 
 // Ported from py/tests/test_herdr_subagents.py
-// test_yolo_composer_status_is_readable_but_input_requires_process_guard.
+// test_owned_muse_delivers_at_every_footer_mode_and_through_a_collapsed_paste.
+//
+// #395 muse-launch-overrides-input: a session agentctl launched takes input at whatever approval
+// mode its launch chose, through the same process, staged-editor and transcript proofs. A long
+// paste may show only as Muse's placeholder with its paste hint on the footer line, and a
+// versioned header Muse has scrolled away does not matter once the process is pinned.
 #[test]
-fn yolo_composer_status_is_readable_but_input_requires_process_guard() {
+fn owned_muse_delivers_at_every_footer_mode_and_through_a_collapsed_paste() {
+    let long = "first line of a long brief\r\nsecond line, café 🙂, and the rest of it";
+    for (mode, header, collapse_over, prompt) in [
+        ("YOLO", true, None, "a short literal $(prompt)"),
+        ("Launch overrides", true, None, "a short literal $(prompt)"),
+        ("", true, None, "a short literal $(prompt)"),
+        ("Launch overrides", true, Some(40), long),
+        ("Launch overrides", false, Some(40), long),
+        ("Auto-review", false, Some(40), long),
+    ] {
+        let fixture = Fixture::new();
+        let manager = start_muse(&fixture);
+        *fixture.client.status.lock().unwrap() = Some("done".to_owned());
+        *fixture.client.muse_editor.lock().unwrap() =
+            Some(MuseEditor::new(mode, header, collapse_over));
+        let case = format!("{mode:?} header={header} collapse={collapse_over:?}");
+        assert_eq!(
+            manager.status("worker").unwrap()["agent_status"],
+            "idle",
+            "{case}"
+        );
+        let result = manager.send("worker", prompt, held()).unwrap();
+        assert_eq!(result.delivered.len(), 1, "{case}: {result:?}");
+        assert_eq!(
+            fixture
+                .client
+                .literal_pastes
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, text)| text.clone())
+                .collect::<Vec<_>>(),
+            [format!(
+                "{BRACKETED_PASTE_START}{prompt}{BRACKETED_PASTE_END}"
+            )],
+            "{case}"
+        );
+        assert_eq!(fixture.client.keys_sent.lock().unwrap().len(), 1, "{case}");
+    }
+}
+
+// New: every refusal raised before any input leaves the prompt pending (exit 75), never
+// quarantined as possibly submitted (#395 muse-launch-overrides-input).
+#[test]
+fn a_muse_refusal_before_any_input_keeps_the_prompt_pending() {
     let fixture = Fixture::new();
     let manager = start_muse(&fixture);
+    *fixture.client.status.lock().unwrap() = Some("done".to_owned());
+    *fixture.client.muse_editor.lock().unwrap() =
+        Some(MuseEditor::new("Launch overrides", true, None));
+    let error = manager
+        .send("worker", "colored \u{1b}[31m text", held())
+        .unwrap_err();
+    assert!(matches!(error, AgentError::Pending(_)), "{error}");
+    assert_eq!(error.exit_code(), 75);
+    assert!(error.to_string().contains("nothing was typed"), "{error}");
+    no_input(&fixture);
+    let retained = agent::read_private_json(&error.undelivered().unwrap().artifact).unwrap();
+    assert_eq!(retained["delivery_state"], "pending");
+    assert!(retained.get("possibly_submitted").is_none());
+
+    // The same refusal through the adapter itself is not staged, whatever the footer says.
     let record = manager.load("worker").unwrap();
     let pane = record.pane_id.clone().unwrap();
-    show(
-        &fixture,
-        "done",
-        &format!(
-            "Muse Code 1.4.0\nprior Auto-review note\n{DIVIDER}\n❯\n{DIVIDER}\n\
-             kiki · xhigh · /work · YOLO\n"
-        ),
-    );
     let client = manager.workspace_client(&record);
-    assert_eq!(AgentApi::pane_info(&client, &pane).unwrap().status, "idle");
-    let error = AgentApi::run(&client, &pane, "must remain pending").unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("effect-coupled process-generation"),
-        "{error}"
-    );
+    let error = AgentApi::run(&client, &pane, "nul \0 byte").unwrap_err();
+    assert_eq!(error.kind(), AdapterErrorKind::NotStaged, "{error}");
     no_input(&fixture);
 }
 
@@ -116,7 +166,8 @@ fn foreign_muse_standard_mode_retains_the_auto_review_input_policy() {
     let error = manager
         .send("foreign", "must remain untyped", held())
         .unwrap_err();
-    assert!(matches!(error, AgentError::PossiblySubmitted(_)), "{error}");
+    assert!(matches!(error, AgentError::Pending(_)), "{error}");
+    assert_eq!(error.exit_code(), 75);
     assert!(error.to_string().contains("Auto-review"), "{error}");
     no_input(&fixture);
     assert_eq!(manager.load("foreign").unwrap().adapter, "herdr-foreign");

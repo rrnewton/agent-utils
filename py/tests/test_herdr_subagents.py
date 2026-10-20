@@ -16,6 +16,7 @@ from agentctl.client import (
 from agentctl.errors import (
     AgentDeliveryError, AgentPending, HerdrUnavailable, InputExpectationFailed,
 )
+from agentctl.submission import PromptNotStaged
 from agentctl.subagents import (
     ManagedAgents, _GuardedTerminal, _WorkspaceClient, environment_entries, harness_arguments,
 )
@@ -1537,24 +1538,102 @@ def test_verified_muse_yolo_composer_reports_idle_staged_and_paused(
     assert manager.status("worker")["agent_status"] == "paused"
 
 
-def test_yolo_composer_status_is_readable_but_input_requires_process_guard(
+def _owned_muse_editor(
+    fake: FakeManagedClient, monkeypatch: pytest.MonkeyPatch, *, mode: str,
+    header: bool = True, collapse_over: int | None = None,
+) -> list[str]:
+    """Draw an owned Muse pane's editor as Muse 1.4 does, and record each literal paste.
+
+    Muse counts a paste in code points, CRLF as one, and shows a long one only as its
+    placeholder, with a paste hint on the footer line (rs/agentctl/testdata/muse-frames.json).
+    """
+    divider = "─" * 40
+    draft = ""
+    history: list[str] = []
+    pastes: list[str] = []
+
+    def length(text: str) -> int:
+        return len(text.replace("\r\n", "\n"))
+
+    def screen(*_args: object, **_kwargs: object) -> str:
+        if draft and collapse_over is not None and length(draft) > collapse_over:
+            editor = f"❯ [Pasted Content {length(draft)} chars]"
+            notice = "             Paste again to expand for editing"
+        else:
+            editor, notice = ("❯ " + draft if draft else "❯"), ""
+        footer = f"kiki · xhigh · /work{f' · {mode}' if mode else ''}{notice}"
+        return (("Muse Code 1.4.12\n" if header else "") + "\n".join(history)
+                + f"\n{divider}\n{editor}\n{divider}\n{footer}\n")
+
+    def paste(pane_id: str, text: str, *, expect_terminal: str | None = None) -> None:
+        nonlocal draft
+        fake._effect(pane_id, expect_terminal)
+        assert not draft and text.startswith("\x1b[200~") and text.endswith("\x1b[201~")
+        draft = text[len("\x1b[200~"):-len("\x1b[201~")]
+        pastes.append(text)
+
+    original_keys = fake.send_keys
+
+    def keys(pane_id: str, value: str, *, expect_terminal: str | None = None) -> None:
+        nonlocal draft
+        original_keys(pane_id, value, expect_terminal=expect_terminal)
+        if value == "Enter":
+            history.append(f"❯ {draft}\n◇ Thinking (0s · esc to interrupt)")
+            draft = ""
+
+    monkeypatch.setattr(fake, "read", screen)
+    monkeypatch.setattr(fake, "send_text", paste, raising=False)
+    monkeypatch.setattr(fake, "send_keys", keys)
+    return pastes
+
+
+@pytest.mark.parametrize(("mode", "header", "collapse_over", "prompt"), [
+    ("YOLO", True, None, "a short literal $(prompt)"),
+    ("Launch overrides", True, None, "a short literal $(prompt)"),
+    ("", True, None, "a short literal $(prompt)"),
+    ("Launch overrides", True, 40, "first line of a long brief\r\nsecond line, café 🙂, and the rest of it"),
+    ("Launch overrides", False, 40, "first line of a long brief\r\nsecond line, café 🙂, and the rest of it"),
+    ("Auto-review", False, 40, "first line of a long brief\r\nsecond line, café 🙂, and the rest of it"),
+])
+def test_owned_muse_delivers_at_every_footer_mode_and_through_a_collapsed_paste(
+    mode: str, header: bool, collapse_over: int | None, prompt: str,
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # #395 muse-launch-overrides-input: a session agentctl launched takes input at whatever
+    # approval mode its launch chose, through the same process, staged-editor and transcript
+    # proofs. A long paste may show only as Muse's placeholder with its paste hint on the footer
+    # line, and a versioned header Muse has scrolled away does not matter once the process is
+    # pinned.
     manager, fake = setup(tmp_path, monkeypatch)
     manager.start("worker", cwd=str(tmp_path), harness="muse")
-    record = manager.get("worker")
     fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="done")
-    divider = "─" * 40
-    screen = (
-        f"Muse Code 1.4.0\nprior Auto-review note\n{divider}\n❯\n{divider}\n"
-        "kiki · xhigh · /work · YOLO\n"
-    )
-    monkeypatch.setattr(fake, "read", lambda *_args, **_kwargs: screen)
-    client = _WorkspaceClient(cast(HerdrClient, fake), record)
-    assert client.pane_info("w1:p1").status == "idle"
-    with pytest.raises(HerdrUnavailable, match="effect-coupled process-generation"):
-        client.prompt_agent("w1:p1", "must remain pending")
-    assert fake.submitted == []
+    pastes = _owned_muse_editor(fake, monkeypatch, mode=mode, header=header,
+                                collapse_over=collapse_over)
+    assert manager.status("worker")["agent_status"] == "idle"
+    result = manager.send("worker", prompt)
+    assert len(result.delivered) == 1, result
+    assert pastes == [f"\x1b[200~{prompt}\x1b[201~"]
+    assert fake.keys_sent == [("w1:p1", "Enter")]
+
+
+def test_a_muse_refusal_before_any_input_keeps_the_prompt_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Every refusal raised before any input leaves the prompt pending (exit 75), never
+    # quarantined as possibly submitted (#395 muse-launch-overrides-input).
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="muse")
+    fake.infos["w1:p1"] = replace(fake.infos["w1:p1"], status="done")
+    pastes = _owned_muse_editor(fake, monkeypatch, mode="Launch overrides")
+    with pytest.raises(AgentPending, match="nothing was typed") as raised:
+        manager.send("worker", "colored \x1b[31m text", ready_timeout=0)
+    assert raised.value.exit_code == 75
+    assert pastes == [] and fake.keys_sent == []
+
+    client = _WorkspaceClient(cast(HerdrClient, fake), manager.get("worker"))
+    with pytest.raises(PromptNotStaged, match="nothing was typed"):
+        client.prompt_agent("w1:p1", "nul \0 byte")
+    assert pastes == [] and fake.keys_sent == []
 
 
 def test_session_replacement_and_extra_panes_refuse_mutation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

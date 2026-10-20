@@ -14,9 +14,15 @@ impl agent::AgentRuntime for Clock {
 }
 
 pub(super) struct MuseEditor {
+    /// The footer's fourth field; empty draws the three-field standard footer.
     mode: String,
     staged: Option<String>,
     history: Vec<String>,
+    /// Whether the versioned header is still on screen; Muse 1.4 scrolls it away.
+    header: bool,
+    /// Pastes longer than this many characters show only as Muse 1.4's placeholder, and the
+    /// footer line carries its paste hint while one is staged.
+    collapse_over: Option<usize>,
 }
 
 impl Default for MuseEditor {
@@ -25,19 +31,48 @@ impl Default for MuseEditor {
             mode: "Auto-review".to_owned(),
             staged: None,
             history: Vec::new(),
+            header: true,
+            collapse_over: None,
         }
     }
 }
 
 impl MuseEditor {
+    pub(super) fn new(mode: &str, header: bool, collapse_over: Option<usize>) -> Self {
+        Self {
+            mode: mode.to_owned(),
+            header,
+            collapse_over,
+            ..Self::default()
+        }
+    }
+
     pub(super) fn screen(&self) -> String {
-        let editor = self
+        // Muse counts code points, CRLF as one (rs/agentctl/testdata/muse-frames.json).
+        let length = |text: &str| text.chars().count() - text.matches("\r\n").count();
+        let collapsed = self
             .staged
-            .as_ref()
-            .map_or_else(|| "❯".to_owned(), |text| format!("❯ {text}"));
+            .as_deref()
+            .filter(|text| self.collapse_over.is_some_and(|limit| length(text) > limit));
+        let editor = match (collapsed, self.staged.as_ref()) {
+            (Some(text), _) => format!("❯ [Pasted Content {} chars]", length(text)),
+            (None, Some(text)) => format!("❯ {text}"),
+            (None, None) => "❯".to_owned(),
+        };
+        let header = if self.header { "Muse Code 1.3.0\n" } else { "" };
+        let mode = if self.mode.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", self.mode)
+        };
+        let notice = if collapsed.is_some() {
+            "             Paste again to expand for editing"
+        } else {
+            ""
+        };
         format!(
-            "Muse Code 1.3.0\n{}\n────────────\n{editor}\n────────────\nwatermelon-preview · xhigh · /work/project · {}\n",
-            self.history.join("\n"), self.mode
+            "{header}{}\n────────────\n{editor}\n────────────\nwatermelon-preview · xhigh · /work/project{mode}{notice}\n",
+            self.history.join("\n")
         )
     }
 
@@ -313,12 +348,15 @@ fn herdr_093_foreign_muse_current_yolo_mode_refuses_input_even_with_historical_a
         )
         .unwrap_err();
     assert!(error.to_string().contains("Auto-review"), "{error}");
-    assert!(matches!(error, AgentError::PossiblySubmitted(_)));
+    // The refusal comes before any input, so the prompt stays pending (#395
+    // muse-launch-overrides-input), never quarantined as possibly submitted.
+    assert!(matches!(error, AgentError::Pending(_)), "{error}");
+    assert_eq!(error.exit_code(), 75);
+    assert!(error.to_string().contains("nothing was typed"), "{error}");
     no_input(&fixture);
     let retained = agent::read_private_json(&error.undelivered().unwrap().artifact).unwrap();
-    assert_eq!(retained["delivery_state"], "inflight");
-    assert_eq!(retained["possibly_submitted"], true);
-    assert_eq!(retained["delivery_attempts"], 1);
+    assert_eq!(retained["delivery_state"], "pending");
+    assert!(retained.get("possibly_submitted").is_none());
     assert!(manager
         .drain_with_runtime("foreign", quick_delivery(), &Clock::default())
         .unwrap()

@@ -98,7 +98,8 @@ while keeping their terminals available for direct inspection.
 
    Muse can also be adopted with `--harness muse`. Adoption requires a stable
    foreground process and terminal identity; automated delivery uses the same
-   verified composer and Auto-review policy as an owned Muse session.
+   verified composer as an owned Muse session, and only while the adopted pane's
+   footer reads `Auto-review`.
 
 3. Send follow-up work and inspect progress:
 

@@ -39,14 +39,15 @@ from agentctl.client import (
     herdr_error_code,
     muse_auto_review_idle_composer,
     muse_idle_composer,
-    muse_prompt_in_composer,
-    muse_prompt_is_exact_composer,
-    muse_prompt_transcript_count,
     muse_startup_metadata,
     muse_trust_prompt,
     muse_verified_process_composer,
     muse_verified_process_goal_paused,
     muse_verified_process_idle_composer,
+    muse_verified_process_paste_in_composer,
+    muse_verified_process_paste_is_exact_composer,
+    muse_verified_process_prompt_transcript_count,
+    muse_verified_process_turn_running,
     relay_trust_prompt,
 )
 from agentctl.errors import (
@@ -1637,7 +1638,8 @@ class _WorkspaceClient:
                         )
                         else "staged"
                         if (reported_status in ("idle", "done")
-                            and muse_verified_process_composer(screen))
+                            and muse_verified_process_composer(screen)
+                            and not muse_verified_process_turn_running(screen))
                         else "working"
                     ),
                     session_agent=info.session_agent,
@@ -1763,22 +1765,7 @@ class _WorkspaceClient:
                 pane_id, command, native,
                 lambda: self.client.prompt_agent(pane_id, command, terminal=native),
             )
-        if "\0" in command or "\x1b" in command:
-            raise HerdrUnavailable(
-                "Muse pane prompts cannot contain NUL or terminal escape characters"
-            )
-        info = self.pane_info(pane_id)
-        if info.status != "idle":
-            raise HerdrUnavailable(
-                f"custom pane {pane_id} is not at a verified idle Muse composer"
-            )
-        before = self.client.read(pane_id, source="visible", lines=200)
-        if not muse_auto_review_idle_composer(before):
-            raise HerdrUnavailable(
-                "Muse input requires the legacy reviewed Auto-review composer; "
-                "current YOLO input remains pending until Herdr provides an "
-                "effect-coupled process-generation guard"
-            )
+        before = self._muse_paste_baseline(pane_id, command)
         guarded = self._guarded()
         guarded.send_text(
             pane_id, f"{_BRACKETED_PASTE_START}{command}{_BRACKETED_PASTE_END}"
@@ -1789,7 +1776,7 @@ class _WorkspaceClient:
             self._verify_muse_harness(pane_id)
             staged = self.client.read(pane_id, source="visible", lines=200)
             self._verify_muse_harness(pane_id)
-            if staged != before and muse_prompt_is_exact_composer(staged, command):
+            if staged != before and muse_verified_process_paste_is_exact_composer(staged, command):
                 break
             time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
         else:
@@ -1798,9 +1785,56 @@ class _WorkspaceClient:
             )
         guarded.send_keys(pane_id, "Enter")
         self.custom_submission = (
-            staged, command, muse_prompt_transcript_count(staged, command),
+            staged, command, muse_verified_process_prompt_transcript_count(staged, command),
         )
         return None
+
+    def _muse_paste_baseline(self, pane_id: str, command: str) -> str:
+        """Prove that the pinned Muse pane may take one literal paste now, and return the
+        screen that the paste must change.
+
+        The pane must show Muse's empty editor with exactly one status footer, read between two
+        checks of the pinned process. Muse 1.4 scrolls its versioned header away, so the process
+        pin, not the header, says the screen is Muse's. Any footer mode will do for a session
+        agentctl launched, since its approval mode is what the owner's launch profile chose:
+        ``YOLO``, ``Auto-review``, the three-field standard footer, or ``Launch overrides``
+        (#382 muse-approval-never-ready). An adopted pane was launched by someone else, so it
+        keeps taking input only at its ``Auto-review`` editor. The mode never limits where a
+        misroute lands: a program that replaces the pinned one between a check and a write is
+        not the one whose footer was read, so the process checks around every effect, not the
+        footer, are the misroute defense (#395 muse-launch-overrides-input).
+
+        Nothing has been typed when this returns, so every refusal is ``PromptNotStaged``: the
+        prompt stays pending instead of being quarantined as possibly submitted.
+        """
+        try:
+            if "\0" in command or "\x1b" in command:
+                raise HerdrUnavailable(
+                    "Muse pane prompts cannot contain NUL or terminal escape characters"
+                )
+            info = self.pane_info(pane_id)
+            if info.status != "idle":
+                raise HerdrUnavailable(
+                    f"custom pane {pane_id} is not at a verified idle Muse composer "
+                    f"(status {info.status})"
+                )
+            self._verify_muse_harness(pane_id)
+            before = self.client.read(pane_id, source="visible", lines=200)
+            self._verify_muse_harness(pane_id)
+            if not muse_verified_process_idle_composer(before):
+                raise HerdrUnavailable(
+                    f"pane {pane_id} does not show an empty Muse editor with one status footer"
+                )
+            if (self.record.adapter == "herdr-foreign"
+                    and not muse_auto_review_idle_composer(before)):
+                raise HerdrUnavailable(
+                    "an adopted Muse pane takes input only at its Auto-review editor"
+                )
+        except PromptNotStaged:
+            raise
+        except (HerdrUnavailable, AgentDeliveryError) as exc:
+            raise PromptNotStaged(f"{exc}; nothing was typed") from exc
+        return before
 
     def wait_agent_status(self, pane_id: str, status: str, timeout_ms: int) -> None:
         """Wait for ``status``; a delivery confirmation ("working") also needs the pinned
@@ -1834,8 +1868,9 @@ class _WorkspaceClient:
                 screen = self.client.read(pane_id, source="visible", lines=200)
                 self._verify_muse_harness(pane_id)
                 if (screen != staged
-                        and muse_prompt_transcript_count(screen, command) > prior_count
-                        and not muse_prompt_in_composer(screen, command)):
+                        and muse_verified_process_prompt_transcript_count(screen, command)
+                        > prior_count
+                        and not muse_verified_process_paste_in_composer(screen, command)):
                     self.custom_submission = None
                     return
                 time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
