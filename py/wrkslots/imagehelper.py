@@ -40,6 +40,7 @@ import struct
 import subprocess
 import sys
 from collections.abc import Sequence
+from typing import Protocol
 
 _LOOP_SET_FD = 0x4C00
 _LOOP_CLR_FD = 0x4C01
@@ -368,8 +369,10 @@ def umount(image_path: str, mount_point: str, *options: str) -> None:
     _check(_libc().umount2(mount_point.encode(), 8), f"umount {mount_point}")  # UMOUNT_NOFOLLOW
 
 
-def rmdir_lost_found(image_path: str, mount_point: str) -> None:
+def rmdir_lost_found(image_path: str, mount_point: str, *options: str) -> None:
     """Remove the root-owned lost+found directory mkfs leaves at a slot image's root."""
+    if options:
+        raise HelperError(f"rmdir-lost-found takes no options, got {' '.join(options)}")
     uid = _invoking_uid()
     descriptor, _name, _image = _open_owned_mount(image_path, mount_point, uid)
     try:
@@ -380,8 +383,10 @@ def rmdir_lost_found(image_path: str, mount_point: str) -> None:
         os.close(descriptor)
 
 
-def trim(image_path: str, mount_point: str) -> None:
+def trim(image_path: str, mount_point: str, *options: str) -> None:
     """Return blocks freed inside a mounted slot image to the host (FITRIM)."""
+    if options:
+        raise HelperError(f"trim takes no options, got {' '.join(options)}")
     uid = _invoking_uid()
     descriptor, _name, _image = _open_owned_mount(image_path, mount_point, uid, os.O_RDONLY)
     try:
@@ -390,8 +395,10 @@ def trim(image_path: str, mount_point: str) -> None:
         os.close(descriptor)
 
 
-def grow(image_path: str, mount_point: str) -> None:
+def grow(image_path: str, mount_point: str, *options: str) -> None:
     """Pick up a larger image file on its loop device and grow the file system online."""
+    if options:
+        raise HelperError(f"grow takes no options, got {' '.join(options)}")
     uid = _invoking_uid()
     descriptor, name, image = _open_owned_mount(image_path, mount_point, uid, os.O_RDONLY)
     try:
@@ -422,7 +429,18 @@ def _system_tool(name: str) -> str:
     raise HelperError(f"{name} was not found as a root-owned executable in the system directories")
 
 
-_OPERATIONS = {
+class _Operation(Protocol):
+    """One helper operation: the image, the mount point, then its own options.
+
+    Every operation has this shape (the ones without options refuse any), and
+    ``_main`` checks the argument count against the bounds in ``_OPERATIONS``
+    before calling through it.
+    """
+
+    def __call__(self, image_path: str, mount_point: str, *options: str) -> None: ...
+
+
+_OPERATIONS: dict[str, tuple[_Operation, int, int]] = {
     "mount": (mount, 2, 3),
     "umount": (umount, 2, 3),
     "rmdir-lost-found": (rmdir_lost_found, 2, 2),
