@@ -1,12 +1,13 @@
 ---
 title: 'thread-header-collapse: a tap folds the card at the top of a thread to a thin coloured bar, and a tap opens it again'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-20T04:42:09.361209688+00:00
-updated_at: 2026-10-20T04:42:09.361209688+00:00
+updated_at: 2026-10-20T05:02:00.380608086+00:00
+closed_at: 2026-10-20T05:02:00.380607976+00:00
 ---
 
 # Description
