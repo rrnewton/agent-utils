@@ -24,6 +24,9 @@ const APP: &str = "A0TESTAPP01";
 const FAKE_CLIENT: &str = r#"#!/bin/sh
 # Fake Slack client: records each invocation's arguments, then answers like the real one.
 printf '%s\n' "$*" >> "$FAKE_SLACK_DIR/argv.log"
+if [ -n "${CLIENT_CERT_PATH-}" ]; then
+  printf '%s\n' "$CLIENT_CERT_PATH" >> "$FAKE_SLACK_DIR/env.log"
+fi
 # Global flags, such as one that selects a Crewmate, come before the subcommand.
 while [ "${1#--}" != "$1" ]; do shift; done
 case "$1 $2" in
@@ -249,6 +252,11 @@ fn helper_process_as_a_crewmate_never_passes_as() {
             "--act-as-bot=1234 slack.reaction add --channel-id=C0C91RW5FAR \
              --message-ts=1792000801.000100 --name=eyes --output=json",
         ]
+    );
+    // The certificate path reached both client runs through the scrubbed environment.
+    assert_eq!(
+        fs::read_to_string(root.join("env.log")).unwrap(),
+        "/etc/certs/user.pem\n/etc/certs/user.pem\n"
     );
 }
 

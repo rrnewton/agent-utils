@@ -1852,12 +1852,14 @@ emoji the configuration chooses instead).
   command-line client's `slack.conversation tail` for the configured channel and
   turns each `message.created` event into one batch.
 * `agentctl-slack-outbound` is the `outbound_command`. It posts replies with
-  `slack.message send` and adds reactions with `slack.reaction add`, so every
-  post and reaction comes from the registered Slack app's bot identity: with
-  `--as=<APP_ID>` when the client holds a person's credentials (the default),
-  or with no `--as` when the client runs as the app's Crewmate
-  (`--client-identity=crewmate`), which acts through its recorded app and
-  refuses `--as`. Without `--app-id` it refuses every request as
+  `slack.message send` and adds reactions with `slack.reaction add`, as the
+  registered Slack app's bot identity: with `--as=<APP_ID>` when the client
+  holds a person's credentials (the default), or with no `--as` when the
+  client runs as the app's Crewmate (`--client-identity=crewmate`), which acts
+  through its recorded app and refuses `--as`. In that mode the bot identity
+  rests on the client's own configuration: a client that in fact holds a
+  person's credentials, for example one missing the `--cli-arg` that selects
+  the Crewmate, posts as that person, and the helper cannot tell. Without `--app-id` it refuses every request as
   `app_identity_required` (not applied, retryable) and runs nothing. A user ID
   is not accepted as the app id.
 
@@ -1957,7 +1959,7 @@ for the client's own):
     "--client-identity=crewmate",
     "--cli-arg=--act-as-crewmate=1234567890",
     "--cli-env=CLIENT_CERT_PATH=/path/to/user-cert.pem",
-    "--cli-env=CLIENT_KEY_PATH=/path/to/user-cert.pem",
+    "--cli-env=CLIENT_KEY_PATH=/path/to/user-key.pem",
     "--app-id=A0123456789", "--channel=C0123456789",
     "--ledger=/path/to/state/ledger"
   ],
@@ -2029,7 +2031,9 @@ same channel on that host, replies posted through it took 0.93 to 1.05 seconds
 from request to receipt, against 1.88 to 2.17 seconds for the helper's own
 client run.
 
-Run the worker as its own long-lived service with the helper's arguments plus
+Run the worker as its own long-lived service with the helper's arguments
+(including `--client-identity` and every `--cli-arg`; a worker whose identity
+or client arguments differ from the helper's holds no spare for it) plus
 `--role=warm-worker` and `--warm-socket=PATH`, and add the same
 `--warm-socket=PATH` to the helper's arguments. When the helper adds a
 reaction to a message (normally the 👀 acknowledgement, at admission), it first

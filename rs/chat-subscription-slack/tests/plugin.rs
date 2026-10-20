@@ -487,6 +487,12 @@ fn a_tail_that_looks_like_a_crewmate_or_stays_silent_is_noted_once() {
     );
 }
 
+static BUSY_CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(NOW_MILLIS);
+
+fn busy_clock() -> u64 {
+    BUSY_CLOCK.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 #[test]
 fn a_stream_that_carries_events_is_never_noted_as_silent() {
     let directory = std::env::temp_dir().join(format!("slack-busy-test-{}", std::process::id()));
@@ -500,12 +506,11 @@ fn a_stream_that_carries_events_is_never_noted_as_silent() {
         ),
         FakeStep::Idle,
     ]);
-    // Far past the quiet window by the fake clock: an event was seen, so nothing is noted.
     let mut backend = SlackBackend::new(Box::new({
         let fake = fake.clone();
         move |_config| Ok(Box::new(fake.clone()) as Box<dyn SlackTransport>)
     }))
-    .with_clock(|| NOW_MILLIS + 24 * 60 * 60 * 1_000);
+    .with_clock(busy_clock);
     let mut subscription = ChatSubscription::open(
         &mut backend,
         &request(None, json!({"diagnostics_log": log.to_str().unwrap()})),
@@ -513,6 +518,11 @@ fn a_stream_that_carries_events_is_never_noted_as_silent() {
     .unwrap();
     commit_next(&mut subscription);
     commit_next(&mut subscription);
+    // A day past the subscription by the fake clock: an event was seen, so nothing is noted.
+    BUSY_CLOCK.store(
+        NOW_MILLIS + 24 * 60 * 60 * 1_000,
+        std::sync::atomic::Ordering::SeqCst,
+    );
     assert!(matches!(
         subscription.next_item().expect("item"),
         Some(SubscriptionItem::Heartbeat(_))

@@ -438,8 +438,9 @@ pub enum ReplyCommandOutcome {
 }
 
 /// Store one reply for an open request, as [`BridgeState::submit_reply`] describes, and then ask
-/// a `chat run` that serves the same state directory to send it at once. The state is opened without the recovery that `chat run`, `chat tick` and `chat close`
-/// perform when they open it, so this is safe while the service runs. The result's
+/// a `chat run` that serves the same state directory to send it at once. The state is opened
+/// without the recovery that `chat run`, `chat tick` and `chat close` perform when they open it,
+/// so this is safe while the service runs. The result's
 /// `service_woken` says whether the wake was sent to a socket of the current user at the state
 /// directory's wake socket path; nothing confirms that a service received it. A service that does
 /// not sends the reply at its next reconciliation, when the agent goes idle, or when it starts.
@@ -546,7 +547,7 @@ fn reply_wake_key(datagram: &[u8]) -> Option<String> {
     chat_runtime::valid_key(key).then(|| key.to_owned())
 }
 
-/// The wake socket of a `chat run` with `--offer-reply-command`. Its thread receives the request
+/// The wake socket of a `chat run` with outbound replies enabled. Its thread receives the request
 /// keys that `chat reply` sends after it stores a reply, hands each to the owner loop, and ends
 /// the loop's wait, so the loop sends the reply at once instead of at its next reconciliation.
 struct ReplyWakeListener {
@@ -564,7 +565,7 @@ impl ReplyWakeListener {
     /// gives, and start its thread. The runner lease makes this the only service on that
     /// directory, so a socket of the current user already there was left by an earlier run and is
     /// replaced; anything else at the path is left alone. A failure is logged and leaves the
-    /// service without a listener, as without the option.
+    /// service without a listener.
     fn start(
         root: &Path,
         wakes: mpsc::SyncSender<String>,
@@ -11075,7 +11076,7 @@ esac
     }
 
     /// `run_owner_loop_notified`, with `transport` as the loop's outbound transport, and with the
-    /// wake socket that `chat run --offer-reply-command` binds listening in `wake_root`, when
+    /// wake socket that `chat run` binds listening in `wake_root`, when
     /// that is given, from before the loop starts until after it ends. Scans of the request
     /// records fall due once an hour.
     #[allow(clippy::too_many_arguments)]

@@ -267,10 +267,10 @@ struct WatchAgents {
     /// Minutes an approval or permission prompt may hold before it is reported, from 1 to 1440 (default: 5)
     #[arg(long, default_value = "5", value_parser = watch_minutes, value_name = "MINUTES")]
     approval_minutes: u64,
-    /// Minutes an agent may sit idle without a verdict before it is reported, from 1 to 1440 (default: 15)
+    /// Minutes an agent may sit idle without a verdict, with an unchanged screen, before it is reported, from 1 to 1440 (default: 15); an idle agent whose screen shows work running (Claude Code's `esc to interrupt`, or a count of background shells or agents) is held to --stall-minutes instead
     #[arg(long, default_value = "15", value_parser = watch_minutes, value_name = "MINUTES")]
     idle_minutes: u64,
-    /// Minutes a working agent may show no new output before it is reported stalled, from 1 to 1440 (default: 30)
+    /// Minutes a working agent, or an idle one whose screen shows work running, may show no new output before it is reported stalled, from 1 to 1440 (default: 30)
     #[arg(long, default_value = "30", value_parser = watch_minutes, value_name = "MINUTES")]
     stall_minutes: u64,
     /// Minutes a running record's harness may be unreachable before it is reported dead, from 1 to 1440 (default: 5)

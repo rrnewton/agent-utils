@@ -666,19 +666,24 @@ coordinator when a condition holds past its threshold:
 | condition | threshold | meaning |
 |---|---|---|
 | `approval-prompt` | `--approval-minutes` (default 5) | a harness approval, permission, or trust prompt at the bottom of the screen |
-| `idle-no-verdict` | `--idle-minutes` (default 15) | idle or done, work was delivered and drained, and no line starts with a `--done-marker` near the bottom of the screen; markers are `DONE:` and `BLOCKED:` unless `--done-marker` is given, which replaces them |
-| `stalled` | `--stall-minutes` (default 30) | marked working, or idle or done while the screen shows background work still running, timed from the last screen change |
+| `idle-no-verdict` | `--idle-minutes` (default 15) | idle or done, timed from the last screen change, work was delivered and drained, and no line starts with a `--done-marker` near the bottom of the screen; markers are `DONE:` and `BLOCKED:` unless `--done-marker` is given, which replaces them |
+| `stalled` | `--stall-minutes` (default 30) | marked working, or idle or done while the screen shows work running (a running turn or background work), timed from the last screen change |
 | `dead` | `--dead-minutes` (default 5) | the record says running but the harness cannot be reached |
 
 An agent that was never sent work, or that still has prompts queued, is never
-reported idle. Nor is one waiting on background work it started: Claude Code
-counts its background shells and sub-agents in the footer under its input box
+reported idle. Idle is timed from the last screen change, since herdr can
+report a Claude Code agent idle while its output still streams. Nor is an
+agent reported idle while its screen shows work running: Claude Code draws
+`esc to interrupt` in the footer under its input box while a turn runs, and
+counts the background shells and sub-agents an agent started there
 (`⏵⏵ auto mode on · 2 shells · ← 1 agent · ↓ to manage`) and in the row that
-closes a turn (`✻ Baked for 5m 51s · done 12:44 AM · 2 shells still running`),
-and while the bottom of the screen shows such a count (`N shell(s)` or
+closes a turn (`✻ Baked for 5m 51s · done 12:44 AM · 2 shells still running`).
+While the footer shows such a segment (`esc to interrupt`, `N shell(s)` or
 `N agent(s)`, with or without `still running`), the agent is held to the
-`stalled` rule instead. This reads the screen's text, so a harness that draws
-no such count, or a count worded differently, is still reported idle. When every watched agent is unreachable at once the terminal
+`stalled` rule instead. When the input box is in view only the footer under
+it is read, because the turn's row still says `still running` after the work
+ends. This reads the screen's text, so a harness that draws no such segment,
+or one worded differently, is still reported idle once its screen holds still. When every watched agent is unreachable at once the terminal
 server is the problem, and the pass says so instead of calling every harness
 dead; repairing that is `agentctl watch`'s job.
 

@@ -123,7 +123,7 @@ impl EpisodeKind {
                 options.markers.join(" or ")
             ),
             Self::Stalled => format!(
-                "working, or idle with background work running, with no new output for over {} minutes",
+                "working, or idle while its screen shows work running, with no new output for over {} minutes",
                 minutes(options.stall)
             ),
             Self::Dead => format!(
@@ -197,17 +197,25 @@ fn has_verdict(screen: &str, markers: &[String]) -> bool {
 /// Bottom screen lines scanned for background work that is still running.
 const BACKGROUND_WINDOW_LINES: usize = 12;
 
-/// The part of a status row near the bottom of `screen` that says background work the
-/// agent started is still running, when one shows. Claude Code counts its background
+/// The part of a status row near the bottom of `screen` that says work is still running, when
+/// one shows: a running turn, or background work the agent started. Claude Code counts its background
 /// shells and sub-agents in the footer under its input box, as in
 /// `⏵⏵ auto mode on · 2 shells · ← 1 agent · ↓ to manage`, and in the row that closes a
-/// turn, as in `✻ Sautéed for 5m 51s · done 12:44 AM · 2 shells still running`. An agent
-/// that went idle waiting on such work, such as a validation gate it runs in a background
-/// shell, has not stopped without a verdict; only one whose screen then stops changing
-/// for the stall threshold is reported, as stalled.
+/// turn, as in `✻ Sautéed for 5m 51s · done 12:44 AM · 2 shells still running`. The turn's
+/// row is history: it still says `still running` after the work ends. So when the input box
+/// (a `❯` row) is in view, only the footer rows under it are read, and the turn's row only
+/// when no input box is. An agent that went idle waiting on such work, such as a validation
+/// gate it runs in a background shell, has not stopped without a verdict; only one whose
+/// screen then stops changing for the stall threshold is reported, as stalled.
 fn background_work(screen: &str) -> Option<String> {
     let lines: Vec<&str> = screen.lines().collect();
-    let start = lines.len().saturating_sub(BACKGROUND_WINDOW_LINES);
+    let mut start = lines.len().saturating_sub(BACKGROUND_WINDOW_LINES);
+    if let Some(input) = lines[start..]
+        .iter()
+        .rposition(|line| line.trim_start().starts_with('❯'))
+    {
+        start += input + 1;
+    }
     lines[start..].iter().rev().find_map(|line| {
         if !line.contains('·') {
             return None;
@@ -219,9 +227,15 @@ fn background_work(screen: &str) -> Option<String> {
     })
 }
 
-/// Whether a footer segment is a count of background shells or agents: `1 shell`,
-/// `2 shells`, `1 agent`, `3 agents`, each optionally followed by `still running`.
+/// Whether a footer segment shows work running: Claude Code's `esc to interrupt`, which it
+/// draws while a turn runs, or a count of background shells or agents: `1 shell`, `2 shells`,
+/// `1 agent`, `3 agents`, each optionally followed by `still running`. Herdr's status can say
+/// `idle` while the footer says `esc to interrupt` and output streams (live finding
+/// 2026-10-20), so the screen wins.
 fn background_count(segment: &str) -> bool {
+    if segment == "esc to interrupt" {
+        return true;
+    }
     let segment = segment.strip_suffix(" still running").unwrap_or(segment);
     let Some((count, noun)) = segment.split_once(' ') else {
         return false;
@@ -366,13 +380,13 @@ fn classify(
             .as_deref()
             .is_some_and(|screen| has_verdict(screen, &options.markers));
         if !verdict {
-            // Waiting on its own background work is not idle: the stall rule below
-            // still reports it if the screen stops changing.
+            // A running turn or its own background work is not idle, whatever Herdr's
+            // status says: the stall rule still reports it if the screen stops changing.
             if let Some(work) = observation.screen.as_deref().and_then(background_work) {
                 return Some((
                     EpisodeKind::Stalled,
                     format!(
-                        "status {} while background work runs ({work}); screen unchanged",
+                        "status {} while the screen shows work running ({work}); screen unchanged",
                         observation.status
                     ),
                 ));
@@ -462,13 +476,18 @@ fn update_episode(
     // A stall is timed from the last screen change, not from the first working poll:
     // an agent that works for an hour with changing output, then stops changing,
     // has been stalled only since it stopped.
-    let since = if kind == EpisodeKind::Stalled {
-        memory.screen_changed_at
-    } else {
-        match &memory.episode {
+    // Idle is timed from the last screen change too: Herdr can report a Claude Code agent
+    // idle while its output still streams, and new output is not idleness.
+    let since = match kind {
+        EpisodeKind::Stalled => memory.screen_changed_at,
+        EpisodeKind::IdleNoVerdict => match &memory.episode {
+            Some(episode) if episode.kind == kind => episode.since.max(memory.screen_changed_at),
+            _ => now,
+        },
+        _ => match &memory.episode {
             Some(episode) if episode.kind == kind => episode.since,
             _ => now,
-        }
+        },
     };
     let notified =
         matches!(&memory.episode, Some(episode) if episode.kind == kind && episode.notified);
@@ -1206,6 +1225,9 @@ mod tests {
     // The same pane once the turn row has scrolled away: only the footer counts the work.
     const BACKGROUND_FOOTER_ONLY: &str = "● Waiting for the validation gate in the background.\n\n❯\u{a0}\n\n  ⏵⏵ auto mode on · 1 shell · ↓ to manage\n";
     const BACKGROUND_AGENT_ONLY: &str = "● A reviewer sub-agent is checking the change.\n\n❯\u{a0}\n\n  ⏵⏵ auto mode on · ← 1 agent · ↓ to manage\n";
+    // Claude Code's footer while a turn runs, read from a live pane on 2026-10-20 that Herdr
+    // reported idle.
+    const WORKING_FOOTER: &str = "● Reading the code.\n\n✽ Orbiting… (5m 38s · ↓ 20.5k tokens)\n\n❯\u{a0}\n\n  ⏵⏵ auto mode on · esc to interrupt · ↓ to manage\n";
     // Claude Code's footer with no background work.
     const QUIET_FOOTER: &str = "● Finished the change.\n\n❯\u{a0}\n\n  ⏵⏵ auto mode on\n";
 
@@ -1228,6 +1250,13 @@ mod tests {
             Some("3 shells still running")
         );
         assert_eq!(background_work(QUIET_FOOTER), None);
+        assert_eq!(
+            background_work(WORKING_FOOTER).as_deref(),
+            Some("esc to interrupt")
+        );
+        // The turn's row is history: once the footer no longer counts the work, it is over.
+        let ended = BACKGROUND_TURN_END.replace(" · 2 shells · ← 1 agent", "");
+        assert_eq!(background_work(&ended), None, "{ended}");
         assert_eq!(background_work(IDLE_SCREEN), None);
         // Prose that mentions shells is not a count, and zero is no work.
         assert_eq!(
@@ -1271,9 +1300,7 @@ mod tests {
         assert_eq!(due["episodes"][0]["kind"], "stalled", "{due}");
         assert_eq!(notifier.sent.len(), 1);
         assert!(
-            notifier.sent[0]
-                .1
-                .contains("background work runs (1 shell)"),
+            notifier.sent[0].1.contains("work running (1 shell)"),
             "{}",
             notifier.sent[0].1
         );
@@ -1287,6 +1314,44 @@ mod tests {
         let idle = pass(&mut probe, &mut notifier, &mut state, 3900.0, &options);
         assert_eq!(idle["episodes"][0]["kind"], "idle-no-verdict", "{idle}");
         assert_eq!(notifier.sent.len(), 2);
+    }
+
+    #[test]
+    fn idle_is_timed_from_the_last_screen_change() {
+        // Herdr said idle while the agent's output kept changing: no idle report until the
+        // screen has held still for the idle threshold.
+        let options = options();
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let screens = ["● step one\n❯\n", "● step two\n❯\n", "● step three\n❯\n"];
+        for (index, screen) in screens.iter().enumerate() {
+            let mut probe = ScriptedProbe(vec![vec![observation("busy", "idle", Some(screen))]]);
+            let at = 600.0 * index as f64;
+            let report = pass(&mut probe, &mut notifier, &mut state, at, &options);
+            assert_eq!(report["episodes"][0]["kind"], "idle-no-verdict", "{report}");
+            assert_eq!(report["episodes"][0]["since"], at, "{report}");
+        }
+        assert!(notifier.sent.is_empty(), "{:?}", notifier.sent);
+        let mut probe = ScriptedProbe(vec![vec![observation("busy", "idle", Some(screens[2]))]]);
+        pass(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            1200.0 + 900.0,
+            &options,
+        );
+        assert_eq!(notifier.sent.len(), 1);
+
+        // A footer that says a turn runs holds an idle-status agent to the stall rule.
+        let mut state = WatchState::default();
+        let mut probe = ScriptedProbe(vec![
+            vec![observation("streaming", "idle", Some(WORKING_FOOTER))],
+            vec![observation("streaming", "idle", Some(WORKING_FOOTER))],
+        ]);
+        pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
+        let held = pass(&mut probe, &mut notifier, &mut state, 1000.0, &options);
+        assert_eq!(held["episodes"][0]["kind"], "stalled", "{held}");
+        assert_eq!(notifier.sent.len(), 1);
     }
 
     #[test]

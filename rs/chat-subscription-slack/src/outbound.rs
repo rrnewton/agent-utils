@@ -383,7 +383,8 @@ impl OutboundConfig {
                                 self.format,
                                 self.timeout,
                                 Diagnostics::new(self.diagnostics_log.clone(), "slack-outbound"),
-                            ),
+                            )
+                            .with_client(self.client_identity, self.cli_arguments.clone()),
                         )))
                     }
                     _ => Ok(inner),

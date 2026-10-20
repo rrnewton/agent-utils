@@ -57,7 +57,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::cli::{self, CliTransport, Completed};
+use crate::cli::{self, CliTransport, ClientIdentity, Completed};
 use crate::diag::Diagnostics;
 use crate::ids::{self, AppId};
 use crate::transport::{
@@ -66,7 +66,9 @@ use crate::transport::{
 };
 
 /// Wire version of the socket protocol.
-const PROTOCOL_VERSION: u64 = 1;
+// 2 added the client identity and prefix arguments to every request, so a worker started for
+// another identity than the helper's holds no spare for it (#383 slack-crewmate-outbound).
+const PROTOCOL_VERSION: u64 = 2;
 /// Largest request line the worker reads: a body of at most 12,000 bytes, JSON-escaped.
 const MAX_REQUEST_LINE_BYTES: usize = 256 * 1024;
 /// Largest response line the helper reads.
@@ -105,6 +107,8 @@ pub struct WarmClient {
     cli: PathBuf,
     app_id: AppId,
     format: TextFormat,
+    identity: ClientIdentity,
+    prefix_arguments: Vec<String>,
     timeout: Duration,
     diagnostics: Diagnostics,
 }
@@ -118,6 +122,13 @@ pub enum WarmPost {
     Posted(String),
     /// The post failed, with application evidence.
     Failed(TransportError),
+}
+
+fn identity_name(identity: ClientIdentity) -> &'static str {
+    match identity {
+        ClientIdentity::User => "user",
+        ClientIdentity::Crewmate => "crewmate",
+    }
 }
 
 fn format_name(format: TextFormat) -> &'static str {
@@ -143,9 +154,20 @@ impl WarmClient {
             cli,
             app_id,
             format,
+            identity: ClientIdentity::User,
+            prefix_arguments: Vec::new(),
             timeout,
             diagnostics,
         }
+    }
+
+    /// The same client, run with `prefix_arguments` before its subcommand and acting as
+    /// `identity`; a spare must match both.
+    #[must_use]
+    pub fn with_client(mut self, identity: ClientIdentity, prefix_arguments: Vec<String>) -> Self {
+        self.identity = identity;
+        self.prefix_arguments = prefix_arguments;
+        self
     }
 
     fn request(&self, op: &str, channel_id: &str, thread_ts: Option<&str>) -> Value {
@@ -155,6 +177,8 @@ impl WarmClient {
             "cli": self.cli,
             "app_id": self.app_id.as_str(),
             "format": format_name(self.format),
+            "client_identity": identity_name(self.identity),
+            "cli_arguments": self.prefix_arguments,
             "channel_id": channel_id,
             "thread_ts": thread_ts,
         })
@@ -758,6 +782,15 @@ impl Worker {
         {
             return Err("the request is for another client, app or format".to_owned());
         }
+        let options = self.transport.options();
+        if request.get("client_identity").and_then(Value::as_str)
+            != Some(identity_name(options.identity))
+            || request.get("cli_arguments") != Some(&json!(options.prefix_arguments))
+        {
+            return Err(
+                "the request is for another client identity or other client arguments".to_owned(),
+            );
+        }
         let channel_id = request
             .get("channel_id")
             .and_then(Value::as_str)
@@ -1150,16 +1183,18 @@ mod tests {
     fn parses_post_responses() {
         assert_eq!(
             parse_post_response(
-                &json!({"version": 1, "result": "posted", "ts": "1700000000.000100"})
+                &json!({"version": PROTOCOL_VERSION, "result": "posted", "ts": "1700000000.000100"})
             ),
             WarmPost::Posted("1700000000.000100".to_owned())
         );
         assert!(matches!(
-            parse_post_response(&json!({"version": 1, "result": "no_spare", "detail": "x"})),
+            parse_post_response(
+                &json!({"version": PROTOCOL_VERSION, "result": "no_spare", "detail": "x"})
+            ),
             WarmPost::NoSpare(_)
         ));
         let WarmPost::Failed(error) = parse_post_response(&json!({
-            "version": 1, "result": "failed", "code": "ratelimited", "detail": "slow down",
+            "version": PROTOCOL_VERSION, "result": "failed", "code": "ratelimited", "detail": "slow down",
             "outcome": "not_applied", "retryable": true
         })) else {
             panic!("a failure");
@@ -1167,9 +1202,9 @@ mod tests {
         assert_eq!(error.outcome, Outcome::NotApplied);
         // Anything the helper cannot read is an unknown outcome, never a reason to post again.
         for response in [
-            json!({"version": 1, "result": "posted", "ts": "nope"}),
-            json!({"version": 2, "result": "no_spare"}),
-            json!({"version": 1, "result": "failed", "code": "x", "outcome": "maybe"}),
+            json!({"version": PROTOCOL_VERSION, "result": "posted", "ts": "nope"}),
+            json!({"version": PROTOCOL_VERSION + 1, "result": "no_spare"}),
+            json!({"version": PROTOCOL_VERSION, "result": "failed", "code": "x", "outcome": "maybe"}),
             json!({"version": 1}),
         ] {
             let WarmPost::Failed(error) = parse_post_response(&response) else {
@@ -1232,7 +1267,11 @@ mod tests {
                 match script {
                     Script::Answer(answer) => respond(&stream, &answer).expect("answer"),
                     Script::Commit(answer) => {
-                        respond(&stream, &json!({"version": 1, "result": "ready"})).expect("ready");
+                        respond(
+                            &stream,
+                            &json!({"version": PROTOCOL_VERSION, "result": "ready"}),
+                        )
+                        .expect("ready");
                         record(&mut reader);
                         if let Some(answer) = answer {
                             respond(&stream, &answer).expect("answer");
@@ -1274,7 +1313,7 @@ mod tests {
         let (socket, seen, server) = stand_in(
             "posted",
             vec![Script::Commit(Some(
-                json!({"version": 1, "result": "posted", "ts": "1700000001.000200"}),
+                json!({"version": PROTOCOL_VERSION, "result": "posted", "ts": "1700000001.000200"}),
             ))],
         );
         let fake = crate::fake::FakeTransport::new();
@@ -1301,9 +1340,11 @@ mod tests {
         // answers the request at all (stopped or hung) cannot have posted, so the helper posts
         // with its own client run. The silent worker costs the helper `READY_TIMEOUT`.
         for script in [
-            Script::Answer(json!({"version": 1, "result": "no_spare", "detail": "none"})),
+            Script::Answer(
+                json!({"version": PROTOCOL_VERSION, "result": "no_spare", "detail": "none"}),
+            ),
             Script::Commit(Some(
-                json!({"version": 1, "result": "failed", "code": "invalid_auth",
+                json!({"version": PROTOCOL_VERSION, "result": "failed", "code": "invalid_auth",
                 "detail": "x", "outcome": "not_applied", "retryable": true}),
             )),
             Script::Silent(READY_TIMEOUT + Duration::from_millis(500)),
@@ -1330,9 +1371,9 @@ mod tests {
     #[test]
     fn a_refusal_that_cannot_succeed_again_is_not_retried() {
         for answer in [
-            json!({"version": 1, "result": "failed", "code": "msg_too_long", "detail": "x",
+            json!({"version": PROTOCOL_VERSION, "result": "failed", "code": "msg_too_long", "detail": "x",
                 "outcome": "not_applied", "retryable": false}),
-            json!({"version": 1, "result": "failed", "code": "ratelimited", "detail": "x",
+            json!({"version": PROTOCOL_VERSION, "result": "failed", "code": "ratelimited", "detail": "x",
                 "outcome": "not_applied", "retryable": true}),
         ] {
             let (socket, _, server) =
@@ -1355,7 +1396,7 @@ mod tests {
         // answering, both leave the post possibly made, so the inner transport is not used.
         for answer in [
             Some(
-                json!({"version": 1, "result": "failed", "code": "transport_timeout",
+                json!({"version": PROTOCOL_VERSION, "result": "failed", "code": "transport_timeout",
                 "detail": "x", "outcome": "unknown", "retryable": true}),
             ),
             None,
@@ -1378,7 +1419,7 @@ mod tests {
         let (socket, seen, server) = stand_in(
             "prepare",
             vec![Script::Answer(
-                json!({"version": 1, "ok": true, "spare": "started"}),
+                json!({"version": PROTOCOL_VERSION, "ok": true, "spare": "started"}),
             )],
         );
         let fake = crate::fake::FakeTransport::new();

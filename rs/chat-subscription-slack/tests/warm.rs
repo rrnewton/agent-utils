@@ -374,3 +374,25 @@ fn a_second_worker_for_the_same_socket_refuses_to_start() {
     run_helper(&root, APP, &reaction(ID1, THREAD));
     wait_for("the spare to start", || sends(&root).0.len() == 1);
 }
+
+#[test]
+fn a_worker_started_for_another_client_identity_holds_no_spare_for_the_helper() {
+    // #383 slack-crewmate-outbound: the worker is its own unit with its own arguments. A worker
+    // run as a Crewmate must not post a user-mode helper's reply without `--as`, nor the reverse,
+    // so a helper whose identity or client arguments differ gets no spare and posts with its own
+    // client run.
+    let root = workspace("identity");
+    let _worker = start_worker(&root, &["--client-identity=crewmate"]);
+    run_helper(&root, APP, &reaction(ID1, THREAD));
+    thread::sleep(Duration::from_millis(300));
+    assert!(sends(&root).0.is_empty(), "no spare for another identity");
+    let replied = run_helper(&root, APP, &send(ID2, THREAD, "own run"));
+    assert_eq!(replied["ok"], true, "{replied}");
+    let lines = log_lines(&root);
+    let sent: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.contains("slack.message send"))
+        .collect();
+    assert_eq!(sent.len(), 1, "{lines:?}");
+    assert!(sent[0].contains(&format!("--as={APP}")), "{}", sent[0]);
+}
