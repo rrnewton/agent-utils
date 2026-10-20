@@ -196,6 +196,14 @@ SHORT_SCREENS = ((667, 375), (375, 330))
 # The design's line: Send's centre at least this far down the screen, where a thumb rests.
 REACH = 0.62
 HOLD_MS = 2000
+# Liveness bound for "the settled card is gone", not a judgement: Playwright polls the condition
+# itself, and the layout this check measures is read only once it holds.  The settle reaches the
+# page on its long-poll watch, answered by this process's own server thread, so the wait is for
+# two starved threads to be scheduled; at gate load (several gates at once, host load 30-130) 5 s
+# was observed to pass with the card still up and no other fault (ci-repair gate 6, 2026-10-19).
+# The step's own wall budget is 960 s (tests.dag.yaml); 120 s keeps a never-settling card a
+# prompt, named failure while leaving scheduling out of what is judged.  `#389 gate-flakes`.
+CARD_GONE_MS = 120_000
 # Point 8's desk, and its channel's one thread: Main's message 3 opened it, and 13 and 14 answer in it.
 DESK = (1280, 800)
 THREAD_ID = "1110000000000000300"
@@ -618,6 +626,11 @@ def until(page: Page, condition: Callable[[], bool], what: str, timeout_ms: int 
     raise AssertionError(f"timed out waiting for {what}")
 
 
+def card_gone(page: Page) -> None:
+    """Wait until the settled send card is no longer drawn (see CARD_GONE_MS)."""
+    page.locator("#post-confirm").wait_for(state="hidden", timeout=CARD_GONE_MS)
+
+
 # Every number this check judges, read in one go from the laid-out page.
 MEASURE_JS = """() => {
   const box = (id) => { const n = document.getElementById(id); return n ? n.getBoundingClientRect() : null; };
@@ -898,7 +911,7 @@ def placement_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: t
     if screenshots:
         page.screenshot(path=str(screenshots / f"card-settings-{width}x{height}.png"), animations="disabled")
     page.click("#post-confirm-send")
-    page.locator("#post-confirm").wait_for(state="hidden", timeout=5000)
+    card_gone(page)
     check([commit.get("confirmed_by") for commit in api.commits] == ["ui"],
           f"{where}: Send on the docked card did not commit once, as the UI: {api.commits}")
     page.click("#close-settings")
@@ -1004,7 +1017,7 @@ def frozen_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: tupl
     page.wait_for_timeout(HOLD_MS + 200)
     page.evaluate(TO_NEWEST_JS)
     page.click("#post-confirm-send")
-    page.locator("#post-confirm").wait_for(state="hidden", timeout=5000)
+    card_gone(page)
     until(page, lambda: any(entry.startswith("claim") for entry in api.log), "the claim of the send")
     page.wait_for_timeout(300)
     frozen = page.evaluate(FROZEN_JS)
@@ -1169,7 +1182,7 @@ def channel_still_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, siz
         if stage == "Send":
             page.wait_for_timeout(HOLD_MS)
             page.click("#post-confirm-send")
-            page.locator("#post-confirm").wait_for(state="hidden", timeout=5000)
+            card_gone(page)
             page.wait_for_timeout(150)
         elif stage == "the box taking back its room":
             page.wait_for_timeout(1300)
@@ -1193,7 +1206,7 @@ def channel_still_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, siz
             page.wait_for_timeout(HOLD_MS)
             # Not a click: Playwright would scroll the card into view first, which is a move the reader made.
             page.evaluate("() => document.getElementById('post-confirm-send').click()")
-            page.locator("#post-confirm").wait_for(state="hidden", timeout=5000)
+            card_gone(page)
             page.wait_for_timeout(150)
         elif stage == "the box taking back its room":
             page.wait_for_timeout(1300)
@@ -1407,7 +1420,7 @@ def columns_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, screensho
 
         # Send on the card commits the draft once, and the reply stays as it was.
         page.click("#post-confirm-send")
-        page.locator("#post-confirm").wait_for(state="hidden", timeout=5000)
+        card_gone(page)
         check([commit.get("confirmed_by") for commit in api.commits] == ["ui"],
               f"{where}: Send on the card beside a reply did not commit the draft once: {api.commits}")
         after = columns_measure(page)
@@ -1603,7 +1616,7 @@ def thread_list_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size:
         # newest line: both stay at their foot, and the status pill stands on the card. Then a reader up
         # the cards keeps the very card through another.
         api.settle()
-        page.locator("#post-confirm").wait_for(state="hidden", timeout=5000)
+        card_gone(page)
         page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; }")
         page.wait_for_timeout(300)
         propose(page, api, 32, LONG_DRAFT)
@@ -1615,7 +1628,7 @@ def thread_list_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size:
         check(arrived["pill"] is not None and rect(arrived["pill"], "bottom") <= rect(arrived["card"], "top") + 0.5,
               f"{where}: the status pill does not stand on the docked card")
         api.settle()
-        page.locator("#post-confirm").wait_for(state="hidden", timeout=5000)
+        card_gone(page)
         page.evaluate("() => { const s = document.getElementById('side-scroll'); s.scrollTop = s.scrollHeight - s.clientHeight - 160; }")
         page.wait_for_timeout(300)
         before = thread_list_measure(page)["first"]
@@ -1815,7 +1828,7 @@ def thread_list_arrival_case(page: Page, url: str, voice: FakeVoice, api: FakeAp
                   f"{where}: a {words} draft arriving and {mod}+1 moved the row a reader {up}px up Main was on from"
                   f" {first} to {back['first']}, or offered no jump ({back['jump']!r})")
             api.settle()
-            page.locator("#post-confirm").wait_for(state="hidden", timeout=5000)
+            card_gone(page)
             page.wait_for_timeout(1300)
 
         # No card at all: a reader up All, Cmd+3, then Esc or Cmd+2, on the same row.
@@ -1895,7 +1908,7 @@ def thread_list_away_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, 
                           abs(float(first["offset"]) - float(now["offset"])) <= 1,
                           f"{where}: {how} moved a reader {up}px up the cards from {first} to {now}{when}")
             api.settle()
-            page.locator("#post-confirm").wait_for(state="hidden", timeout=5000)
+            card_gone(page)
             page.wait_for_timeout(1300)
         check(not api.commits and not api.cancels, f"{where}: a trip posted or withdrew a draft")
     finally:
@@ -1979,7 +1992,7 @@ def thread_list_cards_case(page: Page, url: str, voice: FakeVoice, api: FakeApi,
                       f"{where}: a reader who moved 200px up the cards in two columns was not kept there by {mod}+3:"
                       f" from {moved['first']} to {now['first']}")
             api.settle()
-            page.locator("#post-confirm").wait_for(state="hidden", timeout=5000)
+            card_gone(page)
             page.wait_for_timeout(1300)
         check(not api.commits and not api.cancels, f"{where}: a view key posted or withdrew a draft")
     finally:
@@ -2048,7 +2061,7 @@ def room_back_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: t
                     page.tap("#post-confirm-send")
                 else:
                     page.click("#post-confirm-send")
-                page.locator("#post-confirm").wait_for(state="hidden", timeout=5000)
+                card_gone(page)
                 gone = time.monotonic()
                 if more:
                     focus = page.evaluate("() => document.activeElement ? document.activeElement.id : ''")
@@ -2376,7 +2389,7 @@ def card_alone_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: 
                 page.tap("#post-confirm-send")
             else:
                 api.settle()
-            page.locator("#post-confirm").wait_for(state="hidden", timeout=5000)
+            card_gone(page)
             gone = time.monotonic()
             if back is not None:
                 page.wait_for_timeout(200)
@@ -2597,10 +2610,10 @@ def help_key_trip_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, siz
             check(docked == ["frame-body", "dock", False], f"{where}: the premise, the card docked under Help: {docked}")
             if change == "settle":
                 api.settle()
-                page.locator("#post-confirm").wait_for(state="hidden", timeout=5000)
+                card_gone(page)
             elif change == "tap":
                 page.tap("#post-confirm-send")
-                page.locator("#post-confirm").wait_for(state="hidden", timeout=5000)
+                card_gone(page)
             else:
                 serial += 1
                 api.propose({"serial": serial, "handle": f"hAnDlE-browser-check-{serial:04d}",
@@ -2627,7 +2640,7 @@ def help_key_trip_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, siz
                             f" and Send tappable {after['sendHit']}")
             if change == "shorter":
                 api.settle()
-                page.locator("#post-confirm").wait_for(state="hidden", timeout=5000)
+                card_gone(page)
                 page.wait_for_timeout(1300)
             page.evaluate("() => document.getElementById('scroll-area').focus()")
         taps = sum(1 for *_, change, _ in trips if change == "tap")
