@@ -67,6 +67,7 @@ import mimetypes
 import os
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -376,6 +377,24 @@ class Walk:
         except Exception as error:  # noqa: BLE001 - Playwright's timeout, said as this check's failure
             raise AssertionError(f"{self.label}: {why}") from error
 
+    def posted_since(self, sent: int, why: str) -> list[Json]:
+        """The replies the fake API has taken since `sent`, once at least one has arrived.
+
+        Send going back to the list says the page has finished, not that this
+        process's server thread has been scheduled to take the POST; a fixed
+        200 ms judged that gap and read an empty list on a loaded machine
+        (done-races validate-land2, 2026-10-19).  Poll the API's own record
+        instead.  `#389 gate-flakes`.
+        """
+        deadline = time.monotonic() + 60
+        while True:
+            with self.api.lock:
+                posted = list(self.api.replies[sent:])
+            if posted:
+                return posted
+            self.check(time.monotonic() < deadline, f"{why}: nothing left the browser")
+            self.page.wait_for_timeout(20)
+
     def press(self, selector: str) -> None:
         """A finger on a phone, the mouse on a desk: at the centre of what `selector` draws, unscrolled."""
         box = self.page.locator(selector).first.bounding_box()
@@ -571,9 +590,7 @@ def send_case(walk: Walk) -> None:
     walk.wait_for(f"() => document.querySelectorAll('#discord-log > li[data-id]').length === {COUNT + 1}",
                   "send: the sent reply never reached the list")
     walk.settled()
-    walk.page.wait_for_timeout(200)
-    with walk.api.lock:
-        posted = list(walk.api.replies[sent:])
+    posted = walk.posted_since(sent, "send")
     walk.check(len(posted) == 1 and posted[0].get("text") == words and posted[0].get("reply_to") == message_id(index),
                f"send: what left the browser was {posted}")
     walk.wait_for(f"() => {{ const li = document.querySelector(\"#discord-log > li[data-id='{message_id(index)}']\");"
@@ -716,9 +733,7 @@ def new_thread_walk(walk: Walk) -> None:
     sent = len(walk.api.replies)
     walk.press("#reply-send")
     walk.wait_for("() => !document.getElementById('screen-main').hidden", "new-thread: Send did not go back to the list")
-    walk.page.wait_for_timeout(200)
-    with walk.api.lock:
-        posted = list(walk.api.replies[sent:])
+    posted = walk.posted_since(sent, "new-thread")
     walk.check(len(posted) == 1 and posted[0].get("thread_id") == thread_of(message_id(index))
                and posted[0].get("reply_to") == message_id(index),
                f"new-thread: what left the browser was {posted}")
@@ -854,9 +869,7 @@ def quote_case(walk: Walk) -> None:
     walk.press("#reply-send")
     walk.wait_for("() => !document.getElementById('screen-main').hidden", "quote: Send did not go back to the list")
     walk.settled()
-    page.wait_for_timeout(200)
-    with walk.api.lock:
-        posted = list(walk.api.replies[sent:])
+    posted = walk.posted_since(sent, "quote")
     walk.check(len(posted) == 1 and posted[0].get("text") == f"{expected}agreed" and posted[0].get("reply_to") == row_id,
                f"quote: what left the browser was {posted}")
     quoted = len(expected.splitlines()) - 1
