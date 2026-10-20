@@ -50,6 +50,7 @@ import json
 import mimetypes
 import os
 import re
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -189,6 +190,31 @@ ROW_JS = """(id) => {
 SELECTED_JS = """() => {
   const row = document.querySelector('#discord-log > li[data-selected="true"]');
   return row ? row.getAttribute('data-id') : null;
+}"""
+
+# Record, in the page, the marked row and the selected row at the moment the Done
+# flash starts.  The moment is brief (DONE_FLASH_HOLD_MS, then a 300 ms fade) and
+# was read through three separate evaluates after a fixed wait; on a loaded
+# machine those round trips outlasted it and measured a ring already let go
+# (search-load-older gate-flake2, 2026-10-19).  A MutationObserver runs in the
+# page at the change itself, so what it keeps is the moment however the host is
+# scheduling this process.  `#389 gate-flakes`.
+MOMENT_JS = """(id) => {
+  const ROW = """ + ROW_JS + """;
+  const list = document.getElementById('discord-log');
+  window.__doneMoment = null;
+  const take = () => {
+    const row = document.querySelector(`#discord-log > li[data-id="${id}"]`);
+    if (!row || row.getAttribute('data-done-flash') !== 'marking' || window.__doneMoment) return;
+    const selected = document.querySelector('#discord-log > li[data-selected="true"]');
+    window.__doneMoment = {
+      marked: ROW(id),
+      selected: selected ? ROW(selected.getAttribute('data-id')) : null,
+    };
+  };
+  new MutationObserver(take).observe(list, { subtree: true, attributes: true,
+    attributeFilter: ['data-done-flash', 'data-selected', 'data-archived'] });
+  take();
 }"""
 
 # The row of chips over the list, the Undo chip's name, the status pill, and the composer's box and
@@ -339,7 +365,7 @@ def open_channel(browser: Browser, api: FakeApi, *, reduced: bool = False, schem
     return page, errors
 
 
-def marking(walk: Walk) -> str:
+def marking(walk: Walk, before_mark: Callable[[str], None] | None = None) -> str:
     """Select a message from the keyboard, see it ringed in the accent, press e. Answers its id."""
     walk.key("ArrowDown")
     walk.page.wait_for_timeout(100)
@@ -349,6 +375,8 @@ def marking(walk: Walk) -> str:
     check(before["outlineStyle"] == "solid" and before["outlineColor"] == before["accent"],
           f"a selected unread message is not ringed solid in the accent: {before}")
     check(before["background"] == before["lit"], f"a selected message is not on the lit surface: {before}")
+    if before_mark is not None:
+        before_mark(marked)
     walk.key("e")
     return marked
 
@@ -437,9 +465,15 @@ def walk_reduced(walk: Walk) -> None:
 
 def walk_pictures(walk: Walk, scheme: Scheme, size: str) -> str:
     """The moment of marking and a selected read message, as the eye is left with them."""
-    marked = marking(walk)
-    walk.page.wait_for_timeout(300)
-    moment, nxt = walk.row(marked), walk.row(walk.selected())
+    marking(walk, lambda marked: walk.page.evaluate(MOMENT_JS, marked))
+    walk.page.wait_for_function("() => window.__doneMoment !== null", timeout=30_000)
+    kept: object = walk.page.evaluate("() => window.__doneMoment")
+    check(isinstance(kept, dict) and isinstance(kept.get("marked"), dict)
+          and isinstance(kept.get("selected"), dict),
+          f"{scheme} {size}: the recorded moment answered {kept!r}")
+    assert isinstance(kept, dict)
+    moment, nxt = kept["marked"], kept["selected"]
+    assert isinstance(moment, dict) and isinstance(nxt, dict)
     check(moment["outlineStyle"] == "dashed" and nxt["outlineStyle"] == "solid",
           f"{scheme} {size}: the moment and the next message are not told apart by the ring: {moment} / {nxt}")
     # From review: in these captures the Undo chip stood on Send.
