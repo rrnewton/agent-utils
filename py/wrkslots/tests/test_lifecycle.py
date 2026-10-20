@@ -54447,6 +54447,34 @@ def test_remove_agent_batch_removes_disk_image_slots(
         pytest.skip(f"no slot image backend on this host: {exc}")
     monkeypatch.setenv("WRKSLOTS_INIT_REPRESENTATION", "image")
     project = tmp_path / "project"
+
+    def unused_fresh_scan(
+        _slot_path: Path, _record: object, *, capture_generation: bool
+    ) -> None:
+        return None
+
+    original_observe_once = wrkslots._observe_slot_use_once
+
+    def unused_lsof_check(*args: object, **kwargs: object) -> object:
+        # The batch routes its own checks through this entry point; only the
+        # ordinary check it dispatches to (the host-wide lsof and /proc
+        # walks) is answered unused.
+        if kwargs.get("agent_batch") is not None:
+            return cast(Callable[..., object], original_observe_once)(*args, **kwargs)
+        return None
+
+    # The fresh /proc scan and the lsof check before the fence each walk
+    # every process on the host; how long they take is the host's load, not
+    # this test's subject, and on a loaded host they spent the items' whole
+    # 60-second budgets before their fences (fresh_process_scan_seconds
+    # 63.5 over four scans and image_lsof_check_seconds 53.9 over two when
+    # this was measured starved).  Answer both unused, as the routing test
+    # above answers the fresh scan; the shared census, the checks' wrappers
+    # and counts, and the fenced scans this test counts stay real, and the
+    # ordinary lsof check itself is covered with live holders elsewhere.
+    # `#389 gate-flakes`.
+    monkeypatch.setattr(wrkslots, "_agent_batch_fresh_use", unused_fresh_scan)
+    monkeypatch.setattr(wrkslots, "_observe_slot_use_once", unused_lsof_check)
     try:
         made, _repository, slots = dead_agent_batch_project(tmp_path, count=2)
         assert made == project
@@ -54571,6 +54599,30 @@ def test_remove_agent_batch_refuses_before_fencing_when_the_image_check_outlasts
     original_rename = wrkslots._rename_slot_path
     renames: list[tuple[Path, Path]] = []
 
+    def unused_fresh_scan(
+        _slot_path: Path, _record: object, *, capture_generation: bool
+    ) -> None:
+        return None
+
+    original_observe_once = wrkslots._observe_slot_use_once
+
+    def unused_lsof_check(*args: object, **kwargs: object) -> object:
+        # The batch routes its own checks through this entry point; only the
+        # ordinary check it dispatches to (the host-wide lsof and /proc
+        # walks) is answered unused.
+        if kwargs.get("agent_batch") is not None:
+            return cast(Callable[..., object], original_observe_once)(*args, **kwargs)
+        return None
+
+    # As in test_remove_agent_batch_removes_disk_image_slots: the fresh
+    # /proc scan's and the lsof check's lengths are the host's load; left
+    # real, the scan refused this item past its own 30-second bound before
+    # the image check ran, and the lsof check itself outlasted even a fresh
+    # item budget.  The image check's wrapper, its count and its place
+    # before the fence stay real; only its host-wide scan is answered.
+    monkeypatch.setattr(wrkslots, "_agent_batch_fresh_use", unused_fresh_scan)
+    monkeypatch.setattr(wrkslots, "_observe_slot_use_once", unused_lsof_check)
+
     def check_then_expire(
         self: wrkslots._AgentRemoveBatchContext,
         check_path: Path,
@@ -54579,6 +54631,14 @@ def test_remove_agent_batch_refuses_before_fencing_when_the_image_check_outlasts
         canonical_path: Path,
         capture_generation: bool,
     ) -> object:
+        # Begin the check with its whole budget, whenever the work before it
+        # (host-wide scans whose length is the host's load) has left the item.
+        # Otherwise a loaded host spends the budget first and the item is
+        # refused at an earlier scan instead of at the path fence this test
+        # is about.  `#389 gate-flakes`.
+        deadline = wrkslots._ITEM_DEADLINE.get()
+        assert deadline is not None
+        deadline.started_at = time.monotonic()
         verdict = original_check(
             self,
             check_path,
@@ -54586,8 +54646,6 @@ def test_remove_agent_batch_refuses_before_fencing_when_the_image_check_outlasts
             canonical_path=canonical_path,
             capture_generation=capture_generation,
         )
-        deadline = wrkslots._ITEM_DEADLINE.get()
-        assert deadline is not None
         deadline.started_at -= deadline.seconds
         return verdict
 
