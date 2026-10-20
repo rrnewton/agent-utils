@@ -20786,8 +20786,133 @@ function withThreadQuery(path, threadId) {
   return threadId ? `${path}${path.includes("?") ? "&" : "?"}thread_id=${encodeURIComponent(threadId)}` : path;
 }
 
+// `#396 thread-color-memory`. A thread keeps its colour on this device across a reload and a trip to
+// another channel and back. The colours are handed out in the order threads are first drawn, so
+// held only in memory they came back different every time a reload — or a channel change, which
+// starts the channel afresh — drew the threads in another order. Each channel's colours are now
+// kept in localStorage and put back before its first thread is drawn; a thread seen for the first
+// time still gets the widest arc left, measured against the ones put back.
+//
+// Bounded, the least recently drawn going first: every colour remembered is an arc a new thread
+// cannot have, so a channel that remembered every thread it ever had would crowd its new ones
+// into slivers. A browser that refuses storage colours threads exactly as before, for the session.
+const THREAD_HUES_KEY = "vibe-talk.thread-hues";
+const THREAD_HUES_VERSION = 1;
+/**
+ * Threads remembered per channel. With 24 the widest arc left is at least 15° wide, so a new thread
+ * lands at least 7.5° from a remembered one; it is this cap that keeps that floor.
+ */
+const THREAD_HUES_PER_CHANNEL = 24;
+/** Threads remembered across every channel at once. */
+const THREAD_HUES_TOTAL = 480;
+/** How stale a thread's "last drawn" may get in a long-open page before it is stored again. */
+const THREAD_HUES_SEEN_REFRESH_MS = 60 * 60 * 1000;
+
+/** The channel id `threadColors` holds the colours of, or null before any is drawn. */
+let threadColorsChannel = null;
+/** Threads drawn since that channel's colours were put back, and when each was last drawn. */
+const threadHuesSeen = new Map();
+let threadHuesSaveOwed = false;
+
+/** Where a channel's colours are kept: by provider as well, since two services may share an id. */
+function threadHueScope(channel) {
+  const known = knownChannels.find((candidate) => String(candidate.id) === String(channel));
+  return JSON.stringify([known && typeof known.provider === "string" ? known.provider : "", String(channel)]);
+}
+
+/**
+ * The newest `limit` of `entries` ([id, [hue, lastDrawn]]), by when each was last drawn, as an
+ * object. Built by `fromEntries`, so an id such as `__proto__` is a key like any other.
+ */
+function newestThreadHues(entries, limit) {
+  return Object.fromEntries(entries.length <= limit ? entries
+    : entries.slice().sort((a, b) => b[1][1] - a[1][1]).slice(0, limit));
+}
+
+/**
+ * Every channel's remembered colours, as {scope: {thread id: [hue, lastDrawn]}}. Storage is a
+ * boundary: anything unreadable is left out, and a refusal to read at all is an empty memory.
+ */
+function readThreadHues() {
+  let stored = null;
+  try {
+    stored = JSON.parse(localStorage.getItem(THREAD_HUES_KEY) || "null");
+  } catch (_error) {
+    return Object.create(null);
+  }
+  if (stored === null || typeof stored !== "object" || stored.v !== THREAD_HUES_VERSION ||
+      stored.channels === null || typeof stored.channels !== "object" || Array.isArray(stored.channels)) {
+    return Object.create(null);
+  }
+  const channels = Object.create(null);
+  for (const [scope, threads] of Object.entries(stored.channels)) {
+    if (threads === null || typeof threads !== "object" || Array.isArray(threads)) continue;
+    const kept = Object.entries(threads).filter(([_id, entry]) =>
+      Array.isArray(entry) && entry.length === 2 && Number.isFinite(entry[0]) && entry[0] >= 0 &&
+      entry[0] < 360 && Number.isFinite(entry[1]));
+    if (kept.length > 0) channels[scope] = newestThreadHues(kept, THREAD_HUES_PER_CHANNEL);
+  }
+  return channels;
+}
+
+/**
+ * Store what this page drew of its channel into the remembered colours, as they stand in storage
+ * now — another window may have written its own since — trimmed to the bounds.
+ */
+function saveThreadHues() {
+  if (!threadHuesSaveOwed) return;
+  threadHuesSaveOwed = false;
+  if (!threadColorsChannel) return;
+  const channels = readThreadHues();
+  const scope = threadHueScope(threadColorsChannel);
+  const threads = new Map(Object.entries(channels[scope] || {}));
+  for (const [id, drawn] of threadHuesSeen) {
+    if (threadColors.has(id)) threads.set(id, [threadColors.get(id), drawn]);
+  }
+  channels[scope] = newestThreadHues([...threads], THREAD_HUES_PER_CHANNEL);
+  const every = Object.entries(channels).flatMap(([held, kept]) =>
+    Object.entries(kept).map(([id, entry]) => [held, id, entry[1]]));
+  if (every.length > THREAD_HUES_TOTAL) {
+    every.sort((a, b) => b[2] - a[2]);
+    for (const [held, id] of every.slice(THREAD_HUES_TOTAL)) {
+      delete channels[held][id];
+      if (Object.keys(channels[held]).length === 0) delete channels[held];
+    }
+  }
+  try {
+    localStorage.setItem(THREAD_HUES_KEY, JSON.stringify({ v: THREAD_HUES_VERSION, channels }));
+  } catch (_error) {
+    // Private browsing or a full quota: the colours hold for this page, as they always did.
+  }
+}
+
+/** Put back `channel`'s remembered colours, after storing what was drawn of the last one. */
+function restoreThreadHues(channel) {
+  saveThreadHues();
+  threadColors.clear();
+  threadHuesSeen.clear();
+  threadColorsChannel = String(channel);
+  if (!threadColorsChannel) return;
+  for (const [id, [hue]] of Object.entries(readThreadHues()[threadHueScope(channel)] || {})) {
+    threadColors.set(id, hue);
+  }
+}
+
 function threadHue(id) {
+  // Whichever path draws a channel's first thread — a reload's saved rows, a read, a change of
+  // channel — its remembered colours are in place before that thread is given one.
+  const channel = String(el("discord-channel").value);
+  if (channel !== threadColorsChannel) restoreThreadHues(channel);
   const key = String(id);
+  const now = Date.now();
+  if (channel && !(threadHuesSeen.get(key) > now - THREAD_HUES_SEEN_REFRESH_MS)) {
+    threadHuesSeen.set(key, now);
+    // Once for everything drawn in this task, not once per thread.
+    if (!threadHuesSaveOwed) {
+      threadHuesSaveOwed = true;
+      Promise.resolve().then(saveThreadHues);
+    }
+  }
   if (threadColors.has(key)) return threadColors.get(key);
   // Split the largest unused arc: the next thread gets the most separated available color.
   // Keep allocations while paging and moving between views, so a thread never changes color
@@ -47721,7 +47846,8 @@ function changeSelectedChannel() {
   timelineMessages = [];
   timelineThreads = [];
   channelContexts.clear();
-  threadColors.clear();
+  // `#396 thread-color-memory`. The channel's own colours, as this device last drew them.
+  restoreThreadHues(el("discord-channel").value);
   el("thread-list").replaceChildren();
   restoreChannelComposer();
   discordMoreAbove = false;
