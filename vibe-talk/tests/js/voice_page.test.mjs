@@ -4978,6 +4978,18 @@ const TUNING_BANDS = {
     "how long a reconnect waits for the call's turns to reach the server before it reads the record " +
     "it hands the new session: shorter builds the record without the turn just said; longer holds " +
     "the reconnect, and the reader's call, on a slow store"],
+  // `#396 thread-color-memory`.
+  THREAD_HUES_VERSION: [1, 1,
+    "the stored thread colours' shape. Changing it recolours every thread on every device, which " +
+    "must be a decision a test sees rather than an edit nobody noticed"],
+  THREAD_HUES_PER_CHANNEL: [8, 32,
+    "threads whose colour one channel remembers. Under eight, a screenful of threads is more than " +
+    "it keeps and a reload recolours some of what was just on screen; past 32 the widest arc left " +
+    "for a new thread can be under 11°, putting it within 6° of a remembered one"],
+  THREAD_HUES_TOTAL: [120, 2000,
+    "threads remembered across every channel. Under 120, a handful of busy channels push each " +
+    "other's colours out; past two thousand it is mostly channels nobody opens, read and rewritten " +
+    "whole each time a thread is first drawn"],
 };
 test("every number this page is tuned by stays inside a band that says what would be wrong", () => {
   for (const [name, [low, high, why]] of Object.entries(TUNING_BANDS)) {
@@ -32726,6 +32738,254 @@ test("All marks every threaded message with a stable colored Thread button and n
   await page.el("thread-back").click();
   assert.equal(page.el("channel-view-flat").getAttribute("aria-pressed"), "true");
 });
+
+// --- `#396 thread-color-memory` -------------------------------------------------------------------
+//
+// A thread keeps its colour on this device across a reload and a trip to another channel and back.
+// Colours are handed out in the order threads are first drawn, so each test below draws the same
+// threads in a DIFFERENT order the second time: held in memory alone, that order decides.
+
+const THREAD_HUES_KEY = "vibe-talk.thread-hues";
+
+/** A channel's messages and thread cards: per thread id, in order, a root and one answer. */
+function threadsOf(ids, firstId = 500, channel = CHANNEL) {
+  const messages = [];
+  const threads = [];
+  ids.forEach((id, i) => {
+    const rootId = String(firstId + 2 * i);
+    const thread = { id, root_message_id: rootId, is_root: true, reply_count: 1, reply_count_exact: true };
+    const root = message({ id: rootId, channel_id: channel.id, content: `root of ${id}`, thread });
+    const answer = message({ id: String(firstId + 2 * i + 1), channel_id: channel.id, content: `answer in ${id}`,
+      thread: { ...thread, is_root: false } });
+    messages.push(root, answer);
+    threads.push({ id, root, title: `About ${id}`, reply_count: 1, reply_count_exact: true, updated_at: answer.timestamp });
+  });
+  return { messages, threads };
+}
+
+/** The colour each thread's tag in the list is drawn in, by thread id — asserting a tag agrees with its thread's others. */
+function hueByThread(page) {
+  const hues = {};
+  for (const row of page.el("discord-log").children) {
+    const badge = threadBadge(row);
+    if (!badge) continue;
+    const held = page.messages.find((m) => String(m.id) === row.getAttribute("data-id"));
+    assert.ok(held && held.thread, `a tagged row ${row.getAttribute("data-id")} is not a message in a thread`);
+    const hue = badge.style.getPropertyValue("--thread-hue");
+    assert.notEqual(hue, "", `${held.thread.id}'s tag has no colour`);
+    if (hues[held.thread.id] !== undefined) assert.equal(hue, hues[held.thread.id], `${held.thread.id} is two colours at once`);
+    hues[held.thread.id] = hue;
+  }
+  return hues;
+}
+
+const hueDistance = (a, b) => {
+  const apart = Math.abs(Number(a) - Number(b)) % 360;
+  return Math.min(apart, 360 - apart);
+};
+
+/** A channel with threads in All, entered from the call view, on `store`. */
+async function threadsPage(data, store = new Map(), script = SCRIPT) {
+  const page = newPage(store, script);
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  return page;
+}
+
+/**
+ * A reload of a page left on that channel, `days` later, finding `data`. The saved rows go first —
+ * a full quota gives them up before anything else — so what the reload draws is what it reads, in
+ * the order it reads it.
+ */
+async function reloadThreads(store, data, script = SCRIPT, days = 1) {
+  store.delete(MESSAGE_CACHE_KEY);
+  const page = newPage(store, script, (p) => {
+    p.setClock(p.clock() + days * 24 * 60 * 60 * 1000);
+    p.messages = data.messages;
+    p.threadingSupported = true;
+    p.threads = data.threads;
+  });
+  await reopenedChannel(page);
+  return page;
+}
+
+/** The negative control: a page that never stores a thread's colour, as before `#396`. */
+const forgetsHues = () => brokenScript("    localStorage.setItem(THREAD_HUES_KEY,", "    void (THREAD_HUES_KEY,");
+
+test("`#396 thread-color-memory`: every thread keeps its colour across a reload that draws them in another order", async () => {
+  const run = async (script) => {
+    const first = await threadsPage(threadsOf(["T-north", "T-south", "T-east"]), new Map(), script);
+    const before = hueByThread(first);
+    const again = await reloadThreads(first.storage, threadsOf(["T-east", "T-south", "T-north"]), script);
+    return { before, after: hueByThread(again) };
+  };
+  const { before, after } = await run(SCRIPT);
+  assert.equal(new Set(Object.values(before)).size, 3, "the premise: three threads, three colours");
+  assert.deepStrictEqual(after, before, "the reload drew the threads in different colours");
+  // The control: in memory alone the reload's order decides, which is the defect the owner saw.
+  const forgot = await run(forgetsHues());
+  assert.notDeepStrictEqual(forgot.after, forgot.before, "the premise: the order the reload draws in matters");
+});
+
+test("`#396 thread-color-memory`: a thread first seen after a reload gets a colour well clear of the remembered ones", async () => {
+  const first = await threadsPage(threadsOf(["T-north", "T-south"]));
+  const before = hueByThread(first);
+  // The newcomer is drawn among them, and before one of them.
+  const again = await reloadThreads(first.storage, threadsOf(["T-south", "T-new", "T-north"]));
+  const after = hueByThread(again);
+  assert.equal(after["T-north"], before["T-north"], "a remembered thread changed colour when a new one arrived");
+  assert.equal(after["T-south"], before["T-south"], "a remembered thread changed colour when a new one arrived");
+  for (const id of ["T-north", "T-south"]) {
+    assert.ok(hueDistance(after["T-new"], after[id]) >= 60,
+      `the new thread's colour ${after["T-new"]} is within 60° of ${id}'s ${after[id]}`);
+  }
+});
+
+test("`#396 thread-color-memory`: every thread keeps its colour across a trip to another channel and back", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    const other = { ...CHANNEL, id: OTHER_CHANNEL.id, label: OTHER_CHANNEL.label };
+    page.channels = [CHANNEL, other];
+    page.threadingSupported = true;
+    const byChannel = {
+      [CHANNEL.id]: threadsOf(["T-north", "T-south", "T-east"], 500, CHANNEL),
+      [other.id]: threadsOf(["O-first", "O-second"], 700, other),
+    };
+    // The fixture's timeline is one channel's; each read here is answered with its own channel's.
+    const serve = page.timeline;
+    page.timeline = async (path, options) => {
+      const channel = page.channels.find((c) => String(path).includes(`/channels/${encodeURIComponent(c.id)}/`));
+      assert.ok(channel, `the page read a channel this fixture has no cast for: ${path}`);
+      page.messages = byChannel[channel.id].messages;
+      page.threads = byChannel[channel.id].threads;
+      const answer = await serve(path, options);
+      return json(answer.status, { ...JSON.parse(await answer.text()), channel });
+    };
+    await signIn(page);
+    await page.el("view-switch").click();
+    await page.settle();
+    const before = hueByThread(page);
+    await readChannel(page, other.id);
+    const elsewhere = hueByThread(page);
+    // Back again, where the channel now reads its threads in another order — and has no saved rows
+    // to draw first, as after a quota gave them up.
+    byChannel[CHANNEL.id] = threadsOf(["T-east", "T-south", "T-north"], 500, CHANNEL);
+    page.storage.delete(MESSAGE_CACHE_KEY);
+    await readChannel(page, CHANNEL.id);
+    return { before, elsewhere, after: hueByThread(page) };
+  };
+  const { before, elsewhere, after } = await run(SCRIPT);
+  assert.equal(new Set(Object.values(before)).size, 3, "the premise: three threads, three colours");
+  assert.deepStrictEqual(Object.keys(elsewhere).sort(), ["O-first", "O-second"], "the premise: the other channel's threads were drawn");
+  assert.deepStrictEqual(after, before, "coming back to the channel recoloured its threads");
+  const forgot = await run(forgetsHues());
+  assert.notDeepStrictEqual(forgot.after, forgot.before, "the premise: the order the return draws in matters");
+});
+
+test("`#396 thread-color-memory`: a channel remembers its most recently drawn threads only, so old ones stop crowding new ones", async () => {
+  const many = (prefix) => Array.from({ length: 24 }, (_, i) => `${prefix}-${i + 1}`);
+  const remembered = (store) => JSON.parse(store.get(THREAD_HUES_KEY)).channels;
+  const first = await threadsPage(threadsOf(many("old")));
+  // A day later the channel's threads are all new ones. The day before's are still remembered while
+  // these are given colours — none of those may change — but it is these the channel keeps.
+  const second = await reloadThreads(first.storage, threadsOf(many("new")), SCRIPT, 1);
+  const newer = hueByThread(second);
+  await second.settle();
+  const kept = Object.values(remembered(second.storage));
+  assert.equal(kept.length, 1, "the premise: one channel remembered");
+  assert.deepStrictEqual(Object.keys(kept[0]).sort(), many("new").sort(),
+    "the channel did not keep exactly its most recently drawn threads");
+  // Another day on, a newcomer among them is measured against the 24 kept, not all 48 ever drawn:
+  // the arc the evicted threads held is free again.
+  const third = await reloadThreads(second.storage, threadsOf([...many("new"), "fresh"]), SCRIPT, 2);
+  const now = hueByThread(third);
+  for (const id of many("new")) assert.equal(now[id], newer[id], `${id} changed colour across the reload`);
+  const nearest = Math.min(...many("new").map((id) => hueDistance(now.fresh, now[id])));
+  assert.ok(nearest >= 10, `the newcomer is ${nearest}° from a remembered thread: evicted colours still crowd it`);
+});
+
+test("`#396 thread-color-memory`: what every channel remembers together is bounded, the least recently drawn going first", async () => {
+  // Left by earlier sessions: 25 other channels of 24 threads each, channel c drawn c days ago.
+  const store = new Map();
+  const day = 24 * 60 * 60 * 1000;
+  const start = Date.UTC(2026, 7, 19, 14, 5, 0); // the fixture's clock
+  const channels = {};
+  for (let c = 1; c <= 25; c += 1) {
+    channels[`elsewhere-${c}`] = Object.fromEntries(Array.from({ length: 24 },
+      (_, i) => [`E${c}-${i}`, [(i * 15) % 360, start - c * day]]));
+  }
+  store.set(THREAD_HUES_KEY, JSON.stringify({ v: 1, channels }));
+  const page = await threadsPage(threadsOf(["T-north", "T-south"]), store);
+  await page.settle();
+  const after = JSON.parse(store.get(THREAD_HUES_KEY)).channels;
+  const counts = Object.fromEntries(Object.entries(after).map(([scope, threads]) => [scope, Object.keys(threads).length]));
+  const total = Object.values(counts).reduce((sum, n) => sum + n, 0);
+  assert.equal(total, 480, `the memory holds ${total} threads, not the 480 it is bounded to`);
+  const ours = Object.entries(after).find(([_scope, threads]) => threads["T-north"]);
+  assert.ok(ours && ours[1]["T-south"], "the channel just drawn lost its colours to older ones");
+  // 600 + 2 is 122 over: the five channels drawn longest ago go whole, and two threads of the sixth.
+  for (let c = 21; c <= 25; c += 1) assert.equal(counts[`elsewhere-${c}`], undefined, `elsewhere-${c} outlived newer channels`);
+  assert.equal(counts["elsewhere-20"], 22);
+  for (let c = 1; c <= 19; c += 1) assert.equal(counts[`elsewhere-${c}`], 24, `elsewhere-${c} lost threads to older ones`);
+});
+
+test("`#396 thread-color-memory`: a browser that refuses to store or read the colours colours threads as before", async () => {
+  // Private browsing and a full quota: both reading and writing the memory throw.
+  class RefusingStore extends Map {
+    has(key) {
+      if (key === THREAD_HUES_KEY) throw new Error("SecurityError: storage is disabled");
+      return super.has(key);
+    }
+    set(key, value) {
+      if (key === THREAD_HUES_KEY) throw new Error("QuotaExceededError");
+      return super.set(key, value);
+    }
+  }
+  const page = await threadsPage(threadDataIds(), new RefusingStore());
+  const before = hueByThread(page);
+  assert.equal(new Set(Object.values(before)).size, 2, "threads were not given colours of their own");
+  // Within the page, a thread still keeps its colour from view to view.
+  await pickThread(page, "main");
+  await pickThread(page, "flat");
+  assert.deepStrictEqual(hueByThread(page), before, "a thread changed colour moving between views");
+  assert.equal(page.el("discord-log").children.length > 0, true, "the channel did not draw");
+
+  // A memory left damaged — another version, an interrupted write — is ignored, then replaced.
+  const store = new Map([[THREAD_HUES_KEY, "{not json"]]);
+  const damaged = await threadsPage(threadDataIds(), store);
+  assert.equal(new Set(Object.values(hueByThread(damaged))).size, 2, "a damaged memory stopped threads being coloured");
+  await damaged.settle();
+  assert.equal(JSON.parse(store.get(THREAD_HUES_KEY)).v, 1, "the damaged memory was not replaced by a readable one");
+});
+
+test("`#396 thread-color-memory`: a memory another version of the page wrote is neither read nor overwritten", async () => {
+  // A newer page in another window, or the one before a downgrade: its shape is not this page's.
+  const foreign = JSON.stringify({ v: 2, channels: { anything: { "T-north": { hue: 5 } } } });
+  const store = new Map([[THREAD_HUES_KEY, foreign]]);
+  const page = await threadsPage(threadDataIds(), store);
+  assert.equal(new Set(Object.values(hueByThread(page))).size, 2, "threads were not given colours of their own");
+  await page.settle();
+  assert.equal(store.get(THREAD_HUES_KEY), foreign, "this page overwrote another version's memory");
+});
+
+test("`#396 thread-color-memory`: an ordinary reload, its saved rows drawn first, keeps every colour", async () => {
+  const data = threadsOf(["T-north", "T-south", "T-east"]);
+  const first = await threadsPage(data);
+  const before = hueByThread(first);
+  const again = newPage(first.storage, SCRIPT, (p) => {
+    p.messages = data.messages;
+    p.threadingSupported = true;
+    p.threads = data.threads;
+  });
+  assert.deepStrictEqual(hueByThread(again), before, "the saved rows were drawn in other colours");
+  await reopenedChannel(again);
+  assert.deepStrictEqual(hueByThread(again), before, "the reload's read recoloured the threads");
+});
+
+/** Two threads, as `threadsOf` builds them. */
+const threadDataIds = () => threadsOf(["T-north", "T-south"]);
 
 test("the normal composer lives after history and posts standalone messages without a reply target", async () => {
   const page = newPage();
