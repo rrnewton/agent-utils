@@ -15344,7 +15344,12 @@ mod tests {
     }
 
     fn temporary(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
+        // Keep a dedicated scratch root available for journal-heavy recovery tests on slow hosts.
+        // This changes only the temporary filesystem; all write boundaries and assertions remain.
+        let root = std::env::var_os("AGENTCTL_CHAT_TEST_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let path = root.join(format!(
             "agentctl-chat-runtime-{name}-{}-{}",
             std::process::id(),
             unix_millis()

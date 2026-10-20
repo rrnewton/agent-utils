@@ -34,3 +34,15 @@ strict no-keystroke inspection interpretation. Both editions now use only the
 adapter's reveal keys for `prompts`, under the same pinned-recipient and pane
 input locks as answering. Expanded forms receive no input. Paused sessions may
 be revealed for inspection, while automated answers remain paused.
+
+
+Validation host note: the unchanged chat-runtime recovery tests exceeded the
+Rust suite's 1,200-second wall limit on this host's journaled filesystem. The
+other 43 selected validation steps passed. The runtime was progressing through
+the maximum-batch write-boundary recovery scenarios and the 4,097-message
+retirement test, as shown by increasing I/O counters and its saved checkpoint.
+`AGENTCTL_CHAT_TEST_TMPDIR` now optionally selects a dedicated temporary root for
+that Rust test module; its default remains the ordinary system temporary root.
+A private executable tmpfs directory avoids the slow journal without changing
+any assertions, scenario counts, failure injection, fsync calls, or timeout.
+Python tests and packaging retain their usual disk-backed temporary directories.
