@@ -54455,12 +54455,36 @@ def test_remove_agent_batch_removes_disk_image_slots(
 
     original_observe_once = wrkslots._observe_slot_use_once
 
-    def unused_lsof_check(*args: object, **kwargs: object) -> object:
+    def unused_lsof_check(
+        slot_path: Path,
+        record: wrkslots.ActiveRecord | None = None,
+        *,
+        use_lsof: bool = True,
+        ignore_invoking_ancestry: bool = False,
+        census: wrkslots._ProcessPathCensus | None = None,
+        fallback_census: wrkslots._ProcessPathCensus | None = None,
+        proc_root: Path = Path("/proc"),
+        ignore_current_process: bool = True,
+        capture_generation: bool = False,
+        agent_batch: wrkslots._AgentRemoveBatchContext | None = None,
+        canonical_path: Path | None = None,
+        after_fence: bool = False,
+        before_image_fence: bool = False,
+        strict_lsof_warnings: bool = False,
+    ) -> wrkslots._LiveUseObservation | None:
         # The batch routes its own checks through this entry point; only the
         # ordinary check it dispatches to (the host-wide lsof and /proc
         # walks) is answered unused.
-        if kwargs.get("agent_batch") is not None:
-            return cast(Callable[..., object], original_observe_once)(*args, **kwargs)
+        if agent_batch is not None:
+            return original_observe_once(
+                slot_path, record, use_lsof=use_lsof,
+                ignore_invoking_ancestry=ignore_invoking_ancestry, census=census,
+                fallback_census=fallback_census, proc_root=proc_root,
+                ignore_current_process=ignore_current_process,
+                capture_generation=capture_generation, agent_batch=agent_batch,
+                canonical_path=canonical_path, after_fence=after_fence,
+                before_image_fence=before_image_fence,
+                strict_lsof_warnings=strict_lsof_warnings)
         return None
 
     # The fresh /proc scan and the lsof check before the fence each walk
@@ -54606,12 +54630,36 @@ def test_remove_agent_batch_refuses_before_fencing_when_the_image_check_outlasts
 
     original_observe_once = wrkslots._observe_slot_use_once
 
-    def unused_lsof_check(*args: object, **kwargs: object) -> object:
+    def unused_lsof_check(
+        slot_path: Path,
+        record: wrkslots.ActiveRecord | None = None,
+        *,
+        use_lsof: bool = True,
+        ignore_invoking_ancestry: bool = False,
+        census: wrkslots._ProcessPathCensus | None = None,
+        fallback_census: wrkslots._ProcessPathCensus | None = None,
+        proc_root: Path = Path("/proc"),
+        ignore_current_process: bool = True,
+        capture_generation: bool = False,
+        agent_batch: wrkslots._AgentRemoveBatchContext | None = None,
+        canonical_path: Path | None = None,
+        after_fence: bool = False,
+        before_image_fence: bool = False,
+        strict_lsof_warnings: bool = False,
+    ) -> wrkslots._LiveUseObservation | None:
         # The batch routes its own checks through this entry point; only the
         # ordinary check it dispatches to (the host-wide lsof and /proc
         # walks) is answered unused.
-        if kwargs.get("agent_batch") is not None:
-            return cast(Callable[..., object], original_observe_once)(*args, **kwargs)
+        if agent_batch is not None:
+            return original_observe_once(
+                slot_path, record, use_lsof=use_lsof,
+                ignore_invoking_ancestry=ignore_invoking_ancestry, census=census,
+                fallback_census=fallback_census, proc_root=proc_root,
+                ignore_current_process=ignore_current_process,
+                capture_generation=capture_generation, agent_batch=agent_batch,
+                canonical_path=canonical_path, after_fence=after_fence,
+                before_image_fence=before_image_fence,
+                strict_lsof_warnings=strict_lsof_warnings)
         return None
 
     # As in test_remove_agent_batch_removes_disk_image_slots: the fresh
