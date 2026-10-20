@@ -2045,6 +2045,7 @@ def room_back_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: t
                               anchoring)
                 serial += 1
                 more = how.startswith("the draft")
+                posted_before = len(api.posted)
                 propose(page, api, serial, LONG_DRAFT if more else SHORT_DRAFT)
                 page.wait_for_timeout(HOLD_MS + 200)
                 if more:
@@ -2068,7 +2069,15 @@ def room_back_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: t
                     check(focus == "channel-compose-text",
                           f"{where}: the premise, the focus handed from More to the box, not to #{focus}")
                 if anchoring == "":
-                    page.wait_for_timeout(300)
+                    # The live read has to land while the card's room is kept (the page
+                    # returns it a second after Send), so start it as soon as the post
+                    # has left, not a fixed 300 ms later: on a loaded machine the wait
+                    # and the read together outlasted that second and the premise read
+                    # a room already handed back (done-races validate-land3,
+                    # 2026-10-19).  `#389 gate-flakes`.
+                    if not more:
+                        until(page, lambda: len(api.posted) > posted_before,
+                              "the sent message to be posted")
                     kept = page.evaluate(LIVE_READ_JS)
                     drawn = page.evaluate(ROOM_JS)
                     check(kept is True and drawn["newest"] == api.posted[-1]["id"],
