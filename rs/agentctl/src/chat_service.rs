@@ -41,6 +41,8 @@ use crate::subagents::{ManagedAgents, ManagedApi};
 
 #[cfg(test)]
 mod grant_refresh_tests;
+#[cfg(test)]
+mod rejection_tests;
 mod reply_reminders;
 mod sender_grants;
 
@@ -963,14 +965,15 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
         transport.set_cancellation(outbound_cancellation.clone());
     }
     let ack_cancellation = OutboundCancellation::new()?;
-    let mut ack_transport = if state.config().ack_emoji().is_some() {
-        outbound
-            .as_ref()
-            .map(CommandOutboundTransport::try_clone_generation)
-            .transpose()?
-    } else {
-        None
-    };
+    let mut ack_transport =
+        if state.config().ack_emoji().is_some() || state.config().reject_emoji().is_some() {
+            outbound
+                .as_ref()
+                .map(CommandOutboundTransport::try_clone_generation)
+                .transpose()?
+        } else {
+            None
+        };
     if let Some(transport) = ack_transport.as_mut() {
         transport.set_cancellation(ack_cancellation.clone());
     }
@@ -980,6 +983,14 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
         .as_ref()
         .map(CommandOutboundTransport::try_clone_generation)
         .transpose()?;
+    let rejection_transport = if state.config().reject_emoji().is_some() {
+        ack_transport
+            .as_ref()
+            .map(CommandOutboundTransport::try_clone_generation)
+            .transpose()?
+    } else {
+        None
+    };
     let ack_queue = ack_transport
         .as_ref()
         .map(|_| Arc::new(AckQueue::default()));
@@ -1000,6 +1011,12 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
             Ok(attempts) => queue_saved_receipts(queue, attempts),
             Err(error) => service_log(format_args!(
                 "agentctl: chat receipt reactions could not be listed: {error}"
+            )),
+        }
+        match state.rejection_reaction_attempts() {
+            Ok(attempts) => queue_saved_rejections(queue, attempts),
+            Err(error) => service_log(format_args!(
+                "agentctl: chat rejection reactions could not be listed: {error}"
             )),
         }
     }
@@ -1030,7 +1047,25 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
             &output_wake,
             |line| service_log(line),
         ) {
-            Ok(worker) => Some(worker),
+            Ok(mut workers) => {
+                if let Some(transport) = rejection_transport {
+                    match spawn_ack_worker(
+                        AckLane::Rejections,
+                        state.clone(),
+                        Arc::clone(ack_queue.as_ref().expect("reaction transport has a queue")),
+                        transport,
+                        Arc::clone(&stop),
+                        Arc::clone(&output_wake),
+                        |line| service_log(line),
+                    ) {
+                        Ok(worker) => workers.rejections = Some(worker),
+                        Err(error) => service_log(format_args!(
+                            "agentctl: chat rejection worker could not start; saved feedback waits for restart: {error}"
+                        )),
+                    }
+                }
+                Some(workers)
+            }
             Err((error, started)) => {
                 let deadline = begin_service_stop(
                     &stop,
@@ -1202,10 +1237,14 @@ struct AckQueueState {
     receipts: VecDeque<String>,
     receipts_retained: BTreeSet<String>,
     receipt_retry_at: BTreeMap<String, Instant>,
+    rejections: VecDeque<String>,
+    rejections_retained: BTreeSet<String>,
+    rejection_retry_at: BTreeMap<String, Instant>,
     rescan: bool,
     // Receipt reactions that did not fit wait for their own rescan, after the queued ones, so a
     // full receipt queue never puts a rescan ahead of the acknowledgements.
     receipt_rescan: bool,
+    rejection_rescan: bool,
     stopped: bool,
 }
 
@@ -1218,10 +1257,13 @@ struct AckQueue {
 enum AckWork {
     Request(String),
     Receipt(String),
+    Rejection(String),
     /// List the saved acknowledgements, and the saved receipt reactions, again.
     Reconcile,
     /// List the saved receipt reactions again.
     ReceiptReconcile,
+    /// List saved rejection feedback again.
+    RejectionReconcile,
 }
 
 /// Which work one reaction worker takes from the [`AckQueue`]. `chat run` runs one worker for
@@ -1233,6 +1275,8 @@ enum AckLane {
     Acknowledgements,
     /// ✅ receipt reactions, and the rescans that list them again.
     Receipts,
+    /// Rejection reactions, independent of acknowledgements and delivery receipts.
+    Rejections,
 }
 
 impl AckLane {
@@ -1240,6 +1284,7 @@ impl AckLane {
         match self {
             Self::Acknowledgements => "agentctl-chat-ack",
             Self::Receipts => "agentctl-chat-receipt",
+            Self::Rejections => "agentctl-chat-rejection",
         }
     }
 
@@ -1247,6 +1292,7 @@ impl AckLane {
         match self {
             Self::Acknowledgements => "chat ACK",
             Self::Receipts => "chat receipt",
+            Self::Rejections => "chat rejection",
         }
     }
 }
@@ -1314,6 +1360,35 @@ impl AckQueue {
         self.changed.notify_all();
     }
 
+    fn enqueue_rejections(&self, keys: impl IntoIterator<Item = String>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.stopped {
+            return;
+        }
+        let now = Instant::now();
+        for key in keys {
+            if state.rejections_retained.contains(&key)
+                || state
+                    .rejection_retry_at
+                    .get(&key)
+                    .is_some_and(|retry| *retry > now)
+            {
+                continue;
+            }
+            if state.rejections_retained.len() >= ACK_QUEUE_CAPACITY {
+                state.rejection_rescan = true;
+                continue;
+            }
+            state.rejection_retry_at.remove(&key);
+            state.rejections_retained.insert(key.clone());
+            state.rejections.push_back(key);
+        }
+        self.changed.notify_all();
+    }
+
     /// Hold the ✅ receipt reaction saved under `key` until `due`, as a failed one is held: a
     /// reaction whose last attempt failed less than `ACK_RETRY_DELAY` ago, as at a restart.
     fn defer_receipt(&self, key: String, due: Instant) {
@@ -1328,6 +1403,21 @@ impl AckQueue {
             return;
         }
         state.receipt_retry_at.insert(key, due);
+        self.changed.notify_all();
+    }
+
+    fn defer_rejection(&self, key: String, due: Instant) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.stopped
+            || state.rejections_retained.contains(&key)
+            || state.rejection_retry_at.len() >= MAX_DIRECT_REQUEST_KEYS
+        {
+            return;
+        }
+        state.rejection_retry_at.insert(key, due);
         self.changed.notify_all();
     }
 
@@ -1386,6 +1476,22 @@ impl AckQueue {
                     }
                     state.receipt_retry_at.values().min().copied()
                 }
+                AckLane::Rejections => {
+                    if let Some(key) = state.rejections.pop_front() {
+                        return Some(AckWork::Rejection(key));
+                    }
+                    if state.rejection_rescan {
+                        state.rejection_rescan = false;
+                        return Some(AckWork::RejectionReconcile);
+                    }
+                    if state.rejection_retry_at.values().any(|retry| *retry <= now) {
+                        state
+                            .rejection_retry_at
+                            .retain(|_, deadline| *deadline > now);
+                        return Some(AckWork::RejectionReconcile);
+                    }
+                    state.rejection_retry_at.values().min().copied()
+                }
             };
             state = match next_retry {
                 Some(retry) => {
@@ -1443,6 +1549,24 @@ impl AckQueue {
         }
         self.changed.notify_all();
     }
+
+    fn rejection_finished(&self, key: &str, failed: bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.rejections_retained.remove(key);
+        if failed {
+            if state.rejection_retry_at.len() < MAX_DIRECT_REQUEST_KEYS {
+                state
+                    .rejection_retry_at
+                    .insert(key.to_owned(), Instant::now() + ACK_RETRY_DELAY);
+            }
+        } else {
+            state.rejection_retry_at.remove(key);
+        }
+        self.changed.notify_all();
+    }
 }
 
 /// Queue the saved ✅ receipt reactions listed in `attempts`, holding each whose last attempt
@@ -1466,10 +1590,29 @@ fn queue_saved_receipts(queue: &AckQueue, attempts: Vec<(String, Option<u64>)>) 
     queue.enqueue_receipts(due);
 }
 
-/// The two reaction workers of `chat run`: see [`AckLane`].
+fn queue_saved_rejections(queue: &AckQueue, attempts: Vec<(String, Option<u64>)>) {
+    let now_millis = chat_runtime::unix_millis();
+    let now = Instant::now();
+    let mut due = Vec::new();
+    for (key, attempted) in attempts {
+        let left = attempted.and_then(|at| {
+            ACK_RETRY_DELAY
+                .checked_sub(Duration::from_millis(now_millis.saturating_sub(at)))
+                .filter(|left| !left.is_zero())
+        });
+        match left {
+            Some(left) => queue.defer_rejection(key, now + left),
+            None => due.push(key),
+        }
+    }
+    queue.enqueue_rejections(due);
+}
+
+/// The acknowledgement and receipt workers, plus an optional rejection worker of `chat run`.
 struct AckWorkers {
     acknowledgements: ServiceWorker,
     receipts: ServiceWorker,
+    rejections: Option<ServiceWorker>,
 }
 
 /// Start both reaction workers, each with its own outbound transport, so that neither lane's
@@ -1508,6 +1651,7 @@ fn spawn_ack_workers(
         Ok(receipts) => Ok(AckWorkers {
             acknowledgements,
             receipts,
+            rejections: None,
         }),
         Err(error) => Err((error, Some(acknowledgements))),
     }
@@ -1546,6 +1690,20 @@ fn spawn_ack_worker(
                             record_receipt_reaction(&mut report, &key, result);
                             log_report(&report, &log);
                         }
+                        AckWork::Rejection(key) => {
+                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                state.ensure_rejection_reaction(&key, &mut transport)
+                            }))
+                            .unwrap_or_else(|_| Err(ChatRuntimeError::Invalid(
+                                "rejection reaction worker panicked; the same operation may be retried".to_owned(),
+                            )));
+                            queue.rejection_finished(&key, result.is_err());
+                            if let Err(error) = result {
+                                log(format_args!(
+                                    "agentctl: chat rejection reaction {key} failed: {error}"
+                                ));
+                            }
+                        }
                         AckWork::Reconcile => match state.pending_ack_keys() {
                             Ok(keys) => {
                                 queue.enqueue(keys);
@@ -1569,6 +1727,12 @@ fn spawn_ack_worker(
                                 "agentctl: chat receipt reactions could not be listed: {error}"
                             )),
                         },
+                        AckWork::RejectionReconcile => match state.rejection_reaction_attempts() {
+                            Ok(attempts) => queue_saved_rejections(&queue, attempts),
+                            Err(error) => log(format_args!(
+                                "agentctl: chat rejection reactions could not be listed: {error}"
+                            )),
+                        },
                     }
                 }
             }));
@@ -1579,6 +1743,9 @@ fn spawn_ack_worker(
                     }
                     AckLane::Receipts => {
                         "receipt reaction worker panicked; operation outcome is uncertain"
+                    }
+                    AckLane::Rejections => {
+                        "rejection reaction queue worker panicked; operation outcome is uncertain"
                     }
                 });
                 stop.stop();
@@ -1633,7 +1800,10 @@ fn join_ack_workers_until(
     );
     let receipts =
         join_lane_worker_until(workers.receipts, AckLane::Receipts, cancellation, deadline);
-    acknowledgements.and(receipts)
+    let rejections = workers.rejections.map_or(Ok(()), |worker| {
+        join_lane_worker_until(worker, AckLane::Rejections, cancellation, deadline)
+    });
+    acknowledgements.and(receipts).and(rejections)
 }
 
 fn connected_provider_join_timeout(timeouts: ProcessPhaseTimeouts) -> Duration {
@@ -1769,6 +1939,7 @@ fn recover_pass<A: ManagedApi + ?Sized>(
         report.more_work = true;
     }
     add_receipt_reactions(state, control, &mut report);
+    add_rejection_reactions(state, control, &mut report);
     *routes = RouteCache::from_entries(state.reply_route_entries()?);
     Ok(report)
 }
@@ -1985,6 +2156,39 @@ fn record_receipt_reaction(
         Ok(Some(_)) => report.receipted.push(key.to_owned()),
         Ok(None) => {}
         Err(error) => report.error("receipt-reaction", key, error),
+    }
+}
+
+fn add_rejection_reactions(
+    state: &BridgeState,
+    control: &mut PassControl<'_>,
+    report: &mut CycleReport,
+) {
+    if control.stop.is_some_and(|stop| stop.ack_queue.is_some()) {
+        return;
+    }
+    let Some(transport) = control.transport.as_mut() else {
+        return;
+    };
+    let attempts = match state.rejection_reaction_attempts() {
+        Ok(attempts) => attempts,
+        Err(error) => {
+            report.error("reject-reaction", "state", error);
+            return;
+        }
+    };
+    for (key, attempted) in attempts.into_iter().take(MAX_KEYS_PER_PASS) {
+        if control.stop.is_some_and(StopState::is_stopped) {
+            return;
+        }
+        if attempted.is_some_and(|at| {
+            chat_runtime::unix_millis().saturating_sub(at) < ACK_RETRY_DELAY.as_millis() as u64
+        }) {
+            continue;
+        }
+        if let Err(error) = state.ensure_rejection_reaction(&key, transport) {
+            report.error("reject-reaction", &key, error);
+        }
     }
 }
 
@@ -3595,6 +3799,16 @@ where
     let mut subscription = ChatSubscription::open(&mut backend, &request).map_err(|error| {
         classify_provider_start_failure(stop, cancellation, registration.identity(), error)
     })?;
+    if state.config().reject_emoji().is_some()
+        && !subscription
+            .capabilities()
+            .event_kinds()
+            .contains(&chat_subscription::EventKind::MessageRejected)
+    {
+        log(format_args!(
+            "agentctl: chat provider: rejection feedback is enabled, but this plugin does not report rejected messages; update the plugin to receive that feedback"
+        ));
+    }
     log(format_args!(
         "agentctl: chat provider: subscribed {}",
         if request.resume_from().is_some() {
@@ -3694,6 +3908,18 @@ where
             chat_runtime::ConsumedItem::Batch(admission) => {
                 if let Some(queue) = stop.ack_queue.as_ref() {
                     queue.enqueue(admission.new_request_keys.iter().cloned());
+                    queue.enqueue_rejections(admission.rejection_saves.saved.iter().cloned());
+                }
+                for error in &admission.rejection_saves.errors {
+                    log(format_args!(
+                        "agentctl: chat rejection reaction could not be saved: {error}"
+                    ));
+                }
+                if admission.rejection_saves.dropped > 0 {
+                    log(format_args!(
+                        "agentctl: chat rejection feedback outbox is full; {} message(s) advanced without feedback",
+                        admission.rejection_saves.dropped,
+                    ));
                 }
                 send_notice(
                     notices,
@@ -6009,6 +6235,7 @@ mod tests {
                     ReactionSetting::Emoji(emoji.to_owned())
                 }),
                 receipt_reaction: ReactionSetting::Inherit,
+                reject_reaction: ReactionSetting::Inherit,
                 backend_configuration: None,
                 outbound_command: None,
                 reply_alias_range: None,
@@ -7496,6 +7723,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 outbound_enabled: true,
                 ack_reaction: ReactionSetting::Emoji("🤖".to_owned()),
                 receipt_reaction: ReactionSetting::Inherit,
+                reject_reaction: ReactionSetting::Inherit,
                 backend_configuration: None,
                 outbound_command: None,
                 reply_alias_range: None,
@@ -8138,6 +8366,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 outbound_enabled: true,
                 ack_reaction: ReactionSetting::Disabled,
                 receipt_reaction: ReactionSetting::Inherit,
+                reject_reaction: ReactionSetting::Inherit,
                 backend_configuration: None,
                 outbound_command: Some(chat_runtime::OutboundCommandConfiguration {
                     executable: "/definitely/missing/helper".into(),
@@ -8203,6 +8432,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 outbound_enabled: true,
                 ack_reaction: ReactionSetting::Disabled,
                 receipt_reaction: ReactionSetting::Inherit,
+                reject_reaction: ReactionSetting::Inherit,
                 backend_configuration: None,
                 outbound_command: Some(chat_runtime::OutboundCommandConfiguration {
                     executable: helper,
@@ -8592,6 +8822,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 outbound_enabled: false,
                 ack_reaction: ReactionSetting::Disabled,
                 receipt_reaction: ReactionSetting::Inherit,
+                reject_reaction: ReactionSetting::Inherit,
                 backend_configuration: None,
                 outbound_command: None,
                 reply_alias_range: None,
@@ -10023,7 +10254,10 @@ arrive after it; chat provider worker panicked"
         assert!(matches!(ended, Ok(())), "{ended:?}");
         assert_eq!(
             *lines.lock().expect("log lines"),
-            ["agentctl: chat provider: subscribed from the saved cursor"]
+            [
+                "agentctl: chat provider: rejection feedback is enabled, but this plugin does not report rejected messages; update the plugin to receive that feedback",
+                "agentctl: chat provider: subscribed from the saved cursor",
+            ]
         );
         assert!(matches!(
             receiver.try_recv(),
@@ -10400,6 +10634,7 @@ esac
             outbound_enabled: true,
             ack_reaction: ReactionSetting::Emoji("🤖".to_owned()),
             receipt_reaction: ReactionSetting::Inherit,
+            reject_reaction: ReactionSetting::Inherit,
             backend_configuration: None,
             outbound_command: Some(chat_runtime::OutboundCommandConfiguration {
                 executable: "/fixture/outbound-helper".into(),
@@ -10861,6 +11096,7 @@ esac
                 outbound_enabled,
                 ack_reaction: ReactionSetting::Disabled,
                 receipt_reaction: ReactionSetting::Inherit,
+                reject_reaction: ReactionSetting::Inherit,
                 backend_configuration: None,
                 outbound_command,
                 reply_alias_range: None,

@@ -20,6 +20,16 @@ The 262,144-byte provider-payload bound covers the complete compact JSON
 reports that same complete size.
 Batch limits count compact JSON encoding and string escaping rather than raw
 UTF-8 alone, so bounded process adapters accept the same domain values.
+An optional `MessageRejected` event carries only bounded channel, message, and
+sender IDs plus a typed `SenderNotAllowed` or `IgnoredPrefix` reason. It allows a
+host to persist rejection feedback without retaining rejected text or granting
+request authority. Its channel must remain inside the subscription authority;
+`MessageCreated` still requires an allowed sender. The provider excludes known
+bot/app message types, edits, deletions, and non-message events. An unknown
+account type may still produce a candidate; the outbound adapter must verify
+that the exact authenticated author account is human before reacting. A feedback
+reference is not that proof. It uses the same durable batch commit and byte
+bounds as other events and does not replace an initial checkpoint or gap.
 The host may also attach a bounded, schema-identified JSON configuration object
 for non-secret resource names. Credentials remain outside the subscription
 contract. A process host may inherit credential values through a separate,

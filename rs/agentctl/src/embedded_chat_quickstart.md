@@ -41,9 +41,14 @@ directory.
 
    The helper is independent of the inbound plugin. The bridge reacts to each
    request twice: 👀 once it is admitted and ✅ once its prompt is verified in
-   the agent's pane. Those defaults are defined once in agentctl; set
-   `ack_reaction` or `receipt_reaction` to another emoji to override one, or
-   to `null`, `""` or `false` to disable it. Omit `outbound_command`, set
+   the agent's pane. Eligible human messages that are refused instead receive
+   ❌ (Slack `x`), including messages from senders whose grants expired or were
+   revoked. Bots, apps, edits, deletes and channel notices receive no rejection
+   reaction. Set `ack_reaction`, `receipt_reaction` or `reject_reaction` to
+   another emoji to override a default, or to `null`, `""` or `false` to disable
+   it. Rejection feedback needs a provider that reports rejected messages and a
+   helper that verifies human authors through `ensure_rejection`; the bundled
+   Slack provider supplies both. Omit `outbound_command`, set
    `outbound_enabled` to `false`, and set `ack_reaction` to null for an
    intentionally inbound-only bridge. Add only subscription-plugin environment
    variable names to `subscription_environment`; every named value must exist

@@ -6,6 +6,7 @@
 //! ```json
 //! {"version":1,"id":"<uuid>","action":"send","channel_id":"C…","thread_id":"C…/threads/<ts>","text":"…"}
 //! {"version":1,"id":"<uuid>","action":"ensure_reaction","channel_id":"C…","message_id":"C…/messages/<ts>","emoji":"🤖"}
+//! {"version":1,"id":"<uuid>","action":"ensure_rejection","channel_id":"C…","message_id":"C…/messages/<ts>","sender_id":"U…","emoji":"❌"}
 //! {"version":1,"id":"<uuid>","action":"resolve_sender","channel_id":"C…","query":"<unixname|email|ID>"}
 //! {"version":1,"id":"<uuid>","action":"list_members","channel_id":"C…"}
 //! ```
@@ -16,6 +17,12 @@
 //! carries a lowercase code, a bounded detail,
 //! whether the operation is proven `not_applied` or `unknown`, and whether retrying the same
 //! UUID may succeed.
+//!
+//! `ensure_rejection` first reads the exact sender's account and requires `is_bot=false` before
+//! adding a reaction. Missing, ambiguous or bot account data is refused as `author_not_human`;
+//! annotations on a message do not prove that its author is human. The lookup and write share
+//! one deadline. Every actual write verifies the account anew; a completed operation replays
+//! its saved receipt without another account lookup or Slack write.
 //!
 //! # Bot identity only
 //!
@@ -37,6 +44,11 @@
 //! `--uncertain-repost-after-seconds` (default 120) have passed since the intent, and then posts
 //! again. A duplicate is therefore possible only when Slack accepted a post whose response was
 //! lost and the listing still does not show it after that window.
+//!
+//! Rejections have a separate, locked journal under the same ledger directory. It binds each
+//! UUID to its app, channel, message, sender and first normalized reaction before a possible
+//! write, and keeps that binding indefinitely. Changed reaction settings never change a
+//! pending or completed operation's original marker. Retain this journal with the bridge.
 //!
 //! A body longer than `--max-chunk-bytes` (default 11,000; Slack accepts at most 12,000) is
 //! posted as several consecutive messages in the same thread, split at line breaks where
@@ -64,6 +76,8 @@ use crate::transport::{
     bounded, ListQuery, Outcome, PostMessage, SlackTransport, TextFormat, TransportError,
     WebApiTransport,
 };
+
+mod rejections;
 
 /// Largest request line accepted.
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
@@ -486,6 +500,12 @@ enum Request {
         message_ts: String,
         emoji: String,
     },
+    Rejection {
+        channel_id: String,
+        message_ts: String,
+        sender_id: String,
+        emoji: String,
+    },
     ResolveSender {
         channel_id: String,
         query: String,
@@ -563,6 +583,42 @@ fn parse_request(object: &Map<String, Value>, action: &str) -> Result<Request, R
                 emoji: text("emoji").ok_or_else(|| invalid("emoji must be a string"))?,
             })
         }
+        "ensure_rejection" => {
+            if !exact_keys(
+                object,
+                &[
+                    "version",
+                    "id",
+                    "action",
+                    "channel_id",
+                    "message_id",
+                    "sender_id",
+                    "emoji",
+                ],
+            ) {
+                return Err(invalid("a rejection request has exactly version, id, action, channel_id, message_id, sender_id and emoji"));
+            }
+            let channel_id =
+                text("channel_id").ok_or_else(|| invalid("channel_id must be a string"))?;
+            let message =
+                text("message_id").ok_or_else(|| invalid("message_id must be a string"))?;
+            let (channel, ts) = ids::parse_resource(&message, "messages")
+                .ok_or_else(|| invalid("message_id is not <channel>/messages/<ts>"))?;
+            if channel != channel_id {
+                return Err(invalid("message_id belongs to another channel"));
+            }
+            let sender_id =
+                text("sender_id").ok_or_else(|| invalid("sender_id must be a string"))?;
+            if !ids::valid_user_id(&sender_id) {
+                return Err(invalid("sender_id must be a Slack user ID"));
+            }
+            Ok(Request::Rejection {
+                channel_id,
+                message_ts: ts.to_owned(),
+                sender_id,
+                emoji: text("emoji").ok_or_else(|| invalid("emoji must be a string"))?,
+            })
+        }
         "resolve_sender" => {
             if !exact_keys(object, &["version", "id", "action", "channel_id", "query"]) {
                 return Err(invalid(
@@ -595,7 +651,7 @@ fn parse_request(object: &Map<String, Value>, action: &str) -> Result<Request, R
             })
         }
         _ => Err(invalid(
-            "action must be send, ensure_reaction, resolve_sender or list_members",
+            "action must be send, ensure_reaction, ensure_rejection, resolve_sender or list_members",
         )),
     }
 }
@@ -634,7 +690,7 @@ pub fn handle_request(
         .filter(|action| {
             matches!(
                 *action,
-                "send" | "ensure_reaction" | "resolve_sender" | "list_members"
+                "send" | "ensure_reaction" | "ensure_rejection" | "resolve_sender" | "list_members"
             )
         });
     let (Some(id), Some(action)) = (id, action) else {
@@ -682,6 +738,7 @@ pub fn handle_request(
     let channel = match &request {
         Request::Send { channel_id, .. }
         | Request::Reaction { channel_id, .. }
+        | Request::Rejection { channel_id, .. }
         | Request::ResolveSender { channel_id, .. }
         | Request::ListMembers { channel_id } => channel_id.clone(),
     };
@@ -691,6 +748,30 @@ pub fn handle_request(
             format!("channel {channel} is not in this helper's --channel list"),
             false,
         ));
+    }
+    if let Request::Rejection {
+        channel_id,
+        message_ts,
+        sender_id,
+        emoji,
+    } = &request
+    {
+        return match rejections::ensure(
+            config,
+            app_id,
+            id,
+            channel_id,
+            message_ts,
+            sender_id,
+            emoji,
+            transport,
+            &diagnostics,
+        ) {
+            Ok(receipt) => line(&json!({
+                "version": 1, "id": id, "action": action, "ok": true, "receipt": receipt,
+            })),
+            Err(refusal) => respond_error(&refusal),
+        };
     }
     let mut transport = match transport() {
         Ok(transport) => transport,
@@ -739,6 +820,7 @@ pub fn handle_request(
                     Refusal::from(error)
                 }),
         },
+        Request::Rejection { .. } => unreachable!("rejections use the durable guarded path"),
         Request::ResolveSender { query, .. } => transport
             .resolve_sender(app_id, &query)
             .map_err(Refusal::from)

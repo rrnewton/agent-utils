@@ -46,9 +46,9 @@ pub struct SlackMessage {
     pub thread_ts: Option<String>,
     /// Slack user ID of the author.
     pub user_id: Option<String>,
-    /// Present when a bot posted the message.
+    /// Bot annotation, which can also accompany a person's user-token post.
     pub bot_id: Option<String>,
-    /// Present when an app posted the message.
+    /// Delivery app annotation; this does not identify the author.
     pub app_id: Option<String>,
     /// Slack message subtype; `None` for an ordinary message.
     pub subtype: Option<String>,
@@ -326,6 +326,59 @@ pub trait SlackTransport: Send {
             false,
         ))
     }
+
+    /// Check authoritative account data for this exact sender. Only an explicit human result
+    /// permits a rejection reaction; absent or ambiguous account information does not.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError`] when the account cannot be checked. Unsupported transports
+    /// refuse without applying a reaction.
+    fn sender_is_human(
+        &mut self,
+        _app_id: &AppId,
+        _sender_id: &str,
+    ) -> Result<bool, TransportError> {
+        Err(TransportError::not_applied(
+            "author_not_human",
+            "this transport cannot verify that the sender is a human; no rejection reaction was applied",
+            false,
+        ))
+    }
+
+    /// Add a rejection reaction only after authoritative account data confirms a human sender.
+    /// Implementations with several client calls must share one deadline across the operation.
+    /// After the account check, call `before_write` successfully before any possible reaction;
+    /// its persistence time is part of that same deadline. A failed account check must not
+    /// call it. The helper uses it to durably bind the operation's first reaction choice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError`] before any write for a nonhuman or unverified author, or when
+    /// checking the account or adding the reaction fails.
+    fn add_rejection(
+        &mut self,
+        app_id: &AppId,
+        channel_id: &str,
+        message_ts: &str,
+        sender_id: &str,
+        name: &str,
+        before_write: &mut dyn FnMut() -> Result<(), TransportError>,
+    ) -> Result<bool, TransportError> {
+        if !self.sender_is_human(app_id, sender_id)? {
+            return Err(unverified_rejection_author());
+        }
+        before_write()?;
+        self.add_reaction(app_id, channel_id, message_ts, name)
+    }
+}
+
+pub(crate) fn unverified_rejection_author() -> TransportError {
+    TransportError::not_applied(
+        "author_not_human",
+        "authoritative account data did not confirm this exact sender is human; no rejection reaction was applied",
+        false,
+    )
 }
 
 /// Placeholder for a direct Slack Web API transport (`conversations.history`,
@@ -384,6 +437,14 @@ impl SlackTransport for WebApiTransport {
         _app_id: &AppId,
         _channel_id: &str,
     ) -> Result<Vec<String>, TransportError> {
+        Err(Self::refusal())
+    }
+
+    fn sender_is_human(
+        &mut self,
+        _app_id: &AppId,
+        _sender_id: &str,
+    ) -> Result<bool, TransportError> {
         Err(Self::refusal())
     }
 }

@@ -460,6 +460,29 @@ impl SlackTransport for WarmTransport {
     ) -> Result<Vec<String>, TransportError> {
         self.inner.list_members(app_id, channel_id)
     }
+
+    fn sender_is_human(&mut self, app_id: &AppId, sender_id: &str) -> Result<bool, TransportError> {
+        self.inner.sender_is_human(app_id, sender_id)
+    }
+
+    fn add_rejection(
+        &mut self,
+        app_id: &AppId,
+        channel_id: &str,
+        message_ts: &str,
+        sender_id: &str,
+        name: &str,
+        before_write: &mut dyn FnMut() -> Result<(), TransportError>,
+    ) -> Result<bool, TransportError> {
+        self.inner.add_rejection(
+            app_id,
+            channel_id,
+            message_ts,
+            sender_id,
+            name,
+            before_write,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

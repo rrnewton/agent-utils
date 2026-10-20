@@ -152,26 +152,88 @@ listing. These operations read the provider and create no outbound post intent.
 
 ### Reactions
 
-The bridge marks each request's chat message in two stages. The
+The bridge marks each accepted request's chat message in two stages. The
 **acknowledgement** goes on once the request is durably admitted; the
 **receipt** goes on once the request's prompt is verified in the agent's pane,
-as described under "Initialize and run". agentctl defines both defaults in one
-place, shared with the bundled Slack provider: 👀 for the acknowledgement
-(Slack `eyes`) and ✅ for the receipt (Slack `white_check_mark`).
+as described under "Initialize and run". A **rejection** marks an eligible human
+message that the bridge refuses, including a sender who was never allowed or
+whose grant expired or was revoked. agentctl shares these defaults with the
+bundled Slack provider: 👀 for acknowledgement (Slack `eyes`), ✅ for receipt
+(Slack `white_check_mark`), and ❌ for rejection (Slack `x`).
 
 | Key | Absent | Unicode emoji | `null`, `""` or `false` |
 | --- | --- | --- | --- |
 | `ack_reaction` | inherit 👀 | use this emoji | no acknowledgement, and so no receipt |
 | `receipt_reaction` | inherit ✅ | use this emoji | no receipt |
+| `reject_reaction` | inherit ❌ | use this emoji | no rejection feedback |
 
 An emoji is one line of at most 64 bytes. A key left absent stays absent in the
 saved bridge state, so a later agentctl with a different default changes the
 bridge's reaction too; a key that is set keeps its value. Only an acknowledged
 request earns a receipt, so a bridge without an acknowledgement adds neither.
-`chat init` refuses a configuration whose two reactions are the same emoji. An
-outbound-disabled configuration must disable `ack_reaction` and may not choose a
-`receipt_reaction`. The outbound helper receives both reactions as
-`ensure_reaction` requests, so it must accept both emoji.
+`chat init` refuses a configuration whose acknowledgement and receipt are the
+same emoji. An outbound-disabled configuration must disable `ack_reaction` and
+may not choose a `receipt_reaction` or `reject_reaction`; their inherited defaults are inactive
+when outbound is disabled. The outbound helper receives acknowledgements and
+receipts as `ensure_reaction` requests, so it must accept both emoji.
+
+Rejection feedback requires a provider that advertises `message_rejected` and a
+helper that implements the guarded `ensure_rejection` action. The bundled Slack
+provider reports ordinary new messages, thread broadcasts, file shares and
+`me_message` messages. It continues to ignore edits, deletes, bot-message
+subtypes, joins, topic changes and other channel notices without reacting.
+Non-message events, messages outside the configured channels, invalid message
+identities and messages before the saved lineage start also get no reaction.
+An older plugin can still run, but cannot report these rejections; `run` logs
+that missing capability at each subscription start.
+
+The rejection event carries only channel, message and sender IDs plus a reason;
+it creates no request, reply route or prompt. Before writing a reaction, the
+Slack helper looks up that exact author with
+`slack.user describe --user=ID --columns=user_id,is_bot --output=json` and
+requires boolean `is_bot=false`. Bot accounts, apps, the bridge's own replies,
+and unknown or ambiguous author data receive no reaction. Stream `app_id` and
+`bot_id` annotations alone do not identify the author as human. A failed lookup
+never proceeds to a reaction.
+
+The helper request has this version-1 NDJSON shape:
+
+```json
+{"version":1,"id":"<uuid>","action":"ensure_rejection","channel_id":"C…","message_id":"C…/messages/<ts>","sender_id":"U…","emoji":"❌"}
+```
+
+Its response repeats the exact version, UUID and action and uses the standard
+reaction receipt, `{"reaction_id":"<message_id>/reactions/x","already_present":false}`,
+or the existing bound error envelope. For a new operation, an account result
+that fails the human check returns nonretryable `author_not_human` with outcome
+`not_applied`. If an earlier attempt may have written the reaction, its outcome
+stays unknown even when a later lookup refuses the author. No helper or host
+falls back to an unguarded reaction when this action is unsupported.
+
+Rejection feedback is best effort. `run` gives it a separate worker so a blocked
+or failed helper does not hold up intake, the committed cursor, accepted
+requests, acknowledgements or receipts. An atomic `rejection-reactions.json`
+under the state lock retains at most 256 operations and 8 MiB, with no message
+text. An operation ID is derived from provider, channel and message identity;
+restart, replay and uncertain results keep that same ID. Completed and finally
+refused operations suppress repeat attempts while retained. Admission suppresses
+queued feedback for that same message, and the worker checks for an admitted or
+retired request again before dispatch. A helper already in flight may finish an
+earlier valid refusal; the bridge does not remove reactions already applied.
+At capacity the oldest terminal record is evicted; replay still derives the same
+operation ID. Helpers must durably bind each rejection operation to its first
+channel, message, sender and emoji. The Slack helper keeps that binding in its
+configured operation ledger, independently of the host's bounded outbox. A
+replay after an emoji change returns the original operation's receipt, so an
+evicted host record cannot cause a second marker. The helper ledger must remain
+with the bridge's state to preserve this history. It retains one bounded record
+and an operation lock per rejection; its total disk usage grows with that history.
+If all records are pending, new feedback is dropped and logged while intake
+continues. Persistence and helper failures are logged without stopping `run`.
+Retryable failed or uncertain operations wait at least 60 seconds before retry,
+including across restart. A disabled `reject_reaction` leaves pending work dormant;
+reenabling it resumes each saved operation with its original emoji. `chat tick`
+tries at most four due rejection operations in its bounded recovery pass.
 
 Before `receipt_reaction` existed, an absent `ack_reaction` meant 🤖 and the
 receipt was always ✅. `chat init` saved `ack_reaction` explicitly then, so a
@@ -186,8 +248,10 @@ leading Unicode whitespace; each prefix must be nonempty, at most 256 UTF-8
 bytes, and contain no control characters. The default excludes nothing.
 Ignored messages still participate in the original provider batch fingerprint,
 replay boundary, and cursor commit, but create no request, reaction ACK or pane
-delivery. This does not suppress already admitted work. Supply the options on
-every run; they do not change the persisted configuration or apply to `chat tick`.
+delivery. Eligible human messages receive the configured rejection reaction;
+bots and apps receive none. This does not suppress already admitted work.
+Supply the options on every run; they do not change the persisted configuration
+or apply to `chat tick`.
 
 In `chat run`, a generation-owned worker queues reaction ACKs as soon as the
 inbound batch is durably admitted and its provider commit is confirmed. Pane
@@ -1954,11 +2018,14 @@ is `C…/messages/<ts>/reactions/<name>`. A sender is the Slack user ID (`U…`)
 reply in a thread routes to the thread root, and the agent's answer is posted
 into that thread.
 
-Inbound filtering. Only messages in `channel_ids`, from permanent owners or
-senders with active grants, with
-no bot or app author, and with no subtype other than `thread_broadcast`,
-`file_share` or `me_message` become requests. Every other event commits as a
-checkpoint so the cursor still advances. Slack's `&amp;`, `&lt;` and `&gt;`
+Inbound filtering. Ordinary new messages in `channel_ids`, including
+`thread_broadcast`, `file_share` and `me_message`, become requests for permanent
+owners and senders with active grants. Eligible messages from other senders,
+or excluded by `--ignore-text-prefix`, produce rejection feedback candidates.
+The helper verifies the exact author is human before writing that feedback;
+stream app and bot annotations alone do not prove authorship. Other subtypes,
+non-message events and invalid identities commit as checkpoints without
+feedback. The cursor advances in every case. Slack's `&amp;`, `&lt;` and `&gt;`
 escapes are undone.
 
 Cursor and recovery. The cursor is `slack1:seq:<n>`, the event stream's
@@ -1973,7 +2040,7 @@ exiting is a retryable failure, and the host reconnects from the saved cursor.
 
 Reaction names. Slack names reactions by shortcode. The helper maps the
 bridge's default reactions through the Slack names defined with them, 👀 to
-`eyes` and ✅ to `white_check_mark`, and a few other common emoji such as 🤖 to
+`eyes`, ✅ to `white_check_mark` and ❌ to `x`, and a few other common emoji such as 🤖 to
 `robot_face`; a shortcode such as `eyes` or `:eyes:` passes through. An unmapped emoji is
 refused as not applied rather than guessed.
 
@@ -2078,11 +2145,11 @@ environment) or, for non-secret values, set it in `cli_environment`.
 | `--cli=PATH` | required | Absolute path of the Slack command-line client. |
 | `--app-id=A…` | none | The posting app. Without it every request is refused. |
 | `--channel=C…` | required, repeatable | Conversations the helper may write to. |
-| `--ledger=DIR` | required | Private operation ledger directory. |
+| `--ledger=DIR` | required | Private operation ledger directory; its parent must already exist. |
 | `--format=markdown\|text` | `markdown` | Body flag: `--markdown=file://-` or `--text=file://-`. |
 | `--bot-user-id=U…\|B…` | none | Extra author IDs that identify the app's posts during reconciliation. |
 | `--uncertain-repost-after-seconds=N` | 120 | 30–86400. |
-| `--timeout-ms=N` | 25000 | 1000–29000, per client call; keep below `timeout_millis`. |
+| `--timeout-ms=N` | 25000 | 1000–29000 per client call; rejection author lookup, durable intent and reaction write share one deadline. Keep below `timeout_millis`. |
 | `--max-chunk-bytes=N` | 11000 | 1000–12000. |
 | `--cli-env=NAME=VALUE` | none | Extra non-secret client environment, repeatable. |
 | `--client-identity=user\|crewmate` | `user` | `user`: the client holds a person's credentials and every write passes `--as=<APP_ID>`. `crewmate`: the client runs as the app's Crewmate and no write passes `--as`. See "Client identities" above. |

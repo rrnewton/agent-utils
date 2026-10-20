@@ -5,7 +5,7 @@
 //! real [`crate::cli::parse_tail_line`] parser; posts and reactions are recorded with the app
 //! identity they used; injected failures model Slack errors and uncertain outcomes.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
@@ -82,6 +82,12 @@ pub struct FakeState {
     pub posts: Vec<FakePost>,
     /// Every reaction added.
     pub reactions: Vec<FakeReaction>,
+    /// Authoritative sender classifications; an absent sender is not confirmed human.
+    pub sender_humanity: BTreeMap<String, bool>,
+    /// Human-author lookups, as `(app_id, sender_id)`.
+    pub humanity_queries: Vec<(String, String)>,
+    /// Injected errors for the next human-author lookups.
+    pub humanity_failures: VecDeque<TransportError>,
     /// Injected outcomes for the next posts.
     pub post_failures: VecDeque<FakePostFailure>,
     /// Number of listing calls.
@@ -239,6 +245,21 @@ impl SlackTransport for FakeTransport {
             ));
         }
         Ok(ts)
+    }
+
+    fn sender_is_human(&mut self, app_id: &AppId, sender_id: &str) -> Result<bool, TransportError> {
+        let mut state = self.state();
+        state
+            .humanity_queries
+            .push((app_id.as_str().to_owned(), sender_id.to_owned()));
+        if let Some(error) = state.humanity_failures.pop_front() {
+            return Err(error);
+        }
+        Ok(state
+            .sender_humanity
+            .get(sender_id)
+            .copied()
+            .unwrap_or(false))
     }
 
     fn add_reaction(

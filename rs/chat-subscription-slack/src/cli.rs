@@ -9,6 +9,7 @@
 //! | reaction | `slack.reaction add --channel-id=C… --message-ts=… --name=… [--as=A…] --output=json` |
 //! | listing | `slack.message list --channel-id=C… [--thread-ts=…] --oldest=… [--as=A…] --output=json` |
 //! | sender lookup | `slack.user describe --user=<unixname\|email\|ID> --columns=user_id [--as=A…] --output=json` |
+//! | human-author check | `slack.user describe --user=U… --columns=user_id,is_bot [--as=A…] --output=json` |
 //! | current members | `slack.conversation members --channel-id=C… --limit=20 --columns=user_id [--page-token=…] [--as=A…] --output=json` |
 //!
 //! Member listings follow every page within one invocation's timeout and return no partial
@@ -815,6 +816,17 @@ fn resolved_sender(document: &Value) -> Result<String, TransportError> {
         .ok_or_else(|| directory_unreadable("the lookup did not return a Slack user ID; pass the ID from the person's Slack profile"))
 }
 
+fn exact_human_sender(document: &Value, sender_id: &str) -> bool {
+    let data = document.get("data").unwrap_or(document);
+    let row = match data {
+        Value::Object(_) => data,
+        Value::Array(rows) if rows.len() == 1 => &rows[0],
+        _ => return false,
+    };
+    row.get("user_id").and_then(Value::as_str) == Some(sender_id)
+        && row.get("is_bot").and_then(Value::as_bool) == Some(false)
+}
+
 fn member_page(document: &Value) -> Result<(Vec<String>, Option<String>), TransportError> {
     if document
         .pointer("/completeness/source_complete")
@@ -1104,6 +1116,51 @@ impl SlackTransport for CliTransport {
             .run(&arguments, None)
             .map_err(|failure| run_failure(failure, false))?;
         resolved_sender(&directory_document(&completed)?)
+    }
+
+    fn sender_is_human(&mut self, app_id: &AppId, sender_id: &str) -> Result<bool, TransportError> {
+        let mut arguments = vec![
+            "slack.user".to_owned(),
+            "describe".to_owned(),
+            format!("--user={sender_id}"),
+            "--columns=user_id,is_bot".to_owned(),
+        ];
+        arguments.extend(self.options.identity.app_argument(app_id));
+        arguments.push("--output=json".to_owned());
+        let completed = self
+            .run(&arguments, None)
+            .map_err(|failure| run_failure(failure, false))?;
+        Ok(exact_human_sender(
+            &directory_document(&completed)?,
+            sender_id,
+        ))
+    }
+
+    fn add_rejection(
+        &mut self,
+        app_id: &AppId,
+        channel_id: &str,
+        message_ts: &str,
+        sender_id: &str,
+        name: &str,
+        before_write: &mut dyn FnMut() -> Result<(), TransportError>,
+    ) -> Result<bool, TransportError> {
+        let deadline = Instant::now() + self.options.timeout;
+        if !self.sender_is_human(app_id, sender_id)? {
+            return Err(crate::transport::unverified_rejection_author());
+        }
+        before_write()?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(TransportError::not_applied(
+                "transport_timeout",
+                "the human-author check and durable intent exhausted the rejection deadline; no reaction was applied",
+                true,
+            ));
+        }
+        let mut reaction = self.clone();
+        reaction.options.timeout = remaining;
+        reaction.add_reaction(app_id, channel_id, message_ts, name)
     }
 
     fn list_members(

@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use chat_subscription::{
     BackendConfiguration, ChannelId, ChatSubscription, ChatSubscriptionBackend, CommittableEvent,
-    DeliveryBatch, InboundMessage, ProviderCursor, SenderId, SubscribeRequest, SubscriptionError,
-    SubscriptionItem,
+    DeliveryBatch, InboundMessage, ProviderCursor, RejectedMessage, RejectionReason, SenderId,
+    SubscribeRequest, SubscriptionError, SubscriptionItem,
 };
 use chat_subscription_slack::fake::{FakeStep, FakeTransport};
 use chat_subscription_slack::plugin::SlackBackend;
@@ -94,12 +94,20 @@ fn single_message(batch: &DeliveryBatch) -> &InboundMessage {
     }
 }
 
+fn single_rejection(batch: &DeliveryBatch) -> &RejectedMessage {
+    match batch.events() {
+        [CommittableEvent::MessageRejected(message)] => message,
+        other => panic!("expected one rejection candidate, found {other:?}"),
+    }
+}
+
 #[test]
 fn fresh_lineage_checkpoints_then_delivers_owner_messages_and_thread_replies() {
     let fake = FakeTransport::new();
     fake.push_script(vec![
         owner_message(101, "1792000801.000100", None, "please &amp; thank you"),
-        // A stranger and a bot user are checkpoints, not requests.
+        // Unallowed user IDs produce metadata candidates, never requests. The helper must
+        // independently verify the exact account is human before reacting to either one.
         event(102, json!({"channel_id": CHANNEL, "message_ts": "1792000802.000100", "slack_user_id": "U0STRANGER1", "text": "hi"})),
         event(103, json!({"channel_id": CHANNEL, "message_ts": "1792000803.000100", "slack_user_id": "U0BRIDGEBOT", "bot_id": "B0BOT000001", "text": "[bot] reply"})),
         // The owner replies inside the first message's thread.
@@ -143,10 +151,16 @@ fn fresh_lineage_checkpoints_then_delivers_owner_messages_and_thread_replies() {
         "agentctl.slack.message.v1"
     );
 
-    for expected in ["slack1:seq:102", "slack1:seq:103"] {
+    for (expected, sender) in [
+        ("slack1:seq:102", "U0STRANGER1"),
+        ("slack1:seq:103", "U0BRIDGEBOT"),
+    ] {
         let skipped = commit_next(&mut subscription);
         assert_eq!(skipped.cursor().as_str(), expected);
-        assert_eq!(skipped.events(), [CommittableEvent::Checkpoint]);
+        let rejected = single_rejection(&skipped);
+        assert_eq!(rejected.sender_id().as_str(), sender);
+        assert_eq!(rejected.channel_id().as_str(), CHANNEL);
+        assert_eq!(rejected.reason(), RejectionReason::SenderNotAllowed);
     }
 
     let reply = commit_next(&mut subscription);
@@ -271,7 +285,13 @@ fn ignored_prefixes_and_a_closed_stream() {
     )
     .unwrap();
     let batch = commit_next(&mut subscription);
-    assert_eq!(batch.events(), [CommittableEvent::Checkpoint]);
+    let rejected = single_rejection(&batch);
+    assert_eq!(rejected.sender_id().as_str(), OWNER);
+    assert_eq!(rejected.reason(), RejectionReason::IgnoredPrefix);
+    assert_eq!(
+        rejected.message_id().as_str(),
+        format!("{CHANNEL}/messages/1792000801.000100")
+    );
     match subscription.next_item() {
         Err(SubscriptionError::Backend(failure)) => {
             assert_eq!(failure.code(), "stream_closed");
@@ -338,9 +358,9 @@ fn authorship_is_the_sender_allowlist_not_the_bot_id() {
     let fake = FakeTransport::new();
     fake.push_script(vec![
         // The owner posting through a third-party app with their own user token.
-        event(201, json!({"channel_id": CHANNEL, "message_ts": "1792000801.000200", "thread_ts": "1792000801.000100", "slack_user_id": OWNER, "bot_id": "B0C6X0ASTSL", "app_id": "A0C1WPP6FR6", "text": "github links please"})),
+        event(201, json!({"channel_id": CHANNEL, "message_ts": "1792000801.000200", "thread_ts": "1792000801.000100", "slack_user_id": OWNER, "bot_id": "B0OTHERAPP1", "app_id": "A0OTHERAPP1", "text": "github links please"})),
         // The bridge's own reply: its app's bot user, never an allowed sender.
-        event(202, json!({"channel_id": CHANNEL, "message_ts": "1792000802.000200", "thread_ts": "1792000801.000100", "slack_user_id": "U0CA580U056", "bot_id": "B0OURBRIDGE", "app_id": "A0C98TMGER4", "text": "reply"})),
+        event(202, json!({"channel_id": CHANNEL, "message_ts": "1792000802.000200", "thread_ts": "1792000801.000100", "slack_user_id": "U0BRIDGEBOT", "bot_id": "B0OURBRIDGE", "app_id": "A0BRIDGEAPP", "text": "reply"})),
         // An unknown bot.
         event(203, json!({"channel_id": CHANNEL, "message_ts": "1792000803.000200", "bot_id": "B0STRANGERB", "text": "noise"})),
         // The owner's plain message.
@@ -358,14 +378,144 @@ fn authorship_is_the_sender_allowlist_not_the_bot_id() {
     assert_eq!(message.text(), "github links please");
     assert!(message.is_thread_reply());
 
-    for expected in ["slack1:seq:202", "slack1:seq:203"] {
-        let skipped = commit_next(&mut subscription);
-        assert_eq!(skipped.cursor().as_str(), expected);
-        assert_eq!(skipped.events(), [CommittableEvent::Checkpoint]);
-    }
+    let bot_candidate = commit_next(&mut subscription);
+    assert_eq!(bot_candidate.cursor().as_str(), "slack1:seq:202");
+    assert_eq!(
+        single_rejection(&bot_candidate).reason(),
+        RejectionReason::SenderNotAllowed
+    );
+    assert_eq!(
+        single_rejection(&bot_candidate).sender_id().as_str(),
+        "U0BRIDGEBOT"
+    );
+    let unknown_bot = commit_next(&mut subscription);
+    assert_eq!(unknown_bot.cursor().as_str(), "slack1:seq:203");
+    assert_eq!(unknown_bot.events(), [CommittableEvent::Checkpoint]);
 
     let plain = commit_next(&mut subscription);
     assert_eq!(single_message(&plain).text(), "plain");
+}
+
+#[test]
+fn eligible_rejections_preserve_exact_metadata_and_advance_the_cursor() {
+    let guest = "U0GUEST001";
+    let fake = FakeTransport::new();
+    let mut script = Vec::new();
+    for (index, subtype) in [
+        None,
+        Some("thread_broadcast"),
+        Some("file_share"),
+        Some("me_message"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut message = json!({"channel_id": CHANNEL, "message_ts": format!("179200080{}.000100", index + 1), "slack_user_id": guest, "app_id": "A0DELIVERY1", "bot_id": "B0ANNOTATE1", "text": "unallowed human, if confirmed by account lookup"});
+        if let Some(subtype) = subtype {
+            message["subtype"] = json!(subtype);
+        }
+        script.push(event(51 + index as u64, message));
+    }
+    script.push(owner_message(
+        55,
+        "1792000805.000100",
+        None,
+        "  &lt;ignored&gt; owner note",
+    ));
+    fake.push_script(script);
+    let mut backend = make_backend(&fake);
+    let mut subscription = ChatSubscription::open(
+        &mut backend,
+        &request(
+            Some("slack1:seq:50"),
+            json!({"ignore_text_prefixes": ["<ignored>"]}),
+        ),
+    )
+    .unwrap();
+    for index in 0..5 {
+        let batch = commit_next(&mut subscription);
+        assert_eq!(
+            batch.cursor().as_str(),
+            format!("slack1:seq:{}", 51 + index)
+        );
+        let rejected = single_rejection(&batch);
+        assert_eq!(rejected.channel_id().as_str(), CHANNEL);
+        assert_eq!(
+            rejected.message_id().as_str(),
+            format!("{CHANNEL}/messages/179200080{}.000100", index + 1)
+        );
+        assert_eq!(
+            rejected.sender_id().as_str(),
+            if index == 4 { OWNER } else { guest }
+        );
+        assert_eq!(
+            rejected.reason(),
+            if index == 4 {
+                RejectionReason::IgnoredPrefix
+            } else {
+                RejectionReason::SenderNotAllowed
+            }
+        );
+    }
+    assert!(fake.state().posts.is_empty());
+    assert!(
+        fake.state().reactions.is_empty(),
+        "the subscription never writes reactions"
+    );
+}
+
+#[test]
+fn edits_deletes_bots_notices_and_invalid_metadata_have_no_rejection_feedback() {
+    let base = json!({"channel_id": CHANNEL, "message_ts": "1792000801.000100", "slack_user_id": "U0GUEST001", "text": "not accepted"});
+    let mut messages = Vec::new();
+    for subtype in [
+        "message_changed",
+        "message_deleted",
+        "channel_join",
+        "channel_topic",
+        "bot_message",
+        "app_message",
+    ] {
+        let mut message = base.clone();
+        message["subtype"] = json!(subtype);
+        messages.push(message);
+    }
+    for (key, value) in [
+        ("channel_id", json!("C0OTHER0001")),
+        ("message_ts", json!("1792000000.000100")),
+        ("message_ts", json!("not-a-timestamp")),
+        ("slack_user_id", json!("not-a-user")),
+        ("slack_user_id", Value::Null),
+    ] {
+        let mut message = base.clone();
+        message[key] = value;
+        messages.push(message);
+    }
+    let count = messages.len();
+    let fake = FakeTransport::new();
+    let mut script = messages
+        .into_iter()
+        .enumerate()
+        .map(|(index, message)| event(101 + index as u64, message))
+        .collect::<Vec<_>>();
+    // Even a normal-looking Slack extension on a non-message envelope is not a rejection.
+    script.push(FakeStep::Line(json!({"seq": 101 + count as u64, "iris_seq_id": 101 + count as u64, "type": "conversation.updated", "payload": {"event_type": "conversation.updated", "slack_message": base}}).to_string()));
+    fake.push_script(script);
+    let mut backend = make_backend(&fake);
+    let mut subscription = ChatSubscription::open(
+        &mut backend,
+        &request(Some("slack1:since:1792000800000"), json!({})),
+    )
+    .unwrap();
+    for index in 0..=count {
+        let batch = commit_next(&mut subscription);
+        assert_eq!(
+            batch.cursor().as_str(),
+            format!("slack1:seq:{}", 101 + index)
+        );
+        assert_eq!(batch.events(), [CommittableEvent::Checkpoint]);
+    }
+    assert!(fake.state().reactions.is_empty());
 }
 
 #[test]
@@ -399,12 +549,25 @@ fn an_allowed_senders_refused_message_is_counted_durably_and_no_one_elses() {
     .unwrap();
     let first = commit_next(&mut subscription);
     assert_eq!(first.events(), [CommittableEvent::Checkpoint]);
-    for _ in 0..3 {
-        assert_eq!(
-            commit_next(&mut subscription).events(),
-            [CommittableEvent::Checkpoint]
-        );
-    }
+    let ignored = commit_next(&mut subscription);
+    assert_eq!(
+        single_rejection(&ignored).reason(),
+        RejectionReason::IgnoredPrefix
+    );
+    assert_eq!(single_rejection(&ignored).sender_id().as_str(), OWNER);
+    assert_eq!(
+        commit_next(&mut subscription).events(),
+        [CommittableEvent::Checkpoint]
+    );
+    let stranger = commit_next(&mut subscription);
+    assert_eq!(
+        single_rejection(&stranger).reason(),
+        RejectionReason::SenderNotAllowed
+    );
+    assert_eq!(
+        single_rejection(&stranger).sender_id().as_str(),
+        "U0STRANGER0"
+    );
     let record: Value = serde_json::from_slice(
         &std::fs::read(directory.join(chat_subscription_slack::refusals::REFUSALS_FILE)).unwrap(),
     )

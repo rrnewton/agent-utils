@@ -35,9 +35,11 @@ use crate::agent::{self, DrainOptions, QueueMessageState};
 use crate::subagents::{ManagedAgents, ManagedApi};
 
 mod grants;
+mod rejections;
 mod reply_reminders;
 
 pub use grants::{parse_grant_duration, SenderGrant, DEFAULT_MAX_GRANT_SECONDS};
+pub use rejections::RejectionSaves;
 
 #[cfg(test)]
 pub(crate) use reply_reminders::REPLY_REMINDER_FILE;
@@ -603,6 +605,10 @@ pub struct BridgeConfiguration {
     /// [`Self::receipt_emoji`].
     #[serde(default, skip_serializing_if = "ReactionSetting::is_inherit")]
     pub receipt_reaction: ReactionSetting,
+    /// The rejection feedback for a human message that cannot create a request: see
+    /// [`Self::reject_emoji`].
+    #[serde(default, skip_serializing_if = "ReactionSetting::is_inherit")]
+    pub reject_reaction: ReactionSetting,
     /// Optional provider-specific non-secret resource configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_configuration: Option<BackendConfigurationDocument>,
@@ -649,6 +655,18 @@ impl BridgeConfiguration {
             .resolve(chat_subscription::reactions::DEFAULT_RECEIPT_REACTION.emoji)
     }
 
+    /// The rejection emoji, or `None` when `reject_reaction` disables feedback. An absent key
+    /// inherits the built-in default. The outbound helper must verify that the sender is a
+    /// human before adding this reaction.
+    #[must_use]
+    pub fn reject_emoji(&self) -> Option<&str> {
+        if !self.outbound_enabled {
+            return None;
+        }
+        self.reject_reaction
+            .resolve(chat_subscription::reactions::DEFAULT_REJECT_REACTION.emoji)
+    }
+
     /// The reply alias numbers this bridge assigns and reads as its own: `reply_alias_range`,
     /// or every number when it is absent.
     #[must_use]
@@ -689,6 +707,9 @@ impl BridgeConfiguration {
         if let Some(reaction) = self.receipt_emoji() {
             validate_single_line(reaction, "receipt reaction", 64)?;
         }
+        if let Some(reaction) = self.reject_emoji() {
+            validate_single_line(reaction, "reject reaction", 64)?;
+        }
         if let Some(outbound) = &self.outbound_command {
             outbound.validate()?;
         }
@@ -705,6 +726,7 @@ impl BridgeConfiguration {
         if !self.outbound_enabled
             && (self.ack_emoji().is_some()
                 || matches!(self.receipt_reaction, ReactionSetting::Emoji(_))
+                || matches!(self.reject_reaction, ReactionSetting::Emoji(_))
                 || self.outbound_command.is_some())
         {
             return Err(ChatRuntimeError::invalid(
@@ -3135,6 +3157,21 @@ pub struct ReactionSubmission<'a> {
     pub request_id: &'a str,
 }
 
+/// One idempotent rejection reaction, conditional on the provider verifying a human author.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RejectionSubmission<'a> {
+    /// Exact provider channel or space resource.
+    pub channel_id: &'a str,
+    /// Exact provider message resource that did not create a request.
+    pub message_id: &'a str,
+    /// Exact provider author that the helper must verify is human.
+    pub sender_id: &'a str,
+    /// Configured Unicode reaction.
+    pub emoji: &'a str,
+    /// Stable operation UUID retained across restart and replay.
+    pub request_id: &'a str,
+}
+
 /// Provider receipt for an ensured reaction.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReactionReceipt {
@@ -3151,6 +3188,21 @@ pub trait ReactionTransport {
         &mut self,
         submission: ReactionSubmission<'_>,
     ) -> std::result::Result<ReactionReceipt, OutboundFailure>;
+
+    /// Verify the exact author is human, then ensure rejection feedback is present. A transport
+    /// without this guarded operation refuses it without sending an ordinary reaction.
+    fn ensure_rejection(
+        &mut self,
+        _submission: RejectionSubmission<'_>,
+    ) -> std::result::Result<ReactionReceipt, OutboundFailure> {
+        Err(OutboundFailure {
+            code: "rejection_unsupported".to_owned(),
+            detail: "reaction transport does not support verified human rejection feedback"
+                .to_owned(),
+            outcome: OutboundOutcome::NotApplied,
+            retryable: false,
+        })
+    }
 }
 
 /// Whether a failed outbound operation is proven absent or may have applied.
@@ -3575,6 +3627,15 @@ impl ReactionTransport for CommandOutboundTransport {
         let response = self.exchange(&request)?;
         decode_reaction_response(&response, &submission)
     }
+
+    fn ensure_rejection(
+        &mut self,
+        submission: RejectionSubmission<'_>,
+    ) -> std::result::Result<ReactionReceipt, OutboundFailure> {
+        let request = encode_rejection_request(&submission)?;
+        let response = self.exchange(&request)?;
+        decode_rejection_response(&response, &submission)
+    }
 }
 
 impl SenderDirectory for CommandOutboundTransport {
@@ -3785,6 +3846,22 @@ pub fn encode_reaction_request(
     })
 }
 
+/// Encode a rejection operation that requires the helper to verify the exact human author.
+pub fn encode_rejection_request(
+    submission: &RejectionSubmission<'_>,
+) -> std::result::Result<Vec<u8>, OutboundFailure> {
+    validate_outbound_rejection(submission)?;
+    encode_wire_request(&json!({
+        "version": 1,
+        "id": submission.request_id,
+        "action": "ensure_rejection",
+        "channel_id": submission.channel_id,
+        "message_id": submission.message_id,
+        "sender_id": submission.sender_id,
+        "emoji": submission.emoji,
+    }))
+}
+
 /// Decode and bind one strict v1 send response to its exact requested authority.
 pub fn decode_send_response(
     payload: &[u8],
@@ -3838,9 +3915,37 @@ pub fn decode_reaction_response(
     submission: &ReactionSubmission<'_>,
 ) -> std::result::Result<ReactionReceipt, OutboundFailure> {
     validate_outbound_reaction(submission)?;
-    match decode_wire_response(payload, submission.request_id, "ensure_reaction")? {
+    decode_bound_reaction_response(
+        payload,
+        submission.request_id,
+        submission.message_id,
+        "ensure_reaction",
+    )
+}
+
+/// Bind a guarded rejection response to its exact operation and message authority.
+pub fn decode_rejection_response(
+    payload: &[u8],
+    submission: &RejectionSubmission<'_>,
+) -> std::result::Result<ReactionReceipt, OutboundFailure> {
+    validate_outbound_rejection(submission)?;
+    decode_bound_reaction_response(
+        payload,
+        submission.request_id,
+        submission.message_id,
+        "ensure_rejection",
+    )
+}
+
+fn decode_bound_reaction_response(
+    payload: &[u8],
+    request_id: &str,
+    message_id: &str,
+    action: &str,
+) -> std::result::Result<ReactionReceipt, OutboundFailure> {
+    match decode_wire_response(payload, request_id, action)? {
         WireReceipt::Reaction(receipt) => {
-            let prefix = format!("{}/reactions/", submission.message_id);
+            let prefix = format!("{message_id}/reactions/");
             if !receipt.reaction_id.starts_with(&prefix)
                 || receipt.reaction_id.len() <= prefix.len()
                 || receipt.reaction_id.len() > chat_subscription::MAX_RESOURCE_ID_BYTES
@@ -3980,6 +4085,18 @@ fn validate_outbound_reaction(
         return Err(not_applied_invalid("reaction is empty or exceeds 64 bytes"));
     }
     Ok(())
+}
+
+fn validate_outbound_rejection(
+    submission: &RejectionSubmission<'_>,
+) -> std::result::Result<(), OutboundFailure> {
+    validate_outbound_reaction(&ReactionSubmission {
+        channel_id: submission.channel_id,
+        message_id: submission.message_id,
+        emoji: submission.emoji,
+        request_id: submission.request_id,
+    })?;
+    validate_resource(submission.sender_id, "sender")
 }
 
 /// Validate a lowercase RFC 4122 version-4 operation UUID.
@@ -4388,6 +4505,8 @@ pub struct ReplyRouteEntry {
 pub struct BatchAdmission {
     /// Newly created durable request keys; replayed duplicates are omitted.
     pub new_request_keys: Vec<String>,
+    /// Independent, best-effort rejection feedback. Its errors never prevent cursor admission.
+    pub rejection_saves: RejectionSaves,
     /// Whether any retained gap still requires request/response reconciliation.
     pub reconciliation_required: bool,
     host_batch_sequence: u64,
@@ -6148,6 +6267,7 @@ impl BridgeState {
             .ok_or_else(|| ChatRuntimeError::invalid("chat host batch sequence is exhausted"))?;
         let mut candidate_records = Vec::new();
         let mut candidate_messages = BTreeMap::new();
+        let mut rejection_candidates = Vec::new();
         let mut request_bytes = 0_u64;
 
         for event in batch.events() {
@@ -6217,6 +6337,11 @@ impl BridgeState {
                     if !permanent_owner && sender_grant.is_none() {
                         // The provider may still be serving a subscription opened before a
                         // revoke or expiry. Commit this message's cursor without a request.
+                        rejection_candidates.push(rejections::RejectionCandidate::new(
+                            &source.channel_id,
+                            &source.message_id,
+                            &source.sender_id,
+                        ));
                         continue;
                     }
                     if self
@@ -6224,6 +6349,11 @@ impl BridgeState {
                         .iter()
                         .any(|prefix| message.text().trim_start().starts_with(prefix.as_str()))
                     {
+                        rejection_candidates.push(rejections::RejectionCandidate::new(
+                            &source.channel_id,
+                            &source.message_id,
+                            &source.sender_id,
+                        ));
                         continue;
                     }
                     let mut record =
@@ -6245,6 +6375,37 @@ impl BridgeState {
                     }
                     request_bytes = request_bytes.saturating_add(encoded_bytes);
                     candidate_records.push(record);
+                }
+                CommittableEvent::MessageRejected(message) => {
+                    if !self
+                        .config
+                        .channel_ids
+                        .iter()
+                        .any(|channel| channel == message.channel_id().as_str())
+                    {
+                        continue;
+                    }
+                    let sender_id = message.sender_id().as_str();
+                    let rejected_at_millis = unix_millis();
+                    let allowed_now = self
+                        .config
+                        .allowed_senders
+                        .iter()
+                        .any(|owner| owner == sender_id)
+                        || sender_grants.iter().any(|grant| {
+                            grant.sender_id == sender_id && grant.active_at(rejected_at_millis)
+                        });
+                    if message.reason() == chat_subscription::RejectionReason::SenderNotAllowed
+                        && allowed_now
+                    {
+                        // A stale provider filter cannot mark a newly granted sender rejected.
+                        continue;
+                    }
+                    rejection_candidates.push(rejections::RejectionCandidate::new(
+                        message.channel_id().as_str(),
+                        message.message_id().as_str(),
+                        sender_id,
+                    ));
                 }
                 CommittableEvent::Checkpoint => {}
                 CommittableEvent::Gap(_) => unreachable!("gaps were rejected before admission"),
@@ -6339,6 +6500,8 @@ impl BridgeState {
                 "admission intent exceeds its durable artifact bound",
             ));
         }
+        let mut rejection_saves =
+            self.save_rejection_reactions_locked(&rejection_candidates, &new_records);
         write_document(&self.admission_path(), &intent)?;
         self.admission_boundary()?;
         for record in &candidate_records {
@@ -6389,8 +6552,14 @@ impl BridgeState {
             agent::sync_directory(&self.root)?;
         }
         self.admission_boundary()?;
+        for error in self.suppress_admitted_rejections_locked(&new_records) {
+            if !rejection_saves.errors.contains(&error) {
+                rejection_saves.errors.push(error);
+            }
+        }
         Ok(BatchAdmission {
             new_request_keys: new_records,
+            rejection_saves,
             reconciliation_required: checkpoint.reconciliation_required,
             host_batch_sequence,
             provider_sequence: batch.sequence().get(),
@@ -12384,6 +12553,13 @@ fn batch_fingerprint(batch: &DeliveryBatch) -> Result<String> {
                     "data": payload.data(),
                 })),
             }),
+            CommittableEvent::MessageRejected(message) => serde_json::json!({
+                "kind": "message_rejected",
+                "channel_id": message.channel_id().as_str(),
+                "message_id": message.message_id().as_str(),
+                "sender_id": message.sender_id().as_str(),
+                "reason": message.reason().as_str(),
+            }),
             CommittableEvent::Checkpoint => serde_json::json!({"kind": "checkpoint"}),
             CommittableEvent::Gap(gap) => serde_json::json!({
                 "kind": "gap",
@@ -15199,6 +15375,7 @@ mod tests {
             outbound_enabled: true,
             ack_reaction: ReactionSetting::Emoji("🤖".to_owned()),
             receipt_reaction: ReactionSetting::Inherit,
+            reject_reaction: ReactionSetting::Inherit,
             backend_configuration: None,
             outbound_command: None,
             reply_alias_range: None,

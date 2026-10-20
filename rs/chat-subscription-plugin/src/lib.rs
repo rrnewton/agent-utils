@@ -38,8 +38,8 @@ use chat_subscription::{
     BackendCapabilities, BackendConfiguration, BackendFailure, CancellationError, ChannelId,
     ChatSubscription, ChatSubscriptionBackend, ChatSubscriptionCancellation, CommittableEvent,
     DeliveryBatch, DeliveryId, EventKind, EventSequence, Heartbeat, InboundMessage, MessageId,
-    ProviderCursor, ProviderPayload, ReconciliationGap, ReplaySupport, SenderId, SubscribeRequest,
-    SubscriptionError, SubscriptionItem, ThreadId,
+    ProviderCursor, ProviderPayload, ReconciliationGap, RejectedMessage, RejectionReason,
+    ReplaySupport, SenderId, SubscribeRequest, SubscriptionError, SubscriptionItem, ThreadId,
 };
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::ser::SerializeSeq;
@@ -583,6 +583,7 @@ enum WireReplay {
 #[serde(rename_all = "snake_case")]
 enum WireEventKind {
     MessageCreated,
+    MessageRejected,
     Checkpoint,
     Gap,
     Heartbeat,
@@ -606,6 +607,7 @@ enum WireItem {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum WireEvent {
     MessageCreated(Box<WireMessageCreated>),
+    MessageRejected(WireRejectedMessage),
     Checkpoint,
     Gap { reason: Option<String> },
 }
@@ -621,6 +623,40 @@ struct WireMessageCreated {
     created_at: String,
     thread_reply: bool,
     provider_payload: Option<WireProviderPayload>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireRejectedMessage {
+    channel_id: String,
+    message_id: String,
+    sender_id: String,
+    reason: WireRejectionReason,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireRejectionReason {
+    SenderNotAllowed,
+    IgnoredPrefix,
+}
+
+impl From<RejectionReason> for WireRejectionReason {
+    fn from(value: RejectionReason) -> Self {
+        match value {
+            RejectionReason::SenderNotAllowed => Self::SenderNotAllowed,
+            RejectionReason::IgnoredPrefix => Self::IgnoredPrefix,
+        }
+    }
+}
+
+impl From<WireRejectionReason> for RejectionReason {
+    fn from(value: WireRejectionReason) -> Self {
+        match value {
+            WireRejectionReason::SenderNotAllowed => Self::SenderNotAllowed,
+            WireRejectionReason::IgnoredPrefix => Self::IgnoredPrefix,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -661,8 +697,16 @@ enum BorrowedWireItem<'a> {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum BorrowedWireEvent<'a> {
     MessageCreated(BorrowedWireMessageCreated<'a>),
+    MessageRejected {
+        channel_id: &'a str,
+        message_id: &'a str,
+        sender_id: &'a str,
+        reason: WireRejectionReason,
+    },
     Checkpoint,
-    Gap { reason: Option<&'a str> },
+    Gap {
+        reason: Option<&'a str>,
+    },
 }
 
 #[derive(Serialize)]
@@ -734,6 +778,12 @@ impl<'a> From<&'a CommittableEvent> for BorrowedWireEvent<'a> {
                     }),
                 })
             }
+            CommittableEvent::MessageRejected(message) => Self::MessageRejected {
+                channel_id: message.channel_id().as_str(),
+                message_id: message.message_id().as_str(),
+                sender_id: message.sender_id().as_str(),
+                reason: message.reason().into(),
+            },
             CommittableEvent::Checkpoint => Self::Checkpoint,
             CommittableEvent::Gap(gap) => Self::Gap {
                 reason: gap.reason(),
@@ -757,6 +807,7 @@ impl From<&BackendCapabilities> for WireCapabilities {
                 .iter()
                 .map(|kind| match kind {
                     EventKind::MessageCreated => WireEventKind::MessageCreated,
+                    EventKind::MessageRejected => WireEventKind::MessageRejected,
                     EventKind::Checkpoint => WireEventKind::Checkpoint,
                     EventKind::Gap => WireEventKind::Gap,
                     EventKind::Heartbeat => WireEventKind::Heartbeat,
@@ -786,6 +837,7 @@ impl TryFrom<WireCapabilities> for BackendCapabilities {
                 .into_iter()
                 .map(|kind| match kind {
                     WireEventKind::MessageCreated => EventKind::MessageCreated,
+                    WireEventKind::MessageRejected => EventKind::MessageRejected,
                     WireEventKind::Checkpoint => EventKind::Checkpoint,
                     WireEventKind::Gap => EventKind::Gap,
                     WireEventKind::Heartbeat => EventKind::Heartbeat,
@@ -831,6 +883,14 @@ impl From<&CommittableEvent> for WireEvent {
                         }
                     }),
                 }))
+            }
+            CommittableEvent::MessageRejected(message) => {
+                Self::MessageRejected(WireRejectedMessage {
+                    channel_id: message.channel_id().as_str().to_owned(),
+                    message_id: message.message_id().as_str().to_owned(),
+                    sender_id: message.sender_id().as_str().to_owned(),
+                    reason: message.reason().into(),
+                })
             }
             CommittableEvent::Checkpoint => Self::Checkpoint,
             CommittableEvent::Gap(gap) => Self::Gap {
@@ -883,6 +943,18 @@ impl TryFrom<WireEvent> for CommittableEvent {
     fn try_from(value: WireEvent) -> Result<Self, Self::Error> {
         match value {
             WireEvent::Checkpoint => Ok(Self::Checkpoint),
+            WireEvent::MessageRejected(message) => {
+                let message = RejectedMessage::new(
+                    ChannelId::new(message.channel_id)
+                        .map_err(|error| PluginError::new("invalid_item", error.to_string()))?,
+                    MessageId::new(message.message_id)
+                        .map_err(|error| PluginError::new("invalid_item", error.to_string()))?,
+                    SenderId::new(message.sender_id)
+                        .map_err(|error| PluginError::new("invalid_item", error.to_string()))?,
+                    message.reason.into(),
+                );
+                Ok(Self::message_rejected(message))
+            }
             WireEvent::Gap { reason } => ReconciliationGap::new(reason)
                 .map(Self::Gap)
                 .map_err(|error| PluginError::new("invalid_item", error.to_string())),
@@ -3463,6 +3535,189 @@ mod tests {
         ] {
             assert_eq!(frame, expected);
         }
+    }
+
+    #[test]
+    fn rejection_reference_wire_contract_round_trips_without_message_text() {
+        for (reason, spelling) in [
+            (RejectionReason::SenderNotAllowed, "sender_not_allowed"),
+            (RejectionReason::IgnoredPrefix, "ignored_prefix"),
+        ] {
+            let event = CommittableEvent::message_rejected(RejectedMessage::new(
+                ChannelId::new("channels/one").expect("channel"),
+                MessageId::new("messages/rejected").expect("message"),
+                SenderId::new("users/guest").expect("sender"),
+                reason,
+            ));
+            let expected = serde_json::json!({
+                "kind": "message_rejected",
+                "channel_id": "channels/one",
+                "message_id": "messages/rejected",
+                "sender_id": "users/guest",
+                "reason": spelling,
+            });
+            assert_eq!(
+                serde_json::to_value(WireEvent::from(&event)).expect("owned reference"),
+                expected,
+            );
+            assert_eq!(
+                serde_json::to_value(BorrowedWireEvent::from(&event)).expect("borrowed reference"),
+                expected,
+            );
+            let decoded: WireEvent =
+                decode_strict_json(&serde_json::to_vec(&expected).expect("reference JSON"))
+                    .expect("strict reference fields");
+            assert_eq!(
+                CommittableEvent::try_from(decoded).expect("bounded IDs"),
+                event
+            );
+            assert_eq!(reason.as_str(), spelling);
+        }
+        let capabilities = BackendCapabilities::new(
+            "fixture",
+            ReplaySupport::Cursor,
+            true,
+            NonZeroU16::new(1).expect("one is nonzero"),
+            vec![EventKind::MessageRejected, EventKind::Heartbeat],
+        )
+        .expect("rejection capability");
+        let encoded = serde_json::to_vec(&WireCapabilities::from(&capabilities))
+            .expect("serialize rejection capability");
+        let wire: WireCapabilities = decode_strict_json(&encoded).expect("decode capability");
+        assert_eq!(
+            BackendCapabilities::try_from(wire).expect("validate capability"),
+            capabilities,
+        );
+    }
+
+    #[test]
+    fn rejection_reference_refuses_unknown_fields_reasons_and_unbounded_ids() {
+        let valid = serde_json::json!({
+            "kind": "message_rejected",
+            "channel_id": "channels/one",
+            "message_id": "messages/rejected",
+            "sender_id": "users/guest",
+            "reason": "sender_not_allowed",
+        });
+        for (field, value) in [
+            (
+                "text",
+                serde_json::json!("must not cross the rejection path"),
+            ),
+            ("thread_id", serde_json::json!("threads/unneeded")),
+            (
+                "provider_payload",
+                serde_json::json!({"schema": "fixture.message.v1", "data": {}}),
+            ),
+            ("reason", serde_json::json!("arbitrary_provider_reason")),
+        ] {
+            let mut candidate = valid.clone();
+            candidate[field] = value;
+            let error = decode_strict_json::<WireEvent>(
+                &serde_json::to_vec(&candidate).expect("malformed reference JSON"),
+            )
+            .expect_err("rejection schema is closed and carries no message data");
+            assert_eq!(error.code(), "invalid_frame");
+        }
+        for (field, maximum) in [
+            ("channel_id", chat_subscription::MAX_RESOURCE_ID_BYTES),
+            ("message_id", chat_subscription::MAX_RESOURCE_ID_BYTES),
+            ("sender_id", chat_subscription::MAX_SENDER_ID_BYTES),
+        ] {
+            for value in [String::new(), "x".repeat(maximum + 1)] {
+                let mut candidate = valid.clone();
+                candidate[field] = serde_json::Value::String(value);
+                let wire: WireEvent = decode_strict_json(
+                    &serde_json::to_vec(&candidate).expect("out-of-bounds reference JSON"),
+                )
+                .expect("JSON syntax remains valid");
+                assert_eq!(
+                    CommittableEvent::try_from(wire)
+                        .expect_err("rejection IDs use the same bounds as normalized messages")
+                        .code(),
+                    "invalid_item",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_event_kind_refuses_hello_before_start() {
+        let raw = br#"{"type":"hello","version":1,"capabilities":{"backend_name":"fixture","replay":"cursor","full_message_data":true,"max_uncommitted":1,"event_kinds":["future_message_rejected","heartbeat"]}}"#;
+        let (writer, mut output) = UnixStream::pair().expect("host output pair");
+        let error = match PluginBackend::connect(Cursor::new(frame(raw)), writer) {
+            Ok(_) => panic!("a host must refuse event kinds it cannot understand"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), "invalid_frame");
+        assert!(error.detail().contains("unknown variant"));
+        let mut written = Vec::new();
+        output
+            .read_to_end(&mut written)
+            .expect("failed handshake closes its output");
+        let mut reader = FramedIo::new(Cursor::new(written), Vec::<u8>::new());
+        assert!(matches!(
+            reader
+                .receive::<ClientFrame>()
+                .expect("decode only host hello"),
+            Some(ClientFrame::Hello { .. })
+        ));
+        assert!(reader
+            .receive::<ClientFrame>()
+            .expect("unknown kind must prevent Start")
+            .is_none());
+    }
+
+    #[test]
+    fn maximum_escaped_rejection_batch_fits_the_existing_frame_bound() {
+        let event = CommittableEvent::message_rejected(RejectedMessage::new(
+            ChannelId::new("\0".repeat(chat_subscription::MAX_RESOURCE_ID_BYTES))
+                .expect("maximum escaped channel"),
+            MessageId::new("\0".repeat(chat_subscription::MAX_RESOURCE_ID_BYTES))
+                .expect("maximum escaped message"),
+            SenderId::new("\0".repeat(chat_subscription::MAX_SENDER_ID_BYTES))
+                .expect("maximum escaped sender"),
+            RejectionReason::SenderNotAllowed,
+        ));
+        let event_bytes = 6
+            * (2 * chat_subscription::MAX_RESOURCE_ID_BYTES
+                + chat_subscription::MAX_SENDER_ID_BYTES)
+            + RejectionReason::SenderNotAllowed.as_str().len()
+            + 8;
+        let mut events = vec![event; chat_subscription::MAX_BATCH_BYTES / event_bytes];
+        events.resize(
+            chat_subscription::MAX_BATCH_EVENTS,
+            CommittableEvent::Checkpoint,
+        );
+        let item = SubscriptionItem::Batch(
+            DeliveryBatch::new(
+                EventSequence::new(u64::MAX).expect("maximum sequence"),
+                ProviderCursor::new("\0".repeat(chat_subscription::MAX_TOKEN_BYTES))
+                    .expect("maximum escaped cursor"),
+                DeliveryId::new("\0".repeat(chat_subscription::MAX_TOKEN_BYTES))
+                    .expect("maximum escaped delivery"),
+                events,
+            )
+            .expect("largest whole number of maximally escaped references fits"),
+        );
+        let owned = serde_json::to_vec(&ServerFrame::Item {
+            item: WireItem::from(&item),
+        })
+        .expect("owned rejection batch");
+        let borrowed = serde_json::to_vec(&BorrowedServerFrame::Item {
+            item: BorrowedWireItem::from(&item),
+        })
+        .expect("borrowed rejection batch");
+        assert_eq!(borrowed, owned);
+        assert!(owned.len() <= MAX_CORE_BATCH_FRAME_BYTES);
+        let wire: ServerFrame = decode_strict_json(&owned).expect("decode bounded frame");
+        let ServerFrame::Item { item: wire } = wire else {
+            panic!("expected item frame");
+        };
+        assert_eq!(
+            SubscriptionItem::try_from(wire).expect("core round trip"),
+            item
+        );
     }
 
     #[test]

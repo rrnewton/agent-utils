@@ -44,7 +44,7 @@ The plugin selects version 1 and reports capabilities:
     "replay": "cursor",
     "full_message_data": true,
     "max_uncommitted": 1,
-    "event_kinds": ["message_created", "checkpoint", "gap", "heartbeat"]
+    "event_kinds": ["message_created", "message_rejected", "checkpoint", "gap", "heartbeat"]
   }
 }
 ```
@@ -53,6 +53,13 @@ The plugin selects version 1 and reports capabilities:
 subset, but `heartbeat` is required. `max_uncommitted` is a nonzero `u16`; a v1
 Start always requests one. Either side may instead send an Error frame during
 negotiation.
+
+`message_rejected` is an optional feedback capability. A plugin that advertises
+it may emit only the bounded reference described below, never an unallowed
+`message_created` event. Older hosts that do not recognize this kind refuse
+Hello before Start; update the host and plugin together. A newer host accepts
+an older plugin without this capability, but that plugin cannot report rejection
+feedback. Unknown event kinds and reasons are errors rather than checkpoints.
 
 After Hello, the host sends Start or Close:
 
@@ -134,6 +141,46 @@ Message-created has exactly the fields shown; `provider_payload` is nullable,
 but must be present when `full_message_data` is true. Empty normalized text is
 valid for attachment-only messages. `created_at` is RFC 3339 with an explicit
 offset or `Z`.
+
+A rejection feedback candidate has exactly these fields:
+
+```json
+{
+  "kind": "message_rejected",
+  "channel_id": "channels/example",
+  "message_id": "messages/rejected",
+  "sender_id": "users/guest",
+  "reason": "sender_not_allowed"
+}
+```
+
+`reason` is `sender_not_allowed` or `ignored_prefix`. This reference contains no
+message text, thread, timestamp, or provider payload and never authorizes a
+request. Its channel must be in Start's channel authority. A
+`sender_not_allowed` reference must name a sender outside Start's allowed sender
+set; `ignored_prefix` may name an allowed sender. Message-created events retain
+their full channel and sender authority checks.
+
+Providers exclude known bot/app message types, edits, deletions, and non-message
+events before constructing feedback candidates. An unknown account type may
+still produce a candidate. A host must also recheck its current policy and have
+its outbound adapter verify that the exact authenticated provider author account
+is human before adding a reaction. The reference alone is not proof that an
+author is human. `full_message_data` applies only to message-created events.
+
+Feedback helpers must also persistently bind each operation UUID to its first
+provider identity, channel, message, sender and reaction choice before a possible
+reaction write. A repeated UUID cannot authorize a different resource or sender.
+An emoji configuration change must not create a second marker for that UUID;
+the helper retains the original choice and can return its saved receipt. This
+history is independent of any bounded host feedback queue.
+
+Rejection references share the batch's durable cursor and commit contract. Their
+IDs and typed reason contribute to canonical replay evidence and the existing
+encoded byte limit. They cannot substitute for the initial Checkpoint or Gap.
+Inclusive replay must preserve the same canonical boundary events across sender
+policy changes; a host refuses a changed boundary rather than silently treating
+a previous rejection as a message admission.
 
 A heartbeat has no durable receipt and permits the next Item immediately. A
 batch is one upstream acknowledgement unit. The plugin emits no later Item

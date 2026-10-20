@@ -177,8 +177,8 @@ pub fn unescape_text(text: &str) -> String {
 ///
 /// The bridge sends reactions as Unicode emoji, while Slack names reactions by shortcode. A
 /// shortcode, with or without colons, passes through unchanged. The bridge's built-in
-/// acknowledgement and receipt map through the Slack names defined beside them in
-/// [`chat_subscription::reactions`], so those two have one definition; a small table covers
+/// acknowledgement, receipt and rejection map through the Slack names defined beside them in
+/// [`chat_subscription::reactions`], so those defaults have one definition; a small table covers
 /// other common Unicode emoji a bridge may configure. Anything else returns `None` and the
 /// reaction is refused as not applied rather than guessed.
 #[must_use]
@@ -269,6 +269,7 @@ mod tests {
     fn reactions_map_to_shortcodes() {
         assert_eq!(reaction_name("🤖").as_deref(), Some("robot_face"));
         assert_eq!(reaction_name("✅").as_deref(), Some("white_check_mark"));
+        assert_eq!(reaction_name("❌").as_deref(), Some("x"));
         assert_eq!(reaction_name("👀").as_deref(), Some("eyes"));
         // An emoji presentation selector does not change the name.
         assert_eq!(
@@ -283,8 +284,7 @@ mod tests {
 
     #[test]
     fn the_bridge_default_reactions_map_through_their_shared_slack_names() {
-        use chat_subscription::reactions::{DEFAULT_ACK_REACTION, DEFAULT_RECEIPT_REACTION};
-        for reaction in [DEFAULT_ACK_REACTION, DEFAULT_RECEIPT_REACTION] {
+        for reaction in chat_subscription::reactions::DEFAULT_REACTIONS {
             assert_eq!(
                 reaction_name(reaction.emoji).as_deref(),
                 Some(reaction.slack_name)

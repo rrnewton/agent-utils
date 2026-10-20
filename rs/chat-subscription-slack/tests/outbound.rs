@@ -1,11 +1,17 @@
 //! Outbound helper behaviour against the fake transport: thread replies, the ACK reaction,
 //! refusal without an app identity, and idempotent recovery of uncertain posts.
 
+use std::fs;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use chat_subscription_slack::fake::{FakePostFailure, FakeTransport};
+use chat_subscription_slack::ids::AppId;
 use chat_subscription_slack::outbound::{handle_request, OutboundConfig};
-use chat_subscription_slack::transport::{SlackTransport, TextFormat, TransportError};
+use chat_subscription_slack::transport::{
+    EventStream, ListQuery, ListedMessage, PostMessage, SlackTransport, SubscribeSpec, TextFormat,
+    TransportError,
+};
 use serde_json::{json, Value};
 
 const CHANNEL: &str = "C0C91RW5FAR";
@@ -18,6 +24,7 @@ fn ledger(name: &str) -> PathBuf {
         .join("slack-outbound-ledgers")
         .join(name);
     let _ = std::fs::remove_dir_all(&root);
+    fs::create_dir_all(root.parent().unwrap()).unwrap();
     root
 }
 
@@ -36,13 +43,115 @@ fn config(ledger: &Path, app: Option<&str>) -> OutboundConfig {
 
 fn run(config: &OutboundConfig, fake: &FakeTransport, request: &Value, now: u64) -> Value {
     let mut transport = || Ok(Box::new(fake.clone()) as Box<dyn SlackTransport>);
+    run_factory(config, request, now, &mut transport)
+}
+
+fn run_factory(
+    config: &OutboundConfig,
+    request: &Value,
+    now: u64,
+    transport: &mut dyn FnMut() -> Result<Box<dyn SlackTransport>, String>,
+) -> Value {
     let clock = move || now;
     let mut line = serde_json::to_vec(request).unwrap();
     line.push(b'\n');
-    let response = handle_request(&line, Ok(config), &mut transport, &clock);
+    let response = handle_request(&line, Ok(config), transport, &clock);
     assert_eq!(response.last(), Some(&b'\n'), "one response line");
     assert_eq!(response.iter().filter(|byte| **byte == b'\n').count(), 1);
     serde_json::from_slice(&response).expect("response is JSON")
+}
+
+fn run_transport(
+    config: &OutboundConfig,
+    request: &Value,
+    transport: impl SlackTransport + 'static,
+) -> Value {
+    let mut transport = Some(Box::new(transport) as Box<dyn SlackTransport>);
+    run_factory(config, request, 1_000, &mut || {
+        Ok(transport.take().expect("one transport"))
+    })
+}
+
+fn rejection_journal(ledger: &Path, id: &str) -> PathBuf {
+    ledger.join("rejections").join(format!("{id}.json"))
+}
+
+fn assert_no_post_intent(ledger: &Path, id: &str) {
+    assert!(
+        !ledger.join(format!("{id}.json")).exists(),
+        "a rejection never creates a posting intent"
+    );
+}
+
+struct HookedReaction {
+    fake: FakeTransport,
+    after_human: Option<Box<dyn FnMut() + Send>>,
+    before_reaction: Option<Box<dyn FnMut() + Send>>,
+    lose_response: bool,
+}
+
+impl HookedReaction {
+    fn new(fake: &FakeTransport) -> Self {
+        Self {
+            fake: fake.clone(),
+            after_human: None,
+            before_reaction: None,
+            lose_response: false,
+        }
+    }
+}
+
+impl SlackTransport for HookedReaction {
+    fn open_stream(
+        &mut self,
+        spec: &SubscribeSpec,
+    ) -> Result<Box<dyn EventStream>, TransportError> {
+        self.fake.open_stream(spec)
+    }
+
+    fn post_message(&mut self, post: &PostMessage<'_>) -> Result<String, TransportError> {
+        self.fake.post_message(post)
+    }
+
+    fn list_messages(
+        &mut self,
+        query: &ListQuery<'_>,
+    ) -> Result<Vec<ListedMessage>, TransportError> {
+        self.fake.list_messages(query)
+    }
+
+    fn sender_is_human(&mut self, app_id: &AppId, sender_id: &str) -> Result<bool, TransportError> {
+        let human = self.fake.sender_is_human(app_id, sender_id)?;
+        if human {
+            if let Some(hook) = self.after_human.as_mut() {
+                hook();
+            }
+        }
+        Ok(human)
+    }
+
+    fn add_reaction(
+        &mut self,
+        app_id: &AppId,
+        channel_id: &str,
+        message_ts: &str,
+        name: &str,
+    ) -> Result<bool, TransportError> {
+        if let Some(hook) = self.before_reaction.as_mut() {
+            hook();
+        }
+        let already_present = self
+            .fake
+            .add_reaction(app_id, channel_id, message_ts, name)?;
+        if self.lose_response {
+            Err(TransportError::unknown(
+                "transport_timeout",
+                "reaction applied but response lost",
+            ))
+        } else {
+            Ok(already_present)
+        }
+    }
 }
 
 fn send(id: &str, thread: Option<&str>, text: &str) -> Value {
@@ -50,6 +159,14 @@ fn send(id: &str, thread: Option<&str>, text: &str) -> Value {
         "version": 1, "id": id, "action": "send", "channel_id": CHANNEL,
         "thread_id": thread.map(|ts| format!("{CHANNEL}/threads/{ts}")),
         "text": text,
+    })
+}
+
+fn rejection(sender_id: &str) -> Value {
+    json!({
+        "version": 1, "id": ID, "action": "ensure_rejection", "channel_id": CHANNEL,
+        "message_id": format!("{CHANNEL}/messages/1792000801.000100"),
+        "sender_id": sender_id, "emoji": "❌",
     })
 }
 
@@ -107,6 +224,493 @@ fn ack_reaction_maps_the_emoji_and_is_idempotent() {
     assert_eq!(state.reactions.len(), 1);
     assert_eq!(state.reactions[0].app_id, APP);
     assert_eq!(state.reactions[0].name, "robot_face");
+    assert!(
+        state.humanity_queries.is_empty(),
+        "normal ACKs do not change protocol or need an author lookup"
+    );
+}
+
+#[test]
+fn rejection_requires_a_confirmed_human_and_is_idempotent() {
+    let ledger = ledger("human-rejection");
+    let config = config(&ledger, Some(APP));
+    let fake = FakeTransport::new();
+    fake.state()
+        .sender_humanity
+        .insert("U0GUEST001".to_owned(), true);
+    let request = rejection("U0GUEST001");
+    let first = run(&config, &fake, &request, 1_000);
+    assert_eq!(first["ok"], json!(true), "{first}");
+    assert_eq!(first["id"], request["id"]);
+    assert_eq!(first["action"], json!("ensure_rejection"));
+    assert_eq!(
+        first["receipt"],
+        json!({
+            "reaction_id": format!("{CHANNEL}/messages/1792000801.000100/reactions/x"),
+            "already_present": false,
+        })
+    );
+    let second = run(&config, &fake, &request, 2_000);
+    assert_eq!(second["ok"], json!(true), "{second}");
+    assert_eq!(second["receipt"]["already_present"], json!(true));
+    let state = fake.state();
+    assert_eq!(state.reactions.len(), 1);
+    assert_eq!(state.reactions[0].app_id, APP);
+    assert_eq!(state.reactions[0].name, "x");
+    assert_eq!(
+        state.humanity_queries,
+        [(APP.to_owned(), "U0GUEST001".to_owned())],
+        "completed receipt replay performs no fresh lookup or reaction"
+    );
+    assert_no_post_intent(&ledger, ID);
+    let record: Value =
+        serde_json::from_slice(&fs::read(rejection_journal(&ledger, ID)).unwrap()).unwrap();
+    assert_eq!(record["name"], "x");
+    assert_eq!(record["complete"], true);
+}
+
+#[test]
+fn bot_and_unknown_accounts_never_receive_rejection_reactions() {
+    let ledger = ledger("nonhuman-rejection");
+    let config = config(&ledger, Some(APP));
+    let fake = FakeTransport::new();
+    fake.state()
+        .sender_humanity
+        .insert("U0BRIDGEBOT".to_owned(), false);
+    // Both requests deliberately lack bot_id and app_id message annotations. A bot account
+    // whose ID starts with U must still be refused by the authoritative account lookup.
+    for sender in ["U0BRIDGEBOT", "U0UNKNOWN01"] {
+        let response = run(&config, &fake, &rejection(sender), 1_000);
+        assert_eq!(response["ok"], json!(false), "{response}");
+        assert_eq!(response["error"]["code"], json!("author_not_human"));
+        assert_eq!(response["error"]["outcome"], json!("not_applied"));
+        assert_eq!(response["error"]["retryable"], json!(false));
+        assert!(response.get("receipt").is_none());
+    }
+    assert_eq!(fake.state().humanity_queries.len(), 2);
+    assert!(fake.state().reactions.is_empty());
+    assert!(fake.state().posts.is_empty());
+    assert_no_post_intent(&ledger, ID);
+    assert!(
+        !rejection_journal(&ledger, ID).exists(),
+        "fresh nonhuman refusals create no possible-effect intent"
+    );
+}
+
+#[test]
+fn a_failed_human_lookup_never_falls_through_to_a_reaction() {
+    let ledger = ledger("failed-author-lookup");
+    let config = config(&ledger, Some(APP));
+    let fake = FakeTransport::new();
+    fake.state()
+        .sender_humanity
+        .insert("U0GUEST001".to_owned(), true);
+    fake.state()
+        .humanity_failures
+        .push_back(TransportError::not_applied(
+            "ratelimited",
+            "try later",
+            true,
+        ));
+    let response = run(&config, &fake, &rejection("U0GUEST001"), 1_000);
+    assert_eq!(response["ok"], json!(false), "{response}");
+    assert_eq!(response["error"]["code"], json!("ratelimited"));
+    assert_eq!(response["error"]["outcome"], json!("not_applied"));
+    assert!(fake.state().reactions.is_empty());
+    assert!(fake.state().posts.is_empty());
+    assert_no_post_intent(&ledger, ID);
+    assert!(!rejection_journal(&ledger, ID).exists());
+}
+
+#[test]
+fn completed_rejection_replay_keeps_the_first_emoji_without_new_slack_calls() {
+    let ledger = ledger("completed-first-choice");
+    let config = config(&ledger, Some(APP));
+    let fake = FakeTransport::new();
+    fake.state()
+        .sender_humanity
+        .insert("U0GUEST001".to_owned(), true);
+    let mut request = rejection("U0GUEST001");
+    let first = run(&config, &fake, &request, 1_000);
+    assert_eq!(first["ok"], true, "{first}");
+    let original = fs::read(rejection_journal(&ledger, ID)).unwrap();
+    // A completed operation replays its historical receipt, not cached permission to write.
+    fake.state()
+        .sender_humanity
+        .insert("U0GUEST001".to_owned(), false);
+    for changed_emoji in [":no_entry_sign:", "🚫"] {
+        request["emoji"] = json!(changed_emoji);
+        let replay = run_factory(&config, &request, 2_000, &mut || {
+            panic!("a completed rejection replay must not construct a Slack client")
+        });
+        assert_eq!(replay["ok"], true, "{replay}");
+        assert_eq!(
+            replay["receipt"]["reaction_id"],
+            first["receipt"]["reaction_id"]
+        );
+        assert_eq!(replay["receipt"]["already_present"], true);
+        assert_eq!(fs::read(rejection_journal(&ledger, ID)).unwrap(), original);
+    }
+    let state = fake.state();
+    assert_eq!(state.reactions.len(), 1);
+    assert_eq!(state.reactions[0].name, "x");
+    assert_eq!(state.reactions[0].app_id, APP);
+    assert_eq!(state.reactions[0].channel_id, CHANNEL);
+    assert_eq!(state.reactions[0].message_ts, "1792000801.000100");
+    assert_eq!(state.humanity_queries.len(), 1);
+    assert!(state.posts.is_empty());
+    assert_no_post_intent(&ledger, ID);
+}
+
+#[test]
+fn uncertain_rejection_replay_keeps_the_first_emoji_and_rechecks_the_author() {
+    let ledger = ledger("uncertain-first-choice");
+    let config = config(&ledger, Some(APP));
+    let fake = FakeTransport::new();
+    fake.state()
+        .sender_humanity
+        .insert("U0GUEST001".to_owned(), true);
+    let record_path = rejection_journal(&ledger, ID);
+    let check_path = record_path.clone();
+    let mut transport = HookedReaction::new(&fake);
+    transport.lose_response = true;
+    transport.before_reaction = Some(Box::new(move || {
+        let record: Value = serde_json::from_slice(
+            &fs::read(&check_path).expect("first choice is durable before a possible reaction"),
+        )
+        .unwrap();
+        assert_eq!(
+            record,
+            json!({
+                "schema": "agentctl.slack-rejection.v1", "id": ID, "app_id": APP,
+                "channel_id": CHANNEL, "message_ts": "1792000801.000100",
+                "sender_id": "U0GUEST001", "name": "x", "complete": false,
+            })
+        );
+        let metadata = fs::metadata(&check_path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(
+            fs::metadata(check_path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }));
+    let mut request = rejection("U0GUEST001");
+    let lost = run_transport(&config, &request, transport);
+    assert_eq!(lost["ok"], false, "{lost}");
+    assert_eq!(lost["error"]["outcome"], "unknown");
+    assert_eq!(
+        fake.state().reactions.len(),
+        1,
+        "Slack applied the response that was lost"
+    );
+    let pending: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    assert_eq!(pending["complete"], false);
+    // This is a new transport and handle_request invocation, with only disk carrying the intent.
+    request["emoji"] = json!("no_entry_sign");
+    let retry = run(&config, &fake, &request, 2_000);
+    assert_eq!(retry["ok"], true, "{retry}");
+    assert_eq!(retry["receipt"]["already_present"], true);
+    assert_eq!(
+        retry["receipt"]["reaction_id"],
+        format!("{CHANNEL}/messages/1792000801.000100/reactions/x")
+    );
+    let state = fake.state();
+    assert_eq!(
+        state.reactions.len(),
+        1,
+        "uncertain retries must not add a different Slack marker"
+    );
+    assert_eq!(state.reactions[0].name, "x");
+    assert_eq!(
+        state.humanity_queries.len(),
+        2,
+        "each possible write rechecks the author"
+    );
+    assert!(state.posts.is_empty());
+    let complete: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    assert_eq!(complete["complete"], true);
+    assert_eq!(complete["name"], "x");
+    assert_no_post_intent(&ledger, ID);
+}
+
+#[test]
+fn a_refused_retry_preserves_the_uncertainty_of_an_earlier_rejection() {
+    let ledger = ledger("uncertain-author-refusal");
+    let config = config(&ledger, Some(APP));
+    let fake = FakeTransport::new();
+    fake.state()
+        .sender_humanity
+        .insert("U0GUEST001".to_owned(), true);
+    let mut transport = HookedReaction::new(&fake);
+    transport.lose_response = true;
+    let mut request = rejection("U0GUEST001");
+    let first = run_transport(&config, &request, transport);
+    assert_eq!(first["error"]["outcome"], "unknown");
+    let pending = fs::read(rejection_journal(&ledger, ID)).unwrap();
+    fake.state()
+        .sender_humanity
+        .insert("U0GUEST001".to_owned(), false);
+    // Even an unsupported replacement emoji cannot discard the prior operation's evidence.
+    request["emoji"] = json!("🚫");
+    let refused = run(&config, &fake, &request, 2_000);
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert_eq!(refused["error"]["code"], "author_not_human");
+    assert_eq!(refused["error"]["outcome"], "unknown");
+    assert_eq!(refused["error"]["retryable"], true);
+    assert_eq!(fake.state().humanity_queries.len(), 2);
+    assert_eq!(
+        fake.state().reactions.len(),
+        1,
+        "a failed new account check cannot write"
+    );
+    assert_eq!(fake.state().reactions[0].name, "x");
+    assert_eq!(fs::read(rejection_journal(&ledger, ID)).unwrap(), pending);
+    let unavailable = run_factory(&config, &request, 3_000, &mut || {
+        Err("client unavailable".to_owned())
+    });
+    assert_eq!(unavailable["error"]["code"], "helper_misconfigured");
+    assert_eq!(unavailable["error"]["outcome"], "unknown");
+    assert!(fake.state().posts.is_empty());
+    assert_no_post_intent(&ledger, ID);
+}
+
+#[test]
+fn reused_rejection_uuid_cannot_change_its_app_channel_message_or_sender() {
+    let ledger = ledger("rejection-identity-conflicts");
+    let config = config(&ledger, Some(APP));
+    let fake = FakeTransport::new();
+    fake.state()
+        .sender_humanity
+        .insert("U0GUEST001".to_owned(), true);
+    let request = rejection("U0GUEST001");
+    let first = run(&config, &fake, &request, 1_000);
+    assert_eq!(first["ok"], true, "{first}");
+    let original = fs::read(rejection_journal(&ledger, ID)).unwrap();
+    let mut other_app = config.clone();
+    other_app.app_id = Some(AppId::new("A0OTHER001").unwrap());
+    let mut channel_config = config.clone();
+    channel_config.channels.push("C0OTHER001".to_owned());
+    let mut other_channel = request.clone();
+    other_channel["channel_id"] = json!("C0OTHER001");
+    other_channel["message_id"] = json!("C0OTHER001/messages/1792000801.000100");
+    let mut other_message = request.clone();
+    other_message["message_id"] = json!(format!("{CHANNEL}/messages/1792000802.000100"));
+    let mut other_sender = request.clone();
+    other_sender["sender_id"] = json!("U0OTHER001");
+    for (config, request) in [
+        (&other_app, request),
+        (&channel_config, other_channel),
+        (&config, other_message),
+        (&config, other_sender),
+    ] {
+        let refused = run_factory(config, &request, 2_000, &mut || {
+            panic!("a rejection identity conflict must contact nothing")
+        });
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert_eq!(refused["error"]["code"], "rejection_conflict");
+        assert_eq!(refused["error"]["outcome"], "not_applied");
+        assert_eq!(refused["error"]["retryable"], false);
+        assert_eq!(fs::read(rejection_journal(&ledger, ID)).unwrap(), original);
+    }
+    assert_eq!(fake.state().humanity_queries.len(), 1);
+    assert_eq!(fake.state().reactions.len(), 1);
+    assert!(fake.state().posts.is_empty());
+}
+
+#[test]
+fn corrupt_oversized_or_unsafe_rejection_journals_contact_nothing() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    for case in [
+        "corrupt",
+        "oversized",
+        "symlink",
+        "hardlink",
+        "permissions",
+        "fifo",
+        "duplicate-key",
+    ] {
+        let ledger = ledger(&format!("rejection-journal-{case}"));
+        let config = config(&ledger, Some(APP));
+        let fake = FakeTransport::new();
+        fake.state()
+            .sender_humanity
+            .insert("U0GUEST001".to_owned(), true);
+        let request = rejection("U0GUEST001");
+        let first = run(&config, &fake, &request, 1_000);
+        assert_eq!(first["ok"], true, "{first}");
+        let record = rejection_journal(&ledger, ID);
+        match case {
+            "corrupt" => fs::write(&record, b"{").unwrap(),
+            "oversized" => {
+                let mut valid = fs::read(&record).unwrap();
+                valid.resize(4097, b' ');
+                serde_json::from_slice::<Value>(&valid)
+                    .expect("only the size guard rejects this valid journal");
+                fs::write(&record, valid).unwrap();
+            }
+            "symlink" => {
+                let target = record.with_extension("saved");
+                fs::rename(&record, &target).unwrap();
+                std::os::unix::fs::symlink(target, &record).unwrap();
+            }
+            "hardlink" => fs::hard_link(&record, record.with_extension("linked")).unwrap(),
+            "permissions" => {
+                fs::set_permissions(&record, fs::Permissions::from_mode(0o644)).unwrap()
+            }
+            "fifo" => {
+                fs::remove_file(&record).unwrap();
+                let name = CString::new(record.as_os_str().as_bytes()).unwrap();
+                // SAFETY: name is a NUL-terminated fixture path; the FIFO is private and never read.
+                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            }
+            "duplicate-key" => {
+                let original = fs::read_to_string(&record).unwrap();
+                fs::write(&record, original.replacen('{', "{\"complete\":false,", 1)).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let refused = run_factory(&config, &request, 2_000, &mut || {
+            panic!("{case}: an unreadable rejection journal must not construct a client")
+        });
+        assert_eq!(refused["ok"], false, "{case}: {refused}");
+        assert_eq!(refused["error"]["code"], "rejection_ledger_unreadable");
+        assert_eq!(refused["error"]["outcome"], "unknown");
+        assert_eq!(refused["error"]["retryable"], true);
+        assert_eq!(fake.state().humanity_queries.len(), 1);
+        assert_eq!(fake.state().reactions.len(), 1);
+        assert!(fake.state().posts.is_empty());
+        assert_no_post_intent(&ledger, ID);
+    }
+}
+
+#[test]
+fn rejection_storage_requires_an_existing_parent_and_refuses_symlink_ancestry() {
+    let root = ledger("rejection-storage-anchor");
+    let fake = FakeTransport::new();
+    let request = rejection("U0GUEST001");
+    let missing_parent = root.join("not-provisioned").join("ledger");
+    let missing_config = config(&missing_parent, Some(APP));
+    let refused = run_factory(&missing_config, &request, 1_000, &mut || {
+        panic!("missing storage anchors cannot start a client")
+    });
+    assert_eq!(refused["error"]["code"], "rejection_ledger_unreadable");
+    assert_eq!(refused["error"]["outcome"], "unknown");
+    assert!(
+        !root.exists(),
+        "a rejected storage anchor creates no missing ancestors"
+    );
+
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::create_dir(root.join("real")).unwrap();
+    std::os::unix::fs::symlink(root.join("real"), root.join("alias")).unwrap();
+    let symlink_ledger = root.join("alias/ledger");
+    let symlink_config = config(&symlink_ledger, Some(APP));
+    let refused = run_factory(&symlink_config, &request, 1_000, &mut || {
+        panic!("a symlink in the ledger ancestry cannot start a client")
+    });
+    assert_eq!(refused["error"]["code"], "rejection_ledger_unreadable");
+    assert_eq!(refused["error"]["outcome"], "unknown");
+    assert!(!root.join("real/ledger").exists());
+    assert!(fake.state().humanity_queries.is_empty());
+    assert!(fake.state().reactions.is_empty());
+    assert!(fake.state().posts.is_empty());
+}
+
+#[test]
+fn rejection_persistence_failure_prevents_a_write_or_a_false_success_receipt() {
+    for before_effect in [true, false] {
+        let ledger = ledger(if before_effect {
+            "rejection-bind-failure"
+        } else {
+            "rejection-complete-failure"
+        });
+        let config = config(&ledger, Some(APP));
+        let fake = FakeTransport::new();
+        fake.state()
+            .sender_humanity
+            .insert("U0GUEST001".to_owned(), true);
+        let record = rejection_journal(&ledger, ID);
+        let blocked = record.clone();
+        let mut transport = HookedReaction::new(&fake);
+        if before_effect {
+            transport.after_human = Some(Box::new(move || {
+                fs::create_dir(&blocked).unwrap();
+            }));
+        } else {
+            transport.before_reaction = Some(Box::new(move || {
+                fs::rename(&blocked, blocked.with_extension("intent")).unwrap();
+                fs::create_dir(&blocked).unwrap();
+            }));
+        }
+        let mut request = rejection("U0GUEST001");
+        let failed = run_transport(&config, &request, transport);
+        assert_eq!(failed["ok"], false, "{failed}");
+        assert_eq!(failed["error"]["code"], "rejection_ledger_unwritable");
+        assert_eq!(failed["error"]["outcome"], "unknown");
+        assert!(failed.get("receipt").is_none());
+        assert_eq!(fake.state().reactions.len(), usize::from(!before_effect));
+        assert_eq!(fake.state().humanity_queries.len(), 1);
+        assert!(fake.state().posts.is_empty());
+        assert_no_post_intent(&ledger, ID);
+        if !before_effect {
+            fs::remove_dir(&record).unwrap();
+            fs::rename(record.with_extension("intent"), &record).unwrap();
+            request["emoji"] = json!("no_entry_sign");
+            let retry = run(&config, &fake, &request, 2_000);
+            assert_eq!(retry["ok"], true, "{retry}");
+            assert_eq!(retry["receipt"]["already_present"], true);
+            assert_eq!(fake.state().reactions.len(), 1);
+            assert_eq!(fake.state().reactions[0].name, "x");
+            assert_eq!(fake.state().humanity_queries.len(), 2);
+        }
+    }
+}
+
+#[test]
+fn rejection_validates_sender_shape_channel_and_exact_fields_before_transport() {
+    let config = config(&ledger("rejection-local-refusal"), Some(APP));
+    let fake = FakeTransport::new();
+    let mut other_channel = rejection("U0GUEST001");
+    other_channel["channel_id"] = json!("C0OTHER0001");
+    other_channel["message_id"] = json!("C0OTHER0001/messages/1792000801.000100");
+    let mut extra = rejection("U0GUEST001");
+    extra["text"] = json!("must not be accepted");
+    let mut missing = rejection("U0GUEST001");
+    missing.as_object_mut().unwrap().remove("sender_id");
+    for (request, code) in [
+        (rejection("member@example.invalid"), "request_invalid"),
+        (other_channel, "channel_not_allowed"),
+        (extra, "request_invalid"),
+        (missing, "request_invalid"),
+    ] {
+        let mut built = false;
+        let mut transport = || {
+            built = true;
+            Ok(Box::new(fake.clone()) as Box<dyn SlackTransport>)
+        };
+        let response: Value = serde_json::from_slice(&handle_request(
+            &serde_json::to_vec(&request).unwrap(),
+            Ok(&config),
+            &mut transport,
+            &|| 1_000,
+        ))
+        .unwrap();
+        assert_eq!(response["ok"], json!(false), "{response}");
+        assert_eq!(response["error"]["code"], json!(code));
+        assert_eq!(response["id"], request["id"]);
+        assert_eq!(response["action"], request["action"]);
+        assert!(!built, "locally refused requests cannot start any client");
+    }
+    assert!(fake.state().reactions.is_empty());
+    assert!(fake.state().humanity_queries.is_empty());
 }
 
 #[test]

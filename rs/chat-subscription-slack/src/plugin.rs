@@ -4,10 +4,13 @@
 //! process server (`chat_subscription_plugin::serve_stdio`) can host it. One subscription opens one
 //! transport event stream for the configured channels and maps each sequenced event to one batch:
 //!
-//! * a `message.created` event in a configured channel, from an allowed sender, not posted by a
-//!   bot or app, not an edit or join notice, and not starting with an ignored prefix, becomes a
+//! * a `message.created` event in a configured channel, from an allowed sender, not an edit or
+//!   join notice, and not starting with an ignored prefix, becomes a
 //!   `message_created` event. Its thread is the thread root's `ts` (the message's own `ts` for a
 //!   top-level message), so replies to a thread route back into that thread;
+//! * an otherwise eligible new message from another sender, or with an ignored prefix, becomes
+//!   a metadata-only `message_rejected` candidate. The outbound helper verifies the author's
+//!   account is human before adding a rejection reaction; message annotations are insufficient;
 //! * every other sequenced event becomes a `checkpoint`, so the cursor still advances.
 //!
 //! # Cursor and recovery
@@ -43,8 +46,8 @@ use chat_subscription::{
     BackendCapabilities, BackendFailure, CancellationError, ChannelId, ChatSubscriptionBackend,
     ChatSubscriptionCancellation, ChatSubscriptionDriver, CommittableEvent, DeliveryBatch,
     DeliveryId, EventKind, EventSequence, Heartbeat, InboundMessage, MessageId, ProviderCursor,
-    ProviderPayload, ReconciliationGap, ReplaySupport, SenderId, SubscribeRequest,
-    SubscriptionItem, ThreadId,
+    ProviderPayload, ReconciliationGap, RejectedMessage, RejectionReason, ReplaySupport, SenderId,
+    SubscribeRequest, SubscriptionItem, ThreadId,
 };
 use serde_json::{Map, Value};
 
@@ -426,6 +429,7 @@ impl SlackBackend {
             NonZeroU16::new(1).expect("one is nonzero"),
             vec![
                 EventKind::MessageCreated,
+                EventKind::MessageRejected,
                 EventKind::Checkpoint,
                 EventKind::Gap,
                 EventKind::Heartbeat,
@@ -645,9 +649,8 @@ impl SlackDriver {
         // A bot_id does not decide it either when the user is an allowed
         // sender. A person who posts through an app with their own user token
         // gets that app's bot_id on the message while slack_user_id stays
-        // theirs (live finding 2026-10-19: three of the owner's thread replies
-        // arrived with slack_user_id U0C23P5291P and bot_id B0C6X0ASTSL and
-        // were dropped as bot-authored). The sender allowlist is the identity
+        // theirs (live finding 2026-10-19: three allowed human thread replies
+        // with this annotation were dropped as bot-authored). The sender allowlist is the identity
         // check. The bridge's own posts are written as its app's bot user, a
         // different user ID, which is never an allowed sender, so they cannot
         // come back as requests.
@@ -656,11 +659,7 @@ impl SlackDriver {
             .as_deref()
             .filter(|user| self.senders.contains(*user))
         else {
-            return Err(if message.bot_id.is_some() {
-                "bot author"
-            } else {
-                "sender not allowed"
-            });
+            return Err("sender not allowed");
         };
         let created = ids::ts_micros(&message.message_ts).ok_or("invalid message ts")?;
         if created < self.created_floor_micros {
@@ -722,6 +721,50 @@ impl SlackDriver {
         )
         .map(|inbound| inbound.with_provider_payload(provider_payload))
         .map_err(|_| "invalid message")
+    }
+
+    /// Metadata for a rejected new message; never text, thread routing or an admitted request.
+    ///
+    /// `bot_id` and `app_id` annotate the delivery and cannot establish the author is a bot or
+    /// human. The outbound helper must verify the exact account before adding a reaction.
+    fn rejected(&self, message: &SlackMessage) -> Option<RejectedMessage> {
+        if !self.channels.contains(&message.channel_id)
+            || message
+                .subtype
+                .as_deref()
+                .is_some_and(|subtype| !MESSAGE_SUBTYPES.contains(&subtype))
+            || ids::ts_micros(&message.message_ts)? < self.created_floor_micros
+        {
+            return None;
+        }
+        let user = message
+            .user_id
+            .as_deref()
+            .filter(|user| ids::valid_user_id(user))?;
+        let reason = if !self.senders.contains(user) {
+            RejectionReason::SenderNotAllowed
+        } else {
+            let text = ids::unescape_text(&message.text);
+            if !self
+                .config
+                .ignore_text_prefixes
+                .iter()
+                .any(|prefix| text.trim_start().starts_with(prefix.as_str()))
+            {
+                return None;
+            }
+            RejectionReason::IgnoredPrefix
+        };
+        Some(RejectedMessage::new(
+            ChannelId::new(message.channel_id.clone()).ok()?,
+            MessageId::new(ids::message_resource(
+                &message.channel_id,
+                &message.message_ts,
+            ))
+            .ok()?,
+            SenderId::new(user).ok()?,
+            reason,
+        ))
     }
 }
 
@@ -812,13 +855,22 @@ impl ChatSubscriptionDriver for SlackDriver {
                             CommittableEvent::message_created(inbound)
                         }
                         Some(Err(reason)) => {
+                            let rejected = message
+                                .as_ref()
+                                .filter(|_| event_type == "message.created")
+                                .and_then(|message| self.rejected(message));
                             // Identifiers only, never text: enough to see why an expected
                             // message was not admitted (for example an unlisted sender ID).
                             let author = message.as_ref().map_or("?", |message| {
                                 message.user_id.as_deref().unwrap_or("none")
                             });
                             self.diagnostics.log(&format!(
-                                "event {sequence}: checkpoint ({reason}; user {author})"
+                                "event {sequence}: {} ({reason}; user {author})",
+                                if rejected.is_some() {
+                                    "rejection candidate"
+                                } else {
+                                    "checkpoint"
+                                }
                             ));
                             // A refused message from an allowed sender is counted durably, so
                             // agentctl can raise an alarm: a person's message was meant to be a
@@ -844,7 +896,10 @@ impl ChatSubscriptionDriver for SlackDriver {
                                     ));
                                 }
                             }
-                            CommittableEvent::Checkpoint
+                            rejected.map_or(
+                                CommittableEvent::Checkpoint,
+                                CommittableEvent::message_rejected,
+                            )
                         }
                         None => {
                             self.diagnostics.log(&format!(

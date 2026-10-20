@@ -61,7 +61,7 @@ pub const MAX_BACKEND_CONFIGURATION_BYTES: usize = 64 * 1_024;
 /// Maximum nesting accepted inside backend configuration.
 pub const MAX_BACKEND_CONFIGURATION_DEPTH: usize = 64;
 /// Number of distinct event categories representable by [`EventKind`].
-pub const MAX_EVENT_KINDS: usize = 4;
+pub const MAX_EVENT_KINDS: usize = 5;
 
 fn validate_text(value: &str, label: &str, maximum: usize) -> Result<(), ValidationError> {
     let bytes = value.len();
@@ -667,11 +667,94 @@ impl ReconciliationGap {
     }
 }
 
+/// A bounded reason why a newly created message was not offered for request admission.
+///
+/// These reasons classify feedback candidates. They confer no sender authority and do not prove
+/// that the author is human; an outbound feedback adapter must verify that the authenticated
+/// provider author account is human before reacting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RejectionReason {
+    /// The authenticated sender was outside the subscription's allowed sender set.
+    SenderNotAllowed,
+    /// The message began with a configured prefix that suppresses request admission.
+    IgnoredPrefix,
+}
+
+impl RejectionReason {
+    /// Return the stable protocol and durable-state spelling of this reason.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SenderNotAllowed => "sender_not_allowed",
+            Self::IgnoredPrefix => "ignored_prefix",
+        }
+    }
+}
+
+/// A newly created message reference that is eligible only for rejection feedback.
+///
+/// The bounded provider IDs locate the resource without retaining its body, thread, or full
+/// provider payload. This reference never authorizes a request. Providers exclude known bot/app
+/// message types, edits, deletions, and other non-message events before constructing it. A
+/// candidate with an unknown account type is permitted, but the outbound adapter must
+/// independently verify a human author before adding feedback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RejectedMessage {
+    channel_id: ChannelId,
+    message_id: MessageId,
+    sender_id: SenderId,
+    reason: RejectionReason,
+}
+
+impl RejectedMessage {
+    /// Construct a reference from already validated, bounded provider IDs and a typed reason.
+    #[must_use]
+    pub fn new(
+        channel_id: ChannelId,
+        message_id: MessageId,
+        sender_id: SenderId,
+        reason: RejectionReason,
+    ) -> Self {
+        Self {
+            channel_id,
+            message_id,
+            sender_id,
+            reason,
+        }
+    }
+
+    /// Borrow the channel containing the rejected message.
+    #[must_use]
+    pub fn channel_id(&self) -> &ChannelId {
+        &self.channel_id
+    }
+
+    /// Borrow the provider's message identifier.
+    #[must_use]
+    pub fn message_id(&self) -> &MessageId {
+        &self.message_id
+    }
+
+    /// Borrow the authenticated provider sender identifier.
+    #[must_use]
+    pub fn sender_id(&self) -> &SenderId {
+        &self.sender_id
+    }
+
+    /// Return the bounded classification for feedback.
+    #[must_use]
+    pub fn reason(&self) -> RejectionReason {
+        self.reason
+    }
+}
+
 /// A receipt-bearing event that advances durable subscription state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommittableEvent {
     /// A fully normalized newly created message.
     MessageCreated(Box<InboundMessage>),
+    /// A metadata-only reference for rejection feedback, never request admission.
+    MessageRejected(Box<RejectedMessage>),
     /// An upstream boundary with no user-visible message.
     Checkpoint,
     /// A boundary that requires reconciliation from a request/response API.
@@ -685,11 +768,18 @@ impl CommittableEvent {
         Self::MessageCreated(Box::new(message))
     }
 
+    /// Wrap a rejection feedback reference without exposing storage indirection to constructors.
+    #[must_use]
+    pub fn message_rejected(message: RejectedMessage) -> Self {
+        Self::MessageRejected(Box::new(message))
+    }
+
     /// Return the capability kind needed to emit this event.
     #[must_use]
     pub fn kind(&self) -> EventKind {
         match self {
             Self::MessageCreated(_) => EventKind::MessageCreated,
+            Self::MessageRejected(_) => EventKind::MessageRejected,
             Self::Checkpoint => EventKind::Checkpoint,
             Self::Gap(_) => EventKind::Gap,
         }
@@ -713,6 +803,12 @@ impl CommittableEvent {
                     + message
                         .provider_payload()
                         .map_or(0, ProviderPayload::encoded_bytes)
+            }
+            Self::MessageRejected(message) => {
+                encoded_json_string_bytes(message.channel_id().as_str())
+                    + encoded_json_string_bytes(message.message_id().as_str())
+                    + encoded_json_string_bytes(message.sender_id().as_str())
+                    + encoded_json_string_bytes(message.reason().as_str())
             }
             Self::Checkpoint => 0,
             Self::Gap(gap) => gap.reason().map_or(0, encoded_json_string_bytes),
@@ -838,6 +934,8 @@ impl SubscriptionItem {
 pub enum EventKind {
     /// Newly created messages with full normalized resource data.
     MessageCreated,
+    /// Bounded message references for rejection feedback, without request authority.
+    MessageRejected,
     /// Cursor-only checkpoints.
     Checkpoint,
     /// Reconciliation gaps.
@@ -924,7 +1022,9 @@ impl BackendCapabilities {
         self.replay
     }
 
-    /// Report whether every message event carries a provider-specific full-resource envelope.
+    /// Report whether every message-created event carries a provider-specific full-resource envelope.
+    ///
+    /// Rejection feedback references never carry a message body or provider payload.
     #[must_use]
     pub fn full_message_data(&self) -> bool {
         self.full_message_data
@@ -1335,6 +1435,18 @@ impl ChatSubscription {
                             return Err(SubscriptionError::MessageOutsideSenderAuthority);
                         }
                     }
+                    if let CommittableEvent::MessageRejected(message) = event {
+                        if !self.channel_membership.contains(message.channel_id()) {
+                            self.poisoned = true;
+                            return Err(SubscriptionError::RejectedMessageOutsideChannelAuthority);
+                        }
+                        if message.reason() == RejectionReason::SenderNotAllowed
+                            && self.sender_membership.contains(message.sender_id())
+                        {
+                            self.poisoned = true;
+                            return Err(SubscriptionError::RejectedMessageFromAllowedSender);
+                        }
+                    }
                 }
             }
             SubscriptionItem::Heartbeat(_) => {
@@ -1467,6 +1579,10 @@ pub enum SubscriptionError {
     MessageOutsideChannelAuthority,
     /// A message named a sender outside the start authority.
     MessageOutsideSenderAuthority,
+    /// A rejection feedback reference named a channel outside the start authority.
+    RejectedMessageOutsideChannelAuthority,
+    /// A sender-not-allowed reference contradicted the start authority.
+    RejectedMessageFromAllowedSender,
     /// A backend advertising full message data omitted its provider envelope.
     MissingFullMessageData,
     /// A prior receive or acknowledgement failed ambiguously.
@@ -1519,6 +1635,11 @@ impl fmt::Display for SubscriptionError {
             Self::MessageOutsideSenderAuthority => {
                 formatter.write_str("subscription message is outside sender authority")
             }
+            Self::RejectedMessageOutsideChannelAuthority => {
+                formatter.write_str("subscription rejection reference is outside channel authority")
+            }
+            Self::RejectedMessageFromAllowedSender => formatter
+                .write_str("subscription sender-not-allowed rejection names an allowed sender"),
             Self::MissingFullMessageData => formatter
                 .write_str("backend advertised full message data but omitted provider_payload"),
             Self::GenerationPoisoned => formatter.write_str(
@@ -1713,7 +1834,7 @@ mod tests {
         .expect_err("more kinds than the enum can represent must fail immediately");
         assert_eq!(
             error.detail(),
-            "backend capabilities contain 5 event kinds; maximum is 4"
+            "backend capabilities contain 6 event kinds; maximum is 5"
         );
 
         let duplicate = BackendCapabilities::new(
@@ -1896,6 +2017,214 @@ mod tests {
             None,
         )
         .expect("request authority is valid")
+    }
+
+    fn rejection(channel: &str, sender: &str, reason: RejectionReason) -> CommittableEvent {
+        CommittableEvent::message_rejected(RejectedMessage::new(
+            ChannelId::new(channel).expect("channel"),
+            MessageId::new("messages/rejected").expect("message"),
+            SenderId::new(sender).expect("sender"),
+            reason,
+        ))
+    }
+
+    fn subscription_with_child(
+        event: CommittableEvent,
+        advertise_rejections: bool,
+    ) -> ChatSubscription {
+        let mut kinds = capabilities().event_kinds().to_vec();
+        if advertise_rejections {
+            kinds.push(EventKind::MessageRejected);
+        }
+        let mut backend = Backend {
+            capabilities: BackendCapabilities::new(
+                "fixture",
+                ReplaySupport::Cursor,
+                true,
+                NonZeroU16::new(1).expect("one is nonzero"),
+                kinds,
+            )
+            .expect("all distinct event kinds fit the capability bound"),
+            items: Some(VecDeque::from([SubscriptionItem::Batch(
+                DeliveryBatch::new(
+                    EventSequence::new(1).expect("sequence"),
+                    ProviderCursor::new("cursor").expect("cursor"),
+                    DeliveryId::new("delivery").expect("delivery"),
+                    vec![CommittableEvent::Checkpoint, event],
+                )
+                .expect("bounded batch"),
+            )])),
+        };
+        ChatSubscription::open(&mut backend, &request()).expect("subscription opens")
+    }
+
+    #[test]
+    fn rejection_reference_is_committable_without_admitting_an_unallowed_sender() {
+        let event = rejection(
+            "channels/one",
+            "users/guest",
+            RejectionReason::SenderNotAllowed,
+        );
+        let mut subscription = subscription_with_child(event.clone(), true);
+        let Some(SubscriptionItem::Batch(batch)) = subscription.next_item().expect("receive")
+        else {
+            panic!("expected a durable rejection reference");
+        };
+        assert_eq!(batch.events(), &[CommittableEvent::Checkpoint, event]);
+        assert_eq!(subscription.outstanding(), Some(&batch));
+        assert_eq!(
+            subscription.next_item(),
+            Err(SubscriptionError::OutstandingDelivery {
+                sequence: batch.sequence(),
+            })
+        );
+        subscription
+            .commit_durable(&batch)
+            .expect("reference follows the same durable commit contract");
+        assert!(subscription.outstanding().is_none());
+
+        let mut message_subscription = subscription_with_child(
+            CommittableEvent::message_created(message(
+                "channels/one",
+                "users/guest",
+                "must not become a request",
+                Some(provider_payload(serde_json::json!({}))),
+            )),
+            true,
+        );
+        assert_eq!(
+            message_subscription.next_item(),
+            Err(SubscriptionError::MessageOutsideSenderAuthority)
+        );
+        assert!(message_subscription.is_poisoned());
+    }
+
+    #[test]
+    fn rejection_reference_requires_its_advertised_capability() {
+        let mut subscription = subscription_with_child(
+            rejection(
+                "channels/one",
+                "users/guest",
+                RejectionReason::SenderNotAllowed,
+            ),
+            false,
+        );
+        assert_eq!(
+            subscription.next_item(),
+            Err(SubscriptionError::UnadvertisedEvent {
+                kind: EventKind::MessageRejected,
+            })
+        );
+        assert!(subscription.is_poisoned());
+        assert!(subscription.outstanding().is_none());
+    }
+
+    #[test]
+    fn rejection_reference_cannot_escape_channel_authority() {
+        for reason in [
+            RejectionReason::SenderNotAllowed,
+            RejectionReason::IgnoredPrefix,
+        ] {
+            let mut subscription =
+                subscription_with_child(rejection("channels/other", "users/guest", reason), true);
+            assert_eq!(
+                subscription.next_item(),
+                Err(SubscriptionError::RejectedMessageOutsideChannelAuthority)
+            );
+            assert!(subscription.is_poisoned());
+            assert!(subscription.outstanding().is_none());
+        }
+    }
+
+    #[test]
+    fn sender_rejection_cannot_contradict_start_authority_but_ignored_prefix_can() {
+        let mut contradictory = subscription_with_child(
+            rejection(
+                "channels/one",
+                "users/owner",
+                RejectionReason::SenderNotAllowed,
+            ),
+            true,
+        );
+        assert_eq!(
+            contradictory.next_item(),
+            Err(SubscriptionError::RejectedMessageFromAllowedSender)
+        );
+        assert!(contradictory.is_poisoned());
+
+        let event = rejection(
+            "channels/one",
+            "users/owner",
+            RejectionReason::IgnoredPrefix,
+        );
+        let mut ignored = subscription_with_child(event.clone(), true);
+        let Some(SubscriptionItem::Batch(batch)) = ignored.next_item().expect("receive") else {
+            panic!("expected a durable ignored-prefix reference");
+        };
+        assert_eq!(batch.events(), &[CommittableEvent::Checkpoint, event]);
+    }
+
+    #[test]
+    fn rejection_reference_cannot_replace_the_initial_boundary() {
+        let event = rejection(
+            "channels/one",
+            "users/guest",
+            RejectionReason::SenderNotAllowed,
+        );
+        let mut kinds = capabilities().event_kinds().to_vec();
+        kinds.push(EventKind::MessageRejected);
+        let mut backend = Backend {
+            capabilities: BackendCapabilities::new(
+                "fixture",
+                ReplaySupport::Cursor,
+                true,
+                NonZeroU16::new(1).expect("one is nonzero"),
+                kinds,
+            )
+            .expect("capabilities"),
+            items: Some(VecDeque::from([SubscriptionItem::Batch(
+                DeliveryBatch::new(
+                    EventSequence::new(1).expect("sequence"),
+                    ProviderCursor::new("cursor").expect("cursor"),
+                    DeliveryId::new("delivery").expect("delivery"),
+                    vec![event],
+                )
+                .expect("batch"),
+            )])),
+        };
+        let mut subscription =
+            ChatSubscription::open(&mut backend, &request()).expect("subscription opens");
+        assert_eq!(
+            subscription.next_item(),
+            Err(SubscriptionError::MissingInitialBoundary)
+        );
+        assert!(subscription.is_poisoned());
+    }
+
+    #[test]
+    fn rejection_ids_and_reason_count_toward_the_encoded_batch_budget() {
+        let event = CommittableEvent::message_rejected(RejectedMessage::new(
+            ChannelId::new("\0".repeat(MAX_RESOURCE_ID_BYTES)).expect("escaped channel"),
+            MessageId::new("\0".repeat(MAX_RESOURCE_ID_BYTES)).expect("escaped message"),
+            SenderId::new("\0".repeat(MAX_SENDER_ID_BYTES)).expect("escaped sender"),
+            RejectionReason::SenderNotAllowed,
+        ));
+        assert_eq!(
+            event.encoded_variable_bytes(),
+            6 * (2 * MAX_RESOURCE_ID_BYTES + MAX_SENDER_ID_BYTES)
+                + RejectionReason::SenderNotAllowed.as_str().len()
+                + 8 // Four JSON strings each contribute their enclosing quotes.
+        );
+        let count = MAX_BATCH_BYTES / event.encoded_variable_bytes() + 1;
+        assert!(count <= MAX_BATCH_EVENTS);
+        let error = DeliveryBatch::new(
+            EventSequence::new(1).expect("sequence"),
+            ProviderCursor::new("cursor").expect("cursor"),
+            DeliveryId::new("delivery").expect("delivery"),
+            vec![event; count],
+        )
+        .expect_err("escaped rejection IDs must not bypass the aggregate byte bound");
+        assert!(error.detail().contains("encoded payload"));
     }
 
     #[test]

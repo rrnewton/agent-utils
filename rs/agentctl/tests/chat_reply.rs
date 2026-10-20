@@ -66,6 +66,7 @@ impl Scratch {
                 outbound_enabled: true,
                 ack_reaction: ReactionSetting::Disabled,
                 receipt_reaction: ReactionSetting::Inherit,
+                reject_reaction: ReactionSetting::Inherit,
                 backend_configuration: None,
                 outbound_command: None,
                 reply_alias_range: None,
