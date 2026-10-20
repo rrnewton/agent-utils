@@ -19302,9 +19302,13 @@ function drawProjection() {
  * on from. `#220 view-switch-instant`.
  */
 function walkCursorOwed() {
-  if (!threadingSupported || discordOlderCursor || channelCanon.channel !== String(el("discord-channel").value)) {
+  if (discordOlderCursor || channelCanon.channel !== String(el("discord-channel").value)) {
     return false;
   }
+  // A page answered from the server's message cache (`#384 cache-serve`): it said more
+  // exists and could not carry the provider's cursor, whatever the view's cover.
+  if (discordWalkCursorOwed) return true;
+  if (!threadingSupported) return false;
   const cover = channelCanon.views.get(viewKey());
   return Boolean(cover && cover.fromAll && cover.live && cover.more);
 }
@@ -19523,6 +19527,7 @@ function clearChannelScreen() {
   archivedIds = new Set();
   discordMoreAbove = false;
   discordOlderCursor = null;
+  discordWalkCursorOwed = false;
   discordNewestId = null;
   el("discord-log").replaceChildren();
   el("thread-list").replaceChildren();
@@ -20733,6 +20738,7 @@ async function changeChannelView(view, threadId = null, summary = null, origin =
   const rows = held || covered ? [] : heldViewRows();
   discordMoreAbove = held ? held.more : false;
   discordOlderCursor = held ? held.cursor : null;
+  discordWalkCursorOwed = false;
   discordNewestId = held ? held.newest : null;
   // The rows on screen stay until the new view's replace them, unless there is nothing to draw.
   if (held || (!covered && rows.length === 0)) {
@@ -23297,6 +23303,7 @@ function applyTimelinePage(payload, older = false, saved = false, delta = false,
       (discordMoreAbove !== false && !discordOlderCursor))) {
     discordMoreAbove = payload.has_more === true;
     discordOlderCursor = payload.next_before || null;
+    discordWalkCursorOwed = payload.has_more === true && !payload.next_before;
   }
   const cover = channelCanon.views.get(viewKey());
   if (cover && !saved && !delta) cover.cursor = discordOlderCursor;
@@ -23651,6 +23658,7 @@ async function loadTimeline(options) {
           timelineMessages = [];
           timelineThreads = [];
           discordOlderCursor = null;
+          discordWalkCursorOwed = false;
           discordMoreAbove = false;
           channelCanon.views.delete(viewKey());
           deltas.length = 0;
@@ -32545,6 +32553,11 @@ const OLDER_TRIGGER_PX = 80;
  */
 let discordMoreAbove = false;
 let discordOlderCursor = null;
+// The last live page said more exists above but carried no cursor to walk back on — a page
+// the server answered from its message cache (`#384 cache-serve`), which cannot mint the
+// provider's backward cursor. The first step back then owes the view a read of its own
+// newest page first (`readWalkCursor`), which the server answers from the provider.
+let discordWalkCursorOwed = false;
 let olderFetchInFlight = false;
 
 /** `has_more` absent means a server too old to say — which is UNKNOWN, and never "no". */
@@ -34802,6 +34815,7 @@ async function loadTodo(options) {
     // scroll to the top prepend unfiltered rows into a filtered list.
     discordMoreAbove = false;
     discordOlderCursor = null;
+    discordWalkCursorOwed = false;
     renderOlderControl();
     backlogSize = messages.length;
     // Quoted, never rewritten: `#61 unread-status` is one posture and it is stated on the server.
@@ -47007,6 +47021,7 @@ function changeSelectedChannel() {
   restoreChannelComposer();
   discordMoreAbove = false;
   discordOlderCursor = null;
+  discordWalkCursorOwed = false;
   discordNewestId = null;
   el("discord-log").replaceChildren();
   // The summary goes with the rows it is about. It is written only inside `loadDiscord`, which

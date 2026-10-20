@@ -8,6 +8,8 @@
 //! A served read must answer while that read is still held; a read that may not be served
 //! must still be waiting when the hold is released.
 
+mod slack_fake;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,12 +19,17 @@ use http_body_util::BodyExt as _;
 use serde_json::Value;
 use tower::ServiceExt as _;
 use vibe_talk::cache::shadow::ConsumerCounts;
+use vibe_talk::cache::sink::Verification;
 use vibe_talk::cache::ChanKey;
+use vibe_talk::chat::ChatError;
 use vibe_talk::discord::fake::FakeDiscord;
 use vibe_talk::live::LiveKind;
 use vibe_talk::model::{ChannelId, MessageId};
+use vibe_talk::providers::ChatRouter;
 use vibe_talk::state::AppState;
-use vibe_talk::testing::{self, ManualClock, TempDir, TimelineChat, READ_CHANNEL, WRITE_TOKEN};
+use vibe_talk::testing::{
+    self, CountingChat, ManualClock, TempDir, TimelineChat, READ_CHANNEL, READ_TOKEN, WRITE_TOKEN,
+};
 
 /// 2026-08-18T12:00:00Z: where the fixtures' messages are written, a minute apart.
 const T0: i64 = 1_787_054_400_000;
@@ -164,12 +171,17 @@ impl Deployment {
     /// A write-token timeline read run on its own task, so a test can hold the provider and
     /// still see whether the request answers.
     fn spawn_timeline(&self, limit: u16) -> tokio::task::JoinHandle<Value> {
+        self.spawn_timeline_as(limit, WRITE_TOKEN)
+    }
+
+    fn spawn_timeline_as(&self, limit: u16, token: &str) -> tokio::task::JoinHandle<Value> {
         let state = self.state.clone();
+        let token = token.to_owned();
         tokio::spawn(async move {
             ok(
                 &state,
                 &path(READ_CHANNEL, &format!("/timeline?view=main&limit={limit}")),
-                WRITE_TOKEN,
+                &token,
             )
             .await
         })
@@ -268,6 +280,7 @@ async fn an_edit_and_a_deletion_the_refresh_finds_correct_what_was_served() {
 
     // The page is put right by live corrections for exactly the rows that were served.
     let (mut updated, mut deleted) = (None::<String>, None::<String>);
+    let mut event_ids: Vec<String> = Vec::new();
     let collect = async {
         while updated.is_none() || deleted.is_none() {
             let live = subscription
@@ -275,6 +288,7 @@ async fn an_edit_and_a_deletion_the_refresh_finds_correct_what_was_served() {
                 .recv()
                 .await
                 .expect("a live correction");
+            event_ids.push(live.event_id.clone());
             match live.kind {
                 LiveKind::Update if live.message.id == d.ids[10] => {
                     updated = Some(live.message.content.clone());
@@ -291,6 +305,32 @@ async fn an_edit_and_a_deletion_the_refresh_finds_correct_what_was_served() {
         .expect("the refresh corrected the served page");
     assert_eq!(updated.as_deref(), Some("message 10, corrected"));
     assert_eq!(deleted.as_deref(), Some(d.ids[9].as_str()));
+    // A subscriber resumes after the LAST event of the id it names, so a correction may never
+    // carry another event's id — its message's create id above all.
+    assert!(
+        event_ids.iter().all(|event_id| event_id.contains("~c")),
+        "correction event ids are their own: {event_ids:?}"
+    );
+    let mut sorted = event_ids.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), event_ids.len(), "and no two share one");
+    let resumed = d
+        .state
+        .live
+        .subscribe(&channel, Some(&MessageId(event_ids[0].clone())));
+    assert!(
+        resumed
+            .replay
+            .iter()
+            .any(|live| live.event_id == event_ids[1]),
+        "resuming after the first correction replays the second: {:?}",
+        resumed
+            .replay
+            .iter()
+            .map(|live| &live.event_id)
+            .collect::<Vec<_>>()
+    );
 
     settled(&d.state).await;
     let timeline = counts(&d.state, "timeline_fallback");
@@ -437,4 +477,329 @@ async fn with_serving_off_a_reload_waits_for_the_provider() {
     );
     settled(&d.state).await;
     assert_eq!(counts(&d.state, "timeline_fallback").served, 0);
+}
+
+#[tokio::test]
+async fn a_read_token_reload_is_never_served() {
+    // Serving is the write scope's: a served read's refresh fills under the caller's grant,
+    // and the read token has none. Its reads are shadowed, as before, and answered upstream.
+    let d = deployment("cache-serve-read-scope").await;
+    d.fill_timeline().await;
+    d.clock.advance(2 * HOUR);
+    d.state.message_cache.set_serve(true);
+
+    let held = d.chat.hold_next_timeline();
+    let mut request = d.spawn_timeline_as(5, READ_TOKEN);
+    assert!(
+        tokio::time::timeout(AT_ONCE, &mut request).await.is_err(),
+        "a read-token reload waits for the provider"
+    );
+    held.release.send(()).expect("the read is waiting");
+    let body = request.await.expect("the request ran");
+    assert_eq!(
+        texts(&body),
+        [
+            "message 7",
+            "message 8",
+            "message 9",
+            "message 10",
+            "message 11"
+        ]
+    );
+    settled(&d.state).await;
+    assert_eq!(counts(&d.state, "timeline_fallback").served, 0);
+}
+
+#[tokio::test]
+async fn a_served_pages_next_full_read_fetches_the_walk_back_cursor() {
+    // A served page cannot mint the provider's backward cursor, so it says more exists
+    // without one — and the view is then not served again until a caller holds a real page.
+    // Otherwise every later load would serve afresh and older history would stay unreachable.
+    let d = deployment("cache-serve-cursor").await;
+    d.fill_timeline().await;
+    d.clock.advance(2 * HOUR);
+    d.state.message_cache.set_serve(true);
+
+    let held = d.chat.hold_next_timeline();
+    let body = tokio::time::timeout(AT_ONCE, d.spawn_timeline(5))
+        .await
+        .expect("the reload answered at once")
+        .expect("the request ran");
+    assert_eq!(body["has_more"], true, "{body}");
+    assert!(body["next_before"].is_null(), "no minted cursor: {body}");
+    assert_eq!(body["has_threads"], false, "{body}");
+    let after = body["next_after"]
+        .as_str()
+        .expect("a forward cursor")
+        .to_owned();
+    held.entered
+        .await
+        .expect("the refresh reached the provider");
+    held.release.send(()).expect("the refresh is waiting");
+    settled(&d.state).await;
+
+    // The forward cursor a served page hands out is one a delta can continue from.
+    let delta = ok(
+        &d.state,
+        &path(
+            READ_CHANNEL,
+            &format!("/timeline?view=main&limit=5&after={}", url_encode(&after)),
+        ),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert!(delta["delta"].is_object(), "a delta answer: {delta}");
+    settled(&d.state).await;
+
+    // The next full read of the view goes upstream, refresh or no: it fetches the page whose
+    // cursor the reader walks back on.
+    let held = d.chat.hold_next_timeline();
+    let mut request = d.spawn_timeline(5);
+    assert!(
+        tokio::time::timeout(AT_ONCE, &mut request).await.is_err(),
+        "the view owed a real page is not served again"
+    );
+    held.release.send(()).expect("the read is waiting");
+    let body = request.await.expect("the request ran");
+    assert!(
+        body["next_before"].is_string(),
+        "the provider's own backward cursor: {body}"
+    );
+    settled(&d.state).await;
+    assert_eq!(counts(&d.state, "timeline_fallback").served, 1);
+
+    // With a real page handed out, serving resumes. Time passes first, as it would: a
+    // snapshot holding what the direct read just wrote, at the very instant of the ask,
+    // is counted late and never served on.
+    d.clock.advance(SECOND);
+    let held = d.chat.hold_next_timeline();
+    let body = tokio::time::timeout(AT_ONCE, d.spawn_timeline(5))
+        .await
+        .expect("answered from the cache again")
+        .expect("the request ran");
+    assert!(body["next_before"].is_null(), "{body}");
+    held.release.send(()).expect("the refresh is waiting");
+    settled(&d.state).await;
+    assert_eq!(counts(&d.state, "timeline_fallback").served, 2);
+}
+
+/// Percent-encode a cursor for a query string: enough for the envelope's own characters.
+fn url_encode(raw: &str) -> String {
+    raw.chars()
+        .flat_map(|c| match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => vec![c],
+            _ => format!("%{:02X}", u32::from(c)).chars().collect(),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_flat_page_off_a_bridge_is_never_served() {
+    // Only a bridge's Flat list is a scope the cache can vouch for whole; Discord's own Flat
+    // view is never answered from it, however fresh its Main scope is.
+    let d = deployment("cache-serve-flat").await;
+    d.fill_timeline().await;
+    d.state.message_cache.set_serve(true);
+
+    let held = d.chat.hold_next_timeline();
+    let state = d.state.clone();
+    let mut request = tokio::spawn(async move {
+        ok(
+            &state,
+            &path(READ_CHANNEL, "/timeline?view=flat&limit=5"),
+            WRITE_TOKEN,
+        )
+        .await
+    });
+    assert!(
+        tokio::time::timeout(AT_ONCE, &mut request).await.is_err(),
+        "a Flat page here waits for the provider"
+    );
+    held.release.send(()).expect("the read is waiting");
+    request.await.expect("the request ran");
+    settled(&d.state).await;
+    assert_eq!(counts(&d.state, "timeline_fallback").served, 0);
+}
+
+#[tokio::test]
+async fn a_provider_whose_account_is_unchecked_is_not_served() {
+    // Rows read as one account must never be handed back as another's: between a credential
+    // swap and the new account being checked against the file, every read goes upstream,
+    // however well the cache would otherwise serve it.
+    let dir = TempDir::new("cache-serve-unverified");
+    let (mut state, fake, _voice) = testing::state_from_toml(&testing::config_toml());
+    let read = ChannelId(READ_CHANNEL.to_owned());
+    for n in 0..12 {
+        fake.seed_at(&read, "Ada", &format!("message {n}"), T0 + n * MINUTE);
+    }
+    let chat = Arc::new(TimelineChat::new(fake));
+    let counting = Arc::new(CountingChat::new(chat.clone()));
+    state.replace_chat(counting.clone());
+    let clock = ManualClock::at(T0 + HOUR);
+    let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
+    ok(
+        &state,
+        &path(READ_CHANNEL, "/timeline?view=main&limit=50"),
+        WRITE_TOKEN,
+    )
+    .await;
+    settled(&state).await;
+    clock.advance(2 * HOUR);
+    state.message_cache.set_serve(true);
+
+    // The provider stops answering which account it is, and the check starts over.
+    for _ in 0..8 {
+        counting.fail_next(
+            "identity",
+            None,
+            ChatError::Transport("the identity read is down".to_owned()),
+        );
+    }
+    state.message_cache.reverify();
+    assert_ne!(
+        state.message_cache.verification(LEGACY),
+        Verification::Verified,
+        "unchecked again from this start of the check"
+    );
+
+    let held = chat.hold_next_timeline();
+    let request_state = state.clone();
+    let mut request = tokio::spawn(async move {
+        ok(
+            &request_state,
+            &path(READ_CHANNEL, "/timeline?view=main&limit=5"),
+            WRITE_TOKEN,
+        )
+        .await
+    });
+    assert!(
+        tokio::time::timeout(AT_ONCE, &mut request).await.is_err(),
+        "unchecked, the reload waits for the provider"
+    );
+    held.release.send(()).expect("the read is waiting");
+    request.await.expect("the request ran");
+    settled(&state).await;
+    assert_eq!(counts(&state, "timeline_fallback").served, 0);
+}
+
+const SLACK: &str = "slack";
+const SLACK_CH: &str = "C0000MAIN1";
+
+fn slack_ms(seconds: i64) -> i64 {
+    (slack_fake::BASE_SECS + seconds) * 1_000
+}
+
+/// A Slack channel of six messages a minute apart, filled into a cache read by `clock`.
+async fn slack_deployment(tag: &str) -> (AppState, slack_fake::Fake, Arc<ManualClock>, TempDir) {
+    let mut fixture = slack_fake::FakeState::default();
+    fixture.history.insert(
+        SLACK_CH.to_owned(),
+        (0..6)
+            .map(|n| {
+                slack_fake::profiled(
+                    &slack_fake::ts(n * 60, 0),
+                    "UADA00001",
+                    "Ada",
+                    &format!("message {n}"),
+                )
+            })
+            .collect(),
+    );
+    let fake = slack_fake::Fake::start(fixture, 10).await;
+    let dir = TempDir::new(tag);
+    let clock = ManualClock::at(slack_ms(3_600));
+    let text = format!(
+        r#"
+[auth]
+read_token = "{READ_TOKEN}"
+write_token = "{WRITE_TOKEN}"
+
+[[providers]]
+key = "{SLACK}"
+kind = "slack"
+api_base = "{base}"
+token = "{token}"
+
+[[channels]]
+id = "{SLACK_CH}"
+label = "team"
+writable = true
+"#,
+        base = fake.base,
+        token = slack_fake::TOKEN,
+    );
+    let (mut state, _discord, _store) = testing::state_with_store_from_toml(&text);
+    let router = ChatRouter::from_config(&state.config).expect("providers build");
+    state.replace_providers(Arc::new(router));
+    let state = testing::with_message_cache(state, dir.path(), clock.clone()).await;
+    ok(
+        &state,
+        &path(SLACK_CH, "/timeline?view=main&limit=50"),
+        WRITE_TOKEN,
+    )
+    .await;
+    settled(&state).await;
+    (state, fake, clock, dir)
+}
+
+/// Rewrite one held message's text upstream, in the fake's history: the cache hears nothing.
+fn slack_edit(fake: &slack_fake::Fake, at_seconds: i64, text: &str) {
+    let mut state = fake.state.lock().expect("the fake's state");
+    let history = state.history.get_mut(SLACK_CH).expect("the channel");
+    let message = history
+        .iter_mut()
+        .find(|message| message["ts"] == slack_fake::ts(at_seconds, 0))
+        .expect("the message");
+    message["text"] = Value::String(text.to_owned());
+}
+
+#[tokio::test]
+async fn a_slack_window_is_never_served_and_a_slack_main_page_is() {
+    // Requirement (c) of #297 cache-coverage-races: a Slack window upstream carries thread
+    // replies the cache keeps in their threads alone, so it is not served at all in this
+    // build, while a Main timeline page is the conversation's own history and may be.
+    let (state, fake, clock, _dir) = slack_deployment("cache-serve-slack").await;
+    state.message_cache.set_serve(true);
+
+    // The window, five seconds after the fill — fresh enough to serve on any other shape.
+    // An edit upstream since the fill settles which answer came back.
+    clock.advance(5 * SECOND);
+    slack_edit(&fake, 300, "message 5, edited upstream");
+    let body = ok(&state, &path(SLACK_CH, "/messages?limit=2"), WRITE_TOKEN).await;
+    assert_eq!(
+        texts(&body),
+        ["message 4", "message 5, edited upstream"],
+        "the window was the provider's own answer"
+    );
+    settled(&state).await;
+    assert_eq!(counts(&state, "messages").served, 0);
+
+    // The Main page, against an edit the cache has not heard of: provisional first, and the
+    // read behind it — here the next full read, which the served view owes a real page —
+    // shows the correction.
+    clock.advance(HOUR);
+    slack_edit(&fake, 240, "message 4, edited upstream");
+    let body = ok(
+        &state,
+        &path(SLACK_CH, "/timeline?view=main&limit=2"),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(
+        texts(&body),
+        ["message 4", "message 5, edited upstream"],
+        "the Main page as the cache holds it, before its refresh lands"
+    );
+    settled(&state).await;
+    assert_eq!(counts(&state, "timeline_fallback").served, 1);
+    let body = ok(
+        &state,
+        &path(SLACK_CH, "/timeline?view=main&limit=2"),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(
+        texts(&body),
+        ["message 4, edited upstream", "message 5, edited upstream"]
+    );
 }

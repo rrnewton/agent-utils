@@ -494,6 +494,14 @@ async fn publish_serve_corrections(state: &AppState, channel: &ChannelId, served
         return;
     };
     if !cache.barrier(std::time::Duration::from_secs(2)).await {
+        // Counts only, as every cache log line: how many served rows go uncorrected on the
+        // page until its next read, never which.
+        tracing::warn!(
+            consumer = "timeline_fallback",
+            served = served.len(),
+            "a page answered from the message cache was refreshed, but what the refresh \
+             offered was not applied in time to correct it"
+        );
         return;
     }
     let checked = tokio::task::spawn_blocking(move || {
@@ -501,10 +509,10 @@ async fn publish_serve_corrections(state: &AppState, channel: &ChannelId, served
             .into_iter()
             .filter_map(|was| match cache.message(&chan, &was.id).served() {
                 Some(Some(now)) if now.message != was => {
-                    Some((crate::live::LiveKind::Update, now.message))
+                    Some((crate::live::LiveKind::Update, now.message, was))
                 }
                 Some(None) if cache.tombstoned(&chan, &was.id).served() == Some(true) => {
-                    Some((crate::live::LiveKind::Delete, was))
+                    Some((crate::live::LiveKind::Delete, was.clone(), was))
                 }
                 _ => None,
             })
@@ -512,9 +520,29 @@ async fn publish_serve_corrections(state: &AppState, channel: &ChannelId, served
     })
     .await
     .unwrap_or_default();
-    for (kind, message) in checked {
-        state.live.publish_correction(channel, kind, message);
+    for (kind, message, was) in checked {
+        state.live.publish_correction(channel, kind, message, &was);
     }
+}
+
+/// Whether the cache now refuses `channel` outright — access to it in doubt or confirmed
+/// lost, an erase of it in flight — read by asking it for one served message. For a refresh
+/// that failed the way a refusal fails it: what was served of such a channel comes off the
+/// page at once, where an ordinary failure (a slow or silent provider) leaves it standing
+/// until the next read. `#384 cache-serve`.
+async fn channel_blocked(state: &AppState, channel: &ChannelId, served: &[Message]) -> bool {
+    let (Some(cache), Some(chan), Some(first)) = (
+        state.message_cache.cache(),
+        state.message_cache.chan_key(channel),
+        served.first().map(|message| message.id.clone()),
+    ) else {
+        return false;
+    };
+    tokio::task::spawn_blocking(move || {
+        matches!(cache.message(&chan, &first), crate::cache::Read::Blocked)
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Refresh one served timeline page upstream (`#384 cache-serve`): the read the request did
@@ -532,6 +560,11 @@ fn spawn_timeline_refresh(
 ) {
     drop(tokio::spawn(async move {
         let _claim = claim;
+        // The channel may have been taken off the list since it was served: then nothing is
+        // read for it at all, as if the serve's request had never made one.
+        if allowed(&state, channel.as_str()).await.is_err() {
+            return;
+        }
         let fetch_began = std::time::Instant::now();
         let fill = state.message_cache.begin_for(caller, &channel);
         let mut page = match state.chat.fetch_timeline(&channel, &request).await {
@@ -542,6 +575,19 @@ fn spawn_timeline_refresh(
                     "a page answered from the message cache could not be refreshed; it stands \
                      until the next read"
                 );
+                // Unless the failure is the provider refusing the channel, which the routed
+                // read has already reported: what was served of a channel the cache now
+                // refuses comes off the page at once.
+                if channel_blocked(&state, &channel, &served).await {
+                    for was in served {
+                        state.live.publish_correction(
+                            &channel,
+                            crate::live::LiveKind::Delete,
+                            was.clone(),
+                            &was,
+                        );
+                    }
+                }
                 return;
             }
         };
@@ -577,18 +623,21 @@ fn spawn_timeline_refresh(
 }
 
 /// Refresh one served window upstream (`#384 cache-serve`): [`read_window`]'s own read,
-/// behind the answer, offered, compared, recorded and corrected as there.
+/// behind the answer, offered, compared and recorded as there. No live corrections: a
+/// window's caller took a final answer, and the page never showed these rows as a window.
 fn spawn_window_refresh(
     state: AppState,
     caller: crate::auth::Scope,
     channel: ChannelId,
     limit: u16,
     claim: RefreshClaim,
-    served: Vec<Message>,
     pending: PendingServe,
 ) {
     drop(tokio::spawn(async move {
         let _claim = claim;
+        if allowed(&state, channel.as_str()).await.is_err() {
+            return;
+        }
         let fetch_began = std::time::Instant::now();
         let mark = state.live.recent().mark(&channel);
         let fill = state.message_cache.begin_for(caller, &channel);
@@ -614,7 +663,6 @@ fn spawn_window_refresh(
             mark,
             read.as_of.as_deref(),
         );
-        publish_serve_corrections(&state, &channel, served).await;
         let mut messages = read.messages;
         stamp(&state, &mut messages);
         crate::noise::filter_for(&state, &channel)
@@ -675,17 +723,16 @@ async fn read_window(
     if let Some(answer) = served {
         let ServedAnswer { view, pending } = *answer;
         let (raw, as_of) = served_messages(&view);
-        if let Some(claim) = state.message_cache.claim_refresh(RefreshKey {
-            channel: channel.id.clone(),
-            read: format!("window:{limit}"),
-        }) {
+        if let Some(claim) = state
+            .message_cache
+            .claim_refresh(RefreshKey::window(channel.id.clone(), limit))
+        {
             spawn_window_refresh(
                 state.clone(),
                 caller,
                 channel.id.clone(),
                 limit,
                 claim,
-                raw.clone(),
                 pending,
             );
         }
@@ -1320,15 +1367,12 @@ pub async fn timeline(
                 ServeOutcome::Served(answer) => {
                     let ServedAnswer { view, pending } = *answer;
                     let (raw, as_of) = served_messages(&view);
-                    if let Some(claim) = state.message_cache.claim_refresh(RefreshKey {
-                        channel: channel.id.clone(),
-                        read: format!(
-                            "timeline:{:?}:{}:{}",
-                            request.view,
-                            thread.unwrap_or_default(),
-                            request.limit
-                        ),
-                    }) {
+                    if let Some(claim) = state.message_cache.claim_refresh(RefreshKey::timeline(
+                        channel.id.clone(),
+                        request.view,
+                        thread,
+                        request.limit,
+                    )) {
                         spawn_timeline_refresh(
                             state.clone(),
                             caller,
@@ -1359,9 +1403,9 @@ pub async fn timeline(
                     let noise = crate::noise::filter_for(state, &channel.id).await;
                     stamp(state, &mut page.messages);
                     noise.mark(&mut page.messages);
-                    state
-                        .read_ahead
-                        .remember(&channel.id, thread, &page.messages, fetch_began);
+                    // Nothing remembered for speech from a served page, as for a served
+                    // window: its head may be hours old, and the copies a real read fetched
+                    // stand until the refresh banks its own.
                     return Ok((channel, page));
                 }
                 ServeOutcome::NotServed(not_served) => shadow = not_served,
@@ -1431,6 +1475,14 @@ pub async fn timeline(
         .remember(&channel.id, thread, &page.messages, fetch_began);
     for gone in page.delta.iter().flat_map(|delta| &delta.deleted) {
         state.read_ahead.forget(&channel.id, gone);
+    }
+    // `#384 cache-serve`: a newest page read upstream and handed to its caller carries the
+    // provider's own backward cursor, so the view owes none and may be served again. A delta
+    // or a step back hands out no such page and notes nothing.
+    if timeline_read == crate::cache::observe::TimelineRead::Newest {
+        state
+            .message_cache
+            .note_real_page(&channel.id, request.view, thread);
     }
     Ok((channel, page))
 }

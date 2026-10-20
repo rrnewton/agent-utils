@@ -4142,21 +4142,29 @@ cache at once instead of waiting for the provider (`#384 cache-serve`):
   cache holds, stamped and marked as upstream ones, with `as_of` set to the newest of them, a
   generic forward cursor for what changes next, and no backward cursor, which the page reads as
   "more above: unknown". However old the copy is, it is provisional only until its refresh lands.
+  A view answered that way is not answered from the cache again until the reader has been given
+  the provider's own page, whose backward cursor a walk back takes: the first step back fetches
+  that page behind the rows, and any later full read fetches it too, so older history is never
+  stranded behind a page with no way back.
 * **A channel's newest window** (`/messages` and its callers: the digest, the to-do list,
   bankruptcy, read-aloud's window), only while what it holds is as fresh as the window re-use
   the server already practises, and never on Slack, whose windows carry thread replies the cache
   holds only in their threads.
 
 Each serve starts one background refresh: the same read upstream, under the caller's grant. Its
-answer is compared with what was served (the counts below), offered to the cache as any read is,
-and then each served message it proves changed — edited, or deleted — is corrected on the page
-by a live update or deletion, the cache's own held copy being the arbiter. A refresh that fails
-is logged with counts only and leaves the served answer standing until the next read.
+answer is compared with what was served (the counts below) and offered to the cache as any read
+is; then, for a timeline page, each served message it proves changed — edited, or deleted — is
+corrected on the page by a live update or deletion, the cache's own held copy being the
+arbiter. A window's caller took a final answer and gets no correction; its refresh is what held
+windows and later reads answer from. A refresh that fails is logged with counts only and leaves
+the served answer standing until the next read — unless the failure is the provider refusing
+the channel and the cache now refuses it too, when what was served comes off the page at once.
 
 A read is served only when the rule that has been measured since `cache-fill` decides for it on
 what the cache holds at that moment: the stretch complete and vouched for, nothing in doubt,
-no text held only as a push brought it. A channel in doubt — a change left out, an erase in
-flight, access in question — is never served. A provider's live feed vouches for what it has
+no text held only as a push brought it, and the provider's account checked against the file in
+this process, so rows read as one account are never handed back as another's. A channel in
+doubt — a change left out, an erase in flight, access in question — is never served. A provider's live feed vouches for what it has
 not reported only while an adapter has actually pushed for that provider within the last hour;
 `[ingest]` merely being on no longer counts. Everything not served goes upstream exactly as
 before, the read token's reads included: read scope is not served in this build, because its

@@ -62,15 +62,25 @@ and marked exactly as upstream ones, so the reader sees messages immediately
 instead of "Loading messages…". Three fields say it is provisional, all of
 which the page already handles for other providers:
 
-- `as_of` is the cached head's instant: the page is complete only up to then.
+- `as_of` is the cached head's instant (the newest held message's own time,
+  which on a quiet channel reads older than the last check of it — the safe
+  direction): the page is complete only up to then.
 - `next_after` is a generic forward cursor from the served page (what the
   server mints whenever a backend issues none), never a backend cursor the
   cache cannot know.
 - `next_before` is absent and `has_more` is true, always: the cache's
   coverage is clipped at its age limit, so it can never prove the scope's
   start, and the page already reads a missing cursor as "more above:
-  unknown". Stepping back from a provisional page waits for the next full
-  read; everything else (reading, replying, live updates) works at once.
+  unknown". A served view is owed the provider's own page: it is not served
+  again until a caller holds one, and the reader's first step back fetches
+  exactly that page behind the rows (the page's existing owed-cursor read,
+  extended to this case), so older history is one tap and one real read
+  away, never unreachable. Everything else (reading, replying, live
+  updates) works at once.
+
+A serve also requires the channel's provider's account to have been checked
+against the file in this process: rows read as one account are never handed
+back as another's, credential swap included.
 
 ## How a served answer is corrected
 
@@ -84,20 +94,30 @@ caller's grant. When it lands:
    upstream exactly as a shadowed one is.
 2. It is offered to the cache as any read is: edits replace, deletions
    tombstone, summaries of old text are orphaned, all by the existing rules.
-3. For each message that was **actually served** and that the cache, after
-   the refresh has been applied, now holds differently — edited text, or no
-   longer held at all — the server publishes a live correction (update or
-   delete) for that message. The page already applies live updates and
-   deletions to rows on screen, so a wrong row is put right without waiting
-   for the next poll; the next ordinary read is correct in any case. The
-   cache is the arbiter, so a refresh copy that is itself stale (a bridge's
-   `as_of` page) cannot "correct" a row backwards. New messages are not
-   published by the refresh: they arrive by the live feed, a delta or the
-   poll, as they do after an ordinary page load today.
+3. For a timeline serve, each message that was **actually served** and that
+   the cache, after the refresh has been applied, now holds differently —
+   edited text, or tombstoned as deleted — is corrected on the page by a
+   live update or delete carrying its own unique event id. The page already
+   applies live updates and deletions to rows on screen, so a wrong row is
+   put right without waiting for the next poll; the next ordinary read is
+   correct in any case. The cache is the arbiter, so a refresh copy that is
+   itself stale (a bridge's `as_of` page) cannot "correct" the file
+   backwards, and a correction whose row has since been overtaken by a
+   newer sighting in the server's held window is not published at all. A
+   window serve publishes no corrections: its caller took a final answer
+   and no page showed its rows as a window; the refresh's recorded read is
+   what held windows and later reads answer from. New messages are not
+   published by either refresh: they arrive by the live feed, a delta or
+   the poll, as they do after an ordinary page load today. A serve whose
+   refresh was already running under another serve of the same read starts
+   no second refresh and is not itself compared; the running refresh's
+   comparison and corrections cover the rows both serves have in common.
 
 A refresh that fails leaves the provisional page standing and is logged with
-counts only; the next poll or read re-checks upstream. Nothing about a serve
-suppresses the ordinary read paths.
+counts only; the next poll or read re-checks upstream. One exception: when
+the failure is the provider refusing the channel and the cache now refuses
+it too, what was served comes off the page by live deletions at once.
+Nothing about a serve suppresses the ordinary read paths.
 
 ## The #297 requirements
 
@@ -105,13 +125,17 @@ suppresses the ordinary read paths.
   serving: the live feed vouches for nothing from before a start (as the
   README already says), and every serve's refresh re-reads the scope at once,
   so a refusal is heard again within one refresh and the existing
-  block-and-erase machinery runs. Until that refresh lands, a restarted
-  server could show rows of a channel whose access was lost before the
-  restart to the write-token reader who already saw them; it cannot show
-  them past that refresh.
+  block-and-erase machinery runs: no later serve of the channel happens, and
+  when the refresh itself is the refused read, what was served comes off the
+  page by live deletions. The honest residue: rows a restarted server serves
+  of a channel whose access was lost before the restart stand on the
+  write-token reader's page until that refresh lands — or, if the refresh
+  fails for an ordinary reason (a silent provider), until the next read.
 - **(b) Two newest reads begun in the same millisecond.** Not fixed here.
-  Its worst case under serving is a just-deleted band row shown until the
-  refresh's delete correction, and counted as an extra row when it happens.
+  Its worst case under serving is a just-deleted band row shown and counted
+  as an extra row; while the band is still open its absence tombstones
+  nothing, so that refresh publishes no delete correction for it, and a
+  later serve can show it again until a listing settles the band.
 - **(c) Slack windows from Main plus thread scopes, or not at all.** Not at
   all: a Slack-shaped channel's window is never served in M9 (its upstream
   window carries thread replies the cache holds only in their threads). A
@@ -156,7 +180,13 @@ from the cache within a second while the provider has not answered at all; an
 edit and a deletion made upstream while the refresh is held correct the
 served page by live events once the refresh lands, and the shadow comparison
 counts them; a channel in doubt (a drop recorded after its rows were seen) is
-not served and waits for upstream. Reload time to first messages is measured
-with the held fake: before, unanswered after two seconds (the test's bound;
-the real provider took 20 s and more); after, the elapsed time of the served
-request, printed by the test run and reported with the work.
+not served and waits for upstream. The file also pins the refusals around
+them: the read token, a Flat page off a bridge, a Slack window, a provider
+whose account is unchecked, and the walk-back cursor a served view is owed.
+Reload time to first messages is measured with the held fake: before,
+unanswered after one second (the test's bound, against a provider that never
+answers; the real one took 20 s and more); after, the elapsed time of the
+served request, printed by the test run and reported with the work. An
+adversarial review of the first build (unverified providers, walk-back,
+correction event ids, evaluation counting) is what several of these
+behaviours now pin down.

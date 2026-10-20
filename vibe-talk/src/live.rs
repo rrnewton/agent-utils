@@ -328,7 +328,10 @@ pub struct LiveHub {
     /// [`LiveHub::reactions_changed`]. Taken only under the feed lock or on its own, never the
     /// other way round.
     reaction_memory: Mutex<BTreeMap<ChannelId, ReactionSets>>,
-    /// How many reaction updates this hub has published: the uniqueness of their event ids.
+    /// How many reaction updates and corrections this hub has published: the uniqueness of
+    /// their event ids. A subscriber resumes after the LAST event of the id it names, so an
+    /// update or correction reusing its message's create id would silently swallow everything
+    /// between the two (`#384 cache-serve`).
     updates: std::sync::atomic::AtomicU64,
 }
 
@@ -712,16 +715,36 @@ impl LiveHub {
     /// read has already offered what it saw, whole, under its fill, and offering the same
     /// message again as a push would hold its text as possibly a snippet. Nor is a correction
     /// offered for clearing unread at the provider: it is not a message that just arrived.
-    pub fn publish_correction(&self, channel: &ChannelId, kind: LiveKind, message: Message) {
+    ///
+    /// `message` replaces the copy `served_as` — what the reader was shown — and the publish
+    /// checks, under the feed lock, that the channel's held window still holds that copy (or
+    /// the correction itself already): a newer copy that arrived since the refresh checked
+    /// the cache is never overwritten backwards by its correction. A held window that never
+    /// held the message proves nothing, and the correction goes out.
+    pub fn publish_correction(
+        &self,
+        channel: &ChannelId,
+        kind: LiveKind,
+        message: Message,
+        served_as: &Message,
+    ) {
         let self_posted = kind != LiveKind::Delete && self.is_self_posted(&message.id);
+        let at = self
+            .updates
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
         let live = LiveMessage {
-            event_id: message.id.as_str().to_owned(),
+            // Never the message's own id: a create already carries it, and a subscriber
+            // resuming after the last event of a named id would skip all between the two.
+            // The hub's epoch and counter make it this publish's alone, as a reaction
+            // update's id is (`#378 live-reactions`).
+            event_id: format!("{}~c{}-{at}", message.id.as_str(), self.epoch),
             kind,
             historical: false,
             message,
             self_posted,
         };
-        self.publish_to_feed_offering(channel, live, false, None, false);
+        self.publish_to_feed_offering(channel, live, false, None, false, Some(served_as));
     }
 
     fn publish_to_feed(
@@ -731,9 +754,12 @@ impl LiveHub {
         deduplicate: bool,
         read: Option<crate::cache::ReadStart>,
     ) -> bool {
-        self.publish_to_feed_offering(channel, live, deduplicate, read, true)
+        self.publish_to_feed_offering(channel, live, deduplicate, read, true, None)
     }
 
+    /// `replaces`, for a correction, is the copy readers were shown: when the held window has
+    /// since taken a different copy of the message, the correction publishes nothing, rather
+    /// than putting an older text back over it.
     fn publish_to_feed_offering(
         &self,
         channel: &ChannelId,
@@ -741,8 +767,26 @@ impl LiveHub {
         deduplicate: bool,
         read: Option<crate::cache::ReadStart>,
         offer_to_cache: bool,
+        replaces: Option<&Message>,
     ) -> bool {
         let mut feeds = lock(&self.feeds);
+        // A correction overtaken under this lock publishes nothing: the held window — raw
+        // copies, as a serve hands back — now holds a copy of the message that is neither
+        // what was served nor the correction, so a newer sighting of it has landed since.
+        if let Some(replaces) = replaces {
+            let held = self.recent.snapshot(channel).held;
+            let overtaken = held
+                .as_ref()
+                .and_then(|held| {
+                    held.messages
+                        .iter()
+                        .find(|message| message.id == live.message.id)
+                })
+                .is_some_and(|now| now != replaces && *now != live.message);
+            if overtaken {
+                return false;
+            }
+        }
         let feed = feeds.entry(channel.clone()).or_insert_with(new_feed);
         if deduplicate {
             if !feed.dedupe.insert(live.event_id.clone()) {

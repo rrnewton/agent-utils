@@ -221,6 +221,12 @@ struct State {
     /// The background refreshes of served answers now running, one per read: a second serve of
     /// the same read starts no second upstream read. `#384 cache-serve`.
     refreshing: Mutex<HashSet<RefreshKey>>,
+    /// Newest timeline views a served page left without a backward cursor, by channel and
+    /// view-and-thread words ([`Sink::note_real_page`]): such a view is not served again until
+    /// a caller has been handed the provider's own page, whose `next_before` the reader walks
+    /// back on. Without this, every later load would serve again and older history would stay
+    /// unreachable on a serving channel forever. `#384 cache-serve`.
+    cursor_owed: Mutex<HashSet<(ChannelId, String)>>,
 }
 
 /// What the shadow has counted since the process started, and how many of its evaluations have
@@ -376,6 +382,38 @@ pub struct RefreshKey {
     pub channel: ChannelId,
     /// Which read of it: never logged, compared for equality only.
     pub read: String,
+}
+
+impl RefreshKey {
+    /// The read [`ServeOutcome::Served`] stands in for: one channel's newest window of `limit`.
+    #[must_use]
+    pub fn window(channel: ChannelId, limit: u16) -> Self {
+        Self {
+            channel,
+            read: format!("window:{limit}"),
+        }
+    }
+
+    /// One channel's newest timeline page of `view` (and `thread`), of `limit`.
+    #[must_use]
+    pub fn timeline(
+        channel: ChannelId,
+        view: TimelineView,
+        thread: Option<&str>,
+        limit: u16,
+    ) -> Self {
+        Self {
+            channel,
+            read: format!("timeline:{view:?}:{}:{limit}", thread.unwrap_or_default()),
+        }
+    }
+}
+
+/// The words a channel's newest timeline view is owed a provider page under
+/// ([`Sink::note_real_page`]): the view and its thread, no size, since any size's real page
+/// carries the cursor a walk back takes. Never logged.
+fn cursor_owed_words(view: TimelineView, thread: Option<&str>) -> String {
+    format!("{view:?}:{}", thread.unwrap_or_default())
 }
 
 /// A running background refresh's claim ([`Sink::claim_refresh`]): dropped, the read may be
@@ -811,13 +849,36 @@ impl Drop for PendingServe {
 }
 
 impl ShadowTask {
-    /// Await the evaluation's read of the cache, once: what counting decides on, and what
-    /// [`Sink::try_serve`] awaits (briefly) before answering from the cache.
+    /// Await the evaluation's read of the cache, once: what counting decides on.
     async fn evaluate(&mut self) {
         if self.evaluated.is_none() {
             if let Some(reading) = self.reading.take() {
                 self.evaluated = reading.await.ok();
             }
+        }
+    }
+
+    /// [`ShadowTask::evaluate`] given at most `wait`: what [`Sink::try_serve`] awaits before
+    /// answering from the cache. On timeout the read is still running and its handle is kept,
+    /// so the evaluation is still counted off the path exactly as a shadow's is — a slower
+    /// evaluation is evidence about the cache, and dropping it from the counts would hide
+    /// precisely that.
+    ///
+    /// Returns whether the evaluation has read.
+    async fn evaluate_for(&mut self, wait: Duration) -> bool {
+        if self.evaluated.is_some() {
+            return true;
+        }
+        let Some(reading) = self.reading.as_mut() else {
+            return false;
+        };
+        match tokio::time::timeout(wait, reading).await {
+            Ok(read) => {
+                self.evaluated = read.ok();
+                self.reading = None;
+                true
+            }
+            Err(_) => false,
         }
     }
 
@@ -1319,12 +1380,18 @@ impl Sink {
     /// at most [`SERVE_WAIT`], and decides by the same rule the shadow counts by.
     ///
     /// [`ServeOutcome::Served`] only when serving is on ([`Sink::serve_enabled`]), the ask is
-    /// one this milestone may answer ([`shadow::serve_eligible`]), and the rule decides
-    /// [`Decision::Serve`] on the snapshot read. The serve is counted as it is handed back;
-    /// the caller starts the read's refresh upstream and hands its answer to the returned
-    /// [`PendingServe`], so the comparison runs as for any shadow. Anything else is
-    /// [`ServeOutcome::NotServed`] with the ask's shadow to carry on with, and the request
-    /// goes upstream exactly as it did before serving existed.
+    /// one this milestone may answer ([`shadow::serve_eligible`]), the channel's provider's
+    /// account has been checked against the file in this process (rows read as one account are
+    /// never handed back as another's, verified again after the snapshot read, in case either
+    /// changed under it), the snapshot holds nothing a read begun at or after the ask wrote
+    /// (counting would call such an evaluation `late` and compare nothing: a serve escapes no
+    /// comparison), and the rule decides [`Decision::Serve`] on the snapshot read. A timeline
+    /// serve also owes the view a provider page ([`Sink::note_real_page`]) and is not repeated
+    /// until one is handed out. The serve is counted as it is handed back; the caller starts
+    /// the read's refresh upstream and hands its answer to the returned [`PendingServe`], so
+    /// the comparison runs as for any shadow. Anything else is [`ServeOutcome::NotServed`]
+    /// with the ask's shadow to carry on with, and the request goes upstream exactly as it did
+    /// before serving existed.
     pub async fn try_serve(
         &self,
         channel: &ChannelId,
@@ -1334,11 +1401,24 @@ impl Sink {
         if !self.serve_enabled() {
             return ServeOutcome::NotServed(self.shadow(channel, ask, live_fed));
         }
-        let shape = {
-            let routes = self.state.routes();
-            routes.fills.get(channel).map(|route| route.shape)
+        // The gates that do not need the snapshot, checked again after it is read: what may
+        // change under the evaluation may not slip a serve past them.
+        let gated = |sink: &Self| {
+            let routes = sink.state.routes();
+            routes.fills.get(channel).is_some_and(|route| {
+                shadow::serve_eligible(&ask, route.shape)
+                    && sink.verification(&route.key) == Verification::Verified
+            })
         };
-        if !shape.is_some_and(|shape| shadow::serve_eligible(&ask, shape)) {
+        if !gated(self) {
+            return ServeOutcome::NotServed(self.shadow(channel, ask, live_fed));
+        }
+        let owed = match &ask {
+            Ask::Timeline { view, thread, .. } => lock(&self.state.cursor_owed)
+                .contains(&(channel.clone(), cursor_owed_words(*view, thread.as_deref()))),
+            _ => false,
+        };
+        if owed {
             return ServeOutcome::NotServed(self.shadow(channel, ask, live_fed));
         }
         let Some(mut shadowed) = self.shadow(channel, ask.clone(), live_fed) else {
@@ -1347,14 +1427,11 @@ impl Sink {
         let Some(task) = shadowed.task.as_mut() else {
             return ServeOutcome::NotServed(Some(shadowed));
         };
-        if tokio::time::timeout(SERVE_WAIT, task.evaluate())
-            .await
-            .is_err()
-        {
+        if !task.evaluate_for(SERVE_WAIT).await {
             return ServeOutcome::NotServed(Some(shadowed));
         }
         let decision = match task.evaluated.as_ref().map(|evaluated| &evaluated.read) {
-            Some(Read::Served(view)) => {
+            Some(Read::Served(view)) if !shadow::late(view, task.asked_ms) => {
                 let evaluated = task.evaluated.as_ref().expect("just matched");
                 shadow::decide(
                     &ask,
@@ -1371,7 +1448,7 @@ impl Sink {
             }
             _ => Decision::Miss(Miss::Blocked),
         };
-        if decision != Decision::Serve {
+        if decision != Decision::Serve || !gated(self) {
             return ServeOutcome::NotServed(Some(shadowed));
         }
         let task = shadowed.task.take().expect("a task was evaluated");
@@ -1381,11 +1458,24 @@ impl Sink {
                 return ServeOutcome::NotServed(Some(Shadowed { task: Some(task) }));
             }
         };
+        if let Ask::Timeline { view, thread, .. } = &ask {
+            lock(&self.state.cursor_owed)
+                .insert((channel.clone(), cursor_owed_words(*view, thread.as_deref())));
+        }
         self.state.shadow.tallies.served(ask.consumer());
         ServeOutcome::Served(Box::new(ServedAnswer {
             view,
             pending: PendingServe { task: Some(task) },
         }))
+    }
+
+    /// Note that a caller has been handed the provider's own newest page of `view` of
+    /// `channel` — with the `next_before` cursor a walk back takes, which no served page can
+    /// mint — so the view may be served from the cache again. Call it once such a page is
+    /// answered upstream, never for a background refresh's page, which no reader holds.
+    /// `#384 cache-serve`.
+    pub fn note_real_page(&self, channel: &ChannelId, view: TimelineView, thread: Option<&str>) {
+        lock(&self.state.cursor_owed).remove(&(channel.clone(), cursor_owed_words(view, thread)));
     }
 
     /// `channel` as the cache names it, under the provider the latest routes give it: for a
@@ -2395,5 +2485,54 @@ mod tests {
             .expect("written again")
             .is(crate::discord::fake::FAKE_BOT_USER_ID, None));
         assert!(writes(&sink));
+    }
+
+    /// `#384 cache-serve`: a serve that stops waiting for its evaluation does not lose the
+    /// count. The evaluation's handle survives the timeout, and counting still decides it
+    /// off the path, asked and missed included.
+    #[tokio::test]
+    async fn an_evaluation_a_serve_stopped_waiting_for_is_still_counted() {
+        let progress = Arc::new(ShadowProgress::default());
+        let reading = tokio::task::spawn_blocking(|| {
+            std::thread::sleep(Duration::from_millis(200));
+            Evaluated::off()
+        });
+        let mut task = ShadowTask {
+            ask: Ask::Window {
+                consumer: shadow::Consumer::Messages,
+                limit: 1,
+            },
+            feed: shadow::Feed::AdditionsOnly,
+            live_fed: false,
+            fed_since_ms: None,
+            asked_ms: 0,
+            reading: Some(reading),
+            evaluated: None,
+            progress: Arc::clone(&progress),
+            cache: Weak::new(),
+        };
+        assert!(
+            !task.evaluate_for(Duration::from_millis(10)).await,
+            "still reading when the wait ran out"
+        );
+        task.evaluate().await;
+        assert!(task.evaluated.is_some(), "and it lands when it lands");
+        task.settle(None);
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while progress.counted.load(Ordering::SeqCst) == 0 {
+            assert!(tokio::time::Instant::now() < deadline, "counted in time");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let messages = progress
+            .tallies
+            .report()
+            .into_iter()
+            .find(|counts| counts.consumer == "messages")
+            .expect("the consumer is counted");
+        assert_eq!(
+            (messages.asked, messages.misses.off),
+            (1, 1),
+            "decided and missed, not dropped from the counts: {messages:?}"
+        );
     }
 }
