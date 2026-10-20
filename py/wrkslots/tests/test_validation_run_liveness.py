@@ -2270,8 +2270,11 @@ def _refused_for_the_run(
     unrelated process caught mid-teardown there (a PID-namespace init of
     another test's, waiting in zap_pid_ns_processes) can make one attempt
     refuse as indeterminate instead.  That state is transient; the refusal
-    these tests assert is the run's own, and every attempt leaves the slot
-    retained, so asking again is safe.  `#389 gate-flakes`.
+    these tests assert is the run's own, and every refused attempt leaves
+    the slot retained, so asking again is safe.  Only that named transient
+    state is retried: any other refusal text fails at once, so a refusal
+    for the wrong reason is not papered over by a later naming attempt.
+    `#389 gate-flakes`.
     """
 
     deadline = time.monotonic() + 60
@@ -2280,6 +2283,7 @@ def _refused_for_the_run(
         assert returncode == expected_returncode, text
         if needle in text:
             return text
+        assert "zap_pid_ns_processes" in text, text
         assert time.monotonic() < deadline, text
         time.sleep(0.1)
 
@@ -2351,7 +2355,10 @@ def test_real_host_batch_seal_waits_for_the_run_process(
         # A batch retains each refused slot and exits 1.
         def remove_once() -> tuple[int, str]:
             returncode = _remove_batch(host.project)
-            return returncode, capsys.readouterr().out
+            captured = capsys.readouterr()
+            # The pidns-teardown note _refused_for_the_run retries on is
+            # printed to stderr; the batch's own refusal is on stdout.
+            return returncode, captured.out + captured.err
 
         output = _refused_for_the_run(
             remove_once,
