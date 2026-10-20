@@ -1,6 +1,6 @@
 ---
 title: 'thread-color-memory: a thread keeps its colour across a reload and a channel switch'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - threads
 - ui
 created_at: 2026-10-20T13:59:33.062215704+00:00
-updated_at: 2026-10-20T13:59:33.062215704+00:00
+updated_at: 2026-10-20T15:00:34.379026930+00:00
+closed_at: 2026-10-20T15:00:34.379026790+00:00
 ---
 
 # Description
