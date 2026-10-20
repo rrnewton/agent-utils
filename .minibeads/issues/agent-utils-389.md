@@ -1,10 +1,11 @@
 ---
 title: 'gate-flakes: landing-gate tests that fail under host load and pass alone'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-10-20T07:43:08.987259053+00:00
-updated_at: 2026-10-20T07:43:08.987259053+00:00
+updated_at: 2026-10-20T12:06:52.199282351+00:00
+closed_at: 2026-10-20T12:06:52.199282060+00:00
 ---
 
 # Description
