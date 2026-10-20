@@ -476,8 +476,8 @@ pub struct DrainOptions {
     /// Also type into a Claude Code pane that Herdr reports `working`, and let Claude Code
     /// queue the prompt behind its current turn. The submission must still be verified against
     /// the composer, which must be empty before typing; a prompt Claude Code never accepts is
-    /// taken back out of the composer and stays pending. Slash commands and other harnesses
-    /// still wait for `idle` or `done`. Off by default.
+    /// taken back out of the composer and stays pending. Codex ordinary follow-ups are accepted while working by default. Slash commands and unsupported
+    /// harnesses still wait for `idle` or `done`. Off by default for Claude.
     pub deliver_while_working: bool,
 }
 
@@ -533,12 +533,17 @@ pub trait AgentRuntime {
         let _ = message_id;
         false
     }
+    /// Optional harness-specific submission key for a working-pane follow-up.
+    fn followup_key(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 /// A runtime that behaves as `inner` and asks a verified submission to withdraw a prompt the
 /// agent never accepts: see [`AgentRuntime::withdraw_unaccepted_prompt`].
 struct WithdrawingRuntime<'a> {
     inner: &'a dyn AgentRuntime,
+    followup_key: Option<&'static str>,
 }
 
 /// A runtime that behaves as `inner` and asks a queue drain to take the prompt `message_id` back
@@ -549,6 +554,9 @@ pub(crate) struct WithdrawUnacceptedRuntime<'a> {
 }
 
 impl AgentRuntime for WithdrawUnacceptedRuntime<'_> {
+    fn followup_key(&self) -> Option<&'static str> {
+        self.inner.followup_key()
+    }
     fn monotonic(&self) -> Duration {
         self.inner.monotonic()
     }
@@ -579,6 +587,9 @@ impl AgentRuntime for WithdrawUnacceptedRuntime<'_> {
 }
 
 impl AgentRuntime for WithdrawingRuntime<'_> {
+    fn followup_key(&self) -> Option<&'static str> {
+        self.followup_key.or_else(|| self.inner.followup_key())
+    }
     fn monotonic(&self) -> Duration {
         self.inner.monotonic()
     }
@@ -964,9 +975,6 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
 
             // A slash command opens a harness menu rather than reaching the composer, so it is
             // never typed into a working pane.
-            let accept_working = options.deliver_while_working
-                && message_text(&document)
-                    .is_ok_and(|text| crate::submission::verifies("claude", &text));
             let readiness = (|| -> AgentResult<AgentPaneInfo> {
                 if target_lock.is_none() {
                     let (lock, info) = lock_resolved_target_with_runtime(client, target, runtime)?;
@@ -983,7 +991,11 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                         .as_deref()
                         .expect("target lock always records its pane"),
                     initial_info.take(),
-                    accept_working,
+                    (
+                        message_text(&document)
+                            .is_ok_and(|text| !text.trim_start().starts_with('/')),
+                        options.deliver_while_working,
+                    ),
                 )
             })();
             let info = match readiness {
@@ -1014,15 +1026,22 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
             // Typing into a working pane relies on the agent to queue the prompt; one it never
             // accepts is taken back out of the composer so that it stays safely pending. So is a
             // prompt whose sender asked for that, wherever it is typed.
-            let withdrawing = WithdrawingRuntime { inner: runtime };
-            let delivery_runtime: &dyn AgentRuntime = if (accept_working
-                && info.status == "working")
-                || runtime.withdraws_unaccepted(&identifier)
-            {
-                &withdrawing
+            let followup_key = if info.status == "working" {
+                crate::harness_tui::harness_tui(info.agent.as_deref())
+                    .map(|adapter| adapter.working_submit_key())
             } else {
-                runtime
+                None
             };
+            let withdrawing = WithdrawingRuntime {
+                inner: runtime,
+                followup_key,
+            };
+            let delivery_runtime: &dyn AgentRuntime =
+                if followup_key.is_some() || runtime.withdraws_unaccepted(&identifier) {
+                    &withdrawing
+                } else {
+                    runtime
+                };
             match deliver_one(
                 client,
                 &info,
@@ -1557,7 +1576,7 @@ fn wait_ready<A: AgentApi + ?Sized>(
     runtime: &dyn AgentRuntime,
     locked_pane_id: &str,
     mut initial_info: Option<AgentPaneInfo>,
-    accept_working: bool,
+    (allow_followups, allow_working_claude): (bool, bool),
 ) -> AgentResult<AgentPaneInfo> {
     let deadline = runtime.monotonic().saturating_add(timeout);
     loop {
@@ -1579,11 +1598,36 @@ fn wait_ready<A: AgentApi + ?Sized>(
         if matches!(info.status.as_str(), "idle" | "done") {
             return Ok(info);
         }
-        // Claude Code queues a prompt submitted while it works, and shows that it did; the
-        // verified submission checks the composer is empty before typing and proves the prompt
-        // left it. Other harnesses are not typed into while they work.
-        if accept_working && info.status == "working" && info.agent.as_deref() == Some("claude") {
-            return Ok(info);
+        let adapter = crate::harness_tui::harness_tui(info.agent.as_deref());
+        if allow_followups
+            && (allow_working_claude || info.agent.as_deref() == Some("codex"))
+            && info.status == "working"
+            && adapter.is_some_and(|a| a.working_followups())
+        {
+            if info.agent.as_deref() == Some("claude") {
+                return Ok(info);
+            }
+            let view = adapter
+                .expect("supported adapter")
+                .classify(&client.read_with_runtime(
+                    &info.pane_id,
+                    "visible",
+                    Some(200),
+                    runtime,
+                )?);
+            if matches!(
+                view.state,
+                crate::harness_tui::State::Working | crate::harness_tui::State::IdleComposer
+            ) {
+                return Ok(info);
+            }
+            if view.state == crate::harness_tui::State::BlockingQuestion {
+                return Err(AgentError::delivery(format!(
+                    "pane {} is blocked; {}",
+                    info.pane_id,
+                    crate::harness_tui::blocked_hint(&view)
+                )));
+            }
         }
         if info.status == "unknown"
             && info.agent.as_deref() == Some("codex")
@@ -1594,8 +1638,14 @@ fn wait_ready<A: AgentApi + ?Sized>(
             return Ok(info);
         }
         if info.status == "blocked" {
+            let hint = adapter.map_or_else(
+                || "Inspect agentctl prompts NAME; unsupported forms require interactive attention.".to_owned(),
+                |adapter| match client.read_with_runtime(&info.pane_id, "visible", Some(200), runtime) {
+                    Ok(screen) => crate::harness_tui::blocked_hint(&adapter.classify(&screen)),
+                    Err(error) => format!("Screen read failed: {error}; inspect agentctl prompts NAME"),
+                });
             return Err(AgentError::delivery(format!(
-                "pane {} is blocked; resolve its visible prompt",
+                "pane {} is blocked; {hint}",
                 info.pane_id
             )));
         }
@@ -3373,6 +3423,11 @@ mod tests {
             source: &str,
             _lines: Option<usize>,
         ) -> crate::error::Result<String> {
+            if source == "visible" {
+                if let Some(screen) = &self.screen {
+                    return crate::submission::PromptTerminal::read_screen(screen, _pane_id);
+                }
+            }
             let mut state = self.state.lock().expect("fake state");
             state.reads.push(source.to_owned());
             if source == "recent-unwrapped" && state.unwrapped_empty {
@@ -4064,7 +4119,7 @@ mod tests {
     }
 
     #[test]
-    fn deliver_while_working_still_waits_for_a_working_codex_and_for_a_draft() {
+    fn working_codex_accepts_followups_and_operator_drafts_still_block() {
         let directory = TestDirectory::new("while-working-codex");
         let screen = crate::submission::fake::FakeScreen::new("codex", true);
         let fake = FakeAgent::with_screen(screen);
@@ -4073,20 +4128,39 @@ mod tests {
             state.states.clear();
             state.last_state = "working".to_owned();
         }
-        let error = send_with_runtime(
+        let result = send_with_runtime(
             &fake,
             &target(),
             directory.path(),
-            "codex keeps waiting",
-            while_working(),
+            "codex receives a follow-up",
+            DrainOptions::default(),
             &FakeRuntime::default(),
         )
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("did not become idle/done"),
-            "{error}"
+        .unwrap();
+        assert_eq!(result.outcome, QueueOutcome::Delivered);
+        assert_eq!(
+            fake.screen.as_ref().unwrap().state().steered,
+            ["codex receives a follow-up"]
         );
-        assert!(fake.screen.as_ref().unwrap().state().pastes.is_empty());
+        enqueue(directory.path(), "second follow-up", Some("second")).unwrap();
+        enqueue(directory.path(), "third follow-up", Some("third")).unwrap();
+        let result = drain_with_runtime(
+            &fake,
+            &target(),
+            directory.path(),
+            DrainOptions::default(),
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(result.delivered.len(), 2);
+        assert_eq!(
+            fake.screen.as_ref().unwrap().state().steered,
+            [
+                "codex receives a follow-up",
+                "second follow-up",
+                "third follow-up"
+            ]
+        );
 
         let directory = TestDirectory::new("while-working-draft");
         let screen = crate::submission::fake::FakeScreen::new("claude", true);

@@ -14,6 +14,7 @@ pub mod client;
 pub mod codex_goal;
 pub(crate) mod credentials;
 pub mod error;
+pub mod harness_tui;
 pub(crate) mod inbox;
 pub mod legacy_cli;
 pub mod plugins;
@@ -24,6 +25,7 @@ pub(crate) mod skill_install;
 pub mod stale_composer;
 pub mod subagents;
 pub mod submission;
+pub mod tui_prompts;
 pub mod units;
 
 /// Reference for the canonical command and its supported adapters.

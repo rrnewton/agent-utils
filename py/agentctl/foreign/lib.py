@@ -2793,10 +2793,15 @@ def _wait_for_tui_prompt(
                 scrollback_tail = _tui_scrollback_tail(_read_tui_recent_scrollback(rec.presentation_pane))
             except AgentOperationError as exc:
                 scrollback_tail = f"<scrollback unavailable: {exc.message}>"
+            from agentctl.harness_tui import harness_tui
+            from agentctl.tui_prompts import blocked_hint
+            adapter = harness_tui("codex")
+            assert adapter is not None
+            hint = blocked_hint(adapter.classify(scrollback_tail))
             raise AgentOperationError(
                 "tui_blocked",
                 f"TUI agent {rec.name!r} is blocked; resolve its visible prompt before coordinator delivery; "
-                f"scrollback tail: {scrollback_tail}",
+                f"{hint} scrollback tail: {scrollback_tail}",
             )
         remaining = deadline - now
         if remaining <= 0:

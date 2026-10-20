@@ -1,0 +1,165 @@
+//! Codex default-keymap question forms.
+use super::{navigation, option_row, plain, AnswerPlan, HarnessTui, Question, State, View};
+
+pub struct CodexTui;
+impl HarnessTui for CodexTui {
+    fn working_followups(&self) -> bool {
+        true
+    }
+    fn open_question_keys(&self) -> &'static [&'static str] {
+        &["shift+left"]
+    }
+    fn classify(&self, screen: &str) -> View {
+        let clean = plain(screen);
+        let rows: Vec<_> = clean.lines().collect();
+        let tail = rows[rows.len().saturating_sub(16)..]
+            .join("\n")
+            .to_lowercase();
+        let footer = rows
+            .iter()
+            .rev()
+            .find(|r| !r.trim().is_empty())
+            .map_or(String::new(), |r| r.trim().to_lowercase());
+        let header = rows.iter().enumerate().rev().find_map(|(i, row)| {
+            let h = row.trim().strip_prefix("Question ")?;
+            let (index, rest) = h.split_once('/')?;
+            let (total, suffix) = rest.split_once(" (")?;
+            if !suffix.ends_with(" unanswered)") || index.parse::<usize>().is_err() {
+                return None;
+            }
+            Some((i, total.parse::<usize>().ok()?))
+        });
+        if let Some((i, total)) = header.filter(|_| {
+            footer.contains("enter to submit answer") || footer.contains("enter to submit all")
+        }) {
+            let mut q = Question {
+                text: String::new(),
+                options: vec![],
+                selected: None,
+                total,
+                collapsed: false,
+                notes: tail.contains("tab or esc to clear notes"),
+                draft: String::new(),
+            };
+            let mut title = vec![];
+            let mut editor = false;
+            for row in &rows[i + 1..] {
+                let line = row.trim();
+                if line.contains("enter to submit") {
+                    break;
+                }
+                if let Some((option, selected)) = option_row(row, '›') {
+                    if selected {
+                        q.selected = Some(option.number);
+                    }
+                    q.options.push(option);
+                } else if let Some(content) = line.strip_prefix('›') {
+                    editor = true;
+                    let content = content.trim();
+                    if !matches!(content, "Type your answer (optional)" | "Add notes") {
+                        q.draft = content.to_owned();
+                    }
+                } else if !line.is_empty() {
+                    if let Some(last) = q.options.last_mut() {
+                        last.text.push(' ');
+                        last.text.push_str(line);
+                    } else {
+                        title.push(line);
+                    }
+                }
+            }
+            q.text = title.join("\n");
+            if q.text.is_empty() || (q.options.is_empty() && !editor) {
+                return View::state(State::MenuOrPicker);
+            }
+            return View::question(q);
+        }
+        if tail.contains("shift+← to answer") || tail.contains("shift+left to answer") {
+            return View::question(Question {
+                text: "Question collapsed; text and options are not visible.".to_owned(),
+                options: vec![],
+                selected: None,
+                total: 1,
+                collapsed: true,
+                notes: false,
+                draft: String::new(),
+            });
+        }
+        let composer = crate::submission::composer_view("codex", screen);
+        let modal_region = if composer.is_some() { &footer } else { &tail };
+        if [
+            "esc to cancel",
+            "enter to confirm",
+            "trust this folder",
+            "allow command?",
+            "enter to submit",
+            "select model",
+        ]
+        .iter()
+        .any(|s| modal_region.contains(s))
+        {
+            return View::state(State::MenuOrPicker);
+        }
+        if composer.is_some()
+            && (tail.contains("esc to interrupt") || tail.contains("tab to queue message"))
+        {
+            return View::state(State::Working);
+        }
+        if crate::submission::codex_idle_composer(screen) {
+            return View::state(State::IdleComposer);
+        }
+        View::state(State::Unknown)
+    }
+    fn answer_plan(
+        &self,
+        q: &Question,
+        option: Option<usize>,
+        text: Option<&str>,
+    ) -> Result<AnswerPlan, String> {
+        if let Some(number) = option {
+            let keys = navigation(q, number)?;
+            if q.options
+                .iter()
+                .any(|o| o.number == number && o.text.starts_with("None of the above"))
+            {
+                return Err("the free-text option needs --text, not --option".to_owned());
+            }
+            return Ok(AnswerPlan {
+                submit_key: "Enter",
+                keys,
+                text: None,
+                selected: Some(number),
+            });
+        }
+        let text = text
+            .filter(|t| !t.trim().is_empty() && !t.chars().any(char::is_control))
+            .ok_or("--text must be nonempty single-line text without terminal controls")?;
+        if q.options.is_empty() {
+            if q.total != 1 || q.collapsed || !q.draft.is_empty() || q.notes {
+                return Err(
+                    "free-text question is not empty or has an unsupported layout".to_owned(),
+                );
+            }
+            return Ok(AnswerPlan {
+                submit_key: "Enter",
+                keys: vec![],
+                text: Some(text.to_owned()),
+                selected: None,
+            });
+        }
+        let other = q
+            .options
+            .iter()
+            .find(|o| o.text.starts_with("None of the above"))
+            .ok_or("this question has no visible free-text option; choose --option")?
+            .number;
+        let mut keys = navigation(q, other)?;
+        keys.push("Tab");
+        Ok(AnswerPlan {
+            submit_key: "Enter",
+            keys,
+            text: Some(text.to_owned()),
+            selected: Some(other),
+        })
+    }
+}

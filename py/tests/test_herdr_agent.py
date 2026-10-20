@@ -20,6 +20,7 @@ from agentctl.agent import Target, drain, enqueue, read, send, status
 from agentctl.agent import QueueResult
 import agentctl.legacy_cli as agent_cli
 from agentctl.client import AgentPaneInfo, HerdrClient, Pane
+from agentctl.submission import SubmissionReceipt
 from agentctl.errors import AgentDeliveryError, AgentPending, AgentPossiblySubmitted, HerdrUnavailable
 
 
@@ -115,12 +116,13 @@ class FakeAgentHerdr:
         assert workspace_id == "w1"
         return self.workspace
 
-    def prompt_agent(self, pane_id: str, text: str) -> None:
+    def prompt_agent(self, pane_id: str, text: str) -> SubmissionReceipt | None:
         assert pane_id == "w1:p1"
         self.run_entered.set()
         if self.run_release is not None:
             assert self.run_release.wait(5)
         self.runs.append(text)
+        return None
 
     def wait_agent_status(self, pane_id: str, state: str, timeout_ms: int) -> None:
         self.waits.append((pane_id, state, timeout_ms))
@@ -128,6 +130,9 @@ class FakeAgentHerdr:
             raise AssertionError(state)
 
     def read(self, pane_id: str, *, source: str, lines: int) -> str:
+        if source == "visible":
+            assert pane_id == "w1:p1" and lines == 200
+            return ""  # This legacy fake has no rendered composer.
         assert pane_id == "w1:p1" and source in ("recent-unwrapped", "recent") and lines == 17
         return self.read_text
 

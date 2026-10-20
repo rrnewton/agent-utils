@@ -8094,6 +8094,57 @@ its drain would type first, so it was not queued",
         Ok(text)
     }
 
+    /// Reveal a blocking question for inspection, or answer it with pinned-recipient guards.
+    pub fn prompts(
+        &self,
+        agent_name: &str,
+        selection: Option<(Option<usize>, Option<&str>)>,
+    ) -> Result<Value> {
+        let _lock = self.lock(agent_name)?;
+        let record = self.load(agent_name)?;
+        self.checked_policy(&record, false)?;
+        let adapter = crate::harness_tui::harness_tui(Some(&record.harness))
+            .ok_or_else(|| fail("this harness has no supported TUI question adapter"))?;
+        let workspace = WorkspaceClient {
+            client: self.client,
+            record: &record,
+            goal_objective: Mutex::new(None),
+            custom_submission: Mutex::new(None),
+            queue: None,
+            check_prompt: false,
+            expected_workspace: self.project_workspace()?,
+            readback: None,
+        };
+        let pane = record
+            .pane_id
+            .as_deref()
+            .ok_or_else(|| fail("interactive pane required"))?;
+        let runtime = agent::SystemRuntime::default();
+        if selection.is_some() {
+            record.input_allowed()?;
+        }
+        let (_pane_lock, _info) = agent::lock_resolved_target(&workspace, &self.target(&record)?)?;
+        let terminal = workspace.guarded(&runtime)?;
+        if let Some(selection) = selection {
+            crate::tui_prompts::answer(
+                &terminal,
+                pane,
+                adapter,
+                selection,
+                &|pane| workspace.verify_recipient(pane, true),
+                &runtime,
+            )
+        } else {
+            Ok(json!(crate::tui_prompts::inspect_question(
+                &terminal,
+                pane,
+                adapter,
+                &|pane| workspace.verify_recipient(pane, true),
+                &runtime,
+            )?))
+        }
+    }
+
     /// Read what a chat bridge scans for replies and persist it as the latest bounded snapshot:
     /// see [`agent::read_capture`].
     pub(crate) fn read_capture(&self, agent_name: &str, lines: usize) -> Result<String> {

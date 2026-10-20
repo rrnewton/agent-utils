@@ -307,7 +307,7 @@ def revive_fixture():
         source = args[args.index("--source") + 1]
         if source == "visible" and not pane.get("empty_shell", True):
             state["harness"], state["status"] = pane["harness"], pane.get("status", "idle")
-            sys.stdout.write(composer_screen())
+            sys.stdout.write(pane.get("screen") or composer_screen())
         else:
             sys.stdout.write("preserved old terminal output\n")
     elif args[:2] == ["pane", "close"]:
@@ -1485,7 +1485,7 @@ def _revive_interop(harness: Harness, report: Report) -> None:
                     and old_process.poll() is None and new_process.pid != old_process.pid,
                     "original harness was not pinned to the separate live fixture child",
                 )
-                _revive_pane_state(root, {"status": "working"})
+                _revive_pane_state(root, {"status": "working", "screen": "unrecognized terminal layout\n"})
                 queued = harness._invoke_one(producer, root, (
                     "send", "worker", "old queued instruction", "--message-id", "pending-work",
                     "--ready-timeout", "0", *common,
@@ -1796,7 +1796,9 @@ def _successful_send(harness: Harness, report: Report) -> None:
 
 
 def _pending_and_ambiguous(harness: Harness, report: Report) -> None:
-    busy = harness.case("pending", {"status": "working"})
+    # An unknown busy renderer must remain safely pending. A recognized Codex
+    # working composer is now a positive follow-up delivery path.
+    busy = harness.case("pending", {"status": "working", "screen": "unrecognized terminal layout\n"})
     pending_arguments = (
         "send",
         "keep pending",
@@ -1823,6 +1825,14 @@ def _pending_and_ambiguous(harness: Harness, report: Report) -> None:
         and _state(busy.rust_root).get("submitted") == [],
         "busy prompt was injected",
     )
+
+    working = harness.case("working-followup", {"status": "working"})
+    python, rust = harness.invoke(working, pending_arguments)
+    report.exact("send/working-followup", python, rust, 0)
+    report.require("send/working-followup-once",
+        _state(working.python_root).get("submitted") == ["keep pending"]
+        and _state(working.rust_root).get("submitted") == ["keep pending"],
+        "recognized working Codex did not accept exactly one follow-up")
 
     ambiguous = harness.case("ambiguous", {"run_mode": "fail"})
     ambiguous_arguments = (
@@ -2011,7 +2021,7 @@ def _shared_queue_interop(harness: Harness, report: Report) -> None:
         ("python-to-rust", harness.python, harness.rust),
         ("rust-to-python", harness.rust, harness.python),
     ):
-        case = harness.case(f"interop-{label}", {"status": "working"})
+        case = harness.case(f"interop-{label}", {"status": "working", "screen": "unrecognized terminal layout\n"})
         root = case.python_root
         pending = harness._invoke_one(
             producer,
@@ -2031,6 +2041,7 @@ def _shared_queue_interop(harness: Harness, report: Report) -> None:
         )
         state = _state(root)
         state["status"] = "idle"
+        state.pop("screen", None)
         (root / "state.json").write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
         drained = harness._invoke_one(
             consumer,
@@ -2349,7 +2360,7 @@ def _managed_lifecycle(harness: Harness, report: Report) -> None:
         report.require(f"managed/interop/{label}", started.returncode == sent.returncode == stopped.returncode == 0 and _state(root).get("submitted") == ["shared registry"],
                        f"registry interop failed: {started!r} {sent!r} {stopped!r}")
 
-    for label, change in (("offline", {"offline": True}), ("busy", {"status": "working"}), ("extra-pane", {"extra_pane": True})):
+    for label, change in (("offline", {"offline": True}), ("busy", {"status": "working", "screen": "unrecognized terminal layout\n"}), ("extra-pane", {"extra_pane": True})):
         case = harness.case(f"managed-{label}")
         common = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/registry")
         harness.invoke(case, ("start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1", *common))

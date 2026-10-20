@@ -25,6 +25,12 @@ class Harness(HerdrClient):
     def workspace_label(self, workspace_id: str) -> str:
         return "project"
 
+    def read(self, pane_id: str, *, source: str = "recent-unwrapped", lines: int | None = None) -> str:
+        # This queue fixture has no modeled composer. Native working status alone
+        # must remain insufficient for typing; form-capable terminals are tested separately.
+        assert source == "visible" and lines == 200
+        return "unrecognized terminal layout\n"
+
     def prompt_agent(
         self, pane_id: str, text: str, *, terminal: GuardedInput | None = None,
     ) -> None:

@@ -142,6 +142,14 @@ enum Commands {
     /// Deliver queued prompts that are known not to have been submitted
     #[command(after_help = "Example: agentctl drain reviewer --ready-timeout 60")]
     Drain(Drain),
+    /// Inspect blocking questions; reveal collapsed forms without selecting or submitting
+    #[command(after_help = "Example: agentctl prompts reviewer")]
+    Prompts(Named),
+    /// Answer a recognized TUI question, verifying dismissal; never retry uncertain answers
+    #[command(
+        after_help = "Examples:\n  agentctl answer reviewer --option 2\n  agentctl answer reviewer --text 'Use the existing approach'"
+    )]
+    Answer(Answer),
     /// Read visible terminal output and save a bounded snapshot
     #[command(
         after_help = "Examples:\n  agentctl read reviewer --lines 100\n  agentctl read sub-cloud-worker --output last\n\nFor an agentcloud agent, --output last prints the last settled run's final reply from\n`agentcloudctl output` (unbounded by --lines); tail and all read the agentterm tab."
@@ -197,6 +205,19 @@ enum Commands {
 struct Named {
     /// Registered agent name (1-32 lowercase letters, digits, and hyphens)
     name: String,
+}
+
+#[derive(Args)]
+#[command(group(clap::ArgGroup::new("selection").required(true).args(["option", "text"])))]
+struct Answer {
+    #[command(flatten)]
+    agent: Named,
+    /// One-based option number printed by prompts
+    #[arg(long, value_name = "N")]
+    option: Option<usize>,
+    /// Literal single-line answer for a supported empty free-text form
+    #[arg(long, value_name = "TEXT")]
+    text: Option<String>,
 }
 
 #[derive(Args)]
@@ -380,7 +401,7 @@ struct Delivery {
     /// Maximum known-safe submission attempts per message
     #[arg(long, default_value = "3", value_parser = clap::value_parser!(u64).range(1..=1_000_000))]
     max_attempts: u64,
-    /// Also type into a Claude Code pane that is working (native, or behind a root slot relay), and let Claude Code queue the prompt behind its current turn (default: off, which waits for idle or done up to --ready-timeout). The composer must be empty first and the submission verified; a prompt Claude Code never accepts is taken back out and stays pending. Slash commands and other harnesses still wait
+    /// Also type into a Claude Code pane that is working (native, or behind a root slot relay), and let Claude Code queue the prompt behind its current turn (default: off, which waits for idle or done up to --ready-timeout). The composer must be empty first and the submission verified; a prompt Claude Code never accepts is taken back out and stays pending. Codex ordinary follow-ups use Enter while working by default; slash commands and unsupported harnesses still wait
     #[arg(long)]
     deliver_while_working: bool,
 }
@@ -996,7 +1017,7 @@ struct ChatRun {
     /// Print an `agentctl chat reply` command in each request prompt that gives the two reply marker lines, as a way to send a reply at once (default: off). A prompt leaves the command out when no file is left at this executable's path or a word of the command cannot be printed safely. With or without this option, a service with outbound replies enabled listens for that command's wakes on the state directory's .wake.sock, unless the socket's absolute path exceeds 107 bytes. The agent must be able to run this executable and write the state directory; applies only to this run.
     #[arg(long)]
     offer_reply_command: bool,
-    /// Also type a request into the coordinator's pane while Herdr reports it `working`, when the pane runs Claude Code, and let Claude Code queue it behind the current turn (default: off, which waits for `idle` or `done`). The composer must be empty first, and the submission must be verified: the prompt leaves the composer, with Claude Code's queued-message hint or the prompt shown, and an Enter it drops is pressed again with a doubling wait. A prompt it never accepts is taken back out of the composer and stays pending. Slash commands and other harnesses still wait; applies only to this run.
+    /// Also type a request into the coordinator's pane while Herdr reports it `working`, when the pane runs Claude Code, and let Claude Code queue it behind the current turn (default: off, which waits for `idle` or `done`). The composer must be empty first, and the submission must be verified: the prompt leaves the composer, with Claude Code's queued-message hint or the prompt shown, and an Enter it drops is pressed again with a doubling wait. A prompt it never accepts is taken back out of the composer and stays pending. Codex ordinary follow-ups use Enter while working by default; slash commands and unsupported harnesses still wait; applies only to this run.
     #[arg(long)]
     deliver_while_working: bool,
     /// Clear text left unsubmitted in the coordinator's composer once it has blocked a request and stayed unchanged for DURATION, such as 30m (default: off). Units: s, m or h; a bare number is seconds; at least 1m. The text is first saved with mode 0600 under the state directory's composer-backups/, then deleted with editing keys and the composer proved empty, and then posted once to the first configured channel through the outbound helper with a "[chat-bridge WARNING]" notice; delivery then resumes. Any change to the text restarts the wait, nothing is cleared while the agent works, and a failed clear leaves the text and posts nothing. Requires an outbound helper; applies only to this run.
@@ -1784,6 +1805,11 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         }
         Commands::List => json!(manager.list()?),
         Commands::Status(value) => manager.status(&value.name)?,
+        Commands::Prompts(value) => manager.prompts(&value.name, None)?,
+        Commands::Answer(value) => manager.prompts(
+            &value.agent.name,
+            Some((value.option, value.text.as_deref())),
+        )?,
         Commands::Send(value) => {
             if value.model.is_some() {
                 return Err(Failure::Usage(

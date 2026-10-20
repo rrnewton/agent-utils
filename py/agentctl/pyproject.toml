@@ -32,7 +32,7 @@ herdr-subagents = "agentctl.foreign_cli:main"
 herdr-chat = "agentctl.chat:main"
 
 [tool.setuptools]
-packages = ["agentctl", "agentctl.foreign", "agentctl.foreign.mcp"]
+packages = ["agentctl", "agentctl.foreign", "agentctl.foreign.mcp", "agentctl.harness_tui"]
 package-dir = { agentctl = "." }
 include-package-data = false
 

@@ -58,7 +58,8 @@ def _delivery(parser: argparse.ArgumentParser) -> None:
         help="interactive only: also type into a Claude Code pane that is working, native or behind a root slot "
              "relay, and let Claude Code queue the prompt behind its turn (default: off, which waits for idle or "
              "done). The composer must be empty first and the submission verified; a prompt Claude Code never "
-             "accepts is taken back out and stays pending. Slash commands and other harnesses still wait")
+             "accepts is taken back out and stays pending. Codex ordinary follow-ups use Enter while working "
+             "by default; slash commands and unsupported harnesses still wait")
 
 
 def _environment_entry(value: str) -> str:
@@ -189,6 +190,13 @@ def parser() -> argparse.ArgumentParser:
     drain = command("drain", "Deliver safely pending interactive requests; never replay uncertain submissions.",
         "agentctl drain reviewer --ready-timeout 0", named=True)
     _delivery(drain)
+    command("prompts", "Inspect a blocking question; reveal collapsed forms without selecting or submitting.",
+        "agentctl prompts reviewer", named=True)
+    answer = command("answer", "Answer a recognized TUI question and verify it was dismissed; never retry uncertain answers.",
+        "agentctl answer reviewer --option 2", named=True)
+    selection = answer.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--option", type=_bounded_uint, metavar="N", help="one-based option number printed by prompts")
+    selection.add_argument("--text", metavar="TEXT", help="literal single-line answer for a supported empty free-text form")
     read = command("read", "Read a terminal snapshot or a headless transcript/answer.",
         "agentctl read reviewer --lines 100", named=True)
     read.add_argument("--lines", type=_bounded_uint, default=500, metavar="COUNT", help="maximum tail/snapshot lines (default: 500)")
@@ -462,6 +470,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = sessions.status(name)
         elif args.command == "send":
             result = sessions.send_session(name, _text(args) or "", message_id=args.message_id, model=args.model, **options)
+        elif args.command == "prompts":
+            result = sessions.prompts(name)
+        elif args.command == "answer":
+            result = sessions.prompts(name, option=args.option, text=args.text, answering=True)
         elif args.command == "read":
             sys.stdout.write(sessions.read_session(name, lines=args.lines, output=args.output, since_turn=args.since_turn))
             return 0

@@ -1,0 +1,52 @@
+[
+  {
+    "harness": "codex",
+    "state": "idle_composer",
+    "screen": "»\n  GPT default · /work/project\n"
+  },
+  {
+    "harness": "codex",
+    "state": "working",
+    "screen": "• Working (2s • esc to interrupt)\n»\n  GPT default · /work/project\n"
+  },
+  {
+    "harness": "codex",
+    "state": "blocking_question",
+    "screen": "• Queued follow-up inputs\n  ? 1 question\n  shift+← to answer\n»\n  GPT default · /work/project\n"
+  },
+  {
+    "harness": "codex",
+    "state": "menu_or_picker",
+    "screen": "Select model\n› 1. Example\n  esc to cancel\n"
+  },
+  {
+    "harness": "codex",
+    "state": "unknown",
+    "screen": "shell$\n"
+  },
+  {
+    "harness": "claude",
+    "state": "idle_composer",
+    "screen": "──────\n❯\n──────\n  ? for shortcuts\n"
+  },
+  {
+    "harness": "claude",
+    "state": "working",
+    "screen": "──────\n❯\n──────\n  esc to interrupt\n"
+  },
+  {
+    "harness": "claude",
+    "state": "blocking_question",
+    "screen": "──────\nWhich scope should I use?\n❯ 1. Focused\n  2. Complete\nEnter to select · ↑/↓ to navigate · Esc to cancel\n"
+  },
+  {
+    "harness": "claude",
+    "state": "menu_or_picker",
+    "screen": "──────\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEnter to select · ↑/↓ to navigate · Esc to cancel\n"
+  },
+  {
+    "harness": "claude",
+    "state": "unknown",
+    "screen": "shell$\n"
+  }
+]

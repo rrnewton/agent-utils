@@ -115,6 +115,7 @@ _CODEX_QUEUED_ROWS = (
 #: Set while a queue drain types into a pane that is working: a prompt the agent then never
 #: accepts is taken back out of the composer and reported as not typed, so it stays pending.
 _WITHDRAW_UNACCEPTED: ContextVar[bool] = ContextVar("agentctl_withdraw_unaccepted", default=False)
+_FOLLOWUP_KEY: ContextVar[str | None] = ContextVar("agentctl_followup_key", default=None)
 #: Keys that move to the end of the composer's current row and delete back to its start.
 CLEAR_ROW_KEYS = ("ctrl+e", "ctrl+u")
 #: Sent when a pair of :data:`CLEAR_ROW_KEYS` changed nothing, as on an empty row.
@@ -136,6 +137,16 @@ def withdrawing_unaccepted() -> Iterator[None]:
 def withdraw_requested() -> bool:
     """Whether the current delivery types into a working pane (see :func:`withdrawing_unaccepted`)."""
     return _WITHDRAW_UNACCEPTED.get()
+
+
+@contextmanager
+def working_followup(key: str | None) -> Iterator[None]:
+    """Use the harness adapter's follow-up key without changing ordinary submissions."""
+    token = _FOLLOWUP_KEY.set(key)
+    try:
+        yield
+    finally:
+        _FOLLOWUP_KEY.reset(token)
 
 
 class PromptNotStaged(HerdrUnavailable):
@@ -421,6 +432,9 @@ def _printed(before: ComposerView, after: ComposerView, text: str) -> str | None
 
 
 def _submit_key(harness: str, view: ComposerView) -> str:
+    followup_key = _FOLLOWUP_KEY.get()
+    if followup_key is not None:
+        return followup_key
     # A busy Codex steers the active turn on Enter and queues on Tab. It shows
     # the Tab hint only while it is busy and holds staged text.
     if harness == "codex" and _CODEX_QUEUE_HINT in view.footer:
@@ -468,6 +482,13 @@ def submit_verified(
             raise PromptNotStaged(
                 f"pane {pane_id}: composer read failed before typing: {exc}"
             ) from exc
+        from agentctl.harness_tui import State, harness_tui
+        from agentctl.tui_prompts import blocked_hint
+        adapter = harness_tui(harness)
+        if adapter is not None:
+            tui_view = adapter.classify(screen)
+            if tui_view.state in (State.QUESTION, State.MENU):
+                raise PromptNotStaged(f"pane {pane_id} is blocked; {blocked_hint(tui_view)}; nothing was typed")
         before = composer_view(harness, screen)
         if before is not None:
             break

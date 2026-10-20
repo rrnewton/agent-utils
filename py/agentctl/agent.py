@@ -31,7 +31,7 @@ from agentctl.errors import (
     ProbableMisroute,
 )
 from agentctl.prompt_time import retime as _retime_prompt
-from agentctl.submission import PromptNotStaged, SubmissionReceipt, withdrawing_unaccepted
+from agentctl.submission import PromptNotStaged, SubmissionReceipt, withdrawing_unaccepted, working_followup
 
 __all__ = [
     "Target", "QueueResult", "resolve_target", "enqueue", "drain", "send", "status", "read",
@@ -1834,6 +1834,7 @@ def _wait_ready(
     locked_pane_id: str,
     initial_info: AgentPaneInfo | None = None,
     accept_working: bool = False,
+    allow_followups: bool = True,
 ) -> AgentPaneInfo:
     deadline = monotonic() + timeout
     while True:
@@ -1845,16 +1846,31 @@ def _wait_ready(
             )
         if info.status in ("idle", "done"):
             return info
-        # Claude Code queues a prompt submitted while it works and shows that it did; the
-        # verified submission checks the composer is empty first and proves the prompt left it.
-        if accept_working and info.status == "working" and info.agent == "claude":
-            return info
+        from agentctl.harness_tui import State, harness_tui
+        from agentctl.tui_prompts import blocked_hint
+        adapter = harness_tui(info.agent)
+        if (allow_followups and info.status == "working" and adapter is not None
+                and adapter.working_followups and (accept_working or info.agent == "codex")):
+            # Native status alone cannot distinguish a question from a working composer.
+            if info.agent == "claude":
+                return info
+            view = adapter.classify(client.read(info.pane_id, source="visible", lines=200))
+            if view.state in (State.WORKING, State.IDLE):
+                return info
+            if view.state == State.QUESTION:
+                raise AgentDeliveryError(f"pane {info.pane_id} is blocked; {blocked_hint(view)}")
         codex_ready = getattr(client, "codex_idle_ready", None)
         if (info.agent == "codex" and info.status == "unknown"
                 and callable(codex_ready) and codex_ready(info)):
             return info
         if info.status == "blocked":
-            raise AgentDeliveryError(f"pane {info.pane_id} is blocked; resolve its visible prompt")
+            detail = "Inspect agentctl prompts NAME; unsupported forms require interactive attention."
+            if adapter is not None:
+                try:
+                    detail = blocked_hint(adapter.classify(client.read(info.pane_id, source="visible", lines=200)))
+                except HerdrUnavailable as exc:
+                    detail += f" Screen read failed: {exc}"
+            raise AgentDeliveryError(f"pane {info.pane_id} is blocked; {detail}")
         if monotonic() >= deadline:
             raise AgentDeliveryError(
                 f"pane {info.pane_id} did not become idle/done within {timeout:g}s; last status={info.status}"
@@ -1870,7 +1886,11 @@ def _deliver_one(
     working_timeout: float,
 ) -> None:
     try:
-        receipt = client.prompt_agent(info.pane_id, text)
+        from agentctl.harness_tui import harness_tui
+        adapter = harness_tui(info.agent)
+        key = adapter.working_submit_key if adapter is not None and info.status == "working" else None
+        with working_followup(key):
+            receipt = client.prompt_agent(info.pane_id, text)
     except PromptNotStaged as exc:
         raise _NotStaged(str(exc)) from exc
     except MisrouteRecovered as exc:
@@ -1923,7 +1943,8 @@ def drain(
 
     With ``deliver_while_working``, a Claude Code pane that is working is also typed into and
     Claude Code queues the prompt; one it never accepts is taken back out and stays pending.
-    Slash commands and other harnesses still wait for idle or done.
+    Codex ordinary follow-ups use its working composer by default. Slash commands and unsupported
+    harnesses still wait for idle or done.
     """
     with atomic_write_policy(atomic_policy):
         return _drain(client, target, root, ready_timeout=ready_timeout,
@@ -2028,6 +2049,7 @@ def _drain(
                         locked_pane_id=locked_pane_id,
                         initial_info=initial_info,
                         accept_working=accept_working,
+                        allow_followups=not str(document.get("text", "")).lstrip().startswith("/"),
                     )
                     initial_info = None
                 except (AgentDeliveryError, HerdrUnavailable) as exc:
@@ -2062,7 +2084,7 @@ def _drain(
                     try:
                         # Typing into a working pane relies on the agent to queue the prompt; one
                         # it never accepts is taken back out of the composer so it stays pending.
-                        with (withdrawing_unaccepted() if accept_working and info.status == "working"
+                        with (withdrawing_unaccepted() if (accept_working or info.agent == "codex") and info.status == "working"
                               else nullcontext()):
                             _deliver_one(
                                 client, info, _typed_text(document),

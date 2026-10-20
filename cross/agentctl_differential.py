@@ -1737,7 +1737,7 @@ def _handoff_and_pending(harness: Harness, report: Report) -> None:
     case = harness.case("primary-handoff")
     if not _start(harness, report, case, "primary/handoff/start"):
         return
-    _change(case, {"status": "working"})
+    _change(case, {"status": "working", "screen": "unrecognized terminal layout\n"})
     _pair(harness, report, case, "primary/handoff/busy-pending",
           ("send", "worker", "queued before handoff", "--message-id", "waiting", "--ready-timeout", "0", *_COMMON), 75)
     _pair(harness, report, case, "primary/handoff/pause", ("pause", "worker", *_COMMON))
@@ -1748,7 +1748,7 @@ def _handoff_and_pending(harness: Harness, report: Report) -> None:
     report.require("primary/handoff/preserved-input", all(_state(root).get("submitted") == []
                    and _state(root).get("focused") == "w1:p1" for root in (case.python_root, case.rust_root)),
                    "handoff injected input or failed to focus the owned pane")
-    _change(case, {"status": "idle"})
+    _change(case, {"status": "idle", "screen": ""})
     _pair(harness, report, case, "primary/handoff/resume", ("resume", "worker", *_COMMON))
     _pair(harness, report, case, "primary/handoff/drain", ("drain", "worker", *_COMMON))
     report.require("primary/handoff/pending-once", all(_state(root).get("submitted") == ["queued before handoff"]

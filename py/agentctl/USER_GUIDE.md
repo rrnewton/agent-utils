@@ -854,8 +854,50 @@ To steer a Claude Code agent that is busy, `--deliver-while-working` on `send`,
 types into a pane that is working, native or behind a root slot relay, and lets
 Claude Code queue the prompt behind its current turn. The composer must be empty
 first and the submission is verified; a prompt Claude Code never accepts is
-taken back out of the composer and stays pending. Slash commands and other
-harnesses still wait for idle or done.
+taken back out of the composer and stays pending. Harnesses without a follow-up
+adapter still wait for idle or done. Codex ordinary follow-ups are delivered
+while it is working by default: its adapter verifies a working composer and uses
+paste plus Enter, so the active turn can receive the instruction. The existing
+empty-composer and at-most-once checks still apply. A blocking question is not a
+working composer, even when Herdr's status has not caught up with the screen.
+Slash commands still wait for idle or done.
+
+To inspect a question without selecting or submitting an answer:
+
+```sh
+agentctl prompts reviewer
+agentctl answer reviewer --option 2
+agentctl answer reviewer --text 'Use the existing approach'
+```
+
+`prompts` prints JSON with `state` and, when recognizable, the question's text,
+numbered options, current selection, and any existing draft. The state is
+`idle_composer`, `working`, `blocking_question`, `menu_or_picker`, or `unknown`.
+It reads the visible screen and uses Shift+Left to reveal a collapsed Codex
+question, then verifies and prints the expanded form. Inspection never selects,
+pastes, or submits an answer. `answer` also opens a collapsed form if needed,
+then answers only if its layout is recognized.
+
+Both editions support default-keymap Codex single-question option and free-text
+forms. With `--text`, an option form must offer a visible "None of the above"
+entry; the adapter selects it and opens its empty notes editor. Claude Code's
+recognized single-question selection form supports `--option`; unknown free-text
+and multi-question forms require interactive attention. Pickers and permission
+dialogs are not answered by these commands. Existing drafts, hidden options,
+multiple questions, remapped submission hints, and unfamiliar layouts are refused.
+
+`--option N` uses the one-based number printed on screen; `--text TEXT` is literal,
+nonempty, single-line text without terminal controls. Exactly one is required.
+Session, workspace, terminal, and pinned process checks remain in force, and
+answering shares the exact-pane input lock with `send`/`drain`. Paused sessions
+can be inspected, including revealing a collapsed form, but must be resumed before automated answers.
+
+The answer's submit key is sent once. Success requires the form to disappear
+into a recognized idle or working composer. A refusal before input exits 75;
+an uncertain outcome after input was attempted exits 76 and is never retried
+automatically. Inspect the pane before another answer. Answering does not drain
+pending messages automatically: run `agentctl drain NAME` when ready. Blocked
+`send`/`drain` errors include the visible question and point to these commands.
 
 `agentctl wait NAME` returns when the agent is ready for input again, which for
 an interactive agent means its current turn has ended. Read the result with

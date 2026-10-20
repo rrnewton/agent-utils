@@ -25,6 +25,8 @@ Use the installed command as the authority:
 - `agentctl status NAME`
 - `agentctl send NAME --file PROMPT`
 - `agentctl read NAME --lines 500`
+- `agentctl prompts NAME` (reveal a collapsed question for inspection; never select or submit)
+- `agentctl answer NAME --option N` or `--text TEXT` (recognized forms only)
 - `agentctl move NAME`
 - `agentctl userguide`
 

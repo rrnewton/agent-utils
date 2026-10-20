@@ -10,6 +10,17 @@ from pathlib import Path
 
 import pytest
 
+from typing import cast
+
+from agentctl import cli
+from agentctl.errors import AgentDeliveryError, AgentPending, AgentPossiblySubmitted
+from agentctl.harness_tui import HarnessTui, State, harness_tui
+from agentctl.tui_prompts import answer
+from .test_herdr_agent import FakeAgentHerdr, target
+from .test_agentctl_sessions import setup
+from agentctl.submission import SubmissionReceipt, submit_verified
+from agentctl.agent import send
+
 from agentctl.agent import Target, drain, enqueue
 from agentctl.client import AgentPaneInfo, HerdrClient
 from agentctl.errors import HerdrUnavailable
@@ -1024,6 +1035,274 @@ def test_clear_composer_empties_a_multi_row_draft_without_submitting() -> None:
 def test_the_cli_passes_deliver_while_working_only_when_asked() -> None:
     from agentctl import cli
 
-    parsed = cli.parser().parse_args(["send", "worker", "--deliver-while-working", "steer"])
+    parsed = cli.parser().parse_args(["send", "worker", "steer", "--deliver-while-working"])
     assert parsed.deliver_while_working is True
     assert cli.parser().parse_args(["send", "worker", "steer"]).deliver_while_working is False
+
+
+# Shared terminal form captures and guarded question-answering contracts.
+ComposerTerminal = FakeAgent
+
+FIXTURES = Path(__file__).resolve().parents[2] / "rs" / "agentctl" / "tests" / "fixtures" / "tui"
+
+
+def adapter(name: str = "codex") -> HarnessTui:
+    value = harness_tui(name)
+    assert value is not None
+    return value
+
+
+def test_shared_state_snapshots() -> None:
+    for row in json.loads((FIXTURES / "states.json").read_text()):
+        assert adapter(row["harness"]).classify(row["screen"]).state == row["state"]
+    assert harness_tui("unknown") is None
+
+
+@pytest.mark.parametrize("kind", ["options", "freeform", "multi_question_first", "hidden_options_footer", "options_notes_visible"])
+def test_upstream_codex_snapshots(kind: str) -> None:
+    view = adapter().classify((FIXTURES / f"codex-{kind}.txt").read_text())
+    assert view.state == State.QUESTION
+    assert view.question is not None and view.question.text
+    if kind == "options":
+        assert [o.number for o in view.question.options] == [1, 2, 3, 4]
+        assert view.question.selected == 1
+        assert adapter().answer_plan(view.question, 2, None).keys == ("Down",)
+        assert adapter().answer_plan(view.question, None, "Alternative").keys == ("Down", "Down", "Down", "Tab")
+    elif kind == "freeform":
+        assert adapter().answer_plan(view.question, None, "Details").text == "Details"
+    else:
+        with pytest.raises(ValueError):
+            adapter().answer_plan(view.question, 2, None)
+
+
+class FormTerminal:
+    """Replay a captured form; apply the few actual key effects the adapter requests."""
+
+    def __init__(self, kind: str = "options", *, collapsed: bool = False, drop: bool = False) -> None:
+        self.screen = (FIXTURES / f"codex-{kind}.txt").read_text()
+        self.collapsed = collapsed
+        self.drop = drop
+        self.keys: list[str] = []
+        self.texts: list[str] = []
+        self.seconds = 0.0
+
+    def read_screen(self, pane: str) -> str:
+        assert pane == "w1:p1"
+        return "• Queued follow-up inputs\n  ? 1 question\n  shift+← to answer" if self.collapsed else self.screen
+
+    def send_keys(self, pane: str, key: str) -> None:
+        assert pane == "w1:p1"
+        self.keys.append(key)
+        if key == "shift+left":
+            self.collapsed = False
+        elif key in ("Down", "Up"):
+            q = adapter().classify(self.screen).question
+            assert q is not None and q.selected is not None
+            selected = q.selected + (1 if key == "Down" else -1)
+            self.screen = self.screen.replace("› ", "  ")
+            self.screen = self.screen.replace(f"  {selected}. ", f"› {selected}. ")
+        elif key == "Tab":
+            self.screen = self.screen.replace("tab to add notes", "tab or esc to clear notes")
+            self.screen = self.screen.replace("  tab or esc", "  › Add notes\n\n  tab or esc")
+        elif key == "Enter" and not self.drop:
+            self.screen = "• Working (2s • esc to interrupt)\n»\n  GPT default · /work/project\n"
+
+    def send_text(self, pane: str, text: str) -> None:
+        assert pane == "w1:p1"
+        self.texts.append(text)
+        value = text.removeprefix("\x1b[200~").removesuffix("\x1b[201~")
+        self.screen = self.screen.replace("› Type your answer (optional)", "› " + value)
+        self.screen = self.screen.replace("› Add notes", "› " + value)
+
+    def native_prompt(self, pane: str, text: str) -> None:
+        raise AssertionError("answer must not use ordinary prompt delivery")
+
+    def sleep(self, seconds: float) -> None:
+        self.seconds += seconds
+
+
+@pytest.mark.parametrize("collapsed", [False, True])
+def test_option_answer_opens_navigates_and_verifies_dismissal(collapsed: bool) -> None:
+    terminal = FormTerminal(collapsed=collapsed)
+    result = answer(terminal, "w1:p1", adapter(), option=2, verify=lambda p: None,
+                    sleep=terminal.sleep, monotonic=lambda: terminal.seconds)
+    assert result["answered"] is True
+    assert terminal.keys == (["shift+left"] if collapsed else []) + ["Down", "Enter"]
+    assert not terminal.texts
+
+
+@pytest.mark.parametrize("kind", ["freeform", "options"])
+def test_literal_text_answer(kind: str) -> None:
+    terminal = FormTerminal(kind)
+    assert answer(terminal, "w1:p1", adapter(), text="A literal answer", verify=lambda p: None,
+                  sleep=terminal.sleep, monotonic=lambda: terminal.seconds)["answered"] is True
+    assert terminal.keys.count("Enter") == 1
+    assert terminal.texts == ["\x1b[200~A literal answer\x1b[201~"]
+
+
+def test_dropped_submit_is_uncertain_and_never_retried() -> None:
+    terminal = FormTerminal(drop=True)
+    with pytest.raises(AgentPossiblySubmitted) as exc:
+        answer(terminal, "w1:p1", adapter(), option=1, verify=lambda p: None,
+               sleep=terminal.sleep, monotonic=lambda: terminal.seconds)
+    assert exc.value.exit_code == 76
+    assert terminal.keys == ["Enter"]
+
+
+@pytest.mark.parametrize("kind,option,text", [("options", 99, None), ("options", 4, None),
+    ("freeform", None, "\x1bBAD"), ("freeform", None, "two\nlines"),
+    ("multi_question_first", 1, None), ("hidden_options_footer", 2, None)])
+def test_refusal_before_input(kind: str, option: int | None, text: str | None) -> None:
+    terminal = FormTerminal(kind)
+    with pytest.raises(AgentDeliveryError) as exc:
+        answer(terminal, "w1:p1", adapter(), option=option, text=text, verify=lambda p: None)
+    assert exc.value.exit_code == 75
+    assert not terminal.keys and not terminal.texts
+
+
+def test_recipient_failure_before_effect_never_sends() -> None:
+    terminal = FormTerminal()
+    def refuse(pane: str) -> None:
+        raise AgentDeliveryError("recipient replaced")
+    with pytest.raises(AgentDeliveryError, match="recipient replaced"):
+        answer(terminal, "w1:p1", adapter(), option=1, verify=refuse)
+    assert not terminal.keys
+
+
+def test_question_cannot_be_confused_with_a_menu_or_quoted_transcript() -> None:
+    terminal = FormTerminal()
+    terminal.screen = "Choose model?\n› 1. Fast\n  enter to select | esc to cancel"
+    with pytest.raises(AgentDeliveryError, match="no supported"):
+        answer(terminal, "w1:p1", adapter(), option=1, verify=lambda p: None)
+    assert not terminal.keys
+    for name in ("claude", "codex"):
+        assert adapter(name).classify("Transcript: enter to submit answer\n$ shell").state != State.QUESTION
+
+
+def test_cli_selection_is_mutually_exclusive_and_required() -> None:
+    assert cli.parser().parse_args(["prompts", "worker"]).command == "prompts"
+    for args in (["answer", "worker"], ["answer", "worker", "--option", "1", "--text", "x"]):
+        with pytest.raises(SystemExit):
+            cli.parser().parse_args(args)
+
+
+def test_busy_codex_uses_followup_but_slash_commands_stay_pending(tmp_path: Path) -> None:
+    class Busy(FakeAgentHerdr):
+        def read(self, pane_id: str, *, source: str, lines: int) -> str:
+            if source == "visible":
+                return "• Working (2s • esc to interrupt)\n»\n  GPT default · /work/project\n"
+            return super().read(pane_id, source=source, lines=lines)
+    fake = Busy(["working"])
+    result = send(cast(HerdrClient, fake), target(), str(tmp_path), "follow up", ready_timeout=0)
+    assert result.delivered
+    assert len(fake.runs) == 1
+    with pytest.raises(AgentPending):
+        send(cast(HerdrClient, fake), target(), str(tmp_path), "/model", ready_timeout=0)
+    assert len(fake.runs) == 1
+
+
+def test_busy_codex_verified_transport_uses_enter(tmp_path: Path) -> None:
+    terminal = ComposerTerminal("codex", busy=True)
+    class Busy(FakeAgentHerdr):
+        def read(self, pane_id: str, *, source: str, lines: int) -> str:
+            return terminal.read_screen(pane_id) if source == "visible" else super().read(pane_id, source=source, lines=lines)
+
+        def prompt_agent(self, pane_id: str, text: str) -> SubmissionReceipt:
+            return submit_verified(terminal, pane_id, "codex", text)
+
+    result = send(cast(HerdrClient, Busy(["working"])), target(), str(tmp_path), "Act on this follow-up", ready_timeout=0)
+    assert result.delivered
+    assert terminal.keys == ["Enter"]
+    assert terminal.steered == ["Act on this follow-up"]
+    assert terminal.queued == []
+
+
+def test_blocked_send_retains_pending_and_names_question_and_answer(tmp_path: Path) -> None:
+    class Blocked(FakeAgentHerdr):
+        def read(self, pane_id: str, *, source: str, lines: int) -> str:
+            return (FIXTURES / "codex-options.txt").read_text()
+    fake = Blocked(["blocked"])
+    with pytest.raises(AgentPending, match="Choose an option.*agentctl answer"):
+        send(cast(HerdrClient, fake), target(), str(tmp_path), "Later work", ready_timeout=0)
+    assert not fake.runs
+    assert len(list((tmp_path / "inbox").glob("*.json"))) == 1
+
+
+def test_managed_inspection_is_read_only_and_paused_answer_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, _calls = setup(tmp_path, monkeypatch)
+    sessions.start_session("worker", cwd=str(tmp_path))
+    terminal = FormTerminal()
+    monkeypatch.setattr(fake, "read_screen", terminal.read_screen, raising=False)
+    before = sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*"))
+    result = sessions.prompts("worker")
+    assert result["state"] == State.QUESTION
+    assert not terminal.keys and not terminal.texts and not fake.submitted
+    assert sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*")) == before
+    sessions.pause("worker")
+    assert sessions.prompts("worker")["state"] == State.QUESTION
+    with pytest.raises(AgentDeliveryError, match="paused"):
+        sessions.prompts("worker", option=1, answering=True)
+    assert not terminal.keys
+
+
+def test_managed_answer_rechecks_process_and_uses_guarded_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, _calls = setup(tmp_path, monkeypatch)
+    sessions.start_session("worker", cwd=str(tmp_path))
+    terminal = FormTerminal()
+    fake.expect_supported = True
+    monkeypatch.setattr(fake, "read_screen", terminal.read_screen, raising=False)
+    def keys(pane: str, key: str, *, expect_terminal: str | None = None) -> None:
+        fake._effect(pane, expect_terminal)
+        terminal.send_keys(pane, key)
+    monkeypatch.setattr(fake, "send_keys", keys)
+    assert sessions.prompts("worker", option=1, answering=True)["answered"] is True
+    assert terminal.keys == ["Enter"]
+    assert fake.expected_terminals == ["term-1"]
+
+
+def test_inspection_reveals_only_and_never_selects_or_submits() -> None:
+    from agentctl.tui_prompts import inspect_question
+    terminal = FormTerminal(collapsed=True)
+    view = inspect_question(terminal, "w1:p1", adapter(), verify=lambda p: None,
+                            sleep=terminal.sleep, monotonic=lambda: terminal.seconds)
+    assert view.question is not None and view.question.selected == 1
+    assert terminal.keys == ["shift+left"] and not terminal.texts
+    inspect_question(terminal, "w1:p1", adapter(), verify=lambda p: None)
+    assert terminal.keys == ["shift+left"]
+
+
+def test_paused_managed_inspection_reveals_with_guarded_input_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, fake, _calls = setup(tmp_path, monkeypatch)
+    sessions.start_session("worker", cwd=str(tmp_path))
+    sessions.pause("worker")
+    terminal = FormTerminal(collapsed=True)
+    fake.expect_supported = True
+    monkeypatch.setattr(fake, "read_screen", terminal.read_screen, raising=False)
+    def keys(pane: str, key: str, *, expect_terminal: str | None = None) -> None:
+        fake._effect(pane, expect_terminal)
+        terminal.send_keys(pane, key)
+    monkeypatch.setattr(fake, "send_keys", keys)
+    result = sessions.prompts("worker")
+    assert result["state"] == State.QUESTION
+    assert terminal.keys == ["shift+left"]
+    assert fake.expected_terminals == ["term-1"]
+    assert not terminal.texts and not fake.submitted
+    with pytest.raises(AgentDeliveryError, match="paused"):
+        sessions.prompts("worker", option=2, answering=True)
+    assert terminal.keys == ["shift+left"]
+
+
+def test_inspection_stops_after_reveal_if_the_form_is_unrecognized() -> None:
+    from agentctl.tui_prompts import inspect_question
+    terminal = FormTerminal(collapsed=True)
+    terminal.screen = "Choose model?\n› 1. Fast\n  enter to select | esc to cancel"
+    with pytest.raises(AgentPossiblySubmitted, match="question did not open"):
+        inspect_question(terminal, "w1:p1", adapter(), verify=lambda p: None,
+                         sleep=terminal.sleep, monotonic=lambda: terminal.seconds)
+    assert terminal.keys == ["shift+left"] and not terminal.texts

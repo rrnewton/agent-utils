@@ -22,7 +22,7 @@ from agentctl.profiles import (
     validate_muse_headless_arguments,
     validate_structured_harness_argument_conflicts,
 )
-from agentctl.subagents import AgentRecord, ManagedAgents, _name, _native_session
+from agentctl.subagents import AgentRecord, ManagedAgents, _WorkspaceClient, _name, _native_session
 
 
 class Sessions(ManagedAgents):
@@ -263,6 +263,33 @@ class Sessions(ManagedAgents):
                 since_turn=since_turn, tail=lines if output == "tail" else None)
             result = as_mapping(response["result"], "read result")
             return str(result.get("text", result.get("output", "")))
+
+    def prompts(self, name: str, *, option: int | None = None,
+                text: str | None = None, answering: bool = False) -> dict[str, object]:
+        """Reveal for inspection or answer under the session and pane input locks."""
+        from agentctl.harness_tui import harness_tui
+        from agentctl.tui_prompts import answer, inspect_question
+
+        with self._lock(name):
+            record = self._load(name)
+            self._checked(record, enforce_policy=True)
+            adapter = harness_tui(record.harness)
+            if adapter is None:
+                raise AgentDeliveryError(f"{record.harness} has no supported TUI question adapter")
+            guard = _WorkspaceClient(self.client, record)
+            assert record.pane_id is not None
+            if answering:
+                self._require_automation(record)
+            # Inspection may reveal a form, so it shares the exact-pane input lock too.
+            lock, pane, _info = agent._lock_resolved_target(self.client, record.target())
+            try:
+                terminal = guard._guarded()
+                if not answering:
+                    return asdict(inspect_question(terminal, pane, adapter, verify=guard.verify_recipient))
+                return answer(terminal, pane, adapter, option=option, text=text,
+                              verify=guard.verify_recipient)
+            finally:
+                lock.close()
 
     def stop(
         self, name: str, *, expected_token: str | None = None,

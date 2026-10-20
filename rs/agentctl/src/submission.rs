@@ -864,7 +864,10 @@ fn printed(after: &ComposerView, after_screen: &str, shown: &ShownBefore) -> Opt
     None
 }
 
-fn submit_key(harness: &str, view: &ComposerView) -> &'static str {
+fn submit_key(harness: &str, view: &ComposerView, runtime: &dyn AgentRuntime) -> &'static str {
+    if let Some(key) = runtime.followup_key() {
+        return key;
+    }
     // A busy Codex steers the active turn on Enter and queues on Tab. It shows
     // the Tab hint only while it is busy and holds staged text.
     if harness == "codex" && view.footer.contains(CODEX_QUEUE_HINT) {
@@ -919,6 +922,19 @@ pub fn submit_verified(
                 ))
             }
         };
+        if let Some(adapter) = crate::harness_tui::harness_tui(Some(harness)) {
+            let view = adapter.classify(&screen);
+            if matches!(
+                view.state,
+                crate::harness_tui::State::BlockingQuestion
+                    | crate::harness_tui::State::MenuOrPicker
+            ) {
+                return refuse(format!(
+                    "pane {pane_id} is blocked; {}; nothing was typed",
+                    crate::harness_tui::blocked_hint(&view)
+                ));
+            }
+        }
         if let Some(before) = composer_view(harness, &screen) {
             break (screen, before);
         }
@@ -988,7 +1004,7 @@ pub fn submit_verified(
         runtime.sleep(POLL);
     };
 
-    let mut key = submit_key(harness, &view);
+    let mut key = submit_key(harness, &view, runtime);
     terminal.send_keys(pane_id, key)?;
     let mut presses: u32 = 1;
     let mut wait = FIRST_RETRY;
@@ -1035,7 +1051,7 @@ pub fn submit_verified(
                     )));
                 }
                 if now >= next_press {
-                    key = submit_key(harness, &current);
+                    key = submit_key(harness, &current, runtime);
                     terminal.send_keys(pane_id, key)?;
                     presses += 1;
                     wait = (wait * 2).min(MAX_RETRY);
