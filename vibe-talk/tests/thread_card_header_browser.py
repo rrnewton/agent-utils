@@ -25,9 +25,8 @@ loopback origin, at a 1280x800 desk with a mouse, in the dark scheme and the lig
   crossing the card to the dock: nothing moves for 2.5 s -> the mouse resting on the card: after 1.5 s
   Main glides, through several scroll positions, until the root is on screen and the line whole -> the X:
   the cards -> the long question's card's replies button: its text cut to three lines, the card exactly
-  as tall as the summarised one's -> a click on the text: all of it, over the list, which neither moves
-  nor shrinks by a pixel, the heading its own height -> Esc: three lines again, the thread still open ->
-  Esc: the cards.
+  as tall as the summarised one's -> Esc: the cards. (A press on the card folds it to a bar since
+  `#388 thread-header-collapse`, which tests/thread_header_collapse_browser.py walks.)
 
 The card moves up (part 2 of #298): "I would like to see the SAME colorful card move up to the top of the
 screen ... So it just moves up and disgorges its internal messages underneath". Watched frame by frame
@@ -47,17 +46,13 @@ scroll down, but should be the fixed header object") -> the X, Esc and <- each g
 With reduced motion asked for: the card at the top is at its place in every frame from the first, and
 nothing fades, in two columns and from the thread list.
 
-Esc after two columns went (`#281 view-keys`): two columns again (real Ctrl+4) -> the long question's
-card opened over its thread on the right -> real Ctrl+1: one column, the card closed with its column ->
-the picker: a thread across the window -> Esc: back to Main at once, no Esc spent on a card out of sight.
-
 A redraw of Main leaves the keys where the reader is (`#284 redraw-keeps-pane`), at the desk with the
 page's clock installed, so the channel's own re-read can be brought forward: two columns over the cards
 -> the mouse over Main's newest message, which selects it and takes the focus -> the summarised card's
 replies button: its thread on the right -> a new message in the channel and the re-read brought
 forward: Main drawn again, the selected message's row replaced -> real Esc: the right column's thread
 closes. Then the same with the focus lost first, by a click on the card at the top where it takes no
-focus, its age: the focus on the body -> the re-read: Main drawn again, the focus still on the body and
+focus, its age (which folds the card, `#388`): the focus on the body -> the re-read: Main drawn again, the focus still on the body and
 not given to Main -> real Esc: the right column's thread closes.
 
 On a 412x915 phone by touch, in the dark scheme and the light: the thread list from the view picker
@@ -146,7 +141,6 @@ HEADER_JS = """(root) => {
         text: text ? text.textContent : '', tip: document.getElementById('side-thread-card-text').getAttribute('title'),
         clamped: Boolean(text) && text.scrollHeight > text.clientHeight + 2,
         lines: text ? Math.round(text.clientHeight / parseFloat(getComputedStyle(text).lineHeight)) : 0,
-        expanded: card.hasAttribute('data-expanded'),
         box: box(card), heading: box(document.getElementById('side-heading')),
         list: {...box(area), scrollTop: area.scrollTop, clientHeight: area.clientHeight},
         titleShown: document.getElementById('side-title').getClientRects().length > 0,
@@ -325,7 +319,6 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             elif kind == "desk":
                 desk_walk(desk)
                 list_walk(desk)
-                esc_walk(desk)
             elif kind == "reduced":
                 reduced_walk(desk)
             elif kind == "type":
@@ -606,31 +599,9 @@ def desk_walk(desk: Desk) -> None:
                f"the card at the top is {long_box['height']}px over the long question and {box['height']}px over the other")
     desk.shot("4-long")
 
-    # A click on its text: all of it, over the list, which does not move by a pixel.
-    before = part(long, "list")
-    page.click("#side-thread-card-text")
-    desk.wait_for("() => document.getElementById('side-thread-card').hasAttribute('data-expanded')",
-                  "a click on the clamped text did not open the card")
-    desk.settled()
-    opened = measure(desk)
-    after, opened_box = part(opened, "list"), part(opened, "box")
-    desk.check(not opened["clamped"] and number(opened, "lines") > 3, f"the opened card does not show its whole text: {opened['lines']} lines")
-    for key in ("top", "height", "scrollTop", "clientHeight"):
-        desk.check(number(after, key) == number(before, key), f"opening the card moved the list: {key} {before[key]} -> {after[key]}")
-    desk.check(abs(number(part(opened, "heading"), "height") - number(part(long, "heading"), "height")) <= 0.5,
-               "the heading changed height as the card opened")
-    desk.check(number(opened_box, "bottom") > number(after, "top") + 20, f"the opened card is not over the list: {opened_box} over {after}")
-    desk.shot("5-expanded")
     page.keyboard.press("Escape")
-    desk.wait_for("() => !document.getElementById('side-thread-card').hasAttribute('data-expanded')", "Esc did not close the card")
-    desk.settled()
-    closed = measure(desk)
-    desk.check(bool(closed["clamped"]) and number(closed, "lines") == 3 and page.is_visible("#side-pane"),
-               "Esc did more than close the card, or left its text whole")
-    page.keyboard.press("Escape")
-    desk.wait_for("() => !document.getElementById('side-list').hidden", "the next Esc did not close the thread")
-    desk.notes.append(f"the long question's card was three lines and the same height; opened, {number(opened, 'lines'):.0f} "
-                      "lines over the list, which moved by no pixel; Esc closed it, and Esc again the thread")
+    desk.wait_for("() => !document.getElementById('side-list').hidden", "Esc did not close the thread")
+    desk.notes.append("the long question's card was three lines and the same height; Esc closed the thread")
 
     # Thread(N) on the root in Main, the thread's card on screen on the right: the card moves up from
     # there too, as it does from its replies button.
@@ -764,42 +735,6 @@ def list_walk(desk: Desk) -> None:
 # --- Esc after two columns went, the card at the top left open ----------------------------------------------
 
 
-def esc_walk(desk: Desk) -> None:
-    """`#281 view-keys` x `#298`: the right column's card opened over its thread, then real Ctrl+1 and a
-    thread across the window from the picker. The first Esc goes back to Main: the card went with the
-    column, and Esc closes only a card on screen, so no Esc is spent on one nobody can see."""
-    page = desk.page
-    page.keyboard.press("Control+4")
-    desk.wait_for("() => document.getElementById('screen-main').getAttribute('data-columns') === 'two'",
-                  "Ctrl+4 did not come back to two columns")
-    desk.settled()
-    if page.is_visible("#side-close"):
-        page.click("#side-close")
-        desk.wait_for("() => !document.getElementById('side-list').hidden", "the X did not go back to the cards")
-    open_card(desk, REPLICA)
-    page.click("#side-thread-card-text")
-    desk.wait_for("() => document.getElementById('side-thread-card').hasAttribute('data-expanded')",
-                  "a click on the clamped text did not open the card")
-    page.keyboard.press("Control+1")
-    desk.wait_for("() => !document.getElementById('screen-main').hasAttribute('data-columns')"
-                  " && document.getElementById('thread-select').value === 'main'", "Ctrl+1 did not show Main in one column")
-    desk.check(not page.evaluate("() => document.getElementById('side-thread-card').hasAttribute('data-expanded')"),
-               "the right column's card was left open after two columns went")
-    page.select_option("#thread-select", f"thread:{RUNNER}")
-    desk.wait_for("() => !document.getElementById('thread-heading').hidden"
-                  f" && document.getElementById('thread-card').getAttribute('data-thread') === '{RUNNER}'",
-                  "the picker did not open the thread across the window")
-    at_rest(desk, "thread-card", "pane-discord")
-    page.focus("#scroll-area")
-    page.keyboard.press("Escape")
-    desk.wait_for("() => document.getElementById('thread-heading').hidden"
-                  " && document.getElementById('thread-select').value === 'main'",
-                  "after Ctrl+1 the first Esc in a thread did not go back to Main: it was spent on a card out of sight",
-                  seconds=3)
-    desk.notes.append("the card at the top of the right column opened, then Ctrl+1 and a thread from the picker: the first "
-                      "Esc went back to Main")
-
-
 # --- a redraw of Main while the reader is in the right column (#284) -------------------------------------
 
 # How long the page waits between its re-reads of the channel (web/voice.js `DISCORD_POLL_MS`), and a little.
@@ -828,6 +763,7 @@ def redraw_walk(desk: Desk, api: ColumnsApi) -> None:
                       f"{where}: the mouse over Main's newest message did not select it")
         open_card(desk, RUNNER)
         if lose:
+            # A press on the card folds it to a bar (`#388 thread-header-collapse`) and takes no focus.
             page.click("#side-thread-card-age")
             desk.settled()
             desk.check(page.evaluate(FOCUS_JS) == "body",

@@ -855,15 +855,14 @@ steps:
   # before the press — first drawn on its card, then only upward through several places, the thread
   # fading in under it, the line following it and the thread's scroll position fixed; real Ctrl+3 and a
   # card's replies button: the same card heading the thread across the window, fixed while it scrolls,
-  # the X, Esc and <- back to the list; the card opened on the right, then real Ctrl+1 and a thread from the
-  # picker: the first Esc back to Main; nothing moving under reduced motion; and on a 412x915 phone by
+  # the X, Esc and <- back to the list; nothing moving under reduced motion; and on a 412x915 phone by
   # touch, two lines and a 44px X. Measured on 2026-10-14: about 30s wall, most of it the glide's waits.
   # `#284 redraw-keeps-pane`: and a redraw of Main, the channel's re-read brought forward on the page's
   # clock, leaving the keys in the right column, after its replies button and with the focus lost to the
   # body, so a real Esc still closes its thread.
   - group: check
     job: thread-card-header-browser
-    desc: a thread under its card at the top — on the right, joined to its root by one line a resting mouse glides Main along, and across the window from the thread list — the card moving up from its place in the list, its long text opened over the list with nothing moving, a redraw of Main leaving the keys on the right, in current Chromium at 1280x800 in both schemes and with reduced motion, and at 412x915 by touch
+    desc: a thread under its card at the top — on the right, joined to its root by one line a resting mouse glides Main along, and across the window from the thread list — the card moving up from its place in the list, a redraw of Main leaving the keys on the right, in current Chromium at 1280x800 in both schemes and with reduced motion, and at 412x915 by touch
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/thread_card_header_browser.py
     jobs_flag: ""
@@ -872,6 +871,26 @@ steps:
     hint:
       resources: {browser: 1}
       est_duration_s: 30
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#388 thread-header-collapse` in the browser engine, at 393x852 by touch and 1280x800 with a mouse and
+  # the keys, in the dark scheme and the light: a press on the card at the top of a thread folds it to a
+  # 14px bar of its fill and edge with a 24px press target and a press on the bar opens it, no row on
+  # screen moving part-way up the thread or at its foot; a link in it and its X do not fold it; a reload
+  # keeps it folded; in two columns the line from the root meets the bar, its lane left of every row.
+  # Measured on 2026-10-19: about 25s wall.
+  - group: check
+    job: thread-header-collapse-browser
+    desc: the card at the top of a thread folded by a press to a thin bar of its own colours and opened again, nothing under it moving, kept across a reload, joined to its root, in current Chromium at 393x852 by touch and 1280x800 with a mouse, in both schemes
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/thread_header_collapse_browser.py
+    jobs_flag: ""
+    timeout: 150
+    cpu_timeout: 90
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 25
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 

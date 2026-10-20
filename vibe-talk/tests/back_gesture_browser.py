@@ -547,7 +547,7 @@ def installed_walk(desk: Desk) -> None:
                f"{navigation(page)}")
     _quiet, reopened = reload_quietly(desk, REOPENED_LIST_THREAD, "the reload did not reopen the thread from the list")
     # Here the reader touches the page first, so whatever the page still wanted to push is pushed. On the
-    # thread card's age, which acts on nothing (`#298 thread-card-header`: the card is the thread's heading).
+    # thread card's age, which pushes nothing: it folds the card to a bar (`#388 thread-header-collapse`).
     tap(desk, "#thread-card-age")
     desk.settled()
     back_through_reopened(desk, reopened)

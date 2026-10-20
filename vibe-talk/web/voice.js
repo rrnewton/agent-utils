@@ -9210,8 +9210,6 @@ function onPointerDown(event) {
   const kind = String((event && event.pointerType) || "");
   if (kind === "mouse") mouseInUse();
   else if (kind) touchInUse();
-  // `#298 thread-card-header`. A press outside the opened card at the top of a thread closes it.
-  collapseThreadCardOutside(event);
   const target = event && event.target;
   if (currentScreen !== "main" || !target) return;
   const pane = KEY_PANES.find((each) => { const list = each.list(); return list !== null && nodeWithin(list, target); });
@@ -10442,8 +10440,7 @@ function closeDetailsOn(target) {
  * popover, the prompts tray, or a details sheet closes; then the search; then a message box with text
  * in it is left, the draft kept and the focus back on the list (question 4), while an empty one goes
  * Back at once, there being nothing to keep; a picker on the bar is left for the list, whatever it
- * holds (`isBarPicker`); then the card at the top of a thread, opened over its list, closes, while it
- * is on screen (`#298 thread-card-header`); then a highlighted thread card on screen is put out (`#277
+ * holds (`isBarPicker`); then a highlighted thread card on screen is put out (`#277
  * thread-card-focus`); then a thread selected in All by its strip is let go (`#299 all-thread-strip`);
  * then Back: out of Settings, Help or Reply, out of the thread list to what it
  * was chosen from, or out of a thread — to the thread list, for one opened from it (`#281 view-keys`).
@@ -10473,9 +10470,6 @@ function onEscape(event, target) {
     focusList(paneFor(target));
     return true;
   }
-  // `#298 thread-card-header`. The card at the top of a thread opened over its list closes first; the
-  // next Esc goes back out of the thread. Only a card on screen: one out of sight is nobody's Esc.
-  if (collapseThreadCard(expandedThreadCardOnScreen())) return true;
   if (putOutLitCard()) return true;
   // `#299 all-thread-strip`. A thread selected in All by its strip is let go before All is left.
   if (clearAllThreadFocus()) return true;
@@ -10598,7 +10592,7 @@ const KEYS_WRITING = "Writing";
 const KEYMAP = [
   {
     group: KEYS_PAGE, chords: [{ key: "Escape" }],
-    does: "Back: closes a menu, the search, a sheet or a thread's card opened at the top of the thread, takes " +
+    does: "Back: closes a menu, the search or a sheet, takes " +
       "the highlight off a thread card, lets go of a thread selected in All, leaves Settings, " +
       "Help, Reply or a thread — one opened from the thread list goes back to it — and leaves the thread list for " +
       "the view it was chosen from. In a message box with text in it, leaves the box first and keeps the draft; " +
@@ -20833,8 +20827,6 @@ function renderChannelNavigation() {
   el("channel-view-tabs").hidden = true;
   renderThreadSelect();
   el("thread-heading").hidden = channelView !== "thread";
-  // `#298 thread-card-header`. A card opened over the list goes with its thread.
-  if (channelView !== "thread") collapseThreadCard(leftEl("thread-card"));
   for (const view of ["main", "threads", "flat"]) {
     el(`channel-view-${view}`).setAttribute("aria-pressed", channelView === view ? "true" : "false");
   }
@@ -40435,10 +40427,6 @@ function leaveColumns(next = "one", left = null) {
   columnsShown = false;
   // ...and the cards' walk, unless the cards stay, across the window as the thread list.
   if (next !== "list") endRepliesWalk();
-  // `#298 thread-card-header`. The card at the top of the right column's thread, opened over its list,
-  // goes with the column: Cmd-1, Cmd-2, Cmd-3, Cmd-\ or a window narrowed under two columns leave
-  // nothing open out of sight, for the next Esc to be spent on. Two columns come back to it closed.
-  collapseThreadCard(leftEl("side-thread-card"));
   if (columns.side.mode === "thread") {
     inColumn(columns.side, () => {
       dropReplyArrowTap();
@@ -40572,7 +40560,6 @@ function renderSideMode() {
   const card = leftEl("side-thread-card");
   if (card.hidden === thread) card.hidden = !thread;
   if (leftEl("side-title").hidden !== thread) leftEl("side-title").hidden = thread;
-  if (!thread) collapseThreadCard(card);
   // The jump to a thread's newest message is the thread's: over the cards it would jump in a list that
   // is not on screen. A thread selected again decides it afresh (`renderJumpNewest`).
   if (!thread && !leftEl("side-jump-newest").hidden) leftEl("side-jump-newest").hidden = true;
@@ -41336,10 +41323,8 @@ function putOutLitCard() {
 //     away and adds nothing inside the scroller for the reader's place (`#280 scroll-stability`) to
 //     allow for; and its height is fixed, the text clamped as a card's is, so a name or a summary that
 //     arrives after the thread opened moves nothing under the reader.
-//   * THE WHOLE TEXT IS ONE PRESS AWAY. Where the clamp cuts it, a click on the text — or Enter or Space
-//     on it — opens the card downward OVER the list, which neither moves nor shrinks: the heading keeps
-//     its height while the card overflows it. A second press, Esc, a press outside it, or the thread
-//     going puts it back. Its button's name, and its tooltip, are the whole text whatever is drawn.
+//   * A PRESS FOLDS IT TO A BAR (`#388 thread-header-collapse`, below), and opens it again. Its button's
+//     name, and its tooltip, are the whole text whatever is drawn.
 //   * IT IS JOINED TO ITS ROOT. In two columns the line from the thread's first message on Main goes to
 //     it (`columnLinkPairs`), as it went to its card in the list.
 
@@ -41350,9 +41335,6 @@ function putOutLitCard() {
  * @type {Map<string, string>}
  */
 const threadCardsDrawn = new Map();
-
-/** The card at the top of a thread that is open over its list, or null. */
-let expandedThreadCard = /** @type {HTMLElement | null} */ (null);
 
 /**
  * Whether thread `choice` is one nobody has answered, by the rule its grey Thread tag is drawn by
@@ -41373,7 +41355,7 @@ function threadUnanswered(choice, tally) {
  * Draw `card`, the card at the top of a thread, for thread `choice`, from `tally`: what the thread is
  * about, how long since it moved, its replies and unread, and its colour — or grey, for a thread nobody
  * has answered. Its parts are the elements whose ids are the card's and `-text`, `-age` and `-count`.
- * Written only when what it would draw has changed; a thread that changes puts an opened card back.
+ * Written only when what it would draw has changed.
  *
  * @param {HTMLElement} card
  * @param {ReturnType<typeof threadChoice> | null} choice
@@ -41389,10 +41371,7 @@ function paintThreadCard(card, choice, tally) {
   const signature = JSON.stringify([choice.id, text, age, replies, unread, unanswered]);
   if (threadCardsDrawn.get(card.id) === signature) return;
   threadCardsDrawn.set(card.id, signature);
-  if (card.getAttribute("data-thread") !== choice.id) {
-    collapseThreadCard(card);
-    card.setAttribute("data-thread", choice.id);
-  }
+  if (card.getAttribute("data-thread") !== choice.id) card.setAttribute("data-thread", choice.id);
   const state = unanswered ? "start" : "open";
   if (card.getAttribute("data-thread-state") !== state) card.setAttribute("data-thread-state", state);
   const hue = String(threadHue(choice.id));
@@ -41412,100 +41391,107 @@ function paintThreadCard(card, choice, tally) {
   const count = leftEl(`${card.id}-count`);
   count.replaceChildren(...cardCountParts("side-card", replies, unread));
   if (count.hidden !== (!replies && !unread)) count.hidden = !replies && !unread;
-  noteThreadCardClamp(card);
   // The link to the card goes, or comes, with the thread's first reply.
   scheduleColumnLinks();
 }
 
-/**
- * Whether the clamp cuts `card`'s text, which only a closed card can say: what its text holds runs
- * past what it shows.
- *
- * @param {HTMLElement} card
- */
-function threadCardClamped(card) {
-  const words = childByClass(leftEl(`${card.id}-text`), "side-card-text");
-  return Boolean(words) && !card.hidden && !card.hasAttribute("data-expanded") &&
-    Number(words.scrollHeight) > Number(words.clientHeight) + 1;
+// --- the card at the top of a thread folded to a bar ------------------------------------------------
+//
+// `#388 thread-header-collapse`. The owner, 2026-10-19: "On a small mobile screen, I don't like wasting
+// vertical space on the thread header at the top. I like the consistent visual language for the colored
+// thread cards. But I don't always want to use the space. The same way tapping a message expands and
+// contracts it I want tapping that header to collapse it to basically a thin colored bar. Just enough
+// vertical height that you can see the inside color as well as the border color and so it's wide enough
+// to tap on."
+//
+//   * A PRESS ANYWHERE ON THE CARD but its X, or a link in it, folds it to a bar of its fill and its
+//     edge, and a press on the bar opens it again. Its text is the button the keys reach, which says
+//     `aria-expanded` and is named by the whole text, folded or not; folded, it is the bar's press
+//     target, taller than the colour it covers (web/voice.css).
+//   * ONE CHOICE FOR THE DEVICE, every thread, both columns: kept as the neighbouring settings are, and
+//     a card drawn for another thread is folded or not as the last one was.
+//   * NOTHING UNDER IT MOVES. The card is in its column's heading, so folding it gives its height to the
+//     list under it, whose top rises by that much; the list is scrolled by as much, so every row the
+//     reader sees stays where it was, and a reader on the newest line stays on it (`followFoot`, and the
+//     room past the right column's foot fitted again, `#338 column-overscroll`).
+//   * It replaces `#298`'s press on clamped text opening the card over the list: the press has one
+//     meaning on the card now, as it has on a message.
+
+const THREAD_CARD_FOLD_KEY = "vibe-talk.voice.thread-card-folded";
+
+/** The cards at the top of a thread, one per column, and the list each heads. */
+const THREAD_CARD_LISTS = [["thread-card", "scroll-area"], ["side-thread-card", "side-scroll"]];
+
+/** What was stored. ABSENT MEANS OPEN; a browser that refuses storage reads as nothing stored. */
+function storedThreadCardFolded() {
+  try {
+    return localStorage.getItem(THREAD_CARD_FOLD_KEY) === "on";
+  } catch (_error) {
+    return false;
+  }
 }
 
-/**
- * Say on `card` whether its text can be opened, at the next frame, once the text drawn is laid out:
- * `data-clamped` on the card, which the stylesheet gives the pointer, and its button's `aria-expanded`,
- * which a card whose text is whole does not carry. An opened card is measured again when it closes.
- *
- * @param {HTMLElement} card
- */
-function noteThreadCardClamp(card) {
-  const measure = () => {
-    if (card.hasAttribute("data-expanded")) return;
-    const clamped = threadCardClamped(card);
-    const button = leftEl(`${card.id}-text`);
-    if (card.hasAttribute("data-clamped") !== clamped) {
-      if (clamped) card.setAttribute("data-clamped", "");
-      else card.removeAttribute("data-clamped");
+/** Whether the cards at the top of a thread are folded to a bar: the reader's choice, kept on the device. */
+let threadCardFolded = storedThreadCardFolded();
+
+/** Draw the cards at the top of a thread folded or open, as `threadCardFolded` says: written only where it changed. */
+function renderThreadCardFold() {
+  for (const [id] of THREAD_CARD_LISTS) {
+    const card = leftEl(id);
+    if (card.hasAttribute("data-folded") !== threadCardFolded) {
+      if (threadCardFolded) card.setAttribute("data-folded", "");
+      else card.removeAttribute("data-folded");
     }
-    if (!clamped) button.removeAttribute("aria-expanded");
-    else if (button.getAttribute("aria-expanded") !== "false") button.setAttribute("aria-expanded", "false");
-  };
-  if (typeof requestAnimationFrame === "function") requestAnimationFrame(measure);
-  else measure();
+    const button = leftEl(`${id}-text`);
+    const expanded = threadCardFolded ? "false" : "true";
+    if (button.getAttribute("aria-expanded") !== expanded) button.setAttribute("aria-expanded", expanded);
+  }
 }
 
 /**
- * A press on the card's text: an opened card closes, and a card whose text the clamp cuts opens over
- * the list below. A card whose text is whole does nothing. Measured at the press, so a column that has
- * been widened or narrowed since the card was drawn is asked as it is now.
+ * A click on `card`, the card at the top of a thread: folded or opened, unless it was on the X or a link
+ * in it, which do their own acts, or it ended a selection of the card's text made with the mouse.
  *
  * @param {HTMLElement} card
+ * @param {Event} event
  */
-function toggleThreadCard(card) {
-  if (collapseThreadCard(card)) return;
-  if (!threadCardClamped(card)) return;
-  // The heading keeps the height it has, and the card grows out of it over the list: neither the list
-  // nor anything in it moves (`#280 scroll-stability`).
-  const slot = /** @type {HTMLElement} */ (card.parentNode);
-  slot.style.height = `${slot.getBoundingClientRect().height}px`;
-  card.setAttribute("data-expanded", "");
-  card.setAttribute("data-clamped", "");
-  leftEl(`${card.id}-text`).setAttribute("aria-expanded", "true");
-  expandedThreadCard = card;
+function threadCardPressed(card, event) {
+  for (let node = /** @type {Node | null} */ (event.target); node && node !== card; node = node.parentNode) {
+    const tag = String(/** @type {HTMLElement} */ (node).tagName || "").toLowerCase();
+    if (tag === "a" || (tag === "button" && node !== leftEl(`${card.id}-text`))) return;
+  }
+  const selection = typeof getSelection === "function" ? getSelection() : null;
+  if (selection && !selection.isCollapsed && nodeWithin(card, selection.anchorNode)) return;
+  setThreadCardFolded(!threadCardFolded);
 }
 
 /**
- * Close the opened card at the top of a thread — `card`, or whichever is open — its text clamped again
- * and its heading its own height. Whether one was open: Esc closes it before it does anything else.
+ * Fold the cards at the top of a thread to a bar, or open them: kept, and drawn, with every list a card
+ * on screen heads scrolled by as far as its top moved, so the rows the reader sees stay where they were.
+ * A reader on the newest line is kept on it (`followFoot`); one in the room past the right column's foot
+ * stays where they are in it, the room fitted to the column's new height (`#338 column-overscroll`).
  *
- * @param {HTMLElement | null} [card]
+ * @param {boolean} folded
  */
-function collapseThreadCard(card = expandedThreadCard) {
-  if (!card || !card.hasAttribute("data-expanded")) return false;
-  card.removeAttribute("data-expanded");
-  /** @type {HTMLElement} */ (card.parentNode).style.height = "";
-  leftEl(`${card.id}-text`).setAttribute("aria-expanded", "false");
-  if (expandedThreadCard === card) expandedThreadCard = null;
-  noteThreadCardClamp(card);
-  return true;
-}
-
-/**
- * The opened card at the top of a thread while the reader can see it: the right column's while two
- * columns show it over its thread, the window's while a thread is across it, on the main screen.
- * Else null. Esc closes this card and nothing else: a card left open out of sight — Settings or Help
- * over it, the thread list across the window — would otherwise take an Esc that did nothing the
- * reader could see, and the next Esc would be the one that did what they asked (`#281 view-keys`).
- */
-function expandedThreadCardOnScreen() {
-  const card = expandedThreadCard;
-  if (!card || !channelOnScreen() || !drawnOnPage(card)) return null;
-  if (card === leftEl("side-thread-card")) return columnsShown && columns.side.mode === "thread" ? card : null;
-  return threadListShown ? null : card;
-}
-
-/** A press anywhere outside the opened card at the top of a thread closes it, as a press outside a ⋯ menu does. */
-function collapseThreadCardOutside(event) {
-  const target = event && event.target;
-  if (expandedThreadCard && target && !nodeWithin(expandedThreadCard, target)) collapseThreadCard();
+function setThreadCardFolded(folded) {
+  try {
+    localStorage.setItem(THREAD_CARD_FOLD_KEY, folded ? "on" : "off");
+  } catch (_error) {
+    // A browser that refuses storage still honours the choice for this session.
+  }
+  const held = THREAD_CARD_LISTS.filter(([card]) => drawnOnPage(leftEl(card))).map(([, id]) => {
+    const area = leftEl(id);
+    return { area, top: area.getBoundingClientRect().top, foot: atBottom(area) && overscrollRoom(area) === 0 };
+  });
+  threadCardFolded = folded;
+  renderThreadCardFold();
+  for (const { area, top, foot } of held) {
+    area.scrollTop += area.getBoundingClientRect().top - top;
+    fitOverscroll(area);
+    if (foot) followFoot(area);
+  }
+  // The line from the root meets the card, or the bar, at its middle.
+  scheduleColumnLinks();
 }
 
 /** The right column's card at the top of its thread, as the rows now stand, after a pass over either column's rows. */
@@ -47544,11 +47530,12 @@ el("scroll-area").addEventListener("pointercancel", () => { threadBackGesture = 
 el("column-toggle").addEventListener("click", toggleColumns);
 // The X's one act, which the back gesture's is too (`#304 back-gesture-in-app`).
 el("side-close").addEventListener("click", closeSideByX);
-// `#298 thread-card-header`. The text of the card at the top of the right column's thread opens it over
-// the list where the clamp cuts it, and closes it again.
-leftEl("side-thread-card-text").addEventListener("click", () => toggleThreadCard(leftEl("side-thread-card")));
-// ...and so does the text of the card at the top of a thread across the window.
-leftEl("thread-card-text").addEventListener("click", () => toggleThreadCard(leftEl("thread-card")));
+// `#388 thread-header-collapse`. A press on the card at the top of a thread, in either column, folds it
+// to a bar or opens it again; drawn as the device last chose before anything is shown.
+for (const [id] of THREAD_CARD_LISTS) {
+  leftEl(id).addEventListener("click", (event) => threadCardPressed(leftEl(id), event));
+}
+renderThreadCardFold();
 // The card moving up as its thread opens ends with its animation, or the thread's fading in with its
 // own: each ends its own part (`endCardFlightPart`).
 for (const id of ["thread-card", "side-thread-card", "pane-discord", "side-pane"]) {

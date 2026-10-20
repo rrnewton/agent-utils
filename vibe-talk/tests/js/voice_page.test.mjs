@@ -50260,7 +50260,8 @@ const headerCard = (page, id = "side-thread-card") => {
     age: page.el(`${id}-age`).textContent,
     count: count.hidden ? "" : count.text(),
     unread: part("side-card-unread") ? part("side-card-unread").textContent : "",
-    expanded: card.hasAttribute("data-expanded"),
+    folded: card.hasAttribute("data-folded"),
+    expanded: button.getAttribute("aria-expanded"),
     highlighted: card.hasAttribute("data-highlighted"),
   };
 };
@@ -50316,8 +50317,8 @@ test("Ctrl+\\ AND Cmd+\\ turn two columns on and off like the layout button, and
  * The channel of `threadData`, on a server with a change record, read in All and then in two columns.
  * `script` is web/voice.js, or a copy broken on purpose for a negative control.
  */
-async function twoColumnServer(arrange = null, script = SCRIPT) {
-  const page = newPage(new Map(), script);
+async function twoColumnServer(arrange = null, script = SCRIPT, store = new Map()) {
+  const page = newPage(store, script);
   const data = threadData();
   page.threadingSupported = true;
   page.threads = data.threads;
@@ -52810,14 +52811,18 @@ test("`#298 thread-card-header`: the card at the top of a thread is in the right
     "the X under a finger is not 44px whatever the type size");
   assert.ok(cssRules(CSS_CODE, ".thread-card-close").every((rule) => !/rem/.test(rule) || /1\.75rem/.test(rule)),
     "the X under a finger grows with the type");
-  // Opened, its text whole over the list, above the links and the line under the heading.
-  const opened = cssBlockOutside(TWO_COLUMN_QUERY, ".thread-card-header[data-expanded] > .side-card > .side-card-text");
-  assert.match(opened, /-webkit-line-clamp:\s*none/);
-  assert.match(opened, /(^|[^-])height:\s*auto/);
-  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, ".thread-card-header[data-expanded]"), /z-index:\s*3/);
-  assert.equal(tokenValues(CSS_CODE, "--card-shadow").length, 2, "the opened card's shadow is not given in both schemes");
+  // `#388 thread-header-collapse`. Folded, a bar of its own edge and tint, 14px from edge to edge, with
+  // nothing in it but its text's button: out of sight, and 6px past the bar above and below, the bar's
+  // 24px press target. tests/thread_header_collapse_browser.py measures it in Chromium.
+  const folded = cssBlockOutside(TWO_COLUMN_QUERY, ".side-card-row.thread-card-header[data-folded]");
+  assert.match(folded, /(^|[^-])height:\s*14px/, "the bar is not 14px tall");
+  assert.match(folded, /(^|[^-])padding:\s*0/);
+  assert.doesNotMatch(folded, /(^|[;{\s])(border|background)(-[a-z-]+)?:/, "the bar is not drawn in the card's own edge and tint");
+  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, ".thread-card-header[data-folded] > :not(.side-card)"), /display:\s*none/);
+  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, ".thread-card-header[data-folded] > .side-card"), /inset:\s*-6px 0/,
+    "the bar's press target is not 6px past it above and below");
   // Over a thread the heading gives up its rule and its least height, the card having its border, and
-  // holds the card at its top, so a card opened past it is not centred on it, moving up.
+  // holds the card at its top.
   const heading = cssBlockOutside(TWO_COLUMN_QUERY, "#side-heading:has(> #side-thread-card:not([hidden]))");
   assert.match(heading, /border-bottom:\s*0/);
   assert.match(heading, /align-items:\s*flex-start/);
@@ -53002,129 +53007,94 @@ test("`#298 thread-card-header`: the card at the top counts the thread's replies
   assert.ok(always.writes > 0, "the negative control wrote nothing either, so the check above proves nothing");
 });
 
-test("`#298 thread-card-header`: where the clamp cuts the card's text a press on it opens the card over the list — the heading its own height, the list unmoved — and a second press, Esc, a press outside it or another thread closes it; whole text does not open", async () => {
-  const { page, data } = await twoColumnServer();
-  const [first] = data.threads;
-  await openerOf(cardRow(page, first.id)).click();
-  await page.settle();
-  const card = page.el("side-thread-card");
-  const button = page.el("side-thread-card-text");
-  const heading = page.el("side-heading");
-  const area = page.el("side-scroll");
-  // The fixture lays nothing out: the words hold more than the text box, given no height, shows — as a
-  // clamped card's do.
-  assert.equal(card.hasAttribute("data-clamped"), true, "the clamped text does not say it can be opened");
-  assert.equal(button.getAttribute("aria-expanded"), "false");
-  const place = { top: area.scrollTop, height: area.clientHeight };
-  const tall = heading.getBoundingClientRect().height;
-  assert.ok(tall > 0, "the heading has no height, so this proves nothing");
-  await button.click();
-  assert.equal(headerCard(page).expanded, true, "a press on the clamped text did not open the card");
-  assert.equal(button.getAttribute("aria-expanded"), "true");
-  assert.equal(heading.style.height, `${tall}px`, "the heading did not keep its height while the card is open");
-  assert.deepStrictEqual({ top: area.scrollTop, height: area.clientHeight }, place, "opening the card moved the list");
-  await button.click();
-  assert.equal(headerCard(page).expanded, false, "a second press did not close the card");
-  assert.equal(heading.style.height, "", "the heading kept a height of its own after the card closed");
-  assert.equal(button.getAttribute("aria-expanded"), "false");
-  // Esc closes it first, and only the next Esc closes the thread.
-  await button.click();
-  await press(page, area, "Escape");
-  assert.equal(headerCard(page).expanded, false, "Esc did not close the card");
-  assert.equal(page.el("side-pane").hidden, false, "Esc closed the thread before the card");
-  await press(page, area, "Escape");
-  await page.settle();
-  assert.ok(cardsUp(page), "the second Esc did not close the thread");
-  // A press outside it closes it; one on it does not.
-  await openerOf(cardRow(page, first.id)).click();
-  await page.settle();
-  await button.click();
-  await page.documentEvent("pointerdown", { target: page.el("side-thread-card-age"), pointerType: "mouse" });
-  assert.equal(headerCard(page).expanded, true, "a press on the card closed it");
-  await page.documentEvent("pointerdown", { target: rowWithId(page, "200"), pointerType: "mouse" });
-  assert.equal(headerCard(page).expanded, false, "a press outside the card did not close it");
-  // Another thread: the card closes as it is drawn for that one.
-  await button.click();
-  await threadBadge(rowWithId(page, "203")).click();
-  await page.settle();
-  assert.equal(headerCard(page).expanded, false, "the card stayed open for another thread");
-  assert.equal(heading.style.height, "");
-  // Text the clamp does not cut: not offered, and a press opens nothing.
-  const words = button.children[0];
-  words.clientHeight = words.scrollHeight + LINE_PX;
-  await threadBadge(rowWithId(page, "201")).click();
-  await page.settle();
-  assert.equal(card.hasAttribute("data-clamped"), false, "whole text says it can be opened");
-  assert.equal(button.getAttribute("aria-expanded"), null, "whole text says it is collapsed");
-  await button.click();
-  assert.equal(headerCard(page).expanded, false, "a card whose text is whole opened");
-});
-
-test("`#298 thread-card-header` x `#281 view-keys`: a card opened at the top of the right column's thread closes when two columns go — Cmd-1, Cmd-2, Cmd-\\, Cmd-3 — and Esc closes only a card on screen, so the next Esc anywhere else does what it does there, never spent on a card out of sight", async () => {
-  // The review's path: two columns, the thread opened from its card, its card opened over the list,
-  // a view key, a thread across the window from the picker, Esc. That Esc is Back to Main.
-  const LEAVES = [
-    ["Cmd-1", (page) => press(page, page.el("side-scroll"), "1", { ctrlKey: true })],
-    ["Cmd-2", (page) => press(page, page.el("side-scroll"), "2", { ctrlKey: true })],
-    ["Cmd-\\", (page) => press(page, page.el("side-scroll"), "\\", { ctrlKey: true })],
-    ["Cmd-3", (page) => press(page, page.el("side-scroll"), "3", { ctrlKey: true })],
-  ];
-  const columnsUp = (page) => page.el("screen-main").getAttribute("data-columns") === "two";
-  const run = async (script, leave) => {
+test("`#388 thread-header-collapse`: a press on the card at the top of the right column's thread — its text, its age, its count — folds it to a bar, and a press on the bar opens it; its X and a link in it do not; its text's button says aria-expanded; the choice is the device's, for every thread", async () => {
+  const FOLD_KEY = "vibe-talk.voice.thread-card-folded";
+  const run = async (script) => {
     const { page, data } = await twoColumnServer(null, script);
-    const [first, second] = data.threads;
+    const [first] = data.threads;
     await openerOf(cardRow(page, first.id)).click();
     await page.settle();
-    await page.el("side-thread-card-text").click();
-    assert.equal(headerCard(page).expanded, true, "the card did not open, so this proves nothing");
-    await leave(page);
-    await page.settle();
-    assert.equal(columnsUp(page), false, "the key did not leave two columns, so this proves nothing");
-    const left = headerCard(page).expanded;
-    await pickThread(page, `thread:${second.id}`);
-    assert.equal(page.el("thread-heading").hidden, false, "no thread across the window, so this proves nothing");
-    await press(page, page.el("scroll-area"), "Escape");
-    await page.settle();
-    return { page, left, view: page.el("thread-select").value, heading: !page.el("thread-heading").hidden };
+    const card = page.el("side-thread-card");
+    // The browser hands the card the press on whatever in it was pressed: the fixture does not bubble.
+    const pressOn = (target) => card.dispatch("click", { target });
+    const seen = [headerCard(page)];
+    await pressOn(page.el("side-thread-card-text"));
+    seen.push({ ...headerCard(page), stored: page.storage.get(FOLD_KEY) });
+    await pressOn(page.el("side-thread-card-text"));
+    seen.push({ ...headerCard(page), stored: page.storage.get(FOLD_KEY) });
+    await pressOn(page.el("side-thread-card-age"));
+    seen.push(headerCard(page));
+    await pressOn(page.el("side-thread-card-count"));
+    seen.push(headerCard(page));
+    // Its X, and a link in it, are not the card: neither folds it.
+    const link = new FakeElement("", "a");
+    card.append(link);
+    await pressOn(link);
+    seen.push(headerCard(page));
+    card.removeChild(link);
+    await pressOn(page.el("side-close"));
+    seen.push(headerCard(page));
+    return { page, seen };
   };
-  for (const [name, leave] of LEAVES) {
-    const { page, left, view, heading } = await run(SCRIPT, leave);
-    assert.equal(left, false, `${name} left the right column's card open out of sight`);
-    assert.equal(heading, false, `${name}, then a thread from the picker: the first Esc was spent on a card nobody could see`);
-    assert.doesNotMatch(view, /^thread:/, `${name}: the first Esc left the reader in the thread`);
-    // Two columns again: the card there is closed, over the thread still selected there.
-    await press(page, page.el("scroll-area"), "4", { ctrlKey: true });
-    await page.settle();
-    assert.equal(columnsUp(page), true, `${name}: Cmd-4 did not come back to two columns`);
-    assert.equal(page.el("side-thread-card").hidden, false, `${name}: two columns came back without the thread`);
-    assert.equal(headerCard(page).expanded, false, `${name}: two columns came back to the card still open`);
-  }
-  // The control: with neither the column taking its card with it nor Esc asking whether a card shows,
-  // the first Esc is spent on the card out of sight and the reader stays in the thread.
-  const findA = "  collapseThreadCard(leftEl(\"side-thread-card\"));\n";
-  const findB = "if (collapseThreadCard(expandedThreadCardOnScreen())) return true;";
-  const blind = brokenScript(findA, "").replace(findB, "if (collapseThreadCard()) return true;");
-  assert.ok(SCRIPT.includes(findB) && blind.includes("if (collapseThreadCard()) return true;"), "the control patched nothing");
-  const spent = await run(blind, LEAVES[0][1]);
-  assert.equal(spent.heading, true, "the negative control left the thread on the first Esc too, so the check above proves nothing");
+  const { page, seen } = await run(SCRIPT);
+  const said = seen.map(({ folded, expanded, stored }) => (stored === undefined ? { folded, expanded } : { folded, expanded, stored }));
+  assert.deepStrictEqual(said, [
+    { folded: false, expanded: "true" },
+    { folded: true, expanded: "false", stored: "on" },
+    { folded: false, expanded: "true", stored: "off" },
+    { folded: true, expanded: "false" },
+    { folded: false, expanded: "true" },
+    { folded: false, expanded: "true" },
+    { folded: false, expanded: "true" },
+  ], "a press on the card did not fold and open it, or one on its X or a link did");
+  // Folded, the card is still the thread's, and so is the next thread's: one choice for every thread.
+  await page.el("side-thread-card").dispatch("click", { target: page.el("side-thread-card-text") });
+  await threadBadge(rowWithId(page, "203")).click();
+  await page.settle();
+  assert.equal(headerCard(page).thread, page.el("side-thread-card").getAttribute("data-thread"));
+  assert.notEqual(headerCard(page).thread, seen[0].thread, "the badge did not open another thread, so this proves nothing");
+  assert.equal(headerCard(page).folded, true, "another thread's card did not keep the fold");
+  assert.equal(wideCard(page).folded, true, "the card across the window does not share the choice");
+  // Its X still closes the thread, folded or not: the press goes to it, never to the card.
+  await page.el("side-thread-card").dispatch("click", { target: page.el("side-thread-card-text") });
+  await page.el("side-close").click();
+  await page.settle();
+  assert.ok(cardsUp(page), "the X did not close the thread");
+  // The control: a card that takes every press inside it as its own folds on its X and on a link.
+  const blind = await run(brokenScript(
+    "if (tag === \"a\" || (tag === \"button\" && node !== leftEl(`${card.id}-text`))) return;", ""));
+  assert.deepStrictEqual(blind.seen.slice(-2).map(({ folded }) => folded), [true, false],
+    "the negative control did not fold on the link and open again on the X, so the check above proves nothing");
+});
 
-  // Out of sight with two columns still chosen: Settings over the card. Esc leaves Settings, and the
-  // card, still on screen under it, is as the reader left it.
-  for (const script of [SCRIPT, brokenScript(findB, "if (collapseThreadCard()) return true;")]) {
-    const { page, data } = await twoColumnServer(null, script);
+test("`#388 thread-header-collapse`: the fold is kept on the device — a reload draws the card at the top folded, in two columns and across the window; with nothing kept, open", async () => {
+  const FOLD_KEY = "vibe-talk.voice.thread-card-folded";
+  const reopened = async (stored, script = SCRIPT) => {
+    const { page, data } = await twoColumnServer(null, script, new Map(stored === null ? [] : [[FOLD_KEY, stored]]));
     await openerOf(cardRow(page, data.threads[0].id)).click();
     await page.settle();
-    await page.el("side-thread-card-text").click();
-    await press(page, page.el("side-scroll"), ",");
-    assert.equal(page.screen(), "settings");
-    await press(page, page.el("screen-settings"), "Escape");
-    if (script === SCRIPT) {
-      assert.equal(page.screen(), "main", "Esc on Settings was spent on the card under it");
-      assert.equal(headerCard(page).expanded, true, "leaving Settings closed the card the reader had opened");
-    } else {
-      assert.equal(page.screen(), "settings", "the negative control left Settings too, so the check above proves nothing");
-    }
-  }
+    const right = headerCard(page);
+    return { right: [right.folded, right.expanded], wide: [wideCard(page).folded, wideCard(page).expanded] };
+  };
+  assert.deepStrictEqual(await reopened("on"), { right: [true, "false"], wide: [true, "false"] }, "the reload forgot the fold");
+  assert.deepStrictEqual(await reopened("off"), { right: [false, "true"], wide: [false, "true"] });
+  assert.deepStrictEqual(await reopened(null), { right: [false, "true"], wide: [false, "true"] }, "with nothing kept the card is folded");
+  // The control: a page that reads nothing kept draws the card open after the reload.
+  const forgot = await reopened("on", brokenScript("return localStorage.getItem(THREAD_CARD_FOLD_KEY) === \"on\";", "return false;"));
+  assert.deepStrictEqual(forgot.right, [false, "true"], "the negative control kept the fold too, so the check above proves nothing");
+  // Across the window: a thread from the picker, the card read from the same choice.
+  const page = await threadPage("main");
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  await page.el("thread-card").dispatch("click", { target: page.el("thread-card-age") });
+  assert.equal(page.storage.get(FOLD_KEY), "on");
+  assert.deepStrictEqual([wideCard(page).folded, wideCard(page).expanded], [true, "false"]);
+  // The X across the window goes back, and does not open the card.
+  await page.el("thread-card").dispatch("click", { target: page.el("thread-back") });
+  await page.el("thread-back").click();
+  await page.settle();
+  assert.equal(page.el("thread-heading").hidden, true, "the X did not leave the thread");
+  assert.equal(wideCard(page).folded, true, "the X across the window opened the card");
 });
 
 test("`#298 thread-card-header`: over a thread on the right its one link joins its root on Main to the card at the top, as the selection's — whole, or clipped at Main's edge while the root is off it — and the cards' links come back with the cards", async () => {
@@ -53388,12 +53358,11 @@ test("`#298 thread-card-header`: a thread across the window is headed by the sam
     assert.doesNotMatch(HTML_CODE, new RegExp(`id="${gone}"`), `the old heading's #${gone} is still beside the card`);
   }
   assert.doesNotMatch(HTML_CODE, /← Back/, "the X is still a button saying Back");
-  // The heading holds the card at its top, so an opened card grows downward, and draws no rule of its
-  // own under the card's border.
+  // The heading holds the card at its top, and draws no rule of its own under the card's border.
   assert.match(cssBlockOutside(TWO_COLUMN_QUERY, "#thread-heading"), /align-items:\s*flex-start/);
   assert.match(cssBlockOutside(TWO_COLUMN_QUERY, "#channel-navigation:has(> #thread-heading:not([hidden]))"), /border-bottom:\s*0/);
-  // On a phone, two lines of it, still a fixed height; opened, all of it.
-  const phone = cssBlockIn("(max-width: 599.98px)", "#thread-card:not([data-expanded]) > .side-card > .side-card-text");
+  // On a phone, two lines of it, still a fixed height.
+  const phone = cssBlockIn("(max-width: 599.98px)", "#thread-card > .side-card > .side-card-text");
   assert.match(phone, /-webkit-line-clamp:\s*2/);
   assert.match(phone, /(^|[^-])height:\s*calc\(2 \* 1\.35em\)/, "the phone's card is not a fixed height");
   // The move up: a transform from where the card in the list was, for as long as the stylesheet says,
@@ -53517,48 +53486,6 @@ test("`#298 thread-card-header`: the card across the window counts the thread's 
   const heading = await run(brokenScript(
     "  if (!sideActive && channelView === \"thread\") paintThreadCard(leftEl(\"thread-card\"), openThreadChoice(), tally);\n", ""));
   assert.notDeepStrictEqual(heading.counted, counted, "the negative control counted the Done anyway, so the check above proves nothing");
-});
-
-test("`#298 thread-card-header`: across the window, where the clamp cuts the card's text a press on it opens the card over the list — the heading its own height, the list unmoved — and Esc, a press outside it, or leaving the thread closes it", async () => {
-  const page = await threadPage("main");
-  await threadBadge(rowWithId(page, "201")).click();
-  await page.settle();
-  const card = page.el("thread-card");
-  const button = page.el("thread-card-text");
-  const heading = page.el("thread-heading");
-  const area = page.el("scroll-area");
-  assert.equal(card.hasAttribute("data-clamped"), true, "the clamped text does not say it can be opened");
-  assert.equal(button.getAttribute("aria-expanded"), "false");
-  const place = { top: area.scrollTop, height: area.clientHeight };
-  const tall = heading.getBoundingClientRect().height;
-  assert.ok(tall > 0, "the heading has no height, so this proves nothing");
-  await button.click();
-  assert.equal(wideCard(page).expanded, true, "a press on the clamped text did not open the card");
-  assert.equal(button.getAttribute("aria-expanded"), "true");
-  assert.equal(heading.style.height, `${tall}px`, "the heading did not keep its height while the card is open");
-  assert.deepStrictEqual({ top: area.scrollTop, height: area.clientHeight }, place, "opening the card moved the list");
-  // Esc closes it first, and only the next Esc leaves the thread.
-  await press(page, area, "Escape");
-  assert.equal(wideCard(page).expanded, false, "Esc did not close the card");
-  assert.equal(heading.style.height, "");
-  assert.equal(page.el("thread-heading").hidden, false, "Esc left the thread before closing the card");
-  // A press outside it closes it; one on it does not.
-  await button.click();
-  await page.documentEvent("pointerdown", { target: page.el("thread-card-age"), pointerType: "mouse" });
-  assert.equal(wideCard(page).expanded, true, "a press on the card closed it");
-  await page.documentEvent("pointerdown", { target: rowWithId(page, "202"), pointerType: "mouse" });
-  assert.equal(wideCard(page).expanded, false, "a press outside the card did not close it");
-  // Leaving the thread with the card open: it is closed when a thread is next opened.
-  await button.click();
-  await page.el("thread-back").click();
-  await page.settle();
-  assert.equal(page.el("thread-heading").hidden, true);
-  assert.equal(wideCard(page).expanded, false, "the card stayed open over a list that is not its thread");
-  assert.equal(heading.style.height, "");
-  await threadBadge(rowWithId(page, "203")).click();
-  await page.settle();
-  assert.equal(wideCard(page).expanded, false);
-  assert.equal(wideCard(page).text, "second thread root");
 });
 
 test("`#298 thread-card-header`: a thread opened from its card on screen on the right has its card at the top start where that card was and move up, the thread fading in under it and the line following it a frame at a time, until the animations end or their time is up", async () => {
@@ -57079,19 +57006,6 @@ test("`#299 all-thread-strip`: t presses the selected message's strip — select
   event = await press(page, rowWithId(page, "201"), "t");
   assert.deepStrictEqual(focusOf(page), NO_FOCUS, "t worked with single keys off");
   assert.equal(stripOf(rowWithId(page, "201")).keys, null, "the strip still says t with single keys off");
-
-  // `#298` x `#281`: the card at the top of the right column's thread opened, Ctrl+2 to All, a thread
-  // selected there: Esc lets go of it, and is not spent on the card left behind out of sight.
-  const { page: wide, data } = await twoColumnServer();
-  await openerOf(cardRow(wide, data.threads[0].id)).click();
-  await wide.settle();
-  await wide.el("side-thread-card-text").click();
-  await press(wide, wide.el("side-scroll"), "2", { ctrlKey: true });
-  await wide.settle();
-  assert.equal(wide.el("thread-select").value, "flat");
-  await stripOf(rowWithId(wide, "203")).strip.click();
-  await press(wide, wide.el("scroll-area"), "Escape");
-  assert.deepStrictEqual(focusOf(wide), NO_FOCUS, "Esc in All was spent on the card left open on the right");
 });
 
 test("`#299 all-thread-strip`: neither selecting nor letting go reads, marks or redraws a row — read rows keep their state; and a finger resting or sliding on a strip neither archives its message nor opens its details", async () => {
