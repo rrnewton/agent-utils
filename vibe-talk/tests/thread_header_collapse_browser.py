@@ -32,7 +32,12 @@ on Main -> its card's replies button: its thread on the right under its card, on
 meeting the bar's left edge inside the bar, its lane still left of every row of the thread
 (`#385 thread-line-overlap`) and right of the divider -> Enter on the card's button: the card again,
 aria-expanded true, the line meeting the card's edge -> Space: the bar again -> a click on the bar:
-the card.
+the card -> a reader 20px above the foot, inside the slack that counts as on the newest line, folds it:
+no row moves -> at the foot, PgDn opens the room past it (`#338 column-overscroll`) -> opening the card
+and folding it again there: folding moves no row, and opening moves them down by at most half the
+card's growth, which the room's own rule asks of a shorter column (its end keeps the last card's top no
+higher than the column's middle). Every bar is hit-tested: a press across the whole height of its
+press target lands on the card.
 
 No horizontal overflow and no page error at any step. Pass --screenshots DIR to keep a PNG of each state
 for review; --web-root DIR to run the same walk against another copy of the page.
@@ -111,6 +116,10 @@ STATE_JS = """({card, area, list}) => {
         overflow: document.documentElement.scrollWidth - window.innerWidth,
     };
 }"""
+
+# Whether a press at each of `ys`, at `x`, lands on card `card`: the browser's hit test.
+HIT_JS = """({card, x, ys}) => ys.map((y) => { const hit = document.elementFromPoint(x, y);
+    return Boolean(hit && hit.closest('#' + card)); })"""
 
 # A link in the card, which a press on must not fold it: put in for the purpose, its default kept from
 # the browser so the press does nothing else.
@@ -268,6 +277,13 @@ def check_bar(desk: Desk, open_state: Json, folded: Json, where: str) -> str:
                f"{where}: the bar's press target {target} is not at least {TARGET_PX}px over the bar {bar}")
     for key in ("fill", "edge", "leftEdge"):
         desk.check(open_state[key] == folded[key], f"{where}: the bar's {key} is {folded[key]}, the card's {open_state[key]}")
+    # What a press lands on, by the browser's own hit test, across the target's whole height.
+    card_id = str(desk.page.evaluate("() => [...document.querySelectorAll('.thread-card-header[data-folded]')]"
+                                     ".find((card) => card.getClientRects().length > 0).id"))
+    x = bar["left"] + bar["width"] / 2
+    ys = [target["top"] + 0.5, bar["top"] + bar["height"] / 2, target["bottom"] - 0.5]
+    hits = desk.page.evaluate(HIT_JS, {"card": card_id, "x": x, "ys": ys})
+    desk.check(hits == [True, True, True], f"{where}: presses at y {ys} over the bar land on it: {hits}")
     return f"{bar['height']:.0f}px bar, {target['height']:.0f}px press target"
 
 
@@ -464,9 +480,49 @@ def desk_walk(desk: Desk) -> None:
     page.click("#side-thread-card", position={"x": 200, "y": BAR_PX / 2})
     page.mouse.move(5, desk.height - 5)
     folded_to(desk, "side-thread-card", False, "a click on the bar did not open the card")
+
+    # A reader 20px above the foot, inside the slack that counts as on the newest line: not pulled down it.
+    page.evaluate("() => { const a = document.getElementById('side-scroll'); a.scrollTop = a.scrollHeight - a.clientHeight - 20; }")
+    desk.settled()
+    near_foot = desk_state(desk)
+    page.click("#side-thread-card-age")
+    page.mouse.move(5, desk.height - 5)
+    folded_to(desk, "side-thread-card", True, "a click on the card's age did not fold it")
+    check_still(desk, near_foot, desk_state(desk), "folding 20px above the foot")
+
+    # In the room past the foot (`#338 column-overscroll`), opened by PgDn at the foot: neither opening the
+    # card nor folding it moves a row.
+    page.evaluate("() => { const a = document.getElementById('side-scroll'); a.scrollTop = a.scrollHeight; a.focus(); }")
+    desk.settled()
+    desk.settled()
+    page.keyboard.press("PageDown")
+    desk.wait_for("() => document.getElementById('side-overscroll').getBoundingClientRect().height > 0", "PgDn at the foot opened no room past it")
+    page.wait_for_timeout(400)
+    desk.settled()
+    in_room = desk_state(desk)
+    room = float(page.evaluate("() => document.getElementById('side-overscroll').getBoundingClientRect().height"))
+    page.click("#side-thread-card", position={"x": 200, "y": BAR_PX / 2})
+    page.mouse.move(5, desk.height - 5)
+    folded_to(desk, "side-thread-card", False, "a click on the bar did not open the card")
+    opened_in_room = desk_state(desk)
+    grew = box(opened_in_room, "heading")["height"] - box(in_room, "heading")["height"]
+    was, now = rows_of(in_room), rows_of(opened_in_room)
+    moved = [now[row] - was[row] for row in was if row in now]
+    desk.check(len(moved) >= 2 and all(-STILL_PX <= shift <= grew / 2 + STILL_PX for shift in moved),
+               f"opening the card at the end of the room past the foot moved rows by {moved}, more than half its growth {grew:.0f}px")
+    page.click("#side-thread-card-age")
+    page.mouse.move(5, desk.height - 5)
+    folded_to(desk, "side-thread-card", True, "a click on the card's age did not fold it")
+    check_still(desk, opened_in_room, desk_state(desk), "folding the card in the room past the foot")
+    room_moved = max((abs(shift) for shift in moved), default=0)
+    page.click("#side-thread-card", position={"x": 200, "y": BAR_PX / 2})
+    page.mouse.move(5, desk.height - 5)
+    folded_to(desk, "side-thread-card", False, "a click on the bar did not open the card")
     desk.notes.append(f"folded by a click on its age, a {bar}, its fill and edge the card's, {held} rows of the thread "
                       f"unmoved; open, {card_line}; folded, {bar_line}; Enter and Space on its button opened and folded "
-                      "it, and a click on the bar opened it")
+                      f"it, and a click on the bar opened it; a reader 20px above the foot did not move, nor one in the "
+                      f"{room:.0f}px room past it as it folded; opening there moved them {room_moved:.1f}px of the "
+                      f"{grew / 2:.0f}px the room's rule allows")
 
 
 if __name__ == "__main__":

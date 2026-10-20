@@ -8327,7 +8327,7 @@ textarea {
 /* On a phone, over a thread across the window, two lines of it rather than three: the card is the
    screen's heading there, and a third line is a line less of the thread. Still a fixed height. */
 @media (max-width: 599.98px) {
-  #thread-card > .side-card > .side-card-text {
+  #thread-card:not([data-folded]) > .side-card > .side-card-text {
     -webkit-line-clamp: 2;
     line-clamp: 2;
     height: calc(2 * 1.35em);

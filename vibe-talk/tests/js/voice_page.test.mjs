@@ -53055,7 +53055,7 @@ test("`#388 thread-header-collapse`: a press on the card at the top of the right
   assert.notEqual(headerCard(page).thread, seen[0].thread, "the badge did not open another thread, so this proves nothing");
   assert.equal(headerCard(page).folded, true, "another thread's card did not keep the fold");
   assert.equal(wideCard(page).folded, true, "the card across the window does not share the choice");
-  // Its X still closes the thread, folded or not: the press goes to it, never to the card.
+  // Its X, on the card opened again, closes the thread: the press goes to it, never to the card.
   await page.el("side-thread-card").dispatch("click", { target: page.el("side-thread-card-text") });
   await page.el("side-close").click();
   await page.settle();
@@ -53089,12 +53089,15 @@ test("`#388 thread-header-collapse`: the fold is kept on the device — a reload
   await page.el("thread-card").dispatch("click", { target: page.el("thread-card-age") });
   assert.equal(page.storage.get(FOLD_KEY), "on");
   assert.deepStrictEqual([wideCard(page).folded, wideCard(page).expanded], [true, "false"]);
-  // The X across the window goes back, and does not open the card.
+  // A press on the X across the window is not the card's. (Folded, the X is not drawn: the stylesheet
+  // hides everything in the bar but its button, which this fixture does not lay out.)
   await page.el("thread-card").dispatch("click", { target: page.el("thread-back") });
+  assert.equal(wideCard(page).folded, true, "a press on the X across the window opened the card");
+  await page.el("thread-card").dispatch("click", { target: page.el("thread-card-text") });
   await page.el("thread-back").click();
   await page.settle();
   assert.equal(page.el("thread-heading").hidden, true, "the X did not leave the thread");
-  assert.equal(wideCard(page).folded, true, "the X across the window opened the card");
+  assert.equal(wideCard(page).folded, false, "leaving the thread folded the card");
 });
 
 test("`#298 thread-card-header`: over a thread on the right its one link joins its root on Main to the card at the top, as the selection's — whole, or clipped at Main's edge while the root is off it — and the cards' links come back with the cards", async () => {
@@ -53362,7 +53365,7 @@ test("`#298 thread-card-header`: a thread across the window is headed by the sam
   assert.match(cssBlockOutside(TWO_COLUMN_QUERY, "#thread-heading"), /align-items:\s*flex-start/);
   assert.match(cssBlockOutside(TWO_COLUMN_QUERY, "#channel-navigation:has(> #thread-heading:not([hidden]))"), /border-bottom:\s*0/);
   // On a phone, two lines of it, still a fixed height.
-  const phone = cssBlockIn("(max-width: 599.98px)", "#thread-card > .side-card > .side-card-text");
+  const phone = cssBlockIn("(max-width: 599.98px)", "#thread-card:not([data-folded]) > .side-card > .side-card-text");
   assert.match(phone, /-webkit-line-clamp:\s*2/);
   assert.match(phone, /(^|[^-])height:\s*calc\(2 \* 1\.35em\)/, "the phone's card is not a fixed height");
   // The move up: a transform from where the card in the list was, for as long as the stylesheet says,

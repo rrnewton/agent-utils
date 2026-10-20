@@ -41468,8 +41468,12 @@ function threadCardPressed(card, event) {
 /**
  * Fold the cards at the top of a thread to a bar, or open them: kept, and drawn, with every list a card
  * on screen heads scrolled by as far as its top moved, so the rows the reader sees stay where they were.
- * A reader on the newest line is kept on it (`followFoot`); one in the room past the right column's foot
- * stays where they are in it, the room fitted to the column's new height (`#338 column-overscroll`).
+ * A reader exactly on the newest line is kept on it (`followFoot`); one a little above it stays where
+ * they are, not pulled down the slack. In the room past the right column's foot (`#338
+ * column-overscroll`) the room is fitted to the column at once: a fold leaves the reader where they are
+ * in it, and an opening too, except at the room's end, which keeps its own rule — the last card's top no
+ * higher than the middle of the column, which a shorter column has lower — and so lets the rows there
+ * down by at most half the card's growth, in the frame the card opens rather than one after.
  *
  * @param {boolean} folded
  */
@@ -41481,12 +41485,15 @@ function setThreadCardFolded(folded) {
   }
   const held = THREAD_CARD_LISTS.filter(([card]) => drawnOnPage(leftEl(card))).map(([, id]) => {
     const area = leftEl(id);
-    return { area, top: area.getBoundingClientRect().top, foot: atBottom(area) && overscrollRoom(area) === 0 };
+    return { area, top: area.getBoundingClientRect().top, scrolled: area.scrollTop,
+      foot: atBottom(area, 1) && overscrollRoom(area) === 0 };
   });
   threadCardFolded = folded;
   renderThreadCardFold();
-  for (const { area, top, foot } of held) {
-    area.scrollTop += area.getBoundingClientRect().top - top;
+  // From the scroll position read before, not the one now: a list grown under a reader near its foot has
+  // been clamped to its new end by the layout that measured it, and adding to that put them further up.
+  for (const { area, top, scrolled, foot } of held) {
+    area.scrollTop = scrolled + area.getBoundingClientRect().top - top;
     fitOverscroll(area);
     if (foot) followFoot(area);
   }
