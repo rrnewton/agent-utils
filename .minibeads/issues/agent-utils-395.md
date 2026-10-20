@@ -1,12 +1,13 @@
 ---
 title: 'muse-launch-overrides-input: agentctl refuses to type into a Muse launched with launch-flag overrides, and reports the refusal as an ambiguous outcome'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - agentctl
 created_at: 2026-10-20T12:23:37.166153286+00:00
-updated_at: 2026-10-20T12:23:37.166153286+00:00
+updated_at: 2026-10-20T13:07:53.119765922+00:00
+closed_at: 2026-10-20T13:07:53.119765772+00:00
 ---
 
 # Description
