@@ -204,6 +204,26 @@ def _line(child: subprocess.Popen[str]) -> str:
     return line.strip()
 
 
+def _seconds(reader: cpu.ProcessGroupCpu) -> float:
+    """`reader.seconds()`, retrying only a scan-deadline refusal.
+
+    One observation authenticates and scans /proc within the product's
+    one-second bound; on a loaded host the scan may not get that second, and
+    the reader rightly refuses with "scan deadline". These tests assert what
+    an observation says, not that the host ran it within the bound on the
+    first try, so ask again until one lands or 30 s pass. Any other refusal
+    is the answer and propagates at once. `#389 gate-flakes`.
+    """
+    deadline = time.monotonic() + 30
+    while True:
+        try:
+            return reader.seconds()
+        except cpu.Unavailable as exc:
+            if str(exc) != "scan deadline" or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
 def test_native_unreaped_zombie_and_reaping_keep_cpu_and_close_fds(native_helper: Path) -> None:
     before = len(list(Path("/proc/self/fd").iterdir()))
     with subprocess.Popen([str(native_helper), "zombie"], start_new_session=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as child:
@@ -218,7 +238,7 @@ def test_native_unreaped_zombie_and_reaping_keep_cpu_and_close_fds(native_helper
                 assert pair.original.ticks > 0
                 assert cpu._poll(pair.pidfd, time.monotonic() + 1) & select.POLLIN
                 assert pair.valid(time.monotonic() + 1)
-                first = reader.seconds()
+                first = _seconds(reader)
                 assert first >= pair.original.ticks / cpu._clk_tck()
                 child.stdin.write("r"); child.stdin.flush()
                 assert _line(child) == "reaped"
@@ -226,7 +246,7 @@ def test_native_unreaped_zombie_and_reaping_keep_cpu_and_close_fds(native_helper
                 # Force an observation after reaping without sleeping for cache expiry.
                 with cpu._lock:
                     cpu._snapshot_at = float("-inf")
-                assert reader.seconds() >= first
+                assert _seconds(reader) >= first
             finally:
                 pair.close()
         finally:
@@ -251,12 +271,12 @@ def test_native_exited_leader_with_live_worker(native_helper: Path) -> None:
                 time.sleep(.001)
             assert cpu._poll(reader.owner.pidfd, deadline) == 0
             assert reader.owner.valid(deadline)
-            before = reader.seconds()
+            before = _seconds(reader)
             child.stdin.write("b"); child.stdin.flush()
             assert _line(child) == "worked"
             with cpu._lock:
                 cpu._snapshot_at = float("-inf")
-            assert reader.seconds() > before
+            assert _seconds(reader) > before
         finally:
             reader.close()
             child.stdin.write("x"); child.stdin.flush()
@@ -285,7 +305,7 @@ def test_native_cache_reuses_success_and_refusal_but_requires_owner(native_helpe
             monkeypatch.setattr(cpu._KernelSource, "samples", original)
             with cpu._lock:
                 cpu._snapshot_at = float("-inf")
-            value = first.seconds()
+            value = _seconds(first)
             at = cpu._snapshot_at
             assert second.seconds() == value
             assert cpu._snapshot_at == at
@@ -349,7 +369,7 @@ def test_new_owned_reader_evicts_expired_compatibility_registration(native_helpe
         _line(child)
         old = cpu.ProcessGroupCpu(child.pid)
         try:
-            old.seconds()
+            _seconds(old)
             with cpu._lock:
                 cpu._compat[child.pid] = (old, time.monotonic() - 1)
             monkeypatch.setattr(cpu, "_MAX_GROUPS", 1)
@@ -357,7 +377,7 @@ def test_new_owned_reader_evicts_expired_compatibility_registration(native_helpe
             try:
                 assert new.key != old.key
                 assert old.owner is None
-                assert new.seconds() >= 0
+                assert _seconds(new) >= 0
                 with pytest.raises(cpu.Unavailable, match="closed"):
                     old.seconds()
             finally:
@@ -380,7 +400,7 @@ def test_native_nonleader_exec_preserves_held_identity(native_helper: Path) -> N
         try:
             assert reader.owner is not None and reader.proc is not None
             key = reader.key
-            before = reader.seconds()
+            before = _seconds(reader)
             child.stdin.write("e"); child.stdin.flush()
             assert _line(child) == "executed"
             assert reader.proc.pid(reader.owner.pidfd, time.monotonic() + 1) == child.pid
@@ -390,7 +410,7 @@ def test_native_nonleader_exec_preserves_held_identity(native_helper: Path) -> N
             assert _line(child) == "worked"
             with cpu._lock:
                 cpu._snapshot_at = float("-inf")
-            after = reader.seconds()
+            after = _seconds(reader)
             assert after > before
             assert reader.key == key
             print(json.dumps({"native": "nonleader-exec", "pid": child.pid, "owner": key, "before_cpu": before, "after_cpu": after}))
@@ -419,7 +439,7 @@ def test_native_ptrace_reparent_keeps_zombie_until_real_parent_reaps(native_help
                 assert pair.valid(time.monotonic() + 1)
                 assert f"TracerPid:\t{child.pid}\n" in Path(f"/proc/{tracee}/status").read_text()
                 before_waited = waited_ticks()
-                before = reader.seconds()
+                before = _seconds(reader)
                 child.stdin.write("t"); child.stdin.flush()
                 assert _line(child) == "detached"
                 assert "TracerPid:\t0\n" in Path(f"/proc/{tracee}/status").read_text()
@@ -431,7 +451,7 @@ def test_native_ptrace_reparent_keeps_zombie_until_real_parent_reaps(native_help
                 assert not pair.valid(time.monotonic() + 1)
                 with cpu._lock:
                     cpu._snapshot_at = float("-inf")
-                after = reader.seconds()
+                after = _seconds(reader)
                 assert after >= before
                 print(json.dumps({"native": "ptrace-reparent", "pid": child.pid, "tracee": tracee, "zombie_ticks": pair.original.ticks, "ptracer_waited_ticks": before_waited, "before_cpu": before, "after_cpu": after}))
             finally:
@@ -475,7 +495,7 @@ def test_clock_rate_errors_are_typed_at_owned_and_compatibility_apis(native_help
         _line(child)
         reader = cpu.ProcessGroupCpu(child.pid)
         try:
-            assert reader.seconds() > 0
+            assert _seconds(reader) > 0
             for value in (100, 250):
                 with monkeypatch.context() as patch:
                     patch.setattr(os, "sysconf", lambda name, value=value: value)
@@ -494,7 +514,7 @@ def test_clock_rate_errors_are_typed_at_owned_and_compatibility_apis(native_help
                     with pytest.raises(cpu.Unavailable, match="SC_CLK_TCK unavailable"):
                         reader.seconds()
                     assert cpu.subtree_cpu_seconds(child.pid) is None
-            assert reader.seconds() > 0
+            assert _seconds(reader) > 0
         finally:
             reader.close()
             child.stdin.write("r"); child.stdin.flush()
