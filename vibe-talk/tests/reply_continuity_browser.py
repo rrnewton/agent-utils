@@ -391,7 +391,12 @@ class Walk:
             with self.api.lock:
                 posted = list(self.api.replies[sent:])
             if posted:
-                return posted
+                # The old fixed read also caught a second copy posted in the
+                # same burst; keep that detection horizon after the first
+                # arrival instead of returning at first sight.
+                self.page.wait_for_timeout(200)
+                with self.api.lock:
+                    return list(self.api.replies[sent:])
             self.check(time.monotonic() < deadline, f"{why}: nothing left the browser")
             self.page.wait_for_timeout(20)
 

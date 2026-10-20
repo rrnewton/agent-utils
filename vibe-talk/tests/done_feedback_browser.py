@@ -203,16 +203,22 @@ MOMENT_JS = """(id) => {
   const ROW = """ + ROW_JS + """;
   const list = document.getElementById('discord-log');
   window.__doneMoment = null;
+  let watch;
   const take = () => {
     const row = document.querySelector(`#discord-log > li[data-id="${id}"]`);
     if (!row || row.getAttribute('data-done-flash') !== 'marking' || window.__doneMoment) return;
     const selected = document.querySelector('#discord-log > li[data-selected="true"]');
+    // The flash is lit on the row being read a redraw before the selection
+    // moves off it; a snapshot then would compare the row to itself.
+    if (!selected || selected === row) return;
     window.__doneMoment = {
       marked: ROW(id),
-      selected: selected ? ROW(selected.getAttribute('data-id')) : null,
+      selected: ROW(selected.getAttribute('data-id')),
     };
+    watch.disconnect();
   };
-  new MutationObserver(take).observe(list, { subtree: true, attributes: true,
+  watch = new MutationObserver(take);
+  watch.observe(list, { subtree: true, attributes: true,
     attributeFilter: ['data-done-flash', 'data-selected', 'data-archived'] });
   take();
 }"""
@@ -465,8 +471,11 @@ def walk_reduced(walk: Walk) -> None:
 
 def walk_pictures(walk: Walk, scheme: Scheme, size: str) -> str:
     """The moment of marking and a selected read message, as the eye is left with them."""
-    marking(walk, lambda marked: walk.page.evaluate(MOMENT_JS, marked))
-    walk.page.wait_for_function("() => window.__doneMoment !== null", timeout=30_000)
+    marked = marking(walk, lambda row_id: walk.page.evaluate(MOMENT_JS, row_id))
+    try:
+        walk.page.wait_for_function("() => window.__doneMoment !== null", timeout=30_000)
+    except Exception as error:  # noqa: BLE001 - said with the row's state below
+        check(False, f"{scheme} {size}: the Done moment was never recorded: {walk.row(marked)} ({error})")
     kept: object = walk.page.evaluate("() => window.__doneMoment")
     check(isinstance(kept, dict) and isinstance(kept.get("marked"), dict)
           and isinstance(kept.get("selected"), dict),

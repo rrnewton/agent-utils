@@ -201,9 +201,12 @@ HOLD_MS = 2000
 # page on its long-poll watch, answered by this process's own server thread, so the wait is for
 # two starved threads to be scheduled; at gate load (several gates at once, host load 30-130) 5 s
 # was observed to pass with the card still up and no other fault (ci-repair gate 6, 2026-10-19).
-# The step's own wall budget is 960 s (tests.dag.yaml); 120 s keeps a never-settling card a
-# prompt, named failure while leaving scheduling out of what is judged.  `#389 gate-flakes`.
-CARD_GONE_MS = 120_000
+# The step's own wall budget is 960 s (tests.dag.yaml); 30 s keeps a never-settling card a
+# prompt, named failure at the first site (15 sites at 120 s could outrun the
+# step budget and lose the name) while giving a starved pair of threads six
+# times the bound that was observed to expire.  Scheduling beyond that is
+# still judged -- it is a liveness bound, not a proof.  `#389 gate-flakes`.
+CARD_GONE_MS = 30_000
 # Point 8's desk, and its channel's one thread: Main's message 3 opened it, and 13 and 14 answer in it.
 DESK = (1280, 800)
 THREAD_ID = "1110000000000000300"
@@ -2070,11 +2073,15 @@ def room_back_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, size: t
                           f"{where}: the premise, the focus handed from More to the box, not to #{focus}")
                 if anchoring == "":
                     # The live read has to land while the card's room is kept (the page
-                    # returns it a second after Send), so start it as soon as the post
-                    # has left, not a fixed 300 ms later: on a loaded machine the wait
-                    # and the read together outlasted that second and the premise read
-                    # a room already handed back (done-races validate-land3,
-                    # 2026-10-19).  `#389 gate-flakes`.
+                    # returns it a second after Send).  The card is already observed
+                    # gone above; spend none of what is left of that second on a
+                    # fixed 300 ms before starting the read -- on a loaded machine
+                    # the wait and the read together outlasted it and the premise
+                    # read a room already handed back (done-races validate-land3,
+                    # 2026-10-19).  The read itself is still served by a starved
+                    # server thread, so this narrows the window rather than
+                    # closing it; the premise below fails by name if it misses.
+                    # `#389 gate-flakes`.
                     if not more:
                         until(page, lambda: len(api.posted) > posted_before,
                               "the sent message to be posted")
