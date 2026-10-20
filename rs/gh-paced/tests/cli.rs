@@ -2254,21 +2254,54 @@ fn three_429_pages() -> String {
     )
 }
 
+/// How many threads `pid` has, from `/proc`. `None` once it is gone.
+fn thread_count(pid: u32) -> Option<usize> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Threads:"))
+        .and_then(|rest| rest.trim().parse().ok())
+}
+
+/// Wait until gh-paced's stdout reader thread has stopped. Once gh has exited, gh-paced runs
+/// five threads: main, a reader and a writer for stdout, and a reader and a writer for stderr.
+/// The stderr pair ends at the end of that stream, and the stdout writer ends only after the
+/// reader has closed its queue, which it does as it stops. So at most two threads left means
+/// the stdout reader has stopped, however long a loaded host took to run it. `#389 gate-flakes`.
+fn wait_for_reader_stopped(child: &std::process::Child) {
+    let begun = Instant::now();
+    loop {
+        match thread_count(child.id()) {
+            Some(n) if n <= 2 => return,
+            None => panic!("gh-paced exited before its reader stopped"),
+            _ => {}
+        }
+        assert!(
+            begun.elapsed().as_secs_f64() < 120.0,
+            "the stdout reader never stopped"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 /// The account lock is held and `lock_wait_secs` is 3, so each time the stdout reader records a
 /// cooldown its hook waits 3 s and gives up. gh writes its pages and exits during the hook for the
 /// first 429; the reader then sees the exit, reads the second 429 and waits 3 s again, by which
 /// time the stream has been silent for more than 2 s as far as the reader knows and it stops
-/// reading, with the third page, gh's own output, still unread. The test lets the lock go 6.5 s
-/// after gh's exit. With `late`, the terminal is never read, so gh-paced is still delivering when
-/// TERM arrives 7.5 s after gh's exit. Either way the cooldown must be the two days of the third
-/// page; before round 13 it was the 1,200 s of the second, because a reader stopped at a cutoff
+/// reading, with the third page, gh's own output, still unread. The test lets the lock go once
+/// the reader has stopped (see [`wait_for_reader_stopped`]), in time for the bookkeeping after
+/// gh's exit, which waits 3 s for the same lock. A fixed sleep judged that moment instead, and
+/// on a loaded host it let go after the bookkeeping had already given up. With `late`, the
+/// terminal is never read, so gh-paced is still delivering when TERM arrives after the lock is
+/// let go. Either way the cooldown must be the two days of the third page; before round 13 it
+/// was the 1,200 s of the second, because a reader stopped at a cutoff
 /// handed the rest of stdout to a drainer that does not scan it, or, after a late signal, dropped
 /// it.
 fn assert_stopped_reader_scans_what_gh_wrote(name: &str, late: bool) {
     let config = FAST.replacen('{', r#"{"lock_wait_secs": 3, "#, 1);
     let sb = Sandbox::new(name, &config);
     let (master, slave) = pty_pair();
-    let child = sb
+    let mut child = sb
         .cmd(&["api", "-i", "--paginate", "repos/o/r"])
         .env("FAKE_GH_GO", sb.path("go"))
         .env("FAKE_GH_STDOUT_HEAD", three_429_pages())
@@ -2296,12 +2329,18 @@ fn assert_stopped_reader_scans_what_gh_wrote(name: &str, late: bool) {
         (None, Some(reader))
     };
     wait_for_log(&sb, "end api");
-    let exited = Instant::now();
-    std::thread::sleep(std::time::Duration::from_millis(6500));
+    wait_for_reader_stopped(&child);
+    // The reader has stopped, and gh-paced is still there: its bookkeeping has yet to take the
+    // lock this test holds. How long the reader took depends on how gh's output fell into
+    // chunks, each with changed signals burning one 3 s hook wait, so no elapsed time proves
+    // this; still running does.
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "gh-paced finished before the lock was let go"
+    );
     drop(held);
     let before = epoch_now();
     if late {
-        std::thread::sleep(std::time::Duration::from_millis(1000));
         // SAFETY: signalling our own child, which has not been reaped.
         unsafe {
             libc::kill(child.id() as i32, libc::SIGTERM);
@@ -2318,10 +2357,6 @@ fn assert_stopped_reader_scans_what_gh_wrote(name: &str, late: bool) {
     } else {
         assert_eq!(o.status.code(), Some(1), "{err}");
     }
-    assert!(
-        exited.elapsed().as_secs_f64() > 6.0,
-        "gh-paced finished before the lock was let go: {err}"
-    );
     assert_two_day_cooldown(&sb, before, &err);
     if let Some(reader) = reader {
         // What the reader took before it stopped was delivered too, in order.
