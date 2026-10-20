@@ -54472,10 +54472,11 @@ def test_remove_agent_batch_removes_disk_image_slots(
         before_image_fence: bool = False,
         strict_lsof_warnings: bool = False,
     ) -> wrkslots._LiveUseObservation | None:
-        # The batch routes its own checks through this entry point; only the
-        # ordinary check it dispatches to (the host-wide lsof and /proc
-        # walks) is answered unused.
-        if agent_batch is not None:
+        # The batch routes its own checks through this entry point, and its
+        # fenced fallback names a fenced (``.fenced.``) path; both stay on
+        # the original check.  Only the ordinary check of the unfenced
+        # image slot (the host-wide lsof and /proc walks) is answered unused.
+        if agent_batch is not None or ".fenced." in slot_path.name:
             return original_observe_once(
                 slot_path, record, use_lsof=use_lsof,
                 ignore_invoking_ancestry=ignore_invoking_ancestry, census=census,
@@ -54647,10 +54648,11 @@ def test_remove_agent_batch_refuses_before_fencing_when_the_image_check_outlasts
         before_image_fence: bool = False,
         strict_lsof_warnings: bool = False,
     ) -> wrkslots._LiveUseObservation | None:
-        # The batch routes its own checks through this entry point; only the
-        # ordinary check it dispatches to (the host-wide lsof and /proc
-        # walks) is answered unused.
-        if agent_batch is not None:
+        # The batch routes its own checks through this entry point, and its
+        # fenced fallback names a fenced (``.fenced.``) path; both stay on
+        # the original check.  Only the ordinary check of the unfenced
+        # image slot (the host-wide lsof and /proc walks) is answered unused.
+        if agent_batch is not None or ".fenced." in slot_path.name:
             return original_observe_once(
                 slot_path, record, use_lsof=use_lsof,
                 ignore_invoking_ancestry=ignore_invoking_ancestry, census=census,
