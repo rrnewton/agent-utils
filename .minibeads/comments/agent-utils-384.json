@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-384-c929a2c7852",
+    "issue_id": "agent-utils-384",
+    "author": "mu-cache",
+    "body": "[muse watermelon] Delivered on main at 899d82d5 (7 commits for #384 cache-serve), gate green (validate: OK), release build green. With [message_cache] enabled and serve = true (default false), a write-scope newest timeline page and a fresh newest window are answered from the cache at once and refreshed upstream behind the answer; the refresh is compared through the shadow counters and corrects served rows it proves edited or deleted by live event. A channel in doubt, a Slack window, a thread page, the read token, and any read while the provider's account is unchecked are never served. A served view is owed the provider's own page before it serves again, so walk-back always has its cursor. Measured with the fake provider held (never answers): reload to first messages was unanswered after 1 s before (the real provider took 20 s and more) and is 3 ms after. Unverified: no real-deployment run; turning serve on for a host still wants its shadow counts watched first, as the README now says. Design: ai_docs/transient/2026-10-19-cache-serve.md.",
+    "created_at": "2026-10-20T01:26:09.039348859Z",
+    "updated_at": "2026-10-20T01:26:09.039348859Z"
+  }
+]
