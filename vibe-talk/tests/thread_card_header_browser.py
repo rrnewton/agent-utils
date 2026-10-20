@@ -628,7 +628,20 @@ def desk_walk(desk: Desk) -> None:
 
 
 def list_card(desk: Desk, thread_id: str) -> tuple[dict[str, float], str]:
-    """Card `thread_id` of the thread list, its box and what it says."""
+    """Card `thread_id` of the thread list, its box and what it says.
+
+    The cards are drawn first from the channel's roots, saying each root's
+    own words; the threads read then folds in the summaries and repaints a
+    summarised card with its name and summary (`sideCardText`).  Read the
+    card only once that read has landed for this thread, or on a loaded
+    machine the words read here are the root's while the heading card,
+    painted after the fold, says the summary.  `#389 gate-flakes`.
+    """
+    desk.wait_for(
+        f"() => channelCanon.threads.some((held) => String(held.id) === '{thread_id}')",
+        f"the threads read never brought {thread_id}'s summary",
+    )
+    desk.settled()
     box = card_box(desk, thread_id)
     said = str(desk.page.text_content(f"#side-cards > li[data-id='{thread_id}'] .side-card-text"))
     return box, said
