@@ -5,6 +5,18 @@ description: Start, inspect, message, and retire persistent named coding-agent s
 
 # agentctl
 
+## Coordinators: stay light
+
+Keep the big picture and stay responsive to the user and your subagents,
+while reading deeply enough to understand what they do.
+Delegate heavy or long work to external agents (`agentctl` lanes or agentcloud),
+not in-process subagents, which can block you on permission prompts.
+Keep your own tool calls minimal and short, always with timeouts.
+Anything likely to take more than a few seconds (builds, long fetches,
+multi-step investigations, or pushes in bulk) goes to a worker.
+Answer the user within minutes, even partially, and come back with results.
+Do not stay in long tool chains.
+
 Use the installed command as the authority:
 
 - `agentctl quickstart`
