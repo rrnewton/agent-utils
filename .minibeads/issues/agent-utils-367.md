@@ -1,12 +1,13 @@
 ---
 title: 'python-minimum-failures: tests that fail on Python 3.10, the declared minimum'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - validation
 created_at: 2026-10-19T09:35:56.223051728+00:00
-updated_at: 2026-10-19T09:35:56.223051728+00:00
+updated_at: 2026-10-20T23:11:07.335957538+00:00
+closed_at: 2026-10-20T23:11:07.335957407+00:00
 ---
 
 # Description
