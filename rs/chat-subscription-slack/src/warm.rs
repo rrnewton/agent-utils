@@ -878,7 +878,7 @@ impl Worker {
     #[allow(unsafe_code)]
     fn start_spare(&self, key: SpareKey) -> io::Result<Spare> {
         let arguments = cli::post_arguments(
-            &self.app_id,
+            self.transport.options().identity.app_argument(&self.app_id),
             &key.channel_id,
             Some(&key.thread_ts),
             self.format,

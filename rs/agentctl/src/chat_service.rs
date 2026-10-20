@@ -438,8 +438,7 @@ pub enum ReplyCommandOutcome {
 }
 
 /// Store one reply for an open request, as [`BridgeState::submit_reply`] describes, and then ask
-/// a `chat run` that serves the same state directory with `--offer-reply-command` to send it at
-/// once. The state is opened without the recovery that `chat run`, `chat tick` and `chat close`
+/// a `chat run` that serves the same state directory to send it at once. The state is opened without the recovery that `chat run`, `chat tick` and `chat close`
 /// perform when they open it, so this is safe while the service runs. The result's
 /// `service_woken` says whether the wake was sent to a socket of the current user at the state
 /// directory's wake socket path; nothing confirms that a service received it. A service that does
@@ -655,6 +654,16 @@ impl ReplyWakeListener {
         remove_reply_wake_socket(&self.path, self.identity);
         joined
     }
+}
+
+/// Whether `chat run` listens on the state directory's wake socket: whenever its configuration
+/// lets `chat reply` store a reply, which needs `outbound_enabled`. It does not depend on
+/// `--offer-reply-command`, which only decides whether prompts print the command: an agent or
+/// operator can run `chat reply` without being offered it, as when a reply printed between the
+/// marker lines was not captured, and a service that did not listen then sent that reply only at
+/// its next reconciliation or restart (live finding 2026-10-19, #392 chat-reply-no-wake).
+fn listens_for_reply_wakes(config: &BridgeConfiguration) -> bool {
+    config.outbound_enabled
 }
 
 /// The wake socket's thread: hand each well-formed request key to the owner loop and end its
@@ -896,8 +905,8 @@ pub struct RunSettings {
     /// Admission exclusions: owner messages whose text starts with one of these are not admitted.
     pub ignored_text_prefixes: Vec<String>,
     /// Name `agentctl chat reply` in each request prompt that gives the two reply marker lines,
-    /// as [`BridgeState::with_reply_command_offered`] describes, and listen on the state
-    /// directory's wake socket so a reply that command stores is sent at once.
+    /// as [`BridgeState::with_reply_command_offered`] describes. The service listens on the state
+    /// directory's wake socket either way: see [`listens_for_reply_wakes`].
     pub offer_reply_command: bool,
     /// Clear a draft left in the coordinator's composer once it has held a request and stayed
     /// unchanged this long, as [`crate::stale_composer`] describes; `None`, the default, never
@@ -1073,7 +1082,7 @@ pub fn run_with_settings<A: ManagedApi + ?Sized>(
     };
     let (reply_wake_sender, reply_wakes) = mpsc::sync_channel(REPLY_WAKE_CAPACITY);
     // Bound before the owner loop's first recovery pass, which sends any reply stored earlier.
-    let reply_wake = if offer_reply_command {
+    let reply_wake = if listens_for_reply_wakes(state.config()) {
         ReplyWakeListener::start(
             state_root,
             reply_wake_sender,
@@ -13803,6 +13812,45 @@ request. No open chat request has been sent to you."]
             ReplyCommandOutcome::Stored(result) => panic!("stored {result}"),
         }
         assert_eq!(stored("third"), expected("stored", 3));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_service_listens_for_chat_reply_wakes_without_offer_reply_command() {
+        // Live finding 2026-10-19 (#392 chat-reply-no-wake): `chat reply` printed
+        // `service_woken: false` and the reply waited for a restart, because the service listened
+        // only with `--offer-reply-command`. Listening now depends on outbound replies alone.
+        let (state, key, root) = state_with_request();
+        assert!(state.config().outbound_enabled);
+        assert!(listens_for_reply_wakes(state.config()));
+        let mut silent = state.config().clone();
+        silent.outbound_enabled = false;
+        assert!(!listens_for_reply_wakes(&silent));
+        // A listener started as `chat run` starts one hears the command and hands its loop the
+        // request key.
+        let identifier = state
+            .next_reply_route(&key)
+            .expect("reply route")
+            .expect("open request")
+            .identifier;
+        let (sender, wakes) = mpsc::sync_channel(REPLY_WAKE_CAPACITY);
+        let listener = ReplyWakeListener::start(
+            &root,
+            sender,
+            Arc::default(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("listen on the wake socket");
+        match reply(&root, &key, &identifier, "answer").expect("chat reply") {
+            ReplyCommandOutcome::Stored(result) => {
+                assert_eq!(result["service_woken"], true, "{result}");
+            }
+            ReplyCommandOutcome::TryAgain(reason) => panic!("try again: {reason}"),
+        }
+        assert_eq!(wakes.recv_timeout(Duration::from_secs(5)), Ok(key));
+        listener
+            .stop(Instant::now() + Duration::from_secs(5))
+            .expect("stop the listener");
         fs::remove_dir_all(root).expect("cleanup");
     }
 

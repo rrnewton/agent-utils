@@ -16,7 +16,11 @@
 //! # Bot identity only
 //!
 //! Every write acts as the configured Slack app (`--app-id=A…`). Without an app id the helper
-//! refuses every request as not applied and contacts nothing.
+//! refuses every request as not applied and contacts nothing. By default the client holds a
+//! person's credentials and each write passes `--as=<app id>`; with `--client-identity=crewmate`
+//! the client runs as the app's Crewmate, which acts through its recorded app and refuses `--as`,
+//! so no write passes it. `--cli-arg=ARG` (repeatable) goes before the subcommand on every client
+//! run, such as the client's flag that selects the Crewmate, so no wrapper script is needed.
 //!
 //! # Idempotency
 //!
@@ -49,7 +53,7 @@ use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 
-use crate::cli::{CliOptions, CliTransport, TailOptions};
+use crate::cli::{CliOptions, CliTransport, ClientIdentity, TailOptions};
 use crate::diag::Diagnostics;
 use crate::ids::{self, AppId};
 use crate::transport::{
@@ -88,6 +92,10 @@ pub struct OutboundConfig {
     pub transport: HelperTransport,
     /// Client path for the CLI transport.
     pub cli: Option<PathBuf>,
+    /// Arguments placed before the subcommand on every client run.
+    pub cli_arguments: Vec<String>,
+    /// Who the client acts as when it writes.
+    pub client_identity: ClientIdentity,
     /// Extra non-secret client environment.
     pub cli_environment: Vec<(String, String)>,
     /// The posting app; `None` refuses every request.
@@ -129,6 +137,8 @@ impl OutboundConfig {
         let mut config = Self {
             transport: HelperTransport::Cli,
             cli: None,
+            cli_arguments: Vec::new(),
+            client_identity: ClientIdentity::User,
             cli_environment: Vec::new(),
             app_id: None,
             channels: Vec::new(),
@@ -162,6 +172,22 @@ impl OutboundConfig {
                         return Err("--cli must be an absolute path".to_owned());
                     }
                     config.cli = Some(path);
+                }
+                "--cli-arg" => {
+                    if value.is_empty() || value.chars().any(char::is_control) {
+                        return Err("--cli-arg must be a nonempty single-line argument".to_owned());
+                    }
+                    if config.cli_arguments.len() >= 16 {
+                        return Err("at most 16 --cli-arg arguments are accepted".to_owned());
+                    }
+                    config.cli_arguments.push(value.to_owned());
+                }
+                "--client-identity" => {
+                    config.client_identity = match value {
+                        "user" => ClientIdentity::User,
+                        "crewmate" => ClientIdentity::Crewmate,
+                        _ => return Err("--client-identity must be user or crewmate".to_owned()),
+                    };
                 }
                 "--cli-env" => {
                     let (key, item) = value
@@ -297,6 +323,8 @@ impl OutboundConfig {
     fn cli_transport(&self) -> Result<CliTransport, String> {
         CliTransport::new(CliOptions {
             program: self.cli.clone().ok_or("--cli is required")?,
+            prefix_arguments: self.cli_arguments.clone(),
+            identity: self.client_identity,
             environment: self.cli_environment.clone(),
             timeout: self.timeout,
             tail: TailOptions::default(),
@@ -1035,6 +1063,37 @@ mod tests {
         assert!(OutboundConfig::parse(&arguments[..3]).is_err());
         assert_eq!(config.role, Role::Helper);
         assert_eq!(config.warm_socket, None);
+    }
+
+    #[test]
+    fn parses_crewmate_arguments() {
+        let base = [
+            "--cli=/usr/bin/slack",
+            "--app-id=A0BRVKV248L",
+            "--channel=C0C91RW5FAR",
+            "--ledger=/var/lib/x",
+        ]
+        .map(str::to_owned);
+        let with = |extra: &[&str]| {
+            let mut arguments = base.to_vec();
+            arguments.extend(extra.iter().map(|argument| (*argument).to_owned()));
+            OutboundConfig::parse(&arguments)
+        };
+        let default = with(&[]).expect("valid");
+        assert_eq!(default.client_identity, ClientIdentity::User);
+        assert!(default.cli_arguments.is_empty());
+        let crewmate = with(&[
+            "--client-identity=crewmate",
+            "--cli-arg=--act-as=1234",
+            "--cli-arg=--quiet",
+        ])
+        .expect("valid");
+        assert_eq!(crewmate.client_identity, ClientIdentity::Crewmate);
+        assert_eq!(crewmate.cli_arguments, ["--act-as=1234", "--quiet"]);
+        assert!(with(&["--client-identity=app"]).is_err());
+        assert!(with(&["--cli-arg="]).is_err());
+        assert!(with(&["--cli-arg=a\nb"]).is_err());
+        assert!(with(&["--cli-arg=x"; 17]).is_err());
     }
 
     #[test]

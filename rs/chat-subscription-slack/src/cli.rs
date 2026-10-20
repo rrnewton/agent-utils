@@ -5,13 +5,17 @@
 //! | Operation | Command |
 //! | --- | --- |
 //! | inbound stream | `slack.conversation tail --channel-id=C… --event-types=message.created --include-iris-seq-id --output=json --heartbeats --catchup=…` |
-//! | post | `slack.message send --channel-id=C… --markdown=file://- [--thread-ts=…] --as=A… --output=json` |
-//! | reaction | `slack.reaction add --channel-id=C… --message-ts=… --name=… --as=A… --output=json` |
-//! | listing | `slack.message list --channel-id=C… [--thread-ts=…] --oldest=… --as=A… --output=json` |
+//! | post | `slack.message send --channel-id=C… --markdown=file://- [--thread-ts=…] [--as=A…] --output=json` |
+//! | reaction | `slack.reaction add --channel-id=C… --message-ts=… --name=… [--as=A…] --output=json` |
+//! | listing | `slack.message list --channel-id=C… [--thread-ts=…] --oldest=… [--as=A…] --output=json` |
 //!
 //! Message bodies travel on standard input (`file://-`), so they never appear in a process
-//! argument list. Every write passes `--as=<app id>`; without that flag the client would act as
-//! the human whose credentials it holds, which this transport never does.
+//! argument list. A client that holds a person's credentials ([`ClientIdentity::User`], the
+//! default) is given `--as=<app id>` on every write; without that flag it would act as the human
+//! whose credentials it holds, which this transport never does. A client that runs as the app's
+//! Crewmate ([`ClientIdentity::Crewmate`]) already acts through the app recorded on it and refuses
+//! `--as`, so it is never given one. [`CliOptions::prefix_arguments`] go before the subcommand on
+//! every run, such as a client flag that selects the Crewmate.
 //!
 //! Each tail stdout line is one JSON object: `{"type": "message.created", "iris_seq_id": N,
 //! "payload": {"container_id": "C…", "slack_message": {"channel_id", "message_ts", "thread_ts",
@@ -57,11 +61,38 @@ pub struct TailOptions {
     pub stall_timeout_seconds: Option<u64>,
 }
 
+/// Who the configured client acts as when it writes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClientIdentity {
+    /// The client holds a person's credentials, so every write passes `--as=<app id>` to act as
+    /// the app instead.
+    #[default]
+    User,
+    /// The client runs as the app's Crewmate, which acts through the app recorded on it and
+    /// refuses `--as`, so no write passes it.
+    Crewmate,
+}
+
+impl ClientIdentity {
+    /// The `--as` argument a write by this client takes to act as `app_id`, if any.
+    #[must_use]
+    pub fn app_argument(self, app_id: &AppId) -> Option<String> {
+        match self {
+            Self::User => Some(format!("--as={app_id}")),
+            Self::Crewmate => None,
+        }
+    }
+}
+
 /// Configuration of the command-line transport.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CliOptions {
     /// Absolute path of the client executable.
     pub program: PathBuf,
+    /// Arguments placed before the subcommand on every invocation.
+    pub prefix_arguments: Vec<String>,
+    /// Who the client acts as when it writes.
+    pub identity: ClientIdentity,
     /// Extra non-secret environment values set on every invocation.
     pub environment: Vec<(String, String)>,
     /// Deadline for one non-streaming invocation.
@@ -91,6 +122,7 @@ impl CliTransport {
 
     fn command(&self) -> Command {
         let mut command = Command::new(&self.options.program);
+        command.args(&self.options.prefix_arguments);
         command.envs(
             self.options
                 .environment
@@ -727,10 +759,11 @@ fn run_failure(failure: RunFailure, write: bool) -> TransportError {
     }
 }
 
-/// The client arguments of one post, whose body the client reads from standard input.
+/// The client arguments of one post, whose body the client reads from standard input. `app`
+/// is the `--as` argument, if the client takes one: see [`ClientIdentity::app_argument`].
 #[must_use]
 pub(crate) fn post_arguments(
-    app_id: &AppId,
+    app: Option<String>,
     channel_id: &str,
     thread_ts: Option<&str>,
     format: TextFormat,
@@ -748,7 +781,7 @@ pub(crate) fn post_arguments(
     if let Some(thread_ts) = thread_ts {
         arguments.push(format!("--thread-ts={thread_ts}"));
     }
-    arguments.push(format!("--as={app_id}"));
+    arguments.extend(app);
     arguments.push("--output=json".to_owned());
     arguments
 }
@@ -830,7 +863,12 @@ impl SlackTransport for CliTransport {
     }
 
     fn post_message(&mut self, post: &PostMessage<'_>) -> Result<String, TransportError> {
-        let arguments = post_arguments(post.app_id, post.channel_id, post.thread_ts, post.format);
+        let arguments = post_arguments(
+            self.options.identity.app_argument(post.app_id),
+            post.channel_id,
+            post.thread_ts,
+            post.format,
+        );
         let completed = self
             .run(&arguments, Some(post.text.as_bytes()))
             .map_err(|failure| run_failure(failure, true))?;
@@ -844,15 +882,15 @@ impl SlackTransport for CliTransport {
         message_ts: &str,
         name: &str,
     ) -> Result<bool, TransportError> {
-        let arguments = vec![
+        let mut arguments = vec![
             "slack.reaction".to_owned(),
             "add".to_owned(),
             format!("--channel-id={channel_id}"),
             format!("--message-ts={message_ts}"),
             format!("--name={name}"),
-            format!("--as={app_id}"),
-            "--output=json".to_owned(),
         ];
+        arguments.extend(self.options.identity.app_argument(app_id));
+        arguments.push("--output=json".to_owned());
         let completed = self
             .run(&arguments, None)
             .map_err(|failure| run_failure(failure, true))?;
@@ -896,9 +934,9 @@ impl SlackTransport for CliTransport {
             "--limit=20".to_owned(),
             "--columns=message_ts,thread_ts,author_user_id,is_author_bot,content".to_owned(),
             "--content-format=text".to_owned(),
-            format!("--as={}", query.app_id),
-            "--output=json".to_owned(),
         ]);
+        arguments.extend(self.options.identity.app_argument(query.app_id));
+        arguments.push("--output=json".to_owned());
         let completed = self
             .run(&arguments, None)
             .map_err(|failure| run_failure(failure, false))?;

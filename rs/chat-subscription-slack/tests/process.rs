@@ -1,6 +1,7 @@
 //! The real executables, driven the way the bridge drives them, against a fake Slack client
-//! script. This checks the client command lines (including `--as=<app>` on every write) and the
-//! process protocol framing end to end.
+//! script. This checks the client command lines (`--as=<app>` on every write of a client that
+//! holds a person's credentials, and none for a Crewmate) and the process protocol framing end to
+//! end.
 
 use std::fs;
 use std::io::Write;
@@ -23,6 +24,8 @@ const APP: &str = "A0TESTAPP01";
 const FAKE_CLIENT: &str = r#"#!/bin/sh
 # Fake Slack client: records each invocation's arguments, then answers like the real one.
 printf '%s\n' "$*" >> "$FAKE_SLACK_DIR/argv.log"
+# Global flags, such as one that selects a Crewmate, come before the subcommand.
+while [ "${1#--}" != "$1" ]; do shift; done
 case "$1 $2" in
   "slack.conversation tail")
     cat "$FAKE_SLACK_DIR/tail.jsonl"
@@ -209,6 +212,44 @@ fn helper_process_posts_in_thread_and_reacts_as_the_app() {
     for call in &calls {
         assert!(call.contains("--as=A0TESTAPP01") && !call.contains("--as-user"));
     }
+}
+
+#[test]
+fn helper_process_as_a_crewmate_never_passes_as() {
+    // #383 slack-crewmate-outbound: a client run as the app's Crewmate refuses `--as`, and it
+    // needs its own selecting flag and certificate environment, which the operator wrapped in a
+    // script. The helper now does both itself.
+    let root = workspace("helper-crewmate");
+    let mut arguments = helper_arguments(&root, Some(APP));
+    arguments.extend([
+        "--client-identity=crewmate".to_owned(),
+        "--cli-arg=--act-as-bot=1234".to_owned(),
+        "--cli-env=CLIENT_CERT_PATH=/etc/certs/user.pem".to_owned(),
+    ]);
+    let send = json!({
+        "version": 1, "id": "0b7e4f6a-1c2d-4e5f-8a9b-0c1d2e3f4a5b", "action": "send",
+        "channel_id": CHANNEL, "thread_id": format!("{CHANNEL}/threads/1792000801.000100"),
+        "text": "done",
+    });
+    let response = run_helper(&root, &arguments, &send);
+    assert_eq!(response["ok"], json!(true), "{response}");
+    let reaction = json!({
+        "version": 1, "id": "1b7e4f6a-1c2d-4e5f-9a9b-0c1d2e3f4a5b", "action": "ensure_reaction",
+        "channel_id": CHANNEL, "message_id": format!("{CHANNEL}/messages/1792000801.000100"),
+        "emoji": "👀",
+    });
+    let response = run_helper(&root, &arguments, &reaction);
+    assert_eq!(response["ok"], json!(true), "{response}");
+    let calls = invocations(&root);
+    assert_eq!(
+        calls,
+        [
+            "--act-as-bot=1234 slack.message send --channel-id=C0C91RW5FAR \
+             --markdown=file://- --thread-ts=1792000801.000100 --output=json",
+            "--act-as-bot=1234 slack.reaction add --channel-id=C0C91RW5FAR \
+             --message-ts=1792000801.000100 --name=eyes --output=json",
+        ]
+    );
 }
 
 #[test]

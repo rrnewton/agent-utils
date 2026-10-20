@@ -454,8 +454,12 @@ The command never contacts Herdr, a helper, or a provider. It is safe while
 `chat run`, `chat tick` and `chat close` perform when they open it, and it holds
 off SIGHUP, SIGINT, SIGQUIT and SIGTERM while it stores the reply.
 
-A service running with `--offer-reply-command` listens on a datagram socket,
-`.wake.sock` in its state directory. After it stores a reply that is not sent
+A running service with outbound replies enabled listens on a datagram socket,
+`.wake.sock` in its state directory, with or without `--offer-reply-command`,
+which decides only whether prompts print the command. (Before #392
+chat-reply-no-wake, the Rust edition listened only with that option, so a
+reply stored without it waited for the next reconciliation or a restart; the
+Python edition always listened.) After it stores a reply that is not sent
 yet, `reply` sends the request key to that socket, and the service sends the
 reply at once instead of at its next reconciliation. `service_woken` says
 whether the key was sent to a socket of the current user at that path; nothing
@@ -466,7 +470,8 @@ binds the socket by the same absolute path that the prompt's command names, so
 a service whose state directory has an absolute path longer than 96 bytes, not
 counting a trailing slash, cannot listen: it logs why and runs on without the
 socket, as does a service that finds something other than a socket of its own
-user at that path. The prompt offers the command only with this option, because
+user at that path. The prompt offers the command only with
+`--offer-reply-command`, because
 the agent must be able to run the service's executable and write the state
 directory. Like `--ignore-text-prefix`, the option applies only to the run it
 is given to.
@@ -1847,9 +1852,12 @@ emoji the configuration chooses instead).
   command-line client's `slack.conversation tail` for the configured channel and
   turns each `message.created` event into one batch.
 * `agentctl-slack-outbound` is the `outbound_command`. It posts replies with
-  `slack.message send` and adds reactions with `slack.reaction add`, always
-  with `--as=<APP_ID>`, so every post and reaction comes from the registered
-  Slack app's bot identity. Without `--app-id` it refuses every request as
+  `slack.message send` and adds reactions with `slack.reaction add`, so every
+  post and reaction comes from the registered Slack app's bot identity: with
+  `--as=<APP_ID>` when the client holds a person's credentials (the default),
+  or with no `--as` when the client runs as the app's Crewmate
+  (`--client-identity=crewmate`), which acts through its recorded app and
+  refuses `--as`. Without `--app-id` it refuses every request as
   `app_identity_required` (not applied, retryable) and runs nothing. A user ID
   is not accepted as the app id.
 
@@ -1896,6 +1904,68 @@ the outcome stays unknown until `--uncertain-repost-after-seconds` (default
 `--max-chunk-bytes` (default 11,000; Slack's limit is 12,000) are posted as
 consecutive messages in the same thread.
 
+### Client identities: listen as a member, post as the app
+
+The plugin's tail and the outbound helper run separate clients, named
+separately: `cli_path` in `backend_configuration` for the tail, and `--cli` in
+the helper's arguments. Give them different identities when the app posts
+through a Crewmate:
+
+* The tail must run as a human member of the channel. Slack delivers channel
+  message events to a member's own event subscription, not to an app's
+  Crewmate. Observed on 2026-10-19 (#390 slack-inbound-identity): a tail run
+  as the posting app's Crewmate subscribed, reported heartbeats and hourly
+  stalls and revivals, and received no event for hours, while the same tail
+  run as the owner caught up the waiting message at once. The plugin's
+  diagnostics log warns once when the client's standard error names a
+  Crewmate, and notes once when a stream has stayed subscribed for 30 minutes
+  without any event; in a quiet channel that note is expected and harmless.
+* The helper may run as the app's Crewmate. Pass `--client-identity=crewmate`
+  so no write passes `--as`, and pass the client's own flag that selects the
+  Crewmate with `--cli-arg=ARG` (repeatable; each goes before the subcommand
+  on every client run). Or keep the default `--client-identity=user` with a
+  client that holds a member's credentials, which every write then redirects
+  to the app with `--as=<APP_ID>`.
+
+Either way, `allowed_senders` still decides whose messages are requests, and a
+post by the app is never one.
+
+The host runs both clients with a scrubbed environment: the plugin gets only
+the variables listed below plus `subscription_environment`, and the helper
+only the names in `outbound_command.environment`. A client that obtains a
+Crewmate credential from the user's own TLS client certificate needs the
+variables that name that certificate and its key. They hold paths, not
+secrets, so pass them as `--cli-env=NAME=PATH` to the helper (and in
+`cli_environment` for the plugin, if its client needs them too), or set them
+in the service's environment and list their names in
+`outbound_command.environment` or `subscription_environment`. A client that
+cannot find them fails each write as not applied, with the client's own error
+in the helper's diagnostics log.
+
+For example, with a client whose `--act-as-crewmate=ID` flag selects the
+Crewmate (the flag, the variable names, and the paths here are placeholders
+for the client's own):
+
+```json
+"backend_configuration": {"schema": "agentctl.slack.v1", "data": {
+  "cli_path": "/usr/local/bin/slack-client"
+}},
+"outbound_command": {
+  "executable": "/path/to/agentctl-slack-outbound",
+  "arguments": [
+    "--cli=/usr/local/bin/slack-client",
+    "--client-identity=crewmate",
+    "--cli-arg=--act-as-crewmate=1234567890",
+    "--cli-env=CLIENT_CERT_PATH=/path/to/user-cert.pem",
+    "--cli-env=CLIENT_KEY_PATH=/path/to/user-cert.pem",
+    "--app-id=A0123456789", "--channel=C0123456789",
+    "--ledger=/path/to/state/ledger"
+  ],
+  "environment": ["HOME", "USER", "LOGNAME", "PATH"],
+  "timeout_millis": 30000
+}
+```
+
 ### Plugin settings (`backend_configuration`, schema `agentctl.slack.v1`)
 
 Unknown keys are refused.
@@ -1932,6 +2002,8 @@ environment) or, for non-secret values, set it in `cli_environment`.
 | `--timeout-ms=N` | 25000 | 1000–29000, per client call; keep below `timeout_millis`. |
 | `--max-chunk-bytes=N` | 11000 | 1000–12000. |
 | `--cli-env=NAME=VALUE` | none | Extra non-secret client environment, repeatable. |
+| `--client-identity=user\|crewmate` | `user` | `user`: the client holds a person's credentials and every write passes `--as=<APP_ID>`. `crewmate`: the client runs as the app's Crewmate and no write passes `--as`. See "Client identities" above. |
+| `--cli-arg=ARG` | none | An argument placed before the subcommand on every client run, such as the client's flag that selects a Crewmate; repeatable, at most 16, each nonempty and on one line. |
 | `--diagnostics-log=PATH` | stderr | Private diagnostics file. |
 | `--transport=cli\|web-api` | `cli` | `web-api` refuses every request. |
 | `--warm-socket=PATH` | none | Use the warm worker listening at this absolute path (at most 107 bytes); see below. |

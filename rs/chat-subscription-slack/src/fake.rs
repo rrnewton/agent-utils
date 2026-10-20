@@ -13,8 +13,8 @@ use std::time::Duration;
 use crate::cli::parse_tail_line;
 use crate::ids::AppId;
 use crate::transport::{
-    EventStream, ListQuery, ListedMessage, PostMessage, SlackTransport, StreamCancel, StreamWait,
-    SubscribeSpec, TextFormat, TransportError,
+    EventStream, ListQuery, ListedMessage, PostMessage, SlackTransport, StreamCancel, StreamRecord,
+    StreamWait, SubscribeSpec, TextFormat, TransportError,
 };
 
 /// One scripted stream step.
@@ -26,6 +26,8 @@ pub enum FakeStep {
     Idle,
     /// The stream ends.
     Close(String),
+    /// A line the client wrote to its standard error.
+    Stderr(String),
 }
 
 /// One recorded post.
@@ -164,6 +166,9 @@ impl EventStream for FakeStream {
             Some(FakeStep::Line(line)) => StreamWait::Record(parse_tail_line(&line)),
             Some(FakeStep::Idle) => StreamWait::Idle,
             Some(FakeStep::Close(reason)) => StreamWait::Closed(reason),
+            Some(FakeStep::Stderr(line)) => {
+                StreamWait::Record(StreamRecord::Notice(format!("stream stderr: {line}")))
+            }
             None => {
                 let (guard, _) = changed
                     .wait_timeout_while(guard, wait, |cancelled| !*cancelled)

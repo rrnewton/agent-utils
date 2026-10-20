@@ -422,3 +422,102 @@ fn an_allowed_senders_refused_message_is_counted_durably_and_no_one_elses() {
     assert_eq!(recent[1]["channel_id"], "C0OTHERCHAN");
     assert!(recent.iter().all(|refusal| refusal["user_id"] == OWNER));
 }
+
+static QUIET_CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(NOW_MILLIS);
+
+fn quiet_clock() -> u64 {
+    QUIET_CLOCK.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[test]
+fn a_tail_that_looks_like_a_crewmate_or_stays_silent_is_noted_once() {
+    // #390 slack-inbound-identity: a tail run as the posting app's Crewmate subscribed and
+    // received no event for hours. The diagnostics log now says so.
+    let directory =
+        std::env::temp_dir().join(format!("slack-identity-test-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let log = directory.join("plugin.log");
+    let fake = FakeTransport::new();
+    fake.push_script(vec![
+        FakeStep::Stderr(
+            "ERROR: could not obtain a credential for CREWMATE:4520000000000000".to_owned(),
+        ),
+        FakeStep::Stderr("Crewmate: no detail".to_owned()),
+        FakeStep::Idle,
+        FakeStep::Idle,
+        FakeStep::Idle,
+    ]);
+    let mut backend = SlackBackend::new(Box::new({
+        let fake = fake.clone();
+        move |_config| Ok(Box::new(fake.clone()) as Box<dyn SlackTransport>)
+    }))
+    .with_clock(quiet_clock);
+    let mut subscription = ChatSubscription::open(
+        &mut backend,
+        &request(None, json!({"diagnostics_log": log.to_str().unwrap()})),
+    )
+    .unwrap();
+    commit_next(&mut subscription);
+    let heartbeat = |subscription: &mut ChatSubscription| {
+        assert!(matches!(
+            subscription.next_item().expect("item"),
+            Some(SubscriptionItem::Heartbeat(_))
+        ));
+    };
+    // Both stderr lines are read before the first heartbeat; the warning is written once.
+    heartbeat(&mut subscription);
+    QUIET_CLOCK.store(
+        NOW_MILLIS + 30 * 60 * 1_000,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    heartbeat(&mut subscription);
+    heartbeat(&mut subscription);
+    let text = std::fs::read_to_string(&log).unwrap();
+    std::fs::remove_dir_all(&directory).unwrap();
+    assert_eq!(text.matches("names a Crewmate").count(), 1, "{text}");
+    assert!(
+        text.contains("Point cli_path at a client that runs as the human member"),
+        "{text}"
+    );
+    assert_eq!(
+        text.matches("no event has arrived in the 30 minutes")
+            .count(),
+        1,
+        "{text}"
+    );
+}
+
+#[test]
+fn a_stream_that_carries_events_is_never_noted_as_silent() {
+    let directory = std::env::temp_dir().join(format!("slack-busy-test-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let log = directory.join("plugin.log");
+    let fake = FakeTransport::new();
+    fake.push_script(vec![
+        event(
+            401,
+            json!({"channel_id": CHANNEL, "message_ts": "1792000951.000100", "slack_user_id": "U0STRANGER1", "text": "hi"}),
+        ),
+        FakeStep::Idle,
+    ]);
+    // Far past the quiet window by the fake clock: an event was seen, so nothing is noted.
+    let mut backend = SlackBackend::new(Box::new({
+        let fake = fake.clone();
+        move |_config| Ok(Box::new(fake.clone()) as Box<dyn SlackTransport>)
+    }))
+    .with_clock(|| NOW_MILLIS + 24 * 60 * 60 * 1_000);
+    let mut subscription = ChatSubscription::open(
+        &mut backend,
+        &request(None, json!({"diagnostics_log": log.to_str().unwrap()})),
+    )
+    .unwrap();
+    commit_next(&mut subscription);
+    commit_next(&mut subscription);
+    assert!(matches!(
+        subscription.next_item().expect("item"),
+        Some(SubscriptionItem::Heartbeat(_))
+    ));
+    let text = std::fs::read_to_string(&log).unwrap();
+    std::fs::remove_dir_all(&directory).unwrap();
+    assert!(!text.contains("no event has arrived"), "{text}");
+}

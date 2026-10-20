@@ -667,11 +667,18 @@ coordinator when a condition holds past its threshold:
 |---|---|---|
 | `approval-prompt` | `--approval-minutes` (default 5) | a harness approval, permission, or trust prompt at the bottom of the screen |
 | `idle-no-verdict` | `--idle-minutes` (default 15) | idle or done, work was delivered and drained, and no line starts with a `--done-marker` near the bottom of the screen; markers are `DONE:` and `BLOCKED:` unless `--done-marker` is given, which replaces them |
-| `stalled` | `--stall-minutes` (default 30) | marked working, timed from the last screen change |
+| `stalled` | `--stall-minutes` (default 30) | marked working, or idle or done while the screen shows background work still running, timed from the last screen change |
 | `dead` | `--dead-minutes` (default 5) | the record says running but the harness cannot be reached |
 
 An agent that was never sent work, or that still has prompts queued, is never
-reported idle. When every watched agent is unreachable at once the terminal
+reported idle. Nor is one waiting on background work it started: Claude Code
+counts its background shells and sub-agents in the footer under its input box
+(`⏵⏵ auto mode on · 2 shells · ← 1 agent · ↓ to manage`) and in the row that
+closes a turn (`✻ Baked for 5m 51s · done 12:44 AM · 2 shells still running`),
+and while the bottom of the screen shows such a count (`N shell(s)` or
+`N agent(s)`, with or without `still running`), the agent is held to the
+`stalled` rule instead. This reads the screen's text, so a harness that draws
+no such count, or a count worded differently, is still reported idle. When every watched agent is unreachable at once the terminal
 server is the problem, and the pass says so instead of calling every harness
 dead; repairing that is `agentctl watch`'s job.
 

@@ -20,6 +20,17 @@
 //! `slack1:since:<start - initial_backfill_seconds>`; messages created before that instant are
 //! never delivered. A provider report of lost events, or a saved position the provider can no
 //! longer replay, becomes a `gap`, which stops the bridge for operator review.
+//!
+//! # Whose events the stream carries
+//!
+//! The event stream carries the channel events delivered to the identity the client runs as.
+//! Slack delivers channel message events to a human member's own subscription, not to an app's
+//! Crewmate: on 2026-10-19 a tail run as the posting app's Crewmate subscribed and received no
+//! event for hours, while the same tail run as the owner caught up at once (#390
+//! slack-inbound-identity). So `cli_path` must run as a member, while the outbound helper's own
+//! `--cli` may run as the Crewmate. The diagnostics log warns once when the client's standard
+//! error names a Crewmate, and notes once when a stream stays subscribed for
+//! [`QUIET_NOTICE_MILLIS`] with no event at all, which in a busy channel points the same way.
 
 use std::collections::BTreeSet;
 use std::num::NonZeroU16;
@@ -58,6 +69,12 @@ const MAX_IGNORED_PREFIXES: usize = 32;
 // bot posts) is not a request.
 const MESSAGE_SUBTYPES: &[&str] = &["thread_broadcast", "file_share", "me_message"];
 const TRUNCATION_MARKER: &str = "\n[message truncated by the Slack provider]";
+/// How long a stream may stay subscribed without any event before the diagnostics log notes it.
+pub const QUIET_NOTICE_MILLIS: u64 = 30 * 60 * 1_000;
+const CREWMATE_WARNING: &str = "warning: the event stream client's output names a Crewmate, \
+so the tail may run as an app's Crewmate; Slack delivers channel message events to a human \
+member's own subscription, not to an app's Crewmate, so such a tail receives none. Point cli_path \
+at a client that runs as the human member, and keep the Crewmate for the outbound helper's --cli";
 
 /// Which transport reaches Slack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -218,6 +235,8 @@ impl PluginConfig {
                     })?;
                 Some(CliOptions {
                     program,
+                    prefix_arguments: Vec::new(),
+                    identity: crate::cli::ClientIdentity::User,
                     environment,
                     timeout: Duration::from_secs(
                         optional_seconds(data, "cli_timeout_seconds", 1..=120)?.unwrap_or(60),
@@ -533,6 +552,11 @@ impl ChatSubscriptionBackend for SlackBackend {
             cancel: Arc::clone(&self.cancel),
             diagnostics,
             refusals,
+            now_millis: self.now_millis,
+            opened_at_millis: now,
+            events_seen: false,
+            quiet_noted: false,
+            crewmate_warned: false,
             _transport: transport,
         }))
     }
@@ -557,6 +581,12 @@ struct SlackDriver {
     cancel: Arc<SharedCancel>,
     diagnostics: Diagnostics,
     refusals: crate::refusals::RefusalRecorder,
+    now_millis: fn() -> u64,
+    opened_at_millis: u64,
+    // Whether the stream has carried any sequenced event, replayed or new.
+    events_seen: bool,
+    quiet_noted: bool,
+    crewmate_warned: bool,
     _transport: Box<dyn SlackTransport>,
 }
 
@@ -721,6 +751,20 @@ impl ChatSubscriptionDriver for SlackDriver {
             }
             match self.stream.next(self.config.heartbeat_interval) {
                 StreamWait::Idle | StreamWait::Record(StreamRecord::Heartbeat) => {
+                    if !self.events_seen
+                        && !self.quiet_noted
+                        && (self.now_millis)().saturating_sub(self.opened_at_millis)
+                            >= QUIET_NOTICE_MILLIS
+                    {
+                        self.quiet_noted = true;
+                        self.diagnostics.log(&format!(
+                            "notice: no event has arrived in the {} minutes since this stream \
+                             subscribed; if the channel had messages in that time, check that \
+                             cli_path runs as a member that receives the channel's events (a \
+                             tail run as an app's Crewmate receives none)",
+                            QUIET_NOTICE_MILLIS / 60_000
+                        ));
+                    }
                     let sequence = self.take_sequence()?;
                     return Ok(Some(SubscriptionItem::Heartbeat(Heartbeat::new(sequence))));
                 }
@@ -733,6 +777,13 @@ impl ChatSubscriptionDriver for SlackDriver {
                 }
                 StreamWait::Record(StreamRecord::Notice(notice)) => {
                     self.diagnostics.log(&notice);
+                    if !self.crewmate_warned
+                        && notice.starts_with("stream stderr:")
+                        && notice.to_ascii_lowercase().contains("crewmate")
+                    {
+                        self.crewmate_warned = true;
+                        self.diagnostics.log(CREWMATE_WARNING);
+                    }
                 }
                 StreamWait::Record(StreamRecord::Gap(reason)) => {
                     let cursor = self
@@ -746,6 +797,7 @@ impl ChatSubscriptionDriver for SlackDriver {
                     event_type,
                     message,
                 }) => {
+                    self.events_seen = true;
                     if self.floor_sequence.is_some_and(|floor| sequence <= floor) {
                         continue;
                     }

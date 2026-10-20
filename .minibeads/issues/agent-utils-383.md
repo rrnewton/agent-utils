@@ -1,12 +1,13 @@
 ---
 title: 'slack-crewmate-outbound: the Slack outbound helper always passes --as, which a Crewmate-run client refuses'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - agentctl
 created_at: 2026-10-19T21:53:26.645806646+00:00
-updated_at: 2026-10-19T21:53:26.645806646+00:00
+updated_at: 2026-10-20T07:53:17.946821320+00:00
+closed_at: 2026-10-20T07:53:17.946821149+00:00
 ---
 
 # Description

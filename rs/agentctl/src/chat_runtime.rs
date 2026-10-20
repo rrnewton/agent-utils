@@ -31076,6 +31076,91 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
     }
 
     #[test]
+    fn a_reply_in_a_live_claude_code_rendering_is_captured() {
+        // #391 fenced-reply-not-captured. On 2026-10-20 a Claude Code coordinator that was
+        // mid-turn when its request was typed believed it had printed a reply between the marker
+        // lines, and the bridge captured nothing. Its transcript showed why: the reply text was
+        // in a thinking block, without marker lines, and no ordinary text it printed held a
+        // marker. These screens are rows of a real Claude Code pane read through Herdr on
+        // 2026-10-20 (a block after a lead row, a wrapped body row, the turn's closing row with
+        // background shells, the input box with its no-break space, and the footer), with the
+        // request's prompt echoed as Claude Code shows a prompt typed mid-turn. Each block is
+        // captured, so terminal capture was not what failed.
+        let root = temporary("live-claude-code-rendering");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let key = admitted(&state, 1).remove(0);
+        let prompt = prompted(&state, &key);
+        let echo = prompt
+            .split('\n')
+            .enumerate()
+            .map(|(index, line)| match (index, line.is_empty()) {
+                (0, _) => format!("❯ {line}"),
+                (_, true) => String::new(),
+                (_, false) => format!("  {line}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let footer = "✻ Sautéed for 5m 51s · done 12:44 AM · 2 shells still running\n\n\n\
+                      ❯\u{a0}\n\n  ⏵⏵ auto mode on · 2 shells · ← 1 agent · ↓ to manage\n";
+        // The block follows a lead row of the same message, as the live pane drew it.
+        let after_lead = format!(
+            "  Ran 7 shell commands\n\n\
+             ● Pausing so a capture can record how Claude Code draws this pane. The block below \
+             is the reply to the\n  request typed while the turn ran:\n\n\
+             \x20 <CHAT_REPLY_001>\n\
+             \x20 ACK, I got your test message. This line is deliberately long so that Claude \
+             Code wraps it across more than one row\n\
+             \x20 of the pane.\n\
+             \x20 Second line.\n\
+             \x20 </CHAT_REPLY_001>\n\n{footer}"
+        );
+        // Mid-turn: a tool call, the prompt Claude Code surfaced with the next tool result, and
+        // the reply opening its own message before the next tool call.
+        let mid_turn = format!(
+            "● Bash(sleep 30; agentctl chat status --bridge-state state)\n  ⎿  delivered None\n\n\
+             {echo}\n\n\
+             ● <CHAT_REPLY_001>\n  ACK, mid-turn.\n  </CHAT_REPLY_001>\n\n\
+             ● Bash(sleep 20; tail -3 helper.log)\n  ⎿  Running…\n\n{footer}"
+        );
+        for (screen, ordinal) in [(&after_lead, 1), (&mid_turn, 2)] {
+            let capture = state.capture_snapshot(screen).expect("capture");
+            assert_eq!(capture.replies, [(key.clone(), vec![ordinal])], "{screen}");
+            assert!(
+                capture.unknown_ids.is_empty()
+                    && capture.suppressed_ids.is_empty()
+                    && capture.refused.is_empty(),
+                "{screen}{capture:?}"
+            );
+        }
+        // What the coordinator printed on 2026-10-20: the reply's text with no marker lines,
+        // which posts nothing.
+        let unmarked = format!(
+            "{echo}\n\n● ACK, I got your test message.\n\n\
+             ● Bash(sleep 20; tail -3 helper.log)\n  ⎿  Running…\n\n{footer}"
+        );
+        let capture = state.capture_snapshot(&unmarked).expect("capture");
+        assert!(capture.replies.is_empty(), "{unmarked}{capture:?}");
+        let mut transport = FakeReplyTransport::default();
+        while state
+            .publish_one(&key, &mut transport)
+            .expect("publish captured reply")
+            .is_some()
+        {}
+        let texts = transport
+            .submissions
+            .iter()
+            .map(|submission| submission.2.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(texts.len(), 2, "{texts:?}");
+        assert!(
+            texts[0].ends_with("of the pane.\nSecond line."),
+            "{texts:?}"
+        );
+        assert!(texts[1].ends_with("ACK, mid-turn."), "{texts:?}");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn the_echoed_request_prompt_posts_nothing() {
         // The request prompt writes the reply marker lines out whole, and the bridge types that
         // prompt into the agent's pane, where it shows as a user turn: the prompt character and
