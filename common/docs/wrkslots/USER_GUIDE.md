@@ -348,7 +348,8 @@ reclaim fact, never the whole decision.
 
 The registered running command answers for agent slots only. It receives the agent name as its only
 positional argument and receives `WRKSLOTS_PROJECT_ROOT`, `WRKSLOTS_SLOT`, `WRKSLOTS_SLOT_TYPE`
-(always `agent`), `WRKSLOTS_TASK`, `WRKSLOTS_AGENT`, `WRKSLOTS_MACHINE`, generation, and owner
+(always `agent`), `WRKSLOTS_SLOT_PATH` (the normalized absolute slot directory, which may already be
+absent), `WRKSLOTS_TASK`, `WRKSLOTS_AGENT`, `WRKSLOTS_MACHINE`, generation, and owner
 identity fields in the environment. Its exit status means:
 
 - `0`: the registered mechanism verified the agent is dead;

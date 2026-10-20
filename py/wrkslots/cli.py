@@ -5418,10 +5418,22 @@ def _assert_external_handoff_source(path: Path) -> None:
         )
 
 
-def _assert_legacy_handoff_is_not_tracked(path: Path) -> None:
+def _legacy_handoff_is_committed_project_file(path: Path) -> bool:
+    """Whether a slot's HANDOFF.md is the repository's own committed file.
+
+    Returns True for a file tracked at HEAD with no staged or working-tree
+    change: that is the project's file, identical in every checkout, not a
+    handoff this slot's agent wrote, so it is ignored as a handoff. Measured
+    2026-10-19: a repository with a committed root HANDOFF.md refused removal
+    of every one of its flat-layout slots (13 rows) because the refusal below
+    fired for the unmodified file. Returns False for an untracked file. A
+    tracked file that differs from HEAD still refuses: its bytes are not
+    slot-specific provenance either way.
+    """
+
     root = _git_worktree_root_for_handoff_source(path, "legacy HANDOFF.md")
     if root is None:
-        return
+        return False
     try:
         relative = path.resolve(strict=True).relative_to(root)
     except (OSError, ValueError) as exc:
@@ -5441,17 +5453,48 @@ def _assert_legacy_handoff_is_not_tracked(path: Path) -> None:
         check=False,
         env_overrides={"GIT_OPTIONAL_LOCKS": "0"},
     )
-    if result.returncode == 0:
-        raise Refusal(
-            "slot HANDOFF.md is tracked by Git and cannot prove a slot-specific "
-            f"handoff: {path}"
-        )
-    if result.returncode != 1:
+    if result.returncode == 1:
+        return False
+    if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
         raise Refusal(
             f"cannot determine whether legacy HANDOFF.md is tracked by Git: {path}"
             + (f": {detail}" if detail else "")
         )
+    unchanged = _GitVcs._run(
+        root,
+        (
+            "-c",
+            "core.fsmonitor=false",
+            "diff",
+            "--quiet",
+            "--no-ext-diff",
+            "HEAD",
+            "--",
+            relative.as_posix(),
+        ),
+        check=False,
+        env_overrides={"GIT_OPTIONAL_LOCKS": "0"},
+    )
+    if unchanged.returncode == 0:
+        return True
+    if unchanged.returncode == 1:
+        raise Refusal(
+            "slot HANDOFF.md is tracked by Git and modified, so it cannot prove a "
+            f"slot-specific handoff: {path}"
+        )
+    detail = unchanged.stderr.strip() or unchanged.stdout.strip()
+    raise Refusal(
+        f"cannot determine whether tracked legacy HANDOFF.md differs from HEAD: {path}"
+        + (f": {detail}" if detail else "")
+    )
+
+
+def _slot_legacy_handoff_is_committed_project_file(slot_path: Path) -> bool:
+    path = slot_path / "HANDOFF.md"
+    if path.is_symlink() or not path.is_file():
+        return False
+    return _legacy_handoff_is_committed_project_file(path)
 
 
 def _legacy_handoff_artifact(
@@ -5472,7 +5515,8 @@ def _legacy_handoff_artifact(
     actual_source_path = _canonical_handoff_source(
         path, contents, identity, f"slot {record.slot} HANDOFF.md"
     )
-    _assert_legacy_handoff_is_not_tracked(actual_source_path)
+    if _legacy_handoff_is_committed_project_file(actual_source_path):
+        return None
     source_path = (
         _slot_directory(config, record.slot, record.slot_type) / "HANDOFF.md"
     ).resolve(strict=False)
@@ -17209,6 +17253,11 @@ def _liveness_environment(config: Config, record: ActiveRecord) -> dict[str, str
         "WRKSLOTS_PROJECT_ROOT": str(config.root),
         "WRKSLOTS_SLOT": record.slot,
         "WRKSLOTS_SLOT_TYPE": record.slot_type,
+        # The slot directory, so the liveness authority can observe use of
+        # the path itself, not only of the agent name.
+        "WRKSLOTS_SLOT_PATH": os.path.normpath(
+            str(_slot_directory(config, record.slot, record.slot_type).absolute())
+        ),
         "WRKSLOTS_AGENT": record.agent,
         "WRKSLOTS_TASK": record.task,
         "WRKSLOTS_MACHINE": record.machine,
@@ -22940,6 +22989,24 @@ def _assert_handoff_read(
         config, record, slot_path, events=selected_events
     )
     if artifact is None:
+        if latest is not None and _slot_legacy_handoff_is_committed_project_file(slot_path):
+            # A recorded read of a slot whose HANDOFF.md is now the
+            # repository's own committed file: the read stays recorded, and
+            # there is no slot-specific file left to restore or to read
+            # again (see _legacy_handoff_is_committed_project_file).
+            return latest
+        if latest is not None and _path_is_absent(slot_path):
+            # The slot directory itself is gone, so a legacy HANDOFF.md that
+            # lived in it is gone with it, and "restore the exact file" is
+            # an impossible remedy. The read is durably recorded in the event
+            # log (sequence, digest, time), which is what removal needs: proof
+            # that a coordinator saw the handoff. A sidecar that vanished
+            # after an owner-authenticated write still refuses in
+            # _resolve_handoff_artifact above, and a present directory still
+            # refuses below. Measured 2026-10-19: 15 rows whose read handoff
+            # had been salvaged before their directories were removed could
+            # never be retired.
+            return latest
         if latest is not None:
             raise Refusal(
                 f"slot {record.slot} handoff artifact disappeared after it was read. "
@@ -27430,6 +27497,20 @@ def _cmd_hold(args: argparse.Namespace) -> int:
     return 0
 
 
+def _record_storage_absent(config: Config, record: ActiveRecord) -> bool:
+    """True only when lstat proves the slot directory and every checkout path absent."""
+
+    try:
+        _assert_record_paths(config, record)
+    except Refusal:
+        return False
+    paths = [_slot_directory(config, record.slot, record.slot_type)]
+    paths.extend(
+        _stored_path(config, checkout.path, "checkout path") for checkout in record.checkouts
+    )
+    return all(_path_is_absent(path) for path in paths)
+
+
 def _cmd_unhold(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
@@ -27437,7 +27518,27 @@ def _cmd_unhold(args: argparse.Namespace) -> int:
         _refuse_partial_state(config)
         _assert_no_journal(config)
         states, _archives = _validate_global_state(config)
-        _assert_command_registry_storage(config, states, args)
+        try:
+            _assert_command_registry_storage(config, states, args)
+        except Refusal as exc:
+            # A hold protects storage, and releasing one changes nothing on
+            # disk: every removal or recovery proof still runs afterwards.
+            # Once the held slot's storage is absent, its storage refusal
+            # ("slot directory is missing or unsafe") made the hold permanent,
+            # and the row with it. Measured 2026-10-19: 7 held rows whose
+            # directories had been salvaged and removed could not be released.
+            # A storage defect in a slot whose directory still exists refuses.
+            held = next(
+                (row for row in _load_active(config).slots if row.slot == args.slot), None
+            )
+            if held is None or not _record_storage_absent(config, held):
+                raise
+            print(
+                f"NOTE: slot {held.slot} storage is absent ({exc}); releasing its hold "
+                "changes nothing on disk, and recover-absent-agent-rows still proves "
+                "everything else before retiring the row",
+                file=sys.stderr,
+            )
         record = _find_record(_load_active(config), args.slot)
         path = _hold_path(config, record.slot, record.machine)
         if _load_hold(config, record.slot, record.machine) is None:
@@ -33366,6 +33467,11 @@ def _audit_record(
             agent_running,
         )
     reasons: list[str] = []
+    # Reasons the recover-absent commands do not share, dropped below once the
+    # slot directory is known to be absent, so that audit and recovery agree:
+    # recovery needs no owner generation when none was recorded
+    # (_assert_absent_agent_liveness checks a recorded one only).
+    removal_only_reasons: list[str] = []
     process_census_unknown = False
     if not release_honoured:
         if not heartbeat_expired:
@@ -33377,6 +33483,7 @@ def _audit_record(
             reasons.append(f"liveness is {liveness_state}: {liveness_detail}")
         if record.owner is None:
             reasons.append("no owner process generation is recorded, so death is unknown")
+            removal_only_reasons.append(reasons[-1])
         elif owner_state != "dead":
             reasons.append(f"recorded owner is {owner_state}: {owner_detail}")
     slot_path = _slot_directory(config, record.slot, record.slot_type)
@@ -33423,6 +33530,8 @@ def _audit_record(
                 raise Refusal(f"checkout {checkout.name} remote URL changed")
     except Refusal as exc:
         reasons.append(str(exc))
+    if slot_absent:
+        reasons = [reason for reason in reasons if reason not in removal_only_reasons]
     if slot_absent and release_honoured and owner_state != "dead":
         # An honoured release lets REMOVE proceed past a live owner, but the
         # recover-absent commands bind the exact recorded owner generation and
@@ -33639,6 +33748,29 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         rows: list[dict[str, object]] = []
         running_agent_count = 0
         audit_vcs = _AuditGitVcs()
+        # A Git worktree registered inside a row's slot that no checkout of
+        # the row names (a nested helper such as `<slot>/.base-<hex>`) makes
+        # remove refuse through _assert_command_registry_storage, so audit
+        # must not call that slot DELETABLE. Measured 2026-10-19: a slot audit
+        # reported DELETABLE was refused by remove for exactly this.
+        stray_registrations: dict[tuple[str, str], list[str]] = {}
+        stray_registration_error: str | None = None
+        try:
+            for finding in _registry_storage_inconsistencies(
+                config, states, vcs=audit_vcs, verify_row_identity=False
+            ):
+                if (
+                    finding.kind == "git-registration-without-row"
+                    and finding.slot_type is not None
+                    and finding.slot is not None
+                ):
+                    stray_registrations.setdefault(
+                        (finding.slot_type, finding.slot), []
+                    ).append(finding.detail)
+        except Refusal as exc:
+            stray_registration_error = (
+                f"cannot list Git worktree registrations inside the managed root: {exc}"
+            )
         cache_planned: dict[str, tuple[CacheDirectory, ...]] = {}
         cache_errors: dict[str, str] = {}
         record_cache_subjects: dict[tuple[str, str, int], str] = {}
@@ -33782,6 +33914,17 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                 represented_seals.add(
                     (record.machine, record.slot, sealed_generation)
                 )
+            if row["verdict"] in ("DELETABLE", "BLOCKED"):
+                strays = stray_registrations.get((record.slot_type, record.slot), [])
+                if stray_registration_error is not None:
+                    strays = [stray_registration_error]
+                if strays and not _path_is_absent(
+                    _slot_directory(config, record.slot, record.slot_type)
+                ):
+                    reasons = row["reasons"]
+                    assert isinstance(reasons, list)
+                    reasons.extend(strays)
+                    row["verdict"] = "BLOCKED"
             rows.append(row)
             running_agent_count += int(running)
         metrics.finish(
@@ -51828,6 +51971,17 @@ def _absent_agent_journal_inputs(
     return item, record, branch_witnesses, expected_receipts, archive_entry
 
 
+class _AbsentAgentCensusRefusal(Refusal):
+    """The liveness, process, mount or user-service census refused an absent row.
+
+    Same text as the refusal it wraps. Only this kind withdraws a prepared
+    recovery journal (_recover_absent_agent_row): it describes the host at
+    one instant, so a rerun from a fresh plan is the retry. A refusal about
+    the row's own evidence (handoff, storage, remote containment) keeps the
+    journal, so a resume re-checks exactly what was planned.
+    """
+
+
 def _assert_absent_agent_safe(
     config: Config,
     record: ActiveRecord,
@@ -51849,7 +52003,12 @@ def _assert_absent_agent_safe(
         record,
         _slot_directory(config, record.slot, record.slot_type),
     )
-    _assert_absent_agent_liveness(config, record, paths)
+    try:
+        _assert_absent_agent_liveness(config, record, paths)
+    except StateError:
+        raise
+    except Refusal as exc:
+        raise _AbsentAgentCensusRefusal(str(exc)) from exc
     vcs = _GitVcs()
     selected_witnesses = (
         tuple(branch_witnesses)
@@ -51931,15 +52090,38 @@ def _recover_absent_agent_row(
         _restore_worktree_modules_set_aside(
             administration, _worktree_modules_retained(administration, recorded)
         )
-    _assert_absent_agent_safe(
-        config,
-        current,
-        branch_witnesses,
-        frozenset(removed_names),
-        preserved=preserved_names,
-        containment=containment,
-        module_salvage=module_salvage,
-    )
+    try:
+        _assert_absent_agent_safe(
+            config,
+            current,
+            branch_witnesses,
+            frozenset(removed_names),
+            preserved=preserved_names,
+            containment=containment,
+            module_salvage=module_salvage,
+        )
+    except _AbsentAgentCensusRefusal as exc:
+        # ⚠️ ONE ROW'S TRANSIENT REFUSAL MUST NOT HOLD THE JOURNAL. A journal
+        # still in its prepared phase records only intent: no rescue ref was
+        # pushed, no registration removed, nothing archived. Leaving it in
+        # place made every later row of a batch refuse with "requested agent
+        # row differs from the interrupted recovery" until a separate
+        # `recover` ran. Measured 2026-10-19: 2 of 3 batches stopped that way
+        # on a churning user-systemd census. Withdrawing it is exact, and a
+        # rerun of the row re-proves everything from the start. Only a census
+        # refusal withdraws it (_AbsentAgentCensusRefusal).
+        if (
+            raw.get("phase") == "prepared"
+            and not removed_names
+            and preserved_count == 0
+        ):
+            _clear_journal(config, raw)
+            raise Refusal(
+                f"{exc}. state: REFUSED -- nothing had been pushed, removed or "
+                f"archived for agent row {item.slot}, so its recovery journal was "
+                "withdrawn; rerun the row to retry"
+            ) from exc
+        raise
     journal = dict(raw)
     preserved = [
         dict(_as_mapping(value, f"preserved[{index}]"))
@@ -56494,6 +56676,27 @@ def _user_systemd_jobs(
 
 
 def _user_systemd_snapshot() -> tuple[Mapping[str, str], ...]:
+    """Every user service and scope with its path evidence, from a settled listing.
+
+    The manager is listed, the properties of each unit not yet read are read,
+    and the manager is listed again (with its jobs). The snapshot is the
+    second listing once every unit in it has evidence read while the unit had
+    exactly the identity, state and job it has in that listing.
+
+    ⚠️ ONLY UNREAD OR CHANGED UNITS ARE READ AGAIN, AND A UNIT THAT VANISHED IS
+    DROPPED. Each attempt used to re-read every unit and refuse unless the
+    whole population was identical across the attempt. Measured 2026-10-19 on
+    a shared host: short-lived ``run-p<pid>-i<n>.scope`` units start and stop
+    several times a second, so 4 of 6 snapshots refused, and every recovery
+    and removal that needed one failed with them. A unit gone from the later
+    listing no longer exists and cannot use any path; a unit new in it has no
+    evidence yet, so it is read on the next attempt, and so is a unit whose
+    state or job changed. Evidence is kept only when the properties report
+    the state the listing gave, because that state chose which properties
+    were read. What is returned is still exactly the later listing, each unit
+    with evidence matching it.
+    """
+
     budget = _ReadOnlyCommandBudget.start(
         timeout_seconds=30,
         stdout_limit=1024 * 1024,
@@ -56510,10 +56713,14 @@ def _user_systemd_snapshot() -> tuple[Mapping[str, str], ...]:
             *_USER_SYSTEMD_UNIT_PROPERTIES,
         )
     }
+    # unit name -> (the unit exactly as its evidence was read, the evidence)
+    evidence: dict[str, tuple[_UserSystemdUnit, dict[str, str]]] = {}
     for attempt in range(_USER_SYSTEMD_SNAPSHOT_ATTEMPTS):
-        selected_by_name = {unit.unit: unit for unit in selected}
-        evidence: dict[str, dict[str, str]] = {}
         for unit in selected:
+            known = evidence.get(unit.unit)
+            if known is not None and known[0] == unit:
+                continue
+            evidence.pop(unit.unit, None)
             live = unit.active_state not in {"inactive", "failed"} or unit.job_id != 0
             if unit.unit.endswith(".service"):
                 properties = (
@@ -56525,12 +56732,9 @@ def _user_systemd_snapshot() -> tuple[Mapping[str, str], ...]:
             else:
                 properties = _USER_SYSTEMD_SCOPE_PROPERTIES
                 interface = "org.freedesktop.systemd1.Scope"
-            evidence[unit.unit] = _user_systemd_properties(
+            read = _user_systemd_properties(
                 unit.object_path, interface, properties, budget
             )
-
-        current: list[_UserSystemdUnit] = []
-        for unit in selected:
             values = _user_systemd_properties(
                 unit.object_path,
                 _USER_SYSTEMD_UNIT_INTERFACE,
@@ -56551,34 +56755,22 @@ def _user_systemd_snapshot() -> tuple[Mapping[str, str], ...]:
             sub_state = _user_systemd_state(
                 values["SubState"], f"user-systemd unit {unit.unit} substate"
             )
-            evidence[unit.unit]["RequiresMountsFor"] = values["RequiresMountsFor"]
-            current.append(
-                dataclasses.replace(
-                    unit,
-                    load_state=load_state,
-                    active_state=active_state,
-                    sub_state=sub_state,
-                )
-            )
+            read["RequiresMountsFor"] = values["RequiresMountsFor"]
+            if (load_state, active_state, sub_state) == (
+                unit.load_state,
+                unit.active_state,
+                unit.sub_state,
+            ):
+                evidence[unit.unit] = (unit, read)
 
         listed_after = _user_systemd_units(budget)
         listed_after_by_name = {unit.unit: unit for unit in listed_after}
         jobs = _user_systemd_jobs(budget, listed_after_by_name)
-        current = [
-            dataclasses.replace(
-                unit,
-                job_id=jobs.get(unit.unit, (0, "", "/"))[0],
-                job_type=jobs.get(unit.unit, (0, "", "/"))[1],
-                job_path=jobs.get(unit.unit, (0, "", "/"))[2],
-            )
-            for unit in current
-        ]
         listed_jobs = {
             unit.unit: (unit.job_id, unit.job_type, unit.job_path)
             for unit in listed_after
             if unit.job_id != 0
         }
-        current_by_name = {unit.unit: unit for unit in current}
         listed_with_jobs = tuple(
             dataclasses.replace(
                 unit,
@@ -56588,11 +56780,11 @@ def _user_systemd_snapshot() -> tuple[Mapping[str, str], ...]:
             )
             for unit in listed_after
         )
-        listed_with_jobs_by_name = {unit.unit: unit for unit in listed_with_jobs}
-        stable = (
-            listed_jobs == jobs
-            and selected_by_name == current_by_name
-            and current_by_name == listed_with_jobs_by_name
+        for name in set(evidence) - set(listed_after_by_name):
+            del evidence[name]
+        stable = listed_jobs == jobs and all(
+            unit.unit in evidence and evidence[unit.unit][0] == unit
+            for unit in listed_with_jobs
         )
         if not stable:
             if attempt < _USER_SYSTEMD_SNAPSHOT_ATTEMPTS - 1:
@@ -56606,7 +56798,7 @@ def _user_systemd_snapshot() -> tuple[Mapping[str, str], ...]:
         result: list[dict[str, str]] = []
         for unit in listed_with_jobs:
             values = {name: "" for name in property_names}
-            values.update(evidence[unit.unit])
+            values.update(evidence[unit.unit][1])
             values.update(
                 {
                     "Id": unit.unit,

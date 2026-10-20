@@ -932,9 +932,15 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # Its 3 cases of a discard that never mounts an image through the stale
     # copy (a fence that cannot release it, a rolled-back fence, and destroy's
     # phase) are mapped.
-    assert len(all_tests) == 2087
+    # The 10 guard false-positive cases of 2026-10-19 (the liveness slot path,
+    # a read legacy handoff gone with its directory and its present-directory
+    # refusal, unhold of absent storage and its present-slot refusal, a
+    # withdrawn prepared journal, an ownerless absent row audit, a nested
+    # registered worktree, transient user-systemd scopes, and a modified
+    # tracked flat handoff) are mapped.
+    assert len(all_tests) == 2097
     assert len(ordinary) == 337
-    assert len(mapped) == 1750
+    assert len(mapped) == 1760
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {

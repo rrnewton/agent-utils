@@ -21007,9 +21007,11 @@ def test_two_flat_tracked_handoffs_are_not_legacy_retirement_evidence(
         str(os.getpid()),
     )
 
+    # The committed project file is identical in every checkout and is not a
+    # handoff at all: read-handoff finds none, and records no read.
     for refused_read in (first_read, second_read):
         assert refused_read.returncode == 3
-        assert "tracked by Git" in refused_read.stderr
+        assert "has no handoff sidecar or legacy HANDOFF.md" in refused_read.stderr
     queued = json.loads(
         raw_command(project, "retirement-queue", "--format", "json").stdout
     )
@@ -22461,7 +22463,7 @@ def test_historical_unprovenanced_read_refuses_manual_remove_until_safe_reread(
     assert not checkout(project).parent.exists()
 
 
-def test_tracked_flat_handoff_with_historical_read_refuses_manual_remove(
+def test_tracked_flat_handoff_with_historical_read_does_not_block_remove(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -22481,12 +22483,41 @@ def test_tracked_flat_handoff_with_historical_read_refuses_manual_remove(
     set_liveness(project, "dead")
     monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None)
 
+    removed = raw_command(project, "remove", "slot01", "--coordinator-pid", str(os.getpid()), "--expected-generation", "1")
+
+    # Regression 2026-10-19: a repository's committed root HANDOFF.md refused
+    # removal of every flat slot. The unmodified committed file is the
+    # project's, not the slot's, so it neither blocks removal nor counts as
+    # an unread or vanished handoff, and the recorded read stays recorded.
+    assert removed.returncode == 0, removed.stderr
+    assert not checkout(project).exists()
+    assert (repository / "HANDOFF.md").is_file()
+
+
+def test_modified_tracked_flat_handoff_still_refuses_remove(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, repository, _remote = make_project(
+        tmp_path, worktrees_directory="worktrees/slots", layout="flat"
+    )
+    broadcast = repository / "HANDOFF.md"
+    broadcast.write_text("shared repository instructions\n", encoding="utf-8")
+    git(repository, "add", "HANDOFF.md")
+    git(repository, "commit", "-m", "add shared instructions")
+    git(repository, "push", "origin", "main")
+    assert create(project).returncode == 0
+    handoff = checkout(project) / "HANDOFF.md"
+    handoff.write_text("slot-specific notes over the shared file\n", encoding="utf-8")
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None)
+
     refused = raw_command(project, "remove", "slot01", "--coordinator-pid", str(os.getpid()), "--expected-generation", "1")
 
     assert refused.returncode == 3
-    assert "tracked by Git" in refused.stderr
-    assert checkout(project).is_dir()
-    assert handoff.is_file()
+    assert "tracked by Git and modified" in refused.stderr
+    assert handoff.read_text(encoding="utf-8") == "slot-specific notes over the shared file\n"
 
 
 
@@ -48991,11 +49022,73 @@ def test_user_systemd_busctl_relists_changed_unit_population_before_success(
 
     monkeypatch.setattr(wrkslots, "_run_user_busctl", run)
     snapshot = wrkslots._user_systemd_snapshot()
-    assert listing_reads == 3
+    # A unit new in the later listing has no evidence yet, so it costs one
+    # more attempt. A unit that only vanished does not: it no longer exists,
+    # and every unit still listed already has matching evidence.
+    vanished_only = set(later_names) < set(initial_names)
+    assert listing_reads == (2 if vanished_only else 3)
     assert {unit["Id"] for unit in snapshot} == expected_names
     if "second.service" in expected_names:
         second = next(unit for unit in snapshot if unit["Id"] == "second.service")
         assert second["WorkingDirectory"] == "/work/second.service"
+
+
+def test_user_systemd_snapshot_settles_while_transient_scopes_come_and_go(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression 2026-10-19: short-lived run-*.scope units refused 4 of 6 snapshots.
+
+    The population never holds still across a whole attempt: each listing
+    drops the previous transient scope, and some add a new one, as a host
+    starting short commands under systemd-run does. A stable service is listed
+    throughout. The old loop refused because no attempt saw two identical
+    listings. Only unread units are read now, a vanished one is dropped, and
+    the snapshot settles on the first later listing that adds nothing unread.
+    """
+
+    stable = busctl_unit_row("stable.service")
+    listings = [
+        ["a"],
+        ["b"],  # a vanished, b is new and unread
+        [],  # b vanished; nothing unread remains
+        ["c"],
+        ["d"],
+    ]
+    listing_reads = 0
+    reads: list[str] = []
+
+    def run(arguments: Sequence[str], _budget: object, **_kwargs: object) -> bytes:
+        nonlocal listing_reads
+        call = tuple(arguments)
+        if call[0] == "call" and call[4] == "ListUnitsByPatterns":
+            scopes = listings[min(listing_reads, len(listings) - 1)]
+            listing_reads += 1
+            rows = [stable, *(busctl_unit_row(f"run-{name}.scope") for name in scopes)]
+            return busctl_json("a(ssssssouso)", [rows])
+        if call[0] == "call" and call[4] == "ListJobs":
+            return busctl_json("a(usssoo)", [[]])
+        unit = call[2].rsplit("/", 1)[1].replace("_2e", ".").replace("_2d", "-")
+        if call[3] in ("org.freedesktop.systemd1.Service", "org.freedesktop.systemd1.Scope"):
+            reads.append(unit)
+            source = (
+                wrkslots._USER_SYSTEMD_SERVICE_PROPERTIES
+                if call[3].endswith("Service")
+                else wrkslots._USER_SYSTEMD_SCOPE_PROPERTIES
+            )
+            specs = tuple(spec for spec in source if spec[0] in call[4:])
+            return busctl_property_values(specs, {"ControlGroup": f"/user.slice/{unit}"})
+        return busctl_property_values(
+            wrkslots._USER_SYSTEMD_UNIT_PROPERTIES,
+            {"Id": unit, "LoadState": "loaded", "ActiveState": "active", "SubState": "running"},
+        )
+
+    monkeypatch.setattr(wrkslots, "_run_user_busctl", run)
+    snapshot = wrkslots._user_systemd_snapshot()
+    assert [unit["Id"] for unit in snapshot] == ["stable.service"]
+    assert snapshot[0]["ControlGroup"] == "/user.slice/stable.service"
+    assert listing_reads == 3
+    # The stable service is read once, not once per attempt; each new scope once.
+    assert reads == ["stable.service", "run-a.scope", "run-b.scope"]
 
 
 def test_user_systemd_busctl_retries_new_job_before_accepting_inactive_unit(
@@ -56598,3 +56691,229 @@ from wrkslots.tests import orphan_retire_cases  # noqa: E402
 
 _collect_lifecycle_cases(foreign_mount_ns_cases)
 _collect_lifecycle_cases(orphan_retire_cases)
+
+
+# ---------------------------------------------------------------------------
+# Guard false positives measured 2026-10-19 on a shared host: rows whose
+# directories had already been salvaged and removed could not be retired.
+# ---------------------------------------------------------------------------
+
+
+def test_liveness_environment_names_the_slot_path(tmp_path: Path) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    config = wrkslots._load_config(str(project), "testhost")
+    record = wrkslots._find_record(wrkslots._load_active(config), "slot01")
+    environment = wrkslots._liveness_environment(config, record)
+    expected = wrkslots._slot_directory(config, "slot01", "agent").absolute()
+    assert environment["WRKSLOTS_SLOT_PATH"] == os.path.normpath(str(expected))
+    assert Path(environment["WRKSLOTS_SLOT_PATH"]).name == environment["WRKSLOTS_SLOT"]
+
+
+def test_recover_absent_agent_row_accepts_a_read_legacy_handoff_gone_with_its_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The handoff was read, salvaged, and removed with the slot directory.
+
+    "restore the exact legacy HANDOFF.md" is impossible once the directory is
+    gone; the read itself is durably recorded, which is what removal needs.
+    The read is the legacy in-place kind such rows carry (no sidecar).
+    """
+
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    config = wrkslots._load_config(str(project), "testhost")
+    slot_path = wrkslots._slot_directory(config, "slot01", "agent")
+    contents = b"continue from here\n"
+    (slot_path / "HANDOFF.md").write_bytes(contents)
+    _append_historical_unprovenanced_read(config, contents)
+    record = mark_recorded_owner_dead(project, "slot01")
+    shutil.rmtree(slot_path)
+    assert not wrkslots._handoff_sidecar_path(config, "slot01", 1).exists()
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_agent_recovery(project, record, apply=True) == 0, capsys.readouterr().err
+    assert not wrkslots._load_active(config).slots
+    assert wrkslots._load_archive(config).records[-1]["slot"] == "slot01"
+    assert registry_journals(project) == []
+
+
+def test_read_legacy_handoff_missing_from_a_present_directory_still_refuses(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    config = wrkslots._load_config(str(project), "testhost")
+    slot_path = wrkslots._slot_directory(config, "slot01", "agent")
+    _append_historical_unprovenanced_read(config, b"continue from here\n")
+    record = wrkslots._find_record(wrkslots._load_active(config), "slot01")
+    with pytest.raises(wrkslots.Refusal, match="disappeared after it was read"):
+        wrkslots._assert_handoff_read(config, record, slot_path)
+
+
+def test_unhold_releases_a_hold_on_a_row_whose_storage_is_absent(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    held = raw_command(project, "hold", "slot01", "--reason", "keep for review")
+    assert held.returncode == 0, held.stderr
+    record = mark_recorded_owner_dead(project, "slot01")
+    config = wrkslots._load_config(str(project), "testhost")
+    shutil.rmtree(wrkslots._slot_directory(config, "slot01", "agent"))
+    assert wrkslots._load_hold(config, "slot01", "testhost") is not None
+
+    released = raw_command(project, "unhold", "slot01")
+
+    assert released.returncode == 0, released.stderr
+    assert "released hold slot=slot01" in released.stdout
+    assert "storage is absent" in released.stderr
+    assert wrkslots._load_hold(config, "slot01", "testhost") is None
+    assert wrkslots._find_record(wrkslots._load_active(config), "slot01") == record
+
+
+def test_unhold_still_refuses_a_storage_defect_in_a_present_slot(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    held = raw_command(project, "hold", "slot01", "--reason", "keep for review")
+    assert held.returncode == 0, held.stderr
+    # An unexpected entry: the slot directory no longer matches its record.
+    config = wrkslots._load_config(str(project), "testhost")
+    (wrkslots._slot_directory(config, "slot01", "agent") / "stray").mkdir()
+
+    released = raw_command(project, "unhold", "slot01")
+
+    assert released.returncode == 3
+    assert wrkslots._load_hold(config, "slot01", "testhost") is not None
+
+
+def test_recover_absent_agent_rows_withdraws_a_prepared_journal_so_later_rows_proceed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One row's transient census refusal used to block every later row.
+
+    The refusal comes after the journal is written but before anything is
+    pushed or removed, so the journal is withdrawn, the other rows recover,
+    and a rerun recovers the refused row.
+    """
+
+    project, _repository, _remote, records = absent_agent_rows_project(tmp_path, monkeypatch)
+    config = wrkslots._load_config(str(project), "testhost")
+    original = wrkslots._assert_absent_agent_liveness
+    calls = {"gone01": 0}
+
+    def flaky(config_: wrkslots.Config, record: wrkslots.ActiveRecord, paths: Sequence[Path]) -> None:
+        if record.slot == "gone01":
+            calls["gone01"] += 1
+            if calls["gone01"] == 2:
+                raise wrkslots.Refusal(
+                    "user-systemd unit population, identity, state, or jobs changed during "
+                    "three bounded enumeration attempts"
+                )
+        original(config_, record, paths)
+
+    monkeypatch.setattr(wrkslots, "_assert_absent_agent_liveness", flaky)
+    returncode, stdout, stderr = run_absent_agent_rows(
+        project,
+        *(f"--row={absent_row_argument(record)}" for record in records),
+        "--format",
+        "json",
+        apply=True,
+    )
+    assert returncode == 1, stderr
+    payload, outcomes = absent_rows_payload(stdout)
+    assert outcomes == {"gone01": "refused", "gone02": "recovered", "gone03": "recovered"}
+    refused = next(
+        row for row in cast(list[Mapping[str, object]], payload["rows"]) if row["slot"] == "gone01"
+    )
+    assert "recovery journal was withdrawn" in str(refused["reason"])
+    assert payload["recovery_required"] is False
+    assert registry_journals(project) == []
+    assert [row.slot for row in wrkslots._load_active(config).slots] == ["gone01"]
+
+    returncode, stdout, stderr = run_absent_agent_rows(
+        project, f"--row={absent_row_argument(records[0])}", apply=True
+    )
+    assert returncode == 0, stderr
+    assert not wrkslots._load_active(config).slots
+    assert registry_journals(project) == []
+
+
+def test_audit_calls_an_absent_ownerless_row_recoverable_and_recovery_agrees(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No owner generation recorded: recovery never needed one, so audit must not block."""
+
+    project, repository, _remote = make_project(tmp_path)
+    record = prepare_absent_agent_row(project, repository)
+    config = wrkslots._load_config(str(project), "testhost")
+    state = wrkslots._load_active(config)
+    expired = (
+        dt.datetime.now(dt.timezone.utc)
+        - dt.timedelta(seconds=record.heartbeat_ttl_seconds + 1)
+    ).isoformat(timespec="seconds")
+    ownerless = replace(record, owner=None, heartbeat_at=expired)
+    wrkslots._write_active_state(
+        config,
+        wrkslots._replace_record(state, ownerless),
+        action="test-ownerless-row",
+        slot=record.slot,
+    )
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_process_path_census",
+        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+    )
+
+    stdout = io.StringIO()
+    with contextlib.redirect_stdout(stdout):
+        assert wrkslots.main(["--project-root", str(project), "audit", "--format", "json"]) == 0
+    (row,) = [row for row in json.loads(stdout.getvalue())["slots"] if row["slot"] == record.slot]
+    assert row["verdict"] == "RECOVERABLE", row["reasons"]
+    assert not any("no owner process generation" in reason for reason in row["reasons"])
+
+    assert run_absent_agent_recovery(project, ownerless, apply=True) == 0
+    assert not wrkslots._load_active(config).slots
+
+
+def test_audit_blocks_a_slot_holding_a_nested_registered_worktree_as_remove_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """audit said DELETABLE, then remove refused over `<slot>/.base-<hex>`."""
+
+    project, repository, _remote = make_project(
+        tmp_path, worktrees_directory="worktrees/slots", layout="flat"
+    )
+    assert create(project).returncode == 0
+    slot_path = checkout(project)
+    exclude = Path(git(repository, "rev-parse", "--git-common-dir").stdout.strip())
+    if not exclude.is_absolute():
+        exclude = repository / exclude
+    (exclude / "info").mkdir(exist_ok=True)
+    with (exclude / "info" / "exclude").open("a", encoding="utf-8") as handle:
+        handle.write(".base-*\n")
+    git(repository, "worktree", "add", "--detach", str(slot_path / ".base-3ed06ee8"), "HEAD")
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_process_path_census",
+        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+    )
+
+    stdout = io.StringIO()
+    with contextlib.redirect_stdout(stdout):
+        assert wrkslots.main(["--project-root", str(project), "audit", "--format", "json"]) == 0
+    (row,) = json.loads(stdout.getvalue())["slots"]
+    assert row["verdict"] == "BLOCKED", row["reasons"]
+    assert any(".base-3ed06ee8" in reason for reason in row["reasons"])
+
+    refused = remove(project)
+    assert refused.returncode == 3
+    assert ".base-3ed06ee8" in refused.stderr
