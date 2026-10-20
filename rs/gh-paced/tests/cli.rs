@@ -2263,22 +2263,33 @@ fn thread_count(pid: u32) -> Option<usize> {
         .and_then(|rest| rest.trim().parse().ok())
 }
 
-/// Wait until gh-paced's stdout reader thread has stopped. Once gh has exited, gh-paced runs
-/// five threads: main, a reader and a writer for stdout, and a reader and a writer for stderr.
-/// The stderr pair ends at the end of that stream, and the stdout writer ends only after the
-/// reader has closed its queue, which it does as it stops. So at most two threads left means
-/// the stdout reader has stopped, however long a loaded host took to run it. `#389 gate-flakes`.
+/// Wait until gh-paced's stdout reader thread has stopped.
+///
+/// In this test's spawn (stdout a terminal to tee, stderr piped, stdin null)
+/// the runner's thread set is main plus a reader and writer for each stream.
+/// The stderr pair ends at the end of that stream, and the stdout writer
+/// ends only after the reader has closed its queue, which it does as it
+/// stops.  So once the tee threads have been seen up (at least three
+/// threads), at most two left means the stdout reader has stopped, however
+/// long a loaded host took to run it.  The latch matters: gh is spawned
+/// before the tee threads, and a starved main could let `end api` be logged
+/// while gh-paced still has one thread — that sample must not be mistaken
+/// for the reader having stopped, or the lock would be let go before any
+/// hook wait and the stopped-reader rescan never exercised.
+/// `#389 gate-flakes`.
 fn wait_for_reader_stopped(child: &std::process::Child) {
     let begun = Instant::now();
+    let mut tee_threads_seen = false;
     loop {
         match thread_count(child.id()) {
-            Some(n) if n <= 2 => return,
+            Some(n) if n >= 3 => tee_threads_seen = true,
+            Some(n) if n <= 2 && tee_threads_seen => return,
+            Some(_) => {}
             None => panic!("gh-paced exited before its reader stopped"),
-            _ => {}
         }
         assert!(
             begun.elapsed().as_secs_f64() < 120.0,
-            "the stdout reader never stopped"
+            "the stdout reader never stopped (tee threads seen: {tee_threads_seen})"
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
