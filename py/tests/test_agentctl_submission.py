@@ -1035,9 +1035,26 @@ def test_clear_composer_empties_a_multi_row_draft_without_submitting() -> None:
 def test_the_cli_passes_deliver_while_working_only_when_asked() -> None:
     from agentctl import cli
 
+    parsed = cli.parser().parse_args(["send", "worker", "--deliver-while-working", "steer"])
+    assert parsed.deliver_while_working is True
     parsed = cli.parser().parse_args(["send", "worker", "steer", "--deliver-while-working"])
     assert parsed.deliver_while_working is True
     assert cli.parser().parse_args(["send", "worker", "steer"]).deliver_while_working is False
+
+
+def test_the_cli_refuses_a_value_starved_option_instead_of_shifting_a_name() -> None:
+    """A trailing option without its value is a usage error on every Python.
+
+    The leaf regrouping that lets older argparse intermix options with an
+    optional positional must never place the name behind such an option,
+    where it would be taken as the missing value.
+    """
+    from agentctl import cli
+
+    with pytest.raises(SystemExit):
+        cli.parser().parse_args(["revive", "worker", "--expected-token"])
+    with pytest.raises(SystemExit):
+        cli.parser().parse_args(["send", "worker", "--file"])
 
 
 # Shared terminal form captures and guarded question-answering contracts.

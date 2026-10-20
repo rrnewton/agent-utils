@@ -12,6 +12,16 @@ import pytest
 
 from wrkslots import cli
 
+# fcntl omits the seal constants when Python was built against old kernel
+# headers; the Linux ABI numbers are fixed, so name them as a fallback.
+_F_ADD_SEALS: int = getattr(fcntl, "F_ADD_SEALS", 1033)
+_SEALS: int = (
+    getattr(fcntl, "F_SEAL_SEAL", 1)
+    | getattr(fcntl, "F_SEAL_SHRINK", 2)
+    | getattr(fcntl, "F_SEAL_GROW", 4)
+    | getattr(fcntl, "F_SEAL_WRITE", 8)
+)
+
 
 # Deliberately a contract stub: it exposes controlled typed values to exercise
 # the bridge's comparisons. It is not evidence for a producer's verifier.
@@ -72,8 +82,7 @@ def binding_fixture(
     os.write(authority_fd, json.dumps(record).encode())
     os.fchmod(authority_fd, 0o400)
     if sealed:
-        fcntl.fcntl(authority_fd, fcntl.F_ADD_SEALS,
-                    fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE)
+        fcntl.fcntl(authority_fd, _F_ADD_SEALS, _SEALS)
     request: dict[str, dict[str, object]] = {"environment": {"FIXTURE_TOOL_AUTHORITY": f"/proc/{os.getpid()}/fd/{authority_fd}"}, "expected": expected}
     return module, request, (root_fd, authority_fd)
 

@@ -43,7 +43,7 @@ import urllib.parse
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Set as AbstractSet
 from pathlib import Path, PurePosixPath
-from typing import IO, NoReturn, Protocol, TextIO, TypedDict, TypeVar
+from typing import IO, NoReturn, Protocol, TextIO, TypedDict, TypeVar, cast, overload
 
 from wrkslots import __version__, imagecmd, sandbox, slotimage, yamlconfig
 
@@ -19766,8 +19766,11 @@ def _observe_slot_use_once(
 
 
 def _parse_timestamp(value: str, label: str) -> dt.datetime:
+    # Durable records name UTC with "Z"; fromisoformat reads it only from
+    # Python 3.11, so normalize it the way the other timestamp parsers do.
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
     try:
-        parsed = dt.datetime.fromisoformat(value)
+        parsed = dt.datetime.fromisoformat(normalized)
     except ValueError as exc:
         raise StateError(f"invalid timestamp in {label}: {value!r}") from exc
     if parsed.tzinfo is None:
@@ -42581,10 +42584,13 @@ holder, _descriptor = module.proc_fd_identity(authority_path, role="tool authori
 descriptor = os.open(authority_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK)
 try:
     metadata = os.fstat(descriptor)
-    seals = fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE
+    # fcntl omits the seal constants when Python was built against old kernel
+    # headers; the Linux ABI numbers are fixed, so name them as a fallback.
+    seals = (getattr(fcntl, "F_SEAL_SEAL", 1) | getattr(fcntl, "F_SEAL_SHRINK", 2)
+             | getattr(fcntl, "F_SEAL_GROW", 4) | getattr(fcntl, "F_SEAL_WRITE", 8))
     if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 0
             or metadata.st_mode & 0o222 or not 0 < metadata.st_size <= 4096
-            or fcntl.fcntl(descriptor, fcntl.F_GET_SEALS) & seals != seals):
+            or fcntl.fcntl(descriptor, getattr(fcntl, "F_GET_SEALS", 1034)) & seals != seals):
         raise ValueError("tool descriptor locator is not bounded, anonymous and sealed")
     locator = json.loads(os.read(descriptor, 4097))
 finally:
@@ -59457,6 +59463,187 @@ def _cmd_recover(
     return 0
 
 
+_ARGPARSE_NEEDS_REGROUPING: bool | None = None
+
+_ParserNamespace = TypeVar("_ParserNamespace")
+
+
+def _argparse_needs_regrouping() -> bool:
+    """Whether this argparse splits optional positionals around options.
+
+    Older argparse releases match each optional positional (nargs "?" or "*")
+    against only the first contiguous block of positional words, so a leaf
+    grammar such as SLOT [COMMAND...] rejects "run slot01 --isolation root
+    -- bash" with "unrecognized arguments" on Python 3.10 and 3.11.
+    Feature-detect instead of naming a version: the behaviour has changed
+    inside a patch series before.
+    """
+    global _ARGPARSE_NEEDS_REGROUPING
+    if _ARGPARSE_NEEDS_REGROUPING is not None:
+        return _ARGPARSE_NEEDS_REGROUPING
+
+    class _Probe(argparse.ArgumentParser):
+        def error(self, message: str) -> NoReturn:
+            raise ValueError(message)
+
+        def exit(self, status: int = 0, message: str | None = None) -> NoReturn:
+            raise ValueError(message or "exit")
+
+    root = _Probe(add_help=False)
+    commands = root.add_subparsers(dest="command")
+    child = commands.add_parser("send", add_help=False)
+    child.add_argument("name")
+    child.add_argument("text", nargs="?")
+    child.add_argument("--flag", action="store_true")
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            parsed = root.parse_args(["send", "worker", "--flag", "steer"])
+    except (SystemExit, ValueError):
+        _ARGPARSE_NEEDS_REGROUPING = True
+        return True
+    text: object = getattr(parsed, "text", None)
+    flag: object = getattr(parsed, "flag", None)
+    _ARGPARSE_NEEDS_REGROUPING = not (text == "steer" and flag is True)
+    return _ARGPARSE_NEEDS_REGROUPING
+
+
+def _regrouped_leaf_arguments(
+    parser: argparse.ArgumentParser, args: Iterable[str]
+) -> list[str]:
+    """Put a leaf parser's positional words together, ahead of its options.
+
+    Returns the words unchanged unless this argparse needs regrouping, the
+    parser is a leaf (no subcommands of its own) with an optional positional,
+    and every option word can be classified from the parser's own actions.
+    Word order inside each kind is preserved, and positional words stay
+    first so an option error still happens after they are parsed. A "--"
+    terminator is the exception: its words can look like options (they are
+    the command a box runs), so they stay behind it, with the options ahead
+    of it and every positional word in one block behind it. Anything
+    unclassifiable (an unknown option, an option taking a variable number
+    of values) falls back to the original order, where argparse reports its
+    own error.
+    """
+    values = list(args)
+    if not _argparse_needs_regrouping():
+        return values
+    actions = parser._actions
+    if any(isinstance(action, argparse._SubParsersAction) for action in actions):
+        return values
+    if not any(
+        not registered.option_strings
+        and registered.nargs in (argparse.OPTIONAL, argparse.ZERO_OR_MORE)
+        for registered in actions
+    ):
+        return values
+    options: dict[str, argparse.Action] = {}
+    for registered in actions:
+        for option in registered.option_strings:
+            options[option] = registered
+    positionals: list[str] = []
+    optionals: list[str] = []
+    tail: list[str] | None = None
+    index = 0
+    while index < len(values):
+        word = values[index]
+        if word == "--":
+            tail = values[index + 1 :]
+            break
+        if (
+            word == "-"
+            or not word.startswith("-")
+            or (
+                parser._negative_number_matcher.match(word)
+                and not parser._has_negative_number_optionals
+            )
+        ):
+            positionals.append(word)
+            index += 1
+            continue
+        attached = False
+        action: argparse.Action | None
+        if word.startswith("--"):
+            name, separator, _value = word.partition("=")
+            action = options.get(name)
+            if action is None and parser.allow_abbrev:
+                candidates = {
+                    options[option]
+                    for option in options
+                    if option.startswith("--") and option.startswith(name)
+                }
+                action = candidates.pop() if len(candidates) == 1 else None
+            if action is None:
+                return values
+            attached = bool(separator)
+        else:
+            action = options.get(word) or options.get(word[:2])
+            if action is None:
+                return values
+            if len(word) > 2:
+                if action.nargs == 0 and not all(
+                    options.get(f"-{letter}") is not None
+                    and options[f"-{letter}"].nargs == 0
+                    for letter in word[1:]
+                ):
+                    return values
+                attached = True
+        if action.nargs not in (0, None) and not (
+            isinstance(action.nargs, int) and action.nargs > 0
+        ):
+            return values
+        optionals.append(word)
+        index += 1
+        if attached or action.nargs == 0:
+            continue
+        count = action.nargs if isinstance(action.nargs, int) else 1
+        for _ in range(count):
+            if index >= len(values):
+                # A value-starved option: regrouping would put the first
+                # positional behind it and let it steal that word as its
+                # value, turning a usage error into a shifted parse.
+                return values
+            optionals.append(values[index])
+            index += 1
+    if tail is None:
+        return positionals + optionals
+    return optionals + ["--"] + positionals + tail
+
+
+class _LeafRegroupingParser(argparse.ArgumentParser):
+    """An argument parser whose leaf subcommands regroup where required."""
+
+    @overload
+    def parse_known_args(
+        self, args: Iterable[str] | None = None, namespace: None = None,
+    ) -> tuple[argparse.Namespace, list[str]]:
+        """Parse arguments into a new namespace."""
+        ...
+
+    @overload
+    def parse_known_args(
+        self, args: Iterable[str] | None, namespace: _ParserNamespace,
+    ) -> tuple[_ParserNamespace, list[str]]:
+        """Parse arguments into the supplied namespace."""
+        ...
+
+    @overload
+    def parse_known_args(
+        self, *, namespace: _ParserNamespace
+    ) -> tuple[_ParserNamespace, list[str]]:
+        """Parse process arguments into the supplied namespace."""
+        ...
+
+    def parse_known_args(
+        self, args: Iterable[str] | None = None, namespace: object | None = None,
+    ) -> tuple[object, list[str]]:
+        """Regroup leaf arguments where this argparse requires it."""
+        current = namespace if namespace is not None else argparse.Namespace()
+        regrouped = _regrouped_leaf_arguments(self, args) if args is not None else None
+        return super().parse_known_args(
+            cast("Sequence[str] | None", regrouped), current
+        )
+
+
 class _HelpFormatter(argparse.RawDescriptionHelpFormatter):
     def __init__(self, prog: str) -> None:
         super().__init__(prog, max_help_position=30, width=100)
@@ -59728,7 +59915,7 @@ Global options (--project-root, --machine, --wait-lock,
 Exit status: 0 success/no gate finding, 1 audit gate action, 2 command-line
 usage or audit gate unknown, 3 fail-closed refusal.
 """
-    parser = argparse.ArgumentParser(
+    parser = _LeafRegroupingParser(
         prog="wrkslots",
         description=description,
         epilog=epilog,

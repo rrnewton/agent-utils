@@ -67,6 +67,70 @@ def _expand(root: Path, pattern: str) -> list[Path]:
     return list(found)
 
 
+def _broken_symlinks(root: Path) -> list[Path]:
+    found: list[Path] = []
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.is_symlink() and not os.path.exists(entry.path):
+                found.append(Path(entry.path))
+            elif entry.is_dir(follow_symlinks=False):
+                pending.append(Path(entry.path))
+    return found
+
+
+def _pattern_matches(pattern: tuple[str, ...], parts: tuple[str, ...]) -> bool:
+    if not pattern:
+        return not parts
+    if pattern[0] == "**":
+        return any(
+            _pattern_matches(pattern[1:], parts[index:])
+            for index in range(len(parts) + 1)
+        )
+    return (
+        bool(parts)
+        and fnmatch.fnmatchcase(parts[0], pattern[0])
+        and _pattern_matches(pattern[1:], parts[1:])
+    )
+
+
+def _glob_expected(root: Path, pattern: str) -> list[Path]:
+    """``Path.glob`` on the contract release, spelled version-neutrally.
+
+    The product's contract is the newer ``Path.glob``, which yields a broken
+    symlink whose name matches; Python 3.10's ``Path.glob`` drops it. Add
+    back exactly those matches, found by listing the tree, so the oracle is
+    the same set on every supported interpreter.
+    """
+    expected = list(root.glob(pattern))
+    for candidate in _broken_symlinks(root):
+        if candidate not in expected and _pattern_matches(
+            tuple(pattern.split("/")), candidate.relative_to(root).parts
+        ):
+            expected.append(candidate)
+    return expected
+
+
+def _assert_glob_contract(
+    root: Path, pattern: str, found: Sequence[Path], *, ordered: bool
+) -> None:
+    """Assert the expansion against the version-neutral glob contract.
+
+    The set is oracled on every interpreter. The order is oracled only where
+    ``Path.glob`` is the contract release (3.12+): 3.10's glob both drops
+    broken-symlink matches and yields its matches in a different order, so
+    there is no order oracle there to compare against.
+    """
+    assert sorted(found) == sorted(_glob_expected(root, pattern))
+    if ordered and sys.version_info >= (3, 12):
+        assert list(found) == list(root.glob(pattern))
+
+
 @pytest.mark.parametrize(
     "pattern",
     (
@@ -85,20 +149,18 @@ def _expand(root: Path, pattern: str) -> list[Path]:
 )
 def test_expansion_yields_what_path_glob_yields(tmp_path: Path, pattern: str) -> None:
     root = _tree(tmp_path)
-    expected = list(root.glob(pattern))
     found = _expand(root, pattern)
-    assert sorted(found) == sorted(expected)
     assert len(found) == len(set(found))
     parts = pattern.split("/")
-    if "**" not in parts or (
+    # Only these shapes are also yielded in Path.glob's order, so the first
+    # refusal a checkout reports is unchanged. Other shapes, such as
+    # 'ignored/*/**/target', may name a different first unsafe path.
+    ordered = "**" not in parts or (
         parts.count("**") == 1
         and parts[-2] == "**"
         and not any(magic in "".join(parts[:-2]) for magic in "*?[")
-    ):
-        # Only these shapes are also yielded in Path.glob's order, so the first
-        # refusal a checkout reports is unchanged. Other shapes, such as
-        # 'ignored/*/**/target', may name a different first unsafe path.
-        assert found == expected
+    )
+    _assert_glob_contract(root, pattern, found, ordered=ordered)
 
 
 def test_trailing_recursive_wildcard_yields_directories_without_following_links(
@@ -121,8 +183,9 @@ def test_unreadable_directory_contributes_nothing(tmp_path: Path) -> None:
         if os.access(closed, os.R_OK):
             pytest.skip("directory permissions are not enforced for this user")
         for pattern in LIVE_SHAPED:
-            expected = list(root.glob(pattern))
-            assert _expand(root, pattern) == expected
+            _assert_glob_contract(
+                root, pattern, _expand(root, pattern), ordered=True
+            )
         assert not any(
             closed in path.parents for path in _expand(root, "ignored/**/target")
         )
@@ -162,9 +225,9 @@ def test_joint_expansion_lists_each_directory_once(
     assert sorted(listed) == sorted([str(root), *below])
     assert len(listed) == len(set(listed))
     assert budget.work.consumed == len(listed)
-    assert expanded == tuple(
-        (pattern, tuple(root.glob(pattern))) for pattern in LIVE_SHAPED
-    )
+    assert [pattern for pattern, _found in expanded] == list(LIVE_SHAPED)
+    for pattern, found in expanded:
+        _assert_glob_contract(root, pattern, found, ordered=True)
 
 
 def _chain(root: Path, depth: int) -> Path:

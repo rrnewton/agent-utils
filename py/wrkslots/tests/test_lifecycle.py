@@ -37576,6 +37576,7 @@ def test_recover_absent_agent_row_keeps_a_running_writer_from_remaking_submodule
 # Requests and replies are one JSON line each.
 ABSENT_AGENT_MODULE_HOLDER = textwrap.dedent(
     '''\
+    import ctypes
     import json
     import os
     import subprocess
@@ -37583,6 +37584,15 @@ ABSENT_AGENT_MODULE_HOLDER = textwrap.dedent(
     import threading
 
     kind, repository, work = sys.argv[1:4]
+
+
+    def unshare(flags):
+        # os.unshare and the os.CLONE_* constants arrive in Python 3.12; the
+        # libc call with the fixed Linux flag values works on the minimum.
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.unshare(flags) != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), "unshare")
 
 
     def read_line():
@@ -37632,12 +37642,12 @@ ABSENT_AGENT_MODULE_HOLDER = textwrap.dedent(
     def hold():
         if kind.endswith("-cwd"):
             if kind.startswith("thread-"):
-                os.unshare(os.CLONE_FS)
+                unshare(0x00000200)  # CLONE_FS
             os.chdir(repository)
             serve(".", ())
             return
         if kind.startswith("thread-"):
-            os.unshare(os.CLONE_FILES)
+            unshare(0x00000400)  # CLONE_FILES
         descriptor = os.open(repository, os.O_RDONLY | os.O_DIRECTORY)
         serve(f"/proc/self/fd/{descriptor}", (descriptor,))
 

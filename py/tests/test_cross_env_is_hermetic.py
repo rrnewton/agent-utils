@@ -1636,10 +1636,21 @@ def test_the_interpreter_copy_in_every_case_runs_the_program_its_arguments_name(
     root = case.python_root
     runtime = root / "fake-muse-runtime"
     marker = tmp_path / "chosen-program-ran"
-    completed = subprocess.run(
-        [str(runtime), "-c", f"open({str(marker)!r}, 'w', encoding='utf-8').write('ran')"],
-        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60, check=False,
-    )
+
+    def run_copy(env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(runtime), "-c", f"open({str(marker)!r}, 'w', encoding='utf-8').write('ran')"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60,
+            check=False, env=env,
+        )
+
+    completed = run_copy()
+    if completed.returncode != 0 and "Could not find platform" in completed.stderr:
+        # A relocatable interpreter build locates its standard library
+        # relative to the binary, so a lone copy cannot start until its home
+        # is named. That names the same library its own layout would carry;
+        # the copy still runs the program its arguments choose.
+        completed = run_copy({**os.environ, "PYTHONHOME": sys.base_prefix})
 
     assert completed.returncode == 0, completed.stderr
     assert marker.read_text(encoding="utf-8") == "ran"

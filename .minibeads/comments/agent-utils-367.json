@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-367-c778cd8bd43",
+    "issue_id": "agent-utils-367",
+    "author": "mu-py310",
+    "body": "[muse watermelon] Resolved on CPython 3.10.21 (standalone build, project-local venv), six family-preserving shards of the py tree via scripts/run_pytest_shard.py: before 70 failed of 9475, after 6 failed of 9476. Product defects fixed: argparse leaf grammars that intermix options with an optional positional (agentctl send/goal, wrkslots run/box/shell-command) are regrouped where the running argparse needs it (feature-detected; a value-starved option never steals a positional), and wrkslots timestamps accept a trailing Z on 3.10. Tests made version-neutral: the cache-glob oracle no longer takes a newer Path.glob as the contract for broken-symlink matches or order, and the lifecycle holder uses libc unshare instead of the 3.12 os.unshare. Environmental: fcntl seal constants missing from standalone builds now fall back to the fixed Linux ABI numbers in product and fixture (the kernel seals work), and the copied-interpreter case names PYTHONHOME for a relocatable build. Residual: the 6 after failures are all same-UID census refusals under host process churn (census did not close / evidence changed / 30s /proc bound), the same mode as 5 before failures; an isolated rerun passed 36 and still hit census churn on 2. They are version-independent host-load failures, not 3.10 defects. A root -- before a subcommand still fails closed on stock 3.10 argparse (see #236 root-terminator-parser probes); leaf regrouping deliberately does not change root parsers. Nothing found suggests dropping 3.10.",
+    "created_at": "2026-10-20T22:42:23.621929850Z",
+    "updated_at": "2026-10-20T22:42:23.621929850Z"
+  }
+]

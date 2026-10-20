@@ -14,7 +14,7 @@ import os
 import secrets
 import shutil
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeVar
 
 from wrkslots import sandbox, slotimage
 
@@ -23,8 +23,10 @@ if TYPE_CHECKING:
 
 GIB = 1024**3
 
+_ParserT = TypeVar("_ParserT", bound=argparse.ArgumentParser)
 
-def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser], formatter: type[argparse.HelpFormatter]) -> None:
+
+def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[argparse.HelpFormatter]) -> None:
     """Add the image, run, limits, and shell-command subcommands to the parser."""
 
     image = subparsers.add_parser(

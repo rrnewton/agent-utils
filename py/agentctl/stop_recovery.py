@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import os
 import re
 import shlex
@@ -70,6 +72,149 @@ class _ParserContext:
 
 _Namespace = TypeVar("_Namespace")
 
+_ARGPARSE_NEEDS_REGROUPING: bool | None = None
+
+
+def _argparse_needs_regrouping() -> bool:
+    """Whether this argparse splits optional positionals around options.
+
+    Older argparse releases match each optional positional (nargs "?" or "*")
+    against only the first contiguous block of positional words, so a leaf
+    grammar such as NAME [TEXT] --flag rejects "send worker --flag steer"
+    with "unrecognized arguments: steer" on Python 3.10 and 3.11.
+    Feature-detect instead of naming a version: the behaviour has changed
+    inside a patch series before.
+    """
+    global _ARGPARSE_NEEDS_REGROUPING
+    if _ARGPARSE_NEEDS_REGROUPING is not None:
+        return _ARGPARSE_NEEDS_REGROUPING
+
+    class _Probe(argparse.ArgumentParser):
+        def error(self, message: str) -> NoReturn:
+            raise ValueError(message)
+
+        def exit(self, status: int = 0, message: str | None = None) -> NoReturn:
+            raise ValueError(message or "exit")
+
+    root = _Probe(add_help=False)
+    commands = root.add_subparsers(dest="command")
+    child = commands.add_parser("send", add_help=False)
+    child.add_argument("name")
+    child.add_argument("text", nargs="?")
+    child.add_argument("--flag", action="store_true")
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            parsed = root.parse_args(["send", "worker", "--flag", "steer"])
+    except (SystemExit, ValueError):
+        _ARGPARSE_NEEDS_REGROUPING = True
+        return True
+    text: object = getattr(parsed, "text", None)
+    flag: object = getattr(parsed, "flag", None)
+    _ARGPARSE_NEEDS_REGROUPING = not (text == "steer" and flag is True)
+    return _ARGPARSE_NEEDS_REGROUPING
+
+
+def _regrouped_leaf_arguments(
+    parser: argparse.ArgumentParser, args: Iterable[str]
+) -> list[str]:
+    """Put a leaf parser's positional words together, ahead of its options.
+
+    Returns the words unchanged unless this argparse needs regrouping, the
+    parser is a leaf (no subcommands of its own) with an optional positional,
+    and every option word can be classified from the parser's own actions.
+    Word order inside each kind is preserved, and positional words stay
+    first so an option error (a bad value, an unknown option) still happens
+    after they are parsed, as the stop-context capture above relies on. A
+    "--" terminator is the exception: its words can look like options, so
+    they stay behind it, with the options ahead of it and every positional
+    word in one block behind it. Anything unclassifiable (an unknown option,
+    an option taking a variable number of values) falls back to the original
+    order, where argparse reports its own error.
+    """
+    values = list(args)
+    if not _argparse_needs_regrouping():
+        return values
+    actions = parser._actions
+    if any(isinstance(action, argparse._SubParsersAction) for action in actions):
+        return values
+    if not any(
+        not registered.option_strings
+        and registered.nargs in (argparse.OPTIONAL, argparse.ZERO_OR_MORE)
+        for registered in actions
+    ):
+        return values
+    options: dict[str, argparse.Action] = {}
+    for registered in actions:
+        for option in registered.option_strings:
+            options[option] = registered
+    positionals: list[str] = []
+    optionals: list[str] = []
+    tail: list[str] | None = None
+    index = 0
+    while index < len(values):
+        word = values[index]
+        if word == "--":
+            tail = values[index + 1 :]
+            break
+        if (
+            word == "-"
+            or not word.startswith("-")
+            or (
+                parser._negative_number_matcher.match(word)
+                and not parser._has_negative_number_optionals
+            )
+        ):
+            positionals.append(word)
+            index += 1
+            continue
+        attached = False
+        action: argparse.Action | None
+        if word.startswith("--"):
+            name, separator, _value = word.partition("=")
+            action = options.get(name)
+            if action is None and parser.allow_abbrev:
+                candidates = {
+                    options[option]
+                    for option in options
+                    if option.startswith("--") and option.startswith(name)
+                }
+                action = candidates.pop() if len(candidates) == 1 else None
+            if action is None:
+                return values
+            attached = bool(separator)
+        else:
+            action = options.get(word) or options.get(word[:2])
+            if action is None:
+                return values
+            if len(word) > 2:
+                if action.nargs == 0 and not all(
+                    options.get(f"-{letter}") is not None
+                    and options[f"-{letter}"].nargs == 0
+                    for letter in word[1:]
+                ):
+                    return values
+                attached = True
+        if action.nargs not in (0, None) and not (
+            isinstance(action.nargs, int) and action.nargs > 0
+        ):
+            return values
+        optionals.append(word)
+        index += 1
+        if attached or action.nargs == 0:
+            continue
+        count = action.nargs if isinstance(action.nargs, int) else 1
+        for _ in range(count):
+            if index >= len(values):
+                # A value-starved option: regrouping would put the first
+                # positional behind it and let it steal that word as its
+                # value, turning a usage error into a shifted parse.
+                return values
+            optionals.append(values[index])
+            index += 1
+    if tail is None:
+        return positionals + optionals
+    return optionals + ["--"] + positionals + tail
+
 
 class StopRecoveryParser(argparse.ArgumentParser):
     """Keep parsed stop context for syntax errors, without inspecting raw argv."""
@@ -117,8 +262,9 @@ class StopRecoveryParser(argparse.ArgumentParser):
             context.completed = None
         context.active.append(current)
         try:
+            regrouped = _regrouped_leaf_arguments(self, args) if args is not None else None
             # argparse copies `args` with list(); typeshed versions differ on Sequence vs Iterable.
-            result = super().parse_known_args(cast("Sequence[str] | None", args), current)
+            result = super().parse_known_args(cast("Sequence[str] | None", regrouped), current)
             context.completed = result[0]
             return result
         finally:
