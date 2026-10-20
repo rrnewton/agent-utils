@@ -42,7 +42,13 @@ other 43 selected validation steps passed. The runtime was progressing through
 the maximum-batch write-boundary recovery scenarios and the 4,097-message
 retirement test, as shown by increasing I/O counters and its saved checkpoint.
 `AGENTCTL_CHAT_TEST_TMPDIR` now optionally selects a dedicated temporary root for
-that Rust test module; its default remains the ordinary system temporary root.
+the chat-runtime and chat-service Rust test modules; its default remains the ordinary system temporary root.
 A private executable tmpfs directory avoids the slow journal without changing
 any assertions, scenario counts, failure injection, fsync calls, or timeout.
 Python tests and packaging retain their usual disk-backed temporary directories.
+
+The first complete Rust run with dedicated runtime scratch finished all 1,338
+cases: 1,337 passed, with one stale assertion expecting the old blocked error.
+That assertion now requires both operator commands, retaining pending/no-input
+checks. Chat-service fixtures also accept the same scratch setting; their
+4,096-record retirement-ring case was the other major journal-bound test.

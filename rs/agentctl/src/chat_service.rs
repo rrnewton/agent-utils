@@ -6203,6 +6203,13 @@ mod tests {
         (state, admission.new_request_keys.remove(0), root)
     }
 
+    fn test_scratch_root() -> std::path::PathBuf {
+        // Match the chat-runtime fixtures' optional scratch filesystem on slow hosts.
+        std::env::var_os("AGENTCTL_CHAT_TEST_TMPDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+    }
+
     /// A new bridge state, in a private directory of its own, that reacts to each request with
     /// `ack_reaction`, holding one admitted request; with the admission of its batch, whose
     /// commit is left unconfirmed.
@@ -6213,7 +6220,7 @@ mod tests {
         chat_runtime::BatchAdmission,
         std::path::PathBuf,
     ) {
-        let root = std::env::temp_dir().join(format!(
+        let root = test_scratch_root().join(format!(
             "agentctl-chat-service-{}-{}",
             std::process::id(),
             NEXT_STATE.fetch_add(1, AtomicOrdering::Relaxed)
@@ -7703,7 +7710,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
 
     #[test]
     fn credential_files_reach_the_delivery_alarm_and_the_startup_log() {
-        let root = std::env::temp_dir().join(format!(
+        let root = test_scratch_root().join(format!(
             "agentctl-chat-service-{}-{}",
             std::process::id(),
             NEXT_STATE.fetch_add(1, AtomicOrdering::Relaxed)

@@ -4630,7 +4630,8 @@ mod tests {
             DrainOptions::default(),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("visible prompt"));
+        assert!(error.to_string().contains("agentctl prompts NAME"));
+        assert!(error.to_string().contains("agentctl answer NAME"));
         assert!(matches!(error, AgentError::Pending(_)));
         assert!(fake.runs().is_empty());
     }
