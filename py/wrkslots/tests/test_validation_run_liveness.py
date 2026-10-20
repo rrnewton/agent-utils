@@ -22,7 +22,7 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Iterator, Mapping, Sequence, Set as AbstractSet
+from collections.abc import Callable, Iterator, Mapping, Sequence, Set as AbstractSet
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -2261,6 +2261,29 @@ def _end_run(host: _RealHost, run: _RunProcess) -> None:
     host.tables.clear()
 
 
+def _refused_for_the_run(
+    attempt: Callable[[], tuple[int, str]], expected_returncode: int, needle: str
+) -> str:
+    """Run `attempt` until its refusal names the validation run.
+
+    The real-host tests judge liveness from the host's real /proc, so an
+    unrelated process caught mid-teardown there (a PID-namespace init of
+    another test's, waiting in zap_pid_ns_processes) can make one attempt
+    refuse as indeterminate instead.  That state is transient; the refusal
+    these tests assert is the run's own, and every attempt leaves the slot
+    retained, so asking again is safe.  `#389 gate-flakes`.
+    """
+
+    deadline = time.monotonic() + 60
+    while True:
+        returncode, text = attempt()
+        assert returncode == expected_returncode, text
+        if needle in text:
+            return text
+        assert time.monotonic() < deadline, text
+        time.sleep(0.1)
+
+
 def _assert_judged_live_run(host: _RealHost, run: _RunProcess, text: str) -> None:
     """The refusal named the run's process, and the real table showed it."""
 
@@ -2282,9 +2305,15 @@ def test_real_host_completed_removal_waits_for_the_run_process(
     host = _prepare_real_host(tmp_path, monkeypatch)
 
     with _real_run_process(host) as run:
-        assert _remove_completed(host.project) == 3
-        error = capsys.readouterr().err
-        assert "validation-run authority reports the run may still use slot slot01" in error
+        def remove_once() -> tuple[int, str]:
+            returncode = _remove_completed(host.project)
+            return returncode, capsys.readouterr().err
+
+        error = _refused_for_the_run(
+            remove_once,
+            3,
+            "validation-run authority reports the run may still use slot slot01",
+        )
         _assert_judged_live_run(host, run, error)
         _assert_retained(host.project, host.tree)
 
@@ -2320,12 +2349,16 @@ def test_real_host_batch_seal_waits_for_the_run_process(
 
     with _real_run_process(host) as run:
         # A batch retains each refused slot and exits 1.
-        assert _remove_batch(host.project) == 1
-        output = capsys.readouterr().out
-        assert (
+        def remove_once() -> tuple[int, str]:
+            returncode = _remove_batch(host.project)
+            return returncode, capsys.readouterr().out
+
+        output = _refused_for_the_run(
+            remove_once,
+            1,
             "RETAINED: slot01 reason=validation-run authority reports the run may "
-            "still use slot slot01"
-        ) in output
+            "still use slot slot01",
+        )
         _assert_judged_live_run(host, run, output)
         assert not wrkslots._validate_batch_seal_journal_path(config).exists()
         _assert_retained(host.project, host.tree)
@@ -2359,8 +2392,16 @@ def test_real_host_finish_recovery_waits_for_the_run_process(
     # A run that starts on the checkout after the batch journaled its finish.
     with _real_run_process(host) as run:
         host.tables.clear()
-        assert wrkslots.main(recover) == 3
-        error = capsys.readouterr().err
+
+        def recover_once() -> tuple[int, str]:
+            returncode = wrkslots.main(recover)
+            return returncode, capsys.readouterr().err
+
+        error = _refused_for_the_run(
+            recover_once,
+            3,
+            f"has live exact process generation {run.child.pid} for row slot01",
+        )
         _assert_judged_live_run(host, run, error)
         assert finish_path.exists()
         _assert_retained(host.project, host.tree)
