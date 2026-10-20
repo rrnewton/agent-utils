@@ -7,7 +7,14 @@ description: Answer chat requests that the agentctl chat bridge types into your 
 
 The bridge (`agentctl chat run`) types each chat message from an allowed sender
 into the coordinator's pane as a request prompt, and sends your replies back to
-the chat thread.
+the chat thread. The original `allowed_senders` are permanent owners. Other
+senders need an unexpired grant created by `agentctl chat grant --bridge-state
+DIR SENDER --for DURATION`; `--all-members` grants the channel's explicitly
+enumerated current members, and never future joiners. Every grant needs a
+lifetime such as `30m`, `12h` or `7d`, within the configurable maximum (30 days
+by default). `chat grants` lists active and expired grants and `chat revoke`
+removes a temporary grant. A running bridge applies these changes without a
+restart; permanent owners remain allowed.
 
 This skill describes the compiled (Rust) bridge, whose prompts say "The user's
 request arrived through the configured chat bridge" and open with the message's

@@ -821,7 +821,12 @@ fn corroborated(before: &ComposerView, after: &ComposerView, text: &str) -> Opti
         return Some("pasted prompt appeared above the composer".to_owned());
     }
     let screen = format!("{}\n{}", after.transcript, after.footer);
-    if let Some(marker) = QUEUE_MARKERS.iter().find(|marker| screen.contains(*marker)) {
+    // Claude draws its queued-message hint inside the empty composer. Its paste hint can
+    // temporarily replace the working status row, so the footer alone misses that evidence.
+    if let Some(marker) = QUEUE_MARKERS
+        .iter()
+        .find(|marker| screen.contains(*marker) || after.composer.contains(*marker))
+    {
         return Some(format!("agent queue marker is visible ({marker:?})"));
     }
     if screen.contains(WORKING_MARKER) {
@@ -3127,6 +3132,67 @@ mod tests {
         );
         assert!(receipt.printed, "{receipt:?}");
         assert_eq!((receipt.elapsed, took), (POLL, POLL));
+    }
+
+    #[test]
+    fn a_new_queue_placeholder_proves_submission_while_the_paste_hint_hides_the_status() {
+        let frames = Frames::new(
+            claude_screen(&["• earlier"], "", BUSY_STATUS),
+            claude_screen(&["• earlier"], "run the tests", PASTE_STATUS),
+            vec![claude_screen(
+                &["• earlier"],
+                QUEUED_PLACEHOLDER,
+                PASTE_STATUS,
+            )],
+        );
+        let (receipt, took) = submit_frames(&frames, "run the tests");
+        assert!(receipt.printed && receipt.settled, "{receipt:?}");
+        assert_eq!(
+            receipt.evidence,
+            "agent queue marker appeared (\"Press up to edit queued messages\")"
+        );
+        assert_eq!((receipt.elapsed, took), (POLL, POLL));
+        assert_eq!(*frames.keys.lock().unwrap(), ["Enter"]);
+    }
+
+    #[test]
+    fn a_preexisting_queue_placeholder_with_a_paste_hint_is_not_printed_evidence() {
+        let queued = claude_screen(&["• earlier"], QUEUED_PLACEHOLDER, PASTE_STATUS);
+        let frames = Frames::new(
+            queued.clone(),
+            claude_screen(&["• earlier"], "run the tests", PASTE_STATUS),
+            vec![queued],
+        );
+        let (receipt, took) = submit_frames(&frames, "run the tests");
+        assert!(!receipt.printed && receipt.settled, "{receipt:?}");
+        assert_eq!(took, POLL + PRINT_GRACE);
+        assert_eq!(*frames.keys.lock().unwrap(), ["Enter"]);
+    }
+
+    #[test]
+    fn a_queue_placeholder_redraw_does_not_prove_a_dropped_key_was_accepted() {
+        let queued = claude_screen(&["• earlier"], QUEUED_PLACEHOLDER, PASTE_STATUS);
+        let staged = claude_screen(&["• earlier"], "run the tests", PASTE_STATUS);
+        let frames = Frames::new(queued.clone(), staged.clone(), vec![queued, staged]);
+        let result = submit_verified(
+            &frames,
+            "w1:p1",
+            "claude",
+            "run the tests",
+            SubmitTimeouts {
+                submit: Duration::from_secs(1),
+                ..SubmitTimeouts::default()
+            },
+            &Clock::default(),
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("it was NOT submitted"),
+            "a transient redraw with an old queue hint must not confirm a dropped key"
+        );
+        assert!(frames.keys.lock().unwrap().len() > 1);
     }
 
     #[test]

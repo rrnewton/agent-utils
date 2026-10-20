@@ -34,7 +34,10 @@ use unicode_width::UnicodeWidthStr;
 use crate::agent::{self, DrainOptions, QueueMessageState};
 use crate::subagents::{ManagedAgents, ManagedApi};
 
+mod grants;
 mod reply_reminders;
+
+pub use grants::{parse_grant_duration, SenderGrant, DEFAULT_MAX_GRANT_SECONDS};
 
 #[cfg(test)]
 pub(crate) use reply_reminders::REPLY_REMINDER_FILE;
@@ -404,6 +407,10 @@ const fn default_outbound_enabled() -> bool {
     true
 }
 
+const fn default_max_grant_seconds() -> u64 {
+    DEFAULT_MAX_GRANT_SECONDS
+}
+
 const fn default_outbound_timeout_millis() -> u64 {
     30_000
 }
@@ -431,6 +438,9 @@ pub enum ChatRuntimeError {
     /// journaled in `boundary-mismatch.json`, and automatic reconnect is refused until an
     /// operator recovers the state.
     BoundaryMismatch(String),
+    /// Sender grants changed while a provider item was in flight. Nothing from that batch was
+    /// admitted or acknowledged; subscribe again from the previous durable cursor.
+    SenderScopeChanged,
 }
 
 impl ChatRuntimeError {
@@ -452,6 +462,9 @@ impl fmt::Display for ChatRuntimeError {
             }
             Self::BoundaryMismatch(detail) => {
                 write!(formatter, "provider replaced the saved boundary: {detail}")
+            }
+            Self::SenderScopeChanged => {
+                formatter.write_str("sender grants changed during provider receive")
             }
         }
     }
@@ -570,8 +583,11 @@ pub struct BridgeConfiguration {
     pub subscription_environment: Vec<String>,
     /// Provider channel or space authorities.
     pub channel_ids: Vec<String>,
-    /// Authenticated provider sender authorities.
+    /// Permanent authenticated provider sender authorities (the bridge's owners).
     pub allowed_senders: Vec<String>,
+    /// Longest temporary sender grant, in seconds; defaults to 30 days.
+    #[serde(default = "default_max_grant_seconds")]
+    pub max_grant_seconds: u64,
     /// Stable named coordinator in the agent registry.
     pub agent_name: String,
     /// Human-readable agent label used in outbound replies.
@@ -653,6 +669,11 @@ impl BridgeConfiguration {
     }
 
     fn validate(&self) -> Result<()> {
+        if self.max_grant_seconds == 0 || self.max_grant_seconds > u64::MAX / 1_000 {
+            return Err(ChatRuntimeError::invalid(
+                "max_grant_seconds must be positive and fit a millisecond timestamp",
+            ));
+        }
         validate_slug(
             &self.subscription_plugin,
             "subscription plugin",
@@ -2241,6 +2262,10 @@ struct RequestRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ack_error: Option<String>,
     admitted_at_millis: u64,
+    // The exact temporary authority used at admission. Retained requests can finish after the
+    // grant expires or is revoked; new messages still require a currently active grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sender_grant: Option<SenderGrant>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     admitted_host_batch_sequence: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2306,6 +2331,7 @@ impl RequestRecord {
             reaction_already_present: None,
             ack_error: None,
             admitted_at_millis: unix_millis(),
+            sender_grant: None,
             admitted_host_batch_sequence: None,
             admitted_provider_sequence: None,
             admitted_delivery_id: None,
@@ -2333,6 +2359,16 @@ impl RequestRecord {
             ));
         }
         self.message.validate()?;
+        if let Some(grant) = &self.sender_grant {
+            grant.validate()?;
+            if grant.sender_id != self.message.sender_id
+                || !grant.active_at(self.admitted_at_millis)
+            {
+                return Err(ChatRuntimeError::invalid(
+                    "saved request was not admitted within its sender grant",
+                ));
+            }
+        }
         if self.next_reply_ordinal == 0
             || self.next_reply_ordinal > MAX_REPLY_ORDINAL.saturating_add(1)
             || self.next_send_ordinal == 0
@@ -3215,6 +3251,22 @@ pub struct CommandOutboundTransport {
     cancellation: Option<OutboundCancellation>,
 }
 
+/// Read-only provider directory operations used by the operator's grant command.
+pub trait SenderDirectory {
+    /// Resolve one provider query to an exact authenticated sender ID in a configured channel.
+    fn resolve_sender(
+        &mut self,
+        channel_id: &str,
+        query: &str,
+    ) -> std::result::Result<String, OutboundFailure>;
+
+    /// Enumerate the channel's complete current member list, or refuse incomplete results.
+    fn list_members(
+        &mut self,
+        channel_id: &str,
+    ) -> std::result::Result<Vec<String>, OutboundFailure>;
+}
+
 /// Cloneable event-driven cancellation for a running one-shot outbound helper.
 #[derive(Clone, Debug)]
 pub struct OutboundCancellation {
@@ -3525,6 +3577,79 @@ impl ReactionTransport for CommandOutboundTransport {
     }
 }
 
+impl SenderDirectory for CommandOutboundTransport {
+    fn resolve_sender(
+        &mut self,
+        channel_id: &str,
+        query: &str,
+    ) -> std::result::Result<String, OutboundFailure> {
+        validate_resource(channel_id, "channel")?;
+        validate_single_line(
+            query,
+            "sender query",
+            chat_subscription::MAX_RESOURCE_ID_BYTES,
+        )
+        .map_err(|error| not_applied_invalid(error.to_string()))?;
+        let id = random_operation_uuid().map_err(|error| not_applied_invalid(error.to_string()))?;
+        let request = encode_wire_request(&json!({
+            "version": 1, "id": id, "action": "resolve_sender",
+            "channel_id": channel_id, "query": query,
+        }))?;
+        let response = self.exchange(&request)?;
+        match decode_wire_response(&response, &id, "resolve_sender")? {
+            WireReceipt::ResolvedSender(receipt) => {
+                validate_directory_sender(&receipt.sender_id)?;
+                Ok(receipt.sender_id)
+            }
+            _ => Err(OutboundFailure::protocol(
+                "resolve_sender response has the wrong receipt",
+            )),
+        }
+    }
+
+    fn list_members(
+        &mut self,
+        channel_id: &str,
+    ) -> std::result::Result<Vec<String>, OutboundFailure> {
+        validate_resource(channel_id, "channel")?;
+        let id = random_operation_uuid().map_err(|error| not_applied_invalid(error.to_string()))?;
+        let request = encode_wire_request(&json!({
+            "version": 1, "id": id, "action": "list_members", "channel_id": channel_id,
+        }))?;
+        let response = self.exchange(&request)?;
+        match decode_wire_response(&response, &id, "list_members")? {
+            WireReceipt::Members(receipt) => {
+                if receipt.sender_ids.len() > chat_subscription::MAX_ALLOWED_SENDERS {
+                    return Err(OutboundFailure::protocol(
+                        "member list exceeds the sender limit",
+                    ));
+                }
+                for sender in &receipt.sender_ids {
+                    validate_directory_sender(sender)?;
+                }
+                let mut senders = receipt.sender_ids;
+                senders.sort();
+                senders.dedup();
+                Ok(senders)
+            }
+            _ => Err(OutboundFailure::protocol(
+                "list_members response has the wrong receipt",
+            )),
+        }
+    }
+}
+
+fn validate_directory_sender(sender: &str) -> std::result::Result<(), OutboundFailure> {
+    SenderId::new(sender.to_owned())
+        .map_err(|error| OutboundFailure::protocol(error.to_string()))?;
+    if sender == "*" {
+        return Err(OutboundFailure::protocol(
+            "a sender ID cannot be a wildcard",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct SendWireRequest<'a> {
     version: u32,
@@ -3577,6 +3702,20 @@ struct WireFailure {
 enum WireReceipt {
     Send(SendWireReceipt),
     Reaction(ReactionWireReceipt),
+    ResolvedSender(ResolvedSenderWireReceipt),
+    Members(MembersWireReceipt),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolvedSenderWireReceipt {
+    sender_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MembersWireReceipt {
+    sender_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3687,8 +3826,8 @@ fn decode_bound_send_response(
             }
             Ok(receipt.message_id)
         }
-        WireReceipt::Reaction(_) => Err(OutboundFailure::protocol(
-            "send response contains a reaction receipt",
+        _ => Err(OutboundFailure::protocol(
+            "send response contains a different operation's receipt",
         )),
     }
 }
@@ -3715,8 +3854,8 @@ pub fn decode_reaction_response(
                 already_present: receipt.already_present,
             })
         }
-        WireReceipt::Send(_) => Err(OutboundFailure::protocol(
-            "reaction response contains a send receipt",
+        _ => Err(OutboundFailure::protocol(
+            "reaction response contains a different operation's receipt",
         )),
     }
 }
@@ -5175,7 +5314,31 @@ impl BridgeState {
                 return Err(ChatRuntimeError::BoundaryMismatch(mismatch.detail()));
             }
         }
-        self.config.subscribe_request(checkpoint.cursor.as_deref())
+        let mut config = self.config.clone();
+        config.allowed_senders = self.subscription_senders_locked(unix_millis())?;
+        config.subscribe_request(checkpoint.cursor.as_deref())
+    }
+
+    /// Current explicit sender IDs for the provider subscription. Admission checks the durable
+    /// grants again under its write lock, so an older subscription cannot admit expired or
+    /// revoked authority.
+    pub(crate) fn subscription_senders(&self) -> Result<Vec<String>> {
+        let _snapshot = self.lock_state_snapshot()?;
+        self.subscription_senders_locked(unix_millis())
+    }
+
+    fn subscription_senders_locked(&self, now: u64) -> Result<Vec<String>> {
+        Ok(self.senders_from_grants(&self.read_grants_locked()?, now))
+    }
+
+    fn senders_from_grants(&self, grants: &[SenderGrant], now: u64) -> Vec<String> {
+        let mut senders = self.config.allowed_senders.clone();
+        for grant in grants {
+            if grant.active_at(now) && !senders.contains(&grant.sender_id) {
+                senders.push(grant.sender_id.clone());
+            }
+        }
+        senders
     }
 
     /// The journaled boundary refusal, if any; it may name an earlier boundary.
@@ -5796,9 +5959,29 @@ impl BridgeState {
 
     /// Persist every child event and the cursor without acknowledging the provider.
     pub fn admit_batch(&self, batch: &DeliveryBatch) -> Result<BatchAdmission> {
+        self.admit_batch_scoped(batch, None)
+    }
+
+    fn admit_batch_scoped(
+        &self,
+        batch: &DeliveryBatch,
+        expected_senders: Option<&[SenderId]>,
+    ) -> Result<BatchAdmission> {
         let state_lock =
             agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
         state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let sender_grants = self.read_grants_locked()?;
+        // A provider may have reduced a newly granted sender's message to a checkpoint using
+        // its old allowlist. Check under the grant writers' lock before advancing any cursor,
+        // so the refreshed subscription can replay that item with its complete message.
+        if expected_senders.is_some_and(|expected| {
+            !expected.iter().map(SenderId::as_str).eq(self
+                .senders_from_grants(&sender_grants, unix_millis())
+                .iter()
+                .map(String::as_str))
+        }) {
+            return Err(ChatRuntimeError::SenderScopeChanged);
+        }
         let mut checkpoint = self.read_checkpoint()?;
         self.repair_boundary_commit_locked(&mut checkpoint)?;
         self.recover_admission_locked(&checkpoint)?;
@@ -6017,6 +6200,25 @@ impl BridgeState {
                     }
                     // Keep every original message in the replay boundary, including ignored
                     // text, but create no request/ACK identity or reply route for ignored input.
+                    if !self.config.channel_ids.contains(&source.channel_id) {
+                        return Err(ChatRuntimeError::invalid(
+                            "message is outside configured channel authority",
+                        ));
+                    }
+                    let admitted_at_millis = unix_millis();
+                    let permanent_owner = self.config.allowed_senders.contains(&source.sender_id);
+                    let sender_grant = sender_grants
+                        .iter()
+                        .find(|grant| {
+                            grant.sender_id == source.sender_id
+                                && grant.active_at(admitted_at_millis)
+                        })
+                        .cloned();
+                    if !permanent_owner && sender_grant.is_none() {
+                        // The provider may still be serving a subscription opened before a
+                        // revoke or expiry. Commit this message's cursor without a request.
+                        continue;
+                    }
                     if self
                         .ignored_text_prefixes
                         .iter()
@@ -6026,6 +6228,8 @@ impl BridgeState {
                     }
                     let mut record =
                         RequestRecord::from_saved_message(source, self.config.ack_emoji())?;
+                    record.admitted_at_millis = admitted_at_millis;
+                    record.sender_grant = if permanent_owner { None } else { sender_grant };
                     record.admitted_host_batch_sequence = Some(host_batch_sequence);
                     record.admitted_provider_sequence = Some(batch.sequence().get());
                     record.admitted_delivery_id = Some(batch.delivery_id().as_str().to_owned());
@@ -10048,10 +10252,11 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
     fn validate_request_record(&self, record: &RequestRecord, path_key: &str) -> Result<()> {
         record.validate(path_key)?;
         if !self.config.channel_ids.contains(&record.message.channel_id)
-            || !self
+            || (!self
                 .config
                 .allowed_senders
                 .contains(&record.message.sender_id)
+                && record.sender_grant.is_none())
         {
             return Err(ChatRuntimeError::invalid(
                 "saved request is outside configured channel or sender authority",
@@ -11903,11 +12108,29 @@ pub fn consume_one(
     subscription: &mut ChatSubscription,
     state: &BridgeState,
 ) -> Result<ConsumedItem> {
+    consume_one_scoped(subscription, state, None)
+}
+
+/// Receive under one explicit provider sender scope. A scope change refuses admission before
+/// acknowledging the item, so the service can refresh without losing a provider-filtered message.
+pub(crate) fn consume_one_for_senders(
+    subscription: &mut ChatSubscription,
+    state: &BridgeState,
+    senders: &[SenderId],
+) -> Result<ConsumedItem> {
+    consume_one_scoped(subscription, state, Some(senders))
+}
+
+fn consume_one_scoped(
+    subscription: &mut ChatSubscription,
+    state: &BridgeState,
+    senders: Option<&[SenderId]>,
+) -> Result<ConsumedItem> {
     match subscription.next_item()? {
         None => Ok(ConsumedItem::End),
         Some(SubscriptionItem::Heartbeat(_)) => Ok(ConsumedItem::Heartbeat),
         Some(SubscriptionItem::Batch(batch)) => {
-            let admission = state.admit_batch(&batch)?;
+            let admission = state.admit_batch_scoped(&batch, senders)?;
             subscription.commit_durable(&batch)?;
             state.confirm_batch_commit(&admission)?;
             Ok(ConsumedItem::Batch(admission))
@@ -14970,6 +15193,7 @@ mod tests {
             subscription_environment: Vec::new(),
             channel_ids: vec!["spaces/example".to_owned()],
             allowed_senders: vec!["users/owner".to_owned()],
+            max_grant_seconds: crate::chat_runtime::DEFAULT_MAX_GRANT_SECONDS,
             agent_name: "coordinator".to_owned(),
             agent_label: "codex coordinator".to_owned(),
             outbound_enabled: true,

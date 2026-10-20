@@ -60,6 +60,7 @@ impl Scratch {
                 subscription_environment: Vec::new(),
                 channel_ids: vec!["spaces/example".to_owned()],
                 allowed_senders: vec!["users/owner".to_owned()],
+                max_grant_seconds: agentctl::chat_runtime::DEFAULT_MAX_GRANT_SECONDS,
                 agent_name: "worker".to_owned(),
                 agent_label: "worker".to_owned(),
                 outbound_enabled: true,

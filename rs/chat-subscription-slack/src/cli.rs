@@ -1,6 +1,6 @@
 //! Transport over an installed Slack command-line client.
 //!
-//! The operator configures the client's absolute path. The transport uses four of its commands:
+//! The operator configures the client's absolute path. The transport uses these commands:
 //!
 //! | Operation | Command |
 //! | --- | --- |
@@ -8,6 +8,12 @@
 //! | post | `slack.message send --channel-id=C… --markdown=file://- [--thread-ts=…] [--as=A…] --output=json` |
 //! | reaction | `slack.reaction add --channel-id=C… --message-ts=… --name=… [--as=A…] --output=json` |
 //! | listing | `slack.message list --channel-id=C… [--thread-ts=…] --oldest=… [--as=A…] --output=json` |
+//! | sender lookup | `slack.user describe --user=<unixname\|email\|ID> --columns=user_id [--as=A…] --output=json` |
+//! | current members | `slack.conversation members --channel-id=C… --limit=20 --columns=user_id [--page-token=…] [--as=A…] --output=json` |
+//!
+//! Member listings follow every page within one invocation's timeout and return no partial
+//! result. They refuse incomplete source data, dropped rows, inconsistent pagination, repeated
+//! tokens or more than [`chat_subscription::MAX_ALLOWED_SENDERS`] distinct user IDs.
 //!
 //! Message bodies travel on standard input (`file://-`), so they never appear in a process
 //! argument list. A client that holds a person's credentials ([`ClientIdentity::User`], the
@@ -22,6 +28,7 @@
 //! "slack_user_id", "bot_id", "app_id", "subtype", "text", "team_id"}}}`, plus
 //! `{"type": "HEARTBEAT"}` and `{"type": "GAP", ...}` records.
 
+use std::collections::BTreeSet;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
@@ -753,10 +760,114 @@ fn run_failure(failure: RunFailure, write: bool) -> TransportError {
             "the Slack client did not finish before its deadline",
             true,
         ),
-        RunFailure::Wait(error) => {
+        RunFailure::Wait(error) if write => {
             TransportError::unknown("transport_wait_failed", format!("waiting failed: {error}"))
         }
+        RunFailure::Wait(error) => TransportError::not_applied(
+            "transport_wait_failed",
+            format!("waiting failed: {error}"),
+            true,
+        ),
     }
+}
+
+fn directory_unreadable(detail: &str) -> TransportError {
+    TransportError::not_applied("directory_unreadable", detail, false)
+}
+
+/// Directory reads accept one complete JSON document, never a prefix of a truncated result.
+fn directory_document(completed: &Completed) -> Result<Value, TransportError> {
+    if !completed.status.success() {
+        return Err(exit_failure(completed, false));
+    }
+    if completed.stdout.len() >= MAX_STDOUT_BYTES {
+        return Err(directory_unreadable(
+            "the directory response reached the output limit; pass explicit Slack user IDs instead",
+        ));
+    }
+    let text = std::str::from_utf8(&completed.stdout)
+        .map_err(|_| directory_unreadable("the directory response was not UTF-8"))?;
+    let start = text
+        .find(['{', '['])
+        .ok_or_else(|| directory_unreadable("the directory response was not a JSON document"))?;
+    let parsed: Value = serde_json::from_str(&text[start..]).map_err(|_| {
+        directory_unreadable("the directory response was not one complete JSON document")
+    })?;
+    if parsed.get("status").and_then(Value::as_str) == Some("error") {
+        return Err(exit_failure(completed, false));
+    }
+    Ok(parsed)
+}
+
+fn resolved_sender(document: &Value) -> Result<String, TransportError> {
+    let data = document.get("data").unwrap_or(document);
+    let row = match data {
+        Value::Object(_) => data,
+        Value::Array(rows) if rows.len() == 1 => &rows[0],
+        _ => {
+            return Err(directory_unreadable("the lookup did not return exactly one person; pass a Slack user ID from the person's Slack profile"));
+        }
+    };
+    row.get("user_id")
+        .and_then(Value::as_str)
+        .filter(|id| ids::valid_user_id(id))
+        .map(str::to_owned)
+        .ok_or_else(|| directory_unreadable("the lookup did not return a Slack user ID; pass the ID from the person's Slack profile"))
+}
+
+fn member_page(document: &Value) -> Result<(Vec<String>, Option<String>), TransportError> {
+    if document
+        .pointer("/completeness/source_complete")
+        .and_then(Value::as_bool)
+        != Some(true)
+        || document.get("dropped_row_count").and_then(Value::as_u64) != Some(0)
+    {
+        return Err(directory_unreadable("the member listing did not confirm complete source data with no dropped rows; no partial listing is returned"));
+    }
+    let rows = document
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| directory_unreadable("the member listing did not contain a data array"))?;
+    let members = rows
+        .iter()
+        .map(|row| {
+            row.get("user_id")
+                .and_then(Value::as_str)
+                .filter(|id| ids::valid_user_id(id))
+                .map(str::to_owned)
+                .ok_or_else(|| directory_unreadable("a member row did not contain a Slack user ID; no partial listing is returned"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let pagination = document.get("pagination").ok_or_else(|| {
+        directory_unreadable(
+            "the member listing did not report pagination; no partial listing is returned",
+        )
+    })?;
+    let has_next = pagination
+        .get("has_next_page")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            directory_unreadable("the member listing did not say whether another page exists")
+        })?;
+    let token = match pagination.get("next_page_token") {
+        Some(Value::String(token))
+            if token.len() <= 4_096 && !token.chars().any(char::is_control) =>
+        {
+            (!token.is_empty()).then(|| token.clone())
+        }
+        Some(Value::Null) | None => None,
+        _ => {
+            return Err(directory_unreadable(
+                "the member listing had an invalid page token",
+            ))
+        }
+    };
+    if has_next != token.is_some() {
+        return Err(directory_unreadable(
+            "the member listing had inconsistent pagination; no partial listing is returned",
+        ));
+    }
+    Ok((members, token))
 }
 
 /// The client arguments of one post, whose body the client reads from standard input. `app`
@@ -978,6 +1089,81 @@ impl SlackTransport for CliTransport {
                 })
             })
             .collect())
+    }
+
+    fn resolve_sender(&mut self, app_id: &AppId, query: &str) -> Result<String, TransportError> {
+        let mut arguments = vec![
+            "slack.user".to_owned(),
+            "describe".to_owned(),
+            format!("--user={query}"),
+            "--columns=user_id".to_owned(),
+        ];
+        arguments.extend(self.options.identity.app_argument(app_id));
+        arguments.push("--output=json".to_owned());
+        let completed = self
+            .run(&arguments, None)
+            .map_err(|failure| run_failure(failure, false))?;
+        resolved_sender(&directory_document(&completed)?)
+    }
+
+    fn list_members(
+        &mut self,
+        app_id: &AppId,
+        channel_id: &str,
+    ) -> Result<Vec<String>, TransportError> {
+        let deadline = Instant::now() + self.options.timeout;
+        let mut members = BTreeSet::new();
+        let mut tokens = BTreeSet::new();
+        let mut page_token = None;
+        // Even an unhelpful client returning unique tokens and empty pages cannot run forever.
+        for _ in 0..=chat_subscription::MAX_ALLOWED_SENDERS {
+            let mut arguments = vec![
+                "slack.conversation".to_owned(),
+                "members".to_owned(),
+                format!("--channel-id={channel_id}"),
+                "--limit=20".to_owned(),
+                "--columns=user_id".to_owned(),
+            ];
+            if let Some(token) = &page_token {
+                arguments.push(format!("--page-token={token}"));
+            }
+            arguments.extend(self.options.identity.app_argument(app_id));
+            arguments.push("--output=json".to_owned());
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(TransportError::not_applied(
+                    "transport_timeout",
+                    "the member listing could not finish every page before its deadline; no partial listing is returned",
+                    true,
+                ));
+            }
+            let completed = run_bounded(self.client_command(&arguments), None, remaining)
+                .map_err(|failure| run_failure(failure, false))?;
+            let (page, next) = member_page(&directory_document(&completed)?)?;
+            members.extend(page);
+            if members.len() > chat_subscription::MAX_ALLOWED_SENDERS {
+                return Err(TransportError::not_applied(
+                    "member_limit_exceeded",
+                    format!(
+                        "the channel has more than {} members; pass explicit sender IDs instead",
+                        chat_subscription::MAX_ALLOWED_SENDERS
+                    ),
+                    false,
+                ));
+            }
+            let Some(token) = next else {
+                return Ok(members.into_iter().collect());
+            };
+            if !tokens.insert(token.clone()) {
+                return Err(directory_unreadable(
+                    "the member listing repeated a page token; no partial listing is returned",
+                ));
+            }
+            page_token = Some(token);
+        }
+        Err(directory_unreadable(
+            "the member listing exceeded its page limit; no partial listing is returned",
+        ))
     }
 }
 

@@ -637,6 +637,7 @@ mod tests {
                 subscription_environment: Vec::new(),
                 channel_ids: vec!["spaces/example".to_owned()],
                 allowed_senders: vec!["users/owner".to_owned()],
+                max_grant_seconds: crate::chat_runtime::DEFAULT_MAX_GRANT_SECONDS,
                 agent_name: "coordinator".to_owned(),
                 agent_label: "coordinator".to_owned(),
                 outbound_enabled: true,

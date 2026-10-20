@@ -448,6 +448,18 @@ impl SlackTransport for WarmTransport {
     ) -> Result<Vec<ListedMessage>, TransportError> {
         self.inner.list_messages(query)
     }
+
+    fn resolve_sender(&mut self, app_id: &AppId, query: &str) -> Result<String, TransportError> {
+        self.inner.resolve_sender(app_id, query)
+    }
+
+    fn list_members(
+        &mut self,
+        app_id: &AppId,
+        channel_id: &str,
+    ) -> Result<Vec<String>, TransportError> {
+        self.inner.list_members(app_id, channel_id)
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

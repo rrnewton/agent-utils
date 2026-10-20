@@ -30,6 +30,7 @@ Create a private owner-only JSON file (normally mode `0600`):
   "subscription_environment": ["PROVIDER_CERT", "PROVIDER_KEY"],
   "channel_ids": ["spaces/example"],
   "allowed_senders": ["users/owner"],
+  "max_grant_seconds": 2592000,
   "agent_name": "coordinator",
   "agent_label": "codex coordinator",
   "outbound_enabled": true,
@@ -69,6 +70,85 @@ startup the host validates and hashes a native helper of at most 64 MiB, copies
 those exact bytes into a sealed in-memory executable, and retains that image for
 the generation. Reply and reaction operations neither reopen nor rehash the
 source path.
+
+### Permanent owners and temporary sender grants
+
+`allowed_senders` holds the permanent owners' authenticated provider IDs. To
+invite someone else, give the bridge state and a required lifetime:
+
+```sh
+agentctl chat grant --bridge-state DIR U0GUEST001 --for 12h --note 'project discussion'
+agentctl chat grant --bridge-state DIR member@example.org --for 7d
+agentctl chat grant --bridge-state DIR --all-members --for 30m
+agentctl chat grants --bridge-state DIR
+agentctl chat grants --bridge-state DIR --json
+agentctl chat revoke --bridge-state DIR U0GUEST001 U0GUEST002
+agentctl chat grant-limit --bridge-state DIR --for 30d
+```
+
+`--for` accepts a positive whole number followed by seconds (`s`), minutes (`m`),
+hours (`h`), days (`d`) or weeks (`w`); zero, fractional and overflowing values
+are refused. The default maximum is 30 days (2,592,000 seconds), stored as
+`config.max_grant_seconds` in `bridge.json`. An older state without that key
+uses the same default. Set it in the initial configuration or change it with
+`grant-limit --for DURATION` on existing state. This changes the limit for new
+grants and renewals; existing grants keep their recorded expiry. A duration
+above the current maximum is refused before any grant is written.
+
+Supply raw provider sender IDs, such as Slack `U…` IDs. With a helper supporting
+`resolve_sender`, names and emails are resolved first and only IDs are saved.
+Without a directory-capable helper, use IDs directly; for the bundled Slack
+client, find one with `slack.user describe --user <unixname|email|ID>`.
+An unresolved Slack name or email is refused before any grant is saved.
+`--all-members` requires `list_members` support: it enumerates the current
+members of every configured channel and writes one grant per ID, listing them
+all in the command's JSON result. An incomplete or failed enumeration refuses
+the whole command. There is no wildcard and a later joiner receives no grant.
+Permanent owners in the enumeration are listed separately and remain owners.
+
+Each grant in private `grants.json` records its sender ID, creation and expiry
+as Unix milliseconds, and optional `--note` (at most 2,000 UTF-8 bytes). Repeating
+`grant` for an ID replaces its grant with a lifetime starting now. `grants`
+lists permanent owners and both active and expired grants, with time remaining;
+`--json` reports the same fields with `status` and `remaining_seconds`.
+`revoke` removes a temporary grant, and refuses an attempt to remove a permanent
+owner. Revoke expired entries to free retained slots: there are at most 256
+retained grants and at most 256 distinct permanent owners plus active grants.
+Grants, revocations and limit changes take the bridge's common state lock and
+use its atomic, synced document writes, so concurrent commands preserve each
+other's changes.
+
+The running service checks the grant file after every provider item or
+heartbeat and refreshes the explicit provider sender list when it changes,
+resuming at the durable cursor without restarting the service. The bundled
+Slack plugin's heartbeat interval defaults to 30 seconds, so on a quiet stream
+new grants normally reach its subscription within that interval. The service logs
+`sender grants changed; refreshing subscription`. If a grant changes while an
+item is being received, the admission lock detects the stale sender list before
+committing it. The refreshed subscription replays that item from the previous
+durable cursor, so the old provider filter cannot discard the first new message.
+Expiry and revocation are also checked under the admission lock for every
+batch: they immediately stop admitting new messages, whose cursor is still
+committed as for other unallowed messages. The service records and logs each
+expiry once across batches and restarts; renewing the grant permits a new
+expiry notice. Requests admitted while the grant was active can still finish
+and receive replies afterwards.
+
+Every provider must preserve its saved cursor's canonical replay evidence when
+the sender list changes. The bundled Slack provider resumes strictly after that
+cursor. An inclusive provider that changes the saved boundary's contents still
+triggers the existing boundary-mismatch refusal and explicit recovery procedure;
+a grant does not relax that check.
+
+The directory extension uses the configured helper's existing version-1 NDJSON
+envelope and bounded supervisor. A `resolve_sender` request contains `version`,
+`id` (a fresh UUID), `action`, `channel_id` and `query`; its success `receipt`
+is `{"sender_id":"U…"}`. `list_members` has the same envelope and channel with
+no query; its receipt is `{"sender_ids":["U…","U…"]}`. The response repeats
+the exact version, UUID and action and sets `ok:true`; errors use the existing
+`ok:false` error envelope. A provider must return the complete explicit list or
+refuse, including when pagination, permissions or a deadline prevent a complete
+listing. These operations read the provider and create no outbound post intent.
 
 ### Reactions
 
@@ -1870,11 +1950,12 @@ only implemented one; `transport: "web_api"` (plugin) or `--transport=web-api`
 Resource names. The channel is the Slack conversation ID (`C…`). A message is
 `C…/messages/<ts>`, a thread is `C…/threads/<root ts>`, and a reaction receipt
 is `C…/messages/<ts>/reactions/<name>`. A sender is the Slack user ID (`U…`), so
-`allowed_senders` lists user IDs. A top-level message starts its own thread; a
+`allowed_senders` and temporary grants store user IDs. A top-level message starts its own thread; a
 reply in a thread routes to the thread root, and the agent's answer is posted
 into that thread.
 
-Inbound filtering. Only messages in `channel_ids`, from `allowed_senders`, with
+Inbound filtering. Only messages in `channel_ids`, from permanent owners or
+senders with active grants, with
 no bot or app author, and with no subtype other than `thread_broadcast`,
 `file_share` or `me_message` become requests. Every other event commits as a
 checkpoint so the cursor still advances. Slack's `&amp;`, `&lt;` and `&gt;`
@@ -1929,7 +2010,7 @@ through a Crewmate:
   client that holds a member's credentials, which every write then redirects
   to the app with `--as=<APP_ID>`.
 
-Either way, `allowed_senders` still decides whose messages are requests, and a
+Either way, permanent owners and active grants decide whose messages are requests, and a
 post by the app is never one.
 
 The host runs both clients with a scrubbed environment: the plugin gets only

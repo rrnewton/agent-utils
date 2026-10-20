@@ -120,6 +120,7 @@ fn a_bridge_configuration_for_slack_is_accepted_by_the_plugin() {
         subscription_environment: Vec::new(),
         channel_ids: vec![CHANNEL.to_owned()],
         allowed_senders: vec!["U0OWNER0001".to_owned()],
+        max_grant_seconds: agentctl::chat_runtime::DEFAULT_MAX_GRANT_SECONDS,
         agent_name: "slack-test".to_owned(),
         agent_label: "slack test agent".to_owned(),
         outbound_enabled: true,

@@ -698,6 +698,26 @@ enum ChatCommand {
     Init(ChatInit),
     /// Inspect durable bridge state without contacting Herdr or a provider
     Status(ChatState),
+    /// Grant explicit senders temporary permission to message the bridge
+    #[command(
+        after_help = "Examples:\n  agentctl chat grant --bridge-state DIR U0GUEST001 --for 12h --note 'project discussion'\n  agentctl chat grant --bridge-state DIR member@example.org --for 7d\n  agentctl chat grant --bridge-state DIR --all-members --for 30m\n\nEvery grant needs a positive duration. The default configurable maximum is 30 days.\nNames need an outbound helper supporting resolve_sender; raw provider IDs work without it.\n--all-members enumerates every configured channel now, lists each saved ID, and never grants\na wildcard or future members. A running bridge refreshes its sender list after the current\nprovider item or heartbeat; expiry and revocation are checked again for each batch."
+    )]
+    Grant(ChatGrant),
+    /// List permanent owners and active or expired grants, with time remaining
+    #[command(
+        after_help = "Example: agentctl chat grants --bridge-state DIR\n\nRead-only; never contacts Herdr or the provider. Expired grants stay listed until revoked or\nrenewed. Times in --json are Unix milliseconds and remaining_seconds is zero when expired."
+    )]
+    Grants(ChatGrants),
+    /// Revoke temporary sender grants; permanent owners cannot be removed
+    #[command(
+        after_help = "Example: agentctl chat revoke --bridge-state DIR U0GUEST001\n\nUse provider IDs or names resolved by the configured helper. Revocation applies to new\nmessages immediately at admission, including on an already open provider subscription."
+    )]
+    Revoke(ChatRevoke),
+    /// Change max_grant_seconds in the existing bridge config without re-initializing it
+    #[command(
+        after_help = "Example: agentctl chat grant-limit --bridge-state DIR --for 30d\n\nThe default maximum is 30 days. This sets the limit for future grants and renewals; already\nissued grants keep their recorded expiry. The service does not need to restart."
+    )]
+    GrantLimit(ChatGrantLimit),
     /// Approve one unchanged checkpoint-only gap retry while the service is stopped
     RetryCheckpointGap(ChatRetryGap),
     /// Approve an exact committed-boundary replay, including messages, with the runner stopped
@@ -746,6 +766,51 @@ struct ChatState {
     /// Private durable bridge state directory
     #[arg(long, value_name = "DIR")]
     bridge_state: PathBuf,
+}
+
+#[derive(Args)]
+struct ChatGrant {
+    #[command(flatten)]
+    state: ChatState,
+    /// Provider sender IDs, or names/emails resolved by the configured helper
+    #[arg(value_name = "SENDER", required_unless_present = "all_members", conflicts_with = "all_members", num_args = 1..)]
+    senders: Vec<String>,
+    /// Enumerate and grant the current members of all configured channels explicitly
+    #[arg(long)]
+    all_members: bool,
+    /// Required lifetime: positive whole number with s, m, h, d or w (30m, 12h, 7d)
+    #[arg(long = "for", value_name = "DURATION", value_parser = crate::chat_runtime::parse_grant_duration)]
+    duration: Duration,
+    /// Optional reason retained with each grant (at most 2000 UTF-8 bytes)
+    #[arg(long, value_name = "TEXT")]
+    note: Option<String>,
+}
+
+#[derive(Args)]
+struct ChatGrants {
+    #[command(flatten)]
+    state: ChatState,
+    /// Print one JSON document instead of the text listing
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct ChatRevoke {
+    #[command(flatten)]
+    state: ChatState,
+    /// Provider sender IDs, or names/emails resolved by the configured helper
+    #[arg(value_name = "SENDER", required = true, num_args = 1..)]
+    senders: Vec<String>,
+}
+
+#[derive(Args)]
+struct ChatGrantLimit {
+    #[command(flatten)]
+    state: ChatState,
+    /// Maximum lifetime for future grants: positive whole number with s, m, h, d or w
+    #[arg(long = "for", value_name = "DURATION", value_parser = crate::chat_runtime::parse_grant_duration)]
+    duration: Duration,
 }
 
 #[derive(Args)]
@@ -1851,6 +1916,37 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
         }
         ChatCommand::Status(value) => {
             let result = crate::chat_service::status(&value.bridge_state).map_err(Failure::Chat)?;
+            write_json(&result).map_err(Failure::Output)?;
+            Ok(0)
+        }
+        ChatCommand::Grant(value) => {
+            let result = crate::chat_service::grant(
+                &value.state.bridge_state,
+                &value.senders,
+                value.all_members,
+                value.duration,
+                value.note.as_deref(),
+            )
+            .map_err(Failure::Chat)?;
+            write_json(&result).map_err(Failure::Output)?;
+            Ok(0)
+        }
+        ChatCommand::Grants(value) => {
+            let listing = crate::chat_service::grants(&value.state.bridge_state, value.json)
+                .map_err(Failure::Chat)?;
+            write_text(&listing).map_err(Failure::Output)?;
+            Ok(0)
+        }
+        ChatCommand::Revoke(value) => {
+            let result = crate::chat_service::revoke(&value.state.bridge_state, &value.senders)
+                .map_err(Failure::Chat)?;
+            write_json(&result).map_err(Failure::Output)?;
+            Ok(0)
+        }
+        ChatCommand::GrantLimit(value) => {
+            let result =
+                crate::chat_service::grant_limit(&value.state.bridge_state, value.duration)
+                    .map_err(Failure::Chat)?;
             write_json(&result).map_err(Failure::Output)?;
             Ok(0)
         }

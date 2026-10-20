@@ -39,7 +39,12 @@ use crate::error::AdapterErrorKind;
 use crate::stale_composer::{HerdrComposerPane, StaleComposer};
 use crate::subagents::{ManagedAgents, ManagedApi};
 
+#[cfg(test)]
+mod grant_refresh_tests;
 mod reply_reminders;
+mod sender_grants;
+
+pub use sender_grants::{grant, grant_limit, grants, revoke};
 
 use reply_reminders::ReplyReminders;
 pub use reply_reminders::{
@@ -2598,6 +2603,9 @@ impl ProviderBackoff {
 #[derive(Debug)]
 enum ProviderGenerationError {
     Cancelled,
+    // The current provider item is committed; reconnect immediately with a fresh explicit
+    // sender list. This is an operator policy change, not a provider outage.
+    Reconfigure,
     Cleanup(String),
     Retryable(String),
     Fatal(String),
@@ -3420,6 +3428,8 @@ fn run_provider_worker(
                 stop.record_cleanup_error("provider reported cancellation without an owner stop");
                 break;
             }
+            Err(ProviderGenerationError::Reconfigure) if !stop.is_stopped() => continue,
+            Err(ProviderGenerationError::Reconfigure) => break,
             Err(ProviderGenerationError::Cleanup(error)) => {
                 stop.record_cleanup_error(format!("provider shutdown cleanup failed: {error}"));
                 break;
@@ -3604,8 +3614,51 @@ where
                 .map_err(|error| ProviderGenerationError::Cleanup(error.to_string()))?;
             return Err(ProviderGenerationError::Cancelled);
         }
-        let consumed = match chat_runtime::consume_one(&mut subscription, state) {
+        for grant in state
+            .take_expired_grants()
+            .map_err(|error| ProviderGenerationError::Retryable(error.to_string()))?
+        {
+            log(format_args!(
+                "agentctl: chat grant expired: {} (expired at {} Unix ms)",
+                grant.sender_id, grant.expires_at_millis
+            ));
+        }
+        let senders = state
+            .subscription_senders()
+            .map_err(|error| ProviderGenerationError::Retryable(error.to_string()))?;
+        if !request
+            .allowed_senders()
+            .iter()
+            .map(|sender| sender.as_str())
+            .eq(senders.iter().map(String::as_str))
+        {
+            subscription.close().map_err(|error| {
+                ProviderGenerationError::Cleanup(format!(
+                    "provider close for sender grant refresh failed: {error}"
+                ))
+            })?;
+            log(format_args!(
+                "agentctl: chat provider: sender grants changed; refreshing subscription"
+            ));
+            return Err(ProviderGenerationError::Reconfigure);
+        }
+        let consumed = match chat_runtime::consume_one_for_senders(
+            &mut subscription,
+            state,
+            request.allowed_senders(),
+        ) {
             Ok(consumed) => consumed,
+            Err(ChatRuntimeError::SenderScopeChanged) => {
+                subscription.close().map_err(|error| {
+                    ProviderGenerationError::Cleanup(format!(
+                        "provider close for sender grant refresh failed: {error}"
+                    ))
+                })?;
+                log(format_args!(
+                    "agentctl: chat provider: sender grants changed; refreshing subscription"
+                ));
+                return Err(ProviderGenerationError::Reconfigure);
+            }
             Err(ChatRuntimeError::UnresolvedGap(detail)) => {
                 cancel_provider(cancellation).map_err(|error| {
                     ProviderGenerationError::Fatal(format!(
@@ -5948,6 +6001,7 @@ mod tests {
                 subscription_environment: Vec::new(),
                 channel_ids: vec!["spaces/example".to_owned()],
                 allowed_senders: vec!["users/owner".to_owned()],
+                max_grant_seconds: crate::chat_runtime::DEFAULT_MAX_GRANT_SECONDS,
                 agent_name: "coordinator".to_owned(),
                 agent_label: "coordinator".to_owned(),
                 outbound_enabled: true,
@@ -7436,6 +7490,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 subscription_environment: vec!["AGENTCTL_TEST_CERT_PATH".to_owned()],
                 channel_ids: vec!["spaces/example".to_owned()],
                 allowed_senders: vec!["users/owner".to_owned()],
+                max_grant_seconds: crate::chat_runtime::DEFAULT_MAX_GRANT_SECONDS,
                 agent_name: "coordinator".to_owned(),
                 agent_label: "coordinator".to_owned(),
                 outbound_enabled: true,
@@ -8077,6 +8132,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 subscription_environment: Vec::new(),
                 channel_ids: vec!["spaces/allowed".to_owned()],
                 allowed_senders: vec!["users/owner".to_owned()],
+                max_grant_seconds: crate::chat_runtime::DEFAULT_MAX_GRANT_SECONDS,
                 agent_name: "coordinator".to_owned(),
                 agent_label: "coordinator".to_owned(),
                 outbound_enabled: true,
@@ -8141,6 +8197,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 subscription_environment: Vec::new(),
                 channel_ids: vec!["spaces/allowed".to_owned()],
                 allowed_senders: vec!["users/owner".to_owned()],
+                max_grant_seconds: crate::chat_runtime::DEFAULT_MAX_GRANT_SECONDS,
                 agent_name: "coordinator".to_owned(),
                 agent_label: "coordinator".to_owned(),
                 outbound_enabled: true,
@@ -8529,6 +8586,7 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 subscription_environment: Vec::new(),
                 channel_ids: vec!["spaces/example".to_owned()],
                 allowed_senders: vec!["users/owner".to_owned()],
+                max_grant_seconds: crate::chat_runtime::DEFAULT_MAX_GRANT_SECONDS,
                 agent_name: "coordinator".to_owned(),
                 agent_label: "coordinator".to_owned(),
                 outbound_enabled: false,
@@ -10336,6 +10394,7 @@ esac
             subscription_environment: Vec::new(),
             channel_ids: vec!["spaces/example".to_owned()],
             allowed_senders: vec!["users/owner".to_owned()],
+            max_grant_seconds: crate::chat_runtime::DEFAULT_MAX_GRANT_SECONDS,
             agent_name: "coordinator".to_owned(),
             agent_label: "coordinator".to_owned(),
             outbound_enabled: true,
@@ -10796,6 +10855,7 @@ esac
                 subscription_environment: Vec::new(),
                 channel_ids: vec!["spaces/example".to_owned()],
                 allowed_senders: vec!["users/owner".to_owned()],
+                max_grant_seconds: crate::chat_runtime::DEFAULT_MAX_GRANT_SECONDS,
                 agent_name: "worker".to_owned(),
                 agent_label: "worker".to_owned(),
                 outbound_enabled,

@@ -6,10 +6,14 @@
 //! ```json
 //! {"version":1,"id":"<uuid>","action":"send","channel_id":"C…","thread_id":"C…/threads/<ts>","text":"…"}
 //! {"version":1,"id":"<uuid>","action":"ensure_reaction","channel_id":"C…","message_id":"C…/messages/<ts>","emoji":"🤖"}
+//! {"version":1,"id":"<uuid>","action":"resolve_sender","channel_id":"C…","query":"<unixname|email|ID>"}
+//! {"version":1,"id":"<uuid>","action":"list_members","channel_id":"C…"}
 //! ```
 //!
 //! A success names the posted message (`C…/messages/<ts>`) or reaction
-//! (`C…/messages/<ts>/reactions/<name>`). A failure carries a lowercase code, a bounded detail,
+//! (`C…/messages/<ts>/reactions/<name>`), or returns `sender_id` / `sender_ids` for a read-only
+//! directory request. Membership is always enumerated explicitly, never as a wildcard. A failure
+//! carries a lowercase code, a bounded detail,
 //! whether the operation is proven `not_applied` or `unknown`, and whether retrying the same
 //! UUID may succeed.
 //!
@@ -482,6 +486,13 @@ enum Request {
         message_ts: String,
         emoji: String,
     },
+    ResolveSender {
+        channel_id: String,
+        query: String,
+    },
+    ListMembers {
+        channel_id: String,
+    },
 }
 
 fn exact_keys(object: &Map<String, Value>, keys: &[&str]) -> bool {
@@ -552,7 +563,40 @@ fn parse_request(object: &Map<String, Value>, action: &str) -> Result<Request, R
                 emoji: text("emoji").ok_or_else(|| invalid("emoji must be a string"))?,
             })
         }
-        _ => Err(invalid("action must be send or ensure_reaction")),
+        "resolve_sender" => {
+            if !exact_keys(object, &["version", "id", "action", "channel_id", "query"]) {
+                return Err(invalid(
+                    "a sender lookup has exactly version, id, action, channel_id and query",
+                ));
+            }
+            let query = text("query").ok_or_else(|| invalid("query must be a string"))?;
+            if query.is_empty()
+                || query.len() > 320
+                || query.chars().any(char::is_whitespace)
+                || query.chars().any(char::is_control)
+            {
+                return Err(invalid("query must be one unixname, email address or Slack user ID, at most 320 bytes without whitespace"));
+            }
+            Ok(Request::ResolveSender {
+                channel_id: text("channel_id")
+                    .ok_or_else(|| invalid("channel_id must be a string"))?,
+                query,
+            })
+        }
+        "list_members" => {
+            if !exact_keys(object, &["version", "id", "action", "channel_id"]) {
+                return Err(invalid(
+                    "a member listing has exactly version, id, action and channel_id",
+                ));
+            }
+            Ok(Request::ListMembers {
+                channel_id: text("channel_id")
+                    .ok_or_else(|| invalid("channel_id must be a string"))?,
+            })
+        }
+        _ => Err(invalid(
+            "action must be send, ensure_reaction, resolve_sender or list_members",
+        )),
     }
 }
 
@@ -587,7 +631,12 @@ pub fn handle_request(
     let action = object
         .get("action")
         .and_then(Value::as_str)
-        .filter(|action| matches!(*action, "send" | "ensure_reaction"));
+        .filter(|action| {
+            matches!(
+                *action,
+                "send" | "ensure_reaction" | "resolve_sender" | "list_members"
+            )
+        });
     let (Some(id), Some(action)) = (id, action) else {
         return failure_line(
             Value::Null,
@@ -631,9 +680,10 @@ pub fn handle_request(
         Err(refusal) => return respond_error(&refusal),
     };
     let channel = match &request {
-        Request::Send { channel_id, .. } | Request::Reaction { channel_id, .. } => {
-            channel_id.clone()
-        }
+        Request::Send { channel_id, .. }
+        | Request::Reaction { channel_id, .. }
+        | Request::ResolveSender { channel_id, .. }
+        | Request::ListMembers { channel_id } => channel_id.clone(),
     };
     if !config.channels.contains(&channel) {
         return respond_error(&Refusal::not_applied(
@@ -689,6 +739,41 @@ pub fn handle_request(
                     Refusal::from(error)
                 }),
         },
+        Request::ResolveSender { query, .. } => transport
+            .resolve_sender(app_id, &query)
+            .map_err(Refusal::from)
+            .and_then(|sender_id| {
+                if !ids::valid_user_id(&sender_id) {
+                    return Err(Refusal::not_applied(
+                        "directory_unreadable",
+                        "the sender lookup did not return a Slack user ID; find the ID in the person's Slack profile and pass it explicitly",
+                        false,
+                    ));
+                }
+                Ok(json!({"sender_id": sender_id}))
+            }),
+        Request::ListMembers { channel_id } => transport
+            .list_members(app_id, &channel_id)
+            .map_err(Refusal::from)
+            .and_then(|mut sender_ids| {
+                if sender_ids.iter().any(|sender| !ids::valid_user_id(sender)) {
+                    return Err(Refusal::not_applied(
+                        "directory_unreadable",
+                        "the member listing contained an invalid Slack user ID; no partial listing is returned",
+                        false,
+                    ));
+                }
+                sender_ids.sort();
+                sender_ids.dedup();
+                if sender_ids.len() > chat_subscription::MAX_ALLOWED_SENDERS {
+                    return Err(Refusal::not_applied(
+                        "member_limit_exceeded",
+                        format!("the channel has more than {} members; pass explicit sender IDs instead", chat_subscription::MAX_ALLOWED_SENDERS),
+                        false,
+                    ));
+                }
+                Ok(json!({"sender_ids": sender_ids}))
+            }),
     };
     match result {
         Ok(receipt) => line(&json!({

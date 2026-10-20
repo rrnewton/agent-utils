@@ -1318,6 +1318,63 @@ fn a_snapshot_failure_before_any_write_leaves_the_message_pending() {
 }
 
 #[test]
+fn a_transient_peer_read_failure_after_submission_is_retried_and_delivered() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    add_bystander(&fixture);
+    *fixture.client.fail_scrollback_after_effect.lock().unwrap() = Some(("peer".to_owned(), 1));
+    send(&fixture, "worker", LONG).expect("delivered after retrying the peer read");
+    assert_eq!(runs(&fixture), [LONG]);
+    assert!(failed_documents(&fixture, "worker").is_empty());
+    assert_eq!(
+        *fixture.client.fail_scrollback_after_effect.lock().unwrap(),
+        Some(("peer".to_owned(), 0))
+    );
+}
+
+#[test]
+fn a_peer_read_failure_that_persists_keeps_the_prompt_unproven() {
+    TEST_READBACK.with(|limit| limit.set(Some(Duration::from_millis(250))));
+    let fixture = Fixture::new();
+    fixture.start(None);
+    add_bystander(&fixture);
+    *fixture.client.fail_scrollback_after_effect.lock().unwrap() =
+        Some(("peer".to_owned(), usize::MAX));
+    let error = send(&fixture, "worker", LONG).expect_err("unproven while the peer cannot be read");
+    assert_eq!(
+        error.outcome(),
+        Some(agent::QueueOutcome::PossiblySubmitted),
+        "{error}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("cannot verify peer pane peer after submission to owned"),
+        "{error}"
+    );
+    assert_eq!(runs(&fixture), [LONG]);
+    assert_eq!(failed_documents(&fixture, "worker").len(), 1);
+}
+
+#[test]
+fn a_peer_prompt_discovered_after_a_transient_read_failure_is_still_quarantined() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    add_bystander(&fixture);
+    *fixture.client.scrollback_on_effect.lock().unwrap() =
+        Some(("peer".to_owned(), vec![LONG.to_owned()]));
+    *fixture.client.fail_scrollback_after_effect.lock().unwrap() = Some(("peer".to_owned(), 1));
+    let error = send(&fixture, "worker", LONG).expect_err("the peer also shows this prompt");
+    assert!(
+        error.to_string().contains("cannot be attributed"),
+        "{error}"
+    );
+    assert_eq!(runs(&fixture), [LONG]);
+    assert_eq!(failed_documents(&fixture, "worker").len(), 1);
+    assert!(fixture.client.keys_sent.lock().unwrap().is_empty());
+}
+
+#[test]
 fn a_peer_pane_herdr_reports_missing_is_skipped_by_the_snapshot() {
     let fixture = Fixture::new();
     fixture.start(None);

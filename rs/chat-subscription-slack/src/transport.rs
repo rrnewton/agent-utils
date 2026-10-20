@@ -3,7 +3,8 @@
 //! Inbound, a transport opens one ordered event stream for the configured channels, starting at a
 //! [`Catchup`] position. Each sequenced record carries the provider's durable event sequence
 //! number, which the plugin uses as its replay cursor. Outbound, a transport posts a message, adds
-//! a reaction, and lists recent messages so an uncertain post can be reconciled.
+//! a reaction, and lists recent messages so an uncertain post can be reconciled. Directory reads
+//! resolve a sender query to one user ID and enumerate a conversation's current members.
 //!
 //! Every write takes an [`AppId`]: there is no way to ask a transport to post as a user.
 
@@ -293,6 +294,38 @@ pub trait SlackTransport: Send {
         &mut self,
         query: &ListQuery<'_>,
     ) -> Result<Vec<ListedMessage>, TransportError>;
+
+    /// Resolve one unixname, email address or Slack user ID to its provider user ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError`] when the query cannot be resolved unambiguously. Transports
+    /// without a directory refuse; callers can accept a raw Slack user ID instead.
+    fn resolve_sender(&mut self, _app_id: &AppId, _query: &str) -> Result<String, TransportError> {
+        Err(TransportError::not_applied(
+            "directory_unsupported",
+            "this transport cannot resolve people; pass a Slack user ID (U… or W…) from the person's Slack profile",
+            false,
+        ))
+    }
+
+    /// Enumerate every current member of one conversation as an explicit Slack user ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError`] if enumeration is incomplete or unsupported. A partial list
+    /// must never be returned as a successful result.
+    fn list_members(
+        &mut self,
+        _app_id: &AppId,
+        _channel_id: &str,
+    ) -> Result<Vec<String>, TransportError> {
+        Err(TransportError::not_applied(
+            "directory_unsupported",
+            "this transport cannot enumerate channel members; pass explicit Slack user IDs instead",
+            false,
+        ))
+    }
 }
 
 /// Placeholder for a direct Slack Web API transport (`conversations.history`,
@@ -339,6 +372,18 @@ impl SlackTransport for WebApiTransport {
         &mut self,
         _query: &ListQuery<'_>,
     ) -> Result<Vec<ListedMessage>, TransportError> {
+        Err(Self::refusal())
+    }
+
+    fn resolve_sender(&mut self, _app_id: &AppId, _query: &str) -> Result<String, TransportError> {
+        Err(Self::refusal())
+    }
+
+    fn list_members(
+        &mut self,
+        _app_id: &AppId,
+        _channel_id: &str,
+    ) -> Result<Vec<String>, TransportError> {
         Err(Self::refusal())
     }
 }

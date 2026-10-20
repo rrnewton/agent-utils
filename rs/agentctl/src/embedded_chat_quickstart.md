@@ -21,6 +21,7 @@ directory.
      "subscription_environment": [],
      "channel_ids": ["spaces/example"],
      "allowed_senders": ["users/owner"],
+     "max_grant_seconds": 2592000,
      "agent_name": "coordinator",
      "agent_label": "codex coordinator",
      "outbound_enabled": true,
@@ -61,6 +62,29 @@ directory.
 
    Stop with SIGINT or SIGTERM. A service manager may restart the same `run`
    command against the same state directory.
+
+4. Invite temporary senders without re-initializing or restarting the bridge:
+
+   ```sh
+   agentctl chat grant --bridge-state DIR U0GUEST001 --for 12h --note 'project discussion'
+   agentctl chat grant --bridge-state DIR member@example.org --for 7d
+   agentctl chat grant --bridge-state DIR --all-members --for 30m
+   agentctl chat grants --bridge-state DIR
+   agentctl chat revoke --bridge-state DIR U0GUEST001
+   agentctl chat grant-limit --bridge-state DIR --for 30d
+   ```
+
+   `allowed_senders` are permanent owners. Every temporary grant needs `--for`:
+   a positive whole number followed by `s`, `m`, `h`, `d` or `w`. The default
+   maximum is 30 days (`max_grant_seconds`); `grant-limit` changes it in the
+   existing state. Names require a directory-capable outbound helper; raw
+   provider IDs work without one. For Slack, find an ID with
+   `slack.user describe --user <unixname|email|ID>`. `--all-members` uses the
+   helper to enumerate every configured channel and lists separate grants for
+   its current members; later joiners get no permission. The running service
+   refreshes its subscription after its current provider item or heartbeat.
+   Expired or revoked grants cannot admit a new message, even on an older
+   subscription; its cursor still advances. The service logs each expiry once.
 
 Use `agentctl chat status --bridge-state DIR` for a read-only durable status
 snapshot. Stop `run` before `agentctl chat tick --bridge-state DIR`, which runs

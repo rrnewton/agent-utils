@@ -2807,10 +2807,30 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         pane_id: &str,
         text: &str,
         before: &BTreeMap<String, usize>,
+        runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<BTreeMap<String, &'static str>> {
+        let deadline = runtime.monotonic() + self.readback_limit();
         let mut states = BTreeMap::new();
         for peer in before.keys().filter(|peer| peer.as_str() != pane_id) {
-            states.insert(peer.clone(), self.observe(peer, text, before)?);
+            // A transient read failure in another agent's pane is not evidence about this
+            // submission. Retry only the observation, within one shared read-back deadline;
+            // never type again or skip a peer whose outcome remains unknown.
+            let state = loop {
+                match self.observe(peer, text, before) {
+                    Ok(state) => break state,
+                    Err(error) => {
+                        let now = runtime.monotonic();
+                        if runtime.cancelled() || now >= deadline {
+                            return Err(AdapterError::unavailable(format!(
+                                "cannot verify peer pane {peer} after submission to {pane_id}: \
+                                 {error}; delivery attribution remains unproven"
+                            )));
+                        }
+                        runtime.sleep(Duration::from_millis(250).min(deadline.saturating_sub(now)));
+                    }
+                }
+            };
+            states.insert(peer.clone(), state);
         }
         Ok(states)
     }
@@ -2827,7 +2847,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<()> {
         let in_target = self.seen_in_target(pane_id, text, before, runtime)?;
-        let states = self.peer_states(pane_id, text, before)?;
+        let states = self.peer_states(pane_id, text, before, runtime)?;
         let fresh: Vec<&String> = states
             .iter()
             .filter(|(_, state)| **state == "fresh")
@@ -2882,7 +2902,7 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         let in_target = matches!(submission, Submission::Verified(receipt) if receipt.printed)
             || self.seen_in_target(pane_id, text, before, runtime)?;
         recipient_holds()?;
-        let states = self.peer_states(pane_id, text, before)?;
+        let states = self.peer_states(pane_id, text, before, runtime)?;
         let fresh: Vec<&String> = states
             .iter()
             .filter(|(_, state)| **state == "fresh")
@@ -10141,6 +10161,7 @@ pub(crate) mod tests {
                     drop_note: AtomicBool::new(false),
                     scrollback_on_effect: Mutex::new(None),
                     fail_scrollback: Mutex::new(None),
+                    fail_scrollback_after_effect: Mutex::new(None),
                     expected_terminals: Mutex::new(Vec::new()),
                     replace_harness_before_effect: AtomicBool::new(false),
                     swap_terminal_before_effect: AtomicBool::new(false),
@@ -10589,6 +10610,9 @@ pub(crate) mod tests {
         pub(crate) scrollback_on_effect: Mutex<Option<(String, Vec<String>)>>,
         /// A pane whose scrollback cannot be read.
         pub(crate) fail_scrollback: Mutex<Option<String>>,
+        /// A pane and the number of reads that fail after a prompt has been written. The
+        /// pre-send snapshot still succeeds, as with a transient peer failure during read-back.
+        pub(crate) fail_scrollback_after_effect: Mutex<Option<(String, usize)>>,
         /// The expected terminal sent with each input effect, in order.
         expected_terminals: Mutex<Vec<Option<String>>>,
         /// Replace the pane's harness as the next input effect reaches it.
@@ -11393,6 +11417,15 @@ pub(crate) mod tests {
             }
             if self.fail_scrollback.lock().unwrap().as_deref() == Some(pane) {
                 return Err(AdapterError::unavailable("scrollback read failed"));
+            }
+            if !self.runs.lock().unwrap().is_empty() {
+                let mut failures = self.fail_scrollback_after_effect.lock().unwrap();
+                if let Some((failed_pane, left)) = failures.as_mut() {
+                    if failed_pane == pane && *left > 0 {
+                        *left -= 1;
+                        return Err(AdapterError::unavailable("scrollback read failed"));
+                    }
+                }
             }
             Ok(self
                 .scrollback
