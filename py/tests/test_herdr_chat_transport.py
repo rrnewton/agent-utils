@@ -964,11 +964,19 @@ def test_command_timeout_terminates_descendants_holding_output_pipes(tmp_path: P
         "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
         "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); time.sleep(60)"
     )
+    # The timeout is the thing under test: the script sleeps 60 s, so any shorter
+    # timeout fires it. It must still leave the script time to start, spawn its
+    # child and publish the child's PID; 0.5 s did not, on a loaded host, and the
+    # test then read a missing or empty PID file. `#389 gate-flakes`.
+    timeout = 10.0
     started = time.monotonic()
     with pytest.raises(subprocess.TimeoutExpired):
-        _run_command((sys.executable, "-c", script, str(pid_path)), timeout=0.5)
-    assert time.monotonic() - started < 5
-    _assert_command_child_gone(int(pid_path.read_text()), "timed-out")
+        _run_command((sys.executable, "-c", script, str(pid_path)), timeout=timeout)
+    assert time.monotonic() - started < timeout + 5
+    (child_pid,) = _wait_for_process_identities(
+        pid_path, 1, "timed-out command", timeout=5,
+    )
+    _assert_command_child_gone(child_pid, "timed-out")
 
 
 @pytest.mark.parametrize("cleanup", ["cooperative", "emergency", "census-error"])
