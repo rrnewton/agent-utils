@@ -6357,7 +6357,15 @@ mod tests {
             },
         )
         .expect("delivery pass");
-        assert_eq!(report.delivered, vec![key.clone()]);
+        // The whole report, so a pass that delivered nothing says whether it
+        // pended, was uncertain, or errored (the census-audit gate of
+        // 2026-10-19 saw `delivered` empty once under load and nothing more
+        // could be told from the failure).  `#389 gate-flakes`.
+        assert_eq!(
+            report.delivered,
+            vec![key.clone()],
+            "delivery pass report: {report:?}"
+        );
         assert!(
             report.errors.is_empty(),
             "unexpected errors: {:?}",
