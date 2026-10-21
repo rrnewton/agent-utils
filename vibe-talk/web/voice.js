@@ -29382,7 +29382,7 @@ function renderReplyLinks() {
     else row.removeAttribute("data-coalesce");
     if (child) {
       row.setAttribute("data-root-child", "");
-      row.style.setProperty("--thread-hue", threadHue(String(selectedThreadId)));
+      /** @type {HTMLElement} */ (row).style.setProperty("--thread-hue", threadHue(String(selectedThreadId)));
     } else if (row.hasAttribute("data-root-child")) row.removeAttribute("data-root-child");
     if (at >= 0) row.setAttribute("data-stack-under", under);
     else if (child) row.setAttribute("data-stack-under", "third");
