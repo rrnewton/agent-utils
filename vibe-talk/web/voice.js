@@ -209,7 +209,7 @@ const ALL_CHANNELS = "*";
  *   | "save-voice-post-prefix" | "save-voice-system-prompt"
  *   | "search-in-all" | "search-toggle" | "send-text" | "side-clear-backlog" | "side-close" | "side-jump-newest"
  *   | "side-more-threads" | "side-older" | "side-search-replies" | "side-send" | "side-thread-card-text"
- *   | "side-unread-only" | "speaker"
+ *   | "side-unpack" | "side-unread-only" | "speaker"
  *   | "summarise" | "talk"
  *   | "thread-back" | "thread-card-text"
  *   | "todo-filter" | "undo-dismiss" | "undo-send-dismiss" | "upstream-clear-push"
@@ -2015,6 +2015,7 @@ function lastColumnCard() {
   for (const list of lists) {
     const rows = [...list.children];
     for (let at = rows.length - 1; at >= 0; at -= 1) {
+      if (rows[at].hasAttribute("data-unpack-thread")) continue;
       if (rows[at].getBoundingClientRect().height > 0) return rows[at];
     }
   }
@@ -8849,7 +8850,8 @@ function visibleScroller(node = document.activeElement) {
 function paneRows(pane) {
   const list = pane.list();
   if (!list) return [];
-  return /** @type {HTMLElement[]} */ ([...list.children]).filter((row) => row.hasAttribute("data-id") && rowShown(row));
+  return /** @type {HTMLElement[]} */ ([...list.children])
+    .filter((row) => row.hasAttribute("data-id") && !row.hasAttribute("data-unpack-thread") && rowShown(row));
 }
 
 /** The row of `pane` that `node` is in, or null. */
@@ -8858,7 +8860,8 @@ function rowOf(pane, node) {
   if (!list || !node) return null;
   for (let at = node; at && at !== list; at = at.parentNode) {
     if (at.parentNode === list) {
-      return typeof at.hasAttribute === "function" && at.hasAttribute("data-id") ? /** @type {HTMLElement} */ (at) : null;
+      return typeof at.hasAttribute === "function" && at.hasAttribute("data-id") &&
+        !at.hasAttribute("data-unpack-thread") ? /** @type {HTMLElement} */ (at) : null;
     }
   }
   return null;
@@ -40950,8 +40953,12 @@ function renderSideCards() {
   if (signature !== sideCardsDrawn) {
     sideCardsDrawn = signature;
     keepingCardPlace(() => {
+      if (unpackObserver !== null) {
+        unpackObserver.disconnect();
+        unpackObserver = null;
+      }
       list.replaceChildren(...cards.flatMap((card) =>
-        [sideCard(card), ...(unpacked ? unpackBlock(card.choice) : [])]));
+        [sideCard(card), ...(unpacked ? inColumn(columns.main, () => unpackBlock(card.choice)) : [])]));
       filterSideCards();
     });
   } else {
@@ -41107,7 +41114,17 @@ function placeOpenedCards() {
  * facts (`markReplyMatch`). Nothing is read as the search is typed: a reply the page does not hold is
  * found once the cards' own walk further back has read it (`searchReplies`, `#262 search-load-older`).
  */
+/** Whether read runs stood suspended when the blocks were last drawn (`filterSideCards`). */
+let unpackSuspendedDrawn = false;
+
 function filterSideCards() {
+  if (unpackOnScreen() && readRunsSuspended() !== unpackSuspendedDrawn) {
+    unpackSuspendedDrawn = readRunsSuspended();
+    sideCardsDrawn = "";
+    renderSideCards();
+    return;
+  }
+  unpackSuspendedDrawn = readRunsSuspended();
   const terms = searchOpen ? searchTerms(searchQuery) : [];
   const marking = searchOpen ? searchTerms(markedQuery) : [];
   const allRows = /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children]);
@@ -41312,7 +41329,13 @@ let unpackReadsRunning = 0;
 let unpackObserver = null;
 
 /** Whether `choice`'s card says a summary rather than its root's words (`#405 root-under-summary`). */
-const cardIsSummarized = (choice) => Boolean(choice) && sideCardRootText(choice) !== "";
+const cardIsSummarized = (choice) => {
+  if (!choice) return false;
+  const summary = choice.summary;
+  const named = summary && typeof summary.display_name === "string" ? summary.display_name.trim() : "";
+  const said = summary && typeof summary.summary === "string" ? summary.summary.trim() : "";
+  return Boolean(named && said) || sideCardRootText(choice) !== "";
+};
 
 /** Whether unpacked blocks belong on screen: pressed, and the Threads view (Cmd+3) showing cards. */
 const unpackOnScreen = () => threadsUnpacked && threadListOnScreen() && columns.side.mode === "list";
@@ -41352,7 +41375,8 @@ function unpackHeldMessages(choice) {
   if (channelCanon.channel !== String(el("discord-channel").value)) return [];
   const held = channelCanon.messages.filter((message) => threadOf(message) === choice.id);
   const root = choice.root;
-  if (root && !held.some((message) => String(message.id) === String(root.id))) {
+  if (root && !channelCanon.removed.has(String(root.id)) &&
+      !held.some((message) => String(message.id) === String(root.id))) {
     return inTimeOrder([root, ...held], "timestamp");
   }
   return held;
@@ -41366,10 +41390,16 @@ function isThreadRoot(message, choice) {
 
 /** Whether thread `choice` still owes unpacking a read: held replies short of its count, uncovered. */
 function unpackNeedsRead(choice, held) {
-  if (unpackReads.has(choice.id)) return false;
+  const state = unpackReads.get(choice.id);
+  if (state === "queued" || state === "reading" || state === "failed") return false;
+  const replies = held.filter((message) => !isThreadRoot(message, choice)).length;
+  if (state === "done") {
+    // Read once, and again only when the thread has grown past what that read brought.
+    if (typeof choice.count === "number" && replies < choice.count) unpackReads.delete(choice.id);
+    else return false;
+  }
   const cover = channelCanon.views.get(viewKey("thread", choice.id));
   if (cover && !cover.more) return false;
-  const replies = held.filter((message) => !isThreadRoot(message, choice)).length;
   if (typeof choice.count === "number") return replies < choice.count;
   return !cover && replies === 0;
 }
@@ -41377,7 +41407,8 @@ function unpackNeedsRead(choice, held) {
 /** What one block would draw, as a signature, so a pass that changes nothing rebuilds nothing. */
 function unpackSignature(choice, held) {
   const opened = unpackOpenedRuns.get(choice.id);
-  return JSON.stringify([choice.id, readMode, cardIsSummarized(choice),
+  return JSON.stringify([choice.id, readMode, readRunsSuspended(), hideEmptyMessages, combineMessages,
+    cardIsSummarized(choice),
     held.map((message) => [String(message.id), stillToDo(message, channelCanon.dismissed)]),
     opened ? [...opened].sort() : [], unpackReads.get(choice.id) || ""]);
 }
@@ -41385,7 +41416,8 @@ function unpackSignature(choice, held) {
 /** The line a collapsed run of read rows is drawn as in an unpacked block: the run's own words. */
 function unpackRunLine(choice, ids) {
   const row = document.createElement("li");
-  row.className = "unpack-row unpack-read-run";
+  row.className = "discord-message unpack-row unpack-read-run";
+  row.setAttribute("data-who", "human");
   row.setAttribute("data-unpack-thread", choice.id);
   const line = document.createElement("button");
   line.className = "read-run";
@@ -41465,8 +41497,14 @@ function unpackBlock(choice) {
       const first = part.group[0];
       row.setAttribute("data-who", bucketFor(first.author_id, first.author_is_bot,
         String(el("discord-channel").value)));
-      row.setAttribute("data-archived",
-        part.group.every((message) => done.has(String(message.id))) ? "true" : "false");
+      const archived = part.group.every((message) => done.has(String(message.id)));
+      row.setAttribute("data-archived", archived ? "true" : "false");
+      const noise = part.group.every(isNoise);
+      row.setAttribute("data-noise", !archived && noise ? "true" : "false");
+      row.setAttribute("data-own-read",
+        !archived && !noise && markOwnRead && row.getAttribute("data-who") === "me" ? "true" : "false");
+      const doneButton = doneButtonOf(row);
+      if (doneButton) doneButton.textContent = archived ? "Unarchive" : "Done";
       row.setAttribute("data-stack-under", "third");
       row.style.setProperty("--thread-hue", threadHue(choice.id));
       row.replaceChildren(bridgePiece(), ...row.children);
@@ -41483,12 +41521,17 @@ function unpackBlock(choice) {
     row.style.setProperty("--thread-hue", threadHue(choice.id));
   });
   const cover = channelCanon.views.get(viewKey("thread", choice.id));
-  if (unpackNeedsRead(choice, held)) {
+  if (unpackReads.get(choice.id) === "failed") {
+    const failed = document.createElement("li");
+    failed.className = "unpack-row unpack-loading hint";
+    failed.setAttribute("data-unpack-thread", choice.id);
+    failed.textContent = "Could not load this thread.";
+    rows.push(failed);
+  } else if (unpackNeedsRead(choice, held)) {
     const loading = document.createElement("li");
     loading.className = "unpack-row unpack-loading hint";
     loading.setAttribute("data-unpack-thread", choice.id);
-    loading.textContent = unpackReads.get(choice.id) === "failed"
-      ? "Could not load this thread." : "Loading thread…";
+    loading.textContent = "Loading thread…";
     rows.push(loading);
     watchUnpackBlock(loading, choice.id);
   } else if (cover && cover.more) {
@@ -41541,11 +41584,16 @@ function pumpUnpackReads() {
 async function readUnpackThread(id) {
   const channel = String(el("discord-channel").value);
   try {
+    if (channelCanon.channel !== channel) loadCanon(channel);
+    const held = heldNow(channelCanon);
     const path = withThreadQuery(
       `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=thread&limit=${DISCORD_PAGE_LIMIT}&reason=threads`, id);
-    const payload = await api(path);
-    if (String(el("discord-channel").value) !== channel) return;
-    foldTimelinePage(payload, false, "thread", id);
+    const payload = await readTimeline(path, undefined);
+    if (String(el("discord-channel").value) !== channel) {
+      unpackReads.delete(id);
+      return;
+    }
+    foldTimelinePage(payload, false, "thread", id, held);
     unpackReads.set(id, "done");
   } catch (_error) {
     unpackReads.set(id, "failed");
@@ -41832,7 +41880,8 @@ function cardForArrow(target) {
   const list = cardsOnScreen();
   const right = list === leftEl("side-cards");
   if (!list || (right && paneFor(target) !== sidePane)) return null;
-  const rows = /** @type {HTMLElement[]} */ ([...list.children]).filter(rowShown);
+  const rows = /** @type {HTMLElement[]} */ ([...list.children])
+    .filter((row) => !row.hasAttribute("data-unpack-thread") && rowShown(row));
   const held = rows.find((row) => row !== target && nodeWithin(row, target));
   if (held) return held;
   const lit = litCard();
@@ -42260,6 +42309,13 @@ function closeSideThread() {
  * or its cards and the thread list read behind them.
  */
 function resetSideColumn(reopen = false) {
+  // `#404 threads-unpack-all`. Unpack reads and opened runs were the last channel's.
+  unpackReads.clear();
+  unpackOpenedRuns.clear();
+  if (unpackObserver !== null) {
+    unpackObserver.disconnect();
+    unpackObserver = null;
+  }
   endSearchWalk(columns.side);
   columns.side.searchNote = null;
   // `#262 search-load-older`. And the cards' walk, and what the last one found: they were this channel's.
