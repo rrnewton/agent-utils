@@ -7129,42 +7129,37 @@ textarea {
    * here is smaller than the first or as large as the second. Measured at 1280x800: 149px before,
    * 50px when everything fits one row, 92px when it needs two.
    *
-   * IT STILL FOLLOWS THE COLUMN. `#55` and `#58` put the controls under the thing they act on and
-   * the switch beside the transcript it switches, and that judgement stands; what changes is that
-   * the dock now spends the column's width instead of leaving it empty. The column is drawn as
-   * the dock's own padding — half of what the window has beyond the reader's chosen width, plus
-   * the 0.6rem inset the controls always had — so it is the same box the panes are held to, and
-   * it moves with the width handle. Padding rather than `position`: the dock is still the third
-   * grid row of the frame, and the suite asserts that it is.
-   *
-   * IT WRAPS RATHER THAN TRUNCATES. When a long channel name and the three reading buttons do not
-   * fit the column together, the pane's buttons go to a second row, at the right, beside the
-   * switch — a second 36px row costs less than a name the reader cannot read, which is the other
-   * half of the owner's complaint. A picker is cut only when the bar's own row is out of room: the
-   * view picker first (a thread title beside a long channel name can do that in the default
-   * column), and the channel's only once the view picker is at its floor, which in a column of 45
-   * characters it can be.
+   * `#406 command-bar-one-row`. IT SPANS THE WINDOW, IN ONE ROW. The dock used to follow the reading
+   * column, drawn as its own padding, and to wrap the pane's buttons onto a second row when the
+   * pickers and they did not fit that column together. "Thread list" or a thread's name was enough
+   * to do it, beside half a window of nothing; the owner: "spills onto two rows in the command bar
+   * even though there is PLENTY of horizontal space.. an artificial width construction ... Let's
+   * keep that bar one row that can go up to full width on desktop and size our widgets
+   * appropriately." So the dock spans the window less the 0.6rem inset the controls always had, in
+   * one view as in two columns (`#373 two-column-full-width` spanned it there already), and so the
+   * switch no longer moves when two columns come and go. It does not wrap: the pane keeps its width
+   * and the bar takes what is left, where a picker too long for it ends in an ellipsis — the view
+   * picker first, and the channel's only once the view picker is at its floor — and the view
+   * picker's tooltip names the whole thread (`renderThreadSelect`). Padding rather than `position`:
+   * the dock is still the third grid row of the frame, and the suite asserts that it is.
    *
    * THE SWITCH DOES NOT MOVE. It is the control you actually flick, and flicking it is what changes
-   * everything else in the row: the call's buttons become the channel's, a long name arrives, the
-   * row count changes. A switch that rode along with all that was a different place to click after
-   * every click — measured, about 265px sideways and a row up between the call and the channel.
-   * So on a desk it has one place: the lower right corner of the column, at the end of the last
-   * row, whatever the view, the call or the channel's name. See `#view-switch` below.
+   * everything else in the row: the call's buttons become the channel's, a long name arrives.
+   * A switch that rode along with all that was a different place to click after every click —
+   * measured, about 265px sideways and a row up between the call and the channel. So on a desk it
+   * has one place: the lower right corner of the window, at the end of the row, whatever the view,
+   * the call or the channel's name. See `#view-switch` below.
    *
-   * `--dock-inset` is the column, as an inset from either side of the window. It is stated once
-   * here because four things are placed by it: the dock's own padding, and the switch, the prompts
-   * tray and the pace popover, which are placed against the dock. (The `100%` resolves against the
-   * window's width in all four: the dock spans the frame, so its box and its containing block are
-   * the same width. The `ch` in the reading width resolves in the type of whatever uses it, which
-   * is why the switch, below, is set in the page's.)
+   * `--dock-inset` is the dock's inset from either side of the window. It is stated once here
+   * because four things are placed by it: the dock's own padding, and the switch, the prompts tray
+   * and the pace popover, which are placed against the dock.
    */
   #dock {
-    --dock-inset: max(0.6rem, calc((100% - var(--reading-width)) / 2 + 0.6rem));
+    --dock-inset: 0.6rem;
     --dock-switch: 7.5rem;
     position: relative;
     display: flex;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
     align-items: end;
     gap: 0.4rem 0.5rem;
     padding: 0.4rem var(--dock-inset);
@@ -7179,22 +7174,20 @@ textarea {
   /* The dock carries the padding on a desk: there is no curved corner to clear and no band to
      separate from the pane below, because the pane is beside it now.
      `static`, so the switch and the prompts tray are placed against the DOCK rather than the bar.
-     The bar is the first item of a row that wraps, so its own box is a different shape in every
-     state; the dock's is the column, and the column is where both of them belong. */
+     The bar is the part of the row that gives way, so its own box is a different shape in every
+     state; the dock's is the window less its inset, and that is where both of them belong. */
   #control-bar[data-placement="bottom"] {
     padding: 0;
     position: static;
   }
 
   /*
-   * THE SWITCH'S ONE PLACE: the lower right corner of the column, on the dock's last row.
+   * THE SWITCH'S ONE PLACE: the lower right corner of the window, at the end of the dock's row.
    *
    * Taken out of the bar's flow and set in the corner, with the pane keeping the room for it — the
    * pane's right margin, below, is exactly the switch's fixed width and the pane's own gap. So the
-   * pane and the switch wrap together: when they fit beside the bar, one row ends Hide read, Pace,
-   * Read, switch; when they do not, the second row does, under the pickers. Either way the switch
-   * is the same width in the same corner, and the bottom of the window does not move, so neither
-   * does it. Placed against the dock and kept clear by the pane, never over anything: the dock is
+   * row ends Hide read, Pace, Read, switch, the switch the same width in the same corner whatever
+   * the bar holds. Placed against the dock and kept clear by the pane, never over anything: the dock is
    * still the frame's third grid row, and the switch's room is in its flow.
    *
    * 7.5rem holds "Channel" in DejaVu Sans, one of the widest common faces, at the 0.85rem every
@@ -7240,8 +7233,8 @@ textarea {
     white-space: nowrap;
   }
 
-  /* The tray opens above the dock across the column, as it did when the bar was held to the column
-     itself — it is placed against the dock now, whose padding box is the whole window. */
+  /* The tray opens above the dock across its width, placed against the dock, whose padding box is
+     the whole window. */
   #control-bar[data-placement="bottom"] #prompts-tray {
     left: var(--dock-inset);
     right: var(--dock-inset);
@@ -7257,16 +7250,15 @@ textarea {
 
   /* The pane is a row of buttons, not a tile, in markup order — Sound, Clear, Hang up, Talk on
      the call; Hide read, Pace, Read on the channel, the order the phone tile shows them in.
-     `margin-left: auto` keeps it at the right of its row, against the room it keeps for the
-     switch: on the bar's row when everything fits, on a row of its own when it has wrapped. It
-     wraps its own buttons as a last resort, rather than running past the column, when a long note
-     after a call makes it wider than the column on its own.
+     `margin-left: auto` keeps it at the right of the row, against the room it keeps for the
+     switch. It keeps its width (`#406 command-bar-one-row`): the bar beside it is what gives way,
+     its pickers ending in an ellipsis and its pack scrolling sideways, so the row stays one row.
      `static`, so the pace popover is placed against the dock: see `.popover` below. */
   #control-pane {
-    flex: 0 1 auto;
+    flex: 0 0 auto;
     min-width: 0;
     display: flex;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
     justify-content: flex-end;
     align-items: end;
     gap: 0.4rem;
@@ -7275,7 +7267,7 @@ textarea {
     position: static;
   }
 
-  /* The pace popover opens ABOVE THE DOCK, over the list, at the column's right edge. Placed against
+  /* The pace popover opens ABOVE THE DOCK, over the list, at the window's right edge. Placed against
      the pane, as on a phone, it opened over whatever row was above the pane — on a desk, the switch
      and the pickers, which the popover then sat on top of until it was dismissed. */
   .popover {

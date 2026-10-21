@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser pairing-link-browser offline-cache-browser reactions-browser system-bots-browser edited-mark-browser rich-headers-browser read-aloud-browser read-aloud-blocks-browser post-confirm-browser approval-card-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser search-chord-browser composer-key-browser two-column-browser desktop-layout-browser bookmark-browser reply-continuity-browser reply-in-column-browser reply-marks-read-browser done-sync-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser composer-grow-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser thread-card-header-browser thread-header-collapse-browser thread-line-browser empty-messages-browser all-thread-strip-browser scroll-stability-browser copy-message-browser fold-steps-browser back-gesture-browser live-pill-browser stale-live-read-browser provider-groups-browser voice-reconnect-browser live-relay-check-self-test live-relay-check channel-search-browser column-overscroll-browser channel-box-browser
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser pairing-link-browser offline-cache-browser reactions-browser system-bots-browser edited-mark-browser rich-headers-browser read-aloud-browser read-aloud-blocks-browser post-confirm-browser approval-card-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser search-chord-browser composer-key-browser command-bar-browser two-column-browser desktop-layout-browser bookmark-browser reply-continuity-browser reply-in-column-browser reply-marks-read-browser done-sync-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser composer-grow-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser thread-card-header-browser thread-header-collapse-browser thread-line-browser empty-messages-browser all-thread-strip-browser scroll-stability-browser copy-message-browser fold-steps-browser back-gesture-browser live-pill-browser stale-live-read-browser provider-groups-browser voice-reconnect-browser live-relay-check-self-test live-relay-check channel-search-browser column-overscroll-browser channel-box-browser
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -311,6 +311,14 @@ search-chord-browser:
 # it against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each step.
 composer-key-browser:
 	python3 tests/composer_key_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
+
+# `#406 command-bar-one-row` in a real Chromium at 1280x800, 1920x1080 and 900x700: the desk's dock is one
+# row across the window on a 120-character thread, the thread list, Main, All and two columns, its view
+# picker's tooltip naming the thread whole; a 393x852 phone's bar is one row above the pane's tile. Pass
+# BASELINE_WEB_ROOT=dir (a copy of the page from before) to require the phone's dock to match it to the
+# pixel, WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each.
+command-bar-browser:
+	python3 tests/command_bar_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(BASELINE_WEB_ROOT),--baseline-web-root $(BASELINE_WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#355 provider-grouped-channels` in a real Chromium at 1280x800 and a 375x812 phone: with two chat
 # services, the bar's channel picker holds one <optgroup> per service in configuration order; Alt+Down

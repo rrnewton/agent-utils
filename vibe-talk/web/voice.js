@@ -22074,7 +22074,11 @@ function renderThreadSelect() {
   const why = threadingSupported
     ? "Which view of the channel to read: Main, All, the thread list, two columns, or one thread."
     : "This channel's chat service does not offer threads here, so Main is the whole channel.";
-  if (select.title !== why) select.title = why;
+  // `#406 command-bar-one-row`. On a desk a name too long for the bar ends in an ellipsis, and the
+  // option itself is cut at `THREAD_TITLE_CHARS`: the tooltip names the open thread whole.
+  const shownThread = current.startsWith("thread:") ? openThreadChoice() : null;
+  const title = shownThread ? `${threadName(shownThread, Infinity)}\n${why}` : why;
+  if (select.title !== title) select.title = title;
   // Its description says why it is inert, when it is; a picker that chooses needs none.
   setTextIfChanged(leftEl("thread-select-note"), threadingSupported ? "" : why);
   // The right column's heading and cards name threads from the same store.
