@@ -972,10 +972,12 @@ def main_held(reader: Reader, why: str) -> None:
 
 def reload_in_thread_list(reader: Reader) -> None:
     """At the desk, the page reloaded in the thread list, which each window reloads into: the list opens at its
-    foot and holds there once the channel has been read. In the thread list the dock is only as wide as the
-    reading column, and its last button comes in about 30 ms after the cards are placed, wrapping it onto a
+    foot and holds there once the channel has been read. In the thread list the dock was only as wide as the
+    reading column, and its last button came in about 30 ms after the cards were placed, wrapping it onto a
     second row: before the right column's dock-growth keeper took the cards too, that left the list 43px above
-    its foot for good."""
+    its foot for good. Since `#406 command-bar-one-row` the dock spans the window in one row, and this fixture's
+    thread list, which wrapped it, is where the owner saw the wrap: the dock now stays one row through the
+    reload, and the list still opens at its foot."""
     page, api = reader.page, reader.api
     size = page.viewport_size
     assert size is not None
@@ -991,10 +993,11 @@ def reload_in_thread_list(reader: Reader) -> None:
         page.wait_for_timeout(25)
     reader.check(api.timeline_requests() > reads, "the reload never read the channel")
     reader.quiet(800)
-    reader.check(float(page.evaluate("() => document.getElementById('dock').getBoundingClientRect().height")) > 60,
-                 "the dock is one row in the thread list, so the reload proves nothing")
+    tall = float(page.evaluate("() => document.getElementById('dock').getBoundingClientRect().height"))
+    reader.check(tall <= 56, f"the dock is {tall:.0f}px tall in the thread list: it wrapped onto a second row")
     list_at_foot(reader, "a reload in the thread list")
-    reader.notes.append("a reload in the thread list, its dock on two rows, opened the list at its foot and held it")
+    reader.notes.append(f"a reload in the thread list, its dock one row ({tall:.0f}px), opened the list at its foot "
+                        "and held it")
 
 
 def view_keys_walk(reader: Reader) -> None:
