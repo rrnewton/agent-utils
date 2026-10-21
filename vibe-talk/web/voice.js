@@ -10896,6 +10896,15 @@ const KEYMAP = [
     run: (event) => (modHeld(event) ? copyChordFromKeyboard() : copyFromKeyboard()),
   },
   {
+    // `#408 copy-upstream-link`. l was free as a bare letter (Shift+L is the links filter), and
+    // as one it never fires in a text field. On a row with no link to copy the button is not
+    // there to press and the key does nothing, as the menu offers nothing.
+    group: KEYS_MESSAGE, chords: [{ key: "l" }],
+    does: () => `Copy its link in ${providerDescriptions.size > 1 ? "its chat service" : chatServiceName()}: the message's own address there, where the server could form one`,
+    rowControls: ["row-copy-link-button"],
+    run: (event, target) => pressRowButton(target, "row-copy-link-button") !== null,
+  },
+  {
     group: KEYS_VIEW, chords: [{ key: "h" }],
     does: "Show read, Collapse read, Hide read, in turn",
     controls: ["todo-filter"],
@@ -19609,6 +19618,11 @@ function foldLiveMessage(message, live = false, replayed = false, read = null) {
   // mark away: an edit is never undone, and the stream's copy may come by a path that cannot see it.
   if (held && held.edited_timestamp && !kept.edited_timestamp) {
     kept = { ...kept, edited_timestamp: held.edited_timestamp };
+  }
+  // `#408 copy-upstream-link`. Nor does a copy with no upstream address take one away: absent is
+  // "this copy came by a path that formed none", and the address of a message does not change.
+  if (held && held.upstream_url && !kept.upstream_url) {
+    kept = { ...kept, upstream_url: held.upstream_url };
   }
   channelCanon.messages = inTimeOrder(
     [...channelCanon.messages.filter((candidate) => String(candidate.id) !== id), kept], "timestamp");
@@ -32966,6 +32980,28 @@ function discordNode(messages) {
     setMenu(false);
     guardQuietly(() => copyMessageText(content))();
   }));
+  // `#408 copy-upstream-link`. The message's own address in the service it came from, formed by
+  // the server and carried on the message: offered only where one came back, never shown
+  // disabled for a message with none. The FIRST constituent's, as the row's reply is: a combined
+  // row is one post in parts, and its link lands at its start.
+  const upstreamUrl =
+    typeof message.upstream_url === "string" && message.upstream_url !== ""
+      ? message.upstream_url
+      : null;
+  let copyLink = null;
+  if (upstreamUrl !== null) {
+    const linkService = upstreamServiceName(message);
+    copyLink = document.createElement("button");
+    copyLink.className = "row-copy-link-button";
+    copyLink.setAttribute("type", "button");
+    copyLink.setAttribute("title", `Copy a link to this message in ${linkService} to the clipboard`);
+    copyLink.textContent = `Copy link in ${linkService}`;
+    sayRowShortcut(copyLink, "row-copy-link-button");
+    copyLink.addEventListener("click", inThisColumn(() => {
+      setMenu(false);
+      guardQuietly(() => copyUpstreamLink(upstreamUrl, linkService))();
+    }));
+  }
   // `#202 read-through-here`. What the owner reached for the read marker to do: grey everything up
   // to and including this row IN THIS APP — the same Done a row's own button records — so that with
   // Hide read on, doing it on the newest row leaves an empty list. Where the provider's own marker
@@ -33032,7 +33068,9 @@ function discordNode(messages) {
   readCaption.setAttribute("aria-hidden", "true");
   readCaption.textContent = "Mark read";
   readGroup.append(readCaption, readThrough, upstreamRead);
-  menu.append(copy, pinItem, bookmarkItem, readGroup);
+  // Copy text first, then its link where the message has one, then Pin: the two copies together,
+  // ahead of the acts that change anything.
+  menu.append(copy, ...(copyLink ? [copyLink] : []), pinItem, bookmarkItem, readGroup);
   more.append(moreButton, menu);
   acts.append(more);
   // `#50 todo-view`. The non-gestural way to say "dealt with", and the one a keyboard can reach.
@@ -33197,6 +33235,35 @@ async function markReadThroughHere(row, upstreamId) {
   }
   // Short enough for one line on a phone: the status line cuts a long sentence off.
   setStatus(upstream ? `Marked ${count} read here and in ${service}.` : `Marked ${count} read.`);
+}
+
+/**
+ * The service a message's own link points into, by name: its channel's provider's, for the
+ * "Copy link in …" words. `#408 copy-upstream-link`.
+ *
+ * The provider of the channel the message was served in, or of the channel on screen where that
+ * names none the page knows (a thread's own channel, a pin's): rows on screen belong to the
+ * channel on screen. Last, the deployment's name, which with one provider is that provider's.
+ *
+ * @param {any} message
+ */
+function upstreamServiceName(message) {
+  for (const id of [message && message.channel_id, currentChannelId()]) {
+    if (!id) continue;
+    const provider = providerOfChannel(id);
+    if (provider && typeof provider.name === "string" && provider.name.trim()) return provider.name.trim();
+  }
+  return chatServiceName();
+}
+
+/**
+ * Put a message's own address in its service on the clipboard, and say whether it went.
+ * `#408 copy-upstream-link`.
+ */
+async function copyUpstreamLink(url, service) {
+  const copied = await writeClipboardText(String(url || ""));
+  setStatus(copied ? `Copied the link in ${service}.` : COPY_REFUSED);
+  return copied;
 }
 
 /**
@@ -36951,6 +37018,7 @@ function provisionalPin(message) {
     // Drawn as the message is until the server's own copy of the pin arrives; never sent.
     content_html: renderedHtmlOf(message),
     ...(message.heading ? { heading: message.heading } : {}),
+    ...(message.upstream_url ? { upstream_url: message.upstream_url } : {}),
     truncated: false,
     timestamp: String(message.timestamp || ""),
     thread_id: threadOf(message),
@@ -36978,6 +37046,9 @@ function keptMessage(pin, channel) {
   if (renderedHtmlOf(pin) !== "") message.content_html = pin.content_html;
   // `#242 rich-headers`. Found by the server in the same text, ellipsis and all.
   if (pin.heading) message.heading = pin.heading;
+  // `#408 copy-upstream-link`. Formed by the server as the pin was served, as a loaded
+  // message's is, so a row drawn from a pin alone offers the link too.
+  if (typeof pin.upstream_url === "string" && pin.upstream_url !== "") message.upstream_url = pin.upstream_url;
   if (pin.thread_id) {
     message.thread = {
       id: pin.thread_id, root_message_id: null, is_root: pin.thread_root, reply_count: null, reply_count_exact: false,
@@ -47453,6 +47524,9 @@ function applyClientConfig(config) {
   for (const id of ["chat-provider-settings", "chat-provider-help"]) {
     el(id).textContent = chatProviderName || "Chat";
   }
+  // `#408 copy-upstream-link`: the list of keys was said at first load, before any service was
+  // named; say it again now the names are known, so the copy-link key names its service.
+  renderKeyHints();
   // `#343 pwa-app-name`. What this deployment calls its app. The server already wrote it into the
   // title of the page it served; taking it from this answer as well keeps the title the name the
   // server gives now, should the two ever differ. An older server sends none, and the title stays

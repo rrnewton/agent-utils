@@ -845,6 +845,26 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#408 copy-upstream-link` in the browser engine: the fake channel as Google Chat, its long question
+  # carrying its own address there as a served read would. At 1280x800 and 393x852 its ⋯ menu offers
+  # "Copy link in Google Chat" second under Copy text, wholly inside the window; the item and a real l
+  # put the address on the clipboard whole (read back with `clipboard-read` granted, a sentinel on it
+  # before the key) and the status pill says so; a message with no address offers no item and l copies
+  # nothing.
+  - group: check
+    job: copy-upstream-link-browser
+    desc: Copy link in Google Chat in the ⋯ menu copies the message's own address, by the item and by l, absent without one, read back from the clipboard in current Chromium at 1280x800 and 393x852
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/copy_upstream_link_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 8
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#304 back-gesture-in-app` in the browser engine, at a 412x915 Android phone (touch, a mobile Chrome user
   # agent, and the standalone display mode, answered by an init script where DevTools ignores its override):
   # a thread opened from its root is one history entry at the same address, and the browser's Back -- what the

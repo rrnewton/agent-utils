@@ -15984,6 +15984,51 @@ test("Copy text in the ⋯ menu copies the whole row's text, and says so", async
   assert.equal(page.el("status").textContent, "This browser would not copy to the clipboard.");
 });
 
+test("Copy link in the ⋯ menu copies the message's own address in its service, and is absent without one", async () => {
+  // `#408 copy-upstream-link`. The address is the server's, carried on the message; the item is
+  // named for the message's provider and sits with the other copy.
+  const page = newPage();
+  await signIn(page);
+  const address = "https://discord.com/channels/900000000000000001/900000000000000002/8000000000000000300";
+  const rows = await showDiscord(page, [
+    message({ id: "8000000000000000300", content: "with a link", upstream_url: address,
+      timestamp: "2026-08-19T04:31:00.000Z" }),
+    message({ id: "8000000000000000301", content: "without one", author: "ada", author_is_bot: false,
+      timestamp: "2026-08-19T04:36:00.000Z" }),
+  ]);
+  assert.equal(rows.length, 2, "the fixture did not produce two rows");
+  const items = rowMoreMenu(rows[0]).children;
+  assert.deepStrictEqual(items.map((node) => node.className).slice(0, 2),
+    ["row-copy-button", "row-copy-link-button"], "the link is not with Copy text at the menu's head");
+  const link = rows[0].descendants().find((node) => node.className === "row-copy-link-button");
+  assert.equal(link.textContent, "Copy link in Discord");
+  assert.equal(link.getAttribute("aria-keyshortcuts"), "L", "a screen reader is not told the key");
+  assert.equal(rows[1].descendants().find((node) => node.className === "row-copy-link-button"), undefined,
+    "a message with no address was offered a copy of one");
+
+  await rowMoreButton(rows[0]).click();
+  await link.click();
+  await page.settle();
+  assert.equal(page.clipboard, address, "the address was not copied");
+  assert.equal(rowMoreMenu(rows[0]).hidden, true, "the ⋯ menu stayed open after copying");
+  assert.equal(page.el("status").textContent, "Copied the link in Discord.");
+
+  // l does the same on the highlighted row, and the ? list says so.
+  page.clipboard = undefined;
+  await press(page, rows[0], "l");
+  assert.equal(page.clipboard, address, "l did not copy the link");
+  assert.equal(page.el("status").textContent, "Copied the link in Discord.");
+  const listed = page.el("keyboard-keys").descendants().filter((node) => node.tagName === "kbd").map((node) => node.textContent);
+  assert.ok(listed.includes("l"), `the list of keys does not name l: ${listed.join(" | ")}`);
+  const entry = page.el("keyboard-keys").descendants().find((node) => node.tagName === "kbd" && node.textContent === "l");
+  assert.match(entry.parentNode.text(), /Copy its link in Discord/);
+  // On the row with no address, l is nothing.
+  page.clipboard = undefined;
+  const event = await press(page, rows[1], "l");
+  assert.equal(event.defaulted, true, "l was taken on a row with no link");
+  assert.equal(page.clipboard, undefined);
+});
+
 test("mark read through here targets the newest part without archiving the row", async () => {
   const page = newPage();
   page.upstreamReadMarkSupported = true;
