@@ -8601,9 +8601,10 @@ function onComposerKey(event, send) {
 // what the keys do. The message boxes keep their own Enter (`onComposerKey`), the reading-width handle
 // its arrows and the search field its Escape; each runs first, at its element, and a key it handled
 // arrives here with `defaultPrevented` and is left alone. The table names those keys too, as answered
-// by someone else, so that the list is whole. The one key heard before all of them is the search's
-// chord, which a binding marked `everywhere` hands to a second listener, at the window, in the capture
-// phase (`onEverywhereKey`, `#344 search-shortcut`); it walks the same table.
+// by someone else, so that the list is whole. The keys heard before all of them are the search's
+// chord and the message box's, which a binding marked `everywhere` hands to a second listener, at the
+// window, in the capture phase (`onEverywhereKey`, `#344 search-shortcut`, `#403 composer-key-global`);
+// it walks the same table.
 //
 // THE RULES, which are the proposal's section 5:
 //
@@ -10209,9 +10210,14 @@ function undoFromKeyboard() {
  * c: the box to write in: the channel's (a thread's, in a thread), the reply's on Reply, or on the
  * call's view the agent's, under the transcript (`#241 voice-composer`). Going to the agent's box
  * opens nothing: a conversation starts only when something is sent from it.
+ *
+ * `#403 composer-key-global`. In two columns it is the box of the column being worked on, which the
+ * key chose (`paneFor`): a reply open at the foot of a column is that column's box, not the other's,
+ * and the right column on its thread cards has none, so the box there is Main's. Both were nothing,
+ * or the other column's reply, before.
  */
 function composeFromKeyboard() {
-  if (replyOnScreen()) {
+  if (currentScreen === "reply" || (replyOnScreen() && activeColumn === replyColumn)) {
     el("reply-text").focus();
     return true;
   }
@@ -10223,7 +10229,8 @@ function composeFromKeyboard() {
     return true;
   }
   const box = el("channel-compose-text");
-  if (!channelOnScreen() || !shownNode(box)) return false;
+  if (!channelOnScreen() || behindThreadList(box)) return false;
+  if (!shownNode(box)) return sideActive ? inColumn(columns.main, composeFromKeyboard) : false;
   // The box is at the foot of the list, and writing in it is going there: as far as shows it.
   focusMinimally(box);
   return true;
@@ -10241,10 +10248,21 @@ function composeFromKeyboard() {
  * the call's view. Settings and Help are left first, as their Back leaves them, because the box is on
  * the screen they cover. Returns whether it did anything; the bindings that call it keep the
  * browser's own default for the chord shut either way.
+ *
+ * `#403 composer-key-global`. The owner, in two columns: "when a message in the right column is
+ * highlighted and focus is elsewhere. But if focus was in the left column it worked. It seemed
+ * selective. It should be globally applicable." The rule, which Help states: in two columns the box
+ * of the column the focus is in; with the focus in neither (the bar, the page itself) the box of the
+ * column holding the selection, which is the one the keys moved last (`paneFor`); and Main's where
+ * that column has none, as on the thread cards. The thread list is left first too, for the view it
+ * was chosen from, because it covers the column whose box it is; and the column is asked again once
+ * whatever covered it has gone. Ctrl+S is heard before any element's own listener (`everywhere`).
  */
 function writeFromKeyboard() {
   if (currentScreen === "settings" || currentScreen === "help") closeSettings();
-  return composeFromKeyboard();
+  if (threadListOnScreen()) threadListBack();
+  const pane = currentScreen === "main" ? paneFor(document.activeElement) : null;
+  return inColumn(pane ? paneColumn(pane) : activeColumn, composeFromKeyboard);
 }
 
 /** ↑ in the box of the channel while it is empty: the newest message selected, as a preference of Slack has it. */
@@ -10879,12 +10897,15 @@ const KEYMAP = [
     run: () => composeFromKeyboard(),
   },
   {
-    group: KEYS_WRITING, chords: [{ key: "s", mod: true }],
-    does: "The message box c goes to, from anywhere: typing in the search, on Settings or on Help too. " +
+    // `#403 composer-key-global`. Heard first, at the window, so nothing the focus is on keeps it
+    // from the box (`onEverywhereKey`), and a held chord's repeats are refused there too: each is the
+    // browser's Save page as well. The box is focused once.
+    group: KEYS_WRITING, chords: [{ key: "s", mod: true }], everywhere: true,
+    does: "The message box, from anywhere: typing in the search, on a button, a thread card, Settings, Help or " +
+      "the thread list too. In two columns, the box of the column you are in, or of the one with the selected " +
+      "message; Main's from the thread cards. A reply open at the foot of a column is that column's box. " +
       "Never the Save page of the browser",
     controls: ["channel-compose-text", "reply-text", "compose-text"],
-    // Repeats so that a held chord's repeats are taken as well: each is the browser's Save page too.
-    // The box is focused once.
     repeats: true,
     run: (event) => {
       if (!event.repeat) writeFromKeyboard();
@@ -10989,7 +11010,8 @@ function onPageKey(event) {
 
 /**
  * The chords that act whatever holds the focus: those of the bindings marked `everywhere`, today the
- * search's Ctrl+/ (Cmd+/). `#344 search-shortcut`.
+ * search's Ctrl+/ (Cmd+/), `#344 search-shortcut`, and the message box's Ctrl+S (Cmd+S), `#403
+ * composer-key-global`.
  *
  * Registered at the WINDOW in the CAPTURE phase, which a keydown reaches first: before the document,
  * before any element's own listener and before `onPageKey`. So nothing the page adds later can keep the
@@ -10998,7 +11020,7 @@ function onPageKey(event) {
  * default is refused at once, so it is never the browser's, even where it finds nothing to open; a held
  * chord's repeats are refused too, and do nothing more. The key is NOT stopped: `onPageKey` still hears
  * it, notes the keys in use, and leaves it alone as a key already taken (`defaultPrevented`), as does
- * every element's own listener, none of which answers a Ctrl or Cmd chord with "/".
+ * every element's own listener, none of which answers a Ctrl or Cmd chord with "/" or S.
  *
  * Nothing fires while an input method composes. An AltGr chord (Ctrl and Alt together, as Windows sends
  * it) matches no binding, so a "/" typed with AltGr is still a "/".
