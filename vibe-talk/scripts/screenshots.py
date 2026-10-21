@@ -2645,12 +2645,17 @@ DOCK_CONTROLS_JS = (
 )
 
 
-def dock_inside_column_js(pane: str) -> str:
-    """Every control in the dock inside the column `pane` is held to, and no two overlapping."""
+def dock_one_row_js() -> str:
+    """`#406 command-bar-one-row`: every control in the dock on one row, inside the window less the
+    dock's padding, and no two overlapping. It was held to the reading column, and wrapped there."""
     return (
-        f"(() => {{ const col = document.getElementById('{pane}').getBoundingClientRect(); "
+        "(() => { const d = document.getElementById('dock'), s = getComputedStyle(d), "
+        "dr = d.getBoundingClientRect(); "
+        "const col = {left: dr.left + parseFloat(s.paddingLeft), right: dr.right - parseFloat(s.paddingRight)}; "
         f"const boxes = {DOCK_CONTROLS_JS}.map((n) => n.getBoundingClientRect()); "
-        "return boxes.length > 0 && boxes.every((r) => r.left >= col.left - 1 && r.right <= col.right + 1) "
+        "const mids = boxes.map((r) => (r.top + r.bottom) / 2); "
+        "return boxes.length > 0 && Math.max(...mids) - Math.min(...mids) <= 4 "
+        "&& boxes.every((r) => r.left >= col.left - 1 && r.right <= col.right + 1) "
         "&& boxes.every((a, i) => boxes.every((b, j) => j <= i "
         "|| Math.min(a.right, b.right) - Math.max(a.left, b.left) <= 0.5 "
         "|| Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) <= 0.5)); })()"
@@ -2678,11 +2683,12 @@ DESK_DOCK_HEIGHT = (
     "the dock is at most two rows of them, not the 149px of thumb-sized tiles it was",
     "document.getElementById('dock').getBoundingClientRect().height <= 100",
 )
-# The switch's one place on a desk: the column's lower right corner, at the end of the dock's last row,
+# The switch's one place on a desk: the dock's lower right corner — the window's, since `#406
+# command-bar-one-row` — at the end of its row,
 # whatever the view and whether there is a call. It moved with the row, and the second click of a
 # flick between the views met an empty dock.
 DESK_SWITCH_CORNER = (
-    "the Voice/Channel switch is in the column's lower right corner, at the end of the dock's last row",
+    "the Voice/Channel switch is in the dock's lower right corner, at the end of its row",
     "(() => { const d = document.getElementById('dock'), s = getComputedStyle(d), r = d.getBoundingClientRect(); "
     "const w = document.getElementById('view-switch').getBoundingClientRect(); "
     "return Math.abs(w.right - (r.right - parseFloat(s.paddingRight))) <= 0.5 "
@@ -4361,10 +4367,10 @@ SCENES: tuple[Scene, ...] = (
                 "document.getElementById('pane-voice').getBoundingClientRect().right) < 20",
             ),
             (
-                # `#218 desktop-dock` made the dock one wrapping row inside the column, so this is
-                # stated as the column itself rather than as the pane being narrower than the dock.
-                "the controls follow the column rather than spanning the desk, overlapping nothing",
-                dock_inside_column_js("pane-voice"),
+                # `#406 command-bar-one-row`: the dock no longer follows the column (`#218
+                # desktop-dock` held it there, and it wrapped); it spans the window in one row.
+                "the controls are one row across the window, whatever the column, overlapping nothing",
+                dock_one_row_js(),
             ),
             (
                 "there is a real transcript in it to judge the line length by",
@@ -5250,7 +5256,7 @@ SCENES: tuple[Scene, ...] = (
     ),
     Scene(
         name="39-desktop-dock-channel",
-        what="the dock on a desk over the channel: one wrapping row of ordinary controls, names whole",
+        what="the dock on a desk over the channel: one row of ordinary controls across the window, names whole",
         act=_act_open_channel,
         # `#218 desktop-dock`. Desks only: the phone keeps its thumb-sized dock, and these sizes on a
         # phone would be the defect, not the feature.
@@ -5281,8 +5287,8 @@ SCENES: tuple[Scene, ...] = (
                 "return sel.getBoundingClientRect().width >= natural - 1; })()",
             ),
             (
-                "the dock's controls are inside the list's column and overlap nothing",
-                dock_inside_column_js("pane-discord"),
+                "the dock's controls are one row across the window and overlap nothing",
+                dock_one_row_js(),
             ),
         ),
     ),
@@ -5302,8 +5308,8 @@ SCENES: tuple[Scene, ...] = (
                 + " && window.__visible('prompts-open') && window.__visible('read-new')",
             ),
             (
-                "the dock's controls are inside the transcript's column and overlap nothing",
-                dock_inside_column_js("pane-voice"),
+                "the dock's controls are one row across the window and overlap nothing",
+                dock_one_row_js(),
             ),
         ),
     ),
