@@ -1,6 +1,6 @@
 ---
 title: 'composer-key-global: Ctrl+S (Cmd+S) reaches a message box from every focus and selection state'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - keyboard
 - ui
 created_at: 2026-10-21T15:31:44.784642920+00:00
-updated_at: 2026-10-21T15:31:44.784642920+00:00
+updated_at: 2026-10-21T16:15:33.241362892+00:00
+closed_at: 2026-10-21T16:15:33.241362762+00:00
 ---
 
 # Description

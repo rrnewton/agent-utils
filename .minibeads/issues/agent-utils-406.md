@@ -1,6 +1,6 @@
 ---
 title: 'command-bar-one-row: the desktop command bar stays one row, across the window'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - ui
 - desktop
 created_at: 2026-10-21T15:47:28.813857185+00:00
-updated_at: 2026-10-21T15:47:28.813857185+00:00
+updated_at: 2026-10-21T16:15:33.244076678+00:00
+closed_at: 2026-10-21T16:15:33.244076558+00:00
 ---
 
 # Description

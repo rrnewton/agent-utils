@@ -6943,10 +6943,12 @@ test("on a desktop both lists are held to a reading column, and the phone is lef
   assert.doesNotMatch(cssBlock("#control-pane"), /position:\s*(fixed|absolute)/);
   // ...and neither half sets a column of its own any more, which would be a second column inside
   // the first and stop the pane sitting beside the bar.
+  // (`#406 command-bar-one-row` caps the pane at what the dock leaves beside the bar's floor and the
+  // switch, which is no column: the room it may wrap its buttons in, as a last resort.)
   for (const half of ["#control-pane", '#control-bar[data-placement="bottom"]']) {
     assert.doesNotMatch(
       cssBlockIn(DESKTOP_QUERY, half),
-      /max-width/,
+      /max-width:(?!\s*calc\(100% - var\(--bar-floor\))/,
       `${half} is held to a column of its own inside the dock's`
     );
   }
@@ -6988,21 +6990,26 @@ test("the reading-width handle is a sibling of the scroll area, not a passenger 
 /** How tall a control in the desktop dock may be, in px: a mouse's 32px target, short of a slab. */
 const DESK_CONTROL_PX = [32, 40];
 
-test("on a desk the dock is ONE ROW of ordinary-sized controls, which never wraps", () => {
+test("on a desk the dock is ONE ROW of ordinary-sized controls, the pickers giving way before it wraps", () => {
   // `#406 command-bar-one-row`. It wrapped the pane onto a second row when the pickers and it did not
   // fit the column: "Thread list" or a long thread's name did that, beside half a window of nothing.
   // tests/command_bar_browser.py measures the row in Chromium at 1280x800 and 1920x1080.
   const dock = cssBlockIn(DESKTOP_QUERY, "#dock");
   assert.match(dock, /display:\s*flex/, "the dock is still two stacked bands on a desk");
   assert.match(dock, /flex-wrap:\s*nowrap/, "the dock still wraps onto a second row on a desk");
-  // The bar takes the room the pane leaves, and gives way: the pane keeps its width, a row at the right
-  // of the bar, not a tile, and does not wrap its own buttons either.
+  // The bar takes the room the pane leaves, and gives way down to its floor: the pane keeps its width, a
+  // row at the right of the bar, not a tile. Only with the bar at its floor (a large default font after
+  // a call, in the narrowest desk) does the pane wrap its own buttons, rather than run under the bar.
   assert.match(cssBlockIn(DESKTOP_QUERY, "#control-bar-bottom"), /flex:\s*1 1 auto/);
-  assert.match(cssBlockIn(DESKTOP_QUERY, "#control-bar-bottom"), /min-width:\s*0/, "the bar cannot give way");
+  assert.match(cssBlockIn(DESKTOP_QUERY, "#control-bar-bottom"), /min-width:\s*var\(--bar-floor\)/,
+    "the bar can be squeezed to nothing under the pane");
+  assert.match(cssValue(dock, "--bar-floor") || "", /^[\d.]+rem$/);
   const pane = cssBlockIn(DESKTOP_QUERY, "#control-pane");
   assert.match(pane, /display:\s*flex/, "the pane is still the phone's tile on a desk");
   assert.match(pane, /flex:\s*0 0 auto/, "the pane shrinks, so its buttons are squeezed instead of the pickers");
-  assert.match(pane, /flex-wrap:\s*nowrap/, "the pane wraps its own buttons onto a second row");
+  assert.match(pane, /max-width:\s*calc\(100% - var\(--bar-floor\) - var\(--dock-switch\)/,
+    "the pane can grow over the bar's floor or the switch's room");
+  assert.match(pane, /flex-wrap:\s*wrap/, "the pane has no last resort but to run under the bar");
   assert.match(pane, /margin-left:\s*auto/, "the pane is not held at the right of its row");
   // Every control at a desk's size: no smaller than a mouse's target, and nowhere near the
   // phone's 44px squares or the slabs the owner photographed.
@@ -50731,7 +50738,8 @@ function twoColumnWidthProblems(css) {
   if (!/max-width:\s*var\(--reading-width\)/.test(desk("#pane-discord"))) problems.push("one column lost its reading width");
   // The things placed by the column follow it.
   if (!/width:\s*calc\(50% - 1\.2rem\)/.test(inside(two("> #scroll-tools")))) problems.push("the chips over the left list keep the reading width");
-  if (!/--dock-inset:\s*0\.6rem/.test(inside('body:has(#screen-main[data-columns="two"]:not([hidden])) #dock'))) problems.push("the dock keeps the reading width's inset in two columns");
+  // Since `#406 command-bar-one-row` the desk's dock spans the window in every view, two columns included.
+  if (!/--dock-inset:\s*0\.6rem/.test(desk("#dock"))) problems.push("the dock keeps the reading width's inset in two columns");
   return problems;
 }
 
@@ -76092,6 +76100,12 @@ test("`#403 composer-key-global`: a reply open at the foot of a column is THAT c
     assert.equal(focused(page), page.el("reply-text"), `${chordName(fields)} from the left column left the focus on ${focusName(page)}`);
     await chordFrom(page, null, fields, `${chordName(fields)} from the page body`);
     assert.equal(focused(page), page.el("reply-text"), `${chordName(fields)} from the body after the left left the focus on ${focusName(page)}`);
+    // In the left column's own channel box, beside its reply, with a draft: it stays, the draft untouched.
+    await page.el("channel-compose-text").setValue("not the reply");
+    await chordFrom(page, page.el("channel-compose-text"), fields, `${chordName(fields)} in Main's box beside the reply`);
+    assert.equal(focused(page), page.el("channel-compose-text"),
+      `${chordName(fields)} in Main's box beside its reply moved the focus to ${focusName(page)}`);
+    assert.equal(page.el("channel-compose-text").value, "not the reply");
   }
 });
 
