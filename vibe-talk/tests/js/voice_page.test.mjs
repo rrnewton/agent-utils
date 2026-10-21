@@ -76185,6 +76185,8 @@ test("`#406 command-bar-one-row`: the view picker's tooltip names the open threa
   // Back to Main: the tooltip names no thread.
   await pickThread(page, "main");
   assert.equal(picker.title, general, "the tooltip still names a thread after leaving it");
+});
+
 // --- unpack every thread under its card (#404 threads-unpack-all) and the root under a summary (#405) --
 //
 // The owner, 2026-10-21: bridging one thread in All breaks when another is bridged; he wants every
