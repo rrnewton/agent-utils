@@ -76553,3 +76553,58 @@ test("`#407 unpack-row-parity` negative controls: Main, a thread, and the cards 
   await press(cards, cards.el("side-scroll"), ";");
   assert.equal(statusSaid(cards), "No long messages here to expand or collapse.", "; over packed cards found folds");
 });
+
+test("`#407 unpack-row-parity`: an unpacked row's Done flash runs its course, its pin is drawn at once, and Enter on a run line leaves the keys on its row", async () => {
+  const { page } = await parityPage({ long: false });
+  await doneButton(unpackedRow(page, "703")).click();
+  await page.settle();
+  assert.equal(unpackedRow(page, "703").getAttribute("data-done-flash"), "marking", "the Done drew no moment of marking");
+  page.expireTimers(DONE_FLASH_HOLD_MS);
+  assert.equal(unpackedRow(page, "703").getAttribute("data-done-flash"), "fading");
+  page.expireTimers(DONE_FLASH_FADE_MS);
+  assert.equal(unpackedRow(page, "703").hasAttribute("data-done-flash"), false, "the moment outlived its timers on an unpacked row");
+  // p pins the selected unpacked row, and the row says so at once, as a row of Main does.
+  const area = page.el("side-scroll");
+  area.focus();
+  await mouseOnto(page, unpackedRow(page, "707"));
+  await pressHere(page, "p");
+  await page.settle();
+  assert.equal(page.pinCalls.at(-1)?.id, "707", "p did not pin the selected unpacked row");
+  assert.equal(unpackedRow(page, "707").getAttribute("data-pinned"), "true", "the pinned unpacked row is not drawn pinned");
+  // Enter on a block's run line: the run opens and the keys stay on its first row, focused.
+  await page.el("todo-filter").click(); // Show -> Collapse
+  await page.settle();
+  const head = unpackRows(page, "spaces/A/threads/raw").find((li) => li.getAttribute("data-read-run") === "head");
+  area.focus();
+  await mouseOnto(page, head);
+  await pressHere(page, "Enter");
+  assert.equal(unpackedRow(page, "706").hidden, false, "Enter did not open the run");
+  assert.equal(focused(page), unpackedRow(page, "705"), `after Enter on the run line the focus is on ${focusName(page)}`);
+  assert.equal(unpackedRow(page, "705").getAttribute("tabindex"), "0", "the run's first row is not the Tab stop");
+  await pressHere(page, "ArrowDown");
+  assert.equal(heldRow(page), "706", "↓ after opening the run did not go on from its first row");
+});
+
+test("`#407 unpack-row-parity`: Reply from an unpacked row is the screen's reply, and Cancel comes back to the cards where they were", async () => {
+  const { page } = await parityPage({ long: false });
+  const area = page.el("side-scroll");
+  area.focus();
+  await mouseOnto(page, unpackedRow(page, "703"));
+  const was = area.scrollTop;
+  await pressHere(page, "r");
+  assert.equal(page.screen(), "reply", "r did not open the reply screen");
+  await page.el("reply-cancel").click();
+  await page.settle();
+  assert.equal(page.screen(), "main");
+  assert.equal(area.scrollTop, was, "the cards moved under a reply from an unpacked row");
+  assert.ok(page.el("side-cards").children.some((li) => li.hasAttribute("data-unpack-thread")), "the cards came back packed");
+});
+
+test("`#407 unpack-row-parity`: n goes to the next unread message over unpacked cards, a card standing for its unread replies", async () => {
+  const { page } = await parityPage({ long: false });
+  const area = page.el("side-scroll");
+  area.focus();
+  await mouseOnto(page, unpackedRow(page, "700"));
+  await pressHere(page, "n");
+  assert.equal(heldRow(page), "703", "n did not skip the read rows to the unread reply");
+});

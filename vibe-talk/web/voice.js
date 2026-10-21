@@ -5606,7 +5606,8 @@ function carrySelection(anchor, row, substituted) {
     if (anchor.focused) takeRow(pane, row, true);
     return;
   }
-  pane.marks.set(pane.context(), { id: anchor.selected, drawn: anchor.drawn, index: paneRows(pane).indexOf(row) });
+  pane.marks.set(pane.context(), { id: anchor.selected, card: row.hasAttribute("data-card"), drawn: anchor.drawn,
+    index: paneRows(pane).indexOf(row) });
   if (anchor.drawn) {
     releaseRow(pane, row);
     row.setAttribute("tabindex", "0");
@@ -9818,7 +9819,9 @@ function openFromKeyboard(event, target) {
   if (!pane || !row) return took;
   if (row.getAttribute("data-read-run") === "head") {
     openReadRun(row);
-    selectRow(pane, row, false);
+    // `#407 unpack-row-parity`. In an unpacked block the run's rows are drawn anew: its first row's.
+    const now = row.parentNode ? row : liveUnpackedRow(row);
+    if (now) selectRow(pane, now, false);
     return true;
   }
   // A card: a press on it, which highlights it and shows it whole, or puts that out. The keys stay on
@@ -19664,6 +19667,8 @@ function projectView(view = channelView, thread = selectedThreadId) {
 /** The read state of the rows on screen is the store's read state for those rows. */
 function syncCanonDismissed() {
   if (!threadingSupported || channelCanon.channel !== String(el("discord-channel").value)) return;
+  // `#407 unpack-row-parity`. Over the cards the right column has no rows on screen to speak for.
+  if (sideActive && columns.side.mode !== "thread") return;
   for (const message of timelineMessages) {
     const id = String(message.id);
     if (archivedIds.has(id)) channelCanon.dismissed.add(id);
@@ -27687,6 +27692,25 @@ function renderChannelRows() {
   // `#299 all-thread-strip`. The thread selected in All, on the rows as they now stand: a live reply of
   // it arrives at full strength, any other message dimmed.
   paintAllThreadFocus();
+  // `#407 unpack-row-parity`. Whatever this pass was for — a read aloud starting or ending, a pin, a
+  // reply sent — the rows unpacked under the cards are dressed again with it, as message rows.
+  if (!sideActive) dressUnpackedRows();
+}
+
+/**
+ * Dress every message row unpacked under the cards again from what the page holds now
+ * (`dressChannelRow`), in the right column they were built in. Nothing while none are on screen.
+ */
+function dressUnpackedRows() {
+  if (!unpackOnScreen()) return;
+  inColumn(columns.side, () => {
+    const rows = /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children])
+      .filter((row) => row.hasAttribute("data-unpack-thread") && row.hasAttribute("data-id"));
+    if (rows.length === 0) return;
+    const viewing = String(el("discord-channel").value);
+    const pass = { tally: replyTally(), answered: answeredBy(rows, viewing), viewing, inMain: false, inAll: false };
+    for (const row of rows) dressChannelRow(row, pass);
+  });
 }
 
 /**
@@ -35197,9 +35221,12 @@ function readRunLine(row) {
     // focus is lit as if under the pointer — a read message drawn as though it were not.
     const focused = document.activeElement === line && line.matches(":focus-visible");
     openReadRun(row);
-    if (focused) {
-      row.setAttribute("tabindex", "-1");
-      row.focus({ preventScroll: true });
+    // `#407 unpack-row-parity`. A run in an unpacked block is opened by drawing the block again: the
+    // row it was is the new one standing for the same message.
+    const now = row.parentNode ? row : liveUnpackedRow(row);
+    if (focused && now) {
+      now.setAttribute("tabindex", "-1");
+      now.focus({ preventScroll: true });
     }
   }));
   row.replaceChildren(line, ...row.children);
@@ -35355,11 +35382,28 @@ function openReadRun(row) {
   if (thread !== null) {
     sideCardsDrawn = "";
     renderSideColumn();
+    // The block is new rows: the selection, its Tab stop and its focus go to the run's first row's.
+    keepSelection();
     return;
   }
   applyReadRuns();
   renderScrollTools();
   requestVisibleSummaries();
+}
+
+/**
+ * The row now standing in the cards for `row`, an unpacked row a redraw of its block took away: the
+ * new row of the same thread holding its first message, or null. `#407 unpack-row-parity`.
+ *
+ * @param {Element} row
+ * @returns {HTMLElement | null}
+ */
+function liveUnpackedRow(row) {
+  const thread = row.getAttribute("data-unpack-thread");
+  const [first] = idsOf(row);
+  if (thread === null || !first) return null;
+  return /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children]).find((one) =>
+    one.getAttribute("data-unpack-thread") === thread && idsOf(one).includes(first)) || null;
 }
 
 /** The row on screen standing for `row`: itself, or the line of the collapsed run it is hidden in. */
@@ -35915,7 +35959,8 @@ function drawDoneFlash(row) {
 
 /** Every drawn row of every list brought into line with `doneFlashing`, after a phase changes. */
 function drawDoneFlashes() {
-  for (const id of ["discord-log", "side-log", "pinned-log"]) {
+  // `#407 unpack-row-parity`. And the rows unpacked under the cards, which are message rows too.
+  for (const id of ["discord-log", "side-log", "pinned-log", "side-cards"]) {
     const list = document.getElementById(id);
     for (const row of list ? [...list.children] : []) drawDoneFlash(row);
   }
@@ -35974,6 +36019,14 @@ function flashDone(row) {
  * after a round trip to Discord.
  */
 async function refreshAfterInboxChange() {
+  // `#407 unpack-row-parity`. An act on a row unpacked under the cards is made in the right column,
+  // which draws no thread of its own while it shows them: what changed is drawn in the cards, and its
+  // left-over thread is neither drawn nor written over the store.
+  if (sideActive && columns.side.mode !== "thread") {
+    sideCardsDrawn = "";
+    renderSideColumn();
+    return;
+  }
   if (threadingSupported) {
     renderCachedTimeline();
     saveChannelScope();
@@ -38529,6 +38582,12 @@ let replyQuote = null;
  * @param {string} [quote]
  */
 function openReply(messages, from = null, quote = "") {
+  // `#407 unpack-row-parity`. A row unpacked under the cards acts in the right column, which shows no
+  // thread to answer in or come back to: its reply is the left column's, the screen's own reply.
+  if (sideActive && columns.side.mode !== "thread") {
+    inColumn(columns.main, () => openReply(messages, from, quote));
+    return;
+  }
   // `#277 reply-in-column`. A reply already open in a column is put down first, its words kept as
   // Cancel keeps them. In the same column, the place the first was opened from is still the one to go
   // back to: the reader has not left the column, and the box only moves from one message to another.
@@ -42965,7 +43024,7 @@ function noteLinkedSelection() {
   const pane = activePane();
   const lit = pane ? pane.lit : null;
   const key = header !== null ? `header:${header}` : card !== null ? `card:${card}`
-    : pane && lit ? `${pane.name}:${lit.getAttribute("data-id")}` : "";
+    : pane && lit ? `${pane.name}:${lit.hasAttribute("data-card") ? "card:" : ""}${lit.getAttribute("data-id")}` : "";
   if (key !== linkedSelection) {
     linkedSelection = key;
     columnGlideSpent = "";
