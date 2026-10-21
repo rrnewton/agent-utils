@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser pairing-link-browser offline-cache-browser reactions-browser system-bots-browser edited-mark-browser rich-headers-browser read-aloud-browser read-aloud-blocks-browser post-confirm-browser approval-card-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser search-chord-browser composer-key-browser command-bar-browser two-column-browser desktop-layout-browser bookmark-browser reply-continuity-browser reply-in-column-browser reply-marks-read-browser done-sync-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser composer-grow-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser thread-card-header-browser thread-header-collapse-browser thread-line-browser empty-messages-browser all-thread-strip-browser scroll-stability-browser copy-message-browser fold-steps-browser back-gesture-browser live-pill-browser stale-live-read-browser provider-groups-browser voice-reconnect-browser live-relay-check-self-test live-relay-check channel-search-browser column-overscroll-browser channel-box-browser
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser pairing-link-browser offline-cache-browser reactions-browser system-bots-browser edited-mark-browser rich-headers-browser read-aloud-browser read-aloud-blocks-browser post-confirm-browser approval-card-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser search-chord-browser composer-key-browser command-bar-browser two-column-browser desktop-layout-browser bookmark-browser reply-continuity-browser reply-in-column-browser reply-marks-read-browser done-sync-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser composer-grow-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser thread-card-header-browser thread-header-collapse-browser threads-unpack-browser thread-line-browser empty-messages-browser all-thread-strip-browser scroll-stability-browser copy-message-browser fold-steps-browser back-gesture-browser live-pill-browser stale-live-read-browser provider-groups-browser voice-reconnect-browser live-relay-check-self-test live-relay-check channel-search-browser column-overscroll-browser channel-box-browser
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -441,6 +441,16 @@ thread-card-header-browser:
 # of the page, and SCREENSHOTS=dir to keep a PNG of each state.
 thread-header-collapse-browser:
 	python3 tests/thread_header_collapse_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
+
+# `#404 threads-unpack-all` and `#405 root-under-summary` in a real Chromium at 1280x800 with a mouse
+# and the keys and 393x852 by touch, in both schemes: Unpack all draws every thread's messages under
+# its card on a bridge in the thread's colour, the summarised thread's root first as the card's child
+# and a raw thread with no root row; Collapse read folds each block's read run onto its spine and Hide
+# read leaves read replies out while keeping the summarised root; off is cards alone, and a reload
+# keeps it on. Forty threads say what unpacking costs. Pass WEB_ROOT=dir to run it against another
+# copy of the page, and SCREENSHOTS=dir to keep a PNG of each state.
+threads-unpack-browser:
+	python3 tests/threads_unpack_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#385 thread-line-overlap` in a real Chromium at 1000x800, 1280x800 (both schemes) and 1920x1080 with a
 # mouse, and 393x852 by touch: the line from a thread's root to its card on the right runs down a lane at

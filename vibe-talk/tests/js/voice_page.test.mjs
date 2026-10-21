@@ -461,7 +461,7 @@ const FIXTURE_TREE = {
   "thread-heading": ["thread-card"],
   "thread-card": ["thread-card-text", "thread-card-age", "thread-card-count", "thread-back"],
   // `#298 thread-card-header`. Over a thread the heading is the thread's card, with the X in it.
-  "side-heading": ["side-title", "side-unread-only", "side-thread-card"],
+  "side-heading": ["side-title", "side-unread-only", "side-unpack", "side-thread-card"],
   "side-thread-card": ["side-thread-card-text", "side-thread-card-age", "side-thread-card-count", "side-close"],
   // `#338 column-overscroll`. Last, the room past the foot: no height, and so nothing in the layout, until the
   // page gives it one, which a test draws with `drawOverscroll`.
@@ -4385,6 +4385,12 @@ const TUNING_BANDS = {
   DISMISS_BATCH: [1, 1000,
     "ids per dismissal request (#202 read-through-here); the server refuses a batch over its " +
     "ceiling of 1000 (#240 reading-bookmark), and a batch of none would never finish"],
+  UNPACK_READS_AT_ONCE: [1, 8,
+    "threads unpacking may read at once (#404 threads-unpack-all): one makes a fast scroll wait on " +
+    "each thread in turn, many spend the chat service's calls on threads the reader scrolled past"],
+  UNPACK_NEAR_PX: [100, 2000,
+    "how far below the screen an unpacked block starts its read (#404 threads-unpack-all): nearer " +
+    "shows Loading thread at reading speed, farther reads threads nobody reaches"],
   OUTGOING_TIMEOUT_MS: [15000, 180000,
     "slow mobile sends need time to complete, but a lost response must not spin forever or block queued messages"],
   OUTGOING_RETRY_FIRST_MS: [2000, 15000,
@@ -76179,4 +76185,139 @@ test("`#406 command-bar-one-row`: the view picker's tooltip names the open threa
   // Back to Main: the tooltip names no thread.
   await pickThread(page, "main");
   assert.equal(picker.title, general, "the tooltip still names a thread after leaving it");
+// --- unpack every thread under its card (#404 threads-unpack-all) and the root under a summary (#405) --
+//
+// The owner, 2026-10-21: bridging one thread in All breaks when another is bridged; he wants every
+// thread chained at once, under the Threads view (Cmd+3), which already lists by last updated — a
+// toggle that unpacks all threads' messages under their cards in the bridged style, respecting
+// Show/Collapse/Hide read. And under a summarized card, the raw root as first child.
+
+const UNPACK_STORAGE = "vibe-talk.voice.threads-unpacked";
+
+/** Two threads: one the summariser named and summed up, one raw. Each: root, two read replies, one unread. */
+function unpackData() {
+  const sum = { id: "spaces/A/threads/sum", root_message_id: "700", is_root: true, reply_count: 3, reply_count_exact: true };
+  const raw = { id: "spaces/A/threads/raw", root_message_id: "704", is_root: true, reply_count: 3, reply_count_exact: true };
+  const messages = [
+    message({ id: "700", content: "sum root words that jog memory", thread: sum }),
+    message({ id: "701", content: "sum read one", thread: { ...sum, is_root: false } }),
+    message({ id: "702", content: "sum read two", thread: { ...sum, is_root: false } }),
+    message({ id: "703", content: "sum fresh answer", thread: { ...sum, is_root: false } }),
+    message({ id: "704", content: "raw root words on the card", thread: raw }),
+    message({ id: "705", content: "raw read one", thread: { ...raw, is_root: false } }),
+    message({ id: "706", content: "raw read two", thread: { ...raw, is_root: false } }),
+    message({ id: "707", content: "raw fresh answer", thread: { ...raw, is_root: false } }),
+  ];
+  const threads = [
+    { id: sum.id, root: messages[0], title: "Thread", reply_count: 3, reply_count_exact: true,
+      updated_at: messages[3].timestamp, display_name: "sum-topic", summary: "A short sum of the thread." },
+    { id: raw.id, root: messages[4], title: "Thread", reply_count: 3, reply_count_exact: true,
+      updated_at: messages[7].timestamp },
+  ];
+  return { messages, threads };
+}
+
+/** The unpacked rows under card `threadId`, in order: their first message ids and run lines. */
+const unpackRows = (page, threadId) =>
+  page.el("side-cards").children.filter((li) => li.getAttribute("data-unpack-thread") === threadId);
+
+async function unpackPage(storage = null) {
+  const data = unpackData();
+  const page = newPage(storage || new Map());
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  page.messages = data.messages;
+  forwardTimeline(page);
+  for (const id of ["700", "701", "702", "704", "705", "706"]) page.dealtWith.add(id);
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await pickThread(page, "threads");
+  await page.settle();
+  return { page, data };
+}
+
+test("`#404 threads-unpack-all`: Unpack all is a toggle beside Unread only, off means cards alone, u is in the help", async () => {
+  assertMarkupContains("side-heading", "side-unpack");
+  const tag = /<button\s+id="side-unpack"[^>]*>/.exec(HTML_CODE)[0];
+  assert.match(tag, /aria-pressed="false"/);
+  assert.match(HTML_CODE, /id="side-unpack"[^>]*>Unpack all<\/button>/);
+  const { page } = await unpackPage();
+  const toggle = page.el("side-unpack");
+  assert.equal(toggle.hidden, false, "the toggle is not offered over the cards");
+  assert.equal(toggle.getAttribute("aria-pressed"), "false");
+  assert.equal(toggle.getAttribute("aria-keyshortcuts"), "U", "the toggle does not name its key");
+  assert.deepStrictEqual(unpackRows(page, "spaces/A/threads/sum"), [], "off, messages are already unpacked");
+  assert.ok(page.el("keyboard-keys").text().includes("Unpack"), "the ? help does not list the key");
+  await page.documentEvent("keydown", { key: "u" });
+  await page.settle();
+  assert.equal(toggle.getAttribute("aria-pressed"), "true", "u did not unpack");
+  assert.equal(page.storage.get(UNPACK_STORAGE), "on", "the choice was not kept on the device");
+  await toggle.click();
+  await page.settle();
+  assert.deepStrictEqual(unpackRows(page, "spaces/A/threads/sum"), [], "off again left rows behind");
+  assert.equal(page.storage.get(UNPACK_STORAGE), "off");
+});
+
+test("`#404 threads-unpack-all` + `#405 root-under-summary`: every thread's messages under its card, bridged, summarized first with its root child and raw without a duplicate", async () => {
+  const { page } = await unpackPage();
+  await page.el("side-unpack").click();
+  await page.settle();
+  const cards = page.el("side-cards").children.filter((li) => li.hasAttribute("data-card"))
+    .map((li) => li.getAttribute("data-id"));
+  assert.deepStrictEqual(cards, ["spaces/A/threads/sum", "spaces/A/threads/raw"], "card order changed");
+  const sumRows = unpackRows(page, "spaces/A/threads/sum");
+  assert.deepStrictEqual(sumRows.flatMap((li) => (li.getAttribute("data-ids") || "").split(" ")),
+    ["700", "701", "702", "703"], "the summarized block is not root then replies in time order");
+  assert.ok(sumRows[0].hasAttribute("data-root-child"), "the root is not drawn as the card's first child");
+  assert.ok(sumRows.every((li) => li.descendants().some((n) => n.className === "reply-bridge")),
+    "an unpacked row has no bridge piece");
+  assert.ok(sumRows.every((li) => li.hasAttribute("data-coalesce")), "an unpacked row has no place in its bridge");
+  const rawRows = unpackRows(page, "spaces/A/threads/raw");
+  assert.deepStrictEqual(rawRows.flatMap((li) => (li.getAttribute("data-ids") || "").split(" ")),
+    ["705", "706", "707"], "the raw block duplicates the root its card already says");
+  assert.ok(!rawRows.some((li) => li.hasAttribute("data-root-child")), "a raw card grew a root child");
+});
+
+test("`#404 threads-unpack-all` x `#221 read-modes`: Collapse read folds runs onto the bridge; Hide read leaves read replies out of every block but keeps a summarized root", async () => {
+  const { page } = await unpackPage();
+  await page.el("side-unpack").click();
+  await page.settle();
+  await page.el("todo-filter").click(); // Show -> Collapse
+  await page.settle();
+  assert.equal(page.el("todo-filter").getAttribute("data-read-mode"), "collapse");
+  for (const threadId of ["spaces/A/threads/sum", "spaces/A/threads/raw"]) {
+    const runs = unpackRows(page, threadId).filter((li) => li.hasClass("unpack-read-run"));
+    assert.equal(runs.length, 1, `${threadId}: its two read replies are not one run line`);
+    assert.match(runs[0].descendants().find((n) => n.className === "read-run").textContent, /2 read messages/,
+      "the run line does not say what it holds");
+    assert.ok(runs[0].descendants().some((n) => n.className === "reply-bridge"), "the run line hangs off no bridge");
+  }
+  await page.el("todo-filter").click(); // Collapse -> Hide
+  await page.settle();
+  assert.equal(page.el("todo-filter").getAttribute("data-read-mode"), "hide");
+  assert.deepStrictEqual(unpackRows(page, "spaces/A/threads/sum")
+    .flatMap((li) => (li.getAttribute("data-ids") || "").split(" ")), ["700", "703"],
+    "Hide read did not leave exactly the summarized root and the unread reply");
+  assert.deepStrictEqual(unpackRows(page, "spaces/A/threads/raw")
+    .flatMap((li) => (li.getAttribute("data-ids") || "").split(" ")), ["707"],
+    "Hide read kept a read reply under the raw card");
+});
+
+test("`#405 root-under-summary`: in a thread headed by a summarized card the read root stays as first child under Hide read; under a raw card it does not (negative control)", async () => {
+  const { page } = await unpackPage();
+  await page.el("todo-filter").click();
+  await page.el("todo-filter").click(); // Hide read
+  await page.settle();
+  await pickThread(page, "thread:spaces/A/threads/sum");
+  await page.settle();
+  const rows = [...page.el("discord-log").children];
+  assert.ok(rows.length > 0 && (rows[0].getAttribute("data-ids") || "").split(" ").includes("700"),
+    "the summarized thread does not start with its root under Hide read");
+  assert.ok(rows[0].hasAttribute("data-root-child"), "the root is not drawn as the card's child");
+  await pickThread(page, "thread:spaces/A/threads/raw");
+  await page.settle();
+  const rawRows = [...page.el("discord-log").children];
+  assert.ok(!rawRows.some((li) => li.hasAttribute("data-root-child")), "a raw card's thread grew a root child");
+  assert.ok(!rawRows.flatMap((li) => (li.getAttribute("data-ids") || "").split(" ")).includes("704"),
+    "the raw thread kept its read root under Hide read, so the summarized check proves nothing");
 });

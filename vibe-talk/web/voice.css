@@ -1145,6 +1145,7 @@ a.search-hit-link {
 
 /* ...and it gains the accent with the selected row, as Reply does. */
 #side-log li.discord-message[data-selected="true"] .thread-badge[data-thread-state="start"],
+#side-cards li.discord-message[data-selected="true"] .thread-badge[data-thread-state="start"],
 #discord-log li.discord-message[data-selected="true"] .thread-badge[data-thread-state="start"],
 #pinned-log li.discord-message[data-selected="true"] .thread-badge[data-thread-state="start"] {
   color: var(--ink);
@@ -1180,6 +1181,7 @@ a.search-hit-link {
 
 /* N replies gives up its line to share it. */
 #side-log li.discord-message[data-unread-replies] > .thread-replies,
+#side-cards li.discord-message[data-unread-replies] > .thread-replies,
 #discord-log li.discord-message[data-unread-replies] > .thread-replies {
   display: inline-block;
 }
@@ -1820,6 +1822,7 @@ a.search-hit-link {
  * account that delivered them is an implementation detail of this bridge.
  */
 #side-log li.discord-message[data-who="me"],
+#side-cards li.discord-message[data-who="me"],
 #discord-log li.discord-message[data-who="me"],
 #pinned-log li.discord-message[data-who="me"],
 #reply-context li.discord-message[data-who="me"],
@@ -1851,6 +1854,7 @@ a.search-hit-link {
  * their colour -- two signals, either of which would do on its own.
  */
 #side-log li.discord-message[data-who="coder"],
+#side-cards li.discord-message[data-who="coder"],
 #discord-log li.discord-message[data-who="coder"],
 #pinned-log li.discord-message[data-who="coder"],
 #reply-context li.discord-message[data-who="coder"],
@@ -1875,11 +1879,13 @@ a.search-hit-link {
  * Warm rather than a third blue, so it is not read as a variant of `me`, and centred between the
  * two insets so the geometry still says "neither side of this conversation". */
 #side-log li.discord-message[data-who="human"],
+#side-cards li.discord-message[data-who="human"],
 #discord-log li.discord-message[data-who="human"],
 #pinned-log li.discord-message[data-who="human"],
 #reply-context li.discord-message[data-who="human"],
 #reply-target li.discord-message[data-who="human"],
 #side-log li.discord-message[data-who="bot"],
+#side-cards li.discord-message[data-who="bot"],
 #discord-log li.discord-message[data-who="bot"],
 #pinned-log li.discord-message[data-who="bot"],
 #reply-context li.discord-message[data-who="bot"],
@@ -1993,6 +1999,7 @@ a.search-hit-link {
  * file — so every row that is not a reply is drawn exactly as before.
  */
 #side-log li.discord-message,
+#side-cards li.discord-message,
 #discord-log li.discord-message,
 #pinned-log li.discord-message {
   opacity: var(--row-opacity, 1);
@@ -2023,9 +2030,11 @@ a.search-hit-link {
  * archived is the reader's own decision and outranks an inference about what happens to be loaded.
  */
 #side-log li.discord-message[data-archived="true"],
+#side-cards li.discord-message[data-archived="true"],
 #discord-log li.discord-message[data-archived="true"],
 #pinned-log li.discord-message[data-archived="true"],
 #side-log li.discord-message[data-own-read="true"],
+#side-cards li.discord-message[data-own-read="true"],
 #discord-log li.discord-message[data-own-read="true"],
 #pinned-log li.discord-message[data-own-read="true"] {
   --row-opacity: 0.42;
@@ -2044,6 +2053,7 @@ a.search-hit-link {
  * rescued with Not noise when a rule caught a real message.
  */
 #side-log li.discord-message[data-noise="true"],
+#side-cards li.discord-message[data-noise="true"],
 #discord-log li.discord-message[data-noise="true"],
 #pinned-log li.discord-message[data-noise="true"] {
   --row-opacity: 0.32;
@@ -2058,21 +2068,27 @@ a.search-hit-link {
    because `filter` does not inherit that treatment. `#239 single-selection`: selected is what the
    mouse over a row is now, as well as the keys' choice. */
 #side-log li.discord-message[data-archived="true"][data-selected="true"],
+#side-cards li.discord-message[data-archived="true"][data-selected="true"],
 #discord-log li.discord-message[data-archived="true"][data-selected="true"],
 #pinned-log li.discord-message[data-archived="true"][data-selected="true"],
 #side-log li.discord-message[data-own-read="true"][data-selected="true"],
+#side-cards li.discord-message[data-own-read="true"][data-selected="true"],
 #discord-log li.discord-message[data-own-read="true"][data-selected="true"],
 #pinned-log li.discord-message[data-own-read="true"][data-selected="true"],
 #side-log li.discord-message[data-noise="true"][data-selected="true"],
+#side-cards li.discord-message[data-noise="true"][data-selected="true"],
 #discord-log li.discord-message[data-noise="true"][data-selected="true"],
 #pinned-log li.discord-message[data-noise="true"][data-selected="true"],
 #side-log li.discord-message[data-archived="true"]:focus-within,
+#side-cards li.discord-message[data-archived="true"]:focus-within,
 #discord-log li.discord-message[data-archived="true"]:focus-within,
 #pinned-log li.discord-message[data-archived="true"]:focus-within,
 #side-log li.discord-message[data-own-read="true"]:focus-within,
+#side-cards li.discord-message[data-own-read="true"]:focus-within,
 #discord-log li.discord-message[data-own-read="true"]:focus-within,
 #pinned-log li.discord-message[data-own-read="true"]:focus-within,
 #side-log li.discord-message[data-noise="true"]:focus-within,
+#side-cards li.discord-message[data-noise="true"]:focus-within,
 #discord-log li.discord-message[data-noise="true"]:focus-within,
 #pinned-log li.discord-message[data-noise="true"]:focus-within {
   --row-filter: none;
@@ -2105,6 +2121,7 @@ a.search-hit-link {
  * no width.
  */
 #side-log li.discord-message[data-reading="true"],
+#side-cards li.discord-message[data-reading="true"],
 #discord-log li.discord-message[data-reading="true"],
 #pinned-log li.discord-message[data-reading="true"] {
   --row-opacity: 1;
@@ -2122,6 +2139,7 @@ a.search-hit-link {
  * ring may also be round. Its place on the list is unchanged: it is the same row, marked.
  */
 #side-log li.discord-message[data-replying],
+#side-cards li.discord-message[data-replying],
 #discord-log li.discord-message[data-replying],
 #pinned-log li.discord-message[data-replying] {
   --row-opacity: 1;
@@ -2149,6 +2167,7 @@ a.search-hit-link {
  * cannot. So the promise gets an edge and the event gets the surface.
  */
 #side-log li.discord-message[data-pending="true"],
+#side-cards li.discord-message[data-pending="true"],
 #discord-log li.discord-message[data-pending="true"],
 #pinned-log li.discord-message[data-pending="true"] {
   --row-opacity: 1;
@@ -2167,6 +2186,7 @@ a.search-hit-link {
 /* A reader who has asked not to be moved is not asking to be moved by this either. */
 @media (prefers-reduced-motion: reduce) {
   #side-log li.discord-message[data-pending="true"],
+  #side-cards li.discord-message[data-pending="true"],
   #discord-log li.discord-message[data-pending="true"],
   #pinned-log li.discord-message[data-pending="true"] {
     animation: none;
@@ -2217,6 +2237,7 @@ a.search-hit-link {
  * the next one.
  */
 #side-log li.discord-message[data-is-reply="true"][data-who],
+#side-cards li.discord-message[data-is-reply="true"][data-who],
 #discord-log li.discord-message[data-is-reply="true"][data-who],
 #reply-target li.discord-message[data-is-reply="true"][data-who] {
   margin-left: var(--reply-gutter);
@@ -2226,6 +2247,7 @@ a.search-hit-link {
 /* Inside the list's own gutter, which is clear of a notch already, so its words need no room for
    one. */
 #side-log li.discord-message[data-is-reply="true"][data-who="coder"],
+#side-cards li.discord-message[data-is-reply="true"][data-who="coder"],
 #discord-log li.discord-message[data-is-reply="true"][data-who="coder"],
 #reply-target li.discord-message[data-is-reply="true"][data-who="coder"] {
   padding-left: 0.4rem;
@@ -2271,19 +2293,26 @@ a.search-hit-link {
  * leaves the strip out (`:not(.thread-strip)`), and the strip stands over the veil.
  */
 #side-log li.discord-message[data-is-reply="true"][data-who],
+#side-cards li.discord-message[data-is-reply="true"][data-who],
 #discord-log li.discord-message[data-is-reply="true"][data-who],
 #side-log li.discord-message[data-stack-under][data-who],
+#side-cards li.discord-message[data-stack-under][data-who],
 #discord-log li.discord-message[data-stack-under][data-who],
 #side-log li.discord-message[data-unread-replies][data-who],
+#side-cards li.discord-message[data-unread-replies][data-who],
 #discord-log li.discord-message[data-unread-replies][data-who],
 #side-log li.discord-message[data-reply-marker][data-who],
+#side-cards li.discord-message[data-reply-marker][data-who],
 #discord-log li.discord-message[data-reply-marker][data-who],
 #side-log li.discord-message[data-bookmark][data-who],
+#side-cards li.discord-message[data-bookmark][data-who],
 #discord-log li.discord-message[data-bookmark][data-who],
 #side-log li.discord-message[data-seam][data-who],
+#side-cards li.discord-message[data-seam][data-who],
 #discord-log li.discord-message[data-seam][data-who],
 #pinned-log li.discord-message[data-seam][data-who],
 #side-log li.discord-message[data-seam-below][data-who],
+#side-cards li.discord-message[data-seam-below][data-who],
 #discord-log li.discord-message[data-seam-below][data-who],
 #pinned-log li.discord-message[data-seam-below][data-who],
 #discord-log li.discord-message[data-thread-strip][data-who] {
@@ -2294,19 +2323,26 @@ a.search-hit-link {
 }
 
 #side-log li.discord-message[data-is-reply="true"] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#side-cards li.discord-message[data-is-reply="true"] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #discord-log li.discord-message[data-is-reply="true"] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #side-log li.discord-message[data-stack-under] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#side-cards li.discord-message[data-stack-under] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #discord-log li.discord-message[data-stack-under] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #side-log li.discord-message[data-unread-replies] > :not(.thread-strip):not(.thread-unread):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#side-cards li.discord-message[data-unread-replies] > :not(.thread-strip):not(.thread-unread):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #discord-log li.discord-message[data-unread-replies] > :not(.thread-strip):not(.thread-unread):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #side-log li.discord-message[data-reply-marker] > :not(.thread-strip):not(.reply-marker):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#side-cards li.discord-message[data-reply-marker] > :not(.thread-strip):not(.reply-marker):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #discord-log li.discord-message[data-reply-marker] > :not(.thread-strip):not(.reply-marker):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #side-log li.discord-message[data-bookmark] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
+#side-cards li.discord-message[data-bookmark] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
 #discord-log li.discord-message[data-bookmark] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
 #side-log li.discord-message[data-seam] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
+#side-cards li.discord-message[data-seam] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
 #discord-log li.discord-message[data-seam] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
 #pinned-log li.discord-message[data-seam] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
 #side-log li.discord-message[data-seam-below] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
+#side-cards li.discord-message[data-seam-below] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
 #discord-log li.discord-message[data-seam-below] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
 #pinned-log li.discord-message[data-seam-below] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather):not(.bookmark-line):not(.row-seam),
 #discord-log li.discord-message[data-thread-strip] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather) {
@@ -2317,6 +2353,7 @@ a.search-hit-link {
    parts, for a root that is also a reply. (`:not(.thread-strip)` is weight only, as on the rules over
    a row's parts above, which `#299 all-thread-strip` gave it.) */
 #side-log li.discord-message[data-unread-replies] > .thread-unread:not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#side-cards li.discord-message[data-unread-replies] > .thread-unread:not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #discord-log li.discord-message[data-unread-replies] > .thread-unread:not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather) {
   position: relative;
   z-index: 1;
@@ -2328,19 +2365,26 @@ a.search-hit-link {
    shadow, under the veil, is the border's colour drained: the neutral edge in place of a speaker's
    tinted one, at `--row-grey`. */
 #side-log li.discord-message[data-is-reply="true"]::after,
+#side-cards li.discord-message[data-is-reply="true"]::after,
 #discord-log li.discord-message[data-is-reply="true"]::after,
 #side-log li.discord-message[data-stack-under]::after,
+#side-cards li.discord-message[data-stack-under]::after,
 #discord-log li.discord-message[data-stack-under]::after,
 #side-log li.discord-message[data-unread-replies]::after,
+#side-cards li.discord-message[data-unread-replies]::after,
 #discord-log li.discord-message[data-unread-replies]::after,
 #side-log li.discord-message[data-reply-marker]::after,
+#side-cards li.discord-message[data-reply-marker]::after,
 #discord-log li.discord-message[data-reply-marker]::after,
 #side-log li.discord-message[data-bookmark]::after,
+#side-cards li.discord-message[data-bookmark]::after,
 #discord-log li.discord-message[data-bookmark]::after,
 #side-log li.discord-message[data-seam]::after,
+#side-cards li.discord-message[data-seam]::after,
 #discord-log li.discord-message[data-seam]::after,
 #pinned-log li.discord-message[data-seam]::after,
 #side-log li.discord-message[data-seam-below]::after,
+#side-cards li.discord-message[data-seam-below]::after,
 #discord-log li.discord-message[data-seam-below]::after,
 #pinned-log li.discord-message[data-seam-below]::after,
 #discord-log li.discord-message[data-thread-strip]::after {
@@ -2368,6 +2412,7 @@ a.search-hit-link {
  * touch target square inside the row's height: a reply is at least a gutter tall.
  */
 #side-log .reply-jump,
+#side-cards .reply-jump,
 #discord-log .reply-jump {
   --reply-stroke: 0.1875rem;
   position: absolute;
@@ -2388,6 +2433,7 @@ a.search-hit-link {
 /* The gap between this row and the one above: a row's own margin under it, and this row's top
    border, which the square's `top: 0` is inside. An arrow that rises by this meets the row above. */
 #side-log .reply-jump[data-reply-style="adjacent"],
+#side-cards .reply-jump[data-reply-style="adjacent"],
 #discord-log .reply-jump[data-reply-style="adjacent"] {
   --reply-rise: calc(0.5rem + 1px);
   top: 0;
@@ -2412,6 +2458,7 @@ a.search-hit-link {
  * from that row's own arrow where nothing of this one is drawn.
  */
 #side-log .reply-jump-mark,
+#side-cards .reply-jump-mark,
 #discord-log .reply-jump-mark {
   position: absolute;
   right: 0;
@@ -2420,8 +2467,10 @@ a.search-hit-link {
 }
 
 #side-log .reply-jump-mark::before,
+#side-cards .reply-jump-mark::before,
 #discord-log .reply-jump-mark::before,
 #side-log .reply-jump-mark::after,
+#side-cards .reply-jump-mark::after,
 #discord-log .reply-jump-mark::after {
   content: "";
   position: absolute;
@@ -2429,6 +2478,7 @@ a.search-hit-link {
 }
 
 #side-log .reply-jump-mark::after,
+#side-cards .reply-jump-mark::after,
 #discord-log .reply-jump-mark::after {
   pointer-events: auto;
 }
@@ -2444,6 +2494,7 @@ a.search-hit-link {
  * angle is the point, so that the run is its axis.
  */
 #side-log .reply-jump[data-reply-style="disconnected"] .reply-jump-mark,
+#side-cards .reply-jump[data-reply-style="disconnected"] .reply-jump-mark,
 #discord-log .reply-jump[data-reply-style="disconnected"] .reply-jump-mark {
   top: calc(50% - 1.2rem);
   width: 1.7rem;
@@ -2452,6 +2503,7 @@ a.search-hit-link {
 }
 
 #side-log .reply-jump[data-reply-style="disconnected"] .reply-jump-mark::before,
+#side-cards .reply-jump[data-reply-style="disconnected"] .reply-jump-mark::before,
 #discord-log .reply-jump[data-reply-style="disconnected"] .reply-jump-mark::before {
   right: calc(0.5rem - var(--reply-stroke) / 2);
   bottom: 0;
@@ -2466,6 +2518,7 @@ a.search-hit-link {
 /* Placed by its point, at the drawing box's top left: a browser rounds a border's width to whole
    pixels, so a head placed by its far side would put its point a fraction of a pixel off the run. */
 #side-log .reply-jump[data-reply-style="disconnected"] .reply-jump-mark::after,
+#side-cards .reply-jump[data-reply-style="disconnected"] .reply-jump-mark::after,
 #discord-log .reply-jump[data-reply-style="disconnected"] .reply-jump-mark::after {
   top: 0.087rem;
   left: 0.087rem;
@@ -2484,6 +2537,7 @@ a.search-hit-link {
  * (`measureReplyArrows`) and the shaft moves right by `--reply-shift` to come up under its edge.
  */
 #side-log .reply-jump[data-reply-style="adjacent"] .reply-jump-mark,
+#side-cards .reply-jump[data-reply-style="adjacent"] .reply-jump-mark,
 #discord-log .reply-jump[data-reply-style="adjacent"] .reply-jump-mark {
   top: calc(0.45rem - var(--reply-rise));
   bottom: calc(100% - 1.35rem);
@@ -2494,12 +2548,14 @@ a.search-hit-link {
 }
 
 #side-log .reply-jump[data-reply-style="adjacent"] .reply-jump-mark::before,
+#side-cards .reply-jump[data-reply-style="adjacent"] .reply-jump-mark::before,
 #discord-log .reply-jump[data-reply-style="adjacent"] .reply-jump-mark::before {
   content: none;
 }
 
 /* The head, a solid triangle centred on the shaft, its point on the row above's bottom edge. */
 #side-log .reply-jump[data-reply-style="adjacent"] .reply-jump-mark::after,
+#side-cards .reply-jump[data-reply-style="adjacent"] .reply-jump-mark::after,
 #discord-log .reply-jump[data-reply-style="adjacent"] .reply-jump-mark::after {
   left: calc(var(--reply-stroke) / -2);
   top: -0.45rem;
@@ -2517,12 +2573,14 @@ a.search-hit-link {
  * corner is the span; the upper, with the run along to the head, is `::before`.
  */
 #side-log .reply-jump[data-reply-reach="side"] .reply-jump-mark,
+#side-cards .reply-jump[data-reply-reach="side"] .reply-jump-mark,
 #discord-log .reply-jump[data-reply-reach="side"] .reply-jump-mark {
   top: calc(-1 * var(--reply-rise));
   width: calc(1.2rem + var(--reply-stroke) / 2);
 }
 
 #side-log .reply-jump[data-reply-reach="side"] .reply-jump-mark::before,
+#side-cards .reply-jump[data-reply-reach="side"] .reply-jump-mark::before,
 #discord-log .reply-jump[data-reply-reach="side"] .reply-jump-mark::before {
   content: "";
   left: calc(-1 * var(--reply-stroke));
@@ -2536,6 +2594,7 @@ a.search-hit-link {
 
 /* Placed by its point, which is its right side, for the reason the other arrow's head is. */
 #side-log .reply-jump[data-reply-reach="side"] .reply-jump-mark::after,
+#side-cards .reply-jump[data-reply-reach="side"] .reply-jump-mark::after,
 #discord-log .reply-jump[data-reply-reach="side"] .reply-jump-mark::after {
   left: auto;
   right: calc(1.2rem - var(--reply-run, 0px));
@@ -2551,13 +2610,16 @@ a.search-hit-link {
    pointer gets the same under hover, in the pointer query beside the row's own tint and for the
    same reason — a touch screen leaves `:hover` stuck on whatever was tapped last. */
 #side-log .reply-jump:active,
+#side-cards .reply-jump:active,
 #discord-log .reply-jump:active,
 #side-log .reply-jump:focus-visible,
+#side-cards .reply-jump:focus-visible,
 #discord-log .reply-jump:focus-visible {
   background: color-mix(in srgb, var(--accent) 18%, transparent);
 }
 
 #side-log .reply-jump:focus-visible,
+#side-cards .reply-jump:focus-visible,
 #discord-log .reply-jump:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
@@ -2589,6 +2651,7 @@ a.search-hit-link {
  * (`#226 page-energy-profile`).
  */
 #side-log .reply-marker,
+#side-cards .reply-marker,
 #discord-log .reply-marker {
   --reply-marker-dot: 0.7rem;
   --reply-marker-target: 1.75rem;
@@ -2611,6 +2674,7 @@ a.search-hit-link {
 }
 
 #side-log .reply-marker::before,
+#side-cards .reply-marker::before,
 #discord-log .reply-marker::before {
   content: "";
   position: absolute;
@@ -2626,6 +2690,7 @@ a.search-hit-link {
    for a row that is a reply and has replies of its own. (`:not(.thread-strip)` is weight only, the
    weight every rule over a row's parts gained with `#299 all-thread-strip`.) */
 #side-log li.discord-message[data-reply-marker] > .reply-marker:not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#side-cards li.discord-message[data-reply-marker] > .reply-marker:not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #discord-log li.discord-message[data-reply-marker] > .reply-marker:not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather) {
   filter: none;
 }
@@ -2639,19 +2704,23 @@ a.search-hit-link {
  * column, and the disc back on the corner (the desktop block at the foot of this file).
  */
 #side-log li.discord-message[data-who="coder"]:not([data-is-reply="true"]):not([data-stack-under]) > .reply-marker,
+#side-cards li.discord-message[data-who="coder"]:not([data-is-reply="true"]):not([data-stack-under]) > .reply-marker,
 #discord-log li.discord-message[data-who="coder"]:not([data-is-reply="true"]):not([data-stack-under]) > .reply-marker {
   left: calc(env(safe-area-inset-left) - 1px - (var(--reply-marker-target) - var(--reply-marker-dot)) / 2);
 }
 
 /* Pressed, and reached by keyboard: a halo round the disc, and the arrow's own ring round its target. */
 #side-log .reply-marker:active::before,
+#side-cards .reply-marker:active::before,
 #discord-log .reply-marker:active::before,
 #side-log .reply-marker:focus-visible::before,
+#side-cards .reply-marker:focus-visible::before,
 #discord-log .reply-marker:focus-visible::before {
   box-shadow: 0 0 0 0.25rem color-mix(in srgb, var(--accent) 30%, transparent);
 }
 
 #side-log .reply-marker:focus-visible,
+#side-cards .reply-marker:focus-visible,
 #discord-log .reply-marker:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
@@ -2671,16 +2740,19 @@ a.search-hit-link {
  *     but space is. Elsewhere the head is far enough along the foot, and the circle stays put.
  */
 #side-log .reply-jump[data-reply-reach="side"][data-reply-hub] .reply-jump-mark::before,
+#side-cards .reply-jump[data-reply-reach="side"][data-reply-hub] .reply-jump-mark::before,
 #discord-log .reply-jump[data-reply-reach="side"][data-reply-hub] .reply-jump-mark::before {
   height: calc(1.4rem + var(--reply-stroke) / 2 + 1px);
 }
 
 #side-log .reply-jump[data-reply-reach="side"][data-reply-hub] .reply-jump-mark::after,
+#side-cards .reply-jump[data-reply-reach="side"][data-reply-hub] .reply-jump-mark::after,
 #discord-log .reply-jump[data-reply-reach="side"][data-reply-hub] .reply-jump-mark::after {
   top: -1.4rem;
 }
 
 #side-log li.discord-message[data-reply-lift] > .reply-marker,
+#side-cards li.discord-message[data-reply-lift] > .reply-marker,
 #discord-log li.discord-message[data-reply-lift] > .reply-marker {
   bottom: calc(-1px - var(--reply-marker-target) / 2 + 0.7rem);
 }
@@ -2704,33 +2776,39 @@ a.search-hit-link {
  * over the next reply.
  */
 #side-log li.discord-message[data-stack-under][data-who],
+#side-cards li.discord-message[data-stack-under][data-who],
 #discord-log li.discord-message[data-stack-under][data-who],
 #reply-target li.discord-message[data-stack-under][data-who] {
   min-height: var(--reply-gutter);
 }
 
 #side-log li.discord-message[data-stack-under="coder"][data-who],
+#side-cards li.discord-message[data-stack-under="coder"][data-who],
 #discord-log li.discord-message[data-stack-under="coder"][data-who],
 #reply-target li.discord-message[data-stack-under="coder"][data-who] {
   margin-left: calc(var(--reply-gutter) - 0.75rem - env(safe-area-inset-left));
 }
 
 #side-log li.discord-message[data-stack-under="me"][data-who],
+#side-cards li.discord-message[data-stack-under="me"][data-who],
 #discord-log li.discord-message[data-stack-under="me"][data-who],
 #reply-target li.discord-message[data-stack-under="me"][data-who] {
   margin-left: calc(var(--speaker-inset) + var(--reply-gutter));
 }
 
 #side-log li.discord-message[data-stack-under="third"][data-who],
+#side-cards li.discord-message[data-stack-under="third"][data-who],
 #discord-log li.discord-message[data-stack-under="third"][data-who],
 #reply-target li.discord-message[data-stack-under="third"][data-who] {
   margin-left: calc(var(--speaker-inset) / 2 + var(--reply-gutter));
 }
 
 #side-log li.discord-message[data-stack-under="reply"][data-who],
+#side-cards li.discord-message[data-stack-under="reply"][data-who],
 #discord-log li.discord-message[data-stack-under="reply"][data-who],
 #reply-target li.discord-message[data-stack-under="reply"][data-who],
 #side-log li.discord-message[data-stack-under="me-reply"][data-who],
+#side-cards li.discord-message[data-stack-under="me-reply"][data-who],
 #discord-log li.discord-message[data-stack-under="me-reply"][data-who],
 #reply-target li.discord-message[data-stack-under="me-reply"][data-who] {
   margin-left: calc(var(--reply-gutter) * 2);
@@ -2738,6 +2816,7 @@ a.search-hit-link {
 
 /* The agent's tile keeps a left edge for its line to meet, as the agent's reply does. */
 #side-log li.discord-message[data-stack-under][data-who="coder"],
+#side-cards li.discord-message[data-stack-under][data-who="coder"],
 #discord-log li.discord-message[data-stack-under][data-who="coder"],
 #reply-target li.discord-message[data-stack-under][data-who="coder"] {
   padding-left: 0.4rem;
@@ -2749,6 +2828,7 @@ a.search-hit-link {
    the parent or another reply in the stack, a reply to a reply as much as one to the parent; one tap
    on an arrow means that message, and it is back in its row once the stack is put away. */
 #side-log li.discord-message[data-stack-under] > .reply-jump,
+#side-cards li.discord-message[data-stack-under] > .reply-jump,
 #discord-log li.discord-message[data-stack-under] > .reply-jump {
   display: none;
 }
@@ -2761,6 +2841,7 @@ a.search-hit-link {
  * is, folded or open, and at any type size: every length is the rows' own or in `rem`.
  */
 #side-log .reply-bridge,
+#side-cards .reply-bridge,
 #discord-log .reply-bridge {
   --reply-stroke: 0.1875rem;
   --reply-rise: calc(0.5rem + 1px);
@@ -2776,6 +2857,7 @@ a.search-hit-link {
 }
 
 #side-log .reply-bridge::after,
+#side-cards .reply-bridge::after,
 #discord-log .reply-bridge::after {
   content: "";
   position: absolute;
@@ -2788,8 +2870,10 @@ a.search-hit-link {
 
 /* The last reply's part ends in its own line, round the corner, as the arrow's leg does. */
 #side-log li.discord-message[data-coalesce="last"] > .reply-bridge,
+#side-cards li.discord-message[data-coalesce="last"] > .reply-bridge,
 #discord-log li.discord-message[data-coalesce="last"] > .reply-bridge,
 #side-log li.discord-message[data-coalesce="only"] > .reply-bridge,
+#side-cards li.discord-message[data-coalesce="only"] > .reply-bridge,
 #discord-log li.discord-message[data-coalesce="only"] > .reply-bridge {
   bottom: auto;
   height: calc(var(--reply-rise) + 1.35rem);
@@ -2798,8 +2882,10 @@ a.search-hit-link {
 }
 
 #side-log li.discord-message[data-coalesce="last"] > .reply-bridge::after,
+#side-cards li.discord-message[data-coalesce="last"] > .reply-bridge::after,
 #discord-log li.discord-message[data-coalesce="last"] > .reply-bridge::after,
 #side-log li.discord-message[data-coalesce="only"] > .reply-bridge::after,
+#side-cards li.discord-message[data-coalesce="only"] > .reply-bridge::after,
 #discord-log li.discord-message[data-coalesce="only"] > .reply-bridge::after {
   content: none;
 }
@@ -2811,6 +2897,7 @@ a.search-hit-link {
  * is still the X's: the bridge takes no taps.
  */
 #side-log .reply-ungather,
+#side-cards .reply-ungather,
 #discord-log .reply-ungather {
   position: absolute;
   top: 0;
@@ -2828,6 +2915,7 @@ a.search-hit-link {
 }
 
 #side-log .reply-ungather-mark,
+#side-cards .reply-ungather-mark,
 #discord-log .reply-ungather-mark {
   position: absolute;
   top: calc(1.35rem - 0.09375rem - 0.6rem);
@@ -2842,8 +2930,10 @@ a.search-hit-link {
 }
 
 #side-log .reply-ungather-mark::before,
+#side-cards .reply-ungather-mark::before,
 #discord-log .reply-ungather-mark::before,
 #side-log .reply-ungather-mark::after,
+#side-cards .reply-ungather-mark::after,
 #discord-log .reply-ungather-mark::after {
   content: "";
   position: absolute;
@@ -2857,18 +2947,22 @@ a.search-hit-link {
 }
 
 #side-log .reply-ungather-mark::after,
+#side-cards .reply-ungather-mark::after,
 #discord-log .reply-ungather-mark::after {
   transform: translate(-50%, -50%) rotate(-45deg);
 }
 
 #side-log .reply-ungather:active,
+#side-cards .reply-ungather:active,
 #discord-log .reply-ungather:active,
 #side-log .reply-ungather:focus-visible,
+#side-cards .reply-ungather:focus-visible,
 #discord-log .reply-ungather:focus-visible {
   background: color-mix(in srgb, var(--accent) 18%, transparent);
 }
 
 #side-log .reply-ungather:focus-visible,
+#side-cards .reply-ungather:focus-visible,
 #discord-log .reply-ungather:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
@@ -2884,6 +2978,7 @@ a.search-hit-link {
  * answers is usually dimmed as answered (`data-replied`) — the very row being looked for.
  */
 #side-log li.discord-message[data-landed="true"],
+#side-cards li.discord-message[data-landed="true"],
 #discord-log li.discord-message[data-landed="true"] {
   --row-opacity: 1;
   --row-filter: none;
@@ -2893,6 +2988,7 @@ a.search-hit-link {
 /* Declared after the veil a reply's box recedes under, and weighing the same, so on a lit reply
    this takes the pseudo-element: a lit row is at full strength, and has no veil to draw. */
 #side-log li.discord-message[data-landed="true"]::after,
+#side-cards li.discord-message[data-landed="true"]::after,
 #discord-log li.discord-message[data-landed="true"]::after {
   content: "";
   position: absolute;
@@ -2913,6 +3009,7 @@ a.search-hit-link {
 /* Lit and then simply gone, for a reader who has asked the page not to animate. */
 @media (prefers-reduced-motion: reduce) {
   #side-log li.discord-message[data-landed="true"]::after,
+  #side-cards li.discord-message[data-landed="true"]::after,
   #discord-log li.discord-message[data-landed="true"]::after {
     animation: none;
   }
@@ -2931,6 +3028,7 @@ a.search-hit-link {
  * speaker's tile is not a line.
  */
 #side-log li.discord-message[data-read-run="head"],
+#side-cards li.discord-message[data-read-run="head"],
 #discord-log li.discord-message[data-read-run="head"] {
   --row-opacity: 1 !important;
   --row-filter: none !important;
@@ -2950,13 +3048,16 @@ a.search-hit-link {
 }
 
 #side-log li.discord-message[data-read-run="head"]::before,
+#side-cards li.discord-message[data-read-run="head"]::before,
 #discord-log li.discord-message[data-read-run="head"]::before,
 #side-log li.discord-message[data-read-run="head"]::after,
+#side-cards li.discord-message[data-read-run="head"]::after,
 #discord-log li.discord-message[data-read-run="head"]::after {
   content: none !important;
 }
 
 #side-log li.discord-message[data-read-run="head"] > :not(.read-run),
+#side-cards li.discord-message[data-read-run="head"] > :not(.read-run),
 #discord-log li.discord-message[data-read-run="head"] > :not(.read-run) {
   display: none !important;
 }
@@ -2964,8 +3065,10 @@ a.search-hit-link {
 /* ...but the bookmark's line, which a run can start right under. Equal weight and later, so it
    wins. `#240 reading-bookmark`. */
 #side-log li.discord-message[data-read-run="head"] > .bookmark-line,
+#side-cards li.discord-message[data-read-run="head"] > .bookmark-line,
 #discord-log li.discord-message[data-read-run="head"] > .bookmark-line,
 #side-log li.discord-message[data-read-run="head"] > .row-seam,
+#side-cards li.discord-message[data-read-run="head"] > .row-seam,
 #discord-log li.discord-message[data-read-run="head"] > .row-seam {
   display: flex !important;
 }
@@ -2976,6 +3079,7 @@ a.search-hit-link {
  * of the words, so it reads as a seam in the list rather than as another message.
  */
 #side-log .read-run,
+#side-cards .read-run,
 #discord-log .read-run {
   display: flex;
   align-items: center;
@@ -2998,8 +3102,10 @@ a.search-hit-link {
 }
 
 #side-log .read-run::before,
+#side-cards .read-run::before,
 #discord-log .read-run::before,
 #side-log .read-run::after,
+#side-cards .read-run::after,
 #discord-log .read-run::after {
   content: "";
   flex: 1 1 0;
@@ -3008,14 +3114,17 @@ a.search-hit-link {
 }
 
 #side-log .read-run:active,
+#side-cards .read-run:active,
 #discord-log .read-run:active,
 #side-log .read-run:focus-visible,
+#side-cards .read-run:focus-visible,
 #discord-log .read-run:focus-visible {
   background: color-mix(in srgb, var(--accent) 14%, transparent);
   color: var(--ink);
 }
 
 #side-log .read-run:focus-visible,
+#side-cards .read-run:focus-visible,
 #discord-log .read-run:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
@@ -3032,22 +3141,26 @@ a.search-hit-link {
  * the line is exactly the gap between the two. It is not a control: a stray tap cannot clear it.
  */
 #side-log,
+#side-cards,
 #discord-log {
   --bookmark-room: 2rem;
 }
 
 #side-log li.discord-message[data-bookmark="above"],
+#side-cards li.discord-message[data-bookmark="above"],
 #discord-log li.discord-message[data-bookmark="above"] {
   margin-top: var(--bookmark-room);
 }
 
 /* Below the newest row, after it was marked Done with the line on it: the room is under the row. */
 #side-log li.discord-message[data-bookmark="below"],
+#side-cards li.discord-message[data-bookmark="below"],
 #discord-log li.discord-message[data-bookmark="below"] {
   margin-bottom: var(--bookmark-room);
 }
 
 #side-log .bookmark-line,
+#side-cards .bookmark-line,
 #discord-log .bookmark-line {
   position: absolute;
   /* As wide as the list, as the lines between rows are (`#250 date-separators`, below): out past the
@@ -3072,18 +3185,22 @@ a.search-hit-link {
 
 /* Outside the row's border box: the row's own one-pixel border is inside 100%. */
 #side-log li.discord-message[data-bookmark="above"] > .bookmark-line,
+#side-cards li.discord-message[data-bookmark="above"] > .bookmark-line,
 #discord-log li.discord-message[data-bookmark="above"] > .bookmark-line {
   bottom: calc(100% + 1px);
 }
 
 #side-log li.discord-message[data-bookmark="below"] > .bookmark-line,
+#side-cards li.discord-message[data-bookmark="below"] > .bookmark-line,
 #discord-log li.discord-message[data-bookmark="below"] > .bookmark-line {
   top: calc(100% + 1px);
 }
 
 #side-log .bookmark-line::before,
+#side-cards .bookmark-line::before,
 #discord-log .bookmark-line::before,
 #side-log .bookmark-line::after,
+#side-cards .bookmark-line::after,
 #discord-log .bookmark-line::after {
   content: "";
   flex: 1 1 0;
@@ -3106,6 +3223,7 @@ a.search-hit-link {
  * the row, and both margins are kept.
  */
 #side-log,
+#side-cards,
 #discord-log,
 #pinned-log {
   /* Two lines of the gap's words at the reader's type size, with air: a gap's line that does not fit
@@ -3116,6 +3234,7 @@ a.search-hit-link {
 }
 
 #side-log li.discord-message[data-seam="gap"],
+#side-cards li.discord-message[data-seam="gap"],
 #discord-log li.discord-message[data-seam="gap"],
 #pinned-log li.discord-message[data-seam="gap"] {
   --seam-room: var(--gap-room);
@@ -3126,38 +3245,45 @@ a.search-hit-link {
    stretch before it, the days go on the stretch's own line instead, after its count, and the row has
    no rule of its own. */
 #side-log li.discord-message[data-seam="day"],
+#side-cards li.discord-message[data-seam="day"],
 #discord-log li.discord-message[data-seam="day"],
 #pinned-log li.discord-message[data-seam="day"] {
   --seam-room: var(--day-room);
 }
 
 #side-log li.discord-message[data-seam="day"] > .row-seam:not(.row-seam-below)::before,
+#side-cards li.discord-message[data-seam="day"] > .row-seam:not(.row-seam-below)::before,
 #discord-log li.discord-message[data-seam="day"] > .row-seam:not(.row-seam-below)::before,
 #pinned-log li.discord-message[data-seam="day"] > .row-seam:not(.row-seam-below)::before,
 #side-log li.discord-message[data-seam="day"] > .row-seam:not(.row-seam-below)::after,
+#side-cards li.discord-message[data-seam="day"] > .row-seam:not(.row-seam-below)::after,
 #discord-log li.discord-message[data-seam="day"] > .row-seam:not(.row-seam-below)::after,
 #pinned-log li.discord-message[data-seam="day"] > .row-seam:not(.row-seam-below)::after {
   border-top-style: solid;
 }
 
 #side-log li.discord-message[data-seam],
+#side-cards li.discord-message[data-seam],
 #discord-log li.discord-message[data-seam],
 #pinned-log li.discord-message[data-seam] {
   margin-top: var(--seam-room);
 }
 
 #side-log li.discord-message[data-seam][data-bookmark="above"],
+#side-cards li.discord-message[data-seam][data-bookmark="above"],
 #discord-log li.discord-message[data-seam][data-bookmark="above"] {
   margin-top: calc(var(--seam-room) + var(--bookmark-room));
 }
 
 #side-log li.discord-message[data-seam-below],
+#side-cards li.discord-message[data-seam-below],
 #discord-log li.discord-message[data-seam-below],
 #pinned-log li.discord-message[data-seam-below] {
   margin-bottom: var(--gap-room);
 }
 
 #side-log .row-seam,
+#side-cards .row-seam,
 #discord-log .row-seam,
 #pinned-log .row-seam {
   position: absolute;
@@ -3189,6 +3315,7 @@ a.search-hit-link {
    container, and a margin's percentage is of the list's width. A desk restates these where it
    restates the margins. */
 #side-log li.discord-message[data-who="me"],
+#side-cards li.discord-message[data-who="me"],
 #discord-log li.discord-message[data-who="me"],
 #pinned-log li.discord-message[data-who="me"] {
   --row-inset-left: var(--speaker-inset);
@@ -3196,6 +3323,7 @@ a.search-hit-link {
 }
 
 #side-log li.discord-message[data-who="coder"],
+#side-cards li.discord-message[data-who="coder"],
 #discord-log li.discord-message[data-who="coder"],
 #pinned-log li.discord-message[data-who="coder"] {
   --row-inset-left: calc(-0.75rem - env(safe-area-inset-left));
@@ -3203,9 +3331,11 @@ a.search-hit-link {
 }
 
 #side-log li.discord-message[data-who="human"],
+#side-cards li.discord-message[data-who="human"],
 #discord-log li.discord-message[data-who="human"],
 #pinned-log li.discord-message[data-who="human"],
 #side-log li.discord-message[data-who="bot"],
+#side-cards li.discord-message[data-who="bot"],
 #discord-log li.discord-message[data-who="bot"],
 #pinned-log li.discord-message[data-who="bot"] {
   --row-inset-left: calc(var(--speaker-inset) / 2);
@@ -3213,16 +3343,19 @@ a.search-hit-link {
 }
 
 #side-log li.discord-message[data-is-reply="true"][data-who],
+#side-cards li.discord-message[data-is-reply="true"][data-who],
 #discord-log li.discord-message[data-is-reply="true"][data-who] {
   --row-inset-left: var(--reply-gutter);
 }
 
 #side-log li.discord-message[data-seam][data-bookmark="above"] > .row-seam:not(.row-seam-below),
+#side-cards li.discord-message[data-seam][data-bookmark="above"] > .row-seam:not(.row-seam-below),
 #discord-log li.discord-message[data-seam][data-bookmark="above"] > .row-seam:not(.row-seam-below) {
   bottom: calc(100% + 1px + var(--bookmark-room));
 }
 
 #side-log .row-seam-below,
+#side-cards .row-seam-below,
 #discord-log .row-seam-below,
 #pinned-log .row-seam-below {
   top: calc(100% + 1px);
@@ -3231,9 +3364,11 @@ a.search-hit-link {
 }
 
 #side-log .row-seam::before,
+#side-cards .row-seam::before,
 #discord-log .row-seam::before,
 #pinned-log .row-seam::before,
 #side-log .row-seam::after,
+#side-cards .row-seam::after,
 #discord-log .row-seam::after,
 #pinned-log .row-seam::after {
   content: "";
@@ -3270,6 +3405,7 @@ a.search-hit-link {
 /* Anchor for the mark above, and the reason a swipe can move the row: a transform on a static
    element still paints, but the strike would travel with it and the row's own box would not. */
 #side-log li.discord-message,
+#side-cards li.discord-message,
 #discord-log li.discord-message,
 #pinned-log li.discord-message {
   position: relative;
@@ -3283,6 +3419,7 @@ a.search-hit-link {
    `:hover`: a tap on a touch screen leaves `:hover` stuck on the row it landed on, so a phone would
    end up with one permanently undimmed row and no way to clear it. */
 #side-log li.discord-message:focus-within,
+#side-cards li.discord-message:focus-within,
 #discord-log li.discord-message:focus-within,
 #pinned-log li.discord-message:focus-within {
   --row-opacity: 1;
@@ -3294,6 +3431,7 @@ a.search-hit-link {
    the drag itself sets `transition: none` while a finger is down, because a transform that eases
    toward the finger reads as lag. */
 #side-log li.discord-message,
+#side-cards li.discord-message,
 #discord-log li.discord-message,
 #pinned-log li.discord-message {
   touch-action: pan-y;
@@ -3759,6 +3897,7 @@ a.search-hit-link {
  * colour, because the three speaker colours are what the reader is otherwise reading the row by.
  */
 #side-log li.discord-message[data-summarised="true"],
+#side-cards li.discord-message[data-summarised="true"],
 #discord-log li.discord-message[data-summarised="true"],
 #pinned-log li.discord-message[data-summarised="true"] {
   background: var(--summary-bg);
@@ -3795,6 +3934,7 @@ a.search-hit-link {
  *     and nothing came back.
  */
 #side-log li.discord-message[data-summary-failed="true"],
+#side-cards li.discord-message[data-summary-failed="true"],
 #discord-log li.discord-message[data-summary-failed="true"],
 #pinned-log li.discord-message[data-summary-failed="true"] {
   background: var(--summary-fail-bg);
@@ -3808,6 +3948,7 @@ a.search-hit-link {
 /* The two words, in the failure's own ink. The tint says something is wrong at a glance; this is
    the part a screen reader can say and a greyscale screenshot still carries. */
 #side-log li.discord-message[data-summary-failed="true"] .summary-mark,
+#side-cards li.discord-message[data-summary-failed="true"] .summary-mark,
 #discord-log li.discord-message[data-summary-failed="true"] .summary-mark,
 #pinned-log li.discord-message[data-summary-failed="true"] .summary-mark {
   color: var(--summary-fail-ink);
@@ -3868,6 +4009,7 @@ a.search-hit-link {
  * instead, each item growing taller rather than any item, or the menu, running off the screen.
  */
 #side-log .meta,
+#side-cards .meta,
 #discord-log .meta,
 #pinned-log .meta {
   position: relative;
@@ -3996,6 +4138,7 @@ a.search-hit-link {
    and with both sides set and a width the box is overconstrained and the right one is dropped: the
    gold edge landed on a pinned reply's LEFT side, against its arrow. */
 #side-log li.discord-message[data-pinned="true"]::after,
+#side-cards li.discord-message[data-pinned="true"]::after,
 #discord-log li.discord-message[data-pinned="true"]::after,
 #pinned-log li.discord-message[data-pinned="true"]::after {
   content: "";
@@ -5297,6 +5440,7 @@ a.search-hit-link {
  * is; a tap selects silently, and draws nothing.
  */
 #side-log li.discord-message[data-selected="true"],
+#side-cards li.discord-message[data-selected="true"],
 #discord-log li.discord-message[data-selected="true"],
 #pinned-log li.discord-message[data-selected="true"] {
   background: var(--row-hover);
@@ -5313,15 +5457,19 @@ a.search-hit-link {
    that CAN act must not be invisible. A reader who has never selected a row still has to be able to
    see that a reply is possible. */
 #side-log li.discord-message[data-selected="true"] .reply-button,
+#side-cards li.discord-message[data-selected="true"] .reply-button,
 #discord-log li.discord-message[data-selected="true"] .reply-button,
 #pinned-log li.discord-message[data-selected="true"] .reply-button,
 #side-log li.discord-message[data-selected="true"] .done-button,
+#side-cards li.discord-message[data-selected="true"] .done-button,
 #discord-log li.discord-message[data-selected="true"] .done-button,
 #pinned-log li.discord-message[data-selected="true"] .done-button,
 #side-log li.discord-message[data-selected="true"] .not-noise-button,
+#side-cards li.discord-message[data-selected="true"] .not-noise-button,
 #discord-log li.discord-message[data-selected="true"] .not-noise-button,
 #pinned-log li.discord-message[data-selected="true"] .not-noise-button,
 #side-log li.discord-message[data-selected="true"] .upstream-read-button,
+#side-cards li.discord-message[data-selected="true"] .upstream-read-button,
 #discord-log li.discord-message[data-selected="true"] .upstream-read-button,
 #pinned-log li.discord-message[data-selected="true"] .upstream-read-button {
   color: var(--ink);
@@ -5331,6 +5479,7 @@ a.search-hit-link {
 /* `#221 read-modes`. A collapsed run's line gives up the row's tile, ring included, so its selection
    is drawn on the line: the look it has when pressed, and the ring. */
 #side-log li.discord-message[data-read-run="head"][data-selected="true"] > .read-run,
+#side-cards li.discord-message[data-read-run="head"][data-selected="true"] > .read-run,
 #discord-log li.discord-message[data-read-run="head"][data-selected="true"] > .read-run {
   background: color-mix(in srgb, var(--accent) 14%, transparent);
   color: var(--ink);
@@ -5354,6 +5503,7 @@ a.search-hit-link {
  * the dashes are gaps, not a thin solid line.
  */
 #side-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-own-read="true"], [data-noise="true"]),
+#side-cards li.discord-message[data-selected="true"]:is([data-archived="true"], [data-own-read="true"], [data-noise="true"]),
 #discord-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-own-read="true"], [data-noise="true"]),
 #pinned-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-own-read="true"], [data-noise="true"]) {
   border-color: transparent;
@@ -5362,12 +5512,14 @@ a.search-hit-link {
 }
 
 #side-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-own-read="true"], [data-noise="true"]) :is(.reply-button, .done-button, .not-noise-button, .upstream-read-button),
+#side-cards li.discord-message[data-selected="true"]:is([data-archived="true"], [data-own-read="true"], [data-noise="true"]) :is(.reply-button, .done-button, .not-noise-button, .upstream-read-button),
 #discord-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-own-read="true"], [data-noise="true"]) :is(.reply-button, .done-button, .not-noise-button, .upstream-read-button),
 #pinned-log li.discord-message[data-selected="true"]:is([data-archived="true"], [data-own-read="true"], [data-noise="true"]) :is(.reply-button, .done-button, .not-noise-button, .upstream-read-button) {
   border-color: var(--muted);
 }
 
 #side-log li.discord-message[data-read-run="head"][data-selected="true"] > .read-run,
+#side-cards li.discord-message[data-read-run="head"][data-selected="true"] > .read-run,
 #discord-log li.discord-message[data-read-run="head"][data-selected="true"] > .read-run {
   outline-style: dashed;
   outline-color: var(--read-ring);
@@ -5416,6 +5568,7 @@ a.search-hit-link {
    switched off; and only on a row the selection is not drawing, so it never hides a ring the
    selection is. */
 #side-log li.discord-message[data-done-flash]:not([data-selected="true"]),
+#side-cards li.discord-message[data-done-flash]:not([data-selected="true"]),
 #discord-log li.discord-message[data-done-flash]:not([data-selected="true"]),
 #pinned-log li.discord-message[data-done-flash]:not([data-selected="true"]) {
   outline: 2px dashed transparent;
@@ -5424,6 +5577,7 @@ a.search-hit-link {
 
 /* The grey ring itself, the selected read row's. A row still selected has it from the rule above. */
 #side-log li.discord-message[data-done-flash="marking"]:not([data-selected="true"]),
+#side-cards li.discord-message[data-done-flash="marking"]:not([data-selected="true"]),
 #discord-log li.discord-message[data-done-flash="marking"]:not([data-selected="true"]),
 #pinned-log li.discord-message[data-done-flash="marking"]:not([data-selected="true"]) {
   border-color: transparent;
@@ -5431,17 +5585,20 @@ a.search-hit-link {
 }
 
 #side-log li.discord-message[data-done-flash="marking"],
+#side-cards li.discord-message[data-done-flash="marking"],
 #discord-log li.discord-message[data-done-flash="marking"],
 #pinned-log li.discord-message[data-done-flash="marking"] {
   animation: done-marking 0.25s ease-out;
 }
 
 #side-log li.discord-message[data-done-flash="marking"]::after,
+#side-cards li.discord-message[data-done-flash="marking"]::after,
 #discord-log li.discord-message[data-done-flash="marking"]::after {
   animation: done-veil 0.25s ease-out;
 }
 
 #side-log li.discord-message[data-done-flash="fading"]:not([data-selected="true"]),
+#side-cards li.discord-message[data-done-flash="fading"]:not([data-selected="true"]),
 #discord-log li.discord-message[data-done-flash="fading"]:not([data-selected="true"]),
 #pinned-log li.discord-message[data-done-flash="fading"]:not([data-selected="true"]) {
   animation: done-fading 0.3s ease-out;
@@ -5450,9 +5607,11 @@ a.search-hit-link {
 /* No motion asked for: the same grey ring, held, and the same read look, at once. */
 @media (prefers-reduced-motion: reduce) {
   #side-log li.discord-message[data-done-flash],
+  #side-cards li.discord-message[data-done-flash],
   #discord-log li.discord-message[data-done-flash],
   #pinned-log li.discord-message[data-done-flash],
   #side-log li.discord-message[data-done-flash]::after,
+  #side-cards li.discord-message[data-done-flash]::after,
   #discord-log li.discord-message[data-done-flash]::after {
     animation: none;
   }
@@ -5495,6 +5654,7 @@ a.search-hit-link {
    the selection draws it. */
 @media (hover: none), (pointer: coarse) {
   #side-log li.discord-message:focus-within,
+  #side-cards li.discord-message:focus-within,
   #discord-log li.discord-message:focus-within,
   #pinned-log li.discord-message:focus-within {
     background: var(--row-hover);
@@ -5502,6 +5662,7 @@ a.search-hit-link {
   }
 
   #side-log li.discord-message:focus-within .reply-button,
+  #side-cards li.discord-message:focus-within .reply-button,
   #discord-log li.discord-message:focus-within .reply-button,
   #pinned-log li.discord-message:focus-within .reply-button {
     color: var(--ink);
@@ -5569,6 +5730,7 @@ a.search-hit-link {
  * metadata line has three things on it and fits.
  */
 #side-log .meta,
+#side-cards .meta,
 #discord-log .meta,
 #pinned-log .meta,
 #reply-context .meta,
@@ -5606,12 +5768,14 @@ a.search-hit-link {
  */
 /* The time beside the name on a line the controls have left, never spread to its far end. */
 #side-log li.discord-message > .meta,
+#side-cards li.discord-message > .meta,
 #discord-log li.discord-message > .meta,
 #pinned-log li.discord-message > .meta {
   justify-content: flex-start;
 }
 
 #side-log li.discord-message > .meta > .msg-author,
+#side-cards li.discord-message > .meta > .msg-author,
 #discord-log li.discord-message > .meta > .msg-author,
 #pinned-log li.discord-message > .meta > .msg-author {
   flex: 1 1 3em;
@@ -5640,12 +5804,12 @@ a.search-hit-link {
 }
 
 @container rows (max-width: 31.99rem) {
-  :is(#side-log, #discord-log, #pinned-log) li.discord-message[data-collapsed="true"] .row-acts > :is(.reply-button:not([data-quote]), .not-noise-button, .done-button) {
+  :is(#side-log, #side-cards, #discord-log, #pinned-log) li.discord-message[data-collapsed="true"] .row-acts > :is(.reply-button:not([data-quote]), .not-noise-button, .done-button) {
     display: none;
   }
 
   /* Never promoted onto the header line here, however short: its own line, under it. */
-  :is(#side-log, #discord-log, #pinned-log) li.discord-message > .meta > .rh-head {
+  :is(#side-log, #side-cards, #discord-log, #pinned-log) li.discord-message > .meta > .rh-head {
     order: 99;
     flex-basis: 100%;
     font-size: calc(0.88rem * var(--msg-scale));
@@ -5671,6 +5835,7 @@ a.search-hit-link {
  * heading shows. `data-rich-headers="off"` on the root hides the heading and puts them back.
  */
 #side-log,
+#side-cards,
 #discord-log,
 #pinned-log,
 #reply-context,
@@ -5852,7 +6017,9 @@ a.search-hit-link {
 #pinned-log .body,
 #pinned-log .summary-text,
 #side-log .body,
+#side-cards .body,
 #side-log .summary-text,
+#side-cards .summary-text,
 #discord-log .body,
 #discord-log .summary-text {
   font-size: calc(0.88rem * var(--msg-scale));
@@ -5863,6 +6030,7 @@ a.search-hit-link {
 #reply-context .elided,
 #pinned-log .elided,
 #side-log .elided,
+#side-cards .elided,
 #discord-log .elided {
   font-size: calc(0.88rem * var(--msg-scale));
 }
@@ -5876,6 +6044,7 @@ a.search-hit-link {
  * all -- a hidden button is not focusable, and would have removed the keyboard path entirely.
  */
 #side-log .fold,
+#side-cards .fold,
 #discord-log .fold,
 #pinned-log .fold,
 #reply-context .fold {
@@ -5889,6 +6058,7 @@ a.search-hit-link {
 }
 
 #side-log .fold:focus-visible,
+#side-cards .fold:focus-visible,
 #discord-log .fold:focus-visible,
 #pinned-log .fold:focus-visible,
 #reply-context .fold:focus-visible {
@@ -7489,6 +7659,7 @@ textarea {
      exactly as it was; two columns set them to nothing (the two-column block below), so those rows
      span their column. The owner's inset is not one of them: the owner's rows keep it everywhere. */
   #side-log li.discord-message[data-who="me"],
+  #side-cards li.discord-message[data-who="me"],
   #discord-log li.discord-message[data-who="me"],
   #pinned-log li.discord-message[data-who="me"],
   #reply-context li.discord-message[data-who="me"],
@@ -7497,6 +7668,7 @@ textarea {
   }
 
   #side-log li.discord-message[data-who="coder"],
+  #side-cards li.discord-message[data-who="coder"],
   #discord-log li.discord-message[data-who="coder"],
   #pinned-log li.discord-message[data-who="coder"],
   #reply-context li.discord-message[data-who="coder"],
@@ -7508,11 +7680,13 @@ textarea {
   }
 
   #side-log li.discord-message[data-who="human"],
+  #side-cards li.discord-message[data-who="human"],
   #discord-log li.discord-message[data-who="human"],
   #pinned-log li.discord-message[data-who="human"],
   #reply-context li.discord-message[data-who="human"],
   #reply-target li.discord-message[data-who="human"],
   #side-log li.discord-message[data-who="bot"],
+  #side-cards li.discord-message[data-who="bot"],
   #discord-log li.discord-message[data-who="bot"],
   #pinned-log li.discord-message[data-who="bot"],
   #reply-context li.discord-message[data-who="bot"],
@@ -7524,6 +7698,7 @@ textarea {
      inset is wider than that here: his reply keeps the larger of the two, so it is still drawn on
      his side of the column. The arrow follows the box (`right: 100%`). */
   #side-log li.discord-message[data-is-reply="true"][data-who="me"],
+  #side-cards li.discord-message[data-is-reply="true"][data-who="me"],
   #discord-log li.discord-message[data-is-reply="true"][data-who="me"],
   #reply-target li.discord-message[data-is-reply="true"][data-who="me"] {
     margin-left: max(var(--reply-gutter), min(15%, 6rem));
@@ -7532,12 +7707,14 @@ textarea {
   /* `#249 search-highlight` and `#250 date-separators`. The insets the lines between rows reach back
      across, as the margins just above give them on a desk. */
   #side-log li.discord-message[data-who="me"],
+  #side-cards li.discord-message[data-who="me"],
   #discord-log li.discord-message[data-who="me"],
   #pinned-log li.discord-message[data-who="me"] {
     --row-inset-left: min(15cqw, 6rem);
   }
 
   #side-log li.discord-message[data-who="coder"],
+  #side-cards li.discord-message[data-who="coder"],
   #discord-log li.discord-message[data-who="coder"],
   #pinned-log li.discord-message[data-who="coder"] {
     --row-inset-left: 0px;
@@ -7545,9 +7722,11 @@ textarea {
   }
 
   #side-log li.discord-message[data-who="human"],
+  #side-cards li.discord-message[data-who="human"],
   #discord-log li.discord-message[data-who="human"],
   #pinned-log li.discord-message[data-who="human"],
   #side-log li.discord-message[data-who="bot"],
+  #side-cards li.discord-message[data-who="bot"],
   #discord-log li.discord-message[data-who="bot"],
   #pinned-log li.discord-message[data-who="bot"] {
     --row-inset-left: var(--desk-third-inset, min(7cqw, 3rem));
@@ -7555,11 +7734,13 @@ textarea {
   }
 
   #side-log li.discord-message[data-is-reply="true"][data-who],
+  #side-cards li.discord-message[data-is-reply="true"][data-who],
   #discord-log li.discord-message[data-is-reply="true"][data-who] {
     --row-inset-left: var(--reply-gutter);
   }
 
   #side-log li.discord-message[data-is-reply="true"][data-who="me"],
+  #side-cards li.discord-message[data-is-reply="true"][data-who="me"],
   #discord-log li.discord-message[data-is-reply="true"][data-who="me"] {
     --row-inset-left: max(var(--reply-gutter), min(15cqw, 6rem));
   }
@@ -7568,30 +7749,35 @@ textarea {
      these are the desk's edges, restated from the rules just above as the phone's are restated
      beside the stack's own rules. After the owner's reply, which they outrank in a stack. */
   #side-log li.discord-message[data-stack-under="coder"][data-who],
+  #side-cards li.discord-message[data-stack-under="coder"][data-who],
   #discord-log li.discord-message[data-stack-under="coder"][data-who],
   #reply-target li.discord-message[data-stack-under="coder"][data-who] {
     margin-left: var(--reply-gutter);
   }
 
   #side-log li.discord-message[data-stack-under="me"][data-who],
+  #side-cards li.discord-message[data-stack-under="me"][data-who],
   #discord-log li.discord-message[data-stack-under="me"][data-who],
   #reply-target li.discord-message[data-stack-under="me"][data-who] {
     margin-left: calc(min(15%, 6rem) + var(--reply-gutter));
   }
 
   #side-log li.discord-message[data-stack-under="third"][data-who],
+  #side-cards li.discord-message[data-stack-under="third"][data-who],
   #discord-log li.discord-message[data-stack-under="third"][data-who],
   #reply-target li.discord-message[data-stack-under="third"][data-who] {
     margin-left: calc(var(--desk-third-inset, min(7%, 3rem)) + var(--reply-gutter));
   }
 
   #side-log li.discord-message[data-stack-under="reply"][data-who],
+  #side-cards li.discord-message[data-stack-under="reply"][data-who],
   #discord-log li.discord-message[data-stack-under="reply"][data-who],
   #reply-target li.discord-message[data-stack-under="reply"][data-who] {
     margin-left: calc(var(--reply-gutter) * 2);
   }
 
   #side-log li.discord-message[data-stack-under="me-reply"][data-who],
+  #side-cards li.discord-message[data-stack-under="me-reply"][data-who],
   #discord-log li.discord-message[data-stack-under="me-reply"][data-who],
   #reply-target li.discord-message[data-stack-under="me-reply"][data-who] {
     margin-left: calc(max(var(--reply-gutter), min(15%, 6rem)) + var(--reply-gutter));
@@ -7601,6 +7787,7 @@ textarea {
      window's edge, so it has room beside it, and its circle goes back to the corner, as every other
      row's is. */
   #side-log li.discord-message[data-who="coder"]:not([data-is-reply="true"]):not([data-stack-under]) > .reply-marker,
+  #side-cards li.discord-message[data-who="coder"]:not([data-is-reply="true"]):not([data-stack-under]) > .reply-marker,
   #discord-log li.discord-message[data-who="coder"]:not([data-is-reply="true"]):not([data-stack-under]) > .reply-marker {
     left: calc(-1px - var(--reply-marker-target) / 2);
   }
@@ -8048,6 +8235,32 @@ textarea {
   border-color: var(--accent);
   color: var(--ink);
   background: color-mix(in srgb, var(--accent) 18%, var(--panel));
+}
+
+/* `#404 threads-unpack-all`. Unpack all, beside Unread only in the Threads view: pressed as it is. */
+#side-unpack[aria-pressed="true"] {
+  border-color: var(--accent);
+  color: var(--ink);
+  background: color-mix(in srgb, var(--accent) 18%, var(--panel));
+}
+
+/* `#404 threads-unpack-all`. A thread unpacked under its card: its rows are channel rows in the
+   cards list (every `#side-log` row rule above has its `#side-cards` twin), hung one gutter in on
+   a bridge in the thread's own colour, as All's gathered replies hang on theirs in the accent.
+   A collapsed run of read rows keeps the run line's grey words, joined to the spine by the
+   bridge's own stub instead of the seam's left hairline. */
+#side-cards .reply-bridge {
+  color: hsl(var(--thread-hue, 210) 55% 50%);
+}
+
+#side-cards .unpack-read-run > .read-run::before {
+  content: none;
+}
+
+/* `#405 root-under-summary`. The root as a summarized card's first child, in a thread or unpacked:
+   its bridge in the thread's colour, where the row carries it. */
+li.discord-message[data-root-child] > .reply-bridge {
+  color: hsl(var(--thread-hue, 210) 55% 50%);
 }
 
 /* `#231 two-column-polish`. The right column's freshness: the pill's words, the pill's size and its

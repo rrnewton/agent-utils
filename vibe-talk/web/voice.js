@@ -10862,6 +10862,14 @@ const KEYMAP = [
     controls: ["todo-filter"],
     run: () => readModeFromKeyboard(),
   },
+  // `#404 threads-unpack-all`. u was free; it acts only over the Threads view's cards, as its chip does.
+  {
+    group: KEYS_VIEW, chords: [{ key: "u" }],
+    does: "In the Thread list, Unpack all: every thread's messages under its card, bridged as in All, " +
+      "or pack them away again. The read modes apply inside each thread",
+    controls: ["side-unpack"],
+    run: () => unpackFromKeyboard(),
+  },
   {
     group: KEYS_VIEW, chords: [{ key: "p", shift: true }],
     does: "Only the pinned messages, or all of them again",
@@ -22814,10 +22822,16 @@ function holdsUnreadReplies(message, tally) {
  */
 function readFilterKeeps() {
   const counting = threadingSupported && channelView === "main";
+  // `#405 root-under-summary`. Under a summarized card the root is kept however read it is: it is
+  // the first child the card's words are about, and Hide read hiding it would leave the summary
+  // heading a thread whose first message cannot be seen. A raw card already says the root.
+  const keptRoot = channelView === "thread" && cardIsSummarized(openThreadChoice())
+    ? openThreadRootId() : null;
   /** @type {ReplyTally | null} */
   let tally = null;
   return (message) => {
     if (stillToDo(message)) return true;
+    if (keptRoot !== null && String(message.id) === keptRoot) return true;
     if (!counting) return false;
     if (tally === null) tally = replyTally();
     return holdsUnreadReplies(message, tally);
@@ -29352,16 +29366,28 @@ function renderReplyLinks() {
     }
   }
   const under = parentRow ? stackUnder(parentRow) : "";
+  // `#405 root-under-summary`. In a thread headed by a summarized card, its root row is the card's
+  // first child: one bridged row at the head, drawn as a gathered reply is. A raw card's root is
+  // an ordinary row, the card already saying it, so nothing is duplicated.
+  const rootId = channelView === "thread" ? openThreadRootId() : null;
+  const rootChild = rootId !== null && cardIsSummarized(openThreadChoice())
+    ? rows.find((row) => isOpenThreadRoot(row, rootId)) || null : null;
   let above = null;
   for (const row of rows) {
     const at = stack.indexOf(row);
-    const place = at < 0 ? (row === parentRow && stack.length > 0 ? "parent" : "")
+    const child = row === rootChild;
+    const place = at < 0 ? (child ? "only" : row === parentRow && stack.length > 0 ? "parent" : "")
       : stack.length === 1 ? "only" : at === 0 ? "first" : at === stack.length - 1 ? "last" : "middle";
     if (place) row.setAttribute("data-coalesce", place);
     else row.removeAttribute("data-coalesce");
+    if (child) {
+      row.setAttribute("data-root-child", "");
+      row.style.setProperty("--thread-hue", threadHue(String(selectedThreadId)));
+    } else if (row.hasAttribute("data-root-child")) row.removeAttribute("data-root-child");
     if (at >= 0) row.setAttribute("data-stack-under", under);
+    else if (child) row.setAttribute("data-stack-under", "third");
     else row.removeAttribute("data-stack-under");
-    gutterPiece(row, "reply-bridge", at >= 0, bridgePiece);
+    gutterPiece(row, "reply-bridge", at >= 0 || child, bridgePiece);
     gutterPiece(row, "reply-ungather", at === 0, ungatherButton);
     const arrow = childByClass(row, "reply-jump");
     if (arrow) {
@@ -33733,7 +33759,8 @@ function repliesDay() {
 }
 
 /** The cards the search and Unread only show now, by thread id. */
-const cardsFound = () => /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children]).filter(rowShown)
+const cardsFound = () => /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children])
+  .filter((row) => row.hasAttribute("data-card") && rowShown(row))
   .map((row) => String(row.getAttribute("data-id")));
 
 /** Whether cards' walk `walk` is still the reader's: the same search, the same store, the cards still up. */
@@ -33841,7 +33868,8 @@ function repliesWalkNote(walk, reason) {
 
 /** How many threads with a reply cards' walk `walk` read saying every word have no card. */
 function repliesUnlisted(walk) {
-  const carded = new Set([...leftEl("side-cards").children].map((row) => String(row.getAttribute("data-id"))));
+  const carded = new Set([...leftEl("side-cards").children].filter((row) => row.hasAttribute("data-card"))
+    .map((row) => String(row.getAttribute("data-id"))));
   return [...walk.matched].filter((id) => !carded.has(id)).length;
 }
 
@@ -36564,6 +36592,8 @@ function setReadMode(mode) {
     // Runs opened under Collapse read are a way of looking at that list, and the reader has just
     // chosen another way: coming back to Collapse read collapses them all again.
     openedReadRuns.clear();
+    // `#404 threads-unpack-all`. And the runs opened in unpacked blocks, for the same reason.
+    unpackOpenedRuns.clear();
     // Kept across a reload, as the reader left it. `#189 restore-ui-state`.
     uiStateSettled = true;
     saveUiState();
@@ -36579,6 +36609,9 @@ function setReadMode(mode) {
     if (threadingSupported) {
       // One read mode, for both columns. `#229 desktop-two-column`.
       eachColumn(renderCachedTimeline);
+      // `#404 threads-unpack-all`. And inside every unpacked block.
+      sideCardsDrawn = "";
+      if (sideColumnUp()) renderSideColumn();
     } else if (todoMode !== wasHiding) {
       // A read of another route, which keeps the reader's place as a refresh does and is placed again
       // when it lands. What it brings is the reader's own act, not something that arrived.
@@ -40765,6 +40798,7 @@ function renderSideMode() {
   // is not on screen. A thread selected again decides it afresh (`renderJumpNewest`).
   if (!thread && !leftEl("side-jump-newest").hidden) leftEl("side-jump-newest").hidden = true;
   renderSideUnreadToggle();
+  renderUnpackToggle();
   // `#262 search-load-older`. A thread selected over the cards ends their walk for the search, aborting
   // its read; the cards back are offered it again (`renderSideCards`).
   if (thread) renderRepliesSearch();
@@ -40908,13 +40942,16 @@ function renderSideCards() {
     replies: sideCardReplies(choice, tally),
     unread: sideCardUnread(choice, tally),
   }));
-  const signature = JSON.stringify(cards.map(({ choice, text, root, age, replies, unread }) =>
-    [choice.id, text, root, age, replies, unread]));
+  const unpacked = unpackOnScreen();
+  const signature = JSON.stringify([unpacked, cards.map(({ choice, text, root, age, replies, unread }) =>
+    [choice.id, text, root, age, replies, unread,
+      unpacked ? unpackSignature(choice, unpackHeldMessages(choice)) : ""])]);
   const more = olderThreadsToRead();
   if (signature !== sideCardsDrawn) {
     sideCardsDrawn = signature;
     keepingCardPlace(() => {
-      list.replaceChildren(...cards.map(sideCard));
+      list.replaceChildren(...cards.flatMap((card) =>
+        [sideCard(card), ...(unpacked ? unpackBlock(card.choice) : [])]));
       filterSideCards();
     });
   } else {
@@ -40950,7 +40987,8 @@ function cardAnchor() {
   if (atBottom(area)) return { newest: true, id: null, offset: 0 };
   const top = area.getBoundingClientRect().top;
   const foot = top + (area.clientHeight || 0);
-  const rows = /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children]).filter(rowShown);
+  const rows = /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children])
+    .filter((row) => row.hasAttribute("data-card") && rowShown(row));
   const seen = (/** @type {HTMLElement} */ row) => {
     const box = row.getBoundingClientRect();
     return box.bottom > top && box.top < foot;
@@ -40976,7 +41014,8 @@ function placeCardAnchor(anchor) {
     followFoot(area);
     return true;
   }
-  const rows = /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children]);
+  const rows = /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children])
+    .filter((row) => row.hasAttribute("data-card"));
   const at = rows.findIndex((row) => row.getAttribute("data-id") === anchor.id);
   if (at < 0) return false;
   let row = rowShown(rows[at]) ? rows[at] : null;
@@ -41071,10 +41110,13 @@ function placeOpenedCards() {
 function filterSideCards() {
   const terms = searchOpen ? searchTerms(searchQuery) : [];
   const marking = searchOpen ? searchTerms(markedQuery) : [];
-  const rows = /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children]);
+  const allRows = /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children]);
+  const rows = allRows.filter((row) => row.hasAttribute("data-card"));
   const replies = terms.length > 0 ? heldReplyText() : null;
   let unread = 0;
   let shown = 0;
+  /** @type {Map<string, boolean>} */
+  const cardShown = new Map();
   for (const row of rows) {
     const text = row.getAttribute("data-search") || "";
     const fresh = row.hasAttribute("data-unread");
@@ -41091,6 +41133,14 @@ function filterSideCards() {
     markSearchHits(row, said ? marking : []);
     if (fresh) unread += 1;
     if (kept && said) shown += 1;
+    cardShown.set(String(row.getAttribute("data-id")), kept && said);
+  }
+  // `#404 threads-unpack-all`. A card's unpacked block goes where its card goes.
+  for (const row of allRows) {
+    const thread = row.getAttribute("data-unpack-thread");
+    if (thread === null) continue;
+    const shownBlock = cardShown.get(thread) === true;
+    if (row.hidden === shownBlock) row.hidden = !shownBlock;
   }
   // `#281 view-keys`. A failed read of older threads is said over the cards it left as they were.
   const state = [olderThreadsFailure(), sideListState(rows.length, unread, shown)].filter((part) => part !== "").join(" ");
@@ -41207,6 +41257,304 @@ function setSideUnreadOnly(on) {
 /** `filterSideCards`, the reader's place in the cards kept: the search typed, opened or closed. */
 function refilterSideCards() {
   keepingCardPlace(filterSideCards);
+}
+
+// --- unpack every thread under its card (#404 threads-unpack-all) ----------------------------------
+//
+// The owner, 2026-10-21: in All, **N replies** bridges one thread at a time — the children come up
+// to meet the parent, which stays put — and bridging another thread breaks the first. He wants
+// every thread chained at once in one stream. So in the Threads view (Cmd+3), which already lists
+// threads by last updated, **Unpack all** (key u) draws each thread's messages under its card, in
+// time order, joined by the same bridge All's gathering draws (`#215 reply-coalesce`), tinted by
+// the thread's colour. The read modes apply inside each block as they do in a thread: under
+// Collapse read a run of read rows is one grey line hanging off the spine by its own stub; under
+// Hide read read rows are absent. Blocks are later siblings of their card in `#side-cards`, never
+// children, so every walk that knows cards by `data-card` is untouched. A thread whose replies the
+// store does not hold in full is read only as its block nears the screen, at most a few at a time,
+// and only its newest page: older history stays behind opening the thread, and its block says so.
+
+/** The device's choice of unpacked threads: "on", or anything else for cards alone. */
+const THREADS_UNPACKED_KEY = "vibe-talk.voice.threads-unpacked";
+
+/** How many threads unpacking may be reading at once: enough that scrolling never waits on one. */
+const UNPACK_READS_AT_ONCE = 3;
+
+/** How far below the cards on screen a block starts its read, in px: about one screenful ahead. */
+const UNPACK_NEAR_PX = 400;
+
+/** Whether Unpack all is pressed, kept on this device. `#404 threads-unpack-all`. */
+function storedThreadsUnpacked() {
+  try {
+    return localStorage.getItem(THREADS_UNPACKED_KEY) === "on";
+  } catch (_error) {
+    return false;
+  }
+}
+
+/** Whether every thread's messages stand unpacked under its card. */
+let threadsUnpacked = storedThreadsUnpacked();
+
+/**
+ * The runs of read messages the reader has opened in unpacked blocks, by thread, as message ids:
+ * as `openedReadRuns` is for a thread's own list. Forgotten with the read mode (`setReadMode`).
+ *
+ * @type {Map<string, Set<string>>}
+ */
+const unpackOpenedRuns = new Map();
+
+/** Threads an unpack read is owed, running, done or failed for, so each is read once. */
+const unpackReads = new Map();
+
+/** Reads under way for unpacked blocks: `UNPACK_READS_AT_ONCE` at most. */
+let unpackReadsRunning = 0;
+
+/** The observer that reads a thread as its block nears the screen, made when first wanted. */
+let unpackObserver = null;
+
+/** Whether `choice`'s card says a summary rather than its root's words (`#405 root-under-summary`). */
+const cardIsSummarized = (choice) => Boolean(choice) && sideCardRootText(choice) !== "";
+
+/** Whether unpacked blocks belong on screen: pressed, and the Threads view (Cmd+3) showing cards. */
+const unpackOnScreen = () => threadsUnpacked && threadListOnScreen() && columns.side.mode === "list";
+
+/** Unpack all: offered over the Threads view's cards, and pressed as the reader left it. */
+function renderUnpackToggle() {
+  const button = leftEl("side-unpack");
+  const offered = columns.side.mode === "list" && threadListShown;
+  if (button.hidden === offered) button.hidden = !offered;
+  const pressed = threadsUnpacked ? "true" : "false";
+  if (button.getAttribute("aria-pressed") !== pressed) button.setAttribute("aria-pressed", pressed);
+}
+
+/** The reader pressed Unpack all, or u: kept on this device, and the cards drawn again. */
+function setThreadsUnpacked(on) {
+  threadsUnpacked = on;
+  try {
+    localStorage.setItem(THREADS_UNPACKED_KEY, on ? "on" : "off");
+  } catch (_error) {
+    // A browser that refuses storage still honours the choice for this session.
+  }
+  renderUnpackToggle();
+  sideCardsDrawn = "";
+  if (sideColumnUp()) renderSideColumn();
+}
+
+/** u, over the Threads view: unpack every thread, or pack them away again. Elsewhere, nothing. */
+function unpackFromKeyboard() {
+  if (!threadListOnScreen() || columns.side.mode !== "list") return false;
+  setThreadsUnpacked(!threadsUnpacked);
+  setStatus(threadsUnpacked ? "Every thread unpacked under its card." : "Threads packed away.");
+  return true;
+}
+
+/** The store's messages of thread `choice.id`, oldest first, its root among them where it is held. */
+function unpackHeldMessages(choice) {
+  if (channelCanon.channel !== String(el("discord-channel").value)) return [];
+  const held = channelCanon.messages.filter((message) => threadOf(message) === choice.id);
+  const root = choice.root;
+  if (root && !held.some((message) => String(message.id) === String(root.id))) {
+    return inTimeOrder([root, ...held], "timestamp");
+  }
+  return held;
+}
+
+/** Is `message` the root of thread `id`, by its record or by being the summary's root? */
+function isThreadRoot(message, choice) {
+  if (message.thread && message.thread.is_root === true) return true;
+  return Boolean(choice.root) && String(message.id) === String(choice.root.id);
+}
+
+/** Whether thread `choice` still owes unpacking a read: held replies short of its count, uncovered. */
+function unpackNeedsRead(choice, held) {
+  if (unpackReads.has(choice.id)) return false;
+  const cover = channelCanon.views.get(viewKey("thread", choice.id));
+  if (cover && !cover.more) return false;
+  const replies = held.filter((message) => !isThreadRoot(message, choice)).length;
+  if (typeof choice.count === "number") return replies < choice.count;
+  return !cover && replies === 0;
+}
+
+/** What one block would draw, as a signature, so a pass that changes nothing rebuilds nothing. */
+function unpackSignature(choice, held) {
+  const opened = unpackOpenedRuns.get(choice.id);
+  return JSON.stringify([choice.id, readMode, cardIsSummarized(choice),
+    held.map((message) => [String(message.id), stillToDo(message, channelCanon.dismissed)]),
+    opened ? [...opened].sort() : [], unpackReads.get(choice.id) || ""]);
+}
+
+/** The line a collapsed run of read rows is drawn as in an unpacked block: the run's own words. */
+function unpackRunLine(choice, ids) {
+  const row = document.createElement("li");
+  row.className = "unpack-row unpack-read-run";
+  row.setAttribute("data-unpack-thread", choice.id);
+  const line = document.createElement("button");
+  line.className = "read-run";
+  line.setAttribute("type", "button");
+  line.textContent = readRunText(ids.length);
+  line.setAttribute("title", `Show these ${ids.length} read messages`);
+  line.addEventListener("click", (event) => {
+    if (event) event.stopPropagation();
+    const opened = unpackOpenedRuns.get(choice.id) || new Set();
+    for (const id of ids) opened.add(id);
+    unpackOpenedRuns.set(choice.id, opened);
+    sideCardsDrawn = "";
+    renderSideColumn();
+  });
+  row.append(bridgePiece(), line);
+  return row;
+}
+
+/**
+ * Thread `choice`'s unpacked block: its message rows under its card, bridged, the read modes
+ * applied as in its own list. Under a summarized card the root is the first child, kept under
+ * every read mode (`#405 root-under-summary`); under a raw card the replies alone, the card
+ * already being the root. A thread still owed a read ends in its loading line, observed.
+ *
+ * @param {ReturnType<typeof threadChoice>} choice
+ * @returns {HTMLElement[]}
+ */
+function unpackBlock(choice) {
+  const held = unpackHeldMessages(choice);
+  const summarized = cardIsSummarized(choice);
+  const done = channelCanon.dismissed;
+  let messages = held.filter((message) => !hiddenEmpty(message));
+  if (!summarized) messages = messages.filter((message) => !isThreadRoot(message, choice));
+  if (readMode === "hide" && !readRunsSuspended()) {
+    messages = messages.filter((message) => stillToDo(message, done) ||
+      (summarized && isThreadRoot(message, choice)));
+  }
+  const groups = glom(messages);
+  /** @type {Array<{group: any[] | null, ids: string[]}>} */
+  const parts = [];
+  if (readMode === "collapse" && !readRunsSuspended()) {
+    const opened = unpackOpenedRuns.get(choice.id) || new Set();
+    let run = [];
+    const close = () => {
+      const ids = run.flatMap((group) => group.map((message) => String(message.id)));
+      if (run.length >= READ_RUN_MIN_ROWS && !ids.some((id) => opened.has(id))) {
+        parts.push({ group: null, ids });
+      } else {
+        for (const group of run) parts.push({ group, ids: group.map((message) => String(message.id)) });
+        if (ids.some((id) => opened.has(id))) {
+          for (const id of ids) opened.add(id);
+          unpackOpenedRuns.set(choice.id, opened);
+        }
+      }
+      run = [];
+    };
+    groups.forEach((group, index) => {
+      const read = group.every((message) => !stillToDo(message, done));
+      const rootChild = summarized && group.some((message) => isThreadRoot(message, choice));
+      if (read && !rootChild && index < groups.length - 1) run.push(group);
+      else {
+        close();
+        parts.push({ group, ids: group.map((message) => String(message.id)) });
+      }
+    });
+    close();
+  } else {
+    for (const group of groups) parts.push({ group, ids: group.map((message) => String(message.id)) });
+  }
+  const rows = parts.map((part) => {
+    const row = part.group === null ? unpackRunLine(choice, part.ids) : discordNode(part.group);
+    row.setAttribute("data-unpack-thread", choice.id);
+    if (part.group !== null) {
+      row.className = `${row.className} unpack-row`;
+      // The speaker and read dress `renderChannelRows` gives a channel row, from the same rules,
+      // so a read reply is greyed here exactly as in its thread.
+      const first = part.group[0];
+      row.setAttribute("data-who", bucketFor(first.author_id, first.author_is_bot,
+        String(el("discord-channel").value)));
+      row.setAttribute("data-archived",
+        part.group.every((message) => done.has(String(message.id))) ? "true" : "false");
+      row.setAttribute("data-stack-under", "third");
+      row.style.setProperty("--thread-hue", threadHue(choice.id));
+      row.replaceChildren(bridgePiece(), ...row.children);
+      if (summarized && part.group.some((message) => isThreadRoot(message, choice))) {
+        row.setAttribute("data-root-child", "");
+      }
+    }
+    return row;
+  });
+  rows.forEach((row, at) => {
+    const place = rows.length === 1 ? "only" : at === 0 ? "first" : at === rows.length - 1 ? "last" : "middle";
+    row.setAttribute("data-coalesce", place);
+    if (!row.hasAttribute("data-stack-under")) row.setAttribute("data-stack-under", "third");
+    row.style.setProperty("--thread-hue", threadHue(choice.id));
+  });
+  const cover = channelCanon.views.get(viewKey("thread", choice.id));
+  if (unpackNeedsRead(choice, held)) {
+    const loading = document.createElement("li");
+    loading.className = "unpack-row unpack-loading hint";
+    loading.setAttribute("data-unpack-thread", choice.id);
+    loading.textContent = unpackReads.get(choice.id) === "failed"
+      ? "Could not load this thread." : "Loading thread…";
+    rows.push(loading);
+    watchUnpackBlock(loading, choice.id);
+  } else if (cover && cover.more) {
+    const older = document.createElement("li");
+    older.className = "unpack-row unpack-older hint";
+    older.setAttribute("data-unpack-thread", choice.id);
+    older.textContent = "Older messages are in the thread.";
+    rows.push(older);
+  }
+  return rows;
+}
+
+/** Read thread `id` for its block as `row` nears the screen; at once where nothing can watch. */
+function watchUnpackBlock(row, id) {
+  if (typeof IntersectionObserver !== "function") {
+    queueUnpackRead(id);
+    return;
+  }
+  if (unpackObserver === null) {
+    unpackObserver = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        unpackObserver.unobserve(entry.target);
+        queueUnpackRead(String(entry.target.getAttribute("data-unpack-thread")));
+      }
+    }, { root: leftEl("side-scroll"), rootMargin: `${UNPACK_NEAR_PX}px` });
+  }
+  unpackObserver.observe(row);
+}
+
+/** Queue thread `id`'s newest page for its block, `UNPACK_READS_AT_ONCE` at a time. */
+function queueUnpackRead(id) {
+  if (!id || unpackReads.has(id)) return;
+  unpackReads.set(id, "queued");
+  pumpUnpackReads();
+}
+
+/** Start queued unpack reads while fewer than `UNPACK_READS_AT_ONCE` are on the wire. */
+function pumpUnpackReads() {
+  for (const [id, state] of unpackReads) {
+    if (unpackReadsRunning >= UNPACK_READS_AT_ONCE) return;
+    if (state !== "queued") continue;
+    unpackReads.set(id, "reading");
+    unpackReadsRunning += 1;
+    guardQuietly(() => readUnpackThread(id))();
+  }
+}
+
+/** One thread's newest page, folded into the store, its block drawn again from what it brought. */
+async function readUnpackThread(id) {
+  const channel = String(el("discord-channel").value);
+  try {
+    const path = withThreadQuery(
+      `/api/v1/channels/${encodeURIComponent(channel)}/timeline?view=thread&limit=${DISCORD_PAGE_LIMIT}&reason=threads`, id);
+    const payload = await api(path);
+    if (String(el("discord-channel").value) !== channel) return;
+    foldTimelinePage(payload, false, "thread", id);
+    unpackReads.set(id, "done");
+  } catch (_error) {
+    unpackReads.set(id, "failed");
+  } finally {
+    unpackReadsRunning -= 1;
+    sideCardsDrawn = "";
+    if (sideColumnUp()) renderSideColumn();
+    pumpUnpackReads();
+  }
 }
 
 /**
@@ -41327,7 +41675,10 @@ function paintLitCard(row, id) {
 /** Draw every card of both lists as the highlight now stands, and the links between the columns with it. */
 function paintLitCards() {
   for (const list of ["side-cards", "thread-list"]) {
-    for (const row of /** @type {HTMLElement[]} */ ([...leftEl(list).children])) paintLitCard(row, cardThread(row));
+    for (const row of /** @type {HTMLElement[]} */ ([...leftEl(list).children])) {
+      if (row.hasAttribute("data-unpack-thread")) continue;
+      paintLitCard(row, cardThread(row));
+    }
   }
   noteLinkedSelection();
 }
@@ -47765,6 +48116,9 @@ el("side-more-threads").addEventListener("click", guardQuietly(loadOlderThreads)
 // `#262 search-load-older`. The cards' own way further back for the search, and Stop while it walks.
 leftEl("side-search-replies").addEventListener("click", guardQuietly(repliesControlPressed));
 leftEl("side-unread-only").addEventListener("click", () => setSideUnreadOnly(!sideUnreadOnly));
+// `#404 threads-unpack-all`. Every thread's messages under its card, in the Threads view.
+leftEl("side-unpack").addEventListener("click", () => setThreadsUnpacked(!threadsUnpacked));
+renderUnpackToggle();
 inColumn(columns.side, () => {
   el("channel-compose-text").addEventListener("input", inThisColumn(rememberChannelDraft));
   el("channel-send").addEventListener("click", inThisColumn(guardQuietly(sendChannelMessage)));

@@ -657,6 +657,13 @@
               -->
               <button id="side-unread-only" class="chip" type="button" aria-pressed="false" title="Show only the threads with unread replies" hidden>Unread only</button>
               <!--
+                `#404 threads-unpack-all`. The owner, 2026-10-21: bridging one thread in All breaks
+                when another is bridged; he wants every thread chained at once. In the Threads view
+                (Cmd+3) this toggle unpacks each thread's messages under its card, bridged as in
+                All. Only over the cards of the Threads view. Kept on this device; key u.
+              -->
+              <button id="side-unpack" class="chip" type="button" aria-pressed="false" title="Show every thread's messages under its card" hidden>Unpack all</button>
+              <!--
                 `#298 thread-card-header`. The owner, of the thread cards: "When I drill into a given
                 thread card to see the messages inside it, I would like to KEEP that same style ... the
                 SAME colorful card move up to the top of the screen and KEEP its connector linkage over

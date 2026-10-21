@@ -935,6 +935,24 @@ steps:
   # screen moving part-way up the thread or at its foot; a link in it and its X do not fold it; a reload
   # keeps it folded; in two columns the line from the root meets the bar, its lane left of every row.
   # Measured on 2026-10-19: about 25s wall.
+  # `#404 threads-unpack-all` and `#405 root-under-summary` in the browser engine, at 1280x800 and
+  # 393x852 in both schemes: every thread unpacked under its card on a bridge in its colour, the
+  # summarised root first as the card's child, read runs on the spine under Collapse read, read
+  # replies gone under Hide read, off unchanged, kept across a reload; forty threads timed.
+  - group: check
+    job: threads-unpack-browser
+    desc: every thread's messages unpacked under its card, bridged in the thread colour with the summarised root first, read modes inside each block, kept across a reload, in current Chromium at 1280x800 and 393x852 in both schemes
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/threads_unpack_browser.py
+    jobs_flag: ""
+    timeout: 300
+    cpu_timeout: 180
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 60
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   - group: check
     job: thread-header-collapse-browser
     desc: the card at the top of a thread folded by a press to a thin bar of its own colours and opened again, nothing under it moving, kept across a reload, joined to its root, in current Chromium at 393x852 by touch and 1280x800 with a mouse, in both schemes
