@@ -650,6 +650,23 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#403 composer-key-global`. Ctrl+S (Cmd+S) in two columns from a thread card, either column's
+  # selected message, the search glass, the page body, the search field and the thread list, through CDP.
+  # Measured on 2026-10-21 outside dagrun on a loaded host: about 5s wall.
+  - group: check
+    job: composer-key-browser
+    desc: Ctrl+S (Cmd+S) to the message box the rule names in two columns, from cards, selections, a button, the body, a text field and the thread list, pressed through CDP in current Chromium at 1280x800
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/composer_key_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 12
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#355 provider-grouped-channels` in the browser engine at 1280x800 and a 375x812 phone: with two chat
   # services the bar's channel picker holds one <optgroup> per service in configuration order, Alt+Down
   # and Alt+Up through CDP step across the groups in the order shown, a reload restores the channel
