@@ -24,7 +24,8 @@ and no page error at any step.
 `#407 unpack-row-parity`. At each desk size an unpacked row is then driven as a row of any other list
 is, with a real mouse and real keys: the mouse over an unpacked row lights it (one row lit on the page,
 drawn with the selection's ring); ↓ and ↑ move the selection through the rows of a block and across to
-the next card in reading order; Enter opens and folds the selected row; : and ; collapse and expand
+the next card in reading order; e marks the selected row Done with the list left where it was, and z
+puts it back; Enter opens and folds the selected row; : and ; collapse and expand
 every unpacked row, saying so; under Collapse read the block's run is the run line every list draws,
 which Enter on it opens. Negative control: before any of it, ↓ over the cards packed goes card to card.
 
@@ -72,14 +73,34 @@ class UnpackApi(ColumnsApi):
 
 
 class ParityApi(UnpackApi):
-    """UnpackApi with every reply long enough to fold, for the keys that open and fold one."""
+    """UnpackApi with every reply long enough to fold, for the keys that open and fold one, and Done
+    and its Undo served, for the key that marks one."""
 
     def __init__(self) -> None:
         super().__init__()
+        self.done = set(DISMISSED)
         for row in self.messages:
             thread = row.get("thread")
             if isinstance(thread, dict) and thread.get("is_root") is False:
                 row["content"] = f"{row['content']} {FILLER * 6}"
+
+    def post(self, path: str, body: Json) -> tuple[int, Json]:
+        ids = body.get("messages")
+        named = [str(one) for one in ids] if isinstance(ids, list) else []
+        if path.endswith("/dismiss"):
+            with self.lock:
+                self.done.update(named)
+            return 200, {"dismissed": named}
+        if path.endswith("/restore"):
+            with self.lock:
+                self.done.difference_update(named)
+            return 200, {"messages": named}
+        return super().post(path, body)
+
+    def timeline(self, query: dict[str, list[str]]) -> Json:
+        with self.lock:
+            done = sorted(self.done)
+        return {**super().timeline(query), "dismissed": done}
 
 
 class ManyApi(ColumnsApi):
@@ -353,6 +374,24 @@ def parity(chromium: BrowserType, args: argparse.Namespace, label: str, width: i
     desk.check(selected_key(desk) == after, f"↓ from the card went to {lit(desk)}, not its first row {after}")
     desk.shot("2-keys")
 
+    # e on the selected row marks it Done as anywhere, and the list stays where the reader is.
+    done_target = next(key for key in runner_rows[3:] if page.locator(
+        f'#side-cards > li[data-unpack-thread="{RUNNER}"][data-id="{key}"][data-archived="false"]').count())
+    done_row = f'#side-cards > li[data-unpack-thread="{RUNNER}"][data-id="{done_target}"]'
+    mouse_onto(desk, done_row)
+    was = page.locator(done_row).bounding_box()
+    page.keyboard.press("e")
+    desk.wait_for(f"() => document.querySelector('{done_row}[data-archived=\"true\"]') !== null",
+                  f"e did not mark unpacked row {done_target} Done")
+    desk.settled()
+    now = page.locator(done_row).bounding_box()
+    desk.check(was is not None and now is not None and abs(now["y"] - was["y"]) <= 2,
+               f"the list moved under a Done on an unpacked row: {was} -> {now}")
+    page.keyboard.press("z")
+    desk.wait_for(f"() => document.querySelector('{done_row}[data-archived=\"false\"]') !== null",
+                  "z did not put the Done back")
+    desk.settled()
+
     # Enter on the selected row opens it, and again folds it; : and ; fold and open every unpacked row.
     folds = page.evaluate(FOLDS_JS)
     desk.check(len(folds) >= 6 and all(state == "true" for state in folds.values()),
@@ -397,7 +436,7 @@ def parity(chromium: BrowserType, args: argparse.Namespace, label: str, width: i
     desk.check(overflow <= 0, f"horizontal overflow of {overflow}px")
     desk.check(not errors, f"page errors: {errors}")
     page.context.close()
-    return f"parity-{label}: hover, ↓/↑ across cards and rows, Enter, ; and :, and the run line, as elsewhere"
+    return f"parity-{label}: hover, ↓/↑ across cards and rows, e and z, Enter, ; and :, and the run line, as elsewhere"
 
 
 def perf(chromium: BrowserType, args: argparse.Namespace) -> str:
