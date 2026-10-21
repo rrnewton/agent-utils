@@ -10256,12 +10256,24 @@ function composeFromKeyboard() {
  * column holding the selection, which is the one the keys moved last (`paneFor`); and Main's where
  * that column has none, as on the thread cards. The thread list is left first too, for the view it
  * was chosen from, because it covers the column whose box it is; and the column is asked again once
- * whatever covered it has gone. Ctrl+S is heard before any element's own listener (`everywhere`).
+ * whatever covered it has gone. In a message box on screen it stays, a reply open in that column or
+ * not; on a column's chips, outside its scroller, it is that column's box. Ctrl+S is heard before any
+ * element's own listener (`everywhere`).
  */
 function writeFromKeyboard() {
   if (currentScreen === "settings" || currentScreen === "help") closeSettings();
   if (threadListOnScreen()) threadListBack();
-  const pane = currentScreen === "main" ? paneFor(document.activeElement) : null;
+  const held = document.activeElement;
+  // Already in a message box on screen: it stays there, even beside a reply open in its column.
+  if (isComposer(held) && shownNode(held) && !behindThreadList(held) && !inColumnGone(held)) return true;
+  /** @type {KeyPane | null} */
+  let pane = null;
+  if (currentScreen === "main") {
+    // The chips over a column's foot are outside its scroller and still that column's.
+    if (held && nodeWithin(leftEl("side-tools"), held)) pane = sidePane;
+    else if (held && nodeWithin(leftEl("scroll-tools"), held)) pane = channelPane;
+    else pane = paneFor(held);
+  }
   return inColumn(pane ? paneColumn(pane) : activeColumn, composeFromKeyboard);
 }
 

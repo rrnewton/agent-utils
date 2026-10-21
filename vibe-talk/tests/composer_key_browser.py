@@ -16,8 +16,8 @@ At 1280x800, after each chord: the focus in the box the rule names, and the chor
   two columns, the right column on its thread cards: from a card and from the page body, Main's box ->
   a thread open on the right: from a message selected in the right column, the right column's box; from
   a message selected in the left column, Main's; from the search glass (a button on the bar) with the
-  selection on the right, the right column's; from the page body with the selection on the left, Main's
-  -> the thread list (Ctrl+3): left for the view it was chosen from, and Main's box -> the negative
+  selection on the right, the right column's; from the page body with the selection on the left, Main's;
+  on each column's Newest chip, outside its scroller, that column's box -> the thread list (Ctrl+3): left for the view it was chosen from, and Main's box -> the negative
   control: typing in the search field the chord still goes to a message box and never saves the page,
   and in a box with a draft it stays, the draft untouched.
 
@@ -51,6 +51,8 @@ FOCUS_JS = """() => {
 }"""
 
 BLUR_JS = "() => { if (document.activeElement) document.activeElement.blur(); }"
+
+SHOW_CHIPS_JS = "() => { for (const id of ['jump-newest', 'side-jump-newest']) document.getElementById(id).hidden = false; }"
 
 
 def focus(walk: Walk) -> str:
@@ -118,9 +120,19 @@ def thread_open(walk: Walk) -> None:
     chord(walk, "from the page body, the selection on the left", "channel-compose-text")
     select_row(walk, SIDE_ROW)
     chord(walk, "Cmd+S from the right column's selected message", "side-compose-text", "Meta+s")
+    # A column's chips are outside its scroller and still that column's: each chip's box, whichever
+    # column holds the selection. Shown as when each list is scrolled up; a hidden chip takes no focus.
+    page.evaluate(SHOW_CHIPS_JS)
+    page.focus("#jump-newest")
+    chord(walk, "on the left column's chip, the selection on the right", "channel-compose-text")
+    select_row(walk, FIRST_ROW)
+    page.evaluate(SHOW_CHIPS_JS)
+    page.focus("#side-jump-newest")
+    chord(walk, "on the right column's chip, the selection on the left", "side-compose-text")
     walk.notes.append("with a thread open on the right, Ctrl+S went to the right column's box from its selected "
                       "message and from the search glass with the selection there, and to Main's from the left "
-                      "column's selected message and from the body with the selection there; Cmd+S as Ctrl+S")
+                      "column's selected message and from the body with the selection there; Cmd+S as Ctrl+S; on each "
+                      "column's Newest chip, that column's box")
 
 
 def in_a_field(walk: Walk) -> None:

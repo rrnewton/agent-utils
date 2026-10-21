@@ -14,7 +14,9 @@ gear, the pickers, the layout button, the reading buttons and the switch on one 
 centres within 4px of each other), the dock one control tall, nothing past the window's edges, the
 switch in the window's lower right corner, and for the thread its whole name in the view picker's
 tooltip, and the picker set to end a label too long for it in an ellipsis. In two columns (1000px and
-wider) the same.
+wider) the same. And the widest the pane gets, the call view after a call with its note under Talk, in a
+24px default font at 900x700 and 1280x800: nothing drawn over anything, the pane wrapping its own
+buttons as a last resort once the bar is at its floor.
 
 The negative control, a 393x852 phone: the bar is one row above the pane's tile, the dock spans the
 window, and the dock is the same height whichever view is chosen. With --baseline-web-root DIR (a copy
@@ -55,9 +57,17 @@ DOCK_JS = """() => {
   const box = (node) => { const r = node.getBoundingClientRect();
     return {left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height}; };
   const drawn = (node) => node.getClientRects().length > 0 && getComputedStyle(node).visibility !== 'hidden';
+  // The pack scrolls sideways: a member is drawn only as far as the pack shows it, and not at all past it.
+  const pack = document.getElementById('bar-pack').getBoundingClientRect();
+  const clipped = (node, r) => {
+    if (!node.parentNode || node.parentNode.id !== 'bar-pack') return r;
+    const left = Math.max(r.left, pack.left), right = Math.min(r.right, pack.right);
+    return right - left > 0.5 ? {...r, left, right, width: right - left} : null;
+  };
   const controls = [...document.querySelectorAll(
     '#open-settings, #bar-pack > *, #view-switch, #control-pane > button, #control-pane > .control')]
-    .filter(drawn).map((node) => ({id: node.id || node.className, ...box(node)}));
+    .filter(drawn).map((node) => [node, clipped(node, box(node))]).filter(([, r]) => r)
+    .map(([node, r]) => ({id: node.id || node.className, ...r}));
   const select = document.getElementById('thread-select');
   return {dock: box(document.getElementById('dock')), pane: box(document.getElementById('control-pane')),
           bar: box(document.getElementById('control-bar')), controls, width: innerWidth, height: innerHeight,
@@ -85,8 +95,22 @@ def number(box: object, key: str) -> float:
     return float(value)
 
 
+def overlaps(state: Json, where: str) -> None:
+    """No two controls of the dock drawn over each other, and none past the window's edges."""
+    drawn = controls(state)
+    width = float(state["width"])  # type: ignore[arg-type]
+    for i, one in enumerate(drawn):
+        check(number(one, "left") >= -0.5 and number(one, "right") <= width + 0.5,
+              f"{where}: #{one['id']} runs past the window: {one}")
+        for other in drawn[i + 1:]:
+            across = min(number(one, "right"), number(other, "right")) - max(number(one, "left"), number(other, "left"))
+            down = min(number(one, "bottom"), number(other, "bottom")) - max(number(one, "top"), number(other, "top"))
+            check(across <= 0.5 or down <= 0.5, f"{where}: #{one['id']} and #{other['id']} overlap: {one} {other}")
+
+
 def one_row(state: Json, where: str) -> None:
-    """Every control of the dock on one row, inside the window, the switch in its corner."""
+    """Every control of the dock on one row, inside the window, overlapping none, the switch in its corner."""
+    overlaps(state, where)
     drawn = controls(state)
     check(len(drawn) >= 5, f"{where}: fixture: only {len(drawn)} controls drawn in the dock: {drawn}")
     centres = [(number(one, "top") + number(one, "bottom")) / 2 for one in drawn]
@@ -175,6 +199,35 @@ def desk(browser: Browser, url: str, width: int, height: int, shots: Path | None
     page.context.close()
 
 
+# After a call, as renderControls draws it: Talk says "Start a new call" with its one-clause note under it.
+AFTER_CALL_JS = """() => { document.getElementById('hang-up').hidden = true;
+  document.getElementById('control-pane').className = 'solo';
+  document.getElementById('talk').className = 'control control-talk';
+  document.getElementById('talk-label').textContent = 'Start a new call';
+  const note = document.getElementById('talk-note');
+  note.textContent = 'the agent starts fresh — the earlier conversation was too long to replay';
+  note.hidden = false; }"""
+
+
+def large_font_after_call(browser: Browser, url: str, width: int, height: int, notes: list[str]) -> None:
+    """The widest the pane gets — after a call, its note under Talk — in a 24px default font: past the
+    bar's floor the pane wraps its own buttons, as a last resort, and nothing is drawn over anything."""
+    page = open_page(browser, url, width, height)
+    page.click("#view-switch")
+    page.wait_for_function("() => document.getElementById('view-switch').getAttribute('aria-checked') !== 'true'",
+                           timeout=10_000)
+    page.evaluate("() => { document.documentElement.style.fontSize = '24px'; }")
+    page.evaluate(AFTER_CALL_JS)
+    page.wait_for_timeout(300)
+    state = dock(page)
+    overlaps(state, f"{width}x{height}, 24px type, after a call")
+    bar = next((one for one in controls(state) if one["id"] == "open-settings"), None)
+    check(bar is not None, f"{width}x{height}, 24px type, after a call: the gear is not drawn")
+    notes.append(f"{width}x{height} at a 24px default font after a call: nothing drawn over anything, the dock "
+                 f"{number(state['dock'], 'height'):.0f}px tall")
+    page.context.close()
+
+
 def phone_boxes(browser: Browser, url: str, shots: Path | None, tag: str) -> dict[str, list[dict[str, float | str]]]:
     page = open_page(browser, url, 393, 852, mobile=True)
     found: dict[str, list[dict[str, float | str]]] = {}
@@ -250,6 +303,8 @@ def main() -> int:
             browser = playwright.chromium.launch(headless=True, executable_path=args.browser_executable)
             for width, height in ((1280, 800), (1920, 1080), (900, 700)):
                 desk(browser, urls[0], width, height, args.screenshots, notes)
+            for width, height in ((900, 700), (1280, 800)):
+                large_font_after_call(browser, urls[0], width, height, notes)
             phone = phone_boxes(browser, urls[0], args.screenshots, "page")
             if len(urls) > 1:
                 baseline = phone_boxes(browser, urls[1], args.screenshots, "baseline")

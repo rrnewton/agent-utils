@@ -7157,6 +7157,8 @@ textarea {
   #dock {
     --dock-inset: 0.6rem;
     --dock-switch: 7.5rem;
+    /* The bar's floor: see `#control-bar-bottom`. */
+    --bar-floor: 8rem;
     position: relative;
     display: flex;
     flex-wrap: nowrap;
@@ -7165,10 +7167,12 @@ textarea {
     padding: 0.4rem var(--dock-inset);
   }
 
-  /* The bar takes what the pane leaves, so its pack can give the pickers their names. */
+  /* The bar takes what the pane leaves, so its pack can give the pickers their names. Its floor is the
+     gear and one picker at its own floor beside it (`#406 command-bar-one-row`): past that the pane is
+     what gives way, never the bar under the pane. */
   #control-bar-bottom {
     flex: 1 1 auto;
-    min-width: 0;
+    min-width: var(--bar-floor);
   }
 
   /* The dock carries the padding on a desk: there is no curved corner to clear and no band to
@@ -7253,12 +7257,17 @@ textarea {
      `margin-left: auto` keeps it at the right of the row, against the room it keeps for the
      switch. It keeps its width (`#406 command-bar-one-row`): the bar beside it is what gives way,
      its pickers ending in an ellipsis and its pack scrolling sideways, so the row stays one row.
+     Only with the bar at its floor — a large default font, after a call, when Talk carries its
+     note, in the narrowest desk — does the pane wrap its own buttons, as a last resort, rather than
+     run under the bar or the switch: its widest is what the dock has less the bar's floor, the
+     switch's room and the gaps.
      `static`, so the pace popover is placed against the dock: see `.popover` below. */
   #control-pane {
     flex: 0 0 auto;
     min-width: 0;
+    max-width: calc(100% - var(--bar-floor) - var(--dock-switch) - 0.4rem - 0.5rem);
     display: flex;
-    flex-wrap: nowrap;
+    flex-wrap: wrap;
     justify-content: flex-end;
     align-items: end;
     gap: 0.4rem;
@@ -7877,12 +7886,6 @@ textarea {
   #screen-main[data-columns="two"] > #scroll-tools {
     left: 25%;
     width: calc(50% - 1.2rem);
-  }
-
-  /* The dock spans the pair: from the left column's left edge to the right column's right edge, which
-     since `#373 two-column-full-width` are the window's, less the inset the controls always had. */
-  body:has(#screen-main[data-columns="two"]:not([hidden])) #dock {
-    --dock-inset: 0.6rem;
   }
 
   /* The transient status speaks over the left column, where its chips are, not across the divider. */
