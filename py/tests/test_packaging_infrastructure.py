@@ -938,9 +938,12 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # withdrawn prepared journal, an ownerless absent row audit, a nested
     # registered worktree, transient user-systemd scopes, and a modified
     # tracked flat handoff) are mapped.
-    assert len(all_tests) == 2097
+    # The two partial-clone containment cases of dev-hermit dh-6a8rf (a
+    # blobless clone's search and recheck fetch commits only, and promisor
+    # object-store detection) are mapped.
+    assert len(all_tests) == 2099
     assert len(ordinary) == 337
-    assert len(mapped) == 1760
+    assert len(mapped) == 1762
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {

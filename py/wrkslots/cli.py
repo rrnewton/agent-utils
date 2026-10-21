@@ -15882,6 +15882,7 @@ class _GitVcs:
         destination: str,
         haves: Sequence[str] = (),
         env_overrides: Mapping[str, str],
+        promisor: bool = False,
     ) -> list[str]:
         """Fetch exactly the advertised refs into the temporary repository.
 
@@ -15904,6 +15905,17 @@ class _GitVcs:
         and is refused when the remote reports that it is shallow: a shallow
         remote can advertise a ref without holding that ref's older history,
         so its refs cannot show that it holds a commit.
+
+        ``promisor`` says the source object store belongs to a partial clone
+        (_is_promisor_object_store), which lacks trees or blobs of commits it
+        holds. A remote answering the have-refs above assumes every object
+        those commits reach is present and sends deltas against bases that
+        are not, which Git refuses ("pack has N unresolved deltas"). Such a
+        store is therefore fetched commits only (--filter=tree:0), with the
+        URL as remote ``proof`` for that one fetch, exactly as in
+        _assert_remote_sends_history; the commits it then walks are still the
+        ones the remote sent, and the tree-less commits it adds sit in a
+        promisor pack, as the partial clone's own fetches leave them.
         """
 
         names = sorted(advertised)
@@ -15932,9 +15944,22 @@ class _GitVcs:
                 ),
                 env_overrides=env_overrides,
             )
+        fetch_env = dict(env_overrides)
+        if promisor:
+            proof_config = (
+                _NETWORK_CONFIG
+                + b'[remote "proof"]\n\turl = '
+                + _git_config_quoted(url, "remote URL")
+                + b"\n"
+            )
+            (isolated / "config").write_bytes(proof_config)
+            fetch_env[_NETWORK_CONFIG_SHA256_ENV] = hashlib.sha256(
+                proof_config
+            ).hexdigest()
         arguments = [
             "fetch",
             f"--depth={_GIT_COMPLETE_HISTORY_DEPTH}",
+            *(("--filter=tree:0",) if promisor else ()),
             "--no-tags",
             "--no-write-fetch-head",
             "--no-auto-maintenance",
@@ -15942,24 +15967,30 @@ class _GitVcs:
             "--no-recurse-submodules",
             "--stdin",
             "--",
-            url,
+            "proof" if promisor else url,
         ]
-        fetched = self._run_bytes(
-            isolated,
-            arguments,
-            input_bytes=b"".join(
-                b"+" + os.fsencode(name) + f":{destination}{index}\n".encode("ascii")
-                for index, name in enumerate(names)
-            ),
-            env_overrides=env_overrides,
-            timeout_seconds=_ABSENT_AGENT_REMOTE_FETCH_SECONDS,
-            timeout_refusal=(
-                f"Git did not fetch {len(names)} remote ref(s) into a temporary "
-                f"repository within {_ABSENT_AGENT_REMOTE_FETCH_SECONDS:g} seconds; "
-                "the fetch was stopped and no ref of the source repository was read "
-                "or written. remedy: rerun when the remote answers faster"
-            ),
-        )
+        try:
+            fetched = self._run_bytes(
+                isolated,
+                arguments,
+                input_bytes=b"".join(
+                    b"+" + os.fsencode(name) + f":{destination}{index}\n".encode("ascii")
+                    for index, name in enumerate(names)
+                ),
+                env_overrides=fetch_env,
+                timeout_seconds=_ABSENT_AGENT_REMOTE_FETCH_SECONDS,
+                timeout_refusal=(
+                    f"Git did not fetch {len(names)} remote ref(s) into a temporary "
+                    f"repository within {_ABSENT_AGENT_REMOTE_FETCH_SECONDS:g} seconds; "
+                    "the fetch was stopped and no ref of the source repository was read "
+                    "or written. remedy: rerun when the remote answers faster"
+                ),
+            )
+        finally:
+            if promisor:
+                # Git recorded remote proof as a promisor; nothing else that
+                # runs in this repository may fetch from it lazily.
+                (isolated / "config").write_bytes(_NETWORK_CONFIG)
         if fetched.returncode != 0:
             raise Refusal(
                 f"Git could not fetch {len(names)} remote ref(s) into a temporary "
@@ -15979,6 +16010,46 @@ class _GitVcs:
                 "Git fetched a different ref inventory than the remote advertised"
             )
         return names
+
+    def _is_promisor_object_store(self, checkout: Path) -> bool:
+        """Say whether ``checkout``'s object store may lack objects its commits reach.
+
+        A partial clone records its promisor remote in its configuration and
+        keeps what that remote sent in packs marked by a ``.promisor`` file;
+        either one counts, so a store holding promisor packs counts even when
+        its configuration was edited afterwards.
+        """
+
+        pack = self.common_directory(checkout) / "objects" / "pack"
+        if pack.is_dir() and not pack.is_symlink() and any(pack.glob("*.promisor")):
+            return True
+        result = self._run(
+            checkout,
+            [
+                "config",
+                "--null",
+                "--get-regexp",
+                r"^(extensions\.partialclone|remote\..*\.promisor)$",
+            ],
+            check=False,
+        )
+        if result.returncode not in (0, 1):
+            raise Refusal(
+                "cannot determine whether the repository is a partial clone"
+                + _git_failure_detail(result)
+            )
+        for entry in result.stdout.split("\0"):
+            key, _, value = entry.partition("\n")
+            if key.lower() == "extensions.partialclone" and value:
+                return True
+            if key.lower().endswith(".promisor") and value.lower() in (
+                "true",
+                "yes",
+                "on",
+                "1",
+            ):
+                return True
+        return False
 
     @staticmethod
     def _refuse_shallow_fetch(isolated: Path, count: int) -> None:
@@ -16018,6 +16089,7 @@ class _GitVcs:
         _validate_remote(remote)
         if not SHA_RE.fullmatch(commit):
             raise Refusal(f"cannot search the remote for invalid commit {commit!r}")
+        promisor = self._is_promisor_object_store(checkout)
         with self._isolated_remote(checkout, remote, authority) as (
             isolated,
             object_env,
@@ -16045,6 +16117,7 @@ class _GitVcs:
                     destination=destination,
                     haves=(commit,),
                     env_overrides=object_env,
+                    promisor=promisor,
                 )
                 result = self._run(
                     isolated,
@@ -16102,6 +16175,7 @@ class _GitVcs:
             raise Refusal(f"cannot compare invalid commit {commit!r} with {shown}")
         destination = f"{_ABSENT_AGENT_FETCHED_REF_ROOT}checked/"
         fetched = f"{destination}0"
+        promisor = self._is_promisor_object_store(checkout)
         with self._isolated_remote(checkout, remote, authority) as (
             isolated,
             object_env,
@@ -16118,6 +16192,7 @@ class _GitVcs:
                 destination=destination,
                 haves=(commit,),
                 env_overrides=object_env,
+                promisor=promisor,
             )
             result = self._run(
                 isolated,

@@ -42418,9 +42418,117 @@ def test_remote_containment_search_negotiates_from_the_recorded_head(
         "refs/heads/main": tip
     }
     assert len(fetches) == 1
+    # A complete clone is fetched with every object, as before.
+    assert not any(arg.startswith("--filter") for arg in fetches[0])
     assert git(consumer, "cat-file", "-e", tip, check=False).returncode == 0
     assert received.is_file()
     assert received.stat().st_size < 64 * 1024
+
+
+def test_remote_containment_search_in_a_blobless_clone_fetches_commits_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A blobless clone holds commits whose blobs it never downloaded. The
+    # remote tip edits a file those commits already reach, so a remote
+    # answering the have-refs negotiated from them sends the new blob as a
+    # delta against an old one the clone lacks, and the fetch failed with
+    # "unresolved deltas" (dh-6a8rf). The search and its confirmation must
+    # still find the remote branch, commits only, and leave the clone's refs
+    # and configuration as they were.
+    producer = tmp_path / "producer"
+    remote = tmp_path / "origin.git"
+    consumer = tmp_path / "consumer"
+    git(tmp_path, "init", "--initial-branch=main", str(producer))
+    git(producer, "config", "user.name", "Wrkslots Test")
+    git(producer, "config", "user.email", "wrkslots@example.invalid")
+    lines = [f"line {index} {os.urandom(8).hex()}\n" for index in range(4000)]
+    for index in range(3):
+        lines[index * 7] = f"edit {index}\n"
+        (producer / "payload.txt").write_text("".join(lines), encoding="utf-8")
+        git(producer, "add", "payload.txt")
+        git(producer, "commit", "-m", f"history {index}")
+    head = git(producer, "rev-parse", "HEAD").stdout.strip()
+    git(tmp_path, "init", "--bare", "--initial-branch=main", str(remote))
+    git(remote, "config", "uploadpack.allowFilter", "true")
+    git(producer, "push", str(remote), "HEAD:refs/heads/main")
+    git(
+        tmp_path,
+        "clone",
+        "--filter=blob:none",
+        "--no-checkout",
+        f"file://{remote}",
+        str(consumer),
+    )
+    blob = git(producer, "rev-parse", "HEAD:payload.txt").stdout.strip()
+    absent = subprocess.run(
+        ["git", "-C", str(consumer), "cat-file", "-e", blob],
+        env={**os.environ, "GIT_NO_LAZY_FETCH": "1"},
+        capture_output=True,
+        check=False,
+    )
+    assert absent.returncode != 0
+    lines[1] = "advanced\n"
+    (producer / "payload.txt").write_text("".join(lines), encoding="utf-8")
+    git(producer, "commit", "-am", "remote tip edits the payload")
+    tip = git(producer, "rev-parse", "HEAD").stdout.strip()
+    git(producer, "push", str(remote), "HEAD:refs/heads/main")
+    config_before = (consumer / ".git" / "config").read_bytes()
+    refs_before = all_refs(consumer)
+    run_bytes = wrkslots._GitVcs._run_bytes
+    fetches: list[Sequence[str]] = []
+
+    def trace_bytes_fetch(
+        repository: Path, args: Sequence[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        if args and args[0] == "fetch":
+            fetches.append(args)
+        return run_bytes(repository, args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(wrkslots._GitVcs, "_run_bytes", staticmethod(trace_bytes_fetch))
+    vcs = wrkslots._GitVcs()
+    assert vcs._is_promisor_object_store(consumer)
+    authority = vcs.remote_authority(consumer, "origin")
+    assert vcs.remote_refs_containing_commit(consumer, "origin", head, authority) == {
+        "refs/heads/main": tip
+    }
+    assert (
+        vcs.remote_ref_contains_commit(consumer, "origin", "refs/heads/main", head, authority)
+        == tip
+    )
+    # The search, the recheck, and the confirming fetch into an empty store.
+    assert len(fetches) == 3
+    assert all("--filter=tree:0" in args for args in fetches)
+    assert (consumer / ".git" / "config").read_bytes() == config_before
+    assert all_refs(consumer) == refs_before
+    fsck = subprocess.run(
+        ["git", "-C", str(consumer), "fsck", "--connectivity-only"],
+        env={**os.environ, "GIT_NO_LAZY_FETCH": "1"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert fsck.returncode == 0, fsck.stderr
+
+
+def test_promisor_object_store_is_read_from_packs_and_configuration(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    git(tmp_path, "init", "--initial-branch=main", str(repository))
+    vcs = wrkslots._GitVcs()
+    assert not vcs._is_promisor_object_store(repository)
+    git(repository, "config", "remote.origin.promisor", "true")
+    assert vcs._is_promisor_object_store(repository)
+    git(repository, "config", "remote.origin.promisor", "false")
+    assert not vcs._is_promisor_object_store(repository)
+    git(repository, "config", "--unset", "remote.origin.promisor")
+    git(repository, "config", "core.repositoryformatversion", "1")
+    git(repository, "config", "extensions.partialClone", "origin")
+    assert vcs._is_promisor_object_store(repository)
+    git(repository, "config", "--unset", "extensions.partialClone")
+    assert not vcs._is_promisor_object_store(repository)
+    (repository / ".git" / "objects" / "pack" / "pack-0.promisor").write_bytes(b"")
+    assert vcs._is_promisor_object_store(repository)
 
 
 def test_recover_absent_agent_row_accepts_unchanged_unregistered_branch(
