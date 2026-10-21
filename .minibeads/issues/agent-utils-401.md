@@ -1,13 +1,14 @@
 ---
 title: 'hidden-channels-fold: hidden channels folded at the foot of Settings'' channel section'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 - settings
 created_at: 2026-10-21T14:51:19.833543606+00:00
-updated_at: 2026-10-21T14:51:19.833543606+00:00
+updated_at: 2026-10-21T16:14:08.775365157+00:00
+closed_at: 2026-10-21T16:14:08.775365047+00:00
 ---
 
 # Description

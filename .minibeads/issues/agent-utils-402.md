@@ -1,13 +1,14 @@
 ---
 title: 'who-is-who-channel-box: Who is who back in Settings'' channel section, following its picker'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 - settings
 created_at: 2026-10-21T14:51:11.180407857+00:00
-updated_at: 2026-10-21T14:51:11.180407857+00:00
+updated_at: 2026-10-21T16:14:08.771063806+00:00
+closed_at: 2026-10-21T16:14:08.771063706+00:00
 ---
 
 # Description
