@@ -701,7 +701,17 @@ While the footer shows such a segment (`esc to interrupt`, `N shell(s)` or
 `stalled` rule instead. When the input box is in view only the footer under
 it is read, because the turn's row still says `still running` after the work
 ends. This reads the screen's text, so a harness that draws no such segment,
-or one worded differently, is still reported idle once its screen holds still. When every watched agent is unreachable at once the terminal
+or one worded differently, is still reported idle once its screen holds still.
+A Claude Code pane whose view is scrolled up is neither `stalled` nor
+`idle-no-verdict`, however long it holds still: Claude Code freezes the
+transcript there and ends the last row above its input box with
+`16 new messages (ctrl+End) ↓`, and its pane keeps no scrollback, so the
+running turn's timer, the newest output, and any verdict are all out of
+sight. A growing count is a screen change like any other. While the view stays
+scrolled no stall or idle clock runs (an episode already reported is kept, so
+it is not reported twice), the pass lists the agent under `scrolled` in its
+JSON, and scrolling back to the bottom starts the clocks again. Approval
+prompts are still reported, since they are drawn at the bottom. When every watched agent is unreachable at once the terminal
 server is the problem, and the pass says so instead of calling every harness
 dead; repairing that is `agentctl watch`'s job.
 

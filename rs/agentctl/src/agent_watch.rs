@@ -246,6 +246,41 @@ fn background_count(segment: &str) -> bool {
         && matches!(noun, "shell" | "shells" | "agent" | "agents")
 }
 
+/// How many new messages Claude Code says wait below its view, when the view is scrolled up.
+/// Scrolled up, Claude Code freezes the transcript where the reader left it and ends the last
+/// row above its input box with `16 new messages (ctrl+End) ↓`, raising the count as messages
+/// arrive below (live panes, 2026-10-20). Its pane keeps no terminal scrollback, so nothing
+/// below the view can be read: not the running turn's timer, not the newest output, not a
+/// closing verdict. A growing count changes the screen, which is progress like any change; a
+/// count that holds still proves nothing, since one long tool call or sub-agent run is a
+/// single message. The pill is read only at the end of that one row, between the input box's
+/// rule and any blank rows, so a transcript that quotes it is not a scrolled view.
+fn scrolled_below(screen: &str) -> Option<u64> {
+    let lines: Vec<&str> = screen.lines().collect();
+    let start = lines.len().saturating_sub(BACKGROUND_WINDOW_LINES);
+    let input = start
+        + lines[start..]
+            .iter()
+            .rposition(|line| line.trim_start().starts_with('❯'))?;
+    let row = lines[..input].iter().rev().find(|line| {
+        let line = line.trim();
+        !line.is_empty() && !line.chars().all(|character| character == '─')
+    })?;
+    let row = row.trim_end().strip_suffix('↓')?.trim_end();
+    let row = match row.strip_suffix(')') {
+        Some(hinted) => hinted.rsplit_once('(')?.0.trim_end(),
+        None => row,
+    };
+    let row = row
+        .strip_suffix(" new messages")
+        .or_else(|| row.strip_suffix(" new message"))?;
+    let count = row.rsplit(char::is_whitespace).next()?;
+    if count.is_empty() || !count.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    count.parse::<u64>().ok().filter(|count| *count > 0)
+}
+
 /// FNV-1a over `text`. Persisted hashes must read the same in every process, so the
 /// standard library's per-process-keyed hasher cannot be used for them.
 fn stable_hash(text: &str) -> u64 {
@@ -414,6 +449,26 @@ fn withdraw_pending(state: &mut WatchState, agent: &str, episode: &Episode) {
     state.pending.retain(|notice| notice.key() != key);
 }
 
+/// The report row for an episode this pass could not judge, left exactly as it was.
+fn held_row(
+    observation: &Observation,
+    episode: &Episode,
+    now: f64,
+    options: &WatchAgentsOptions,
+    detail: &str,
+) -> Value {
+    json!({
+        "agent": observation.name,
+        "kind": episode.kind.as_str(),
+        "status": observation.status,
+        "since": episode.since,
+        "age_seconds": now - episode.since,
+        "reported": episode.notified,
+        "due": now - episode.since >= options.threshold(episode.kind).as_secs_f64(),
+        "detail": detail,
+    })
+}
+
 /// Append at most one new notice for `observation`, after updating its episode memory.
 /// Returns the live episode row for the report, past-threshold or not.
 fn update_episode(
@@ -433,16 +488,13 @@ fn update_episode(
     // the screen can be read again; only `gone` classifies without one.
     if observation.screen.is_none() && observation.status != "gone" {
         return memory.episode.as_ref().map(|episode| {
-            json!({
-                "agent": observation.name,
-                "kind": episode.kind.as_str(),
-                "status": observation.status,
-                "since": episode.since,
-                "age_seconds": now - episode.since,
-                "reported": episode.notified,
-                "due": now - episode.since >= options.threshold(episode.kind).as_secs_f64(),
-                "detail": "screen unreadable this pass; episode held",
-            })
+            held_row(
+                observation,
+                episode,
+                now,
+                options,
+                "screen unreadable this pass; episode held",
+            )
         });
     }
     if memory.screen_hash != hash {
@@ -459,6 +511,34 @@ fn update_episode(
         }
     }
     let found = classify(observation, options);
+    // A view scrolled up hides whatever would show progress or a verdict, so neither a stall
+    // nor idleness can be judged from it, however long it holds still. No clock runs while it
+    // shows: an episode of the condition it seems to show is kept only once reported, so it is
+    // not reported twice, and any other episode ends here with its unsent notice. Scrolling
+    // back to the bottom changes the screen, so a stall or idle clock starts again from there.
+    // A growing count already changed the screen above, which ended any stall. A prompt is
+    // still read: it is drawn at the bottom.
+    if let Some(below) = observation.screen.as_deref().and_then(scrolled_below) {
+        if let Some((kind @ (EpisodeKind::Stalled | EpisodeKind::IdleNoVerdict), _)) = found {
+            if let Some(cleared) = memory
+                .episode
+                .take_if(|episode| !(episode.notified && episode.kind == kind))
+            {
+                withdraw_pending(state, &observation.name, &cleared);
+            }
+            let row = memory.episode.as_ref().map(|episode| {
+                held_row(
+                    observation,
+                    episode,
+                    now,
+                    options,
+                    &format!("view scrolled up with {below} new message(s) below it; episode held"),
+                )
+            });
+            state.agents.insert(observation.name.clone(), memory);
+            return row;
+        }
+    }
     // Recovered, or moved to a different condition: an unsent notice for the old
     // episode is withdrawn, so a rate-limit window cannot deliver stale news. A
     // notice already queued for the coordinator cannot be unsent.
@@ -641,6 +721,15 @@ fn watch_agents_once(
         });
     }
     let notice = flush_notices(state, notifier, now, options);
+    // Agents whose view is scrolled up cannot be judged stalled or idle; say which, so a
+    // quiet report is not read as a clean bill.
+    let scrolled: Vec<Value> = observations
+        .iter()
+        .filter_map(|row| {
+            let below = row.screen.as_deref().and_then(scrolled_below)?;
+            Some(json!({"agent": row.name, "new_messages": below}))
+        })
+        .collect();
     json!({
         "schema": STATE_SCHEMA,
         "checked_at": now,
@@ -650,6 +739,7 @@ fn watch_agents_once(
         "probe_error": probe_error,
         "agents": seen.len(),
         "episodes": episodes,
+        "scrolled": scrolled,
         "notice": notice,
         "waiting": state.pending.len(),
     })
@@ -1352,6 +1442,229 @@ mod tests {
         let held = pass(&mut probe, &mut notifier, &mut state, 1000.0, &options);
         assert_eq!(held["episodes"][0]["kind"], "stalled", "{held}");
         assert_eq!(notifier.sent.len(), 1);
+    }
+
+    // Claude Code scrolled up while it works, from a live pane on 2026-10-20: the frozen
+    // transcript, the divider where the new messages begin, the pill at the end of the last row
+    // above the input box, the input box between its rules, and the footer.
+    const SCROLLED_WORKING: &str = "● Bash(python3 - \"$P\" <<'EOF'\n      import sys…)\n  ⎿  # DBG3 two channels read\n     … +2 lines\n\n──────────────── 16 new messages ────────────────\n\n● Bash(python3 - \"$P\" <<'EOF'\n      import sys,re…)                    16 new messages (ctrl+End) ↓\n\n────────────────────────────────────────\n❯\u{a0}\n────────────────────────────────────────\n  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent\n";
+    // A pane of the shape the watcher reported stalled on 2026-10-20: a live capture's turn
+    // row with its pill drawn over it, and a footer counting the validation run in a
+    // background shell.
+    const SCROLLED_GATING: &str = "● The validation gate is running on the rebased HEAD. I'll push only if it passes.\n\n✻ Sautéed for 23m 29s · done 10:02 PM                         7 new messages (ctrl+End) ↓\n\n────────────────────────────────────────\n❯\u{a0}\n────────────────────────────────────────\n  ⏵⏵ auto mode on · 1 shell · ↓ to manage\n";
+    // The same kind of pane at the bottom of its view, from a live pane on 2026-10-20: the
+    // running turn's timer is the last row above the input box.
+    const LIVE_WORKING: &str = "● Foreground long-running command with streaming output · 44s\n  ⎿  $ for i in $(seq 1 65); do echo \"tick $i\"; sleep 1; done (45s · 46 lines)\n     (ctrl+b to run in background)\n\n✢ Processing… (4m 19s · ↓ 13.1k tokens)\n\n────────────────────────────────────────\n❯\n────────────────────────────────────────\n  ⏵⏵ auto mode on · 1 shell · esc to interrupt · ← 1 agent · ↓ to manage\n";
+    const RULED_IDLE: &str = "● Finished the change.\n\n────────────────────────────────────────\n❯\u{a0}\n────────────────────────────────────────\n  ⏵⏵ auto mode on\n";
+
+    /// [`SCROLLED_WORKING`] with nothing running in its footer, as an idle agent's would be.
+    fn scrolled_quiet() -> String {
+        SCROLLED_WORKING.replace(" · ← 1 agent", "")
+    }
+
+    #[test]
+    fn a_scrolled_view_is_read_from_the_row_above_the_input_box() {
+        assert_eq!(scrolled_below(SCROLLED_WORKING), Some(16));
+        assert_eq!(scrolled_below(SCROLLED_GATING), Some(7));
+        assert_eq!(
+            scrolled_below(&SCROLLED_GATING.replace("7 new messages", "1 new message")),
+            Some(1)
+        );
+        // The footer under the input box is still live while the view is scrolled.
+        assert_eq!(background_work(SCROLLED_GATING).as_deref(), Some("1 shell"));
+        for screen in [
+            LIVE_WORKING,
+            RULED_IDLE,
+            IDLE_SCREEN,
+            DONE_SCREEN,
+            QUIET_FOOTER,
+            WORKING_FOOTER,
+            BACKGROUND_TURN_END,
+            BACKGROUND_FOOTER_ONLY,
+        ] {
+            assert_eq!(scrolled_below(screen), None, "{screen}");
+        }
+        // The divider alone, which marks where new messages begin, is not the pill.
+        let divider_only =
+            SCROLLED_WORKING.replace("                    16 new messages (ctrl+End) ↓", "");
+        assert_eq!(scrolled_below(&divider_only), None, "{divider_only}");
+        // A transcript that quotes the pill anywhere but at the end of that one row is not a
+        // scrolled view.
+        let quoted = RULED_IDLE.replace(
+            "● Finished the change.",
+            "● Scrolled up it reads 7 new messages (ctrl+End) ↓\n● Finished the change.",
+        );
+        assert_eq!(scrolled_below(&quoted), None, "{quoted}");
+        let inline = RULED_IDLE.replace(
+            "● Finished the change.",
+            "● It reads `7 new messages (ctrl+End) ↓` there.",
+        );
+        assert_eq!(scrolled_below(&inline), None, "{inline}");
+        // No input box in view, and a zero count, are not a scrolled view either.
+        assert_eq!(
+            scrolled_below("● x    16 new messages (ctrl+End) ↓\n"),
+            None
+        );
+        assert_eq!(
+            scrolled_below(&SCROLLED_GATING.replace("7 new", "0 new")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_scrolled_view_is_never_reported_stalled_or_idle() {
+        let options = options();
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        // Working, idle with a background shell (the 2026-10-20 report), and idle with no
+        // verdict in view, each frozen for two hours: the verdict, the turn's timer, and the
+        // newest output are all below the view.
+        let screens = [
+            observation("working", "working", Some(SCROLLED_WORKING)),
+            observation("gating", "idle", Some(SCROLLED_GATING)),
+            observation("quiet", "idle", Some(&scrolled_quiet())),
+        ];
+        for at in [0.0, 1800.0, 3600.0, 7200.0] {
+            let mut probe = ScriptedProbe(vec![screens.to_vec()]);
+            let report = pass(&mut probe, &mut notifier, &mut state, at, &options);
+            assert_eq!(report["episodes"], json!([]), "{report}");
+            assert_eq!(report["ok"], true, "{report}");
+            assert_eq!(report["scrolled"][1]["agent"], "gating", "{report}");
+            assert_eq!(report["scrolled"][1]["new_messages"], 7, "{report}");
+        }
+        assert!(notifier.sent.is_empty(), "{:?}", notifier.sent);
+        assert!(state.pending.is_empty());
+
+        // A prompt is drawn at the bottom, so it is still reported from a scrolled pane.
+        let prompted = SCROLLED_GATING.replace(
+            "  ⏵⏵ auto mode on · 1 shell · ↓ to manage\n",
+            "Do you want to proceed?\n❯ 1. Yes\n",
+        );
+        let mut probe = ScriptedProbe(vec![
+            vec![observation("asking", "idle", Some(&prompted))],
+            vec![observation("asking", "idle", Some(&prompted))],
+        ]);
+        pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
+        let due = pass(&mut probe, &mut notifier, &mut state, 300.0, &options);
+        assert_eq!(due["episodes"][0]["kind"], "approval-prompt", "{due}");
+        assert_eq!(notifier.sent.len(), 1);
+    }
+
+    #[test]
+    fn a_growing_new_message_count_is_progress() {
+        let options = options();
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let more =
+            SCROLLED_WORKING.replace("16 new messages (ctrl+End)", "17 new messages (ctrl+End)");
+        let mut probe = ScriptedProbe(vec![
+            vec![observation("working", "working", Some(SCROLLED_WORKING))],
+            vec![observation("working", "working", Some(SCROLLED_WORKING))],
+            vec![observation("working", "working", Some(&more))],
+        ]);
+        pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
+        pass(&mut probe, &mut notifier, &mut state, 600.0, &options);
+        assert_eq!(state.agents["working"].screen_changed_at, 0.0);
+        pass(&mut probe, &mut notifier, &mut state, 1200.0, &options);
+        assert_eq!(state.agents["working"].screen_changed_at, 1200.0);
+    }
+
+    #[test]
+    fn scrolling_back_down_starts_the_clocks_again() {
+        let options = options();
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        // Scrolled for two hours, then back at the bottom of a stalled screen: the stall is
+        // timed from the return.
+        for at in [0.0, 3600.0, 7200.0] {
+            let mut probe = ScriptedProbe(vec![vec![observation(
+                "working",
+                "working",
+                Some(SCROLLED_WORKING),
+            )]]);
+            pass(&mut probe, &mut notifier, &mut state, at, &options);
+        }
+        for at in [7260.0, 7260.0 + 1799.0] {
+            let mut probe = ScriptedProbe(vec![vec![observation(
+                "working",
+                "working",
+                Some(LIVE_WORKING),
+            )]]);
+            let report = pass(&mut probe, &mut notifier, &mut state, at, &options);
+            assert_eq!(report["episodes"][0]["since"], 7260.0, "{report}");
+        }
+        assert!(notifier.sent.is_empty(), "{:?}", notifier.sent);
+        let mut probe = ScriptedProbe(vec![vec![observation(
+            "working",
+            "working",
+            Some(LIVE_WORKING),
+        )]]);
+        let due = pass(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            7260.0 + 1800.0,
+            &options,
+        );
+        assert_eq!(due["episodes"][0]["kind"], "stalled", "{due}");
+        assert_eq!(notifier.sent.len(), 1);
+
+        // Idle with no verdict, timed past its threshold before the view was scrolled: the
+        // scroll drops the unreported episode, so the return starts a fresh idle clock.
+        let mut state = WatchState::default();
+        let mut notifier = RecordingNotifier::default();
+        for (at, screen) in [
+            (0.0, RULED_IDLE),
+            (899.0, scrolled_quiet().as_str()),
+            (960.0, RULED_IDLE),
+            (960.0 + 899.0, RULED_IDLE),
+        ] {
+            let mut probe = ScriptedProbe(vec![vec![observation("quiet", "idle", Some(screen))]]);
+            pass(&mut probe, &mut notifier, &mut state, at, &options);
+        }
+        assert!(notifier.sent.is_empty(), "{:?}", notifier.sent);
+        let mut probe = ScriptedProbe(vec![vec![observation("quiet", "idle", Some(RULED_IDLE))]]);
+        pass(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            960.0 + 900.0,
+            &options,
+        );
+        assert_eq!(notifier.sent.len(), 1);
+    }
+
+    #[test]
+    fn a_reported_episode_is_held_through_a_scroll_and_not_reported_twice() {
+        let options = options();
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        for at in [0.0, 900.0] {
+            let mut probe =
+                ScriptedProbe(vec![vec![observation("quiet", "idle", Some(RULED_IDLE))]]);
+            pass(&mut probe, &mut notifier, &mut state, at, &options);
+        }
+        assert_eq!(notifier.sent.len(), 1);
+        let mut probe = ScriptedProbe(vec![vec![observation(
+            "quiet",
+            "idle",
+            Some(&scrolled_quiet()),
+        )]]);
+        let held = pass(&mut probe, &mut notifier, &mut state, 1000.0, &options);
+        assert_eq!(held["episodes"][0]["kind"], "idle-no-verdict", "{held}");
+        assert_eq!(held["episodes"][0]["reported"], true, "{held}");
+        assert!(
+            held["episodes"][0]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("16 new message(s)")),
+            "{held}"
+        );
+        for at in [1100.0, 5000.0] {
+            let mut probe =
+                ScriptedProbe(vec![vec![observation("quiet", "idle", Some(RULED_IDLE))]]);
+            pass(&mut probe, &mut notifier, &mut state, at, &options);
+        }
+        assert_eq!(notifier.sent.len(), 1, "{:?}", notifier.sent);
     }
 
     #[test]
