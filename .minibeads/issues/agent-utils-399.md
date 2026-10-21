@@ -1,13 +1,14 @@
 ---
 title: 'slack-quiet-cursor: a quiet channel lets the Slack cursor fall out of the event stream''s retention'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - agentctl
 - slack
 created_at: 2026-10-21T01:12:49.900795184+00:00
-updated_at: 2026-10-21T01:12:49.900795184+00:00
+updated_at: 2026-10-21T01:34:56.205169516+00:00
+closed_at: 2026-10-21T01:34:56.205169356+00:00
 ---
 
 # Description
