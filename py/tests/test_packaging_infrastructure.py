@@ -947,9 +947,12 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # object-store detection) are mapped.
     # The retained-handle census case of dev-hermit dh-9qy9v (more files than
     # the former 4,096-file bound still bind their row) is mapped.
-    assert len(all_tests) == 2107
+    # The 3 nested-repository repair cases of 2026-10-20 (an unabsorbed Git
+    # directory moving with a fenced slot, its core.worktree refusal, and a
+    # missing .git) are mapped.
+    assert len(all_tests) == 2110
     assert len(ordinary) == 337
-    assert len(mapped) == 1770
+    assert len(mapped) == 1773
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {

@@ -16497,6 +16497,28 @@ class _GitVcs:
 
     def repair_nested_repository(self, checkout: Path) -> None:
         git_file = checkout / ".git"
+        if git_file.is_dir() and not git_file.is_symlink():
+            # A submodule whose Git directory was never absorbed keeps it inside the
+            # checkout, so moving the slot moves it too and there is no pointer to repair,
+            # unless core.worktree pins the old location.
+            # Read the file alone, from outside any repository: discovery inside the
+            # moved checkout would itself fail on a stale core.worktree.
+            pinned = self._run(
+                Path("/"),
+                ["config", "--file", str(git_file / "config"), "--get", "core.worktree"],
+                check=False,
+            )
+            if pinned.returncode == 0 and pinned.stdout.strip():
+                raise Refusal(
+                    f"nested repository {checkout} sets core.worktree "
+                    f"{pinned.stdout.strip()!r}; refusing to move it"
+                )
+            if pinned.returncode not in (0, 1):
+                raise Refusal(
+                    f"cannot read nested repository configuration {git_file}: "
+                    f"{pinned.stderr.strip() or f'git exit {pinned.returncode}'}"
+                )
+            return
         if git_file.is_symlink() or not git_file.is_file():
             raise Refusal(f"nested repository has no safe .git file: {git_file}")
         try:

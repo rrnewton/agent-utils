@@ -57207,3 +57207,52 @@ def test_audit_blocks_a_slot_holding_a_nested_registered_worktree_as_remove_does
     refused = remove(project)
     assert refused.returncode == 3
     assert ".base-3ed06ee8" in refused.stderr
+
+
+# Repairing nested repositories after a slot directory is fenced (renamed). A
+# submodule whose Git directory was absorbed has a .git file pointing elsewhere,
+# and that pointer must be rewritten when the slot moves. One whose Git directory
+# was never absorbed keeps it inside the checkout, so it moves with the slot and
+# needs nothing, unless core.worktree pins the old location. Removing such a slot
+# used to stop half way, with the slot fenced, on "nested repository has no safe
+# .git file".
+def _unabsorbed_nested_git(cwd: Path, *args: str) -> None:
+    subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True)
+
+
+def _unabsorbed_nested_clone(tmp_path: Path) -> Path:
+    nested = tmp_path / "slot" / "agent-utils"
+    nested.mkdir(parents=True)
+    _unabsorbed_nested_git(nested, "init", "-q")
+    _unabsorbed_nested_git(nested, "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+         "commit", "-q", "--allow-empty", "-m", "first")
+    return nested
+
+
+def test_an_unabsorbed_git_directory_needs_no_repair(tmp_path: Path) -> None:
+    nested = _unabsorbed_nested_clone(tmp_path)
+    moved = tmp_path / "fenced"
+    (tmp_path / "slot").rename(moved)
+
+    wrkslots._GitVcs().repair_nested_repository(moved / "agent-utils")
+
+    assert (moved / "agent-utils" / ".git").is_dir()
+    assert not nested.exists()
+
+
+def test_an_unabsorbed_git_directory_pinned_by_core_worktree_refuses(tmp_path: Path) -> None:
+    nested = _unabsorbed_nested_clone(tmp_path)
+    _unabsorbed_nested_git(nested, "config", "core.worktree", str(nested))
+    moved = tmp_path / "fenced"
+    (tmp_path / "slot").rename(moved)
+
+    with pytest.raises(wrkslots.Refusal, match="sets core.worktree"):
+        wrkslots._GitVcs().repair_nested_repository(moved / "agent-utils")
+
+
+def test_a_missing_git_entry_still_refuses(tmp_path: Path) -> None:
+    plain = tmp_path / "slot" / "agent-utils"
+    plain.mkdir(parents=True)
+
+    with pytest.raises(wrkslots.Refusal, match="no safe .git file"):
+        wrkslots._GitVcs().repair_nested_repository(plain)
