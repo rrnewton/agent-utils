@@ -75964,3 +75964,181 @@ test("`#353 relay-echo-as-owner`: a relayed prompt sent again after a reconnect 
   assert.deepEqual(youRowsSaying(page, "the release is tagged"), [], "a relayed prompt's echo was drawn as the owner's words");
   assert.ok(!storedTexts(page).some((t) => t.startsWith("you: ") && t.includes("the release is tagged")), storedTexts(page).join("\n"));
 });
+
+// --- `#403 composer-key-global` -------------------------------------------------------------------
+//
+// The owner, 2026-10-21, on a desk in two columns: "I was just trying 'Cmd-s' to select the message
+// entry box... it didn't work. E.g. when a message in the right column is highlighted and focus is
+// elsewhere. But if focus was in the left column it worked. It seemed selective. It should be globally
+// applicable." The rule Help states: the box of the column the focus is in; with the focus in neither
+// (the bar, the page itself) the box of the column holding the selection; Main's from the thread cards,
+// which have none. A reply open at the foot of a column is that column's box. The thread list, like
+// Settings and Help, is left first. tests/composer_key_browser.py presses the chord in real Chromium.
+
+/** Ctrl+S, or with `fields` Cmd+S, from `target` (null for the page body): it must be refused to the browser. */
+async function chordFrom(page, target, fields, where) {
+  const event = await press(page, target, "s", fields);
+  assert.equal(event.defaulted, false, `${where}: the chord was left to the browser, whose Save page it is`);
+  assert.equal(page.el("search-field").hidden, true, `${where}: the chord opened the search`);
+  return event;
+}
+
+const CHORDS = [{ ctrlKey: true }, { metaKey: true }];
+const chordName = (fields) => (fields.metaKey ? "Cmd+S" : "Ctrl+S");
+
+test("`#403 composer-key-global`: in two columns, from the right column's THREAD CARDS, Ctrl+S and Cmd+S go to Main's box", async () => {
+  // Before the fix the right column, which has no box on its cards, was asked for its own, and nothing
+  // moved: from a card, a highlighted card, the list, its Unread only, or the body after the cards.
+  const cases = [
+    ["a card", async (page) => cardOf(page, cardIds(page)[0])],
+    ["a highlighted card", async (page) => {
+      await cardOf(page, cardIds(page)[0]).click();
+      await page.settle();
+      assert.deepStrictEqual(litCards(page), [cardIds(page)[0]], "the premise is a highlighted card");
+      return cardOf(page, cardIds(page)[0]);
+    }],
+    ["the right column's list", async (page) => page.el("side-scroll")],
+    ["Unread only", async (page) => page.el("side-unread-only")],
+    ["the page body, the selection on a card", async (page) => {
+      await press(page, page.el("side-scroll"), "ArrowDown");
+      return null;
+    }],
+  ];
+  for (const fields of CHORDS) {
+    for (const [where, from] of cases) {
+      const what = `${chordName(fields)} from ${where}`;
+      const { page } = await twoColumnServer();
+      assert.equal(page.el("side-pane").hidden, true, "the premise is the right column on its cards");
+      await chordFrom(page, await from(page), fields, what);
+      assert.equal(focused(page), page.el("channel-compose-text"), `${what} left the focus on ${focusName(page)}`);
+      assert.ok(inTwoColumns(page), `${what} left two columns`);
+    }
+  }
+});
+
+test("`#403 composer-key-global`: on the THREAD LIST, Ctrl+S and Cmd+S leave it for the view it was chosen from, and its box", async () => {
+  for (const fields of CHORDS) {
+    for (const where of ["a card", "the list", "the page body"]) {
+      const what = `${chordName(fields)} from ${where} on the thread list`;
+      const page = await threadPage();
+      const view = page.el("thread-select").value;
+      await press(page, page.el("scroll-area"), "3", { ctrlKey: true });
+      await page.settle();
+      assert.equal(page.el("thread-select").value, "threads", "the premise is the thread list");
+      const target = where === "a card" ? cardOf(page, cardIds(page)[0]) : where === "the list" ? page.el("side-scroll") : null;
+      await chordFrom(page, target, fields, what);
+      await page.settle();
+      assert.equal(page.el("thread-select").value, view, `${what} did not go back to ${view}`);
+      assert.equal(focused(page), page.el("channel-compose-text"), `${what} left the focus on ${focusName(page)}`);
+    }
+  }
+});
+
+test("`#403 composer-key-global`: with a thread open on the right, the chord goes to the box of the column the focus or the selection is in", async () => {
+  const side = "side-compose-text";
+  const main = "channel-compose-text";
+  const cases = [
+    ["the right column's selected message", side, async (page) => {
+      await press(page, page.el("side-scroll"), "ArrowDown");
+      assert.ok(nodeIn(page.el("side-log"), focused(page)), `the premise is a selected message on the right, not ${focusName(page)}`);
+      return focused(page);
+    }],
+    ["the left column's selected message", main, async (page) => {
+      await press(page, page.el("scroll-area"), "ArrowUp");
+      assert.ok(nodeIn(page.el("discord-log"), focused(page)), `the premise is a selected message on the left, not ${focusName(page)}`);
+      return focused(page);
+    }],
+    ["a message's Reply button on the right", side, async (page) => replyButton(sideRow(page, "202"))],
+    ["a message's Reply button on the left", main, async (page) => replyButton(rowWithId(page, "200"))],
+    ["the right column's X", side, async (page) => page.el("side-close")],
+    ["the page body, the selection on the right", side, async (page) => {
+      await press(page, page.el("side-scroll"), "ArrowDown");
+      return null;
+    }],
+    ["the page body, the selection on the left", main, async (page) => {
+      await press(page, page.el("scroll-area"), "ArrowUp");
+      return null;
+    }],
+    ["the search glass, the selection on the right", side, async (page) => {
+      await press(page, page.el("side-scroll"), "ArrowDown");
+      return page.el("search-toggle");
+    }],
+    ["the search glass, the selection on the left", main, async (page) => {
+      await press(page, page.el("scroll-area"), "ArrowUp");
+      return page.el("search-toggle");
+    }],
+  ];
+  for (const fields of CHORDS) {
+    for (const [where, box, from] of cases) {
+      const what = `${chordName(fields)} from ${where}`;
+      const { page } = await replyColumnsPage();
+      await chordFrom(page, await from(page), fields, what);
+      assert.equal(focused(page), page.el(box), `${what} left the focus on ${focusName(page)}`);
+    }
+  }
+});
+
+test("`#403 composer-key-global`: a reply open at the foot of a column is THAT column's box, not the other's", async () => {
+  // Before the fix the reply took the chord from both columns: a reader in the right column's thread
+  // was sent to the left column's reply.
+  for (const fields of CHORDS) {
+    const { page } = await replyColumnsPage();
+    await replyButton(rowWithId(page, "200")).click();
+    await page.settle();
+    assert.equal(replyBoxAt(page), "left", "the premise is a reply open in the left column");
+    await press(page, page.el("side-scroll"), "ArrowDown");
+    await chordFrom(page, focused(page), fields, `${chordName(fields)} from the right column`);
+    assert.equal(focused(page), page.el("side-compose-text"),
+      `${chordName(fields)} from the right column's thread left the focus on ${focusName(page)}`);
+    await press(page, page.el("scroll-area"), "ArrowUp");
+    await chordFrom(page, focused(page), fields, `${chordName(fields)} from the left column`);
+    assert.equal(focused(page), page.el("reply-text"), `${chordName(fields)} from the left column left the focus on ${focusName(page)}`);
+    await chordFrom(page, null, fields, `${chordName(fields)} from the page body`);
+    assert.equal(focused(page), page.el("reply-text"), `${chordName(fields)} from the body after the left left the focus on ${focusName(page)}`);
+  }
+});
+
+test("`#403 composer-key-global`: the chord is heard before any element's own listener, so one that stops it keeps nothing from the box", async () => {
+  // Before the fix the chord was the document's, and a listener on the card that stopped it left the
+  // reader on the card, the Save page refused but nothing else done.
+  const { page } = await twoColumnServer();
+  const card = cardOf(page, cardIds(page)[0]);
+  card.addEventListener("keydown", (event) => {
+    event.stopPropagation();
+  });
+  await chordFrom(page, card, { ctrlKey: true }, "Ctrl+S on a card whose listener stops the key");
+  assert.equal(focused(page), page.el("channel-compose-text"), `a stopped Ctrl+S left the focus on ${focusName(page)}`);
+  // A held chord: the box once, every repeat refused.
+  const repeat = await chordFrom(page, focused(page), { ctrlKey: true, repeat: true }, "a held Ctrl+S's repeat");
+  assert.equal(repeat.defaulted, false);
+  assert.equal(focused(page), page.el("channel-compose-text"));
+});
+
+test("`#403 composer-key-global` negative control: IN A TEXT FIELD the chord still goes to the message box and never saves the page", async () => {
+  for (const platform of ["Linux x86_64", "MacIntel"]) {
+    for (const fields of CHORDS) {
+      const what = `${chordName(fields)} on ${platform}`;
+      // The search field, the selection on the right: the right column's box; its words kept.
+      const { page } = await twoColumnServer((p) => p.setPlatform(platform));
+      await threadBadge(rowWithId(page, "201")).click();
+      await page.settle();
+      await press(page, page.el("side-scroll"), "ArrowDown");
+      await page.el("search-toggle").click();
+      await page.settle();
+      assert.equal(focused(page), page.el("search-field"), "the premise is the focus in the search field");
+      await page.el("search-field").setValue("engine");
+      let event = await press(page, page.el("search-field"), "s", fields);
+      assert.equal(event.defaulted, false, `${what} in the search field was left to the browser's Save page`);
+      assert.equal(page.el("search-field").value, "engine", `${what} threw the search away`);
+      assert.equal(focused(page), page.el("side-compose-text"), `${what} in the search field left the focus on ${focusName(page)}`);
+      // In each column's box, with a draft: it stays, the draft untouched.
+      for (const box of ["channel-compose-text", "side-compose-text"]) {
+        await page.el(box).setValue("half a thought");
+        event = await press(page, page.el(box), "s", fields);
+        assert.equal(event.defaulted, false, `${what} in #${box} was left to the browser's Save page`);
+        assert.equal(focused(page), page.el(box), `${what} in #${box} moved the focus to ${focusName(page)}`);
+        assert.equal(page.el(box).value, "half a thought", `${what} in #${box} touched the draft`);
+      }
+    }
+  }
+});
