@@ -2,7 +2,10 @@
 //!
 //! A [`FakeTransport`] is a cheap clonable handle on shared state, so a test can give one clone
 //! to the code under test and inspect another. Streams replay scripted tail lines through the
-//! real [`crate::cli::parse_tail_line`] parser; posts and reactions are recorded with the app
+//! real [`crate::cli::parse_tail_line`] and [`crate::cli::classify_tail_stderr`] parsers, and
+//! prove positions with the real [`PositionProof`], in script order: a script models the order
+//! in which the plugin reads the client's two pipes, which need not be the order the client
+//! wrote them in. Posts and reactions are recorded with the app
 //! identity they used; injected failures model Slack errors and uncertain outcomes.
 
 use std::collections::{BTreeMap, VecDeque};
@@ -10,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
-use crate::cli::parse_tail_line;
+use crate::cli::{classify_tail_stderr, parse_tail_line, PositionProof};
 use crate::ids::AppId;
 use crate::transport::{
     EventStream, ListQuery, ListedMessage, PostMessage, SlackTransport, StreamCancel, StreamRecord,
@@ -28,6 +31,9 @@ pub enum FakeStep {
     Close(String),
     /// A line the client wrote to its standard error.
     Stderr(String),
+    /// As a script's first step, the stream fails to open: [`SlackTransport::open_stream`]
+    /// returns this error. Anywhere else it closes the stream.
+    OpenFails(TransportError),
 }
 
 /// One recorded post.
@@ -157,6 +163,8 @@ pub struct FakeStream {
     steps: VecDeque<FakeStep>,
     flag: Arc<(Mutex<bool>, Condvar)>,
     closed: Arc<AtomicBool>,
+    proof: PositionProof,
+    proven: Option<u64>,
 }
 
 impl EventStream for FakeStream {
@@ -168,13 +176,22 @@ impl EventStream for FakeStream {
         if *guard {
             return StreamWait::Cancelled;
         }
+        if let Some(position) = self.proven.take() {
+            return StreamWait::Record(StreamRecord::Position(position));
+        }
         match self.steps.pop_front() {
-            Some(FakeStep::Line(line)) => StreamWait::Record(parse_tail_line(&line)),
+            Some(FakeStep::Line(line)) => {
+                let record = parse_tail_line(&line);
+                self.proven = self.proof.stdout(&record);
+                StreamWait::Record(record)
+            }
             Some(FakeStep::Idle) => StreamWait::Idle,
             Some(FakeStep::Close(reason)) => StreamWait::Closed(reason),
             Some(FakeStep::Stderr(line)) => {
-                StreamWait::Record(StreamRecord::Notice(format!("stream stderr: {line}")))
+                self.proven = self.proof.stderr(&line);
+                StreamWait::Record(classify_tail_stderr(&line))
             }
+            Some(FakeStep::OpenFails(error)) => StreamWait::Closed(error.detail),
             None => {
                 let (guard, _) = changed
                     .wait_timeout_while(guard, wait, |cancelled| !*cancelled)
@@ -208,10 +225,15 @@ impl SlackTransport for FakeTransport {
         let mut state = self.state();
         state.opened.push(spec.clone());
         let steps = state.scripts.pop_front().unwrap_or_default();
+        if let Some(FakeStep::OpenFails(error)) = steps.first() {
+            return Err(error.clone());
+        }
         Ok(Box::new(FakeStream {
             steps: steps.into(),
             flag: Arc::new((Mutex::new(false), Condvar::new())),
             closed: Arc::new(AtomicBool::new(false)),
+            proof: PositionProof::new(spec, None),
+            proven: None,
         }))
     }
 

@@ -287,6 +287,169 @@ pub fn classify_tail_stderr(line: &str) -> StreamRecord {
     }
 }
 
+/// Proves, from one tail's own output, a stream position that is safe to commit.
+///
+/// The tail filters events in the client, so its sequence keeps moving through events the
+/// plugin never sees, and only an event for the channel names a sequence on standard output.
+/// Heartbeats name none. The one other position the client reports is the subscribe response
+/// it writes to standard error once catch-up is done. With `--catchup=<S>` and the explicit
+/// subscription mode (the default), the client:
+///
+/// 1. writes `Catching up from S...`, then reads the stream from `S` inclusive to the head it
+///    reports, every event, filtered or not, writing each matching event to standard output
+///    and flushing it;
+/// 2. writes `Fetched N events` only when that read ends normally; every failure (retention
+///    overflow, throttling, a server error) writes its own message instead;
+/// 3. subscribes from `lastKnownPosition` = the last sequence it read, and writes
+///    `Subscribe response: SubscribeResponse(seqId=A, lastIssuedSeqId=B, ...,
+///    requestedPositionSeqId=C)`, where `C` is the position it asked for and `A` the one
+///    the stream resolved. Delivery resumes after it;
+/// 4. writes a `HEARTBEAT` line to standard output after each later subscription refresh.
+///
+/// So when 1 to 3 appear in order with `A == C`, `C >= S` and `B >= C`, every matching event
+/// at or before `C` was written to standard output before the subscribe response was written.
+/// The plugin reads the two pipes separately, so the response can arrive before those events
+/// do. A heartbeat is the barrier: it is written after the response, so once one has been read
+/// from standard output every event written before the response has been read too. Then `C`
+/// is proven. Only the first subscribe response counts, and any other shape proves nothing.
+/// Neither does a standard output line dropped before the heartbeat, since it may have been one
+/// of those events.
+///
+/// If catch-up read nothing at all, the client subscribes without a position and the response
+/// names the head, which catch-up did not prove. That cannot give `C > S`: catch-up reads from
+/// `S` inclusive, `S` was issued (it came from an event or an earlier proof), and a position
+/// that is no longer retained fails with an overflow instead of printing `Fetched`. So the
+/// first page holds at least `S`, and nothing earlier than any retained event can be missing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PositionProof {
+    stage: ProofStage,
+    candidate: Option<u64>,
+    heartbeat_seen: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProofStage {
+    AwaitCatchup(u64),
+    CatchingUp(u64),
+    Fetched(u64),
+    Done,
+}
+
+impl PositionProof {
+    /// A proof for a stream opened with `spec` in subscription `mode` (`None` is the default,
+    /// explicit). Only a sequence catch-up in explicit mode can prove anything.
+    #[must_use]
+    pub fn new(spec: &SubscribeSpec, mode: Option<&str>) -> Self {
+        let stage = match spec.catchup {
+            Catchup::Sequence(start) if matches!(mode, None | Some("explicit")) => {
+                ProofStage::AwaitCatchup(start)
+            }
+            _ => ProofStage::Done,
+        };
+        Self {
+            stage,
+            candidate: None,
+            heartbeat_seen: false,
+        }
+    }
+
+    /// Observe one standard error line; returns the position it completes a proof of.
+    pub fn stderr(&mut self, line: &str) -> Option<u64> {
+        let line = strip_ansi(line);
+        let line = line.trim();
+        if let Some(response) = line.strip_prefix("Subscribe response:") {
+            if let ProofStage::Fetched(start) = self.stage {
+                self.candidate =
+                    subscribed_position(response).filter(|&position| position >= start);
+            }
+            self.stage = ProofStage::Done;
+        } else if let Some(from) = line
+            .strip_prefix("Catching up from ")
+            .and_then(|rest| rest.strip_suffix("..."))
+        {
+            self.stage = match self.stage {
+                ProofStage::AwaitCatchup(start) if from.parse() == Ok(start) => {
+                    ProofStage::CatchingUp(start)
+                }
+                _ => ProofStage::Done,
+            };
+        } else if line.starts_with("Fetched ") && line.ends_with(" events") {
+            self.stage = match self.stage {
+                ProofStage::CatchingUp(start) => ProofStage::Fetched(start),
+                _ => ProofStage::Done,
+            };
+        }
+        self.ready()
+    }
+
+    /// Observe one standard output record; returns the position it completes a proof of.
+    pub fn stdout(&mut self, record: &StreamRecord) -> Option<u64> {
+        match record {
+            StreamRecord::Heartbeat => self.heartbeat_seen = true,
+            // A line read before the barrier that could have been an event but was dropped
+            // (oversized, not JSON, no sequence) may be a channel message at or before the
+            // position, so the position is no longer proven.
+            StreamRecord::Notice(notice)
+                if !self.heartbeat_seen
+                    && notice != "blank line"
+                    && !notice.starts_with("stream reported ") =>
+            {
+                self.stage = ProofStage::Done;
+                self.candidate = None;
+            }
+            _ => {}
+        }
+        self.ready()
+    }
+
+    fn ready(&mut self) -> Option<u64> {
+        if self.heartbeat_seen {
+            self.candidate.take()
+        } else {
+            None
+        }
+    }
+}
+
+/// `C` from `SubscribeResponse(seqId=A, lastIssuedSeqId=B, ..., requestedPositionSeqId=C)`,
+/// only when `A == C <= B`.
+fn subscribed_position(response: &str) -> Option<u64> {
+    let fields = response
+        .trim()
+        .strip_prefix("SubscribeResponse(")?
+        .strip_suffix(')')?;
+    let field = |name: &str| -> Option<u64> {
+        let mut values = fields
+            .split(',')
+            .filter_map(|field| field.trim().strip_prefix(name)?.strip_prefix('='));
+        let value = values.next()?.parse().ok()?;
+        values.next().is_none().then_some(value)
+    };
+    let resolved = field("seqId")?;
+    let requested = field("requestedPositionSeqId")?;
+    let head = field("lastIssuedSeqId")?;
+    (resolved == requested && requested <= head).then_some(requested)
+}
+
+/// Remove terminal colour sequences (`ESC [ ... m`), which the client writes to standard error
+/// even with `--no-color`.
+fn strip_ansi(line: &str) -> String {
+    let mut plain = String::with_capacity(line.len());
+    let mut characters = line.chars();
+    while let Some(character) = characters.next() {
+        if character == '\u{1b}' {
+            for skipped in characters.by_ref() {
+                if skipped.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            plain.push(character);
+        }
+    }
+    plain
+}
+
 /// Read one line of at most `limit` bytes; longer lines are consumed and reported as truncated.
 ///
 /// Returns `Ok(None)` at end of input, otherwise whether the line was truncated.
@@ -331,6 +494,7 @@ pub fn read_bounded_line(
 
 enum Pumped {
     Record(StreamRecord),
+    Stderr(String),
     Closed(String),
     Cancelled,
 }
@@ -350,6 +514,8 @@ pub struct CliStream {
     receiver: Receiver<Pumped>,
     sender: Sender<Pumped>,
     cancelled: bool,
+    proof: PositionProof,
+    proven: Option<u64>,
 }
 
 impl EventStream for CliStream {
@@ -357,8 +523,18 @@ impl EventStream for CliStream {
         if self.cancelled {
             return StreamWait::Cancelled;
         }
+        if let Some(position) = self.proven.take() {
+            return StreamWait::Record(StreamRecord::Position(position));
+        }
         match self.receiver.recv_timeout(wait) {
-            Ok(Pumped::Record(record)) => StreamWait::Record(record),
+            Ok(Pumped::Record(record)) => {
+                self.proven = self.proof.stdout(&record);
+                StreamWait::Record(record)
+            }
+            Ok(Pumped::Stderr(line)) => {
+                self.proven = self.proof.stderr(&line);
+                StreamWait::Record(classify_tail_stderr(&line))
+            }
             Ok(Pumped::Closed(reason)) => StreamWait::Closed(reason),
             Ok(Pumped::Cancelled) => {
                 self.cancelled = true;
@@ -538,8 +714,8 @@ fn pump_stderr(stderr: impl Read + Send + 'static, sender: Sender<Pumped>) {
         let mut reader = BufReader::new(stderr);
         let mut line = Vec::new();
         while let Ok(Some(_)) = read_bounded_line(&mut reader, &mut line, 4_096) {
-            let record = classify_tail_stderr(&String::from_utf8_lossy(&line));
-            if sender.send(Pumped::Record(record)).is_err() {
+            let line = String::from_utf8_lossy(&line).into_owned();
+            if sender.send(Pumped::Stderr(line)).is_err() {
                 return;
             }
         }
@@ -982,6 +1158,8 @@ impl SlackTransport for CliTransport {
             receiver,
             sender,
             cancelled: false,
+            proof: PositionProof::new(spec, self.options.tail.mode.as_deref()),
+            proven: None,
         }))
     }
 
@@ -1269,6 +1447,130 @@ mod tests {
             classify_tail_stderr("queue overflow: the requested position is too far behind"),
             StreamRecord::Gap(_)
         ));
+    }
+
+    fn sequence_spec(start: u64) -> SubscribeSpec {
+        SubscribeSpec {
+            channel_ids: vec!["C0C91RW5FAR".to_owned()],
+            catchup: Catchup::Sequence(start),
+        }
+    }
+
+    // The client's standard error around a catch-up, as captured from a live tail (colour codes
+    // included), with its position values as parameters.
+    fn catchup_stderr(start: u64, response: &str) -> Vec<String> {
+        vec![
+            "\u{1b}[2mUsing port: 46507\u{1b}[0m".to_owned(),
+            format!("Catching up from {start}..."),
+            "Fetched 0 events".to_owned(),
+            "Catch-up complete (0 events). Switching to live streaming...".to_owned(),
+            "\u{1b}[33mSubscribing to agent events for user 1 (mode: explicit)...\u{1b}[0m"
+                .to_owned(),
+            format!("\u{1b}[2mSubscribe response: {response}\u{1b}[0m"),
+            "\u{1b}[32mTailing events (Ctrl+C to stop)...\u{1b}[0m".to_owned(),
+        ]
+    }
+
+    const RESPONSE: &str = "SubscribeResponse(seqId=225029, lastIssuedSeqId=225029, \
+        syncId=1009015592, requestedPositionSeqId=225029)";
+
+    fn prove(proof: &mut PositionProof, stderr: &[String]) -> Option<u64> {
+        let mut proven = None;
+        for line in stderr {
+            proven = proven.or(proof.stderr(line));
+        }
+        proven.or_else(|| proof.stdout(&StreamRecord::Heartbeat))
+    }
+
+    #[test]
+    fn a_completed_catchup_proves_its_subscribe_position_after_a_heartbeat() {
+        let mut proof = PositionProof::new(&sequence_spec(223_201), None);
+        for line in catchup_stderr(223_201, RESPONSE) {
+            assert_eq!(proof.stderr(&line), None, "no heartbeat yet: {line}");
+        }
+        // An event is not the barrier; only a heartbeat is written strictly after the response.
+        assert_eq!(proof.stdout(&parse_tail_line(r#"{"type":"STALL"}"#)), None);
+        assert_eq!(proof.stdout(&StreamRecord::Heartbeat), Some(225_029));
+        // A position is proven once per stream.
+        assert_eq!(proof.stdout(&StreamRecord::Heartbeat), None);
+    }
+
+    #[test]
+    fn a_heartbeat_read_before_the_response_is_still_the_barrier() {
+        let mut proof = PositionProof::new(&sequence_spec(223_201), Some("explicit"));
+        assert_eq!(proof.stdout(&StreamRecord::Heartbeat), None);
+        let stderr = catchup_stderr(223_201, RESPONSE);
+        let proven: Vec<_> = stderr
+            .iter()
+            .filter_map(|line| proof.stderr(line))
+            .collect();
+        assert_eq!(proven, [225_029]);
+    }
+
+    #[test]
+    fn nothing_unproven_becomes_a_position() {
+        let ok = catchup_stderr(100, RESPONSE);
+        // Not a sequence catch-up, or not the explicit mode.
+        for (spec, mode) in [
+            (
+                SubscribeSpec {
+                    catchup: Catchup::SinceSeconds(60),
+                    ..sequence_spec(100)
+                },
+                None,
+            ),
+            (
+                SubscribeSpec {
+                    catchup: Catchup::None,
+                    ..sequence_spec(100)
+                },
+                None,
+            ),
+            (sequence_spec(100), Some("override")),
+        ] {
+            assert_eq!(prove(&mut PositionProof::new(&spec, mode), &ok), None);
+        }
+        // The catch-up started elsewhere, failed (no "Fetched"), or came after the response.
+        let mut other_start = ok.clone();
+        other_start[1] = "Catching up from 99...".to_owned();
+        let mut overflow = ok.clone();
+        overflow[2] =
+            "queue overflow: the requested position is too far behind the current head".to_owned();
+        let mut late = ok.clone();
+        late.swap(1, 5);
+        late.swap(2, 5);
+        for stderr in [other_start, overflow, late] {
+            assert_eq!(
+                prove(&mut PositionProof::new(&sequence_spec(100), None), &stderr),
+                None,
+                "{stderr:?}"
+            );
+        }
+        // Responses that do not resume where catch-up ended.
+        for response in [
+            "SubscribeResponse(seqId=225030, lastIssuedSeqId=225030, syncId=1, requestedPositionSeqId=225029)",
+            "SubscribeResponse(seqId=225029, lastIssuedSeqId=225028, syncId=1, requestedPositionSeqId=225029)",
+            "SubscribeResponse(seqId=99, lastIssuedSeqId=225029, syncId=1, requestedPositionSeqId=99)",
+            "SubscribeResponse(seqId=225029, lastIssuedSeqId=225029, syncId=1)",
+            "SubscribeResponse(seqId=None, lastIssuedSeqId=225029, syncId=1, requestedPositionSeqId=None)",
+            "SubscribeResponse(seqId=1, seqId=225029, lastIssuedSeqId=225029, requestedPositionSeqId=225029)",
+            "subscribed",
+        ] {
+            let stderr = catchup_stderr(100, response);
+            assert_eq!(
+                prove(&mut PositionProof::new(&sequence_spec(100), None), &stderr),
+                None,
+                "{response}"
+            );
+        }
+        // Only the first response counts.
+        let mut proof = PositionProof::new(&sequence_spec(100), None);
+        let mut twice = catchup_stderr(
+            100,
+            "SubscribeResponse(seqId=1, lastIssuedSeqId=1, syncId=1, requestedPositionSeqId=1)",
+        );
+        twice.push(format!("Subscribe response: {RESPONSE}"));
+        assert_eq!(prove(&mut proof, &twice), None);
     }
 
     #[test]

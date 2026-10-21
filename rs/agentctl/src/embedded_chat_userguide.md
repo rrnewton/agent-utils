@@ -2038,6 +2038,28 @@ record, or a saved position the stream can no longer replay, is reported as a
 `Gap`, which stops `run` for operator review as described above. The tail
 exiting is a retryable failure, and the host reconnects from the saved cursor.
 
+Quiet channels. The stream keeps events for about eight hours, and its sequence
+counts every event the client receives, while the client passes on only this
+channel's messages. So the cursor also moves to a position the tail proves: when
+a tail started with `--catchup=<n>` (in the default explicit mode) prints
+`Catching up from <n>...`, then `Fetched ... events`, then a subscribe response
+whose `seqId` and `requestedPositionSeqId` are equal, not below `n` and not past
+`lastIssuedSeqId`, every channel event at or before that position was already
+printed. The plugin commits a checkpoint there once it has also read a
+`HEARTBEAT` line, which the client writes only after that response, so no event
+still in transit on the other pipe can be skipped. Any other output proves
+nothing and moves nothing. A tail proves a position only once, after its
+catch-up, so when the cursor has not moved for `cursor_refresh_seconds` the
+plugin reopens the tail from its committed sequence; the new tail replays
+everything after it and proves the head. A `slack1:since:` cursor is never moved
+this way, and a tail in the `override` subscription mode is never reopened. If a
+reopened tail goes a whole `cursor_refresh_seconds` without proving a position,
+the plugin stops reopening until it is restarted (reopening again would only
+restart catch-up from the same, older sequence). Should a channel event ever
+arrive at or before a proven position without having been delivered, the plugin
+reports a `Gap` instead of skipping it. The diagnostics log records each `cursor
+refresh` and each proven `position`.
+
 Reaction names. Slack names reactions by shortcode. The helper maps the
 bridge's default reactions through the Slack names defined with them, 👀 to
 `eyes`, ✅ to `white_check_mark` and ❌ to `x`, and a few other common emoji such as 🤖 to
@@ -2129,6 +2151,7 @@ Unknown keys are refused.
 | `device_id`, `caller`, `subscriber_app_id`, `subscription_mode` | unset | Passed to the tail as `--device-id`, `--caller`, `--app-id`, `--mode`. |
 | `tail_heartbeat_seconds`, `tail_stall_timeout_seconds` | unset | Passed as `--heartbeat-interval` and `--stall-timeout`. |
 | `heartbeat_interval_seconds` | 30 | Idle heartbeat period towards the host. |
+| `cursor_refresh_seconds` | 7200 | Reopen the tail when the sequence cursor has not moved for this long, so a quiet channel's cursor stays inside the stream's retention (see "Cursor and recovery"). 600–21600, or 0 to never reopen. |
 | `initial_backfill_seconds` | 0 | A new state directory also delivers messages this many seconds old. |
 | `ignore_text_prefixes` | `[]` | Messages starting with one of these are never delivered. |
 | `diagnostics_log` | stderr | Private diagnostics file (identifiers and codes only, never message text). |

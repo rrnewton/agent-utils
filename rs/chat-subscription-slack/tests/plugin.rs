@@ -694,3 +694,417 @@ fn a_stream_that_carries_events_is_never_noted_as_silent() {
     std::fs::remove_dir_all(&directory).unwrap();
     assert!(!text.contains("no event has arrived"), "{text}");
 }
+
+// #399 slack-quiet-cursor: the tail filters events in the client, so in a quiet channel the
+// stream's sequence moved on for hours while the cursor stood still, and a restart after more
+// than the stream's retention found a gap. These scripts use the client's own standard error.
+
+fn heartbeat_line() -> FakeStep {
+    FakeStep::Line(r#"{"type":"HEARTBEAT","ts":1.0}"#.to_owned())
+}
+
+fn catchup_from(start: u64) -> Vec<FakeStep> {
+    vec![
+        FakeStep::Stderr(format!("Catching up from {start}...")),
+        FakeStep::Stderr("Fetched 0 events".to_owned()),
+        FakeStep::Stderr("Catch-up complete (0 events). Switching to live streaming...".to_owned()),
+    ]
+}
+
+fn subscribed_at(position: u64) -> FakeStep {
+    FakeStep::Stderr(format!(
+        "\u{1b}[2mSubscribe response: SubscribeResponse(seqId={position}, \
+         lastIssuedSeqId={position}, syncId=702801000, requestedPositionSeqId={position})\u{1b}[0m"
+    ))
+}
+
+fn checkpoint_at(batch: &DeliveryBatch, cursor: &str) {
+    assert_eq!(batch.cursor().as_str(), cursor);
+    assert_eq!(batch.events(), [CommittableEvent::Checkpoint]);
+}
+
+#[test]
+fn a_quiet_channel_moves_the_cursor_to_the_proven_stream_position() {
+    let fake = FakeTransport::new();
+    let mut script = catchup_from(223_201);
+    script.extend([subscribed_at(225_029), heartbeat_line()]);
+    fake.push_script(script);
+    let mut backend = make_backend(&fake);
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &request(Some("slack1:seq:223201"), json!({})))
+            .unwrap();
+    checkpoint_at(&commit_next(&mut subscription), "slack1:seq:225029");
+    assert_eq!(fake.state().opened[0].catchup, Catchup::Sequence(223_201));
+    subscription.close().unwrap();
+
+    // A restart resumes from the new position: inside the retention, so no gap.
+    fake.push_script(vec![owner_message(
+        225_030,
+        "1792000830.000100",
+        None,
+        "after the quiet spell",
+    )]);
+    let mut backend = make_backend(&fake);
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &request(Some("slack1:seq:225029"), json!({})))
+            .unwrap();
+    let batch = commit_next(&mut subscription);
+    assert_eq!(batch.cursor().as_str(), "slack1:seq:225030");
+    assert_eq!(single_message(&batch).text(), "after the quiet spell");
+    assert_eq!(fake.state().opened[1].catchup, Catchup::Sequence(225_029));
+    subscription.close().unwrap();
+}
+
+#[test]
+fn an_event_racing_the_proof_is_delivered_and_never_skipped() {
+    let fake = FakeTransport::new();
+    // The plugin reads the client's two pipes separately: here the subscribe response is read
+    // before the catch-up event the client had already written to its standard output.
+    let mut script = catchup_from(100);
+    script.extend([
+        subscribed_at(150),
+        owner_message(100, "1792000801.000100", None, "already admitted"),
+        owner_message(120, "1792000802.000100", None, "caught up"),
+        heartbeat_line(),
+        owner_message(151, "1792000803.000100", None, "live"),
+    ]);
+    fake.push_script(script);
+    let mut backend = make_backend(&fake);
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &request(Some("slack1:seq:100"), json!({}))).unwrap();
+    let caught_up = commit_next(&mut subscription);
+    assert_eq!(caught_up.cursor().as_str(), "slack1:seq:120");
+    assert_eq!(single_message(&caught_up).text(), "caught up");
+    checkpoint_at(&commit_next(&mut subscription), "slack1:seq:150");
+    let live = commit_next(&mut subscription);
+    assert_eq!(live.cursor().as_str(), "slack1:seq:151");
+    assert_eq!(single_message(&live).text(), "live");
+    subscription.close().unwrap();
+}
+
+#[test]
+fn a_proof_behind_a_delivered_event_does_not_move_the_cursor_back() {
+    let fake = FakeTransport::new();
+    // The heartbeat was read first, and a live event overtook the subscribe response.
+    let mut script = vec![heartbeat_line()];
+    script.extend(catchup_from(100));
+    script.extend([
+        owner_message(160, "1792000804.000100", None, "live first"),
+        subscribed_at(150),
+        owner_message(161, "1792000805.000100", None, "next"),
+    ]);
+    fake.push_script(script);
+    let mut backend = make_backend(&fake);
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &request(Some("slack1:seq:100"), json!({}))).unwrap();
+    assert_eq!(
+        commit_next(&mut subscription).cursor().as_str(),
+        "slack1:seq:160"
+    );
+    assert_eq!(
+        commit_next(&mut subscription).cursor().as_str(),
+        "slack1:seq:161"
+    );
+    subscription.close().unwrap();
+}
+
+#[test]
+fn an_unproven_subscribe_position_commits_nothing() {
+    let fake = FakeTransport::new();
+    // Catch-up ended in an error (no "Fetched" line), so the response proves nothing.
+    fake.push_script(vec![
+        FakeStep::Stderr("Catching up from 100...".to_owned()),
+        FakeStep::Stderr("Fetch error (ServerError): unavailable.".to_owned()),
+        subscribed_at(150),
+        heartbeat_line(),
+        owner_message(151, "1792000803.000100", None, "live"),
+    ]);
+    let mut backend = make_backend(&fake);
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &request(Some("slack1:seq:100"), json!({}))).unwrap();
+    assert_eq!(
+        commit_next(&mut subscription).cursor().as_str(),
+        "slack1:seq:151"
+    );
+    subscription.close().unwrap();
+}
+
+static REFRESH_CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(NOW_MILLIS);
+
+fn refresh_clock() -> u64 {
+    REFRESH_CLOCK.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[test]
+fn a_cursor_that_stays_still_reopens_the_stream_and_is_refreshed() {
+    let fake = FakeTransport::new();
+    // The first stream proves nothing (its tail started without these lines).
+    fake.push_script(vec![FakeStep::Idle, FakeStep::Idle]);
+    // The reopened stream replays everything after the committed sequence, then proves the head.
+    let mut second = catchup_from(500);
+    second.extend([
+        owner_message(500, "1792000801.000100", None, "already admitted"),
+        owner_message(600, "1792000806.000100", None, "arrived during the reopen"),
+        subscribed_at(900),
+        heartbeat_line(),
+    ]);
+    fake.push_script(second);
+    let mut backend = SlackBackend::new(Box::new({
+        let fake = fake.clone();
+        move |_config| Ok(Box::new(fake.clone()) as Box<dyn SlackTransport>)
+    }))
+    .with_clock(refresh_clock);
+    let mut subscription = ChatSubscription::open(
+        &mut backend,
+        &request(
+            Some("slack1:seq:500"),
+            json!({"cursor_refresh_seconds": 600}),
+        ),
+    )
+    .unwrap();
+    let heartbeat = |subscription: &mut ChatSubscription| {
+        assert!(matches!(
+            subscription.next_item().expect("item"),
+            Some(SubscriptionItem::Heartbeat(_))
+        ));
+    };
+    heartbeat(&mut subscription);
+    assert_eq!(fake.state().opened.len(), 1);
+    REFRESH_CLOCK.store(
+        NOW_MILLIS + 600 * 1_000,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    heartbeat(&mut subscription);
+    assert_eq!(fake.state().opened.len(), 2);
+    assert_eq!(fake.state().opened[1].catchup, Catchup::Sequence(500));
+    let replayed = commit_next(&mut subscription);
+    assert_eq!(replayed.cursor().as_str(), "slack1:seq:600");
+    assert_eq!(
+        single_message(&replayed).text(),
+        "arrived during the reopen"
+    );
+    checkpoint_at(&commit_next(&mut subscription), "slack1:seq:900");
+    subscription.close().unwrap();
+}
+
+static SINCE_CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(NOW_MILLIS);
+
+fn since_clock() -> u64 {
+    SINCE_CLOCK.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[test]
+fn a_time_cursor_is_not_refreshed_and_a_failed_reopen_is_retryable() {
+    let fake = FakeTransport::new();
+    fake.push_script(vec![FakeStep::Idle, FakeStep::Idle]);
+    let mut backend = SlackBackend::new(Box::new({
+        let fake = fake.clone();
+        move |_config| Ok(Box::new(fake.clone()) as Box<dyn SlackTransport>)
+    }))
+    .with_clock(since_clock);
+    let mut subscription = ChatSubscription::open(
+        &mut backend,
+        &request(None, json!({"cursor_refresh_seconds": 600})),
+    )
+    .unwrap();
+    commit_next(&mut subscription);
+    SINCE_CLOCK.store(
+        NOW_MILLIS + 24 * 60 * 60 * 1_000,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    assert!(matches!(
+        subscription.next_item().expect("item"),
+        Some(SubscriptionItem::Heartbeat(_))
+    ));
+    assert_eq!(fake.state().opened.len(), 1);
+    subscription.close().unwrap();
+
+    // A sequence cursor whose reopen fails reports a retryable failure; the host reconnects
+    // from the saved cursor.
+    fake.push_script(vec![FakeStep::Idle]);
+    fake.push_script(vec![FakeStep::OpenFails(
+        chat_subscription_slack::transport::TransportError::not_applied(
+            "client_unavailable",
+            "the Slack client could not be started",
+            true,
+        ),
+    )]);
+    let mut backend = SlackBackend::new(Box::new({
+        let fake = fake.clone();
+        move |_config| Ok(Box::new(fake.clone()) as Box<dyn SlackTransport>)
+    }))
+    .with_clock(since_clock);
+    let mut subscription = ChatSubscription::open(
+        &mut backend,
+        &request(Some("slack1:seq:7"), json!({"cursor_refresh_seconds": 600})),
+    )
+    .unwrap();
+    SINCE_CLOCK.store(
+        NOW_MILLIS + 25 * 60 * 60 * 1_000,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    let error = subscription.next_item().expect_err("reopen fails");
+    assert!(error.to_string().contains("client_unavailable"), "{error}");
+    assert_eq!(fake.state().opened.len(), 3);
+}
+
+#[test]
+fn cursor_refresh_seconds_is_validated() {
+    let fake = FakeTransport::new();
+    for value in [json!(1), json!(599), json!(21_601), json!("600")] {
+        let mut backend = make_backend(&fake);
+        assert!(
+            ChatSubscription::open(
+                &mut backend,
+                &request(None, json!({"cursor_refresh_seconds": value})),
+            )
+            .is_err(),
+            "{value}"
+        );
+    }
+    for value in [0, 600, 21_600] {
+        fake.push_script(vec![]);
+        let mut backend = make_backend(&fake);
+        ChatSubscription::open(
+            &mut backend,
+            &request(None, json!({"cursor_refresh_seconds": value})),
+        )
+        .unwrap()
+        .close()
+        .unwrap();
+    }
+}
+
+static STOP_CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(NOW_MILLIS);
+
+fn stop_clock() -> u64 {
+    STOP_CLOCK.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[test]
+fn a_reopen_that_proves_nothing_stops_further_reopens() {
+    // Without this, each reopen would restart catch-up from the same sequence, older every
+    // time, until the client reported it beyond the retention and the bridge stopped.
+    let fake = FakeTransport::new();
+    fake.push_script(vec![FakeStep::Idle]);
+    // The reopened tail's catch-up fails, so it proves nothing.
+    fake.push_script(vec![
+        FakeStep::Stderr("Catching up from 500...".to_owned()),
+        FakeStep::Stderr("Fetch throttled after 5 retries.".to_owned()),
+        subscribed_at(900),
+        heartbeat_line(),
+        FakeStep::Idle,
+        FakeStep::Idle,
+    ]);
+    let mut backend = SlackBackend::new(Box::new({
+        let fake = fake.clone();
+        move |_config| Ok(Box::new(fake.clone()) as Box<dyn SlackTransport>)
+    }))
+    .with_clock(stop_clock);
+    let mut subscription = ChatSubscription::open(
+        &mut backend,
+        &request(
+            Some("slack1:seq:500"),
+            json!({"cursor_refresh_seconds": 600}),
+        ),
+    )
+    .unwrap();
+    let mut heartbeat_at = |seconds: u64| {
+        STOP_CLOCK.store(
+            NOW_MILLIS + seconds * 1_000,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        assert!(matches!(
+            subscription.next_item().expect("item"),
+            Some(SubscriptionItem::Heartbeat(_))
+        ));
+        fake.state().opened.len()
+    };
+    assert_eq!(heartbeat_at(600), 2);
+    // The reopened stream gets one full interval to prove a position, then reopening stops.
+    assert_eq!(heartbeat_at(900), 2);
+    assert_eq!(heartbeat_at(1_200), 2);
+    assert_eq!(heartbeat_at(10_000), 2);
+}
+
+static OVERRIDE_CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(NOW_MILLIS);
+
+fn override_clock() -> u64 {
+    OVERRIDE_CLOCK.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[test]
+fn the_override_mode_never_reopens() {
+    let fake = FakeTransport::new();
+    fake.push_script(vec![FakeStep::Idle]);
+    let mut backend = SlackBackend::new(Box::new({
+        let fake = fake.clone();
+        move |_config| Ok(Box::new(fake.clone()) as Box<dyn SlackTransport>)
+    }))
+    .with_clock(override_clock);
+    let mut subscription = ChatSubscription::open(
+        &mut backend,
+        &request(
+            Some("slack1:seq:500"),
+            json!({"cursor_refresh_seconds": 600, "subscription_mode": "override"}),
+        ),
+    )
+    .unwrap();
+    OVERRIDE_CLOCK.store(
+        NOW_MILLIS + 24 * 60 * 60 * 1_000,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    assert!(matches!(
+        subscription.next_item().expect("item"),
+        Some(SubscriptionItem::Heartbeat(_))
+    ));
+    assert_eq!(fake.state().opened.len(), 1);
+}
+
+#[test]
+fn an_event_behind_a_proven_position_is_a_gap_not_a_skip() {
+    // Should a proof ever be wrong, a channel event at or before it arrives later; it is
+    // reported rather than silently dropped as a replay.
+    let fake = FakeTransport::new();
+    let mut script = catchup_from(100);
+    script.extend([
+        subscribed_at(150),
+        heartbeat_line(),
+        // A replay of an event already read is not new, and is skipped as before.
+        owner_message(100, "1792000801.000100", None, "already admitted"),
+        owner_message(120, "1792000802.000100", None, "behind the proof"),
+    ]);
+    fake.push_script(script);
+    let mut backend = make_backend(&fake);
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &request(Some("slack1:seq:100"), json!({}))).unwrap();
+    checkpoint_at(&commit_next(&mut subscription), "slack1:seq:150");
+    let gap = next_batch(&mut subscription);
+    assert_eq!(gap.cursor().as_str(), "slack1:seq:150");
+    match gap.events() {
+        [CommittableEvent::Gap(gap)] => {
+            assert!(gap.reason().unwrap().contains("event 120"), "{gap:?}");
+        }
+        other => panic!("expected a gap, found {other:?}"),
+    }
+}
+
+#[test]
+fn a_dropped_line_before_the_barrier_cancels_the_proof() {
+    let fake = FakeTransport::new();
+    let mut script = catchup_from(100);
+    script.extend([
+        FakeStep::Line("{truncated".to_owned()),
+        subscribed_at(150),
+        heartbeat_line(),
+        owner_message(151, "1792000803.000100", None, "live"),
+    ]);
+    fake.push_script(script);
+    let mut backend = make_backend(&fake);
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &request(Some("slack1:seq:100"), json!({}))).unwrap();
+    assert_eq!(
+        commit_next(&mut subscription).cursor().as_str(),
+        "slack1:seq:151"
+    );
+}
