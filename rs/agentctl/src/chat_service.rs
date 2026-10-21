@@ -16571,7 +16571,10 @@ sends that reply once the pane shows it"
         let typed = reminders_typed(&fixture);
         assert_eq!(typed.len(), 1, "{typed:#?}");
         assert!(typed[0].contains("reply ID 002"), "{}", typed[0]);
-        assert!(!typed[0].contains("001"), "{}", typed[0]);
+        // Named by its reply ID and key: a bare "001" can occur in the bridge-state path, which
+        // carries the test's process ID.
+        assert!(!typed[0].contains("reply ID 001"), "{}", typed[0]);
+        assert!(!typed[0].contains(&key), "{}", typed[0]);
         assert!(
             typed[0].contains(" chat sent --bridge-state "),
             "{}",
