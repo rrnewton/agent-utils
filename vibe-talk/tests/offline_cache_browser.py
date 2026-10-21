@@ -167,13 +167,13 @@ taken first.
 First of all, the dock (`#218 desktop-dock`), in the dark theme, at a 1280x800 desk, a 1600x1000 one
 and the two phones, on the call view — idle, live, and after a call with its note under Talk — and on
 the channel, under a thirty-character name, with a thread open beside it, and under a short name. On a
-desk every control in it is 32 to 40px tall and at least 32px wide, inside the list's column, and
-overlapping no other; the dock is one row (at most 56px) where everything fits — the idle call, the
-short name, and the long name once the column is dragged wide — and at most 100px where it does not,
-the reading buttons then under the switch at the right of the second row; the pane reads Sound, Clear,
-Hang up, Talk and Hide read, Pace, Read, left to right; the channel's picker is as wide as its name,
-with a thread open too, and only in the narrowest column is it cut, ending in an ellipsis, with the
-view picker at its floor and nothing scrolled out of the pack; and a Tab walk from the gear visits the
+desk every control in it is 32 to 40px tall and at least 32px wide, inside the window less the dock's
+inset, and overlapping no other; the dock is one row (at most 56px) in every state but the one after a
+call, whose Talk carries a note — the long name with the reading buttons beside it, and since `#406
+command-bar-one-row` across the window, so the reading column dragged wide or narrow leaves it as it
+was; the pane reads Sound, Clear, Hang up, Talk and Hide read, Pace, Read, left to right; the
+channel's picker is as wide as its name, with a thread open too, and nothing is scrolled out of the
+pack; and a Tab walk from the gear visits the
 controls in the order they are seen, each with a ring nothing clips. On a phone the dock is the one it
 was before: 149px, its bar and its tile of large buttons at their old heights and widths.
 
@@ -2047,10 +2047,10 @@ DOCK_SIZES = (("desktop", 1280, 800, False), ("desktop-1600", 1600, 1000, False)
 # A channel whose name is thirty characters, the length the owner's picker cut off at nine rem.
 LONG_CHANNEL = {"id": "1110000000000000002", "label": "overnight release coordination", "writable": True,
                 "alias": None, "added": False}
-# The tallest the desktop dock may stand: two rows of 36px controls with their gap and padding when
-# a long name and the three reading buttons do not share the column's one row, and one row when they
-# do. It stood 149px before, with a channel name cut short in it. The second is the post-call state,
-# whose Talk carries a one-clause note under its word.
+# The tallest the desktop dock may stand: it stood 149px before `#218 desktop-dock`, with a channel
+# name cut short in it, and two 36px rows when a long name and the reading buttons did not share the
+# column; one row since `#406 command-bar-one-row`. The third is the post-call state, whose Talk
+# carries a one-clause note under its word.
 DOCK_DESK_MAX_PX = 100
 DOCK_ONE_ROW_MAX_PX = 56
 DOCK_NOTE_MAX_PX = 120
@@ -2175,15 +2175,12 @@ DOCK_JS = """({desk, order}) => {
                 if (w > 0.5 && h > 0.5) problems.push(`#${boxes[i].id} and #${boxes[j].id} overlap`);
             }
         }
-        const list = ['pane-discord', 'pane-voice'].map((id) => document.getElementById(id)).find(shown);
-        const column = list ? box(list) : {left: inner.left, right: inner.right};
         const note = document.getElementById('talk-note');
         for (const {id, r} of boxes) {
             const tall = id === 'talk' && shown(note) ? 64 : DESK[1];
             if (r.height < DESK[0] - 0.5 || r.height > tall + 0.5) problems.push(`#${id} is ${r.height.toFixed(1)}px tall`);
             if (r.width < DESK[0] - 0.5) problems.push(`#${id} is ${r.width.toFixed(1)}px wide`);
-            if (r.left < inner.left - 0.5 || r.right > inner.right + 0.5) problems.push(`#${id} runs out of the dock's column`);
-            if (r.left < column.left - 1 || r.right > column.right + 1) problems.push(`#${id} is outside the list's column`);
+            if (r.left < inner.left - 0.5 || r.right > inner.right + 0.5) problems.push(`#${id} runs out of the dock`);
             if (r.top < d.top || r.bottom > d.bottom + 0.5) problems.push(`#${id} hangs out of the dock`);
             // The word level with its icon, as a desktop control's is: all but Talk over its note.
             const el = document.getElementById(id);
@@ -2195,12 +2192,12 @@ DOCK_JS = """({desk, order}) => {
                 if (Math.abs(off) > 0.5) problems.push(`#${id}'s word stands ${off.toFixed(1)}px off its icon's middle`);
             }
         }
-        // The switch's one place: the column's lower right corner, at the end of the dock's last row,
+        // The switch's one place: the dock's lower right corner, at the end of its row,
         // with nothing to the right of it and nothing below it.
         const flick = boxes.find(({id}) => id === 'view-switch');
         if (flick) {
             const s = flick.r;
-            if (Math.abs(s.right - inner.right) > 0.5) problems.push(`the switch ends ${(inner.right - s.right).toFixed(1)}px short of the column's right edge`);
+            if (Math.abs(s.right - inner.right) > 0.5) problems.push(`the switch ends ${(inner.right - s.right).toFixed(1)}px short of the dock's right edge`);
             if (Math.abs(s.bottom - (d.bottom - parseFloat(ds.paddingBottom))) > 0.5) problems.push(`the switch is not at the foot of the dock`);
             if (boxes.some(({id, r}) => id !== 'view-switch' && (r.top + r.bottom) / 2 > (s.top + s.bottom) / 2 + 4)) problems.push('a control sits below the switch');
             if (boxes.some(({id, r}) => id !== 'view-switch' && r.right > s.left + 0.5 && r.bottom > s.top + 0.5)) problems.push('a control sits right of the switch on its row');
@@ -3280,8 +3277,8 @@ class DockApi(FakeApi):
 def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int,
               mobile: bool) -> str:
     """`#218 desktop-dock`: the dock on the call view and the channel, in the dark theme the owner
-    reads in. On a desk: ordinary controls in one row where they fit and two where they do not, inside
-    the column, overlapping nothing, the pickers wide enough for a thirty-character name, the switch
+    reads in. On a desk: ordinary controls in one row across the window (`#406 command-bar-one-row`),
+    overlapping nothing, the pickers wide enough for a thirty-character name, the switch
     in the same corner in every state and a second click in the same spot switching back, and every
     stop of a Tab walk ringed and unclipped. On a phone: the dock the phone had. Answers a summary."""
     api = DockApi()
@@ -3451,20 +3448,21 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
                   == LONG_CHANNEL["label"] and len(str(LONG_CHANNEL["label"])) >= 30,
                   f"{label}: the channel open is not the thirty-character one")
             reading = ["todo-filter", "read-speed", "read-aloud"]
-            channel = measured("the channel, a long name", reading)
+            channel = measured("the channel, a long name", reading, rows=1 if desk else None)
             shot("4-channel-long-name")
             if desk:
                 tabbed("the channel, a long name", channel)
-                # Two rows here: the pickers on the first, and on the second the reading buttons at its
-                # right, beside the switch.
+                # One row (`#406 command-bar-one-row`): the pickers, then the reading buttons, then the
+                # switch, all on one line. It was two, the reading buttons under the pickers.
                 boxes = channel["boxes"]
                 switch, read, picker = boxes["view-switch"], boxes["read-aloud"], boxes["discord-channel"]
                 middle = {name: box["top"] + box["height"] / 2 for name, box in boxes.items()}
-                check(channel["rows"] == 2 and abs(middle["view-switch"] - middle["read-aloud"]) < 4
-                      and middle["discord-channel"] < middle["read-aloud"] - 4
+                check(abs(middle["view-switch"] - middle["read-aloud"]) < 4
+                      and abs(middle["discord-channel"] - middle["read-aloud"]) < 4
+                      and picker["left"] + picker["width"] < read["left"]
                       and read["left"] + read["width"] < switch["left"],
-                      f"{label}: the reading buttons are not beside the switch on a second row, under the"
-                      f" pickers: {picker}, {read}, {switch}")
+                      f"{label}: the pickers, the reading buttons and the switch are not one row, in that"
+                      f" order: {picker}, {read}, {switch}")
                 # Pace's popover, opened by a real click: over the list, above the dock and inside the
                 # column. Placed against the pane, it opened over the row above the pane — the switch
                 # and the pickers, under it until it was dismissed.
@@ -3483,9 +3481,8 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
                 flick("true", "a third click in the same spot did not open the channel again")
                 until("() => document.getElementById('read-aloud').hidden === false",
                       "the channel's Read did not come back")
-            # A thread open in the view picker beside the long name. In the default column the two
-            # names, the gear, the device button and the switch do not fit one row, and the VIEW
-            # picker gives way: the channel's name stays whole.
+            # A thread open in the view picker beside the long name: one row still, the channel's
+            # name whole.
             thread_option = page.evaluate(
                 "() => [...document.getElementById('thread-select').options].map((o) => o.value)"
                 ".find((v) => v.startsWith('thread:'))")
@@ -3493,7 +3490,7 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
             page.select_option("#thread-select", str(thread_option))
             until("() => document.getElementById('thread-select').value.startsWith('thread:')",
                   "the thread did not open")
-            measured("a thread beside the long name", reading, whole=("discord-channel",))
+            measured("a thread beside the long name", reading, rows=1 if desk else None, whole=("discord-channel",))
             shot("5-channel-thread")
             page.select_option("#thread-select", "flat")
             # A short name: everything shares one row on a desk.
@@ -3505,7 +3502,7 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
 
             if desk:
                 # ONE PLACE FOR THE SWITCH in every state of the default column: idle, live, after a
-                # call, a long name over two rows, a thread, a short name in one. Its right edge and its
+                # call, a long name, a thread, a short name. Its right edge and its
                 # bottom are the same in all of them, and so is its width, whichever word it shows.
                 spread = {edge: max(values) - min(values) for edge, values in (
                     ("right", [b["left"] + b["width"] for b in switches.values()]),
@@ -3514,31 +3511,26 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
                 check(len(switches) >= 6 and all(moved <= 0.5 for moved in spread.values()),
                       f"{label}: the switch moves between states ({spread}): {switches}")
 
-                # The column dragged wide with the reader's own control: the long name and the three
-                # reading buttons share one row.
+                # The column dragged wide, and pulled in to its narrowest, with the reader's own
+                # control: the dock spans the window (`#406 command-bar-one-row`), so it is the same
+                # one row, every control where it was, whatever the reading column's width.
                 page.select_option("#discord-channel", str(LONG_CHANNEL["id"]))
                 until("() => document.getElementById('discord-channel').value === "
                       f"{json.dumps(LONG_CHANNEL['id'])}", "the long channel did not open again")
+                before = measured("the default column, the long name", reading, rows=1)["boxes"]
                 page.evaluate("""() => { const range = document.getElementById('reading-width');
                     range.value = '110'; range.dispatchEvent(new Event('input')); }""")
                 until("() => document.documentElement.style.getPropertyValue('--reading-width') === '110ch'",
                       "the width handle's control did not take")
-                measured("a wide column, the long name", reading, rows=1)
+                wide = measured("a wide column, the long name", reading, rows=1)["boxes"]
                 shot("7-wide-column")
-                # And pulled in to its narrowest, where the bar's own row truly is out of room: the
-                # view picker at its floor, the channel's name the one cut, ending in an ellipsis, and
-                # nothing pushed out of the pack's sight.
                 page.evaluate("""() => { const range = document.getElementById('reading-width');
                     range.value = range.min; range.dispatchEvent(new Event('input')); }""")
                 until("() => document.documentElement.style.getPropertyValue('--reading-width') === "
                       "document.getElementById('reading-width').min + 'ch'", "the width handle's control did not narrow")
-                narrow = measured("the narrowest column, the long name", reading, whole=("thread-select",))
-                cut = narrow["pickers"]["discord-channel"]
-                floor = narrow["boxes"]["thread-select"]["width"]
-                check(cut["width"] < cut["natural"] and cut["width"] >= 5 * 16 - 0.5 and floor >= 5 * 16 - 0.5,
-                      f"{label}: in the narrowest column the pickers are {cut['width']:.1f}px and {floor:.1f}px")
-                check(page.evaluate("() => getComputedStyle(document.getElementById('discord-channel')).textOverflow")
-                      == "ellipsis", f"{label}: a cut channel name does not say it was cut")
+                narrow = measured("the narrowest column, the long name", reading, rows=1)["boxes"]
+                check(wide == before and narrow == before,
+                      f"{label}: the dock moved with the reading column: {before} / {wide} / {narrow}")
                 shot("8-narrow-column")
 
             check(not errors, f"{label}: the page threw: {errors}")

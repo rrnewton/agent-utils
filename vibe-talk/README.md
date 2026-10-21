@@ -8408,24 +8408,29 @@ blurred.
 
 The phone is the device this page is used on, so the phone layout is the one everything above
 describes. On a wide screen with a pointing device it becomes something else: the transcript and
-the channel are held to a **reading column** instead of filling the window, the dock follows that
-column rather than spanning the desk, and a handle on the column's edge — draggable, and reachable
+the channel are held to a **reading column** instead of filling the window, the dock spans the
+window under it in one row (`#406 command-bar-one-row`), and a handle on the column's edge — draggable, and reachable
 from the keyboard — sets how wide it is. The width is stored per browser, in characters, and is
 clamped to 45–120 on the way in and on the way out, because storage is shared with everything else
 on the origin and a hand-edited entry is a thing people do. The settings screen carries a slider
 that drives exactly the same value, so the choice is reachable without a mouse.
 
 **The dock is sized for a mouse on a desk, not a thumb** (`#218 desktop-dock`). On a phone it is a
-strip of 44px targets above a tile of large buttons; on a desk the same controls are one wrapping
-row of ordinary 36px buttons, icon and word side by side, inside the column. Everything shares one
-row when it fits — about 50px of dock where the phone's composition stood 149px — and when a long
-channel name and the reading buttons do not fit together, the buttons take a second row, beside the
-switch, rather than the name being cut, for about 92px. The Voice/Channel switch has ONE place on a
-desk, the lower right corner of the column, in every view and state: flicking it changes the row it
-sits in, and a switch that moved with the row was somewhere else for the second click. The channel
-and view pickers are as wide as the names they show, up to a cap; the view picker gives way first
-when the row is short, and the channel's name is cut, with an ellipsis, only when the view picker is
-already at its floor. Every control shows a focus ring; Tab visits the bar's controls in the order
+strip of 44px targets above a tile of large buttons; on a desk the same controls are ONE ROW of
+ordinary 36px buttons, icon and word side by side, about 50px of dock where the phone's composition
+stood 149px. Until `#406 command-bar-one-row` the dock was held to the reading column and wrapped the
+reading buttons onto a second row when a long channel name, "Thread list" or a thread's name left
+them no room beside the pickers. The owner: "spills onto two rows in the command bar even though there
+is PLENTY of horizontal space.. an artificial width construction ... Let's keep that bar one row that
+can go up to full width on desktop". So it now spans the window, in one view as in two columns, and
+never wraps. The pane keeps its width and the pickers give way: they are as wide as the names they show, up to a
+cap, the view picker gives way first when the row is short, and the channel's name is cut, with an
+ellipsis, only when the view picker is already at its floor. The view picker's tooltip names an open
+thread whole, which its option cuts at 28 characters. The Voice/Channel switch has ONE place on a
+desk, the lower right corner of the window, in every view and state: a switch that moved with the
+row was somewhere else for the second click. `tests/command_bar_browser.py` (`make
+command-bar-browser`) measures the row in Chromium at 1280x800, 1920x1080 and 900x700, with "Thread
+list" and a 120-character thread chosen, and the 393px phone against what it was. Every control shows a focus ring; Tab visits the bar's controls in the order
 they are seen, then the switch, then the pane's buttons — the bar's own order, as on a phone. A
 reader on the newest line stays on it when the dock grows a row under them, so a call's turns are
 still followed once it goes live. The phone's dock is not touched: `tests/offline_cache_browser.py`

@@ -6925,26 +6925,19 @@ test("on a desktop both lists are held to a reading column, and the phone is lef
       `${pane} is given a width or a margin outside the desktop query, so the phone gets the column too`
     );
   }
-  // The dock follows the column rather than spanning the desk — never by being pinned. The frame
-  // test above asserts the pane is still a grid row; this is the other half. `#58 control-bar` put
-  // the bar in the dock as well, and it follows the column for the same reason: a bar spanning a
-  // metre of desk puts the switch a screen away from the transcript it switches.
-  //
-  // `#218 desktop-dock` moved the column from the bar and the pane to the DOCK, which lays the two
-  // out side by side: its padding is half of what the window has beyond the reading width, so its
-  // content box is the column — the same box the panes are held to, moving with the same handle.
-  // The inset is stated once, as `--dock-inset`, because the switch and the prompts tray are placed
-  // by it as well as the dock's padding.
+  // The dock is never pinned: the frame test above asserts the pane is still a grid row; this is the
+  // other half. `#218 desktop-dock` held the DOCK to the column, as its padding; `#406
+  // command-bar-one-row` spans it across the window instead, at the owner's word: "keep that bar one
+  // row that can go up to full width on desktop". The inset is stated once, as `--dock-inset`, because
+  // the switch and the prompts tray are placed by it as well as the dock's padding, and it is the
+  // window's less the controls' own inset, not the reading column's.
   const dock = cssBlockIn(DESKTOP_QUERY, "#dock");
-  assert.match(
-    cssValue(dock, "--dock-inset") || "",
-    /max\([^;]*100%\s*-\s*var\(--reading-width\)/,
-    "the dock's inset is not the column's"
-  );
+  assert.equal(cssValue(dock, "--dock-inset"), "0.6rem", "the dock is held to a column narrower than the window");
+  assert.doesNotMatch(dock, /reading-width/, "the dock is still sized by the reading column");
   assert.match(
     cssValue(dock, "padding") || "",
     /var\(--dock-inset\)/,
-    "the dock spans the whole desktop while the list above it is a column"
+    "the dock's padding is not its inset"
   );
   assert.doesNotMatch(cssBlock("#dock"), /position:\s*(fixed|absolute)/);
   assert.doesNotMatch(cssBlock("#control-pane"), /position:\s*(fixed|absolute)/);
@@ -6995,18 +6988,21 @@ test("the reading-width handle is a sibling of the scroll area, not a passenger 
 /** How tall a control in the desktop dock may be, in px: a mouse's 32px target, short of a slab. */
 const DESK_CONTROL_PX = [32, 40];
 
-test("on a desk the dock is one wrapping row of ordinary-sized controls", () => {
+test("on a desk the dock is ONE ROW of ordinary-sized controls, which never wraps", () => {
+  // `#406 command-bar-one-row`. It wrapped the pane onto a second row when the pickers and it did not
+  // fit the column: "Thread list" or a long thread's name did that, beside half a window of nothing.
+  // tests/command_bar_browser.py measures the row in Chromium at 1280x800 and 1920x1080.
   const dock = cssBlockIn(DESKTOP_QUERY, "#dock");
   assert.match(dock, /display:\s*flex/, "the dock is still two stacked bands on a desk");
-  assert.match(
-    dock,
-    /flex-wrap:\s*wrap/,
-    "the dock has no second row to fall back to, so a long channel name has to be cut instead"
-  );
-  // The bar takes the room the pane leaves, and the pane is a row at the right of it, not a tile.
+  assert.match(dock, /flex-wrap:\s*nowrap/, "the dock still wraps onto a second row on a desk");
+  // The bar takes the room the pane leaves, and gives way: the pane keeps its width, a row at the right
+  // of the bar, not a tile, and does not wrap its own buttons either.
   assert.match(cssBlockIn(DESKTOP_QUERY, "#control-bar-bottom"), /flex:\s*1 1 auto/);
+  assert.match(cssBlockIn(DESKTOP_QUERY, "#control-bar-bottom"), /min-width:\s*0/, "the bar cannot give way");
   const pane = cssBlockIn(DESKTOP_QUERY, "#control-pane");
   assert.match(pane, /display:\s*flex/, "the pane is still the phone's tile on a desk");
+  assert.match(pane, /flex:\s*0 0 auto/, "the pane shrinks, so its buttons are squeezed instead of the pickers");
+  assert.match(pane, /flex-wrap:\s*nowrap/, "the pane wraps its own buttons onto a second row");
   assert.match(pane, /margin-left:\s*auto/, "the pane is not held at the right of its row");
   // Every control at a desk's size: no smaller than a mouse's target, and nowhere near the
   // phone's 44px squares or the slabs the owner photographed.
@@ -7134,10 +7130,11 @@ test("on a desk the view switch has one place, and the pane keeps the room for i
   // The switch rode along with the row: between the bar and the pane when they shared one, at the end
   // of the first row when they did not — about 265px sideways and a row up between the call and the
   // channel, so a second click where the first had landed met an empty dock. It is set in the
-  // column's lower right corner now, the same width whatever word it shows.
+  // dock's lower right corner now — the window's, since `#406 command-bar-one-row` — the same width
+  // whatever word it shows.
   const flick = cssBlockIn(DESKTOP_QUERY, '#control-bar[data-placement="bottom"] #view-switch');
   assert.match(flick, /position:\s*absolute/, "the switch is still carried along by the row");
-  assert.match(flick, /right:\s*var\(--dock-inset\)/, "the switch is not at the column's right edge");
+  assert.match(flick, /right:\s*var\(--dock-inset\)/, "the switch is not at the dock's right edge");
   assert.match(flick, /bottom:\s*0\.4rem/, "the switch is not at the foot of the dock");
   assert.equal(
     cssValue(flick, "bottom"),
@@ -76141,4 +76138,31 @@ test("`#403 composer-key-global` negative control: IN A TEXT FIELD the chord sti
       }
     }
   }
+});
+
+// --- `#406 command-bar-one-row` -------------------------------------------------------------------
+
+test("`#406 command-bar-one-row`: the view picker's tooltip names the open thread WHOLE, which its option cuts", async () => {
+  // On a desk the bar no longer wraps: a label too long for it ends in an ellipsis, and the option is
+  // cut at 28 characters of name besides. The tooltip is where the whole name is.
+  const long = "Release train for the autumn platform update: canary widening, staging migration check, cache headers, retry wrapper fix";
+  assert.equal(long.length, 120);
+  const page = newPage();
+  const data = threadData();
+  data.threads[0].title = long;
+  data.threads[0].root.content = long;
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  const picker = page.el("thread-select");
+  const general = picker.title;
+  assert.doesNotMatch(general, /Release train/, "the tooltip names a thread nobody has opened");
+  await pickThread(page, `thread:${data.threads[0].id}`);
+  const option = picker.children.find((one) => one.value === picker.value);
+  assert.ok(option && option.textContent.endsWith("…"), `the premise is an option cut short: ${option && option.textContent}`);
+  assert.equal(picker.title, `${long}\n${general}`, "the tooltip does not name the open thread whole");
+  // Back to Main: the tooltip names no thread.
+  await pickThread(page, "main");
+  assert.equal(picker.title, general, "the tooltip still names a thread after leaving it");
 });
