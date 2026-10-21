@@ -761,6 +761,23 @@ pub trait ChatClient: Send + Sync {
         None
     }
 
+    /// The address of the message `id` in `channel` in this provider's own service, for the
+    /// page's "Copy link in \<service\>". `#408 copy-upstream-link`; see
+    /// [`crate::upstream_url`].
+    ///
+    /// Formed from what this provider already knows — its configuration and what it has learned
+    /// of its workspace or servers — and `None` wherever no address can be formed. Synchronous
+    /// and best-effort on purpose: it is asked of every message as it is served, so it may only
+    /// read what is already held, never ask the service.
+    fn upstream_url(
+        &self,
+        _channel: &ChannelId,
+        _id: &MessageId,
+        _thread: Option<&crate::threads::MessageThread>,
+    ) -> Option<String> {
+        None
+    }
+
     /// Whether this backend supports channel and thread timeline views.
     fn supports_threading(&self) -> bool {
         false
@@ -2307,6 +2324,7 @@ mod lookup_tests {
             reactions: None,
             heading: None,
             mentions: Vec::new(),
+            upstream_url: None,
         }
     }
 
@@ -2641,6 +2659,7 @@ mod threads_tests {
             reactions: None,
             heading: None,
             mentions: Vec::new(),
+            upstream_url: None,
         }
     }
 

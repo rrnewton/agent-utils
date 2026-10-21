@@ -590,6 +590,11 @@ pub struct DiscordConfig {
     ///
     /// Public: a user id is visible on every message that account has ever sent.
     pub owner_user_id: Option<String>,
+    /// The Discord server (guild) these channels live in, when the operator has said it: what
+    /// a message's Discord address needs for its first segment, for the page's "Copy link in
+    /// Discord". `#408 copy-upstream-link`. Unset, a link is formed only for a channel whose
+    /// server a head read has learned.
+    pub guild_id: Option<String>,
     /// API base, so a test or a proxy can point elsewhere.
     pub api_base: String,
     /// Deadline for one ordinary provider HTTP request, in seconds.
@@ -763,6 +768,10 @@ pub struct SlackSettings {
     pub max_post_chars: Option<usize>,
     /// The most UTF-8 bytes one post may hold, as Slack is sent it, when the operator has said.
     pub max_post_bytes: Option<usize>,
+    /// The workspace's own address (`https://acme.slack.com`), when the operator has said it:
+    /// where a message's permalink lives, for the page's "Copy link in Slack". `#408
+    /// copy-upstream-link`; see [`crate::slack::SlackConfig::workspace_url`].
+    pub workspace_url: Option<String>,
 }
 
 /// How one provider is reached.
@@ -1099,6 +1108,7 @@ struct FileDiscord {
     thread_api: Option<crate::threads::ThreadApi>,
     bot_token: Option<Secret>,
     owner_user_id: Option<String>,
+    guild_id: Option<String>,
     coding_agent_user_ids: Option<Vec<String>>,
     api_base: Option<String>,
     request_timeout_seconds: Option<u64>,
@@ -1137,6 +1147,10 @@ struct FileProvider {
     api_base: Option<String>,
     token: Option<Secret>,
     owner_user_id: Option<String>,
+    // Discord-protocol providers only: the server their channels live in, for a message's link.
+    guild_id: Option<String>,
+    // Slack providers only: the workspace's own address, for a message's permalink.
+    workspace_url: Option<String>,
     coding_agent_user_ids: Option<Vec<String>>,
     request_timeout_seconds: Option<u64>,
     live_poll_seconds: Option<u64>,
@@ -2765,6 +2779,7 @@ fn legacy_discord_provider<'e>(
         get(ENV_DISCORD_OWNER_USER_ID)
             .map(str::to_owned)
             .or(file.owner_user_id),
+        file.guild_id,
         file.api_base,
         request_timeout_seconds,
         file.channel_registration,
@@ -2800,6 +2815,7 @@ fn discord_protocol(
     provider_name: String,
     bot_token: Secret,
     owner_user_id: Option<String>,
+    guild_id: Option<String>,
     api_base: Option<String>,
     request_timeout_seconds: u64,
     channel_registration: Option<bool>,
@@ -2905,6 +2921,19 @@ fn discord_protocol(
                 .to_owned(),
         });
     }
+    // `#408 copy-upstream-link`: a guild that is not a snowflake could only form links that open
+    // nothing, so it is refused here rather than at every copy.
+    let guild_id = guild_id
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty());
+    if let Some(guild) = &guild_id {
+        if !(17..=20).contains(&guild.len()) || !guild.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(ConfigError::Invalid {
+                field: format!("{prefix}.guild_id"),
+                detail: format!("{guild:?} is not a Discord server (guild) id"),
+            });
+        }
+    }
     Ok(DiscordConfig {
         provider_name,
         thread_api: thread_api.unwrap_or_default(),
@@ -2912,6 +2941,7 @@ fn discord_protocol(
         owner_user_id: owner_user_id
             .map(|id| id.trim().to_owned())
             .filter(|id| !id.is_empty()),
+        guild_id,
         api_base,
         request_timeout_seconds,
         channel_registration,
@@ -3107,11 +3137,15 @@ fn provider_entry<'e>(
             if entry.upstream_clear.is_some() {
                 return Err(refuse("upstream_clear", "discord"));
             }
+            if entry.workspace_url.is_some() {
+                return Err(refuse("workspace_url", "discord"));
+            }
             ProviderKind::Discord(discord_protocol(
                 &format!("providers.{key}"),
                 name.clone(),
                 token,
                 entry.owner_user_id,
+                entry.guild_id,
                 entry.api_base,
                 request_timeout_seconds,
                 entry.channel_registration,
@@ -3164,6 +3198,25 @@ fn provider_entry<'e>(
             if entry.markup.is_some() {
                 return Err(refuse("markup", "slack"));
             }
+            if entry.guild_id.is_some() {
+                return Err(refuse("guild_id", "slack"));
+            }
+            // `#408 copy-upstream-link`: a workspace address no permalink can be formed on is
+            // refused here, as a bad API base is, rather than silently forming no link.
+            let workspace_url = entry
+                .workspace_url
+                .map(|url| url.trim().to_owned())
+                .filter(|url| !url.is_empty());
+            if let Some(url) = &workspace_url {
+                if crate::upstream_url::workspace_origin(url).is_none() {
+                    return Err(ConfigError::Invalid {
+                        field: field("workspace_url"),
+                        detail: format!(
+                            "{url:?} is not an https workspace address (https://acme.slack.com)"
+                        ),
+                    });
+                }
+            }
             let api_base = entry
                 .api_base
                 .unwrap_or_else(|| DEFAULT_SLACK_API_BASE.to_owned());
@@ -3199,6 +3252,7 @@ fn provider_entry<'e>(
                 upstream_clear: entry.upstream_clear.unwrap_or(false),
                 max_post_chars: post_size.chars,
                 max_post_bytes: post_size.bytes,
+                workspace_url,
             })
         }
         other => {
@@ -3394,6 +3448,71 @@ writable = true
 provider = "slack"
 "#;
 
+    /// `#408 copy-upstream-link`: the two settings a message's own link is formed from load on
+    /// their own kinds, are refused on the other, and a value no link can be formed from is
+    /// refused by name.
+    #[test]
+    fn a_guild_and_a_workspace_load_for_copy_upstream_link() {
+        let text = MULTI
+            .replace(
+                "channel_registration = true\nthread_api = \"off\"",
+                "channel_registration = true\nthread_api = \"off\"\nguild_id = \"900000000000000001\"",
+            )
+            .replace(
+                "live_poll_seconds = 15",
+                "live_poll_seconds = 15\nworkspace_url = \"https://acme.slack.com/\"",
+            );
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid");
+        let ProviderKind::Discord(gchat) = &cfg.provider("gchat").expect("gchat").kind else {
+            panic!("gchat is a Discord-protocol bridge");
+        };
+        assert_eq!(gchat.guild_id.as_deref(), Some("900000000000000001"));
+        let ProviderKind::Slack(slack) = &cfg.provider("slack").expect("slack").kind else {
+            panic!("slack is a Slack provider");
+        };
+        assert_eq!(
+            slack.workspace_url.as_deref(),
+            Some("https://acme.slack.com/")
+        );
+
+        for (bad, field) in [
+            (
+                MULTI.replace(
+                    "thread_api = \"off\"",
+                    "thread_api = \"off\"\nguild_id = \"general\"",
+                ),
+                "providers.gchat.guild_id",
+            ),
+            (
+                MULTI.replace(
+                    "thread_api = \"off\"",
+                    "thread_api = \"off\"\nworkspace_url = \"https://acme.slack.com\"",
+                ),
+                "providers.gchat.workspace_url",
+            ),
+            (
+                MULTI.replace(
+                    "live_poll_seconds = 15",
+                    "live_poll_seconds = 15\nguild_id = \"900000000000000001\"",
+                ),
+                "providers.slack.guild_id",
+            ),
+            (
+                MULTI.replace(
+                    "live_poll_seconds = 15",
+                    "live_poll_seconds = 15\nworkspace_url = \"acme.slack.com\"",
+                ),
+                "providers.slack.workspace_url",
+            ),
+        ] {
+            let refused = Config::from_toml_and_env(&bad, &env(&[])).expect_err("refused");
+            match refused {
+                ConfigError::Invalid { field: named, .. } => assert_eq!(named, field),
+                other => panic!("{other:?} is not the refusal of {field}"),
+            }
+        }
+    }
+
     #[test]
     fn several_providers_load_without_a_legacy_discord_section() {
         let cfg = Config::from_toml_and_env(MULTI, &env(&[])).expect("valid multi config");
@@ -3457,6 +3576,7 @@ provider = "slack"
             upstream_clear: settings.upstream_clear,
             max_post_chars: settings.max_post_chars,
             max_post_bytes: settings.max_post_bytes,
+            workspace_url: settings.workspace_url.clone(),
         }
         .post_limit()
     }

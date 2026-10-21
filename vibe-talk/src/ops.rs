@@ -332,6 +332,14 @@ fn stamp(state: &AppState, messages: &mut [Message]) {
     for message in messages {
         message.spoken_time = crate::clock::spoken(&message.timestamp, &state.config.timezone);
         message.spoken_content = prepared_body(state, &message.content, &message.mentions, now_ms);
+        // `#408 copy-upstream-link`: the message's own address in its service, formed by its
+        // provider from what it already holds. Overwritten rather than trusted, as the spoken
+        // forms are: a copy an adapter or a cache supplied does not get to say where a reader's
+        // copied link goes.
+        message.upstream_url =
+            state
+                .chat
+                .upstream_url(&message.channel_id, &message.id, message.thread.as_ref());
     }
 }
 

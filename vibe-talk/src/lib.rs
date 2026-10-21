@@ -98,6 +98,7 @@ pub mod timeline_forward;
 pub mod untrusted;
 pub mod upstream_clear;
 pub mod upstream_profile;
+pub mod upstream_url;
 pub mod voice_agent;
 pub mod voice_bridge;
 pub mod voice_health;

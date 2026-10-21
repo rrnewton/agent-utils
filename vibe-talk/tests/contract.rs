@@ -84,6 +84,7 @@ fn message(id: &str) -> Message {
         reactions: None,
         heading: None,
         mentions: Vec::new(),
+        upstream_url: None,
     }
 }
 
@@ -135,6 +136,8 @@ fn threaded_message(id: &str) -> Message {
             title: Some("Status".into()),
             cut: 28,
         }),
+        // `#408 copy-upstream-link`: present here, absent on the plain sample.
+        upstream_url: Some("https://chat.google.com/room/AAAa1/BBBb2/CCCc3".into()),
         ..message(id)
     }
 }
@@ -397,6 +400,9 @@ fn pin(id: &str, threaded: bool) -> Pin {
             title: None,
             cut: 7,
         }),
+        // `#408 copy-upstream-link`: present on the threaded sample and absent on the other.
+        upstream_url: threaded
+            .then(|| "https://acme.slack.com/archives/C0123ABCD/p1700000000000100".into()),
     }
 }
 

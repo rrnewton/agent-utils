@@ -494,7 +494,8 @@
           "reply_count_exact": true,
           "root_message_id": "200"
         },
-        "timestamp": "2026-09-25T12:00:00+00:00"
+        "timestamp": "2026-09-25T12:00:00+00:00",
+        "upstream_url": "https://chat.google.com/room/AAAa1/BBBb2/CCCc3"
       },
       "replayed": true,
       "self_posted": true,
@@ -558,7 +559,8 @@
         "reply_count_exact": true,
         "root_message_id": "200"
       },
-      "timestamp": "2026-09-25T12:00:00+00:00"
+      "timestamp": "2026-09-25T12:00:00+00:00",
+      "upstream_url": "https://chat.google.com/room/AAAa1/BBBb2/CCCc3"
     },
     {
       "author": "someone",
@@ -668,7 +670,8 @@
             "reply_count_exact": true,
             "root_message_id": "200"
           },
-          "timestamp": "2026-09-25T12:00:00+00:00"
+          "timestamp": "2026-09-25T12:00:00+00:00",
+          "upstream_url": "https://chat.google.com/room/AAAa1/BBBb2/CCCc3"
         }
       ],
       "untrusted_content_notice": "third-party text"
@@ -879,7 +882,8 @@
         "thread_id": "t1",
         "thread_root": true,
         "timestamp": "2026-09-25T12:00:00+00:00",
-        "truncated": true
+        "truncated": true,
+        "upstream_url": "https://acme.slack.com/archives/C0123ABCD/p1700000000000100"
       },
       "pinned": true,
       "pins_notice": "pins are this server's own",
@@ -944,7 +948,8 @@
           "thread_id": "t1",
           "thread_root": true,
           "timestamp": "2026-09-25T12:00:00+00:00",
-          "truncated": true
+          "truncated": true,
+          "upstream_url": "https://acme.slack.com/archives/C0123ABCD/p1700000000000100"
         }
       ],
       "pins_notice": "pins are this server's own",
@@ -1062,7 +1067,8 @@
             "reply_count_exact": true,
             "root_message_id": "200"
           },
-          "timestamp": "2026-09-25T12:00:00+00:00"
+          "timestamp": "2026-09-25T12:00:00+00:00",
+          "upstream_url": "https://chat.google.com/room/AAAa1/BBBb2/CCCc3"
         }
       ],
       "next_before": "cursor",
@@ -1179,7 +1185,8 @@
             "reply_count_exact": true,
             "root_message_id": "200"
           },
-          "timestamp": "2026-09-25T12:00:00+00:00"
+          "timestamp": "2026-09-25T12:00:00+00:00",
+          "upstream_url": "https://chat.google.com/room/AAAa1/BBBb2/CCCc3"
         }
       ],
       "next_before": null,
@@ -1345,7 +1352,8 @@
             "reply_count_exact": true,
             "root_message_id": "200"
           },
-          "timestamp": "2026-09-25T12:00:00+00:00"
+          "timestamp": "2026-09-25T12:00:00+00:00",
+          "upstream_url": "https://chat.google.com/room/AAAa1/BBBb2/CCCc3"
         }
       ],
       "next_after": "forward-2",

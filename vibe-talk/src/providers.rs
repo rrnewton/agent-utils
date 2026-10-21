@@ -188,6 +188,7 @@ impl ChatRouter {
                         upstream_clear: slack.upstream_clear,
                         max_post_chars: slack.max_post_chars,
                         max_post_bytes: slack.max_post_bytes,
+                        workspace_url: slack.workspace_url.clone(),
                     })?
                     .with_shim_profile(profile.provider(&provider.key, &provider.name)),
                 ),
@@ -739,6 +740,28 @@ impl ChatClient for ChatRouter {
     fn owner_author_id(&self) -> Option<String> {
         self.default
             .and_then(|index| self.entries[index].client.owner_author_id())
+    }
+
+    /// The owning provider's address for the message. `#408 copy-upstream-link`.
+    ///
+    /// Routed by the channel the message was served in. A thread-scoped Slack channel
+    /// (`C…~ts`) is not itself routed — its conversation is — so that one falls back to the
+    /// conversation's provider. A channel no provider holds forms no address: another
+    /// provider's shape is never guessed at, because a link into the wrong service is worse
+    /// than none.
+    fn upstream_url(
+        &self,
+        channel: &ChannelId,
+        id: &MessageId,
+        thread: Option<&crate::threads::MessageThread>,
+    ) -> Option<String> {
+        let index = self.index_for(channel).or_else(|| {
+            channel
+                .as_str()
+                .split_once(crate::slack::ids::THREAD_SEPARATOR)
+                .and_then(|(base, _)| self.index_for(&ChannelId(base.to_owned())))
+        })?;
+        self.entries[index].client.upstream_url(channel, id, thread)
     }
 
     fn supports_threading(&self) -> bool {

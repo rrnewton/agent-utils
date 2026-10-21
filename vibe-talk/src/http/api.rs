@@ -471,6 +471,7 @@ pub async fn ingest_event(
                 reactions: None,
                 heading: None,
                 mentions: Vec::new(),
+                upstream_url: None,
             };
             (crate::live::LiveKind::Delete, channel_id, tombstone)
         }
@@ -4108,6 +4109,34 @@ pub struct PinRequest {
     pub thread_root: bool,
 }
 
+/// Fill each pin's `upstream_url`: its message's own address in its service, formed by the
+/// channel's provider as on a read, so a row drawn from a pin alone offers its link like a
+/// loaded message does. `#408 copy-upstream-link`.
+fn fill_pin_links<'p>(
+    state: &AppState,
+    channel: &crate::model::ChannelInfo,
+    pins: impl IntoIterator<Item = &'p mut crate::store::Pin>,
+) {
+    let Some(client) = state.providers.client_for(&channel.id) else {
+        return;
+    };
+    for pin in pins {
+        let thread = pin
+            .snapshot
+            .thread_id
+            .as_deref()
+            .map(|id| crate::threads::MessageThread {
+                id: id.to_owned(),
+                root_message_id: None,
+                is_root: pin.snapshot.thread_root,
+                reply_count: None,
+                reply_count_exact: false,
+            });
+        pin.upstream_url =
+            client.upstream_url(&channel.id, &pin.snapshot.message_id, thread.as_ref());
+    }
+}
+
 /// `GET /api/v1/channels/{channel_id}/pins` — every pin in the channel, oldest message first.
 pub async fn pins(
     State(state): State<AppState>,
@@ -4116,6 +4145,7 @@ pub async fn pins(
 ) -> Result<Response, ApiError> {
     let (channel, mut pins) = ops::pins(&state, &channel_id).await?;
     crate::render::fill_pins(&state.config, &state.headings, &channel, &mut pins.pins);
+    fill_pin_links(&state, &channel, &mut pins.pins);
     Ok(no_store(Json(crate::contract::PinsResponse {
         channel,
         pins: pins.pins,
@@ -4150,6 +4180,7 @@ pub async fn pin_message(
     };
     let (channel, mut change) = ops::pin(&state, &channel_id, &snapshot).await?;
     crate::render::fill_pins(&state.config, &state.headings, &channel, &mut change.pin);
+    fill_pin_links(&state, &channel, &mut change.pin);
     Ok(no_store(Json(crate::contract::PinChangeResponse {
         channel,
         message_id: snapshot.message_id,

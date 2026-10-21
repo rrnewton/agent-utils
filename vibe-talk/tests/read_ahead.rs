@@ -65,6 +65,7 @@ fn message(id: &str, thread: Option<&str>) -> Message {
         reactions: None,
         heading: None,
         mentions: Vec::new(),
+        upstream_url: None,
     }
 }
 

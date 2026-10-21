@@ -752,6 +752,18 @@ declare namespace VibeTalk {
      * [`Message::spoken_time`] for the one that is.
      */
     timestamp: string;
+    /**
+     * The message's own address in the service it came from, for the page's "Copy link in
+     * \<service\>". `#408 copy-upstream-link`; see [`crate::upstream_url`].
+     *
+     * FORMED BY THIS SERVER when a message is served (`ops::stamp`, and the live stream's
+     * rendering), from the parts the provider already holds, and absent wherever no address can
+     * be formed — an unknown workspace or guild, an id of an unread shape — which the page
+     * draws as no menu item rather than a disabled one. Never stored and never trusted from
+     * whoever sent the message, for the reason [`Message::noise`] is not: it follows this
+     * deployment's configuration, which a stored copy would outlive.
+     */
+    upstream_url?: string | null;
   }
 
   /**
@@ -1087,6 +1099,12 @@ declare namespace VibeTalk {
      * Whether `content` was cut to fit.
      */
     truncated: boolean;
+    /**
+     * The pinned message's own address in its service, formed when the pin is SERVED and never
+     * stored, by [`crate::model::Message::upstream_url`]'s rules — so a row drawn from a pin
+     * alone offers its link like a loaded message does. `#408 copy-upstream-link`.
+     */
+    upstream_url?: string | null;
   }
 
   /**

@@ -66,6 +66,7 @@ fn thread_message(id: &str, n: i64, content: &str) -> Message {
         reactions: None,
         heading: None,
         mentions: Vec::new(),
+        upstream_url: None,
     }
 }
 

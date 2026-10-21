@@ -105,6 +105,7 @@ fn message(
         reactions: None,
         heading: None,
         mentions: Vec::new(),
+        upstream_url: None,
     }
 }
 

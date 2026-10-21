@@ -299,6 +299,17 @@ pub struct Message {
     /// would be bytes down a phone's connection that say nothing new. The cache keeps it.
     #[serde(skip)]
     pub mentions: Vec<MentionName>,
+    /// The message's own address in the service it came from, for the page's "Copy link in
+    /// \<service\>". `#408 copy-upstream-link`; see [`crate::upstream_url`].
+    ///
+    /// FORMED BY THIS SERVER when a message is served (`ops::stamp`, and the live stream's
+    /// rendering), from the parts the provider already holds, and absent wherever no address can
+    /// be formed — an unknown workspace or guild, an id of an unread shape — which the page
+    /// draws as no menu item rather than a disabled one. Never stored and never trusted from
+    /// whoever sent the message, for the reason [`Message::noise`] is not: it follows this
+    /// deployment's configuration, which a stored copy would outlive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_url: Option<String>,
 }
 
 /// Who one user mention names. `#318 slack-mention-names`; see [`Message::mentions`].
@@ -589,6 +600,7 @@ mod tests {
             reactions: None,
             heading: None,
             mentions: Vec::new(),
+            upstream_url: None,
         }
     }
 

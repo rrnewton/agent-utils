@@ -46,6 +46,7 @@ fn message(id: &str) -> Message {
         content_html: String::new(),
         heading: None,
         mentions: Vec::new(),
+        upstream_url: None,
         noise: false,
         reactions: None,
     }

@@ -908,6 +908,7 @@ pub fn parse_message(value: &serde_json::Value) -> Result<Message, ChatError> {
         reactions: parse_reactions(value.get("reactions")),
         heading: None,
         mentions: Vec::new(),
+        upstream_url: None,
     })
 }
 
@@ -1065,6 +1066,9 @@ pub struct HttpDiscordClient {
     /// every later head read of a server's channels is one request. remote-ops-audit W12
     /// `#287 bulk-reads`; see `heads`.
     guilds: heads::GuildCache,
+    /// The Discord server (guild) the operator said these channels live in, when they have:
+    /// what a message's Discord address needs for its first segment. `#408 copy-upstream-link`.
+    guild_id: Option<String>,
     /// The bulk reads the bridge showed it does not serve, though configured to. Fix round 1 of
     /// remote-ops-audit W10 and W11 `#287 bulk-reads`.
     unserved: Unserved,
@@ -1136,6 +1140,12 @@ impl HttpDiscordClient {
             recent_many_reads: config.recent_many_reads,
             thread_reads: config.thread_reads,
             guilds: heads::GuildCache::default(),
+            guild_id: config
+                .guild_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned),
             unserved: Unserved::default(),
             limiter: RateLimiter::new(),
         })
@@ -1252,6 +1262,31 @@ impl ChatClient for HttpDiscordClient {
 
     fn owner_author_id(&self) -> Option<String> {
         self.owner_user_id.clone()
+    }
+
+    /// The message's address in the service behind this client. `#408 copy-upstream-link`.
+    ///
+    /// The two shapes are told apart by the ids themselves, as they never overlap: a Google
+    /// Chat bridge's channels and threads are Chat resource names (`spaces/…`), which
+    /// [`crate::upstream_url::google_chat_url`] forms the web client's address from, and
+    /// Discord's are snowflakes, whose address needs the guild — the configured one, or the
+    /// server a head read has learned this channel belongs to, and with neither, none.
+    fn upstream_url(
+        &self,
+        channel: &ChannelId,
+        id: &MessageId,
+        thread: Option<&crate::threads::MessageThread>,
+    ) -> Option<String> {
+        if let Some(url) =
+            crate::upstream_url::google_chat_url(channel.as_str(), id.as_str(), thread)
+        {
+            return Some(url);
+        }
+        let guild = self
+            .guild_id
+            .clone()
+            .or_else(|| self.guilds.guild_of(channel.as_str()))?;
+        crate::upstream_url::discord_message_url(&guild, channel.as_str(), id.as_str())
     }
 
     fn supports_threading(&self) -> bool {
@@ -1799,6 +1834,7 @@ mod tests {
             provider_name: "Google Chat".to_owned(),
             bot_token: Secret::new("abc"),
             owner_user_id: None,
+            guild_id: None,
             api_base: api_base.to_owned(),
             request_timeout_seconds: 20,
             channel_registration,
@@ -2183,6 +2219,7 @@ mod tests {
             recent_many_reads: false,
             thread_reads: false,
             guilds: heads::GuildCache::default(),
+            guild_id: None,
             unserved: Unserved::default(),
             limiter: RateLimiter::new(),
         };
@@ -2214,6 +2251,7 @@ mod tests {
             recent_many_reads: false,
             thread_reads: false,
             guilds: heads::GuildCache::default(),
+            guild_id: None,
             unserved: Unserved::default(),
             limiter: RateLimiter::new(),
         }
@@ -2417,6 +2455,7 @@ mod tests {
             recent_many_reads: false,
             thread_reads: false,
             guilds: heads::GuildCache::default(),
+            guild_id: None,
             unserved: Unserved::default(),
             limiter: RateLimiter::new(),
         };
@@ -2487,6 +2526,7 @@ mod tests {
             recent_many_reads: false,
             thread_reads: false,
             guilds: heads::GuildCache::default(),
+            guild_id: None,
             unserved: Unserved::default(),
             limiter: RateLimiter::new(),
         };
@@ -2546,6 +2586,7 @@ mod tests {
             recent_many_reads: false,
             thread_reads: false,
             guilds: heads::GuildCache::default(),
+            guild_id: None,
             unserved: Unserved::default(),
             limiter: RateLimiter::new(),
         };
@@ -2609,6 +2650,7 @@ mod tests {
                 recent_many_reads: false,
                 thread_reads: false,
                 guilds: heads::GuildCache::default(),
+                guild_id: None,
                 unserved: Unserved::default(),
                 limiter: RateLimiter::new(),
             };
@@ -2665,6 +2707,7 @@ mod tests {
             recent_many_reads: false,
             thread_reads: false,
             guilds: heads::GuildCache::default(),
+            guild_id: None,
             unserved: Unserved::default(),
             limiter: RateLimiter::new(),
         };
@@ -2747,6 +2790,7 @@ mod tests {
             recent_many_reads: false,
             thread_reads: false,
             guilds: heads::GuildCache::default(),
+            guild_id: None,
             unserved: Unserved::default(),
             limiter: RateLimiter::new(),
         };

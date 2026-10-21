@@ -4,8 +4,8 @@
 //!
 //! Stored: the provider's [`Message`] as the client normalised it, minus every field that is
 //! derived when it is served. Reading a row back gives exactly the message the client produced,
-//! with those fields empty: `spoken_time`, `spoken_content`, `content_html`, `heading` and
-//! `noise` are never stored, so a row served from the cache goes through stamping, the noise
+//! with those fields empty: `spoken_time`, `spoken_content`, `content_html`, `heading`,
+//! `noise` and `upstream_url` are never stored, so a row served from the cache goes through stamping, the noise
 //! rules and rendering exactly as an upstream one does. Provider JSON as received, headers,
 //! cursors and tokens are never stored either.
 
@@ -112,6 +112,9 @@ impl Incoming {
         message.content_html = String::new();
         message.heading = None;
         message.noise = false;
+        // `#408 copy-upstream-link`: formed when served, from the deployment's current
+        // configuration, so a stored one is never read back stale.
+        message.upstream_url = None;
         let edited_ms = message
             .edited_timestamp
             .as_deref()
@@ -234,6 +237,7 @@ pub(crate) fn reconstruct(
         reactions: extra.reactions,
         heading: None,
         mentions: extra.mentions,
+        upstream_url: None,
     }
 }
 

@@ -125,6 +125,9 @@ pub struct HttpSlackClient {
     pub(super) upstream_clear: bool,
     /// The account this client posts as, learned from `auth.test` or from its first post.
     self_user_id: Mutex<Option<String>>,
+    /// The workspace's own origin (`https://acme.slack.com`), as configured or as `auth.test`
+    /// reported it, where a message's permalink lives. `#408 copy-upstream-link`.
+    workspace_url: Mutex<Option<String>>,
     users: Mutex<HashMap<String, CachedUser>>,
     /// Each group DM's member ids, or `None` where Slack would not list them, and when that was
     /// learned, so the channel browser names it by its members without asking again. `#317
@@ -206,6 +209,12 @@ impl HttpSlackClient {
             channel_discovery: config.channel_discovery,
             upstream_clear: config.upstream_clear,
             self_user_id: Mutex::new(None),
+            workspace_url: Mutex::new(
+                config
+                    .workspace_url
+                    .as_deref()
+                    .and_then(crate::upstream_url::workspace_origin),
+            ),
             users: Mutex::new(HashMap::new()),
             group_members: GroupMembers::default(),
             channel_names: super::mentions::ChannelNames::default(),
@@ -823,6 +832,9 @@ impl Raw {
             // Who each `<@U…>` in the words names, so the page and speech can say. `#318
             // slack-mention-names`; see `super::mentions`.
             mentions: super::mentions::names_for(text, resolved),
+            // Formed when the message is served (`ops::stamp` asks this client's
+            // `upstream_url`), never at read: the workspace address may not be learned yet.
+            upstream_url: None,
         })
     }
 }
@@ -869,6 +881,32 @@ impl ChatClient for HttpSlackClient {
 
     fn owner_author_id(&self) -> Option<String> {
         self.owner_user_id.clone()
+    }
+
+    /// The message's Slack permalink. `#408 copy-upstream-link`.
+    ///
+    /// The conversation is read from the channel the message was served in — a thread-scoped
+    /// channel names it before its `~` — and the `ts` from the message's own id. A reply's
+    /// thread root is its thread record's id, which for Slack IS the root's `ts`; a root links
+    /// plainly, as Slack's own link to it does. No workspace address held, no link.
+    fn upstream_url(
+        &self,
+        channel: &ChannelId,
+        id: &MessageId,
+        thread: Option<&crate::threads::MessageThread>,
+    ) -> Option<String> {
+        let workspace = self
+            .workspace_url
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()?;
+        let reference = ids::ChannelRef::parse(channel.as_str())?;
+        let ts = ids::ts_from_message_id(id)?;
+        let root = thread
+            .filter(|thread| !thread.is_root)
+            .map(|thread| thread.id.as_str())
+            .or(reference.thread_ts.as_deref().filter(|root| *root != ts));
+        crate::upstream_url::slack_permalink(&workspace, &reference.conversation, &ts, root)
     }
 
     fn supports_threading(&self) -> bool {
@@ -1018,6 +1056,22 @@ impl ChatClient for HttpSlackClient {
                 .filter(|id| !id.is_empty())
                 .ok_or_else(|| shape("auth.test answer has no string \"user_id\" field"))?;
             self.learn_self(id);
+            // `#408 copy-upstream-link`: `auth.test` also reports the workspace's own address,
+            // which is where a message's permalink lives. Learned only where the configuration
+            // did not say one — the operator's word stands over the provider's.
+            if let Some(reported) = value
+                .get("url")
+                .and_then(Value::as_str)
+                .and_then(crate::upstream_url::workspace_origin)
+            {
+                let mut slot = self
+                    .workspace_url
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if slot.is_none() {
+                    *slot = Some(reported);
+                }
+            }
             let handle = value
                 .get("user")
                 .and_then(Value::as_str)
@@ -1204,6 +1258,7 @@ mod tests {
             upstream_clear: false,
             max_post_chars: None,
             max_post_bytes: None,
+            workspace_url: None,
         })
         .expect("client")
     }

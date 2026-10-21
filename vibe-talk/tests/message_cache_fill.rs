@@ -42,6 +42,7 @@ fn message(channel: &str, at_ms: i64, text: &str) -> Message {
     Message {
         edited_timestamp: None,
         mentions: Vec::new(),
+        upstream_url: None,
         thread: None,
         id: MessageId::at_time_ms(at_ms),
         channel_id: id(channel),

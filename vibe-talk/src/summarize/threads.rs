@@ -1764,6 +1764,7 @@ mod tests {
             reactions: None,
             heading: None,
             mentions: Vec::new(),
+            upstream_url: None,
         };
         let mut messages = vec![message("0", "THE ROOT: the runner pool is down to one mac")];
         for n in 1..40 {

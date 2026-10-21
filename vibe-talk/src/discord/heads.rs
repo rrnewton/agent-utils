@@ -53,6 +53,15 @@ impl GuildCache {
         self.lock().get(channel).cloned()
     }
 
+    /// The server `channel` belongs to, once a head read has learned it: what a message's
+    /// Discord address needs for its first segment. `#408 copy-upstream-link`.
+    pub(super) fn guild_of(&self, channel: &str) -> Option<String> {
+        match self.get(channel) {
+            Some(Home::Server(guild)) => Some(guild),
+            _ => None,
+        }
+    }
+
     fn set(&self, channel: &str, home: Home) {
         self.lock().insert(channel.to_owned(), home);
     }

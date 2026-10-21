@@ -141,6 +141,13 @@ live_poll_seconds = 0
 # per account, in the browser, with no restart.
 # owner_user_id = "000000000000000000"
 
+# guild_id is the Discord server (guild) the channels below live in: right-click the SERVER'S name
+# -> Copy Server ID, with the same Developer Mode. It is what a message's own Discord address
+# (discord.com/channels/<guild>/<channel>/<message>) needs for its first part, so set it and each
+# row's menu offers "Copy link in Discord". Without it, the link is offered only for a channel
+# whose server a read has already learned.
+# guild_id = "000000000000000000"
+
 # coding_agent_user_ids names the accounts your coding agents post as. The channel view draws each
 # as the coding agent, and then no other bot: without it, the one bot in a channel besides this
 # server is guessed to be the coding agent. A Slack provider makes no such guess, because Slack's
@@ -166,6 +173,8 @@ live_poll_seconds = 0
 # registered_channels_writable = false
 # channel_discovery = true
 # upstream_clear = false         # offer "Clear unread in Slack" in Settings; needs a user token
+# workspace_url = "https://acme.slack.com"   # where "Copy link in Slack" points; unset, Slack's
+#                                # own auth.test answer is used when it reports one
 
 [auth]
 # Credentials THIS server demands of its callers. Not Discord's, not ElevenLabs'.

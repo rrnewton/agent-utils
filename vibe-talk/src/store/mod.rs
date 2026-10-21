@@ -1257,6 +1257,11 @@ pub struct Pin {
     /// [`crate::model::Message::heading`]'s rules. `#242 rich-headers`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heading: Option<crate::model::Heading>,
+    /// The pinned message's own address in its service, formed when the pin is SERVED and never
+    /// stored, by [`crate::model::Message::upstream_url`]'s rules — so a row drawn from a pin
+    /// alone offers its link like a loaded message does. `#408 copy-upstream-link`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_url: Option<String>,
 }
 
 /// A channel's pins, and the revision they are at.

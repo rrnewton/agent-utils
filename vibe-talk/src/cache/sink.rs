@@ -2255,6 +2255,7 @@ mod tests {
         Message {
             edited_timestamp: None,
             mentions: Vec::new(),
+            upstream_url: None,
             thread: None,
             id: crate::model::MessageId::at_time_ms(at),
             channel_id: channel.clone(),

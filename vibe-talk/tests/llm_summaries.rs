@@ -269,6 +269,7 @@ fn message(id: &str, content: &str) -> Message {
         reactions: None,
         heading: None,
         mentions: Vec::new(),
+        upstream_url: None,
     }
 }
 

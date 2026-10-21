@@ -196,6 +196,7 @@ impl Fake {
             upstream_clear: false,
             max_post_chars: None,
             max_post_bytes: None,
+            workspace_url: None,
         }
     }
 

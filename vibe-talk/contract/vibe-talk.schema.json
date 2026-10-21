@@ -697,6 +697,13 @@
         "timestamp": {
           "description": "The exact instant, ISO-8601, as reported by the chat provider. Compute with this one.\n\nUnrounded on purpose: sub-second precision is ordering information, and anything that has\nto decide which of two messages came first needs it. This field is never spoken; see\n[`Message::spoken_time`] for the one that is.",
           "type": "string"
+        },
+        "upstream_url": {
+          "description": "The message's own address in the service it came from, for the page's \"Copy link in\n\\<service\\>\". `#408 copy-upstream-link`; see [`crate::upstream_url`].\n\nFORMED BY THIS SERVER when a message is served (`ops::stamp`, and the live stream's\nrendering), from the parts the provider already holds, and absent wherever no address can\nbe formed — an unknown workspace or guild, an id of an unread shape — which the page\ndraws as no menu item rather than a disabled one. Never stored and never trusted from\nwhoever sent the message, for the reason [`Message::noise`] is not: it follows this\ndeployment's configuration, which a stored copy would outlive.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -1108,6 +1115,13 @@
         "truncated": {
           "description": "Whether `content` was cut to fit.",
           "type": "boolean"
+        },
+        "upstream_url": {
+          "description": "The pinned message's own address in its service, formed when the pin is SERVED and never\nstored, by [`crate::model::Message::upstream_url`]'s rules — so a row drawn from a pin\nalone offers its link like a loaded message does. `#408 copy-upstream-link`.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

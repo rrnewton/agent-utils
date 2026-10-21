@@ -32,6 +32,7 @@ pub(crate) fn message(id: &str, author: &str, content: &str, created_ms: i64) ->
         reactions: None,
         heading: None,
         mentions: Vec::new(),
+        upstream_url: None,
     }
 }
 

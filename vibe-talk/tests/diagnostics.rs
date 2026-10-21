@@ -419,6 +419,7 @@ async fn a_channel_whose_messages_come_back_blank_warns_about_the_message_conten
                 reactions: None,
                 heading: None,
                 mentions: Vec::new(),
+                upstream_url: None,
             }])
         }
         async fn post_message(

@@ -1163,6 +1163,13 @@ fn judge(
             &confirmed,
             &message.mentions,
         );
+        // `#408 copy-upstream-link`: as `ops::stamp` forms it on a read, so a message that
+        // arrived live offers its link like one a read brought — and never the one an adapter
+        // put there, which is overwritten here as the rendered body is. Routed by the channel
+        // the event is for, which a thread message's own channel need not be.
+        message.upstream_url = app.providers.client_for(channel).and_then(|client| {
+            client.upstream_url(&message.channel_id, &message.id, message.thread.as_ref())
+        });
     }
 }
 
@@ -3104,6 +3111,7 @@ mod tests {
             reactions: None,
             heading: None,
             mentions: Vec::new(),
+            upstream_url: None,
         }
     }
 }

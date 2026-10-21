@@ -1170,6 +1170,7 @@ mod tests {
             reactions: None,
             heading: None,
             mentions: Vec::new(),
+            upstream_url: None,
         }
     }
 
