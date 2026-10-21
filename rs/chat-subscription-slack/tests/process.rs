@@ -31,6 +31,12 @@ fi
 while [ "${1#--}" != "$1" ]; do shift; done
 case "$1 $2" in
   "slack.conversation tail")
+    # Optional standard error first: the worst order in which the plugin can read the two
+    # pipes, since the real client writes its catch-up events before its subscribe response.
+    if [ -f "$FAKE_SLACK_DIR/tail.stderr" ]; then
+      cat "$FAKE_SLACK_DIR/tail.stderr" >&2
+      sleep 0.3
+    fi
     cat "$FAKE_SLACK_DIR/tail.jsonl"
     exec sleep 30 ;;
   "slack.message send")
@@ -133,6 +139,76 @@ fn plugin_process_delivers_a_slack_message() {
     assert!(calls[0].contains("--event-types=message.created"));
     assert!(calls[0].contains("--include-iris-seq-id"));
     assert!(calls[0].contains("--catchup=none"));
+}
+
+#[test]
+fn plugin_process_commits_a_proven_position_only_after_the_events_before_it() {
+    // #399 slack-quiet-cursor, through the real client pipes: the subscribe response is read
+    // first, so the position must wait for the heartbeat behind the caught-up event.
+    let root = workspace("position");
+    fs::write(
+        root.join("tail.stderr"),
+        "Catching up from 500...\nFetched 1 events\n\
+         \u{1b}[2mSubscribe response: SubscribeResponse(seqId=900, lastIssuedSeqId=900, \
+         syncId=1, requestedPositionSeqId=900)\u{1b}[0m\n",
+    )
+    .unwrap();
+    let line = json!({
+        "seq": 1, "ts": 1.0, "type": "message.created", "source": "slack", "iris_seq_id": 600,
+        "payload": {"event_type": "message.created", "container_id": CHANNEL,
+            "slack_message": {"channel_id": CHANNEL, "message_ts": "4102444800.000100",
+                "slack_user_id": OWNER, "text": "caught up"}}
+    });
+    fs::write(
+        root.join("tail.jsonl"),
+        format!("{line}\n{{\"type\":\"HEARTBEAT\",\"ts\":1.0}}\n"),
+    )
+    .unwrap();
+    let data = Map::from_iter([
+        ("cli_path".to_owned(), json!(root.join("slack-cli"))),
+        (
+            "cli_environment".to_owned(),
+            json!({"FAKE_SLACK_DIR": root}),
+        ),
+        ("diagnostics_log".to_owned(), json!(root.join("plugin.log"))),
+    ]);
+    let request = SubscribeRequest::new(
+        vec![ChannelId::new(CHANNEL).unwrap()],
+        vec![SenderId::new(OWNER).unwrap()],
+        Some(ProviderCursor::new("slack1:seq:500").unwrap()),
+    )
+    .unwrap()
+    .with_backend_configuration(BackendConfiguration::new("agentctl.slack.v1", data).unwrap());
+
+    let child =
+        ProcessPluginChild::spawn(Command::new(env!("CARGO_BIN_EXE_agentctl-slack-plugin")))
+            .expect("plugin starts");
+    let (mut backend, cancellation) = child.connect(timeouts()).expect("handshake");
+    {
+        let mut subscription = ChatSubscription::open(&mut backend, &request).expect("subscribed");
+        let mut batches = Vec::new();
+        while batches.len() < 2 {
+            match subscription.next_item().expect("item") {
+                Some(SubscriptionItem::Batch(batch)) => {
+                    subscription.commit_durable(&batch).expect("commit");
+                    batches.push(batch);
+                }
+                Some(SubscriptionItem::Heartbeat(_)) => {}
+                None => panic!("plugin ended early"),
+            }
+        }
+        assert_eq!(batches[0].cursor().as_str(), "slack1:seq:600");
+        assert!(matches!(
+            batches[0].events(),
+            [CommittableEvent::MessageCreated(_)]
+        ));
+        assert_eq!(batches[1].cursor().as_str(), "slack1:seq:900");
+        assert_eq!(batches[1].events(), [CommittableEvent::Checkpoint]);
+    }
+    drop(backend);
+    let status = cancellation.cancel().expect("plugin reaped");
+    assert!(status.success(), "plugin exited with {status}");
+    assert!(invocations(&root)[0].contains("--catchup=500"));
 }
 
 fn run_helper(root: &Path, arguments: &[String], request: &Value) -> Value {

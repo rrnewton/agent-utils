@@ -24,6 +24,21 @@
 //! never delivered. A provider report of lost events, or a saved position the provider can no
 //! longer replay, becomes a `gap`, which stops the bridge for operator review.
 //!
+//! # Keeping the cursor inside the stream's retention
+//!
+//! The stream retains events for a bounded time (about eight hours) and its sequence counts
+//! every event the client receives, while the client passes on only the configured channel's
+//! messages. A cursor that moved only with those messages fell out of the retention in a quiet
+//! channel, and the next restart found a gap (#399 slack-quiet-cursor). So when the transport
+//! proves a later position ([`StreamRecord::Position`]: every event at or before it has already
+//! been returned; see [`crate::cli::PositionProof`] for how the client's output proves one),
+//! the driver commits a `checkpoint` there. A proof comes once per stream, after its catch-up,
+//! so when the cursor has not moved for `cursor_refresh_seconds` the driver closes the stream
+//! and opens a new one from its committed sequence; that stream's catch-up drains to the head
+//! and proves it. Reopening loses nothing: the new stream replays everything after the
+//! committed sequence, and no batch is outstanding at that point. A time cursor
+//! (`slack1:since:`) is never moved this way, since its resume is not a sequence catch-up.
+//!
 //! # Whose events the stream carries
 //!
 //! The event stream carries the channel events delivered to the identity the client runs as.
@@ -72,6 +87,8 @@ const MAX_IGNORED_PREFIXES: usize = 32;
 // bot posts) is not a request.
 const MESSAGE_SUBTYPES: &[&str] = &["thread_broadcast", "file_share", "me_message"];
 const TRUNCATION_MARKER: &str = "\n[message truncated by the Slack provider]";
+/// Default `cursor_refresh_seconds`: well inside the stream's retention of about eight hours.
+pub const DEFAULT_CURSOR_REFRESH: Duration = Duration::from_secs(2 * 60 * 60);
 /// How long a stream may stay subscribed without any event before the diagnostics log notes it.
 pub const QUIET_NOTICE_MILLIS: u64 = 30 * 60 * 1_000;
 const CREWMATE_WARNING: &str = "warning: the event stream client's output names a Crewmate, \
@@ -97,6 +114,8 @@ pub struct PluginConfig {
     pub cli: Option<CliOptions>,
     /// Seconds between idle heartbeats sent to the host.
     pub heartbeat_interval: Duration,
+    /// Reopen the stream when a sequence cursor has not moved for this long; `None` never does.
+    pub cursor_refresh: Option<Duration>,
     /// A new lineage also delivers messages created this many seconds before start.
     pub initial_backfill_seconds: u64,
     /// Messages starting with one of these (after leading whitespace) are never delivered.
@@ -180,6 +199,7 @@ impl PluginConfig {
             "tail_heartbeat_seconds",
             "tail_stall_timeout_seconds",
             "heartbeat_interval_seconds",
+            "cursor_refresh_seconds",
             "initial_backfill_seconds",
             "ignore_text_prefixes",
             "diagnostics_log",
@@ -277,12 +297,23 @@ impl PluginConfig {
                 .collect::<Result<_, _>>()?,
             Some(_) => return Err(invalid("ignore_text_prefixes must be a list of at most 32 strings")),
         };
+        let cursor_refresh = match optional_seconds(data, "cursor_refresh_seconds", 0..=21_600)? {
+            None => Some(DEFAULT_CURSOR_REFRESH),
+            Some(0) => None,
+            Some(seconds) if seconds < 600 => {
+                return Err(invalid(
+                    "cursor_refresh_seconds must be 0 (never) or from 600 to 21600",
+                ))
+            }
+            Some(seconds) => Some(Duration::from_secs(seconds)),
+        };
         Ok(Self {
             transport,
             cli,
             heartbeat_interval: Duration::from_secs(
                 optional_seconds(data, "heartbeat_interval_seconds", 1..=300)?.unwrap_or(30),
             ),
+            cursor_refresh,
             initial_backfill_seconds: optional_seconds(
                 data,
                 "initial_backfill_seconds",
@@ -558,10 +589,12 @@ impl ChatSubscriptionBackend for SlackBackend {
             refusals,
             now_millis: self.now_millis,
             opened_at_millis: now,
+            advanced_at_millis: now,
+            channel_ids: spec.channel_ids,
             events_seen: false,
             quiet_noted: false,
             crewmate_warned: false,
-            _transport: transport,
+            transport,
         }))
     }
 }
@@ -587,11 +620,14 @@ struct SlackDriver {
     refusals: crate::refusals::RefusalRecorder,
     now_millis: fn() -> u64,
     opened_at_millis: u64,
+    // When the sequence cursor last moved, or the stream was last opened.
+    advanced_at_millis: u64,
+    channel_ids: Vec<String>,
     // Whether the stream has carried any sequenced event, replayed or new.
     events_seen: bool,
     quiet_noted: bool,
     crewmate_warned: bool,
-    _transport: Box<dyn SlackTransport>,
+    transport: Box<dyn SlackTransport>,
 }
 
 impl SlackDriver {
@@ -603,6 +639,44 @@ impl SlackDriver {
             .checked_add(1)
             .ok_or_else(|| failure("sequence_exhausted", "protocol sequence exhausted", false))?;
         Ok(sequence)
+    }
+
+    /// Reopen the stream from the committed sequence when it has not moved for
+    /// `cursor_refresh`, so the new stream's catch-up can prove a position near the head.
+    /// Called only between batches, when none awaits acknowledgement.
+    fn refresh_cursor(&mut self) -> Result<(), BackendFailure> {
+        let (Some(refresh), Some(floor)) = (self.config.cursor_refresh, self.floor_sequence) else {
+            return Ok(());
+        };
+        let now = (self.now_millis)();
+        let still = now.saturating_sub(self.advanced_at_millis);
+        if u128::from(still) < refresh.as_millis() {
+            return Ok(());
+        }
+        // Whatever the old stream still holds is replayed by the new one, which starts after
+        // the committed sequence.
+        self.advanced_at_millis = now;
+        self.diagnostics.log(&format!(
+            "cursor refresh: the cursor has not moved for {} minutes; reopening the event stream \
+             from sequence {floor}",
+            still / 60_000
+        ));
+        if let Err(detail) = self.stream.close() {
+            return Err(failure("stream_close_failed", detail, true));
+        }
+        let spec = SubscribeSpec {
+            channel_ids: self.channel_ids.clone(),
+            catchup: Catchup::Sequence(floor),
+        };
+        self.stream = self.transport.open_stream(&spec).map_err(|error| {
+            failure(
+                &error.code,
+                format!("reopening the Slack event stream failed: {}", error.detail),
+                error.retryable,
+            )
+        })?;
+        self.cancel.register(self.stream.canceller());
+        Ok(())
     }
 
     fn batch(
@@ -808,8 +882,31 @@ impl ChatSubscriptionDriver for SlackDriver {
                             QUIET_NOTICE_MILLIS / 60_000
                         ));
                     }
+                    self.refresh_cursor()?;
                     let sequence = self.take_sequence()?;
                     return Ok(Some(SubscriptionItem::Heartbeat(Heartbeat::new(sequence))));
+                }
+                StreamWait::Record(StreamRecord::Position(position)) => {
+                    // A time cursor is not converted: its lineage floor would not survive a
+                    // restart, and its stream is not a sequence catch-up that proves one.
+                    let Some(floor) = self.floor_sequence else {
+                        continue;
+                    };
+                    if position <= floor {
+                        continue;
+                    }
+                    self.floor_sequence = Some(position);
+                    self.advanced_at_millis = (self.now_millis)();
+                    self.diagnostics.log(&format!(
+                        "position {position}: checkpoint (the stream proved every event at or \
+                         before it was delivered; the cursor was at {floor})"
+                    ));
+                    return self
+                        .batch(
+                            Cursor::Sequence(position).encode(),
+                            CommittableEvent::Checkpoint,
+                        )
+                        .map(Some);
                 }
                 StreamWait::Cancelled => {
                     return Err(failure("cancelled", "the subscription was cancelled", true));
@@ -845,6 +942,7 @@ impl ChatSubscriptionDriver for SlackDriver {
                         continue;
                     }
                     self.floor_sequence = Some(sequence);
+                    self.advanced_at_millis = (self.now_millis)();
                     let cursor = Cursor::Sequence(sequence).encode();
                     let event = match message.as_ref().map(|message| self.admit(message)) {
                         Some(Ok(inbound)) => {

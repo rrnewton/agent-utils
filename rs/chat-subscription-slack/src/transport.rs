@@ -72,6 +72,10 @@ pub enum StreamRecord {
     },
     /// The subscription refreshed.
     Heartbeat,
+    /// The transport has proved that every event at or before this sequence number that this
+    /// stream will ever carry has already been returned, so a cursor at it skips nothing. The
+    /// number may be ahead of every event returned, because the stream filters events out.
+    Position(u64),
     /// The provider reported lost events.
     Gap(String),
     /// Informational output, logged and otherwise ignored.
