@@ -14951,6 +14951,16 @@ fn decode_document<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T> {
 }
 
 fn read_artifact_bytes(path: &Path, maximum: usize) -> Result<Vec<u8>> {
+    read_artifact_bytes_opened(path, maximum, || {})
+}
+
+/// [`read_artifact_bytes`], calling `opened` once `path` is open and before what it opened is
+/// inspected: the moment a writer's rename can land, which tests force with it.
+fn read_artifact_bytes_opened(
+    path: &Path,
+    maximum: usize,
+    opened: impl FnOnce(),
+) -> Result<Vec<u8>> {
     // O_NONBLOCK: a pipe left where a record belongs is rejected by the type check below
     // instead of blocking the open, which can run under the state lock. It changes nothing for a
     // regular file.
@@ -14958,10 +14968,18 @@ fn read_artifact_bytes(path: &Path, maximum: usize) -> Result<Vec<u8>> {
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
+    opened();
     let metadata = file.metadata()?;
+    // No links left means a writer renamed a replacement over the file, or removed it, after it
+    // was opened. Records are written whole and renamed into place, so what was opened is a
+    // complete earlier copy, the one a read a moment sooner would have returned; it is read as
+    // such. A reader that does not hold the state lock meets this, such as a delivery pass
+    // reading its request while the acknowledgement worker records the reaction on it, and
+    // refusing the copy failed that pass (#394 ack-delivered-empty). More than one link is a
+    // hard link to the record, and is refused.
     if !metadata.file_type().is_file()
         || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.nlink() != 1
+        || metadata.nlink() > 1
         || metadata.permissions().mode() & 0o077 != 0
     {
         return Err(ChatRuntimeError::invalid(format!(
@@ -28918,6 +28936,63 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             })
         );
         assert_eq!(transport.submissions.len(), 2);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_record_replaced_while_a_lockless_read_opens_it_reads_as_its_earlier_copy() {
+        // #394 ack-delivered-empty: a delivery pass reads its request without the state lock,
+        // and the acknowledgement worker can rename the request's next copy over it between the
+        // read's open and its inspection of what it opened. The opened file then has no links;
+        // that read failed the pass, which delivered nothing. Forced here at that moment, with
+        // the acknowledgement as the writer.
+        let root = temporary("lockless-read");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let admission = state
+            .admit_batch(&delivery(1, "cursor-1", "receipt-1"))
+            .expect("admit request");
+        let key = &admission.new_request_keys[0];
+        let mut transport = FakeReactionTransport::default();
+        let path = state.request_path(key);
+        let bytes = read_artifact_bytes_opened(&path, MAX_REQUEST_RECORD_BYTES, || {
+            assert!(matches!(
+                state.ensure_ack(key, &mut transport),
+                Ok(AckResult::Acked(_))
+            ));
+        })
+        .expect("the copy the read opened");
+        let opened: RequestRecord = decode_document(&bytes).expect("a whole record");
+        state
+            .validate_request_record(&opened, key)
+            .expect("a valid record");
+        assert_eq!(opened.ack_phase, AckPhase::Pending, "the earlier copy");
+        assert_eq!(
+            state.read_request(key).expect("current record").ack_phase,
+            AckPhase::Acked
+        );
+
+        // Removed once opened, as retirement removes a request: the earlier copy too.
+        let removed = root.join("removed.json");
+        write_document(&removed, &serde_json::json!({"phase": "pending"})).expect("record");
+        let bytes = read_artifact_bytes_opened(&removed, 1 << 10, || {
+            fs::remove_file(&removed).expect("remove record");
+        })
+        .expect("the copy the read opened");
+        assert_eq!(
+            decode_document::<Value>(&bytes).expect("a whole record")["phase"],
+            "pending"
+        );
+
+        // A record with a second link is still refused.
+        fs::hard_link(&path, root.join("linked.json")).expect("hard link");
+        let error = read_artifact_bytes(&path, MAX_REQUEST_RECORD_BYTES)
+            .expect_err("a hard-linked record is refused");
+        assert!(
+            error
+                .to_string()
+                .contains("not a private owner-only regular file"),
+            "{error}"
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 

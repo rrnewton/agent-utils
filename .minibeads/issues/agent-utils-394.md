@@ -1,10 +1,11 @@
 ---
 title: 'ack-delivered-empty: a delivery pass delivered nothing once beside its acknowledgement worker'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 created_at: 2026-10-20T10:45:11.891088866+00:00
-updated_at: 2026-10-20T10:45:11.891088866+00:00
+updated_at: 2026-10-21T00:12:49.589152740+00:00
+closed_at: 2026-10-21T00:12:49.589152620+00:00
 ---
 
 # Description
