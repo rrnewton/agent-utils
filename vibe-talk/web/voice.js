@@ -184,7 +184,7 @@ const ALL_CHANNELS = "*";
  *   | "channel-view-flat" | "channel-view-main" | "channel-view-threads" | "clear-alias"
  *   | "clear-backlog" | "clear-view" | "close-browse-channels" | "close-help" | "close-reply"
  *   | "close-settings" | "collapse-all" | "column-toggle" | "dismiss-banner"
- *   | "dismiss-error" | "dismiss-status" | "expand-all" | "fold-help" | "fold-auto-read" | "fold-canned-prompts" | "fold-combining" | "fold-connection" | "fold-control-bar" | "fold-dismissed" | "fold-empty-messages" | "fold-identities" | "fold-instructions" | "fold-keyboard" | "fold-mark-own" | "fold-message-cache" | "fold-microphone" | "fold-provider" | "fold-reading-full" | "fold-reading-width" | "fold-relay" | "fold-resuming" | "fold-rich-headers" | "fold-sending" | "fold-settings-all" | "fold-settings-channels" | "fold-settings-messages" | "fold-settings-screen" | "fold-settings-storage" | "fold-settings-voice-agent" | "fold-storage" | "fold-text-size" | "fold-token" | "fold-typing" | "forget-conversations"
+ *   | "dismiss-error" | "dismiss-status" | "expand-all" | "fold-help" | "fold-auto-read" | "fold-canned-prompts" | "fold-combining" | "fold-connection" | "fold-control-bar" | "fold-dismissed" | "fold-empty-messages" | "fold-hidden-channels" | "fold-instructions" | "fold-keyboard" | "fold-mark-own" | "fold-message-cache" | "fold-microphone" | "fold-provider" | "fold-reading-full" | "fold-reading-width" | "fold-relay" | "fold-resuming" | "fold-rich-headers" | "fold-sending" | "fold-settings-all" | "fold-settings-channels" | "fold-settings-messages" | "fold-settings-screen" | "fold-settings-storage" | "fold-settings-voice-agent" | "fold-storage" | "fold-text-size" | "fold-token" | "fold-typing" | "forget-conversations"
  *   | "forget-dismissed-sends" | "forget-token"
  *   | "dismissed-send-close" | "dismissed-send-copy" | "dismissed-send-restore"
  *   | "retry-start"
@@ -1317,7 +1317,7 @@ function showScreen(name) {
   if (name === "settings" && previous !== "settings") refreshVoicePostPrefix();
   // `#193 compose-draft-loss`. Its ages and channel names as they are now, and none past its days.
   if (name === "settings" && previous !== "settings") renderDismissedSends();
-  // `#349 channel-settings-all`. Who is who in the channel being read, which may have changed since.
+  // `#402 who-is-who-channel-box`. Who is who in the box's channel, as the census stands now.
   if (name === "settings" && previous !== "settings") renderIdentityRows();
   if (name !== previous || focusLost()) settleFocus();
   // `#304 back-gesture-in-app`. A screen opened has an entry to go back through, and one left has none.
@@ -1370,9 +1370,9 @@ const SETTINGS_FOLDS = [
   "empty-messages",
   "combining",
   "rich-headers",
-  "identities",
   "dismissed",
   "settings-channels",
+  "hidden-channels",
   "settings-screen",
   "text-size",
   "reading-width",
@@ -27092,34 +27092,57 @@ function bucketFor(authorId, isBot, channelId) {
 let identityListChannel = null;
 
 /**
- * The Settings panel: one row per account seen IN THE CHANNEL BEING READ, saying what it is and
- * letting that be changed.
+ * `#402 who-is-who-channel-box`. What the list says in place of its rows with All channels chosen:
+ * a list of who spoke is one channel's. The owner may ask for the list hidden there instead, which is
+ * `el("identity-group").hidden` set for All channels too in `renderIdentityRows`, and this line gone.
+ */
+const IDENTITY_PICK_ONE = "Pick one channel to see who is who.";
+
+/**
+ * The Settings panel: one row per account seen IN THE CHANNEL THE CHANNEL BOX'S PICKER IS ON, saying
+ * what it is and letting that be changed.
  *
  * Rebuilt wholesale rather than patched, because the set of accounts grows as the channel is read
  * and the guesses for accounts ALREADY listed can change when a new one arrives — the sole-other-
  * bot rule is a statement about the whole census. A partial update would leave a stale "coding
  * agent" beside the second bot that has just disqualified it.
  *
- * `#349 channel-settings-all`. The channel is `#discord-channel`, the one the reader is looking at,
- * and the list's first line names it. It used to be `#settings-channel`, the picker of the per-channel
- * box the list sat in; the owner asked for it out of that box, whose picker now offers All channels,
- * and a list of who spoke cannot follow "all". So it is a group of Messages, about the channel whose
- * messages it decides how to draw. Still one channel's census: a bot that only speaks somewhere else
- * cannot spoil the guess here.
+ * `#402 who-is-who-channel-box`. The channel is `#settings-channel`, the picker at the head of the
+ * box this list sits at the foot of, and NOT `#discord-channel`, which is what the reader is looking
+ * at: everything in that box is about the channel its picker names, and pointing it elsewhere
+ * navigates nowhere. `#349 channel-settings-all` had moved the list to Messages, following the
+ * channel being read, when the picker gained All channels; the owner, 2026-10-21, wanted it back
+ * "along with everything that varies depending on selecting the channel in the drop down". With All
+ * channels chosen it says so in one line (`IDENTITY_PICK_ONE`) instead of rows. Still one channel's
+ * census: a bot that only speaks somewhere else cannot spoil the guess here.
  *
  * `#351 settings-polish`. The line under the list (`#identity-state`) says what a choice just made in
  * it did, and the choice was made in one channel's list: under another channel's it reads as a report
- * about rows nobody has touched. It went when Settings' picker moved the list; the list follows the
- * channel being read now, so it goes when that channel changes (`identityListChannel`).
+ * about rows nobody has touched. So it goes when the list's channel changes (`identityListChannel`).
  */
 function renderIdentityRows() {
   const host = el("identity-list");
-  const channelId = el("discord-channel").value;
-  const seen = seenIn(channelId);
+  const channelId = el("settings-channel").value;
   if (String(channelId) !== identityListChannel) {
     el("identity-state").textContent = "";
     identityListChannel = String(channelId);
   }
+  // No channel to be about (a service with none on the list, whose box already says how to add one):
+  // no heading over nothing.
+  const none = channelId !== ALL_CHANNELS && !knownChannel(channelId);
+  el("identity-group").hidden = none;
+  if (none) {
+    host.replaceChildren();
+    return;
+  }
+  if (channelId === ALL_CHANNELS) {
+    const pick = document.createElement("p");
+    pick.className = "hint";
+    pick.textContent = IDENTITY_PICK_ONE;
+    host.replaceChildren(pick);
+    return;
+  }
+  const seen = seenIn(channelId);
   const ids = Object.keys(seen).sort((a, b) => {
     const left = seen[a];
     const right = seen[b];
@@ -27137,15 +27160,15 @@ function renderIdentityRows() {
     // says whatever the picker above it says. The list changes when that picker does, and "nobody
     // yet" without a name reads as a broken panel rather than as an unread channel.
     empty.textContent =
-      `Nobody yet in ${channelName(knownChannel(channelId))}, the channel you are reading. ` +
-      "Everyone who speaks in it appears here as it is read.";
+      `Nobody yet in ${channelName(knownChannel(channelId))}. Read that channel, and everyone ` +
+      "who has spoken in it appears here.";
     host.replaceChildren(empty);
     return;
   }
   // Which channel the rows are about, through the one rule that names channels.
   const about = document.createElement("p");
   about.className = "hint identity-channel";
-  about.textContent = `In ${channelName(knownChannel(channelId))}, the channel you are reading:`;
+  about.textContent = `In ${channelName(knownChannel(channelId))}:`;
   const rows = ids.map((id) => {
     const who = seen[id];
     // A <label> WRAPPING its control, rather than a <div> plus `for="identity-<id>"`.
@@ -27373,9 +27396,9 @@ function renderChannelRows() {
   }
   if (learned) {
     persistJson(AUTHORS_KEY, authorsSeen);
-    // `#349 channel-settings-all`. The list is the channel being read's, which is the one that just
-    // learned something.
-    renderIdentityRows();
+    // `#402 who-is-who-channel-box`. Only if Settings' box is on the channel that just learned
+    // something. Otherwise the list is another channel's, and rebuilding it draws the same rows again.
+    if (el("settings-channel").value === viewing) renderIdentityRows();
   }
   // `#222 unread-replies`. The replies the store holds, counted once for every row's thread chip.
   const tally = replyTally();
@@ -45524,12 +45547,10 @@ function fillChannelSelect(id) {
   } else {
     select.value = "";
   }
-  if (id === "discord-channel") {
-    rememberActiveChannel();
-    // `#351 settings-polish`. A list redrawn onto another channel than the one it showed (the channel
-    // being read removed from under it, in Settings) moves who is who to the channel read now.
-    if (String(select.value) !== String(chosen)) renderIdentityRows();
-  }
+  if (id === "discord-channel") rememberActiveChannel();
+  // `#351 settings-polish`, `#402 who-is-who-channel-box`. Settings' picker redrawn onto another
+  // channel than the one it showed (the box's channel removed from under it) moves who is who with it.
+  if (id === "settings-channel" && String(select.value) !== String(chosen)) renderIdentityRows();
 }
 
 /**
@@ -45549,6 +45570,11 @@ function renderRemoveChannel(channel) {
  * Draw the hidden configured channels, each with Show again, or take the list away when there
  * are none. Names go through `channelName` like every picker, so a channel he renamed is offered
  * back under his name for it.
+ *
+ * `#401 hidden-channels-fold`. The list is a fold at the foot of the Channels section, and its
+ * heading says how many it holds, so a folded list still says whether there is anything in it.
+ * Whether it is open is the reader's (`setFold`), never this redraw's. The group shown or hidden
+ * brings a fold into sight or takes it out, which Expand all counts (`renderSettingsFoldAll`).
  */
 function renderHiddenChannels() {
   // `#355 provider-grouped-channels`. With several services, the chosen service's hidden channels.
@@ -45572,7 +45598,9 @@ function renderHiddenChannels() {
     return row;
   });
   el("hidden-channel-list").replaceChildren(...rows);
+  el("fold-hidden-channels").textContent = `Hidden channels (${rows.length})`;
   el("hidden-channels").hidden = rows.length === 0;
+  renderSettingsFoldAll();
 }
 
 /** Take the server's whole answer about the list: both pickers, the hidden list, the cache. */
@@ -45894,6 +45922,10 @@ async function addDirectoryChannel(entry) {
   entry.tracked = true;
   entry.channel_id = payload.channel && payload.channel.id ? String(payload.channel.id) : null;
   if (entry.channel_id) pointSettingsAt(entry.channel_id);
+  // The box onto the channel just added, as `addChannel` does: with one chat service `pointSettingsAt`
+  // only sets the picker, which fires nothing, and who is who names its channel (`#402
+  // who-is-who-channel-box`), so a box left drawn for the last channel says so in words.
+  renderChannelBox();
   renderChannelDirectory();
   // Named from the answer, for the reason `addChannel` gives.
   const added = channelName(payload.channel || { label });
@@ -45944,14 +45976,16 @@ async function removeChannel() {
 /**
  * Redraw everything in the channel box for the channel its picker is on, or for all of them.
  *
- * ONE CALL, because the box holds more than one thing scoped by that picker — what this channel is
- * called and what it offers, and whether its unread is cleared upstream — and every caller needs all
- * of them. `#349 channel-settings-all` took the list of who is who out of the box (it follows the
- * channel being read now, under Messages), so it is not redrawn here.
+ * ONE CALL, because the box holds several things scoped by that picker — what this channel is called
+ * and what it offers, whether its unread is cleared upstream, and who is in it — and every caller
+ * needs all of them. `#349 channel-settings-all` took the list of who is who out of the box and
+ * `#402 who-is-who-channel-box` put it back, so it is redrawn here again. The hidden channels under
+ * the box are the service's, not the channel's (`renderHiddenChannels`), and are not redrawn here.
  */
 function renderChannelBox() {
   renderAliasEditor();
   renderUpstreamClear();
+  renderIdentityRows();
 }
 
 /** Whether Settings' channel box is on All channels. `#349 channel-settings-all`. */

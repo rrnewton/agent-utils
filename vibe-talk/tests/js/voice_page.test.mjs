@@ -494,7 +494,15 @@ const FIXTURE_TREE = {
   "fold-settings-voice-agent-body": ["fold-sending", "agent-settings"],
   "agent-settings": ["fold-provider", "fold-provider-body"],
   "settings-messages": ["fold-settings-messages", "fold-settings-messages-body"],
-  "fold-settings-messages-body": ["fold-mark-own", "identity-group", "dismissed-group"],
+  "fold-settings-messages-body": ["fold-mark-own", "dismissed-group"],
+  // `#402 who-is-who-channel-box` put Who is who back at the foot of the channel box, and `#401
+  // hidden-channels-fold` the hidden channels in a fold after it, whose group hidden takes it out of
+  // Expand all.
+  "settings-channels": ["fold-settings-channels", "fold-settings-channels-body"],
+  "fold-settings-channels-body": ["channel-settings", "hidden-channels"],
+  "channel-settings": ["identity-group"],
+  "hidden-channels": ["fold-hidden-channels", "fold-hidden-channels-body"],
+  "fold-hidden-channels-body": ["hidden-channel-list"],
   "dismissed-group": ["fold-dismissed", "fold-dismissed-body"],
   "fold-dismissed-body": ["dismissed-sends-state", "dismissed-sends", "forget-dismissed-sends", "dismissed-send-popout"],
   "dismissed-send-popout": [
@@ -19053,87 +19061,183 @@ const listedNames = (page) =>
     .filter((node) => node.className === "identity-name")
     .map((node) => node.text());
 
-test("WHO IS WHO IS IN MESSAGES, out of the per-channel box, and names the channel it is about (#349)", async () => {
-  // `#349 channel-settings-all`. The owner: "drop the who-is-who part" from the per-channel box,
-  // whose picker now offers All channels. It moved to Messages rather than going, because it is the
-  // one way to name a coding agent where the server cannot guess one. Placement is the claim, not
-  // decoration: a list of accounts drawn without saying whose channel they are is a list the reader
-  // cannot attribute to anything, so its first line names the channel.
-  const problems = (html) => {
-    const found = [];
-    const code = html.replace(/<!--[\s\S]*?-->/g, " ");
-    const box = settingsSection("Channels", code);
-    if (box.includes('id="identity-list"') || /Who is who/.test(box)) found.push("who is who is in the channel box");
-    const group = new RegExp(settingsHeading(3, "Who is who")).test(settingsSection("Messages", code))
-      ? settingsGroup("Who is who", code) : "";
-    if (!group.includes('id="identity-list"')) found.push("Messages has no Who is who list");
-    if (!/data-help="identities"/.test(group)) found.push("Who is who has no way to the entry that explains the guesses");
-    if ((code.match(/id="identity-list"/g) || []).length !== 1) found.push("there is not exactly one list");
-    return found;
-  };
-  assert.deepStrictEqual(problems(HTML), []);
-  // The negative control: the group put back at the foot of the channel box, where it was.
-  const group = `${settingsGroup("Who is who")}</section>`;
-  const back = HTML.replace(group, "").replace(/(<p id="upstream-clear-state" class="hint" aria-live="polite"><\/p>\s*<\/div>)/,
-    `$1${group.replace(/<\/?section[^>]*>/g, "")}`);
-  assert.notEqual(back, HTML, "the negative control changed nothing");
-  assert.deepStrictEqual(problems(back), ["who is who is in the channel box", "Messages has no Who is who list",
-    "Who is who has no way to the entry that explains the guesses"]);
+/** The markup of the channel box, `#channel-settings`, to the `</section>` that closes it. */
+function channelBoxCode(html) {
+  const opens = html.indexOf('<section class="settings-group" id="channel-settings"');
+  return opens < 0 ? "" : html.slice(opens, html.indexOf("</section>", opens));
+}
+
+/**
+ * What is wrong with Who is who's place against `#402 who-is-who-channel-box`, as sentences; empty when
+ * nothing is. A function of the markup, so the negative control can hand it the list where `#349` put it.
+ */
+function whoIsWhoPlaceProblems(html) {
+  const found = [];
+  const code = html.replace(/<!--[\s\S]*?-->/g, " ");
+  const box = channelBoxCode(code);
+  const at = box.indexOf('id="identity-list"');
+  if (at < 0) found.push("the channel box has no Who is who list");
+  if (at >= 0 && !(box.indexOf('id="upstream-clear-state"') < at)) found.push("Who is who is not under Clear unread");
+  if (!new RegExp(settingsHeading(3, "Who is who")).test(box)) found.push("the list in the box has no Who is who heading");
+  if (!/data-help="identities"/.test(box)) found.push("Who is who has no way to the entry that explains the guesses");
+  if (/Who is who|id="identity-list"/.test(settingsSection("Messages", code))) found.push("Who is who is still in Messages");
+  if ((code.match(/id="identity-list"/g) || []).length !== 1) found.push("there is not exactly one list");
+  return found;
+}
+
+test("`#402 who-is-who-channel-box`: WHO IS WHO IS AT THE FOOT OF THE CHANNEL BOX, out of Messages, and names its channel", async () => {
+  // The owner, 2026-10-21: "it should stay under the channel section along with everything that varies
+  // depending on selecting the channel in the drop down". `#349 channel-settings-all` had moved it to
+  // Messages; it is back where it was before that, under Clear unread.
+  assert.deepStrictEqual(whoIsWhoPlaceProblems(HTML), []);
+  // The negative control: the list where `#349` put it, a group of Messages before Recently dismissed.
+  const box = /<!--\s*WHO IS WHO:[\s\S]*?-->\s*<div id="identity-group">[\s\S]*?<p id="identity-state"[^>]*><\/p>\s*<\/div>\s*/.exec(HTML);
+  assert.ok(box, "the negative control cannot find the list in the box");
+  const group = '<section class="settings-group" id="identity-group"><div class="group-head">' +
+    '<h3 title="Everyone who has spoken in the channel you are reading.">Who is who</h3>' +
+    '<button class="help-link" id="help-link-identities" type="button" data-help="identities">?</button></div>' +
+    '<div id="identity-list"></div><p id="identity-state" class="hint" aria-live="polite"></p></section>';
+  const back = HTML.replace(box[0], "").replace('<section class="settings-group" id="dismissed-group">',
+    `${group}<section class="settings-group" id="dismissed-group">`);
+  assert.deepStrictEqual(whoIsWhoPlaceProblems(back), ["the channel box has no Who is who list",
+    "the list in the box has no Who is who heading", "Who is who has no way to the entry that explains the guesses",
+    "Who is who is still in Messages"]);
   const page = newPage();
   await signIn(page);
   await showDiscord(page, crowd());
   await page.el("open-settings").click();
-  assert.match(page.el("identity-list").children[0].textContent, /^In lead team, the channel you are reading:$/,
+  assert.match(page.el("identity-list").children[0].textContent, /^In lead team:$/,
     "the list does not say which channel it is about");
 });
 
-test("the list follows the channel being READ, and Settings' channel picker does not move it (#349)", async () => {
+test("`#402 who-is-who-channel-box`: the list follows the channel box's picker, and the channel being read does not move it", async () => {
   const page = newPage();
-  page.channels = [{ ...CHANNEL }, { ...OTHER_CHANNEL }];
-  serveByChannel(page, {
-    [CHANNEL.id]: [
-      message({ id: "3000000000000000001", channel_id: CHANNEL.id, author: "alice", author_id: "10", author_is_bot: false }),
-    ],
-    [OTHER_CHANNEL.id]: [
-      message({ id: "3000000000000000002", channel_id: OTHER_CHANNEL.id, author: "mallory", author_id: "30", author_is_bot: false }),
-    ],
-  });
+  twoCasts(page);
   await signIn(page);
   await showDiscord(page, []);
   await readChannel(page, OTHER_CHANNEL.id);
   await readChannel(page, CHANNEL.id);
   await page.el("open-settings").click();
-
+  assert.equal(page.el("settings-channel").value, CHANNEL.id);
   assert.deepStrictEqual(listedNames(page), ["alice"], "the list is not scoped to one channel");
-  // The box's picker is about the box: pointing it elsewhere, or at All channels, leaves the list on
-  // the channel being read, and navigates nowhere.
+  // The picker is the list's: another channel there lists that channel's cast, and navigates nowhere.
   await settingsChannel(page, OTHER_CHANNEL.id);
-  assert.deepStrictEqual(listedNames(page), ["alice"], "the box's picker moved the list off the channel being read");
-  await settingsChannel(page, "*");
-  assert.deepStrictEqual(listedNames(page), ["alice"]);
+  assert.deepStrictEqual(listedNames(page), ["mallory"], "the box's picker did not move the list");
+  assert.match(page.el("identity-list").children[0].textContent, /^In build noise:$/);
   assert.equal(page.el("discord-channel").value, CHANNEL.id, "a Settings redraw navigated");
-  // Reading the other channel and coming back to Settings lists that channel's cast.
+  await settingsChannel(page, CHANNEL.id);
+  assert.deepStrictEqual(listedNames(page), ["alice"]);
+  // Reading another channel and coming back to Settings leaves the list on the box's channel.
   await page.el("close-settings").click();
   await readChannel(page, OTHER_CHANNEL.id);
   await page.el("open-settings").click();
-  assert.deepStrictEqual(listedNames(page), ["mallory"], "the list kept the previous channel's cast");
-  assert.match(page.el("identity-list").children[0].textContent, /^In build noise,/);
-  // The negative control: the list as it was, following the box's picker. It then lists the cast of
-  // the channel the picker happens to be on, which is how this test would fail.
-  const before = newPage(new Map(), brokenScript('  const channelId = el("discord-channel").value;\n  const seen = seenIn(channelId);',
-    '  const channelId = el("settings-channel").value;\n  const seen = seenIn(channelId);'));
-  before.channels = [{ ...CHANNEL }, { ...OTHER_CHANNEL }];
-  serveByChannel(before, {
-    [CHANNEL.id]: [message({ id: "3000000000000000001", channel_id: CHANNEL.id, author: "alice", author_id: "10", author_is_bot: false })],
-    [OTHER_CHANNEL.id]: [message({ id: "3000000000000000002", channel_id: OTHER_CHANNEL.id, author: "mallory", author_id: "30", author_is_bot: false })],
-  });
+  assert.equal(page.el("settings-channel").value, CHANNEL.id);
+  assert.deepStrictEqual(listedNames(page), ["alice"], "the channel being read moved the list off the box's channel");
+  // The negative control: the list as `#349` drew it, following the channel being read. The box's picker
+  // then leaves it where it was, which is how this test would fail.
+  const before = newPage(new Map(), brokenScript('  const host = el("identity-list");\n  const channelId = el("settings-channel").value;',
+    '  const host = el("identity-list");\n  const channelId = el("discord-channel").value;'));
+  twoCasts(before);
   await signIn(before);
   await showDiscord(before, []);
   await readChannel(before, OTHER_CHANNEL.id);
   await readChannel(before, CHANNEL.id);
-  await settingsChannel(before, OTHER_CHANNEL.id);
   await before.el("open-settings").click();
-  assert.deepStrictEqual(listedNames(before), ["mallory"], "the negative control lists the read channel's cast anyway");
+  await settingsChannel(before, OTHER_CHANNEL.id);
+  assert.deepStrictEqual(listedNames(before), ["alice"], "the negative control follows the box's picker anyway");
+});
+
+test("`#402 who-is-who-channel-box`: on All channels the list asks for one channel, and a channel chosen lists its cast again", async () => {
+  const page = await allChannelsPage({}, twoCasts);
+  await page.el("close-settings").click();
+  await readChannel(page, OTHER_CHANNEL.id);
+  await readChannel(page, CHANNEL.id);
+  await page.el("open-settings").click();
+  assert.deepStrictEqual(listedNames(page), ["alice"]);
+  await settingsChannel(page, "*");
+  assert.equal(page.el("identity-list").text(), "Pick one channel to see who is who.",
+    "All channels does not ask for one channel");
+  assert.deepStrictEqual(page.el("identity-list").descendants().filter((node) => node.tagName === "select"), [],
+    "All channels offers a row to change");
+  await settingsChannel(page, OTHER_CHANNEL.id);
+  assert.deepStrictEqual(listedNames(page), ["mallory"], "a channel chosen after All channels lists no cast");
+  // A choice made in one channel's list, then All channels: the line about it goes with the list.
+  await chooseIdentity(page, "coder");
+  assert.match(page.el("identity-state").textContent, /^Saved\./);
+  await settingsChannel(page, "*");
+  assert.equal(page.el("identity-state").textContent, "", "the line about a choice outlived the list it was about");
+  // `#355 provider-grouped-channels`: a service's All channels is All channels too.
+  const services = await servicesPage((one) => {
+    one.channels = [{ ...TEAM_A }, { ...TEAM_B }, { ...SPACE_A }];
+  });
+  await services.el("open-settings").click();
+  await services.settle();
+  assert.equal(pickerChoices(services)[0][1], "All Slack channels");
+  await settingsChannel(services, "*");
+  assert.equal(services.el("identity-list").text(), "Pick one channel to see who is who.");
+  // The negative control: a list with no word for All channels draws one for a channel that is not one.
+  const blind = newPage(new Map(), brokenScript("  if (channelId === ALL_CHANNELS) {\n", "  if (false) {\n"));
+  blind.chatProviderName = "Google Chat";
+  blind.upstreamClearSupported = true;
+  twoCasts(blind);
+  await signIn(blind);
+  await blind.el("open-settings").click();
+  await blind.settle();
+  await settingsChannel(blind, "*");
+  assert.notEqual(blind.el("identity-list").text(), "Pick one channel to see who is who.",
+    "the negative control asked for one channel anyway, so the check above proves nothing");
+});
+
+test("`#402 who-is-who-channel-box`: a channel added from Browse moves the box, and who is who names it", async () => {
+  const addFromBrowse = async (script = SCRIPT) => {
+    const page = newPage(new Map(), script);
+    page.channelRegistrationSupported = true;
+    page.channelDiscoverySupported = true;
+    page.directory = browsingPage().directory;
+    await openBrowser(page);
+    const row = page.el("channel-directory-list").children[1];
+    await row.children.find((kid) => kid.tagName === "button").click();
+    await page.settle();
+    return page;
+  };
+  const page = await addFromBrowse();
+  assert.equal(String(page.el("settings-channel").value), String(page.registeredChannelId));
+  assert.match(page.el("identity-list").text(), /^Nobody yet in Release Train\./, "who is who is still drawn for the last channel");
+  // The negative control: the add without the box redrawn leaves who is who on the channel before.
+  const stale = await addFromBrowse(brokenScript("  if (entry.channel_id) pointSettingsAt(entry.channel_id);\n" +
+    "  // The box onto the channel just added, as `addChannel` does: with one chat service `pointSettingsAt`\n" +
+    "  // only sets the picker, which fires nothing, and who is who names its channel (`#402\n" +
+    "  // who-is-who-channel-box`), so a box left drawn for the last channel says so in words.\n" +
+    "  renderChannelBox();\n", "  if (entry.channel_id) pointSettingsAt(entry.channel_id);\n"));
+  assert.doesNotMatch(stale.el("identity-list").text(), /Release Train/,
+    "the negative control named the new channel anyway, so the check above proves nothing");
+});
+
+test("`#402 who-is-who-channel-box`: a service with no channel on the list draws no Who is who over nothing", async () => {
+  const emptyService = async (script = SCRIPT) => {
+    const reference = await servicesPage();
+    const page = newPage(new Map(), script);
+    twoServices(page);
+    page.providers = reference.providers;
+    page.channels = [{ ...TEAM_A }];
+    await signIn(page);
+    await page.el("open-settings").click();
+    await page.settle();
+    const states = [page.el("identity-group").hidden];
+    await chooseService(page, "gchat");
+    states.push(page.el("identity-group").hidden);
+    await chooseService(page, "slack");
+    states.push(page.el("identity-group").hidden);
+    return { page, states };
+  };
+  const { page, states } = await emptyService();
+  await chooseService(page, "gchat");
+  assert.deepStrictEqual(settingsOptions(page), []);
+  assert.deepStrictEqual(states, [false, true, false], "Who is who is headed over an empty list, or did not come back");
+  // The negative control: a list that never hides its group.
+  const blind = await emptyService(brokenScript('  el("identity-group").hidden = none;\n', ""));
+  assert.deepStrictEqual(blind.states, [false, false, false],
+    "the negative control hid the group anyway, so the check above proves nothing");
 });
 
 /** Two channels, each with its own one-person cast: alice in CHANNEL, mallory in OTHER_CHANNEL. */
@@ -19152,7 +19256,7 @@ async function chooseIdentity(page, bucket) {
   await select.dispatch("change");
 }
 
-test("`#351 settings-polish`: who is who's line about a choice goes when the channel being read changes, and stays while it does not", async () => {
+test("`#351 settings-polish`: who is who's line about a choice goes when the box's channel changes, and stays while it does not", async () => {
   const page = newPage();
   twoCasts(page);
   await signIn(page);
@@ -19166,20 +19270,22 @@ test("`#351 settings-polish`: who is who's line about a choice goes when the cha
   await page.el("close-settings").click();
   await page.el("open-settings").click();
   assert.match(page.el("identity-state").textContent, /^Saved\./, "the line went with the list unchanged");
-  // Another channel read: its list, and no report about the last one's.
+  // `#402 who-is-who-channel-box`. Another channel read changes nothing here: the list is the box's.
   await page.el("close-settings").click();
   await readChannel(page, OTHER_CHANNEL.id);
   await page.el("open-settings").click();
+  assert.match(page.el("identity-state").textContent, /^Saved\./, "reading another channel cleared a line about the box's list");
+  // Another channel in the box: its list, and no report about the last one's.
+  await settingsChannel(page, OTHER_CHANNEL.id);
   assert.deepStrictEqual(listedNames(page), ["mallory"]);
   assert.equal(page.el("identity-state").textContent, "", "the line still reports a choice made in another channel's list");
-  // The channel being read removed from under the list, in Settings: the list goes to the channel read
-  // now, and the line about a choice made in the removed one's goes with it.
+  // The box's channel removed from under the list: the picker moves on, the list with it, and the line
+  // about a choice made in the removed one's goes.
   await chooseIdentity(page, "bot");
   assert.match(page.el("identity-state").textContent, /^Saved\./);
-  await settingsChannel(page, OTHER_CHANNEL.id);
   await page.el("remove-channel").click();
   await page.settle();
-  assert.equal(page.el("discord-channel").value, CHANNEL.id);
+  assert.equal(page.el("settings-channel").value, CHANNEL.id);
   assert.deepStrictEqual(listedNames(page), ["alice"], "the list stayed on the channel removed from under it");
   assert.equal(page.el("identity-state").textContent, "", "the line outlived the list it was about");
   // The negative control: a list that never clears the line.
@@ -19192,16 +19298,14 @@ test("`#351 settings-polish`: who is who's line about a choice goes when the cha
   await readChannel(blind, CHANNEL.id);
   await blind.el("open-settings").click();
   await chooseIdentity(blind, "coder");
-  await blind.el("close-settings").click();
-  await readChannel(blind, OTHER_CHANNEL.id);
-  await blind.el("open-settings").click();
+  await settingsChannel(blind, OTHER_CHANNEL.id);
   assert.match(blind.el("identity-state").textContent, /^Saved\./, "the negative control cleared the line anyway, so the check above proves nothing");
 });
 
-test("`#351 settings-polish`: with two columns open, who is who stays on the channel being read whichever column learns an author", async () => {
+test("`#351 settings-polish`: with two columns open, who is who lists the authors either column learns in the box's channel", async () => {
   // Both columns read one channel: the bar's picker, which is not one of the elements the right column
-  // stands in for (COLUMN_IDS), so the list cannot follow a column to another channel. This pins that:
-  // with a thread drawn in the right column, its authors are listed under the line naming the channel read.
+  // stands in for (COLUMN_IDS), so the right column cannot learn authors of another channel. This pins
+  // that: with a thread drawn in the right column, its authors are listed under the line naming the channel.
   assert.ok(!/^\s*"discord-channel":/m.test(SCRIPT_CODE.slice(SCRIPT_CODE.indexOf("const COLUMN_IDS = {"),
     SCRIPT_CODE.indexOf("};", SCRIPT_CODE.indexOf("const COLUMN_IDS = {")))), "the right column has a channel picker of its own");
   const { page, data } = await twoColumnServer((page, data) => {
@@ -19213,7 +19317,7 @@ test("`#351 settings-polish`: with two columns open, who is who stays on the cha
   assert.equal(page.el("side-pane").hidden, false, "the thread is not open in the right column");
   await page.el("open-settings").click();
   assert.ok(listedNames(page).includes("zed"), `an author of the right column's thread is not listed: ${listedNames(page)}`);
-  assert.match(page.el("identity-list").children[0].textContent, /^In lead team, the channel you are reading:$/);
+  assert.match(page.el("identity-list").children[0].textContent, /^In lead team:$/);
 });
 
 test("a channel nobody has spoken in yet says WHICH channel is empty rather than showing a blank panel", async () => {
@@ -19221,9 +19325,9 @@ test("a channel nobody has spoken in yet says WHICH channel is empty rather than
   page.channels = [{ ...CHANNEL }, { ...OTHER_CHANNEL }];
   serveByChannel(page, { [CHANNEL.id]: [], [OTHER_CHANNEL.id]: [] });
   await signIn(page);
-  await readChannel(page, OTHER_CHANNEL.id);
   await page.el("open-settings").click();
-  assert.match(page.el("identity-list").text(), /build noise/, "it does not say what is empty");
+  await settingsChannel(page, OTHER_CHANNEL.id);
+  assert.match(page.el("identity-list").text(), /^Nobody yet in build noise\./, "it does not say what is empty");
 });
 
 test("A BOT THAT ONLY SPEAKS SOMEWHERE ELSE CANNOT SPOIL THE GUESS HERE", async () => {
@@ -30112,6 +30216,200 @@ test("the hidden channels client-config reports are offered back under the owner
     false,
     "a hidden channel was put in the picker"
   );
+});
+
+// --- `#401 hidden-channels-fold` ------------------------------------------------------------------
+//
+// The owner, 2026-10-21: "That little section that shows old hidden channels. I think it should stay
+// at the bottom of that pane and be collapsed by default. When I'm switching channels and seeing the
+// interface update it seems invasive to have this bit in the middle that shows the old removed
+// channels." tests/channel_box_browser.py measures, in Chromium, that opening it moves nothing above it.
+
+/** Three configured channels taken off the list, as client-config reports them. */
+const HIDDEN_THREE = [
+  { id: "1110000000000000071", label: "old builds", alias: null, writable: true },
+  { id: "1110000000000000072", label: "retired alerts", alias: null, writable: true },
+  { id: "1110000000000000073", label: "launch room", alias: null, writable: true },
+];
+
+/**
+ * What is wrong with the hidden channels' place against `#401`, as sentences; empty when nothing is. A
+ * function of the markup, so each negative control can hand it the list somewhere else.
+ */
+function hiddenFoldProblems(html) {
+  const found = [];
+  const code = html.replace(/<!--[\s\S]*?-->/g, " ");
+  const section = settingsSection("Channels", code);
+  if (channelBoxCode(code).includes('id="hidden-channel-list"')) found.push("the hidden channels are inside the channel box");
+  const fold = new RegExp('<section class="settings-group" id="hidden-channels" hidden>\\s*<div class="group-head">\\s*' +
+    '<h3\\b[^>]*><button class="fold-toggle" id="fold-hidden-channels" type="button" aria-expanded="false" ' +
+    'aria-controls="fold-hidden-channels-body">Hidden channels</button></h3>\\s*</div>\\s*' +
+    '<div class="fold-body" id="fold-hidden-channels-body" hidden="until-found">([\\s\\S]*?)</div>\\s*</section>').exec(section);
+  if (!fold) {
+    found.push("the hidden channels are not a fold of their own, hidden while there are none");
+    return found;
+  }
+  if (!fold[1].includes('id="hidden-channel-list"')) found.push("the list is not inside the fold");
+  // The foot of the section: after the fold, only the end of the section's body.
+  if (!/^\s*<\/div>\s*$/.test(section.slice(fold.index + fold[0].length))) found.push("the fold is not the last thing in the section");
+  return found;
+}
+
+test("`#401 hidden-channels-fold`: the hidden channels are a fold of their own at the foot of the Channels section", () => {
+  assert.deepStrictEqual(hiddenFoldProblems(HTML), []);
+  const group = /<section class="settings-group" id="hidden-channels" hidden>[\s\S]*?<\/ul>\s*<\/div>\s*<\/section>\s*/.exec(HTML);
+  assert.ok(group, "the negative controls cannot find the fold");
+  // The negative control: the list where it was, in the middle of the box under its buttons.
+  const middle = HTML.replace(group[0], "").replace('<p id="remove-channel-state" class="hint" aria-live="polite"></p>',
+    '<p id="remove-channel-state" class="hint" aria-live="polite"></p><div id="hidden-channels" hidden>' +
+    '<p class="hint">Hidden channels from this server\'s configuration:</p>' +
+    '<ul id="hidden-channel-list" class="channel-directory" aria-label="Hidden channels"></ul></div>');
+  assert.deepStrictEqual(hiddenFoldProblems(middle),
+    ["the hidden channels are inside the channel box", "the hidden channels are not a fold of their own, hidden while there are none"]);
+  // ...and the fold at the head of the section, above the box, where a picker change would move it.
+  const above = HTML.replace(group[0], "").replace('<section class="settings-group" id="channel-settings"',
+    `${group[0]}<section class="settings-group" id="channel-settings"`);
+  assert.deepStrictEqual(hiddenFoldProblems(above), ["the fold is not the last thing in the section"]);
+});
+
+test("`#401 hidden-channels-fold`: folded on every load, its heading counting what is in it, and gone while nothing is", async () => {
+  const page = newPage();
+  page.hiddenChannels = HIDDEN_THREE.map((channel) => ({ ...channel }));
+  await signIn(page);
+  await page.el("open-settings").click();
+  await page.el("fold-settings-channels").click();
+  assert.equal(page.el("hidden-channels").hidden, false, "the hidden channels are not offered");
+  assert.equal(page.el("fold-hidden-channels").textContent, "Hidden channels (3)", "the heading does not count them");
+  assert.equal(settingsFoldState(page, "hidden-channels"), false, "the hidden channels are open as Settings opens");
+  // Drawn inside the folded body, so the browser's find still reaches a name.
+  const rows = page.el("hidden-channel-list").children;
+  assert.deepStrictEqual(rows.map((row) => row.children[0].textContent), ["old builds", "retired alerts", "launch room"]);
+  assert.ok(rows.every((row) => nodeIn(page.el("fold-hidden-channels-body"), row)), "a row is outside the fold");
+  // A fold like the rest: its heading opens it, and Expand all counts it.
+  await page.el("fold-hidden-channels").click();
+  assert.equal(settingsFoldState(page, "hidden-channels"), true);
+  await page.el("fold-settings-all").click();
+  await page.el("fold-settings-all").click();
+  assert.equal(settingsFoldState(page, "hidden-channels"), false, "Fold all left the hidden channels open");
+  // A reload folds it again.
+  const again = reloadWith(new Map(page.storage), []);
+  again.hiddenChannels = HIDDEN_THREE.map((channel) => ({ ...channel }));
+  await signIn(again);
+  await again.el("open-settings").click();
+  assert.equal(settingsFoldState(again, "hidden-channels"), false, "the fold was remembered across a reload");
+  // None hidden: the group is gone, and Expand all does not count a fold nobody can see.
+  const none = newPage();
+  none.agentSettingsUrl = null;
+  await signIn(none);
+  await none.el("open-settings").click();
+  assert.equal(none.el("hidden-channels").hidden, true, "an empty fold is offered");
+  assert.equal(none.el("agent-settings").hidden, true);
+  assert.equal(none.el("message-cache-group").hidden, true);
+  for (const slug of scriptFolds(SCRIPT_CODE).filter((one) => !["provider", "message-cache", "hidden-channels"].includes(one))) {
+    if (!foldOpenOn(none, slug)) await none.el(`fold-${slug}`).click();
+  }
+  assert.equal(none.el("fold-settings-all").textContent, "Fold all", "the empty fold is counted by Expand all");
+  // The negative control: a heading that does not count.
+  const mute = newPage(new Map(), brokenScript('  el("fold-hidden-channels").textContent = `Hidden channels (${rows.length})`;\n', ""));
+  mute.hiddenChannels = HIDDEN_THREE.map((channel) => ({ ...channel }));
+  await signIn(mute);
+  await mute.el("open-settings").click();
+  assert.equal(mute.el("fold-hidden-channels").textContent, "Hidden channels",
+    "the negative control counted anyway, so the check above proves nothing");
+});
+
+/** Whether the fold `slug` is open on `page`, by its button. */
+const foldOpenOn = (page, slug) => page.el(`fold-${slug}`).getAttribute("aria-expanded") === "true";
+
+/**
+ * Settings with two channels and hidden ones, the fold left `open`, then the box's picker moved twice:
+ * the fold's state after each move.
+ */
+async function hiddenFoldAcrossPicker(open, script = SCRIPT) {
+  const page = newPage(new Map(), script);
+  page.channels = [{ ...CHANNEL }, { ...OTHER_CHANNEL }];
+  page.hiddenChannels = HIDDEN_THREE.map((channel) => ({ ...channel }));
+  await signIn(page);
+  await page.el("open-settings").click();
+  await page.el("fold-settings-channels").click();
+  if (open) await page.el("fold-hidden-channels").click();
+  const states = [];
+  for (const id of [OTHER_CHANNEL.id, CHANNEL.id]) {
+    await settingsChannel(page, id);
+    states.push(foldOpenOn(page, "hidden-channels"));
+  }
+  return { page, states };
+}
+
+test("`#401 hidden-channels-fold`: a picker change leaves the fold as the reader left it, closed or open (negative controls)", async () => {
+  const closed = await hiddenFoldAcrossPicker(false);
+  assert.deepStrictEqual(closed.states, [false, false], "a picker change opened the hidden channels");
+  assert.equal(closed.page.el("fold-hidden-channels").textContent, "Hidden channels (3)");
+  const open = await hiddenFoldAcrossPicker(true);
+  assert.deepStrictEqual(open.states, [true, true], "a picker change folded the hidden channels");
+  // Settings left and opened again is the same visit.
+  await open.page.el("close-settings").click();
+  await open.page.el("open-settings").click();
+  assert.equal(settingsFoldState(open.page, "hidden-channels"), true, "the fold closed itself behind the reader's back");
+  // The negative controls: a box redraw that decides the fold, either way.
+  const opens = await hiddenFoldAcrossPicker(false, brokenScript("function renderChannelBox() {\n",
+    'function renderChannelBox() {\n  setFold("hidden-channels", true);\n'));
+  assert.deepStrictEqual(opens.states, [true, true], "the negative control left the fold closed, so the check above proves nothing");
+  const folds = await hiddenFoldAcrossPicker(true, brokenScript("function renderChannelBox() {\n",
+    'function renderChannelBox() {\n  setFold("hidden-channels", false);\n'));
+  assert.deepStrictEqual(folds.states, [false, false], "the negative control left the fold open, so the check above proves nothing");
+});
+
+test("`#401 hidden-channels-fold`: with two services, another service recounts the fold and leaves it as it was", async () => {
+  const hiddenTeam = { id: "C0400EEEEE", label: "old team", writable: false, provider: "slack" };
+  const hiddenSpaces = ["1110000000000000481", "1110000000000000482"].map((id, at) =>
+    ({ id, label: `old space ${at + 1}`, writable: false, provider: "gchat" }));
+  const page = await servicesPage((one) => {
+    one.channels = [{ ...TEAM_A }, { ...SPACE_A }];
+    one.hiddenChannels = [hiddenTeam, ...hiddenSpaces];
+  });
+  await page.el("open-settings").click();
+  await page.settle();
+  assert.equal(page.el("settings-service").value, "slack");
+  assert.equal(page.el("fold-hidden-channels").textContent, "Hidden channels (1)");
+  assert.equal(foldOpenOn(page, "hidden-channels"), false);
+  await chooseService(page, "gchat");
+  assert.equal(page.el("fold-hidden-channels").textContent, "Hidden channels (2)", "the count is not the service's");
+  assert.equal(foldOpenOn(page, "hidden-channels"), false, "another service opened the fold");
+  await page.el("fold-hidden-channels").click();
+  await chooseService(page, "slack");
+  assert.equal(foldOpenOn(page, "hidden-channels"), true, "another service folded the fold");
+});
+
+test("`#401 hidden-channels-fold`: Show again works from inside the fold, recounting it, and the last one takes the fold away", async () => {
+  const showFromFold = async (script = SCRIPT) => {
+    const page = newPage(new Map(), script);
+    page.hiddenChannels = HIDDEN_THREE.slice(0, 2).map((channel) => ({ ...channel }));
+    await signIn(page);
+    await page.el("open-settings").click();
+    await page.el("fold-settings-channels").click();
+    await page.el("fold-hidden-channels").click();
+    const row = page.el("hidden-channel-list").children[0];
+    assert.ok(nodeIn(page.el("fold-hidden-channels-body"), row), "the row is not inside the fold");
+    await row.children[1].click();
+    await page.settle();
+    return page;
+  };
+  const page = await showFromFold();
+  assert.deepEqual(page.showChannelCalls, [HIDDEN_THREE[0].id]);
+  assert.ok(page.el("discord-channel").children.some((option) => option.value === HIDDEN_THREE[0].id),
+    "Show again did not put the channel back in the picker");
+  assert.equal(page.el("settings-channel").value, HIDDEN_THREE[0].id, "the box is not on the channel shown again");
+  assert.match(page.el("remove-channel-state").text(), /Shown again/);
+  assert.equal(page.el("fold-hidden-channels").textContent, "Hidden channels (1)", "the heading kept the old count");
+  assert.equal(settingsFoldState(page, "hidden-channels"), true, "Show again folded the list it was pressed in");
+  await page.el("hidden-channel-list").children[0].children[1].click();
+  await page.settle();
+  assert.deepEqual(page.showChannelCalls, [HIDDEN_THREE[0].id, HIDDEN_THREE[1].id]);
+  assert.equal(page.el("hidden-channels").hidden, true, "an empty fold is still offered");
+  // The negative control: a Show again that is not wired does nothing, and is caught.
+  const dead = await showFromFold(brokenScript("    show.addEventListener(\"click\", guardQuietly(() => showChannelAgain(channel)));\n", ""));
+  assert.deepEqual(dead.showChannelCalls, [], "the negative control reached the server anyway, so the check above proves nothing");
 });
 
 test("the per-channel settings are all under ONE channel selector", async () => {
@@ -60695,10 +60993,11 @@ test("`#271 settings-groups`: the Messages section holds the message options, an
   const messages = groupsIn("Messages");
   // `#332 settings-voice-agent-section` took the message-reading setting to Voice agent and How
   // messages are said to Help, so Messages is the marking and drawing of messages, and only that.
-  // `#349 channel-settings-all` moved Who is who here, out of the per-channel box.
+  // `#349 channel-settings-all` moved Who is who here, out of the per-channel box, and `#402
+  // who-is-who-channel-box` put it back there.
   // `#386 hide-empty-messages` put Empty messages beside Mark-read automatically, the owner's place for it.
   assert.deepStrictEqual(messages, ["Your own messages", "Mark-read automatically", "Empty messages", "Combining messages",
-    "Rich headers", "Who is who", "Recently dismissed"]);
+    "Rich headers", "Recently dismissed"]);
   for (const agentGroup of ["Sending", "Instructions", "Resuming", "Arriving messages during a call",
     "Reading full messages in channel view"]) {
     assert.ok(!messages.includes(agentGroup), `"${agentGroup}" is in Messages`);
@@ -61249,7 +61548,8 @@ test("`#347 settings-prose`: how live updates arrive is still said, in Connectio
 //
 // The owner, 2026-10-18 ("settings complaints"): the channel drop-down gains "All channels"; Clear
 // unread can be set for all at once; show "Mixed" when channels differ; drop the who-is-who part from
-// that pane. Who is who moved to Messages, which the tests beside `renderIdentityRows` cover.
+// that pane. Who is who moved to Messages; `#402 who-is-who-channel-box` put it back in the box, which
+// the tests beside `renderIdentityRows` cover.
 
 /** Settings on a server with two channels whose chat service can clear unread, each in its `modes`. */
 async function allChannelsPage(modes = {}, arrange = (_page) => {}) {

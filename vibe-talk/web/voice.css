@@ -769,8 +769,10 @@ a.search-hit-link {
   margin-inline-start: auto;
 }
 
-/* A group's own heading, inside a section: what a card's heading used to be, one step quieter. */
-#screen-settings .settings-group > .group-head > h3 {
+/* A group's own heading, inside a section: what a card's heading used to be, one step quieter.
+   `#402 who-is-who-channel-box`: Who is who, at the foot of the channel box, is headed as one. */
+#screen-settings .settings-group > .group-head > h3,
+#screen-settings #identity-group > .group-head > h3 {
   font-size: 0.92rem;
   margin: 0.15rem 0 0.3rem;
 }
@@ -1916,6 +1918,12 @@ a.search-hit-link {
   gap: 0.35rem 0.6rem;
   padding: 0.45rem 0;
   border-bottom: 1px solid var(--edge);
+}
+
+/* `#401 hidden-channels-fold`. The last row needs no rule of its own: the hidden channels' fold under
+   it opens with one, and the two together read as a gap with nothing in it. */
+#identity-list > .identity-row:last-child {
+  border-bottom: none;
 }
 
 /* `break-word`, NOT `anywhere`, and the difference is the whole of the defect above: both break a

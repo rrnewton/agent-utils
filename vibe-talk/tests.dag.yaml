@@ -670,6 +670,27 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#402 who-is-who-channel-box` and `#401 hidden-channels-fold` in the browser engine at 1280x800 and a
+  # 393x852 phone: Settings' Channels section with two channels and three hidden ones. Who is who is in the
+  # channel box and follows its picker; the hidden channels are a fold headed "Hidden channels (3)", folded
+  # and the last thing drawn in the section; opening it moves none of the boxes above it, a picker change
+  # leaves it folded, and Show again works inside it. The fake-DOM suite lays nothing out, so only this
+  # proves the fold is at the foot and moves nothing. Measured on 2026-10-21 outside dagrun at load 29:
+  # about 4s wall, 1.4s CPU.
+  - group: check
+    job: channel-box-browser
+    desc: Settings' channel section in current Chromium at 1280x800 and 393x852, Who is who in the channel box following its picker, and the hidden channels a folded fold at its foot that moves nothing above it
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/channel_box_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 6
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#371 channel-search-hash` in the browser engine at 1280x800: one Slack service whose channels are
   # written `#name`; the bar's picker lists them without the '#', so typing `team` into the focused
   # picker through CDP chooses `#team-builds`, and the channel browser counts the seconds of a slow
