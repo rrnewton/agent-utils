@@ -8257,10 +8257,16 @@ textarea {
   content: none;
 }
 
-/* `#405 root-under-summary`. The root as a summarized card's first child, in a thread or unpacked:
-   its bridge in the thread's colour, where the row carries it. */
+/* `#405 root-under-summary`. The root as a summarized card's first child: unpacked, on its bridge
+   in the thread's colour; in a thread, an edge in that colour inside its own box, so the row keeps
+   its width and its place beside the link's lane (`#385 thread-line-overlap`). */
 li.discord-message[data-root-child] > .reply-bridge {
   color: hsl(var(--thread-hue, 210) 55% 50%);
+}
+
+#side-log li.discord-message[data-root-child],
+#discord-log li.discord-message[data-root-child] {
+  box-shadow: inset 3px 0 hsl(var(--thread-hue, 210) 55% 50%);
 }
 
 /* `#231 two-column-polish`. The right column's freshness: the pill's words, the pill's size and its

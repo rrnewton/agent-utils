@@ -29387,10 +29387,12 @@ function renderReplyLinks() {
       row.setAttribute("data-root-child", "");
       /** @type {HTMLElement} */ (row).style.setProperty("--thread-hue", threadHue(String(selectedThreadId)));
     } else if (row.hasAttribute("data-root-child")) row.removeAttribute("data-root-child");
+    // No stack inset and no bridge for the child here: in a thread its rows stay one width, level
+    // with the card, with the link's lane beside them (`#385 thread-line-overlap`); the hue edge
+    // (web/voice.css) is what joins it to the card. Unpacked blocks indent theirs (`unpackBlock`).
     if (at >= 0) row.setAttribute("data-stack-under", under);
-    else if (child) row.setAttribute("data-stack-under", "third");
     else row.removeAttribute("data-stack-under");
-    gutterPiece(row, "reply-bridge", at >= 0 || child, bridgePiece);
+    gutterPiece(row, "reply-bridge", at >= 0, bridgePiece);
     gutterPiece(row, "reply-ungather", at === 0, ungatherButton);
     const arrow = childByClass(row, "reply-jump");
     if (arrow) {
