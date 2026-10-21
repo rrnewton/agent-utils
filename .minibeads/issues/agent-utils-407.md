@@ -1,12 +1,13 @@
 ---
 title: 'unpack-row-parity: unpacked thread rows answer the mouse and keys as message rows do everywhere else'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-21T20:17:17.497952628+00:00
-updated_at: 2026-10-21T20:17:17.497952628+00:00
+updated_at: 2026-10-21T21:22:55.439640048+00:00
+closed_at: 2026-10-21T21:22:55.439639598+00:00
 ---
 
 # Description
