@@ -46675,7 +46675,7 @@ const ROW_ACTS = ":is(.reply-button:not([data-quote]), .not-noise-button, .done-
 
 test("`#377 compact-collapsed-rows`: a narrow list takes Reply and Done off a collapsed row only, never an open one", () => {
   const body = containerBody(COMPACT_QUERY);
-  const lists = ":is(#side-log, #discord-log, #pinned-log)";
+  const lists = ":is(#side-log, #side-cards, #discord-log, #pinned-log)";
   const selector = `${lists} li.discord-message[data-collapsed="true"] .row-acts > ${ROW_ACTS}`;
   const hidden = wholeRules(body, selector).join("\n");
   assert.match(hidden, /display:\s*none/, "a collapsed row in a narrow list still draws Reply and Done");

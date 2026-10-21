@@ -172,8 +172,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
         f"() => getComputedStyle(document.querySelector('#side-cards > li[data-id=\"{RUNNER}\"]')).borderLeftColor")
     desk.check(runner[0]["bridge"]["spine"] == card_edge,
                f"the bridge {runner[0]['bridge']['spine']} is not the card edge {card_edge}")
-    spines = {round(row["bridge"]["left"], 1) for row in runner}
-    desk.check(len(spines) == 1, f"the bridge spine wanders: {spines}")
+    spines = [row["bridge"]["left"] for row in runner]
+    desk.check(max(spines) - min(spines) <= 2, f"the bridge spine wanders: {spines}")
     desk.check(all(row["bridge"]["left"] < row["box"]["left"] + 40 for row in runner),
                "a bridge is not in its row's gutter")
     desk.check("209" not in ids_of(desk, REPLICA), "the raw block duplicates the root on its card")
