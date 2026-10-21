@@ -111,3 +111,22 @@ hides read replies under every unpacked thread while keeping summarized
 roots). Chromium walk (`vibe-talk/tests/threads_unpack_browser.py`, fixture
 of `two_column_browser.py`) at 1280x800 and 393x852, dark and light, toggle
 on/off, collapsed read runs, with screenshots.
+
+## Addendum, later on 2026-10-21: `#407 unpack-row-parity`
+
+The owner tried (1) and found the unpacked rows outside the facilities of every other list: no hover
+highlight, no keys on the selected row, `:` doing nothing, and asked for shared code rather than a
+separate implementation. What changed from the design above:
+
+- The selection (`paneRows`, `rowOf`) no longer leaves `data-unpack-thread` rows out, so the mouse,
+  ↓/↑/j/k, `n` and every key about one message reach them through `sidePane`, as any list's rows.
+  A kept selection records whether it is on a card, since a card and its root's row can share an id.
+- Blocks are built in the right column (the column `sidePane` acts in), with its read state caught
+  up with the store's for the messages drawn, so a key and a row's own button act in one column.
+- A block's rows are dressed by `dressChannelRow` (extracted from `renderChannelRows`), filtered by
+  `readFilterKeeps(thread)` under Hide read, and folded by `readRunPlan` (extracted from
+  `applyReadRuns`) under Collapse read: the `.unpack-read-run` line and its own opened-runs map are
+  gone; a block's run is the ordinary run line, opened as in its thread (`openedReadRuns` under the
+  thread's `viewKey`).
+- `;` and `:` fold the unpacked rows (`visibleFolds` reads the cards' list in the right column); `→`
+  on an unpacked row goes into its thread; Through here covers the rows above it in its own thread.

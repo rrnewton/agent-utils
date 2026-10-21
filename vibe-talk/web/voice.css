@@ -7769,6 +7769,12 @@ textarea {
     margin-left: calc(var(--desk-third-inset, min(7%, 3rem)) + var(--reply-gutter));
   }
 
+  /* `#407 unpack-row-parity`. And a collapsed run's line in an unpacked thread, as on a phone: the
+     extra attribute puts it over the phone's rule, which comes later in the file. */
+  #side-cards li.discord-message[data-read-run="head"][data-stack-under="third"][data-who] {
+    margin-left: calc(var(--desk-third-inset, min(7%, 3rem)) + var(--reply-gutter)) !important;
+  }
+
   #side-log li.discord-message[data-stack-under="reply"][data-who],
   #side-cards li.discord-message[data-stack-under="reply"][data-who],
   #discord-log li.discord-message[data-stack-under="reply"][data-who],
@@ -8246,14 +8252,25 @@ textarea {
 
 /* `#404 threads-unpack-all`. A thread unpacked under its card: its rows are channel rows in the
    cards list (every `#side-log` row rule above has its `#side-cards` twin), hung one gutter in on
-   a bridge in the thread's own colour, as All's gathered replies hang on theirs in the accent.
-   A collapsed run of read rows keeps the run line's grey words, joined to the spine by the
-   bridge's own stub instead of the seam's left hairline. */
+   a bridge in the thread's own colour, as All's gathered replies hang on theirs in the accent. */
 #side-cards .reply-bridge {
   color: hsl(var(--thread-hue, 210) 55% 50%);
 }
 
-#side-cards .unpack-read-run > .read-run::before {
+/* `#407 unpack-row-parity`. A collapsed run of read rows in an unpacked thread is the run line every
+   list draws on the run's first row (`#221 read-modes`), which in a block keeps its row's place on
+   the bridge: the stack's indent, restated from the stack's own rules (and the desk's, at the foot
+   of this file) over the line's, and its piece of the spine, whose stub joins the grey words in
+   place of the line's left hairline. */
+#side-cards li.discord-message[data-read-run="head"][data-stack-under="third"] {
+  margin-left: calc(var(--speaker-inset) / 2 + var(--reply-gutter)) !important;
+}
+
+#side-cards li.discord-message[data-read-run="head"] > .reply-bridge {
+  display: block !important;
+}
+
+#side-cards li.discord-message[data-read-run="head"][data-stack-under] > .read-run::before {
   content: none;
 }
 

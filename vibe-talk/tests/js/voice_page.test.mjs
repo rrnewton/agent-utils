@@ -76288,7 +76288,8 @@ test("`#404 threads-unpack-all` x `#221 read-modes`: Collapse read folds runs on
   await page.settle();
   assert.equal(page.el("todo-filter").getAttribute("data-read-mode"), "collapse");
   for (const threadId of ["spaces/A/threads/sum", "spaces/A/threads/raw"]) {
-    const runs = unpackRows(page, threadId).filter((li) => li.hasClass("unpack-read-run"));
+    // `#407 unpack-row-parity`: the run line every list draws, on the run's first row.
+    const runs = unpackRows(page, threadId).filter((li) => li.getAttribute("data-read-run") === "head");
     assert.equal(runs.length, 1, `${threadId}: its two read replies are not one run line`);
     assert.match(runs[0].descendants().find((n) => n.className === "read-run").textContent, /2 read messages/,
       "the run line does not say what it holds");
@@ -76322,4 +76323,233 @@ test("`#405 root-under-summary`: in a thread headed by a summarized card the rea
   assert.ok(!rawRows.some((li) => li.hasAttribute("data-root-child")), "a raw card's thread grew a root child");
   assert.ok(!rawRows.flatMap((li) => (li.getAttribute("data-ids") || "").split(" ")).includes("704"),
     "the raw thread kept its read root under Hide read, so the summarized check proves nothing");
+});
+
+// --- an unpacked row is a message row like any other (#407 unpack-row-parity) ---------------------------
+//
+// The owner, 2026-10-21, after trying #404: "When I mouse over the unpacked messages they do not
+// highlight. I can click to collapse expand but not use a keystroke on the highlighted one. Keystroke
+// ':' does not work to expand/collapse all. I don't want us to have separate code." So an unpacked row
+// answers the mouse, the selection, every key about one message, ; and :, and the read modes exactly as
+// a row of Main, All or a thread does, through the same code: these press the same keys on both.
+
+/** `unpackData` with every message long enough to fold, and, with `collide`, thread ids that are their roots' ids. */
+function parityData({ long = true, collide = false } = {}) {
+  const data = unpackData();
+  const ids = collide ? { "spaces/A/threads/sum": "700", "spaces/A/threads/raw": "704" } : {};
+  const renamed = (id) => ids[id] || id;
+  const messages = data.messages.map((one) => ({ ...one,
+    content: long ? longMessage(`message ${one.id}`) : one.content,
+    thread: { ...one.thread, id: renamed(one.thread.id) } }));
+  const threads = data.threads.map((one) => ({ ...one, id: renamed(one.id),
+    root: messages.find((m) => m.id === one.root.id) }));
+  return { messages, threads };
+}
+
+async function parityPage({ read = ["700", "701", "702", "704", "705", "706"], ...options } = {}) {
+  const data = parityData(options);
+  const page = newPage(new Map([[UNPACK_STORAGE, "on"]]));
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  page.messages = data.messages;
+  forwardTimeline(page);
+  for (const id of read) page.dealtWith.add(id);
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await pickThread(page, "threads");
+  await page.settle();
+  return { page, data };
+}
+
+/** The unpacked row standing for message `id` in the Threads view. */
+const unpackedRow = (page, id) => page.el("side-cards").children.find((li) =>
+  li.hasAttribute("data-unpack-thread") && (li.getAttribute("data-ids") || "").split(" ").includes(id));
+
+/** The mouse moved over `row` of the Threads view, scrolled first to the top of the list's screen. */
+async function mouseOnto(page, row) {
+  const area = page.el("side-scroll");
+  area.scrollTop += row.getBoundingClientRect().top;
+  const box = row.getBoundingClientRect();
+  await mouseTo(page, row, 300, box.top + 5);
+}
+
+/** What holds the focus, as `card:<thread>` for a card and the first message id for a message row. */
+const heldRow = (page) => {
+  const held = focused(page);
+  if (!held || !held.getAttribute) return focusName(page);
+  if (held.hasAttribute && held.hasAttribute("data-card")) return `card:${held.getAttribute("data-id")}`;
+  return held.getAttribute("data-id") !== null ? held.getAttribute("data-id") : focusName(page);
+};
+
+test("`#407 unpack-row-parity`: the mouse over an unpacked row lights it as it lights a row of Main, and nothing else is lit", async () => {
+  const { page } = await parityPage({ long: false });
+  const row = unpackedRow(page, "703");
+  assert.ok(row, "the fixture did not unpack 703 under its card");
+  await mouseOnto(page, row);
+  assert.deepStrictEqual(litRows(page), ["side-cards:703"], `the mouse over 703 lit ${JSON.stringify(litRows(page))}`);
+  assert.equal(row.getAttribute("tabindex"), "0", "the row the mouse chose is not the selection's Tab stop");
+  // Onto another unpacked row, of the other thread: the selection follows, one row lit.
+  await mouseOnto(page, unpackedRow(page, "707"));
+  assert.deepStrictEqual(litRows(page), ["side-cards:707"]);
+  // And onto a card, which the mouse lit before as well: the same selection.
+  await mouseOnto(page, cardRow(page, "spaces/A/threads/raw"));
+  assert.deepStrictEqual(litRows(page), ["side-cards:spaces/A/threads/raw"]);
+});
+
+test("`#407 unpack-row-parity`: ↓ and ↑ (and j and k) walk cards and unpacked rows in reading order, one selection", async () => {
+  const { page } = await parityPage({ long: false });
+  const area = page.el("side-scroll");
+  area.focus();
+  await mouseOnto(page, cardRow(page, "spaces/A/threads/sum"));
+  const walk = [];
+  for (let step = 0; step < 6; step += 1) {
+    await pressHere(page, step % 2 ? "j" : "ArrowDown");
+    walk.push(heldRow(page));
+  }
+  assert.deepStrictEqual(walk, ["700", "701", "702", "703", "card:spaces/A/threads/raw", "705"],
+    "↓ and j did not go through the unpacked rows in reading order");
+  assert.deepStrictEqual(litRows(page), ["side-cards:705"], "more than the selection is lit");
+  await pressHere(page, "ArrowUp");
+  assert.equal(heldRow(page), "card:spaces/A/threads/raw", "↑ did not come back from an unpacked row to its card");
+  await pressHere(page, "k");
+  assert.equal(heldRow(page), "703", "k did not go up from a card into the block above it");
+});
+
+test("`#407 unpack-row-parity`: a thread whose id is its root's id: the root child selected is the row lit, not its card", async () => {
+  const { page } = await parityPage({ long: false, collide: true });
+  assert.ok(cardRow(page, "700") && unpackedRow(page, "700"), "the fixture has no card and root child sharing an id");
+  page.el("side-scroll").focus();
+  await mouseOnto(page, unpackedRow(page, "700"));
+  assert.deepStrictEqual(litRows(page), ["side-cards:700"]);
+  assert.equal(page.el("side-cards").children.find((li) => li.getAttribute("data-selected") === "true"),
+    unpackedRow(page, "700"), "the root child's selection lit its card");
+  await pressHere(page, "ArrowDown");
+  assert.equal(heldRow(page), "701", "↓ from the root child did not go on to its first reply");
+  await pressHere(page, "ArrowUp");
+  assert.equal(focused(page), unpackedRow(page, "700"), "↑ went back to the card, not the root child");
+  await pressHere(page, "ArrowUp");
+  assert.equal(heldRow(page), "card:700", "↑ from the root child did not reach its card");
+});
+
+test("`#407 unpack-row-parity`: Enter and o fold the selected unpacked row, e marks it Done, r replies to it, as on Main", async () => {
+  const { page } = await parityPage();
+  const area = page.el("side-scroll");
+  area.focus();
+  await mouseOnto(page, unpackedRow(page, "703"));
+  assert.equal(unpackedRow(page, "703").getAttribute("data-collapsed"), "true", "the fixture's 703 is not folded");
+  await pressHere(page, "Enter");
+  assert.equal(unpackedRow(page, "703").getAttribute("data-collapsed"), "false", "Enter did not open the selected unpacked row");
+  await pressHere(page, "o");
+  assert.equal(unpackedRow(page, "703").getAttribute("data-collapsed"), "true", "o did not fold it again");
+  await pressHere(page, "e");
+  assert.deepStrictEqual(page.dismissCalls.at(-1), { messages: ["703"] }, "e did not mark the selected unpacked row Done");
+  await page.settle();
+  assert.equal(unpackedRow(page, "703").getAttribute("data-archived"), "true", "the Done row is not drawn read");
+  // e again on the same row puts it back, as the row's own button would: the row's read state is the one acted on.
+  await mouseOnto(page, unpackedRow(page, "707"));
+  await mouseOnto(page, unpackedRow(page, "703"));
+  await pressHere(page, "e");
+  await page.settle();
+  assert.equal(unpackedRow(page, "703").getAttribute("data-archived"), "false", "e on a Done unpacked row did not put it back");
+  await mouseOnto(page, unpackedRow(page, "707"));
+  await pressHere(page, "r");
+  assert.equal(page.screen(), "reply", "r did not reply to the selected unpacked row");
+  assert.equal(page.el("reply-target").children[0].getAttribute("data-id"), "707", "r answered another message");
+});
+
+test("`#407 unpack-row-parity`: ; and : step the unpacked rows' folds as they step a thread's, each step said", async () => {
+  const { page } = await parityPage();
+  const area = page.el("side-scroll");
+  area.focus();
+  const rows = () => foldState(page, "side-cards");
+  const all = ["700", "701", "702", "703", "705", "706", "707"];
+  assert.deepStrictEqual(rows(), { open: [], shut: all }, "the fixture's unpacked rows are not all folded");
+  await press(page, area, ";");
+  assert.equal(statusSaid(page), FOLD_SAID.expand, `; said ${statusSaid(page)}`);
+  assert.deepStrictEqual(rows(), { open: all, shut: [] }, "; did not expand every unpacked row");
+  await press(page, area, ":", { shiftKey: true });
+  assert.equal(statusSaid(page), FOLD_SAID.collapse);
+  assert.deepStrictEqual(rows(), { open: [], shut: all }, ": did not collapse every unpacked row");
+  await press(page, area, ":", { shiftKey: true });
+  assert.equal(statusSaid(page), FOLD_SAID.unread);
+  assert.deepStrictEqual(rows(), { open: ["703", "707"], shut: ["700", "701", "702", "705", "706"] },
+    ": did not open the unread rows and fold the read ones");
+});
+
+test("`#407 unpack-row-parity`: Collapse read draws a block's run as every list draws one, and Enter on it opens it", async () => {
+  const { page } = await parityPage({ long: false });
+  await page.el("todo-filter").click(); // Show -> Collapse
+  await page.settle();
+  const block = unpackRows(page, "spaces/A/threads/raw");
+  const head = block.find((li) => li.getAttribute("data-read-run") === "head");
+  assert.ok(head, "the raw block's read run is not the shared run line");
+  assert.deepStrictEqual((head.getAttribute("data-ids") || "").split(" "), ["705"], "the run line is not on its first row");
+  assert.equal(unpackedRow(page, "706").getAttribute("data-read-run"), "member");
+  assert.equal(unpackedRow(page, "706").hidden, true, "the run's second row shows");
+  assert.ok(!block.some((li) => li.hasClass("unpack-read-run")), "a second kind of run line is still drawn");
+  assert.match(head.descendants().find((n) => n.className === "read-run").textContent, /2 read messages/);
+  // The summarized root stays out of every run, as an open thread's root does.
+  assert.equal(unpackedRow(page, "700").getAttribute("data-read-run"), null, "the summarized root joined a run");
+  // Selected and opened by its key, as a run in Main is.
+  const area = page.el("side-scroll");
+  area.focus();
+  await mouseOnto(page, head);
+  assert.deepStrictEqual(litRows(page), ["side-cards:705"], "the run line is not selectable");
+  await pressHere(page, "Enter");
+  assert.equal(unpackedRow(page, "706").hidden, false, "Enter on the run line did not open it");
+  assert.equal(unpackedRow(page, "705").getAttribute("data-read-run"), null);
+  // And stays open as the block is drawn again, as a run opened in a thread stays open.
+  await page.el("side-unpack").click();
+  await page.el("side-unpack").click();
+  await page.settle();
+  assert.equal(unpackedRow(page, "706").hidden, false, "the opened run shut again when its block was drawn again");
+});
+
+test("`#407 unpack-row-parity`: Through here on an unpacked row covers the rows above it in its own thread, as in the thread", async () => {
+  const { page } = await parityPage({ long: false, read: [] });
+  const row = unpackedRow(page, "706");
+  const through = row.descendants().find((n) => n.className === "row-read-through-button");
+  await through.click();
+  await page.settle();
+  const marked = page.dismissCalls.at(-1).messages;
+  assert.deepStrictEqual(marked, ["705", "706"], "Through here did not cover exactly its own thread's rows above it");
+  assert.ok(!marked.some((id) => ["700", "701", "702", "703"].includes(id)),
+    `Through here marked another thread's rows above it: ${marked}`);
+});
+
+test("`#407 unpack-row-parity` negative controls: Main, a thread, and the cards packed answer the same keys as before", async () => {
+  /** The mouse onto `row` of the list `scroller` scrolls, its top at the top of the screen; then ↓. */
+  const pointThenDown = async (page, scroller, row) => {
+    const area = page.el(scroller);
+    area.focus();
+    area.scrollTop += row.getBoundingClientRect().top;
+    await mouseTo(page, row, 300, row.getBoundingClientRect().top + 5);
+    await pressHere(page, "ArrowDown");
+  };
+  // Main: ↓ from a message to the next, Enter opens it, ; expands.
+  const main = await foldStepPage(6);
+  await pointThenDown(main, "scroll-area", channelRow(main, "1"));
+  assert.equal(selectedId(main), "2", "↓ in Main did not go to the next message");
+  await pressHere(main, "Enter");
+  assert.equal(channelRow(main, "2").getAttribute("data-collapsed"), "false", "Enter in Main did not open the message");
+  await press(main, main.el("scroll-area"), ";");
+  assert.equal(statusSaid(main), FOLD_SAID.expand);
+  // A thread: the same keys over its rows.
+  const { page } = await parityPage();
+  await pickThread(page, "thread:spaces/A/threads/raw");
+  await page.settle();
+  const rows = page.el("discord-log").children.filter((li) => li.hasAttribute("data-id"));
+  assert.deepStrictEqual(rows.map((li) => li.getAttribute("data-id")), ["704", "705", "706", "707"], "the thread did not open");
+  await pointThenDown(page, "scroll-area", rows[1]);
+  assert.equal(selectedId(page), "706", "↓ in a thread did not go on");
+  await pressHere(page, "Enter");
+  assert.equal(rows[2].getAttribute("data-collapsed"), "false", "Enter in a thread did not open the message");
+  await press(page, page.el("scroll-area"), ";");
+  assert.equal(statusSaid(page), FOLD_SAID.expand, "; in a thread said otherwise");
+  // The cards with Unpack all off: ↓ goes card to card, and ; has nothing to fold.
+  const { page: cards } = await unpackPage();
+  await pointThenDown(cards, "side-scroll", cardRow(cards, "spaces/A/threads/sum"));
+  assert.equal(heldRow(cards), "card:spaces/A/threads/raw", "↓ over packed cards did not go card to card");
+  await press(cards, cards.el("side-scroll"), ";");
+  assert.equal(statusSaid(cards), "No long messages here to expand or collapse.", "; over packed cards found folds");
 });

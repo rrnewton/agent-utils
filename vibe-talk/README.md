@@ -51,7 +51,10 @@ four views are offered, in the view picker and on Ctrl+1 to Ctrl+4 (Cmd on a Mac
   the card's × (or Esc, or ←) goes back to where it was opened from. **Unpack all** beside **Unread
   only** (key `u`, kept on this device) draws every thread's messages under its card at once, in time
   order on a bridge in the thread's colour, as **N replies** gathers one thread in **All**; the read
-  modes apply inside each thread, a collapsed run of read messages hanging off its bridge. A thread
+  modes apply inside each thread, a collapsed run of read messages hanging off its bridge. The
+  unpacked messages are message rows like any other: the mouse lights them, ↓/↑ and j/k walk cards
+  and messages in reading order, every key about one message acts on the one selected, ; and : open
+  and fold them, and → goes into its thread (`#407 unpack-row-parity`). A thread
   whose replies are not held yet is read as its card nears the screen, its newest page only.
   Wherever a card says a summary rather than the thread's first message — here and at the head of an
   open thread — that first message stands first under the card as its child, however read it is; a

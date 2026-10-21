@@ -3686,11 +3686,13 @@ function renderJumpNewest() {
  */
 function visibleFolds() {
   if (searchOpen && linksOnly) return [];
-  // Nor a thread's rows in the right column while it shows the cards: they are not on screen.
-  // `#301 semicolon-expand-cycle`, whose keys work in either column.
-  if (sideActive && columns.side.mode !== "thread") return [];
+  // In the right column while it shows the cards, not its thread's rows, which are not on screen, but
+  // the cards' list: the messages unpacked under them, which are folded as a thread's are (`#407
+  // unpack-row-parity`), and none where nothing is unpacked, a card being no fold. `#301
+  // semicolon-expand-cycle`, whose keys work in either column.
+  const list = sideActive && columns.side.mode !== "thread" ? leftEl("side-cards") : visibleList();
   // Nor the rows of a collapsed run of read messages, whose text is behind its line. `#221 read-modes`.
-  return foldsOf(visibleList()).filter((entry) => !entry.li.hasAttribute("data-read-run"));
+  return foldsOf(list).filter((entry) => !entry.li.hasAttribute("data-read-run"));
 }
 
 /** How many redraws are under way that pass over the scroll tools once, at their end. `#226`. */
@@ -3901,8 +3903,7 @@ function nextFoldStep(from, way, folds) {
  */
 function foldStepAnchor() {
   const pane = sideActive ? sidePane : channelPane;
-  const mark = markOf(pane);
-  const chosen = mark ? paneRowFor(pane, mark.id) : null;
+  const chosen = markedRow(pane, markOf(pane));
   const row = chosen && rowInView(pane, chosen) ? chosen : paneRows(pane).find((one) => rowInView(pane, one));
   return row ? anchorAt(row) : null;
 }
@@ -5453,7 +5454,7 @@ function filterAnchor() {
   const area = el("scroll-area");
   const pane = currentView === "discord" ? (sideActive ? sidePane : channelPane) : null;
   const mark = pane ? markOf(pane) : null;
-  const chosen = mark ? paneRowFor(pane, mark.id) : null;
+  const chosen = pane ? markedRow(pane, mark) : null;
   const showing = Boolean(pane && mark && chosen && rowInView(pane, chosen));
   const held = currentFilterHold();
   // The anchor the last change was asked to keep, while the reader has neither moved nor chosen
@@ -8724,6 +8725,9 @@ const isComposer = (node) => Boolean(node) && COMPOSER_FIELDS.includes(String(no
 /**
  * @typedef {object} KeySelection
  * @property {string} id The message the selection is on: its row's `data-id`.
+ * @property {boolean} [card] Whether that row is a thread's card, which shares its `data-id` with its
+ *   root's row where the thread is named after its root and the root stands unpacked under it (`#407
+ *   unpack-row-parity`). Absent where it is not known, as for a selection a filter carried.
  * @property {boolean} drawn Whether it is drawn and holds the focus: the keyboard, the mouse or a jump
  *   chose it. A tap on a touch screen selects silently (`drawnBy`).
  * @property {number} index Where its row was in the list, for when the row goes.
@@ -8846,12 +8850,15 @@ function visibleScroller(node = document.activeElement) {
   return el(`screen-${currentScreen}`);
 }
 
-/** The rows a pane's keys move through, top to bottom: its messages that are drawn. */
+/**
+ * The rows a pane's keys move through, top to bottom: its messages that are drawn, and over the cards
+ * the cards with every thread's messages unpacked under them (`#407 unpack-row-parity`), in the order
+ * they are read.
+ */
 function paneRows(pane) {
   const list = pane.list();
   if (!list) return [];
-  return /** @type {HTMLElement[]} */ ([...list.children])
-    .filter((row) => row.hasAttribute("data-id") && !row.hasAttribute("data-unpack-thread") && rowShown(row));
+  return /** @type {HTMLElement[]} */ ([...list.children]).filter((row) => row.hasAttribute("data-id") && rowShown(row));
 }
 
 /** The row of `pane` that `node` is in, or null. */
@@ -8860,8 +8867,7 @@ function rowOf(pane, node) {
   if (!list || !node) return null;
   for (let at = node; at && at !== list; at = at.parentNode) {
     if (at.parentNode === list) {
-      return typeof at.hasAttribute === "function" && at.hasAttribute("data-id") &&
-        !at.hasAttribute("data-unpack-thread") ? /** @type {HTMLElement} */ (at) : null;
+      return typeof at.hasAttribute === "function" && at.hasAttribute("data-id") ? /** @type {HTMLElement} */ (at) : null;
     }
   }
   return null;
@@ -8870,13 +8876,20 @@ function rowOf(pane, node) {
 /**
  * The row standing for message `id` in `pane` now: its own, the combined row holding it, or the
  * line of the collapsed run it is in (`#221 read-modes`); in the right column's list, the card of
- * thread `id`, which has a `data-id` and no messages. Null when the list does not draw it.
+ * thread `id`, which has a `data-id` and no messages. Null when the list does not draw it. `card` says
+ * which of the two it is where that is known (`KeySelection`): a card and its root's row unpacked
+ * under it can share an id.
+ *
+ * @param {KeyPane} pane
+ * @param {string | null | undefined} id
+ * @param {boolean | undefined} [card]
  */
-function paneRowFor(pane, id) {
+function paneRowFor(pane, id, card = undefined) {
   const list = pane.list();
   if (!list || !id) return null;
   const held = /** @type {HTMLElement[]} */ ([...list.children]).find((row) =>
-    idsOf(row).includes(String(id)) || (row.hasAttribute("data-card") && row.getAttribute("data-id") === String(id)));
+    (card !== true && idsOf(row).includes(String(id))) ||
+    (card !== false && row.hasAttribute("data-card") && row.getAttribute("data-id") === String(id)));
   const shown = held ? shownRowFor(held) : null;
   return shown && rowShown(shown) ? shown : null;
 }
@@ -8884,9 +8897,17 @@ function paneRowFor(pane, id) {
 /** The selection kept for the list `pane` is showing now, or null. */
 const markOf = (pane) => pane.marks.get(pane.context()) || null;
 
+/** The row `pane`'s kept selection `mark` is on now, or null: `paneRowFor`, a card told from a message. */
+const markedRow = (pane, mark) => (mark ? paneRowFor(pane, mark.id, mark.card) : null);
+
+/** Whether `row` is the row the kept selection `mark` names. */
+const markNames = (mark, row) => Boolean(mark) && mark.id === row.getAttribute("data-id") &&
+  (mark.card === undefined || mark.card === row.hasAttribute("data-card"));
+
 /** Note `row` as the selection of the list `pane` is showing, without making `pane` the one in use. */
 function setMark(pane, row, drawn) {
-  pane.marks.set(pane.context(), { id: String(row.getAttribute("data-id")), drawn, index: paneRows(pane).indexOf(row) });
+  pane.marks.set(pane.context(), { id: String(row.getAttribute("data-id")), card: row.hasAttribute("data-card"),
+    drawn, index: paneRows(pane).indexOf(row) });
 }
 
 /** Note `row` as the selection of the list `pane` is showing, `pane` as the one in use, and draw it. */
@@ -8895,7 +8916,7 @@ function markRow(pane, row, drawn) {
   setMark(pane, row, drawn);
   // Another message chosen — by the keys, the mouse, a tap, the focus or a jump — is the reader acting
   // in the list. `#243 filter-keeps-selection`. A redraw keeping the same one (`keepSelection`) is not.
-  if (!was || was.id !== String(row.getAttribute("data-id"))) inColumn(paneColumn(pane), readerActed);
+  if (!markNames(was, row)) inColumn(paneColumn(pane), readerActed);
   lastPane = pane;
   drawSelection();
 }
@@ -8927,8 +8948,8 @@ function drawSelection() {
     const held = pane.row;
     let row = null;
     if (mark && mark.drawn) {
-      row = held && held.getAttribute("data-id") === mark.id && held.parentNode === pane.list() && rowShown(held)
-        ? held : paneRowFor(pane, mark.id);
+      row = held && markNames(mark, held) && held.parentNode === pane.list() && rowShown(held)
+        ? held : markedRow(pane, mark);
     }
     if (pane.lit === row) continue;
     if (pane.lit) pane.lit.removeAttribute("data-selected");
@@ -8967,14 +8988,13 @@ function noteRow(pane, row) {
 function currentRow(pane, node) {
   const held = rowOf(pane, node);
   if (held && rowShown(held)) return held;
-  const mark = markOf(pane);
-  return mark ? paneRowFor(pane, mark.id) : null;
+  return markedRow(pane, markOf(pane));
 }
 
 /** The row selected with a ring in this list, while it is on screen: what the focus comes back to. */
 function drawnRow(pane) {
   const mark = markOf(pane);
-  return mark && mark.drawn ? paneRowFor(pane, mark.id) : null;
+  return mark && mark.drawn ? markedRow(pane, mark) : null;
 }
 
 /** The row at `index` in `pane`, or the nearest one there is: where a row that went is replaced. */
@@ -9054,7 +9074,7 @@ function keepSelection() {
     if (!mark || !mark.drawn) continue;
     const had = document.activeElement === held;
     const lost = had || focusLost();
-    const row = paneRowFor(pane, mark.id) || (lost ? nearRow(pane, mark.index) : null);
+    const row = markedRow(pane, mark) || (lost ? nearRow(pane, mark.index) : null);
     if (!row) continue;
     pane.row = row;
     // Not `markRow`: a redraw of both columns must not make whichever came last the one in use.
@@ -9233,7 +9253,7 @@ function noteClickedRow(pane, node) {
   if (!row) return;
   const mark = markOf(pane);
   const drawn = drawnBy();
-  if (mark && mark.id === row.getAttribute("data-id") && (mark.drawn || !drawn) && lastPane === pane) return;
+  if (mark && markNames(mark, row) && (mark.drawn || !drawn) && lastPane === pane) return;
   if (!drawn) {
     noteRow(pane, row);
     return;
@@ -9249,7 +9269,7 @@ function noteClickedRow(pane, node) {
 function onPaneFocus(pane, event) {
   const row = rowOf(pane, event && event.target);
   const mark = markOf(pane);
-  const same = Boolean(row && mark && mark.id === row.getAttribute("data-id"));
+  const same = Boolean(row && mark && markNames(mark, row));
   if (row && !drawnBy()) {
     if (!same) noteRow(pane, row);
   } else if (row && !(same && mark && mark.drawn && pane.row === row)) {
@@ -9625,8 +9645,13 @@ function rowForAct(target, runLine = false, stay = false) {
   return { pane, row: null, took: Boolean(first) };
 }
 
-/** The first unread message after `at` in `rows`, by the read rule both read modes share. */
-const unreadAfter = (rows, at) => rows.slice(at + 1).find((row) => !rowIsRead(row)) || null;
+/**
+ * The first unread message after `at` in `rows`, by the read rule both read modes share. Over the cards
+ * a card, which holds no message, is unread while it says its thread has unread replies (`#407
+ * unpack-row-parity`: its messages unpacked under it are rows of their own, read by the same rule).
+ */
+const unreadAfter = (rows, at) => rows.slice(at + 1).find((row) =>
+  (row.hasAttribute("data-card") ? row.hasAttribute("data-unread") : !rowIsRead(row))) || null;
 
 /** n: the next unread message below the selected one, or below the top of the screen. */
 function nextUnreadFromKeyboard(target) {
@@ -9645,13 +9670,21 @@ function nextUnreadFromKeyboard(target) {
 }
 
 /**
- * After a Done made from the keyboard: on to the unread message `nextId` it chose before the act,
- * else back on the message itself, else (it has gone, under Hide read) the row now where it was.
- * The rows are already the new ones: the list is redrawn before the write goes out. `stay` moves
- * the selection without the focus, as `rowForAct` says.
+ * After a Done made from the keyboard: on to the unread row `next` it chose before the act, else back
+ * on the message itself, else (it has gone, under Hide read) the row now where it was. The rows are
+ * already the new ones: the list is redrawn before the write goes out, so `next` is found again by its
+ * id, a card told from a message (`paneRowFor`). `stay` moves the selection without the focus, as
+ * `rowForAct` says.
+ *
+ * @param {KeyPane} pane
+ * @param {HTMLElement | null} next
+ * @param {string} ownId
+ * @param {number} at
+ * @param {boolean} [stay]
  */
-function landAfterDone(pane, nextId, ownId, at, stay = false) {
-  const row = (nextId && paneRowFor(pane, nextId)) || paneRowFor(pane, ownId) || nearRow(pane, at);
+function landAfterDone(pane, next, ownId, at, stay = false) {
+  const again = next ? paneRowFor(pane, next.getAttribute("data-id"), next.hasAttribute("data-card")) : null;
+  const row = again || paneRowFor(pane, ownId, false) || nearRow(pane, at);
   if (!row) return;
   takeRow(pane, row, !stay);
   bringIntoView(pane, row);
@@ -9677,7 +9710,7 @@ function doneFromKeyboard(target) {
   const at = rows.indexOf(row);
   const next = marking ? unreadAfter(rows, at) : null;
   guardQuietly(() => toggleArchived(ids, row))();
-  landAfterDone(pane, next && next.getAttribute("data-id"), ids[0], at, stay);
+  landAfterDone(pane, next, ids[0], at, stay);
   return true;
 }
 
@@ -22821,15 +22854,21 @@ function holdsUnreadReplies(message, tally) {
  * rule). The store is walked only when a read row is asked after: Show read and Collapse read ask
  * after none.
  *
+ * `thread` is a thread whose messages are drawn, as a thread's: the open thread of the column by
+ * default, or one unpacked under its card (`unpackBlock`, `#407 unpack-row-parity`), which keeps what
+ * the thread would.
+ *
+ * @param {ReturnType<typeof threadChoice> | null} [thread]
  * @returns {(message: any) => boolean}
  */
-function readFilterKeeps() {
-  const counting = threadingSupported && channelView === "main";
+function readFilterKeeps(thread = channelView === "thread" ? openThreadChoice() : null) {
+  const counting = threadingSupported && channelView === "main" && thread === null;
   // `#405 root-under-summary`. Under a summarized card the root is kept however read it is: it is
   // the first child the card's words are about, and Hide read hiding it would leave the summary
   // heading a thread whose first message cannot be seen. A raw card already says the root.
-  const keptRoot = channelView === "thread" && cardIsSummarized(openThreadChoice())
-    ? openThreadRootId() : null;
+  const keptRoot = thread && cardIsSummarized(thread)
+    ? (channelView === "thread" && thread.id === String(selectedThreadId) ? openThreadRootId()
+      : thread.root ? String(thread.root.id) : null) : null;
   /** @type {ReplyTally | null} */
   let tally = null;
   return (message) => {
@@ -27409,6 +27448,174 @@ function authorLabel(row) {
   return row.getAttribute("data-author-bot") === "true" ? `${name} (bot)` : name;
 }
 
+/**
+ * The messages some row of `rows` answers, by their ids, with those a reply sent from here answers
+ * once its post is acknowledged: what dims a row as replied to (`dressChannelRow`).
+ *
+ * EVERY pointer a row carries, not only its own: a message combined into a row still answered whatever
+ * it answered. See `data-answers` in `discordNode`. A positive acknowledgement is already evidence of a
+ * reply, even while a slower history read has not returned its provider ID. Pending or wholly
+ * unconfirmed sends are not that evidence.
+ *
+ * @param {Element[]} rows
+ * @param {string} viewing The channel the rows are of.
+ * @returns {Set<string>}
+ */
+function answeredBy(rows, viewing) {
+  const answered = new Set();
+  for (const entry of outgoingMessages.values()) {
+    if (entry.channel === viewing && entry.replyTo &&
+        (entry.state === "sent" || entry.postedCount > 0)) answered.add(entry.replyTo);
+  }
+  for (const row of rows) {
+    for (const parent of String(row.getAttribute("data-answers") || "").split(" ").filter(Boolean)) answered.add(parent);
+  }
+  return answered;
+}
+
+/**
+ * Draw one channel row's state from what the page holds now: its thread chips, replied to, its speaker,
+ * Done, pinned, noise, read automatically, being read aloud, and its author line and Done button's word.
+ * What every pass over the rows does for every row it draws (`renderChannelRows`), and what an unpacked
+ * block does for its rows (`unpackBlock`, `#407 unpack-row-parity`): one dress for a message row, in
+ * whichever list it stands.
+ *
+ * `pass` is what the pass worked out once for all its rows: `tally` (`replyTally`), `answered`
+ * (`answeredBy`), `viewing`, the channel, and whether the row is one of Main's own list (`inMain`) or
+ * All's (`inAll`), which draw a root's unread replies and the thread strips.
+ *
+ * @param {Element} row
+ * @param {{tally: ReplyTally, answered: Set<string>, viewing: string, inMain: boolean, inAll: boolean}} pass
+ */
+function dressChannelRow(row, { tally, answered, viewing, inMain, inAll }) {
+  const id = row.getAttribute("data-id") || "";
+  drawThreadChips(row, tally, inMain, inAll);
+  // Every message the row stands for. One of them on an ordinary row; see the combining note.
+  const ids = idsOf(row);
+  // DIMS, never hides. See the note at the head of this section: this is derived from what
+  // happens to be loaded, and evidence that admits it is incomplete must not remove anything.
+  row.setAttribute("data-replied", ids.some((one) => answered.has(one)) ? "true" : "false");
+  // The speaker treatment, on the same pass and from the same census. `me` and `coder` are drawn
+  // as the transcript's two speakers; see web/voice.css.
+  row.setAttribute(
+    "data-who",
+    bucketFor(
+      row.getAttribute("data-author-id"),
+      row.getAttribute("data-author-bot") === "true",
+      viewing
+    )
+  );
+  // GREYS, never hides, and that is the whole distinction between this and the To do filter.
+  // Being archived is DECLARED by the reader, so unlike `data-replied` it is not evidence that
+  // might be incomplete — but a channel view that removed the row would leave the reader no way
+  // to see what they had archived, and no way to change their mind about it.
+  const who = row.getAttribute("data-who");
+  // EVERY constituent, or not at all. A row half of whose messages have been archived shows as
+  // UNREAD: the other reading files an unseen message away behind one the reader has dealt with,
+  // and the whole point of the archive is that it says what is left.
+  const isArchived = ids.length > 0 && ids.every((one) => archivedIds.has(one));
+  row.setAttribute("data-archived", isArchived ? "true" : "false");
+  // `#245 done-feedback`. The moment of a Done, on whichever row now stands for the message.
+  drawDoneFlash(row);
+  // `#206 pin-message`. Pinned when ANY message the row stands for is — the `every` reading would
+  // hide a pin behind its row's unpinned half — and Unpin then acts on every one of them. The
+  // chip says it in words, and says when what is shown is the copy the pin kept.
+  const isPinned = ids.some(isPinnedId);
+  row.setAttribute("data-pinned", isPinned ? "true" : "false");
+  const chip = childByClass(row, "pin-chip");
+  if (chip) {
+    chip.hidden = !isPinned;
+    chip.setAttribute(
+      "title",
+      rowMessages(row).some((message) => keptByPin.has(message))
+        ? "Pinned on this server. This is the copy kept when it was pinned; the message is older " +
+            "than what is loaded."
+        : "Pinned on this server, for every device. The chat service's own pins are not changed."
+    );
+  }
+  const pinItem = childByClass(row, "row-pin-button");
+  if (pinItem) pinItem.textContent = isPinned ? "Unpin message" : "Pin message";
+  // `#196 auto-read-noise`. Read automatically, by the server's verdict on EVERY constituent —
+  // `joinsGroup` keeps a placeholder out of a real message's row, so a mixed row is not one the
+  // reader should be told is noise. Dimmed, never hidden, here: hiding is Hide read's job, and
+  // a row that vanished could not be rescued from a rule that caught it by mistake.
+  const held = rowMessages(row);
+  const isNoiseRow = held.length > 0 && held.every(isNoise);
+  row.setAttribute("data-noise", !isArchived && isNoiseRow ? "true" : "false");
+  const rescue = notNoiseButtonOf(row);
+  if (rescue) rescue.hidden = !isNoiseRow;
+  // Separate from the declared archive: this one is implied, carries no undo, and disappears
+  // the moment the setting is turned off.
+  row.setAttribute(
+    "data-own-read",
+    !isArchived && !isNoiseRow && markOwnRead && who === "me" ? "true" : "false"
+  );
+  const isReading = nowPlaying !== null && nowPlaying.id === id;
+  // ASKED FOR, but not yet speaking. Distinct from `data-reading` on purpose: this one the
+  // reader can still change their mind about, and it is the only thing on screen during a wait
+  // that is entirely somebody else's network.
+  row.setAttribute("data-pending", pendingRead === id ? "true" : "false");
+  // IS THIS MESSAGE ITSELF AN ANSWER? The opposite direction from `data-replied`, and the more
+  // reliable one: that is derived from whatever happens to be loaded and misses an answer
+  // further back than the window, whereas the pointer for this is ON the message. Correct
+  // whether or not the message it answers is anywhere on screen.
+  row.setAttribute("data-is-reply", row.getAttribute("data-reply-to") ? "true" : "false");
+  // WHICH ROW IS SPEAKING. Without it the reader taps, waits, and has nothing but the sound to
+  // tell them which message they hit — on a list where the next act archives it.
+  row.setAttribute("data-reading", isReading ? "true" : "false");
+  // THE ROW BEING READ STAYS OPEN.
+  //
+  // The owner watched a message he was listening to collapse mid-read and assumed a stray tap.
+  // It was not: the channel re-reads itself every DISCORD_POLL_MS, `applyNewestPage` rebuilds
+  // every row, and a freshly built row starts folded. So a long message being read aloud folded
+  // itself on the next poll, every time, while its own audio was still playing. Hearing the
+  // whole message and being shown a clamped third of it is the wrong pair.
+  // The row's own fold, on a row drawn again from a held view as on one just built. `#301`.
+  const entry = /** @type {any} */ (row).foldEntry;
+  if (isReading && entry && isFolded(entry)) {
+    setFolded(entry, false);
+  }
+
+  // The row's own way back, labelled for what it will DO rather than for what the row is. In the
+  // To do filter an archived row is never on screen, so this only ever reads "Done" there.
+  // WHO, printed only where the colour cannot say it. `me` and `coder` are drawn as the
+  // transcript's two speakers, so their names are a line of chrome restating what the row's own
+  // colour already said. A third party is one of many and has to be named.
+  // THE AUTHOR LINE, decided ONCE. It used to be set twice — the name here and `reading` in a
+  // later block — and the later write is the one that lost, so the row being read never said so.
+  //
+  // While the audio runs, `reading` replaces the name: that is the fact the reader wants at a
+  // glance on a list where the next thing that happens is the row archiving itself. It is shown
+  // even for a principal whose colour already names them, because hiding it would leave the row
+  // saying nothing at all.
+  const named = childByClass(row, "msg-author");
+  if (named) {
+    named.className = isReading ? "msg-author reading-mark" : "msg-author";
+    // `#376 read-aloud-blocks`: and how far through, "reading 2 of 5", in a read of several parts.
+    named.textContent = isReading ? readingLabel() : authorLabel(row);
+    named.hidden = !isReading && (who === "me" || who === "coder");
+    // `#377 compact-collapsed-rows`. Where the header line has no room for the whole name it shows a
+    // prefix and an ellipsis (web/voice.css); the whole name is here, for a pointer resting on it.
+    const whole = isReading ? "" : authorLabel(row);
+    if ((named.getAttribute("title") || "") !== whole) {
+      if (whole) named.setAttribute("title", whole);
+      else named.removeAttribute("title");
+    }
+  }
+  // The block being read, lit again on a row the poll has just rebuilt. `#376`.
+  markReadingBlock(row);
+  const done = doneButtonOf(row);
+  if (done) {
+    done.textContent = isArchived ? "Unarchive" : "Done";
+    done.setAttribute(
+      "title",
+      isArchived
+        ? "Put this back in the list. This does not change the source chat service."
+        : "Mark as dealt with here. This does not change the source chat service."
+    );
+  }
+}
+
 function renderChannelRows() {
   // `#206 pin-message`. The Pinned filter's list first, so that the pass below derives its rows as
   // well: it is drawn from the same messages and has to agree with the channel about every one.
@@ -27422,25 +27629,12 @@ function renderChannelRows() {
   // and every bucket drawn on it is a statement about who is in THIS conversation.
   const viewing = el("discord-channel").value;
   // Every message some LOADED message answers.
-  const answered = new Set();
-  // A positive acknowledgement is already evidence of a reply, even while a slower history read
-  // has not returned its provider ID. Pending or wholly unconfirmed sends are not that evidence.
-  for (const entry of outgoingMessages.values()) {
-    if (entry.channel === viewing && entry.replyTo &&
-        (entry.state === "sent" || entry.postedCount > 0)) answered.add(entry.replyTo);
-  }
+  const answered = answeredBy(rows, viewing);
   // The author census FIRST and in full, because `bucketFor` asks how many other bots there are —
   // a question no single row can answer, and one whose answer must not change halfway through the
   // loop that is applying it.
   let learned = false;
   for (const row of rows) {
-    // EVERY pointer the row carries, not only its own: a message combined into a row still
-    // answered whatever it answered. See `data-answers` in `discordNode`.
-    for (const parent of String(row.getAttribute("data-answers") || "")
-      .split(" ")
-      .filter(Boolean)) {
-      answered.add(parent);
-    }
     learned =
       noteAuthor(
         viewing,
@@ -27462,132 +27656,8 @@ function renderChannelRows() {
   const inAll = drawingAll();
   markListView();
   for (const row of [...rows, ...el("pinned-log").children]) {
-    const id = row.getAttribute("data-id") || "";
-    drawThreadChips(row, tally, channelView === "main" && mainList.has(row), inAll && mainList.has(row));
-    // Every message the row stands for. One of them on an ordinary row; see the combining note.
-    const ids = idsOf(row);
-    // DIMS, never hides. See the note at the head of this section: this is derived from what
-    // happens to be loaded, and evidence that admits it is incomplete must not remove anything.
-    row.setAttribute("data-replied", ids.some((one) => answered.has(one)) ? "true" : "false");
-    // The speaker treatment, on the same pass and from the same census. `me` and `coder` are drawn
-    // as the transcript's two speakers; see web/voice.css.
-    row.setAttribute(
-      "data-who",
-      bucketFor(
-        row.getAttribute("data-author-id"),
-        row.getAttribute("data-author-bot") === "true",
-        viewing
-      )
-    );
-    // GREYS, never hides, and that is the whole distinction between this and the To do filter.
-    // Being archived is DECLARED by the reader, so unlike `data-replied` it is not evidence that
-    // might be incomplete — but a channel view that removed the row would leave the reader no way
-    // to see what they had archived, and no way to change their mind about it.
-    const who = row.getAttribute("data-who");
-    // EVERY constituent, or not at all. A row half of whose messages have been archived shows as
-    // UNREAD: the other reading files an unseen message away behind one the reader has dealt with,
-    // and the whole point of the archive is that it says what is left.
-    const isArchived = ids.length > 0 && ids.every((one) => archivedIds.has(one));
-    row.setAttribute("data-archived", isArchived ? "true" : "false");
-    // `#245 done-feedback`. The moment of a Done, on whichever row now stands for the message.
-    drawDoneFlash(row);
-    // `#206 pin-message`. Pinned when ANY message the row stands for is — the `every` reading would
-    // hide a pin behind its row's unpinned half — and Unpin then acts on every one of them. The
-    // chip says it in words, and says when what is shown is the copy the pin kept.
-    const isPinned = ids.some(isPinnedId);
-    row.setAttribute("data-pinned", isPinned ? "true" : "false");
-    const chip = childByClass(row, "pin-chip");
-    if (chip) {
-      chip.hidden = !isPinned;
-      chip.setAttribute(
-        "title",
-        rowMessages(row).some((message) => keptByPin.has(message))
-          ? "Pinned on this server. This is the copy kept when it was pinned; the message is older " +
-              "than what is loaded."
-          : "Pinned on this server, for every device. The chat service's own pins are not changed."
-      );
-    }
-    const pinItem = childByClass(row, "row-pin-button");
-    if (pinItem) pinItem.textContent = isPinned ? "Unpin message" : "Pin message";
-    // `#196 auto-read-noise`. Read automatically, by the server's verdict on EVERY constituent —
-    // `joinsGroup` keeps a placeholder out of a real message's row, so a mixed row is not one the
-    // reader should be told is noise. Dimmed, never hidden, here: hiding is Hide read's job, and
-    // a row that vanished could not be rescued from a rule that caught it by mistake.
-    const held = rowMessages(row);
-    const isNoiseRow = held.length > 0 && held.every(isNoise);
-    row.setAttribute("data-noise", !isArchived && isNoiseRow ? "true" : "false");
-    const rescue = notNoiseButtonOf(row);
-    if (rescue) rescue.hidden = !isNoiseRow;
-    // Separate from the declared archive: this one is implied, carries no undo, and disappears
-    // the moment the setting is turned off.
-    row.setAttribute(
-      "data-own-read",
-      !isArchived && !isNoiseRow && markOwnRead && who === "me" ? "true" : "false"
-    );
-    const isReading = nowPlaying !== null && nowPlaying.id === id;
-    // ASKED FOR, but not yet speaking. Distinct from `data-reading` on purpose: this one the
-    // reader can still change their mind about, and it is the only thing on screen during a wait
-    // that is entirely somebody else's network.
-    row.setAttribute("data-pending", pendingRead === id ? "true" : "false");
-    // IS THIS MESSAGE ITSELF AN ANSWER? The opposite direction from `data-replied`, and the more
-    // reliable one: that is derived from whatever happens to be loaded and misses an answer
-    // further back than the window, whereas the pointer for this is ON the message. Correct
-    // whether or not the message it answers is anywhere on screen.
-    row.setAttribute("data-is-reply", row.getAttribute("data-reply-to") ? "true" : "false");
-    // WHICH ROW IS SPEAKING. Without it the reader taps, waits, and has nothing but the sound to
-    // tell them which message they hit — on a list where the next act archives it.
-    row.setAttribute("data-reading", isReading ? "true" : "false");
-    // THE ROW BEING READ STAYS OPEN.
-    //
-    // The owner watched a message he was listening to collapse mid-read and assumed a stray tap.
-    // It was not: the channel re-reads itself every DISCORD_POLL_MS, `applyNewestPage` rebuilds
-    // every row, and a freshly built row starts folded. So a long message being read aloud folded
-    // itself on the next poll, every time, while its own audio was still playing. Hearing the
-    // whole message and being shown a clamped third of it is the wrong pair.
-    // The row's own fold, on a row drawn again from a held view as on one just built. `#301`.
-    const entry = /** @type {any} */ (row).foldEntry;
-    if (isReading && entry && isFolded(entry)) {
-      setFolded(entry, false);
-    }
-
-    // The row's own way back, labelled for what it will DO rather than for what the row is. In the
-    // To do filter an archived row is never on screen, so this only ever reads "Done" there.
-    // WHO, printed only where the colour cannot say it. `me` and `coder` are drawn as the
-    // transcript's two speakers, so their names are a line of chrome restating what the row's own
-    // colour already said. A third party is one of many and has to be named.
-    // THE AUTHOR LINE, decided ONCE. It used to be set twice — the name here and `reading` in a
-    // later block — and the later write is the one that lost, so the row being read never said so.
-    //
-    // While the audio runs, `reading` replaces the name: that is the fact the reader wants at a
-    // glance on a list where the next thing that happens is the row archiving itself. It is shown
-    // even for a principal whose colour already names them, because hiding it would leave the row
-    // saying nothing at all.
-    const named = childByClass(row, "msg-author");
-    if (named) {
-      named.className = isReading ? "msg-author reading-mark" : "msg-author";
-      // `#376 read-aloud-blocks`: and how far through, "reading 2 of 5", in a read of several parts.
-      named.textContent = isReading ? readingLabel() : authorLabel(row);
-      named.hidden = !isReading && (who === "me" || who === "coder");
-      // `#377 compact-collapsed-rows`. Where the header line has no room for the whole name it shows a
-      // prefix and an ellipsis (web/voice.css); the whole name is here, for a pointer resting on it.
-      const whole = isReading ? "" : authorLabel(row);
-      if ((named.getAttribute("title") || "") !== whole) {
-        if (whole) named.setAttribute("title", whole);
-        else named.removeAttribute("title");
-      }
-    }
-    // The block being read, lit again on a row the poll has just rebuilt. `#376`.
-    markReadingBlock(row);
-    const done = doneButtonOf(row);
-    if (done) {
-      done.textContent = isArchived ? "Unarchive" : "Done";
-      done.setAttribute(
-        "title",
-        isArchived
-          ? "Put this back in the list. This does not change the source chat service."
-          : "Mark as dealt with here. This does not change the source chat service."
-      );
-    }
+    dressChannelRow(row, { tally, answered, viewing,
+      inMain: channelView === "main" && mainList.has(row), inAll: inAll && mainList.has(row) });
   }
   // `#214 reply-arrow` and `#215 reply-coalesce`. Each reply's gutter, from the rows now around it
   // and the speakers just decided for them.
@@ -33049,8 +33119,11 @@ async function markReadThroughHere(row, upstreamId) {
   // The row's OWN list: the channel's, or the Pinned filter's, where "above it" means the pins above.
   // With replies gathered (`#215 reply-coalesce`) it is still the rows ABOVE IT ON THE SCREEN, the
   // stack included, because that is what the item says it does and what the reader is looking at.
-  // Gathering itself marks nothing.
-  const rows = [...(row.parentNode || el("discord-log")).children];
+  // Gathering itself marks nothing. `#407 unpack-row-parity`: a thread unpacked under its card is that
+  // thread's list, as in the thread: other threads' rows above it in the cards are not "above it".
+  const thread = row.getAttribute("data-unpack-thread");
+  const rows = [...(row.parentNode || el("discord-log")).children]
+    .filter((one) => thread === null || one.getAttribute("data-unpack-thread") === thread);
   const at = rows.indexOf(row);
   if (at < 0) return;
   const covered = rows.slice(0, at + 1).flatMap(idsOf);
@@ -35183,38 +35256,13 @@ function applyReadRuns() {
   if (!collapsing && collapsedRunRows === 0) return;
   const list = el("discord-log");
   const rows = [...list.children];
-  const key = viewKey();
-  const opened = openedReadRuns.get(key) || new Set();
   const rootId = collapsing ? openThreadRootId() : null;
-  /** @type {Map<Element, {role: string, count: number}>} */
-  const placed = new Map();
-  if (collapsing) {
-    let run = [];
-    const close = () => {
-      const ids = run.flatMap(idsOf);
-      if (run.length >= READ_RUN_MIN_ROWS && ids.some((id) => opened.has(id))) {
-        // Opened: it stays open as it grows, so what joined it since is remembered with it.
-        for (const id of ids) opened.add(id);
-      } else if (run.length >= READ_RUN_MIN_ROWS) {
-        run.forEach((row, index) => placed.set(row, { role: index === 0 ? "head" : "member", count: ids.length }));
-      }
-      run = [];
-    };
-    rows.forEach((row, index) => {
-      // Nor a row of replies the reader gathered under their message (`#215 reply-coalesce`): they
-      // were gathered to be read together, and a line in the stack would break the bridge.
-      // Nor a root on Main whose thread holds an unread reply (`#222 unread-replies`): Hide read
-      // keeps it, so Collapse read does, by the attribute the pass has just set from the same rule.
-      if (index < rows.length - 1 && rowIsRead(row) && !isOpenThreadRoot(row, rootId) &&
-          !row.hasAttribute("data-coalesce") && !row.hasAttribute("data-unread-replies")) {
-        run.push(row);
-      } else {
-        close();
-      }
-    });
-    close();
-    if (opened.size > 0) openedReadRuns.set(key, opened);
-  }
+  // Nor a row of replies the reader gathered under their message (`#215 reply-coalesce`): they were
+  // gathered to be read together, and a line in the stack would break the bridge. Nor a root on Main
+  // whose thread holds an unread reply (`#222 unread-replies`): Hide read keeps it, so Collapse read
+  // does, by the attribute the pass has just set from the same rule.
+  const placed = collapsing ? readRunPlan(rows, viewKey(), (row) => rowIsRead(row) && !isOpenThreadRoot(row, rootId) &&
+    !row.hasAttribute("data-coalesce") && !row.hasAttribute("data-unread-replies")) : new Map();
   collapsedRunRows = placed.size;
   const want = (row) => placed.get(row) || { role: null, count: 0 };
   const changed = rows.some((row) => {
@@ -35236,9 +35284,51 @@ function applyReadRuns() {
   renderReplyLinks();
 }
 
-/** The rows of the collapsed run `row` belongs to, its line's row first. */
+/**
+ * Where each row of `rows`, a list's rows in order, goes under Collapse read: every run of at least
+ * `READ_RUN_MIN_ROWS` rows next to each other that `joins` is a run, its first row the "head" its line
+ * is drawn on and the rest its "members", with how many messages it stands for; the last row never
+ * joins one. A run with a message the reader opened in it, in the list `key` names (`viewKey`), stays
+ * open, and what has joined it since is remembered as opened with it. The one rule of the runs, for
+ * the channel's list (`applyReadRuns`) and for each thread unpacked under its card (`unpackBlock`,
+ * `#407 unpack-row-parity`), which differ only in what may join one.
+ *
+ * @param {Element[]} rows
+ * @param {string} key
+ * @param {(row: Element) => boolean} joins
+ * @returns {Map<Element, {role: string, count: number}>}
+ */
+function readRunPlan(rows, key, joins) {
+  const opened = openedReadRuns.get(key) || new Set();
+  /** @type {Map<Element, {role: string, count: number}>} */
+  const placed = new Map();
+  let run = [];
+  const close = () => {
+    const ids = run.flatMap(idsOf);
+    if (run.length >= READ_RUN_MIN_ROWS && ids.some((id) => opened.has(id))) {
+      // Opened: it stays open as it grows, so what joined it since is remembered with it.
+      for (const id of ids) opened.add(id);
+    } else if (run.length >= READ_RUN_MIN_ROWS) {
+      run.forEach((row, index) => placed.set(row, { role: index === 0 ? "head" : "member", count: ids.length }));
+    }
+    run = [];
+  };
+  rows.forEach((row, index) => {
+    if (index < rows.length - 1 && joins(row)) run.push(row);
+    else close();
+  });
+  close();
+  if (opened.size > 0) openedReadRuns.set(key, opened);
+  return placed;
+}
+
+/**
+ * The rows of the collapsed run `row` belongs to, its line's row first: in its own list, the channel's
+ * or the cards' with threads unpacked under them, where a card ends a block's run (`#407
+ * unpack-row-parity`).
+ */
 function readRunRows(row) {
-  const rows = [...el("discord-log").children];
+  const rows = [...(row.parentNode || el("discord-log")).children];
   let head = rows.indexOf(row);
   while (head > 0 && rows[head].getAttribute("data-read-run") === "member") head -= 1;
   const run = [rows[head]];
@@ -35248,15 +35338,25 @@ function readRunRows(row) {
   return run;
 }
 
-/** Open the collapsed run `row` is in: a tap on its line, or a jump to a message inside it. */
+/**
+ * Open the collapsed run `row` is in: a tap on its line, Enter on it, or a jump to a message inside
+ * it. A run in a thread unpacked under its card is that thread's, opened as in the thread, and its
+ * block drawn again (`#407 unpack-row-parity`).
+ */
 function openReadRun(row) {
   if (!row || !row.hasAttribute("data-read-run")) return;
-  const key = viewKey();
+  const thread = row.getAttribute("data-unpack-thread");
+  const key = thread === null ? viewKey() : viewKey("thread", thread);
   const opened = openedReadRuns.get(key) || new Set();
   for (const one of readRunRows(row)) {
     for (const id of idsOf(one)) opened.add(id);
   }
   openedReadRuns.set(key, opened);
+  if (thread !== null) {
+    sideCardsDrawn = "";
+    renderSideColumn();
+    return;
+  }
   applyReadRuns();
   renderScrollTools();
   requestVisibleSummaries();
@@ -36456,6 +36556,26 @@ function mirrorArchived(ids, done) {
 // thread is brought into line here too, after an act made in the left column.
 
 /**
+ * `copy`, a copy of which messages are Done, with `ids` brought into line with the store's
+ * (`channelCanon.dismissed`): `copy` itself where none of them differs, else a new set, since `copy`
+ * may be the very set a list on screen is drawn from.
+ *
+ * @param {Set<string>} copy
+ * @param {string[]} ids
+ * @returns {Set<string>}
+ */
+function caughtUpDone(copy, ids) {
+  const moved = ids.filter((id) => copy.has(id) !== channelCanon.dismissed.has(id));
+  if (moved.length === 0) return copy;
+  const next = new Set(copy);
+  for (const id of moved) {
+    if (channelCanon.dismissed.has(id)) next.add(id);
+    else next.delete(id);
+  }
+  return next;
+}
+
+/**
  * Every copy of the read state of `ids` that the page holds out of sight, into line with the store's
  * (`channelCanon.dismissed`), after a Done, a put back, or a failed one taken back: the views held in
  * either column, and the right column's own while it does not show a thread. Each copy is replaced
@@ -36478,16 +36598,7 @@ function followDoneEverywhere(ids, madeIn) {
   if (!threadingSupported || channelCanon.channel !== String(el("discord-channel").value)) return;
   const named = ids.map(String);
   /** @param {Set<string>} copy */
-  const caughtUp = (copy) => {
-    const moved = named.filter((id) => copy.has(id) !== channelCanon.dismissed.has(id));
-    if (moved.length === 0) return copy;
-    const next = new Set(copy);
-    for (const id of moved) {
-      if (channelCanon.dismissed.has(id)) next.add(id);
-      else next.delete(id);
-    }
-    return next;
-  };
+  const caughtUp = (copy) => caughtUpDone(copy, named);
   for (const held of channelContexts.values()) held.dismissed = caughtUp(held.dismissed);
   if (!sideShowing() && activeColumn !== columns.side && columns.side.state !== null) {
     inColumn(columns.side, () => {
@@ -36597,8 +36708,6 @@ function setReadMode(mode) {
     // Runs opened under Collapse read are a way of looking at that list, and the reader has just
     // chosen another way: coming back to Collapse read collapses them all again.
     openedReadRuns.clear();
-    // `#404 threads-unpack-all`. And the runs opened in unpacked blocks, for the same reason.
-    unpackOpenedRuns.clear();
     // Kept across a reload, as the reader left it. `#189 restore-ui-state`.
     uiStateSettled = true;
     saveUiState();
@@ -40959,8 +41068,15 @@ function renderSideCards() {
         unpackObserver.disconnect();
         unpackObserver = null;
       }
-      list.replaceChildren(...cards.flatMap((card) =>
-        [sideCard(card), ...(unpacked ? inColumn(columns.main, () => unpackBlock(card.choice)) : [])]));
+      // `#407 unpack-row-parity`. Unpacked rows are built in the right column, the column of the cards
+      // the keys and the mouse move them in (`sidePane`), its read state brought into line with the
+      // store's for every message drawn, as each thread's own would be: a key acting on a row asks it.
+      const blocks = unpacked ? inColumn(columns.side, () => {
+        const shown = cards.flatMap((card) => unpackHeldMessages(card.choice).map((message) => String(message.id)));
+        archivedIds = caughtUpDone(archivedIds, shown);
+        return cards.map((card) => unpackBlock(card.choice, tally));
+      }) : [];
+      list.replaceChildren(...cards.flatMap((card, at) => [sideCard(card), ...(unpacked ? blocks[at] : [])]));
       filterSideCards();
     });
   } else {
@@ -41004,7 +41120,8 @@ function cardAnchor() {
   };
   const mark = markOf(sidePane);
   const card = (/** @type {string | null} */ id) => (id === null ? undefined : rows.find((one) => one.getAttribute("data-id") === id));
-  const row = [card(litCard()), card(mark ? mark.id : null)].find((one) => one && seen(one)) || rows.find(seen);
+  const row = [card(litCard()), card(mark && mark.card !== false ? mark.id : null)].find((one) => one && seen(one)) ||
+    rows.find(seen);
   if (!row) return null;
   return { newest: false, id: String(row.getAttribute("data-id")), offset: row.getBoundingClientRect().top - top };
 }
@@ -41154,11 +41271,12 @@ function filterSideCards() {
     if (kept && said) shown += 1;
     cardShown.set(String(row.getAttribute("data-id")), kept && said);
   }
-  // `#404 threads-unpack-all`. A card's unpacked block goes where its card goes.
+  // `#404 threads-unpack-all`. A card's unpacked block goes where its card goes, a row hidden in a
+  // collapsed run of read messages staying hidden behind its line (`#407 unpack-row-parity`).
   for (const row of allRows) {
     const thread = row.getAttribute("data-unpack-thread");
     if (thread === null) continue;
-    const shownBlock = cardShown.get(thread) === true;
+    const shownBlock = cardShown.get(thread) === true && row.getAttribute("data-read-run") !== "member";
     if (row.hidden === shownBlock) row.hidden = !shownBlock;
   }
   // `#281 view-keys`. A failed read of older threads is said over the cards it left as they were.
@@ -41313,14 +41431,6 @@ function storedThreadsUnpacked() {
 /** Whether every thread's messages stand unpacked under its card. */
 let threadsUnpacked = storedThreadsUnpacked();
 
-/**
- * The runs of read messages the reader has opened in unpacked blocks, by thread, as message ids:
- * as `openedReadRuns` is for a thread's own list. Forgotten with the read mode (`setReadMode`).
- *
- * @type {Map<string, Set<string>>}
- */
-const unpackOpenedRuns = new Map();
-
 /** Threads an unpack read is owed, running, done or failed for, so each is read once. */
 const unpackReads = new Map();
 
@@ -41408,120 +41518,58 @@ function unpackNeedsRead(choice, held) {
 
 /** What one block would draw, as a signature, so a pass that changes nothing rebuilds nothing. */
 function unpackSignature(choice, held) {
-  const opened = unpackOpenedRuns.get(choice.id);
+  const opened = openedReadRuns.get(viewKey("thread", choice.id));
   return JSON.stringify([choice.id, readMode, readRunsSuspended(), hideEmptyMessages, combineMessages,
     cardIsSummarized(choice),
     held.map((message) => [String(message.id), stillToDo(message, channelCanon.dismissed)]),
-    opened ? [...opened].sort() : [], unpackReads.get(choice.id) || ""]);
-}
-
-/** The line a collapsed run of read rows is drawn as in an unpacked block: the run's own words. */
-function unpackRunLine(choice, ids) {
-  const row = document.createElement("li");
-  row.className = "discord-message unpack-row unpack-read-run";
-  row.setAttribute("data-who", "human");
-  row.setAttribute("data-unpack-thread", choice.id);
-  const line = document.createElement("button");
-  line.className = "read-run";
-  line.setAttribute("type", "button");
-  line.textContent = readRunText(ids.length);
-  line.setAttribute("title", `Show these ${ids.length} read messages`);
-  line.addEventListener("click", (event) => {
-    if (event) event.stopPropagation();
-    const opened = unpackOpenedRuns.get(choice.id) || new Set();
-    for (const id of ids) opened.add(id);
-    unpackOpenedRuns.set(choice.id, opened);
-    sideCardsDrawn = "";
-    renderSideColumn();
-  });
-  row.append(bridgePiece(), line);
-  return row;
+    opened ? [...opened].sort() : [], unpackReads.get(choice.id) || "", nowPlaying ? nowPlaying.id : "", pendingRead]);
 }
 
 /**
- * Thread `choice`'s unpacked block: its message rows under its card, bridged, the read modes
- * applied as in its own list. Under a summarized card the root is the first child, kept under
- * every read mode (`#405 root-under-summary`); under a raw card the replies alone, the card
- * already being the root. A thread still owed a read ends in its loading line, observed.
+ * Thread `choice`'s unpacked block: its message rows under its card, bridged. They are the rows a
+ * thread draws, built, dressed and folded by the code that draws a thread (`#407 unpack-row-parity`):
+ * `discordNode` over `glom`, the dress of every channel row (`dressChannelRow`), what Hide read keeps
+ * of a thread (`readFilterKeeps`) and the runs Collapse read folds (`readRunPlan`), each opened as in
+ * the thread. Built in the right column (`renderSideCards`), whose list the keys and the mouse move
+ * through here (`sidePane`), so a key on a row and a press of its own button act in the same column.
+ * Under a summarized card the root is the first child, kept under every read mode and never in a run
+ * (`#405 root-under-summary`); under a raw card the replies alone, the card already being the root.
+ * A thread still owed a read ends in its loading line, observed.
  *
  * @param {ReturnType<typeof threadChoice>} choice
+ * @param {ReplyTally} tally
  * @returns {HTMLElement[]}
  */
-function unpackBlock(choice) {
+function unpackBlock(choice, tally) {
   const held = unpackHeldMessages(choice);
   const summarized = cardIsSummarized(choice);
-  const done = channelCanon.dismissed;
   let messages = held.filter((message) => !hiddenEmpty(message));
   if (!summarized) messages = messages.filter((message) => !isThreadRoot(message, choice));
-  if (readMode === "hide" && !readRunsSuspended()) {
-    messages = messages.filter((message) => stillToDo(message, done) ||
-      (summarized && isThreadRoot(message, choice)));
-  }
-  const groups = glom(messages);
-  /** @type {Array<{group: any[] | null, ids: string[]}>} */
-  const parts = [];
-  if (readMode === "collapse" && !readRunsSuspended()) {
-    const opened = unpackOpenedRuns.get(choice.id) || new Set();
-    let run = [];
-    const close = () => {
-      const ids = run.flatMap((group) => group.map((message) => String(message.id)));
-      if (run.length >= READ_RUN_MIN_ROWS && !ids.some((id) => opened.has(id))) {
-        parts.push({ group: null, ids });
-      } else {
-        for (const group of run) parts.push({ group, ids: group.map((message) => String(message.id)) });
-        if (ids.some((id) => opened.has(id))) {
-          for (const id of ids) opened.add(id);
-          unpackOpenedRuns.set(choice.id, opened);
-        }
-      }
-      run = [];
-    };
-    groups.forEach((group, index) => {
-      const read = group.every((message) => !stillToDo(message, done));
-      const rootChild = summarized && group.some((message) => isThreadRoot(message, choice));
-      if (read && !rootChild && index < groups.length - 1) run.push(group);
-      else {
-        close();
-        parts.push({ group, ids: group.map((message) => String(message.id)) });
-      }
-    });
-    close();
-  } else {
-    for (const group of groups) parts.push({ group, ids: group.map((message) => String(message.id)) });
-  }
-  const rows = parts.map((part) => {
-    const row = part.group === null ? unpackRunLine(choice, part.ids) : discordNode(part.group);
+  if (hidingRead()) messages = messages.filter(readFilterKeeps(choice));
+  const rows = glom(messages).map((group) => {
+    const row = discordNode(group);
     row.setAttribute("data-unpack-thread", choice.id);
-    if (part.group !== null) {
-      row.className = `${row.className} unpack-row`;
-      // The speaker and read dress `renderChannelRows` gives a channel row, from the same rules,
-      // so a read reply is greyed here exactly as in its thread.
-      const first = part.group[0];
-      row.setAttribute("data-who", bucketFor(first.author_id, first.author_is_bot,
-        String(el("discord-channel").value)));
-      const archived = part.group.every((message) => done.has(String(message.id)));
-      row.setAttribute("data-archived", archived ? "true" : "false");
-      const noise = part.group.every(isNoise);
-      row.setAttribute("data-noise", !archived && noise ? "true" : "false");
-      row.setAttribute("data-own-read",
-        !archived && !noise && markOwnRead && row.getAttribute("data-who") === "me" ? "true" : "false");
-      const doneButton = doneButtonOf(row);
-      if (doneButton) doneButton.textContent = archived ? "Unarchive" : "Done";
-      row.setAttribute("data-stack-under", "third");
-      row.style.setProperty("--thread-hue", threadHue(choice.id));
-      row.replaceChildren(bridgePiece(), ...row.children);
-      if (summarized && part.group.some((message) => isThreadRoot(message, choice))) {
-        row.setAttribute("data-root-child", "");
-      }
-    }
+    row.className = `${row.className} unpack-row`;
+    if (summarized && group.some((message) => isThreadRoot(message, choice))) row.setAttribute("data-root-child", "");
     return row;
   });
+  const viewing = String(el("discord-channel").value);
+  const pass = { tally, answered: answeredBy(rows, viewing), viewing, inMain: false, inAll: false };
   rows.forEach((row, at) => {
+    dressChannelRow(row, pass);
     const place = rows.length === 1 ? "only" : at === 0 ? "first" : at === rows.length - 1 ? "last" : "middle";
     row.setAttribute("data-coalesce", place);
-    if (!row.hasAttribute("data-stack-under")) row.setAttribute("data-stack-under", "third");
+    row.setAttribute("data-stack-under", "third");
     row.style.setProperty("--thread-hue", threadHue(choice.id));
+    row.replaceChildren(bridgePiece(), ...row.children);
   });
+  const placed = readMode === "collapse" && !readRunsSuspended()
+    ? readRunPlan(rows, viewKey("thread", choice.id), (row) => rowIsRead(row) && !row.hasAttribute("data-root-child"))
+    : new Map();
+  for (const row of rows) {
+    const { role, count } = placed.get(row) || { role: null, count: 0 };
+    placeInReadRun(row, role, count);
+  }
   const cover = channelCanon.views.get(viewKey("thread", choice.id));
   if (unpackReads.get(choice.id) === "failed") {
     const failed = document.createElement("li");
@@ -41872,8 +41920,10 @@ function cardsOnScreen() {
 /**
  * The card → goes into, on the cards on screen — the right column's while the key is for that column,
  * or the Threads list in one column: the card whose own button holds the focus, as Tab leaves it, which
- * is the card the key was pressed on; else the highlighted card while it shows; else, on the right, the
- * card the keys are on, while it is on screen. Null anywhere else.
+ * is the card the key was pressed on; else, with the keys on a message unpacked under a card, that card,
+ * as → on a message of All goes into its thread (`#407 unpack-row-parity`); else the highlighted card
+ * while it shows; else, on the right, the card the keys are on, while it is on screen. Null anywhere
+ * else.
  *
  * @param {HTMLElement} target
  * @returns {HTMLElement | null}
@@ -41886,6 +41936,9 @@ function cardForArrow(target) {
     .filter((row) => !row.hasAttribute("data-unpack-thread") && rowShown(row));
   const held = rows.find((row) => row !== target && nodeWithin(row, target));
   if (held) return held;
+  const keyed = right ? keyContext(target).row : null;
+  const under = keyed ? keyed.getAttribute("data-unpack-thread") : null;
+  if (under !== null) return rows.find((row) => cardThread(row) === under) || null;
   const lit = litCard();
   const chosen = lit === null ? undefined : rows.find((row) => cardThread(row) === lit);
   if (chosen) return chosen;
@@ -42311,9 +42364,8 @@ function closeSideThread() {
  * or its cards and the thread list read behind them.
  */
 function resetSideColumn(reopen = false) {
-  // `#404 threads-unpack-all`. Unpack reads and opened runs were the last channel's.
+  // `#404 threads-unpack-all`. Unpack reads were the last channel's.
   unpackReads.clear();
-  unpackOpenedRuns.clear();
   if (unpackObserver !== null) {
     unpackObserver.disconnect();
     unpackObserver = null;

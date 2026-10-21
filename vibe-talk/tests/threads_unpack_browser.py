@@ -21,6 +21,13 @@ read: read replies gone from every block, the summarised root still first -> Sho
 off: cards alone again -> u (desk) or the chip (phone) on, reload: still on. No horizontal overflow
 and no page error at any step.
 
+`#407 unpack-row-parity`. At each desk size an unpacked row is then driven as a row of any other list
+is, with a real mouse and real keys: the mouse over an unpacked row lights it (one row lit on the page,
+drawn with the selection's ring); ↓ and ↑ move the selection through the rows of a block and across to
+the next card in reading order; Enter opens and folds the selected row; : and ; collapse and expand
+every unpacked row, saying so; under Collapse read the block's run is the run line every list draws,
+which Enter on it opens. Negative control: before any of it, ↓ over the cards packed goes card to card.
+
 Then, at the desk in the dark, a channel of forty threads: the time from pressing Unpack all to every
 block drawn, and the row count, said in the notes.
 
@@ -41,7 +48,7 @@ from typing import TYPE_CHECKING
 import offline_cache_browser as fixture
 from offline_cache_browser import Json, handler_for, said
 from thread_card_header_browser import phone_thread_list
-from two_column_browser import CANARY, REPLICA, RUNNER, ColumnsApi, Desk, thread_record
+from two_column_browser import CANARY, FILLER, REPLICA, RUNNER, ColumnsApi, Desk, thread_record
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType
@@ -62,6 +69,17 @@ class UnpackApi(ColumnsApi):
 
     def timeline(self, query: dict[str, list[str]]) -> Json:
         return {**super().timeline(query), "dismissed": DISMISSED}
+
+
+class ParityApi(UnpackApi):
+    """UnpackApi with every reply long enough to fold, for the keys that open and fold one."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        for row in self.messages:
+            thread = row.get("thread")
+            if isinstance(thread, dict) and thread.get("is_root") is False:
+                row["content"] = f"{row['content']} {FILLER * 6}"
 
 
 class ManyApi(ColumnsApi):
@@ -108,6 +126,22 @@ STATE_JS = """(threadId) => {
                 run: run ? {...box(run), text: run.textContent} : null};
     });
 }"""
+
+
+# The selection as drawn: every row lit on the page, by list and id, and the lit row's ring.
+LIT_JS = """() => [...document.querySelectorAll('li[data-selected="true"]')].map((li) => ({
+    list: li.parentElement.id, id: li.getAttribute('data-id'), card: li.hasAttribute('data-card'),
+    unpacked: li.getAttribute('data-unpack-thread'), focused: document.activeElement === li,
+    outline: getComputedStyle(li).outlineStyle, run: li.getAttribute('data-read-run')}))"""
+
+# The rows the keys move through over the cards, in order: shown, with an id.
+WALK_JS = """() => [...document.querySelectorAll('#side-cards > li[data-id]')]
+    .filter((li) => !li.hidden && li.getClientRects().length > 0)
+    .map((li) => (li.hasAttribute('data-card') ? 'card:' : '') + li.getAttribute('data-id'))"""
+
+# The unpacked rows' folds: id -> data-collapsed, for the rows that fold.
+FOLDS_JS = """() => Object.fromEntries([...document.querySelectorAll('#side-cards > li[data-unpack-thread][data-collapsed]')]
+    .map((li) => [li.getAttribute('data-id'), li.getAttribute('data-collapsed')]))"""
 
 
 def arguments() -> argparse.Namespace:
@@ -230,6 +264,142 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
     return f"{label}: unpacked, collapsed, hidden, packed and reloaded, no page error"
 
 
+def lit(desk: Desk) -> list[dict[str, object]]:
+    found: list[dict[str, object]] = desk.page.evaluate(LIT_JS)
+    return found
+
+
+def walk_order(desk: Desk) -> list[str]:
+    found: list[str] = desk.page.evaluate(WALK_JS)
+    return found
+
+
+def mouse_onto(desk: Desk, selector: str) -> None:
+    """A real mouse moved onto the row `selector` names, brought to the middle of the screen first."""
+    page = desk.page
+    page.locator(selector).evaluate("(li) => li.scrollIntoView({block: 'center'})")
+    desk.settled()
+    box = page.locator(selector).bounding_box()
+    assert box is not None, f"{selector} has no box"
+    page.mouse.move(box["x"] + box["width"] / 2, box["y"] + 12)
+    page.mouse.move(box["x"] + box["width"] / 2 + 3, box["y"] + 14)
+    desk.settled()
+
+
+def selected_key(desk: Desk) -> str:
+    rows = lit(desk)
+    desk.check(len(rows) == 1, f"not one row lit: {rows}")
+    row = rows[0]
+    return ("card:" if row["card"] else "") + str(row["id"])
+
+
+def parity(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int,
+           scheme: str) -> str:
+    """`#407 unpack-row-parity`: an unpacked row answers the mouse and the keys as any message row does."""
+    desk, errors = open_page(chromium, args, f"parity-{label}", width, height, scheme, False, ParityApi())
+    page = desk.page
+    phone_thread_list(desk)
+    # Negative control: the cards packed, ↓ goes card to card. Newest activity at the foot.
+    cards = walk_order(desk)
+    desk.check(len(cards) == 3 and all(key.startswith("card:") for key in cards), f"not three cards alone: {cards}")
+    first, second = cards[0], cards[1]
+    mouse_onto(desk, f'#side-cards > li[data-card][data-id="{first[5:]}"]')
+    desk.check(selected_key(desk) == first, f"the mouse did not light the card: {lit(desk)}")
+    page.keyboard.press("ArrowDown")
+    desk.settled()
+    desk.check(selected_key(desk) == second, f"↓ over packed cards went to {lit(desk)}, not {second}")
+
+    page.locator("#side-unpack").click()
+    desk.wait_for(f"() => document.querySelectorAll('#side-cards > li[data-unpack-thread=\"{RUNNER}\"]').length >= 9",
+                  "the summarised thread did not unpack under its card")
+    desk.settled()
+    order = walk_order(desk)
+    desk.check([key for key in order if key.startswith("card:")] == cards, f"unpacking moved the cards: {order}")
+
+    def block(card: str) -> list[str]:
+        at = order.index(card) + 1
+        rest = order[at:]
+        return rest[:next((n for n, key in enumerate(rest) if key.startswith("card:")), len(rest))]
+
+    runner_rows = block(f"card:{RUNNER}")
+    desk.check(len(runner_rows) >= 9, f"the walk over the cards does not hold the unpacked rows: {order}")
+
+    # The mouse over an unpacked row lights it, and only it, with the selection's ring and the focus.
+    target = runner_rows[2]
+    mouse_onto(desk, f'#side-cards > li[data-unpack-thread="{RUNNER}"][data-id="{target}"]')
+    rows = lit(desk)
+    desk.check(len(rows) == 1 and rows[0]["id"] == target and rows[0]["unpacked"] == RUNNER,
+               f"the mouse over unpacked row {target} lit {rows}")
+    desk.check(rows[0]["outline"] != "none", f"the lit unpacked row draws no ring: {rows[0]}")
+    desk.check(bool(rows[0]["focused"]), "the row the mouse lit does not hold the focus")
+    desk.shot("1-hover")
+
+    # ↓ and ↑ through the block, in reading order, and across to the next card.
+    page.keyboard.press("ArrowDown")
+    desk.settled()
+    desk.check(selected_key(desk) == runner_rows[3], f"↓ from {target} went to {lit(desk)}, not {runner_rows[3]}")
+    page.keyboard.press("ArrowUp")
+    desk.settled()
+    desk.check(selected_key(desk) == target, f"↑ did not come back to {target}: {lit(desk)}")
+    top_rows = block(first)
+    desk.check(len(top_rows) >= 1, f"the first card's thread unpacked nothing: {order}")
+    mouse_onto(desk, f'#side-cards > li[data-unpack-thread="{first[5:]}"][data-id="{top_rows[-1]}"]')
+    page.keyboard.press("ArrowDown")
+    desk.settled()
+    desk.check(selected_key(desk) == second, f"↓ from a block's last row went to {lit(desk)}, not the next card")
+    page.keyboard.press("ArrowDown")
+    desk.settled()
+    after = block(second)[0]
+    desk.check(selected_key(desk) == after, f"↓ from the card went to {lit(desk)}, not its first row {after}")
+    desk.shot("2-keys")
+
+    # Enter on the selected row opens it, and again folds it; : and ; fold and open every unpacked row.
+    folds = page.evaluate(FOLDS_JS)
+    desk.check(len(folds) >= 6 and all(state == "true" for state in folds.values()),
+               f"the unpacked replies do not arrive folded: {folds}")
+    fold_target = next(key for key in runner_rows if key in folds)
+    mouse_onto(desk, f'#side-cards > li[data-unpack-thread="{RUNNER}"][data-id="{fold_target}"]')
+    page.keyboard.press("Enter")
+    desk.settled()
+    desk.check(page.evaluate(FOLDS_JS)[fold_target] == "false", f"Enter did not open unpacked row {fold_target}")
+    page.keyboard.press("Enter")
+    desk.settled()
+    desk.check(page.evaluate(FOLDS_JS)[fold_target] == "true", f"Enter again did not fold unpacked row {fold_target}")
+    page.keyboard.press(";")
+    desk.settled()
+    desk.check(all(state == "false" for state in page.evaluate(FOLDS_JS).values()), "; did not expand every unpacked row")
+    desk.check(page.locator("#status").text_content() == "Expanded all", "; did not say what it did")
+    desk.shot("3-expanded")
+    page.keyboard.press(":")
+    desk.settled()
+    desk.check(all(state == "true" for state in page.evaluate(FOLDS_JS).values()), ": did not collapse every unpacked row")
+    desk.check(page.locator("#status").text_content() == "Collapsed all", ": did not say what it did")
+
+    # Collapse read: the block's run is the run line every list draws, and Enter on it opens it.
+    page.click("#todo-filter")
+    desk.wait_for("() => document.getElementById('todo-filter').getAttribute('data-read-mode') === 'collapse'",
+                  "Collapse read was not reached")
+    desk.settled()
+    head = f'#side-cards > li[data-unpack-thread="{REPLICA}"][data-read-run="head"]'
+    desk.check(page.locator(head).count() == 1, "the raw block's read run is not the shared run line")
+    run_box = page.locator(f"{head} > .read-run").bounding_box()
+    bridge_box = page.locator(f"{head} > .reply-bridge").bounding_box()
+    desk.check(run_box is not None and bridge_box is not None and bridge_box["x"] < run_box["x"],
+               f"the run line hangs off no bridge: line {run_box}, bridge {bridge_box}")
+    mouse_onto(desk, head)
+    rows = lit(desk)
+    desk.check(len(rows) == 1 and rows[0]["run"] == "head", f"the mouse did not light the run line: {rows}")
+    desk.shot("4-run-lit")
+    page.keyboard.press("Enter")
+    desk.settled()
+    desk.check(page.locator(head).count() == 0, "Enter on the run line did not open it")
+    overflow = page.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")
+    desk.check(overflow <= 0, f"horizontal overflow of {overflow}px")
+    desk.check(not errors, f"page errors: {errors}")
+    page.context.close()
+    return f"parity-{label}: hover, ↓/↑ across cards and rows, Enter, ; and :, and the run line, as elsewhere"
+
+
 def perf(chromium: BrowserType, args: argparse.Namespace) -> str:
     desk, errors = open_page(chromium, args, "perf-1280-dark", 1280, 800, "dark", False, ManyApi())
     page = desk.page
@@ -268,6 +438,9 @@ def main() -> int:
     with sync_playwright() as playwright:
         for label, width, height, scheme, touch in SIZES:
             report.append(walk(playwright.chromium, args, label, width, height, scheme, touch))
+        for label, width, height, scheme, touch in SIZES:
+            if not touch:
+                report.append(parity(playwright.chromium, args, label, width, height, scheme))
         report.append(perf(playwright.chromium, args))
     for line in report:
         print(line)
