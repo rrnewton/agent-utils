@@ -128,7 +128,7 @@ def serve(api: ColumnsApi) -> ThreadingHTTPServer:
 
 
 def open_page(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int,
-              scheme: str, touch: bool, api: ColumnsApi) -> Desk:
+              scheme: str, touch: bool, api: ColumnsApi) -> tuple[Desk, list[str]]:
     server = serve(api)
     profile = tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-unpack-")
     context = chromium.launch_persistent_context(
@@ -137,10 +137,10 @@ def open_page(chromium: BrowserType, args: argparse.Namespace, label: str, width
         has_touch=touch, is_mobile=touch)
     page = context.pages[0] if context.pages else context.new_page()
     desk = Desk(page, args.screenshots, label, width, height)
-    desk.page_errors = []  # type: ignore[attr-defined]
-    page.on("pageerror", lambda error: desk.page_errors.append(str(error)))  # type: ignore[attr-defined]
+    errors: list[str] = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
     page.goto(f"http://127.0.0.1:{server.server_address[1]}/")
-    return desk
+    return desk, errors
 
 
 def ids_of(desk: Desk, thread_id: str) -> list[str]:
@@ -149,7 +149,7 @@ def ids_of(desk: Desk, thread_id: str) -> list[str]:
 
 def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int,
          scheme: str, touch: bool) -> str:
-    desk = open_page(chromium, args, label, width, height, scheme, touch, UnpackApi())
+    desk, errors = open_page(chromium, args, label, width, height, scheme, touch, UnpackApi())
     page = desk.page
     phone_thread_list(desk)
     toggle = page.locator("#side-unpack")
@@ -225,13 +225,13 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
     desk.shot("6-reloaded-unpacked")
     overflow = page.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")
     desk.check(overflow <= 0, f"horizontal overflow of {overflow}px")
-    desk.check(not desk.page_errors, f"page errors: {desk.page_errors}")  # type: ignore[attr-defined]
+    desk.check(not errors, f"page errors: {errors}")
     page.context.close()
     return f"{label}: unpacked, collapsed, hidden, packed and reloaded, no page error"
 
 
 def perf(chromium: BrowserType, args: argparse.Namespace) -> str:
-    desk = open_page(chromium, args, "perf-1280-dark", 1280, 800, "dark", False, ManyApi())
+    desk, errors = open_page(chromium, args, "perf-1280-dark", 1280, 800, "dark", False, ManyApi())
     page = desk.page
     page.fill("#api-token", fixture.TOKEN)
     page.click("#save-token")
@@ -248,6 +248,7 @@ def perf(chromium: BrowserType, args: argparse.Namespace) -> str:
     desk.settled()
     elapsed = time.monotonic() - started
     rows = page.evaluate("() => document.querySelectorAll('#side-cards > li[data-unpack-thread]').length")
+    desk.check(not errors, f"page errors: {errors}")
     desk.shot("1-forty-unpacked")
     page.context.close()
     return f"perf: 40 threads, {rows} unpacked rows drawn in {elapsed:.2f}s from the press"
