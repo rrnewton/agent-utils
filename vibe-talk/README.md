@@ -7395,7 +7395,7 @@ from, so it cannot name a key the page does not answer.
 | `;`, `:`; Ctrl+;, Ctrl+: (Cmd on a Mac) | The long messages, a step a press: expand all, then the unread open and the read folded, then collapse all, and round again; `:` goes the other way. The chords do the same from anywhere, a message box or the search included. See below |
 | `b` or `m` | Back to the bookmark, with the message under it selected |
 | `c` | Write to the channel (or the thread you are in); on Reply, the reply; in the call view, to the agent |
-| Ctrl+S (Cmd+S) | The same box from anywhere: typing in the search, on Settings or Help too. The browser's "Save page" never opens |
+| Ctrl+S (Cmd+S) | The same box from anywhere: typing in the search, on a button, a thread card, Settings, Help or the thread list too. In two columns, the box of the column you are in, or of the one with the selected message; Main's from the thread cards. The browser's "Save page" never opens |
 | Ctrl+Enter (Cmd+Enter) | In a message box, send; anywhere else, the message box, as Ctrl+S |
 | ↑ in the empty message box | Select the newest message |
 | Alt+↓, Alt+↑ (Option on a Mac) | The next or previous channel |
@@ -7488,6 +7488,17 @@ in a message box it sends, as before. Held down from outside a box, it goes to t
 draft there unsent: its repeats arrive in the box, and a repeat never sends. The search keeps `/` and
 the magnifying glass, and Ctrl+/ (Cmd+/) from anywhere since `#344 search-shortcut`; the Help list
 says where Ctrl+S went.
+
+`#403 composer-key-global`. The owner found Cmd+S "selective" in two columns: it did nothing from
+the right column's thread cards or from the thread list. Now it works from everywhere. In two columns it goes to the box of the column the focus is in.
+With the focus in neither column (on the bar, or on the page itself) it goes to the box of the column with the selected message.
+From the thread cards, which have no box, it goes to Main's. A reply open at the foot of a column is that column's box. The
+thread list is left first, as Settings and Help are, for the view it was chosen from. The chord is
+heard at the window before any element's own listener, as the search's is, so nothing on the page
+can keep it from the box or let the browser's Save page open. `make -C vibe-talk
+composer-key-browser` presses it through CDP in a real Chromium at 1280x800: from a thread card, the
+right and left columns' selected messages, the search glass, the page body, the search field, both
+boxes with a draft, and the thread list.
 
 ### Copying the highlighted message
 
