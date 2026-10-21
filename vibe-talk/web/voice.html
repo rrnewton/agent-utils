@@ -1514,36 +1514,6 @@
                   </section>
 
                   <!--
-                    WHO IS WHO: which account in the channel being read is you, which is the coding agent,
-                    and which are other people and bots, as the channel view draws them.
-
-                    `#349 channel-settings-all`. The owner, 2026-10-18: "drop the who-is-who part" from
-                    the per-channel box, whose picker now offers All channels, which no list of speakers
-                    can follow. It moved here, beside the other settings about how messages are drawn,
-                    rather than going: it is the one way to name a coding agent where the server cannot
-                    guess one (a Slack channel, or a deployment that names its agents), and the choices
-                    already made are stored and keep applying either way.
-
-                    It follows the channel the reader is READING (`#discord-channel`), which its first line
-                    names. It used to follow the box's picker, and before that it listed every account
-                    seen anywhere, which let a bot from another channel spoil the sole-other-bot guess;
-                    the census is still per channel. A CHOICE is about the ACCOUNT, in every channel it
-                    speaks in — see `renderIdentityRows` in web/voice.js.
-                  -->
-                  <section class="settings-group" id="identity-group">
-                    <div class="group-head">
-                      <h3 title="Everyone who has spoken in the channel you are reading. Italic means guessed. A choice follows the account into every channel."><button class="fold-toggle" id="fold-identities" type="button" aria-expanded="false" aria-controls="fold-identities-body">Who is who</button></h3>
-                      <button class="help-link" id="help-link-identities" type="button" data-help="identities" aria-label="About who is who in a channel" title="Everyone who has spoken in the channel you are reading. Italic means guessed. A choice follows the account into every channel.">?</button>
-                    </div>
-                    <div class="fold-body" id="fold-identities-body" hidden="until-found">
-                      <!-- Rows are built by `renderIdentityRows` in web/voice.js, under a line naming the
-                           channel. Empty until that channel has been read, and it says so. -->
-                      <div id="identity-list"></div>
-                      <p id="identity-state" class="hint" aria-live="polite"></p>
-                    </div>
-                  </section>
-
-                  <!--
                     `#193 compose-draft-loss`. A send dismissed from the outbox unsent is not gone at one
                     tap: it is kept here, on this device only, for a week (the newest ten), and Put back
                     returns it to its channel's outbox. web/voice.js writes the list and the line above it.
@@ -1679,17 +1649,6 @@
                       <button id="open-browse-channels" class="secondary" type="button" aria-expanded="false" aria-controls="browse-channel-fields" hidden>Browse channels</button>
                     </div>
                     <p id="remove-channel-state" class="hint" aria-live="polite"></p>
-
-                    <!--
-                      `#199 removable-config-channels`. Configured channels taken off the list, each with
-                      the one act that puts it back. Hidden while there are none. Rows are built by
-                      `renderHiddenChannels` in web/voice.js, in the directory's row shape: a name and a
-                      button.
-                    -->
-                    <div id="hidden-channels" hidden>
-                      <p class="hint">Hidden channels from this server's configuration:</p>
-                      <ul id="hidden-channel-list" class="channel-directory" aria-label="Hidden channels"></ul>
-                    </div>
 
                     <div id="rename-fields" hidden>
                       <label for="channel-alias">Call it</label>
@@ -1831,6 +1790,56 @@
                         <button id="upstream-clear-push" class="secondary" type="button" hidden>Mark read now</button>
                       </div>
                       <p id="upstream-clear-state" class="hint" aria-live="polite"></p>
+                    </div>
+
+                    <!--
+                      WHO IS WHO: which account in the channel chosen above is you, which is the coding
+                      agent, and which are other people and bots, as the channel view draws them.
+
+                      `#402 who-is-who-channel-box`. The owner, 2026-10-21: "it should stay under the
+                      channel section along with everything that varies depending on selecting the
+                      channel in the drop down". So it is back at the foot of this box, where it was
+                      before `#349 channel-settings-all` moved it to Messages, and it follows the box's
+                      picker (`#settings-channel`) again, which its first line names. A list of who spoke
+                      cannot follow All channels, so on All channels one line asks for a channel instead.
+
+                      Still one channel's census, so a bot that only speaks somewhere else cannot spoil
+                      the sole-other-bot guess. A CHOICE is about the ACCOUNT, in every channel it speaks
+                      in — see `renderIdentityRows` in web/voice.js.
+                    -->
+                    <div id="identity-group">
+                      <hr class="settings-rule" />
+                      <div class="group-head">
+                        <h3 title="Everyone who has spoken in the channel chosen above. Italic means guessed. A choice follows the account into every channel.">Who is who</h3>
+                        <button class="help-link" id="help-link-identities" type="button" data-help="identities" aria-label="About who is who in a channel" title="Everyone who has spoken in the channel chosen above. Italic means guessed. A choice follows the account into every channel.">?</button>
+                      </div>
+                      <!-- Rows are built by `renderIdentityRows` in web/voice.js, under a line naming the
+                           channel. Empty until that channel has been read, and it says so. -->
+                      <div id="identity-list"></div>
+                      <p id="identity-state" class="hint" aria-live="polite"></p>
+                    </div>
+                  </section>
+
+                  <!--
+                    `#199 removable-config-channels`. Configured channels taken off the list, each with
+                    the one act that puts it back. Hidden while there are none. Rows are built by
+                    `renderHiddenChannels` in web/voice.js, in the directory's row shape: a name and a
+                    button.
+
+                    `#401 hidden-channels-fold`. The owner, 2026-10-21: "it should stay at the bottom of
+                    that pane and be collapsed by default. When I'm switching channels and seeing the
+                    interface update it seems invasive to have this bit in the middle". So it is the last
+                    group of the section, after the box, and a fold like every other group here (folded
+                    on each load, kept as the reader leaves it while the page is open), whose heading
+                    counts what is inside. Nothing in it depends on the box's channel, so a picker change
+                    neither redraws it nor opens it, and it sits under everything that does change.
+                  -->
+                  <section class="settings-group" id="hidden-channels" hidden>
+                    <div class="group-head">
+                      <h3 title="Channels from this server's configuration that you took off your list."><button class="fold-toggle" id="fold-hidden-channels" type="button" aria-expanded="false" aria-controls="fold-hidden-channels-body">Hidden channels</button></h3>
+                    </div>
+                    <div class="fold-body" id="fold-hidden-channels-body" hidden="until-found">
+                      <ul id="hidden-channel-list" class="channel-directory" aria-label="Hidden channels"></ul>
                     </div>
                   </section>
                 </div>
@@ -2243,9 +2252,10 @@
                 The call transcript tells its two speakers apart by side, colour and corner. The
                 channel can do the same, but only once it knows which account is which. A display
                 name alone cannot reliably distinguish you, the bridge and the coding agent. The
-                list is in <strong>Messages</strong>, and shows everyone who has spoken in the
-                channel you are reading, which its first line names, with what this page guessed
-                shown in italics; change any of them and the channel is redrawn.
+                list is at the foot of the channel's settings in <strong>Channels</strong>, and shows
+                everyone who has spoken in the channel chosen there, which its first line names, with
+                what this page guessed shown in italics; change any of them and the channel is
+                redrawn. With <strong>All channels</strong> chosen it asks you to pick one.
               </p>
               <p class="hint">
                 The guesses, in the order they are tried: the account this bridge posts as is
@@ -2662,8 +2672,8 @@
                 many it reached. Rename and Remove name one channel, so they step aside; Add and
                 Browse stay. Where this server reads several chat services it is all of the chosen
                 service's channels, <strong>All Slack channels</strong> for example, and never
-                reaches another service's. Who is who, which used to sit at the foot of this group,
-                is under <strong>Messages</strong>, for the channel you are reading.
+                reaches another service's. Who is who, at the foot of this group, lists one
+                channel's speakers, so with All channels chosen it asks you to pick one.
               </p>
               <p class="hint">
                 <strong>Several chat services.</strong> Where this server reads more than one, the
@@ -2691,8 +2701,9 @@
                 Any channel can be <strong>removed</strong> from your list here. One added here is
                 forgotten. One that came from the server's configuration file is
                 <strong>hidden</strong> instead, because the server never writes that file: it stays
-                off your list across restarts, and <strong>Show again</strong> under Hidden channels
-                puts it back. Adding it again from Browse or by its id does the same.
+                off your list across restarts, and <strong>Show again</strong> under
+                <strong>Hidden channels</strong>, folded at the foot of this group with how many there
+                are, puts it back. Adding it again from Browse or by its id does the same.
               </p>
               <h2>What to call a channel</h2>
               <p class="hint">

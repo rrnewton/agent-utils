@@ -3704,7 +3704,8 @@ def _act_channel_settings_all(driver: Driver) -> None:
     Two channels whose service can clear unread, set differently (the server's answers are routed:
     the screenshot server has one channel and a chat service that cannot), All channels chosen, and
     the Channels section scrolled to the top: the count, Add and Browse without Rename and Remove,
-    and Clear unread showing Mixed with the line saying how they differ. Who is who is not there.
+    and Clear unread showing Mixed with the line saying how they differ. Who is who, at the foot of the
+    box since `#402 who-is-who-channel-box`, asks for one channel instead of listing anyone.
     """
     driver.page.route("**/api/v1/client-config", _all_channels_config)
     driver.page.route("**/api/v1/channels/*/upstream-clear", _all_channels_clear)
@@ -6275,7 +6276,7 @@ SCENES: tuple[Scene, ...] = (
     ),
     Scene(
         name="64-channel-settings-all",
-        what="Settings, Channels on All channels: Rename and Remove aside, Clear unread Mixed across two channels, and no Who is who",
+        what="Settings, Channels on All channels: Rename and Remove aside, Clear unread Mixed across two channels, and Who is who asking for one channel",
         act=_act_channel_settings_all,
         after=_after_channel_settings_all,
         profiles=SETTINGS_PROFILES,
@@ -6308,10 +6309,12 @@ SCENES: tuple[Scene, ...] = (
                 "return window.__visible(id) && b.top >= s.top - 1 && b.bottom <= s.bottom + 1; })",
             ),
             (
-                # ...and who is who is not in the box any more: it is under Messages.
-                "no Who is who in the Channels section; it is in Messages",
-                "!document.getElementById('settings-channels').contains(document.getElementById('identity-list')) "
-                "&& document.getElementById('settings-messages').contains(document.getElementById('identity-list'))",
+                # `#402 who-is-who-channel-box`: who is who is back in the box, and on All channels it asks
+                # for one channel rather than listing anyone.
+                "Who is who is in the channel box, asking for one channel, and not in Messages",
+                "document.getElementById('channel-settings').contains(document.getElementById('identity-list')) "
+                "&& !document.getElementById('settings-messages').contains(document.getElementById('identity-list')) "
+                "&& document.getElementById('identity-list').textContent === 'Pick one channel to see who is who.'",
             ),
             (
                 "nothing on the settings screen is wider than it",
@@ -7377,8 +7380,9 @@ def check_state_controls() -> list[str]:
         # tooltip (`h.title === q.title`).
         "63-settings-prose": ("Mark-read automatically", "p.id !== ''", "h.title === q.title"),
         # `#349 channel-settings-all`. Pinned to All channels being chosen (`s.value === '*'`), to Mixed
-        # said in words (`Mixed: On in 1`), and to Who is who being out of the box (`settings-messages`).
-        "64-channel-settings-all": ("s.value === '*'", "Mixed: On in 1", "settings-messages"),
+        # said in words (`Mixed: On in 1`), and, `#402 who-is-who-channel-box`, to Who is who in the box
+        # asking for one channel (`Pick one channel`).
+        "64-channel-settings-all": ("s.value === '*'", "Mixed: On in 1", "Pick one channel"),
         # `#348 settings-dynamic-lists`. Pinned to the dark monospaced panel (`Math.max(...rgb) < 48`),
         # to the fixed resizable scrolling list (`s.resize === 'vertical'`) and its one-line rows
         # (`textOverflow`); to the pop-out's whole text (`t.length > 400`); and to the readout's

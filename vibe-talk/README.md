@@ -6907,7 +6907,8 @@ file never named, so nothing reads it, posts there, or streams it. All of that f
 place: `AppState::channel` and `AppState::all_channels` subtract the hidden set, and every consumer
 already goes through them.
 
-**Getting it back.** Settings lists *Hidden channels from this server's configuration*, each with
+**Getting it back.** Settings lists them under **Hidden channels**, a fold at the foot of the
+Channels section headed with how many there are (`#401 hidden-channels-fold`), each with
 **Show again** (`DELETE /api/v1/channels/{id}/hidden`). Adding it again also works, by its id or
 from Browse channels, where a hidden channel is offered like any channel not on the list. Either
 way the file's label and write policy apply, not the ones typed when adding it. Adding from Browse
@@ -7750,8 +7751,8 @@ the groups sit as rows inside a handful of sections, and each section is the car
 | Section | Holds |
 |---|---|
 | **Voice agent** | Sending (ask before the agent sends — first, where it is looked for), Instructions, Resuming, Arriving messages during a call, Reading full messages in channel view, Canned prompts, Microphone, and the provider's console link |
-| **Messages** | Your own messages, Mark-read automatically, Combining messages, Rich headers, Who is who, Recently dismissed |
-| **Channels** | the per-channel box: rename, remove, add, browse, clear unread upstream — for one channel, or for all of them (`#349 channel-settings-all`); with several chat services, a Service picker first (`#355 provider-grouped-channels`) |
+| **Messages** | Your own messages, Mark-read automatically, Combining messages, Rich headers, Recently dismissed |
+| **Channels** | the per-channel box: rename, remove, add, browse, clear unread upstream — for one channel, or for all of them (`#349 channel-settings-all`) — and Who is who for the channel chosen (`#402 who-is-who-channel-box`); with several chat services, a Service picker first (`#355 provider-grouped-channels`); under the box, the hidden channels, folded (`#401 hidden-channels-fold`) |
 | **Screen and keys** | Text size, Reading width, Control bar, Typing, Keyboard |
 | **Storage and connection** | Stored conversations, Saved messages on this server (the message cache's switch, its Erase and what it holds; shown only to the write token, and only when client-config carries `message_cache` — `#208 persistent-cache`), Token, Connection status |
 
@@ -7809,7 +7810,8 @@ The page suite holds each of these to the markup with a negative control for eac
 `63-settings-prose` photographs the Messages section with no line of description under a heading at
 393x852, 1280x800 and 1920x1080. Tooltips are a mouse's: on a phone the `?` is the way in, as before.
 
-**Who is who left the channel box** (`#349 channel-settings-all`). The owner asked for "the
+**Who is who left the channel box** (`#349 channel-settings-all`; put back by `#402
+who-is-who-channel-box`, below). The owner asked for "the
 who-is-who part" out of the per-channel box, whose picker now offers All channels, which no list of
 speakers can follow. It moved to **Messages**, beside the other settings about how messages are
 drawn, rather than going: it is the one way to name a coding agent where the server will not guess
@@ -7818,6 +7820,24 @@ in this browser and keep applying. It follows the channel being **read**, which 
 and is still one channel's census, so a bot that only speaks somewhere else cannot spoil the guess.
 `64-channel-settings-all` photographs the box on All channels, Clear unread Mixed across two
 channels, at 393x852, 1280x800 and 1920x1080.
+
+**Who is who is back in the channel box** (`#402 who-is-who-channel-box`). The owner, 2026-10-21:
+"it should stay under the channel section along with everything that varies depending on selecting
+the channel in the drop down". It sits at the foot of the box again, under Clear unread, and lists
+the speakers of the channel the box's picker is on, redrawn whenever the picker changes; reading
+another channel does not move it. On **All channels** (or a service's **All Slack channels**) it says
+"Pick one channel to see who is who." instead of listing anyone. A choice still follows the account
+into every channel it speaks in, and choices made while it was under Messages are kept.
+
+**The hidden channels are folded at the foot** (`#401 hidden-channels-fold`). The owner, 2026-10-21:
+the list of hidden channels "should stay at the bottom of that pane and be collapsed by default", as
+it sat in the middle of the box and redrew around him as he switched channels. It is now the last
+group of the Channels section, after the box: a fold like every other on Settings (folded on each
+load, kept as left while the page is open, opened by Expand all), headed **Hidden channels (3)** with
+how many it holds, and gone while there are none. Nothing in it depends on the box's channel, so a
+picker change neither redraws nor opens it. `make channel-box-browser` checks both in real Chromium at
+1280x800 and 393x852: the fold is the last thing drawn in the section, opening it moves nothing above
+it, a picker change leaves it folded, and Show again works inside it.
 
 **Several chat services: the service first** (`#355 provider-grouped-channels`). The owner,
 2026-10-18: "under the Channels setting ... drop-down for Service=Slack/etc and then within that a
