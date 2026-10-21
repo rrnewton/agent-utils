@@ -710,7 +710,9 @@ running turn's timer, the newest output, and any verdict are all out of
 sight. A growing count is a screen change like any other. While the view stays
 scrolled no stall or idle clock runs (an episode already reported is kept, so
 it is not reported twice), the pass lists the agent under `scrolled` in its
-JSON, and scrolling back to the bottom starts the clocks again. Approval
+JSON and is not `ok`, and scrolling back to the bottom starts the clocks again.
+No notice is sent about the scroll itself, so a view left scrolled up hides a
+real stall until someone scrolls it down. Approval
 prompts are still reported, since they are drawn at the bottom. When every watched agent is unreachable at once the terminal
 server is the problem, and the pass says so instead of calling every harness
 dead; repairing that is `agentctl watch`'s job.
@@ -731,8 +733,8 @@ whether it was reported, and notices still owed — is kept in
 watcher stopped between queueing a batch and recording that fact re-derives
 the same ID after a restart and the coordinator's queue recognises it instead
 of delivering it twice. `--once` runs a single pass, prints it as JSON, and
-exits 0 only when the team could be probed and no episode is reported or due,
-1 otherwise; `--check-only` sends nothing and does not consume an episode's
+exits 0 only when the team could be probed, no episode is reported or due, and
+no view is scrolled up, 1 otherwise; `--check-only` sends nothing and does not consume an episode's
 one report.
 
 Run it beside `agent-watch.service` under its own user unit. This unit is a

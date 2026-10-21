@@ -274,10 +274,9 @@ fn scrolled_below(screen: &str) -> Option<u64> {
     let row = row
         .strip_suffix(" new messages")
         .or_else(|| row.strip_suffix(" new message"))?;
-    let count = row.rsplit(char::is_whitespace).next()?;
-    if count.is_empty() || !count.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
+    // The pill can be drawn flush against the transcript row it covers, so the count is the
+    // row's trailing digits, not its last word.
+    let count = &row[row.len() - row.bytes().rev().take_while(u8::is_ascii_digit).count()..];
     count.parse::<u64>().ok().filter(|count| *count > 0)
 }
 
@@ -721,8 +720,8 @@ fn watch_agents_once(
         });
     }
     let notice = flush_notices(state, notifier, now, options);
-    // Agents whose view is scrolled up cannot be judged stalled or idle; say which, so a
-    // quiet report is not read as a clean bill.
+    // Agents whose view is scrolled up cannot be judged stalled or idle; say which, and do
+    // not call the pass ok, so a quiet report is not read as a clean bill.
     let scrolled: Vec<Value> = observations
         .iter()
         .filter_map(|row| {
@@ -735,6 +734,7 @@ fn watch_agents_once(
         "checked_at": now,
         "coordinator": options.coordinator,
         "ok": probe_error.is_null()
+            && scrolled.is_empty()
             && episodes.iter().all(|row| row["reported"] != true && row["due"] != true),
         "probe_error": probe_error,
         "agents": seen.len(),
@@ -1505,6 +1505,11 @@ mod tests {
             scrolled_below("● x    16 new messages (ctrl+End) ↓\n"),
             None
         );
+        // A pill drawn flush against the row it covers still gives its count.
+        assert_eq!(
+            scrolled_below(&SCROLLED_WORKING.replace("…)                    16 new", "…)16 new")),
+            Some(16)
+        );
         assert_eq!(
             scrolled_below(&SCROLLED_GATING.replace("7 new", "0 new")),
             None
@@ -1528,7 +1533,7 @@ mod tests {
             let mut probe = ScriptedProbe(vec![screens.to_vec()]);
             let report = pass(&mut probe, &mut notifier, &mut state, at, &options);
             assert_eq!(report["episodes"], json!([]), "{report}");
-            assert_eq!(report["ok"], true, "{report}");
+            assert_eq!(report["ok"], false, "{report}");
             assert_eq!(report["scrolled"][1]["agent"], "gating", "{report}");
             assert_eq!(report["scrolled"][1]["new_messages"], 7, "{report}");
         }
