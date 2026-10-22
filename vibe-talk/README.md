@@ -7389,7 +7389,7 @@ from, so it cannot name a key the page does not answer.
 | `;`, `:`; Ctrl+;, Ctrl+: (Cmd on a Mac) | The long messages, a step a press: expand all, then the unread open and the read folded, then collapse all, and round again; `:` goes the other way. The chords do the same from anywhere, a message box or the search included. See below |
 | `b` or `m` | Back to the bookmark, with the message under it selected |
 | `c` | Write to the channel (or the thread you are in); on Reply, the reply; in the call view, to the agent |
-| Ctrl+S (Cmd+S) | The same box from anywhere: typing in the search, on a button, a thread card, Settings, Help or the thread list too. In two columns, the box of the column you are in, or of the one with the selected message; Main's from the thread cards. The browser's "Save page" never opens |
+| Ctrl+S (Cmd+S) | The same box from anywhere: typing in the search, on a button, a thread card, Settings, Help or the thread list too. In two columns, the box of the column you are in, or of the one with the selected message; Main's from the thread cards. It never changes the view when the view has a box: in the thread list with **Main channel** on, the box at the foot of the cards. The browser's "Save page" never opens |
 | Ctrl+Enter (Cmd+Enter) | In a message box, send; anywhere else, the message box, as Ctrl+S |
 | ↑ in the empty message box | Select the newest message |
 | Alt+↓, Alt+↑ (Option on a Mac) | The next or previous channel |
@@ -7487,7 +7487,10 @@ says where Ctrl+S went.
 the right column's thread cards or from the thread list. Now it works from everywhere. In two columns it goes to the box of the column the focus is in.
 With the focus in neither column (on the bar, or on the page itself) it goes to the box of the column with the selected message.
 From the thread cards, which have no box, it goes to Main's. With a reply open, it goes to the reply's box, the one box drawn. The
-thread list is left first, as Settings and Help are, for the view it was chosen from. The chord is
+thread list is left first, as Settings and Help are, for the view it was chosen from, but only where it has no box of its own:
+`#422 composer-key-stay` states the rule for every view, that the chord never changes the view when the view on screen has a
+box. With **Main channel** on (`#419 threads-view-main-messages`) the main channel's box is the last card, and Ctrl+S goes to
+it (or to a reply open among the cards) and the thread list stays. The chord is
 heard at the window before any element's own listener, as the search's is, so nothing on the page
 can keep it from the box or let the browser's Save page open. `make -C vibe-talk
 composer-key-browser` presses it through CDP in a real Chromium at 1280x800: from a thread card, the
