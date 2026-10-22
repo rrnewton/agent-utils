@@ -2800,6 +2800,62 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     page.selection.text = "";
     await page.documentEvent("selectionchange");
   };
+  /**
+   * `#429 keyboard-hides-bar`. The window's height, as the layout viewport (`innerHeight`) and the visual
+   * viewport report it, in CSS pixels at a scale of 1: a 393x852 phone with no keyboard up, until a test
+   * says otherwise. An on-screen keyboard takes its height from the visual viewport, and from the layout
+   * one too where the browser resizes the content for it (Chrome on Android, told so by web/voice.html);
+   * a desk or a phone with a keyboard plugged in takes nothing from either.
+   */
+  page.viewport = { layout: 852, visual: 852, scale: 1, listeners: [] };
+  /** Resize the viewports, and tell the page as a browser does, by `resize` on the visual viewport. */
+  page.resizeViewport = async ({ visual, layout = page.viewport.layout, scale = page.viewport.scale }) => {
+    Object.assign(page.viewport, { visual, layout, scale });
+    for (const fn of page.viewport.listeners) await fn({ type: "resize" });
+    await page.settle();
+  };
+  /**
+   * `#429 keyboard-hides-bar`. The VirtualKeyboard API, as Chrome has it: absent unless a test installs
+   * it, before the page loads (from `arrange`), as the page reads it then. `page.setVirtualKeyboard`
+   * reports a keyboard of a height, and the `geometrychange` a browser fires for it.
+   */
+  page.useVirtualKeyboard = () => {
+    const listeners = [];
+    navigator.virtualKeyboard = {
+      boundingRect: { x: 0, y: 0, width: 0, height: 0 },
+      addEventListener: (type, fn) => {
+        if (type === "geometrychange") listeners.push(fn);
+      },
+    };
+    page.setVirtualKeyboard = async (height) => {
+      navigator.virtualKeyboard.boundingRect = { x: 0, y: 852 - height, width: height > 0 ? 393 : 0, height };
+      for (const fn of listeners) await fn({ type: "geometrychange" });
+      await page.settle();
+    };
+  };
+  /**
+   * `#429 keyboard-hides-bar`. The focus moves to `target`, as a tap on a field moves it: `focusout` from
+   * whatever had it, naming where it is going, then `focusin` at the new one, each going to the element
+   * and to each one around it, then to the document, as they bubble in a browser. `null` is the focus
+   * going nowhere, as a tap on the list does.
+   */
+  page.moveFocus = async (target) => {
+    const from = FakeElement.focused;
+    if (from === target) return;
+    if (from) {
+      FakeElement.focused = null;
+      const out = { type: "focusout", target: from, relatedTarget: target };
+      for (let at = from; at; at = at.parentNode) await at.dispatch("focusout", out);
+      await page.documentEvent("focusout", out);
+    }
+    if (target) {
+      target.focus();
+      const into = { type: "focusin", target, relatedTarget: from };
+      for (let at = target; at; at = at.parentNode) await at.dispatch("focusin", into);
+      await page.documentEvent("focusin", into);
+    }
+    await page.settle();
+  };
   const context = {
     document,
     localStorage,
@@ -2810,6 +2866,21 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     window: {
       AudioContext: function () { return new FakeAudioContext(page); },
       location: { origin: "https://vibe.example" },
+      // `#429 keyboard-hides-bar`. See `page.viewport`.
+      get innerHeight() {
+        return page.viewport.layout;
+      },
+      visualViewport: {
+        get height() {
+          return page.viewport.visual;
+        },
+        get scale() {
+          return page.viewport.scale;
+        },
+        addEventListener: (type, fn) => {
+          if (type === "resize") page.viewport.listeners.push(fn);
+        },
+      },
       addEventListener: (type, fn, options) => {
         const capture = options === true || Boolean(options && typeof options === "object" && options.capture);
         const listeners = capture ? windowCaptureListeners : windowListeners;
@@ -4341,6 +4412,11 @@ const TRANSCRIPT_PAGE_LIMIT = sourceConstant("TRANSCRIPT_PAGE_LIMIT");
 // The bands are deliberately WIDE. They are not a second opinion about the tuning; they are the
 // boundary between a judgement and a different behaviour wearing the same name.
 const TUNING_BANDS = {
+  KEYBOARD_MIN_PX: [100, 220,
+    "the least height an on-screen keyboard takes from the viewport before the page hides both bars for it: " +
+    "lower takes a browser's toolbar sliding away, or a hardware keyboard's accessory strip, for a keyboard " +
+    "and hides the bars under a reader who is not typing on the screen; higher misses a landscape phone's " +
+    "keyboard, which leaves well under half of a 393px screen (#429 keyboard-hides-bar)"],
   BACK_TRAVERSAL_MS: [500, 10000,
     "how long the page waits for its own going-back through the history to land: shorter takes a " +
     "busy phone's ordinary traversal for one that never came and stops going back, leaving entries the " +
@@ -11689,6 +11765,264 @@ test("the Read control becomes a way OUT once a session is on", async () => {
     /--warn/,
     "an active session looks exactly like an inactive one"
   );
+});
+
+// --- `#429 keyboard-hides-bar` ----------------------------------------------------------------------
+//
+// The owner, writing in the channel view on a phone: the open keyboard and both bars left too little of
+// the list to read the message being answered. While the on-screen keyboard is up the page is the list
+// and the box; a focused field alone, as on a desk or with a keyboard plugged in, changes nothing.
+
+/**
+ * Move the focus as a tap does (`page.moveFocus`), and let the page decide on it: it does so once the
+ * tap is over, on a timer of its own, which `page.settle` does not run.
+ */
+const focusOn = async (page, target) => {
+  await page.moveFocus(target);
+  page.expireTimers(0);
+};
+
+/** What the page says about the keyboard, on the root element: "open", "closed", or null before it has changed. */
+const keyboardSaid = (page) => page.documentElement.getAttribute("data-keyboard");
+
+/** The `@media` block holding the stylesheet's keyboard rules, brace-matched, and the query it is under. */
+function keyboardMedia() {
+  const first = CSS_CODE.indexOf('[data-keyboard="open"]');
+  assert.ok(first >= 0, "web/voice.css has no rule for the keyboard being up");
+  const at = CSS_CODE.lastIndexOf("@media", first);
+  const open = CSS_CODE.indexOf("{", at);
+  let depth = 0;
+  for (let i = open; i < CSS_CODE.length; i += 1) {
+    if (CSS_CODE[i] === "{") depth += 1;
+    else if (CSS_CODE[i] === "}" && --depth === 0) {
+      return { query: CSS_CODE.slice(at + "@media".length, open).trim(), body: CSS_CODE.slice(open + 1, i), start: at, end: i };
+    }
+  }
+  return assert.fail("the keyboard's @media block is never closed");
+}
+
+test("`#429 keyboard-hides-bar`: both rows go while the keyboard is up, only on a touch screen, and a way out of sound stays", () => {
+  const { query, body, start, end } = keyboardMedia();
+  assert.equal(query, "(pointer: coarse)", "the bars can go on a desk, whatever the script decides");
+  const outside = CSS_CODE.slice(0, start) + CSS_CODE.slice(end);
+  assert.doesNotMatch(outside, /data-keyboard/, "a keyboard rule outside the touch-screen block");
+  // The channel view only: the call's view keeps its dock over the keyboard (`#241 voice-composer`).
+  for (const rule of body.matchAll(/([^{}]+)\{[^{}]*\}/g)) {
+    for (const selector of rule[1].split(/,\s*(?=:root)/)) {
+      assert.match(selector.trim(), /^:root\[data-keyboard="open"\]:has\(#pane-discord:not\(\[hidden\]\)\) /,
+        `a keyboard rule reaches past the channel view: ${selector.trim()}`);
+    }
+  }
+  // Both rows: the control bar wherever it is mounted, and the dock with nothing in it to stop.
+  assert.match(cssRules(body, ':root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-bar').join("\n"), /display:\s*none/,
+    "the control bar stays up over the keyboard");
+  // (Read whole: `cssRules` splits a selector list at its commas, and this one has a comma inside `:has()`.)
+  assert.match(body,
+    /:root\[data-keyboard="open"\]:has\(#pane-discord:not\(\[hidden\]\)\) #dock:not\(:has\(#read-aloud\[data-active="true"\]:not\(\[hidden\]\), #hang-up:not\(\[hidden\]\)\)\) \{\s*display:\s*none;\s*\}/,
+    "the dock stays up over the keyboard with nothing playing");
+  // The header the bar was moved to goes with it, but never Settings' way back.
+  assert.match(body, /#topbar:has\(#control-bar-top > #control-bar\):not\(:has\(#close-settings:not\(\[hidden\]\), #close-help:not\(\[hidden\]\)\)\)/);
+  // A reading or a call keeps one slim row: its Stop or Hang up, and nothing else of the tile.
+  assert.match(body,
+    /:root\[data-keyboard="open"\]:has\(#pane-discord:not\(\[hidden\]\)\) #control-pane > :not\(#hang-up, #read-aloud\[data-active="true"\]\) \{\s*display:\s*none;\s*\}/,
+    "the rest of the tile stays up beside Stop");
+  assert.match(cssRules(body, ':root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-pane').join("\n"), /grid-template-rows:\s*2\.75rem/);
+  // Nothing the box needs is in either bar: Send and Grow are the composers', in the list.
+  for (const id of ["channel-send", "send-text", "reply-send"]) {
+    if (!PAGE_ELEMENTS.has(id)) continue;
+    assert.ok(HTML.indexOf(`id="${id}"`) < HTML.indexOf('<footer id="dock">'), `${id} is in the dock, and would go with it`);
+  }
+});
+
+test("`#429 keyboard-hides-bar`: a focused box and a visual viewport a keyboard shorter is the keyboard up; blur or the keyboard going brings the bars back", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1000000000000000001" })]);
+  const box = page.el("channel-compose-text");
+  assert.notEqual(keyboardSaid(page), "open", "the keyboard is up before anything was focused");
+
+  // Safari: the visual viewport shrinks, the layout does not.
+  await focusOn(page, box);
+  assert.notEqual(keyboardSaid(page), "open", "a focused box was taken for a keyboard before the viewport shrank");
+  await page.resizeViewport({ visual: 480 });
+  assert.equal(keyboardSaid(page), "open", "a keyboard taking 372px of the visual viewport went unnoticed");
+  // The box losing the focus brings the bars back, whatever the viewport says yet: once the tap that took
+  // the focus is over, and not inside it, where Chromium's click would land on whatever moved under the
+  // finger (tests/keyboard_hides_bar_browser.py measured Stop's click landing on the tile around it).
+  assert.equal([...page.timers.values()].filter((timer) => timer.ms === 0).length, 0,
+    "the premise: nothing the page decides once a tap is over is waiting");
+  await page.moveFocus(null);
+  assert.equal(keyboardSaid(page), "open", "the bars came back inside the tap that took the focus");
+  page.expireTimers(0);
+  assert.equal(keyboardSaid(page), "closed", "the bars stayed away after the box lost the focus");
+  await page.resizeViewport({ visual: 852 });
+
+  // Chrome on Android, told to resize the content: the layout viewport shrinks with the visual one, so
+  // comparing the two would see nothing.
+  await focusOn(page, box);
+  await page.resizeViewport({ visual: 520, layout: 520 });
+  assert.equal(keyboardSaid(page), "open", "a keyboard that resized the layout too went unnoticed");
+  // The keyboard dismissed with the box still focused (Android's Back): the bars come back.
+  await page.resizeViewport({ visual: 852, layout: 852 });
+  assert.equal(keyboardSaid(page), "closed", "the bars stayed away after the keyboard went down");
+  assert.equal(page.document.activeElement, box, "the premise: the box still has the focus");
+});
+
+test("`#429 keyboard-hides-bar`: a focused field with nothing taken from the viewport is no keyboard — a desk, or a keyboard plugged in", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1000000000000000001" })]);
+  for (const id of ["channel-compose-text", "search-field"]) {
+    await focusOn(page, page.el(id));
+    assert.notEqual(keyboardSaid(page), "open", `focus in ${id} alone was taken for an on-screen keyboard`);
+  }
+  // A browser's toolbar sliding away, a pinch zoom, and a window made shorter with nothing focused.
+  await page.resizeViewport({ visual: 772 });
+  assert.notEqual(keyboardSaid(page), "open", "80px of toolbar was taken for a keyboard");
+  await page.resizeViewport({ visual: 426, scale: 2 });
+  assert.notEqual(keyboardSaid(page), "open", "a pinch zoom was taken for a keyboard");
+  await page.resizeViewport({ visual: 852, scale: 1 });
+  await focusOn(page, null);
+  await page.resizeViewport({ visual: 400, layout: 400 });
+  assert.notEqual(keyboardSaid(page), "open", "a shorter window with nothing focused was taken for a keyboard");
+  // A checkbox is no field: Grow, focused by its click, with the viewport short against the screen.
+  await focusOn(page, page.el("channel-compose-grow"));
+  assert.notEqual(keyboardSaid(page), "open", "a focused checkbox was taken for a keyboard");
+  // The window made shorter with nothing to type in (split screen, a freeform window) is the window from
+  // then on: the box focused in it, with a keyboard plugged in, is no keyboard on the screen.
+  await focusOn(page, null);
+  await focusOn(page, page.el("channel-compose-text"));
+  assert.notEqual(keyboardSaid(page), "open", "a window made shorter before the box was focused was taken for a keyboard");
+  // ...and a keyboard coming up in it still is one.
+  await page.resizeViewport({ visual: 220, layout: 220 });
+  assert.equal(keyboardSaid(page), "open", "a keyboard in the shorter window went unnoticed");
+});
+
+test("`#429 keyboard-hides-bar`: a keyboard is both 150px and a fifth of the screen, so neither a tall screen's toolbar nor a short one's is one", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1000000000000000001" })]);
+  await focusOn(page, page.el("channel-compose-text"));
+  // 160px of an 852px screen: past 150px, short of a fifth (170px).
+  await page.resizeViewport({ visual: 692 });
+  assert.notEqual(keyboardSaid(page), "open", "160px of a tall screen was taken for a keyboard");
+  await page.resizeViewport({ visual: 680 });
+  assert.equal(keyboardSaid(page), "open", "172px of the screen, a keyboard's, went unnoticed");
+  await page.resizeViewport({ visual: 852 });
+  // A landscape screen 393px tall: 100px is past a fifth (79px) and short of 150px.
+  await focusOn(page, null);
+  page.documentElement.clientWidth = 852;
+  await page.resizeViewport({ visual: 393, layout: 393 });
+  await focusOn(page, page.el("channel-compose-text"));
+  await page.resizeViewport({ visual: 293, layout: 293 });
+  assert.notEqual(keyboardSaid(page), "open", "100px of a short screen was taken for a keyboard");
+  await page.resizeViewport({ visual: 213, layout: 213 });
+  assert.equal(keyboardSaid(page), "open", "180px of a landscape screen, a keyboard's, went unnoticed");
+});
+
+test("`#429 keyboard-hides-bar`: the focus moving from the box to the search keeps the bars away, with no flash between", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1000000000000000001" })]);
+  await focusOn(page, page.el("channel-compose-text"));
+  await page.resizeViewport({ visual: 480 });
+  assert.equal(keyboardSaid(page), "open");
+  const said = [];
+  const set = page.documentElement.setAttribute.bind(page.documentElement);
+  page.documentElement.setAttribute = (name, value) => {
+    if (name === "data-keyboard") said.push(value);
+    return set(name, value);
+  };
+  await focusOn(page, page.el("search-field"));
+  assert.deepEqual(said, [], "the bars came back for a moment between two fields");
+  assert.equal(keyboardSaid(page), "open");
+});
+
+test("`#429 keyboard-hides-bar`: a reading playing as the keyboard comes up goes on playing, Stop still on screen", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1000000000000000001" }), message({ id: "1000000000000000002" })]);
+  await page.el("read-aloud").click();
+  await page.settle();
+  assert.equal(page.el("read-aloud").getAttribute("data-active"), "true", "the premise: reading is on");
+  const playing = page.players.filter((player) => !player.paused).length;
+
+  await focusOn(page, page.el("channel-compose-text"));
+  await page.resizeViewport({ visual: 480 });
+  assert.equal(keyboardSaid(page), "open");
+  assert.equal(page.el("read-aloud").getAttribute("data-active"), "true", "the keyboard stopped the reading");
+  assert.equal(page.el("read-aloud-label").text(), "Stop", "the way out no longer says it is one");
+  assert.equal(page.el("read-aloud").hidden, false, "Stop went with the bars");
+  assert.equal(page.players.filter((player) => !player.paused).length, playing, "the keyboard paused the audio");
+  // And Stop, pressed with the keyboard up, stops it.
+  await page.el("read-aloud").click();
+  await page.settle();
+  assert.equal(page.el("read-aloud").getAttribute("data-active"), "false", "Stop did nothing with the keyboard up");
+});
+
+test("`#429 keyboard-hides-bar`: the pace popover, whose button has gone, closes as the keyboard comes up", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1000000000000000001" })]);
+  await page.el("read-speed").click();
+  await page.settle();
+  assert.equal(page.el("speed-popover").hidden, false, "the premise: the popover is open");
+  await focusOn(page, page.el("channel-compose-text"));
+  await page.resizeViewport({ visual: 480 });
+  assert.equal(page.el("speed-popover").hidden, true, "a popover was left open over the keyboard");
+  assert.equal(page.el("read-speed").getAttribute("aria-expanded"), "false");
+});
+
+test("`#429 keyboard-hides-bar`: where the browser reports the keyboard (the VirtualKeyboard API), that is heard too", async () => {
+  const page = newPage(new Map(), SCRIPT, (p) => p.useVirtualKeyboard());
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1000000000000000001" })]);
+  await focusOn(page, page.el("channel-compose-text"));
+  await page.setVirtualKeyboard(320);
+  assert.equal(keyboardSaid(page), "open", "a keyboard the browser reported went unheard");
+  await page.setVirtualKeyboard(0);
+  assert.equal(keyboardSaid(page), "closed", "the bars stayed away after the browser reported the keyboard gone");
+  // Reported with nothing focused, it is not the reader writing here.
+  await focusOn(page, null);
+  await page.setVirtualKeyboard(320);
+  assert.notEqual(keyboardSaid(page), "open");
+});
+
+test("`#429 keyboard-hides-bar`: a turned phone measures its tallest again, so the shorter landscape screen is no keyboard", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1000000000000000001" })]);
+  await focusOn(page, page.el("channel-compose-text"));
+  page.documentElement.clientWidth = 852;
+  await page.resizeViewport({ visual: 393, layout: 393 });
+  assert.notEqual(keyboardSaid(page), "open", "turning the phone was taken for a keyboard");
+  await page.resizeViewport({ visual: 180, layout: 180 });
+  assert.equal(keyboardSaid(page), "open", "a keyboard on the turned phone went unnoticed");
+});
+
+test("`#429 keyboard-hides-bar`: turned with the keyboard up, the bars stay away until the keyboard goes, at a width never seen without it", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1000000000000000001" })]);
+  page.documentElement.clientWidth = 393;
+  await page.resizeViewport({ visual: 852, layout: 852 });
+  await focusOn(page, page.el("channel-compose-text"));
+  await page.resizeViewport({ visual: 516, layout: 516 });
+  assert.equal(keyboardSaid(page), "open");
+  // Turned: 852 wide, the keyboard still up, 193px left. This width has never been seen without it.
+  page.documentElement.clientWidth = 852;
+  await page.resizeViewport({ visual: 193, layout: 193 });
+  assert.equal(keyboardSaid(page), "open", "turning the phone with the keyboard up brought the bars back");
+  // Turned back, the keyboard still up: portrait's own tallest says so.
+  page.documentElement.clientWidth = 393;
+  await page.resizeViewport({ visual: 516, layout: 516 });
+  assert.equal(keyboardSaid(page), "open", "turning back with the keyboard up brought the bars back");
+  // Landscape again, then the keyboard down: the height grows by a keyboard's, and the bars come back.
+  page.documentElement.clientWidth = 852;
+  await page.resizeViewport({ visual: 193, layout: 193 });
+  assert.equal(keyboardSaid(page), "open");
+  await page.resizeViewport({ visual: 393, layout: 393 });
+  assert.equal(keyboardSaid(page), "closed", "the keyboard went down on the turned phone and the bars stayed away");
 });
 
 test("READ OWNS THE THUMB POSITION, and placement is explicit so DOM order cannot decide it", async () => {

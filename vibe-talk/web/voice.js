@@ -8485,6 +8485,69 @@ function writingToAgent() {
     document.activeElement === leftEl("compose-text");
 }
 
+/**
+ * `#429 keyboard-hides-bar`. The boxes in the lists a reader writes in, each field with the box it is in:
+ * the channel's (in Main's list, or among the cards since `#419 threads-view-main-messages`), the right
+ * column's, and a reply open in the stream (`#410 inline-reply-editor`), in whichever list holds it. The
+ * call's is `writingToAgent`'s.
+ */
+const LIST_BOXES = [
+  ["channel-compose-text", "channel-composer"],
+  ["side-compose-text", "side-composer"],
+  ["reply-text", "column-reply"],
+  ["reply-text", "side-reply"],
+];
+
+/**
+ * The box in `area` the reader is writing in, or null. `#429 keyboard-hides-bar`: the on-screen keyboard
+ * takes its height from the list, and a list that shrinks keeps its scroll position, so the channel's box
+ * at its foot, or a reply's under its message, went below the window, Send with it, as the call's had
+ * before `#241 voice-composer` kept it in view. The keepers of the two lists bring this box into view
+ * whole as their list shrinks, if it was in view before (`boxWasInView`): a reader who scrolled up to read
+ * the message being answered is left there.
+ *
+ * @param {HTMLElement} area
+ * @returns {HTMLElement | null}
+ */
+function boxBeingWritten(area) {
+  if (currentScreen !== "main") return null;
+  const held = document.activeElement;
+  for (const [field, box] of LIST_BOXES) {
+    if (held === leftEl(field) && nodeWithin(area, leftEl(box))) return leftEl(box);
+  }
+  return null;
+}
+
+/**
+ * Whether any of `box` was in the view of `area` while the list was `height` tall. The list shrinks from
+ * its foot with its scroll position kept, so where the box stands below the list's top is where it stood.
+ *
+ * @param {HTMLElement} box
+ * @param {HTMLElement} area
+ * @param {number} height
+ */
+function boxWasInView(box, area, height) {
+  const rect = box.getBoundingClientRect();
+  const top = rect.top - area.getBoundingClientRect().top;
+  return top < height && top + rect.height > 0;
+}
+
+/**
+ * `#429 keyboard-hides-bar`. Keep the box being written in `area` in view as the list shrinks from
+ * `seen.list` to `now.list`, if it was in view; whether it did.
+ *
+ * @param {HTMLElement} area
+ * @param {{list: number} | null} seen
+ * @param {{list: number}} now
+ */
+function keepWrittenBox(area, seen, now) {
+  if (seen === null || seen.list <= 0 || now.list >= seen.list) return false;
+  const box = boxBeingWritten(area);
+  if (box === null || !boxWasInView(box, area, seen.list)) return false;
+  keepBoxInView(box, area);
+  return true;
+}
+
 // --- the box that grows -------------------------------------------------------------------------
 //
 // `#340 composer-grow-box`. The owner, on a desk: pasting a long message left the message box tiny,
@@ -49350,6 +49413,112 @@ if (typeof window.addEventListener === "function") {
     else decide();
   });
 }
+// --- the on-screen keyboard ------------------------------------------------------------------------
+//
+// `#429 keyboard-hides-bar`. The owner, writing in the channel view on a phone: the open keyboard, the
+// big Read and Pace tile and the control bar above it left too little of the screen to read the message
+// being answered, and nobody writing a message is being read to at the same time — "hide the entire
+// bar, both rows of it, until the keyboard is dismissed again". So while the on-screen keyboard is up
+// the page is the list and the box being typed in, and both rows come back as the keyboard goes down or
+// the field loses the focus.
+//
+//   * A FOCUSED FIELD IS NOT A KEYBOARD. A desk, or a phone with a keyboard plugged in, focuses the same
+//     field with no keyboard on the screen. What only an on-screen keyboard does is take height from the
+//     visual viewport, so "up" is both: a field the reader types in has the focus (the message box, a
+//     reply in the stream, the search), AND the visible height is well short of the tallest this window
+//     has been at its width, or `navigator.virtualKeyboard` reports a keyboard with a height, where the
+//     browser has it. The page does not set that API's `overlaysContent`, which would undo
+//     `interactive-widget=resizes-content`, and some browsers report no geometry without it; the
+//     viewport is the signal every phone browser gives.
+//   * THE TALLEST, NOT THE LAYOUT VIEWPORT. With `interactive-widget=resizes-content` (web/voice.html),
+//     Chrome on Android shrinks the layout viewport with the keyboard, so `innerHeight` shrinks with the
+//     visual viewport and comparing the two sees nothing; Safari leaves the layout alone and shrinks the
+//     visual viewport only. The tallest height seen at this width is the screen without a keyboard on
+//     both, and a turn of the phone, which changes the width, starts it again. The visual viewport is
+//     reckoned at the page's own scale, so a pinch zoom is not a keyboard; the threshold clears a
+//     browser's own toolbars sliding away, which change the height by well under it.
+//   * WHAT GOES IS THE STYLESHEET'S. This sets `data-keyboard` on the root element and nothing else;
+//     web/voice.css takes the bars away only in the channel view and only where the pointer is coarse,
+//     and never the box, its Send or its Grow, which are in the list. The call's view keeps its dock
+//     over the keyboard, as `#241 voice-composer` laid it out to.
+//   * THE SOUND GOES ON. A reading already playing as the keyboard comes up keeps playing — the reader
+//     asked for it and is only answering something — and a call keeps going; the tile shrinks to a slim
+//     Stop, or Hang up, instead of going, so the way out stays one tap away. The pace popover, whose
+//     button has gone, is closed.
+//   * THE READER'S PLACE is kept by the keepers the dock already has: the list grows at its foot as the
+//     bars go, its scroll position left as it was (a reader at the foot stays there), and as they come
+//     back the dock-growth keeper of `#280 scroll-stability` holds a reader at the foot on it.
+
+/** The least height, in CSS pixels, an on-screen keyboard takes: more than a browser's toolbar. */
+const KEYBOARD_MIN_PX = 150;
+/** ...and the least share of the tallest viewport it takes, for a tall screen's taller toolbars. */
+const KEYBOARD_MIN_SHARE = 0.2;
+
+/**
+ * The keyboard as last decided; the tallest visible height seen at each width the window has had,
+ * which is that width's screen with no keyboard; the width last measured; and, across a turn of the
+ * phone with the keyboard up, the height the new width was first measured at (`turnedAt`), null otherwise.
+ *
+ * @type {{up: boolean, tallest: Map<number, number>, width: number, turnedAt: number | null}}
+ */
+const onScreenKeyboard = { up: false, tallest: new Map(), width: -1, turnedAt: null };
+
+/**
+ * Decide again whether the on-screen keyboard is up, as above, and tell the stylesheet when that
+ * changes.
+ *
+ *   * NOTHING FOCUSED, THE WINDOW IS WHAT IT IS: a window made shorter with no field to type in (split
+ *     screen, a freeform window, a desk) is that width's height from now on, not a keyboard to come.
+ *   * A TURN OF THE PHONE WITH THE KEYBOARD UP is measured at a width whose screen may never have been
+ *     seen without it, so the keyboard is taken to be up still, until the height grows by a keyboard's
+ *     or the field loses the focus; a width seen before is measured against its own tallest.
+ */
+function noteKeyboard() {
+  const field = document.activeElement;
+  const typing = isTextField(field);
+  const viewport = window.visualViewport;
+  const visible = viewport ? viewport.height * (viewport.scale || 1) : window.innerHeight || 0;
+  const width = (document.documentElement && document.documentElement.clientWidth) || 0;
+  const turned = width !== onScreenKeyboard.width && onScreenKeyboard.width !== -1;
+  onScreenKeyboard.width = width;
+  const measured = Math.max(visible, window.innerHeight || 0);
+  const tallest = typing ? Math.max(onScreenKeyboard.tallest.get(width) || 0, measured) : measured;
+  onScreenKeyboard.tallest.set(width, tallest);
+  const least = (height) => Math.max(KEYBOARD_MIN_PX, height * KEYBOARD_MIN_SHARE);
+  if (!typing) onScreenKeyboard.turnedAt = null;
+  else if (turned && onScreenKeyboard.up) onScreenKeyboard.turnedAt = visible;
+  else if (onScreenKeyboard.turnedAt !== null && visible - onScreenKeyboard.turnedAt >= least(tallest)) {
+    onScreenKeyboard.turnedAt = null;
+  }
+  const virtual = navigator.virtualKeyboard;
+  const reported = Boolean(virtual && virtual.boundingRect && virtual.boundingRect.height > 0);
+  const shrunk = visible > 0 && tallest - visible >= least(tallest);
+  const up = typing && (reported || shrunk || onScreenKeyboard.turnedAt !== null);
+  if (up === onScreenKeyboard.up) return;
+  onScreenKeyboard.up = up;
+  document.documentElement.setAttribute("data-keyboard", up ? "open" : "closed");
+  if (up && !el("speed-popover").hidden) closeSpeedPopover();
+}
+
+if (window.visualViewport && typeof window.visualViewport.addEventListener === "function") {
+  window.visualViewport.addEventListener("resize", () => noteKeyboard());
+} else if (typeof window.addEventListener === "function") {
+  window.addEventListener("resize", () => noteKeyboard());
+}
+if (navigator.virtualKeyboard && typeof navigator.virtualKeyboard.addEventListener === "function") {
+  navigator.virtualKeyboard.addEventListener("geometrychange", () => noteKeyboard());
+}
+// A focus that moves is decided once the tap that moved it is over, from where the focus went. A tap
+// moves the focus at its `mousedown`, and Chromium hit-tests the same tap's `click` afterwards: the bars
+// coming back in between moved Stop out from under the finger, and the click landed on the tile around
+// it (measured in tests/keyboard_hides_bar_browser.py). A row tapped in the list would move the same
+// way, and in reading mode that tap reads it. From one field to another the focus has arrived by then,
+// and nothing comes back for the moment between them.
+for (const type of ["focusin", "focusout"]) {
+  document.addEventListener(type, () => setTimeout(() => noteKeyboard(), 0));
+}
+// The window as it loads, which is the first measure of its tallest.
+noteKeyboard();
 // Before the first channel read, so the very first list of rows is already filtered rather
 // than appearing unfiltered for a frame and then rearranging under the reader.
 loadIdentities();
@@ -49853,6 +50022,8 @@ if (typeof window.ResizeObserver === "function") {
       keepComposerInView();
       return;
     }
+    // `#429 keyboard-hides-bar`: the channel's box and a reply in the stream as well, where they were in view.
+    if (keepWrittenBox(area, seen, now)) return;
     if (grew > 0 && seen !== null && seen.gap !== undefined) {
       if (seen.gap <= BOTTOM_SLACK_PX) area.scrollTop = area.scrollHeight;
       return;
@@ -49883,6 +50054,8 @@ if (typeof window.ResizeObserver === "function") {
     // comes while they are on the list. Taken from the hidden column instead, it was no growth at all, and a
     // reader who had left from the foot of the cards came back the card's height above it.
     if (currentScreen === "main") sideUnderLists = now;
+    // `#429 keyboard-hides-bar`. A box being written in this list, kept in view as the keyboard shrinks it.
+    if (currentScreen === "main" && keepWrittenBox(area, seen, now)) return;
     if (sideColumnUp() && currentView === "discord" && columns.side.mode === "list") {
       if (!cardsOpening && grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) followFoot(area);
       return;

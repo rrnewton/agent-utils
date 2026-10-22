@@ -7193,6 +7193,52 @@ textarea {
   grid-row: 1 / span 2;
 }
 
+/* `#429 keyboard-hides-bar`. WHILE THE ON-SCREEN KEYBOARD IS UP IN THE CHANNEL VIEW, the page is the list
+ * and the box being typed in, and nothing else. The owner: the keyboard and the bars together left too
+ * little of the list to read the message being answered, and a reader writing is not being read to —
+ * "hide the entire bar, both rows of it, until the keyboard is dismissed again". web/voice.js says when
+ * the keyboard is up (`data-keyboard` on the root, from a focused field AND a visual viewport that has
+ * lost a keyboard's height); this says what goes, and only where the pointer is coarse, so a desk never
+ * loses its bars whatever the script decides.
+ *
+ *   * THE CHANNEL VIEW ONLY (#pane-discord shown). The call's view keeps its dock over the keyboard, which
+ *     is what `#241 voice-composer` laid it out for: the switch, Talk and Hang up beside the box the reader
+ *     is talking to the agent through.
+ *   * BOTH ROWS: the control bar (the gear, the channel and view pickers, the Voice/Channel switch), in
+ *     the dock or in the header where the reader moved it, and the tile under it. The header goes with the
+ *     bar only while the bar is all it holds; Settings' title and way back stay.
+ *   * NOTHING THE BOX NEEDS: Send, Grow and the box itself are in the list, not in either bar.
+ *   * A WAY OUT OF SOUND STAYS. A reading already playing keeps playing, and a call keeps going, so the
+ *     tile shrinks to ONE slim row holding Stop, or Hang up, instead of going: the sound is a tap from
+ *     stopping. Everything else in the tile goes. */
+@media (pointer: coarse) {
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-bar,
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #topbar:has(#control-bar-top > #control-bar):not(:has(#close-settings:not([hidden]), #close-help:not([hidden]))) {
+    display: none;
+  }
+
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #dock:not(:has(#read-aloud[data-active="true"]:not([hidden]), #hang-up:not([hidden]))) {
+    display: none;
+  }
+
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-pane {
+    grid-template-rows: 2.75rem;
+    padding-top: 0.35rem;
+    padding-bottom: calc(0.35rem + env(safe-area-inset-bottom));
+  }
+
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-pane > :not(#hang-up, #read-aloud[data-active="true"]) {
+    display: none;
+  }
+
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-pane > :is(#hang-up, #read-aloud) {
+    grid-column: 1 / -1;
+    grid-row: 1;
+    flex-direction: row;
+    gap: 0.4rem;
+  }
+}
+
 /* The caveat that used to be a paragraph in the transcript: one clause, attached to the action it
    is about, and only on the screen where it applies. */
 .control-note {

@@ -1309,6 +1309,25 @@ steps:
     hint:
       resources: {browser: 1}
       est_duration_s: 9
+
+  # `#429 keyboard-hides-bar` in the browser engine, at 393x852 by touch with the on-screen keyboard
+  # simulated as Chrome on Android lays it out (the viewport 336px shorter): a focused box alone keeps both
+  # bars; the keyboard up takes the control bar and the dock away and the list reaches the window's foot,
+  # the box, Send and the message above on screen; down, or the box losing the focus, brings both back with
+  # the reader at the foot; a reply mid-list stays whole above the keys and its message does not move as
+  # they go; Read on leaves one slim Stop that a tap really stops. At 1280x800 with a mouse, a shorter
+  # window with the box focused keeps both bars. Measured on 2026-10-22: about 8s wall.
+  - group: check
+    job: keyboard-hides-bar-browser
+    desc: both bars away while the on-screen keyboard is up and back as it goes or the box loses the focus, the reader's place kept and a slim Stop while reading, in current Chromium at 393x852 by touch and 1280x800
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/keyboard_hides_bar_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 8
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
