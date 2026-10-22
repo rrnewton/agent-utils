@@ -48,9 +48,18 @@ four views are offered, in the view picker and on Ctrl+1 to Ctrl+4 (Cmd on a Mac
   at that end; **Older threads…** above the oldest card reads further back. Esc goes back to the view
   it was chosen from. A thread opened from a card opens across the window, the card moving up to
   head it; every thread opened across the window, however it was opened, is headed by its card, and
-  the card's × (or Esc, or ←) goes back to where it was opened from. **Unpack msgs** in its heading
-  (key `u`, kept on this device) draws every thread's messages under its card at once, in time
-  order on a bridge in the thread's colour, as **N replies** gathers one thread in **All**; the read
+  the card's × (or Esc, or ←) goes back to where it was opened from. **Unpack** in its heading
+  (key `u`, kept on this device) goes round **Pack all**, **Unpack unread** and **Unpack all**, saying
+  which (`#440 thread-card-pack-toggle`): an unpacked thread draws its messages under its card, in time
+  order on a bridge in the thread's colour, as **N replies** gathers one thread in **All**. Unpack unread
+  unpacks the threads with an unread message and packs the read ones, whose cards' edges go grey there
+  and in no other state, so a thread you finish packs where it is and stays, rather than going. Each
+  card also packs and unpacks its own thread: a click on it (or Enter or `o`) goes three lines → the
+  card whole → whole with its messages unpacked → three lines, a card that says a summary going two
+  ways; the ▲ in the first unpacked message's gutter (where All's bridge has its ×), or `^`, packs the
+  thread with its card kept where it is. A thread's own choice outranks Unpack until Unpack is pressed
+  again, and both are kept on this device. The Threads view highlights no card and dims none, as All
+  and two columns do (`#277`); a click there is the pack toggle. The read
   modes apply inside each thread, a collapsed run of read messages hanging off its bridge. The
   unpacked messages are message rows like any other: the mouse lights them, ↓/↑ and j/k walk cards
   and messages in reading order, every key about one message acts on the one selected, ; and : open
@@ -7425,6 +7434,7 @@ from, so it cannot name a key the page does not answer.
 | `r`, `p`, `s`, `.`, `i` | Reply, pin, read aloud, the ⋯ menu, the message details |
 | Ctrl+C (Cmd+C) or `y` | Copy the highlighted message, all of its text as written; on a thread card, its first message. With text selected, or in a text box, Ctrl+C is the browser's copy as ever (see below) |
 | Ctrl+1, Ctrl+2, Ctrl+3, Ctrl+4 (Cmd on a Mac) | Main, All, the thread list, two columns — from anywhere, a message box or the search included. The bare `1`, `2`, `3` are retired |
+| `u`, `^` | In the Thread list, Unpack in turn (Pack all, Unpack unread, Unpack all); `^` packs the thread of the selected card or message into its card (`#440 thread-card-pack-toggle`) |
 | `h` | Show read, Fold read, Hide read, in turn, as the button in the bar does, in every view, the Threads view's cards included; the status line says which (`#432 read-mode-unify`) |
 | Shift+P, Shift+L | The Pinned and Links filters |
 | `;`, `:`; Ctrl+;, Ctrl+: (Cmd on a Mac) | The long messages, a step a press: expand all, then the unread open and the read folded, then collapse all, and round again; `:` goes the other way. The chords do the same from anywhere, a message box or the search included. See below |

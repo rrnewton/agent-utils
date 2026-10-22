@@ -15,6 +15,8 @@ The owner, 2026-10-22, of the Threads view (Cmd+3) after `#419 threads-view-main
   under Hide read the Threads view's main rows left the owner's own message out.
 * `#432 read-mode-unify`: one read mode for every view, the cards included, key h saying it; Fold read
   (was Collapse read) folds runs of read threads into "... N read threads ...".
+* `#440 thread-card-pack-toggle`: each thread packed and unpacked from its card, three ways; Unpack three
+  ways, Unpack unread greying the read cards' edge; an up triangle packing a thread in place.
 * `#423 back-key-consistency`: "if I press Cmd-[ on the thread list view it jumps back to the Main view but
   it does NOT have kind of navigation (or back?) effect on other views". Ctrl/Cmd+[ and ] walk back and
   forward through the places visited, in every view.
@@ -25,8 +27,8 @@ threads), two of Main's messages (220 and 223) the owner's, from one loopback or
 (All), the Threads view from the picker ->
 
 1. the three chips at rest look alike, each pressed looks like the others pressed and unlike at rest
-   (border, background and words, as computed), and each says its state in aria-pressed; named Unpack msgs,
-   Main channel and Latest update (Main and Latest on a phone; Unread only went with #432);
+   (border, background and words, as computed), and each says its state in aria-pressed; named Pack all
+   (Unpack's first state, #440), Main channel and Latest update (Main and Latest on a phone);
 2. Main channel on -> Cmd+S from a card: the focus in the box at the foot of the cards, the Threads view
    kept; Reply on a main-channel message, Cmd+S: the reply's box, still the Threads view; Main channel off
    -> Cmd+S goes back to the view the list was chosen from (negative control);
@@ -44,7 +46,11 @@ threads), two of Main's messages (220 and 223) the owner's, from one loopback or
 7. the replica and canary threads read on the server, reloaded: in All, h -> the button says Fold read, the
    status line says so, and run lines are drawn; the Threads view -> "... 2 read threads" over their two
    cards, the runner's card (unread, newest) drawn; a tap on the line opens it; h -> Hide read: the two read
-   cards gone, the runner's left; h -> Show read: all three.
+   cards gone, the runner's left; h -> Show read: all three;
+8. Unpack unread: the runner unpacked, the read replica and canary packed, their edges one grey and the
+   runner's its colour; Pack all: every edge its own colour; Unpack all, the triangle on the replica's first
+   unpacked row (aria-label Pack thread): pressed, the replica packed, its card within a pixel of where it
+   was; a click on the replica's card goes whole, unpacked, collapsed.
 
 No page error and no sideways scroll at any step. Pass --screenshots DIR to keep a PNG of each state;
 --web-root DIR to run against another copy of the page (an older one fails it at the chips).
@@ -131,7 +137,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--screenshots", type=Path, help="directory to write one PNG per state into (default: none)")
     parser.add_argument("--port", type=int, default=0,
                         help="loopback port for the fake server (default: 0, any free port)")
-    parser.add_argument("--only", choices=("chips", "compose", "center", "back", "order", "sent", "readmode"), action="append",
+    parser.add_argument("--only", choices=("chips", "compose", "center", "back", "order", "sent", "readmode", "pack"), action="append",
                         help="run only these parts of the walk, repeatable (default: all of them)")
     parser.add_argument("--size", choices=[size[0] for size in SIZES], action="append",
                         help="walk only at these sizes, repeatable: desk is 1280x800, phone 393x852 (default: both)")
@@ -177,7 +183,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             desk = Desk(page, args.screenshots, f"threads-polish-{label}", width, height)
             page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             sign_in(desk)
-            parts = args.only or ["chips", "compose", "center", "back", "order", "sent", "readmode"]
+            parts = args.only or ["chips", "compose", "center", "back", "order", "sent", "readmode", "pack"]
             if "chips" in parts:
                 chips_walk(desk, touch)
             if "compose" in parts:
@@ -191,8 +197,11 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             if "sent" in parts:
                 sent_walk(desk)
             # Last: it marks two threads read on the server, which every later step would see.
-            if "readmode" in parts:
+            if "readmode" in parts or "pack" in parts:
                 read_mode_walk(desk, api)
+            # After it, with the replica and canary threads read and the runner's not.
+            if "pack" in parts:
+                pack_walk(desk)
             check(not errors, f"{label}: the page threw: {errors}")
             context.close()
             return f"{version} at {width}x{height}: " + "; ".join(desk.notes)
@@ -220,9 +229,13 @@ def to_threads(desk: Desk) -> None:
 
 
 def set_chip(desk: Desk, chip: str, on: bool) -> None:
+    """Press `chip` until it is on or off; Unpack goes round three states (`#440`), passing "mixed"."""
     page = desk.page
-    if (page.get_attribute(f"#{chip}", "aria-pressed") == "true") != on:
+    for _ in range(3):
+        if (page.get_attribute(f"#{chip}", "aria-pressed") == "true") == on and page.get_attribute(f"#{chip}", "aria-pressed") != "mixed":
+            break
         page.click(f"#{chip}")
+        desk.settled()
     desk.wait_for(f"() => document.getElementById('{chip}').getAttribute('aria-pressed') === '{'true' if on else 'false'}'",
                   f"#{chip} did not turn {'on' if on else 'off'}")
     desk.settled()
@@ -244,8 +257,8 @@ def chips_walk(desk: Desk, touch: bool) -> None:
     looks = {str(found["look"]) for found in rest.values()}
     desk.check(len(looks) == 1, f"the chips at rest do not look alike: {rest}")
     names = {name: str(found["text"]) for name, found in rest.items()}
-    desk.check(names == ({"side-unpack": "Unpack msgs", "side-main": "Main", "side-order": "Latest"} if touch else
-                         {"side-unpack": "Unpack msgs", "side-main": "Main channel", "side-order": "Latest update"}),
+    desk.check(names == ({"side-unpack": "Pack all", "side-main": "Main", "side-order": "Latest"} if touch else
+                         {"side-unpack": "Pack all", "side-main": "Main channel", "side-order": "Latest update"}),
                f"the chips' names: {names}")
     pressed: dict[str, dict[str, object]] = {}
     for name in CHIPS:
@@ -572,6 +585,92 @@ def read_mode_walk(desk: Desk, api: PolishApi) -> None:
     state(desk)
     desk.notes.append("h in All: Fold read said and drawn; Threads view: '… 2 read threads' over the read cards, opened by a tap; "
                       "Hide read leaves the runner alone; Show read all three")
+
+
+
+PACK_JS = """() => {
+    const card = (id) => document.querySelector(`#side-cards > li[data-card][data-id='${id}']`);
+    const info = (id) => { const li = card(id); const r = li.getBoundingClientRect();
+        return {state: li.getAttribute('data-card-state'), edge: getComputedStyle(li).borderLeftColor, top: r.top,
+                rows: document.querySelectorAll(`#side-cards > li[data-unpack-thread='${id}']`).length}; };
+    return {mode: document.getElementById('side-cards').getAttribute('data-unpack'),
+            chip: document.getElementById('side-unpack').innerText.trim(),
+            pressed: document.getElementById('side-unpack').getAttribute('aria-pressed'),
+            runner: info('RUNNER'), replica: info('REPLICA'), canary: info('CANARY')};
+}""".replace("RUNNER", RUNNER).replace("REPLICA", REPLICA).replace("CANARY", CANARY)
+
+
+def packs(desk: Desk) -> dict[str, object]:
+    found = desk.page.evaluate(PACK_JS)
+    assert isinstance(found, dict)
+    return found
+
+
+def unpack_to(desk: Desk, pressed: str) -> None:
+    for _ in range(3):
+        if desk.page.get_attribute("#side-unpack", "aria-pressed") == pressed:
+            return
+        desk.page.click("#side-unpack")
+        desk.settled()
+    desk.check(desk.page.get_attribute("#side-unpack", "aria-pressed") == pressed, f"Unpack never reached {pressed}")
+
+
+def pack_walk(desk: Desk) -> None:
+    page = desk.page
+    to_threads(desk)
+    unpack_to(desk, "mixed")
+    desk.wait_for(f"() => document.querySelectorAll(\"#side-cards > li[data-unpack-thread='{RUNNER}']\").length > 0",
+                  "Unpack unread did not unpack the unread runner")
+    desk.settled()
+    found = packs(desk)
+    runner, replica, canary = found["runner"], found["replica"], found["canary"]
+    assert isinstance(runner, dict) and isinstance(replica, dict) and isinstance(canary, dict)
+    desk.check(found["chip"] == "Unpack unread" and found["mode"] == "unread", f"the chip in Unpack unread: {found}")
+    desk.check(replica["rows"] == 0 and canary["rows"] == 0, f"Unpack unread unpacked a read thread: {found}")
+    desk.check(replica["edge"] == canary["edge"] and replica["edge"] != runner["edge"],
+               f"the read cards' edges are not one grey beside the runner's colour: {replica['edge']}, {canary['edge']}, {runner['edge']}")
+    desk.shot("8-unpack-unread")
+    grey = replica["edge"]
+    unpack_to(desk, "false")
+    found = packs(desk)
+    replica, canary = found["replica"], found["canary"]
+    assert isinstance(replica, dict) and isinstance(canary, dict)
+    desk.check(found["chip"] == "Pack all" and replica["edge"] != grey and replica["edge"] != canary["edge"],
+               f"Pack all left a read card's edge grey: {found}")
+    # The triangle packs a thread in place: the replica's, mid-list, under Unpack all. (The runner's card is
+    # the last: packing it shortens the list under the reader, and at the list's end the browser clamps.)
+    unpack_to(desk, "true")
+    desk.wait_for(f"() => document.querySelector(\"#side-cards > li[data-unpack-thread='{REPLICA}'] .unpack-pack\") !== null",
+                  "the replica's first unpacked row holds no triangle")
+    label = page.get_attribute(f"#side-cards > li[data-unpack-thread='{REPLICA}'] .unpack-pack", "aria-label")
+    desk.check(label == "Pack thread", f"the triangle is named {label!r}")
+    page.evaluate(f"() => document.querySelector(\"#side-cards > li[data-card][data-id='{REPLICA}']\").scrollIntoView({{block: 'start'}})")
+    desk.settled()
+    before = packs(desk)["replica"]
+    assert isinstance(before, dict)
+    desk.shot("8-triangle")
+    page.click(f"#side-cards > li[data-unpack-thread='{REPLICA}'] .unpack-pack")
+    desk.wait_for(f"() => document.querySelectorAll(\"#side-cards > li[data-unpack-thread='{REPLICA}']\").length === 0",
+                  "the triangle did not pack the replica")
+    desk.settled()
+    after = packs(desk)["replica"]
+    assert isinstance(after, dict)
+    moved = float(str(after["top"])) - float(str(before["top"]))
+    desk.check(abs(moved) <= 1, f"packing moved the replica's card by {moved:.1f}px")
+    unpack_to(desk, "false")
+    # A click on the replica's card, which says its first message (the runner's says a summary, so goes two
+    # ways): whole, unpacked, collapsed.
+    for want in ("expanded", "unpacked", "collapsed"):
+        page.click(f"#side-cards > li[data-card][data-id='{REPLICA}'] .side-card")
+        desk.wait_for(f"() => document.querySelector(\"#side-cards > li[data-card][data-id='{REPLICA}']\").getAttribute('data-card-state') === '{want}'",
+                      f"a click on the replica's card did not go to {want}")
+        desk.settled()
+        lit = page.evaluate("() => document.querySelectorAll('#side-cards > li[data-highlighted]').length")
+        desk.check(lit == 0, "a click on a card of the thread list highlighted it")
+    unpack_to(desk, "false")
+    state(desk)
+    desk.notes.append(f"Unpack unread: the runner unpacked, the read cards' edge {grey}; Pack all: their own colours; the "
+                      f"triangle packed the replica, its card moved {moved:.1f}px; clicks on its card went whole, unpacked, collapsed")
 
 
 if __name__ == "__main__":

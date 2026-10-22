@@ -547,8 +547,13 @@ def keeper_and_views_walk(walk: Walk) -> None:
     walk.check(summarised_at_three is not None and summarised_at_three["whole"]
                and summarised_at_three["clamp"] == "none",
                f"`#428 summary-cards-full`: a summarised card is cut at 3 lines: {summarised_at_three}")
-    # Unpacked thread rows fold by the same count.
-    page.click("#side-unpack")
+    # Unpacked thread rows fold by the same count. Unpack all: the chip goes Pack all, Unpack unread, Unpack all
+    # (`#440 thread-card-pack-toggle`), so it is pressed until it says so.
+    for _ in range(3):
+        if page.get_attribute("#side-unpack", "aria-pressed") == "true":
+            break
+        page.click("#side-unpack")
+        walk.settled()
     walk.wait_for("() => !!document.querySelector('#side-cards li.discord-message[data-id=\"606\"] > .body.clamped')",
                   "Unpack all drew no folded thread row")
     walk.settled()
@@ -556,7 +561,9 @@ def keeper_and_views_walk(walk: Walk) -> None:
     walk.body_lines(unpacked, 3, "an unpacked thread row")
     labels_at = "() => [...document.querySelectorAll('#side-cards li.discord-message[data-id=\"606\"] .elided > span')].map((s) => s.textContent)"
     at_three = walk.page.evaluate(labels_at)
-    page.click("#side-scroll")
+    # The keys to the cards' list by its focus: a click there lands on a card, which in the Threads view packs
+    # or unpacks its thread (`#440 thread-card-pack-toggle`).
+    page.focus("#side-scroll")
     for _ in range(3):
         walk.more()
     at_six = walk.page.evaluate(labels_at)
@@ -564,11 +571,18 @@ def keeper_and_views_walk(walk: Walk) -> None:
                f"an unpacked row's hidden-word count was not recounted at six lines: {at_three} then {at_six}")
     for _ in range(6):
         walk.fewer()
+    unpacked = walk.row("606", "#side-cards")
+    walk.check(unpacked["bodyHeight"] == 0, "at zero an unpacked row still draws its body")
+    # An unpacked thread's card is shown whole (`#440 thread-card-pack-toggle`: unpacked is the card whole
+    # with its messages), so the cards are packed again for the raw card's one naming line.
+    for _ in range(3):
+        if page.get_attribute("#side-unpack", "aria-pressed") == "false":
+            break
+        page.click("#side-unpack")
+        walk.settled()
     card = page.evaluate(CARD_JS, RAW_THREAD)
     walk.check(card is not None and abs(card["height"] / card["lineHeight"] - 1) <= 0.3,
                f"at zero a raw card is not kept to its one naming line: {card}")
-    unpacked = walk.row("606", "#side-cards")
-    walk.check(unpacked["bodyHeight"] == 0, "at zero an unpacked row still draws its body")
     # `#428 summary-cards-full`: the summarised card gives up no word at zero, where the raw card
     # beside it is down to its one naming line (above), and its heading over its thread is whole.
     summarised = page.evaluate(CARD_JS, SUMMARISED)

@@ -1450,8 +1450,9 @@ def view_keys(walk: Walk, mod: str, words: str) -> None:
         check(now["focus"] == "search-field", f"{words}+{digit} took the focus out of the search: {now['focus']!r}")
         check(now["search"] == "step", f"{words}+{digit} typed into the search: {now['search']!r}")
     walk.key("Escape")
-    # Inside the thread list, on a card: each chord leaves it; Enter highlights the card, -> goes into its
-    # thread (`#279 thread-card-focus`) and Esc comes back.
+    # Inside the thread list, on a card: each chord leaves it; Enter opens the card (whole, or unpacked where it
+    # says a summary), the keys staying on it (`#440 thread-card-pack-toggle`; it highlighted the card before), -> goes into its thread (`#279
+    # thread-card-focus`) and Esc comes back.
     for digit in ("1", "2", "4"):
         choose("3", "from one column or two")
         press(walk.cdp, "ArrowDown")
@@ -1464,7 +1465,7 @@ def view_keys(walk: Walk, mod: str, words: str) -> None:
                                 timeout=5000)
     press(walk.cdp, "Enter")
     walk.page.wait_for_function("() => document.activeElement"
-                                " && document.activeElement.matches('#side-cards > li[data-id][data-highlighted]')",
+                                " && document.activeElement.matches('#side-cards > li[data-id][data-card-state]:not([data-card-state=\"collapsed\"])')",
                                 timeout=5000)
     walk.settled()
     check(view()["layout"] == "list" and not view()["heading"], f"Enter on a card left the thread list: {view()}")
@@ -1476,14 +1477,12 @@ def view_keys(walk: Walk, mod: str, words: str) -> None:
     walk.page.wait_for_function("() => document.getElementById('screen-main').getAttribute('data-columns') === 'list'",
                                 timeout=10_000)
     walk.shot(f"view-keys-{words.lower()}-back-to-list")
-    # The card entered is still highlighted, and Esc on the list takes that off first, there.
+    # The card entered is still shown whole and nothing is highlighted (`#440 thread-card-pack-toggle`): the
+    # thread list has no highlight for Esc to take off first.
     lit = "() => document.querySelectorAll('#side-cards > li[data-highlighted]').length"
-    check(walk.page.evaluate(lit) == 1, f"coming back to the thread list lost the card's highlight: {view()}")
-    press(walk.cdp, "Escape")
-    walk.page.wait_for_function(f"() => ({lit})() === 0", timeout=5000)
-    walk.settled()
-    check(view()["layout"] == "list", f"Esc on a highlighted card left the thread list: {view()}")
-    check(walk.last_key()["prevented"] is True, f"Esc on a highlighted card was not the page's: {walk.last_key()}")
+    whole = "() => document.querySelectorAll('#side-cards > li[data-card-state]:not([data-card-state=\"collapsed\"])').length"
+    check(walk.page.evaluate(lit) == 0, f"coming back to the thread list drew a card highlighted: {view()}")
+    check(walk.page.evaluate(whole) == 1, f"coming back to the thread list packed the card shown whole: {view()}")
     # Then Esc on the list itself: back to what it was chosen from. That list came from two columns.
     escape_to("columns", "two", "chosen from two columns")
     # From All, on a card and on the list's own scroller: All again, in one column.

@@ -672,9 +672,11 @@
                 `#404 threads-unpack-all`. The owner, 2026-10-21: bridging one thread in All breaks
                 when another is bridged; he wants every thread chained at once. In the Threads view
                 (Cmd+3) this toggle unpacks each thread's messages under its card, bridged as in
-                All. Only over the cards of the Threads view. Kept on this device; key u.
+                All. Only over the cards of the Threads view. Kept on this device; key u. `#440
+                thread-card-pack-toggle`: three ways since, Pack all, Unpack unread and Unpack all, and it
+                says which (web/voice.js, `renderUnpackToggle`); each card packs and unpacks its own thread.
               -->
-              <button id="side-unpack" class="chip" type="button" aria-pressed="false" title="Show every thread's messages under its card" hidden>Unpack msgs</button>
+              <button id="side-unpack" class="chip" type="button" aria-pressed="false" title="Pack all. Press for unpack unread" hidden>Pack all</button>
               <!--
                 `#419 threads-view-main-messages`. The owner, 2026-10-21: "we have room for one more button
                 -- a toggle to show Main msgs. When that is on we should see messages to the main channel
@@ -2570,15 +2572,21 @@
                 thread last moved) or <strong>Thread created</strong> (where it was started); a press, or
                 <kbd>d</kbd>, changes it, and it is remembered too.
                 <strong>Older threads…</strong> at its
-                top reads further back. A click on a card <strong>highlights</strong> it: it shows all
-                of it, and every other card's edge goes grey, until you click another card, the same one
-                again, or press <kbd>Esc</kbd>. The card's <strong>N replies · M unread</strong> opens
-                its thread across the window, and so does <kbd>→</kbd>, on the highlighted card or the
-                one the keys are on: the card moves up to the top of the window and stays there, over the
+                top reads further back. A click on a card (or <kbd>Enter</kbd> on it) goes round its
+                thread's three states: three lines, the card whole, the card whole with the thread's
+                messages <strong>unpacked</strong> under it, and back to three lines; a card that says a
+                summary has two, packed and unpacked. The <strong>▲</strong> in the first unpacked
+                message's gutter, or <kbd>^</kbd>, packs the thread again, its card staying where it is.
+                The chip in the heading is <strong>Pack all</strong>, <strong>Unpack unread</strong> (the
+                threads with an unread message unpacked, the read ones packed, their edge grey) or
+                <strong>Unpack all</strong>; a press, or <kbd>u</kbd>, moves it on and gives every thread
+                back to it. Both are remembered on this device. The card's <strong>N replies · M
+                unread</strong> opens its thread across the window, and so does <kbd>→</kbd>, on the card
+                the keys are on: the card moves up to the top of the window and stays there, over the
                 thread's messages, as the heading of every thread you open across the window — its
                 words, colour, age and counts, its text opened in full over the messages by a click
                 where it is cut. The <strong>×</strong> on it, <kbd>Esc</kbd> or <kbd>←</kbd> comes back
-                to the list. <kbd>Esc</kbd> on the list itself, once no card is highlighted, goes back to
+                to the list. <kbd>Esc</kbd> on the list itself goes back to
                 the view you chose it from: Main, All or the thread you were reading, or two columns. The
                 search finds a card by its own words or by the replies already loaded for its thread, and
                 says <em>in replies</em> on a card it found only there.

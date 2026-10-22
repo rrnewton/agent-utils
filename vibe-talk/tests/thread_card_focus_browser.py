@@ -585,19 +585,15 @@ def phone_list_walk(desk: Desk) -> None:
     desk.settled()
     before = state(desk, "side-cards")
     shown = by_id(before)
-    grey = colour(before, "grey")
     drawn = edge_pixels(desk, before)
-    # The highlight is the channel's: the card lit on the Threads list is the one lit here.
-    desk.check(bool(shown[CANARY]["lit"]), f"the thread list does not have the Threads list's highlight: {shown[CANARY]}")
+    # `#440 thread-card-pack-toggle`. The thread list highlights no card and greys none, whatever the
+    # Threads list had lit: every card three lines, its edge in its thread's colour.
     for card_id, card in shown.items():
+        desk.check(not card["lit"], f"the thread list drew {card_id} highlighted")
         edge = colour(card, "edge")
-        if card_id == CANARY:
-            desk.check(chroma(edge) >= COLOURED and chroma(drawn[card_id]) >= COLOURED_PIXEL,
-                       f"the highlighted card's edge is {edge}, drawn {drawn[card_id]}")
-        else:
-            desk.check(near(edge, grey), f"the edge of {card_id} is {edge}, not the grey {grey}")
-            desk.check(chroma(drawn[card_id]) <= GREY, f"the edge of {card_id} is drawn {drawn[card_id]}, not grey")
-            desk.check(number(card, "lines") == 3, f"{card_id} is not three lines: {card['lines']}")
+        desk.check(chroma(edge) >= COLOURED and chroma(drawn[card_id]) >= COLOURED_PIXEL,
+                   f"the edge of {card_id} is {edge}, drawn {drawn[card_id]}, not its colour")
+        desk.check(number(card, "lines") == 3, f"{card_id} is not three lines: {card['lines']}")
     # A finger's target: the way into each thread is a thumb high, where the desk's chip is the facts' height.
     tall = page.evaluate("() => [...document.querySelectorAll('#side-cards .side-card-open')]"
                          ".map((button) => button.getBoundingClientRect().height)")
@@ -607,25 +603,24 @@ def phone_list_walk(desk: Desk) -> None:
     no_overflow(desk, before, "the thread list")
     desk.shot("4-thread-list")
 
-    # A tap on the long question's card: it takes the highlight and shows all of itself; the list stays.
+    # A tap on the long question's card: shown whole, nothing highlighted or greyed; the list stays.
     page.touchscreen.tap(*card_point(desk, "side-cards", REPLICA, ".side-card-text"))
-    desk.wait_for(f"() => document.querySelector(\"#side-cards > li[data-id='{REPLICA}']\").getAttribute('data-highlighted') === 'true'",
-                  "a tap on a card of the thread list did not highlight it")
+    desk.wait_for(f"() => document.querySelector(\"#side-cards > li[data-id='{REPLICA}']\").getAttribute('data-card-state') === 'expanded'",
+                  "a tap on a card of the thread list did not show it whole")
     desk.settled()
     desk.settled()
     desk.check(page.evaluate("() => document.getElementById('screen-main').getAttribute('data-columns')") == "list"
                and not page.is_visible("#thread-heading"), "a tap on a card of the thread list entered its thread")
-    lit = state(desk, "side-cards")
-    now = by_id(lit)
+    now = by_id(state(desk, "side-cards"))
     desk.check(not now[REPLICA]["clamped"] and number(now[REPLICA], "lines") > 3,
-               f"the highlighted card is not shown whole: {now[REPLICA]}")
-    desk.check(not now[CANARY]["lit"] and near(colour(now[CANARY], "edge"), grey),
-               f"the card that had the highlight kept it or its colour: {now[CANARY]}")
-    desk.check(chroma(colour(now[REPLICA], "edge")) >= COLOURED, f"the highlighted card's edge is {colour(now[REPLICA], 'edge')}")
-    no_overflow(desk, lit, "the thread list, a card highlighted")
-    desk.shot("5-thread-list-highlighted")
+               f"the card tapped is not shown whole: {now[REPLICA]}")
+    for card_id, card in now.items():
+        desk.check(not card["lit"] and chroma(colour(card, "edge")) >= COLOURED,
+                   f"a tap highlighted {card_id} or greyed its edge: {card}")
+    no_overflow(desk, state(desk, "side-cards"), "the thread list, a card shown whole")
+    desk.shot("5-thread-list-card-whole")
 
-    # Its replies button: the thread, across the window. Back: the thread list, the card still highlighted.
+    # Its replies button: the thread, across the window. Back: the thread list, the card still whole.
     page.touchscreen.tap(*card_point(desk, "side-cards", REPLICA, ".side-card-open"))
     desk.wait_for("() => !document.getElementById('thread-heading').hidden"
                   " && !document.getElementById('screen-main').hasAttribute('data-columns')"
@@ -639,13 +634,12 @@ def phone_list_walk(desk: Desk) -> None:
                   " && !document.getElementById('side-list').hidden",
                   "Back from the thread did not come back to the thread list")
     desk.settled()
-    back = state(desk, "side-cards")
-    desk.check(bool(by_id(back)[REPLICA]["lit"]), "coming back to the thread list lost the highlight")
-    no_overflow(desk, back, "back on the thread list")
-    desk.notes.append(f"the thread list the picker chose had the Threads list's highlight, the other edges grey; its "
-                      f"replies buttons {min(float(height) for height in tall):.0f}px tall; a tap highlighted the long "
-                      "question's card, shown whole, without entering it; its replies button opened the thread across "
-                      "the window, and Back came to the list with the card still highlighted")
+    back = by_id(state(desk, "side-cards"))
+    desk.check(not back[REPLICA]["clamped"], "coming back to the thread list packed the card shown whole")
+    desk.notes.append(f"the thread list highlighted nothing and greyed nothing; its replies buttons "
+                      f"{min(float(height) for height in tall):.0f}px tall; a tap showed the long question's card whole "
+                      "without entering it; its replies button opened the thread across the window, and Back came to "
+                      "the list with the card still whole")
 
 
 if __name__ == "__main__":

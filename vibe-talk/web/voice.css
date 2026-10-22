@@ -600,7 +600,8 @@ a.search-hit-link {
    attribute, the same way wherever it is: ringed and tinted in the accent, its words in the ink, as the
    bar's filters are. One rule for all of them, so a toggle chip added later (as `#419`'s Main channel
    was, drawn the same on and off until this) is pressed like the rest without a rule of its own. */
-.chip[aria-pressed="true"] {
+.chip[aria-pressed="true"],
+.chip[aria-pressed="mixed"] {
   border-color: var(--accent);
   color: var(--ink);
   background: color-mix(in srgb, var(--accent) 18%, var(--panel));
@@ -2918,6 +2919,22 @@ a.search-hit-link {
 #side-cards .reply-ungather-mark::after,
 #discord-log .reply-ungather-mark::after {
   transform: translate(-50%, -50%) rotate(-45deg);
+}
+
+/* `#440 thread-card-pack-toggle`. The thread's Pack, in the first unpacked row's gutter: the X's own button
+   and disc (above), an up triangle drawn in it in place of the X. */
+#side-cards .unpack-pack-mark::before {
+  width: 0;
+  height: 0;
+  border-radius: 0;
+  background: none;
+  border-inline: 0.3rem solid transparent;
+  border-bottom: 0.42rem solid currentColor;
+  transform: translate(-50%, -62%);
+}
+
+#side-cards .unpack-pack-mark::after {
+  content: none;
 }
 
 #side-log .reply-ungather:active,
@@ -8615,12 +8632,15 @@ li.discord-message[data-root-child] > .reply-bridge {
 }
 
 /* ...and every other card's edge and unread count grey, while the highlighted one shows: a card the
-   filters hide greys nothing. */
-.side-cards:has(> .side-card-row[data-highlighted]:not([hidden]):not(.search-hidden)) > .side-card-row:not([data-highlighted]) {
+   filters hide greys nothing. `#440 thread-card-pack-toggle`: and, by the same rule, a read thread's card
+   under Unpack unread, packed while the unread ones stand unpacked, and in no other state. */
+.side-cards:has(> .side-card-row[data-highlighted]:not([hidden]):not(.search-hidden)) > .side-card-row:not([data-highlighted]),
+.side-cards[data-unpack="unread"] > .side-card-row[data-thread-read] {
   border-left-color: var(--thread-grey);
 }
 
-.side-cards:has(> .side-card-row[data-highlighted]:not([hidden]):not(.search-hidden)) > .side-card-row:not([data-highlighted]) .side-card-unread {
+.side-cards:has(> .side-card-row[data-highlighted]:not([hidden]):not(.search-hidden)) > .side-card-row:not([data-highlighted]) .side-card-unread,
+.side-cards[data-unpack="unread"] > .side-card-row[data-thread-read] .side-card-unread {
   color: var(--muted);
 }
 
@@ -8660,10 +8680,13 @@ li.discord-message[data-root-child] > .reply-bridge {
  * whole at every collapsed-lines count, 0 included; the count is for raw text, which is
  * unbounded. Still the clamped height at least, as a highlighted card, so a short summary's card
  * is the size of its neighbours. The card at the top of a thread is stated by id further down,
- * where its phone rule has to be outranked.
+ * where its phone rule has to be outranked. `#440 thread-card-pack-toggle`: and a card the Threads view's
+ * pack toggle has opened, whole or unpacked (`data-card-state`).
  */
 .side-card-row[data-highlighted] > .side-card > .side-card-text,
-.side-card-row[data-summarised-card] > .side-card > .side-card-text {
+.side-card-row[data-summarised-card] > .side-card > .side-card-text,
+.side-card-row[data-card-state="expanded"] > .side-card > .side-card-text,
+.side-card-row[data-card-state="unpacked"] > .side-card > .side-card-text {
   display: block;
   -webkit-line-clamp: none;
   line-clamp: none;

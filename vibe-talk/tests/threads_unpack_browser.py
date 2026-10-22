@@ -177,6 +177,15 @@ FOLDS_JS = """() => Object.fromEntries([...document.querySelectorAll('#side-card
     .map((li) => [li.getAttribute('data-id'), li.getAttribute('data-collapsed')]))"""
 
 
+def unpack_all(desk: Desk) -> None:
+    """Unpack all: the chip pressed on round its states (`#440 thread-card-pack-toggle`) until it says so."""
+    for _ in range(3):
+        if desk.page.get_attribute("#side-unpack", "aria-pressed") == "true":
+            return
+        desk.page.click("#side-unpack")
+        desk.settled()
+    desk.check(desk.page.get_attribute("#side-unpack", "aria-pressed") == "true", "the chip never reached Unpack all")
+
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--browser-executable", default=os.environ.get("VIBE_TALK_CHROMIUM"),
@@ -220,13 +229,13 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
     page = desk.page
     phone_thread_list(desk)
     toggle = page.locator("#side-unpack")
-    desk.check(toggle.is_visible(), "Unpack msgs is not offered over the thread list")
-    desk.check(toggle.get_attribute("aria-pressed") == "false", "Unpack msgs starts pressed")
+    desk.check(toggle.is_visible(), "Unpack is not offered over the thread list")
+    desk.check(toggle.get_attribute("aria-pressed") == "false", "Unpack does not start at Pack all")
     desk.check(page.evaluate("() => document.querySelectorAll('#side-cards > li[data-unpack-thread]').length") == 0,
                "rows are unpacked before the toggle is pressed")
     desk.shot("1-packed")
 
-    toggle.click()
+    unpack_all(desk)
     desk.wait_for(f"() => document.querySelectorAll('#side-cards > li[data-unpack-thread=\"{RUNNER}\"]').length >= 9",
                   "the summarised thread did not unpack under its card")
     desk.settled()
@@ -354,7 +363,7 @@ def parity(chromium: BrowserType, args: argparse.Namespace, label: str, width: i
     desk.settled()
     desk.check(selected_key(desk) == second, f"↓ over packed cards went to {lit(desk)}, not {second}")
 
-    page.locator("#side-unpack").click()
+    unpack_all(desk)
     desk.wait_for(f"() => document.querySelectorAll('#side-cards > li[data-unpack-thread=\"{RUNNER}\"]').length >= 9",
                   "the summarised thread did not unpack under its card")
     desk.settled()
@@ -475,7 +484,7 @@ def perf(chromium: BrowserType, args: argparse.Namespace) -> str:
     desk.wait_for("() => document.querySelectorAll('#side-cards > li[data-card]').length === 40",
                   "forty cards were not listed")
     started = time.monotonic()
-    page.click("#side-unpack")
+    unpack_all(desk)
     desk.wait_for("() => document.querySelectorAll('#side-cards > li[data-unpack-thread]').length >= 160",
                   "forty threads did not unpack", seconds=30)
     desk.settled()

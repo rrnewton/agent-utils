@@ -4437,6 +4437,9 @@ const TUNING_BANDS = {
     "how many places Ctrl/Cmd+[ can go back through: fewer cuts off a reader who has walked through the " +
     "views and threads for a while, and Back stops short of where they began; far more holds a history " +
     "nobody walks back through (#423 back-key-consistency)"],
+  THREAD_CARD_STATES_KEPT: [50, 5000,
+    "how many threads' own pack or unpack choices the device keeps: fewer forgets a choice the reader made in " +
+    "a busy channel before they come back to it; far more grows the record without bound (#440 thread-card-pack-toggle)"],
   UPSTREAM_CLEAR_RECHECK_MS: [2000, 15000,
     "how often, after a Mark read now the server stopped waiting on, Settings asks what it came to: " +
     "sooner asks a server with nothing new to say, later leaves the line saying \"still waiting\" " +
@@ -26121,9 +26124,12 @@ test("`#281 view-keys`: CTRL+1 TO CTRL+4 choose Main, All, the thread list and t
   await press(page, card, "Enter");
   await page.settle();
   assert.equal(layout(), "list", "Enter on a card left the thread list");
-  assert.equal(card.getAttribute("data-highlighted"), "true", "Enter on a card of the thread list did not highlight it");
-  assert.equal(focused(page), card, `after Enter on a card the focus is on ${focusName(page)}`);
-  await press(page, card, "ArrowRight");
+  // `#440 thread-card-pack-toggle`: Enter on a card of the thread list goes round its states, highlighting nothing.
+  const again = cardRow(page, card.getAttribute("data-id"));
+  assert.equal(again.getAttribute("data-card-state"), "expanded", "Enter on a card of the thread list did not open it whole");
+  assert.equal(again.hasAttribute("data-highlighted"), false, "Enter on a card of the thread list highlighted it");
+  assert.equal(focused(page), again, `after Enter on a card the focus is on ${focusName(page)}`);
+  await press(page, again, "ArrowRight");
   await page.settle();
   assert.equal(layout(), null, "a card opened its thread inside the list");
   assert.equal(page.el("thread-heading").hidden, false, "→ on a card did not open its thread");
@@ -26986,40 +26992,33 @@ test("`#281 view-keys`: ESC ON THE THREAD LIST goes back to the view it was chos
 
   // From Main, through a thread opened from the list: its Esc is the list, and the list's is Main —
   // not the thread again, which would go round and round.
-  // `#279 thread-card-focus`: Enter on a card highlights it, and → goes into its thread. Back on the list,
-  // the card is still highlighted: the first Esc takes that off, there, and only the next leaves the list.
+  // `#279 thread-card-focus`, `#440 thread-card-pack-toggle`: Enter on a card of the thread list opens it
+  // whole, highlighting nothing, and → goes into its thread. Back on the list, Esc leaves it at once.
   await choose("1", page.el("scroll-area"));
   await choose("3");
   const opened = await toCard();
+  const openedId = opened.getAttribute("data-id");
   await press(page, opened, "Enter");
   await page.settle();
   onTheList("Enter on a card");
-  assert.deepStrictEqual(litCards(page), [opened.getAttribute("data-id")], "Enter on a card did not highlight it");
-  await press(page, opened, "ArrowRight");
+  assert.deepStrictEqual(litCards(page), [], "Enter on a card of the thread list highlighted it");
+  await press(page, cardRow(page, openedId), "ArrowRight");
   await page.settle();
-  assert.equal(picker.value, `thread:${opened.getAttribute("data-id")}`, "→ on a card did not open its thread");
+  assert.equal(picker.value, `thread:${openedId}`, "→ on a card did not open its thread");
   await escape(focused(page) || page.el("scroll-area"));
   onTheList("Esc from a thread opened from the list");
-  assert.deepStrictEqual(litCards(page), [opened.getAttribute("data-id")], "coming back to the list lost the highlight");
-  const putOut = await escape();
-  assert.equal(putOut.defaulted, false, "Esc on the highlighted card's list was left to the browser");
-  onTheList("Esc with a card highlighted");
-  assert.deepStrictEqual(litCards(page), [], "the first Esc on the list did not take the highlight off");
   await escape();
   assert.equal(layout(), null);
   assert.equal(picker.value, "main", "Esc on the list went back to the thread opened from it, not to Main");
   // And so with the list chosen again by Ctrl+3 from such a thread, rather than by its Esc.
   await choose("3");
   const reopened = await toCard();
-  await press(page, reopened, "Enter");
+  const reopenedId = reopened.getAttribute("data-id");
   await press(page, reopened, "ArrowRight");
   await page.settle();
-  assert.equal(picker.value, `thread:${reopened.getAttribute("data-id")}`);
+  assert.equal(picker.value, `thread:${reopenedId}`);
   await choose("3", focused(page) || page.el("scroll-area"));
   onTheList("Ctrl+3 from a thread opened from the list");
-  await escape();
-  assert.deepStrictEqual(litCards(page), [], "Esc did not take the highlight off first");
-  onTheList("Esc with a card highlighted, after Ctrl+3");
   await escape();
   assert.equal(picker.value, "main", "Ctrl+3 from a thread opened from the list made that thread the list's way back");
 
@@ -27064,7 +27063,8 @@ test("`#281 view-keys`: ESC ON THE THREAD LIST goes back to the view it was chos
   assert.ok(keys.includes("and leaves the thread list for the view it was chosen from"), "Esc's entry does not say it leaves the list");
   assert.ok(keys.includes("Esc on the list takes the highlight off, then goes back to the view it was chosen from"),
     "Ctrl+3's entry does not say how to leave the list");
-  assert.match(HTML_CODE, /<kbd>Esc<\/kbd> on the list itself, once no card is highlighted, goes back to\s+the view you chose it from/);
+  // `#440 thread-card-pack-toggle`: the thread list highlights no card, so its Esc goes back at once.
+  assert.match(HTML_CODE, /<kbd>Esc<\/kbd> on the list itself goes back to\s+the view you chose it from/);
 });
 
 test("`#281 view-keys` x `#265 window-channel-memory`: a reloaded window keeps where its thread list and two columns were chosen from", async () => {
@@ -33377,14 +33377,14 @@ test("`#281 view-keys`: the thread list pages back on the server's cursor where 
   assert.equal(cardIds(page)[0], all[19].id, "the oldest card is not at the head");
   assert.equal(more.hidden, true, "Older threads offered past the last page");
 
-  // An old thread, from the second page. A click on its card highlights it there (`#279
-  // thread-card-focus`); its replies button opens it across the window, and the picker names it —
-  // even though it is far past the picker's one screenful.
+  // An old thread, from the second page. A click on its card opens it whole there, highlighting nothing
+  // (`#440 thread-card-pack-toggle`); its replies button opens it across the window, and the picker names
+  // it — even though it is far past the picker's one screenful.
   const old = all[14];
   await cardOf(page, old.id).click();
   await page.settle();
   assert.equal(page.el("screen-main").getAttribute("data-columns"), "list", "a click on a card left the thread list");
-  assert.deepStrictEqual(litCards(page), [old.id], "a click on a card of the thread list did not highlight it");
+  assert.deepStrictEqual(litCards(page), [], "a click on a card of the thread list highlighted it");
   const said = listCardSays(page, old.id);
   await openerOf(cardRow(page, old.id)).click();
   await page.settle();
@@ -53232,6 +53232,8 @@ test("`#432 read-mode-unify`: unpacked, a folded run of read threads takes their
   const { page } = await wholeReadColumns(4, [0, 1, 2]);
   await press(page, page.el("scroll-area"), "3", { ctrlKey: true });
   assert.equal(page.el("screen-main").getAttribute("data-columns"), "list", "the premise is the Threads view");
+  // Unpack all (`#440`: Pack all, Unpack unread, Unpack all), so the read threads are unpacked too.
+  await page.el("side-unpack").click();
   await page.el("side-unpack").click();
   await page.settle();
   await readModeTo(page, "Fold read");
@@ -65970,24 +65972,27 @@ test("`#421 chip-states`: every toggle chip is pressed by one rule, from aria-pr
   }
   // The names, the phone keeping "Main" alone.
   assert.match(HTML_CODE, /id="side-main"[^>]*>Main<span class="chip-more"> channel<\/span><\/button>/);
-  assert.match(HTML_CODE, /id="side-unpack"[^>]*>Unpack msgs<\/button>/);
-  assert.doesNotMatch(HTML_CODE, />Main<span class="chip-more"> messages|>Unpack all</, "an old name is still on a chip");
+  assert.match(HTML_CODE, /id="side-unpack"[^>]*>Pack all<\/button>/);
+  assert.doesNotMatch(HTML_CODE, />Main<span class="chip-more"> messages|id="side-unpack"[^>]*>Unpack all</, "an old name is still on a chip");
   const { page } = await mainMessagesPage();
   const keys = page.el("keyboard-keys").text();
-  assert.ok(keys.includes("Main channel") && keys.includes("Unpack msgs"), "the ? help does not use the new names");
+  // Unpack's own names since `#440 thread-card-pack-toggle`: the states it goes round.
+  assert.ok(keys.includes("Main channel") && keys.includes("Unpack unread"), "the ? help does not use the new names");
   assert.ok(!keys.includes("Main messages:") && !keys.includes("Unpack all:"), "the ? help still uses an old name");
-  // Each toggle says its state in aria-pressed, both ways, which is all the rule reads.
+  // Each toggle says its state in aria-pressed, round and back, which is all the rule reads; Unpack, three
+  // ways since `#440 thread-card-pack-toggle`, says its middle state as "mixed", as the read mode's button does.
   for (const id of HEADING_TOGGLES) {
     const chip = page.el(id);
     assert.equal(chip.hidden, false, `#${id} is not offered over the Threads view's cards`);
     assert.equal(chip.getAttribute("aria-pressed"), "false");
-    await chip.click();
-    await page.settle();
-    assert.equal(chip.getAttribute("aria-pressed"), "true", `#${id} pressed does not say so`);
-    await chip.click();
-    await page.settle();
-    assert.equal(chip.getAttribute("aria-pressed"), "false", `#${id} let go does not say so`);
+    for (const pressed of id === "side-unpack" ? ["mixed", "true", "false"] : ["true", "false"]) {
+      await chip.click();
+      await page.settle();
+      assert.equal(chip.getAttribute("aria-pressed"), pressed, `#${id} pressed does not say ${pressed}`);
+    }
   }
+  assert.match(cssRules(CSS_UNCONDITIONAL, '.chip[aria-pressed="mixed"]').join("\n"), /border-color:\s*var\(--accent\)/,
+    "a chip in its middle state is not drawn pressed");
 });
 
 test("`#281 view-keys` x `#279 thread-card-focus`: the thread list's cards are two columns' cards — a click highlights one without leaving the list, the highlight goes on through Ctrl+4, and its replies button or → opens its thread across the window", async () => {
@@ -66002,42 +66007,45 @@ test("`#281 view-keys` x `#279 thread-card-focus`: the thread list's cards are t
   await press(page, page.el("scroll-area"), "3", { ctrlKey: true });
   assert.equal(layout(), "list", "Ctrl+3 did not show the thread list");
 
-  // A click highlights, and stays in the list; another card takes it; the same card again puts it out.
+  // `#440 thread-card-pack-toggle`. A click stays in the list and highlights nothing: it goes round the
+  // card's states, whole, unpacked, and back; another card's click is that card's own.
+  const state = (id) => cardRow(page, id).getAttribute("data-card-state");
   await cardOf(page, a).click();
   await page.settle();
   assert.equal(layout(), "list", "a click on a card of the thread list left it");
   assert.equal(page.el("thread-heading").hidden, true, "a click on a card entered its thread");
-  assert.deepStrictEqual(litCards(page), [a], "a click on a card of the thread list did not highlight it");
+  assert.deepStrictEqual(litCards(page), [], "a click on a card of the thread list highlighted it");
+  assert.equal(state(a), "expanded", "a click on a card did not show it whole");
   assert.equal(cardOf(page, a).getAttribute("aria-expanded"), "true");
   await cardOf(page, b).click();
   await page.settle();
-  assert.deepStrictEqual(litCards(page), [b], "another card did not take the highlight");
-  await cardOf(page, b).click();
-  await page.settle();
-  assert.deepStrictEqual(litCards(page), [], "the highlighted card pressed again kept the highlight");
+  assert.deepStrictEqual([state(a), state(b)], ["expanded", "expanded"], "another card's click moved the first");
   await cardOf(page, a).click();
   await page.settle();
+  assert.equal(state(a), "unpacked", "the second click did not unpack the thread");
+  await cardOf(page, a).click();
+  await page.settle();
+  assert.equal(state(a), "collapsed", "the third click did not pack the thread");
+  assert.equal(cardOf(page, a).getAttribute("aria-expanded"), "false");
 
-  // One highlight per channel, the same in two columns: Ctrl+4 brings Main in beside the same card, lit.
-  await press(page, focused(page), "4", { ctrlKey: true });
+  // Two columns keep the highlight (`#277`): a click there lights a card; the thread list does not show it.
+  await press(page, focused(page) || page.el("side-scroll"), "4", { ctrlKey: true });
   assert.equal(layout(), "two");
-  assert.deepStrictEqual(litCards(page), [a], "two columns lost the thread list's highlight");
+  assert.deepStrictEqual(litCards(page), [], "two columns show a highlight nobody made");
+  await cardOf(page, a).click();
+  await page.settle();
+  assert.deepStrictEqual(litCards(page), [a], "a click in two columns did not highlight the card");
   await press(page, focused(page), "3", { ctrlKey: true });
   assert.equal(layout(), "list");
-  assert.deepStrictEqual(litCards(page), [a], "the thread list lost two columns' highlight");
+  assert.deepStrictEqual(litCards(page), [], "the thread list drew two columns' highlight");
 
-  // → with the keys on another card is the highlighted card's way in: across the window, one column.
+  // → is the card the keys are on: across the window, one column; ← is the list again.
   await press(page, cardRow(page, c), "ArrowRight");
   assert.equal(layout(), null, "→ opened the thread inside the thread list");
-  assert.equal(picker.value, `thread:${a}`, "→ did not go into the highlighted card's thread");
+  assert.equal(picker.value, `thread:${c}`, "→ did not go into the card the keys were on");
   assert.equal(page.el("thread-heading").hidden, false);
-  // ← is the list again, the card still highlighted; Esc there takes the highlight off and stays.
   await press(page, focused(page) || page.el("scroll-area"), "ArrowLeft");
   assert.equal(layout(), "list", "← from a thread opened from the list did not come back to it");
-  assert.deepStrictEqual(litCards(page), [a]);
-  await press(page, focused(page) || page.el("side-scroll"), "Escape");
-  assert.equal(layout(), "list", "the first Esc left the thread list with a card highlighted");
-  assert.deepStrictEqual(litCards(page), [], "Esc did not take the highlight off");
 
   // With none highlighted, → is the card the keys are on; and a card's replies button opens its own.
   await press(page, cardRow(page, c), "ArrowRight");
@@ -78286,14 +78294,14 @@ function unpackData() {
 const unpackRows = (page, threadId) =>
   page.el("side-cards").children.filter((li) => li.getAttribute("data-unpack-thread") === threadId);
 
-async function unpackPage(storage = null) {
+async function unpackPage(storage = null, read = []) {
   const data = unpackData();
   const page = newPage(storage || new Map());
   page.threadingSupported = true;
   page.threads = data.threads;
   page.messages = data.messages;
   forwardTimeline(page);
-  for (const id of ["700", "701", "702", "704", "705", "706"]) page.dealtWith.add(id);
+  for (const id of ["700", "701", "702", "704", "705", "706", ...read]) page.dealtWith.add(id);
   await signIn(page);
   await showDiscord(page, data.messages);
   await pickThread(page, "threads");
@@ -78301,11 +78309,11 @@ async function unpackPage(storage = null) {
   return { page, data };
 }
 
-test("`#404 threads-unpack-all`: Unpack msgs is a toggle in the cards' heading, off means cards alone, u is in the help", async () => {
+test("`#404 threads-unpack-all`: Unpack is a chip in the cards' heading, Pack all means cards alone, u is in the help", async () => {
   assertMarkupContains("side-heading", "side-unpack");
   const tag = /<button\s+id="side-unpack"[^>]*>/.exec(HTML_CODE)[0];
   assert.match(tag, /aria-pressed="false"/);
-  assert.match(HTML_CODE, /id="side-unpack"[^>]*>Unpack msgs<\/button>/);
+  assert.match(HTML_CODE, /id="side-unpack"[^>]*>Pack all<\/button>/);
   const { page } = await unpackPage();
   const toggle = page.el("side-unpack");
   assert.equal(toggle.hidden, false, "the toggle is not offered over the cards");
@@ -78313,14 +78321,172 @@ test("`#404 threads-unpack-all`: Unpack msgs is a toggle in the cards' heading, 
   assert.equal(toggle.getAttribute("aria-keyshortcuts"), "U", "the toggle does not name its key");
   assert.deepStrictEqual(unpackRows(page, "spaces/A/threads/sum"), [], "off, messages are already unpacked");
   assert.ok(page.el("keyboard-keys").text().includes("Unpack"), "the ? help does not list the key");
+  // `#440 thread-card-pack-toggle`: three states, Pack all, Unpack unread, Unpack all; u and a press go round.
   await page.documentEvent("keydown", { key: "u" });
   await page.settle();
-  assert.equal(toggle.getAttribute("aria-pressed"), "true", "u did not unpack");
-  assert.equal(page.storage.get(UNPACK_STORAGE), "on", "the choice was not kept on the device");
+  assert.equal(toggle.getAttribute("aria-pressed"), "mixed", "u did not go to Unpack unread");
+  assert.equal(toggle.text(), "Unpack unread");
+  assert.equal(page.storage.get(UNPACK_STORAGE), "unread", "the choice was not kept on the device");
+  await page.documentEvent("keydown", { key: "u" });
+  await page.settle();
+  assert.equal(toggle.getAttribute("aria-pressed"), "true", "u did not go to Unpack all");
+  assert.equal(toggle.text(), "Unpack all");
+  assert.ok(unpackRows(page, "spaces/A/threads/sum").length > 0, "Unpack all left a thread packed");
   await toggle.click();
   await page.settle();
-  assert.deepStrictEqual(unpackRows(page, "spaces/A/threads/sum"), [], "off again left rows behind");
-  assert.equal(page.storage.get(UNPACK_STORAGE), "off");
+  assert.equal(toggle.text(), "Pack all");
+  assert.deepStrictEqual(unpackRows(page, "spaces/A/threads/sum"), [], "Pack all left rows behind");
+  assert.equal(page.storage.get(UNPACK_STORAGE), "packed");
+});
+
+// --- each thread packed and unpacked from its card (#440 thread-card-pack-toggle) ------------------------
+//
+// The owner, 2026-10-22: "I want to toggle pack/unpack on different threads the same way I toggle
+// collapse/expand on messages ... a 3 state toggle. Collapsed, expanded card but no children, expanded card
+// and expanded children ... a little up triangle to pack those messages back into the card." And "let's also
+// go 3-way with unpacking in thread list view ... pack read threads and unpack any with non-zero unread child
+// messages ... ONLY in this middle state ... render as grey the colorful left sidebar of the READ cards".
+
+const CARD_STATES_STORAGE = "vibe-talk.voice.thread-card-states";
+const RAW = "spaces/A/threads/raw";
+const SUM = "spaces/A/threads/sum";
+
+/** Card `id`'s state as drawn, and how many rows stand unpacked under it. */
+const cardSays = (page, id) => [cardRow(page, id).getAttribute("data-card-state"), unpackRows(page, id).length > 0];
+
+test("`#440 thread-card-pack-toggle`: a click or Enter on a card goes collapsed, whole, unpacked and back; a summarized card, the same whole and collapsed, goes two ways; nothing is highlighted or dimmed", async () => {
+  const { page } = await unpackPage();
+  assert.deepStrictEqual(cardSays(page, RAW), ["collapsed", false], "the premise is Pack all");
+  for (const want of [["expanded", false], ["unpacked", true], ["collapsed", false]]) {
+    await cardOf(page, RAW).click();
+    await page.settle();
+    assert.deepStrictEqual(cardSays(page, RAW), want, `a click did not take the raw card to ${want[0]}`);
+    assert.deepStrictEqual(litCards(page), [], "a click on a card of the thread list highlighted it");
+    assert.equal(page.el("side-cards").children.some((li) => li.hasAttribute("data-highlighted")), false, "a card is drawn highlighted");
+  }
+  // The keys: Enter on the card, as a click.
+  await press(page, cardRow(page, RAW), "Enter");
+  assert.deepStrictEqual(cardSays(page, RAW), ["expanded", false], "Enter did not go on to the card whole");
+  assert.equal(focused(page), cardRow(page, RAW), `after Enter the keys are on ${focusName(page)}, not the card drawn anew`);
+  // The summarized card: packed, unpacked, packed.
+  for (const want of [["unpacked", true], ["collapsed", false]]) {
+    await cardOf(page, SUM).click();
+    await page.settle();
+    assert.deepStrictEqual(cardSays(page, SUM), want, `a click did not take the summarized card to ${want[0]}`);
+  }
+  // A card shown whole is drawn whole: the stylesheet lifts the three-line clamp for both open states.
+  for (const state of ["expanded", "unpacked"]) {
+    assert.match(cssBlock(`.side-card-row[data-card-state="${state}"] > .side-card > .side-card-text`), /-webkit-line-clamp:\s*none/,
+      `a card ${state} is still held to three lines`);
+  }
+});
+
+test("`#440 thread-card-pack-toggle`: Unpack goes Pack all, Unpack unread, Unpack all; Unpack unread unpacks the threads with an unread message and greys the read cards' edge, in that state alone", async () => {
+  // The summarized thread read whole (703 too), the raw one with an unread reply.
+  const { page } = await unpackPage(null, ["703"]);
+  const chip = page.el("side-unpack");
+  const list = page.el("side-cards");
+  assert.equal(cardRow(page, SUM).hasAttribute("data-thread-read"), true, "the premise: the summarized thread read whole");
+  assert.equal(cardRow(page, RAW).hasAttribute("data-thread-read"), false, "the premise: the raw thread unread");
+  const steps = [
+    ["Unpack unread", "mixed", "unread", { [SUM]: false, [RAW]: true }],
+    ["Unpack all", "true", "all", { [SUM]: true, [RAW]: true }],
+    ["Pack all", "false", "packed", { [SUM]: false, [RAW]: false }],
+  ];
+  for (const [name, pressed, mode, unpacked] of steps) {
+    await chip.click();
+    await page.settle();
+    assert.equal(chip.text(), name, `the chip does not say ${name}`);
+    assert.equal(chip.getAttribute("aria-pressed"), pressed);
+    assert.equal(page.storage.get(UNPACK_STORAGE), mode, "the state was not kept on the device");
+    assert.deepStrictEqual({ [SUM]: unpackRows(page, SUM).length > 0, [RAW]: unpackRows(page, RAW).length > 0 }, unpacked,
+      `${name} unpacked the wrong threads`);
+    assert.equal(list.getAttribute("data-unpack"), mode, "the cards do not say Unpack's state for the stylesheet");
+  }
+  // The grey edge: the highlight's own dim rule, for a read card under Unpack unread and in no other state.
+  const dim = cssRules(CSS_UNCONDITIONAL, '.side-cards[data-unpack="unread"] > .side-card-row[data-thread-read]').join("\n");
+  assert.match(dim, /border-left-color:\s*var\(--thread-grey\)/, "a read card under Unpack unread is not greyed");
+  assert.ok(cssRules(CSS_UNCONDITIONAL, ".side-cards:has(> .side-card-row[data-highlighted]:not([hidden]):not(.search-hidden)) > .side-card-row:not([data-highlighted])")
+    .some((block) => block === cssRules(CSS_UNCONDITIONAL, '.side-cards[data-unpack="unread"] > .side-card-row[data-thread-read]')[0]),
+    "the grey edge is not the highlight's own dim rule");
+  for (const mode of ["packed", "all"]) {
+    assert.equal(cssRules(CSS_CODE, `.side-cards[data-unpack="${mode}"] > .side-card-row[data-thread-read]`).length, 0, `${mode} greys read cards`);
+  }
+  // Two columns' cards say no state, so no read card greys there.
+  await press(page, page.el("side-scroll"), "u");
+  assert.equal(list.getAttribute("data-unpack"), "unread");
+  page.wideDesk = true;
+  await press(page, page.el("side-scroll"), "4", { ctrlKey: true });
+  assert.equal(list.getAttribute("data-unpack"), "", "two columns' cards say Unpack's state");
+});
+
+test("`#440 thread-card-pack-toggle`: a thread's own choice outranks Unpack until Unpack is pressed again; choices and Unpack are kept on the device, and an old on means Unpack all", async () => {
+  const storage = new Map([[UNPACK_STORAGE, "on"]]);
+  const { page } = await unpackPage(storage);
+  assert.equal(page.el("side-unpack").text(), "Unpack all", "an older page's on is not Unpack all");
+  assert.deepStrictEqual([cardSays(page, SUM)[1], cardSays(page, RAW)[1]], [true, true]);
+  // The raw thread packed by its own click (unpacked -> collapsed), the summarized one left to Unpack.
+  await cardOf(page, RAW).click();
+  await page.settle();
+  assert.deepStrictEqual(cardSays(page, RAW), ["collapsed", false], "the thread's own choice did not pack it");
+  assert.deepStrictEqual(cardSays(page, SUM), ["unpacked", true], "another thread followed the first's choice");
+  assert.ok(String(page.storage.get(CARD_STATES_STORAGE)).includes(RAW), "the thread's choice was not kept on the device");
+  // Kept across a reload.
+  const data = unpackData();
+  const again = reloadWith(page.storage, data.messages, (p) => {
+    p.threadingSupported = true;
+    p.threads = data.threads;
+    for (const id of ["700", "701", "702", "704", "705", "706"]) p.dealtWith.add(id);
+  });
+  await reopenedChannel(again);
+  await pickThread(again, "threads");
+  await again.settle();
+  assert.deepStrictEqual([cardSays(again, SUM)[1], cardSays(again, RAW)[1]], [true, false], "a reload lost the thread's choice");
+  // Unpack pressed: every thread back to it (Pack all), and round to Unpack all, the raw one unpacked again.
+  await again.el("side-unpack").click();
+  await again.settle();
+  assert.deepStrictEqual([cardSays(again, SUM)[1], cardSays(again, RAW)[1]], [false, false]);
+  await again.el("side-unpack").click();
+  await again.el("side-unpack").click();
+  await again.settle();
+  assert.deepStrictEqual([cardSays(again, SUM)[1], cardSays(again, RAW)[1]], [true, true], "Unpack did not take the thread back from its choice");
+});
+
+test("`#440 thread-card-pack-toggle`: the triangle in the first unpacked row's gutter, and ^, pack the thread with its card where it was; a thread read under Unpack unread packs in place and stays", async () => {
+  const { page } = await unpackPage(new Map([[UNPACK_STORAGE, "all"]]));
+  const first = unpackRows(page, RAW)[0];
+  const pack = first.children.find((node) => String(node.className).split(/\s+/).includes("unpack-pack"));
+  assert.ok(pack, "the first unpacked row holds no triangle");
+  assert.equal(pack.getAttribute("aria-label"), "Pack thread");
+  assert.ok(String(pack.getAttribute("title")).includes("Pack"), "the triangle has no tooltip");
+  assert.equal(unpackRows(page, RAW).slice(1).some((row) => row.children.some((node) => String(node.className).includes("unpack-pack"))),
+    false, "a later row holds a triangle too");
+  assert.match(cssBlock("#side-cards .unpack-pack-mark::before"), /border-bottom:\s*0\.42rem solid currentColor/, "the mark is not an up triangle");
+  const area = page.el("side-scroll");
+  area.scrollTop = 40;
+  await area.dispatch("scroll");
+  const top = () => cardRow(page, RAW).getBoundingClientRect().top;
+  const before = top();
+  await pack.click();
+  await page.settle();
+  assert.deepStrictEqual(cardSays(page, RAW), ["collapsed", false], "the triangle did not pack the thread");
+  assert.equal(top(), before, "packing moved the card");
+  // ^ on the summarized thread's first unpacked row packs that one.
+  await press(page, unpackRows(page, SUM)[0], "^");
+  assert.deepStrictEqual(cardSays(page, SUM), ["collapsed", false], "^ did not pack the thread of the row it was on");
+  assert.ok(page.el("keyboard-keys").text().includes("pack the thread"), "the ? help does not list ^");
+  // Unpack unread: the raw thread, unread, unpacked; read on the server, it packs and its card stays.
+  const reading = await unpackPage(new Map([[UNPACK_STORAGE, "unread"]]));
+  assert.deepStrictEqual(cardSays(reading.page, RAW), ["unpacked", true], "the premise: the unread raw thread unpacked");
+  // The reader marks its unread reply Done, as e does on any row.
+  const fresh = unpackRows(reading.page, RAW).find((row) => String(row.getAttribute("data-ids")).split(" ").includes("707"));
+  assert.ok(fresh, "the premise: the unread reply is unpacked");
+  await press(reading.page, fresh, "e");
+  await reading.page.settle();
+  const card = cardRow(reading.page, RAW);
+  assert.deepStrictEqual(cardSays(reading.page, RAW), ["collapsed", false], "a thread read under Unpack unread stayed unpacked");
+  assert.equal(card.hidden, false, "a thread read under Unpack unread went from the list");
+  assert.equal(card.hasAttribute("data-thread-read"), true, "the read thread's card does not say so, so it is not greyed");
 });
 
 test("`#411 thread-view-row-padding`: a row unpacked under its card has the message row's box, from the rule every list's rows take", async () => {

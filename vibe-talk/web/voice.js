@@ -10231,7 +10231,10 @@ function openFromKeyboard(event, target) {
   if (row.hasAttribute("data-card")) {
     const card = childByClass(row, "side-card");
     if (card) card.click();
-    focusList(sidePane);
+    // `#440 thread-card-pack-toggle`. In the Threads view the press drew the card anew: the keys stay on it.
+    const now = row.parentNode ? null : liveCardRow(row);
+    if (now) selectRow(sidePane, now, false);
+    else focusList(sidePane);
     return true;
   }
   actOnRow(row, childByClass(row, "fold"));
@@ -11385,10 +11388,18 @@ const KEYMAP = [
   // `#404 threads-unpack-all`. u was free; it acts only over the Threads view's cards, as its chip does.
   {
     group: KEYS_VIEW, chords: [{ key: "u" }],
-    does: "In the Thread list, Unpack msgs: every thread's messages under its card, bridged as in All, " +
-      "or pack them away again. The read modes apply inside each thread",
+    does: "In the Thread list, Unpack, in turn: Pack all, Unpack unread (the threads with an unread message " +
+      "unpacked under their cards, the read ones packed and greyed), Unpack all. It gives every thread back to " +
+      "it. The read modes apply inside each thread",
     controls: ["side-unpack"],
     run: () => unpackFromKeyboard(),
+  },
+  // `#440 thread-card-pack-toggle`. ^ was free; over the Threads view only, as the triangle is.
+  {
+    group: KEYS_VIEW, chords: [{ key: "^" }],
+    does: "In the Thread list, pack the thread of the selected card or message back into its card, the card " +
+      "kept where it is, as its triangle does. Enter or o on a card goes round collapsed, whole and unpacked",
+    run: (event, target) => packFromKeyboard(target),
   },
   // `#419 threads-view-main-messages`. a was free; it acts only over the Threads view's cards, as its chip does.
   {
@@ -42563,13 +42574,15 @@ function renderSideCards() {
     age: briefAge(Number.isFinite(choice.at) ? choice.at : choice.started),
     replies: sideCardReplies(choice, tally),
     unread: sideCardUnread(choice, tally),
-  })).map((card) => ({ ...card, read: threadIsRead(card.choice, card.unread) }));
-  const unpacked = unpackOnScreen();
+  })).map((card) => ({ ...card, read: threadIsRead(card.choice, card.unread) }))
+    // `#440 thread-card-pack-toggle`. Each thread's card, collapsed, whole or unpacked (`cardState`).
+    .map((card) => ({ ...card, state: cardState(card.choice, card.read) }));
+  const unpacked = cards.some((card) => card.state === "unpacked");
   // `#419 threads-view-main-messages`. And the main channel's messages that are not threads, among them.
   const main = mainRowsOnScreen() ? mainRowMessages(new Set(cards.map(({ choice }) => choice.id))) : [];
-  const signature = JSON.stringify([order, readMode, readRunsSuspended(), unpacked, cards.map(({ choice, text, summarized, root, age, replies, unread, read }) =>
-    [choice.id, text, summarized, root, age, replies, unread, read,
-      unpacked ? unpackSignature(choice, unpackHeldMessages(choice)) : ""]),
+  const signature = JSON.stringify([order, readMode, readRunsSuspended(), unpackMode, cards.map(({ choice, text, summarized, root, age, replies, unread, read, state }) =>
+    [choice.id, text, summarized, root, age, replies, unread, read, state,
+      state === "unpacked" ? unpackSignature(choice, unpackHeldMessages(choice)) : ""]),
   main.map((message) => [String(message.id), stillToDo(message, channelCanon.dismissed)]),
   main.length ? [readMode, combineMessages, nowPlaying ? nowPlaying.id : "", pendingRead] : ""]);
   const more = olderThreadsToRead();
@@ -42584,9 +42597,10 @@ function renderSideCards() {
       // the keys and the mouse move them in (`sidePane`), its read state brought into line with the
       // store's for every message drawn, as each thread's own would be: a key acting on a row asks it.
       const blocks = unpacked ? inColumn(columns.side, () => {
-        const shown = cards.flatMap((card) => unpackHeldMessages(card.choice).map((message) => String(message.id)));
+        const shown = cards.filter((card) => card.state === "unpacked")
+          .flatMap((card) => unpackHeldMessages(card.choice).map((message) => String(message.id)));
         archivedIds = caughtUpDone(archivedIds, shown);
-        return cards.map((card) => unpackBlock(card.choice, tally));
+        return cards.map((card) => (card.state === "unpacked" ? unpackBlock(card.choice, tally) : []));
       }) : [];
       const drawn = cards.map((card, at) => [sideCard(card), ...(unpacked ? blocks[at] : [])]);
       // `#419 threads-view-main-messages`. Main's messages in the list's order: each run of them between
@@ -42605,6 +42619,10 @@ function renderSideCards() {
   } else {
     filterSideCards();
   }
+  // `#440 thread-card-pack-toggle`. Unpack's state over the Threads view's cards, where the stylesheet greys
+  // a read card under Unpack unread; nothing over two columns' cards.
+  const mode = cardsCycle() ? unpackMode : "";
+  if ((list.getAttribute("data-unpack") || "") !== mode) list.setAttribute("data-unpack", mode);
   // Above the cards, so the reader's place is kept as it comes or goes.
   const button = /** @type {HTMLButtonElement} */ (leftEl("side-more-threads"));
   if (button.hidden === more) {
@@ -42919,8 +42937,54 @@ function refilterSideCards() {
 // store does not hold in full is read only as its block nears the screen, at most a few at a time,
 // and only its newest page: older history stays behind opening the thread, and its block says so.
 
-/** The device's choice of unpacked threads: "on", or anything else for cards alone. */
+/**
+ * The device's choice of Unpack: a name in `UNPACK_MODES`. `#440 thread-card-pack-toggle`: it was "on" or
+ * "off" until then, which still mean Unpack all and Pack all (`storedUnpackMode`).
+ */
 const THREADS_UNPACKED_KEY = "vibe-talk.voice.threads-unpacked";
+
+// --- each thread packed or unpacked from its card (#440 thread-card-pack-toggle) -------------------------
+//
+// The owner, 2026-10-22: "I want to toggle pack/unpack on different threads the same way I toggle
+// collapse/expand on messages. Currently CLICK on a thread card in thread list view lights up that card
+// ... and dims the colored left edge of all the other threads. That's a behavior from the interleave All
+// view that really doesn't make sense in the thread view ... a 3 state toggle. Collapsed, expanded card
+// but no children, expanded card and expanded children ... a little up triangle to pack those messages back
+// into the card." And: "let's also go 3-way with unpacking in thread list view ... The middle state will
+// be to pack read threads and unpack any with non-zero unread child messages ... ONLY in this middle state
+// I would also like to render as grey the colorful left sidebar of the READ cards".
+//
+//   * UNPACK, THREE WAYS: Pack all, Unpack unread (a thread with any unread message unpacked, a read one
+//     packed, by `threadIsRead`), Unpack all; the chip says which, and a press or u goes on to the next.
+//     Kept on this device. Only in Unpack unread is a read card's colour strip grey, by the very rule that
+//     greys the other cards while one is highlighted (web/voice.css).
+//   * EACH THREAD, THREE WAYS, in the Threads view only: a click on its card, or Enter or o on it, goes
+//     collapsed (three lines) -> whole, nothing unpacked -> whole with its messages unpacked -> collapsed.
+//     A summarized card (`#405`), written to fit, skips the middle state: whole and three lines are the
+//     same card. The Threads view highlights no card and dims none; two columns keep `#277`'s highlight.
+//   * A THREAD'S CHOICE OUTRANKS UNPACK for that thread until Unpack is pressed again, which gives every
+//     thread of the channel back to it. Kept on this device with Unpack (`THREAD_CARD_STATES_KEY`).
+//   * PACKED IN PLACE: the up triangle in the first unpacked row's gutter, where All's bridge has its X, or
+//     ^ on a thread's card or row, packs it, its card held where it is on the screen; a thread read under
+//     Unpack unread packs where it is too (`keepingCardPlace`), its card staying in the list.
+
+/** The Unpack chip's states, in the order a press goes round them. */
+const UNPACK_MODES = ["packed", "unread", "all"];
+
+/** What the Unpack chip says in each state: the state it is in, as the read mode's button does. */
+const UNPACK_MODE_NAMES = { packed: "Pack all", unread: "Unpack unread", all: "Unpack all" };
+
+/** What u says on the status line as it moves the chip to each state. */
+const UNPACK_MODE_SAID = {
+  packed: "Threads packed away.", unread: "The unread threads unpacked, the read ones packed.",
+  all: "Every thread unpacked under its card.",
+};
+
+/** The device's choice of each thread's card, by channel and thread: what outranks Unpack for it. */
+const THREAD_CARD_STATES_KEY = "vibe-talk.voice.thread-card-states";
+
+/** How many threads' choices are kept on the device: the most recent, far more than a list shows. */
+const THREAD_CARD_STATES_KEPT = 300;
 
 /** How many threads unpacking may be reading at once: enough that scrolling never waits on one. */
 const UNPACK_READS_AT_ONCE = 3;
@@ -42928,17 +42992,68 @@ const UNPACK_READS_AT_ONCE = 3;
 /** How far below the cards on screen a block starts its read, in px: about one screenful ahead. */
 const UNPACK_NEAR_PX = 400;
 
-/** Whether Unpack msgs is pressed, kept on this device. `#404 threads-unpack-all`. */
-function storedThreadsUnpacked() {
+/** Unpack's state, kept on this device; an older page's "on" and "off" mean Unpack all and Pack all. */
+function storedUnpackMode() {
   try {
-    return localStorage.getItem(THREADS_UNPACKED_KEY) === "on";
+    const kept = localStorage.getItem(THREADS_UNPACKED_KEY);
+    if (kept === "on") return "all";
+    return UNPACK_MODES.includes(String(kept)) ? String(kept) : "packed";
   } catch (_error) {
-    return false;
+    return "packed";
   }
 }
 
-/** Whether every thread's messages stand unpacked under its card. */
-let threadsUnpacked = storedThreadsUnpacked();
+/** Unpack's state: one of `UNPACK_MODES`. `#404 threads-unpack-all`, three ways since `#440`. */
+let unpackMode = storedUnpackMode();
+
+/** A thread's card, three ways, in the order a press goes round them. */
+const CARD_STATES = ["collapsed", "expanded", "unpacked"];
+
+/** The threads' own choices, `channel\nthread` -> "collapsed", "expanded" or "unpacked", the most recent last. */
+const threadCardStates = storedThreadCardStates();
+
+/** The threads' choices kept on this device, or none where they cannot be read. */
+function storedThreadCardStates() {
+  /** @type {Map<string, string>} */
+  const states = new Map();
+  try {
+    const kept = JSON.parse(localStorage.getItem(THREAD_CARD_STATES_KEY) || "[]");
+    if (Array.isArray(kept)) {
+      for (const pair of kept) {
+        if (Array.isArray(pair) && typeof pair[0] === "string" && CARD_STATES.includes(pair[1])) states.set(pair[0], pair[1]);
+      }
+    }
+  } catch (_error) {
+    // A record that cannot be read is no choice at all: Unpack decides every thread.
+  }
+  return states;
+}
+
+/** Keep the threads' choices on this device, the most recent `THREAD_CARD_STATES_KEPT`. */
+function keepThreadCardStates() {
+  try {
+    localStorage.setItem(THREAD_CARD_STATES_KEY, JSON.stringify([...threadCardStates].slice(-THREAD_CARD_STATES_KEPT)));
+  } catch (_error) {
+    // A browser that refuses storage still honours the choices for this session.
+  }
+}
+
+/** Where thread `id` of the channel on screen keeps its choice in `threadCardStates`. */
+const cardStateKey = (id) => `${String(el("discord-channel").value)}\n${id}`;
+
+/** Whether the cards on screen are the Threads view's, where each thread is packed or unpacked from its card. */
+const cardsCycle = () => threadListOnScreen() && columns.side.mode === "list";
+
+/**
+ * Thread `choice`'s card as the Threads view draws it: its own choice, else Unpack's (`read`, by
+ * `threadIsRead`). Collapsed everywhere else.
+ */
+function cardState(choice, read) {
+  if (!cardsCycle()) return "collapsed";
+  const own = threadCardStates.get(cardStateKey(choice.id));
+  if (own) return own;
+  return unpackMode === "all" || (unpackMode === "unread" && !read) ? "unpacked" : "collapsed";
+}
 
 /** Threads an unpack read is owed, running, done or failed for, so each is read once. */
 const unpackReads = new Map();
@@ -42958,37 +43073,135 @@ const cardIsSummarized = (choice) => {
   return Boolean(named && said) || sideCardRootText(choice) !== "";
 };
 
-/** Whether unpacked blocks belong on screen: pressed, and the Threads view (Cmd+3) showing cards. */
-const unpackOnScreen = () => threadsUnpacked && threadListOnScreen() && columns.side.mode === "list";
+/**
+ * Whether unpacked blocks may be on screen: the Threads view (Cmd+3) showing cards, Unpack unpacking or a
+ * thread unpacked by its own choice. Which threads are is each card's (`cardState`).
+ */
+const unpackOnScreen = () => cardsCycle() && (unpackMode !== "packed" ||
+  [...threadCardStates].some(([key, state]) => state === "unpacked" && key.startsWith(`${String(el("discord-channel").value)}\n`)));
 
-/** Unpack msgs: offered over the Threads view's cards, and pressed as the reader left it. */
+/** The Unpack chip: offered over the Threads view's cards, saying its state; `mixed` for Unpack unread. */
 function renderUnpackToggle() {
   const button = leftEl("side-unpack");
   const offered = columns.side.mode === "list" && threadListShown;
   if (button.hidden === offered) button.hidden = !offered;
-  const pressed = threadsUnpacked ? "true" : "false";
+  const pressed = unpackMode === "all" ? "true" : unpackMode === "unread" ? "mixed" : "false";
   if (button.getAttribute("aria-pressed") !== pressed) button.setAttribute("aria-pressed", pressed);
+  setTextIfChanged(button, UNPACK_MODE_NAMES[unpackMode]);
+  const next = UNPACK_MODE_NAMES[nextUnpackMode()];
+  const title = `${UNPACK_MODE_NAMES[unpackMode]}. Press for ${next.toLowerCase()}`;
+  if (button.title !== title) button.title = title;
 }
 
-/** The reader pressed Unpack msgs, or u: kept on this device, and the cards drawn again. */
-function setThreadsUnpacked(on) {
-  threadsUnpacked = on;
+/** The state after Unpack's, round the cycle. */
+const nextUnpackMode = () => UNPACK_MODES[(UNPACK_MODES.indexOf(unpackMode) + 1) % UNPACK_MODES.length];
+
+/**
+ * The reader pressed Unpack, or u: its next state, kept on this device, every thread of the channel given
+ * back to it (their own choices let go), and the cards drawn again where the reader is.
+ */
+function setUnpackMode(mode) {
+  unpackMode = UNPACK_MODES.includes(mode) ? mode : "packed";
   try {
-    localStorage.setItem(THREADS_UNPACKED_KEY, on ? "on" : "off");
+    localStorage.setItem(THREADS_UNPACKED_KEY, unpackMode);
   } catch (_error) {
     // A browser that refuses storage still honours the choice for this session.
   }
+  const prefix = `${String(el("discord-channel").value)}\n`;
+  for (const key of [...threadCardStates.keys()]) {
+    if (key.startsWith(prefix)) threadCardStates.delete(key);
+  }
+  keepThreadCardStates();
   renderUnpackToggle();
   sideCardsDrawn = "";
-  if (sideColumnUp()) renderSideColumn();
+  if (sideColumnUp()) keepingCardPlace(renderSideColumn);
 }
 
-/** u, over the Threads view: unpack every thread, or pack them away again. Elsewhere, nothing. */
+/** u, over the Threads view: Unpack's next state. Elsewhere, nothing. */
 function unpackFromKeyboard() {
-  if (!threadListOnScreen() || columns.side.mode !== "list") return false;
-  setThreadsUnpacked(!threadsUnpacked);
-  setStatus(threadsUnpacked ? "Every thread unpacked under its card." : "Threads packed away.");
+  if (!cardsCycle()) return false;
+  setUnpackMode(nextUnpackMode());
+  setStatus(UNPACK_MODE_SAID[unpackMode]);
   return true;
+}
+
+/**
+ * Thread `id` drawn `state` by its own choice, outranking Unpack until it is pressed again, kept on this
+ * device; the cards drawn again with its card held where it is on the screen (`row`, as drawn now).
+ */
+function setCardState(id, state, row) {
+  const key = cardStateKey(id);
+  threadCardStates.delete(key);
+  threadCardStates.set(key, state);
+  keepThreadCardStates();
+  const area = leftEl("side-scroll");
+  const before = row && row.parentNode && rowShown(row) ? row.getBoundingClientRect().top : null;
+  sideCardsDrawn = "";
+  renderSideColumn();
+  // The card is drawn anew: the selection, its Tab stop and its focus go to the new one.
+  keepSelection();
+  const now = cardRow(id);
+  if (before === null || !now || !rowShown(now)) return;
+  area.scrollTop += now.getBoundingClientRect().top - before;
+}
+
+/** Thread `id`'s card in the cards on screen, or null. */
+function cardRow(id) {
+  return /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children])
+    .find((one) => one.hasAttribute("data-card") && one.getAttribute("data-id") === id) || null;
+}
+
+/**
+ * A press on the Threads view's card `row` of thread `choice`, or Enter or o on it: its next state, round
+ * collapsed, whole and unpacked; a summarized card, the same whole and collapsed, round two.
+ */
+function cycleCardState(choice, row) {
+  const order = cardIsSummarized(choice) ? ["collapsed", "unpacked"] : CARD_STATES;
+  const now = String(row.getAttribute("data-card-state") || "collapsed");
+  const at = order.indexOf(now);
+  const next = at < 0 ? "unpacked" : order[(at + 1) % order.length];
+  setCardState(choice.id, next, row);
+  setStatus(next === "unpacked" ? "Thread unpacked under its card." : next === "expanded" ? "Card shown whole." : "Thread packed.");
+}
+
+/**
+ * Pack thread `id` into its card, from its triangle or ^: collapsed, its card held where it is. Whether
+ * there was one to pack.
+ */
+function packThread(id) {
+  const row = cardRow(id);
+  if (!row) return false;
+  setCardState(id, "collapsed", row);
+  setStatus("Thread packed.");
+  return true;
+}
+
+/** ^, over the Threads view: pack the thread of the selected card or unpacked row. Elsewhere, nothing. */
+function packFromKeyboard(target) {
+  if (!cardsCycle()) return false;
+  const { row } = keyContext(target);
+  const id = row ? row.getAttribute("data-card") !== null ? row.getAttribute("data-id") : row.getAttribute("data-unpack-thread") : null;
+  if (!id) return false;
+  return packThread(id);
+}
+
+/** The up triangle in a thread's first unpacked row's gutter, where All's bridge has its X: packs the thread. */
+function packButton(id) {
+  const button = document.createElement("button");
+  button.className = "reply-ungather unpack-pack";
+  button.setAttribute("type", "button");
+  button.setAttribute("aria-label", "Pack thread");
+  button.setAttribute("title", "Pack this thread's messages back into its card (^)");
+  const mark = document.createElement("span");
+  mark.className = "reply-ungather-mark unpack-pack-mark";
+  mark.setAttribute("aria-hidden", "true");
+  button.append(mark);
+  button.addEventListener("click", (event) => {
+    // The row's own tap would fold the message or read it aloud; this tap is the triangle's.
+    if (event) event.stopPropagation();
+    packThread(id);
+  });
+  return button;
 }
 
 /** The store's messages of thread `choice.id`, oldest first, its root among them where it is held. */
@@ -43068,7 +43281,9 @@ function unpackBlock(choice, tally) {
     row.setAttribute("data-coalesce", place);
     row.setAttribute("data-stack-under", "third");
     row.style.setProperty("--thread-hue", threadHue(choice.id));
-    row.replaceChildren(bridgePiece(), ...row.children);
+    // `#440 thread-card-pack-toggle`. The first row's gutter holds the triangle that packs the thread,
+    // where All's bridge holds its X.
+    row.replaceChildren(...(at === 0 ? [packButton(choice.id)] : []), bridgePiece(), ...row.children);
   });
   const placed = readMode === "fold" && !readRunsSuspended()
     ? readRunPlan(rows, viewKey("thread", choice.id), (row) => rowIsRead(row) && !row.hasAttribute("data-root-child"))
@@ -43558,7 +43773,7 @@ function foldCardRuns(list) {
  * but the button under it, which goes into the thread and says how many replies it has and how many of
  * them are unread (`cardOpener`). Beside that, how long since the thread moved.
  */
-function sideCard({ choice, text, summarized, root, age, replies, unread, read }) {
+function sideCard({ choice, text, summarized, root, age, replies, unread, read, state = "collapsed" }) {
   const row = document.createElement("li");
   row.className = "side-card-row";
   // `data-id` and `data-card`: the keys move through the cards as through messages, and know them apart.
@@ -43575,8 +43790,12 @@ function sideCard({ choice, text, summarized, root, age, replies, unread, read }
   body.className = "side-card-text";
   body.textContent = text;
   button.append(body);
-  button.addEventListener("click", () => toggleLitCard(choice.id, row));
+  // `#440 thread-card-pack-toggle`. In the Threads view a press goes round the card's states; in two
+  // columns it highlights the card, as it always did (`#277 thread-card-focus`).
+  const press = () => (cardsCycle() ? cycleCardState(choice, row) : toggleLitCard(choice.id, row));
+  button.addEventListener("click", press);
   sayRowShortcut(button, "side-card");
+  row.setAttribute("data-card-state", state);
   const facts = document.createElement("span");
   facts.className = "side-card-facts";
   facts.textContent = age;
@@ -43591,7 +43810,7 @@ function sideCard({ choice, text, summarized, root, age, replies, unread, read }
   row.addEventListener("click", (event) => {
     const at = event && event.target;
     if (at && at !== row && !nodeWithin(facts, at)) return;
-    toggleLitCard(choice.id, row);
+    press();
   });
   // Where the search says it found the card in its replies (`markReplyMatch`).
   /** @type {any} */ (row).cardFacts = facts;
@@ -43645,6 +43864,8 @@ const litCards = new Map();
 
 /** The thread whose card is highlighted in the channel on screen, or null. */
 function litCard() {
+  // `#440 thread-card-pack-toggle`. The Threads view highlights no card: a press there packs and unpacks.
+  if (cardsCycle()) return null;
   return litCards.get(String(el("discord-channel").value)) || null;
 }
 
@@ -43666,7 +43887,9 @@ function paintLitCard(row, id) {
     else row.removeAttribute("data-highlighted");
   }
   const button = childByClass(row, row.hasAttribute("data-card") ? "side-card" : "thread-open");
-  const expanded = lit ? "true" : "false";
+  // In the Threads view, whether the card is shown whole, unpacked or not (`#440 thread-card-pack-toggle`).
+  const whole = cardsCycle() && row.hasAttribute("data-card") ? row.getAttribute("data-card-state") !== "collapsed" : lit;
+  const expanded = whole ? "true" : "false";
   if (button && button.getAttribute("aria-expanded") !== expanded) button.setAttribute("aria-expanded", expanded);
 }
 
@@ -50196,7 +50419,7 @@ el("side-more-threads").addEventListener("click", guardQuietly(loadOlderThreads)
 // `#262 search-load-older`. The cards' own way further back for the search, and Stop while it walks.
 leftEl("side-search-replies").addEventListener("click", guardQuietly(repliesControlPressed));
 // `#404 threads-unpack-all`. Every thread's messages under its card, in the Threads view.
-leftEl("side-unpack").addEventListener("click", () => setThreadsUnpacked(!threadsUnpacked));
+leftEl("side-unpack").addEventListener("click", () => setUnpackMode(nextUnpackMode()));
 leftEl("side-main").addEventListener("click", () => setMainRowsShown(!mainRowsShown));
 // `#426 threads-sort-toggle`. The cards' order, in the Threads view.
 leftEl("side-order").addEventListener("click", () => setThreadOrder(nextThreadOrder()));
