@@ -59065,6 +59065,10 @@ test("`#439 search-unmatched-separators`: tapping an unmatched line shows that r
     .find((kid) => kid.hasClass("row-seam") && !kid.hasClass("row-seam-below"));
   assert.equal(line.tagName, "button", "an unmatched line is not a control a tap can open");
   assert.match(line.getAttribute("aria-label"), /^Show 3 unmatched messages/);
+  // A finger on the line is on the line, not on the row under it: no hold, no swipe.
+  await rows.find((li) => li.getAttribute("data-id") === "8").dispatch("pointerdown",
+    { pointerId: 1, pointerType: "touch", clientX: 10, clientY: 10, target: line });
+  assert.equal(page.expireTimers(HOLD_MS), 0, "a finger on an unmatched line armed its row's hold");
   await line.click();
   await page.settle();
   assert.deepStrictEqual(shownIds(), ["4", "5", "6", "7", "8", "12"], "the tap did not show exactly its run");
@@ -59158,6 +59162,14 @@ test("`#439 search-unmatched-separators`: among the cards a gap counts the messa
     .map((li) => li.getAttribute("data-id")), ["spaces/A/threads/one & two", "spaces/A/threads/another"],
     "the tap did not show the thread the line stood for");
   assert.deepStrictEqual(seamsOf(page, "side-cards"), [], "the opened card's line stayed");
+  // Typing away and back to the same words does not bring the opened run back un-tapped.
+  await page.el("search-field").setValue("first thread");
+  await page.settle();
+  await page.el("search-field").setValue("first");
+  await page.settle();
+  assert.deepStrictEqual(cards.filter((li) => !li.hasClass("search-hidden") && !li.hidden)
+    .map((li) => li.getAttribute("data-id")), ["spaces/A/threads/one & two"],
+    "a search typed away and back resurrected an opened card run");
   // The bar still counts matches, not what was shown by hand.
   assert.match(page.el("search-count").textContent, /loaded|thread/);
   await page.el("search-field").setValue("thread root");
