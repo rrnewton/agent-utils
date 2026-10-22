@@ -244,6 +244,11 @@ class Walk:
         self.check(over <= 1, f"the page is {over:.0f}px wider than the window")
 
 
+def count_only(words: str | None) -> str | None:
+    """A gap line's words without the days it reaches: "… 3 unmatched messages …"."""
+    return words.split(" · ")[0] + " …" if words and " · " in words else words
+
+
 def walk_through(walk: Walk) -> None:
     page = walk.page
     page.fill("#api-token", TOKEN)
@@ -262,7 +267,6 @@ def walk_through(walk: Walk) -> None:
     walk.settled()
     walk.check(walk.shown() == ["201", "204", "209", "214"], f"lantern shows {walk.shown()}")
     seams = walk.seams()
-    count_only = lambda words: words.split(" · ")[0] + " …" if words and " · " in words else words
     words_only = [(row_id, count_only(above), count_only(below)) for row_id, above, below in seams]
     walk.check(words_only == [
         ("201", "… 1 unmatched message …", None),
