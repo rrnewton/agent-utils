@@ -209,7 +209,7 @@ const ALL_CHANNELS = "*";
  *   | "save-voice-post-prefix" | "save-voice-system-prompt"
  *   | "search-in-all" | "search-toggle" | "send-text" | "side-clear-backlog" | "side-close" | "side-jump-newest"
  *   | "side-more-threads" | "side-older" | "side-search-replies" | "side-send" | "side-thread-card-text"
- *   | "side-main" | "side-order" | "side-unpack" | "side-unread-only" | "speaker"
+ *   | "side-main" | "side-order" | "side-unpack" | "speaker"
  *   | "summarise" | "talk"
  *   | "thread-back" | "thread-card-text"
  *   | "todo-filter" | "undo-bookmark" | "undo-dismiss" | "undo-send-dismiss" | "upstream-clear-push"
@@ -2200,7 +2200,7 @@ let overscrollFootSince = null;
  */
 function overscrollContext() {
   return JSON.stringify([columnsShown, threadListShown, currentScreen, currentView, columns.side.mode,
-    sideUnreadOnly, inColumn(columns.side, () => [channelContextKey(), pinnedOnly, searchKey()])]);
+    readMode, inColumn(columns.side, () => [channelContextKey(), pinnedOnly, searchKey()])]);
 }
 
 /** Whether the room may be open: the right column on screen at a desk, where web/voice.css gives it a box. */
@@ -4053,9 +4053,9 @@ function setAllFolded(folded) {
 // WHAT IT COVERS is what the chips cover (`visibleFolds`): the long messages of the list on screen,
 // each folded to its first lines, or under Summaries to its summary. Not the thread cards, which stay
 // contracted but for the one highlighted (`#277 thread-card-focus`), nor the runs of read messages
-// behind their lines under Collapse read, which `h` opens and shuts.
+// behind their lines under Fold read, which `h` opens and shuts.
 //
-//   * READ is `rowIsRead`, the one rule Hide read, Collapse read and a thread's landing share: a row is
+//   * READ is `rowIsRead`, the one rule Hide read, Fold read and a thread's landing share: a row is
 //     read when every message it stands for is.
 //   * EACH LIST KEEPS ITS OWN STEP, for the session: Main, All, a thread, the right column's thread, the
 //     Pinned list, each by its pane's own name for it (`foldStepKey`). A press goes on from the step that
@@ -4096,15 +4096,18 @@ function setAllFolded(folded) {
 //     a reader on the newest line, through the chips changing height and the right column's keeper. A
 //     box scrolled out of sight, the search and a reply open at a column's foot (under its list, not in
 //     it) leave the reader's row the one kept.
-//   * SAID, briefly and politely, on the status line: "Expanded all", "Expanded unread, collapsed read",
-//     "Collapsed all". A list with no long message in it says so, and keeps its step.
+//   * SAID, briefly and politely, on the status line: "Long messages: all expanded", "Long messages: unread
+//     expanded, read collapsed", "Long messages: all collapsed". A list with no long message in it says so,
+//     and keeps its step. `#432 read-mode-unify`: they said "Expanded unread, collapsed read" until the
+//     owner took that for the read mode's own notice (Show, Fold, Hide read, key h), which they never touch.
 
 /** The steps, in the order ; goes round them. */
 const FOLD_STEPS = ["expand", "unread", "collapse"];
 
 /** What the status line says once each is applied. */
 const FOLD_STEP_WORDS = {
-  expand: "Expanded all", unread: "Expanded unread, collapsed read", collapse: "Collapsed all",
+  expand: "Long messages: all expanded", unread: "Long messages: unread expanded, read collapsed",
+  collapse: "Long messages: all collapsed",
 };
 
 /** What it says where there is nothing to fold or open. */
@@ -4651,7 +4654,7 @@ function refreshSearchCount() {
     authorChoosing() !== "everyone");
 }
 
-/** The cards there are, and how many the search and Unread only leave, as `filterSideCards` last counted. */
+/** The cards there are, and how many the search and the read mode leave, as `filterSideCards` last counted. */
 let sideCardCount = { cards: 0, shown: 0 };
 
 /**
@@ -9983,7 +9986,7 @@ function rowForAct(target, runLine = false, stay = false) {
  * unpack-row-parity`: its messages unpacked under it are rows of their own, read by the same rule).
  */
 const unreadAfter = (rows, at) => rows.slice(at + 1).find((row) =>
-  (row.hasAttribute("data-card") ? row.hasAttribute("data-unread") : !rowIsRead(row))) || null;
+  (row.hasAttribute("data-card") ? !row.hasAttribute("data-thread-read") : !rowIsRead(row))) || null;
 
 /** n: the next unread message below the selected one, or below the top of the screen. */
 function nextUnreadFromKeyboard(target) {
@@ -10053,7 +10056,7 @@ function doneFromKeyboard(target) {
  * its fold control folds it (`readAndCollapse`). In a thread, or in the right column, the message
  * selected there. Only ever a mark: a message already Done stays Done and is folded all the same. The
  * selection stays on the message, and the list does not move under the reader (`foldForRead`). The
- * read modes treat it as any Done: under Collapse read a message that joins a run of read messages
+ * read modes treat it as any Done: under Fold read a message that joins a run of read messages
  * leaves the selection on the run's line, and under Hide read it goes, the selection to the next row.
  *
  * IT USED TO BE DONE THROUGH HERE (`#202 read-through-here`): every message above as well, which one
@@ -10150,8 +10153,9 @@ function openFromKeyboard(event, target) {
   if (!pane || !row) return took;
   if (row.getAttribute("data-read-run") === "head") {
     openReadRun(row);
-    // `#407 unpack-row-parity`. In an unpacked block the run's rows are drawn anew: its first row's.
-    const now = row.parentNode ? row : liveUnpackedRow(row);
+    // `#407 unpack-row-parity`. In an unpacked block the run's rows are drawn anew: its first row's; and
+    // over the cards, the run's first card or row (`#432 read-mode-unify`).
+    const now = row.parentNode ? row : liveUnpackedRow(row) || liveCardRow(row);
     if (now) selectRow(pane, now, false);
     return true;
   }
@@ -10563,10 +10567,15 @@ function viewFromKeyboard(which, repeat) {
   return true;
 }
 
-/** h: the cycle of the Hide read button: Show read, Collapse read, Hide read. */
+/**
+ * h: the cycle of the Hide read button: Show read, Fold read, Hide read. The button's own act
+ * (`cycleReadMode`), so the key, the button's words and the list are one state; and said on the status
+ * line, as the button is not where the reader's eyes are. `#432 read-mode-unify`.
+ */
 function readModeFromKeyboard() {
   if (!channelOnScreen() || el("todo-filter").hidden) return false;
   cycleReadMode();
+  setStatus(READ_MODE_SAID[readMode]);
   return true;
 }
 
@@ -11207,7 +11216,7 @@ const KEYMAP = [
   {
     group: KEYS_MESSAGE, chords: [{ key: "e", shift: true }],
     does: "Read and collapse: marks the message Done, as e does, and read in the chat service too where it " +
-      "can be, as a sent reply does; folds it; the selection stays on it. Under Collapse read, a message that " +
+      "can be, as a sent reply does; folds it; the selection stays on it. Under Fold read, a message that " +
       "joins a run of read messages leaves the selection on the run's “… read messages …” line; under Hide " +
       "read it goes, and the selection moves to the next message. Never puts one back. " +
       "Done through here, which this key used to be, is in the ⋯ menu only",
@@ -11303,7 +11312,7 @@ const KEYMAP = [
   },
   {
     group: KEYS_VIEW, chords: [{ key: "h" }],
-    does: "Show read, Collapse read, Hide read, in turn",
+    does: "Show read, Fold read, Hide read, in turn",
     controls: ["todo-filter"],
     run: () => readModeFromKeyboard(),
   },
@@ -23391,7 +23400,7 @@ function heldUnansweredRoot(id) {
 // vanished under Hide read although the agents' replies were unread. He treats the channel as an
 // inbox. So on Main a root whose thread holds unread replies says how many, in a chip beside its N
 // replies — "12 replies  3 unread", his "N replies, M unread" — and the read filters keep that root:
-// Hide read leaves it in the list and Collapse read never folds it into a run. The root itself is
+// Hide read leaves it in the list and Fold read never folds it into a run. The root itself is
 // still drawn as read; the chip is drawn at full strength over it (web/voice.css), so the cue is not
 // faded with the root it is on.
 //
@@ -23589,9 +23598,9 @@ function holdsUnreadReplies(message, tally) {
 
 /**
  * What the read filters keep: an unread message, and on Main a root whose thread holds an unread
- * reply, or may, as well (`holdsUnreadReplies`). Hide read draws exactly these; Collapse read folds
+ * reply, or may, as well (`holdsUnreadReplies`). Hide read draws exactly these; Fold read folds
  * every row but these (`applyReadRuns`, by the attribute the pass over the rows sets from the same
- * rule). The store is walked only when a read row is asked after: Show read and Collapse read ask
+ * rule). The store is walked only when a read row is asked after: Show read and Fold read ask
  * after none.
  *
  * `thread` is a thread whose messages are drawn, as a thread's: the open thread of the column by
@@ -24737,7 +24746,7 @@ function applyTimelinePage(payload, older = false, saved = false, delta = false,
 /**
  * `preservingScroll` for a redraw that REBUILDS the rows, which takes its anchor with it: the reader
  * is held on the same MESSAGE, found again by id, or on the line of the collapsed run it has joined.
- * `#221 read-modes`: a message dealt with under Collapse read joins a run, a mode change collapses
+ * `#221 read-modes`: a message dealt with under Fold read joins a run, a mode change collapses
  * or hides whole runs above the reader, and a pixel offset kept across either lands on whatever
  * message has moved into that pixel. Kept to the offset as before when the message is not drawn.
  */
@@ -28423,7 +28432,7 @@ function renderChannelRows() {
   renderOutgoingMessages();
   // Settings counts what is loaded, and this is where what is loaded changes.
   renderNoiseCount();
-  // `#221 read-modes`. LAST, from the read state every row has just been given: under Collapse
+  // `#221 read-modes`. LAST, from the read state every row has just been given: under Fold
   // read a message dealt with on this pass joins its run, and a run that grew says so.
   applyReadRuns();
   // `#250 date-separators`. The days, from the rows as the runs leave them, inside whatever anchored
@@ -31047,7 +31056,7 @@ function isNoise(message) {
  * Does this message belong in the list behind Hide read?
  *
  * ONE definition, for both places the threaded view filters. Not archived, not read automatically,
- * and not the reader's own words when they have said those are read. And for what Collapse read
+ * and not the reader's own words when they have said those are read. And for what Fold read
  * collapses and what entering a thread lands on (`#221 read-modes`, `rowIsRead`): a refinement of
  * what counts as unread belongs here, and reaches every read mode at once.
  *
@@ -34872,7 +34881,7 @@ function repliesDay() {
   return cover && cover.more !== false && Number.isFinite(cover.floor) ? dayKeyOf(new Date(cover.floor)) : null;
 }
 
-/** The cards the search and Unread only show now, by thread id. */
+/** The cards the search and the read mode show now, by thread id. */
 const cardsFound = () => /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children])
   .filter((row) => row.hasAttribute("data-card") && rowShown(row))
   .map((row) => String(row.getAttribute("data-id")));
@@ -36041,7 +36050,11 @@ function drawChannelPage(payload, area, at) {
  */
 let todoMode = false;
 
-// --- the read modes: Show read, Collapse read, Hide read ------------------------------------------
+// --- the read modes: Show read, Fold read, Hide read ----------------------------------------------
+//
+// `#432 read-mode-unify`. The owner, 2026-10-22: Fold read was "Collapse read" until now. "Collapse" is the
+// size-bounded message card's word (a long message collapsed to a few lines, `;` and `:`), "fold" the
+// run lines' ("… 21 read messages …"). A saved record that says "collapse" means "fold" (`savedReadMode`).
 //
 // `#221 read-modes`. The owner, 2026-10-08: "since we may have long threads we can introduce
 // further collapsing for the read messages in between. I.e show the thread root then ' ... 45 read
@@ -36052,7 +36065,7 @@ let todoMode = false;
 // So the Hide read button is a cycle, and it names the mode the list is IN, with an icon for each:
 //
 //   * SHOW READ. Every message, read ones greyed: the list as it always was with Hide read off.
-//   * COLLAPSE READ. Each run of read messages is one line, "… 12 read messages …", and a tap on the
+//   * FOLD READ. Each run of read messages is one line, "… 12 read messages …", and a tap on the
 //     line opens that run. Unread messages are shown, and so are two read ones: the root of the
 //     thread on screen, which says what the thread is about, and the newest message, which is where
 //     the conversation stands, what the composer under it answers, and what a send just put there.
@@ -36065,32 +36078,39 @@ let todoMode = false;
 // page does not start hiding anything nobody asked it to hide, and a record kept by an older page —
 // `todo` alone — still means what it meant.
 //
-// WHAT IS READ is `stillToDo`'s answer and nobody else's: Collapse read collapses exactly the
+// WHAT IS READ is `stillToDo`'s answer and nobody else's: Fold read folds exactly the
 // messages Hide read hides. A refinement of what counts as read reaches both modes from there.
 //
 // ENTERING A THREAD lands on its first unread message, unfolded — see `landOnFirstUnread` — in every
-// mode, and the read run before it is a line only under Collapse read. Show read shows what is read:
+// mode, and the read run before it is a line only under Fold read. Show read shows what is read:
 // a mode that said "Show read" while hiding messages on entry would be a button that lies, and the
-// owner's root, "… 45 read messages …", first unread is Collapse read's own drawing.
+// owner's root, "… 45 read messages …", first unread is Fold read's own drawing.
 
 /** The read modes, in the order a tap on the button moves through them. */
-const READ_MODES = ["show", "collapse", "hide"];
+const READ_MODES = ["show", "fold", "hide"];
 
 /** What the button calls each mode: the mode the list is in, not the act a tap performs. */
-const READ_MODE_LABELS = { show: "Show read", collapse: "Collapse read", hide: "Hide read" };
+const READ_MODE_LABELS = { show: "Show read", fold: "Fold read", hide: "Hide read" };
 
 /**
  * The first word of each name, in a span of its own so that a desk's dock row can stand the name in
  * two short lines: `#218 desktop-dock` fitted that row to "Hide read" with nothing to spare, and
- * "Collapse read" on one line beside its icon would push the dock onto a second row. Never drawn
- * alone — a lone "Hide" or "Collapse" reads as the act a tap performs. See web/voice.css.
+ * "Collapse read" (now Fold read) on one line beside its icon would push the dock onto a second row. Never
+ * drawn alone — a lone "Hide" or "Fold" reads as the act a tap performs. See web/voice.css.
  */
-const READ_MODE_VERBS = { show: "Show", collapse: "Collapse", hide: "Hide" };
+const READ_MODE_VERBS = { show: "Show", fold: "Fold", hide: "Hide" };
+
+/** What h says on the status line of each mode it moves to (`readModeFromKeyboard`). `#432 read-mode-unify`. */
+const READ_MODE_SAID = {
+  show: "Show read: everything shown.",
+  fold: "Fold read: read runs folded.",
+  hide: "Hide read: read ones hidden.",
+};
 
 /** The sentence under the pointer for each mode: what it does, and where a tap goes next. */
 const READ_MODE_TITLES = {
-  show: "Read messages are shown, greyed. Tap to collapse each run of them into one line.",
-  collapse: "Each run of read messages is one line; tap a line to open it. Tap to hide read messages.",
+  show: "Read messages are shown, greyed. Tap to fold each run of them into one line.",
+  fold: "Each run of read messages, or of read threads, is one line; tap a line to open it. Tap to hide read messages.",
   hide: "Read messages are hidden. Tap to show them again.",
 };
 
@@ -36113,13 +36133,15 @@ let readMode = "show";
 const openedReadRuns = new Map();
 
 /**
- * How many rows the last pass left in collapsed runs. At zero, outside Collapse read, there is
+ * How many rows the last pass left in collapsed runs. At zero, outside Fold read, there is
  * nothing to undo, and a pass — which runs with every redraw and every filter change — is free.
  */
 let collapsedRunRows = 0;
 
 /** The mode a saved UI record holds: its own `read` when it has one, and otherwise its `todo`. */
 function savedReadMode(saved) {
+  // `#432 read-mode-unify`. Fold read was "Collapse read", and a record kept then still means it.
+  if (saved.read === "collapse") return "fold";
   return READ_MODES.includes(saved.read) ? saved.read : saved.todo ? "hide" : "show";
 }
 
@@ -36129,7 +36151,7 @@ const nextReadMode = (mode) => READ_MODES[(READ_MODES.indexOf(mode) + 1) % READ_
 /**
  * The button, saying the mode: its word, its icon (drawn by web/voice.css off `data-read-mode`), and
  * to a screen reader the mode and where a tap goes. `aria-pressed` is the tri-state ARIA gives a
- * button that is partly on: off for Show read, `mixed` for Collapse read, on for Hide read.
+ * button that is partly on: off for Show read, `mixed` for Fold read, on for Hide read.
  */
 function renderReadModeControl() {
   const button = el("todo-filter");
@@ -36156,7 +36178,7 @@ function renderReadModeControl() {
   // Written only when they change: this runs with every redraw of the controls.
   const said = {
     "data-read-mode": readMode,
-    "aria-pressed": readMode === "hide" ? "true" : readMode === "collapse" ? "mixed" : "false",
+    "aria-pressed": readMode === "hide" ? "true" : readMode === "fold" ? "mixed" : "false",
     "aria-label": `${label}. Tap for ${READ_MODE_LABELS[nextReadMode(readMode)]}`,
     title: READ_MODE_TITLES[readMode],
   };
@@ -36193,7 +36215,7 @@ function readRunsSuspended() {
 
 /**
  * Whether Hide read is leaving read messages out of the list now. `#262 search-load-older`: not while a
- * filter chooses rows on a provider with threads, where Hide read steps aside as Collapse read does
+ * filter chooses rows on a provider with threads, where Hide read steps aside as Fold read does
  * (`readRunsSuspended`) — an old match is read by definition, and a search that walks back under Hide
  * read would draw almost nothing of what it read and say it had searched it. The read mode the reader
  * chose is untouched, and closing the search brings it back. Without threads Hide read is a read of
@@ -36238,8 +36260,9 @@ function readRunLine(row) {
     const focused = document.activeElement === line && line.matches(":focus-visible");
     openReadRun(row);
     // `#407 unpack-row-parity`. A run in an unpacked block is opened by drawing the block again: the
-    // row it was is the new one standing for the same message.
-    const now = row.parentNode ? row : liveUnpackedRow(row);
+    // row it was is the new one standing for the same message; and a run over the cards by drawing them
+    // again (`#432 read-mode-unify`).
+    const now = row.parentNode ? row : liveUnpackedRow(row) || liveCardRow(row);
     if (focused && now) {
       now.setAttribute("tabindex", "-1");
       now.focus({ preventScroll: true });
@@ -36286,7 +36309,7 @@ function placeInReadRun(row, role, count) {
 }
 
 /**
- * Collapse the runs of read messages in the channel list, under Collapse read, and undo every run
+ * Collapse the runs of read messages in the channel list, under Fold read, and undo every run
  * otherwise. Called at the end of every pass over the rows (`renderChannelRows`) and whenever a
  * filter changes (`applySearch`), and idempotent, so a second call changes nothing.
  *
@@ -36295,14 +36318,14 @@ function placeInReadRun(row, role, count) {
  * looking at that has just joined a run is held where it was by the line it joined.
  */
 function applyReadRuns() {
-  const collapsing = readMode === "collapse" && !readRunsSuspended();
+  const collapsing = readMode === "fold" && !readRunsSuspended();
   if (!collapsing && collapsedRunRows === 0) return;
   const list = el("discord-log");
   const rows = [...list.children];
   const rootId = collapsing ? openThreadRootId() : null;
   // Nor a row of replies the reader gathered under their message (`#215 reply-coalesce`): they were
   // gathered to be read together, and a line in the stack would break the bridge. Nor a root on Main
-  // whose thread holds an unread reply (`#222 unread-replies`): Hide read keeps it, so Collapse read
+  // whose thread holds an unread reply (`#222 unread-replies`): Hide read keeps it, so Fold read
   // does, by the attribute the pass has just set from the same rule.
   const placed = collapsing ? readRunPlan(rows, viewKey(), (row) => rowIsRead(row) && !isOpenThreadRoot(row, rootId) &&
     !row.hasAttribute("data-coalesce") && !row.hasAttribute("data-unread-replies")) : new Map();
@@ -36328,7 +36351,7 @@ function applyReadRuns() {
 }
 
 /**
- * Where each row of `rows`, a list's rows in order, goes under Collapse read: every run of at least
+ * Where each row of `rows`, a list's rows in order, goes under Fold read: every run of at least
  * `READ_RUN_MIN_ROWS` rows next to each other that `joins` is a run, its first row the "head" its line
  * is drawn on and the rest its "members", with how many messages it stands for; the last row never
  * joins one. A run with a message the reader opened in it, in the list `key` names (`viewKey`), stays
@@ -36336,18 +36359,22 @@ function applyReadRuns() {
  * the channel's list (`applyReadRuns`) and for each thread unpacked under its card (`unpackBlock`,
  * `#407 unpack-row-parity`), which differ only in what may join one.
  *
+ * `idsFor` says what a row stands for in a run, for remembering it opened: its messages' ids, or over the
+ * Threads view's cards a card's thread (`cardRunIds`, `#432 read-mode-unify`).
+ *
  * @param {Element[]} rows
  * @param {string} key
  * @param {(row: Element) => boolean} joins
+ * @param {(row: Element) => string[]} [idsFor]
  * @returns {Map<Element, {role: string, count: number}>}
  */
-function readRunPlan(rows, key, joins) {
+function readRunPlan(rows, key, joins, idsFor = idsOf) {
   const opened = openedReadRuns.get(key) || new Set();
   /** @type {Map<Element, {role: string, count: number}>} */
   const placed = new Map();
   let run = [];
   const close = () => {
-    const ids = run.flatMap(idsOf);
+    const ids = run.flatMap(idsFor);
     if (run.length >= READ_RUN_MIN_ROWS && ids.some((id) => opened.has(id))) {
       // Opened: it stays open as it grows, so what joined it since is remembered with it.
       for (const id of ids) opened.add(id);
@@ -36389,6 +36416,19 @@ function readRunRows(row) {
 function openReadRun(row) {
   if (!row || !row.hasAttribute("data-read-run")) return;
   const thread = row.getAttribute("data-unpack-thread");
+  // `#432 read-mode-unify`. A run of read threads (and Main's read messages) over the cards: kept open by
+  // what its cards and rows stand for, and the cards drawn again.
+  if (thread === null && row.parentNode === leftEl("side-cards")) {
+    const opened = openedReadRuns.get(cardRunKey()) || new Set();
+    for (const one of cardRunRows(row)) {
+      for (const id of cardRunIds(one)) opened.add(id);
+    }
+    openedReadRuns.set(cardRunKey(), opened);
+    sideCardsDrawn = "";
+    renderSideColumn();
+    keepSelection();
+    return;
+  }
   const key = thread === null ? viewKey() : viewKey("thread", thread);
   const opened = openedReadRuns.get(key) || new Set();
   for (const one of readRunRows(row)) {
@@ -36405,6 +36445,21 @@ function openReadRun(row) {
   applyReadRuns();
   renderScrollTools();
   requestVisibleSummaries();
+}
+
+/**
+ * The row now standing in the cards for `row`, a card or a Main row a redraw of the cards took away (an
+ * opened run of read threads, `#432 read-mode-unify`): the new one of the same kind and id, or null.
+ *
+ * @param {Element} row
+ * @returns {HTMLElement | null}
+ */
+function liveCardRow(row) {
+  const card = row.hasAttribute("data-card");
+  if (!card && !row.hasAttribute("data-main-row")) return null;
+  const id = row.getAttribute("data-id");
+  return /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children]).find((one) =>
+    one.getAttribute("data-id") === id && one.hasAttribute(card ? "data-card" : "data-main-row")) || null;
 }
 
 /**
@@ -37774,8 +37829,8 @@ function setReadMode(mode) {
   const read = keepingFilterPlace(() => {
     readMode = mode;
     todoMode = mode === "hide";
-    // Runs opened under Collapse read are a way of looking at that list, and the reader has just
-    // chosen another way: coming back to Collapse read collapses them all again.
+    // Runs opened under Fold read are a way of looking at that list, and the reader has just
+    // chosen another way: coming back to Fold read folds them all again.
     openedReadRuns.clear();
     // Kept across a reload, as the reader left it. `#189 restore-ui-state`.
     uiStateSettled = true;
@@ -37800,7 +37855,7 @@ function setReadMode(mode) {
       // when it lands. What it brings is the reader's own act, not something that arrived.
       return (todoMode ? loadTodo : loadDiscord)({ keepPosition: true, ownAct: true, readAs: "enter" });
     } else {
-      // Show read and Collapse read are the same read of the channel, drawn two ways.
+      // Show read and Fold read are the same read of the channel, drawn two ways.
       applyReadRuns();
       renderScrollTools();
     }
@@ -40238,7 +40293,7 @@ function unseenColumnReply() {
 // What the grey was: `data-replied` (`#84 reply-aware-dismissal`), the dimming of a message that some
 // loaded message answers, the outbox's acknowledged reply among them. It is an observation drawn on
 // the row and nothing more. It is not Done, so the row's Done button still offered Done, Hide read
-// kept the row, Collapse read did not fold it, the root's count of unread replies on Main went on
+// kept the row, Fold read did not fold it, the root's count of unread replies on Main went on
 // counting it (`#222 unread-replies`), and the server was never told.
 //
 // So a reply that has been SENT marks the message it answers Done, by the Done button's own act
@@ -41694,7 +41749,6 @@ function renderSideMode() {
   // The jump to a thread's newest message is the thread's: over the cards it would jump in a list that
   // is not on screen. A thread selected again decides it afresh (`renderJumpNewest`).
   if (!thread && !leftEl("side-jump-newest").hidden) leftEl("side-jump-newest").hidden = true;
-  renderSideUnreadToggle();
   renderUnpackToggle();
   renderMainToggle();
   renderOrderToggle();
@@ -41788,6 +41842,15 @@ function sideCardRootText(choice) {
   return first && first !== sideCardText(choice) ? first : "";
 }
 
+/**
+ * Whether thread `choice` is read, as the read modes see a thread (`#432 read-mode-unify`): no unread
+ * reply held or reported (`unread`, `sideCardUnread`'s words) and its root read too. One unread message,
+ * the root or any reply, makes the whole thread unread, packed under its card or unpacked.
+ */
+function threadIsRead(choice, unread) {
+  return unread === "" && !(choice.root && stillToDo(choice.root, channelCanon.dismissed));
+}
+
 /** What a card says of its thread's unread replies, as a root on Main says it ("3 unread", "1 new"), or "". */
 function sideCardUnread(choice, tally) {
   const entry = tally.threads.get(choice.id);
@@ -41844,12 +41907,12 @@ function renderSideCards() {
     age: briefAge(Number.isFinite(choice.at) ? choice.at : choice.started),
     replies: sideCardReplies(choice, tally),
     unread: sideCardUnread(choice, tally),
-  }));
+  })).map((card) => ({ ...card, read: threadIsRead(card.choice, card.unread) }));
   const unpacked = unpackOnScreen();
   // `#419 threads-view-main-messages`. And the main channel's messages that are not threads, among them.
   const main = mainRowsOnScreen() ? mainRowMessages(new Set(cards.map(({ choice }) => choice.id))) : [];
-  const signature = JSON.stringify([order, unpacked, cards.map(({ choice, text, root, age, replies, unread }) =>
-    [choice.id, text, root, age, replies, unread,
+  const signature = JSON.stringify([order, readMode, readRunsSuspended(), unpacked, cards.map(({ choice, text, root, age, replies, unread, read }) =>
+    [choice.id, text, root, age, replies, unread, read,
       unpacked ? unpackSignature(choice, unpackHeldMessages(choice)) : ""]),
   main.map((message) => [String(message.id), stillToDo(message, channelCanon.dismissed)]),
   main.length ? [readMode, combineMessages, nowPlaying ? nowPlaying.id : "", pendingRead] : ""]);
@@ -41879,6 +41942,8 @@ function renderSideCards() {
         return runs.map((run) => mainRows(run, tally));
       }) : runs.map(() => []);
       list.replaceChildren(...drawn.flatMap((rows, at) => [...between[at], ...rows]), ...between[drawn.length]);
+      // `#432 read-mode-unify`. Under Fold read, the runs of read threads and Main's read messages.
+      foldCardRuns(list);
       filterSideCards();
     });
   } else {
@@ -42029,9 +42094,11 @@ function placeOpenedCards() {
  * text does not match goes while the search is open. Links leaves them: a card has no links of its
  * own, and its thread's are in its messages.
  *
- * `#259 thread-list-unread-filter`. And with Unread only pressed, a card whose thread has no unread
- * reply goes too: one with no "N unread" or "N new" chip (`data-unread`, `sideCardUnread`). The two
- * are ANDed, and a list they empty says why, over where the cards were (`sideListState`).
+ * `#432 read-mode-unify`. And under Hide read a card whose thread is read goes too, its unpacked rows
+ * with it (`threadIsRead`: no unread reply held or reported, and its root read), as Unread only did
+ * (`#259 thread-list-unread-filter`); under Fold read a card in a run is behind its line
+ * (`foldCardRuns`). The search and the read mode are ANDed, and a list they empty says why, over
+ * where the cards were (`sideListState`).
  *
  * The owner asked whether the search should reach a thread's replies too. What is cheap is done: the
  * replies the page already holds for each thread are searched with the card's own words — each term
@@ -42043,7 +42110,9 @@ function placeOpenedCards() {
 let unpackSuspendedDrawn = false;
 
 function filterSideCards() {
-  if (unpackOnScreen() && readRunsSuspended() !== unpackSuspendedDrawn) {
+  // A filter choosing rows opens every run, and closing it folds them again: unpacked blocks' runs, and
+  // under Fold read the runs of read threads over the cards (`foldCardRuns`, `#432 read-mode-unify`).
+  if ((unpackOnScreen() || readMode === "fold") && readRunsSuspended() !== unpackSuspendedDrawn) {
     unpackSuspendedDrawn = readRunsSuspended();
     sideCardsDrawn = "";
     renderSideCards();
@@ -42061,8 +42130,10 @@ function filterSideCards() {
   const cardShown = new Map();
   for (const row of rows) {
     const text = row.getAttribute("data-search") || "";
-    const fresh = row.hasAttribute("data-unread");
-    const kept = !sideUnreadOnly || fresh;
+    const fresh = !row.hasAttribute("data-thread-read");
+    // `#432 read-mode-unify`. Hide read takes a read thread out with its unpacked rows, as it takes a read
+    // message out of Main; a card in a folded run is hidden behind the run's line.
+    const kept = (!hidingRead() || fresh) && row.getAttribute("data-read-run") !== "member";
     const own = terms.every((term) => text.includes(term));
     const theirs = !own && replies ? replies.get(String(row.getAttribute("data-id"))) || "" : "";
     const inReplies = theirs !== "" && terms.every((term) => text.includes(term) || theirs.includes(term));
@@ -42077,11 +42148,12 @@ function filterSideCards() {
     if (kept && said) shown += 1;
     cardShown.set(String(row.getAttribute("data-id")), kept && said);
   }
-  // `#419 threads-view-main-messages`. Main's messages among the cards, by the cards' own rules: Unread
-  // only keeps those still to do, and the search finds them by their words.
+  // `#419 threads-view-main-messages`. Main's messages among the cards: the read mode chose them as they
+  // were drawn (`mainRowMessages`), a folded run hides its members behind its line, and the search finds
+  // them by their words.
   for (const row of allRows) {
     if (!row.hasAttribute("data-main-row")) continue;
-    const kept = !sideUnreadOnly || !rowIsRead(row);
+    const kept = row.getAttribute("data-read-run") !== "member";
     const said = terms.every((term) => (row.getAttribute("data-search") || "").includes(term));
     if (row.hidden === kept) row.hidden = !kept;
     setClassWord(row, "search-hidden", !said);
@@ -42093,7 +42165,9 @@ function filterSideCards() {
     const thread = row.getAttribute("data-unpack-thread");
     if (thread === null) continue;
     const shownBlock = cardShown.get(thread) === true && row.getAttribute("data-read-run") !== "member";
-    if (row.hidden === shownBlock) row.hidden = !shownBlock;
+    // ...and a block whose card heads a folded run of read threads goes behind the run's line with it.
+    const folded = row.getAttribute("data-card-run") === "member";
+    if (row.hidden === (shownBlock && !folded)) row.hidden = !(shownBlock && !folded);
   }
   // `#281 view-keys`. A failed read of older threads is said over the cards it left as they were.
   const state = [olderThreadsFailure(), sideListState(rows.length, unread, shown)].filter((part) => part !== "").join(" ");
@@ -42149,7 +42223,8 @@ function markReplyMatch(row, on) {
 
 /**
  * What the right column says over its cards, or "" while it shows some: none in the channel, none
- * unread with Unread only pressed, or none the search matches. `#259 thread-list-unread-filter`.
+ * unread under Hide read (`#432 read-mode-unify`; Unread only, `#259`, before it), or none the search
+ * matches.
  *
  * @param {number} cards How many cards there are.
  * @param {number} unread How many of them have unread replies.
@@ -42158,54 +42233,16 @@ function markReplyMatch(row, on) {
 function sideListState(cards, unread, shown) {
   if (cards === 0) return "No threads in this channel yet.";
   if (shown > 0) return "";
-  if (sideUnreadOnly && unread === 0) return "No unread threads.";
+  if (hidingRead() && unread === 0) return "No unread threads.";
   // `#262 search-load-older`. How far back the search has looked, where that is the whole channel: until
   // then the way further back under this line says the day (`renderRepliesSearch`).
   const whole = allLoaded() ? " — all of this channel is loaded" : "";
-  return sideUnreadOnly ? `No unread threads match that search${whole}.` : `No threads match that search${whole}.`;
+  return `No threads match that search${whole}.`;
 }
 
-/** The device's choice of the cards with unread replies only: "on", or anything else for every card. */
-const SIDE_UNREAD_KEY = "vibe-talk.voice.side-unread-only";
-
-/** Whether Unread only is pressed, kept on this device. `#259 thread-list-unread-filter`. */
-function storedSideUnreadOnly() {
-  try {
-    return localStorage.getItem(SIDE_UNREAD_KEY) === "on";
-  } catch (_error) {
-    return false;
-  }
-}
-
-/** Whether the cards are the threads with unread replies only. */
-let sideUnreadOnly = storedSideUnreadOnly();
-
-/** Unread only: offered while the cards are up, and pressed as the reader left it. */
-function renderSideUnreadToggle() {
-  const button = leftEl("side-unread-only");
-  const offered = columns.side.mode === "list";
-  if (button.hidden === offered) button.hidden = !offered;
-  const pressed = sideUnreadOnly ? "true" : "false";
-  if (button.getAttribute("aria-pressed") !== pressed) button.setAttribute("aria-pressed", pressed);
-}
-
-/**
- * The reader pressed Unread only. A filter, so the card the reader is on stays where it is, or the
- * nearest card left when it goes (`keepingCardPlace`, as `#243 filter-keeps-selection` keeps a list
- * of messages); kept on this device, as the layout button's choice is.
- *
- * @param {boolean} on
- */
-function setSideUnreadOnly(on) {
-  sideUnreadOnly = on;
-  try {
-    localStorage.setItem(SIDE_UNREAD_KEY, on ? "on" : "off");
-  } catch (_error) {
-    // A browser that refuses storage still honours the choice for this session.
-  }
-  renderSideUnreadToggle();
-  refilterSideCards();
-}
+// `#432 read-mode-unify`. Unread only (`#259 thread-list-unread-filter`) was the cards' own filter, a
+// chip and a choice kept on this device. It is the read mode now, as for every list: Hide read leaves the
+// read threads out, Fold read folds them into runs (`foldCardRuns`), Show read shows them.
 
 /** `filterSideCards`, the reader's place in the cards kept: the search typed, opened or closed. */
 function refilterSideCards() {
@@ -42220,7 +42257,7 @@ function refilterSideCards() {
 // threads by last updated, **Unpack msgs** (key u; "Unpack all" until `#421 chip-states`) draws each thread's messages under its card, in
 // time order, joined by the same bridge All's gathering draws (`#215 reply-coalesce`), tinted by
 // the thread's colour. The read modes apply inside each block as they do in a thread: under
-// Collapse read a run of read rows is one grey line hanging off the spine by its own stub; under
+// Fold read a run of read rows is one grey line hanging off the spine by its own stub; under
 // Hide read read rows are absent. Blocks are later siblings of their card in `#side-cards`, never
 // children, so every walk that knows cards by `data-card` is untouched. A thread whose replies the
 // store does not hold in full is read only as its block nears the screen, at most a few at a time,
@@ -42345,7 +42382,7 @@ function unpackSignature(choice, held) {
  * Thread `choice`'s unpacked block: its message rows under its card, bridged. They are the rows a
  * thread draws, built, dressed and folded by the code that draws a thread (`#407 unpack-row-parity`):
  * `discordNode` over `glom`, the dress of every channel row (`dressChannelRow`), what Hide read keeps
- * of a thread (`readFilterKeeps`) and the runs Collapse read folds (`readRunPlan`), each opened as in
+ * of a thread (`readFilterKeeps`) and the runs Fold read folds (`readRunPlan`), each opened as in
  * the thread. Built in the right column (`renderSideCards`), whose list the keys and the mouse move
  * through here (`sidePane`), so a key on a row and a press of its own button act in the same column.
  * Under a summarized card the root is the first child, kept under every read mode and never in a run
@@ -42377,7 +42414,7 @@ function unpackBlock(choice, tally) {
     row.style.setProperty("--thread-hue", threadHue(choice.id));
     row.replaceChildren(bridgePiece(), ...row.children);
   });
-  const placed = readMode === "collapse" && !readRunsSuspended()
+  const placed = readMode === "fold" && !readRunsSuspended()
     ? readRunPlan(rows, viewKey("thread", choice.id), (row) => rowIsRead(row) && !row.hasAttribute("data-root-child"))
     : new Map();
   for (const row of rows) {
@@ -42502,8 +42539,8 @@ async function readUnpackThread(id) {
 //     stands for: what Main draws, less its threads' roots. Each is a message row, built and dressed by the
 //     code every list's rows are (`discordNode`, `dressChannelRow`), marked `data-main-row`, and placed
 //     among the cards in the list's order, a card where its thread last moved and a message where it was
-//     posted. Unread only keeps those still to do, the search finds them by their words, and Hide read
-//     leaves out the read ones, as it does in Main.
+//     posted. The search finds them by their words, Hide read leaves out the read ones, as it does in
+//     Main, and Fold read folds them into the cards' runs (`foldCardRuns`, `#432 read-mode-unify`).
 //   * MADE A THREAD WHERE IT IS. Thread or Reply on one opens the reply in the list under it (`#410
 //     inline-reply-editor`), bound for a new thread where the service starts one on a reply's say-so (the
 //     new-thread choice ticked; Slack threads every reply anyway), not the thread view.
@@ -42775,6 +42812,88 @@ function placeMainCard() {
   if (box.hasAttribute("data-main-card") !== wanted) box.toggleAttribute("data-main-card", wanted);
 }
 
+// --- runs of read threads over the cards (#432 read-mode-unify) ------------------------------------------
+//
+// The owner, 2026-10-22: "the thread view will respect show/hide/collapse for unread. Whether thread cards
+// are packed or unpacked it will simply follow the rule that a thread card with any unread-children acts as
+// an unread, and with 100% read acts as read. That does mean we would in collapsed mode show separator
+// lines that say e.g. '... 3 read threads ...'". So under Fold read the cards' list folds as a list of
+// messages does (`readRunPlan`, the one rule of the runs): its items are the cards, each standing with the
+// rows unpacked under it, and Main channel's rows (`#419`); a run of two or more read items in a row, never
+// the last, is one line on its first item, "… 3 read threads …" (and "and 2 read messages" where Main's
+// rows are in it), a tap or Enter opening it (`openReadRun`). A read thread outside a run keeps its
+// unpacked rows folded as a thread's are (`unpackBlock`).
+
+/** The key the cards' opened runs are kept under, by channel (`openedReadRuns`). */
+const cardRunKey = () => `cards:${String(el("discord-channel").value)}`;
+
+/** What an item of the cards stands for in a run: a card its thread, a Main row its messages. */
+const cardRunIds = (row) => (row.hasAttribute("data-card") ? [`card:${row.getAttribute("data-id")}`] : idsOf(row));
+
+/** Whether an item of the cards is read: a card by its thread (`threadIsRead`), a Main row by its messages. */
+const cardRunRead = (row) => (row.hasAttribute("data-card") ? row.hasAttribute("data-thread-read") : rowIsRead(row));
+
+/** What the line of a run over the cards says: how many read threads, and read messages of Main's. */
+function cardRunText(threads, messages) {
+  const parts = [];
+  if (threads > 0) parts.push(`${threads} read thread${threads === 1 ? "" : "s"}`);
+  if (messages > 0) parts.push(`${messages} read message${messages === 1 ? "" : "s"}`);
+  return `… ${parts.join(" and ")}`;
+}
+
+/** The items of the run whose line is on `head`, the line's item first: cards and Main rows, not unpacked rows. */
+function cardRunRows(head) {
+  const rows = [...(head.parentNode || leftEl("side-cards")).children];
+  const run = [head];
+  for (let at = rows.indexOf(head) + 1; at < rows.length; at += 1) {
+    const row = rows[at];
+    if (row.getAttribute("data-card-run") === "member") continue;
+    if (row.getAttribute("data-read-run") !== "member" || row.hasAttribute("data-unpack-thread")) break;
+    run.push(row);
+  }
+  return run;
+}
+
+/**
+ * Fold the runs of read items over the cards in `list` under Fold read, and undo them otherwise: each run's
+ * line on its first item, its other items hidden, and the rows unpacked under its cards marked as in the run
+ * (`data-card-run`), over the folds of their own block, which come back when the run is opened.
+ */
+function foldCardRuns(list) {
+  const rows = /** @type {HTMLElement[]} */ ([...list.children]);
+  const items = rows.filter((row) => row.hasAttribute("data-card") || row.hasAttribute("data-main-row"));
+  const placed = readMode === "fold" && !readRunsSuspended()
+    ? readRunPlan(items, cardRunKey(), cardRunRead, cardRunIds) : new Map();
+  const isItem = new Set(items);
+  /** @type {{row: HTMLElement, threads: number, messages: number} | null} */
+  let run = null;
+  const say = () => {
+    if (!run) return;
+    const line = readRunLine(run.row);
+    const words = cardRunText(run.threads, run.messages);
+    if (line.textContent !== words) line.textContent = words;
+    line.setAttribute("title", `Show ${words.replace(/^… /, "these ")}`);
+  };
+  for (const row of rows) {
+    if (isItem.has(row)) {
+      const role = (placed.get(row) || { role: null }).role;
+      if (role !== "member") {
+        say();
+        run = role === "head" ? { row, threads: 0, messages: 0 } : null;
+      }
+      placeInReadRun(row, role, 0);
+      if (run) {
+        if (row.hasAttribute("data-card")) run.threads += 1;
+        else run.messages += idsOf(row).length;
+      }
+      continue;
+    }
+    if (run) row.setAttribute("data-card-run", "member");
+    else if (row.hasAttribute("data-card-run")) row.removeAttribute("data-card-run");
+  }
+  say();
+}
+
 /**
  * One card. Every string is text; nothing from the chat service is parsed as markup.
  *
@@ -42783,7 +42902,7 @@ function placeMainCard() {
  * but the button under it, which goes into the thread and says how many replies it has and how many of
  * them are unread (`cardOpener`). Beside that, how long since the thread moved.
  */
-function sideCard({ choice, text, root, age, replies, unread }) {
+function sideCard({ choice, text, root, age, replies, unread, read }) {
   const row = document.createElement("li");
   row.className = "side-card-row";
   // `data-id` and `data-card`: the keys move through the cards as through messages, and know them apart.
@@ -42802,8 +42921,10 @@ function sideCard({ choice, text, root, age, replies, unread }) {
   const facts = document.createElement("span");
   facts.className = "side-card-facts";
   facts.textContent = age;
-  // `#259 thread-list-unread-filter`: what Unread only keeps.
+  // `#259 thread-list-unread-filter`: the card's "N unread" or "N new".
   if (unread) row.setAttribute("data-unread", "");
+  // `#432 read-mode-unify`. Read: every message of its thread, root and replies, as the read modes see it.
+  if (read) row.setAttribute("data-thread-read", "");
   const open = cardOpener("side-card", replies, unread, () => guardQuietly(() => enterCard(choice.id, choice.summary, row))());
   row.append(button, facts, open);
   // A press on the card's facts, or on its edge round the buttons, is a press on the card. Its two
@@ -49359,7 +49480,6 @@ for (const id of ["thread-card", "side-thread-card", "pane-discord", "side-pane"
 el("side-more-threads").addEventListener("click", guardQuietly(loadOlderThreads));
 // `#262 search-load-older`. The cards' own way further back for the search, and Stop while it walks.
 leftEl("side-search-replies").addEventListener("click", guardQuietly(repliesControlPressed));
-leftEl("side-unread-only").addEventListener("click", () => setSideUnreadOnly(!sideUnreadOnly));
 // `#404 threads-unpack-all`. Every thread's messages under its card, in the Threads view.
 leftEl("side-unpack").addEventListener("click", () => setThreadsUnpacked(!threadsUnpacked));
 leftEl("side-main").addEventListener("click", () => setMainRowsShown(!mainRowsShown));

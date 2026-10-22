@@ -3,7 +3,7 @@
 
 `#221 read-modes`. The owner opens a thread to read the agent's answer. The page lands on the
 thread's first unread message, unfolded, under the floating pill; and the Hide read button cycles
-Show read, Collapse read and Hide read. The fake-DOM suite pins every branch. This proves what only a
+Show read, Fold read and Hide read. The fake-DOM suite pins every branch. This proves what only a
 browser engine can: where the rows really are once laid out, that the "… N read messages …" line is
 a real 44px target drawn in place of a row's tile, and that a real tap on it opens the run without
 moving the reader.
@@ -17,7 +17,7 @@ touch) and 1280x800 (a desk, mouse) the walk is:
   sign in, open the channel in All, whose dock on a desk is one row in every mode, with the
   button's whole name stacked in two short lines there -> Show read: pick the thread, which lands on the answer,
   unfolded, at the head of the list under the pill, with nothing collapsed -> back to All, tap the
-  button on to Collapse read, which names itself -> pick the thread again: its root at the head,
+  button on to Fold read, which names itself -> pick the thread again: its root at the head,
   one line "… 45 read messages …" at least 44px tall and every point of it pressing it, the answer
   unfolded below in the upper half of the screen -> tap the line: the run opens where it is, the
   root unmoved, no message given the focus -> enter again and press Enter on the line: the run
@@ -34,7 +34,7 @@ Then, in a fresh profile at the same size, the thread is an OLD one: All's windo
 answer and the six messages after it, and says there is more, so the thread's root precedes it.
 `#221 read-modes` x `#220 view-switch-instant`. The walk is:
 
-  sign in, open the channel in All, tap the button on to Collapse read -> pick the thread, whose
+  sign in, open the channel in All, tap the button on to Fold read -> pick the thread, whose
   read the server holds back: the rows All holds are drawn at once and the page lands on the answer,
   unfolded, under the pill, with no root yet -> the read lands: the root at the head, the
   "… 45 read messages …" line, the answer still unfolded below it in the upper half of the screen,
@@ -498,7 +498,7 @@ def tap(page: Page, selector: str, touch: bool) -> None:
 def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict[str, float]) -> list[str]:
     """One reader's walk through the three modes; returns what was measured, one line per step.
 
-    Where Collapse read put the root, the line and the answer is left in `collapsed`.
+    Where Fold read put the root, the line and the answer is left in `collapsed`.
     """
     notes: list[str] = []
 
@@ -561,19 +561,19 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
     notes.append(f"Show read: answer unfolded at {top:.0f}px under the pill at {floating:.0f}px")
     shot("1-show-read-entry")
 
-    # Collapse read: root, one line, the answer.
+    # Fold read: root, one line, the answer.
     back_to_all()
-    cycle_to("Collapse read")
+    cycle_to("Fold read")
     m = measure(page)
-    check(m["mode"] == ["Collapse read", "mixed", "collapse"], f"{size}: Collapse read is said as {m['mode']}")
-    check(m["icons"] == ["collapse"], f"{size}: Collapse read draws icons {m['icons']}")
-    dock_holds(m, "Collapse read")
-    check(m["labelFits"] is True, f"{size}: the words 'Collapse read' touch or cross the button's sides")
+    check(m["mode"] == ["Fold read", "mixed", "fold"], f"{size}: Fold read is said as {m['mode']}")
+    check(m["icons"] == ["fold"], f"{size}: Fold read draws icons {m['icons']}")
+    dock_holds(m, "Fold read")
+    check(m["labelFits"] is True, f"{size}: the words 'Fold read' touch or cross the button's sides")
     m = settled_entry()
     floating = number(m, "floating")
     root_top = number(m, "root", "start")
     check(floating <= root_top <= floating + 16,
-          f"{size}: Collapse read did not keep the root at the head: {root_top:.0f}px under {floating:.0f}px")
+          f"{size}: Fold read did not keep the root at the head: {root_top:.0f}px under {floating:.0f}px")
     check(m["heads"] == 1 and m["members"] == READ_REPLIES - 1,
           f"{size}: the run is {m['heads']} lines over {m['members']} hidden rows, not one over {READ_REPLIES - 1}")
     check(m["lineText"] == f"… {READ_REPLIES} read messages …", f"{size}: the line says {m['lineText']!r}")
@@ -591,7 +591,7 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
           f"{size}: the answer starts at {answer_top:.0f}px, below the upper half of the room under the pill")
     check(m["answerFolded"] == "false", f"{size}: the answer is folded")
     check(number(m, "overflow") <= 0, f"{size}: the page scrolls sideways by {number(m, 'overflow'):.0f}px")
-    notes.append(f"Collapse read: root at {root_top:.0f}px, line {line_height:.0f}px tall at {line_top:.0f}px, "
+    notes.append(f"Fold read: root at {root_top:.0f}px, line {line_height:.0f}px tall at {line_top:.0f}px, "
                  f"answer unfolded at {answer_top:.0f}px")
     collapsed.update(root=root_top, line=line_top, answer=answer_top)
     shot("2-collapse-read-entry")
@@ -720,7 +720,7 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
 
 def held_walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict[str, float],
               gate: threading.Event) -> list[str]:
-    """An old thread in Collapse read: drawn from the rows All holds, then read behind them.
+    """An old thread in Fold read: drawn from the rows All holds, then read behind them.
 
     The thread's read is held at `gate` until the rows All held have been measured.
     """
@@ -744,11 +744,11 @@ def held_walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed:
                            timeout=10_000)
     page.wait_for_timeout(300)
     for _tap in range(3):
-        if named() == "Collapse read":
+        if named() == "Fold read":
             break
         tap(page, "#todo-filter", touch)
         page.wait_for_timeout(250)
-    check(named() == "Collapse read", f"{size}: the cycle never reached Collapse read")
+    check(named() == "Fold read", f"{size}: the cycle never reached Fold read")
 
     # All's window does not reach the root, so the picker offers the thread once a touch has read the
     # channel's thread list, as it does for a thumb.

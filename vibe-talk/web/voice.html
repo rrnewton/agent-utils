@@ -680,20 +680,17 @@
             <div id="side-heading">
               <span id="side-title">Thread list</span>
               <!--
-                `#259 thread-list-unread-filter`. The owner: "Some have "N unread" and others are fully
-                read... I would like a toggle at the top in the banner that says "Threads" in the upper
-                left to filter it to unread only." Beside that heading, and only while it heads the
-                cards: pressed, the cards are the threads with unread replies, by the rule of the chip
-                that says "N unread" or "N new" on a card. Kept on this device.
+                `#432 read-mode-unify`. Unread only (`#259 thread-list-unread-filter`) stood here: the read
+                mode does what it did, for the cards as for every list (Hide read, Fold read, Show read;
+                the button in the bar and key h).
               -->
-              <button id="side-unread-only" class="chip" type="button" aria-pressed="false" title="Show only the threads with unread replies" hidden>Unread<span class="chip-more"> only</span></button>
               <!--
                 `#404 threads-unpack-all`. The owner, 2026-10-21: bridging one thread in All breaks
                 when another is bridged; he wants every thread chained at once. In the Threads view
                 (Cmd+3) this toggle unpacks each thread's messages under its card, bridged as in
                 All. Only over the cards of the Threads view. Kept on this device; key u.
               -->
-              <button id="side-unpack" class="chip" type="button" aria-pressed="false" title="Show every thread's messages under its card" hidden>Unpack<span class="chip-more"> msgs</span></button>
+              <button id="side-unpack" class="chip" type="button" aria-pressed="false" title="Show every thread's messages under its card" hidden>Unpack msgs</button>
               <!--
                 `#419 threads-view-main-messages`. The owner, 2026-10-21: "we have room for one more button
                 -- a toggle to show Main msgs. When that is on we should see messages to the main channel
@@ -709,8 +706,7 @@
                 the top of the thread view is to order by thread creation vs latest update ... start with
                 that and if we add more sort orders make it a drop down." It says the order the cards are
                 in, Latest update or Thread created, and a press goes on to the next. Only over the Threads
-                view's cards. Kept on this device; key d. On a phone it says "Latest" or "Created", and with four
-                chips beside the title its neighbours say "Unread" and "Unpack" there (web/voice.css).
+                view's cards. Kept on this device; key d. On a phone it says "Latest" or "Created" (web/voice.css).
               -->
               <button id="side-order" class="chip" type="button" aria-pressed="false" aria-label="Order: Latest update" title="In order of latest update: the threads by when each last moved. Press for thread created" hidden><span id="side-order-whole" class="chip-whole">Latest update</span><span id="side-order-short" class="chip-short">Latest</span></button>
               <!--
@@ -2165,7 +2161,7 @@
                 on, and the Undo chip names it. Shift+E marks it read and folds it, the ring staying on
                 it: Done here, and read in the chat service too where this server can move its read
                 marker, as a reply you send marks what it answers; the status line says where. Under
-                Collapse read a message that joins a run of read messages takes the ring to the run's
+                Fold read a message that joins a run of read messages takes the ring to the run's
                 line; under Hide read it goes, and the ring moves to the next message.
                 Marking every message above one Done has no key: it is Through here in the
                 message's ⋯ menu, with Undo after it. A list that scrolls under a mouse you are not
@@ -2366,7 +2362,7 @@
               <p class="hint">
                 On <strong>Main</strong>, a message whose thread holds unread replies says how many
                 beside its <strong>N replies</strong>: <strong>M unread</strong>, which opens the thread
-                at the first of them. <strong>Hide read</strong> and <strong>Collapse read</strong>
+                at the first of them. <strong>Hide read</strong> and <strong>Fold read</strong>
                 keep that message in view, though it is read itself. It counts the replies this page
                 holds; <strong>M+ unread</strong> means there may be more, and <strong>N new</strong>
                 means the chat service reports replies this page has not loaded yet, which a tap
@@ -2398,7 +2394,7 @@
               <p class="hint">
                 The button beside Pace says what the list does with messages already read —
                 archived, your own, or read automatically — and a tap moves it on to the next:
-                <strong>Show read</strong> shows them greyed; <strong>Collapse read</strong> turns
+                <strong>Show read</strong> shows them greyed; <strong>Fold read</strong> turns
                 each run of two or more into one line, <em>… 12 read messages …</em>, which a tap
                 opens, while keeping a thread's first message and the newest message in view;
                 <strong>Hide read</strong> takes them out of the list entirely, which is what turns
@@ -2455,7 +2451,7 @@
                 again; <kbd>Shift</kbd>+<kbd>M</kbd> does the same. Your messages are the ones drawn as
                 yours, on the right. A message has to pass every filter in the bar: the search text,
                 Links, Pinned and whose it is. On a chat service with threads Hide read steps aside
-                while one of them is on, as Collapse read does, so your own messages show even when
+                while one of them is on, as Fold read does, so your own messages show even when
                 they count as read; on one without, Hide read still applies, and with your own
                 messages counted as read it leaves none of yours to show.
               </p>
@@ -2484,8 +2480,10 @@
                 left in. The thread list is a card for each of the channel's threads, across the
                 window, newest activity at the bottom as in the channel, each as its name and summary
                 when they have been summarised, or else its first message, three lines at most;
-                <strong>Unread only</strong> beside its heading narrows the list to the threads with
-                unread replies, and is remembered on this device. <strong>Main channel</strong> beside it
+                the read mode in the bar (<kbd>h</kbd>) applies to the cards as to every list: a thread
+                is read when all its messages are, <strong>Hide read</strong> leaves read threads out and
+                <strong>Fold read</strong> folds each run of them into one line, <em>… 3 read
+                threads …</em>. <strong>Main channel</strong> beside its heading
                 (key <kbd>a</kbd>, remembered too) adds the main channel's messages that are not threads
                 yet, among the cards in the order they were posted, and puts the main channel's message
                 box at the foot of the list as its last card: <strong>Reply</strong> or
@@ -2574,7 +2572,7 @@
               </p>
               <p class="hint">
                 With this on they are greyed in the channel, collapsed under
-                <strong>Collapse read</strong> and left out of the list under
+                <strong>Fold read</strong> and left out of the list under
                 <strong>Hide read</strong>. It is not an archive: nothing is recorded on the
                 server, there is nothing to undo, and turning it off brings every one of them
                 straight back. Nothing here changes anything in the source chat service.
@@ -3412,7 +3410,7 @@
           The archive filter, in the BAR. It changes what the list is, so it belongs beside the
           other things that act on the list rather than inside the list it filters.
 
-          `#221 read-modes`: a cycle of three — Show read, Collapse read, Hide read — and it names
+          `#221 read-modes`: a cycle of three — Show read, Fold read, Hide read — and it names
           the one the list is in. One icon per mode, the others `hidden` by web/voice.js: an eye for
           everything shown, a line of dots between two rules for runs collapsed to a line, and the
           filter it always was for read messages left out. The name is two words in two spans, so
@@ -3424,7 +3422,7 @@
             <path d="M2.5 12s3.5-6.5 9.5-6.5 9.5 6.5 9.5 6.5-3.5 6.5-9.5 6.5S2.5 12 2.5 12z" />
             <circle cx="12" cy="12" r="2.6" />
           </svg>
-          <svg class="control-icon read-mode-icon" data-mode="collapse" hidden viewBox="0 0 24 24" aria-hidden="true" fill="none"
+          <svg class="control-icon read-mode-icon" data-mode="fold" hidden viewBox="0 0 24 24" aria-hidden="true" fill="none"
                stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
             <path d="M4 5h16M4 19h16" />
             <path d="M7 12h.01M12 12h.01M17 12h.01" stroke-width="2.6" />

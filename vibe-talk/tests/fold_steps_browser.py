@@ -91,7 +91,8 @@ STILL_PX = 1.0
 # How long after each press the reader's row is watched, frame by frame.
 WATCH_MS = 800
 
-SAID = {"expand": "Expanded all", "unread": "Expanded unread, collapsed read", "collapse": "Collapsed all"}
+SAID = {"expand": "Long messages: all expanded", "unread": "Long messages: unread expanded, read collapsed",
+        "collapse": "Long messages: all collapsed"}
 
 
 def message_id(index: int) -> str:

@@ -48,8 +48,8 @@ four views are offered, in the view picker and on Ctrl+1 to Ctrl+4 (Cmd on a Mac
   at that end; **Older threads…** above the oldest card reads further back. Esc goes back to the view
   it was chosen from. A thread opened from a card opens across the window, the card moving up to
   head it; every thread opened across the window, however it was opened, is headed by its card, and
-  the card's × (or Esc, or ←) goes back to where it was opened from. **Unpack msgs** beside **Unread
-  only** (key `u`, kept on this device) draws every thread's messages under its card at once, in time
+  the card's × (or Esc, or ←) goes back to where it was opened from. **Unpack msgs** in its heading
+  (key `u`, kept on this device) draws every thread's messages under its card at once, in time
   order on a bridge in the thread's colour, as **N replies** gathers one thread in **All**; the read
   modes apply inside each thread, a collapsed run of read messages hanging off its bridge. The
   unpacked messages are message rows like any other: the mouse lights them, ↓/↑ and j/k walk cards
@@ -196,7 +196,7 @@ Marking read is what the message's own read action does. Once the chat service h
 reply, the message is marked Done exactly as its **Done** button would mark it: on the server, at
 once on screen in both columns, with the **Undo** chip to take it back, and with the bookmark line
 sliding on if it was right above that message. Its button then reads **Unarchive**, **Hide read**
-leaves it out, **Collapse read** folds it, and a thread's count of unread replies on Main stops
+leaves it out, **Fold read** folds it, and a thread's count of unread replies on Main stops
 counting it. Where the chat service lets vibe-talk move its own read marker — where the **⋯** menu
 offers **In** *the service* **only** — that marker is then moved through the message as well, as
 that item moves it: for the whole space, and never backward. It is moved only once that Done is
@@ -280,7 +280,7 @@ bar, does. **Thread(N)** opens a message's thread.
 **On Main, a message whose thread holds unread replies says how many.** Beside its **N replies**, a
 chip in the accent says **M unread**, and a tap on it opens the thread at the first of them. Unread is
 what the read modes call unread: not Done, not your own words, not a placeholder read automatically.
-Such a message stays in the list under **Hide read**, and is never folded into a run under **Collapse
+Such a message stays in the list under **Hide read**, and is never folded into a run under **Fold
 read**, although it is still drawn as read itself. The count follows replies as they arrive, as they
 are marked Done here or on another device — Main's own refresh says which, with no read of All or
 the thread — and as you answer in the thread, your own words counting as read and the reply you
@@ -619,7 +619,7 @@ under `vibe-talk.voice.ui-state` and reopens on it:
   All where its chat service has threads and in Main where it has none. The 50 channels most
   recently on screen keep their choice, and fewer when long thread roots would make the record
   large; the least recently used give theirs up first.
-- **The read mode**: Show read, Collapse read or Hide read.
+- **The read mode**: Show read, Fold read or Hide read.
 - **The message you were reading**, at the same height on the screen — the message, not a pixel
   offset. If you were on the newest message, or yours is no longer on the device, the newest.
 - **One read.** The reopened view is drawn from the saved messages first, and the single newest-page
@@ -6047,7 +6047,7 @@ size of the channel.
   Until it lands, "dealt with" here is always **declared** — which is also why nothing yet has to
   decide what happens when derived and declared disagree.
 
-### Show read, Collapse read, Hide read
+### Show read, Fold read, Hide read
 
 `#221 read-modes`. The button beside Pace names what the list does with messages already read —
 archived (Done), your own words, and placeholders read automatically — and each tap moves it on.
@@ -6055,7 +6055,7 @@ Each mode has its own icon and is named in full beside it — on a desk's one-ro
 lines, so the row stays one row — and the tooltip says what the mode does and what a tap moves to:
 
 - **Show read** (the default): every message, the read ones greyed.
-- **Collapse read**: each run of two or more read rows becomes one line, `… 12 read messages …`,
+- **Fold read**: each run of two or more read rows becomes one line, `… 12 read messages …`,
   counting messages rather than rows, and a tap on the line opens that run. A thread's first
   message and the newest message in the list stay in view however read they are: the first says
   what the thread is about, the newest is where the conversation stands. A run grows, shrinks or
@@ -6065,10 +6065,19 @@ lines, so the row stays one row — and the tooltip says what the mode does and 
   a run opens it.
 - **Hide read**: read messages are left out, the queue it always was.
 
-What counts as read is one rule for every mode, so Collapse read collapses exactly what Hide read
+What counts as read is one rule for every mode, so Fold read collapses exactly what Hide read
 hides. On Main, a message whose thread holds unread replies, or new ones the page has not loaded, is
 kept by both, as though it were unread itself (`#222 unread-replies`; see "A message's replies can be gathered under it" above). The mode is kept with the rest of the UI state; a record written before the modes, which
 says only whether Hide read was on, is read as Hide read or Show read.
+
+`#432 read-mode-unify`. **Fold read was called Collapse read**: "collapse" is now only the long message
+held to a few lines (the `;` and `:` keys and the Expand all and Collapse all chips), "fold" the run lines.
+A record saying Collapse read opens in Fold read. **`h` is the read mode's key**, the button's own act, so
+the key, the button's words and the list are one state; it says the mode on the status line ("Fold read:
+read runs folded."). The owner had pressed `:` for it: that key steps the long messages, whose notice said
+"Expanded unread, collapsed read" and now says "Long messages: …". And **the read mode reaches the
+Threads view's cards** (see "The thread list" below): Hide read leaves read threads out, Fold read folds
+runs of them into "… 3 read threads …".
 
 `make -C vibe-talk read-modes-browser` enters a thread with a 45-message read run in each mode in a
 real Chromium at 412x915 and 1280x800, against a loopback fake API, and checks where the first unread
@@ -6490,7 +6499,7 @@ reads and the message you scrolled to is kept where it is instead. With nothing 
 the sentence where the messages were says how far back that is: *Nothing in the 643 messages loaded so
 far, back to Sep 28, matches that search.*
 
-**Hide read steps aside while a search chooses rows**, on a chat service with threads, as Collapse read
+**Hide read steps aside while a search chooses rows**, on a chat service with threads, as Fold read
 does: an old match is read by definition, and a walk under Hide read would read pages and draw almost
 nothing of them. Read matches show greyed, the read mode kept on the device is untouched, and closing
 the search brings Hide read back. On a chat service without threads Hide read is a list of its own,
@@ -6647,14 +6656,14 @@ list jumped and the message he had just found was gone.
 
 So every change of what the list shows keeps the reader's message where it is on the screen: the
 search text typed or cleared, the search closed (Escape or the glass), **Pinned** and **Links** on or
-off, **PRs**, **Commits** and **Actions**, and **Show read**, **Collapse read** and **Hide read**. The
+off, **PRs**, **Commits** and **Actions**, and **Show read**, **Fold read** and **Hide read**. The
 message kept is the **selected** one while it is on screen — chosen by the keys, the mouse, or
 silently by a tap — and otherwise the one at the top of the screen, or the newest line for a reader
 on it. Afterwards it stands at the same height, as near as the ends of the list allow:
 
 - a pin that is the second part of a post the channel combined into one row stands where
   it stood in the Pinned list, and the part above it goes above the screen's line, not below it;
-- under **Collapse read**, a message folded into a run is kept by the run's line;
+- under **Fold read**, a message folded into a run is kept by the run's line;
 - a message the new filter hides is replaced by the **nearest one shown**, in channel order, and
   when it was the selection the status line says why — "Not pinned", "Filtered out", "Hide read
   hides it". Turned back without a scroll, the filter is a round trip: the message comes back where
@@ -6772,7 +6781,7 @@ together when a display name arrives later. Ages use one compact scale: `now`, `
 
 The **thread list** is the right column of two columns on its own, across the window, at every
 width, a phone's included: one rendering of the channel's threads, so the two never drift apart. Its
-heading says **Thread list**, with **Unread only** beside it; each card is the thread's name and summary
+heading says **Thread list**, with its chips beside it; each card is the thread's name and summary
 where the summariser has given them, else its first message, three lines at most, then how long since
 it moved, its replies and how many are unread, newest activity at the foot. **Older threads…** above
 the oldest card reads the next page of the channel's thread list where the reader is, and a failed
@@ -6803,7 +6812,7 @@ A thread that began before All's window is drawn at once from the replies the pa
 (`#220 view-switch-instant`) and lands on the first unread among them, expanded. Those replies never
 include the thread's first message, so the read behind them brings it in, with the older replies,
 and the landing is made again as though they had all been there from the start: the first message
-goes to the head when both fit in the upper half of the screen, as above (under Collapse read: the
+goes to the head when both fit in the upper half of the screen, as above (under Fold read: the
 first message, then "… 12 read messages …", then the expanded message), and otherwise the unread
 message stays exactly where it landed. Either way it stays expanded, even when the read joins an
 earlier message of the same author onto its row, and another read that overtakes this one (a live
@@ -7402,13 +7411,13 @@ from, so it cannot name a key the page does not answer.
 | Ctrl+[, Ctrl+] (Cmd on a Mac) | Back to where you were before, and forward again, in every view: Main, All, the thread list, two columns, a thread, Settings, Help (see below) |
 | Home, End | The top of the list or its newest message, and select it |
 | `e`, or Ctrl+E (Cmd+E) | Done or not Done; marked Done, the ring moves on to the next unread below. The chord does it from a message box or the search too, where `e` is typed: on the message the keys act on, the box keeping the focus and the draft (on a Mac, Ctrl+E in a box is the box's own end of line, so there it is Cmd+E) |
-| Shift+E | Read and collapse: the selected message marked Done, as `e` marks it, and read in the chat service too where it can be, as a sent reply marks what it answers; then folded, the ring staying on it — under Collapse read, on the "… read messages …" line of a run it joins; under Hide read, on the next message, as it goes. Never puts a message back |
+| Shift+E | Read and collapse: the selected message marked Done, as `e` marks it, and read in the chat service too where it can be, as a sent reply marks what it answers; then folded, the ring staying on it — under Fold read, on the "… read messages …" line of a run it joins; under Hide read, on the next message, as it goes. Never puts a message back |
 | `z` | Undo the last Done |
 | Shift+B | Put the bookmark just above the selected message; on the message right under it, take it away |
 | `r`, `p`, `s`, `.`, `i` | Reply, pin, read aloud, the ⋯ menu, the message details |
 | Ctrl+C (Cmd+C) or `y` | Copy the highlighted message, all of its text as written; on a thread card, its first message. With text selected, or in a text box, Ctrl+C is the browser's copy as ever (see below) |
 | Ctrl+1, Ctrl+2, Ctrl+3, Ctrl+4 (Cmd on a Mac) | Main, All, the thread list, two columns — from anywhere, a message box or the search included. The bare `1`, `2`, `3` are retired |
-| `h` | Show read, Collapse read, Hide read, in turn |
+| `h` | Show read, Fold read, Hide read, in turn, as the button in the bar does, in every view, the Threads view's cards included; the status line says which (`#432 read-mode-unify`) |
 | Shift+P, Shift+L | The Pinned and Links filters |
 | `;`, `:`; Ctrl+;, Ctrl+: (Cmd on a Mac) | The long messages, a step a press: expand all, then the unread open and the read folded, then collapse all, and round again; `:` goes the other way. The chords do the same from anywhere, a message box or the search included. See below |
 | `b` or `m` | Back to the bookmark, with the message under it selected |
@@ -7447,7 +7456,7 @@ the row is unread again and the error says why.
 The ring stays on the message, and the list does not move under you: with the message's head on screen
 the rows above it stay put and the rows below close up; with its head scrolled off the top, its foot
 stays where it was (or, for a message taller than the screen read part way through, its head comes to
-the top). The read modes act on it as on any Done: under **Collapse read** a message that joins a run
+the top). The read modes act on it as on any Done: under **Fold read** a message that joins a run
 of read messages goes into it at once, and the ring goes to the run's *… read messages …* line (a read
 message alone between unread ones stays shown, the ring on it); under **Hide read** the message goes,
 and the ring moves on to the next message shown.
@@ -7593,8 +7602,8 @@ round three ways of showing its long messages, a step a press, and `:` steps it 
 Then back to the first. What the keys fold is what the **Expand all** and **Collapse all** chips fold,
 and the chips stay: the long messages of the list on screen, each folded to its opening lines, or under
 **Summaries** to its summary. Not the thread cards, which stay three lines but for the one
-highlighted, and not the runs of read messages behind their lines under Collapse read, which `h` and a
-tap open. Read is the one rule Hide read and Collapse read use: a row is read when every message it
+highlighted, and not the runs of read messages behind their lines under Fold read, which `h` and a
+tap open. Read is the one rule Hide read and Fold read use: a row is read when every message it
 stands for is Done, read automatically, or your own (with that setting on).
 
 **Each list keeps its own step**, for as long as the page is open: Main, All, a thread, the Pinned list
@@ -7655,8 +7664,10 @@ Where it does not stay put:
 
 A list with nothing long in it says so.
 
-The status line says each step for a moment — "Expanded all", "Expanded unread, collapsed read",
-"Collapsed all" — and a screen reader hears it politely. Building this found that a view the page
+The status line says each step for a moment — "Long messages: all expanded", "Long messages: unread
+expanded, read collapsed", "Long messages: all collapsed" — and a screen reader hears it politely. They
+said "Expanded unread, collapsed read" and the like until `#432 read-mode-unify`: read as the read mode's
+notice, they sent the owner looking for run lines these keys never draw (that is Fold read, key `h`). Building this found that a view the page
 held, shown again, came back with its long messages missing from what the chips counted, so after a
 visit to Main the chips offered nothing over All's folded messages; the chips and the keys now read
 the folds from the rows on screen.
@@ -7715,7 +7726,7 @@ with the word *Bookmark* in it, drawn just above one message.
 Where the line is drawn: in Main and All above the first message shown at or after its message (a
 thread reply is placed in Main by its time), in a thread only when its message is in that thread,
 and not in the thread list, the Pinned or Links filters, or while a search is choosing messages.
-Under Collapse read or Hide read it drops to the next message shown, since everything it passes is
+Under Fold read or Hide read it drops to the next message shown, since everything it passes is
 read. Without threads, Hide read is the server's to-do list, which leaves read messages out: there
 a bookmark older than every message shown goes above the first one when the list's window reaches
 its message (the to-do answer's `window_from`), and draws nothing when it is older than the window.
@@ -8501,11 +8512,16 @@ else the thread's first message, three lines at most. The cards run as the chann
 that moves going to the foot and followed there only by a reader already at the foot, and a reader up
 the list kept on their card; closing a thread comes back to the card it was chosen from. At a desk the
 right column scrolls on past its foot into blank room until its last card's top is at half its height
-(`#338 column-overscroll`, under "Room past the right column's foot"). **Unread
-only**, a toggle beside the column's "Thread list" heading (`#259 thread-list-unread-filter`), narrows the
-cards to the threads with unread replies, by the rule of the card's "N unread" or "N new" chip; it is
-kept per device, works with the search, keeps the selected card where it was as it goes on and off,
-and says "No unread threads." over a list it empties. The search over the cards also reads the
+(`#338 column-overscroll`, under "Room past the right column's foot"). **The read
+mode filters the cards** as it filters every list (`#432 read-mode-unify`; until then **Unread only**, a
+toggle of their own, `#259 thread-list-unread-filter`): a thread is unread while any of its messages is,
+its root or a reply, held or only reported (the card's "N unread" or "N new"), and read when all are,
+packed or unpacked. **Hide read** leaves read threads out, their unpacked rows with them, and says "No
+unread threads." over a list it empties; **Fold read** folds each run of two or more read items (a card
+with its unpacked rows, or a Main channel row) into one line, "… 3 read threads …" ("and 2 read
+messages" where Main's rows are in it), a tap or Enter opening it, never the newest card; **Show read**
+shows them all. The search lifts Hide read and Fold read as it does for messages, and the selected card
+stays where it was as the mode changes. The search over the cards also reads the
 replies the page already holds for each thread — each term in the card's words or in its replies —
 and a card found only with its replies says "in replies"; nothing is fetched for it. **Every card stays
 contracted** (`#277 thread-card-focus`): a click on one, or Enter with the keys on it, highlights it —

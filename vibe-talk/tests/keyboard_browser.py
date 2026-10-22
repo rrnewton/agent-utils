@@ -1296,7 +1296,7 @@ def single_selection(walk: Walk, api: FakeApi) -> None:
     # A control a click focused gives the focus up to the message the mouse moves to. Found in review:
     # Show read (or Summarise), clicked, kept the focus with no ring (a click's focus is not
     # `:focus-visible`), the mouse lit a message ring and all, and Enter pressed the button again, the
-    # lit message untouched. Three clicks, Collapse read, Hide read and Show read again, so the list is
+    # lit message untouched. Three clicks, Fold read, Hide read and Show read again, so the list is
     # as it was and only the focus is left behind on the button.
     press(walk.cdp, "j")
     keys_row = one_lit(walk, "j off the long message, before the clicks on Show read")

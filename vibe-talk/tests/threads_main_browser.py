@@ -11,7 +11,7 @@ the main channel's box the last card; Reply on one of those messages opens the o
 
 It serves the checked-out page and the fake API of tests/two_column_browser.py (24 messages, three
 threads), from one loopback origin. At each size: sign in, the thread list from the picker -> the heading
-(title, Unread only, Unpack msgs, Main channel) on the glass's row: its middle level with the glass's
+(title, Unpack msgs, Main channel, the order; Unread only until #432) on the glass's row: its middle level with the glass's
 within a few pixels, every chip ending before the glass begins, nothing past the window's edge -> Main
 messages pressed: the main channel's messages among the cards in time order, the main channel's box the
 last thing in the list -> Reply on an old main-channel message mid-list: the reply's box directly under
@@ -48,7 +48,7 @@ HEADING_JS = """() => {
         if (!n || n.hidden || !n.getClientRects().length) return null;
         const r = n.getBoundingClientRect(); return {left: r.left, right: r.right, top: r.top, bottom: r.bottom}; };
     return {heading: box('side-heading'), glass: box('search-toggle'),
-            chips: ['side-unread-only', 'side-unpack', 'side-main'].map(box),
+            chips: ['side-unpack', 'side-main', 'side-order'].map(box),
             title: box('side-title'), overflow: document.documentElement.scrollWidth - window.innerWidth};
 }"""
 

@@ -13,6 +13,8 @@ The owner, 2026-10-22, of the Threads view (Cmd+3) after `#419 threads-view-main
 * `#426 threads-sort-toggle`: "order by thread creation vs latest update", a chip saying the order.
 * `#430 threads-main-own-sent`: "I still don't see the message that I just sent to the main channel":
   under Hide read the Threads view's main rows left the owner's own message out.
+* `#432 read-mode-unify`: one read mode for every view, the cards included, key h saying it; Fold read
+  (was Collapse read) folds runs of read threads into "... N read threads ...".
 * `#423 back-key-consistency`: "if I press Cmd-[ on the thread list view it jumps back to the Main view but
   it does NOT have kind of navigation (or back?) effect on other views". Ctrl/Cmd+[ and ] walk back and
   forward through the places visited, in every view.
@@ -23,8 +25,8 @@ threads), two of Main's messages (220 and 223) the owner's, from one loopback or
 (All), the Threads view from the picker ->
 
 1. the three chips at rest look alike, each pressed looks like the others pressed and unlike at rest
-   (border, background and words, as computed), and each says its state in aria-pressed; named Unread only,
-   Unpack msgs, and Main channel (Unread, Unpack and Main on a phone);
+   (border, background and words, as computed), and each says its state in aria-pressed; named Unpack msgs,
+   Main channel and Latest update (Main and Latest on a phone; Unread only went with #432);
 2. Main channel on -> Cmd+S from a card: the focus in the box at the foot of the cards, the Threads view
    kept; Reply on a main-channel message, Cmd+S: the reply's box, still the Threads view; Main channel off
    -> Cmd+S goes back to the view the list was chosen from (negative control);
@@ -37,8 +39,12 @@ threads), two of Main's messages (220 and 223) the owner's, from one loopback or
    tests cover Back at the start, Esc as a step back and a page opened on the thread list);
 5. the order chip: the cards by latest update (replica, canary, runner), the chip saying so; d -> by
    creation (runner, replica, canary), the chip "Thread created" ("Created" on a phone) and pressed, the
-   highlighted card still on screen; a reload keeps it; a press goes back; the four chips beside the glass;
-6. Hide read, Main channel on: a message sent from the box at the foot is among the main rows at once.
+   highlighted card still on screen; a reload keeps it; a press goes back; the chips beside the glass;
+6. Hide read, Main channel on: a message sent from the box at the foot is among the main rows at once;
+7. the replica and canary threads read on the server, reloaded: in All, h -> the button says Fold read, the
+   status line says so, and run lines are drawn; the Threads view -> "... 2 read threads" over their two
+   cards, the runner's card (unread, newest) drawn; a tap on the line opens it; h -> Hide read: the two read
+   cards gone, the runner's left; h -> Show read: all three.
 
 No page error and no sideways scroll at any step. Pass --screenshots DIR to keep a PNG of each state;
 --web-root DIR to run against another copy of the page (an older one fails it at the chips).
@@ -64,7 +70,7 @@ if TYPE_CHECKING:
 
 SIZES = (("desk", 1280, 800, False), ("phone", 393, 852, True))
 
-CHIPS = ("side-unread-only", "side-unpack", "side-main")
+CHIPS = ("side-unpack", "side-main", "side-order")
 
 # Main's messages the owner wrote: 220 between the canary thread's last move (218) and the runner's (221).
 OWN_MAIN = ("220", "223")
@@ -125,7 +131,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--screenshots", type=Path, help="directory to write one PNG per state into (default: none)")
     parser.add_argument("--port", type=int, default=0,
                         help="loopback port for the fake server (default: 0, any free port)")
-    parser.add_argument("--only", choices=("chips", "compose", "center", "back", "order", "sent"), action="append",
+    parser.add_argument("--only", choices=("chips", "compose", "center", "back", "order", "sent", "readmode"), action="append",
                         help="run only these parts of the walk, repeatable (default: all of them)")
     parser.add_argument("--size", choices=[size[0] for size in SIZES], action="append",
                         help="walk only at these sizes, repeatable: desk is 1280x800, phone 393x852 (default: both)")
@@ -171,7 +177,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             desk = Desk(page, args.screenshots, f"threads-polish-{label}", width, height)
             page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             sign_in(desk)
-            parts = args.only or ["chips", "compose", "center", "back", "order", "sent"]
+            parts = args.only or ["chips", "compose", "center", "back", "order", "sent", "readmode"]
             if "chips" in parts:
                 chips_walk(desk, touch)
             if "compose" in parts:
@@ -184,6 +190,9 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 order_walk(desk, touch)
             if "sent" in parts:
                 sent_walk(desk)
+            # Last: it marks two threads read on the server, which every later step would see.
+            if "readmode" in parts:
+                read_mode_walk(desk, api)
             check(not errors, f"{label}: the page threw: {errors}")
             context.close()
             return f"{version} at {width}x{height}: " + "; ".join(desk.notes)
@@ -235,8 +244,8 @@ def chips_walk(desk: Desk, touch: bool) -> None:
     looks = {str(found["look"]) for found in rest.values()}
     desk.check(len(looks) == 1, f"the chips at rest do not look alike: {rest}")
     names = {name: str(found["text"]) for name, found in rest.items()}
-    desk.check(names == ({"side-unread-only": "Unread", "side-unpack": "Unpack", "side-main": "Main"} if touch else
-                         {"side-unread-only": "Unread only", "side-unpack": "Unpack msgs", "side-main": "Main channel"}),
+    desk.check(names == ({"side-unpack": "Unpack msgs", "side-main": "Main", "side-order": "Latest"} if touch else
+                         {"side-unpack": "Unpack msgs", "side-main": "Main channel", "side-order": "Latest update"}),
                f"the chips' names: {names}")
     pressed: dict[str, dict[str, object]] = {}
     for name in CHIPS:
@@ -421,7 +430,7 @@ ORDER_CHIP_JS = """() => {
         return {left: r.left, right: r.right, drawn: n.getClientRects().length > 0}; };
     const chip = document.getElementById('side-order');
     return {text: chip.innerText.trim(), label: chip.getAttribute('aria-label'), pressed: chip.getAttribute('aria-pressed'),
-            glass: box('search-toggle'), chips: ['side-unread-only', 'side-unpack', 'side-main', 'side-order'].map(box)};
+            glass: box('search-toggle'), chips: ['side-unpack', 'side-main', 'side-order'].map(box)};
 }"""
 
 
@@ -469,7 +478,7 @@ def order_walk(desk: Desk, touch: bool) -> None:
     desk.wait_for("() => document.getElementById('side-order').getAttribute('aria-pressed') === 'false'", "a press did not go back to latest update")
     desk.check(page.evaluate(CARD_ORDER_JS) == updated, "a press did not put the cards back by latest update")
     desk.notes.append(f"cards by latest update {updated}, d by creation {created} with the highlighted card on screen, kept "
-                      f"across a reload; four chips before the glass")
+                      f"across a reload; the chips before the glass")
 
 
 
@@ -493,6 +502,76 @@ def sent_walk(desk: Desk) -> None:
     desk.shot("6-own-sent-hide-read")
     set_chip(desk, "side-main", False)
     desk.notes.append("under Hide read the message sent from the foot box among the main rows at once")
+
+
+
+# The replica's and the canary's messages, root and replies: their two threads read whole.
+READ_THREADS = ("209", "210", "212", "214", "215", "216", "218")
+
+READ_MODE_JS = """() => ({label: document.getElementById('todo-filter-label').innerText.replace(/\\s+/g, ' ').trim(),
+    mode: document.getElementById('todo-filter').getAttribute('data-read-mode'),
+    status: document.getElementById('status').textContent,
+    lines: [...document.querySelectorAll('#discord-log > li[data-read-run=head], #side-cards > li[data-read-run=head]')]
+        .filter((li) => li.getClientRects().length > 0).map((li) => li.querySelector('.read-run').innerText.replace(/\\s+/g, ' ').trim()).filter(Boolean),
+    cards: [...document.querySelectorAll('#side-cards > li[data-card]')].filter((li) => li.getClientRects().length > 0
+        && !li.hasAttribute('data-read-run')).map((li) => li.getAttribute('data-id'))})"""
+
+
+def read_mode(desk: Desk) -> dict[str, object]:
+    found = desk.page.evaluate(READ_MODE_JS)
+    assert isinstance(found, dict)
+    return found
+
+
+def read_mode_walk(desk: Desk, api: PolishApi) -> None:
+    page = desk.page
+    with api.lock:
+        api.dismissed.update(READ_THREADS)
+    # Reloaded in All, so All is read afresh and knows its replies are Done; reopened on the thread list it
+    # would be drawn from the rows held, the replies' Done arriving with All's own read later.
+    page.select_option("#thread-select", "flat")
+    desk.wait_for("() => document.getElementById('thread-select').value === 'flat'", "the picker did not show All")
+    page.reload(wait_until="load")
+    desk.wait_for("() => document.querySelectorAll('#discord-log > li[data-id], #side-cards > li[data-card]').length > 0",
+                  "the reload drew no list")
+    page.select_option("#thread-select", "flat")
+    desk.wait_for("() => document.getElementById('thread-select').value === 'flat'", "the picker did not show All")
+    desk.settled()
+    while page.get_attribute("#todo-filter", "data-read-mode") != "show":
+        page.click("#todo-filter")
+        desk.settled()
+    page.focus("#scroll-area")
+    page.keyboard.press("h")
+    desk.settled()
+    found = read_mode(desk)
+    desk.check(found["mode"] == "fold" and found["label"] == "Fold read", f"h did not move the button to Fold read: {found}")
+    desk.check(str(found["status"]).startswith("Fold read:"), f"h did not say Fold read: {found['status']!r}")
+    lines = found["lines"]
+    assert isinstance(lines, list)
+    desk.check(len(lines) > 0 and all("read message" in str(line) for line in lines), f"Fold read by h drew no run line in All: {lines}")
+    desk.shot("7-fold-read-all")
+    to_threads(desk)
+    found = read_mode(desk)
+    desk.check(found["lines"] == ["… 2 read threads"], f"the two read threads are not one line: {found}")
+    desk.check(found["cards"] == [RUNNER], f"the unread runner's card is not the one card drawn whole: {found}")
+    desk.shot("7-fold-read-threads")
+    page.click(f"#side-cards > li[data-id='{REPLICA}'] .read-run")
+    desk.settled()
+    found = read_mode(desk)
+    desk.check(found["lines"] == [] and found["cards"] == [REPLICA, CANARY, RUNNER], f"a tap on the line did not open it: {found}")
+    page.focus("#side-scroll")
+    page.keyboard.press("h")
+    desk.settled()
+    found = read_mode(desk)
+    desk.check(found["mode"] == "hide" and found["cards"] == [RUNNER], f"Hide read left a read thread's card: {found}")
+    desk.shot("7-hide-read-threads")
+    page.keyboard.press("h")
+    desk.settled()
+    found = read_mode(desk)
+    desk.check(found["mode"] == "show" and found["cards"] == [REPLICA, CANARY, RUNNER], f"Show read did not bring every card back: {found}")
+    state(desk)
+    desk.notes.append("h in All: Fold read said and drawn; Threads view: '… 2 read threads' over the read cards, opened by a tap; "
+                      "Hide read leaves the runner alone; Show read all three")
 
 
 if __name__ == "__main__":

@@ -459,7 +459,7 @@ const FIXTURE_TREE = {
   "thread-heading": ["thread-card"],
   "thread-card": ["thread-card-text", "thread-card-age", "thread-card-count", "thread-back"],
   // `#298 thread-card-header`. Over a thread the heading is the thread's card, with the X in it.
-  "side-heading": ["side-title", "side-unread-only", "side-unpack", "side-main", "side-order", "side-thread-card"],
+  "side-heading": ["side-title", "side-unpack", "side-main", "side-order", "side-thread-card"],
   "side-thread-card": ["side-thread-card-text", "side-thread-card-age", "side-thread-card-count", "side-close"],
   // `#338 column-overscroll`. Last, the room past the foot: no height, and so nothing in the layout, until the
   // page gives it one, which a test draws with `drawOverscroll`.
@@ -4823,7 +4823,7 @@ const TUNING_BANDS = {
   READ_RUN_MIN_ROWS: [2, 3,
     "the fewest rows a run of read messages collapses at. One trades a message for a line as tall as " +
     "it and hides the reader's own words between the two answers around them; past three, a pair " +
-    "or trio of long read messages between two unread ones is a screen of scrolling Collapse read " +
+    "or trio of long read messages between two unread ones is a screen of scrolling Fold read " +
     "was chosen to take away"],
   // `#222 unread-replies`. How seldom a read of Main may read All behind it for its counts.
   COUNTS_ALL_READ_MS: [120000, 900000,
@@ -15904,7 +15904,7 @@ const shownIds = (page) =>
 
 /**
  * Turn the to-do filter on the way a thumb does. `#221 read-modes`: Hide read is the third of the
- * read modes, so the thumb taps on through Collapse read to it — at most twice from Show read.
+ * read modes, so the thumb taps on through Fold read to it — at most twice from Show read.
  */
 async function turnTodoOn(page) {
   for (let taps = 0; taps < 3 && page.el("todo-filter").getAttribute("aria-pressed") !== "true"; taps += 1) {
@@ -23647,14 +23647,14 @@ test("Shift+E on a short message, which has no fold, marks it and says only that
 });
 
 test("Shift+E UNDER COLLAPSE READ joins the message to the read run round it, the selection on the run's line; UNDER HIDE READ the selection goes on to the next message (#221, #295)", async () => {
-  // Collapse read: unread, two read, unread, two read, then unread. Shift+E on the unread one between
+  // Fold read: unread, two read, unread, two read, then unread. Shift+E on the unread one between
   // the runs joins them, as its Done button's Done does, and the selection is left on what the reader
   // sees there: the line of the run, which the message is now inside.
   const page = newPage();
   const messages = joiningChannel(page);
   await signIn(page);
   await showDiscord(page, messages);
-  await chooseReadMode(page, "Collapse read");
+  await chooseReadMode(page, "Fold read");
   page.el("scroll-area").scrollTop = 0;
   await press(page, page.el("scroll-area"), "ArrowDown");
   for (let i = 0; i < 3 && selectedId(page) !== messages[3].id; i += 1) await pressHere(page, "j");
@@ -23666,7 +23666,7 @@ test("Shift+E UNDER COLLAPSE READ joins the message to the read run round it, th
     "the runs did not join round the message Shift+E marked");
   assert.equal(rowWithId(page, messages[3].id).hidden, true, "the message is still drawn outside the run");
   assert.equal(selectedId(page), messages[1].id, "the selection is not on the run's line");
-  // A read message alone between unread ones is shown, Collapse read's own rule: there the selection
+  // A read message alone between unread ones is shown, Fold read's own rule: there the selection
   // stays on it.
   for (let i = 0; i < 6 && selectedId(page) !== messages[8].id; i += 1) await pressHere(page, "j");
   assert.equal(selectedId(page), messages[8].id);
@@ -25133,7 +25133,7 @@ test("`#239 single-selection`: a key a field took first still says the keys are 
 test("`#239 single-selection`: A COLLAPSED RUN'S LINE, under the mouse, is its row's selection, and j moves on past the run", async () => {
   const page = newPage();
   const messages = runThread(page, { tail: RUN_TAIL });
-  await enterRunThread(page, messages, () => chooseReadMode(page, "Collapse read"));
+  await enterRunThread(page, messages, () => chooseReadMode(page, "Fold read"));
   const rows = page.el("discord-log").children;
   const head = rows[1];
   assert.equal(head.getAttribute("data-read-run"), "head");
@@ -25290,7 +25290,7 @@ test("`#281 view-keys`: CTRL+1 TO CTRL+4 choose Main, All, the thread list and t
     await press(page, page.el("scroll-area"), "h");
     modes.push(mode());
   }
-  assert.deepStrictEqual(modes, ["show", "collapse", "hide", "show"], "h did not cycle the read modes");
+  assert.deepStrictEqual(modes, ["show", "fold", "hide", "show"], "h did not cycle the read modes");
   const tall = await keyboardPage();
   const folded = () => tall.el("discord-log").children.filter((li) => li.getAttribute("data-collapsed") === "true").length;
   assert.ok(folded() > 0);
@@ -25353,7 +25353,8 @@ function foldSteps(page) {
   };
 }
 
-const FOLD_SAID = { expand: "Expanded all", unread: "Expanded unread, collapsed read", collapse: "Collapsed all" };
+const FOLD_SAID = { expand: "Long messages: all expanded", unread: "Long messages: unread expanded, read collapsed",
+  collapse: "Long messages: all collapsed" };
 
 test("`#301 semicolon-expand-cycle`: ; GOES ROUND expand all, the unread open and the read folded, and collapse all, and : the other way, each step said on the status line", async () => {
   const page = await foldStepPage();
@@ -47093,7 +47094,7 @@ async function enterFromHeldRows(page, messages, n, before = async () => {}) {
   return { hold, entering };
 }
 
-for (const mode of ["Show read", "Collapse read", "Hide read"]) {
+for (const mode of ["Show read", "Fold read", "Hide read"]) {
   test(`${mode}: a thread drawn from held rows lands on its first unread at once, and the read behind them leaves it there`, async () => {
     const page = newPage();
     // Two more replies after the answer than RUN_TAIL, so the answer can stand at the head.
@@ -47117,7 +47118,7 @@ for (const mode of ["Show read", "Collapse read", "Hide read"]) {
     assert.equal(answer().getAttribute("data-collapsed"), "false", "the read behind the held rows folded the landed message");
     assert.equal(foldButton(answer()).getAttribute("aria-expanded"), "true");
     assert.equal(answer().getBoundingClientRect().top, top, "the read behind the held rows moved the landed message");
-    if (mode === "Collapse read") {
+    if (mode === "Fold read") {
       assert.equal(readRunLineOf(rowWithId(page, runId(1))).textContent, "… 12 read messages …",
         "the read messages the read brought above the landing were not collapsed");
     }
@@ -47212,10 +47213,10 @@ function entryLayout(page) {
 // An old thread is exactly one whose root precedes All's window, so the held rows never hold its
 // root, and the rule that keeps the root above the first unread when both fit could not apply when
 // the held rows landed. It applies when the read behind them brings the root: the thread ends as one
-// entered with every row of it held. The owner's words for Collapse read: "show the thread root then
+// entered with every row of it held. The owner's words for Fold read: "show the thread root then
 // '… 45 read messages …' then the expanded next message".
 for (const [mode, read, tail, held] of [
-  ["Collapse read", 12, RUN_TAIL, 5],
+  ["Fold read", 12, RUN_TAIL, 5],
   ["Show read", 2, [...RUN_TAIL, ["agent", true], ["own", true]], 7],
 ]) {
   test(`${mode}: an old thread drawn from held rows ends on its root above the first unread when both fit, as one entered with its root held does`, async () => {
@@ -47224,7 +47225,7 @@ for (const [mode, read, tail, held] of [
       const messages = runThread(page, { read, tail });
       const before = async () => {
         await chooseReadMode(page, mode);
-        // A viewport the root and the start of the answer fit in, as in "Collapse read: a thread opens
+        // A viewport the root and the start of the answer fit in, as in "Fold read: a thread opens
         // on its root, one line for the read run, and the first unread unfolded".
         page.el("scroll-area").clientHeight = 700;
       };
@@ -47247,7 +47248,7 @@ for (const [mode, read, tail, held] of [
     const covered = await enter(SCRIPT, false);
     assert.equal(covered.rootAtHead, true, "the premise: entered with every row held, the thread opens on its root");
     assert.ok(covered.answer > covered.root, "the premise: the answer is under the root");
-    assert.equal(covered.line, mode === "Collapse read" ? "… 12 read messages …" : null);
+    assert.equal(covered.line, mode === "Fold read" ? "… 12 read messages …" : null);
     assert.deepStrictEqual(await enter(SCRIPT, true), covered,
       "the read behind the held rows left the root off screen above the answer");
     // ...and the same when a live message overtakes that read, which then lands as a page folded into
@@ -47357,9 +47358,9 @@ test("...and a root the landing put at the head stays there when the reader open
   const run = async (script, fromHeldRows) => {
     const page = newPage(new Map(), script);
     const messages = runThread(page, { tail: RUN_TAIL });
-    // As in "Collapse read: an old thread drawn from held rows ends on its root ...": root and answer fit.
+    // As in "Fold read: an old thread drawn from held rows ends on its root ...": root and answer fit.
     const before = async () => {
-      await chooseReadMode(page, "Collapse read");
+      await chooseReadMode(page, "Fold read");
       page.el("scroll-area").clientHeight = 700;
     };
     if (fromHeldRows) {
@@ -47514,7 +47515,7 @@ test("...and held rows with nothing unread whose read fails leave the reader on 
     { atBottom: false, open: "false" }, "the poll moved nobody without the failure ending the wait; the control proves nothing");
 });
 
-test("Collapse read: a switch from All to Main keeps the reader's message by the line of the run it is hidden in there", async () => {
+test("Fold read: a switch from All to Main keeps the reader's message by the line of the run it is hidden in there", async () => {
   const run = async (script) => {
     const page = newPage(new Map(), script);
     page.threadingSupported = true;
@@ -47537,7 +47538,7 @@ test("Collapse read: a switch from All to Main keeps the reader's message by the
       reply_count_exact: true, updated_at: messages[15].timestamp }];
     await signIn(page);
     await showDiscord(page, messages);
-    await chooseReadMode(page, "Collapse read");
+    await chooseReadMode(page, "Fold read");
     assert.deepStrictEqual(collapsedRows(page), [], "All collapsed a read message standing alone; this proves nothing");
     const area = page.el("scroll-area");
     area.scrollTop = rowWithId(page, "306").offsetTop();
@@ -47565,7 +47566,7 @@ test("a landed message keeps the body the server rendered and its reactions, and
     return m;
   });
   page.messages = messages;
-  await enterRunThread(page, messages, () => chooseReadMode(page, "Collapse read"));
+  await enterRunThread(page, messages, () => chooseReadMode(page, "Fold read"));
   const answer = rowWithId(page, runId(500));
   assert.equal(answer.getAttribute("data-collapsed"), "false", "the rendered answer was not opened");
   assert.ok(atTheHead(page, answer), `the answer landed at ${answer.getBoundingClientRect().top}px`);
@@ -47589,16 +47590,16 @@ test("a landed message keeps the body the server rendered and its reactions, and
   assert.deepStrictEqual(chipsOf(head), ["👍 2"]);
 });
 
-test("the Hide read button cycles Show read, Collapse read and Hide read, names each, and keeps it", async () => {
+test("the Hide read button cycles Show read, Fold read and Hide read, names each, and keeps it", async () => {
   const page = newPage();
   await signIn(page);
   await showDiscord(page, backlog());
   assert.deepStrictEqual(readModeSaid(page), ["Show read", "false", "show"], "the default is not Show read");
-  assert.equal(page.el("todo-filter").getAttribute("aria-label"), "Show read. Tap for Collapse read");
+  assert.equal(page.el("todo-filter").getAttribute("aria-label"), "Show read. Tap for Fold read");
   const steps = [
-    [["Collapse read", "mixed", "collapse"], "collapse", false, "Collapse read. Tap for Hide read"],
+    [["Fold read", "mixed", "fold"], "fold", false, "Fold read. Tap for Hide read"],
     [["Hide read", "true", "hide"], "hide", true, "Hide read. Tap for Show read"],
-    [["Show read", "false", "show"], "show", false, "Show read. Tap for Collapse read"],
+    [["Show read", "false", "show"], "show", false, "Show read. Tap for Fold read"],
   ];
   for (const [said, read, todo, name] of steps) {
     await page.el("todo-filter").click();
@@ -47615,7 +47616,7 @@ test("the Hide read button cycles Show read, Collapse read and Hide read, names 
   await page.settle();
   const reopened = reloadWith(page.storage, backlog());
   await reopenedChannel(reopened);
-  assert.deepStrictEqual(readModeSaid(reopened), ["Collapse read", "mixed", "collapse"], "a reload lost Collapse read");
+  assert.deepStrictEqual(readModeSaid(reopened), ["Fold read", "mixed", "fold"], "a reload lost Fold read");
   // A record from before the modes says only Hide read or not, and means what it meant.
   for (const [todo, said] of [[true, ["Hide read", "true", "hide"]], [false, ["Show read", "false", "show"]]]) {
     const record = { ...savedUiState(reopened), todo };
@@ -47627,15 +47628,15 @@ test("the Hide read button cycles Show read, Collapse read and Hide read, names 
   }
   // Each mode has its own icon, and the page first draws Show read's alone. (Which one is drawn
   // after each tap is measured in Chromium: tests/read_modes_browser.py.)
-  for (const [mode, hidden] of [["show", ""], ["collapse", " hidden"], ["hide", " hidden"]]) {
+  for (const [mode, hidden] of [["show", ""], ["fold", " hidden"], ["hide", " hidden"]]) {
     assert.match(HTML_CODE, new RegExp(`class="control-icon read-mode-icon" data-mode="${mode}"${hidden} viewBox`),
       `the ${mode} icon is not drawn as the page starts`);
   }
   // The name is two words, and the desk's one-row dock stacks them, whole: a lone "Collapse" reads as
-  // the act a tap performs. (This page was left on Collapse read before the reloads. That the dock
+  // the act a tap performs. (This page was left on Fold read before the reloads. That the dock
   // stays one row is measured in Chromium.)
   const words = page.el("todo-filter-label").children.map((node) => [node.className, node.textContent]);
-  assert.deepStrictEqual(words, [["read-mode-verb", "Collapse"], ["read-mode-noun", " read"]]);
+  assert.deepStrictEqual(words, [["read-mode-verb", "Fold"], ["read-mode-noun", " read"]]);
   const desk = "(min-width: 900px) and (pointer: fine)";
   for (const word of ["verb", "noun"]) {
     assert.match(cssBlockIn(desk, `#control-pane #todo-filter .read-mode-${word}`), /display:\s*block/,
@@ -47644,18 +47645,18 @@ test("the Hide read button cycles Show read, Collapse read and Hide read, names 
   assert.doesNotMatch(CSS_CODE, /\.read-mode-noun\s*\{\s*display:\s*none/, "a desk's dock cuts the name to its first word");
 });
 
-test("Collapse read: a thread opens on its root, one line for the read run, and the first unread unfolded", async () => {
+test("Fold read: a thread opens on its root, one line for the read run, and the first unread unfolded", async () => {
   const page = newPage();
   const messages = runThread(page, { tail: RUN_TAIL });
   await enterRunThread(page, messages, async () => {
-    await chooseReadMode(page, "Collapse read");
+    await chooseReadMode(page, "Fold read");
     // A viewport the root, the line and the start of the answer fit in, as they do on a phone in
     // Chromium. This fixture lays a row's meta line out as a column of five lines, and draws the
     // line's row with the message it hides; neither is so in a browser.
     page.el("scroll-area").clientHeight = 700;
   });
   const rows = page.el("discord-log").children;
-  assert.equal(rows.length, 18, "Collapse read took a message out of the list");
+  assert.equal(rows.length, 18, "Fold read took a message out of the list");
   assert.equal(rows[0].getAttribute("data-id"), runId(0));
   assert.equal(rows[0].hasAttribute("data-read-run"), false, "the root, read as it is, was collapsed");
   assert.equal(rows[0].hidden, false);
@@ -47726,12 +47727,12 @@ function splitRunChannel(page) {
   });
 }
 
-test("Collapse read collapses runs of two rows or more, split by unread messages, never the newest", async () => {
+test("Fold read collapses runs of two rows or more, split by unread messages, never the newest", async () => {
   const page = newPage();
   await signIn(page);
   await showDiscord(page, splitRunChannel(page));
   assert.equal(page.el("discord-log").children.length, 8, "the two messages a second apart were not combined");
-  await chooseReadMode(page, "Collapse read");
+  await chooseReadMode(page, "Fold read");
   const role = (id) => rowWithId(page, id).getAttribute("data-read-run");
   // One read message alone between two unread ones is shown: a line would save nothing.
   assert.equal(role("8800000000000000002"), null, "a single read message was collapsed");
@@ -47751,14 +47752,14 @@ test("Collapse read collapses runs of two rows or more, split by unread messages
   await page.el("search-toggle").click();
   await page.settle();
   assert.equal(role("8800000000000000004"), "head", "closing the search did not collapse the run again");
-  // Show read and Collapse read are one read of this channel, drawn two ways.
+  // Show read and Fold read are one read of this channel, drawn two ways.
   const reads = page.pageReads;
   await chooseReadMode(page, "Hide read");
   await chooseReadMode(page, "Show read");
   assert.deepStrictEqual(collapsedRows(page), [], "Show read left a run collapsed");
-  await chooseReadMode(page, "Collapse read");
+  await chooseReadMode(page, "Fold read");
   assert.equal(role("8800000000000000004"), "head");
-  assert.equal(page.pageReads, reads + 1, "Collapse read read the channel again; only leaving Hide read should");
+  assert.equal(page.pageReads, reads + 1, "Fold read read the channel again; only leaving Hide read should");
 });
 
 /** A threaded channel's All: unread, two read, unread, two read, then eight unread. */
@@ -47772,12 +47773,12 @@ function joiningChannel(page) {
   });
 }
 
-test("Collapse read: a message marked Done joins the runs around it, and the reader does not move", async () => {
+test("Fold read: a message marked Done joins the runs around it, and the reader does not move", async () => {
   const page = newPage();
   const messages = joiningChannel(page);
   await signIn(page);
   await showDiscord(page, messages);
-  await chooseReadMode(page, "Collapse read");
+  await chooseReadMode(page, "Fold read");
   const head = (id) => readRunLineOf(rowWithId(page, id));
   assert.equal(head(messages[1].id).textContent, "… 2 read messages …");
   assert.equal(head(messages[4].id).textContent, "… 2 read messages …");
@@ -47798,7 +47799,7 @@ test("Collapse read: a message marked Done joins the runs around it, and the rea
   assert.equal(reading().getBoundingClientRect().top, 0, "splitting the run moved the reader");
 });
 
-test("Collapse read: a run opened from the keyboard hands the focus to its first message, and one tapped open does not", async () => {
+test("Fold read: a run opened from the keyboard hands the focus to its first message, and one tapped open does not", async () => {
   // The line goes as it opens the run. A keyboard left on it would fall back to the start of the page.
   // A tap or a click focuses the line as well, but a row holding the focus is lit as under the
   // pointer, and a read message must not be drawn as though it were not: that focus stays put.
@@ -47806,7 +47807,7 @@ test("Collapse read: a run opened from the keyboard hands the focus to its first
   const messages = joiningChannel(page);
   await signIn(page);
   await showDiscord(page, messages);
-  await chooseReadMode(page, "Collapse read");
+  await chooseReadMode(page, "Fold read");
   const tapped = readRunLineOf(rowWithId(page, messages[1].id));
   tapped.focusFrom("pointer");
   await tapped.click();
@@ -47828,7 +47829,7 @@ test("...and a read that finds a message read elsewhere grows the run, without m
   const messages = joiningChannel(page);
   await signIn(page);
   await showDiscord(page, messages);
-  await chooseReadMode(page, "Collapse read");
+  await chooseReadMode(page, "Fold read");
   const area = page.el("scroll-area");
   const reading = () => rowWithId(page, messages[6].id);
   area.scrollTop += reading().getBoundingClientRect().top;
@@ -47852,7 +47853,7 @@ test("...and the reader's own words turned unread in Settings split the run they
   const page = newPage();
   await signIn(page);
   await showDiscord(page, splitRunChannel(page));
-  await chooseReadMode(page, "Collapse read");
+  await chooseReadMode(page, "Fold read");
   const role = (id) => rowWithId(page, id).getAttribute("data-read-run");
   assert.equal(role("8800000000000000004"), "head");
   assert.equal(role("8800000000000000006"), "member");
@@ -47869,7 +47870,7 @@ test("...and the reader's own words turned unread in Settings split the run they
     "the reader's own words read again did not rejoin the run");
 });
 
-test("Collapse read: a jump to a message inside a run opens the run; Pinned and Hide read are as they were", async () => {
+test("Fold read: a jump to a message inside a run opens the run; Pinned and Hide read are as they were", async () => {
   const page = newPage();
   const messages = joiningChannel(page);
   messages[13] = { ...messages[13], reply_to: messages[5].id };
@@ -47878,7 +47879,7 @@ test("Collapse read: a jump to a message inside a run opens the run; Pinned and 
   page.pinsRevision = 3;
   await signIn(page);
   await showDiscord(page, messages);
-  await chooseReadMode(page, "Collapse read");
+  await chooseReadMode(page, "Fold read");
   assert.equal(rowWithId(page, messages[5].id).getAttribute("data-read-run"), "member");
   await tapArrow(page, rowWithId(page, messages[13].id));
   const answered = rowWithId(page, messages[5].id);
@@ -48020,7 +48021,7 @@ test("...and the message the reader is on, marked Done, is held where it was by 
     page.threadingSupported = threaded;
     await signIn(page);
     await showDiscord(page, messages);
-    await chooseReadMode(page, "Collapse read");
+    await chooseReadMode(page, "Fold read");
     const area = page.el("scroll-area");
     area.scrollTop += rowWithId(page, messages[3].id).getBoundingClientRect().top;
     assert.equal(rowWithId(page, messages[3].id).getBoundingClientRect().top, 0, "the fixture cannot put the reader there");
@@ -48036,7 +48037,7 @@ test("...and the message the reader is on, marked Done, is held where it was by 
   }
 });
 
-test("Collapse read and gathered replies: a reply below a run's line is not drawn as joined to it, and a gathered stack stays whole", async () => {
+test("Fold read and gathered replies: a reply below a run's line is not drawn as joined to it, and a gathered stack stays whole", async () => {
   // A reply whose message is behind a line points at nothing drawn: its arrow is the disconnected one.
   const page = newPage();
   page.dealtWith.add("1000000000000000001");
@@ -48049,7 +48050,7 @@ test("Collapse read and gathered replies: a reply below a run's line is not draw
     message({ id: "1000000000000000004", content: "draining now", reply_to: "1000000000000000003", ...ALICE }),
     message({ id: "1000000000000000005", content: "thanks" }),
   ]);
-  await chooseReadMode(page, "Collapse read");
+  await chooseReadMode(page, "Fold read");
   assert.equal(rowWithId(page, "1000000000000000001").getAttribute("data-read-run"), "head");
   assert.equal(arrowStyle(rowWithId(page, "1000000000000000003")), "disconnected",
     "the reply's arrow joins the line as though the line were the message it answers");
@@ -48065,14 +48066,14 @@ test("Collapse read and gathered replies: a reply below a run's line is not draw
   await gatherChip(gathered, "601").click();
   await gathered.settle();
   assert.deepStrictEqual(shownIds(gathered), GATHERED);
-  await chooseReadMode(gathered, "Collapse read");
+  await chooseReadMode(gathered, "Fold read");
   assert.equal(runCountWords(readRunLineOf(rowWithId(gathered, "597"))), "… 3 read messages …",
     "the read messages outside the stack were not collapsed");
   for (const id of ["602", "603"]) {
     assert.equal(rowWithId(gathered, id).hasAttribute("data-read-run"), false, `gathered reply ${id} was collapsed`);
   }
   assert.deepStrictEqual(stackPlaces(gathered).map(([id]) => id), ["601", "602", "603", "604", "606", "607"],
-    "Collapse read broke the gathered stack");
+    "Fold read broke the gathered stack");
 });
 
 // --- `#222 unread-replies` -------------------------------------------------------------------------
@@ -48194,7 +48195,7 @@ test("ON MAIN a root whose thread holds unread replies says how many, beside N r
 test("HIDE READ keeps a root whose thread holds unread replies, drawn as read; COLLAPSE READ never folds it", async () => {
   const page = newPage();
   await inboxOnMain(page, inboxChannel(page));
-  await chooseReadMode(page, "Collapse read");
+  await chooseReadMode(page, "Fold read");
   // Read, all of them, but 02 and 07 are kept: only 05 and 10 run together, and 01 is a run of one.
   assert.equal(rowWithId(page, inboxId(5)).getAttribute("data-read-run"), "head");
   assert.equal(readRunLineOf(rowWithId(page, inboxId(5))).textContent, "… 2 read messages …");
@@ -48306,15 +48307,15 @@ test("A REPLY ARRIVING counts on its root at once and brings it back under Hide 
 });
 
 test("FROM THE COUNT, the thread opens on its first unread reply, unfolded, in every read mode", async () => {
-  for (const mode of ["Show read", "Collapse read", "Hide read"]) {
+  for (const mode of ["Show read", "Fold read", "Hide read"]) {
     const page = newPage();
     const messages = runThread(page, { tail: RUN_TAIL });
     await signIn(page);
     await showDiscord(page, messages);
     await pickThread(page, "main");
     await chooseReadMode(page, mode);
-    // As the Collapse read entry test has it: the root, the line and the start of the answer fit.
-    if (mode === "Collapse read") page.el("scroll-area").clientHeight = 700;
+    // As the Fold read entry test has it: the root, the line and the start of the answer fit.
+    if (mode === "Fold read") page.el("scroll-area").clientHeight = 700;
     // The agent's answer and the two after it; the owner's own and the swiped ones are read.
     const chip = unreadChip(page, runId(0));
     assert.ok(chip, `${mode}: the owner's question shows no unread count`);
@@ -48324,7 +48325,7 @@ test("FROM THE COUNT, the thread opens on its first unread reply, unfolded, in e
     assert.equal(page.el("thread-select").value, `thread:${RUN_THREAD}`, `${mode}: the count did not open the thread`);
     const answer = rowWithId(page, runId(500));
     assert.equal(answer.getAttribute("data-collapsed"), "false", `${mode}: the first unread reply is folded`);
-    if (mode === "Collapse read") {
+    if (mode === "Fold read") {
       // The root at the head, the read run one line under it, and the answer below in view.
       const root = rowWithId(page, runId(0));
       assert.ok(atTheHead(page, root), `${mode}: the root is at ${root.getBoundingClientRect().top}px, not the head`);
@@ -48429,9 +48430,9 @@ test("A REPLY ONLY MAIN'S READ REPORTS, which nothing brought, counts as new on 
   assert.equal(threadBadge(root).textContent, "Thread(2)");
   assert.equal(threadButton(root).textContent, "2 replies");
   assert.equal(threadBadge(rowWithId(page, inboxId(7))).textContent, "Thread(4)");
-  // Collapse read does not fold it into a run either: 10 is a run of one now, beside it.
-  await chooseReadMode(page, "Collapse read");
-  assert.equal(root.hasAttribute("data-read-run"), false, "Collapse read folded a root with an answer it had not brought");
+  // Fold read does not fold it into a run either: 10 is a run of one now, beside it.
+  await chooseReadMode(page, "Fold read");
+  assert.equal(root.hasAttribute("data-read-run"), false, "Fold read folded a root with an answer it had not brought");
   assert.equal(rowWithId(page, inboxId(5)).getAttribute("data-unread-replies"), "1");
   // All, read, brings both answers: the counts are exact, with no read of Main.
   await pickThread(page, "flat");
@@ -50452,7 +50453,7 @@ test("...it opens a run of read messages the reply is collapsed into, and closes
   for (const id of ["302", "303", "304"]) page.dealtWith.add(id);
   await signIn(page);
   await showDiscord(page, messages);
-  await chooseReadMode(page, "Collapse read");
+  await chooseReadMode(page, "Fold read");
   const reply = () => rowWithId(page, "303");
   assert.equal(reply().getAttribute("data-read-run"), "member", "the reply is not collapsed, so this proves nothing");
   const question = rowWithId(page, "301");
@@ -50633,7 +50634,7 @@ test("`#224 keyboard-shortcuts` x `#221 read-modes`: on the line of a collapsed 
   const page = newPage();
   const messages = runThread(page, { tail: RUN_TAIL });
   page.messages = messages;
-  await enterRunThread(page, messages, () => chooseReadMode(page, "Collapse read"));
+  await enterRunThread(page, messages, () => chooseReadMode(page, "Fold read"));
   const head = rowWithId(page, runId(1));
   assert.equal(head.getAttribute("data-read-run"), "head");
   // Up from the landed answer to the line, as the keys go.
@@ -50901,7 +50902,7 @@ test("`#281 view-keys`: the thread list is the right column on its own, across t
   assert.ok(page.el("side-column").getClientRects().length > 0, "the thread list is not on screen on a phone");
   assert.equal(page.el("side-list").hidden, false);
   assert.equal(page.el("side-close").hidden, true, "an X with nothing to close");
-  assert.equal(page.el("side-unread-only").hidden, false, "Unread only is not over the thread list");
+  assert.equal(page.el("side-unpack").hidden, false, "Unpack msgs is not over the thread list");
   assert.deepStrictEqual(cardIds(page), threadData().threads.map((thread) => thread.id));
   // On a phone two columns are not offered, and Ctrl+4 says why it did nothing.
   assert.ok(!threadOptions(page).some(([value]) => value === "columns"), "a phone was offered two columns");
@@ -52156,17 +52157,17 @@ test("`#261 two-column-connectors`: closing a thread comes back to the card it w
   assert.ok(data.threads.length === 16);
 });
 
-// --- Unread only, on the right column's heading (#259 thread-list-unread-filter) --------------------
+// --- the read mode over the cards (#432 read-mode-unify; Unread only, #259, before it) ---------------
 //
-// The owner, 2026-10-12: "In two column view we get a big list of threads. Some have "N unread" and
-// others are fully read... I would like a toggle at the top in the banner that says "Threads" in the
-// upper left to filter it to unread only."
-
-const SIDE_UNREAD_STORAGE = "vibe-talk.voice.side-unread-only";
+// The owner, 2026-10-12, of #259 thread-list-unread-filter: "Some have "N unread" and others are fully
+// read... I would like a toggle ... to filter it to unread only." And 2026-10-22, #432: "I think we should
+// unify it actually ... the thread view will respect show/hide/collapse for unread ... a thread card with
+// any unread-children acts as an unread, and with 100% read acts as read." So Unread only is gone: the read
+// mode filters the cards as it filters every list.
 
 /** The ids of the cards the filters leave on screen, in order. */
 const shownCardIds = (page) => page.el("side-cards").children
-  .filter((li) => !li.hidden && !li.hasClass("search-hidden")).map((li) => li.getAttribute("data-id"));
+  .filter((li) => li.hasAttribute("data-card") && !li.hidden && !li.hasClass("search-hidden")).map((li) => li.getAttribute("data-id"));
 
 /** The ids of the cards saying their thread has unread replies, by their chip. */
 const unreadCardIds = (page) => page.el("side-cards").children
@@ -52179,130 +52180,238 @@ const readThreadColumns = (count, read, script = SCRIPT, store = null) =>
     if (store) for (const [key, value] of store) p.storage.set(key, value);
   }, script);
 
-test("`#259 thread-list-unread-filter`: Unread only is a toggle on the right column's heading, offered over the cards and not over a thread", async () => {
-  assertMarkupContains("side-heading", "side-unread-only");
-  const tag = /<button\s+id="side-unread-only"[^>]*>/.exec(HTML_CODE)[0];
-  assert.match(tag, /aria-pressed="false"/, "the toggle does not say whether it is pressed");
-  assert.match(tag, /type="button"/);
-  assert.match(tag, /title="Show only the threads with unread replies"/);
-  assert.match(tag, /(?:^|\s)hidden(?=[\s>])/, "the toggle ships on screen, before the cards are");
-  assert.match(HTML_CODE, /id="side-unread-only"[^>]*>Unread<span class="chip-more"> only<\/span><\/button>/, "the toggle does not name itself");
-  const head = HTML_CODE.slice(HTML_CODE.indexOf('id="side-heading"'));
-  assert.ok(head.indexOf('id="side-title"') < head.indexOf('id="side-unread-only"'),
-    "the toggle is not beside the heading it filters");
-  // `#421 chip-states`: pressed by the one rule every toggle chip is.
-  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, '.chip[aria-pressed="true"]'), /border-color:\s*var\(--accent\)/,
-    "pressed, the toggle is not drawn as the bar's filters are");
+/** `manyThreadColumns`, the threads numbered in `read` read whole: root and answer marked Done. */
+const wholeReadColumns = (count, read, script = SCRIPT) =>
+  manyThreadColumns(count, (p) => {
+    for (const i of read) {
+      p.dealtWith.add(String(300 + 2 * i));
+      p.dealtWith.add(String(301 + 2 * i));
+    }
+  }, script);
 
-  const { page } = await readThreadColumns(4, [0, 2]);
-  const toggle = page.el("side-unread-only");
-  assert.equal(toggle.hidden, false, "the toggle is not offered over the cards");
-  assert.equal(toggle.getAttribute("aria-pressed"), "false");
-  await openerOf(cardRow(page, "spaces/A/threads/t1")).click();
-  await page.settle();
-  assert.equal(toggle.hidden, true, "the toggle is offered over a thread, where it filters nothing");
-  await page.el("side-close").click();
-  await page.settle();
-  assert.equal(toggle.hidden, false, "the toggle did not come back with the cards");
+test("`#432 read-mode-unify`: Unread only is gone from the cards' heading, whose chips are Unpack msgs, Main channel and the order, and the read mode is the cards' filter", async () => {
+  assert.doesNotMatch(HTML_CODE, /id="side-unread-only"/, "Unread only is still on the page");
+  const head = HTML_CODE.slice(HTML_CODE.indexOf('id="side-heading"'), HTML_CODE.indexOf('id="side-thread-card"'));
+  const order = ["side-title", "side-unpack", "side-main", "side-order"].map((id) => head.indexOf(`id="${id}"`));
+  assert.ok(order.every((at, i) => at >= 0 && (i === 0 || at > order[i - 1])), `the heading's chips are not in order: ${order}`);
+  assert.match(cssBlock("#side-unpack"), /margin-inline-start:\s*auto/, "the chips do not stand at the heading's far end");
+  assert.doesNotMatch(SCRIPT, /side-unread-only|SIDE_UNREAD_KEY|sideUnreadOnly/, "voice.js still keeps Unread only");
 });
 
-test("`#259 thread-list-unread-filter`: pressed, the cards are the threads with unread replies, by the rule of their chip; kept on the device across a reload", async () => {
-  const { page, server, data: held } = await readThreadColumns(6, [0, 2, 3]);
+test("`#432 read-mode-unify`: Hide read keeps exactly the threads with an unread message — a reply or the root — and Show read every card; one unread reply makes a thread unread", async () => {
+  const { page, server, data: held } = await wholeReadColumns(6, [0, 2, 3]);
+  assert.deepStrictEqual(shownCardIds(page).length, 6, "Show read hides a card");
+  await readModeTo(page, "Hide read");
   const unread = ["spaces/A/threads/t1", "spaces/A/threads/t4", "spaces/A/threads/t5"];
-  assert.deepStrictEqual(unreadCardIds(page), unread, "the fixture's read and unread threads are not what this test is about");
-  assert.equal(shownCardIds(page).length, 6);
-  await page.el("side-unread-only").click();
-  await page.settle();
-  assert.equal(page.el("side-unread-only").getAttribute("aria-pressed"), "true", "the toggle does not say it is pressed");
-  assert.deepStrictEqual(shownCardIds(page), unread, "Unread only did not keep exactly the cards with an unread chip");
-  assert.equal(page.storage.get(SIDE_UNREAD_STORAGE), "on", "the choice was not kept on the device");
+  assert.deepStrictEqual(shownCardIds(page), unread, "Hide read did not keep exactly the threads with an unread message");
   assert.equal(page.el("side-list-state").hidden, true, "a list with cards in it says it is empty");
-  // A reply arriving in a read thread brings its card back, with its chip, at the foot.
+  // A reply arriving in a read thread makes it unread: its card comes back, at the foot.
   await liveReply(page, server, held.messages[0], "400");
   assert.deepStrictEqual(shownCardIds(page), [...unread, "spaces/A/threads/t0"],
-    "a read thread that a reply came into did not come back under Unread only");
-  // Reloaded, the toggle is still pressed and the filter in force.
-  const data = manyThreads(6);
-  const again = reloadWith(page.storage, data.messages, (p) => {
-    p.threadingSupported = true;
-    p.threads = data.threads;
-    p.wideDesk = true;
-    for (const i of [0, 2, 3]) p.dealtWith.add(String(301 + 2 * i));
-  });
-  await reopenedChannel(again);
-  await again.settle();
-  assert.ok(inTwoColumns(again));
-  assert.equal(again.el("side-unread-only").getAttribute("aria-pressed"), "true", "the reload forgot Unread only");
-  // The device's saved copy holds the live reply too, so the thread it came into is still unread.
-  assert.ok(unreadCardIds(again).length < 6, "every thread is unread after the reload, so this proves nothing");
-  assert.deepStrictEqual(shownCardIds(again), unreadCardIds(again), "the reload did not filter the cards");
-  // Off again: every card, and the device remembers that too.
-  await again.el("side-unread-only").click();
-  await again.settle();
-  assert.equal(again.el("side-unread-only").getAttribute("aria-pressed"), "false");
-  assert.equal(shownCardIds(again).length, 6);
-  assert.equal(again.storage.get(SIDE_UNREAD_STORAGE), "off");
+    "a read thread one reply came into is not unread under Hide read");
+  await readModeTo(page, "Show read");
+  assert.equal(shownCardIds(page).length, 6, "back to Show read, every card did not come back");
+  // A thread whose replies are all read but whose root is not is unread too (the root is one of its messages).
+  const rootOnly = await readThreadColumns(2, [0, 1]);
+  await readModeTo(rootOnly.page, "Hide read");
+  assert.deepStrictEqual(unreadCardIds(rootOnly.page), [], "the premise is no unread reply");
+  assert.deepStrictEqual(shownCardIds(rootOnly.page), ["spaces/A/threads/t0", "spaces/A/threads/t1"],
+    "a thread with its root unread was taken for read");
 });
 
-test("`#259 thread-list-unread-filter`: with nothing unread it says so, and with the search it keeps the unread cards the text matches", async () => {
-  const { page } = await readThreadColumns(4, [0, 1, 2, 3]);
-  assert.deepStrictEqual(unreadCardIds(page), [], "a thread is still unread, so this proves nothing");
-  await page.el("side-unread-only").click();
-  await page.settle();
+test("`#432 read-mode-unify`: under Hide read with nothing unread the cards say so, and with the search open Hide read steps aside as it does for messages", async () => {
+  const { page } = await wholeReadColumns(4, [0, 1, 2, 3]);
+  await readModeTo(page, "Hide read");
   assert.deepStrictEqual(shownCardIds(page), []);
   assert.equal(page.el("side-list-state").hidden, false, "an emptied list says nothing");
   assert.equal(page.el("side-list-state").textContent, "No unread threads.");
-  await page.el("side-unread-only").click();
-  await page.settle();
+  await readModeTo(page, "Show read");
   assert.equal(page.el("side-list-state").hidden, true, "the empty state stayed with the cards back");
-
-  const searched = (await readThreadColumns(5, [0, 2])).page;
-  await searched.el("side-unread-only").click();
+  const searched = (await wholeReadColumns(5, [0, 2])).page;
+  await readModeTo(searched, "Hide read");
   await searched.el("search-toggle").click();
-  await searched.el("search-field").setValue("thread 3");
-  await searched.settle();
-  assert.deepStrictEqual(shownCardIds(searched), ["spaces/A/threads/t3"], "the search and Unread only are not both applied");
   await searched.el("search-field").setValue("thread 2");
   await searched.settle();
-  assert.deepStrictEqual(shownCardIds(searched), [], "a read thread the search matches was kept under Unread only");
-  // `#262 search-load-older`: All holds the whole channel here, so the search has looked at every reply.
-  assert.equal(searched.el("side-list-state").textContent, "No unread threads match that search — all of this channel is loaded.");
-  await searched.el("side-unread-only").click();
-  await searched.settle();
-  assert.deepStrictEqual(shownCardIds(searched), ["spaces/A/threads/t2"]);
+  // `#262 search-load-older`: a filter choosing rows lifts Hide read, so a read thread the search finds shows.
+  assert.deepStrictEqual(shownCardIds(searched), ["spaces/A/threads/t2"], "the search did not find a read thread under Hide read");
   await searched.el("search-field").setValue("nothing like this");
   await searched.settle();
   assert.equal(searched.el("side-list-state").textContent, "No threads match that search — all of this channel is loaded.");
 });
 
-test("`#259 thread-list-unread-filter` x `#243 filter-keeps-selection`: the card selected stays where it was as Unread only goes on and off", async () => {
+test("`#432 read-mode-unify` x `#243 filter-keeps-selection`: the card selected stays where it was as Hide read goes on and off", async () => {
   const run = async (script) => {
     // Every other thread read, so the cards left still run past the column's foot.
     const read = Array.from({ length: 15 }, (_, i) => 2 * i);
-    const { page } = await readThreadColumns(30, read, script);
+    const { page } = await wholeReadColumns(30, read, script);
     const area = page.el("side-scroll");
     area.scrollTop = 600;
-    // The keys into the right column, onto an unread card in view: the selection the filter keeps.
     const card = page.el("side-cards").children.find((li) => {
       const box = li.getBoundingClientRect();
-      return li.hasAttribute("data-unread") && box.top > 40 && box.bottom < area.clientHeight - 40;
+      return li.hasAttribute("data-card") && !li.hasAttribute("data-thread-read") && box.top > 40 && box.bottom < area.clientHeight - 40;
     });
     assert.ok(card, "no unread card in view, so this proves nothing");
     await mouseTo(page, card, 900, 100);
-    assert.deepStrictEqual(litRows(page), [`side-cards:${card.getAttribute("data-id")}`]);
-    const at = card.getBoundingClientRect().top;
-    await page.el("side-unread-only").click();
-    await page.settle();
-    const on = card.getBoundingClientRect().top - at;
-    await page.el("side-unread-only").click();
-    await page.settle();
-    return { on, off: card.getBoundingClientRect().top - at, foot: sideAtFoot(page) };
+    const id = card.getAttribute("data-id");
+    const top = () => cardRow(page, id).getBoundingClientRect().top;
+    const at = top();
+    await readModeTo(page, "Hide read");
+    const on = top() - at;
+    await readModeTo(page, "Show read");
+    return { on, off: top() - at };
   };
   const kept = await run(SCRIPT);
-  assert.equal(kept.on, 0, `Unread only moved the card selected by ${kept.on}px`);
-  assert.equal(kept.off, 0, `turning Unread only off moved the card selected by ${kept.off}px`);
-  const loose = await run(brokenScript("  change();\n  placeCardAnchor(anchor);\n", "  change();\n"));
-  assert.notEqual(loose.on, 0, "the negative control kept the card in place, so the check above proves nothing");
+  assert.equal(kept.on, 0, `Hide read moved the card selected by ${kept.on}px`);
+  assert.equal(kept.off, 0, `back to Show read moved the card selected by ${kept.off}px`);
+});
+
+/** What h says on the status line of each mode (`READ_MODE_SAID`). */
+const READ_MODE_STATUS = {
+  show: "Show read: everything shown.",
+  fold: "Fold read: read runs folded.",
+  hide: "Hide read: read ones hidden.",
+};
+
+/** The channel of `threadData` with messages `read` Done, in view `view` ("thread" for its first thread). */
+async function readModePage(view, read = ["200", "201", "202"]) {
+  const page = newPage();
+  const data = threadData();
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  for (const id of read) page.dealtWith.add(id);
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await pickThread(page, view === "thread" ? `thread:${data.threads[0].id}` : view);
+  await page.settle();
+  return page;
+}
+
+/** The run lines a list draws: the words of each, in order. */
+const runLines = (page, list) => page.el(list).children.filter((li) => li.getAttribute("data-read-run") === "head" && !li.hidden)
+  .map((li) => String(li.readRunLine ? li.readRunLine.textContent : ""));
+
+test("`#432 read-mode-unify`: h is the button's own act in All, Main, a thread and the Threads view — the button's words, aria and the list move together — and says the mode", async () => {
+  for (const view of ["flat", "main", "thread", "threads"]) {
+    const page = await readModePage(view);
+    const target = view === "threads" ? page.el("side-scroll") : page.el("scroll-area");
+    for (const [mode, label, pressed] of [["fold", "Fold read", "mixed"], ["hide", "Hide read", "true"], ["show", "Show read", "false"]]) {
+      await press(page, target, "h");
+      assert.deepStrictEqual(readModeSaid(page), [label, pressed, mode], `${view}: h did not move the button to ${label}`);
+      assert.equal(page.el("status").textContent, READ_MODE_STATUS[mode], `${view}: h did not say ${label}`);
+    }
+  }
+});
+
+test("`#432 read-mode-unify`: Fold read by h draws the run lines the button draws, in All", async () => {
+  const lines = async (how) => {
+    const page = await readModePage("flat");
+    if (how === "key") await press(page, page.el("scroll-area"), "h");
+    else {
+      await page.el("todo-filter").click();
+      await page.settle();
+    }
+    return runLines(page, "discord-log");
+  };
+  const byKey = await lines("key");
+  assert.ok(byKey.length > 0 && byKey[0].replace(/\s+/g, " ").startsWith("… 3 read messages"), `h drew no run line: ${byKey}`);
+  assert.deepStrictEqual(byKey, await lines("button"), "h and the button draw different lines");
+});
+
+test("`#432 read-mode-unify`: under Fold read each run of read threads over the cards is one line saying how many, the newest card never in one; a tap opens it, and a thread with one unread reply breaks a run", async () => {
+  // t0, t1, t2 read whole, t3 unread, t4 read alone, t5 read but newest: one run of three.
+  const { page } = await wholeReadColumns(6, [0, 1, 2, 4, 5]);
+  await readModeTo(page, "Fold read");
+  const card = (i) => cardRow(page, `spaces/A/threads/t${i}`);
+  assert.deepStrictEqual(runLines(page, "side-cards"), ["… 3 read threads"], "the run of read threads is not one line saying three");
+  assert.equal(card(0).getAttribute("data-read-run"), "head");
+  assert.ok(card(1).hidden && card(2).hidden, "the run's other cards are drawn");
+  assert.ok(!card(3).hidden && !card(4).hidden && !card(5).hidden, "a card outside the run is hidden");
+  assert.equal(card(4).hasAttribute("data-read-run"), false, "a read thread alone was folded");
+  assert.equal(card(5).hasAttribute("data-read-run"), false, "the newest card joined a run");
+  // A tap on the line opens the run, and it stays open through a redraw.
+  await card(0).readRunLine.click();
+  await page.settle();
+  assert.deepStrictEqual(runLines(page, "side-cards"), [], "the tap did not open the run");
+  assert.ok([0, 1, 2].every((i) => !card(i).hidden), "the opened run's cards are not all drawn");
+  await page.el("side-unpack").click();
+  await page.el("side-unpack").click();
+  await page.settle();
+  assert.deepStrictEqual(runLines(page, "side-cards"), [], "a redraw folded the opened run again");
+  // Another read mode and back folds it again (as a list of messages does).
+  await readModeTo(page, "Show read");
+  assert.deepStrictEqual(runLines(page, "side-cards"), [], "Show read drew a run line");
+  await readModeTo(page, "Fold read");
+  assert.deepStrictEqual(runLines(page, "side-cards"), ["… 3 read threads"]);
+  // One unread reply in t1 makes it unread, and the run of three is broken.
+  const unreadReply = await manyThreadColumns(6, (p) => {
+    for (const i of [0, 1, 2, 4, 5]) p.dealtWith.add(String(300 + 2 * i));
+    for (const i of [0, 2, 4, 5]) p.dealtWith.add(String(301 + 2 * i));
+  });
+  await readModeTo(unreadReply.page, "Fold read");
+  assert.deepStrictEqual(runLines(unreadReply.page, "side-cards"), [], "a thread with an unread reply joined a run of read threads");
+});
+
+test("`#432 read-mode-unify`: the search opens the runs of read threads while it chooses cards, as it opens runs of messages, and they fold again when it closes", async () => {
+  const { page } = await wholeReadColumns(6, [0, 1, 2, 4, 5]);
+  await readModeTo(page, "Fold read");
+  assert.deepStrictEqual(runLines(page, "side-cards"), ["… 3 read threads"], "the premise is a folded run");
+  await page.el("search-toggle").click();
+  await page.el("search-field").setValue("thread 1");
+  await page.settle();
+  assert.deepStrictEqual(runLines(page, "side-cards"), [], "the search left the run folded");
+  assert.deepStrictEqual(shownCardIds(page), ["spaces/A/threads/t1"], "the search did not find a card inside the run");
+  await page.el("search-field").setValue("");
+  await page.el("search-toggle").click();
+  await page.settle();
+  assert.deepStrictEqual(runLines(page, "side-cards"), ["… 3 read threads"], "the run did not fold again once the search closed");
+});
+
+test("`#432 read-mode-unify`: unpacked, a folded run of read threads takes their unpacked rows behind its line, and Enter on the line opens it", async () => {
+  const { page } = await wholeReadColumns(4, [0, 1, 2]);
+  await press(page, page.el("scroll-area"), "3", { ctrlKey: true });
+  assert.equal(page.el("screen-main").getAttribute("data-columns"), "list", "the premise is the Threads view");
+  await page.el("side-unpack").click();
+  await page.settle();
+  await readModeTo(page, "Fold read");
+  const blockOf = (i) => page.el("side-cards").children.filter((li) => li.getAttribute("data-unpack-thread") === `spaces/A/threads/t${i}`);
+  assert.deepStrictEqual(runLines(page, "side-cards").filter((words) => words.includes("thread")), ["… 3 read threads"]);
+  assert.ok([0, 1, 2].every((i) => blockOf(i).every((li) => li.hidden)), "a folded thread's unpacked rows are drawn");
+  assert.ok(blockOf(3).some((li) => !li.hidden), "the unread thread's rows are hidden");
+  const head = cardRow(page, "spaces/A/threads/t0");
+  await press(page, head, "Enter");
+  await page.settle();
+  assert.ok(!runLines(page, "side-cards").some((words) => words.includes("thread")), "Enter on the line did not open the run");
+  assert.ok(blockOf(1).some((li) => !li.hidden), "the opened run's unpacked rows are not drawn");
+});
+
+test("`#432 read-mode-unify`: with Main channel on, a run takes the read main-channel messages among the cards too, and says both", async () => {
+  const page = newPage(new Map([[THREADS_MAIN_STORAGE, "on"]]));
+  const data = freshMessageData();
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  page.messages = data.messages;
+  for (const id of ["200", "201", "202", "203", "204"]) page.dealtWith.add(id);
+  threadedService(page);
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await pickThread(page, "threads");
+  await page.settle();
+  assert.deepStrictEqual(cardsListed(page), ["main:200", "card:spaces/A/threads/one & two", "card:spaces/A/threads/another", "main:210"],
+    "the premise: Main's 200, both cards, then 210");
+  await readModeTo(page, "Fold read");
+  assert.deepStrictEqual(runLines(page, "side-cards"), ["… 2 read threads and 1 read message"],
+    "the run of Main's read message and two read threads does not say both");
+});
+
+test("`#432 read-mode-unify`: a record that says Collapse read, from before Fold read was its name, opens in Fold read", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, backlog());
+  page.storage.set(UI_STATE_KEY, JSON.stringify({ ...savedUiState(page), read: "collapse" }));
+  const older = reloadWith(page.storage, backlog());
+  await reopenedChannel(older);
+  assert.deepStrictEqual(readModeSaid(older), ["Fold read", "mixed", "fold"], "a saved Collapse read did not open as Fold read");
+  assert.equal(savedUiState(older).read, "fold", "the record was not saved again under the new name");
 });
 
 // --- the links between Main's roots and their cards (#261 two-column-connectors) ---------------------
@@ -52622,7 +52731,7 @@ test("`#261 two-column-connectors`: the glide waits for nothing once the selecti
   }
 });
 
-test("`#280 scroll-stability` x `#261`: a selection a redraw hands on, its card gone under Unread only, glides nothing", async () => {
+test("`#280 scroll-stability` x `#261`: a selection a redraw hands on, its card gone under Hide read, glides nothing", async () => {
   const restore = layColumnsOut();
   try {
     const run = async (rest) => {
@@ -52630,8 +52739,8 @@ test("`#280 scroll-stability` x `#261`: a selection a redraw hands on, its card 
       // Main says which replies are Done (`reply_dismissals`), which is how a Done made on another device
       // reaches this one.
       const { page } = await linkedColumns(16, (p) => { p.plainTimeline = p.timeline; });
-      await page.el("side-unread-only").click();
-      await page.settle();
+      // `#432 read-mode-unify`: Hide read, which took over from Unread only, filters the cards.
+      await readModeTo(page, "Hide read");
       const left = page.el("scroll-area");
       const right = page.el("side-scroll");
       left.scrollTop = 0;
@@ -52645,11 +52754,12 @@ test("`#280 scroll-stability` x `#261`: a selection a redraw hands on, its card 
       page.expireTimers(COLUMN_GLIDE_MS);
       assert.equal(left.glides, undefined, "a card whose root was on screen glided Main");
       // The reader goes down Main to its foot, and the first thread is read on another device: its card
-      // goes under Unread only, and the selection is handed to the card now first, whose root is far
+      // goes under Hide read, and the selection is handed to the card now first, whose root is far
       // above Main's foot.
       left.scrollTop = left.scrollHeight;
       await left.dispatch("scroll");
       await page.nextFrame();
+      page.dealtWith.add("300");
       page.dealtWith.add("301");
       page.timeline = page.plainTimeline;
       await reReadChannel(page);
@@ -53710,10 +53820,10 @@ test("`#298 thread-card-header`: over a thread on the right its one link joins i
 test("`#298 thread-card-header`: the link to the card at the top goes from a collapsed run's line when the root is in the run, up from Main's top for a root older than Main holds, and nowhere for a root the search hides", async () => {
   const restore = layColumnsOut();
   try {
-    // Collapse read, every thread but the newest read: the roots in one run, under its line.
+    // Fold read, every thread but the newest read: the roots in one run, under its line.
     const reads = manyThreads(16).messages.slice(0, 30).map((m) => String(m.id));
     let { page } = await linkedColumns(16, (p) => { p.dealtWith = new Set(reads); });
-    await chooseReadMode(page, "Collapse read");
+    await chooseReadMode(page, "Fold read");
     const head = page.el("discord-log").children.find((li) => li.getAttribute("data-read-run") === "head");
     assert.ok(head && rootRow(page, 3).hidden, "the root is not hidden in a collapsed run, so this proves nothing");
     page.el("thread-select").value = "thread:spaces/A/threads/t3";
@@ -55080,7 +55190,7 @@ test("`#240 reading-bookmark`: Main places the line by time for a thread reply, 
   assert.equal(statusText(page), "Your bookmark is not in this thread.", "b did not say why it did nothing");
 });
 
-test("`#240 reading-bookmark`: under Collapse read the line goes above a run it heads or after one it is inside; under Hide read, to the next message shown", async () => {
+test("`#240 reading-bookmark`: under Fold read the line goes above a run it heads or after one it is inside; under Hide read, to the next message shown", async () => {
   const page = newPage();
   await signIn(page);
   await showDiscord(page, backlog(6));
@@ -55090,7 +55200,7 @@ test("`#240 reading-bookmark`: under Collapse read the line goes above a run it 
   const mode = () => page.el("todo-filter").getAttribute("data-read-mode");
   await page.el("todo-filter").click();
   await page.settle();
-  assert.equal(mode(), "collapse");
+  assert.equal(mode(), "fold");
   assert.equal(channelRow(page, bid(1)).getAttribute("data-read-run"), "head", "the fixture made no run");
   assert.deepStrictEqual(bookmarkAt(page), { id: bid(4), place: "above" },
     "a line inside a collapsed run did not drop to the next message shown");
@@ -55107,7 +55217,7 @@ test("`#240 reading-bookmark`: under Collapse read the line goes above a run it 
   await bookmarkRow(page, bid(1));
   await page.el("todo-filter").click();
   await page.settle();
-  assert.equal(mode(), "collapse");
+  assert.equal(mode(), "fold");
   assert.equal(channelRow(page, bid(1)).getAttribute("data-read-run"), "head");
   assert.deepStrictEqual(bookmarkAt(page), { id: bid(1), place: "above" }, "the line is not above the run it heads");
 });
@@ -55626,7 +55736,7 @@ function oracleChannel(page, threads) {
   return messages;
 }
 
-for (const [threads, mode] of [[false, "Collapse read"], [false, "Hide read"], [true, "Show read"], [true, "Hide read"]]) {
+for (const [threads, mode] of [[false, "Fold read"], [false, "Hide read"], [true, "Show read"], [true, "Hide read"]]) {
   const where = threads ? `a threaded Main under ${mode}` : `${mode} without threads`;
   test(`\`#240 reading-bookmark\`: THE SWEEP ORACLE in ${where} — the sweep marks exactly the rows above not yet Done, and the line sits where a fresh placement puts it`, async () => {
     // As above, in the read modes that leave rows out, and in a Main that leaves the thread replies
@@ -56168,19 +56278,19 @@ function readPlaceChannel(page) {
   });
 }
 
-test("`#243 filter-keeps-selection`: Show read, Collapse read and Hide read each keep the selected message where it is — behind its run's line when it is collapsed", async () => {
+test("`#243 filter-keeps-selection`: Show read, Fold read and Hide read each keep the selected message where it is — behind its run's line when it is collapsed", async () => {
   const page = newPage();
   await signIn(page);
   await showDiscord(page, readPlaceChannel(page));
-  // An unread message, selected, through the whole cycle: Collapse read folds the runs above it into
+  // An unread message, selected, through the whole cycle: Fold read folds the runs above it into
   // lines, Hide read reads only what is left, and Show read reads the channel again.
   parkAt(page, "19", 200);
   await clickRow(page, "19");
   const y = yOf(page, "19");
   const top = page.el("scroll-area").scrollTop;
-  await chooseReadMode(page, "Collapse read");
-  keptAt(page, "19", y, "Collapse read");
-  assert.ok(collapsedRows(page).length > 0, "Collapse read collapsed nothing above the message");
+  await chooseReadMode(page, "Fold read");
+  keptAt(page, "19", y, "Fold read");
+  assert.ok(collapsedRows(page).length > 0, "Fold read collapsed nothing above the message");
   await chooseReadMode(page, "Hide read");
   await page.settle();
   keptAt(page, "19", y, "Hide read");
@@ -56190,11 +56300,11 @@ test("`#243 filter-keeps-selection`: Show read, Collapse read and Hide read each
   await page.settle();
   keptAt(page, "19", y, "Show read");
   assert.deepStrictEqual(litIds(page), ["19"], "the message is not lit as the selection after the cycle");
-  // A read message inside a run: under Collapse read the run's line stands where it stood, and is lit.
+  // A read message inside a run: under Fold read the run's line stands where it stood, and is lit.
   parkAt(page, "18", 160);
   await clickRow(page, "18");
   const runAt = yOf(page, "18");
-  await chooseReadMode(page, "Collapse read");
+  await chooseReadMode(page, "Fold read");
   assert.equal(placeRow(page, "18").getAttribute("data-read-run"), "member", "the fixture's message did not join a run");
   keptAt(page, "17", runAt, "the line of the run the selected message joined");
   assert.deepStrictEqual(litIds(page), ["17"], "the run's line is not lit for the selected message inside it");
@@ -56612,19 +56722,19 @@ test("`#256 reply-marks-read`: the reply's Done is the Done button's own act, ca
     "the reply's Done is not in the send's success");
 });
 
-test("`#256 reply-marks-read`: Hide read leaves the message out and Collapse read folds it, once the reply is sent", async () => {
+test("`#256 reply-marks-read`: Hide read leaves the message out and Fold read folds it, once the reply is sent", async () => {
   const page = newPage();
   await signIn(page);
   const ids = backlog(4).map((m) => m.id);
   await showDiscord(page, backlog(4));
   await doneButton(rowWithId(page, ids[0])).click();
   await page.settle();
-  await chooseReadMode(page, "Collapse read");
+  await chooseReadMode(page, "Fold read");
   assert.equal(rowWithId(page, ids[1]).hasAttribute("data-read-run"), false, "the premise is an unread message out of any run");
   await replyAndSend(page, ids[1]);
   assert.ok(rowWithId(page, ids[1]).hasAttribute("data-read-run"),
-    "Collapse read did not fold the message the reply marked read in with the read one above it");
-  assert.equal(rowWithId(page, ids[2]).hasAttribute("data-read-run"), false, "Collapse read folded an unread message");
+    "Fold read did not fold the message the reply marked read in with the read one above it");
+  assert.equal(rowWithId(page, ids[2]).hasAttribute("data-read-run"), false, "Fold read folded an unread message");
   await chooseReadMode(page, "Hide read");
   assert.ok(!shownIds(page).includes(ids[1]), "Hide read kept the message the reply marked read");
   assert.ok(shownIds(page).includes(ids[2]), "Hide read lost an unread message");
@@ -58023,14 +58133,14 @@ test("`#251 author-filter`: ANDed with the search text, Links and Pinned, the co
   assert.equal(page.el("search-empty").textContent, "None of this channel's pinned messages from anyone else match that search.");
 });
 
-test("`#251 author-filter`: it chooses rows, so Collapse read's runs open under it, and Hide read says why Mine is empty when the owner's own count as read", async () => {
+test("`#251 author-filter`: it chooses rows, so Fold read's runs open under it, and Hide read says why Mine is empty when the owner's own count as read", async () => {
   const page = newPage();
   await signIn(page);
   // The agent's messages read, the owner's own read by the setting: everything but 10 and 11 is read.
   const messages = authorChannel();
   for (const m of messages) if (!["10", "11"].includes(m.id) && m.author_id !== OWN.author_id) page.dealtWith.add(m.id);
   await showDiscord(page, messages);
-  await chooseReadMode(page, "Collapse read");
+  await chooseReadMode(page, "Fold read");
   assert.ok(collapsedRows(page).length > 0, "the fixture collapsed nothing");
   await chooseAuthor(page, "mine");
   assert.deepStrictEqual(collapsedRows(page), [], "a run stayed collapsed under the author filter");
@@ -58497,9 +58607,9 @@ test("`#249 search-highlight`: a gap never meets a collapsed run, and the lines 
   const messages = authorChannel();
   for (const m of messages) if (Number(m.id) < 10) page.dealtWith.add(m.id);
   await showDiscord(page, messages);
-  await chooseReadMode(page, "Collapse read");
+  await chooseReadMode(page, "Fold read");
   assert.ok(collapsedRows(page).length > 0, "the fixture collapsed nothing");
-  assert.deepStrictEqual(seamsOf(page), [], "Collapse read drew a gap");
+  assert.deepStrictEqual(seamsOf(page), [], "Fold read drew a gap");
   await search(page, "deploy");
   await page.settle();
   assert.deepStrictEqual(collapsedRows(page), [], "a run stayed collapsed beside a gap");
@@ -58684,7 +58794,7 @@ test("`#250 date-separators`: a collapsed run's line says the days it brings, an
   await signIn(page);
   for (const id of ["2", "3", "4"]) page.dealtWith.add(id);
   await showDiscord(page, dayChannel());
-  await chooseReadMode(page, "Collapse read");
+  await chooseReadMode(page, "Fold read");
   assert.equal(rowWithId(page, "2").getAttribute("data-read-run"), "head", "the fixture collapsed no run");
   assert.equal(lineText(readRunLineOf(rowWithId(page, "2"))), "… 3 read messages · Oct 4 – 6 …",
     "the run's line does not say the days it covers");
@@ -64944,7 +65054,7 @@ test("`#419 threads-view-main-messages`: Thread or Reply on a main-channel messa
     "the box at the foot did not post to the main channel");
 });
 
-test("`#419 threads-view-main-messages`: Unread only keeps the main-channel messages still to read, and the search finds them by their words", async () => {
+test("`#419 threads-view-main-messages` x `#432 read-mode-unify`: Hide read keeps the main-channel messages still to read, and the search finds them by their words", async () => {
   const { page } = await mainMessagesPage(new Map([[THREADS_MAIN_STORAGE, "on"]]));
   page.dealtWith.add("200");
   await refreshDiscord(page, page.messages);
@@ -64952,10 +65062,9 @@ test("`#419 threads-view-main-messages`: Unread only keeps the main-channel mess
   const shownMain = () => page.el("side-cards").children.filter((li) => li.hasAttribute("data-main-row") && !li.hidden
     && !li.hasClass("search-hidden")).map((li) => li.getAttribute("data-id"));
   assert.deepStrictEqual(shownMain(), ["200", "210"], "the premise is both on the list");
-  await page.el("side-unread-only").click();
-  await page.settle();
-  assert.deepStrictEqual(shownMain(), ["210"], "Unread only kept a read main-channel message");
-  await page.el("side-unread-only").click();
+  await readModeTo(page, "Hide read");
+  assert.deepStrictEqual(shownMain(), ["210"], "Hide read kept a read main-channel message");
+  await readModeTo(page, "Show read");
   await search(page, "brand-new");
   assert.deepStrictEqual(shownMain(), ["210"], "the search did not find the main-channel message by its words");
 });
@@ -64976,9 +65085,9 @@ test("`#419 threads-view-main-messages`: in the Threads view the heading is on t
 // 'Main channel' instead of main messages. And 'Unpack msgs'."
 
 /** The Threads view's three toggle chips, by id. */
-const HEADING_TOGGLES = ["side-unread-only", "side-unpack", "side-main"];
+const HEADING_TOGGLES = ["side-unpack", "side-main", "side-order"];
 
-test("`#421 chip-states`: every toggle chip is pressed by one rule, from aria-pressed, as Unread only always was, and the Threads view's are named Main channel and Unpack msgs", async () => {
+test("`#421 chip-states`: every toggle chip is pressed by one rule, from aria-pressed, as Unread only was before #432, and the Threads view's are named Main channel and Unpack msgs", async () => {
   // One rule for every chip with aria-pressed, for every device, in the accent.
   const pressed = cssRules(CSS_UNCONDITIONAL, '.chip[aria-pressed="true"]').join("\n");
   assert.match(pressed, /border-color:\s*var\(--accent\)/, "a pressed chip is not ringed in the accent");
@@ -64998,7 +65107,7 @@ test("`#421 chip-states`: every toggle chip is pressed by one rule, from aria-pr
   }
   // The names, the phone keeping "Main" alone.
   assert.match(HTML_CODE, /id="side-main"[^>]*>Main<span class="chip-more"> channel<\/span><\/button>/);
-  assert.match(HTML_CODE, /id="side-unpack"[^>]*>Unpack<span class="chip-more"> msgs<\/span><\/button>/);
+  assert.match(HTML_CODE, /id="side-unpack"[^>]*>Unpack msgs<\/button>/);
   assert.doesNotMatch(HTML_CODE, />Main<span class="chip-more"> messages|>Unpack all</, "an old name is still on a chip");
   const { page } = await mainMessagesPage();
   const keys = page.el("keyboard-keys").text();
@@ -76588,7 +76697,7 @@ const chordName = (fields) => (fields.metaKey ? "Cmd+S" : "Ctrl+S");
 
 test("`#403 composer-key-global`: in two columns, from the right column's THREAD CARDS, Ctrl+S and Cmd+S go to Main's box", async () => {
   // Before the fix the right column, which has no box on its cards, was asked for its own, and nothing
-  // moved: from a card, a highlighted card, the list, its Unread only, or the body after the cards.
+  // moved: from a card, a highlighted card, the list, its Unread only (now its Unpack msgs, #432), or the body after the cards.
   const cases = [
     ["a card", async (page) => cardOf(page, cardIds(page)[0])],
     ["a highlighted card", async (page) => {
@@ -76598,7 +76707,7 @@ test("`#403 composer-key-global`: in two columns, from the right column's THREAD
       return cardOf(page, cardIds(page)[0]);
     }],
     ["the right column's list", async (page) => page.el("side-scroll")],
-    ["Unread only", async (page) => page.el("side-unread-only")],
+    ["Unpack msgs", async (page) => page.el("side-unpack")],
     ["the page body, the selection on a card", async (page) => {
       await press(page, page.el("side-scroll"), "ArrowDown");
       return null;
@@ -77107,7 +77216,7 @@ test("`#423 back-key-consistency`: a place noted twice — two columns lost to a
 
 /** The read mode button pressed until it says `words`. */
 async function readModeTo(page, words) {
-  const mode = { "Show read": "show", "Collapse read": "collapse", "Hide read": "hide" }[words];
+  const mode = { "Show read": "show", "Fold read": "fold", "Hide read": "hide" }[words];
   for (let press = 0; press < 3 && page.el("todo-filter").getAttribute("data-read-mode") !== mode; press += 1) {
     await page.el("todo-filter").click();
     await page.settle();
@@ -77329,11 +77438,11 @@ async function unpackPage(storage = null) {
   return { page, data };
 }
 
-test("`#404 threads-unpack-all`: Unpack msgs is a toggle beside Unread only, off means cards alone, u is in the help", async () => {
+test("`#404 threads-unpack-all`: Unpack msgs is a toggle in the cards' heading, off means cards alone, u is in the help", async () => {
   assertMarkupContains("side-heading", "side-unpack");
   const tag = /<button\s+id="side-unpack"[^>]*>/.exec(HTML_CODE)[0];
   assert.match(tag, /aria-pressed="false"/);
-  assert.match(HTML_CODE, /id="side-unpack"[^>]*>Unpack<span class="chip-more"> msgs<\/span><\/button>/);
+  assert.match(HTML_CODE, /id="side-unpack"[^>]*>Unpack msgs<\/button>/);
   const { page } = await unpackPage();
   const toggle = page.el("side-unpack");
   assert.equal(toggle.hidden, false, "the toggle is not offered over the cards");
@@ -77400,13 +77509,13 @@ test("`#404 threads-unpack-all` + `#405 root-under-summary`: every thread's mess
   assert.ok(!rawRows.some((li) => li.hasAttribute("data-root-child")), "a raw card grew a root child");
 });
 
-test("`#404 threads-unpack-all` x `#221 read-modes`: Collapse read folds runs onto the bridge; Hide read leaves read replies out of every block but keeps a summarized root", async () => {
+test("`#404 threads-unpack-all` x `#221 read-modes`: Fold read folds runs onto the bridge; Hide read leaves read replies out of every block but keeps a summarized root", async () => {
   const { page } = await unpackPage();
   await page.el("side-unpack").click();
   await page.settle();
   await page.el("todo-filter").click(); // Show -> Collapse
   await page.settle();
-  assert.equal(page.el("todo-filter").getAttribute("data-read-mode"), "collapse");
+  assert.equal(page.el("todo-filter").getAttribute("data-read-mode"), "fold");
   for (const threadId of ["spaces/A/threads/sum", "spaces/A/threads/raw"]) {
     // `#407 unpack-row-parity`: the run line every list draws, on the run's first row.
     const runs = unpackRows(page, threadId).filter((li) => li.getAttribute("data-read-run") === "head");
@@ -77596,7 +77705,7 @@ test("`#407 unpack-row-parity`: ; and : step the unpacked rows' folds as they st
     ": did not open the unread rows and fold the read ones");
 });
 
-test("`#407 unpack-row-parity`: Collapse read draws a block's run as every list draws one, and Enter on it opens it", async () => {
+test("`#407 unpack-row-parity`: Fold read draws a block's run as every list draws one, and Enter on it opens it", async () => {
   const { page } = await parityPage({ long: false });
   await page.el("todo-filter").click(); // Show -> Collapse
   await page.settle();

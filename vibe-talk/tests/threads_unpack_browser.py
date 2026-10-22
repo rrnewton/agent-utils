@@ -16,7 +16,7 @@ At each size and scheme: sign in, All, the thread list from the picker -> three 
 offered and unpressed, no unpacked row (negative control) -> press it: every card gains its messages,
 the summarised block starting with its root as a bridged child in the thread's colour, a raw block
 with no root row (negative control), each bridge's spine left of its boxes and continuous over the
-block -> Collapse read: each block's two read replies are one grey line joined to its spine -> Hide
+block -> Fold read: each block's two read replies are one grey line joined to its spine -> Hide
 read: read replies gone from every block, the summarised root still first -> Show read, Unpack msgs
 off: cards alone again -> u (desk) or the chip (phone) on, reload: still on -> `#411
 thread-view-row-padding`: every unpacked row's header buttons stand at least as far inside its top
@@ -28,7 +28,7 @@ is, with a real mouse and real keys: the mouse over an unpacked row lights it (o
 drawn with the selection's ring); ↓ and ↑ move the selection through the rows of a block and across to
 the next card in reading order; e marks the selected row Done with the list left where it was, and z
 puts it back; Enter opens and folds the selected row; : and ; collapse and expand
-every unpacked row, saying so; under Collapse read the block's run is the run line every list draws,
+every unpacked row, saying so; under Fold read the block's run is the run line every list draws,
 which Enter on it opens. Negative control: before any of it, ↓ over the cards packed goes card to card.
 
 Then, at the desk in the dark, a channel of forty threads: the time from pressing Unpack msgs to every
@@ -250,8 +250,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
     desk.shot("2-unpacked-show")
 
     page.click("#todo-filter")
-    desk.wait_for("() => document.getElementById('todo-filter').getAttribute('data-read-mode') === 'collapse'",
-                  "Collapse read was not reached")
+    desk.wait_for("() => document.getElementById('todo-filter').getAttribute('data-read-mode') === 'fold'",
+                  "Fold read was not reached")
     desk.settled()
     for thread_id in (RUNNER, REPLICA):
         runs = [row for row in page.evaluate(STATE_JS, thread_id) if row["run"]]
@@ -431,17 +431,17 @@ def parity(chromium: BrowserType, args: argparse.Namespace, label: str, width: i
     page.keyboard.press(";")
     desk.settled()
     desk.check(all(state == "false" for state in page.evaluate(FOLDS_JS).values()), "; did not expand every unpacked row")
-    desk.check(page.locator("#status").text_content() == "Expanded all", "; did not say what it did")
+    desk.check(page.locator("#status").text_content() == "Long messages: all expanded", "; did not say what it did")
     desk.shot("3-expanded")
     page.keyboard.press(":")
     desk.settled()
     desk.check(all(state == "true" for state in page.evaluate(FOLDS_JS).values()), ": did not collapse every unpacked row")
-    desk.check(page.locator("#status").text_content() == "Collapsed all", ": did not say what it did")
+    desk.check(page.locator("#status").text_content() == "Long messages: all collapsed", ": did not say what it did")
 
-    # Collapse read: the block's run is the run line every list draws, and Enter on it opens it.
+    # Fold read: the block's run is the run line every list draws, and Enter on it opens it.
     page.click("#todo-filter")
-    desk.wait_for("() => document.getElementById('todo-filter').getAttribute('data-read-mode') === 'collapse'",
-                  "Collapse read was not reached")
+    desk.wait_for("() => document.getElementById('todo-filter').getAttribute('data-read-mode') === 'fold'",
+                  "Fold read was not reached")
     desk.settled()
     head = f'#side-cards > li[data-unpack-thread="{REPLICA}"][data-read-run="head"]'
     desk.check(page.locator(head).count() == 1, "the raw block's read run is not the shared run line")

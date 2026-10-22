@@ -2048,7 +2048,7 @@ def _act_summary_failed(driver: Driver) -> None:
 
 
 def _choose_hide_read(driver: Driver) -> None:
-    """Tap the read-mode button on to Hide read: `#221 read-modes` put Collapse read before it."""
+    """Tap the read-mode button on to Hide read: `#221 read-modes` put Fold read before it."""
     for _tap in range(3):
         if driver.js("document.getElementById('todo-filter').getAttribute('aria-pressed')") == "true":
             return

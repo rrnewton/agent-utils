@@ -2974,7 +2974,7 @@ a.search-hit-link {
 }
 
 /*
- * A RUN OF READ MESSAGES, COLLAPSED. `#221 read-modes`: under Collapse read each run of read
+ * A RUN OF READ MESSAGES, COLLAPSED. `#221 read-modes`: under Fold read each run of read
  * messages is one line, "… 12 read messages …", and a tap on it opens the run.
  *
  * The line is drawn ON THE RUN'S FIRST ROW, which stays the message it is — every act that finds a
@@ -4339,7 +4339,7 @@ a.search-hit-link {
 }
 
 /* The filter reads as thrown, drawn from the SAME attribute that says so to a screen reader:
-   `true` for Hide read and `mixed` for Collapse read, the two modes that take read messages out of
+   `true` for Hide read and `mixed` for Fold read, the two modes that take read messages out of
    the way. `#221 read-modes`. */
 #todo-filter[aria-pressed="true"],
 #todo-filter[aria-pressed="mixed"] {
@@ -7120,12 +7120,19 @@ textarea {
   grid-row: 1 / span 2;
 }
 
-/* `#221 read-modes`. The narrow column holds the mode's name, and "Collapse" is its longest word: a
+/* `#221 read-modes`. The narrow column holds the mode's name, and "Collapse" was its longest word: a
    size down, so the word stands clear of the tile's edges instead of touching both. */
 #control-pane #todo-filter .control-label {
   font-size: 0.72rem;
   line-height: 1.15;
   text-align: center;
+}
+
+/* `#432 read-mode-unify`. And in two lines, its two words one above the other, as at a desk (below):
+   "Fold read", once Collapse read, is just narrow enough to stand on one line, touching both sides. */
+#control-pane #todo-filter .read-mode-verb,
+#control-pane #todo-filter .read-mode-noun {
+  display: block;
 }
 
 /*
@@ -7613,8 +7620,8 @@ textarea {
   /* `#221 read-modes`. The read mode's WHOLE name, here as on the phone tile. Its first word alone
      — "Hide", "Collapse" — reads as the act a tap performs, beside Pace and Read and under the
      "Collapse all" chip, which is the ambiguity the button names its mode to avoid. This row was
-     fitted to "Hide read" with nothing to spare, and "Collapse read" on one line beside its icon
-     pushes the dock onto a second row, the button with it. So the name stands in two short lines a
+     fitted to "Hide read" with nothing to spare, and "Collapse read" (Fold read now) on one line
+     beside its icon pushed the dock onto a second row, the button with it. So the name stands in two short lines a
      size down from the row's words: no wider than its first word was at the row's size, and inside
      the row's height. */
   #control-pane #todo-filter .control-label {
@@ -8263,10 +8270,10 @@ textarea {
   font-weight: 600;
 }
 
-/* `#259 thread-list-unread-filter`. The cards' own filter, at the far end of the heading it narrows,
-   where the X stands over a thread: a quiet chip at rest, and pressed as every toggle chip is
-   (`.chip[aria-pressed="true"]`, `#421 chip-states`), as are Unpack msgs and Main channel beside it. */
-#side-unread-only {
+/* The heading's chips at its far end, where the X stands over a thread: quiet at rest, and pressed as every
+   toggle chip is (`.chip[aria-pressed="true"]`, `#421 chip-states`). Unread only (`#259`) led them until
+   the read mode took its place (`#432 read-mode-unify`). */
+#side-unpack {
   margin-inline-start: auto;
 }
 
@@ -8420,6 +8427,28 @@ li.discord-message[data-root-child] > .reply-bridge {
   border-left-color: hsl(var(--thread-hue, 210) 55% 50%);
   outline: 2px solid var(--accent);
   outline-offset: 2px;
+}
+
+/* `#432 read-mode-unify`. A card standing as the line of a run of read threads under Fold read: the line
+   alone, as a message row heading a run is (`li.discord-message[data-read-run="head"]` above), the card's
+   surface, edge and words given up while it is the line; the card is still the thread, for every act that
+   finds it by its id. The line is the one every run draws (`.read-run`). */
+#side-cards li.side-card-row[data-read-run="head"] {
+  display: block;
+  padding: 0;
+  background: none;
+  border-color: transparent;
+  border-left-color: transparent;
+  outline: none;
+}
+
+#side-cards li.side-card-row[data-read-run="head"] > :not(.read-run) {
+  display: none;
+}
+
+#side-cards li.side-card-row[data-read-run="head"][data-selected="true"] > .read-run {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 /* `#277 thread-card-focus`. The card highlighted: ringed and tinted in its thread's colour. */
