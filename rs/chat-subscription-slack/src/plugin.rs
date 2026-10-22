@@ -100,6 +100,9 @@ const TRUNCATION_MARKER: &str = "\n[message truncated by the Slack provider]";
 pub const DEFAULT_CURSOR_REFRESH: Duration = Duration::from_secs(2 * 60 * 60);
 /// How long a stream may stay subscribed without any event before the diagnostics log notes it.
 pub const QUIET_NOTICE_MILLIS: u64 = 30 * 60 * 1_000;
+/// How many of the newest message timestamps a subscription remembers having carried, to notice a
+/// thread reply whose root it never carried.
+const MAX_CARRIED: usize = 4_096;
 const CREWMATE_WARNING: &str = "warning: the event stream client's output names a Crewmate, \
 so the tail may run as an app's Crewmate; Slack delivers channel message events to a human \
 member's own subscription, not to an app's Crewmate, so such a tail receives none. Point cli_path \
@@ -619,6 +622,9 @@ impl ChatSubscriptionBackend for SlackBackend {
             events_seen: false,
             quiet_noted: false,
             crewmate_warned: false,
+            carried: BTreeSet::new(),
+            carried_since_micros: None,
+            uncarried_noted: BTreeSet::new(),
             transport,
         }))
     }
@@ -660,6 +666,12 @@ struct SlackDriver {
     events_seen: bool,
     quiet_noted: bool,
     crewmate_warned: bool,
+    // The newest `MAX_CARRIED` message timestamps the stream carried in the configured channels,
+    // and the oldest instant from which it remembers every one: see `note_carried`.
+    carried: BTreeSet<u128>,
+    carried_since_micros: Option<u128>,
+    // Thread roots already noted as never carried, so each is noted once.
+    uncarried_noted: BTreeSet<u128>,
     transport: Box<dyn SlackTransport>,
 }
 
@@ -723,6 +735,66 @@ impl SlackDriver {
         })?;
         self.cancel.register(self.stream.canceller());
         Ok(())
+    }
+
+    /// Remember that the stream carried `message`, and note in the diagnostics log a thread reply
+    /// whose root it has not carried although the root is newer than the lineage start and than
+    /// the first message this subscription carried.
+    ///
+    /// The event stream does not publish every message: on 2026-10-21 the owner's thread root
+    /// with an attached file never reached his subscription, while his plain reply in that thread
+    /// did; his queue held no event of any type for the root (#415 slack-file-share-delivery).
+    /// Such a message cannot be delivered from the stream, and the reply alone reaches the agent
+    /// without it, so the log names the root for an operator to find. Only the log: a batch is
+    /// built from its event alone, so a replay stays identical; a root may also merely be late,
+    /// and the client documents that it emits no posts by other bots, so a bot's root looks the
+    /// same and is no message from a person to alarm about.
+    ///
+    /// The instant from which every carried message is remembered is the first one carried, raised
+    /// as the oldest are forgotten, and never lowered: a message that arrives late with an older
+    /// timestamp does not make the roots before it look missed.
+    fn note_carried(&mut self, sequence: u64, message: &SlackMessage) {
+        if !self.channels.contains(&message.channel_id) {
+            return;
+        }
+        let Some(created) = ids::ts_micros(&message.message_ts) else {
+            return;
+        };
+        let since = self.carried_since_micros;
+        let root = message
+            .thread_ts
+            .as_deref()
+            .filter(|root| *root != message.message_ts && ids::valid_ts(root));
+        if let (Some(root), Some(since)) = (root, since) {
+            if ids::ts_micros(root).is_some_and(|at| {
+                at > since
+                    && at >= self.created_floor_micros
+                    && !self.carried.contains(&at)
+                    && self.uncarried_noted.insert(at)
+            }) {
+                self.diagnostics.log(&format!(
+                    "event {sequence}: thread reply {} (user {}) is in thread {root}, whose root \
+                     this stream has not carried although it carried an earlier message; the event \
+                     stream does not publish some messages, such as one with a file, so unless it \
+                     is only late, that root will not be delivered as a request",
+                    message.message_ts,
+                    message.user_id.as_deref().unwrap_or("none")
+                ));
+                if self.uncarried_noted.len() > MAX_CARRIED {
+                    self.uncarried_noted.pop_first();
+                }
+            }
+        }
+        if since.is_none() {
+            self.carried_since_micros = Some(created);
+        }
+        self.carried.insert(created);
+        if self.carried.len() > MAX_CARRIED {
+            // Up to the oldest one forgotten, nothing is known to have been carried.
+            if let Some(forgotten) = self.carried.pop_first() {
+                self.carried_since_micros = self.carried_since_micros.max(Some(forgotten));
+            }
+        }
     }
 
     fn batch(
@@ -1015,6 +1087,9 @@ impl ChatSubscriptionDriver for SlackDriver {
                     }
                     self.floor_sequence = Some(sequence);
                     self.advanced_at_millis = (self.now_millis)();
+                    if let Some(message) = message.as_deref() {
+                        self.note_carried(sequence, message);
+                    }
                     let cursor = Cursor::Sequence(sequence).encode();
                     let event = match message.as_ref().map(|message| self.admit(message)) {
                         Some(Ok(inbound)) => {
