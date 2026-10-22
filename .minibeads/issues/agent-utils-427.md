@@ -1,13 +1,14 @@
 ---
 title: 'server-thread-hues: thread colours are decided by the server as messages arrive'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 - ui
 created_at: 2026-10-22T14:31:16.746579915+00:00
-updated_at: 2026-10-22T14:31:16.746579915+00:00
+updated_at: 2026-10-22T17:01:01.016139447+00:00
+closed_at: 2026-10-22T17:01:01.016139307+00:00
 ---
 
 # Description
