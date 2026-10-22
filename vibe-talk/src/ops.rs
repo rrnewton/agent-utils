@@ -1567,21 +1567,31 @@ pub async fn digest(
 /// How far back [`activity`] reads when the caller does not say: one day.
 pub const DEFAULT_ACTIVITY_HOURS: u64 = 24;
 
-/// How many of each channel's most recent lines [`activity`] carries when the caller does not say.
-pub const DEFAULT_ACTIVITY_LINES: u16 = 8;
+/// How many of each channel's most recent messages [`activity`] carries across every channel when
+/// the caller does not say.
+pub const DEFAULT_ACTIVITY_LINES: u16 = 10;
+
+/// How many of its most recent messages [`activity`] carries for ONE named channel when the caller
+/// does not say: as many as it will carry at all, since a catch-up on one channel is the question
+/// the full text is for. `#437 voice-full-text-catchup`.
+pub const DEFAULT_CHANNEL_ACTIVITY_LINES: u16 = MAX_ACTIVITY_LINES;
 
 /// The most lines per channel [`activity`] will carry, whatever the caller asks for.
 pub const MAX_ACTIVITY_LINES: u16 = 30;
 
 /// What [`activity`] should cover. Every field but the clock is optional.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct ActivityRequest {
+pub struct ActivityRequest<'a> {
     /// Hours back from `now_ms`. Absent means [`DEFAULT_ACTIVITY_HOURS`]; outside
     /// `1..=MAX_WINDOW_HOURS` it is CLAMPED, and [`Activity::asked_hours`] says so.
     pub hours: Option<u64>,
-    /// Lines per channel. Absent means [`DEFAULT_ACTIVITY_LINES`]; clamped to
-    /// `1..=MAX_ACTIVITY_LINES`.
+    /// Lines per channel. Absent means [`DEFAULT_ACTIVITY_LINES`], or
+    /// [`DEFAULT_CHANNEL_ACTIVITY_LINES`] for one `channel`; clamped to `1..=MAX_ACTIVITY_LINES`.
     pub per_channel_limit: Option<u16>,
+    /// Read only this listed channel, by id, rather than every one. `#437 voice-full-text-catchup`:
+    /// "catch me up on that channel" is the same catch-up, with the same deadline and held copy, as
+    /// "catch me up". A channel that is not listed is [`OpError::UnknownChannel`].
+    pub channel: Option<&'a str>,
     /// The clock the window is resolved against: [`now_ms`] in production, a fixed instant in a
     /// test.
     pub now_ms: i64,
@@ -1642,6 +1652,11 @@ pub struct WindowActivity {
     /// The most recent lines inside the window, at most the request's per-channel limit, OLDEST
     /// FIRST like every digest. Placeholders excluded.
     pub entries: Vec<DigestEntry>,
+    /// The same messages in full, stamped, in the same order: what a model reads. `#437
+    /// voice-full-text-catchup`.
+    pub messages: Vec<Message>,
+    /// How many of the `counted` messages are the owner's own. `#438 voice-owner-identity`.
+    pub owners: usize,
     /// Messages inside the window that are not placeholders — the number to say aloud.
     pub counted: usize,
     /// Whether `counted` is the window's whole count. False means the read stopped before it
@@ -1760,17 +1775,28 @@ pub fn activity_scan(state: &AppState, lines: u16) -> u16 {
 pub async fn activity(
     state: &AppState,
     caller: crate::auth::Scope,
-    request: ActivityRequest,
+    request: ActivityRequest<'_>,
 ) -> Result<Activity, OpError> {
     let asked = request.hours.unwrap_or(DEFAULT_ACTIVITY_HOURS);
     let hours = asked.clamp(1, MAX_WINDOW_HOURS);
     let since_ms = hours_before(hours, request.now_ms)?;
     let lines = request
         .per_channel_limit
-        .unwrap_or(DEFAULT_ACTIVITY_LINES)
+        .unwrap_or(if request.channel.is_some() {
+            DEFAULT_CHANNEL_ACTIVITY_LINES
+        } else {
+            DEFAULT_ACTIVITY_LINES
+        })
         .clamp(1, MAX_ACTIVITY_LINES);
     let scan = activity_scan(state, lines);
-    let channels = channels(state).await;
+    let mut channels = channels(state).await;
+    if let Some(only) = request.channel {
+        channels.retain(|channel| channel.id.as_str() == only);
+        if channels.is_empty() {
+            return Err(OpError::UnknownChannel);
+        }
+    }
+    let owner = crate::owner::Owner::of(state);
     let recent = state.live.recent();
     let timing = recent.timing();
     let began = tokio::time::Instant::now();
@@ -1806,7 +1832,7 @@ pub async fn activity(
     let mut reads: Vec<ChannelActivity> = Vec::with_capacity(channels.len());
     for channel in channels {
         let reuse = crate::recent::reuse_for(state, &channel.id);
-        reads.push(channel_activity(state, channel, began, reuse, lines, since_ms).await);
+        reads.push(channel_activity(state, channel, began, reuse, lines, since_ms, &owner).await);
     }
     if !reads.is_empty()
         && reads
@@ -1834,6 +1860,7 @@ async fn channel_activity(
     reuse: std::time::Duration,
     lines: u16,
     since_ms: i64,
+    owner: &crate::owner::Owner,
 ) -> ChannelActivity {
     let known = state.live.recent().snapshot(&channel.id);
     let Some(held) = known.held else {
@@ -1865,7 +1892,9 @@ async fn channel_activity(
         .mark(&mut messages);
     ChannelActivity {
         channel,
-        read: Ok(window_activity(messages, held.whole, lines, since_ms)),
+        read: Ok(window_activity(
+            messages, held.whole, lines, since_ms, owner,
+        )),
         currency,
         as_of: held.as_of,
     }
@@ -1878,6 +1907,7 @@ fn window_activity(
     whole: bool,
     lines: u16,
     since_ms: i64,
+    owner: &crate::owner::Owner,
 ) -> WindowActivity {
     // The count is exact only when the read reached past the start of the window: either the
     // channel ran out, or its oldest fetched message is already older than the window. Otherwise
@@ -1900,12 +1930,18 @@ fn window_activity(
         .filter(|m| message_ms(m).is_none_or(|ms| ms >= since_ms))
         .partition(|m| m.noise);
     let skip = kept.len().saturating_sub(usize::from(lines));
+    let owners = kept
+        .iter()
+        .filter(|m| owner.is_owner(m.author_id.as_str()))
+        .count();
     WindowActivity {
         entries: summary::digest(&kept[skip..], DEFAULT_SUMMARY_CHARS),
+        owners,
         counted: kept.len(),
         complete,
         noise: noise.len(),
         newest,
+        messages: kept.into_iter().skip(skip).collect(),
     }
 }
 
@@ -5949,11 +5985,12 @@ mod tests {
         );
     }
 
-    fn request(hours: Option<u64>) -> ActivityRequest {
+    fn request(hours: Option<u64>) -> ActivityRequest<'static> {
         ActivityRequest {
             hours,
             per_channel_limit: None,
             now_ms: NOW,
+            channel: None,
         }
     }
 
@@ -6074,8 +6111,8 @@ mod tests {
         assert_eq!(read.counted, 20);
         assert_eq!(
             summaries(read),
-            ["m22", "m23", "m24", "m25", "m26", "m27", "m28", "m29"],
-            "the newest eight, oldest first"
+            ["m20", "m21", "m22", "m23", "m24", "m25", "m26", "m27", "m28", "m29"],
+            "the newest ten, oldest first"
         );
     }
 
@@ -6100,7 +6137,11 @@ mod tests {
                 "{asked:?}"
             );
         }
-        for (asked, lines) in [(Some(0), 1), (Some(500), MAX_ACTIVITY_LINES), (None, 8)] {
+        for (asked, lines) in [
+            (Some(0), 1),
+            (Some(500), MAX_ACTIVITY_LINES),
+            (None, DEFAULT_ACTIVITY_LINES),
+        ] {
             let read = activity(
                 &state,
                 Scope::Read,

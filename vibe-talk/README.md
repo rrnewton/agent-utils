@@ -835,7 +835,7 @@ Two things are worth knowing before you begin, because they shape everything els
 | Semantic random access (`resolve`) | **works**, lexical ranking behind a `Ranker` trait |
 | Device speech for the message view's Read control | **prototype.** Uses browser-reported local voices without ElevenLabs credentials. Playback, cancellation, and failures have automated browser coverage; physical-phone audio and background playback remain device checks. |
 | Main, All, a selected thread from the bar's picker, and bottom composer | **works.** Native thread endpoints have loopback HTTP tests; a compatible Google Chat bridge has been exercised with real read-only traffic. Browser interaction and layout were checked at two phone sizes. Posting tests use local fakes. |
-| **MCP over Streamable HTTP at `/mcp`** | **works.** Bearer-authenticated, stateless, eight tools, tested end to end. Never yet driven by a real ElevenLabs agent. |
+| **MCP over Streamable HTTP at `/mcp`** | **works.** Bearer-authenticated, stateless, seven listed tools, tested end to end. Never yet driven by a real ElevenLabs agent. |
 | ElevenLabs voice agent | **reachable, and currently NOT invoking tools.** A real agent has now been driven headlessly (`scripts/run.sh --smoke-agent`): the signed URL mints, the conversation opens, the agent answers — and it calls no tool, saying its tools "appear to be out of date". In the same conversation ElevenLabs reports our MCP server connected with all five tools visible, so the fault is in the agent's own configuration rather than in this server. |
 | **Signed conversation URLs at `/api/v1/signed-url`** | **works against a fake, unverified against live ElevenLabs.** Mints a short-lived signed URL for an agent that has "Enable Authentication" turned on, and the app at `/` is a dependency-free page that uses one. Tested end to end against an in-memory ElevenLabs that refuses a wrong key and an unknown agent, and against a loopback HTTP server that proves the account key travels in a header. |
 | Slow path (ask a coding agent for detail) | **seam only.** The route exists and answers HTTP 501 with an explanation. |
@@ -4420,7 +4420,7 @@ own adapter-only token; every other route uses the read/write tokens described a
 |---|---|---|---|
 | GET | `/healthz` | none | liveness |
 | GET | `/api/v1/channels` | read | configured channels |
-| GET | `/api/v1/activity?hours=&per_channel_limit=` | read | every listed channel's last few hours in one read, the newest message named: the route behind `recent_activity` — see "The eight tools" |
+| GET | `/api/v1/activity?hours=&per_channel_limit=&channel_id=` | read | every listed channel's (or one channel's) last few hours in one read, the newest message named: the route behind `recent_activity` — see "The tools" |
 | POST | `/api/v1/channels` | **write** | direct mode: `{id,label,writable}`; managed mode: `{source,label}` — validate and add a tracked channel; with several services, `provider` names the service, whose own mode decides — see "Several chat providers in one server" |
 | GET | `/api/v1/channel-directory?q=&limit=&cursor=&provider=` | **write** | managed mode: one page of the channels the bridge can see, each marked `tracked` when already a channel here; `provider` lists only that service's |
 | DELETE | `/api/v1/channels/{id}` | **write** | take a channel off the list: one added in the app is forgotten (managed mode also unregisters it upstream); one from the configuration file is hidden — see "Taking a channel off the list" |
@@ -8664,13 +8664,13 @@ JSON-RPC batches are refused with `-32600`. The 2025-06-18 revision removed them
 half-succeeded batch has no coherent HTTP status — which is not a property a write-capable
 endpoint should have.
 
-### The eight tools
+### The tools
 
 | Tool | Scope | Approval intent | What it does |
 |---|---|---|---|
-| `recent_activity` | read | automatic | Catches up on every listed channel in one call, with no required argument: the newest message's channel and time first, then each channel's most recent lines inside the window (`hours`, default 24, at most 168) with an honest count. Listed first. |
+| `recent_activity` | read | automatic | Catches up in one call, with no required argument: the newest message's channel and time first, then each channel's most recent messages inside the window (`hours`, default 24, at most 168), **in full**, with an honest count. `channel_id` reads one channel. Listed first. |
 | `list_channels` | read | automatic | Names the configured channels and which are postable. |
-| `digest_channel` | read | automatic | One speakable line per recent message. |
+| `digest_channel` | read | automatic | One speakable line per recent message. **Not listed** since `#437 voice-full-text-catchup`; answered by name only, for an agent configured with it. |
 | `read_page` | read | automatic | One step of a walk: a page that says it is a page, plus the cursor for the next one. `hours` reads from that many hours ago to now. |
 | `count_messages` | read | automatic | How many, up to a cost ceiling — "at least N" when the ceiling stops it. `hours` counts from that many hours ago. |
 | `find_message` | read | automatic | Describe a message in your own words, get it back in full. |
@@ -8686,9 +8686,24 @@ filler — and the listener then hears a canned "something went wrong". The requ
 way were the open-ended ones: "what happened in the last day" was a channel list, a clock lookup
 and one read per channel. `recent_activity` answers it in one call with no required argument,
 and `hours` on `read_page` and `count_messages` removes the clock lookup from the precise reads.
-Each channel is still one ordinary fetch with the same noise rules and spoken times; the answer
-is capped at about 8 KB, dropping the oldest lines first and saying so, and one channel that
-cannot be read is named as such rather than failing the rest.
+Each channel is still one ordinary fetch with the same noise rules and spoken times, and one
+channel that cannot be read is named as such rather than failing the rest.
+
+**It carries the full text** (`#437 voice-full-text-catchup`). Asked to summarise recent progress,
+a model should reason from what the coding agents actually wrote, not from 160-character lines, so
+every message is given whole — 10 per channel by default across every channel, 30 for one channel
+named by `channel_id` — and a single message longer than 2,000 characters is cut there with a note
+that `read_message` has the rest. The answer stays under about 32 KB (some eight thousand tokens),
+dropping the oldest messages first and saying so, with the way further back (`read_page` with
+`before`). `digest_channel`, which cut every message to 160 characters and read the chat service
+with no deadline and no held copy, is no longer listed to a model: the live calls that reached it
+timed out in the voice runtime while this catch-up would have answered. It still answers by name.
+
+**Every read tool answers by a deadline of its own**: twelve seconds, inside the deployment-managed
+voice runtime's fifteen. A read still waiting for the chat service then answers `not_read_in_time`,
+says that nothing was read, and points at `recent_activity`, rather than leaving the runtime to drop
+the call with nothing said. `post_reply` has no such deadline: half a send is worse than a slow one,
+and its result already says `NOT CONFIRMED` when the answer is lost.
 
 **It answers by a deadline, not when the slowest read ends** (`#210 voice-catchup-speed`). Behind
 a provider bridge that runs one command at a time, three channels cost three reads in series —
@@ -9250,8 +9265,10 @@ Then set per-tool approval. This table is the whole policy:
 
 | Tool | Approval setting | Why |
 |---|---|---|
+| `recent_activity` | **auto** — no approval | The full text of the recent messages, every channel's or one channel's. The main one. |
 | `list_channels` | **auto** — no approval | Names the configured channels. Touches Discord not at all. |
-| `digest_channel` | **auto** — no approval | One spoken line per recent message. The main one. |
+| `read_page` | **auto** — no approval | A page further back, or a period, in full. |
+| `count_messages` | **auto** — no approval | How many, honest about a floor. |
 | `find_message` | **auto** — no approval | A description in your own words → that message, in full. |
 | `read_message` | **auto** — no approval | One known message by id. |
 | **`post_reply`** | **REQUIRE APPROVAL** | **Speaks in your name, in your channel.** |
@@ -9794,6 +9811,43 @@ You can also set it without a restart: **Settings lists every account it has see
 say which is which. That is the faster fix, and it is per-browser; the configuration setting is for
 a deployment that would rather state it once.
 
+### Your own messages, to the voice agent
+
+`#438 voice-owner-identity`. The voice agent is told which messages are yours, so it does not read
+you your own words back. Every message line a model reads — `recent_activity`, `read_page`,
+`find_message`, `read_message` — attributes yours to the user instead of to your display name:
+
+```
+[1557… | 09:51 | exact 2026-10-22T13:51:00Z | the user (Ada Lovelace) <@900000000000000002>] how is the drift going?
+```
+
+and `recent_activity` says how many of a channel's messages are yours ("12 messages in the last 2
+hours, 3 of them the user's own"). The system prompt and the MCP instructions say never to read
+those aloud or summarise them back unless you ask, and to use them only as context for what the
+coding agents answered. The mention token stays, so a reply can still notify you.
+
+Your accounts are, together:
+
+* every provider's `owner_user_id` (`[discord]` or a `[[providers]]` entry);
+* `[owner] user_ids`, for any other account that is yours.
+
+The account this server posts as is not counted unless `user_ids` lists it, though the channel view
+draws its posts as yours: where the coding agents post through that same account (one bot token, or
+one Slack app), counting it would mark every agent message as yours, and the voice agent would read
+you nothing.
+
+```toml
+[owner]
+name = "Ada Lovelace"        # how the agent is told a message is yours; unset, "the user"
+user_ids = ["U0OLDACCOUNT"]  # other accounts that are yours, beyond each owner_user_id
+```
+
+A deployment that already sets `owner_user_id` needs only `name`. An author whose display name is
+only an account number — a bridge that could not resolve the sender — is shown to the model as
+`an unnamed account`, so the number is never read aloud as a name, and anyone else whose display
+name begins "the user" is shown as `someone named "…"`, so no one can choose a name that reads as
+yours.
+
 ### Who the coding agent is
 
 `#323 slack-system-bots`. The channel view draws the coding agent's messages as the call
@@ -9859,7 +9913,7 @@ Beyond the security list above:
   on, keeps a copy and answers from it only with `serve = true` (see "The message cache"). Two short-lived copies are
   kept in memory for reading: read-aloud preparation reuses messages the page fetched in the last
   30 seconds (`#191 read-aloud-first-lag`), and the voice catch-up answers from each channel's
-  newest window when the provider is slow (`#210 voice-catchup-speed`; see "The eight tools").
+  newest window when the provider is slow (`#210 voice-catchup-speed`; see "The tools").
   Obeying `Retry-After` does not change that — it buys time, not quota, so a poll interval still
   spends one request per channel whether or not anybody is listening. That is why `discord.live_poll_seconds` still
   defaults to OFF and why an interval under five seconds is still refused outright rather than

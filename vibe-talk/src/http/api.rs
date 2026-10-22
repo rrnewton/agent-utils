@@ -1973,8 +1973,11 @@ pub async fn digest(
 pub struct ActivityQuery {
     /// Hours back from now, on this server's clock. Default 24, clamped to 1..=168.
     pub hours: Option<u64>,
-    /// How many of each channel's most recent lines to return. Default 8, clamped to 1..=30.
+    /// How many of each channel's most recent lines to return. Default 10 (30 with `channel_id`),
+    /// clamped to 1..=30.
     pub per_channel_limit: Option<u16>,
+    /// Read only this listed channel. `#437 voice-full-text-catchup`.
+    pub channel_id: Option<String>,
 }
 
 /// The newest message any listed channel holds, as far as the reads saw.
@@ -2038,6 +2041,7 @@ pub async fn activity(
         ops::ActivityRequest {
             hours: query.hours,
             per_channel_limit: query.per_channel_limit,
+            channel: query.channel_id.as_deref(),
             now_ms: ops::now_ms(),
         },
     )

@@ -87,7 +87,7 @@ pub const PROMPT_ID: &str = "voice-agent-system";
 
 /// Bump this whenever any of the five prompt files changes, and update every pinned fingerprint
 /// below to match. The test that compares them is what makes the version mean something.
-pub const PROMPT_VERSION: u32 = 10;
+pub const PROMPT_VERSION: u32 = 11;
 
 /// The [`fingerprint`] of [`OWNER_INSTRUCTIONS_HEADING`] at [`PROMPT_VERSION`]. It reaches the
 /// agent only with the owner's instructions, so it is pinned on its own rather than inside a
@@ -95,13 +95,13 @@ pub const PROMPT_VERSION: u32 = 10;
 pub const PINNED_OWNER_HEADING_FINGERPRINT: &str = "fnv1a64:946b5fc6e4828976";
 
 /// The [`fingerprint`] of the read-only prompt at [`PROMPT_VERSION`].
-pub const PINNED_READ_FINGERPRINT: &str = "fnv1a64:2ae49a9c1a7f5a0f";
+pub const PINNED_READ_FINGERPRINT: &str = "fnv1a64:a41031cc01443166";
 
 /// The [`fingerprint`] of the sending prompt that asks first, at [`PROMPT_VERSION`].
-pub const PINNED_WRITE_CONFIRM_FINGERPRINT: &str = "fnv1a64:2b7b564cb9012db4";
+pub const PINNED_WRITE_CONFIRM_FINGERPRINT: &str = "fnv1a64:fdb48ee0865b5abf";
 
 /// The [`fingerprint`] of the sending prompt that posts at once, at [`PROMPT_VERSION`].
-pub const PINNED_WRITE_DIRECT_FINGERPRINT: &str = "fnv1a64:98ebb1b0013036a5";
+pub const PINNED_WRITE_DIRECT_FINGERPRINT: &str = "fnv1a64:31fb0cad75844cb0";
 
 /// Which instructions follow the base: what this caller can do, and how the owner wants sends
 /// confirmed.
@@ -396,9 +396,9 @@ pub struct VoiceAgentProfile {
 /// Build the profile for a caller holding `scope`, under the owner's `approval`, with his own
 /// words for the agent in its prompt (`#272 voice-agent-instructions`).
 ///
-/// Derived from the same manifest the MCP endpoint lists tools from, with the same two filters —
-/// `mcp_exposed`, and write tools only at write scope — so this answer and `tools/list` cannot
-/// disagree about what the agent may call. `manifest` must have been built under the same
+/// Derived from the same manifest the MCP endpoint lists tools from, with the same filters —
+/// `mcp_exposed` and `listed`, and write tools only at write scope — so this answer and
+/// `tools/list` cannot disagree about what the agent may call. `manifest` must have been built under the same
 /// `approval`: that is what makes `post_reply`'s `requires_confirmation` and the prompt agree.
 #[must_use]
 pub fn profile(
@@ -411,7 +411,7 @@ pub fn profile(
 ) -> VoiceAgentProfile {
     let tools: Vec<ToolCapability> = manifest
         .iter()
-        .filter(|tool| tool.mcp_exposed)
+        .filter(|tool| tool.mcp_exposed && tool.listed)
         .map(|tool| ToolCapability {
             name: tool.name,
             access: if tool.mutates {
@@ -754,6 +754,39 @@ mod tests {
                 "the base prompt lost the rule containing {rule:?}"
             );
         }
+    }
+
+    /// `#437 voice-full-text-catchup`, `#438 voice-owner-identity`. The live calls this audit read
+    /// sent every named-channel catch-up to `digest_channel` because the prompt said to, read the
+    /// owner his own messages, and spoke markdown and identifiers that sent the synthesiser into a
+    /// loop.
+    #[test]
+    fn the_base_prompt_catches_up_from_full_text_skips_the_users_own_and_speaks_plainly() {
+        let flat = SYSTEM_PROMPT
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for rule in [
+            "give it channel_id when the user names one channel",
+            "It returns the full text of the recent messages",
+            "answer precisely from what they say",
+            "To go further back than it reaches, use read_page",
+            "an author that begins \"the user\"",
+            "Never read the user's own messages aloud",
+            "never summarize them back to the user unless they ask",
+            "Use them only as context",
+            "no markdown",
+            "nor code, commands, flags, file names or paths",
+        ] {
+            assert!(
+                flat.contains(rule),
+                "the base prompt lost the rule containing {rule:?}"
+            );
+        }
+        assert!(
+            !flat.contains("digest_channel"),
+            "the prompt recommends a tool no model is offered: {flat}"
+        );
     }
 
     /// The prompt once told the model to render every time in one fixed zone, while every chat

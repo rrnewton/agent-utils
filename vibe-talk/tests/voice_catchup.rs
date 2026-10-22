@@ -97,6 +97,7 @@ async fn catch_up(state: &AppState) -> ops::Activity {
         ActivityRequest {
             hours: None,
             per_channel_limit: None,
+            channel: None,
             now_ms: ops::now_ms(),
         },
     )
@@ -667,4 +668,130 @@ async fn a_catch_up_right_after_a_purge_does_not_wait_on_reads_begun_before_it()
         assert_eq!(said(&activity, id), [text], "{id}");
         assert!(current(&activity, id), "{id}");
     }
+}
+
+/// The text of a tool result that may be an error, and whether it was one.
+fn result_of(outcome: &Outcome) -> (String, bool) {
+    let Outcome::Reply(response) = outcome else {
+        panic!("expected a reply, got {outcome:?}");
+    };
+    let result = response.result.as_ref().expect("a result");
+    (
+        result["content"][0]["text"]
+            .as_str()
+            .expect("text")
+            .to_owned(),
+        result["isError"].as_bool().expect("isError"),
+    )
+}
+
+/// `#437 voice-full-text-catchup`. The calls of 2026-10-22: a read queued behind a stalled
+/// provider ran past the voice runtime's fifteen seconds, and the runtime dropped it with nothing
+/// said. A read tool now answers by its own deadline, saying why, and points at the catch-up that
+/// answers from what this server holds.
+#[tokio::test(start_paused = true)]
+async fn a_read_tool_answers_by_its_deadline_when_the_chat_service_stalls() {
+    let h = harness();
+    h.slow
+        .stall(&channel(READ_CHANNEL), Duration::from_secs(58));
+    for (tool, arguments) in [
+        ("read_page", json!({ "channel_id": READ_CHANNEL })),
+        ("digest_channel", json!({ "channel_id": READ_CHANNEL })),
+        (
+            "find_message",
+            json!({ "channel_id": READ_CHANNEL, "query": "green" }),
+        ),
+    ] {
+        let began = Instant::now();
+        let outcome = dispatch(
+            &h.state,
+            Scope::Read,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": tool, "arguments": arguments },
+            }),
+        )
+        .await;
+        assert_eq!(
+            began.elapsed(),
+            vibe_talk::mcp::protocol::TOOL_DEADLINE,
+            "{tool}"
+        );
+        assert!(vibe_talk::mcp::protocol::TOOL_DEADLINE < Duration::from_secs(15));
+        let (text, failed) = result_of(&outcome);
+        assert!(failed, "{tool}: {text}");
+        assert!(text.starts_with("not_read_in_time"), "{tool}: {text}");
+        assert!(text.contains("recent_activity"), "{tool}: {text}");
+    }
+}
+
+/// `#437 voice-full-text-catchup`. "Catch me up on that channel" is the same catch-up as "catch me
+/// up": answered from the reads the call start made, with no read of its own, and only that
+/// channel's messages in it.
+#[tokio::test(start_paused = true)]
+async fn a_catch_up_on_one_channel_answers_from_the_call_starts_reads() {
+    let h = harness();
+    assert_eq!(recent::warm(&h.state), 3);
+    tokio::time::sleep(Duration::from_millis(6_500)).await;
+    let reads = h.slow.reads();
+
+    let began = Instant::now();
+    let outcome = dispatch(
+        &h.state,
+        Scope::Read,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "recent_activity", "arguments": { "channel_id": "lead team" } },
+        }),
+    )
+    .await;
+    assert!(began.elapsed() < ACTIVITY_DEADLINE, "{:?}", began.elapsed());
+    let (text, failed) = result_of(&outcome);
+    assert!(!failed, "{text}");
+    assert!(text.contains("ship it"), "{text}");
+    assert!(
+        !text.contains("build is green") && !text.contains("pager is quiet"),
+        "only the channel asked for: {text}"
+    );
+    assert_eq!(h.slow.reads(), reads, "no read of its own");
+}
+
+/// `#437 voice-full-text-catchup`. The deadline cuts the wait, not the read: a chat service that
+/// answers after it still fills this server's copy, and the next catch-up answers from it without
+/// asking again.
+#[tokio::test(start_paused = true)]
+async fn a_read_that_misses_its_deadline_still_lands_for_the_next_catch_up() {
+    let h = harness();
+    h.slow
+        .stall(&channel(READ_CHANNEL), Duration::from_secs(14));
+    let outcome = dispatch(
+        &h.state,
+        Scope::Read,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            // A window read, as the page's ordinary read is: the read that feeds the catch-up.
+            "params": { "name": "digest_channel", "arguments": { "channel_id": READ_CHANNEL } },
+        }),
+    )
+    .await;
+    assert!(result_of(&outcome).1, "missed its deadline");
+    h.slow.release(&channel(READ_CHANNEL));
+    // The stalled read lands two seconds after the deadline.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let before = h.slow.reads();
+
+    let activity = catch_up(&h.state).await;
+    assert!(current(&activity, READ_CHANNEL));
+    assert_eq!(said(&activity, READ_CHANNEL), ["build is green"]);
+    assert_eq!(
+        h.slow.reads() - before,
+        2,
+        "only the two channels nothing had read were read; the late read was kept"
+    );
 }

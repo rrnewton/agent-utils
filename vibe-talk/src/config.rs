@@ -178,6 +178,8 @@ pub struct Config {
     pub read_aloud: ReadAloudConfig,
     /// Whether message bodies are rewritten for speech before anything says them.
     pub speakable: SpeakableConfig,
+    /// Who the owner is. `#438 voice-owner-identity`.
+    pub owner: OwnerConfig,
     /// ElevenLabs wiring, when configured.
     pub elevenlabs: ElevenLabsConfig,
     /// Provider used for live conversational voice sessions.
@@ -305,6 +307,74 @@ pub struct ReadAloudConfig {
     /// Optional server-side route to the same conversational agent. Useful when the browser uses
     /// a public `wss://` ingress while the application can reach the bridge on loopback.
     pub websocket_url: Option<String>,
+}
+
+/// Who the owner is: the person this deployment reads the chat FOR. `#438 voice-owner-identity`.
+///
+/// The voice agent kept reading the owner his own messages back to him, because nothing it was
+/// handed said which lines were his. Every message line a model reads now marks his as the user's
+/// own, and the prompt says never to read those aloud unless he asks.
+///
+/// His accounts are, together: [`OwnerConfig::user_ids`] and every provider's `owner_user_id`, so a
+/// deployment that already names `owner_user_id` needs only `name` here. The account this server
+/// posts as counts only when listed in `user_ids`: the coding agents may post through it too. See
+/// [`crate::owner::Owner::of`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OwnerConfig {
+    /// How a model is told his messages are his: `the user (Ada Lovelace)`. `None` says `the user`.
+    pub name: Option<String>,
+    /// Accounts that are his beyond each provider's `owner_user_id`: an older account, a second
+    /// workspace's, a bridge's id for him. Trimmed; never empty strings.
+    pub user_ids: Vec<String>,
+}
+
+/// The longest `[owner] name` kept: a name, not a paragraph a model would read as an instruction.
+pub const MAX_OWNER_NAME_CHARS: usize = 80;
+
+/// `[owner]` as written.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileOwner {
+    name: Option<String>,
+    #[serde(default)]
+    user_ids: Vec<String>,
+}
+
+/// Resolve and check `[owner]`. A blank name is no name; a blank id is refused, because it would
+/// otherwise match an author whose id the provider left empty.
+fn owner_config(file: FileOwner) -> Result<OwnerConfig, ConfigError> {
+    let name = file
+        .name
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty());
+    if let Some(name) = &name {
+        if name.chars().count() > MAX_OWNER_NAME_CHARS {
+            return Err(ConfigError::Invalid {
+                field: "owner.name".to_owned(),
+                detail: format!("is longer than {MAX_OWNER_NAME_CHARS} characters; give a name"),
+            });
+        }
+        if name.chars().any(char::is_control) {
+            return Err(ConfigError::Invalid {
+                field: "owner.name".to_owned(),
+                detail: "must be one line of text".to_owned(),
+            });
+        }
+    }
+    let mut user_ids = Vec::new();
+    for id in file.user_ids {
+        let id = id.trim().to_owned();
+        if id.is_empty() {
+            return Err(ConfigError::Invalid {
+                field: "owner.user_ids".to_owned(),
+                detail: "holds an empty id; remove it".to_owned(),
+            });
+        }
+        if !user_ids.contains(&id) {
+            user_ids.push(id);
+        }
+    }
+    Ok(OwnerConfig { name, user_ids })
 }
 
 /// Whether a message body is rewritten before it is spoken.
@@ -1049,6 +1119,8 @@ struct FileConfig {
     #[serde(default)]
     speakable: SpeakableConfig,
     #[serde(default)]
+    owner: FileOwner,
+    #[serde(default)]
     storage: FileStorage,
     #[serde(default)]
     summaries: FileSummaries,
@@ -1518,6 +1590,7 @@ impl Config {
                 websocket_url: file.read_aloud.websocket_url,
             },
             speakable,
+            owner: owner_config(file.owner)?,
             elevenlabs: ElevenLabsConfig {
                 agent_id: get(ENV_ELEVENLABS_AGENT_ID)
                     .map(str::to_owned)
@@ -4226,6 +4299,41 @@ provider = "slack"
         let cfg = Config::from_toml_and_env(FULL, &env(&[(ENV_APP_NAME, &longest)]))
             .expect("the longest name is accepted");
         assert_eq!(cfg.app_name, longest);
+    }
+
+    /// `#438 voice-owner-identity`.
+    #[test]
+    fn the_owner_is_named_once_and_his_accounts_are_trimmed_and_kept_once() {
+        let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
+        assert_eq!(
+            cfg.owner,
+            OwnerConfig::default(),
+            "absent means nobody named"
+        );
+
+        let text = format!(
+            "{FULL}\n[owner]\nname = \"  Ada Lovelace \"\nuser_ids = [\" U0ADA \", \"U0ADA\", \"900\"]\n"
+        );
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
+        assert_eq!(cfg.owner.name.as_deref(), Some("Ada Lovelace"));
+        assert_eq!(cfg.owner.user_ids, ["U0ADA", "900"]);
+
+        let blank = format!("{FULL}\n[owner]\nname = \"   \"\n");
+        let cfg = Config::from_toml_and_env(&blank, &env(&[])).expect("valid config");
+        assert_eq!(cfg.owner.name, None, "a blank name is no name");
+
+        let too_long = "x".repeat(MAX_OWNER_NAME_CHARS + 1);
+        for (owner, field) in [
+            ("user_ids = [\"\"]".to_owned(), "owner.user_ids"),
+            (format!("name = \"{too_long}\""), "owner.name"),
+            ("name = \"Ada\\nLovelace\"".to_owned(), "owner.name"),
+        ] {
+            let text = format!("{FULL}\n[owner]\n{owner}\n");
+            let err = Config::from_toml_and_env(&text, &env(&[])).expect_err(&owner);
+            assert!(err.to_string().contains(field), "{owner}: {err}");
+        }
+        let unknown = format!("{FULL}\n[owner]\nemail = \"ada@example.com\"\n");
+        assert!(Config::from_toml_and_env(&unknown, &env(&[])).is_err());
     }
 
     #[test]

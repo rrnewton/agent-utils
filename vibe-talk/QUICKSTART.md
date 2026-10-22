@@ -438,15 +438,14 @@ Keep ElevenLabs' hosted LLM. Nothing in this project needs you to bring your own
 MCP's legacy remote transport, superseded by Streamable HTTP in protocol revision `2025-03-26`,
 and this server deliberately implements only the current one. Choosing SSE will fail to connect.
 
-4. Set per-tool approval. All eight tools should appear once the server connects; if only seven
+4. Set per-tool approval. All seven tools should appear once the server connects; if only six
    do, you gave it the read token, which is the conservative choice and means posting is off
    entirely.
 
 | Tool | Approval | Why |
 |---|---|---|
-| `recent_activity` | **auto** — no approval | "What happened today?" — every channel's last few hours in one call. |
+| `recent_activity` | **auto** — no approval | "What happened today?" or "catch me up on lead team" — the full text of every channel's (or one channel's) recent messages in one call. This is the main one. |
 | `list_channels` | **auto** — no approval | Names your channels. Reads nothing from Discord. |
-| `digest_channel` | **auto** — no approval | One spoken line per recent message. This is the main one. |
 | `read_page` | **auto** — no approval | Step further back, ten at a time, or jump to a period or the last few hours. Says it is a page. |
 | `count_messages` | **auto** — no approval | "How many are in there?" — bounded, and says when it is a floor. |
 | `find_message` | **auto** — no approval | "The one about the mac runner" → that message, in full. |
@@ -516,7 +515,8 @@ and let it be physically incapable of proposing at all.
 Open the agent in ElevenLabs and start a conversation. Ask, roughly in this order:
 
 1. *"What channels can you see?"* — exercises `list_channels`; proves the connection.
-2. *"What's been happening in lead team?"* — exercises `digest_channel`; this is the real feature.
+2. *"What's been happening in lead team?"* — exercises `recent_activity` for one channel; this is
+   the real feature.
 3. *"Read me the one about the mac runner."* — exercises `find_message`; this is the feature that
    makes it more than a text-to-speech bot.
 4. *"Reply saying I'll look at it tonight."* — exercises `post_reply`. With "Ask me before the

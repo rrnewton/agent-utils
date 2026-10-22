@@ -250,6 +250,7 @@ async fn catch_up(state: &AppState) -> Value {
         vibe_talk::ops::ActivityRequest {
             hours: None,
             per_channel_limit: None,
+            channel: None,
             now_ms: vibe_talk::ops::now_ms(),
         },
     )

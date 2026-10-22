@@ -18,6 +18,7 @@
 //! the containment is in the permission model, not in the prompt.
 
 use crate::model::Message;
+use crate::owner::Owner;
 
 /// The fence that separates untrusted channel text from everything around it.
 pub const FENCE: &str = "<<<UNTRUSTED-CHAT-CONTENT>>>";
@@ -88,32 +89,88 @@ pub fn thread_field(thread: Option<&str>) -> String {
 /// An edited message says `edited` after them, and no time: the model can answer whether a message
 /// was edited when asked, and has no second instant to say aloud in the wrong zone. `#320
 /// slack-edited-mark`.
+///
+/// No message is marked as the owner's here; the voice tools use [`render_for_model_as`].
 #[must_use]
 pub fn render_for_model(messages: &[Message]) -> String {
+    render_for_model_as(messages, &Owner::nobody())
+}
+
+/// [`render_for_model`], with the owner's messages attributed to him as the user's own. `#438
+/// voice-owner-identity`.
+#[must_use]
+pub fn render_for_model_as(messages: &[Message], owner: &Owner) -> String {
     let mut body = String::new();
     for message in messages {
-        // The author's mention token rides along with the message it belongs to. That is the
-        // whole reason a caller can ping the right person without a user-lookup tool: the id is
-        // attached to the thing being replied to, so there is nothing to search for and nothing
-        // to guess. See `crate::model::Message::author_id`.
-        body.push_str(&format!(
-            "[{} | {} | exact {}{} | {} {}{}] {}{}\n",
-            message.id.as_str(),
-            message.spoken(),
-            message.timestamp,
-            if message.edited_timestamp.is_some() {
-                " | edited"
-            } else {
-                ""
-            },
-            neutralize(&message.author),
-            neutralize(&message.author_id.mention()),
-            neutralize(&thread_field(message.reply_thread())),
-            neutralize(&message.content),
-            mentioned(message)
-        ));
+        body.push_str(&model_line(message, owner, None));
     }
     fenced(&body)
+}
+
+/// One message as a model reads it, ending in a newline, NOT fenced: the caller fences the block.
+///
+/// `[id | 09:51 | exact <instant> | author <@author id>] text`. The author is [`Owner::speaker`]'s:
+/// `the user (Name)` for the owner's own messages, so a model can leave them out of what it reads
+/// aloud, and [`crate::owner::UNNAMED`] for a name that is only an id. With `max_body`, a longer
+/// text is cut there and says how much was left out and where the rest is. `#437
+/// voice-full-text-catchup`.
+#[must_use]
+pub fn model_line(message: &Message, owner: &Owner, max_body: Option<usize>) -> String {
+    // The author's mention token rides along with the message it belongs to. That is the
+    // whole reason a caller can ping the right person without a user-lookup tool: the id is
+    // attached to the thing being replied to, so there is nothing to search for and nothing
+    // to guess. See `crate::model::Message::author_id`.
+    format!(
+        "[{} | {} | exact {}{} | {} {}{}] {}{}\n",
+        message.id.as_str(),
+        message.spoken(),
+        message.timestamp,
+        if message.edited_timestamp.is_some() {
+            " | edited"
+        } else {
+            ""
+        },
+        one_line(&neutralize(
+            &owner.speaker(&message.author, message.author_id.as_str())
+        )),
+        neutralize(&message.author_id.mention()),
+        neutralize(&thread_field(message.reply_thread())),
+        continued(&neutralize(&cut_body(&message.content, max_body))),
+        mentioned(message)
+    )
+}
+
+/// A message's text with every line after its first indented, so no line of it can begin the way a
+/// message line does (`[id | time | ...] text`) and pass for another message — one attributed to
+/// the user, say. `#438 voice-owner-identity`.
+#[must_use]
+pub fn continued(text: &str) -> String {
+    text.trim_end_matches('\n').replace('\n', "\n    ")
+}
+
+/// A field that must stay on its line, such as an author's name: line breaks become spaces.
+#[must_use]
+pub fn one_line(text: &str) -> String {
+    text.replace(['\n', '\r'], " ")
+}
+
+/// `content`, or its first `max` characters and a note saying how many more there are and that
+/// `read_message` has all of it.
+fn cut_body(content: &str, max: Option<usize>) -> std::borrow::Cow<'_, str> {
+    let Some(max) = max else {
+        return content.into();
+    };
+    let total = content.chars().count();
+    if total <= max {
+        return content.into();
+    }
+    let kept: String = content.chars().take(max).collect();
+    format!(
+        "{} [cut here by this server: {} more characters; read_message has the whole message]",
+        kept.trim_end(),
+        total - max
+    )
+    .into()
 }
 
 /// Who the message's mentions name, after its text: ` (mentions: <@U0123ABCD> is Ada Lovelace)`.

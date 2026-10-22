@@ -1433,12 +1433,15 @@ mod read_scope_writes_nothing {
                 vec![json!({"channel_id": READ_CHANNEL, "message_id": message})],
             ),
         ]);
-        let offered: BTreeSet<String> =
+        let mut offered: BTreeSet<String> =
             vibe_talk::mcp::protocol::tools_for(&state, vibe_talk::auth::Scope::Read)
                 .await
                 .iter()
                 .map(|tool| tool["name"].as_str().expect("a name").to_owned())
                 .collect();
+        // No longer listed, and still answered by name (`#437 voice-full-text-catchup`), so it
+        // is still called here.
+        offered.insert("digest_channel".to_owned());
         assert_eq!(
             offered,
             arguments.keys().map(|name| (*name).to_owned()).collect(),
