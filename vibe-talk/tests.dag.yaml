@@ -1143,7 +1143,7 @@ steps:
   # Measured on 2026-10-12: about 6s wall.
   - group: check
     job: bookmark-browser
-    desc: the reading bookmark set, jumped to, kept across a reply and advanced by Done, in current Chromium at 1280x800 and 412x915
+    desc: the reading bookmark set, jumped to, kept across a reply and advanced by Done, and taken away by the X on its line with Undo (#420 bookmark-clear), in current Chromium at 1280x800 and 393x852
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/bookmark_browser.py
     jobs_flag: ""

@@ -5656,8 +5656,18 @@ SCENES: tuple[Scene, ...] = (
                 "the line is on screen, a separator that says Bookmark",
                 "(() => { const l = document.querySelector('#bookmark-probe > .bookmark-line'); "
                 "if (!l) return false; const b = l.getBoundingClientRect(); "
-                "return l.getAttribute('role') === 'separator' && /bookmark/i.test(l.textContent) "
+                "const w = l.querySelector(':scope > .bookmark-word'); "
+                "return w && w.getAttribute('role') === 'separator' && /bookmark/i.test(l.textContent) "
                 "&& b.top >= 0 && b.bottom <= innerHeight && b.height >= 20; })()",
+            ),
+            (
+                # `#420 bookmark-clear`: the X at its end, a touch target, named for what it does.
+                "the X at the line's end is a 24px target named Remove bookmark",
+                "(() => { const l = document.querySelector('#bookmark-probe > .bookmark-line'); "
+                "const x = l && l.querySelector(':scope > .bookmark-clear'); if (!x) return false; "
+                "const b = x.getBoundingClientRect(); const r = l.getBoundingClientRect(); "
+                "return x.getAttribute('aria-label') === 'Remove bookmark' && b.width >= 24 && b.height >= 24 "
+                "&& Math.abs(r.right - b.right) <= 1; })()",
             ),
             (
                 # THE layout claim: the line is in the room the row keeps above itself, touching
