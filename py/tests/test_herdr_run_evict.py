@@ -509,6 +509,81 @@ def test_expired_but_busy_tabs_are_never_retired(tmp_path: Path) -> None:
     assert reasons["left"] == "tab t-split holds 2 panes; only an unsplit tab is replaced"
 
 
+def test_a_tab_split_or_moved_after_listing_is_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Tab identity is re-judged under the lock, from a fresh listing.
+
+    The candidate comes from a listing that may be seconds old, and process-info names a
+    pane and its shell, not the tab ``tab close`` destroys. Each mutation below lands on the
+    under-lock re-list (the second ``panes`` call), after the sweep's own listing judged
+    the tab unsplit and in place.
+    """
+    for mutate, expected in (
+        ("split", "tab t-old holds 2 panes; only an unsplit tab is replaced"),
+        ("moved", 'pane was in tab "t-old" when listed but is now in tab "t-else"; refusing to guess'),
+    ):
+        (tmp_path / mutate).mkdir()
+        world = TtlWorld(tmp_path / mutate, ["old"])
+        world.idle("old")
+        world.finished("old", "20261001T090000-alpha-1", "alpha", NOW - 5000)
+        listings = 0
+        listing = world.fake.panes
+
+        def mutated(workspace_id: str | None = None):  # type: ignore[no-untyped-def]
+            nonlocal listings
+            listings += 1
+            if listings == 2:
+                tabs = world.fake.workspaces["w1"].tabs
+                if mutate == "split":
+                    tabs["t-old"].pane_ids.append("sibling")
+                else:
+                    tabs["t-old"].pane_ids.remove("old")
+                    tabs["t-else"] = FakeTab("t-else", "else", "w1", ["old"])
+            return listing(workspace_id)
+
+        monkeypatch.setattr(world.fake, "panes", mutated)
+        result = world.retire()
+        assert result.closed == (), mutate
+        assert world.fake.closed_tabs == [], mutate
+        assert result.kept == (("old", expected),), mutate
+        monkeypatch.undo()
+
+
+def test_a_run_finishing_during_the_sweep_keeps_its_tab(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Expiry is re-judged under the lock from a fresh load, like the shell verdict."""
+    world = TtlWorld(tmp_path, ["old"])
+    world.idle("old")
+    world.finished("old", "20261001T090000-alpha-1", "alpha", NOW - 5000)
+    listings = 0
+    listing = world.fake.panes
+
+    def freshened(workspace_id: str | None = None):  # type: ignore[no-untyped-def]
+        nonlocal listings
+        listings += 1
+        if listings == 2:
+            world.finished("old", "20261001T110000-alpha-9", "alpha", NOW)
+        return listing(workspace_id)
+
+    monkeypatch.setattr(world.fake, "panes", freshened)
+    result = world.retire()
+    assert result.closed == ()
+    assert result.kept == (("old", "last run finished within the idle TTL"),)
+
+
+def test_a_pre_epoch_finish_marker_is_unknown_not_expired(tmp_path: Path) -> None:
+    world = TtlWorld(tmp_path, ["ancient"])
+    world.idle("ancient")
+    world.finished("ancient", "19600101T000000-alpha-1", "alpha", -5.0)
+    result = world.retire()
+    assert result.closed == ()
+    assert result.kept == (
+        ("ancient", "the finish time of this pane's last recorded run is unknown"),
+    )
+
+
 def test_a_locked_expired_tab_is_kept_without_probing(tmp_path: Path) -> None:
     world = TtlWorld(tmp_path, ["held"])
     world.idle("held")

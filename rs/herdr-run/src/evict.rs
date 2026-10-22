@@ -243,7 +243,7 @@ pub fn evict_one<A: HerdrApi + ?Sized>(
     let records = load_run_records(config);
     let mut skipped = Vec::new();
     for candidate in lru_candidates(&panes, &records) {
-        match try_evict(client, config, &candidate, proc_root) {
+        match try_evict(client, config, &candidate, workspace_id, None, proc_root) {
             Ok(reason) => {
                 let eviction = Eviction { candidate, reason };
                 log_eviction(config, workspace_id, agent, &eviction);
@@ -255,10 +255,16 @@ pub fn evict_one<A: HerdrApi + ?Sized>(
     Ok(Err(skipped))
 }
 
+/// An under-lock re-judgement: given the pane as re-listed, a refusal reason or none.
+type Recheck<'a> = &'a dyn Fn(&Pane) -> Option<String>;
+
+#[allow(clippy::too_many_arguments)]
 fn try_evict<A: HerdrApi + ?Sized>(
     client: &A,
     config: &Config,
     candidate: &Candidate,
+    workspace_id: &str,
+    recheck: Option<Recheck<'_>>,
     proc_root: &Path,
 ) -> std::result::Result<String, String> {
     require_unsplit(candidate)?;
@@ -273,7 +279,41 @@ fn try_evict<A: HerdrApi + ?Sized>(
         Err(error) => return Err(format!("cannot lock the pane: {error}")),
     }
     // Judged now, under the lock, and closed at once: never from an earlier survey.
-    let reason = judge_shell(client, config, candidate, proc_root)?;
+    // That includes the TAB's identity, not just the shell's: the listing the candidate
+    // came from may be seconds old, and process-info names a pane and its shell, not the
+    // tab `tab close` is about to destroy. Re-read the listing first: the pane may have
+    // been split (a sibling this verdict never judged would die with the tab) or moved
+    // to another tab (the close would land on a tab nobody judged).
+    let listed = client
+        .panes(Some(workspace_id))
+        .map_err(|error| format!("herdr could not list panes before closing: {error}"))?;
+    let Some(current) = listed.iter().find(|pane| pane.pane_id == candidate.pane_id) else {
+        return Err("herdr reports no such pane".to_owned());
+    };
+    if current.tab_id != candidate.tab_id {
+        return Err(format!(
+            "pane was in tab {} when listed but is now in tab {}; refusing to guess",
+            quote(&candidate.tab_id),
+            quote(&current.tab_id)
+        ));
+    }
+    let fresh = Candidate {
+        pane_id: candidate.pane_id.clone(),
+        tab_id: candidate.tab_id.clone(),
+        last_run: candidate.last_run.clone(),
+        agent: candidate.agent.clone(),
+        tab_panes: listed
+            .iter()
+            .filter(|pane| pane.tab_id == current.tab_id)
+            .count(),
+    };
+    require_unsplit(&fresh)?;
+    if let Some(recheck) = recheck {
+        if let Some(refusal) = recheck(current) {
+            return Err(refusal);
+        }
+    }
+    let reason = judge_shell(client, config, &fresh, proc_root)?;
     client
         .close_tab(&candidate.tab_id)
         .map_err(|error| format!("tab close failed: {error}"))?;
@@ -460,15 +500,19 @@ pub fn ttl_candidates(
     now: f64,
     ttl_seconds: f64,
 ) -> Vec<TtlCandidate> {
+    let mut by_pane: std::collections::HashMap<&str, Vec<&Value>> =
+        std::collections::HashMap::new();
+    for record in records {
+        if let Some(pane_id) = record.get("pane_id").and_then(Value::as_str) {
+            by_pane.entry(pane_id).or_default().push(record);
+        }
+    }
     panes
         .iter()
         .map(|pane| {
-            let mine = records
-                .iter()
-                .filter(|record| {
-                    record.get("pane_id").and_then(Value::as_str) == Some(pane.pane_id.as_str())
-                })
-                .collect::<Vec<_>>();
+            let mine: &[&Value] = by_pane
+                .get(pane.pane_id.as_str())
+                .map_or(&[], Vec::as_slice);
             let tab_panes = panes
                 .iter()
                 .filter(|other| other.tab_id == pane.tab_id)
@@ -499,20 +543,19 @@ pub fn ttl_candidates(
                     false,
                     format!("{unfinished} run(s) for this pane have no recorded exit_code"),
                 )
-            } else if finished_at.is_none() {
-                (
-                    false,
-                    "the finish time of this pane's last recorded run is unknown".to_owned(),
-                )
-            } else if ttl_seconds <= 0.0 {
-                (false, "the idle TTL is disabled".to_owned())
-            } else if now - finished_at.expect("finish checked above") > ttl_seconds {
-                (
-                    true,
-                    "last run finished more than the idle TTL ago".to_owned(),
-                )
             } else {
-                (false, "last run finished within the idle TTL".to_owned())
+                match finished_at {
+                    None => (
+                        false,
+                        "the finish time of this pane's last recorded run is unknown".to_owned(),
+                    ),
+                    Some(_) if ttl_seconds <= 0.0 => (false, "the idle TTL is disabled".to_owned()),
+                    Some(finished) if now - finished > ttl_seconds => (
+                        true,
+                        "last run finished more than the idle TTL ago".to_owned(),
+                    ),
+                    Some(_) => (false, "last run finished within the idle TTL".to_owned()),
+                }
             };
             TtlCandidate {
                 pane_id: pane.pane_id.clone(),
@@ -657,13 +700,10 @@ pub fn retire_idle_tabs<A: HerdrApi + ?Sized>(
     let mut would_close = Vec::new();
     let mut examined = 0usize;
     for verdict in expired {
-        if limit.is_some_and(|limit| examined >= limit) {
+        if let Some(limit) = limit.filter(|limit| examined >= *limit) {
             kept_reasons.insert(
                 verdict.pane_id.clone(),
-                format!(
-                    "not examined: this sweep's limit of {} tab(s) was reached",
-                    limit.expect("limit checked above")
-                ),
+                format!("not examined: this sweep's limit of {limit} tab(s) was reached"),
             );
             continue;
         }
@@ -693,7 +733,15 @@ pub fn retire_idle_tabs<A: HerdrApi + ?Sized>(
             }
             continue;
         }
-        match try_evict(client, config, &candidate, proc_root) {
+        let recheck = |current: &Pane| recheck_still_expired(config, current, verdict, now);
+        match try_evict(
+            client,
+            config,
+            &candidate,
+            &workspace_id,
+            Some(&recheck),
+            proc_root,
+        ) {
             Ok(reason) => {
                 let tab = retired(reason);
                 log_retirement(config, &workspace_id, actor, &tab);
@@ -719,6 +767,61 @@ pub fn retire_idle_tabs<A: HerdrApi + ?Sized>(
         kept,
         listing_error: None,
     }
+}
+
+/// Re-judge expiry under the pane lock, from a fresh spool load.
+///
+/// The sweep judged every candidate from one load, then examines them oldest first; a run
+/// that starts AND finishes on a later candidate while earlier ones are examined would leave
+/// it idle with a free lock, and the stale verdict would close a tab whose last run finished
+/// seconds ago. Reloading here — lock held, close imminent — is the same discipline the shell
+/// verdict already follows.
+fn recheck_still_expired(
+    config: &Config,
+    current: &Pane,
+    expected: &TtlCandidate,
+    now: f64,
+) -> Option<String> {
+    let fresh_records = load_run_records(config);
+    let fresh = ttl_candidates(
+        std::slice::from_ref(current),
+        &fresh_records,
+        now,
+        config.idle_tab_ttl_seconds,
+    )
+    .into_iter()
+    .next()?;
+    if !fresh.recorded {
+        return Some("no recorded run".to_owned());
+    }
+    let (in_scope, recorded_tab, tab_label, workspace_label) =
+        scope_of(&fresh.pane_id, &fresh_records, config);
+    if !in_scope {
+        return Some(format!(
+            "tab {} in workspace {} is not one of ours",
+            quote_optional(tab_label.as_deref()),
+            quote_optional(workspace_label.as_deref())
+        ));
+    }
+    if let Some(recorded_tab) = recorded_tab {
+        if recorded_tab != fresh.tab_id {
+            return Some(format!(
+                "pane was recorded in tab {} but is now in tab {}; refusing to guess",
+                quote(&recorded_tab),
+                quote(&fresh.tab_id)
+            ));
+        }
+    }
+    if !fresh.expired {
+        return Some(fresh.reason);
+    }
+    if fresh.last_run != expected.last_run {
+        return Some(
+            "the pane's last recorded run changed during the sweep; treating the tab as busy"
+                .to_owned(),
+        );
+    }
+    None
 }
 
 fn log_retirement(config: &Config, workspace_id: &str, actor: &str, retired: &RetiredTab) {
@@ -853,6 +956,10 @@ mod tests {
         closed: Mutex<Vec<String>>,
         probed: Mutex<Vec<String>>,
         failing_close: Mutex<BTreeSet<String>>,
+        /// How many times panes were listed, and panes that appear from the second listing
+        /// on — a tab split or moved between a sweep's listing and its under-lock re-list.
+        listings: Mutex<usize>,
+        relist_add: Mutex<Vec<Pane>>,
     }
 
     impl Fake {
@@ -917,6 +1024,12 @@ mod tests {
                 Some("w1"),
                 "only the configured workspace is listed"
             );
+            let mut listings = self.listings.lock().unwrap();
+            *listings += 1;
+            if *listings == 2 {
+                let extra = std::mem::take(&mut *self.relist_add.lock().unwrap());
+                self.panes.lock().unwrap().extend(extra);
+            }
             Ok(self.panes.lock().unwrap().clone())
         }
         fn pane_exists(&self, pane_id: &str) -> bool {
@@ -1263,6 +1376,48 @@ mod tests {
             .kept
             .iter()
             .any(|(pane, reason)| pane == &old && reason == "the idle TTL is disabled"));
+    }
+
+    #[test]
+    fn a_tab_split_after_the_sweep_listing_is_kept() {
+        // Tab identity is re-judged under the lock from a fresh listing: a sibling pane
+        // that appears between the sweep's listing and the close was never judged, so
+        // closing the tab would take it down unjudged.
+        let world = World::new("ttl-split-after-listing");
+        let old = world.tab("old", Some(101));
+        write_finished(
+            &world.project,
+            "r1",
+            &old,
+            &format!("tab-{old}"),
+            "alpha",
+            NOW - 5000.0,
+            Some(0),
+            true,
+        );
+        world.fake.relist_add.lock().unwrap().push(Pane {
+            pane_id: "sibling".to_owned(),
+            tab_id: format!("tab-{old}"),
+            workspace_id: "w1".to_owned(),
+        });
+        let sweep = retire_idle_tabs(
+            &world.fake,
+            &world.config,
+            "tester",
+            NOW,
+            false,
+            None,
+            None,
+            &world.proc_root,
+        );
+        assert!(sweep.closed.is_empty());
+        assert!(world.fake.closed().is_empty());
+        assert_eq!(sweep.kept.len(), 1);
+        assert!(
+            sweep.kept[0].1.contains("holds 2 panes"),
+            "{}",
+            sweep.kept[0].1
+        );
     }
 
     #[test]

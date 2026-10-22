@@ -1513,9 +1513,9 @@ fn command_sweep(config: &Config, options: &SweepOptions) -> Result<i32> {
 }
 
 /// How many expired tabs one finished run may examine while sweeping opportunistically. Each
-/// examination probes a pane and scans `/proc`; the bound keeps housekeeping from ever
-/// stretching a caller's command, and leftovers are picked up by the next run or by
-/// `sweep --idle`.
+/// examination probes a pane and scans `/proc`; the bound limits that probing after a
+/// caller's command (the listing and record read before it are bounded by the workspace and
+/// by retention), and leftovers are picked up by the next run or by `sweep --idle`.
 const OPPORTUNISTIC_SWEEP_LIMIT: usize = 4;
 
 /// Retire idle-expired tabs at the end of a run, without ever changing its result.

@@ -131,7 +131,9 @@ def _record_finish_time(record: dict[str, object], directory: str) -> None:
     if record.get("exit_code") is None:
         return
     finished = completion_mtime(os.path.join(directory, "exit_code"))
-    if finished is not None:
+    # A pre-epoch mtime is not a finish time either edition can agree on (the Rust loader's
+    # duration-since-epoch cannot represent it); unknown keeps the tab in both.
+    if finished is not None and finished >= 0:
         record["finished_at"] = finished
 
 

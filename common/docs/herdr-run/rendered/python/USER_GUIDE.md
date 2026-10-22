@@ -642,9 +642,11 @@ invisible here.
 Retirement happens in two places. A finished `run` sweeps opportunistically — at most four
 expired tabs examined, never its own — so the cleanup happens as a side effect of the work that
 creates the tabs and cannot silently stop the way a timer can; a failure to sweep is a warning
-and never changes the run's result. `herdr-run sweep --idle` is the same sweep without the
-bound, for a timer or an operator; `--dry-run` judges every tab the way `reap`'s survey does —
-without the pane lock — and closes nothing. Both print a line per close on stderr and append a
+and never changes the run's result. Each sweep first lists the workspace and reads the
+surviving run records, which retention bounds; the four-tab bound limits the probing that
+follows. `herdr-run sweep --idle` is the same sweep without the bound, for a timer or an
+operator; `--dry-run` judges every tab the way `reap`'s survey does — without the pane lock,
+so it can name a tab the real sweep would keep for its lock — and closes nothing. Both print a line per close on stderr and append a
 `RETIRED` entry to the audit log. Set `idle_tab_ttl_seconds: 0` to disable retirement entirely.
 
 ### Audit log

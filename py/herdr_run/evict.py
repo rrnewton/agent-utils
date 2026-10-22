@@ -32,7 +32,7 @@ from __future__ import annotations
 import fcntl
 import math
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 from herdr_run import audit, output
@@ -224,7 +224,7 @@ def evict_one(
     records = load_run_records(config)
     skipped: list[tuple[str, str]] = []
     for candidate in lru_candidates(panes, records):
-        verdict = _try_evict(client, config, candidate, proc_root)
+        verdict = _try_evict(client, config, candidate, workspace_id, proc_root)
         if isinstance(verdict, Eviction):
             _log_eviction(config, workspace_id, agent, verdict)
             return verdict
@@ -232,7 +232,14 @@ def evict_one(
     return skipped
 
 
-def _try_evict(client: HerdrClient, config: Config, candidate: Candidate, proc_root: str) -> Eviction | str:
+def _try_evict(
+    client: HerdrClient,
+    config: Config,
+    candidate: Candidate,
+    workspace_id: str,
+    proc_root: str,
+    recheck: Callable[[Pane], str | None] | None = None,
+) -> Eviction | str:
     refusal = _require_unsplit(candidate)
     if refusal is not None:
         return refusal
@@ -248,14 +255,45 @@ def _try_evict(client: HerdrClient, config: Config, candidate: Candidate, proc_r
         except OSError as exc:
             return f"cannot lock the pane: {os_error_text(exc)}"
         # Judged now, under the lock, and closed at once: never from an earlier survey.
-        idle, reason = _judge_shell(client, config, candidate, proc_root)
+        # That includes the TAB's identity, not just the shell's: the listing the candidate
+        # came from may be seconds old, and process-info names a pane and its shell, not the
+        # tab `tab close` is about to destroy. Re-read the listing first: the pane may have
+        # been split (a sibling this verdict never judged would die with the tab) or moved
+        # to another tab (the close would land on a tab nobody judged).
+        try:
+            listed = client.panes(workspace_id)
+        except HerdrRunError as exc:
+            return f"herdr could not list panes before closing: {exc}"
+        current = next((pane for pane in listed if pane.pane_id == candidate.pane_id), None)
+        if current is None:
+            return "herdr reports no such pane"
+        if current.tab_id != candidate.tab_id:
+            return (
+                f"pane was in tab {quote(candidate.tab_id)} when listed but is now in tab "
+                f"{quote(current.tab_id)}; refusing to guess"
+            )
+        fresh = Candidate(
+            pane_id=candidate.pane_id,
+            tab_id=candidate.tab_id,
+            last_run=candidate.last_run,
+            agent=candidate.agent,
+            tab_panes=sum(1 for pane in listed if pane.tab_id == current.tab_id),
+        )
+        refusal = _require_unsplit(fresh)
+        if refusal is not None:
+            return refusal
+        if recheck is not None:
+            refusal = recheck(current)
+            if refusal is not None:
+                return refusal
+        idle, reason = _judge_shell(client, config, fresh, proc_root)
         if not idle:
             return reason
         try:
             client.close_tab(candidate.tab_id)
         except HerdrRunError as exc:
             return f"tab close failed: {exc}"
-        return Eviction(candidate=candidate, reason=reason)
+        return Eviction(candidate=fresh, reason=reason)
     finally:
         lock.close()
 
@@ -420,9 +458,14 @@ def ttl_candidates(
     than ``ttl_seconds`` before ``now`` -- exactly at the boundary is within the TTL. Scope is
     not judged here; :func:`retire_idle_tabs` applies it before anything may close.
     """
+    by_pane: dict[str, list[Mapping[str, object]]] = {}
+    for record in records:
+        pane_id = record.get("pane_id")
+        if isinstance(pane_id, str):
+            by_pane.setdefault(pane_id, []).append(record)
     candidates: list[TtlCandidate] = []
     for pane in panes:
-        mine = [record for record in records if record.get("pane_id") == pane.pane_id]
+        mine = by_pane.get(pane.pane_id, [])
         tab_panes = sum(1 for other in panes if other.tab_id == pane.tab_id)
         if not mine:
             candidates.append(
@@ -571,7 +614,12 @@ def retire_idle_tabs(
                 refusal = reason
             kept_reasons[verdict.pane_id] = refusal
             continue
-        outcome = _try_evict(client, config, candidate, proc_root)
+        def recheck(current: Pane, expected: TtlCandidate = verdict) -> str | None:
+            return _recheck_still_expired(config, current, expected, now)
+
+        outcome = _try_evict(
+            client, config, candidate, workspace_id, proc_root, recheck=recheck
+        )
         if isinstance(outcome, Eviction):
             done = RetiredTab(retired.pane_id, retired.tab_id, retired.agent, retired.last_run, outcome.reason)
             closed.append(done)
@@ -585,6 +633,43 @@ def retire_idle_tabs(
         if verdict.pane_id in kept_reasons
     )
     return IdleSweep(tuple(closed), tuple(would_close), kept, None)
+
+
+def _recheck_still_expired(
+    config: Config, current: Pane, expected: TtlCandidate, now: float
+) -> str | None:
+    """Re-judge expiry under the pane lock, from a fresh spool load.
+
+    The sweep judged every candidate from one load, then examines them oldest first; a run
+    that starts AND finishes on a later candidate while earlier ones are examined would
+    leave it idle with a free lock, and the stale verdict would close a tab whose last run
+    finished seconds ago. Reloading here -- lock held, close imminent -- is the same
+    discipline the shell verdict already follows.
+    """
+    fresh_records = load_run_records(config)
+    fresh = ttl_candidates(
+        [current], fresh_records, now=now, ttl_seconds=config.idle_tab_ttl_seconds
+    )[0]
+    if not fresh.recorded:
+        return "no recorded run"
+    in_scope, recorded_tab, tab_label, workspace_label = _scope_of(
+        fresh.pane_id, fresh_records, config
+    )
+    if not in_scope:
+        return (
+            f"tab {quote_optional(tab_label)} in workspace "
+            f"{quote_optional(workspace_label)} is not one of ours"
+        )
+    if recorded_tab is not None and recorded_tab != fresh.tab_id:
+        return (
+            f"pane was recorded in tab {quote(recorded_tab)} but is now in tab "
+            f"{quote(fresh.tab_id)}; refusing to guess"
+        )
+    if not fresh.expired:
+        return fresh.reason
+    if fresh.last_run != expected.last_run:
+        return "the pane's last recorded run changed during the sweep; treating the tab as busy"
+    return None
 
 
 def _log_retirement(config: Config, workspace_id: str, actor: str, retired: RetiredTab) -> None:

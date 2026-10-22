@@ -1315,9 +1315,9 @@ def _cmd_sweep(config: Config, environ: Mapping[str, str], options: _SweepOption
 
 
 #: How many expired tabs one finished run may examine while sweeping opportunistically. Each
-#: examination probes a pane and scans ``/proc``; the bound keeps housekeeping from ever
-#: stretching a caller's command, and leftovers are picked up by the next run or by
-#: ``herdr-run sweep --idle``.
+#: examination probes a pane and scans ``/proc``; the bound limits that probing after a
+#: caller's command (the listing and record read before it are bounded by the workspace and
+#: by retention), and leftovers are picked up by the next run or by ``herdr-run sweep --idle``.
 _OPPORTUNISTIC_SWEEP_LIMIT = 4
 
 
