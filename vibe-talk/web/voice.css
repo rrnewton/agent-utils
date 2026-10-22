@@ -3468,7 +3468,9 @@ a.search-hit-link {
   background: none;
   border: none;
   border-radius: 0.6rem;
-  font: inherit;
+  /* The family only: the line's own size and leading above are what its room was measured for,
+     and the `font` shorthand would hand both back to the row's. */
+  font-family: inherit;
   pointer-events: auto;
   cursor: pointer;
   touch-action: manipulation;
