@@ -723,6 +723,10 @@ async fn a_read_tool_answers_by_its_deadline_when_the_chat_service_stalls() {
         let (text, failed) = result_of(&outcome);
         assert!(failed, "{tool}: {text}");
         assert!(text.starts_with("not_read_in_time"), "{tool}: {text}");
+        assert!(
+            text.contains(&format!("say the {tool} read timed out")),
+            "{tool}: {text}"
+        );
         assert!(text.contains("recent_activity"), "{tool}: {text}");
     }
 }
