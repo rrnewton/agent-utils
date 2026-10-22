@@ -1,12 +1,13 @@
 ---
 title: 'copy-upstream-link: copy a message''s own link in Slack or Google Chat from its ⋯ menu'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-21T22:59:05.978491551+00:00
-updated_at: 2026-10-21T22:59:05.978491551+00:00
+updated_at: 2026-10-22T01:44:41.891097352+00:00
+closed_at: 2026-10-22T01:44:41.891097221+00:00
 ---
 
 # Description
