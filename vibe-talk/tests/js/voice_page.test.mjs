@@ -4455,9 +4455,17 @@ const TUNING_BANDS = {
   COLLAPSE_OVER_CHARS: [120, 4000,
     "below about a hundred characters ordinary sentences fold, and above a few thousand nothing " +
     "ever does — either way the fold control stops meaning anything"],
-  FOLD_LINES: [3, 3,
-    "the lines the hidden-word count assumes a fold shows: anything but the clamp's three counts " +
-    "words the reader can see, or misses ones they cannot (#244 elision-word-count)"],
+  MIN_COLLAPSED_LINES: [0, 0,
+    "the fewest lines a collapsed message may show (#425 collapsed-lines): above zero the " +
+    "header alone is taken away, and there is nothing below it"],
+  MAX_COLLAPSED_LINES: [4, 12,
+    "the most lines a collapsed message may show (#425 collapsed-lines): under the default's " +
+    "neighbourhood the fold stops being adjustable upward, past a dozen a collapsed message is " +
+    "the wall of text the fold exists to keep off the screen (#47 scrollback-stability)"],
+  DEFAULT_COLLAPSED_LINES: [3, 3,
+    "the lines a fold shows until the reader says otherwise, and the count the hidden-word model " +
+    "is read against in these tests: the owner's three, and the clamp's property in web/voice.css " +
+    "is held to the same number (#425 collapsed-lines, #244 elision-word-count)"],
   ELIDED_MIN_WORDS: [5, 20,
     "the fewest hidden words a fold's label claims: under five the floor is too near nothing to " +
     "say anything is hidden, past twenty a fold over a paragraph says nothing (#244 elision-word-count)"],
@@ -8943,12 +8951,13 @@ test("expanding one message leaves its neighbours exactly as they were", async (
   assert.equal(longOnes[1].getAttribute("data-collapsed"), "true", "the fold does not close again");
 });
 
-test("the collapsed height is really three LINES, and the chips are outside the faded region", () => {
+test("the collapsed height is really LINES — the reader's count, three until they say otherwise — and the chips are outside the faded region", () => {
   // The fixture cannot prove a line clamp — it has no renderer — so the clamp is asserted as a
   // declaration on the selector that has to carry it. `overflow: hidden` is checked by name
   // because without it the box shows every line and the clamp does nothing at all.
   const clamped = cssBlock(".body.clamped");
-  assert.match(clamped, /-webkit-line-clamp:\s*3\b/, "the clamp is not three lines");
+  assert.match(clamped, /-webkit-line-clamp:\s*var\(--collapsed-lines\)/, "the clamp is not the reader's lines");
+  assert.match(cssBlock(":root"), /--collapsed-lines:\s*3\b/, "the page has no default collapsed-lines count");
   assert.match(clamped, /overflow:\s*hidden/, "without this the clamp shows every line anyway");
   assert.match(clamped, /-webkit-box-orient:\s*vertical/);
 
@@ -8973,7 +8982,9 @@ test("the collapsed height is really three LINES, and the chips are outside the 
 // so a line of a class holds a known number of them — and tests/elision_browser.py holds the labels a
 // real Chromium shows to the words it really hides.
 
-const FOLD_LINES = sourceConstant("FOLD_LINES");
+// `#425 collapsed-lines`. The lines a fold shows until the reader says otherwise: the count these
+// labels are worked out at, every page here loading with nothing stored.
+const FOLD_LINES = sourceConstant("DEFAULT_COLLAPSED_LINES");
 const ELIDED_MIN_WORDS = sourceConstant("ELIDED_MIN_WORDS");
 const FOLD_WIDTHS_EM = JSON.parse(
   /^const FOLD_WIDTHS_EM = (\[[\d.,\s]*\]);$/m.exec(SCRIPT_CODE)?.[1] ??
@@ -9007,7 +9018,7 @@ const labelAt = (li, at, rh = null) => {
 };
 
 test("A FOLDED MESSAGE ENDS WITH WHAT IT HIDES, counted at every width class, in both lists (#244)", async () => {
-  assert.equal(FOLD_LINES, 3, "the model's line count is not the clamp's three lines");
+  assert.equal(FOLD_LINES, 3, "the model's default line count is not the clamp's default three");
   const text = wordsOfLength(200, 4);
   assert.ok(text.length > COLLAPSE_OVER_CHARS, "the text would not fold");
   const page = newPage();
@@ -9959,6 +9970,196 @@ test("the − and + are thumb-sized squares that never wrap off the slider's row
   }
   assert.match(button, /touch-action:\s*manipulation/, "two quick presses can zoom the page instead");
   assert.match(cssBlock(".step-button:focus-visible"), /outline:\s*2px solid var\(--accent\)/, "no ring for the keyboard");
+});
+
+// --- `#425 collapsed-lines` ----------------------------------------------------------------------
+//
+// The owner, 2026-10-22: collapsed cards are 3 lines tall by default; the default stays 3, but it
+// should be adjustable to 1 line or 4 lines or whatever, in Settings and by a keystroke not likely
+// to be hit accidentally — Cmd+( and Cmd+) — and, the same day, all the way down to ZERO lines,
+// header and colour and metadata only, without breaking anything. One count, 0 to 8, kept per
+// device, stated once as `--collapsed-lines` for every list. tests/collapsed_lines_browser.py
+// measures what a real Chromium draws at 0, 1, 3 and 6.
+
+const COLLAPSED_LINES_STORE = "vibe-talk.voice.collapsed-lines";
+const collapsedOf = (page) => page.documentElement.style.getPropertyValue("--collapsed-lines");
+
+test("Collapsed message lines is a Settings slider of 0 to 8 with a − and a +, its ends the script's own", () => {
+  const group = settingsGroup("Collapsed message lines");
+  const row = /<div class="msg-scale-row">([\s\S]*?)<\/div>/.exec(group);
+  assert.ok(row, "the slider and its two buttons are not one row");
+  const order = [...row[1].matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]);
+  assert.deepEqual(order, ["collapsed-lines-smaller", "collapsed-lines", "collapsed-lines-larger"],
+    "not −, slider, + in that order");
+  const slider = /<input([^>]*\bid="collapsed-lines"[^>]*)>/.exec(group)[1];
+  for (const [attribute, constant] of [["min", "MIN_COLLAPSED_LINES"], ["max", "MAX_COLLAPSED_LINES"]]) {
+    const markup = (new RegExp(`\\b${attribute}="(\\d+)"`).exec(slider) || [])[1];
+    assert.equal(markup, String(sourceConstant(constant)), `the slider's ${attribute} and ${constant} disagree`);
+  }
+  assert.match(slider, /\bstep="1"/, "the slider does not step one line at a time");
+  assert.equal(sourceConstant("MIN_COLLAPSED_LINES"), 0, "the header alone is not offered");
+  assert.equal(sourceConstant("MAX_COLLAPSED_LINES"), 8);
+  assert.equal(sourceConstant("DEFAULT_COLLAPSED_LINES"), 3, "the default is not the owner's three");
+  for (const [id, name] of [["collapsed-lines-smaller", "Fewer collapsed lines"], ["collapsed-lines-larger", "More collapsed lines"]]) {
+    const button = new RegExp(`<button([^>]*\\bid="${id}"[^>]*)>`).exec(group);
+    assert.ok(button, `#${id} is not a button`);
+    assert.match(button[1], new RegExp(`\\baria-label="${name}"`), `#${id} is not called "${name}"`);
+    assert.match(button[1], /\baria-controls="collapsed-lines"/, `#${id} does not say which control it moves`);
+  }
+});
+
+test("the collapsed-lines count applies at once, is kept per device, clamps at 0 and 8, and a blank store is not zero", async () => {
+  const page = newPage();
+  await signIn(page);
+  await page.el("open-settings").click();
+  assert.equal(collapsedOf(page), "3", "an unconfigured page does not fold at three lines");
+  assert.equal(page.documentElement.getAttribute("data-collapsed-lines"), "3");
+  assert.equal(page.el("collapsed-lines").value, "3", "the slider does not show what is in force");
+  assert.equal(page.el("collapsed-lines-smaller").disabled, false);
+  assert.equal(page.el("collapsed-lines-larger").disabled, false);
+
+  await page.el("collapsed-lines").setValue("1");
+  assert.equal(collapsedOf(page), "1");
+  assert.equal(page.storage.get(COLLAPSED_LINES_STORE), "1", "the count was not kept");
+  assert.equal(page.el("collapsed-lines-state").textContent, "Saved — collapsed messages show 1 line.");
+
+  await page.el("collapsed-lines-smaller").click();
+  assert.equal(collapsedOf(page), "0", "− at one line did not reach the header alone");
+  assert.equal(page.documentElement.getAttribute("data-collapsed-lines"), "0",
+    "zero is not stated for the stylesheet, whose clamp of 0 would show every line");
+  assert.equal(page.el("collapsed-lines-state").textContent, "Saved — collapsed messages show only their header.");
+  assert.equal(page.el("collapsed-lines-smaller").disabled, true, "− is still live at zero");
+  await page.el("collapsed-lines-smaller").click();
+  assert.equal(collapsedOf(page), "0", "− stepped past zero");
+
+  await page.el("collapsed-lines").setValue("99");
+  assert.equal(collapsedOf(page), "8", "an out-of-range count was not clamped");
+  assert.equal(page.el("collapsed-lines-larger").disabled, true, "+ is still live at eight");
+  await page.el("collapsed-lines-larger").click();
+  assert.equal(collapsedOf(page), "8", "+ stepped past eight");
+  assert.equal(page.storage.get(COLLAPSED_LINES_STORE), "8");
+
+  // A reload keeps what was chosen, slider and all.
+  const again = newPage(page.storage);
+  assert.equal(collapsedOf(again), "8", "the count did not survive a reload");
+  assert.equal(again.el("collapsed-lines").value, "8");
+
+  // What another build, or a hand, left in the store: clamped, never an error, and a BLANK entry
+  // is absent — three, not the zero `Number("")` would make of it.
+  for (const [stored, applied] of [["", "3"], ["banana", "3"], ["-4", "0"], ["42", "8"], ["0", "0"], ["5", "5"]]) {
+    const loaded = newPage(new Map([[COLLAPSED_LINES_STORE, stored]]));
+    assert.equal(collapsedOf(loaded), applied, `a stored ${JSON.stringify(stored)} applied as ${collapsedOf(loaded)}`);
+    assert.equal(loaded.el("collapsed-lines").value, applied, `the slider disagrees at a stored ${JSON.stringify(stored)}`);
+  }
+
+  // A browser that keeps nothing is owned up to, and the count still applies for the session.
+  page.storage.set = () => page.storage;
+  await page.el("collapsed-lines").setValue("2");
+  assert.equal(collapsedOf(page), "2", "a refused store stopped the count being applied");
+  assert.match(page.el("collapsed-lines-state").textContent, /refused to store the collapsed lines/);
+});
+
+test("Ctrl+( and Ctrl+) step the collapsed lines and say the count, stop at 0 and 8, and never act in a text field", async () => {
+  const page = await keyboardPage();
+  const status = () => page.el("status").textContent;
+  const fewer = { key: "(", code: "Digit9", ctrlKey: true, shiftKey: true };
+  const more = { key: ")", code: "Digit0", ctrlKey: true, shiftKey: true };
+
+  let event = await press(page, page.el("scroll-area"), fewer.key, fewer);
+  assert.equal(event.defaulted, false, "Ctrl+( was left to the browser");
+  assert.equal(collapsedOf(page), "2", "Ctrl+( did not show one line fewer");
+  assert.equal(status(), "Collapsed messages show 2 lines.", "the new count was not said");
+  assert.equal(page.storage.get(COLLAPSED_LINES_STORE), "2", "the key's count was not kept");
+  assert.equal(page.el("collapsed-lines").value, "2", "the slider did not follow the key");
+
+  // Cmd works as Ctrl does, and the count stops at 0 however often it is pressed — the chord still
+  // taken there, so it is never the browser's zoom instead.
+  await press(page, page.el("scroll-area"), "(", { code: "Digit9", metaKey: true, shiftKey: true });
+  assert.equal(collapsedOf(page), "1");
+  await press(page, page.el("scroll-area"), fewer.key, fewer);
+  assert.equal(collapsedOf(page), "0");
+  assert.equal(status(), "Collapsed messages show only their header.");
+  event = await press(page, page.el("scroll-area"), fewer.key, fewer);
+  assert.equal(collapsedOf(page), "0", "Ctrl+( stepped past zero");
+  assert.equal(event.defaulted, false, "Ctrl+( at zero was left to the browser's zoom");
+
+  for (let i = 0; i < 10; i += 1) await press(page, page.el("scroll-area"), more.key, more);
+  assert.equal(collapsedOf(page), "8", "Ctrl+) did not stop at eight");
+  assert.equal(status(), "Collapsed messages show 8 lines.");
+
+  // By the place of the key where Shift+9 types no bracket (and where a browser reports the digit
+  // under Cmd): the digit on Digit9 with Shift is "(", and on Digit0 is ")"...
+  await press(page, page.el("scroll-area"), "9", { code: "Digit9", ctrlKey: true, shiftKey: true });
+  assert.equal(collapsedOf(page), "7", "Ctrl+Shift+9 reporting a digit did not step fewer by its place");
+  await press(page, page.el("scroll-area"), "0", { code: "Digit0", metaKey: true, shiftKey: true });
+  assert.equal(collapsedOf(page), "8", "Cmd+Shift+0 reporting a digit did not step more by its place");
+  // ...but a bracket actually typed means itself, wherever it sits: ")" on Digit9 is more.
+  await press(page, page.el("scroll-area"), "(", { code: "Digit9", ctrlKey: true, shiftKey: true });
+  assert.equal(collapsedOf(page), "7");
+  await press(page, page.el("scroll-area"), ")", { code: "Digit9", ctrlKey: true, shiftKey: true });
+  assert.equal(collapsedOf(page), "8", "a typed ) on the 9 key was read by its place as ( instead");
+  // Without Shift the digit keys are the browser's, untouched.
+  event = await press(page, page.el("scroll-area"), "9", { code: "Digit9", ctrlKey: true, shiftKey: false });
+  assert.equal(event.defaulted, true, "Ctrl+9 without Shift was taken");
+  assert.equal(collapsedOf(page), "8");
+
+  // In a text field the chord is the field's: not taken, nothing stepped, the draft as it was.
+  await page.el("channel-compose-text").setValue("a draft (with brackets)");
+  for (const field of ["channel-compose-text", "search-field"]) {
+    if (field === "search-field") await press(page, page.el("scroll-area"), "/");
+    event = await press(page, page.el(field), fewer.key, fewer);
+    assert.equal(event.defaulted, true, `Ctrl+( in #${field} was taken from the field`);
+    assert.equal(collapsedOf(page), "8", `Ctrl+( in #${field} stepped the lines`);
+  }
+  assert.equal(page.el("channel-compose-text").value, "a draft (with brackets)", "the chord touched the draft");
+
+  // Both chords are in the ? list, in this keyboard's words, saying what they step and its ends.
+  const listed = page.el("keyboard-keys").descendants().filter((node) => node.tagName === "kbd").map((node) => node.textContent);
+  assert.ok(listed.includes("Ctrl+("), `Ctrl+( is not in the list of keys: ${listed.join(", ")}`);
+  assert.ok(listed.includes("Ctrl+)"), "Ctrl+) is not in the list of keys");
+  const said = page.el("keyboard-keys").text();
+  assert.match(said, /One line fewer in every collapsed message/, "the list does not say what Ctrl+( does");
+  assert.match(said, /One line more/, "the list does not say what Ctrl+) does");
+  assert.match(said, /never taken in a text field/, "the list does not say the chords leave a text field's brackets alone");
+  assert.equal(page.el("collapsed-lines").getAttribute("aria-keyshortcuts"), "Control+( Meta+( Control+) Meta+)",
+    "the slider does not say its keys to a screen reader");
+});
+
+test("one count folds every list, thread cards keep a line at 0, and the hidden-word count follows the count in force", async () => {
+  // The stylesheet's part, which this fixture can only read: one property everywhere a collapsed
+  // row is drawn, the body gone outright at 0, and a card's floor of one line.
+  assert.match(cssBlock(".body.clamped"), /-webkit-line-clamp:\s*var\(--collapsed-lines\)/);
+  assert.match(cssBlock(':root[data-collapsed-lines="0"] .body.clamped'), /display:\s*none/,
+    "at zero the folded body is not gone, only clamped to no clamp");
+  assert.match(cssBlock(':root[data-collapsed-lines="0"] .elided'), /display:\s*none/,
+    "at zero the hidden-word line still takes a line of its own");
+  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, ".side-card-text"), /max\(1, var\(--collapsed-lines\)\)/,
+    "a thread card does not keep its one naming line at zero");
+
+  // The page's part: a folded row's "(~N more words)" is against the count in force, recounted
+  // where it stands when the count changes — fewer claimed as more lines show, never a word the
+  // reader can see.
+  const page = newPage();
+  await signIn(page);
+  const text = wordsOfLength(200, 4);
+  const [row] = await showDiscord(page, [message({ id: "4250000000000000001", content: text })]);
+  const perLine = wordsPerLine(page, 4, 28.5);
+  for (const [value, lines] of [["3", 3], ["1", 1], ["8", 8], ["0", 0], ["3", 3]]) {
+    await page.el("collapsed-lines").setValue(value);
+    assert.equal(collapsedOf(page), value);
+    assert.equal(labelAt(row, PHONE_CLASS), saysHidden(200 - lines * perLine),
+      `at ${lines} lines the count under the fold is not against ${lines} lines`);
+  }
+  // Collapsing and expanding still work at 0: the body keeps its words, only its drawing goes.
+  await page.el("collapsed-lines").setValue("0");
+  assert.equal(row.getAttribute("data-collapsed"), "true");
+  const fold = [...row.descendants()].find((node) => node.hasClass("fold"));
+  assert.ok(fold, "a folded row at zero has no way open");
+  await fold.click();
+  assert.equal(row.getAttribute("data-collapsed"), "false", "a row does not open at zero lines");
+  assert.match(textOfRow(row).text(), /nnnn/, "an opened row at zero has lost its words");
+  await fold.click();
+  assert.equal(row.getAttribute("data-collapsed"), "true", "a row does not fold again at zero lines");
 });
 
 // --- reading a message aloud ------------------------------------------------------------------
@@ -50665,12 +50866,13 @@ test("`#229 desktop-two-column`: with no thread selected, a card per thread, new
   for (const id of cardIds(page)) {
     assert.ok(page.el("side-cards").children.find((li) => li.getAttribute("data-id") === id).hasAttribute("data-card"));
   }
-  // Fixed height, three lines, cut with an ellipsis: the stylesheet's, since this fixture lays nothing out.
+  // Fixed height, the reader's collapsed lines (`#425 collapsed-lines`, never under one on a card),
+  // cut with an ellipsis: the stylesheet's, since this fixture lays nothing out.
   // Outside the two-column block since `#281 view-keys`: the thread list draws the same cards at any width.
   const text = cssBlockOutside(TWO_COLUMN_QUERY, ".side-card-text");
-  assert.match(text, /-webkit-line-clamp:\s*3/);
+  assert.match(text, /-webkit-line-clamp:\s*max\(1, var\(--collapsed-lines\)\)/);
   assert.match(text, /overflow:\s*hidden/);
-  assert.match(text, /height:\s*calc\(3 \* 1\.35em\)/, "a card is not a fixed three lines tall");
+  assert.match(text, /height:\s*calc\(max\(1, var\(--collapsed-lines\)\) \* 1\.35em\)/, "a card is not a fixed height in collapsed lines");
   // `#257 summary-truncation`, since `#277 thread-card-focus`: save the card highlighted, which shows its
   // whole text, three lines tall at least, so nothing the clamp cuts is out of reach. The card under the
   // mouse or the keys does not: see `#277`'s own tests below. Outside the two columns' block since `#281
@@ -50678,8 +50880,8 @@ test("`#229 desktop-two-column`: with no thread selected, a card per thread, new
   const whole = cssBlockOutside(TWO_COLUMN_QUERY, ".side-card-row[data-highlighted] > .side-card > .side-card-text");
   assert.match(whole, /-webkit-line-clamp:\s*none/, "the highlighted card is still clamped");
   assert.match(whole, /overflow:\s*visible/, "the highlighted card still hides what runs over");
-  assert.match(whole, /(^|[^-])height:\s*auto/, "the highlighted card is still a fixed three lines tall");
-  assert.match(whole, /min-height:\s*calc\(3 \* 1\.35em\)/, "the highlighted card shrinks a short card as it is lit");
+  assert.match(whole, /(^|[^-])height:\s*auto/, "the highlighted card is still a fixed height");
+  assert.match(whole, /min-height:\s*calc\(max\(1, var\(--collapsed-lines\)\) \* 1\.35em\)/, "the highlighted card shrinks a short card as it is lit");
   // A long first message is given whole, its line breaks folded, for the clamp to cut.
   page.threads = [];
   const long = message({ id: "210", content: "a long first message\n\nthat runs over several lines " + "and on ".repeat(40),
@@ -52476,7 +52678,7 @@ const litCards = (page, list = "side-cards") => page.el(list).children
 /** Whether the right column shows its cards, not a thread. */
 const cardsUp = (page) => page.el("side-list").hidden === false && page.el("side-pane").hidden === true;
 
-test("`#277 thread-card-focus`: every card stays three lines — under the mouse, the keys' ring and Tab's — and only a highlighted card shows all of it", async () => {
+test("`#277 thread-card-focus`: every card stays the reader's collapsed lines — under the mouse, the keys' ring and Tab's — and only a highlighted card shows all of it", async () => {
   // Anywhere in the stylesheet: since `#281 view-keys` the cards' rules stand outside the two columns'
   // block, for the thread list's cards, which are the same cards across the window.
   for (const lit of ['.side-card-row[data-selected="true"] > .side-card > .side-card-text', ".side-card:focus-visible > .side-card-text"]) {
@@ -52485,8 +52687,8 @@ test("`#277 thread-card-focus`: every card stays three lines — under the mouse
   const whole = cssBlockOutside(TWO_COLUMN_QUERY, ".side-card-row[data-highlighted] > .side-card > .side-card-text");
   assert.match(whole, /-webkit-line-clamp:\s*none/, "a highlighted card is still clamped");
   assert.match(whole, /overflow:\s*visible/, "a highlighted card still hides what runs over");
-  assert.match(whole, /(^|[^-])height:\s*auto/, "a highlighted card is still a fixed three lines tall");
-  assert.match(whole, /min-height:\s*calc\(3 \* 1\.35em\)/, "a short card shrinks as it is highlighted");
+  assert.match(whole, /(^|[^-])height:\s*auto/, "a highlighted card is still a fixed height");
+  assert.match(whole, /min-height:\s*calc\(max\(1, var\(--collapsed-lines\)\) \* 1\.35em\)/, "a short card shrinks as it is highlighted");
   const { page, data } = await twoColumnServer();
   const [first, second] = data.threads;
   await mouseTo(page, cardRow(page, first.id), 900, 60);
@@ -52860,9 +53062,9 @@ test("`#298 thread-card-header`: the card at the top of a thread is in the right
   assert.match(cssBlockOutside(TWO_COLUMN_QUERY, '.side-card-row.thread-card-header[data-thread-state="start"]'),
     /border-color:\s*var\(--thread-grey\)/, "a thread nobody has answered spends a colour on its card");
   assert.deepStrictEqual(cssRules(CSS_CODE, ".thread-card-header[data-highlighted]"), []);
-  // A fixed height: the list card's text, three clamped lines of a fixed height, and an X of a fixed
-  // size on the facts line, which the count beside it is shorter than.
-  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, ".side-card-text"), /(^|[^-])height:\s*calc\(3 \* 1\.35em\)/);
+  // A fixed height: the list card's text, the reader's clamped lines of a fixed height, and an X of
+  // a fixed size on the facts line, which the count beside it is shorter than.
+  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, ".side-card-text"), /(^|[^-])height:\s*calc\(max\(1, var\(--collapsed-lines\)\) \* 1\.35em\)/);
   assert.match(cssBlockOutside(TWO_COLUMN_QUERY, ".thread-card-close"), /(^|[^-])height:\s*1\.75rem/);
   // From review, larger type on a phone: the facts line no longer fits on one line at 150% type on a
   // 360px phone, and the age, the only column that could give way, was squeezed under its own words
@@ -53435,10 +53637,11 @@ test("`#298 thread-card-header`: a thread across the window is headed by the sam
   // The heading holds the card at its top, and draws no rule of its own under the card's border.
   assert.match(cssBlockOutside(TWO_COLUMN_QUERY, "#thread-heading"), /align-items:\s*flex-start/);
   assert.match(cssBlockOutside(TWO_COLUMN_QUERY, "#channel-navigation:has(> #thread-heading:not([hidden]))"), /border-bottom:\s*0/);
-  // On a phone, two lines of it, still a fixed height.
+  // On a phone, two lines of it at most — the reader's count under that, one at least (`#425
+  // collapsed-lines`) — still a fixed height.
   const phone = cssBlockIn("(max-width: 599.98px)", "#thread-card:not([data-folded]) > .side-card > .side-card-text");
-  assert.match(phone, /-webkit-line-clamp:\s*2/);
-  assert.match(phone, /(^|[^-])height:\s*calc\(2 \* 1\.35em\)/, "the phone's card is not a fixed height");
+  assert.match(phone, /-webkit-line-clamp:\s*max\(1, min\(var\(--collapsed-lines\), 2\)\)/);
+  assert.match(phone, /(^|[^-])height:\s*calc\(max\(1, min\(var\(--collapsed-lines\), 2\)\) \* 1\.35em\)/, "the phone's card is not a fixed height");
   // The move up: a transform from where the card in the list was, for as long as the stylesheet says,
   // with the thread fading in under it — nothing laid out — and none of it for a reader who asked for
   // less motion. The script reads the length, and asks no media query.
@@ -60743,7 +60946,7 @@ test("`#271 settings-groups`: the Messages section holds the message options, an
     "Reading full messages in channel view"]) {
     assert.ok(!messages.includes(agentGroup), `"${agentGroup}" is in Messages`);
   }
-  assert.deepStrictEqual(groupsIn("Screen and keys"), ["Text size", "Reading width", "Control bar", "Typing", "Keyboard"]);
+  assert.deepStrictEqual(groupsIn("Screen and keys"), ["Text size", "Reading width", "Collapsed message lines", "Control bar", "Typing", "Keyboard"]);
   assert.deepStrictEqual(groupsIn("Storage and connection"),
     ["Stored conversations", "Saved messages on this server", "Token", "Connection status"]);
   // The per-channel box is its own section, with its `?` beside the section's title.
@@ -62055,7 +62258,7 @@ function foldProblems(html, css, script) {
 
 test("`#346 settings-collapsible`: every section but Server and every group in them folds, hidden until found", () => {
   assert.deepStrictEqual(foldProblems(HTML, CSS_CODE, SCRIPT_CODE), []);
-  assert.equal(scriptFolds(SCRIPT_CODE).length, 29, "a fold went missing from the list, or one was added unchecked");
+  assert.equal(scriptFolds(SCRIPT_CODE).length, 30, "a fold went missing from the list, or one was added unchecked");
 });
 
 test("`#346 settings-collapsible`: the check refuses a fold out of find's reach, an unfolding group, and a list that disagrees (negative controls)", () => {

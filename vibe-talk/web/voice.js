@@ -66,6 +66,7 @@ const RENAMED_FROM_KEY = "gent-talk.token";
 const MIC_SETTINGS_KEY = "vibe-talk.voice.mic";
 const WIDTH_KEY = "vibe-talk.voice.width";
 const MSG_SCALE_KEY = "vibe-talk.voice.msg-scale";
+const COLLAPSED_LINES_KEY = "vibe-talk.voice.collapsed-lines";
 const READ_SPEED_KEY = "vibe-talk.voice.read-speed";
 const MARK_OWN_KEY = "vibe-talk.voice.mark-own-read";
 const MARKER_KEY = "vibe-talk.voice.place-marker";
@@ -155,6 +156,7 @@ const ALL_CHANNELS = "*";
 /**
  * @overload
  * @param {"api-token" | "channel-alias" | "channel-compose-grow" | "channel-directory-search"
+ *   | "collapsed-lines"
  *   | "combine-messages" | "compose-grow" | "enter-sends" | "hide-empty-messages" | "mark-own-read" | "mic-auto-gain"
  *   | "mic-echo-cancellation" | "side-compose-grow"
  *   | "message-cache-enabled"
@@ -184,12 +186,13 @@ const ALL_CHANNELS = "*";
  *   | "channel-view-flat" | "channel-view-main" | "channel-view-threads" | "clear-alias"
  *   | "clear-backlog" | "clear-view" | "close-browse-channels" | "close-help"
  *   | "close-settings" | "collapse-all" | "column-toggle" | "dismiss-banner"
- *   | "dismiss-error" | "dismiss-status" | "expand-all" | "fold-help" | "fold-auto-read" | "fold-canned-prompts" | "fold-combining" | "fold-connection" | "fold-control-bar" | "fold-dismissed" | "fold-empty-messages" | "fold-hidden-channels" | "fold-instructions" | "fold-keyboard" | "fold-mark-own" | "fold-message-cache" | "fold-microphone" | "fold-provider" | "fold-reading-full" | "fold-reading-width" | "fold-relay" | "fold-resuming" | "fold-rich-headers" | "fold-sending" | "fold-settings-all" | "fold-settings-channels" | "fold-settings-messages" | "fold-settings-screen" | "fold-settings-storage" | "fold-settings-voice-agent" | "fold-storage" | "fold-text-size" | "fold-token" | "fold-typing" | "forget-conversations"
+ *   | "dismiss-error" | "dismiss-status" | "expand-all" | "fold-help" | "fold-auto-read" | "fold-canned-prompts" | "fold-collapsed-lines" | "fold-combining" | "fold-connection" | "fold-control-bar" | "fold-dismissed" | "fold-empty-messages" | "fold-hidden-channels" | "fold-instructions" | "fold-keyboard" | "fold-mark-own" | "fold-message-cache" | "fold-microphone" | "fold-provider" | "fold-reading-full" | "fold-reading-width" | "fold-relay" | "fold-resuming" | "fold-rich-headers" | "fold-sending" | "fold-settings-all" | "fold-settings-channels" | "fold-settings-messages" | "fold-settings-screen" | "fold-settings-storage" | "fold-settings-voice-agent" | "fold-storage" | "fold-text-size" | "fold-token" | "fold-typing" | "forget-conversations"
  *   | "forget-dismissed-sends" | "forget-token"
  *   | "dismissed-send-close" | "dismissed-send-copy" | "dismissed-send-restore"
  *   | "retry-start"
  *   | "hang-up"
- *   | "help-link-auto-read" | "help-link-canned-prompts" | "help-link-channel-alias"
+ *   | "collapsed-lines-larger" | "collapsed-lines-smaller"
+ *   | "help-link-auto-read" | "help-link-canned-prompts" | "help-link-channel-alias" | "help-link-collapsed-lines"
  *   | "help-link-combining" | "help-link-connection" | "help-link-control-bar" | "help-link-empty-messages"
  *   | "help-link-identities" | "help-link-keyboard"
  *   | "help-link-live-messages" | "help-link-mark-own" | "help-link-microphone"
@@ -1367,6 +1370,7 @@ const SETTINGS_FOLDS = [
   "settings-screen",
   "text-size",
   "reading-width",
+  "collapsed-lines",
   "control-bar",
   "typing",
   "keyboard",
@@ -1475,6 +1479,7 @@ const HELP_TOPICS = [
   "combining",
   "rich-headers",
   "reading-width",
+  "collapsed-lines",
   "resuming",
   "live-messages",
   "speech-prep",
@@ -2475,9 +2480,12 @@ function freshenDayTitle(event) {
 //
 // The open questions on the issue, answered here rather than left to the reader of a diff:
 //
-//   * COLLAPSED SIZE IS MEASURED IN LINES — three, by `-webkit-line-clamp` in web/voice.css. What
-//     the reader is being protected from is a wall of text, and a wall is a number of lines. The
-//     character count below decides only WHETHER to fold.
+//   * COLLAPSED SIZE IS MEASURED IN LINES — the reader's count (`#425 collapsed-lines`, three
+//     until they say otherwise), by `-webkit-line-clamp` in web/voice.css. What the reader is
+//     being protected from is a wall of text, and a wall is a number of lines. The character
+//     count below decides only WHETHER to fold, and does not move with the count: at a high
+//     count a barely-long message on a wide column may already show whole behind its More, as
+//     one could at three lines on the widest column before the count could move.
 //   * A LONG MESSAGE ARRIVES ALREADY FOLDED. Folding it after the reader has seen it is a jump in
 //     the list for no reason they asked for, which is the same class of defect as the scroll one.
 //   * A SHORT MESSAGE GETS NO CONTROL AT ALL. A fold button that would reveal nothing, on every
@@ -2489,8 +2497,8 @@ function freshenDayTitle(event) {
 //     a preference, and a restored page that came back open would be a wall of text every time.
 //   * COLLAPSE ALL IS ONE ACTION, not a preference. It puts the list back the way it arrived.
 //
-// 280 characters is about four lines at phone width — comfortably past the three the fold shows, so
-// a folded message always has something behind it.
+// 280 characters is about four lines at phone width — comfortably past the three the fold shows by
+// default, so a folded message ordinarily has something behind it.
 const COLLAPSE_OVER_CHARS = 280;
 
 const FOLD_MORE = "More";
@@ -2502,7 +2510,7 @@ const FOLD_LESS = "Less";
 // huge messages or just barely over the limit". So a folded message says, under its last line, how
 // much the fold is keeping back: "(~240 more words)".
 //
-//   * NEVER MORE THAN IS HIDDEN. The fold is a CSS clamp of three lines, so where the cut falls
+//   * NEVER MORE THAN IS HIDDEN. The fold is a CSS clamp of the reader's lines, so where the cut falls
 //     depends on how wide the row's lines are, the text size, and how the browser breaks them. This
 //     file asks the layout engine none of that: a read per long row on every redraw is the forced
 //     layout `#226` took out of the redraw path. It works the count out once, when the row is built,
@@ -2526,7 +2534,7 @@ const FOLD_LESS = "Less";
 //   * NOT EVERYTHING IN A MESSAGE IS PROSE, and the clamp does not treat it all as lines
 //     (`foldRuns`). A TABLE scrolls sideways in a box of its own (web/voice.css, `.md table`), and
 //     the clamp counts no line inside such a box: it draws the table whole and goes on counting
-//     below it, so a table counts as shown, all of it, when it starts inside the three lines, and
+//     below it, so a table counts as shown, all of it, when it starts inside the shown lines, and
 //     hidden when it starts below them. From review: counted as a line per cell, a folded table said
 //     "(~95 more words)" with every word of it on the screen. A CODE BLOCK's lines are its own, in a
 //     monospaced face at its smaller size (`MONO_EM`), and where the clamp's last line is one of
@@ -2543,7 +2551,19 @@ const FOLD_LESS = "Less";
 //     browser breaks there.
 //   * "MORE", and no "…" of its own: the clamp has already ended the last line with one, and the
 //     label continues it. "More" is what says these are the words still hidden, not the total.
-const FOLD_LINES = 3;
+/**
+ * `#425 collapsed-lines`. The lines a fold shows: the reader's own count, per device, three until
+ * they say otherwise. 0 is the header alone, 8 a generous opening; past that the fold is barely a
+ * fold. The stylesheet reads the same count as `--collapsed-lines` (web/voice.css), and this model
+ * counts hidden words against it, so the two cannot disagree about where the cut falls — which is
+ * what the fixed three this replaces held by being one number in two files.
+ */
+const MIN_COLLAPSED_LINES = 0;
+const MAX_COLLAPSED_LINES = 8;
+const DEFAULT_COLLAPSED_LINES = 3;
+
+/** The collapsed-lines count in force; `applyCollapsedLines` is its only writer. */
+let collapsedLines = DEFAULT_COLLAPSED_LINES;
 
 /**
  * The line widths the count is worked out at, in em of the message text: the upper edge of each
@@ -2757,9 +2777,9 @@ function foldPieces(source) {
 /**
  * How many words and characters of `laid` (see `foldPieces`) a fold shows when a line is `widthEm`
  * wide. Words fill a line greedily, a piece too long for a line breaks inside itself as
- * `overflow-wrap: anywhere` breaks it, and a word that STARTS inside the three lines is shown,
- * because the reader can see that it is there. A block drawn whole that starts inside the three
- * lines is shown, all of it, and takes none of them; and where the third line is a code block's,
+ * `overflow-wrap: anywhere` breaks it, and a word that STARTS inside the shown lines is shown,
+ * because the reader can see that it is there. A block drawn whole that starts inside the shown
+ * lines is shown, all of it, and takes none of them; and where the last shown line is a code block's,
  * the next line of that block is shown too, its top in the block's padding.
  */
 function foldShows(laid, widthEm) {
@@ -2770,12 +2790,12 @@ function foldShows(laid, widthEm) {
   let edge = 0;
   const start = (pre) => {
     line += 1;
-    if (line === FOLD_LINES) edge = pre;
-    return line <= FOLD_LINES || (line === FOLD_LINES + 1 && pre !== 0 && pre === edge);
+    if (line === collapsedLines) edge = pre;
+    return line <= collapsedLines || (line === collapsedLines + 1 && pre !== 0 && pre === edge);
   };
   for (const entry of laid.lines) {
     if (entry.whole) {
-      if (line >= FOLD_LINES) break;
+      if (line >= collapsedLines) break;
       words += entry.words;
       chars += entry.chars;
       continue;
@@ -2837,7 +2857,10 @@ const NO_ELISION_LABELS = Object.freeze(FOLD_WIDTHS_EM.map(() => ""));
 function elisionLabels(source) {
   if (source === null) return NO_ELISION_LABELS;
   const runs = typeof source === "string" ? [["s", source]] : source === undefined ? [["s", ""]] : source;
-  const key = JSON.stringify(runs);
+  // `#425 collapsed-lines`. The count is against the lines in force, so they are part of what a
+  // held label is a label FOR: a count made at three lines, served at eight, would claim words
+  // the reader can see, which is the one thing this label may never do.
+  const key = `${collapsedLines}\n${JSON.stringify(runs)}`;
   const held = elisionCounted.get(key);
   if (held) return held;
   const laid = foldPieces(runs);
@@ -3019,6 +3042,10 @@ function foldable(li, meta, body, text, messageId, alsoIds = []) {
     li,
     body,
     fold,
+    // `#425 collapsed-lines`. Held so the count under the fold can be worked out again when the
+    // reader's lines change, without rebuilding the row: a drawn body is read for its runs, and
+    // a spoken turn's count is from this text alone (`foldedTextLine`).
+    foldText: text,
     id: messageId || null,
     also: alsoIds,
     note: null,
@@ -11013,6 +11040,27 @@ const KEYMAP = [
       `(${modKeyName()}+Shift+;) from anywhere, as ${modKeyName()}+; does`,
     run: (event, target) => foldStepFromKeyboard(-1, event, target),
   },
+  // `#425 collapsed-lines`. Ctrl+( and Ctrl+) — Ctrl+Shift+9 and Ctrl+Shift+0 where the brackets sit
+  // there, matched by the character typed and, where Shift+9 types no bracket, by the place of the
+  // key (`parenByPlace`). A chord nobody hits by accident while reading, as the owner asked. It
+  // repeats so a held chord's every repeat is taken from the browser's zoom, and steps on until
+  // the end of the range; in a text field it is never taken at all (`collapsedLinesFromKeyboard`).
+  {
+    group: KEYS_VIEW, chords: [{ key: "(", mod: true }], repeats: true,
+    does: () => `One line fewer in every collapsed message everywhere: ${MIN_COLLAPSED_LINES} to ` +
+      `${MAX_COLLAPSED_LINES} lines, ${MIN_COLLAPSED_LINES} the header alone. ${modKeyName()}+( is ` +
+      `${modKeyName()}+Shift+9. Kept on this device, as Collapsed message lines in Settings, and ` +
+      "never taken in a text field, where it types its bracket",
+    controls: ["collapsed-lines"],
+    run: (event, target) => collapsedLinesFromKeyboard(-1, target),
+  },
+  {
+    group: KEYS_VIEW, chords: [{ key: ")", mod: true }], repeats: true,
+    does: () => `One line more, as ${modKeyName()}+( shows one fewer. ${modKeyName()}+) is ` +
+      `${modKeyName()}+Shift+0`,
+    controls: ["collapsed-lines"],
+    run: (event, target) => collapsedLinesFromKeyboard(1, target),
+  },
   {
     group: KEYS_WRITING, chords: [{ key: "c" }],
     does: "Write to the channel, or in the thread you are in; with a reply open, the reply; in the call view, to the agent",
@@ -11060,7 +11108,7 @@ function chordMatches(chord, event) {
     return Boolean(chord.shift) === Boolean(event.shiftKey) && isLetterKey(event, chord.key);
   }
   const key = typedKey(event);
-  if (chord.key.length === 1 && chord.key !== " ") return key === chord.key || digitByPlace(chord, event);
+  if (chord.key.length === 1 && chord.key !== " ") return key === chord.key || digitByPlace(chord, event) || parenByPlace(chord, event);
   return key === chord.key && Boolean(chord.shift) === Boolean(event.shiftKey);
 }
 
@@ -11073,6 +11121,22 @@ function chordMatches(chord, event) {
 function digitByPlace(chord, event) {
   return Boolean(chord.mod) && /^[0-9]$/.test(chord.key) && !event.shiftKey &&
     !/^[0-9]$/.test(String(event.key || "")) && event.code === `Digit${chord.key}`;
+}
+
+/**
+ * Whether `event` is the bracket chord `chord` by the place of its key: Ctrl or Cmd and Shift on
+ * Digit9 for "(", on Digit0 for ")", where that key types no bracket — a layout whose shifted
+ * digit row is digits, or a browser that reports the digit while Cmd is held, as it may report a
+ * letter (`typedKey`). `#425 collapsed-lines`. Never for a key that DID type a bracket, which
+ * means the bracket it typed: on a German layout Shift+9 is ")" by place for "(", and it is the
+ * ")" chord there, by its character, as every character chord is read. Never without Shift, which
+ * is the browser's own tab key, Ctrl+9 or Ctrl+0.
+ */
+function parenByPlace(chord, event) {
+  const place = chord.key === "(" ? "Digit9" : chord.key === ")" ? "Digit0" : null;
+  if (place === null || !chord.mod || !event.shiftKey) return false;
+  const key = String(event.key || "");
+  return key !== "(" && key !== ")" && event.code === place;
 }
 
 /** A chord of one key that types a character: what the Settings switch turns off, and what never fires in a field. */
@@ -15752,6 +15816,143 @@ function stepMsgScale(direction) {
   // A button disabled under the focus drops it, and the keyboard is left on nothing. The slider
   // between the two takes it, which says the size it is at and moves on with the arrows.
   if (held && button.disabled) el("msg-scale").focus();
+}
+
+/**
+ * `#425 collapsed-lines`. A lines count this page will actually apply, for the reason
+ * `clampReadingWidth` gives: storage is not a trusted input. A blank entry is ABSENT, not zero —
+ * `Number("")` is 0, and 0 is a real count now (the header alone), so taking a blank at its word
+ * would put a reader who never touched the control into the tightest list there is.
+ */
+function clampCollapsedLines(value) {
+  const text = typeof value === "string" ? value.trim() : value;
+  if (text === "" || text === null || text === undefined) {
+    return DEFAULT_COLLAPSED_LINES;
+  }
+  const n = Number(text);
+  if (!Number.isFinite(n)) {
+    return DEFAULT_COLLAPSED_LINES;
+  }
+  return Math.min(MAX_COLLAPSED_LINES, Math.max(MIN_COLLAPSED_LINES, Math.round(n)));
+}
+
+/** What was stored, clamped. A missing or corrupt entry is the default, never an error. */
+function storedCollapsedLines() {
+  const stored = localStorage.getItem(COLLAPSED_LINES_KEY);
+  return clampCollapsedLines(stored === null ? DEFAULT_COLLAPSED_LINES : stored);
+}
+
+/**
+ * Put a lines count on the page, and return the one actually applied, which is the clamped one.
+ * One property on the root reaches every list, as the reading width's does; the value is ALSO the
+ * root's `data-collapsed-lines`, because at 0 the stylesheet hides the folded body outright — a
+ * clamp of 0 reads as no clamp in a browser and would show every line (web/voice.css).
+ */
+function applyCollapsedLines(value) {
+  collapsedLines = clampCollapsedLines(value);
+  document.documentElement.style.setProperty("--collapsed-lines", String(collapsedLines));
+  document.documentElement.setAttribute("data-collapsed-lines", String(collapsedLines));
+  el("collapsed-lines").value = String(collapsedLines);
+  el("collapsed-lines-smaller").disabled = collapsedLines <= MIN_COLLAPSED_LINES;
+  el("collapsed-lines-larger").disabled = collapsedLines >= MAX_COLLAPSED_LINES;
+  return collapsedLines;
+}
+
+/** Store it, and READ IT BACK: private browsing accepts `setItem` and keeps nothing. */
+function persistCollapsedLines(n) {
+  const encoded = String(n);
+  try {
+    localStorage.setItem(COLLAPSED_LINES_KEY, encoded);
+  } catch (_error) {
+    return false;
+  }
+  return localStorage.getItem(COLLAPSED_LINES_KEY) === encoded;
+}
+
+/** The count in words, as Settings and the status line say it. */
+const collapsedLinesWords = (n) =>
+  n === 0 ? "only their header" : `${n} line${n === 1 ? "" : "s"}`;
+
+/**
+ * Work every drawn fold's hidden-word count out again under the count now in force. A label made
+ * at three lines and left at eight would claim words the reader can see — the one thing the label
+ * may never do (`#244 elision-word-count`) — and a channel redraw would only mend the channel's
+ * rows, on the next poll, and the transcript's never. So the rows on the page are recounted where
+ * they stand, from what each draws (`foldedTextLine`), and put back through `setFolded` so the
+ * new line is shown exactly where the old one was.
+ */
+function refreshElisionLines() {
+  elisionCounted.clear();
+  for (const id of FOLD_LISTS) {
+    for (const entry of foldsOf(document.getElementById(id))) {
+      const fresh = foldedTextLine(entry.body, entry.foldText);
+      const old = entry.elided;
+      if (old && fresh) old.replaceWith(fresh);
+      else if (old && !fresh) old.remove();
+      else if (!old && fresh && entry.body.parentNode) {
+        entry.body.parentNode.insertBefore(fresh, entry.body.nextSibling);
+      }
+      entry.elided = fresh;
+      setFolded(entry, isFolded(entry));
+    }
+  }
+}
+
+/**
+ * Apply a new count and say, in Settings, whether it will survive a reload. Every collapsed row
+ * on the page changes height at once, so the change is made between the scroll keepers of BOTH
+ * columns (`captureScroll` and `restoreScroll`, `#47 scrollback-stability`): a reader scrolled up
+ * either list keeps the message they are on, and a reader at the newest line stays on it. Off
+ * the main screen — the slider's own home in Settings — there is no list on screen to hold, and
+ * the count is simply put on.
+ */
+function collapsedLinesChanged(value) {
+  const apply = () => {
+    const n = applyCollapsedLines(value);
+    refreshElisionLines();
+    el("collapsed-lines-state").textContent = persistCollapsedLines(n)
+      ? `Saved — collapsed messages show ${collapsedLinesWords(n)}.`
+      : "This browser refused to store the collapsed lines, so it will be forgotten when you " +
+        `reload (private browsing does this). Collapsed messages show ${collapsedLinesWords(n)} until then.`;
+    return n;
+  };
+  if (currentScreen !== "main") return apply();
+  /** @type {Array<[typeof activeColumn, ReturnType<typeof captureScroll>]>} */
+  const held = [[columns.main, inColumn(columns.main, captureScroll)]];
+  if (sideShowing()) held.push([columns.side, inColumn(columns.side, captureScroll)]);
+  const n = apply();
+  for (const [column, mark] of held) inColumn(column, () => restoreScroll(mark));
+  return n;
+}
+
+/**
+ * One line fewer (-1) or more (+1): what the slider's − and + do, through `collapsedLinesChanged`,
+ * the slider's own path, as `stepMsgScale` steps the text size.
+ *
+ * @param {1 | -1} direction
+ */
+function stepCollapsedLines(direction) {
+  const button = el(direction > 0 ? "collapsed-lines-larger" : "collapsed-lines-smaller");
+  const held = document.activeElement === button;
+  collapsedLinesChanged(clampCollapsedLines(el("collapsed-lines").value) + direction);
+  if (held && button.disabled) el("collapsed-lines").focus();
+}
+
+/**
+ * Ctrl+( and Ctrl+) (Cmd on a Mac): one collapsed line fewer or more, and the status line says the
+ * count it came to. Never in a text field, where the chord is the field's — a bracket typed, and
+ * on some layouts a brace — so the key is left alone there and the browser keeps it; everywhere
+ * else the chord is taken, at the ends of the range too, so it is never the browser's zoom
+ * instead. A held chord steps on, as holding a zoom would, and stops at the end.
+ *
+ * @param {1 | -1} direction
+ * @param {HTMLElement} target
+ */
+function collapsedLinesFromKeyboard(direction, target) {
+  if (isTextField(target)) return false;
+  const n = collapsedLinesChanged(collapsedLines + direction);
+  setStatus(`Collapsed messages show ${collapsedLinesWords(n)}.`);
+  return true;
 }
 
 const MIN_READING_CH = 45;
@@ -48266,6 +48467,9 @@ el("resume-toggle").addEventListener("change", () => {
 // branch on here and no second definition of "is this a desktop" to drift.
 applyReadingWidth(storedReadingWidth());
 applyMsgScale(storedMsgScale());
+// `#425 collapsed-lines`. Before anything is drawn, for the same reason: a first list folded at
+// three and refolded at the reader's count a moment later is a jump nobody asked for.
+applyCollapsedLines(storedCollapsedLines());
 applyReadSpeed(storedReadSpeed());
 applyMarkOwnRead(storedMarkOwnRead());
 applyCombineMessages(storedCombineMessages());
@@ -48297,6 +48501,9 @@ el("reading-width").addEventListener("input", () => readingWidthChanged(el("read
 el("msg-scale").addEventListener("input", () => msgScaleChanged(el("msg-scale").value));
 el("msg-scale-smaller").addEventListener("click", () => stepMsgScale(-1));
 el("msg-scale-larger").addEventListener("click", () => stepMsgScale(1));
+el("collapsed-lines").addEventListener("input", () => collapsedLinesChanged(el("collapsed-lines").value));
+el("collapsed-lines-smaller").addEventListener("click", () => stepCollapsedLines(-1));
+el("collapsed-lines-larger").addEventListener("click", () => stepCollapsedLines(1));
 el("width-grip").addEventListener("pointerdown", onGripDown);
 el("width-grip").addEventListener("pointermove", onGripMove);
 el("width-grip").addEventListener("pointerup", onGripUp);

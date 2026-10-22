@@ -625,6 +625,20 @@ thread-button-browser:
 compact-rows-browser:
 	python3 tests/compact_rows_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS)) $(if $(REPORT),--report)
 
+# `#425 collapsed-lines` in a real Chromium at 1280x800 (keys) and 393x852 (touch): a folded long
+# message's body is 3 lines until Ctrl+( and Cmd+( step it to 1 and to 0 -- the header alone, no gap
+# where the body was, reactions still drawn -- with the count said and the chord taken from the
+# browser, Ctrl+) back up to 6 and no past 8, by bracket and by digit place, never in the message
+# box; the Settings slider and its - and + set the same count and a reload keeps it; the row being
+# read holds its place as the count changes; the same count folds a thread and rows unpacked under
+# their cards, and a raw thread card is the count tall (one line at 0); at 0 a row still opens
+# whole, the selection still moves and Reply still opens. Pass WEB_ROOT=dir to run it against
+# another copy of the page, SCREENSHOTS=dir to keep a PNG of each state (0, 1, 3 and 6 lines among
+# them), and REPORT=1 to print every measure.
+.PHONY: collapsed-lines-browser
+collapsed-lines-browser:
+	python3 tests/collapsed_lines_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS)) $(if $(REPORT),--report)
+
 # `#245 done-feedback` in a real Chromium: at 1280x800 in both schemes, a selected unread message ringed
 # solid in the accent and a selected read one dashed in grey on the same lit surface, each at 3:1 or
 # more against it; e draws the moment on the row it left and lets it go; the Undo chip names the

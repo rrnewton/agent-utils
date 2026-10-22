@@ -1902,6 +1902,53 @@
 
                   <section class="settings-group">
                     <div class="group-head">
+                      <h3 title="How many opening lines a collapsed long message shows. 0 is its header alone."><button class="fold-toggle" id="fold-collapsed-lines" type="button" aria-expanded="false" aria-controls="fold-collapsed-lines-body">Collapsed message lines</button></h3>
+                      <button class="help-link" id="help-link-collapsed-lines" type="button" data-help="collapsed-lines" aria-label="About collapsed message lines" title="How many opening lines a collapsed long message shows. 0 is its header alone.">?</button>
+                    </div>
+                    <div class="fold-body" id="fold-collapsed-lines-body" hidden="until-found">
+                      <!--
+                        `#425 collapsed-lines`. How much of a folded long message is on show, in
+                        lines of its opening: 3 until the reader says otherwise, 0 to 8. 0 is the
+                        header alone — who, when, and the row's chips and buttons, with no text
+                        under them. One count for every list (Main, All, a thread in either
+                        column, threads unpacked, the call's transcript), stated once as
+                        `--collapsed-lines` in web/voice.css; thread cards keep one line at 0,
+                        their text being the card's name. The − and + step one line each, as the
+                        text size's do, and the keys Ctrl+( and Ctrl+) (Cmd on a Mac) step it from
+                        the lists. Kept on this device only, like the text size beside it.
+                      -->
+                      <div class="msg-scale-row">
+                        <button
+                          id="collapsed-lines-smaller"
+                          class="secondary step-button"
+                          type="button"
+                          aria-label="Fewer collapsed lines"
+                          aria-controls="collapsed-lines"
+                          title="Fewer collapsed lines"
+                        >−</button>
+                        <input
+                          id="collapsed-lines"
+                          type="range"
+                          min="0"
+                          max="8"
+                          step="1"
+                          aria-label="collapsed message lines"
+                        />
+                        <button
+                          id="collapsed-lines-larger"
+                          class="secondary step-button"
+                          type="button"
+                          aria-label="More collapsed lines"
+                          aria-controls="collapsed-lines"
+                          title="More collapsed lines"
+                        >+</button>
+                      </div>
+                      <p id="collapsed-lines-state" class="hint" aria-live="polite"></p>
+                    </div>
+                  </section>
+
+                  <section class="settings-group">
+                    <div class="group-head">
                       <h3 title="Where the strip with the gear and the Voice/Channel switch sits: at the bottom, by your thumb, or at the top."><button class="fold-toggle" id="fold-control-bar" type="button" aria-expanded="false" aria-controls="fold-control-bar-body">Control bar</button></h3>
                       <button class="help-link" id="help-link-control-bar" type="button" data-help="control-bar" aria-label="About the control bar" title="Where the strip with the gear and the Voice/Channel switch sits: at the bottom, by your thumb, or at the top.">?</button>
                     </div>
@@ -2743,6 +2790,34 @@
                 ninety characters, and a maximised browser is twice that. Drag the edge of the
                 column, or use the slider — they set the same thing. On a phone it does nothing,
                 because there is no room for a column and no margin to put beside it.
+              </p>
+            </details>
+
+            <details id="help-collapsed-lines" class="help-entry">
+              <summary><h2>Collapsed message lines</h2></summary>
+              <p class="hint">
+                A long message arrives <strong>collapsed</strong>: its opening lines, and a tap
+                (or its <strong>More</strong>) shows the rest. How many opening lines that is —
+                <strong>0 to 8, 3 until you say otherwise</strong> — is
+                <strong>Collapsed message lines</strong> in Settings, under Screen and keys, kept
+                on this device. It is the same count in every view: Main, All, a thread in either
+                column, messages unpacked under their thread cards, and the call's transcript.
+                Thread cards follow it too, but keep one line at 0: their text is the card's name.
+              </p>
+              <p class="hint">
+                <strong>0 is the header alone</strong>: who wrote it, when, its colour and its
+                chips and buttons, with no text under them and no gap where the text was — a list
+                you can scan by author. Opening the message shows it whole, as at any other
+                count, and the "(~N more words)" under a collapsed message counts against the
+                count in force, so it never claims words you can see.
+              </p>
+              <p class="hint">
+                From the keyboard, <kbd>Ctrl</kbd>+<kbd>(</kbd> shows one line fewer and
+                <kbd>Ctrl</kbd>+<kbd>)</kbd> one line more (<kbd>⌘</kbd> on a Mac; that is
+                <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>9</kbd> and
+                <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>0</kbd>). The status line says the new
+                count, the message you are on stays where it is, and neither chord types anything
+                in a message box or zooms the page.
               </p>
             </details>
 
