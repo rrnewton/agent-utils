@@ -1,12 +1,13 @@
 ---
 title: 'open-upstream-link: open a message in Slack, Google Chat or Discord from its ⋯ menu'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-22T02:39:01.319941060+00:00
-updated_at: 2026-10-22T02:48:23.310439211+00:00
+updated_at: 2026-10-22T06:08:20.610420866+00:00
+closed_at: 2026-10-22T06:08:20.610420756+00:00
 ---
 
 # Description
