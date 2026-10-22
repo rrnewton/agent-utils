@@ -477,7 +477,7 @@ def _plant_legacy_agent(project: Path, agent: str = LEGACY_AGENT) -> None:
     active-state write, exactly what an old create would have left behind.
     """
 
-    config = w._load_config(project, "testhost")
+    config = w._load_config(str(project), "testhost")
     state = w._load_active(config, require_repository=False)
     record = w._find_record(state, "slot01")
     state = w._replace_record(state, dataclasses.replace(record, agent=agent))
@@ -513,7 +513,7 @@ def _never_started_remove(
     )
 
 
-def _never_started_events(project: Path) -> list[Mapping[str, object]]:
+def _never_started_events(project: Path) -> list[dict[str, object]]:
     return [
         event
         for event in _events(project)
