@@ -408,6 +408,9 @@ const FIXTURE_TREE = {
     "pinned-log",
     "outgoing-log",
     "channel-composer",
+    // `#410 inline-reply-editor`. Where a reply opened on a row of this column is written, in the
+    // stream: the reply's own box moves in while it is open, so the reader's place counts it.
+    "column-reply",
   ],
   "channel-composer": ["channel-compose-text", "channel-send", "channel-compose-state"],
   // `#59 text-entry-button` and `#60 canned-prompt-buttons` put their buttons in the pack, and
@@ -440,21 +443,16 @@ const FIXTURE_TREE = {
   // rightmost" is an ordering claim and a fixture that held the members in a flat list could not
   // check it. It is also what `setPlacement` re-parents, so the move has something real to move.
   "control-bar": ["open-settings", "bar-pack", "prompts-tray", "view-switch"],
-  // `#200 reply-context`. The reply screen's one scroll: the earlier messages, oldest at the top,
-  // then the message being answered. The SECOND element the model scrolls — see `SCROLLERS`.
-  // `#247 reply-continuity` put the room that holds the message in place at its head, and moved the
-  // line naming the message beside the box's label, out of the scroll.
-  "reply-scroll": ["reply-lead", "reply-context-more", "reply-context-state", "reply-context", "reply-target"],
-  // `#277 reply-in-column`. The block under the conversation, which two columns move to the foot of a
-  // column and back, so what is inside it goes with it: whether the focus is in the reply's box is a
-  // question of where that box is.
-  "screen-reply": ["reply-scroll", "reply-compose"],
-  "reply-compose": ["reply-target-meta", "reply-text", "reply-branch-row", "reply-destination", "reply-cancel", "reply-send", "reply-state"],
+  // `#410 inline-reply-editor`. The reply's box, kept in the left column's place while no reply is open
+  // and moved into the stream of a column and back, so what is inside it goes with it: whether the focus
+  // is in the reply's box is a question of where that box is.
+  "column-reply": ["reply-compose"],
+  "reply-compose": ["reply-target-meta", "reply-text", "reply-branch-row", "reply-destination", "reply-cancel", "reply-send", "reply-grow", "reply-state"],
   "reply-branch-row": ["reply-branch"],
   // `#229 desktop-two-column`. The right column of the desk's two-column layout: its heading, its
   // one scrolling element (the THIRD the model scrolls, see `SCROLLERS`) holding the cards and the
   // thread pane, which nests exactly as #pane-discord does, and its jump over the foot.
-  "side-column": ["side-heading", "side-freshness", "side-scroll", "side-reply", "side-tools"],
+  "side-column": ["side-heading", "side-freshness", "side-scroll", "side-tools"],
   // `#298 thread-card-header`. Over a thread across the window the heading is the thread's card, the X
   // in it, as at the top of the right column: drawn only while the heading over a thread is.
   "channel-navigation": ["channel-view-tabs", "thread-heading"],
@@ -481,6 +479,7 @@ const FIXTURE_TREE = {
     "side-pinned-log",
     "side-outgoing-log",
     "side-composer",
+    "side-reply",
   ],
   "side-composer": ["side-compose-text", "side-send", "side-compose-state"],
   "side-tools": ["side-jump-newest"],
@@ -519,13 +518,10 @@ const FIXTURE_TREE = {
 };
 
 /**
- * The elements the page scrolls: the channel and transcript's shared area, and the reply screen's
- * conversation. Every other element holds a position of zero, as a box that does not scroll does.
+ * The elements the page scrolls: the channel and transcript's shared area, and the right column's.
+ * Every other element holds a position of zero, as a box that does not scroll does.
  */
-const SCROLLERS = new Set(["scroll-area", "reply-scroll", "side-scroll"]);
-
-/** The reply screen's viewport, so "the message being answered is in view" means something. */
-const REPLY_VIEWPORT_PX = 200;
+const SCROLLERS = new Set(["scroll-area", "side-scroll"]);
 
 /** Where web/voice.html defines an id: which line, and how deeply indented. */
 /** `text` as a regex source that matches exactly those characters. */
@@ -1705,7 +1701,6 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     }
   }
   elements.get("scroll-area").clientHeight = SCROLL_VIEWPORT_PX;
-  elements.get("reply-scroll").clientHeight = REPLY_VIEWPORT_PX;
   // `#229 desktop-two-column`. The right column's list is as tall as the left's.
   elements.get("side-scroll").clientHeight = SCROLL_VIEWPORT_PX;
   // ...and the one layout question the page asks about it: whether it has a box at all. web/voice.css
@@ -1763,7 +1758,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     },
     /** Which screen is showing. Exactly one, or this throws — a page with none is a blank app. */
     screen() {
-      const showing = ["signin", "main", "settings", "reply", "help"].filter(
+      const showing = ["signin", "main", "settings", "help"].filter(
         (s) => !page.el(`screen-${s}`).hidden
       );
       assert.equal(showing.length, 1, `exactly one screen must show, not ${showing.join("+")}`);
@@ -4648,17 +4643,6 @@ const TUNING_BANDS = {
     "threads the picker lists before '… Older threads'. Fewer than five and the thread discussed " +
     "this morning is already a second screen away; past about a dozen the phone's native picker " +
     "no longer fits one screen and scrolls, which is what the owner asked it to stop doing"],
-  // `#200 reply-context`: the earlier messages drawn over the one being answered.
-  REPLY_CONTEXT_LIMIT: [4, 30,
-    "earlier messages the reply screen draws before 'Load earlier messages'. Under about four the " +
-    "question being answered is often already off the top; past a few dozen the screen builds a " +
-    "long history on every Reply, most of it never scrolled to"],
-  // `#247 reply-continuity`: how much of the message being answered shows above the box at least.
-  REPLY_SHOWN_PERCENT: [20, 50,
-    "percent of the reply screen's conversation a message taller than it keeps above the box when " +
-    "its top on the list was lower than that. Under a fifth it can open as a line or two above the " +
-    "box, which reads as the message having gone; past a half the message jumps up the screen for " +
-    "any row in the lower half of the list, which is the move the owner asked the screen not to make"],
   // `#204 reply-arrow`: the tap on a reply's arrow, and where it lands.
   REPLY_JUMP_PAGES: [2, 10,
     "older pages one tap on a reply's arrow may read looking for what it answers. Fewer than two " +
@@ -5065,6 +5049,13 @@ const foldButton = (li) => li.descendants().find((node) => node.className === "f
 
 /** The reply control on a rendered channel message. `#51 reply-view`. */
 const replyButton = (li) => li.descendants().find((node) => node.className === "reply-button");
+
+/**
+ * `#410 inline-reply-editor`. Whether the reply's box is open in the stream: on the main screen, in a
+ * list's place for it (#column-reply or #side-reply), as Reply opens it on every list of the channel.
+ */
+const replyInStream = (page) => page.screen() === "main" &&
+  ["column-reply", "side-reply"].some((id) => page.el("reply-compose").parentNode === page.el(id) && !page.el(id).hidden);
 
 /** One buffer of microphone audio arriving from the browser's audio graph. */
 function speakInto(page) {
@@ -6079,14 +6070,14 @@ test("the header shows two things at a time, and which two depends on the screen
   //
   // `#194 thread-picker-polish` added a fourth way back, for the Threads screen, which returns to
   // the channel it lists — at the leading edge with the others. `#281 view-keys` retired that screen
-  // for the thread list, a view of the main screen, and its way back with it.
-  assert.deepStrictEqual(ids, ["close-settings", "close-reply", "close-help"]);
+  // for the thread list, a view of the main screen, and its way back with it. `#410
+  // inline-reply-editor` retired the reply screen, Reply opening in the list, and its way back too.
+  assert.deepStrictEqual(ids, ["close-settings", "close-help"]);
 
   const page = newPage();
   const showing = () =>
     [
       "close-settings",
-      "close-reply",
       "close-help",
       "topbar-title",
       "view-switch",
@@ -6101,14 +6092,13 @@ test("the header shows two things at a time, and which two depends on the screen
   await page.el("close-settings").click();
   assert.deepStrictEqual(showing(), ["view-switch", "open-settings"]);
 
+  // `#410 inline-reply-editor`. Reply is in the list: the header is the main screen's, before and after.
   const [line] = await showDiscord(page, [message({ id: "1", content: "hello" })]);
   await replyButton(line).click();
-  assert.deepStrictEqual(showing(), ["close-reply", "topbar-title"]);
-  // `#200 reply-context`: and then where the reply goes, which on a channel without threads is
-  // its main space.
-  assert.match(page.el("topbar-title").text(), /^Reply · Main · /, "the title bar still says Settings");
+  assert.ok(replyInStream(page), "the premise is a reply open in the list");
+  assert.deepStrictEqual(showing(), ["view-switch", "open-settings"]);
 
-  await page.el("close-reply").click();
+  await page.el("reply-cancel").click();
   assert.deepStrictEqual(showing(), ["view-switch", "open-settings"]);
 });
 
@@ -9123,7 +9113,7 @@ test("THE STYLESHEET SHOWS THE LABEL OF THE WIDTH CLASS THE LINE IS IN, measured
     const lower = i === 0 ? "" : `${FOLD_WIDTHS_EM[i - 1]}em <= `;
     assert.equal(condition, `${lower}width < ${FOLD_WIDTHS_EM[i]}em`, `class ${i} is not the line widths it was counted for`);
   });
-  for (const list of ["#reply-context", "#pinned-log", "#side-log", "#discord-log"]) {
+  for (const list of ["#pinned-log", "#side-log", "#discord-log"]) {
     assert.match(CSS_CODE, new RegExp(`${list} \\.elided[,\\s][^{]*\\{\\s*font-size: calc\\(0\\.88rem \\* var\\(--msg-scale\\)\\);`),
       `in ${list} the line is not at the text's size, so its em is not the text's`);
   }
@@ -9414,15 +9404,14 @@ test("THE HEADER COSTS NO ROW ON THE MAIN SCREEN, AND THE GLASS FLOATS OVER THE 
   assert.equal(page.el("topbar").hidden, true, "the channel view brought the header back");
   assert.equal(page.el("search-toggle").hidden, false, "the channel view has no glass");
 
-  // It is still a title bar wherever it has something to say, with a way back on every one of the
-  // three screens that is a destination.
+  // It is still a title bar wherever it has something to say, with a way back on each of the two
+  // screens that is a destination. A reply is open in the list (`#410 inline-reply-editor`), on the
+  // main screen, which costs no row for it.
   const [line] = page.el("discord-log").children;
   await replyButton(line).click();
-  assert.equal(page.el("topbar").hidden, false, "the reply screen lost its title bar");
-  assert.equal(page.el("close-reply").hidden, false, "the reply screen has no way back");
-  assert.equal(page.el("search-toggle").hidden, true, "the glass followed the reader to Reply");
-  await page.el("close-reply").click();
-  assert.equal(page.el("topbar").hidden, true, "leaving Reply left the header standing");
+  assert.equal(page.el("topbar").hidden, true, "a reply in the list brought the header back");
+  assert.equal(page.el("search-toggle").hidden, false, "the glass went with a reply open in the list");
+  await page.el("reply-cancel").click();
 
   await page.el("open-settings").click();
   assert.equal(page.el("topbar").hidden, false, "the way back out of Settings was hidden");
@@ -9457,7 +9446,7 @@ test("the glass, its field and its count are declared on the floating line, not 
   assertMarkupContains("channel-freshness-anchor", "channel-freshness");
   // OUTSIDE the scroller, beside the pill, for the pill's reasons: inside, the header mask would
   // fade the glass with the content and it would scroll away from the reader who wants it.
-  const main = HTML.slice(HTML.indexOf('id="screen-main"'), HTML.indexOf('id="screen-reply"'));
+  const main = HTML.slice(HTML.indexOf('id="screen-main"'), HTML.indexOf('id="screen-settings"'));
   assert.ok(
     main.indexOf('id="search-toggle"') < main.indexOf('id="scroll-area"'),
     "the glass is inside the scrolling list, where the mask fades it and a scroll takes it away"
@@ -14310,12 +14299,6 @@ test("the fixture carries a scroll position for the elements the page scrolls, a
   const area = page.el("scroll-area");
   area.scrollTop = area.scrollHeight * 2;
   assert.equal(area.scrollTop, area.scrollHeight - area.clientHeight);
-  // `#200 reply-context` gave the reply screen a scroll of its own, and the model the second box.
-  await replyButton(log.children[log.children.length - 1]).click();
-  const reply = page.el("reply-scroll");
-  assert.ok(reply.scrollHeight > reply.clientHeight, "the reply screen does not overflow, so this asks nothing");
-  reply.scrollTop = reply.scrollHeight * 2;
-  assert.equal(reply.scrollTop, reply.scrollHeight - reply.clientHeight);
 
   // WHY the model is allowed only these: the stylesheet's other scrolling elements are outside the
   // layout tree this fixture models, so nothing here has to have an opinion about them. Computed
@@ -18161,7 +18144,7 @@ test("a touch screen keeps its focus tint, and a desk draws the focused row only
 // message, that a failure loses nothing the reader typed, and that coming back puts them where
 // they were.
 
-/** Open the reply screen on the nth rendered channel message. */
+/** Open Reply on the nth rendered channel message: its box, in the list (`#410 inline-reply-editor`). */
 async function openReplyOn(page, messages, index = 0) {
   // `showDiscord` TOGGLES the view switch, so calling it twice would land back on the call. Once
   // the channel is up and rendered, the rows already on screen are the ones to reach for.
@@ -18170,7 +18153,7 @@ async function openReplyOn(page, messages, index = 0) {
   const button = replyButton(lines[index]);
   assert.ok(button, "the rendered channel message carries no reply control");
   await button.click();
-  assert.equal(page.screen(), "reply", "the reply control did not open the reply screen");
+  assert.ok(replyInStream(page), "the reply control did not open the reply in the list");
   return lines[index];
 }
 
@@ -18204,47 +18187,6 @@ test("THE REPLY REALLY REFERENCES THE MESSAGE IT WAS OPENED ON", async () => {
   assert.equal(page.screen(), "main", "a successful send left the reader on the reply screen");
   const lines = page.el("discord-log").children;
   assert.match(lines[lines.length - 1].text(), /looking at it now/);
-});
-
-test("LEAVING TO REPLY AND COMING BACK LANDS ON THE SAME LINE", async () => {
-  // The easy instance of `#47 scrollback-stability`'s requirement, and it uses the SAME mechanism
-  // rather than a second one: an anchor and an offset, not a saved scrollTop. That matters here in
-  // particular, because hiding an element is allowed to reset its scroll position to zero — which
-  // is what the run below simulates.
-  const run = async (script) => {
-    const page = newPage(new Map(), script);
-    await signIn(page);
-    const area = page.el("scroll-area");
-    const lines = await showDiscord(page, tallChannel());
-    area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) * 0.6);
-    const parked = area.scrollTop;
-    assert.ok(parked > 0, "the channel does not overflow, so this test would prove nothing");
-
-    await replyButton(lines[3]).click();
-    // What a browser does to a hidden element's scroll position.
-    area.scrollTop = 0;
-    await page.el("reply-cancel").click();
-    return { page, parked, landed: area.scrollTop };
-  };
-
-  const { page, parked, landed } = await run();
-  assert.equal(page.screen(), "main");
-  assert.equal(landed, parked, `the reader came back ${landed - parked}px from where they left`);
-
-  // THE CONTROL. Without it the fixture could be one that never moves scrollTop at all, and
-  // "it came back to the same place" would be satisfied by a page that does nothing.
-  const control = await run(
-    brokenScript(
-      "  area.scrollTop += mark.anchor.getBoundingClientRect().top - mark.top;",
-      "  void mark;"
-    )
-  );
-  assert.notEqual(
-    control.landed,
-    control.parked,
-    "with the restore deleted the reader still landed in the right place, so this test cannot " +
-      "tell a page that restores from one that does not"
-  );
 });
 
 test("a draft survives leaving without sending, and survives a reload", async () => {
@@ -18358,37 +18300,15 @@ test("a reply that fails does NOT hang up on you", async () => {
   assert.equal(page.el("error").hidden, true, "a reply failure raised the CALL's failure panel");
 });
 
-test("the reply screen puts away the controls that act on the call, and keeps a way back", async () => {
-  const page = newPage();
-  await startTalking(page);
-  await openReplyOn(page, [message({ id: "555", content: "hello" })]);
-
-  assert.equal(page.el("control-pane").hidden, true, "the dock acts on the call, not on this");
-  assert.equal(page.el("view-switch").hidden, true, "it would switch to a screen that is not up");
-  assert.equal(page.el("close-reply").hidden, false, "there is no way back off the reply screen");
-  // The status line stays: a call is still running underneath, and it has to be able to say so.
-  assert.equal(page.el("status-line").hidden, false);
-});
-
-test("the reply screen shows the message being answered, in full, with its id", async () => {
+test("the reply's box names the message being answered, with its id", async () => {
+  // `#410 inline-reply-editor`. The message itself is its row, where it was on the list, unfolded or
+  // not as the reader left it; the box under it says who is answered and the id the answer goes to.
   const page = newPage();
   await signIn(page);
   const long = longMessage("the one being answered");
   await openReplyOn(page, [message({ id: "666777888999000111", author: "build-bot", content: long })]);
-
-  assert.match(page.el("reply-target").text(), /the one being answered/);
   assert.match(page.el("reply-target-meta").textContent, /666777888999000111/);
   assert.match(page.el("reply-target-meta").textContent, /build-bot \(bot\)/);
-  // NOT folded. The fold exists so a list can be skimmed; there is one message here and answering
-  // it is the reason you are looking at it.
-  assert.equal(foldButton(page.el("reply-target")), undefined, "the message you are answering was folded");
-  // Its own scrolling box, so a long one does not push the reply control off the screen. Since
-  // `#200 reply-context` that box is the conversation the message is in, the message included.
-  const scroll = cssBlock("#reply-scroll");
-  assert.match(scroll, /overflow-y:\s*auto/);
-  assert.match(scroll, /overscroll-behavior:\s*contain/);
-  assertMarkupContains("reply-scroll", "reply-target");
-  assert.ok(!markupHolds("reply-scroll", "reply-text"), "the composer scrolls away with the message");
 });
 
 // --- the inbox view ---------------------------------------------------------------------------
@@ -21878,7 +21798,7 @@ const ENTER_COMPOSERS = {
     return {
       page, field: "reply-text",
       ready: async (text) => {
-        if (page.screen() !== "reply") await openReplyOn(page, messages);
+        if (!replyInStream(page)) await openReplyOn(page, messages);
         await page.el("reply-text").setValue(text);
       },
       sent: () => page.repliesPosted.length,
@@ -22368,14 +22288,14 @@ const focusName = (page) => (focused(page) ? `#${focused(page).id || focused(pag
 
 test("EVERY LIST CAN HOLD THE FOCUS, from script and a click but never as a Tab stop, and draws no ring", () => {
   // `#281 view-keys`: and the thread list's, the right column's scroller, as in two columns.
-  for (const id of ["scroll-area", "reply-scroll", "side-scroll", "screen-signin", "screen-settings", "screen-help"]) {
+  for (const id of ["scroll-area", "side-scroll", "screen-signin", "screen-settings", "screen-help"]) {
     const tag = new RegExp(`<[a-z]+ id="${id}"[^>]*>`).exec(HTML_CODE);
     assert.ok(tag, `#${id} is not in the markup`);
     assert.match(tag[0], /\btabindex="-1"/, `#${id} cannot hold the focus, so the scroll keys cannot reach it`);
   }
   // Not a Tab stop anywhere: a list reached by Tab would put a stop the reader has to pass on every screen.
-  assert.doesNotMatch(HTML_CODE, /id="(scroll-area|reply-scroll|screen-[a-z]+)"[^>]*tabindex="0"/);
-  for (const selector of ["#scroll-area:focus", "#reply-scroll:focus", ".screen:focus"]) {
+  assert.doesNotMatch(HTML_CODE, /id="(scroll-area|side-scroll|screen-[a-z]+)"[^>]*tabindex="0"/);
+  for (const selector of ["#scroll-area:focus", "#side-scroll:focus", ".screen:focus"]) {
     assert.match(cssBlock(selector), /outline:\s*none/, `${selector} draws a ring round the whole screen`);
   }
 });
@@ -22394,10 +22314,11 @@ test("THE LIST ON SCREEN TAKES THE FOCUS: signed in, at a view switch, back from
   // Back hides itself as it is pressed, which drops the focus on the floor in a browser.
   await page.el("close-settings").click();
   assert.equal(focused(page), page.el("scroll-area"), `back from Settings the focus is on ${focusName(page)}`);
+  // `#410 inline-reply-editor`. Reply opens in the list, its box taking the focus; Cancel gives it back.
   await replyButton(page.el("discord-log").children[3]).click();
-  assert.equal(page.screen(), "reply");
-  assert.equal(focused(page), page.el("reply-scroll"), `on Reply the focus is on ${focusName(page)}`);
-  await page.el("close-reply").click();
+  assert.ok(replyInStream(page));
+  assert.equal(focused(page), page.el("reply-text"), `on Reply the focus is on ${focusName(page)}`);
+  await page.el("reply-cancel").click();
   assert.equal(focused(page), page.el("scroll-area"), `back from Reply the focus is on ${focusName(page)}`);
 });
 
@@ -22595,13 +22516,14 @@ test("IN THE CALL'S BOX AND THE REPLY BOX a page key pages the list beside them"
   const reply = newPage();
   await signIn(reply);
   await openReplyOn(reply, tallChannel(30), 29);
-  const context = reply.el("reply-scroll");
+  // `#410 inline-reply-editor`. The reply's box is in the list: the list it is in pages.
+  const context = reply.el("scroll-area");
   const at = context.scrollTop;
-  assert.ok(at > 0, `the reply screen opened at ${at}, so a page up from it would prove nothing`);
+  assert.ok(at > 0, `the list was at ${at} with the reply open, so a page up from it would prove nothing`);
   event = await press(reply, reply.el("reply-text"), "PageUp");
   assert.equal(event.defaulted, false, "PageUp in the reply box was left to the box");
-  assert.equal(context.scrollTop, Math.max(0, at - Math.round(REPLY_VIEWPORT_PX * 0.875)),
-    "PageUp in the reply box did not page the conversation above it");
+  assert.equal(context.scrollTop, Math.max(0, at - Math.round(SCROLL_VIEWPORT_PX * 0.875)),
+    "PageUp in the reply box did not page the list it is in");
   assert.equal(focused(reply), reply.el("reply-text"), "PageUp took the reader out of the reply box");
 });
 
@@ -22676,16 +22598,17 @@ test("Ctrl+S AND Cmd+S GO TO THE MESSAGE BOX from the list, the search field and
     assert.equal(page.screen(), "main", `Ctrl+S on ${screen} did not go back to the list`);
     assert.equal(focused(page), page.el("channel-compose-text"), `Ctrl+S on ${screen} left the focus on ${focusName(page)}`);
   }
-  // On Reply, the reply's box, from anywhere on the screen.
+  // With a reply open in the list, the reply's box, from anywhere on the screen (`#410
+  // inline-reply-editor`); and "/" on the list is the search, the reply left open under it.
   const reply = await keyboardPage();
   await openReplyOn(reply, tallChannel(30), 2);
-  event = await press(reply, reply.el("reply-scroll"), "s", { ctrlKey: true });
+  event = await press(reply, reply.el("scroll-area"), "s", { ctrlKey: true });
   assert.equal(event.defaulted, false);
-  assert.equal(reply.screen(), "reply", "Ctrl+S left the reply screen");
+  assert.ok(replyInStream(reply), "Ctrl+S put the reply away");
   assert.equal(focused(reply), reply.el("reply-text"), `Ctrl+S on Reply left the focus on ${focusName(reply)}`);
-  event = await press(reply, reply.el("reply-scroll"), "/");
-  assert.equal(event.defaulted, true, "\"/\" on Reply, where there is nothing to search, was taken anyway");
-  assert.equal(reply.screen(), "reply", "\"/\" left the reply screen");
+  event = await press(reply, reply.el("scroll-area"), "/");
+  assert.equal(reply.el("search-field").hidden, false, "\"/\" on the list beside a reply did not open the search");
+  assert.ok(replyInStream(reply), "\"/\" put the reply away");
   // On the call's view, the agent's box under the transcript (`#241 voice-composer`), in a call and
   // with none: going there starts nothing.
   const call = newPage();
@@ -22734,7 +22657,7 @@ test("Ctrl+Enter OUTSIDE A BOX goes to the message box; in a box it sends, as it
   // In the reply box it sends; on the reply screen outside it, it goes to it.
   const reply = await keyboardPage();
   await openReplyOn(reply, tallChannel(30), 2);
-  let event = await press(reply, reply.el("reply-scroll"), "Enter", { ctrlKey: true });
+  let event = await press(reply, reply.el("scroll-area"), "Enter", { ctrlKey: true });
   assert.equal(focused(reply), reply.el("reply-text"), `Ctrl+Enter on Reply left the focus on ${focusName(reply)}`);
   assert.equal(reply.repliesPosted.length, 0, "Ctrl+Enter outside the box sent the reply");
   await reply.el("reply-text").setValue("on it");
@@ -22779,14 +22702,14 @@ test("a HELD Ctrl+Enter outside a box goes to the box and sends NOTHING: its rep
     const reply = await keyboardPage();
     await openReplyOn(reply, tallChannel(30), 2);
     await reply.el("reply-text").setValue(draft);
-    event = await press(reply, reply.el("reply-scroll"), "Enter", fields);
+    event = await press(reply, reply.el("scroll-area"), "Enter", fields);
     assert.equal(focused(reply), reply.el("reply-text"), `a held ${chord} on Reply left the focus on ${focusName(reply)}`);
     for (let i = 0; i < 3; i += 1) {
       event = await press(reply, focused(reply), "Enter", { ...fields, repeat: true });
       assert.equal(event.defaulted, false, `a held ${chord}'s repeat typed a new line in the reply box`);
     }
     assert.equal(reply.repliesPosted.length, 0, `a held ${chord} on Reply sent the reply's draft`);
-    assert.equal(reply.screen(), "reply", `a held ${chord} on Reply left the Reply screen`);
+    assert.ok(replyInStream(reply), `a held ${chord} on Reply put the reply away`);
     assert.equal(reply.el("reply-text").value, draft, `a held ${chord} on Reply emptied the reply box`);
 
     // On the call's view, in a call, with a draft waiting in the agent's box (`#241 voice-composer`).
@@ -22892,7 +22815,7 @@ test("THE SETTINGS KEY: \",\" and Ctrl+, open Settings with its screen focused; 
   assert.equal(page.screen(), "main");
 });
 
-test("THE SETTINGS KEY where the gear is not: from sign-in it opens and returns; on Reply it does nothing", async () => {
+test("THE SETTINGS KEY where the gear is not: from sign-in it opens and returns; beside a reply open in the list it opens and returns to it", async () => {
   const page = newPage();
   assert.equal(page.screen(), "signin");
   await press(page, null, ",");
@@ -22904,15 +22827,20 @@ test("THE SETTINGS KEY where the gear is not: from sign-in it opens and returns;
   assert.equal(event.defaulted, true);
   assert.equal(page.screen(), "signin");
 
+  // `#410 inline-reply-editor`. A reply is open in the list, on the main screen, where the gear is:
+  // "," there is Settings, and back from it the reply is still open, its words kept.
   const reply = newPage();
   await signIn(reply);
   await openReplyOn(reply, tallChannel(5), 1);
-  let key = await press(reply, reply.el("reply-scroll"), ",");
-  assert.equal(key.defaulted, true, "\",\" on Reply, where it does nothing, was taken anyway");
-  assert.equal(reply.screen(), "reply");
-  key = await press(reply, reply.el("reply-scroll"), ",", { metaKey: true });
-  assert.equal(key.defaulted, false, "Cmd+, on Reply was left to the browser, which opens its own settings");
-  assert.equal(reply.screen(), "reply");
+  await reply.el("reply-text").setValue("half a thought");
+  let key = await press(reply, reply.el("scroll-area"), ",");
+  assert.equal(key.defaulted, false, "\",\" on the list beside a reply was left to the page's text");
+  assert.equal(reply.screen(), "settings", "\",\" on the list beside a reply did not open Settings");
+  await press(reply, reply.el("screen-settings"), "Escape");
+  assert.ok(replyInStream(reply), "back from Settings, the reply was put away");
+  assert.equal(reply.el("reply-text").value, "half a thought");
+  key = await press(reply, reply.el("scroll-area"), ",", { metaKey: true });
+  assert.equal(key.defaulted, false, "Cmd+, beside a reply was left to the browser, which opens its own settings");
 });
 
 test("EVERY CONTROL ON SETTINGS keeps its value the moment it changes: nothing there waits for a Save", () => {
@@ -24162,9 +24090,9 @@ test("ESC IN A MESSAGE BOX leaves the box and keeps the draft; the next Esc goes
   reply.el("reply-text").focus();
   await reply.el("reply-text").setValue("not sent yet");
   await press(reply, reply.el("reply-text"), "Escape");
-  assert.equal(reply.screen(), "reply", "the first Esc in the reply box with text left the reply screen");
-  assert.equal(focused(reply), reply.el("reply-scroll"), `after Esc the focus is on ${focusName(reply)}`);
-  await press(reply, reply.el("reply-scroll"), "Escape");
+  assert.ok(replyInStream(reply), "the first Esc in the reply box with text put the reply away");
+  assert.equal(focused(reply), reply.el("scroll-area"), `after Esc the focus is on ${focusName(reply)}`);
+  await press(reply, reply.el("scroll-area"), "Escape");
   assert.equal(reply.screen(), "main", "the second Esc did not leave the reply screen");
   await replyButton(reply.el("discord-log").children[1]).click();
   assert.equal(reply.el("reply-text").value, "not sent yet", "the draft did not survive Esc");
@@ -24242,9 +24170,9 @@ test("r REPLIES with the box ready; p pins; . opens the ⋯ menu on its first it
   event = await pressCopy(page, page.el("channel-compose-text"));
   assert.equal(event.defaulted, true, "Ctrl+C in a message box was taken from it");
   assert.equal(page.clipboard, undefined, "Ctrl+C in an empty message box copied the message");
-  // r: the reply screen, its box ready to type in.
+  // r: the reply, its box ready to type in, in the list (`#410 inline-reply-editor`).
   await press(page, channelRow(page, "2"), "r");
-  assert.equal(page.screen(), "reply", "r did not open the reply screen");
+  assert.ok(replyInStream(page), "r did not open the reply in the list");
   assert.equal(focused(page), page.el("reply-text"), `on Reply after r the focus is on ${focusName(page)}`);
   assert.ok(row, "the row went");
 });
@@ -26238,13 +26166,16 @@ test("? AND Ctrl+? open the list of every key, and Esc goes back to where they w
   assert.equal(page.screen(), "help");
   await page.el("close-help").click();
   assert.equal(page.screen(), "settings", "Back on Help opened from Settings did not go back to Settings");
-  // Not where the gear is not: on Reply, ? is nobody's.
+  // `#410 inline-reply-editor`. Beside a reply open in the list, ? is the list's: Help, and back from it
+  // the reply is still open.
   const reply = newPage();
   await signIn(reply);
   await openReplyOn(reply, tallChannel(5), 1);
-  const event = await press(reply, reply.el("reply-scroll"), "?", { shiftKey: true });
-  assert.equal(event.defaulted, true);
-  assert.equal(reply.screen(), "reply");
+  const event = await press(reply, reply.el("scroll-area"), "?", { shiftKey: true });
+  assert.equal(event.defaulted, false);
+  assert.equal(reply.screen(), "help", "? beside a reply did not open Help");
+  await press(reply, reply.el("screen-help"), "Escape");
+  assert.ok(replyInStream(reply), "back from Help, the reply was put away");
 });
 
 // --- the search from anywhere (#344 search-shortcut) ---------------------------------------------
@@ -26371,17 +26302,17 @@ test("`#344 search-shortcut`: Ctrl+/ AND Cmd+/ OPEN THE SEARCH FROM ANYWHERE, wh
     assert.equal(off.defaulted, true, "with single keys off, a bare \"/\" was taken");
     assert.equal(page.el("search-field").hidden, true, "with single keys off, a bare \"/\" opened the search");
     await opens(page, page.el("scroll-area"), "with single keys off");
-    // Reply: left with its draft kept, as its Back leaves it; the reply opened again holds it.
+    // `#410 inline-reply-editor`. A reply open in the list stays open, its words in its box: the search
+    // is over the list it is in, a bare "/" in the box is a character, and the chord opens it from there.
     page = await keyboardPage(platform);
-    const answered = (await openReplyOn(page, tallChannel(30), 2)).getAttribute("data-id");
+    await openReplyOn(page, tallChannel(30), 2);
     await page.el("reply-text").setValue("half a reply");
-    const bare = await press(page, page.el("reply-scroll"), "/");
-    assert.equal(page.screen(), "reply", "a bare \"/\" left the reply screen");
-    assert.equal(bare.defaulted, true, "a bare \"/\" on Reply, where there is nothing to search, was taken");
-    await opens(page, page.el("reply-text"), "on Reply");
-    await replyButton(channelRow(page, answered)).click();
-    assert.equal(page.screen(), "reply");
-    assert.equal(page.el("reply-text").value, "half a reply", `${said} on Reply lost the reply's draft`);
+    const bare = await press(page, page.el("reply-text"), "/");
+    assert.equal(bare.defaulted, true, "a bare \"/\" in the reply's box was not left to the box");
+    assert.equal(page.el("search-field").hidden, true, "a bare \"/\" in the reply's box opened the search");
+    await opens(page, page.el("reply-text"), "in the reply's box");
+    assert.ok(replyInStream(page), `${said} in the reply's box put the reply away`);
+    assert.equal(page.el("reply-text").value, "half a reply", `${said} in the reply's box lost the reply's words`);
   }
   // Two columns: the right column's box, its draft as it was; then a reply open at the foot of that
   // column stays open, its draft with it: the search is over the list beside it.
@@ -27413,14 +27344,15 @@ test("a restore that lands up the history shows the jump at once; one that lands
   await page.el("close-settings").click();
   assert.equal(jumpShown(page), true, "back from Settings, the jump did not come back with the place");
   const row = page.el("discord-log").children.find((li) => li.getBoundingClientRect().bottom > 0);
+  // `#410 inline-reply-editor`. A reply opens in the list, which stays on screen with its jump.
   await replyButton(row).click();
   await page.settle();
-  assert.equal(page.screen(), "reply");
-  assert.equal(jumpShown(page), false, "the jump stood over the reply screen");
-  await page.el("close-reply").click();
+  assert.ok(replyInStream(page));
+  assert.equal(jumpShown(page), true, "a reply open in the list took the jump away");
+  await page.el("reply-cancel").click();
   await page.settle();
-  assert.equal(area.scrollTop, parked, "the premise: closing the reply puts the reader back");
-  assert.equal(jumpShown(page), true, "back from replying, the jump did not come back with the place");
+  assert.equal(area.scrollTop, parked, "the premise: putting the reply down leaves the reader where they were");
+  assert.equal(jumpShown(page), true, "back from replying, the jump did not stay with the place");
 });
 
 test("a reload that puts the reader back up the channel shows the jump; one on the newest does not", async () => {
@@ -30974,9 +30906,10 @@ test("A REPLY TO A COMBINED ROW GOES TO THE FIRST MESSAGE'S REAL DISCORD ID", as
   const rows = await showDiscord(page, splitPost());
 
   await replyButton(rows[0]).click();
-  assert.equal(page.screen(), "reply");
-  // What is quoted is the whole row, because that is what the reader tapped Reply on.
-  assert.match(page.el("reply-target").text(), /back up again/, "the quoted message is truncated");
+  assert.ok(replyInStream(page));
+  // The whole row is the message answered, under which the box opens (`#410 inline-reply-editor`).
+  assert.deepStrictEqual(inlineAnchors(page), [`discord-log:${rows[0].getAttribute("data-id")}`],
+    "the box is not under the row Reply was pressed on");
   assert.match(
     page.el("reply-target-meta").textContent,
     /id 1000000000000000001$/,
@@ -33974,7 +33907,7 @@ test("Send on an explicit reply closes its editor immediately and never clears a
   finish(json(200, { posted: message({ id: "9111", content: "my answer", reply_to: "9110" }) }));
   await submitted;
   await page.settle();
-  assert.equal(page.screen(), "reply", "a completed earlier send closed the newer editor");
+  assert.ok(replyInStream(page), "a completed earlier send closed the newer editor");
   assert.equal(page.el("reply-text").value, "another thought on the same question");
   assert.equal(JSON.parse(page.storage.get("vibe-talk.voice.drafts"))["9110"],
     "another thought on the same question");
@@ -34533,660 +34466,8 @@ test("Reply offers no new thread on a root the page has since learnt was answere
   assert.equal(page.el("reply-branch-row").hidden, true, "a new thread was offered on a root that has replies");
 });
 
-// --- the conversation a reply goes into ----------------------------------------------------------
-//
-// `#200 reply-context`. The reply screen's title bar names the thread the reply goes into in the
-// thread picker's own words, and the messages that came before the one being answered are drawn
-// above it, read-only, with the screen opening at the message.
-
-/**
- * A channel with one discussion: an announcement `300`, the discussion's root `301` and its five
- * answers `302`..`306`, an aside `307` on the main channel after it, and `308`, a main-channel
- * question whose thread nobody has answered, which is the one Reply can start a thread from.
- */
-function discussionData() {
-  const thread = { id: "spaces/A/threads/discussion", root_message_id: "301", is_root: true,
-    reply_count: 5, reply_count_exact: true };
-  const lone = { id: "spaces/A/threads/lone", root_message_id: "308", is_root: true,
-    reply_count: 0, reply_count_exact: true };
-  const answer = { ...thread, is_root: false };
-  const messages = [
-    message({ id: "300", content: "an announcement before the discussion" }),
-    message({ id: "301", content: "a discussion opens here", thread }),
-    message({ id: "302", content: "the first answer", thread: answer }),
-    message({ id: "303", content: "the second answer", thread: answer }),
-    message({ id: "304", content: "the third answer", thread: answer }),
-    message({ id: "305", content: "the fourth answer", thread: answer }),
-    message({ id: "306", content: "the fifth answer", thread: answer }),
-    message({ id: "307", content: "an aside on the main channel" }),
-    message({ id: "308", content: "an open question", thread: lone }),
-  ];
-  // Longer than the picker shows, so the picker's option and the heading over the thread differ.
-  const threads = [{ id: thread.id, root: messages[1], title: "Long discussion of the storage migration",
-    reply_count: 5, reply_count_exact: true, updated_at: messages[6].timestamp }];
-  return { messages, threads, thread };
-}
-
-async function discussionPage(setup = () => {}) {
-  const page = newPage();
-  page.threadingSupported = true;
-  const data = discussionData();
-  page.threads = data.threads;
-  setup(page);
-  await signIn(page);
-  await showDiscord(page, data.messages);
-  // The picker touched, as a thumb does before choosing: that is what reads the channel's thread
-  // list, whose names these tests compare. A channel opened in Main used to read it beside Main;
-  // since `#189 restore-ui-state` it opens in All, which does not.
-  await page.el("thread-select").dispatch("pointerdown");
-  await page.settle();
-  return { page, data };
-}
-
-/** The ids of the earlier messages drawn over the one being answered, top to bottom. */
-const contextIds = (page) => page.el("reply-context").children.map((li) => li.getAttribute("data-id"));
-const replyTitle = (page) => page.el("topbar-title").text();
-
-test("the reply screen's title names the thread it posts into as the picker does, and Main by the channel's name", async () => {
-  const { page, data } = await discussionPage((p) => {
-    p.channels = [{ ...CHANNEL, alias: "the planning room" }];
-  });
-  const value = `thread:${data.thread.id}`;
-
-  // A main-channel message: the channel's main space, by the name the owner gave the channel.
-  await replyButton(rowOf(page, "300")).click();
-  assert.equal(replyTitle(page), "Reply · Main · the planning room");
-  await page.el("reply-cancel").click();
-
-  // Inside the thread: the picker's own label for it, with the name less shortened, as the heading
-  // over the thread read until it became the thread's card (`#298 thread-card-header`). The title bar
-  // cuts what does not fit; the picker cuts at a count.
-  await pickThread(page, value);
-  const option = optionLabel(page, value);
-  assert.match(option, / · 5 · Long discussion of the stor…$/, `the picker's label is not what this test expects: ${option}`);
-  const heading = `${option.slice(0, option.indexOf(" · Long"))} · Long discussion of the storage migration`;
-  await replyButton(rowOf(page, "304")).click();
-  assert.equal(replyTitle(page), `Reply · ${heading}`, "the title bar and the heading name the thread differently");
-  assert.ok(replyTitle(page).startsWith(`Reply · ${option.slice(0, -1)}`),
-    `the title bar "${replyTitle(page)}" does not begin with the picker's "${option}"`);
-  await page.el("reply-cancel").click();
-
-  // From All, a thread's answer is named by ITS thread, not by the view it was opened from.
-  await pickThread(page, "flat");
-  await replyButton(rowOf(page, "303")).click();
-  assert.equal(replyTitle(page), `Reply · ${heading}`);
-  await page.el("reply-cancel").click();
-
-  // The new-thread box moves the destination, and the title goes with it, there and back.
-  await pickThread(page, "main");
-  await replyButton(rowOf(page, "308")).click();
-  assert.equal(page.el("reply-branch-row").hidden, false, "this fixture offers no new thread");
-  assert.equal(replyTitle(page), "Reply · Main · the planning room");
-  page.el("reply-branch").checked = true;
-  await page.el("reply-branch").dispatch("change");
-  assert.equal(replyTitle(page), "Reply · New thread · an open question");
-  assert.match(page.el("reply-destination").textContent, /new thread/);
-  page.el("reply-branch").checked = false;
-  await page.el("reply-branch").dispatch("change");
-  assert.equal(replyTitle(page), "Reply · Main · the planning room");
-  assert.match(page.el("reply-destination").textContent, /main channel/);
-
-  // Leaving puts the title bar back to nothing of the reply's.
-  await page.el("reply-cancel").click();
-  assert.equal(page.el("topbar-title").hidden, true);
-});
-
-test("the reply screen's title gives the name a line of its own, so a phone cuts the facts before the name", async () => {
-  // `#200 reply-context`. As one line, "Reply · 38w · 14 · <name>", a phone cut the end, and the
-  // end is the name, the one part that identifies the thread: at 412px with the font at 130%, six
-  // characters of it were left. "Reply" and the facts are now a smaller line, cut first, and the
-  // name has the bar's width and two lines before it is cut. As text it is unchanged: the picker's
-  // label after "Reply", the seam between the lines spoken and not drawn.
-  const { page, data } = await discussionPage((p) => {
-    p.channels = [{ ...CHANNEL, alias: "the planning room" }];
-  });
-  const lines = () => page.el("topbar-title").children.map((part) => [part.className, part.textContent]);
-  await pickThread(page, `thread:${data.thread.id}`);
-  // The picker's facts for it, "13h · 5", before its name.
-  const option = optionLabel(page, `thread:${data.thread.id}`);
-  const facts = option.slice(0, option.indexOf(" · Long"));
-  assert.match(facts, /^(now|\d+[mhdwy]|\d+d\d+h) · 5$/, `the picker's label is not what this test expects: ${option}`);
-  await replyButton(rowOf(page, "304")).click();
-  assert.deepEqual(lines(), [
-    ["title-lead", `Reply · ${facts}`],
-    ["sr-only", " · "],
-    ["title-name", "Long discussion of the storage migration"],
-  ]);
-  await page.el("reply-cancel").click();
-
-  await pickThread(page, "main");
-  await replyButton(rowOf(page, "308")).click();
-  assert.deepEqual(lines(), [["title-lead", "Reply · Main"], ["sr-only", " · "], ["title-name", "the planning room"]]);
-  await page.el("reply-branch").setChecked(true);
-  assert.deepEqual(lines(), [["title-lead", "Reply · New thread"], ["sr-only", " · "], ["title-name", "an open question"]]);
-
-  // What draws those lines so. This fixture lays nothing out, so it reads the rules: the name may
-  // wrap to a second line and is then cut, the lead stays one line and gives way first, and the
-  // title as a whole is no longer the single cut line it was.
-  const name = cssBlock("#topbar-title .title-name");
-  assert.match(name, /display:\s*-webkit-box/);
-  assert.match(name, /-webkit-box-orient:\s*vertical/);
-  assert.match(name, /-webkit-line-clamp:\s*2;/);
-  assert.match(name, /overflow:\s*hidden/, "without overflow: hidden the clamp cuts nothing");
-  assert.match(name, /overflow-wrap:\s*anywhere/, "a name that is one long token runs under the clip");
-  assert.doesNotMatch(name, /nowrap/, "the name is held to one line");
-  const lead = cssBlock("#topbar-title .title-lead");
-  assert.match(lead, /white-space:\s*nowrap/);
-  assert.match(lead, /text-overflow:\s*ellipsis/);
-  assert.doesNotMatch(cssBlock("#topbar-title"), /nowrap|ellipsis/, "the whole title is one cut line again");
-  // At the inherited line height the two lines of a short name were taller than the bar's own
-  // 2.4rem row, so every reply screen paid for the split; at a heading's they fit inside it.
-  assert.match(cssBlock("#topbar-title"), /line-height:\s*1\.2;/);
-  assert.match(cssBlock(".sr-only"), /clip-path:\s*inset\(50%\)/, "the seam between the lines is drawn");
-});
-
-test("a read that places an unplaced message renames the reply screen and moves its earlier messages", async () => {
-  const { page, first, standard } = await unplacedArrival();
-  await replyButton(rowOf(page, "206")).click();
-  assert.match(replyTitle(page), /^Reply · lead team · thread not known yet$/);
-  assert.match(page.el("reply-destination").textContent, /not known yet/);
-
-  // The channel's own poll reads it, with the reply screen still up.
-  page.timeline = standard;
-  await reReadChannel(page);
-  assert.equal(page.screen(), "reply", "the read took the reader off the reply screen");
-  assert.equal(replyTitle(page), `Reply · ${optionLabel(page, `thread:${first.id}`)}`,
-    "the title bar still does not know where the reply goes");
-  assert.match(page.el("reply-destination").textContent, /thread this message belongs to/);
-  assert.deepEqual(contextIds(page), ["201", "202"], "the earlier messages are not the thread's");
-
-  // ...and Send goes there at once, with no placement read of its own.
-  distinctReplies(page);
-  const reads = page.timelineCalls.length;
-  await page.el("reply-text").setValue("placed after all");
-  await page.el("reply-send").click();
-  await page.settle();
-  assert.deepEqual(page.repliesPosted.at(-1).body, { text: "placed after all", reply_to: "206", thread_id: first.id });
-  assert.equal(page.timelineCalls.length, reads, "the send read the channel again to place a placed message");
-});
-
-test("the earlier messages of the thread are drawn above the message being answered, oldest first, and none after it", async () => {
-  const { page, data } = await discussionPage();
-  await pickThread(page, `thread:${data.thread.id}`);
-  await replyButton(rowOf(page, "304")).click();
-
-  assert.deepEqual(contextIds(page), ["301", "302", "303"]);
-  assert.match(page.el("reply-target").text(), /the third answer/);
-  assert.doesNotMatch(page.el("reply-context").text(), /third|fourth|fifth/,
-    "a message from after the one being answered is in its context");
-  const pane = page.el("reply-scroll").children;
-  assert.ok(pane.indexOf(page.el("reply-context")) < pane.indexOf(page.el("reply-target")),
-    "the earlier messages are not above the message");
-  // Drawn as the channel draws its rows: the same row, the same rendered text.
-  const root = page.el("reply-context").children[0];
-  assert.equal(root.className, "discord-message");
-  assert.match(root.descendants().find((node) => node.className === "body").text(), /a discussion opens here/);
-
-  // A draft still belongs to its message, context or not.
-  await page.el("reply-text").setValue("a half-written answer");
-  await page.el("reply-cancel").click();
-  await replyButton(rowOf(page, "304")).click();
-  assert.equal(page.el("reply-text").value, "a half-written answer", "the draft was lost");
-  assert.deepEqual(contextIds(page), ["301", "302", "303"]);
-  await page.el("reply-cancel").click();
-
-  // On Main, what came before on the main channel, and none of the thread's answers.
-  await pickThread(page, "main");
-  await replyButton(rowOf(page, "307")).click();
-  assert.deepEqual(contextIds(page), ["300", "301"]);
-});
-
-test("the earlier messages are read-only: no Reply, Done, more options, thread tag or gesture", async () => {
-  const { page } = await discussionPage();
-  await pickThread(page, "flat");
-  await replyButton(rowOf(page, "307")).click();
-  const rows = page.el("reply-context").children;
-  assert.deepEqual(contextIds(page), ["300", "301"], "this fixture's context is not what the test expects");
-  for (const row of rows) {
-    for (const control of ["reply-button", "done-button", "row-more", "upstream-read-button", "thread-badge",
-      "thread-replies"]) {
-      assert.equal(row.descendants().find((node) => node.hasClass(control)), undefined,
-        `an earlier message carries a ${control}`);
-    }
-    for (const gesture of ["pointerdown", "pointermove", "pointerup", "click"]) {
-      assert.equal((row.listeners.get(gesture) || []).length, 0, `a short earlier message answers ${gesture}`);
-    }
-  }
-  const asked = page.requests.length;
-  await rows[1].click();
-  await page.settle();
-  assert.equal(page.requests.length, asked, "touching an earlier message asked the server for something");
-  assert.equal(page.screen(), "reply");
-});
-
-test("a long earlier message is folded as on the channel, and the message opens it", async () => {
-  const page = newPage();
-  await signIn(page);
-  const long = longMessage("an earlier explanation");
-  await openReplyOn(page, [message({ id: "401", content: long }), message({ id: "402", content: "and so?" })], 1);
-  const [row] = page.el("reply-context").children;
-  const body = row.descendants().find((node) => node.hasClass("body"));
-  assert.equal(body.className, "body clamped", "a long earlier message is drawn in full");
-  // `#244 elision-word-count` with `#247 reply-continuity`: drawn as the list drew it, the line saying
-  // what the fold keeps back included, straight under the text — without it the message over the one
-  // being answered was a line shorter here than on the list, and everything over it moved.
-  const line = elidedOf(row);
-  assert.ok(line, "a folded earlier message has no line saying what it hides");
-  assert.equal(row.children.indexOf(line), row.children.indexOf(body) + 1, "the line is not straight under the text");
-  const listed = elidedOf(channelRow(page, "401"));
-  assert.deepStrictEqual(FOLD_WIDTHS_EM.map((_width, at) => labelAt(row, at)),
-    FOLD_WIDTHS_EM.map((_width, at) => labelAt(channelRow(page, "401"), at)), "the line says something else than the list's");
-  assert.ok(listed, "the fixture's message carries no line on the list");
-  assert.equal(line.hidden, false);
-  await row.click();
-  assert.equal(body.className, "body", "the message did not open");
-  assert.equal(line.hidden, true, "an open earlier message still says words are hidden");
-  assert.equal(foldButton(row).getAttribute("aria-expanded"), "true");
-  // Its control is the keyboard's way in, and it closes it again.
-  await foldButton(row).click();
-  assert.equal(body.className, "body clamped");
-  assert.equal(line.hidden, false, "folded again, the line did not come back");
-});
-
-// --- the reply screen keeps the message where it was (#247 reply-continuity) ------------------------
-//
-// The owner: "Reply jumps to a different view with different FONT SIZE. This is jarring ... I'd
-// rather the top of the message I press Reply on to stay still on the screen. Expand it below and
-// truncate below that (moving up the text entry box underneath)." This fixture lays nothing out but
-// heights, and gives the list and the reply screen's conversation the same origin, y = 0, so "where
-// it was" is the row's top on the list and "where it is" the message's top in the conversation.
-// tests/reply_continuity_browser.py measures the same in Chromium, where the two origins differ.
-
-/** A channel of short messages and one long one, `long`, at the newest end unless placed. */
-function continuityChannel(count = 24, long = null) {
-  return Array.from({ length: count }, (_unused, i) => {
-    const id = String(i + 1);
-    return message({ id, content: id === long ? longMessage(`message ${id}`).repeat(2) : `message ${id}: short` });
-  });
-}
-
-/** The message being answered, as drawn on the reply screen. */
-const replyRow = (page) => page.el("reply-target").children[0];
-
-/**
- * Scroll the list so the row of message `id` has its top at `y`, and press its Reply. Returns where
- * the row's top really was, which a list at either of its ends may not let be `y`.
- */
-async function replyFromRowAt(page, id, y) {
-  const area = page.el("scroll-area");
-  area.scrollTop += channelRow(page, id).getBoundingClientRect().top - y;
-  const was = channelRow(page, id).getBoundingClientRect().top;
-  await replyButton(channelRow(page, id)).click();
-  assert.equal(page.screen(), "reply", "Reply did not open the reply screen");
-  return was;
-}
-
-/** A page on a channel of `messages`. */
-async function continuityPage(messages = continuityChannel()) {
-  const page = newPage();
-  await signIn(page);
-  await showDiscord(page, messages);
-  return page;
-}
-
-test("`#247 reply-continuity`: Reply keeps the message's top where it was on the list, and the box comes up under it", async () => {
-  const room = REPLY_VIEWPORT_PX;
-  // In the middle of the screen, and at its top.
-  for (const y of [60, 0]) {
-    const page = await continuityPage();
-    const was = await replyFromRowAt(page, "12", y);
-    assert.equal(was, y, "this fixture could not put the row where the test asks");
-    const box = replyRow(page).getBoundingClientRect();
-    assert.ok(Math.abs(box.top - was) <= 1, `the message's top moved from ${was} to ${box.top}`);
-    // The conversation ends at the message's foot: the box is directly under it, and nothing that came
-    // after it on the list is on the screen.
-    const pane = page.el("reply-scroll");
-    assert.equal(pane.getAttribute("data-fit"), "message", "the conversation was not sized to end at the message");
-    assert.ok(Math.abs(pane.clientHeight - box.bottom) <= 1, `the conversation ends at ${pane.clientHeight}, the message at ${box.bottom}`);
-    assert.ok(pane.clientHeight < room, "the conversation still fills the screen, so the box is not under the message");
-    assert.equal(page.el("reply-target").text().includes("message 13"), false, "a later message is on the reply screen");
-    // What came before it is above it, as it was: the earlier messages, newest last.
-    assert.deepEqual(contextIds(page).slice(-2), ["10", "11"]);
-    assert.ok(page.el("reply-context").children.at(-1).getBoundingClientRect().bottom <= box.top);
-  }
-});
-
-test("`#247 reply-continuity`: a message whose top was above the list's edge opens at the top", async () => {
-  const page = await continuityPage();
-  const was = await replyFromRowAt(page, "12", -15);
-  assert.equal(was, -15, "this fixture could not put the row half off the top");
-  assert.equal(replyRow(page).getBoundingClientRect().top, 0, "the message was not clamped to the top of the screen");
-  assert.equal(page.el("reply-scroll").getAttribute("data-fit"), "message");
-});
-
-test("`#247 reply-continuity`: low on the screen the message moves up only as far as shows it, or a tall one's opening, above the box", async () => {
-  const room = REPLY_VIEWPORT_PX;
-  const shown = sourceConstant("REPLY_SHOWN_PERCENT") / 100;
-  // A short message near the foot of the list, lower than the reply screen's conversation reaches.
-  const page = await continuityPage();
-  const was = await replyFromRowAt(page, "12", SCROLL_VIEWPORT_PX - 60);
-  const box = replyRow(page).getBoundingClientRect();
-  const pane = page.el("reply-scroll");
-  assert.ok(box.height < room, "this message is taller than the room, so this asks something else");
-  // All of it shows, directly over the box, and it is moved up by no more than that takes.
-  assert.ok(Math.abs(box.bottom - pane.clientHeight) <= 1, `the message ends at ${box.bottom}, the conversation at ${pane.clientHeight}`);
-  assert.ok(Math.abs(box.top - (room - box.height)) <= 1, `the message moved further up than it had to: ${box.top}`);
-  assert.ok(box.top < was);
-  // Lower in the room than its opening third allows, a tall message keeps that much in view.
-  const tall = await continuityPage(continuityChannel(24, "12"));
-  const tallWas = await replyFromRowAt(tall, "12", room - 20);
-  const tallBox = replyRow(tall).getBoundingClientRect();
-  assert.ok(tallBox.height > room, "the message is not taller than the screen");
-  assert.ok(Math.abs(tallBox.top - room * (1 - shown)) <= 1, `a tall message low on the list opened at ${tallBox.top}, not with its opening third shown`);
-  assert.ok(tallBox.top < tallWas);
-  assert.equal(tall.el("reply-scroll").hasAttribute("data-fit"), false,
-    "a message that does not fit shrank the conversation, so the box is not at the foot of the screen");
-});
-
-test("`#247 reply-continuity`: a message taller than the screen keeps its top, the rest a scroll down", async () => {
-  const room = REPLY_VIEWPORT_PX;
-  const page = await continuityPage(continuityChannel(24, "12"));
-  const was = await replyFromRowAt(page, "12", 40);
-  assert.equal(was, 40);
-  const pane = page.el("reply-scroll");
-  const box = replyRow(page).getBoundingClientRect();
-  assert.ok(box.height > room, "the message is not taller than the screen, so this asks nothing");
-  assert.ok(Math.abs(box.top - was) <= 1, `a tall message's top moved from ${was} to ${box.top}`);
-  assert.equal(pane.hasAttribute("data-fit"), false, "the conversation does not take all the room there is");
-  assert.equal(pane.clientHeight, room);
-  assert.ok(pane.scrollHeight - pane.scrollTop > pane.clientHeight, "the rest of the message cannot be scrolled to");
-  // Never folded: answering it is the reason for the screen.
-  const body = replyRow(page).descendants().find((node) => node.hasClass("body"));
-  assert.equal(body.className, "body", "the message being answered was folded");
-});
-
-test("`#247 reply-continuity`: with too little above it, the room over the earlier messages holds the message in place", async () => {
-  // The second message of the channel has one before it, shorter on the reply screen than the space
-  // above its row on the list.
-  const page = await continuityPage(continuityChannel(6));
-  const was = await replyFromRowAt(page, "2", 100);
-  assert.equal(was, 100, "this fixture could not put the row where the test asks");
-  assert.ok(page.el("reply-context").height() < was, "the earlier message fills the space, so this asks nothing");
-  const box = replyRow(page).getBoundingClientRect();
-  assert.ok(Math.abs(box.top - was) <= 1, `the message's top moved from ${was} to ${box.top}`);
-  const lead = page.el("reply-lead");
-  assert.ok(lead.height() > 0, "nothing holds the message in place");
-  assert.equal(page.el("reply-scroll").scrollTop, 0);
-
-  // THE CONTROL: without the room, the message is drawn under the one earlier message, not where it was.
-  const control = newPage(new Map(), brokenScript(
-    "  if (extra > 0) lead.style.height = `${extra}px`;", "  void lead;"));
-  await signIn(control);
-  await showDiscord(control, continuityChannel(6));
-  await replyFromRowAt(control, "2", 100);
-  assert.ok(Math.abs(replyRow(control).getBoundingClientRect().top - was) > 1,
-    "with the room deleted the message was still where it was, so this test cannot tell the two apart");
-});
-
-/** The window resized: the reply screen's conversation given `room`, and the resize event a browser fires. */
-async function resizeReplyRoom(page, room) {
-  page.el("reply-scroll").clientHeight = room;
-  await page.setDesk(page.wideDesk);
-}
-
-test("`#247 reply-continuity`: a resize while Reply is up places the message again where Reply put it", async () => {
-  // tests/reply_continuity_browser.py turns a phone on its side and back, and resizes a desk window,
-  // in Chromium.
-  const page = await continuityPage();
-  await replyFromRowAt(page, "12", 60);
-  const pane = page.el("reply-scroll");
-  let box = replyRow(page).getBoundingClientRect();
-  assert.equal(pane.getAttribute("data-fit"), "message", "the message did not fit to begin with, so this asks something else");
-  // A taller window: nothing moves, and the box stays under the message.
-  await resizeReplyRoom(page, REPLY_VIEWPORT_PX + 100);
-  let now = replyRow(page).getBoundingClientRect();
-  assert.ok(Math.abs(now.top - box.top) <= 1 && Math.abs(pane.clientHeight - now.bottom) <= 1,
-    `a taller window moved the message from ${box.top} to ${now.top}, or left a gap over the box`);
-  // Rewrapped longer, as a phone turned to a narrower width rewraps it: the top stays, and the
-  // conversation ends at the new foot rather than clipping it.
-  const words = replyRow(page).descendants().find((node) => String(node.textContent).startsWith("message 12: short"));
-  words.textContent = `${words.textContent} ${"and more words, rewrapped. ".repeat(4)}`;
-  const taller = replyRow(page).getBoundingClientRect();
-  assert.ok(taller.height > box.height, "the message did not grow, so this asks nothing");
-  await resizeReplyRoom(page, REPLY_VIEWPORT_PX + 100);
-  now = replyRow(page).getBoundingClientRect();
-  assert.ok(Math.abs(now.top - box.top) <= 1, `the rewrapped message's top moved from ${box.top} to ${now.top}`);
-  assert.equal(pane.getAttribute("data-fit"), "message");
-  assert.ok(Math.abs(pane.clientHeight - now.bottom) <= 1, `the conversation ends at ${pane.clientHeight}, the rewrapped message at ${now.bottom}`);
-  // A room made shorter than the message's foot: it moves up only as far as shows it over the box.
-  box = now;
-  await resizeReplyRoom(page, box.bottom - 10);
-  now = replyRow(page).getBoundingClientRect();
-  assert.ok(now.bottom <= pane.clientHeight + 1, `after the room shrank the message ends at ${now.bottom}, under the box at ${pane.clientHeight}`);
-  assert.ok(Math.abs(now.top - (pane.clientHeight - box.height)) <= 1, `the message moved further up than it had to: ${now.top}`);
-  // ...and the room as it was again, as a phone turned back is: back where Reply put it, not left
-  // where the short room had to.
-  await resizeReplyRoom(page, REPLY_VIEWPORT_PX + 100);
-  now = replyRow(page).getBoundingClientRect();
-  assert.ok(Math.abs(now.top - box.top) <= 1, `the room as it was left the message at ${now.top}, not back at ${box.top}`);
-  assert.equal(pane.getAttribute("data-fit"), "message");
-  assert.ok(Math.abs(pane.clientHeight - now.bottom) <= 1, `the conversation ends at ${pane.clientHeight}, the message at ${now.bottom}`);
-
-  // A message too tall for the room it opened in, in a room grown to hold it: its top where it was,
-  // and the box directly under it.
-  const tall = await continuityPage(continuityChannel(24, "12"));
-  await replyFromRowAt(tall, "12", 40);
-  const tallPane = tall.el("reply-scroll");
-  assert.equal(tallPane.hasAttribute("data-fit"), false, "the message fitted to begin with, so this asks nothing");
-  await resizeReplyRoom(tall, Math.ceil(replyRow(tall).getBoundingClientRect().bottom) + 100);
-  const tallBox = replyRow(tall).getBoundingClientRect();
-  assert.ok(Math.abs(tallBox.top - 40) <= 1, `the grown room moved the message's top from 40 to ${tallBox.top}`);
-  assert.ok(Math.abs(tallPane.clientHeight - tallBox.bottom) <= 1,
-    `the grown room left the box at ${tallPane.clientHeight}, under the message's foot at ${tallBox.bottom}`);
-
-  // Read back up the conversation, the message out of view: a changed screen shows the message being
-  // answered again, where Reply put it, with the box under it.
-  const away = await continuityPage();
-  await replyFromRowAt(away, "12", 60);
-  const awayPane = away.el("reply-scroll");
-  awayPane.scrollTop = 0;
-  assert.ok(replyRow(away).getBoundingClientRect().top >= awayPane.clientHeight, "the message is still in view, so this asks nothing");
-  await resizeReplyRoom(away, REPLY_VIEWPORT_PX + 100);
-  const awayBox = replyRow(away).getBoundingClientRect();
-  assert.ok(Math.abs(awayBox.top - 60) <= 1 && Math.abs(awayPane.clientHeight - awayBox.bottom) <= 1,
-    `the message out of view was not brought back over the box: it is at ${awayBox.top}-${awayBox.bottom}, the conversation ends at ${awayPane.clientHeight}`);
-
-  // THE CONTROL: without the refit, the shorter room clips the message under the box.
-  const control = newPage(new Map(), brokenScript("      refitReplyMessage();\n", ""));
-  await signIn(control);
-  await showDiscord(control, continuityChannel());
-  await replyFromRowAt(control, "12", 60);
-  const before = replyRow(control).getBoundingClientRect().bottom;
-  await resizeReplyRoom(control, before - 10);
-  assert.ok(replyRow(control).getBoundingClientRect().bottom > control.el("reply-scroll").clientHeight + 1,
-    "with the refit deleted the message still showed whole, so this test cannot tell the two apart");
-});
-
-test("`#247 reply-continuity`: the message is the channel's row, at the reader's text size, with the accent edge", async () => {
-  // The fixture lays out no type, so this holds the RULES to it; tests/reply_continuity_browser.py
-  // measures the computed sizes in Chromium at several text sizes.
-  const list = cssBlock("#discord-log .body");
-  assert.match(list, /font-size:\s*calc\(0\.88rem \* var\(--msg-scale\)\)/);
-  assert.equal(cssBlock("#reply-target .body"), list, "the message being answered is not drawn at the list's size");
-  // No other rule gives the message's words a size of their own.
-  for (const rule of CSS_CODE.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
-    const selectors = rule[1].split(",").map((part) => part.trim());
-    if (!selectors.some((one) => /#reply-target(?![-\w])/.test(one) && !/\.meta\b/.test(one))) continue;
-    if (!/font-size/.test(rule[2])) continue;
-    assert.ok(selectors.includes("#discord-log .body"), `${rule[1].trim()} sizes the message being answered apart from the list`);
-  }
-  // The speaker rules, the reply gutter and a gathered reply's indent name it beside the channel's list.
-  for (const selector of ['#reply-target li.discord-message[data-who="me"]', '#reply-target li.discord-message[data-who="coder"]',
-    '#reply-target li.discord-message[data-who="human"]', '#reply-target li.discord-message[data-is-reply="true"][data-who]',
-    '#reply-target li.discord-message[data-stack-under="me"][data-who]']) {
-    const twin = selector.replace("#reply-target", "#discord-log");
-    const rules = cssRules(CSS, selector);
-    assert.ok(rules.length > 0, `no rule draws ${selector}`);
-    // Every rule that draws it draws the list's row too: one rule, two lists, as for #side-log.
-    const twins = cssRules(CSS, twin);
-    for (const rule of rules) assert.ok(twins.includes(rule), `${selector} is drawn by a rule ${twin} is not`);
-  }
-  assert.match(cssBlock("#screen-reply #reply-target li.discord-message[data-who]"), /border-color:\s*var\(--accent\)/);
-  // At each text size Settings offers, the size is the reader's and the message's words are in a `.body`.
-  for (const pct of [80, 100, 130, 150]) {
-    const page = await continuityPage();
-    page.el("msg-scale").value = String(pct);
-    await page.el("msg-scale").dispatch("input", {});
-    assert.equal(page.documentElement.style.getPropertyValue("--msg-scale"), String(pct / 100));
-    await replyFromRowAt(page, "12", 60);
-    const row = replyRow(page);
-    assert.equal(row.className, "discord-message", "the message being answered is not the channel's row");
-    assert.equal(row.getAttribute("data-who"), "coder");
-    const body = row.descendants().find((node) => node.hasClass("body"));
-    assert.ok(body && body.className === "body", `at ${pct}% the message's words are not in an unfolded .body`);
-    assert.match(body.text(), /message 12: short/);
-    // Nothing on it acts: no Reply, Done, more options or thread tag.
-    for (const control of ["reply-button", "done-button", "row-more", "thread-badge"]) {
-      assert.equal(row.descendants().find((node) => node.hasClass(control)), undefined, `the message carries a ${control}`);
-    }
-  }
-});
-
-test("`#247 reply-continuity`: a reply keeps the gutter it had on the list, so its lines break where they did", async () => {
-  const messages = continuityChannel(12);
-  messages[9] = message({ id: "10", content: "an answer to the third", reply_to: "3" });
-  const page = await continuityPage(messages);
-  assert.equal(channelRow(page, "10").getAttribute("data-is-reply"), "true");
-  await replyFromRowAt(page, "10", 60);
-  assert.equal(replyRow(page).getAttribute("data-is-reply"), "true", "the reply lost its gutter on the reply screen");
-  assert.equal(replyRow(page).descendants().find((node) => node.hasClass("reply-jump")), undefined,
-    "the arrow came with it, and on this screen it would navigate away from the reply being written");
-});
-
-test("`#247 reply-continuity`: the reply screen is tinted, in both schemes, and only while it is up", async () => {
-  const page = await continuityPage();
-  assert.equal(page.el("frame-body").getAttribute("data-screen"), "main");
-  await replyFromRowAt(page, "12", 60);
-  assert.equal(page.el("frame-body").getAttribute("data-screen"), "reply", "nothing says the reply screen is up");
-  assert.match(cssBlock('#frame-body[data-screen="reply"]'), /background:\s*var\(--reply-tint\)/);
-  const tint = (text) => (/--reply-tint:\s*(#[0-9a-f]{6})/i.exec(text) || [])[1];
-  const page_bg = (text) => (/--bg:\s*(#[0-9a-f]{6})/i.exec(text) || [])[1];
-  const lightAt = CSS_CODE.indexOf("@media (prefers-color-scheme: light)");
-  const sharedLightAt = BASE_CSS.indexOf("@media (prefers-color-scheme: light)");
-  const dark = tint(CSS_CODE.slice(0, lightAt));
-  const light = tint(mediaBody("(prefers-color-scheme: light)"));
-  assert.ok(dark && light, "the tint is not declared for both schemes");
-  assert.notEqual(dark, page_bg(BASE_CSS.slice(0, sharedLightAt)), "the dark tint is the page's own colour");
-  assert.notEqual(light, page_bg(BASE_CSS.slice(sharedLightAt)), "the light tint is the page's own colour");
-  await page.el("reply-cancel").click();
-  assert.equal(page.el("frame-body").getAttribute("data-screen"), "main", "the tint outlived the reply screen");
-});
-
-test("`#247 reply-continuity`: Cancel, Back and Esc come back to exactly where the list was", async () => {
-  for (const leave of ["reply-cancel", "close-reply", "Escape"]) {
-    const page = await continuityPage();
-    const area = page.el("scroll-area");
-    area.scrollTop += channelRow(page, "12").getBoundingClientRect().top - 60;
-    const top = area.scrollTop;
-    assert.ok(top > 0 && top < area.scrollHeight - area.clientHeight - BOTTOM_SLACK_PX, "the list is not mid-scroll");
-    const anchor = channelRow(page, "11").getBoundingClientRect().top;
-    await replyButton(channelRow(page, "12")).click();
-    if (leave === "Escape") await press(page, page.el("reply-scroll"), "Escape");
-    else await page.el(leave).click();
-    assert.equal(page.screen(), "main", `${leave} did not leave the reply screen`);
-    assert.ok(Math.abs(area.scrollTop - top) <= 1, `after ${leave} the list is at ${area.scrollTop}, not ${top}`);
-    assert.equal(channelRow(page, "11").getBoundingClientRect().top, anchor, `after ${leave} the rows are not where they were`);
-  }
-});
-
-test("the earlier messages start at REPLY_CONTEXT_LIMIT, and Load earlier shows the rest the page holds without asking", async () => {
-  const limit = sourceConstant("REPLY_CONTEXT_LIMIT");
-  const page = newPage();
-  await signIn(page);
-  const messages = Array.from({ length: limit + 5 }, (_, i) => message({ id: String(500 + i), content: `note ${i}` }));
-  const lines = await showDiscord(page, messages);
-  await replyButton(lines[lines.length - 1]).click();
-  const held = messages.slice(0, -1).map((m) => m.id);
-  assert.deepEqual(contextIds(page), held.slice(-limit), "the newest earlier messages are not the ones shown");
-  const more = page.el("reply-context-more");
-  assert.equal(more.hidden, false, "nothing offers the earlier messages the page holds");
-  const meta = page.el("reply-target");
-  const before = meta.getBoundingClientRect().top;
-  const asked = page.requests.length;
-  await more.click();
-  await page.settle();
-  assert.deepEqual(contextIds(page), held);
-  assert.equal(page.requests.length, asked, "showing what the page holds asked the server");
-  assert.equal(more.hidden, true, "Load earlier is offered with nothing left to load");
-  assert.equal(meta.getBoundingClientRect().top, before, "the message being answered moved");
-});
-
-test("Load earlier pages the thread back from the server on its cursor, with a GET a read token can make", async () => {
-  const cursor = "opaque cursor /&?";
-  const thread = { id: "spaces/A/threads/paged", root_message_id: "601", is_root: true,
-    reply_count: 7, reply_count_exact: true };
-  const all = [
-    message({ id: "601", content: "a paged discussion opens", thread }),
-    ...Array.from({ length: 7 }, (_, i) =>
-      // Long, so the screen scrolls and holding the message in place is something it has to do.
-      message({ id: String(602 + i), content: longMessage(`answer ${i + 1}`), thread: { ...thread, is_root: false } })),
-  ];
-  const summary = { id: thread.id, root: all[0], title: "Paged discussion", reply_count: 7,
-    reply_count_exact: true, updated_at: all[7].timestamp };
-  // A reader who chose Main in an earlier session, on a device that no longer holds that session's
-  // snapshot: the reopen reads Main alone, so the thread is read for itself, on its own cursor. Opened
-  // from All — the default since `#189 restore-ui-state`, and here the whole thread — it would be
-  // drawn from All's rows and never page. The same arrangement as `mainOnlyThreadPage`.
-  const arrange = (p) => {
-    p.threadingSupported = true;
-    p.threads = [summary];
-    // Read-scope: the context only ever reads.
-    p.tokenScope = "read";
-    const standard = p.timeline;
-    // The thread's newest page is its last four answers; the page before it, the root and the rest.
-    p.timeline = async (path) => {
-      const url = new URL(path, "http://fixture.test");
-      if (url.searchParams.get("view") !== "thread") return standard(path);
-      const older = url.searchParams.get("before") === cursor;
-      return json(200, timelineAnswer({ view: "thread", messages: older ? all.slice(0, 4) : all.slice(4),
-        thread: summary, has_threads: true, has_more: !older, next_before: older ? null : cursor }));
-    };
-  };
-  const first = newPage();
-  arrange(first);
-  await signIn(first);
-  await showDiscord(first, all);
-  await pickThread(first, "main");
-  first.storage.delete(MESSAGE_CACHE_KEY);
-  const page = reloadWith(first.storage, all, (p) => {
-    arrange(p);
-    holdCountsRead(p);
-  });
-  await reopenedChannel(page);
-  await page.settle();
-  await pickThread(page, `thread:${thread.id}`);
-  await replyButton(rowOf(page, "607")).click();
-  assert.deepEqual(contextIds(page), ["605", "606"], "the newest page's earlier answers are not shown");
-  const more = page.el("reply-context-more");
-  assert.equal(more.hidden, false, "nothing offers the thread's older messages");
-
-  const writes = () => page.requests.filter((request) => !request.startsWith("GET")).length;
-  const writesBefore = writes();
-  const meta = page.el("reply-target");
-  const before = meta.getBoundingClientRect().top;
-  await more.click();
-  await page.settle();
-  const read = page.requests.at(-1);
-  assert.match(read, /^GET /, `Load earlier made a ${read}`);
-  assert.ok(read.includes("view=thread") && read.includes(`thread_id=${encodeURIComponent(thread.id)}`) &&
-    read.includes(`before=${encodeURIComponent(cursor)}`), `Load earlier did not page the thread back: ${read}`);
-  assert.equal(writes(), writesBefore, "Load earlier wrote something");
-  assert.deepEqual(contextIds(page), ["601", "602", "603", "604", "605", "606"]);
-  assert.equal(more.hidden, true, "the thread's root is here and Load earlier is still offered");
-  assert.equal(meta.getBoundingClientRect().top, before, "the message being answered moved");
-  assert.equal(page.el("reply-context-state").hidden, true);
-  assert.equal(page.el("error").hidden, true, `a read token raised an error: ${page.el("error").textContent}`);
-});
+/** The note under the reply's box: where Send will post (`renderReplyDestination`). */
+const replyNote = (page) => page.el("reply-destination").textContent;
 
 // The outbox posts the messages bound for one destination in the order they were sent. A reply
 // still being placed has no destination yet: until it has one it may share any, and once it has
@@ -35800,7 +35081,7 @@ test("`#193 compose-draft-loss`: where the browser refuses the draft, Edit leave
   };
   await outgoingEdit(outgoingRows(full)[0]).click();
   await full.settle();
-  assert.equal(full.screen(), "reply", "a full quota kept the reply from its draft");
+  assert.ok(replyInStream(full), "a full quota kept the reply from its draft");
   assert.equal(JSON.parse(full.storage.get("vibe-talk.voice.drafts"))["9321"], "an answer that needs room");
   assert.equal(outgoingRows(full).length, 0);
 });
@@ -35864,11 +35145,11 @@ test("`#193 compose-draft-loss`: Edit on a failed reply opens Reply on the messa
   // A second thought on the same question, left as a draft.
   await openReplyOn(page, messages);
   await page.el("reply-text").setValue("and a second thought");
-  await page.el("close-reply").click();
+  await page.el("reply-cancel").click();
 
   await outgoingEdit(outgoingRows(page)[0]).click();
   await page.settle();
-  assert.equal(page.screen(), "reply", "Edit did not open Reply");
+  assert.ok(replyInStream(page), "Edit did not open Reply");
   assert.match(page.el("reply-target-meta").textContent, /id 9310/, "Reply opened on another message");
   const both = "and a second thought\n\nmy first answer";
   assert.equal(page.el("reply-text").value, both, "Edit lost or overwrote the reply draft");
@@ -35903,7 +35184,7 @@ test("`#193 compose-draft-loss`: a failed reply that started a new thread comes 
 
   await outgoingEdit(outgoingRows(page)[0]).click();
   await page.settle();
-  assert.equal(page.screen(), "reply");
+  assert.ok(replyInStream(page));
   assert.equal(page.el("reply-branch").checked, true, "the new thread it was sent to start was forgotten");
   assert.match(page.el("reply-destination").textContent, /new thread/);
   distinctReplies(page);
@@ -36093,23 +35374,23 @@ test("`#193 compose-draft-loss`: a row with a saved reply draft says Draft besid
 
   await reply.click();
   await page.el("reply-text").setValue("half an answer");
-  await page.el("close-reply").click();
+  await page.el("reply-cancel").click();
   assert.equal(marker("9410").hidden, false, "the row whose reply was left unsent is not marked");
   assert.equal(marker("9411").hidden, true, "another row was marked");
 
   await marker("9410").click();
-  assert.equal(page.screen(), "reply", "Draft did not open Reply");
+  assert.ok(replyInStream(page), "Draft did not open Reply");
   assert.match(page.el("reply-target-meta").textContent, /id 9410/);
   assert.equal(page.el("reply-text").value, "half an answer");
   // Emptied, it goes.
   await page.el("reply-text").setValue("");
-  await page.el("close-reply").click();
+  await page.el("reply-cancel").click();
   assert.equal(marker("9410").hidden, true, "an emptied draft left its mark");
 
   // Written again and sent, it goes too.
   await replyButton(rowOf(page, "9410")).click();
   await page.el("reply-text").setValue("the whole answer");
-  await page.el("close-reply").click();
+  await page.el("reply-cancel").click();
   assert.equal(marker("9410").hidden, false);
   distinctReplies(page);
   await marker("9410").click();
@@ -36125,7 +35406,7 @@ test("`#193 compose-draft-loss`: the Draft mark comes back with its draft after 
   await showDiscord(first, [answered]);
   await replyButton(rowOf(first, "1311")).click();
   await first.el("reply-text").setValue("what I had written");
-  await first.el("close-reply").click();
+  await first.el("reply-cancel").click();
   await first.setVisibility("hidden");
 
   const reloaded = reloadWith(new Map(first.storage), [answered]);
@@ -36151,7 +35432,7 @@ test("`#193 compose-draft-loss`: the Draft mark comes back with its draft after 
   const marker = draftMarkerOf(rowOf(page, "1311"));
   assert.equal(marker.hidden, false, "signing in again lost the mark");
   await marker.click();
-  assert.equal(page.screen(), "reply");
+  assert.ok(replyInStream(page));
   assert.equal(page.el("reply-text").value, "what I had written");
 });
 
@@ -36160,7 +35441,7 @@ test("`#193 compose-draft-loss`: the Draft mark is on its message's row in All, 
   assert.equal(page.el("thread-select").value, "flat");
   await replyButton(rowOf(page, "201")).click();
   await page.el("reply-text").setValue("a reply to the first thread's root");
-  await page.el("close-reply").click();
+  await page.el("reply-cancel").click();
   assert.equal(draftMarkerOf(rowOf(page, "201")).hidden, false, "not marked in All");
   assert.equal(draftMarkerOf(rowOf(page, "200")).hidden, true);
   await pickThread(page, "main");
@@ -37731,19 +37012,21 @@ test("`#269 approval-card-inline`: the card is the next message under the transc
   assert.ok(!page.el("screen-main").hasAttribute("data-draft"), "the room for the card outlived it");
 });
 
-test("`#269 approval-card-inline`: docked under Reply the card's Send is outlined, so it is never taken for the reply's", async () => {
+test("`#269 approval-card-inline`: beside a reply open in the list the card's Send is outlined, so it is never taken for the reply's", async () => {
+  // `#410 inline-reply-editor`. Reply opens in the list the card ends, so the card stays there; its
+  // filled Send is outlined while the reply's box, with a filled Send of its own, is open.
   const page = newPage();
   await proposedDuringACall(page);
   const card = page.el("post-confirm");
   await openReplyOn(page, [message({ id: "300", content: "is the build green yet" })]);
-  assert.equal(card.getAttribute("data-place"), "dock");
-  assert.equal(card.getAttribute("data-screen"), "reply");
-  assert.match(cssBlock('#post-confirm[data-screen="reply"] #post-confirm-send'), /background:\s*transparent/,
-    "the docked Send is as filled as Reply's own");
-  await page.el("close-reply").click();
+  assert.equal(card.getAttribute("data-place"), "channel");
+  assert.equal(card.hasAttribute("data-beside-reply"), true, "the card's Send is not outlined beside the reply");
+  assert.match(cssBlock('#post-confirm[data-beside-reply] #post-confirm-send'), /background:\s*transparent/,
+    "the card's Send is as filled as the reply's own");
+  await page.el("reply-cancel").click();
   await page.settle();
   assert.equal(card.getAttribute("data-place"), "channel");
-  assert.equal(card.hasAttribute("data-screen"), false, "the card still thinks it is under Reply");
+  assert.equal(card.hasAttribute("data-beside-reply"), false, "the card still thinks a reply is beside it");
 });
 
 test("`#269 approval-card-inline`: the card's small text and a frozen card's notes are legible on the owner's tile", () => {
@@ -46753,10 +46036,10 @@ test("a pin older than anything loaded is drawn with the heading the server foun
   assert.ok(boxesOf(row)[0].hasAttribute("data-rh"));
 });
 
-test("a heading that arrives with a later read redraws the Pinned list and the reply screen's earlier messages", async () => {
-  // Both lists are rebuilt only when what they draw changed, and a plain body's HTML is "" with or
+test("a heading that arrives with a later read redraws the Pinned list", async () => {
+  // The list is rebuilt only when what it draws changed, and a plain body's HTML is "" with or
   // without a heading: a paren tag confirmed by a later read, or after a restart, brings a heading to
-  // a message whose text did not change. The heading has to be part of what they compare.
+  // a message whose text did not change. The heading has to be part of what it compares.
   const plain = message({ id: "100", content: HEALTH, author: "build-bot" });
   const later = message({ id: "101", content: "and so?" });
   const headed = { ...plain, heading: HEALTH_HEADING };
@@ -46775,20 +46058,6 @@ test("a heading that arrives with a later read redraws the Pinned list and the r
   assert.deepStrictEqual((piecesOf(pinned) || []).map(([, text]) => text), pieces,
     "the Pinned list kept the row drawn before its heading arrived");
   assert.ok(boxesOf(pinned)[0].hasAttribute("data-rh"));
-
-  // The reply screen follows the store on a threaded channel's reads (`followReplyStore`).
-  const replying = newPage();
-  replying.threadingSupported = true;
-  replying.threads = [];
-  await signIn(replying);
-  await openReplyOn(replying, [plain, later], 1);
-  assert.deepStrictEqual(contextIds(replying), ["100"], "the fixture's earlier message is not drawn");
-  assert.equal(piecesOf(replying.el("reply-context").children[0]), null);
-  await refreshDiscord(replying, [headed, later]);
-  await replying.settle();
-  const earlier = replying.el("reply-context").children[0];
-  assert.deepStrictEqual((piecesOf(earlier) || []).map(([, text]) => text), pieces,
-    "the reply screen kept the earlier message drawn before its heading arrived");
 });
 
 /** A threaded channel in All whose first message, and a thread's root, carry reactions. */
@@ -51000,7 +50269,7 @@ test("`#373 two-column-full-width`: the check refuses a capped list, a desk inse
   assert.notEqual(ownerInBlock, CSS_CODE, "the negative control changed nothing");
   assert.deepStrictEqual(twoColumnWidthProblems(ownerInBlock), ["the owner's rows lose their partial width in two columns"]);
   const ownerVar = CSS_CODE.replace(/(--desk-third-inset:\s*0px;)/, "$1\n    --desk-owner-inset: 0px;")
-    .replace(/(#discord-log li\.discord-message\[data-who="me"\],\n\s*#pinned-log li\.discord-message\[data-who="me"\],\n\s*#reply-context li\.discord-message\[data-who="me"\],\n\s*#reply-target li\.discord-message\[data-who="me"\] \{\n\s*)margin-left: min\(15%, 6rem\);/,
+    .replace(/(#discord-log li\.discord-message\[data-who="me"\],\n\s*#pinned-log li\.discord-message\[data-who="me"\] \{\n\s*)margin-left: min\(15%, 6rem\);/,
       "$1margin-left: var(--desk-owner-inset, min(15%, 6rem));");
   assert.notEqual(ownerVar, CSS_CODE, "the negative control changed nothing");
   assert.deepStrictEqual(twoColumnWidthProblems(ownerVar), ["the owner's rows lose their partial width in two columns"]);
@@ -55428,15 +54697,17 @@ test("`#240 reading-bookmark`: reply, and b goes back to where you were reading"
   const page = await keyboardPageAtTop(tallChannel(30));
   await bookmarkRow(page, "4");
   // A message further down than the line: its Done (`#256 reply-marks-read`) leaves the line alone.
+  // `#410 inline-reply-editor`. The reply is written in the list, and sending it moves nothing: the
+  // reader is where they were reading, and b still goes back to the bookmark.
+  const area = page.el("scroll-area");
   await replyButton(channelRow(page, "8")).click();
   await page.settle();
+  const reading = area.scrollTop;
   page.el("reply-text").value = "on it";
   await page.el("reply-send").click();
   await page.settle();
   assert.equal(page.screen(), "main");
-  assert.ok(atBottomOf(page.el("scroll-area")), "sending did not go to the newest message");
-  assert.equal(statusText(page), "b goes back to your bookmark.");
-  assert.equal(page.el("jump-bookmark").hidden, false, "the way back is not offered after the send");
+  assert.equal(area.scrollTop, reading, "sending moved the list");
   assert.equal(channelRow(page, "8").getAttribute("data-archived"), "true", "the message answered is not Done");
   assert.deepStrictEqual(bookmarkAt(page), { id: "4", place: "above" }, "sending moved the bookmark");
   await press(page, page.el("scroll-area"), "b");
@@ -55448,7 +54719,6 @@ test("`#240 reading-bookmark`: reply, and b goes back to where you were reading"
   page.el("reply-text").value = "and on this";
   await page.el("reply-send").click();
   await page.settle();
-  assert.equal(statusText(page), "b goes back to your bookmark.", "the Done took the way back off the status line");
   assert.deepStrictEqual(bookmarkAt(page), { id: "5", place: "above" }, "the reply's Done did not slide the line as a Done does");
   await press(page, page.el("scroll-area"), "b");
   assert.equal(selectedId(page), "5", "b did not go to where the line slid");
@@ -56547,14 +55817,10 @@ test("`#243 filter-keeps-selection`: a reader who scrolls while the walk back re
 /** Open Reply on the row of `list` holding message `id`, type `text`, press Send, and let it settle. */
 async function replyAndSend(page, id, text = "on it", list = "discord-log") {
   await replyButton(rowHoldingId(page, id, list)).click();
-  // `#277 reply-in-column`. In two columns the box opens at the foot of the column pressed in.
-  if (inTwoColumns(page)) {
-    assert.equal(page.screen(), "main", `Reply on ${id} replaced both columns with the reply screen`);
-    assert.equal(page.el("reply-compose").parentNode, page.el(list.startsWith("side-") ? "side-reply" : "column-reply"),
-      `Reply on ${id} did not open in the column it was pressed in`);
-  } else {
-    assert.equal(page.screen(), "reply", `Reply on ${id} did not open the reply screen`);
-  }
+  // `#410 inline-reply-editor`. The box opens in the list pressed in, in one column or two.
+  assert.ok(replyInStream(page), `Reply on ${id} did not open in the list`);
+  assert.equal(page.el("reply-compose").parentNode, page.el(list.startsWith("side-") ? "side-reply" : "column-reply"),
+    `Reply on ${id} did not open in the column it was pressed in`);
   await page.el("reply-text").setValue(text);
   await page.el("reply-send").click();
   await page.settle();
@@ -59180,7 +58446,6 @@ test("`#185 reply-new-thread`: a new thread started from Reply on Main goes into
   await replyButton(rowOf(page, "210")).click();
   assert.equal(page.el("reply-branch-row").hidden, true, "Reply offered a new thread on a message that heads one");
   assert.equal(page.el("reply-destination").hidden, true, "the sent reply's tick carried over to the next reply");
-  assert.match(replyTitle(page), /^Reply · Main · /);
 });
 
 test("`#185 reply-new-thread`: a live reply the page holds makes the message a thread for Reply as it does for its tag", async () => {
@@ -59217,11 +58482,10 @@ test("`#185 reply-new-thread`: a draft put down with the new-thread box ticked c
   assert.equal(box().checked, false, "the tick followed the reader to another message");
   await page.el("reply-cancel").click();
 
-  // Back to the draft: the words, and where they were going, title and note with them.
+  // Back to the draft: the words, and where they were going, the note with them.
   await replyButton(rowOf(page, "210")).click();
   assert.equal(page.el("reply-text").value, "half an answer");
   assert.equal(box().checked, true, "the draft came back bound for the main channel");
-  assert.equal(page.el("topbar-title").text(), "Reply · New thread · a brand-new message nobody has answered");
   assert.equal(page.el("reply-destination").textContent, "Posts in a new thread on this message, as its first reply.");
 
   // A draft emptied takes its tick with it.
@@ -59271,17 +58535,14 @@ test("`#185 reply-new-thread`: a reply arriving while Reply is open takes the ne
   await replyButton(rowOf(page, "210")).click();
   await page.el("reply-text").setValue("my answer");
   await page.el("reply-branch").setChecked(true);
-  assert.equal(replyTitle(page), "Reply · New thread · a brand-new message nobody has answered");
+  assert.equal(replyNote(page), "Posts in a new thread on this message, as its first reply.");
 
   await answerLoneLive(page, data);
-  assert.equal(page.screen(), "reply");
+  assert.ok(replyInStream(page));
   assert.equal(tagOf(rowOf(page, "210")).text, "Thread(1)", "the tag did not count the live reply");
   assert.equal(page.el("reply-branch-row").hidden, true, "the box still offered to start a thread that has a reply");
   assert.equal(page.el("reply-destination").textContent, INTO_ANSWERED_NOTE);
   assert.equal(page.el("reply-destination").hidden, false);
-  // The thread, named as the picker names one: its activity, the one reply its tag counts, its name.
-  const title = replyTitle(page);
-  assert.match(title, /^Reply · [^·]+ · 1 · a brand-new message nobody has answered$/, "the title did not name the thread it goes into");
   assert.equal(page.el("reply-text").value, "my answer", "the words went with the box");
 
   // Put down and picked up again: still bound for the thread, by the draft's kept choice.
@@ -59290,7 +58551,6 @@ test("`#185 reply-new-thread`: a reply arriving while Reply is open takes the ne
   assert.equal(page.el("reply-text").value, "my answer");
   assert.equal(page.el("reply-branch-row").hidden, true);
   assert.equal(page.el("reply-destination").textContent, INTO_ANSWERED_NOTE, "the kept draft forgot where it was going");
-  assert.equal(replyTitle(page), title);
 
   await page.el("reply-send").click();
   await page.settle();
@@ -59301,7 +58561,6 @@ test("`#185 reply-new-thread`: a reply arriving while Reply is open takes the ne
   assert.equal(page.el("reply-text").value, "");
   assert.equal(page.el("reply-branch-row").hidden, true);
   assert.equal(page.el("reply-destination").hidden, true, "a sent reply's thread carried over to the next one");
-  assert.equal(replyTitle(page), "Reply · Main · lead team");
 });
 
 test("`#185 reply-new-thread`: a reply arriving while Reply is open, unticked, leaves it a reply on the main channel", async () => {
@@ -59316,7 +58575,6 @@ test("`#185 reply-new-thread`: a reply arriving while Reply is open, unticked, l
   assert.equal(page.el("reply-branch").checked, false);
   // As Reply opened on it now would say: Main, which needs no note.
   assert.equal(page.el("reply-destination").hidden, true);
-  assert.equal(replyTitle(page), "Reply · Main · lead team");
   await page.el("reply-send").click();
   await page.settle();
   assert.deepStrictEqual(page.repliesPosted.map((call) => call.body), [{ text: "on the main channel", reply_to: "210" }]);
@@ -59337,7 +58595,7 @@ test("`#185 reply-new-thread`: Edit of a failed new-thread reply whose thread ha
   await answerLoneLive(page, data);
   await outgoingEdit(outgoingRows(page)[0]).click();
   await page.settle();
-  assert.equal(page.screen(), "reply");
+  assert.ok(replyInStream(page));
   assert.equal(page.el("reply-branch-row").hidden, true, "a new thread was offered on a message that heads one");
   assert.equal(page.el("reply-destination").textContent, INTO_ANSWERED_NOTE, "Edit sent the reply to the main channel");
   page.replyResponse = posts;
@@ -59426,7 +58684,7 @@ test("`#267 quote-reply`: a selection across two messages, in a row's header or 
   await page.selectText(wordsIn(first), wordsIn(second), "the first message ... the second");
   assert.deepStrictEqual(labels(), plain, "a selection that grew across two messages left Quote reply behind");
   await replyButton(first).click();
-  assert.equal(page.screen(), "reply");
+  assert.ok(replyInStream(page));
   assert.equal(page.el("reply-text").value, "", "Reply quoted a selection that was not its message's");
 });
 
@@ -59436,7 +58694,7 @@ test("`#267 quote-reply`: Quote reply opens the reply with the words quoted line
   // As a browser reads a selection over two paragraphs and a line break, untidy at the ends.
   await page.selectText(wordsIn(first), null, "  the first   message, about\n\n\n the runner \t\nand  more  \n");
   await replyButton(first).click();
-  assert.equal(page.screen(), "reply", "Quote reply did not open the reply screen");
+  assert.ok(replyInStream(page), "Quote reply did not open the reply in the list");
   const quote = "> the first message, about\n>\n> the runner\n> and more\n\n";
   assert.equal(page.el("reply-text").value, quote, "the quote is not the selection, line by line, then an empty line");
   assert.equal(focused(page), page.el("reply-text"), `the box was not ready to write in: ${focusName(page)}`);
@@ -59544,7 +58802,7 @@ test("`#267 quote-reply`: r on the selected message quotes the words selected in
   FakeElement.focusVisible = true;
   await page.selectText(wordsIn(row), null, "a sentence about the overnight run");
   await press(page, row, "r");
-  assert.equal(page.screen(), "reply", "r did not open the reply screen");
+  assert.ok(replyInStream(page), "r did not open the reply in the list");
   assert.equal(page.el("reply-text").value, "> a sentence about the overnight run\n\n", "r did not quote the selection");
   assert.equal(focused(page), page.el("reply-text"), `after r the focus is on ${focusName(page)}`);
   await page.el("reply-cancel").click();
@@ -59556,8 +58814,8 @@ test("`#267 quote-reply`: r on the selected message quotes the words selected in
   const selected = channelRow(page, "29");
   selected.focus();
   await press(page, selected, "r");
-  assert.equal(page.screen(), "reply");
-  assert.equal(page.el("reply-target").children[0].getAttribute("data-id"), "29", "r answered another message");
+  assert.ok(replyInStream(page));
+  assert.match(page.el("reply-target-meta").textContent, /id 29$/, "r answered another message");
   assert.equal(page.el("reply-text").value, "", "r quoted words from a message it did not answer");
   // The list of keys says so.
   assert.ok(page.el("keyboard-keys").text().includes("Quote reply"), "the list of keys does not say r quotes");
@@ -64203,14 +63461,13 @@ test("`#268 voice-call-drops`: every timer a healthy call arms, fired, never end
 // disruption. Reply in the right column or left column, whichever I clicked the reply button in. But
 // instead the whole screen got replaced with the reply interface." In two columns the reply screen's
 // own box opens at the foot of the column pressed in; one column keeps the reply screen.
-// tests/reply_in_column_browser.py measures where it is drawn in a real browser.
+// tests/inline_reply_browser.py measures where it is drawn in a real browser.
 
-/** Where the reply's box is: "left", "right", or "screen", its place on the reply screen. */
+/** Where the reply's box is: "left", "right", or "closed", put away in the left column's hidden place. */
 const replyBoxAt = (page) => {
   const parent = page.el("reply-compose").parentNode;
-  if (parent === page.el("column-reply")) return "left";
+  if (parent === page.el("column-reply")) return page.el("column-reply").hidden ? "closed" : "left";
   if (parent === page.el("side-reply")) return "right";
-  if (parent === page.el("screen-reply")) return "screen";
   return parent ? `#${parent.id}` : "nowhere";
 };
 
@@ -64235,7 +63492,7 @@ const keyless = (body) => {
   return { ...rest, keyed: Boolean(key) };
 };
 
-test("`#277 reply-in-column`: in two columns Reply opens its box at the foot of the column it was pressed in, both columns staying, and Cancel puts all of it back", async () => {
+test("`#277 reply-in-column`: in two columns Reply opens its box in the column it was pressed in, both columns staying, the other untouched, and Cancel puts it away with nothing moving", async () => {
   const { page } = await replyColumnsPage();
   const left = page.el("scroll-area");
   const right = page.el("side-scroll");
@@ -64255,30 +63512,34 @@ test("`#277 reply-in-column`: in two columns Reply opens its box at the foot of 
     assert.match(page.el("reply-target-meta").textContent, new RegExp(`id ${id}$`), `${column}: the box does not say what it answers`);
     assert.equal(focused(page), page.el("reply-text"), `${column}: the box did not take the focus; ${focusName(page)} has it`);
     assert.deepStrictEqual([shownIds(page), sideIds(page)], [before.leftIds, before.rightIds], `${column}: a column's rows changed`);
+    // `#410 inline-reply-editor`. Neither column moves: the other is not touched, and the pressed one is
+    // not moved to a box this fixture draws at its foot (no anchored layout here; the browser walk
+    // measures the box under its row).
     assert.deepStrictEqual([left.scrollTop, right.scrollTop], [before.left, before.right], `${column}: a column moved`);
     await page.el("reply-cancel").click();
     assert.equal(page.screen(), "main");
-    assert.equal(replyBoxAt(page), "screen", `${column}: Cancel left the box in the column`);
+    assert.equal(replyBoxAt(page), "closed", `${column}: Cancel left the box in the column`);
     assert.deepStrictEqual([page.el("column-reply").hidden, page.el("side-reply").hidden], [true, true],
       `${column}: Cancel left a column's place for a reply on screen`);
     assert.deepStrictEqual(replyingRows(page), [], `${column}: Cancel left the message edged`);
-    assert.deepStrictEqual([left.scrollTop, right.scrollTop], [before.left, before.right], `${column}: Cancel did not put the column back`);
+    assert.deepStrictEqual([left.scrollTop, right.scrollTop], [before.left, before.right], `${column}: Cancel moved a column`);
     assert.ok(nodeWithinFixture(list, focused(page)), `${column}: after Cancel the keys are on ${focusName(page)}, not the column's list`);
   }
 
-  // THE CONTROL: the reply screen in two columns, as it was. The walk above sees it.
+  // THE CONTROL: every reply opened in the left column's place. The walk above sees it.
   const { page: control } = await replyColumnsPage(brokenScript(
-    'const docked = columnsShown && currentScreen === "main" && currentView === "discord";', "const docked = false;"));
-  await replyButton(rowWithId(control, "200")).click();
-  assert.equal(control.screen(), "reply", "the control opened no reply screen, so this test cannot see one");
+    '  return nodeWithin(leftEl("side-column"), list) ? leftEl("side-reply") : leftEl("column-reply");',
+    '  return leftEl("column-reply");'));
+  await replyButton(sideRow(control, "202")).click();
+  assert.equal(replyBoxAt(control), "left", "the control opened the right column's reply on the right, so this test cannot see it");
 });
 
-test("`#277 reply-in-column`: Send from a column posts what the reply screen posts in one column — Main's message to Main, the thread's into its thread — once, and puts the column back", async () => {
-  // One column first: what the reply screen posts for each, from Main and from the thread.
+test("`#277 reply-in-column`: Send from a column posts what a reply in one column posts — Main's message to Main, the thread's into its thread — once, and leaves the column where it was", async () => {
+  // One column first: what a reply posts for each, from Main and from the thread.
   const one = await threadPage("main");
   distinctReplies(one);
   await replyButton(rowOf(one, "200")).click();
-  assert.equal(one.screen(), "reply", "the premise is the reply screen in one column");
+  assert.ok(replyInStream(one), "the premise is the reply in one column");
   await one.el("reply-text").setValue("noted");
   await one.el("reply-send").click();
   await one.settle();
@@ -64298,26 +63559,27 @@ test("`#277 reply-in-column`: Send from a column posts what the reply screen pos
   // Where each column was: at its newest message, which a reader there goes on following as the reply
   // is posted at the foot, or a place up its list, which is kept.
   const place = (area) => (atBottomOf(area) ? "newest" : area.scrollTop);
-  const before = [place(left), place(right)];
   await replyButton(rowWithId(page, "200")).click();
+  const before = [place(left), place(right)];
   await page.el("reply-text").setValue("noted");
   await page.el("reply-send").click();
   // A second press arrives at a box that has gone: nothing more is posted.
   await page.el("reply-send").click();
   await page.settle();
-  assert.equal(replyBoxAt(page), "screen", "Send left the box in the column");
+  assert.equal(replyBoxAt(page), "closed", "Send left the box in the column");
   assert.equal(page.screen(), "main", "Send from a column went to another screen");
-  assert.equal(place(left), before[0], "Send did not put the left column back");
+  assert.equal(place(left), before[0], "Send moved the left column");
   assert.ok(nodeWithinFixture(left, focused(page)), `after Send the keys are on ${focusName(page)}, not the left column's list`);
   await replyButton(sideRow(page, "202")).click();
   assert.equal(replyBoxAt(page), "right");
+  before[1] = place(right);
   await page.el("reply-text").setValue("agreed");
   await press(page, page.el("reply-text"), "Enter");
   await page.settle();
-  assert.equal(replyBoxAt(page), "screen", "Enter sent and left the box in the column");
+  assert.equal(replyBoxAt(page), "closed", "Enter sent and left the box in the column");
   assert.deepStrictEqual(page.repliesPosted.map((call) => keyless(call.body)), expected,
-    "a reply sent from a column did not post what the reply screen posts, once each");
-  assert.equal(place(right), before[1], "Enter did not put the right column back");
+    "a reply sent from a column did not post what a reply in one column posts, once each");
+  assert.equal(place(right), before[1], "Enter moved the right column");
   assert.ok(nodeWithinFixture(right, focused(page)), `after Enter the keys are on ${focusName(page)}, not the right column's list`);
   assert.deepStrictEqual(replyingRows(page), []);
   // The Done a sent reply makes is drawn where the message stands, in the column it was answered in.
@@ -64359,7 +63621,7 @@ test("`#277 reply-in-column`: Escape closes an empty box at once; with words, th
   const left = page.el("scroll-area");
   await replyButton(rowWithId(page, "200")).click();
   await press(page, page.el("reply-text"), "Escape");
-  assert.equal(replyBoxAt(page), "screen", "Escape in an empty box did not put the reply down");
+  assert.equal(replyBoxAt(page), "closed", "Escape in an empty box did not put the reply down");
   assert.ok(nodeWithinFixture(left, focused(page)), `after Escape the keys are on ${focusName(page)}`);
 
   await replyButton(rowWithId(page, "200")).click();
@@ -64371,7 +63633,7 @@ test("`#277 reply-in-column`: Escape closes an empty box at once; with words, th
   assert.equal(focused(page), page.el("reply-text"), `c went to ${focusName(page)}, not the reply open in the column`);
   await press(page, page.el("reply-text"), "Escape");
   await press(page, focused(page), "Escape");
-  assert.equal(replyBoxAt(page), "screen", "the second Escape did not put the reply down");
+  assert.equal(replyBoxAt(page), "closed", "the second Escape did not put the reply down");
   assert.equal(page.screen(), "main");
   assert.ok(inTwoColumns(page), "Escape left two columns");
   assert.equal(sideIds(page).length, 2, "Escape closed the thread on the right as well as the reply");
@@ -64380,39 +63642,62 @@ test("`#277 reply-in-column`: Escape closes an empty box at once; with words, th
   assert.equal(page.el("reply-text").value, "half a thought", "Reply did not open with the draft");
 });
 
-test("`#277 reply-in-column`: two columns going while a reply is open hand it to the reply screen, words and all; a column showing something else puts it away as a draft; one column is the reply screen", async () => {
+test("`#410 inline-reply-editor`: two columns going while a reply is open keep it in the stream where its message is drawn, words and focus and all; where it is not, it opens again, words intact, as soon as its message is drawn", async () => {
+  // The coordinator, 2026-10-21: "when two columns collapse with a reply open, the reply stays inline in
+  // the left column if its message is drawn there; otherwise it becomes a draft that reopens inline, with
+  // its text intact, as soon as that message is drawn again."
   const { page } = await replyColumnsPage();
   await replyButton(sideRow(page, "202")).click();
   await page.el("reply-text").setValue("keep me");
   await page.setDesk(false);
   assert.ok(!inTwoColumns(page), "the premise is one column");
-  assert.equal(page.screen(), "reply", "a reply open in a column was lost when two columns went");
-  assert.equal(replyBoxAt(page), "screen");
+  // Two columns chosen from All go back to it, where the thread's answer is drawn: the reply is open
+  // under it there at once, the reader still typing in it.
+  assert.ok(shownIds(page).includes("202"), `the premise is All in one column: ${shownIds(page)}`);
+  assert.equal(replyBoxAt(page), "left", "the reply was not kept open in the one column, where its message is drawn");
+  assert.deepStrictEqual(inlineAnchors(page), ["discord-log:202"]);
+  assert.equal(focused(page), page.el("reply-text"), `the reader typing lost the box: ${focusName(page)} has the focus`);
   assert.equal(page.el("reply-text").value, "keep me", "the words did not go with the reply");
   assert.match(page.el("reply-target-meta").textContent, /id 202$/);
-  assert.equal(page.el("reply-target").children.length, 1, "the reply screen does not show the message answered");
-  assert.deepStrictEqual([page.el("column-reply").hidden, page.el("side-reply").hidden], [true, true]);
   distinctReplies(page);
   await page.el("reply-send").click();
   await page.settle();
   assert.deepStrictEqual(keyless(page.repliesPosted.at(-1).body),
     { text: "keep me", reply_to: "202", thread_id: "spaces/A/threads/one & two", keyed: false },
-    "the reply moved to the screen did not post where it was going");
-
-  // One column: the reply screen, as it was.
-  await replyButton(rowWithId(page, "200")).click();
-  assert.equal(page.screen(), "reply", "Reply in one column did not open the reply screen");
-  await page.el("reply-cancel").click();
-
-  // Back in two: the X on the thread a reply is open under puts the reply away, keeping its words.
+    "the reply opened again did not post where it was going");
   await page.setDesk(true);
   assert.ok(inTwoColumns(page));
   assert.deepStrictEqual(sideIds(page), ["201", "202"]);
+
+  // The other path, made certain: two columns chosen from Main, which they go back to, and the thread's
+  // reply open on the right, the keys on the left column's list.
+  const away = await threadPage("main");
+  await twoColumns(away);
+  await threadBadge(rowWithId(away, "201")).click();
+  await away.settle();
+  await replyButton(sideRow(away, "202")).click();
+  await away.el("reply-text").setValue("wait for me");
+  away.el("scroll-area").focus();
+  await away.setDesk(false);
+  assert.ok(!shownIds(away).includes("202"), `the premise is Main in one column, without the thread's answer: ${shownIds(away)}`);
+  assert.equal(replyBoxAt(away), "closed", "a reply was left open with its message nowhere on screen");
+  await pickThread(away, "thread:spaces/A/threads/one & two");
+  assert.equal(replyBoxAt(away), "left", "the reply did not open again once its message was drawn");
+  assert.deepStrictEqual(inlineAnchors(away), ["discord-log:202"]);
+  assert.equal(away.el("reply-text").value, "wait for me", "the reply opened again without its words");
+  assert.notEqual(focused(away), away.el("reply-text"), "a reply opened again later took the keys from the list");
+
+  // One column: Reply is in the list, as it is everywhere.
+  await replyButton(rowWithId(page, "200")).click();
+  assert.equal(replyBoxAt(page), "left", "Reply in one column did not open in the list");
+  await page.el("reply-cancel").click();
+
+  // Back in two: the X on the thread a reply is open under puts the reply away, keeping its words.
   await replyButton(sideRow(page, "201")).click();
   await page.el("reply-text").setValue("about the root");
   await page.el("side-close").click();
   await page.settle();
-  assert.equal(replyBoxAt(page), "screen", "a reply open under a thread outlived the thread");
+  assert.equal(replyBoxAt(page), "closed", "a reply open under a thread outlived the thread");
   assert.equal(page.screen(), "main");
   assert.equal(draftMarkerOf(rowWithId(page, "201")).hidden, false, "the words of the reply put away were not kept");
   // ...and the call's view, which has no columns, does too.
@@ -64420,15 +63705,16 @@ test("`#277 reply-in-column`: two columns going while a reply is open hand it to
   assert.equal(replyBoxAt(page), "left");
   await page.el("view-switch").click();
   await page.settle();
-  assert.equal(replyBoxAt(page), "screen", "the call's view kept a reply open in a column");
+  assert.equal(replyBoxAt(page), "closed", "the call's view kept a reply open in a column");
 });
 
-// `#314 reply-focus-flake`. tests/reply_in_column_browser.py failed now and then on a loaded host with "the
-// box lost the focus on the way to the reply screen". The page decides one column or two at the frame after
-// a resize, and Chromium, once it has laid the narrower window out without the column, takes the focus off
-// the box it no longer draws in a task of its own — on a slow frame, before the page's. The hand-off then
-// saw no focus in the box (`leaveColumns`). That browser check holds the page's frames back to make the
-// order certain; here it is the order of the steps.
+// `#314 reply-focus-flake`. The browser check of the reply open in a column (tests/reply_in_column_browser.py,
+// since folded into tests/inline_reply_browser.py) failed now and then on a loaded host with "the box lost
+// the focus on the way to the reply screen". The page decides one column or two at the frame after a resize,
+// and Chromium, once it has laid the narrower window out without the column, takes the focus off the box it
+// no longer draws in a task of its own — on a slow frame, before the page's. The hand-off then saw no focus
+// in the box (`leaveColumns`). That check held the page's frames back to make the order certain; here it is
+// the order of the steps, the reply now opened again in the one column (`#410 inline-reply-editor`).
 
 /** A reply open in `column` of two columns, on `row`, with words in its box and the focus. */
 async function replyTypedInColumn(page, column, row) {
@@ -64449,26 +63735,27 @@ async function narrowedUnderSlowFrame(page, column) {
 
 const REPLY_COLUMNS_ROWS = [["left", (page) => rowWithId(page, "200")], ["right", (page) => sideRow(page, "202")]];
 
-test("`#314 reply-focus-flake`: a window narrowed under a reply open in a column gives the reply screen the box with the focus in it, even where the browser took the focus off it before the page's frame; a box the reader left for nothing is not given it back", async () => {
+test("`#314 reply-focus-flake`: a window narrowed under a reply open in a column keeps the box, opened again in the one column, with the focus in it, even where the browser took the focus off it before the page's frame; a box the reader left for nothing is not given it back", async () => {
   for (const [column, row] of REPLY_COLUMNS_ROWS) {
-    // A quick frame: the box still has the focus when the page hands the reply on.
+    // A quick frame: the box still has the focus when the page hands the reply on, to the one column (All,
+    // which draws both messages: `#410 inline-reply-editor`).
     const { page: quick } = await replyColumnsPage();
     await replyTypedInColumn(quick, column, row);
     await quick.setDesk(false);
-    assert.equal(quick.screen(), "reply", `${column}: the premise is the reply screen`);
+    assert.ok(replyInStream(quick), `${column}: the premise is the reply open in the one column`);
     assert.equal(focused(quick), quick.el("reply-text"), `${column}, quick frame: ${focusName(quick)} has the focus, not the box`);
 
     // A slow one: the browser has taken it already.
     const { page } = await replyColumnsPage();
     await replyTypedInColumn(page, column, row);
     await narrowedUnderSlowFrame(page, column);
-    assert.equal(page.screen(), "reply", `${column}: one column did not hand the reply to the reply screen`);
-    assert.equal(replyBoxAt(page), "screen");
+    assert.ok(replyInStream(page), `${column}: one column did not keep the reply`);
+    assert.equal(replyBoxAt(page), "left");
     assert.equal(page.el("reply-text").value, "halfway through a sentence", `${column}: the words did not go with the reply`);
     assert.equal(focused(page), page.el("reply-text"), `${column}, slow frame: ${focusName(page)} has the focus, not the box`);
 
     // The reader's own leaving is theirs: a click away from the box onto what takes no focus, the box still
-    // drawn, and then the window narrowed. The reply screen's list has the keys, as for any reader not typing.
+    // drawn, and then the window narrowed. The box does not take them back, as for any reader not typing.
     await page.el("reply-cancel").click();
     await page.setDesk(true);
     assert.ok(inTwoColumns(page), `${column}: the premise is two columns again`);
@@ -64476,9 +63763,9 @@ test("`#314 reply-focus-flake`: a window narrowed under a reply open in a column
     assert.ok(page.el("reply-compose").getClientRects().length > 0, `${column}: the premise is a box drawn in its column`);
     await page.loseFocus();
     await page.setDesk(false);
-    assert.equal(page.screen(), "reply");
-    assert.equal(focused(page), page.el("reply-scroll"),
-      `${column}: a box the reader had left took the focus back on the reply screen (${focusName(page)} has it)`);
+    assert.ok(replyInStream(page));
+    assert.notEqual(focused(page), page.el("reply-text"),
+      `${column}: a box the reader had left took the focus back in the one column`);
   }
 
   // Taken by the browser, but the window wide again before the page's frame, and the reader then on the
@@ -64495,7 +63782,7 @@ test("`#314 reply-focus-flake`: a window narrowed under a reply open in a column
     await page.documentEvent("focusin", { type: "focusin", target: page.el("side-scroll"), relatedTarget: null });
     await page.loseFocus();
     await page.setDesk(false);
-    assert.equal(page.screen(), "reply");
+    assert.ok(replyInStream(page));
     return focused(page) === page.el("reply-text");
   };
   assert.equal(await movedOn(SCRIPT), false, "the box took back a focus the reader had given the column's list since");
@@ -64507,7 +63794,7 @@ test("`#314 reply-focus-flake`: a window narrowed under a reply open in a column
     "nodeWithin(el(\"reply-compose\"), document.activeElement)"));
   await replyTypedInColumn(control, "right", REPLY_COLUMNS_ROWS[1][1]);
   await narrowedUnderSlowFrame(control, "right");
-  assert.equal(control.screen(), "reply");
+  assert.ok(replyInStream(control));
   assert.notEqual(focused(control), control.el("reply-text"), "the control kept the focus in the box, so this test cannot see it lost");
   assert.equal(await movedOn(brokenScript('document.addEventListener("focusin", () => {\n  replyFocusTaken = false;\n});', "")), true,
     "the control that never forgets gave the list the focus too, so this test cannot see a focus taken back");
@@ -64558,8 +63845,8 @@ test("`#277 reply-in-column`: a reply sent from a column that does not go says s
     await page.el("reply-text").setValue("this will not go");
     await page.el("reply-send").click();
     await page.settle();
-    assert.equal(replyBoxAt(page), "screen", `${column}: Send left the box in the column`);
-    assert.equal(area.scrollTop, 0, `${column}: the column did not go back to where it was`);
+    assert.equal(replyBoxAt(page), "closed", `${column}: Send left the box in the column`);
+    assert.equal(area.scrollTop, 0, `${column}: Send moved the column`);
     // Where the reader is: the status line, which a screen reader hears.
     assert.equal(page.el("status-line").hidden, false, `${column}: the status line said nothing of the failure`);
     assert.match(page.el("status").textContent, said.status, `${column}: the status line said the wrong thing`);
@@ -64631,19 +63918,19 @@ test("`#277 reply-in-column`: Escape on the other column's list does what it doe
   assert.equal(page.el("reply-text").value, "still writing on the left");
   await press(page, focused(page), "[");
   await press(page, focused(page), "Escape");
-  assert.equal(replyBoxAt(page), "screen", "Escape on the reply's own column did not put it down");
+  assert.equal(replyBoxAt(page), "closed", "Escape on the reply's own column did not put it down");
   assert.equal(draftMarkerOf(rowWithId(page, "200")).hidden, false, "the words were not kept as a draft");
 
   // THE CONTROL: Back that puts down whatever reply is open, wherever the keys are.
   const { page: control } = await replyColumnsPage(brokenScript(
-    'else if (replyOnScreen() && (currentScreen === "reply" || activeColumn === replyColumn)) closeReply();',
+    "else if (replyOnScreen() && replyKeysHere()) closeReply();",
     "else if (replyOnScreen()) closeReply();"));
   await replyButton(rowWithId(control, "200")).click();
   await control.el("reply-text").setValue("still writing on the left");
   await press(control, control.el("reply-text"), "Escape");
   await press(control, focused(control), "]");
   await press(control, focused(control), "Escape");
-  assert.equal(replyBoxAt(control), "screen", "the control kept the reply, so this test cannot see it closed");
+  assert.equal(replyBoxAt(control), "closed", "the control kept the reply, so this test cannot see it closed");
 });
 
 // --- `#281 view-keys` with `#279 thread-card-focus` and `#277 reply-in-column` ------------------------
@@ -64654,6 +63941,192 @@ test("`#277 reply-in-column`: Escape on the other column's list does what it doe
 // before it leaves the list. A reply open at the foot of a column (`#277 reply-in-column`) is put down,
 // its words kept, by the view keys that take its column away, and is handed to the reply screen, over
 // the thread list too, by the layout button and a narrowed window, as it was.
+
+// --- `#410 inline-reply-editor` ----------------------------------------------------------------------
+//
+// The owner, 2026-10-21: "When I press 'reply' on a message inside a thread in two column view, I see a
+// reply box pop up AT THE BOTTOM. But I STILL see the other 'inline' reply box at the bottom of the
+// thread message series ... Why don't we move the 'Reply' box to also be an inline box and NOT show two
+// at once ... gather the existing replies underneath the message we just pressed Reply on, and then our
+// new Reply interface is just the existing inline-message editor (with Grow button) inserted in the
+// stream." Reply opens the reply's box in the list, in one column and two, under the message and the
+// replies gathered under it; the column's own box is hidden while it is open. tests/inline_reply_browser.py
+// measures where it is drawn in a real browser.
+
+/** The rows named as the one the reply's box is drawn under, as "list:id". */
+const inlineAnchors = (page) => ["discord-log", "side-log", "side-cards", "pinned-log"].flatMap((list) =>
+  page.el(list).children.filter((li) => li.hasAttribute("data-inline-reply")).map((li) => `${list}:${li.getAttribute("data-id")}`));
+
+/** A page that opens the reply's box in the stream and leaves the column's own box drawn beside it. */
+const TWO_BOXES = ['  for (const id of ["channel-composer", "side-composer"]) leftEl(id).hidden = true;\n', ""];
+
+test("`#410 inline-reply-editor`: in one column Reply opens the box in the list under the message, the channel's box hidden; Cancel brings that box back, each draft kept where it was", async () => {
+  const page = await scatteredPage();
+  await page.el("channel-compose-text").setValue("for the whole channel");
+  await page.el("channel-compose-text").dispatch("input", {});
+  const area = page.el("scroll-area");
+  const before = area.scrollTop;
+  await replyButton(rowWithId(page, "600")).click();
+  assert.equal(page.screen(), "main", "Reply went to another screen");
+  assert.equal(replyBoxAt(page), "left", `the box is ${replyBoxAt(page)}, not in the list`);
+  assert.equal(page.el("column-reply").parentNode, page.el("pane-discord"), "the box's place is not in the channel's pane");
+  assert.equal(page.el("column-reply").hidden, false);
+  assert.equal(page.el("channel-composer").hidden, true, "the channel's box is still drawn beside the reply's: two boxes");
+  assert.deepStrictEqual(inlineAnchors(page), ["discord-log:600"], "the box is not drawn under the message answered");
+  assert.equal(page.el("column-reply").hasAttribute("data-anchored"), true);
+  assert.deepStrictEqual(shownIds(page), SCATTERED, "a message with no replies moved rows");
+  // This fixture lays out no anchored box: the box is drawn at the list's foot, as where a browser has
+  // no anchor positioning, and that is no reason to move the reader there. (Where it is drawn under its
+  // row, tests/inline_reply_browser.py measures how little the list moves to show it.)
+  assert.equal(area.scrollTop, before, "the list moved to a box drawn at its foot");
+  assert.equal(focused(page), page.el("reply-text"), `the box did not take the focus; ${focusName(page)} has it`);
+  await page.el("reply-text").setValue("half a thought");
+  await page.el("reply-text").dispatch("input", {});
+  await page.el("reply-cancel").click();
+  assert.equal(replyBoxAt(page), "closed", "Cancel left the box in the list");
+  assert.equal(page.el("column-reply").hidden, true);
+  assert.equal(page.el("channel-composer").hidden, false, "Cancel did not bring the channel's box back");
+  assert.deepStrictEqual(inlineAnchors(page), [], "Cancel left a row keeping room for a box");
+  assert.equal(draftMarkerOf(rowWithId(page, "600")).hidden, false, "the reply's words were not kept as its draft");
+  assert.equal(page.el("channel-compose-text").value, "for the whole channel", "the channel's draft was touched");
+  assert.equal(area.scrollTop, before, "putting the reply down moved the list");
+  await replyButton(rowWithId(page, "600")).click();
+  assert.equal(page.el("reply-text").value, "half a thought", "the draft did not come back with the box");
+  assert.equal(page.el("channel-compose-text").value, "for the whole channel");
+
+  // THE CONTROL: the reply's box beside the column's own, two boxes. The walk above sees it.
+  const control = newPage(new Map(), brokenScript(...TWO_BOXES));
+  const data = scatteredThread();
+  control.threadingSupported = true;
+  control.threads = data.threads;
+  await signIn(control);
+  await showDiscord(control, data.messages);
+  await replyButton(rowWithId(control, "600")).click();
+  assert.equal(control.el("channel-composer").hidden, false, "the control hid the channel's box, so this test cannot see two");
+});
+
+test("`#410 inline-reply-editor`: in All Reply gathers the message's replies under it and opens the box under the last; Escape puts them back, and a sent reply leaves them gathered", async () => {
+  const page = await scatteredPage();
+  await replyButton(rowWithId(page, "601")).click();
+  assert.deepStrictEqual(shownIds(page), GATHERED, "the replies were not gathered under the message answered");
+  assert.deepStrictEqual(stackPlaces(page).map(([id]) => id), ["601", "602", "603", "604", "606", "607"],
+    "the gathered replies are not on the bridge");
+  assert.deepStrictEqual(inlineAnchors(page), ["discord-log:607"], "the box is not under the last gathered reply");
+  await press(page, page.el("reply-text"), "Escape");
+  assert.equal(replyBoxAt(page), "closed", "Escape in an empty box did not put the reply down");
+  assert.deepStrictEqual(shownIds(page), SCATTERED, "putting the reply down did not put its replies back in time order");
+  assert.deepStrictEqual(inlineAnchors(page), []);
+
+  await replyButton(rowWithId(page, "601")).click();
+  await page.el("reply-text").setValue("on it");
+  await page.el("reply-send").click();
+  await page.settle();
+  assert.equal(replyBoxAt(page), "closed", "Send left the box in the list");
+  assert.equal(page.el("channel-composer").hidden, false, "Send did not bring the channel's box back");
+  assert.deepStrictEqual(shownIds(page).slice(0, 10), GATHERED.slice(0, 10), "Send put the gathered replies back");
+  assert.equal(page.repliesPosted.at(-1).body.reply_to, "601", "the reply did not answer the message");
+  // The next Reply, on a message nothing answers, puts that gathering back: one gathering at a time.
+  await replyButton(rowWithId(page, "605")).click();
+  assert.equal(shownIds(page).indexOf("602"), SCATTERED.indexOf("602"), "the gathering a sent reply left outlived the next Reply");
+  await page.el("reply-cancel").click();
+
+  // Negative control: a message nothing answers gathers nothing, and its box is under it.
+  const quiet = await scatteredPage();
+  await replyButton(rowWithId(quiet, "605")).click();
+  assert.deepStrictEqual(shownIds(quiet), SCATTERED, "a message with no replies moved rows");
+  assert.deepStrictEqual(inlineAnchors(quiet), ["discord-log:605"]);
+});
+
+test("`#410 inline-reply-editor`: on a thread's root in Main, Reply draws its thread's replies under it as rows of the list, bridged, and Cancel takes them away again", async () => {
+  const page = await scatteredPage();
+  await pickThread(page, "main");
+  const main = shownIds(page);
+  assert.ok(!main.includes("604") && !main.includes("606"), `the premise is Main without the thread's replies: ${main}`);
+  await replyButton(rowWithId(page, "601")).click();
+  const rows = shownIds(page);
+  const at = rows.indexOf("601");
+  assert.deepStrictEqual(rows.slice(at, at + 6), ["601", "602", "603", "604", "606", "607"],
+    `the thread's replies are not gathered under its root: ${rows}`);
+  const brought = page.el("discord-log").children.filter((li) => li.hasAttribute("data-gathered-thread")).map((li) => li.getAttribute("data-id"));
+  assert.deepStrictEqual(brought, ["604", "606"], "the rows the thread brought are not told from Main's own");
+  assert.ok(stackPlaces(page).some(([id]) => id === "604"), "the thread's replies are not on the bridge");
+  assert.deepStrictEqual(inlineAnchors(page), ["discord-log:607"], "the box is not under the last of them");
+  await page.el("reply-cancel").click();
+  assert.deepStrictEqual(shownIds(page), main, "Cancel left the thread's replies in Main");
+  assert.equal(page.el("discord-log").children.some((li) => li.hasAttribute("data-gathered-thread")), false);
+});
+
+test("`#410 inline-reply-editor`: one box — in two columns Reply in the thread on the right opens under the thread, its own box hidden, and Reply on the left moves the one box there", async () => {
+  const { page } = await replyColumnsPage();
+  await replyButton(sideRow(page, "201")).click();
+  assert.equal(replyBoxAt(page), "right");
+  assert.equal(page.el("side-reply").parentNode, page.el("side-pane"), "the right column's place is not in its thread");
+  assert.deepStrictEqual(inlineAnchors(page), ["side-log:202"], "a reply to the thread's root is not under its whole thread");
+  assert.deepStrictEqual([page.el("side-composer").hidden, page.el("channel-composer").hidden], [true, true],
+    "a column's own box is still drawn beside the reply's");
+  await page.el("reply-text").setValue("for the root");
+  await page.el("reply-text").dispatch("input", {});
+  await replyButton(rowWithId(page, "200")).click();
+  assert.equal(replyBoxAt(page), "left", "Reply on the left did not move the box");
+  assert.deepStrictEqual([page.el("column-reply").hidden, page.el("side-reply").hidden], [false, true], "two places hold a box");
+  assert.deepStrictEqual([page.el("side-composer").hidden, page.el("channel-composer").hidden], [true, true],
+    "a column's own box came back while the reply is open on the left");
+  assert.deepStrictEqual(inlineAnchors(page), ["discord-log:200"]);
+  assert.equal(draftMarkerOf(sideRow(page, "201")).hidden, false, "the first reply's words were not kept as its draft");
+  await page.el("reply-cancel").click();
+
+  // Reply on Main's root of the thread the right column shows: its replies are not drawn a second time
+  // beside themselves, as N replies declines to in two columns.
+  await replyButton(rowWithId(page, "201")).click();
+  assert.equal(replyBoxAt(page), "left");
+  assert.deepStrictEqual(page.el("discord-log").children.filter((li) => li.hasAttribute("data-gathered-thread")).map((li) => li.getAttribute("data-id")), [],
+    "the thread shown on the right was drawn again under its root on the left");
+  await page.el("reply-cancel").click();
+
+  // A reply open on the right is the one box from the left column too: Ctrl+S there goes to it.
+  await replyButton(sideRow(page, "202")).click();
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  await press(page, focused(page), "s", { ctrlKey: true });
+  assert.equal(focused(page), page.el("reply-text"), `Ctrl+S from the left column went to ${focusName(page)}, not the reply open on the right`);
+});
+
+test("`#410 inline-reply-editor`: the reply's box is a composer — Grow is the one choice, and Ctrl+S and c go to the box open in the list", async () => {
+  assert.match(cssBlockIn(DESKTOP_QUERY, "#screen-main[data-composer-grow] #reply-text"), /field-sizing:\s*content/,
+    "the reply's box does not grow with Grow ticked");
+  assertMarkupContains("reply-compose", "reply-grow");
+  const page = await scatteredPage();
+  await replyButton(rowWithId(page, "600")).click();
+  await page.el("reply-grow").setChecked(true);
+  assert.equal(page.storage.get("vibe-talk.voice.composer-grow"), "1", "ticking the reply's Grow kept nothing");
+  assert.equal(page.el("channel-compose-grow").checked, true, "the reply's Grow is a choice of its own");
+  await press(page, page.el("scroll-area"), "s", { ctrlKey: true });
+  assert.equal(focused(page), page.el("reply-text"), `Ctrl+S went to ${focusName(page)}, not the reply open in the list`);
+  await press(page, page.el("reply-text"), "Escape");
+  await press(page, page.el("scroll-area"), "c");
+  assert.equal(focused(page), page.el("channel-compose-text"), `with the reply put down, c went to ${focusName(page)}`);
+});
+
+test("`#410 inline-reply-editor`: a reply open under a row unpacked among the cards goes, as a draft, when a card opens its thread", async () => {
+  // From review: the reply is the left column's (`#407 unpack-row-parity`), drawn among the cards; a card
+  // opening its thread hides the cards, and a reply left open there would be out of sight with both
+  // columns' own boxes hidden.
+  const { page } = await parityPage({ long: false });
+  const area = page.el("side-scroll");
+  area.focus();
+  await mouseOnto(page, unpackedRow(page, "703"));
+  await pressHere(page, "r");
+  assert.equal(replyBoxAt(page), "right", "the premise is the reply open among the cards");
+  await page.el("reply-text").setValue("about the unpacked row");
+  await page.el("reply-text").dispatch("input", {});
+  const card = page.el("side-cards").children.find((li) => li.hasAttribute("data-card"));
+  await card.descendants().find((node) => node.hasClass("side-card-open")).click();
+  await page.settle();
+  assert.equal(replyBoxAt(page), "closed", "the reply was left open among the hidden cards");
+  assert.deepStrictEqual([page.el("channel-composer").hidden, page.el("side-composer").hidden], [false, false],
+    "a column's own box stayed hidden after the reply went");
+  assert.equal(JSON.parse(page.storage.get("vibe-talk.voice.drafts") || "{}")["703"], "about the unpacked row",
+    "the reply's words were not kept as its draft");
+});
 
 test("`#281 view-keys` x `#279 thread-card-focus`: the thread list's cards are two columns' cards — a click highlights one without leaving the list, the highlight goes on through Ctrl+4, and its replies button or → opens its thread across the window", async () => {
   // The cards' own rules, highlight and way in included, stand outside the desk's block: a phone's thread list has them.
@@ -64751,12 +64224,12 @@ test("`#281 view-keys` x `#277 reply-in-column`: Ctrl+1 to Ctrl+3 in a reply ope
   assert.equal(page.screen(), "main", "Ctrl+2 in a reply open in a column showed the reply screen over All");
   assert.equal(picker.value, "flat", "Ctrl+2 in a reply open in a column did not choose All");
   assert.equal(layout(), null);
-  assert.equal(replyBoxAt(page), "screen", "the reply's box was left in a column that went");
+  assert.equal(replyBoxAt(page), "closed", "the reply's box was left in a column that went");
   assert.deepStrictEqual([page.el("column-reply").hidden, page.el("side-reply").hidden], [true, true]);
   assert.ok(nodeWithinFixture(page.el("scroll-area"), focused(page)), `after Ctrl+2 the keys are on ${focusName(page)}`);
   assert.equal(draftMarkerOf(rowWithId(page, "200")).hidden, false, "the words of the reply put down were not kept");
   await replyButton(rowWithId(page, "200")).click();
-  assert.equal(page.screen(), "reply", "the premise is the reply screen in one column");
+  assert.ok(replyInStream(page), "the premise is the reply in one column");
   assert.equal(page.el("reply-text").value, "left words", "Reply did not open with the words kept");
   await page.el("reply-cancel").click();
 
@@ -64775,7 +64248,7 @@ test("`#281 view-keys` x `#277 reply-in-column`: Ctrl+1 to Ctrl+3 in a reply ope
   await press(page, page.el("reply-text"), "3", { ctrlKey: true });
   assert.equal(layout(), "list", "Ctrl+3 in a reply open in a column did not show the thread list");
   assert.equal(page.screen(), "main", "Ctrl+3 showed the reply screen over the thread list");
-  assert.equal(replyBoxAt(page), "screen");
+  assert.equal(replyBoxAt(page), "closed");
   assert.ok(nodeWithinFixture(page.el("side-scroll"), focused(page)), `after Ctrl+3 the keys are on ${focusName(page)}`);
   await press(page, focused(page), "4", { ctrlKey: true });
   assert.deepStrictEqual(sideIds(page), ["201", "202"]);
@@ -64792,7 +64265,7 @@ test("`#281 view-keys` x `#277 reply-in-column`: Ctrl+1 to Ctrl+3 in a reply ope
   await page.el("reply-text").setValue("handed over");
   await page.el("column-toggle").click();
   await page.settle();
-  assert.equal(page.screen(), "reply", "the layout button lost a reply open in a column");
+  assert.ok(replyInStream(page), "the layout button lost a reply open in a column");
   assert.equal(page.el("reply-text").value, "handed over", "the words did not go with the reply");
   assert.equal(layout(), "list", "the layout button did not go back to the thread list under the reply");
   await page.el("reply-cancel").click();
@@ -64805,7 +64278,7 @@ test("`#281 view-keys` x `#277 reply-in-column`: Ctrl+1 to Ctrl+3 in a reply ope
   await replyButton(rowWithId(control, "200")).click();
   await control.el("reply-text").setValue("left words");
   await press(control, control.el("reply-text"), "2", { ctrlKey: true });
-  assert.equal(control.screen(), "reply", "the control put the reply down, so this test cannot see it handed over");
+  assert.ok(replyInStream(control), "the control put the reply down, so this test cannot see it handed over");
 });
 
 // --- `#281 view-keys` with `#280 scroll-stability` --------------------------------------------------
@@ -65028,9 +64501,9 @@ test("`#338 column-overscroll`: the room past the right column's foot is drawn a
     "the room is drawn outside the desktop block too");
   assert.match(cssRules(CSS_UNCONDITIONAL, "#side-overscroll").join("\n"), /display:\s*none/,
     "the room is not taken away everywhere else");
-  // The last child of the element after which the right column's place for a reply comes: #side-scroll, by
-  // the fixture's tree, which is checked against the markup as it is built.
-  assert.match(HTML_CODE, /<div id="side-overscroll" aria-hidden="true"><\/div>\s*<\/div>\s*<div id="side-reply"/,
+  // The last child of #side-scroll, by the fixture's tree, which is checked against the markup as it is
+  // built: the scroller closes after it, and the column's jump follows.
+  assert.match(HTML_CODE, /<div id="side-overscroll" aria-hidden="true"><\/div>\s*<\/div>\s*<div id="side-tools"/,
     "the room is not the last thing in the right column's scroller, or is not hidden from assistive technology");
   const { page } = await manyThreadColumns(4, (p) => p.enableResizeObserver());
   const room = page.el("side-overscroll");
@@ -66557,7 +66030,7 @@ test("`#304 back-gesture-in-app`: Settings, Help over it, and the reply screen a
   const answered = page.el("discord-log").children[0];
   await replyButton(answered).click();
   await page.settle();
-  assert.equal(page.screen(), "reply");
+  assert.ok(replyInStream(page));
   assert.deepStrictEqual(backFacts(page), { depth: 1, tag: "reply" });
   await page.el("reply-text").setValue("half a thought");
   await page.browserBack();
@@ -66806,9 +66279,10 @@ test("`#304 back-gesture-in-app`: A REPLY OPEN AT THE FOOT OF THE RIGHT COLUMN i
   assert.deepStrictEqual(unlevelled.docked.facts, { depth: 1, tag: "side" }, "the control with no reply level pushed an entry for it");
   assert.equal(unlevelled.gesture.cards, true, "the control with no reply level kept the right column's thread on the gesture");
   const untold = await dockedReplyWalk(brokenScript(
-    "  // `#304 back-gesture-in-app`. A reply open in a column is a level, as the reply screen is.\n  scheduleBackSync();\n", ""));
+    "  // `#304 back-gesture-in-app`. A reply open in the stream is a level of its own.\n  scheduleBackSync();\n", ""));
   assert.deepStrictEqual(untold.docked.facts, { depth: 1, tag: "side" }, "the control never told a reply opened pushed an entry for it");
-  const undocked = await dockedReplyWalk(brokenScript("  placeToolsOverReply();\n  scheduleBackSync();\n}", "  placeToolsOverReply();\n}"));
+  const undocked = await dockedReplyWalk(brokenScript("  renderReplyingMarks();\n  markCardBesideReply();\n  scheduleBackSync();\n}",
+    "  renderReplyingMarks();\n  markCardBesideReply();\n}"));
   assert.deepStrictEqual(undocked.cancelled.asked, [], "the control never told the reply was put down went back through its entry");
 });
 
@@ -70213,22 +69687,21 @@ for (const reads of ["held", "failing"]) {
       const from = page.timelineCalls.length;
       await replyButton(rowOf(page, "300")).click();
       await page.settle();
-      const opened = { note: page.el("reply-destination").textContent, title: replyTitle(page) };
+      const opened = { note: page.el("reply-destination").textContent };
       await page.el("reply-text").setValue("an answer to a message that is gone");
       await page.el("reply-send").click();
       for (let i = 0; i < 3; i += 1) await page.settle();
       const sent = { posted: page.repliesPosted.map((call) => call.body), placing: replyPlacingReads(page, from),
-        state: page.el("reply-state").textContent, screen: page.screen(), text: page.el("reply-text").value,
+        state: page.el("reply-state").textContent, open: replyInStream(page), text: page.el("reply-text").value,
         outbox: outgoingRows(page).length };
       return { page, opened, sent, release };
     };
     const { page, opened, sent, release } = await run(SCRIPT);
     assert.match(opened.note, /was removed from the channel/, `Reply did not say the message was removed: ${opened.note}`);
-    assert.equal(opened.title, "Reply · lead team · message removed");
     assert.deepStrictEqual(sent.posted, [], "a reply to a message removed upstream was posted");
     assert.deepStrictEqual(sent.placing, [], "Send read the channel for a message removed upstream");
     assert.match(sent.state, /^Not sent: the message you are answering was removed/);
-    assert.equal(sent.screen, "reply", "the refused reply left the reply screen");
+    assert.equal(sent.open, true, "the refused reply put its box away");
     assert.equal(sent.text, "an answer to a message that is gone", "the refused reply lost its words");
     assert.equal(sent.outbox, 0, "the refused reply was queued, to hold up what is written after it");
     if (reads === "held") {
@@ -70254,12 +69727,11 @@ test("`#315 removed-reply-target`: a reply open on a message as it is removed up
       await p.settle();
       before = p.el("reply-destination").textContent;
     });
-    return { page, before, after: page.el("reply-destination").textContent, title: replyTitle(page) };
+    return { page, before, after: page.el("reply-destination").textContent };
   };
-  const { page, before, after, title } = await run(SCRIPT);
+  const { page, before, after } = await run(SCRIPT);
   assert.match(before, /not known yet/, "fixture: the reply did not wait to know where the message is");
   assert.match(after, /was removed from the channel/, `the open reply did not follow the removal: ${after}`);
-  assert.equal(title, "Reply · lead team · message removed");
   distinctReplies(page);
   await page.el("reply-text").setValue("too late");
   await page.el("reply-send").click();
@@ -71413,8 +70885,8 @@ test("`#277 reply-in-column` with `#269 approval-card-inline`: a reply open at t
 
   // THE CONTROL: the card not told when a reply opens in a column. The walk above sees it.
   const control = await draftInTwoColumns(brokenScript(
-    "  replyDocked = true;\n  renderReplyingMarks();\n  markCardBesideReply();\n",
-    "  replyDocked = true;\n  renderReplyingMarks();\n"));
+    '  for (const id of ["channel-composer", "side-composer"]) leftEl(id).hidden = true;\n  renderReplyingMarks();\n  markCardBesideReply();\n',
+    '  for (const id of ["channel-composer", "side-composer"]) leftEl(id).hidden = true;\n  renderReplyingMarks();\n'));
   await replyButton(rowWithId(control, "200")).click();
   await control.settle();
   assert.equal(control.el("post-confirm").hasAttribute("data-beside-reply"), false,
@@ -73055,8 +72527,7 @@ function laidOutLikeChromium(page, main, pane) {
     },
   });
   // Everything else showScreen hides, any of which may hold the focus as it does.
-  for (const id of ["screen-signin", "screen-settings", "screen-reply", "screen-help", "close-settings", "close-reply",
-    "close-help"]) {
+  for (const id of ["screen-signin", "screen-settings", "screen-help", "close-settings", "close-help"]) {
     const node = page.el(id);
     let off = node.hidden;
     Object.defineProperty(node, "hidden", {
@@ -76317,29 +75788,29 @@ test("`#403 composer-key-global`: with a thread open on the right, the chord goe
   }
 });
 
-test("`#403 composer-key-global`: a reply open at the foot of a column is THAT column's box, not the other's", async () => {
-  // Before the fix the reply took the chord from both columns: a reader in the right column's thread
-  // was sent to the left column's reply.
+test("`#403 composer-key-global`: a reply open in a column is the one box, from either column", async () => {
+  // Before `#403` the reply took the chord from both columns while the right column's own box was drawn
+  // beside it, which sent a reader in the right column's thread past their own box. Since `#410
+  // inline-reply-editor` a reply open anywhere is the one box drawn, so it is where the chord goes.
   for (const fields of CHORDS) {
     const { page } = await replyColumnsPage();
     await replyButton(rowWithId(page, "200")).click();
     await page.settle();
     assert.equal(replyBoxAt(page), "left", "the premise is a reply open in the left column");
+    // `#410 inline-reply-editor`. The right column's own box is not drawn while the reply is open: the one
+    // box on the page is the reply's, from either column.
     await press(page, page.el("side-scroll"), "ArrowDown");
     await chordFrom(page, focused(page), fields, `${chordName(fields)} from the right column`);
-    assert.equal(focused(page), page.el("side-compose-text"),
+    assert.equal(focused(page), page.el("reply-text"),
       `${chordName(fields)} from the right column's thread left the focus on ${focusName(page)}`);
     await press(page, page.el("scroll-area"), "ArrowUp");
     await chordFrom(page, focused(page), fields, `${chordName(fields)} from the left column`);
     assert.equal(focused(page), page.el("reply-text"), `${chordName(fields)} from the left column left the focus on ${focusName(page)}`);
     await chordFrom(page, null, fields, `${chordName(fields)} from the page body`);
     assert.equal(focused(page), page.el("reply-text"), `${chordName(fields)} from the body after the left left the focus on ${focusName(page)}`);
-    // In the left column's own channel box, beside its reply, with a draft: it stays, the draft untouched.
-    await page.el("channel-compose-text").setValue("not the reply");
-    await chordFrom(page, page.el("channel-compose-text"), fields, `${chordName(fields)} in Main's box beside the reply`);
-    assert.equal(focused(page), page.el("channel-compose-text"),
-      `${chordName(fields)} in Main's box beside its reply moved the focus to ${focusName(page)}`);
-    assert.equal(page.el("channel-compose-text").value, "not the reply");
+    // `#410 inline-reply-editor`. Neither column's own box is drawn beside the reply: one box.
+    assert.equal(page.el("channel-composer").hidden, true, "Main's box is drawn beside the reply open in its column");
+    assert.equal(page.el("side-composer").hidden, true, "the right column's box is drawn beside a reply on the left");
   }
 });
 
@@ -76710,8 +76181,8 @@ test("`#407 unpack-row-parity`: Enter and o fold the selected unpacked row, e ma
   assert.equal(unpackedRow(page, "703").getAttribute("data-archived"), "false", "e on a Done unpacked row did not put it back");
   await mouseOnto(page, unpackedRow(page, "707"));
   await pressHere(page, "r");
-  assert.equal(page.screen(), "reply", "r did not reply to the selected unpacked row");
-  assert.equal(page.el("reply-target").children[0].getAttribute("data-id"), "707", "r answered another message");
+  assert.ok(replyInStream(page), "r did not reply to the selected unpacked row");
+  assert.match(page.el("reply-target-meta").textContent, /id 707$/, "r answered another message");
 });
 
 test("`#407 unpack-row-parity`: ; and : step the unpacked rows' folds as they step a thread's, each step said", async () => {
@@ -76842,14 +76313,17 @@ test("`#407 unpack-row-parity`: an unpacked row's Done flash runs its course, it
   assert.equal(heldRow(page), "706", "↓ after opening the run did not go on from its first row");
 });
 
-test("`#407 unpack-row-parity`: Reply from an unpacked row is the screen's reply, and Cancel comes back to the cards where they were", async () => {
+test("`#407 unpack-row-parity`: Reply from an unpacked row opens under it among the cards, and Cancel leaves the cards where they were", async () => {
   const { page } = await parityPage({ long: false });
   const area = page.el("side-scroll");
   area.focus();
   await mouseOnto(page, unpackedRow(page, "703"));
   const was = area.scrollTop;
   await pressHere(page, "r");
-  assert.equal(page.screen(), "reply", "r did not open the reply screen");
+  assert.ok(replyInStream(page), "r did not open the reply");
+  // `#410 inline-reply-editor`. In the cards' list, under the row, as it opens under a row anywhere.
+  assert.equal(page.el("side-reply").parentNode, page.el("side-list"), "the reply's box is not among the cards");
+  assert.deepStrictEqual(inlineAnchors(page), ["side-cards:703"], "the box is not under the unpacked row");
   await page.el("reply-cancel").click();
   await page.settle();
   assert.equal(page.screen(), "main");

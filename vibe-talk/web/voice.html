@@ -62,16 +62,10 @@
             <path d="M14.5 5 8 12l6.5 7" />
           </svg>
         </button>
-        <!-- The reply screen gets its OWN way back rather than borrowing the settings one. They
-             go to different places, and scripts/screenshots.py drives #close-settings by name. -->
-        <button id="close-reply" class="icon-button" type="button" aria-label="Back" title="Back" hidden>
-          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M14.5 5 8 12l6.5 7" />
-          </svg>
-        </button>
-        <!-- `#85 voice-desktop-review`. Help gets its OWN way back, for the same reason the reply
-             screen does: it goes somewhere different. Settings returns to the call; Help returns
-             to Settings, which is where the reader was and what they were doing. -->
+        <!-- `#85 voice-desktop-review`. Help gets its OWN way back rather than borrowing the settings
+             one: it goes somewhere different, and scripts/screenshots.py drives #close-settings by
+             name. Settings returns to the call; Help returns to Settings, which is where the reader
+             was and what they were doing. -->
         <button id="close-help" class="icon-button" type="button" aria-label="Back" title="Back" hidden>
           <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
             <path d="M14.5 5 8 12l6.5 7" />
@@ -429,7 +423,7 @@
                 `#269 approval-card-inline`. It is the tentative next message, drawn as the owner's own
                 outgoing tile, at the foot of whatever he is looking at: here, under the call's
                 transcript; under the channel's messages on the channel; and docked at the foot of the
-                screen on Reply, Threads, Settings and Help. ONE element, every id kept, which
+                screen on Threads, Settings and Help. ONE element, every id kept, which
                 `placePostCard` in web/voice.js moves; outside the transcript's list, so nothing that
                 walks the turns ever meets it. The words come first and the buttons last, beside the
                 line saying where it goes, so the thumb lands on Send below what it confirms.
@@ -605,19 +599,56 @@
                 </label>
                 <p id="channel-compose-state" class="hint" role="status" aria-live="polite"></p>
               </div>
+              <!--
+                `#410 inline-reply-editor`. Where a reply opened on a row of this column is written: the
+                reply's own box (#reply-compose, moved here while it is open, so there is one box, one
+                Send and one set of rules), drawn IN THE STREAM, directly under the message answered and
+                the replies gathered under it, with the later messages below. The owner, 2026-10-21:
+                "our new Reply interface is just the existing inline-message editor (with Grow button)
+                inserted in the stream." Never a child of a list, whose children are its message rows:
+                web/voice.css draws it under its row by anchor positioning, the row keeping room for it
+                (`placeInlineReply` in web/voice.js), and the column's box above is hidden while it is
+                open, so one box is on screen. Above the box, a Main root's replies, unpacked as the
+                Threads view unpacks a thread. The right column's is #side-reply (`COLUMN_IDS`). Empty
+                and hidden while no reply is open here.
+              -->
+              <div id="column-reply" role="group" aria-label="Reply" hidden>
+                <!-- The reply's box, `#51 reply-view` to `#410 inline-reply-editor`: kept here, hidden with
+                     its place, while no reply is open, and moved, ids and all, into the place of the list
+                     a reply is opened on. There is no reply screen. -->
+                <div id="reply-compose" class="reply-compose">
+                  <!-- Who is being answered, and the id the answer goes to, on the label's line, above the
+                       box: the message itself is the row above, drawn as the list draws it. -->
+                  <div class="reply-label-row">
+                    <label for="reply-text">Your reply</label>
+                    <p id="reply-target-meta" class="hint"></p>
+                  </div>
+                  <textarea id="reply-text" rows="4" placeholder="write a reply"></textarea>
+                  <!-- `#185 reply-new-thread`. Where Send will post, said before it does: a reply goes
+                       where the message it answers is, and starting a new thread from a main-channel
+                       message is a choice offered only where the chat service can do it. -->
+                  <label id="reply-branch-row" class="toggle" hidden>
+                    <input id="reply-branch" type="checkbox" />
+                    Start a new thread from this message
+                  </label>
+                  <p id="reply-destination" class="hint" hidden></p>
+                  <div class="row reply-actions">
+                    <button id="reply-cancel" class="secondary" type="button">Cancel</button>
+                    <button id="reply-send" type="button">Send reply</button>
+                    <!-- `#410 inline-reply-editor`, `#340 composer-grow-box`: the composers' Grow, the one
+                         choice for every box (see #compose-grow). After Send in the markup, so Tab goes from
+                         the box to the buttons first; web/voice.css draws it at the row's start. -->
+                    <label class="composer-grow" title="Let the box grow with what you type or paste, up to about 60% of the window">
+                      <input id="reply-grow" type="checkbox" /> Grow
+                    </label>
+                  </div>
+                  <!-- A send that failed says so HERE, next to the text it did not send, and the text
+                       stays in the box. -->
+                  <p id="reply-state" class="hint" aria-live="polite"></p>
+                </div>
+              </div>
             </div>
           </div>
-
-          <!--
-            `#277 reply-in-column`. Where a reply opened in the LEFT column of two is written: the reply
-            screen's own box (#reply-compose, moved here while it is open, so there is one box, one Send
-            and one set of rules), at the foot of the column under its list. The owner: "Reply in the
-            right column or left column, whichever I clicked the reply button in." Both columns stay on
-            screen as they were; Send or Cancel puts the box back and the column where it was. The right
-            column's is #side-reply, which stands in for this one there (`COLUMN_IDS`). web/voice.css
-            places it only in two columns; empty and hidden otherwise.
-          -->
-          <div id="column-reply" role="group" aria-label="Reply" hidden></div>
 
           <!--
             `#229 desktop-two-column`. The RIGHT COLUMN of the desk's two-column layout: Main stays in
@@ -746,6 +777,9 @@
                   </label>
                   <p id="side-compose-state" class="hint" role="status" aria-live="polite"></p>
                 </div>
+                <!-- `#410 inline-reply-editor`. The right column's place for a reply opened in it, under its
+                     row: see #column-reply. Over the cards, moved into #side-list with the rows there. -->
+                <div id="side-reply" role="group" aria-label="Reply" hidden></div>
               </div>
               <!--
                 `#338 column-overscroll`. Blank room past the foot, under the cards or the thread: the
@@ -757,8 +791,6 @@
               -->
               <div id="side-overscroll" aria-hidden="true"></div>
             </div>
-            <!-- `#277 reply-in-column`. The right column's place for a reply opened in it: see #column-reply. -->
-            <div id="side-reply" role="group" aria-label="Reply" hidden></div>
             <div id="side-tools">
               <button id="side-jump-newest" class="chip" type="button" aria-label="Jump to the newest message" hidden>
                 <svg class="chip-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
@@ -896,71 +928,6 @@
             <button id="collapse-all" class="chip" type="button" hidden>
               <span id="collapse-all-label">Collapse all</span>
             </button>
-          </div>
-        </section>
-
-        <!-- -------------------------------------------------------------------- reply screen -->
-        <!--
-          `#51 reply-view`. A reply is a different ACT from reading, so it gets a screen rather
-          than a box wedged under the channel: the message being answered has to stay legible while
-          you write, and on a phone a text field under a list means the keyboard covers both.
-
-          Every id here is declared in the MARKUP and never created from script. The test fixture
-          derives the page's element set from this file by regex and throws for anything else, so
-          an element invented at runtime fails there rather than silently at the roadside.
-        -->
-        <section id="screen-reply" class="screen" hidden>
-          <!-- `#200 reply-context`. ONE scroll, holding the conversation the message being
-               answered is in: its earlier messages, oldest at the top, then the message itself.
-               It opens at the message, so the context is above it and reached by scrolling up,
-               and the composer below it stays on screen. Contained: reading back must not move
-               the channel behind it, and a flick that reaches the end must not become a page
-               gesture. The rows are built by `renderReplyContext` in web/voice.js.
-
-               `#247 reply-continuity`. The message is drawn as the channel draws its row, at the
-               same size and in the same place: its top stays where it was on the list, and the
-               scroll ends at its foot, so the box sits directly under it. #reply-lead is the room
-               that puts it there when too little came before it to fill the space above. See
-               `placeReplyMessage`. -->
-          <div id="reply-scroll" tabindex="-1" role="region" aria-label="The conversation being answered">
-            <div id="reply-lead" aria-hidden="true"></div>
-            <button id="reply-context-more" class="secondary" type="button" hidden>Load earlier messages</button>
-            <p id="reply-context-state" class="hint" aria-live="polite" hidden></p>
-            <ul id="reply-context" class="messages" aria-label="Earlier messages"></ul>
-            <ul id="reply-target" class="messages" aria-label="The message being answered"></ul>
-          </div>
-          <!-- `#247 reply-continuity`. Everything under the conversation, as one block: on a desk it
-               is held to the reading column the rows above it are, in the type that column is
-               measured in.
-
-               `#277 reply-in-column`. In two columns this block, ids and all, is moved to the foot
-               of the column Reply was pressed in (#column-reply or #side-reply) and back here when
-               the reply closes: the same box whichever screen it is on. It stays the LAST child of
-               this screen, which is where it is put back. -->
-          <div id="reply-compose" class="reply-compose">
-            <!-- Who is being answered, and the id the answer goes to, on the label's line: under the
-                 message rather than between it and the earlier ones, so that the message itself is
-                 drawn exactly as the channel draws it. -->
-            <div class="reply-label-row">
-              <label for="reply-text">Your reply</label>
-              <p id="reply-target-meta" class="hint"></p>
-            </div>
-            <textarea id="reply-text" rows="4" placeholder="write a reply"></textarea>
-            <!-- `#185 reply-new-thread`. Where Send will post, said before it does: a reply goes
-                 where the message it answers is, and starting a new thread from a main-channel
-                 message is a choice offered only where the chat service can do it. -->
-            <label id="reply-branch-row" class="toggle" hidden>
-              <input id="reply-branch" type="checkbox" />
-              Start a new thread from this message
-            </label>
-            <p id="reply-destination" class="hint" hidden></p>
-            <div class="row">
-              <button id="reply-cancel" class="secondary" type="button">Cancel</button>
-              <button id="reply-send" type="button">Send reply</button>
-            </div>
-            <!-- A send that failed says so HERE, next to the text it did not send, and the text
-                 stays in the box. -->
-            <p id="reply-state" class="hint" aria-live="polite"></p>
           </div>
         </section>
 
@@ -2187,10 +2154,10 @@
                 and never saves the page; so does Ctrl+Enter when you are not in a box. In two
                 columns it is the box of the column you are in, or, from the bar or nowhere in
                 particular, of the column with the selected message; from the thread cards, which
-                have no box, it is Main's. A reply open at the foot of a column is that column's box.
+                have no box, it is Main's. With a reply open, it is the reply's, the one box drawn.
                 Ctrl+S used to open the search, which / and the magnifying glass still do. Ctrl+/ (Cmd+/ on a Mac)
                 opens the search from anywhere: in a box with a draft (no slash is typed), on a
-                picker, on Settings, Help or Reply (its draft kept), or with a menu open, single keys
+                picker, on Settings or Help, beside a reply (it stays open), or with a menu open, single keys
                 on or off. Ctrl+? (Cmd+? on a Mac, that is Cmd+Shift+/) opens this list, as ? does;
                 Ctrl+/ used to. Ctrl+1 to Ctrl+4 (Cmd+1 to
                 Cmd+4 on a Mac) choose the four views — Main, All, the thread list and two columns —
@@ -2306,7 +2273,7 @@
               <p class="hint">
                 Your phone's <strong>back gesture</strong>, and the browser's Back, close what is open
                 over the channel one thing at a time, as its own Back or Esc does: a thread, the
-                thread list, the reply screen, Settings, Help or a menu. With nothing open it leaves
+                thread list, a reply, Settings, Help or a menu. With nothing open it leaves
                 the app. Choosing Main, All or two columns adds nothing to go back through.
               </p>
               <p class="hint">
@@ -2334,6 +2301,20 @@
                 reply is not directly below, the message it answers has a small blue circle on its
                 lower-left corner, the other end of the reply's arrow: tap it to go to the reply, and
                 tap again for the next one.
+              </p>
+              <p class="hint">
+                <strong>Replying.</strong> <strong>Reply</strong> opens the reply box in the list,
+                right where you are: the replies the message already has are gathered under it, joined
+                to it by the same bridge as <strong>N replies</strong> (on a thread's first message in
+                Main, its thread's replies), and the box opens under them, with the later messages
+                below it. It is the same box as the one at the foot of the list, with its
+                <strong>Grow</strong> and its <strong>Send</strong>, and that box is hidden while the
+                reply is open, so there is only ever one. <strong>Send reply</strong>, or
+                <kbd>Enter</kbd> if Enter sends, posts it and the reply joins the others under the
+                message; <strong>Cancel</strong> or <kbd>Esc</kbd> keeps what you wrote as a draft on
+                that message and puts the replies back in time order. Reply on another message moves the
+                box there. <kbd>r</kbd> replies to the selected message, and <kbd>c</kbd> or
+                <kbd>Ctrl</kbd>+<kbd>S</kbd> (<kbd>⌘</kbd>+<kbd>S</kbd> on a Mac) go back to the box.
               </p>
               <p class="hint">
                 <strong>Quote reply.</strong> Select some of a message's words (drag over them, or
@@ -2530,17 +2511,16 @@
                 <kbd>Esc</kbd> puts it back. The <strong>×</strong> on the card goes back to the list. The
                 search, Links and the read mode apply to both columns, and <kbd>[</kbd> and
                 <kbd>]</kbd> move the keys between them. <strong>Reply</strong> and <strong>Quote
-                reply</strong> open the reply box at the foot of the column you pressed them in, with
-                the message you are answering edged in the accent where it stands; both columns stay
-                on screen, and <strong>Send reply</strong>, <strong>Cancel</strong> or
-                <kbd>Esc</kbd> puts the column back where it was. Ctrl+1 to Ctrl+3 pressed in that box
+                reply</strong> open the reply box in the list you pressed them in, as they do in one
+                column (see Replying, below); both columns stay on screen. Ctrl+1 to Ctrl+3 pressed in that box
                 put the reply down, its words kept as a draft, as <strong>Cancel</strong> does, and show
                 the view you chose. A reply that does not go says so on
                 the status line, and that column's <strong>Newest</strong> reads <strong>Reply not
                 sent</strong> until you go down to it and its <strong>Retry</strong>. A narrower window
                 shows the view two columns were chosen from — the thread list, or one column as you left
                 it — and keeps the choice for when the window is wide again; a reply you were writing
-                moves to the reply screen with your words.
+                stays open in the one column if its message is there, and otherwise is kept as a draft
+                and opens again, with your words, as soon as its message is on screen.
               </p>
               <p class="hint">
                 When the configured chat provider supports it, the row's <strong>⋯</strong> menu

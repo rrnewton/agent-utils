@@ -3,11 +3,11 @@
 
 `#247 reply-continuity`. The owner: "Reply jumps to a different view with different FONT SIZE. This is
 jarring ... I'd rather the top of the message I press Reply on to stay still on the screen. Expand it
-below and truncate below that (moving up the text entry box underneath)." The fake-DOM suite
-(tests/js/voice_page.test.mjs) holds the rules and the arithmetic, in a model that lays out nothing
-but heights and gives the list and the reply screen one origin. It cannot say what size the words
-are, whether the reply screen's title bar moves the message, or where the box really ends up. This
-does, in the engine.
+below and truncate below that (moving up the text entry box underneath)." Since `#410
+inline-reply-editor` there is no reply screen at all: Reply opens the reply's box in the list, under
+the message, the message staying the row it was. The fake-DOM suite (tests/js/voice_page.test.mjs)
+holds the rules; it lays nothing out, so it cannot say where the box really ends up, or whether the
+message moved. This does, in the engine.
 
 It serves the checked-out page and a small fake API from one loopback origin: a channel of forty
 messages, short and long, from the agent and from another person, one of them a reply and one taller
@@ -15,21 +15,18 @@ than a phone's screen. At a desk (mouse) and a phone (touch), in the dark scheme
 sizes Settings offers, for a message whose top is in the middle of the list, just under where the
 title bar will be, half under the list's top edge, low on the screen, and taller than the screen:
 
-  scroll the row there and measure its top and the computed size of its words -> press its Reply ->
-  the reply screen is up with its tint; the message is drawn at the same size and the same width;
-  its top is where the row's was (within 1px), or at the top of the conversation where the row's
-  was above that; where it fits, the conversation ends at its foot and the box is directly under
-  it; low on the screen it moves up only as far as shows all of it above the box; taller than the
-  screen it keeps its top and the box is still on screen -> Cancel, and the list is back where it
-  was, to the pixel.
+  scroll the row there and measure it -> press its Reply -> still the main screen, the channel's own
+  box hidden, the reply's box open on its tint directly under the row, as wide as the list; the row
+  not moved by a pixel, the row above it neither; low on the screen the list moves up only as far as
+  shows the whole box, and a row taller than the screen goes up as far as shows the box -> Cancel,
+  and nothing moves but the box, which goes: the row where it is, the list where it was before Reply
+  wherever Reply did not move it, the channel's box back.
 
-Then, at 100%: Reply up while the phone is turned and turned back, or the desk window is made
-shorter, taller, narrower and as it was, and after each the message is placed again where
-Reply put it (never above the conversation, the box directly under it where it fits, its top back
-where the row's was at the height Reply opened at, never moved down when the window shrinks) ->
-Reply and Send, and the reply leaves with its
-reference, the message it answers is marked Done (`#256 reply-marks-read`) and the list is at its
-newest, untinted.
+Then, at 100%: Reply open while the phone is turned and turned back, or the desk window is made
+shorter, taller, narrower and as it was, and after each the box is still directly under its row ->
+Reply and Send, and the reply leaves with its reference, the message it answers is marked Done
+(`#256 reply-marks-read`), the box goes and the channel's comes back, and the list has not moved, or,
+sent from the foot of the list, is still at its foot.
 
 Then `#267 quote-reply`: words of a message selected as a reader selects them -- dragged over with
 the mouse at the desk, which neither folds the row nor takes the selection, and left as a long press
@@ -50,12 +47,11 @@ horizontal overflow and no page error at any step.
 
 `#185 reply-new-thread`. Last, at both sizes, a channel where every message heads a thread nobody
 has answered, as on Google Chat: Reply offers "Start a new thread from this message" under the box,
-unticked, inside the window and above Send -> a press ticks it, the title and the note under the box
-say where the reply now goes, the message stays where Reply put it with the box directly under it
-(one low on the screen too), and Send is on screen -> Send posts the reply into that message's
-thread.
+unticked, inside the window and above Send -> a press ticks it, the note under the box says where
+the reply now goes, the message stays where it was with the box directly under it (one low on the
+screen too), and Send is on screen -> Send posts the reply into that message's thread.
 
-Pass --screenshots DIR to keep a PNG of the reply screen for each case; --web-root DIR to run the
+Pass --screenshots DIR to keep a PNG of the open reply for each case; --web-root DIR to run the
 same walk against another copy of the page.
 """
 
@@ -278,42 +274,51 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
-# The row on the list, the message on the reply screen, and what is around each, measured by the
-# engine. `id` is the message's; the list row and the reply screen's row are found by it.
+# The row on the list, the reply's box under it, and what is around each, measured by the engine.
+# `id` is the message's; its row is found by it.
 MEASURE_JS = """(id) => {
   const box = (node) => {
     if (!node || !node.getClientRects().length) return null;
     const r = node.getBoundingClientRect();
     return {top: r.top, bottom: r.bottom, left: r.left, right: r.right, width: r.width, height: r.height};
   };
-  const shown = (name) => !document.getElementById(`screen-${name}`).hidden;
   const row = [...document.querySelectorAll('#discord-log > li[data-id]')].find((li) => li.dataset.id === id);
-  const target = document.querySelector('#reply-target > li');
   const words = (li) => li ? li.querySelector('.body .md') || li.querySelector('.body') : null;
   const size = (li) => words(li) ? parseFloat(getComputedStyle(words(li)).fontSize) : null;
   const area = document.getElementById('scroll-area');
-  const pane = document.getElementById('reply-scroll');
+  const mount = document.getElementById('column-reply');
   const page = getComputedStyle(document.body).backgroundColor;
   return {
-    screen: shown('reply') ? 'reply' : shown('main') ? 'main' : null,
+    open: !mount.hidden && mount.getClientRects().length > 0,
+    main: !document.getElementById('screen-main').hidden,
+    composer: !document.getElementById('channel-composer').hidden,
     row: box(row), rowSize: size(row), rowWords: box(words(row)),
     above: box(row ? row.previousElementSibling : null),
-    contextAbove: box(document.querySelector('#reply-context > li:last-child')),
-    target: box(target), targetSize: size(target), targetWords: box(words(target)),
-    targetId: target ? target.dataset.id : null,
-    targetClamped: target ? !!target.querySelector('.body.clamped') : null,
+    mount: box(mount), log: box(document.getElementById('discord-log')),
     list: box(area), listTop: area.scrollTop, listMax: area.scrollHeight - area.clientHeight,
-    pane: box(pane), fit: pane.getAttribute('data-fit'),
-    paneScrolls: pane.scrollHeight > pane.clientHeight + 1,
+    // The list's foot less what floats over it, the chips and the status line, as the page reckons it.
+    foot: area.getBoundingClientRect().bottom - ['scroll-tools', 'status-line'].reduce((room, name) => {
+      const over = document.getElementById(name);
+      return room + (over && !over.hidden ? over.getBoundingClientRect().height : 0);
+    }, 0),
     text: box(document.getElementById('reply-text')),
     send: box(document.getElementById('reply-send')),
-    tint: getComputedStyle(document.getElementById('frame-body')).backgroundColor,
+    tint: getComputedStyle(mount).backgroundColor,
     page,
     scale: getComputedStyle(document.documentElement).getPropertyValue('--msg-scale').trim(),
     overflow: document.scrollingElement.scrollWidth - window.innerWidth,
     height: window.innerHeight,
   };
 }"""
+
+OPEN = "() => !document.getElementById('column-reply').hidden"
+CLOSED = "() => document.getElementById('column-reply').hidden"
+# The gap the stylesheet leaves between a row and the box under it, and what a pixel either way allows.
+UNDER_PX = (0, 8)
+# How near its foot a list counts as at its foot, as web/voice.js's `BOTTOM_SLACK_PX` says.
+FOOT_SLACK_PX = 24
+# How far a row's header line can change when Done redraws it read: one line of the header's type.
+DONE_REDRAW_PX = 24
 
 
 def check(condition: bool, message_text: str) -> None:
@@ -422,6 +427,16 @@ class Walk:
         return self.measure(index)
 
 
+def check_under(walk: Walk, measured: Measured, case: str) -> None:
+    """The reply's box is open directly under the row, as wide as the list's rows, the channel's box hidden."""
+    row, mount = measured.box("row"), measured.box("mount")
+    gap = mount["top"] - row["bottom"]
+    walk.check(UNDER_PX[0] - 1 <= gap <= UNDER_PX[1] + 1, f"{case}: the box is {gap:.1f}px under its row, not directly under it")
+    walk.check(measured.found["composer"] is False, f"{case}: the channel's box is drawn beside the reply's")
+    walk.check(measured.text("tint") != measured.text("page") and measured.text("tint") not in ("", "rgba(0, 0, 0, 0)"),
+               f"{case}: the reply's box is not tinted: {measured.text('tint')} on {measured.text('page')}")
+
+
 def reply_case(walk: Walk, index: int, y: float, case: str, scale: int) -> None:
     """Reply on message `index` with its row's top at `y`: what moved, then Cancel and what came back."""
     before = walk.place(index, y)
@@ -439,62 +454,52 @@ def reply_case(walk: Walk, index: int, y: float, case: str, scale: int) -> None:
         walk.press(button)
     else:
         walk.page.evaluate("(selector) => document.querySelector(selector).click()", button)
-    walk.wait_for("() => !document.getElementById('screen-reply').hidden", f"{case}: the reply screen did not open")
+    walk.wait_for(OPEN, f"{case}: Reply did not open the box in the list")
     walk.settled()
     after = walk.measure(index)
-    target, pane, text = after.box("target"), after.box("pane"), after.box("text")
-    walk.check(after.text("targetId") == message_id(index), f"{case}: the reply screen answers {after.text('targetId')}")
-    # The same words at the same size, as wide as they were.
-    walk.check(abs(after.number("targetSize") - before.number("rowSize")) < 0.01,
-               f"{case}: the words are {after.number('targetSize')}px on Reply and {before.number('rowSize')}px on the list")
-    walk.check(abs(target["left"] - row["left"]) <= 1 and abs(target["width"] - row["width"]) <= 1,
-               f"{case}: the message is {target['left']:.1f}+{target['width']:.1f} wide on Reply, "
-               f"{row['left']:.1f}+{row['width']:.1f} on the list")
-    walk.check(after.found["targetClamped"] is False, f"{case}: the message being answered is folded")
-    # The tint, and the page's own colour under it.
-    walk.check(after.text("tint") != after.text("page") and after.text("tint") not in ("", "rgba(0, 0, 0, 0)"),
-               f"{case}: the reply screen is not tinted: {after.text('tint')} on {after.text('page')}")
-    # The box is on the screen, under the message's conversation.
-    walk.check(text["top"] >= pane["bottom"] - 1 and after.box("send")["bottom"] <= after.number("height") + 1,
-               f"{case}: the box is not on screen under the conversation: {text} {pane}")
-    expected = max(row["top"], pane["top"])
+    walk.check(after.found["main"] is True, f"{case}: Reply left the main screen")
+    moved_row = after.box("row")
+    # The same row, at the same size and width: nothing about it changed.
+    walk.check(abs(after.number("rowSize") - before.number("rowSize")) < 0.01, f"{case}: the words changed size")
+    walk.check(abs(moved_row["left"] - row["left"]) <= 1 and abs(moved_row["width"] - row["width"]) <= 1,
+               f"{case}: the row is {moved_row['left']:.1f}+{moved_row['width']:.1f} wide with Reply open, "
+               f"{row['left']:.1f}+{row['width']:.1f} before")
+    check_under(walk, after, case)
+    mount = after.box("mount")
+    log = after.box("log")
+    walk.check(abs(mount["left"] - log["left"]) <= 1 and abs(mount["right"] - log["right"]) <= 1,
+               f"{case}: the box is not as wide as the list its row is in: {mount} {log}")
     if case == "low":
-        # Moved up only as far as shows all of it over the box.
-        walk.check(target["bottom"] <= pane["bottom"] + 1 and abs(target["bottom"] - pane["bottom"]) <= 1,
-                   f"{case}: the message does not end directly over the box: {target} {pane}")
-        walk.check(target["top"] < row["top"], f"{case}: the message did not move up, so this asks nothing: {target}")
-        walk.check(target["height"] <= pane["height"] + 1, f"{case}: the message is taller than the room")
-    elif case == "tall":
-        walk.check(target["height"] > pane["height"], f"{case}: the message is not taller than the screen: {target} {pane}")
-        walk.check(abs(target["top"] - expected) <= 1, f"{case}: a tall message's top moved from {row['top']:.1f} to {target['top']:.1f}")
-        walk.check(after.found["fit"] is None and after.found["paneScrolls"] is True,
-                   f"{case}: the rest of the message is not a scroll down in the whole room: {after.found}")
+        # Moved up only as far as shows the whole box over the chips at the foot.
+        walk.check(moved_row["top"] < row["top"], f"{case}: the list did not move up, so this asks nothing: {moved_row}")
+        walk.check(abs(mount["bottom"] - after.number("foot")) <= 2,
+                   f"{case}: the list did not move up just as far as shows the box: {mount} foot {after.number('foot')}")
+    elif abs(moved_row["top"] - row["top"]) <= 1:
+        walk.check(mount["bottom"] <= after.number("foot") + 1, f"{case}: the box is under the foot of the list: {mount}")
     else:
-        walk.check(abs(target["top"] - expected) <= 1,
-                   f"{case}: the message's top moved from {row['top']:.1f} (kept at {expected:.1f}) to {target['top']:.1f}")
-        walk.check(after.found["fit"] == "message" and abs(pane["bottom"] - target["bottom"]) <= 1,
-                   f"{case}: the conversation does not end at the message's foot: {target} {pane} {after.found['fit']}")
-        walk.check(abs(after.box("targetWords")["top"] - before.box("rowWords")["top"] - (target["top"] - row["top"])) <= 1,
-                   f"{case}: the words moved inside the message: {after.box('targetWords')} {before.box('rowWords')}")
+        # A row whose box would be under the foot (a tall one, open): up just as far as shows the box.
+        walk.check(moved_row["top"] < row["top"], f"{case}: the row moved down: {row} -> {moved_row}")
+        walk.check(abs(mount["bottom"] - after.number("foot")) <= 2,
+                   f"{case}: the row moved from {row['top']:.1f} to {moved_row['top']:.1f}, more than shows the box")
     if case == "middle":
-        # What came before it is where it was too: the earlier message over it, drawn as the list drew it.
-        above, context_above = before.box("above"), after.box("contextAbove")
-        walk.check(abs(context_above["top"] - above["top"]) <= 1 and abs(context_above["height"] - above["height"]) <= 1,
-                   f"{case}: the message above moved from {above} to {context_above}")
+        above, now_above = before.box("above"), after.box("above")
+        walk.check(abs(now_above["top"] - above["top"]) <= 1, f"{case}: the row above moved from {above} to {now_above}")
     walk.check(after.number("overflow") <= 0, f"{case}: the page scrolls sideways")
     walk.shot(f"{scale}-{case}")
-    moved = target["top"] - row["top"]
-    # Cancel, and the list is where it was.
+    moved = moved_row["top"] - row["top"]
+    # Cancel, and nothing moves but the box, which goes: the row is where it is, and so the list is where
+    # it was before Reply wherever Reply did not have to move it to show the box.
     walk.press("#reply-cancel")
-    walk.wait_for("() => !document.getElementById('screen-main').hidden", f"{case}: Cancel did not go back")
+    walk.wait_for(CLOSED, f"{case}: Cancel did not put the box away")
     walk.settled()
     back = walk.measure(index)
-    walk.check(abs(back.number("listTop") - list_top) <= 1, f"{case}: Cancel came back to {back.number('listTop')}, not {list_top}")
-    walk.check(abs(back.box("row")["top"] - row["top"]) <= 1, f"{case}: after Cancel the row is at {back.box('row')['top']}, not {row['top']}")
-    walk.check(back.text("tint") == back.text("page") or back.text("tint") == "rgba(0, 0, 0, 0)",
-               f"{case}: the tint outlived the reply screen: {back.text('tint')}")
-    walk.notes.append(f"{scale}% {case}: words {after.number('targetSize'):.2f}px both, top {row['top']:.1f} -> "
-                      f"{target['top']:.1f} ({moved:+.1f})")
+    walk.check(abs(back.box("row")["top"] - moved_row["top"]) <= 1,
+               f"{case}: Cancel moved the row from {moved_row['top']:.1f} to {back.box('row')['top']:.1f}")
+    if case not in ("low", "tall"):
+        walk.check(abs(back.number("listTop") - list_top) <= 1, f"{case}: Cancel came back to {back.number('listTop')}, not {list_top}")
+    walk.check(back.found["composer"] is True, f"{case}: Cancel did not bring the channel's box back")
+    walk.notes.append(f"{scale}% {case}: the box {mount['top'] - moved_row['bottom']:.1f}px under the row, the row "
+                      f"{row['top']:.1f} -> {moved_row['top']:.1f} ({moved:+.1f})")
 
 
 def continuity_walk(walk: Walk, scales: tuple[int, ...]) -> None:
@@ -522,30 +527,21 @@ def continuity_walk(walk: Walk, scales: tuple[int, ...]) -> None:
 
 
 def open_reply(walk: Walk, index: int, y: float, case: str) -> Measured:
-    """Scroll message `index`'s row to `y` and press its Reply by the button itself; the reply screen, measured."""
+    """Scroll message `index`'s row to `y` and press its Reply by the button itself; the open reply, measured."""
     walk.place(index, y)
     walk.page.evaluate("(selector) => document.querySelector(selector).click()",
                        f"#discord-log > li[data-id='{message_id(index)}'] .reply-button")
-    walk.wait_for("() => !document.getElementById('screen-reply').hidden", f"{case}: the reply screen did not open")
+    walk.wait_for(OPEN, f"{case}: Reply did not open the box in the list")
     walk.settled()
     return walk.measure(index)
 
 
 def resize_case(walk: Walk, sizes: tuple[tuple[int, int], ...]) -> None:
-    """A window resized, or a phone turned and back, while Reply is up: the message placed again where Reply put it.
-
-    After each size the message is never above the conversation's top; where it fits, the
-    conversation ends at its foot with the box directly under it (nothing clipped, no gap); at a
-    height at least the one Reply opened at, its top is back where the row's was; and a window made
-    shorter never moves it down.
-    """
+    """A window resized, or a phone turned and back, while Reply is open: the box still directly under its row."""
     index = 30
     list_box = walk.measure(index).box("list")
     before = open_reply(walk, index, list_box["top"] + list_box["height"] * 0.4, "resize")
-    walk.check(before.found["fit"] == "message", f"resize: the message did not fit to begin with: {before.found}")
-    opened = walk.page.viewport_size
-    assert opened is not None
-    first = before.box("target")["top"]
+    check_under(walk, before, "resize")
     path: list[str] = []
     for width, height in sizes:
         was = walk.page.viewport_size
@@ -554,44 +550,31 @@ def resize_case(walk: Walk, sizes: tuple[tuple[int, int], ...]) -> None:
         walk.settled()
         walk.page.wait_for_timeout(120)
         after = walk.measure(index)
-        target, pane, text = after.box("target"), after.box("pane"), after.box("text")
-        old_target, old_pane = before.box("target"), before.box("pane")
         size = f"{was['width']}x{was['height']} -> {width}x{height}"
-        walk.check(target["top"] >= pane["top"] - 1, f"resize {size}: the message is above the conversation: {target} {pane}")
-        if after.found["fit"] == "message":
-            walk.check(abs(target["bottom"] - pane["bottom"]) <= 1,
-                       f"resize {size}: the conversation does not end at the message's foot: {target} {pane}")
-        else:
-            walk.check(target["height"] > pane["height"],
-                       f"resize {size}: a message the room holds was left unfitted: {target} {pane}")
-        walk.check(text["top"] >= pane["bottom"] - 1, f"resize {size}: the box is not under the conversation: {text} {pane}")
-        offset, old_offset = target["top"] - pane["top"], old_target["top"] - old_pane["top"]
-        if height >= opened["height"] and after.found["fit"] == "message":
-            walk.check(abs(target["top"] - first) <= 1,
-                       f"resize {size}: the message is at {target['top']:.1f}, not back where Reply put it ({first:.1f})")
-        if height < was["height"]:
-            walk.check(offset <= old_offset + 1, f"resize {size}: a shorter window moved the message down: {old_offset:.1f} -> {offset:.1f}")
+        walk.check(after.found["open"] is True, f"resize {size}: the reply went")
+        check_under(walk, after, f"resize {size}")
         walk.check(after.number("overflow") <= 0, f"resize {size}: the page scrolls sideways")
-        path.append(f"{width}x{height} top {target['top']:.1f} ({target['top'] - first:+.1f})")
-        before = after
+        path.append(f"{width}x{height} {after.box('mount')['top'] - after.box('row')['bottom']:.1f}px under")
     walk.shot("resized")
     walk.press("#reply-cancel")
-    walk.wait_for("() => !document.getElementById('screen-main').hidden", "resize: Cancel did not go back")
+    walk.wait_for(CLOSED, "resize: Cancel did not put the box away")
     walk.settled()
-    walk.notes.append(f"resized on Reply, opened with the top at {first:.1f}: " + ", ".join(path))
+    walk.notes.append("resized with Reply open, the box under its row: " + ", ".join(path))
 
 
 def send_case(walk: Walk) -> None:
-    """Send behaves as it did: the reply leaves with its reference, and the list is at its newest, untinted.
-    The message answered is marked Done, on the row and on the server (`#256 reply-marks-read`)."""
+    """Send: the reply leaves with its reference, the box goes and the channel's comes back, and the list does
+    not move. The message answered is marked Done, on the row and on the server (`#256 reply-marks-read`)."""
     index = 31
     list_box = walk.measure(index).box("list")
-    open_reply(walk, index, list_box["top"] + list_box["height"] * 0.4, "send")
+    opened = open_reply(walk, index, list_box["top"] + list_box["height"] * 0.4, "send")
     words = "on it, from the reply continuity check"
     walk.page.fill("#reply-text", words)
     sent = len(walk.api.replies)
+    # Whether the list is at its foot as Send is pressed, by the page's own reckoning of the foot.
+    footed = walk.page.evaluate(f"() => atBottom(document.getElementById('scroll-area'), {FOOT_SLACK_PX})")
     walk.press("#reply-send")
-    walk.wait_for("() => !document.getElementById('screen-main').hidden", "send: Send did not go back to the list")
+    walk.wait_for(CLOSED, "send: Send did not put the box away")
     walk.wait_for(f"() => document.querySelectorAll('#discord-log > li[data-id]').length === {COUNT + 1}",
                   "send: the sent reply never reached the list")
     walk.settled()
@@ -606,11 +589,22 @@ def send_case(walk: Walk) -> None:
         done = set(walk.api.dismissed)
     walk.check(done == {message_id(index)}, f"send: the server holds {sorted(done)} as Done, not the message answered")
     after = walk.measure(index)
-    walk.check(after.number("listTop") >= after.number("listMax") - 2,
-               f"send: the list is at {after.number('listTop')}, not its newest ({after.number('listMax')})")
-    walk.check(after.text("tint") == after.text("page") or after.text("tint") == "rgba(0, 0, 0, 0)",
-               f"send: the tint outlived the reply screen: {after.text('tint')}")
-    walk.notes.append("Send posted the reply to its message, marked that message Done, and left the list at its newest")
+    if footed:
+        # Sent from the foot of the list, the reader is kept at its foot, where the reply lands.
+        walk.check(after.number("listTop") >= after.number("listMax") - 2,
+                   f"send: from the foot, the list is at {after.number('listTop')}, not its foot ({after.number('listMax')})")
+    else:
+        # Where the row is in the list's own box: the line a status takes over the list (`#324
+        # live-pill-covers-row`) may move the box itself, as it does with no reply. The Done the reply
+        # makes redraws the answered row as read, a phone's folded header one line shorter (`#377
+        # compact-collapsed-rows`), and Done keeps the reader's place by the rows around it as any Done
+        # does (`markRowDone`): the row may move by that line, and no further.
+        was = opened.box("row")["top"] - opened.box("list")["top"]
+        now = after.box("row")["top"] - after.box("list")["top"]
+        walk.check(abs(now - was) <= DONE_REDRAW_PX, f"send: the row moved in the list from {was:.1f} to {now:.1f}")
+    walk.check(after.found["composer"] is True, "send: the channel's box did not come back")
+    walk.notes.append("Send posted the reply to its message, marked that message Done, and moved nothing "
+                      "but a reader at the foot, kept at it")
 
 
 # The new-thread box and what is around it, measured by the engine. `#185 reply-new-thread`.
@@ -625,7 +619,6 @@ BRANCH_JS = """() => {
     checked: document.getElementById('reply-branch').checked,
     note: document.getElementById('reply-destination').hidden ? null
       : document.getElementById('reply-destination').textContent,
-    title: document.getElementById('topbar-title').textContent,
     width: window.innerWidth,
   };
 }"""
@@ -660,7 +653,7 @@ STATE_JS = """(id) => {
   return {
     selected: String(getSelection()), label: reply.textContent, quote: reply.getAttribute('data-quote'),
     color: getComputedStyle(reply).color, collapsed: row.getAttribute('data-collapsed'),
-    lit: row.getAttribute('data-selected'), screen: document.getElementById('screen-reply').hidden ? 'main' : 'reply',
+    lit: row.getAttribute('data-selected'), screen: document.getElementById('column-reply').hidden ? 'main' : 'reply',
     value: box.value, caret: box.selectionStart, focused: document.activeElement === box,
     replyRight: r.right, rowRight: li.right, overflow: document.scrollingElement.scrollWidth - window.innerWidth,
     draft: !row.querySelector('.draft-marker').hidden,
@@ -698,11 +691,10 @@ def new_thread_walk(walk: Walk) -> None:
     open_reply(walk, low, list_box["top"] + list_box["height"] * 0.86, "new-thread low")
     tick_branch(walk, "new-thread low")
     after = walk.measure(low)
-    walk.check(after.found["fit"] == "message" and abs(after.box("pane")["bottom"] - after.box("target")["bottom"]) <= 1,
-               f"new-thread low: ticked, the message's foot is not at the box: {after.box('target')} {after.box('pane')}")
+    check_under(walk, after, "new-thread low")
     walk.check(after.box("send")["bottom"] <= after.number("height") + 1, "new-thread low: ticked, Send is below the window")
     walk.press("#reply-cancel")
-    walk.wait_for("() => !document.getElementById('screen-main').hidden", "new-thread low: Cancel did not go back")
+    walk.wait_for(CLOSED, "new-thread low: Cancel did not put the box away")
     walk.settled()
 
     index = 30
@@ -721,15 +713,11 @@ def new_thread_walk(walk: Walk) -> None:
     tick_branch(walk, "new-thread")
     ticked = branch_state(walk)
     after = walk.measure(index)
-    target, pane = after.box("target"), after.box("pane")
-    walk.check(ticked.text("title").startswith("Reply · New thread"),
-               f"new-thread: the title did not follow the box: {ticked.text('title')!r}")
     walk.check(ticked.text("note") == "Posts in a new thread on this message, as its first reply.",
                f"new-thread: ticked, the note says {ticked.found['note']!r}")
-    walk.check(abs(target["top"] - opened.box("target")["top"]) <= 1,
-               f"new-thread: ticking moved the message from {opened.box('target')['top']:.1f} to {target['top']:.1f}")
-    walk.check(after.found["fit"] == "message" and abs(pane["bottom"] - target["bottom"]) <= 1,
-               f"new-thread: ticked, the conversation does not end at the message's foot: {target} {pane}")
+    walk.check(abs(after.box("row")["top"] - opened.box("row")["top"]) <= 1,
+               f"new-thread: ticking moved the message from {opened.box('row')['top']:.1f} to {after.box('row')['top']:.1f}")
+    check_under(walk, after, "new-thread")
     walk.check(after.box("send")["bottom"] <= after.number("height") + 1,
                f"new-thread: ticked, Send is below the window: {after.box('send')}")
     walk.check(after.number("overflow") <= 0, "new-thread: the page scrolls sideways")
@@ -737,13 +725,13 @@ def new_thread_walk(walk: Walk) -> None:
     page.fill("#reply-text", "the first answer in its thread, from the reply continuity check")
     sent = len(walk.api.replies)
     walk.press("#reply-send")
-    walk.wait_for("() => !document.getElementById('screen-main').hidden", "new-thread: Send did not go back to the list")
+    walk.wait_for(CLOSED, "new-thread: Send did not put the box away")
     posted = walk.posted_since(sent, "new-thread")
     walk.check(len(posted) == 1 and posted[0].get("thread_id") == thread_of(message_id(index))
                and posted[0].get("reply_to") == message_id(index),
                f"new-thread: what left the browser was {posted}")
     walk.notes.append(f"the new-thread box {row['width']:.0f}x{row['height']:.0f} between the reply box and Send; "
-                      f"ticked, the title and note followed, the message stayed, and Send posted into its thread")
+                      f"ticked, the note followed, the message stayed, and Send posted into its thread")
 
 
 def quote_text(selected: str) -> str:
@@ -809,13 +797,13 @@ def quote_case(walk: Walk) -> None:
     if not walk.touch:
         # r on the selected message, the selection inside it: the quote, the box focused.
         page.keyboard.press("r")
-        walk.wait_for("() => !document.getElementById('screen-reply').hidden", "quote: r did not open the reply")
+        walk.wait_for(OPEN, "quote: r did not open the reply")
         walk.settled()
         keyed = state()
         walk.check(keyed["value"] == expected and keyed["focused"] is True and keyed["caret"] == len(expected),
                    f"quote: r did not quote {expected!r}: {keyed}")
         walk.press("#reply-cancel")
-        walk.wait_for("() => !document.getElementById('screen-main').hidden", "quote: Cancel did not go back")
+        walk.wait_for(CLOSED, "quote: Cancel did not put the box away")
         walk.settled()
         cancelled = state()
         walk.check(cancelled["draft"] is False, f"quote: an untouched quote was kept as a draft: {cancelled}")
@@ -836,13 +824,13 @@ def quote_case(walk: Walk) -> None:
     else:
         # Tapped as Chromium does it, the selection kept through the tap.
         walk.press(f"#discord-log > li[data-id='{row_id}'] .reply-button")
-        walk.wait_for("() => !document.getElementById('screen-reply').hidden", "quote: the tap did not open the reply")
+        walk.wait_for(OPEN, "quote: the tap did not open the reply")
         walk.settled()
         tapped = state()
         walk.check(tapped["value"] == expected and tapped["focused"] is True and tapped["caret"] == len(expected),
                    f"quote: the tap did not quote {expected!r}: {tapped}")
         walk.press("#reply-cancel")
-        walk.wait_for("() => !document.getElementById('screen-main').hidden", "quote: Cancel did not go back")
+        walk.wait_for(CLOSED, "quote: Cancel did not put the box away")
         walk.settled()
         # Over the blank line between two paragraphs, and a phone that clears it as the finger lands.
         two = message_id(PARAGRAPHS)
@@ -862,7 +850,7 @@ def quote_case(walk: Walk) -> None:
         walk.check("\n>\n" in expected, f"quote: the selection has no blank line to quote: {expected!r}")
         row_id = two
     walk.press(f"#discord-log > li[data-id='{row_id}'] .reply-button")
-    walk.wait_for("() => !document.getElementById('screen-reply').hidden", "quote: Quote reply did not open the reply")
+    walk.wait_for(OPEN, "quote: Quote reply did not open the reply")
     walk.settled()
     opened = state()
     walk.check(opened["value"] == expected, f"quote: the box holds {opened['value']!r}, not {expected!r}")
@@ -872,7 +860,7 @@ def quote_case(walk: Walk) -> None:
     page.keyboard.type("agreed")
     sent = len(walk.api.replies)
     walk.press("#reply-send")
-    walk.wait_for("() => !document.getElementById('screen-main').hidden", "quote: Send did not go back to the list")
+    walk.wait_for(CLOSED, "quote: Send did not put the box away")
     walk.settled()
     posted = walk.posted_since(sent, "quote")
     walk.check(len(posted) == 1 and posted[0].get("text") == f"{expected}agreed" and posted[0].get("reply_to") == row_id,
@@ -918,14 +906,14 @@ def triple_click_case(walk: Walk, list_box: dict[str, float]) -> None:
     walk.check(next_row == "Reply", f"triple-click: the next message's Reply reads {next_row!r}")
     expected = quote_text(str(selected))
     walk.press(f"#discord-log > li[data-id='{row_id}'] .reply-button")
-    walk.wait_for("() => !document.getElementById('screen-reply').hidden", "triple-click: Quote reply did not open the reply")
+    walk.wait_for(OPEN, "triple-click: Quote reply did not open the reply")
     walk.settled()
     opened: object = page.evaluate(STATE_JS, row_id)
     assert isinstance(opened, dict)
     walk.check(opened["value"] == expected == f"> Message {single}: checked.\n\n",
                f"triple-click: the box holds {opened['value']!r}, not {expected!r}")
     walk.press("#reply-cancel")
-    walk.wait_for("() => !document.getElementById('screen-main').hidden", "triple-click: Cancel did not go back")
+    walk.wait_for(CLOSED, "triple-click: Cancel did not put the box away")
     walk.settled()
     where = "the next row" if ended["row"] != row_id else "its own row, outside the words" if not ended["inBody"] else "its words"
     walk.notes.append(f"a triple-click's paragraph, its range ending in {where}, was offered and quoted")

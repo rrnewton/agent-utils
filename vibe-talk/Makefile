@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser pairing-link-browser offline-cache-browser reactions-browser system-bots-browser edited-mark-browser rich-headers-browser read-aloud-browser read-aloud-blocks-browser post-confirm-browser approval-card-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser search-chord-browser composer-key-browser command-bar-browser two-column-browser desktop-layout-browser bookmark-browser reply-continuity-browser reply-in-column-browser reply-marks-read-browser done-sync-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser composer-grow-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser thread-card-header-browser thread-header-collapse-browser threads-unpack-browser thread-line-browser empty-messages-browser all-thread-strip-browser scroll-stability-browser copy-message-browser open-upstream-link-browser thread-hue-spread-browser fold-steps-browser back-gesture-browser live-pill-browser stale-live-read-browser provider-groups-browser voice-reconnect-browser live-relay-check-self-test live-relay-check channel-search-browser column-overscroll-browser channel-box-browser
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page pwa-installability enter-to-send-browser pairing-link-browser offline-cache-browser reactions-browser system-bots-browser edited-mark-browser rich-headers-browser read-aloud-browser read-aloud-blocks-browser post-confirm-browser approval-card-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser search-chord-browser composer-key-browser command-bar-browser two-column-browser desktop-layout-browser bookmark-browser reply-continuity-browser inline-reply-browser reply-marks-read-browser done-sync-browser voice-read-acceptance-self-test android-speech-self-test live-hint-adapter-self-test container-smoke filter-place-browser search-dates-browser voice-composer-browser composer-grow-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser thread-card-header-browser thread-header-collapse-browser threads-unpack-browser thread-line-browser empty-messages-browser all-thread-strip-browser scroll-stability-browser copy-message-browser open-upstream-link-browser thread-hue-spread-browser fold-steps-browser back-gesture-browser live-pill-browser stale-live-read-browser provider-groups-browser voice-reconnect-browser live-relay-check-self-test live-relay-check channel-search-browser column-overscroll-browser channel-box-browser
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -564,29 +564,21 @@ search-dates-browser:
 	python3 tests/search_dates_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#247 reply-continuity` in a real Chromium at 1280x800 (mouse) and 412x915 (touch), at 80%, 100% and
-# 130% text: Reply on a message in the middle of the list, just under where the title bar goes, half
-# under the list's top edge, low on the screen, a reply in its gutter, and one taller than the screen.
-# The words are the list's size and width, the message's top stays where the row's was (within 1px) or
-# at the top, the box comes up directly under it, a low one moves up only as far as shows it, and
-# Cancel comes back to the pixel; the reply screen is tinted in the dark scheme and the light. Pass
+# 130% text: Reply on a message in the middle of the list, just under the list's top, half under its top
+# edge, low on the screen, a reply in its gutter, and one taller than the screen. Since `#410
+# inline-reply-editor` the reply opens in the list: the row is not moved (a low one only as far as shows
+# the box), the box directly under it on its tint, and Cancel moves nothing but the box. Pass
 # WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each.
 reply-continuity-browser:
 	python3 tests/reply_continuity_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
-# `#277 reply-in-column` in a real Chromium at 1280x800, in two columns: Reply and Quote reply (words
-# dragged over with the mouse) pressed in each column open the reply box at the foot of that column, both
-# columns staying where they were to the pixel and the message answered edged and unmoved; Escape, Cancel,
-# Send and Enter put the box back and the column where it was, the keys on its list, a sent reply posted
-# where the reply screen posts it; a message low in a column moves up only as far as shows it over the
-# box; a window narrowed to one column hands an open reply to the reply screen with its words, and
-# `#314 reply-focus-flake` with the focus in its box even where the page's frame comes after the browser
-# has taken the focus off it (the page's frames held back, in each column); `#281
-# view-keys`: real Ctrl+4 in an open reply leaves it, and Ctrl+2 and Ctrl+3 show All and the thread list
-# with the reply put down, its words kept; and one column is the reply screen, as it was. Pass
-# WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep a PNG of each
-# open reply.
-reply-in-column-browser:
-	python3 tests/reply_in_column_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
+# `#410 inline-reply-editor` in a real Chromium at 1280x800 in two columns and one, and 393x852 by touch:
+# Reply opens the reply's box in the stream, under the message and the replies gathered under it, later
+# rows below, one message box on screen; Grow, Send, Cancel, a refused reply, the view keys, and two
+# columns collapsing with a reply open. Pass WEB_ROOT=dir to run it against another copy of the page, and
+# SCREENSHOTS=dir to keep a PNG of each open reply.
+inline-reply-browser:
+	python3 tests/inline_reply_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#300 reply-marks-read` in a real Chromium at 1280x800, in two columns: a Reply docked in either column
 # and the first reply typed in a new thread's box mark what they answer read — Done on the server, the

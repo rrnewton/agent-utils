@@ -1202,23 +1202,23 @@ steps:
       rss_baseline_bytes: 1073741824
 
   # `#247 reply-continuity` in the browser engine, at 1280x800 with a mouse and at 412x915 by touch, at
-  # 80%, 100% and 130% text: Reply on a message in the middle of the list, just under where the title
-  # bar goes, half under the list's top edge, low on the screen, a reply in its gutter, and one taller
-  # than the screen. Its words are the list's computed size and width, its top stays where the row's was
-  # (within 1px) or is clamped to the top, the box comes up directly under it, a low one moves up only as
-  # far as shows it whole, a tall one keeps its top, and Cancel comes back to the pixel; the reply screen
-  # is tinted in the dark scheme and the light. Measured on 2026-10-12: about 18s wall. `#185
-  # reply-new-thread` added two short runs at both sizes on a channel whose messages each head an empty
-  # thread: "Start a new thread" offered between the box and Send, ticking it keeping the message where
-  # Reply put it (one low on the screen too), and Send posting into the message's thread. With them:
-  # about 27s wall. And `#267 quote-reply`: words selected by a mouse drag, a triple-click or as a long
-  # press leaves them make Reply "Quote reply", and r or a tap opens the reply with them quoted and the
-  # caret under them; on a phone at 393 and 360 wide, on long names and reply counts, the label moves
-  # no row's words ("Quote" at Reply's width where "Quote reply" would wrap the header line). With it:
-  # about 38s wall.
+  # 80%, 100% and 130% text: Reply on a message in the middle of the list, just under the list's top,
+  # half under its top edge, low on the screen, a reply in its gutter, and one taller than the screen.
+  # Since `#410 inline-reply-editor` the reply opens in the list: the row is not moved (a low one only
+  # as far as shows the box whole, a tall one up as far as shows it too), the reply's box is
+  # directly under it on its tint, as wide as the list, the channel's box hidden, and Cancel moves
+  # nothing but the box. A resize keeps the box under its row; Send posts and marks the message Done
+  # without moving the list. `#185 reply-new-thread` added two short runs at both sizes on a channel
+  # whose messages each head an empty thread: "Start a new thread" offered between the box and Send,
+  # ticking it keeping the message where it was, and Send posting into the message's thread. And `#267
+  # quote-reply`: words selected by a mouse drag, a triple-click or as a long press leaves them make
+  # Reply "Quote reply", and r or a tap opens the reply with them quoted and the caret under them; on a
+  # phone at 393 and 360 wide, on long names and reply counts, the label moves no row's words ("Quote"
+  # at Reply's width where "Quote reply" would wrap the header line). Measured on 2026-10-21: about 40s
+  # wall.
   - group: check
     job: reply-continuity-browser
-    desc: the replied message kept at the list's size and place, the box under it, the tint, and Quote reply, in current Chromium at 1280x800 and 412x915, and Quote reply moving no row at 393 and 360 wide
+    desc: Reply opening under the message in the list without moving it, the box under its row through a resize, Send and Cancel moving nothing, and Quote reply, in current Chromium at 1280x800 and 412x915, and Quote reply moving no row at 393 and 360 wide
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/reply_continuity_browser.py
     jobs_flag: ""
@@ -1226,35 +1226,31 @@ steps:
     cpu_timeout: 110
     hint:
       resources: {browser: 1}
-      est_duration_s: 38
+      est_duration_s: 40
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
-  # `#277 reply-in-column` in the browser engine, at 1280x800 in two columns with a mouse and the keys:
-  # Reply and Quote reply (words dragged over) pressed in each column open the reply box at that column's
-  # foot -- inside the column, under its list, its chips standing on it -- with both columns where they
-  # were to the pixel, the message answered edged in the accent and unmoved, and the focus in the box
-  # under any quote; Escape on the empty box, Cancel, Send and Enter put the box back and both columns
-  # where they were, the keys on the pressed column's list, and a sent reply is posted where the reply
-  # screen posts it (Main's message to Main, the thread's into it). A message low in the left column moves
-  # up only as far as shows it over the box, and back on Cancel; a window narrowed to 900px hands a reply
-  # open on the right to the reply screen with its words, and `#314 reply-focus-flake` a reply open in
-  # either column with the focus in its box even with the page's frames held 250ms behind the browser's,
-  # which takes the focus off the box first; `#281 view-keys`: real Ctrl+4 in an open reply
-  # leaves it open, and Ctrl+2 and Ctrl+3 show All and the thread list with the reply put down, its words
-  # kept and no reply screen over the view; and one column is the reply screen, as it was. Measured on
-  # 2026-10-14: about 5s wall.
+  # `#410 inline-reply-editor` in the browser engine: at 1280x800 in two columns, Reply on an old message
+  # mid-thread on the right opens the reply's box directly under the row, later rows below it, the row not
+  # moved and one message box on screen, Grow growing it with the rows below following, Cancel putting it
+  # away and the columns' boxes back with a Draft on the row; Reply on Main's replica root brings its
+  # thread's replies under it on the bridge, the box under the last, and Send posts with them staying; in
+  # All, Reply on the runner's root gathers its eight replies under it and Escape puts them back; at
+  # 393x852 by touch, Reply mid-stream and Send; a refused reply from the right column says so on the
+  # status line and the column's chip; the view keys in an open reply (Ctrl+4 keeps it, Ctrl+2 puts it
+  # down as a draft); and two columns narrowed to 393 with a reply open, kept inline where its message is
+  # drawn and reopened with its words once it is drawn again. Measured on 2026-10-21: about 25s wall.
   - group: check
-    job: reply-in-column-browser
-    desc: Reply and Quote reply open in the column they were pressed in, both columns staying put, and Send, Cancel, Escape and Enter putting everything back, in current Chromium at 1280x800
+    job: inline-reply-browser
+    desc: Reply opening in the stream under the message and its replies, later rows below, one message box on screen, in two columns and one, at 1280x800 and 393x852, through Grow, Send, Cancel, a refusal, the view keys and two columns collapsing, in current Chromium
     labels: [validation-vibe-talk]
-    cmd: cd vibe-talk && python3 tests/reply_in_column_browser.py
+    cmd: cd vibe-talk && python3 tests/inline_reply_browser.py
     jobs_flag: ""
-    timeout: 90
-    cpu_timeout: 45
+    timeout: 150
+    cpu_timeout: 90
     hint:
       resources: {browser: 1}
-      est_duration_s: 4
+      est_duration_s: 25
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 

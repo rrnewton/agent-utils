@@ -99,7 +99,7 @@ focus and your place in the list coming back as they do there:
 * a thread, in one column, opened from the thread list (the gesture goes back to the list), or on the
   right in two columns;
 * the thread list, back to the view it was chosen from — a thread, if it was chosen over one;
-* the reply screen, or a reply open at the foot of a column, its words kept as a draft;
+* a reply open in a list, its words kept as a draft;
 * Settings, and Help, back to Settings or to wherever **?** was pressed;
 * a message's **⋯** menu, the reading-pace popover and the prompts tray, before whatever is under
   them — a thread under a menu stays open until the next press.
@@ -133,18 +133,17 @@ with the app as the tab's first entry, and at a desk in two columns.
 any view, including **All**. Replying to a main-channel message posts in the main channel as a reply
 to it: a quote on Google Chat, a reply link on Discord. (Slack has neither, so its backend posts
 such a reply in the message's thread; see [Slack](#slack).) Where the chat service has already named
-an empty thread for the message, as Google Chat does, the reply screen also offers **Start a new
+an empty thread for the message, as Google Chat does, the reply's box also offers **Start a new
 thread from this message**, unticked each time it opens; ticked, the reply is posted into that
 message's thread as its first reply, the way the grey **Thread** starts one. It is offered exactly
 where that message's tag is the grey **Thread**: once the page holds a reply in the thread, from a
 read or the live stream, the tag is **Thread(1)** and Reply has no new thread to offer. That holds
-while the reply screen is open, too: a reply that arrives in the thread takes the box away. An
-unticked reply then still goes to the main channel; a ticked one still goes into the message's
-thread, now as a reply in it, and the title bar names that thread and the note under the box says
-so. A draft put down with the box ticked has it ticked again when you come back to the same message,
+while the reply is open, too: a reply that arrives in the thread takes the box away. An unticked
+reply then still goes to the main channel; a ticked one still goes into the message's thread, now as
+a reply in it, and the note under the box says so. A draft put down with the box ticked has it ticked again when you come back to the same message,
 until the page is reloaded; if the thread has been answered meanwhile, the draft is still bound for
-that thread, and says so, rather than going to the main channel. After **Send** you are back where
-you pressed Reply, and the message's tag is already its thread's **Thread(1)**. Slack does not get
+that thread, and says so, rather than going to the main channel. After **Send** you are where you
+pressed Reply, and the message's tag is already its thread's **Thread(1)**. Slack does not get
 that box: its reply already starts the message's thread, which the server says with
 `replies_in_thread` in `/api/v1/client-config`. Nor does a Discord message that heads no thread:
 Discord's threads are channels of their own, which vibe-talk does not create. A Discord message that
@@ -154,7 +153,7 @@ without saying which thread it is in, and that no read has placed since, is plac
 **All** before the reply is posted; if that read fails, nothing is posted and the reply keeps its
 text for **Retry**. Until it is placed, whatever you send next in that channel waits for it. A
 message the live stream says was removed is still drawn until the read behind the removal lands, but
-a reply to it goes nowhere (`#315 removed-reply-target`): the reply screen says the message was
+a reply to it goes nowhere (`#315 removed-reply-target`): the reply's box says the message was
 removed, and **Send** posts nothing and keeps your words. A reply already waiting to be placed when
 the removal comes is not posted either, and says why. That holds through a reload before the read
 lands, as during an outage.
@@ -163,9 +162,9 @@ lands, as during an outage.
 `#300 reply-marks-read`. Reply on a message and opening its thread to write in it both make a reply
 to the message before, so they mark alike:
 
-* **A targeted reply** — **Reply**, **Quote reply** or a row's **Draft**, on the reply screen or at
-  the foot of a column in two columns — marks the message it answers, on Main or inside a thread, and
-  only that message, never the rest of its thread.
+* **A targeted reply** — **Reply**, **Quote reply** or a row's **Draft**, open in the list — marks
+  the message it answers, on Main or inside a thread, and only that message, never the rest of its
+  thread.
 * **The first reply that starts a thread** marks the thread's first message, however it was started:
   **Reply** on that message (with **Start a new thread from this message** ticked, or on Slack, where a
   reply is a thread reply), or the thread opened from its grey **Thread** (or **→** on the message)
@@ -223,14 +222,11 @@ never twice, and never on a channel whose marker covers more than the channel (a
 shows that Done at its next read of the channel. A proposal not yet confirmed, a refusal and a
 partly posted reply mark nothing.
 
-**The reply screen says where the reply goes, and shows what came before.** Its title bar names
-the thread the reply posts into as the thread picker and the heading over a thread name it (age and
-replies, then the name, which gets a line of its own so a phone does not cut it away), or **Main**
-and the channel's name, and it follows the **Start a new thread** box.
-Above the message being answered are the messages before it in its thread, or on the main channel,
-oldest at the top, drawn as the channel draws them but with nothing on them to tap. The screen opens
-at the message, so they are a scroll up. The newest twelve the app holds come first; **Load earlier
-messages** shows the rest, and then reads earlier pages of that thread, or of Main, from the server.
+**The reply says where it goes, and the list shows what came before.** The note under the reply's box
+names where it posts when that is not the plain answer in place: into the message's thread, into a new
+thread, or, while the stream has not said where a message is, that the thread is not known yet. The
+message itself stays the row it was, everything before it above it, and its replies are gathered under
+it (`#410 inline-reply-editor`, below).
 
 **A reply points at what it answers.** A message that is a reply is set in from the left, with an
 arrow beside its box. When the message it answers is the one directly above it, the arrow leaves
@@ -6077,8 +6073,7 @@ it measures.
 alone do not say whether it is barely over the fold or a wall. So the line under them says how many
 words the fold keeps back: `(~240 more words)`. Opening the message takes the line away; folding it
 again brings it back. It is under the message text in the transcript and in the channel, on a row
-combined from several messages, on the reply screen's earlier messages (drawn as the list drew them,
-`#247 reply-continuity`, so none is a line shorter there than on the list), and on a body the server
+combined from several messages, and on a body the server
 rendered, where the words counted are the ones on the screen (a link counts as its text, never as its
 address).
 
@@ -7183,76 +7178,57 @@ Three decisions worth stating, because the issue left them open:
   the reader stays on the screen, and — because posting is not the call — a live conversation is
   untouched.
 
-Coming back from the reply screen lands on the same line you left, and it does that with the same
-anchor-and-offset mechanism the fold control uses rather than a saved `scrollTop`: hiding an
-element is allowed to reset its scroll position to zero, and a restore expressed as a delta against
-an anchor is correct either way.
+**Reply opens in the list, under the message and its replies** (`#410 inline-reply-editor`). The
+owner, 2026-10-21: "When I press 'reply' on a message inside a thread in two column view, I see a reply
+box pop up AT THE BOTTOM. But I STILL see the other 'inline' reply box at the bottom of the thread
+message series ... Why don't we move the 'Reply' box to also be an inline box and NOT show two at once."
+There is no reply screen any more (it was `#51 reply-view`, `#200 reply-context` and `#247
+reply-continuity`, and in two columns `#277 reply-in-column` put its box at the foot of the column).
+Reply, Quote reply, a row's Draft and a failed reply's Edit, pressed on a row of Main, All, a thread
+(across the window or on the right), the rows unpacked under the Threads view's cards or the Pinned
+filter, open the reply's box in that list, in one column or two, on a phone as on a desk:
 
-**The reply screen keeps the message where it was** (`#247 reply-continuity`). The owner found it
-jarring that Reply changed the font size and moved the message, and asked for the same visual
-continuity as other transitions. Now:
+- **Under the message and the replies it already has.** In All they are gathered under it on the bridge
+  **N replies** draws; in Main and in a thread the replies that point at it come up the same way; on a
+  thread's first message in Main its thread's replies are drawn under it as rows of Main, on the
+  bridge, for as long as they are gathered. A thread's own first message has the whole thread under it
+  already, so its box goes at the thread's end. The box goes under the last of them, or under the
+  message where it has none, with the later messages below it.
+- **The same box as the one at the foot of the list**, with its **Grow** (one choice for every box),
+  its **Send**, Enter and Ctrl+Enter as Settings has them, Ctrl+S and `c` to go back to it, and Esc and
+  **Cancel** to put it down. Who it answers and the id the answer goes to are on the line above it, and
+  the line under it says where it posts, a new thread or a thread not known yet included.
+- **One box at a time.** While the reply is open, the list's own box ("Message the main channel…" or
+  "Reply in this thread…") is hidden, in both columns; Send and Cancel bring it back, and Reply on
+  another message moves the one box there. The words in each are kept apart: the reply's as that
+  message's draft, the list's per channel and thread.
+- **Nothing jumps.** The message stays where it was on the screen as its replies gather under it, and
+  the list moves only where the box would be under its foot, by as little as shows the whole box; a
+  message (or its replies) taller than the room above the box goes up, its top a scroll up to read. Cancel and Esc put the box away and the replies back
+  in time order, moving nothing else. Send leaves the replies gathered, so the reply joins them when it
+  lands, and leaves the reader where they are, or at the foot of the list if they were at its foot.
+- **It follows its row.** The box is drawn under its row by the stylesheet (anchor positioning), the row
+  keeping room under itself as tall as the box, so it stays under it through a fold, a read run, an
+  older page or a live message above it, and a resize.
 
-- **The message is drawn as the list draws its row.** It uses the same renderer, the reader's
-  Settings text size, the speaker's tint and insets, and a reply's gutter or a gathered reply's
-  indent where the row had one. It sits in the same column on a desk, so its lines break in the same
-  places. It is unfolded, and an accent edge marks it as the one being answered. Who it answers and
-  the id the answer goes to sit beside "Your reply", not above the message.
-- **Its top stays where the row's top was.** The conversation scrolls to put it there, and ends at
-  the message's foot, so the box comes up directly under it and nothing that came after it on the
-  list is shown. The earlier messages are above it as before. A row whose top was above the screen
-  (under the list's edge, or where the title bar now is) opens at the top.
-- **It is never pushed under the box.** If the message ends lower than the box leaves room for, it
-  moves up only as far as needed to show all of it above the box. A message taller than the screen
-  keeps its top, with the rest a scroll down, as long as its first third of a screen shows;
-  otherwise it moves up just enough to show that. Where too little came before the message to fill
-  the space above it, an empty room at the head of the conversation holds it in place.
-- **A resize places it again, from the same place.** A window made shorter or taller, or a phone
-  turned on its side and back, re-runs the same rules from where the row's top was when Reply was
-  pressed: in a short room the message moves up only as far as shows it over the box, and back at
-  the size Reply opened at it is where it began. A reader who had scrolled back up the conversation
-  is brought back to the message the same way. A phone's on-screen keyboard is not a resize in
-  Chrome on Android or Safari on iOS: there it pans the whole page over the screen, and the message
-  moves with everything else.
-- **A subtle tint**, the page colour with a little of the accent in it (one value per scheme), says
-  this is Reply. Nothing else changes.
+A column that changes under an open reply (another channel, thread or view) puts it away as a draft; so
+do Ctrl+1 to Ctrl+3 pressed while it is open, while Ctrl+4, two columns already, leaves it open (`#281
+view-keys`). A window narrowed from two columns to one while a reply is open keeps it open in the one
+column where its message is drawn there, the words and the focus with it; where it is not (the reply
+was in a thread on the right and the column left is Main), it is kept as a draft and opens again, with
+its words, as soon as its message is on screen.
 
-Cancel, Back and Esc come back to exactly where the list was. Send still goes to the newest message,
-and `b` or the Bookmark chip brings you back. `make -C vibe-talk reply-continuity-browser` measures
-all of this in Chromium at 1280x800 and 412x915, at three text sizes, then resizes the window (and
-turns the phone) with Reply up, and sends a reply.
-
-**In two columns there is no reply screen** (`#277 reply-in-column`). The owner: "Reply and
-quote-reply destroy two column mode. Again I expected minimal disruption. Reply in the right column
-or left column, whichever I clicked the reply button in." So in two columns, Reply, Quote reply, a
-row's Draft and a failed reply's Edit open the reply screen's own box — "Your reply" and the id it
-answers, the box, the new-thread choice and where it posts, Cancel and Send reply — at the foot of the
-column the button was in, under that column's list. It is the same box, moved (`dockReply` in
-`web/voice.js`), so where a reply goes, the quote, the draft kept on Cancel, Enter and Esc are exactly
-the reply screen's. Both columns stay on screen; the other one does not move, and the pressed one keeps
-its top where it was and is shorter by the box, its chips standing on the box. The message answered
-stays where it is, edged in the accent; only where the box would cover it does the column scroll, by as
-little as shows it. Send, Cancel and Esc put the box back and the column where it was when Reply was
-pressed, with the keys on its list. A column that changes under an open reply (another channel, thread
-or view) puts it away as a draft; so do Ctrl+1 to Ctrl+3 pressed while it is open, as on the reply
-screen, the view they choose taking that column away, while Ctrl+4, two columns already, leaves it
-open (`#281 view-keys`). One column — a phone, or a desk with the layout button off — keeps
-the reply screen: on a phone a box under the list is what the on-screen keyboard covers, and the
-one-column desk keeps the continuity above. A window narrowed to one column while a reply is open in a
-column hands it to the reply screen, words and all. The other way round is left alone on purpose: a
-window widened while the reply screen is up keeps the reply there, the screen you are writing on, and
-two columns come back when it closes.
-
-Because Send from a column stays where you were, a reply that does not go would otherwise be
-invisible: its outbox row, with Retry, is down at the column's foot. So the status line says so — "Your
+Because Send leaves you where you were, a reply that does not go would otherwise be invisible: its
+outbox row, with Retry, is down at the column's foot. So the status line says so — "Your
 reply was not sent. Retry is at the foot of the left column.", or "may not have been posted" where
 delivery is unconfirmed, and a screen reader hears it — and that column's Newest chip reads **Reply not
 sent** (or **Reply unconfirmed**) in the outbox's orange until you have been down to the row; pressing
 it takes you there. A reply the page will send again by itself (offline, or after a provider's blip
 where retrying cannot post twice) is said to be waiting, and the chip changes only if it finally
-fails. Esc on the other column's list acts on that column and leaves the reply alone. The box can be
-dragged taller only to a quarter of the window, so the list over it keeps its room.
-`make -C vibe-talk reply-in-column-browser` measures all of this in Chromium at 1280x800, a refused
-reply from each column included.
+fails. Esc on the other column's list acts on that column and leaves the reply alone.
+`make -C vibe-talk inline-reply-browser` measures all of this in Chromium at 1280x800 in two columns and
+one and at 393x852, a refused reply and two columns collapsing included, and `make -C vibe-talk
+reply-continuity-browser` that the message does not move, at three text sizes and through a resize.
 
 ### Enter sends, in every message box, until you say otherwise
 
@@ -7353,8 +7329,8 @@ message box, where `/` is a slash, and after a channel chosen with the mouse it 
 where `/` is the picker's type-to-find. The chord has no such exceptions. It is heard at the window in
 the capture phase, before any other listener of the page, so nothing on the page can swallow it, and
 its browser default is always refused. A held chord opens the search once. An open menu, the pace
-popover or the prompts tray closes first; the Reply screen is left with its draft kept, as its Back
-leaves it; a reply open at the foot of a column, and a message's details sheet, stay open. On sign-in,
+popover or the prompts tray closes first; a reply open in the list, and a message's details sheet,
+stay open. On sign-in,
 where there is nothing to search, it does nothing. The list of keys moved to `?` and Ctrl+? (Cmd+?,
 which is Cmd+Shift+/), and says where Ctrl+/ went.
 
@@ -7367,8 +7343,8 @@ take the chord before the page sees it. `?` alone and the Help link still open t
 
 `make -C vibe-talk search-chord-browser` presses these chords through CDP in a real Chromium at
 1280x800: from the message box with a draft, the pace popover, a ⋯ menu, the channel picker,
-Settings, Help, the right column, past a listener that stops the key, the Reply screen and with
-single keys off, then on an emulated Mac.
+Settings, Help, the right column, past a listener that stops the key, the box of a reply open in the
+list and with single keys off, then on an emulated Mac.
 
 `make -C vibe-talk keyboard-browser` presses these keys through CDP `Input.dispatchKeyEvent` in a
 real Chromium at 1280x800, so the browser's own default scrolling runs, and measures the list on
@@ -7492,7 +7468,7 @@ from anywhere on a Mac too.
 `#248 composer-key`. Ctrl+S (Cmd+S) opened the search from `#224 keyboard-shortcuts` until the owner
 asked for it to do what it does in other chat clients: "When I'm using keyboard, I want to jump to text
 entry and start typing." It now goes to the box `c` goes to (the channel's, the thread's you are in,
-the reply's on the Reply screen, or on the call's view the agent's box under the transcript), from
+the reply's while one is open in the list, or on the call's view the agent's box under the transcript), from
 anywhere, including while you are typing in the search, and leaves Settings or Help first. Going to
 the agent's box starts nothing: a conversation starts only when you send. Ctrl+Enter (Cmd+Enter) does the same when the focus is not in a text box;
 in a message box it sends, as before. Held down from outside a box, it goes to the box and leaves the
@@ -7503,7 +7479,7 @@ says where Ctrl+S went.
 `#403 composer-key-global`. The owner found Cmd+S "selective" in two columns: it did nothing from
 the right column's thread cards or from the thread list. Now it works from everywhere. In two columns it goes to the box of the column the focus is in.
 With the focus in neither column (on the bar, or on the page itself) it goes to the box of the column with the selected message.
-From the thread cards, which have no box, it goes to Main's. A reply open at the foot of a column is that column's box. The
+From the thread cards, which have no box, it goes to Main's. With a reply open, it goes to the reply's box, the one box drawn. The
 thread list is left first, as Settings and Help are, for the view it was chosen from. The chord is
 heard at the window before any element's own listener, as the search's is, so nothing on the page
 can keep it from the box or let the browser's Save page open. `make -C vibe-talk
@@ -9581,7 +9557,7 @@ disclosure open, the clear control armed, settings, the Discord view, a long tra
 mid-scroll, that same list with one folded answer opened among the closed ones, the moment a turn
 arrives while the reader is up in the history, the desktop reading column at each end of its
 range, and the two connection outcomes that used to look identical — a call suspended by the
-phone, and one that really failed — the reply screen with a short target and with one longer
+phone, and one that really failed — a reply open in the list on a short target and on one longer
 than the frame, one channel row picked out under the pointer, a step further back through the
 channel, the earlier conversation restored from the server after a reload, a turn that was typed
 rather than spoken, the control bar in each of its two homes, that same bar converted into a

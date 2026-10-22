@@ -33,12 +33,13 @@ uncovered and wholly on screen. This lays it out on three phones and measures:
      turn of the owner's does, and the fake API saw the commit and then the claim of its send.
   7. After a reload, the record read with `records=1` restores the same frozen card, with the same
      words, and the same boundary line.
-  8. Beside a reply open in a column (`#277 reply-in-column`), on a desk in two columns: with a reply
-     open at the foot of the left column, the card is still the left list's next message, just above
-     the channel's box, and wholly above the reply's box — neither it nor its Send crosses that box,
-     the divider or anything floating over the foot — and its Send is outlined, unlike the reply's
-     filled "Send reply". A reply open in the right column outlines it too. Send on the card then
-     commits the draft once, and the reply stays open with its words.
+  8. Beside a reply open in a column (`#277 reply-in-column`, in the list since `#410
+     inline-reply-editor`), on a desk in two columns: with a reply open under a message of the left
+     column, the card is still the left list's next message, the channel's box hidden, and neither it
+     nor its Send crosses the reply's box, the divider or anything floating over the foot — and its
+     Send is outlined, unlike the reply's filled "Send reply". A reply open in the right column
+     outlines it too. Send on the card then commits the draft once, and the reply stays open with its
+     words.
   9. The recap a new call was sent (`#270 voice-transcript-markers`), on the hosted protocol with
      resuming on: a call that says something, Hang up, and the next call, which asks for the first
      call's recap (412 words) and sends it. The line above the new call reads "new conversation" with
@@ -1339,7 +1340,7 @@ def columns_measure(page: Page) -> dict[str, object]:
 
 
 def press_reply(page: Page, list_id: str, message_id: str, mount: str, where: str) -> None:
-    """A real click on the row's Reply, and the reply's box open at the foot of `mount`."""
+    """A real click on the row's Reply, and the reply's box open in `mount`, under the row (`#410`)."""
     found = page.evaluate(f"""() => {{
         const b = document.querySelector("#{list_id} > li[data-id='{message_id}'] > .meta .reply-button");
         if (!b) return null;
@@ -1350,7 +1351,8 @@ def press_reply(page: Page, list_id: str, message_id: str, mount: str, where: st
     check(isinstance(found, dict), f"{where}: message {message_id} has no Reply")
     assert isinstance(found, dict)
     page.mouse.click(float(found["x"]), float(found["y"]))
-    page.wait_for_function(f"() => document.getElementById('reply-compose').parentElement.id === '{mount}'",
+    page.wait_for_function(f"() => !document.getElementById('{mount}').hidden"
+                           f" && document.getElementById('reply-compose').parentElement.id === '{mount}'",
                            timeout=10_000)
     page.wait_for_timeout(200)
 
@@ -1384,7 +1386,8 @@ def columns_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, screensho
         check(alone["beside"] is False and alone["sendBackground"] not in TRANSPARENT,
               f"{where}: with no reply open the card's Send is not the filled one ({alone['sendBackground']})")
 
-        # The left column: the reply's box at its foot, under the very list the card ends.
+        # The left column: the reply's box open in its list, under the message (`#410 inline-reply-editor`),
+        # above the card that ends the list, and the channel's box hidden while it is open.
         press_reply(page, "discord-log", str(channel_message(12, "codex", "")["id"]), "column-reply", where)
         page.fill("#reply-text", "still writing")
         page.evaluate(TO_NEWEST_JS)
@@ -1393,19 +1396,15 @@ def columns_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, screensho
         inner_height = float(str(m["innerHeight"]))
         inner_width = float(str(m["innerWidth"]))
         check(m["replyIn"] == "column-reply" and m["leftReply"] is not None,
-              f"{where}: the reply did not open at the foot of the left column ({m['replyIn']})")
+              f"{where}: the reply did not open in the left column ({m['replyIn']})")
         check(m["parent"] == "pane-discord" and m["next"] == "channel-composer",
               f"{where}: the reply moved the card: {m['parent']}, before {m['next']}")
         check(m["card"] is not None and m["send"] is not None, f"{where}: the reply hid the draft")
         for part in ("card", "send"):
             check(not overlaps(m[part], m["leftReply"]), f"{where}: the card's {part} crosses the reply's box")
-            check(rect(m[part], "bottom") <= rect(m["leftReply"], "top") + 0.5,
-                  f"{where}: the card's {part} ends at {rect(m[part], 'bottom'):.1f}, below the reply box's "
-                  f"top at {rect(m['leftReply'], 'top'):.1f}")
             check(rect(m[part], "right") <= rect(m["side"], "left") + 0.5,
                   f"{where}: the card's {part} crosses the divider into the right column")
-        check(rect(m["send"], "bottom") <= rect(m["composer"], "top") + 0.5,
-              f"{where}: the card's Send ends below the channel box's top")
+        check(m["composer"] is None, f"{where}: the channel's box is drawn beside the reply's")
         check(inside(m["send"], inner_height, inner_width) and inside(m["replySend"], inner_height, inner_width),
               f"{where}: a Send is off the screen")
         check(rect(m["replySend"], "top") >= rect(m["leftReply"], "top") - 0.5,
@@ -1456,7 +1455,7 @@ def columns_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, screensho
               f"{where}: the card's Send stayed outlined after the reply went")
     finally:
         api.threaded = False
-    return f"{where}: the card above a reply open in the left column, its Send outlined beside either"
+    return f"{where}: the card clear of a reply open in the left column, its Send outlined beside either"
 
 
 # Point 11, read in one go: the card, the thread list's column and cards, the dock and what floats.

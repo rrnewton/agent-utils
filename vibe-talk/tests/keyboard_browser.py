@@ -418,7 +418,7 @@ RECORD_KEYS_JS = """() => {
 STATE_JS = """(id) => {
   const area = document.getElementById(id);
   const held = document.activeElement;
-  const screens = ['signin', 'main', 'settings', 'reply', 'help'];
+  const screens = ['signin', 'main', 'settings', 'help'];
   return {
     top: area.scrollTop,
     max: area.scrollHeight - area.clientHeight,
@@ -613,8 +613,8 @@ def held_send_key(walk: Walk, api: FakeApi) -> None:
 
     The first keydown puts the focus in the box; every auto-repeat after it is a keydown IN the box,
     where Ctrl+Enter is the send, so a key held past the repeat delay used to send the draft the box
-    was holding. Held here from the channel's list and from the conversation on Reply, each with a
-    draft waiting, through CDP's own `autoRepeat`.
+    was holding. Held here from the channel's list, and from it again with a reply open in it, each
+    with a draft waiting, through CDP's own `autoRepeat`.
     """
     draft = "half-written draft"
     set_value = ("([id, text]) => { const box = document.getElementById(id); box.value = text; "
@@ -650,12 +650,13 @@ def held_send_key(walk: Walk, api: FakeApi) -> None:
     walk.key("Escape")
     row = f"#discord-log > li[data-id='88000000000000{MESSAGES - 3:04d}']"
     walk.page.evaluate("(row) => document.querySelector(row + ' .reply-button').click()", row)
-    walk.page.wait_for_function("() => !document.getElementById('screen-reply').hidden")
-    held("reply-text", "reply-scroll", "from the conversation on Reply")
-    check(walk.state("reply-scroll")["screen"] == "reply", "a held Ctrl+Enter left the Reply screen")
+    # `#410 inline-reply-editor`: the reply is open in the list, so the list beside it is where the chord starts.
+    walk.page.wait_for_function("() => !document.getElementById('column-reply').hidden")
+    held("reply-text", "scroll-area", "from the list beside the open reply")
+    check(walk.page.evaluate("() => !document.getElementById('column-reply').hidden"), "a held Ctrl+Enter put the reply away")
     walk.shot("held-ctrl-enter-on-reply")
     walk.page.click("#reply-cancel")
-    walk.page.wait_for_function("() => document.getElementById('screen-reply').hidden")
+    walk.page.wait_for_function("() => document.getElementById('column-reply').hidden")
     walk.notes.append("a held Ctrl+Enter (one press, three auto-repeats) went to the box from the list and from "
                       "Reply, and sent neither draft")
 
