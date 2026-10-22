@@ -1,12 +1,13 @@
 ---
 title: 'keyboard-hides-bar: hide the channel view''s Read and Pace tile while the on-screen keyboard is up'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-22T15:04:51.364563144+00:00
-updated_at: 2026-10-22T15:04:51.364563144+00:00
+updated_at: 2026-10-22T17:42:26.713817989+00:00
+closed_at: 2026-10-22T17:42:26.713817840+00:00
 ---
 
 # Description

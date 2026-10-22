@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-429-c14d25541ef",
+    "issue_id": "agent-utils-429",
+    "author": "cl-kbd",
+    "body": "[opus 5.5] Delivered in d1ca1db1 (#429 keyboard-hides-bar). In the channel view on a coarse-pointer screen, both bars hide while the on-screen keyboard is up: a focused field AND a visual viewport a keyboard shorter than the tallest seen at that width. The owner widened the scope from the tile to both rows. A slim Stop stays while reading, a slim Hang up during a live call. The call view keeps its dock, as #241 voice-composer requires. Verified by page tests and a Chromium walk at 393x852 with the keyboard simulated by a viewport resize (Android resizes-content style). Unverified: no real phone has run it. On iOS Safari, which shrinks only the visual viewport, the slim Stop row may sit behind the keyboard.",
+    "created_at": "2026-10-22T17:42:42.595302646Z",
+    "updated_at": "2026-10-22T17:42:42.595302646Z"
+  }
+]
