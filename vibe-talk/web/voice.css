@@ -588,6 +588,16 @@ a.search-hit-link {
   font-size: 0.8rem;
 }
 
+/* `#421 chip-states`. A chip that is a toggle says so in `aria-pressed`, and wears it from that one
+   attribute, the same way wherever it is: ringed and tinted in the accent, its words in the ink, as the
+   bar's filters are. One rule for all of them, so a toggle chip added later (as `#419`'s Main channel
+   was, drawn the same on and off until this) is pressed like the rest without a rule of its own. */
+.chip[aria-pressed="true"] {
+  border-color: var(--accent);
+  color: var(--ink);
+  background: color-mix(in srgb, var(--accent) 18%, var(--panel));
+}
+
 /* ------------------------------------------------------------------------------ the body --- */
 
 #frame-body {
@@ -8085,23 +8095,10 @@ textarea {
 }
 
 /* `#259 thread-list-unread-filter`. The cards' own filter, at the far end of the heading it narrows,
-   where the X stands over a thread: a quiet chip at rest, and pressed as the bar's filters are, ringed
-   and tinted in the accent with its words in the ink. */
+   where the X stands over a thread: a quiet chip at rest, and pressed as every toggle chip is
+   (`.chip[aria-pressed="true"]`, `#421 chip-states`), as are Unpack msgs and Main channel beside it. */
 #side-unread-only {
   margin-inline-start: auto;
-}
-
-#side-unread-only[aria-pressed="true"] {
-  border-color: var(--accent);
-  color: var(--ink);
-  background: color-mix(in srgb, var(--accent) 18%, var(--panel));
-}
-
-/* `#404 threads-unpack-all`. Unpack all, beside Unread only in the Threads view: pressed as it is. */
-#side-unpack[aria-pressed="true"] {
-  border-color: var(--accent);
-  color: var(--ink);
-  background: color-mix(in srgb, var(--accent) 18%, var(--panel));
 }
 
 /* `#404 threads-unpack-all`. A thread unpacked under its card: its rows are channel rows in the

@@ -64155,14 +64155,14 @@ async function mainMessagesPage(storage = new Map()) {
   return { page, data };
 }
 
-test("`#419 threads-view-main-messages`: Main messages, a toggle beside Unpack all, puts the main channel's messages that are not threads among the cards in the list's order, and its box at the foot", async () => {
+test("`#419 threads-view-main-messages`: Main channel, a toggle beside Unpack msgs, puts the main channel's messages that are not threads among the cards in the list's order, and its box at the foot", async () => {
   assertMarkupContains("side-heading", "side-main");
   assert.match(/<button\s+id="side-main"[^>]*>/.exec(HTML_CODE)[0], /aria-pressed="false"/);
   const { page } = await mainMessagesPage();
   const toggle = page.el("side-main");
   assert.equal(toggle.hidden, false, "the toggle is not offered over the Threads view's cards");
   assert.equal(toggle.getAttribute("aria-keyshortcuts"), "A", "the toggle does not name its key");
-  assert.ok(page.el("keyboard-keys").text().includes("Main messages"), "the ? help does not list the key");
+  assert.ok(page.el("keyboard-keys").text().includes("Main channel"), "the ? help does not list the key");
   // Off, as it starts: the cards alone, and the box where it was (negative control).
   const off = cardsListed(page);
   assert.ok(off.every((one) => one.startsWith("card:")), `off, the list holds more than cards: ${off}`);
@@ -64248,6 +64248,55 @@ test("`#419 threads-view-main-messages`: in the Threads view the heading is on t
     "the heading's end is not clear of the glass");
   assert.match(cssBlock('#screen-main[data-columns="list"][data-searching] > #side-column'), /var\(--search-bar\)/,
     "the heading does not go back under the open search bar");
+});
+
+// --- `#421 chip-states` ---------------------------------------------------------------------------------
+//
+// The owner, 2026-10-22: "The Main messages toggle in Thread list view (Cmd 3) is working. But it doesn't
+// change its visual style when it is toggled on off. I'd like to change the names on those buttons too.
+// 'Main channel' instead of main messages. And 'Unpack msgs'."
+
+/** The Threads view's three toggle chips, by id. */
+const HEADING_TOGGLES = ["side-unread-only", "side-unpack", "side-main"];
+
+test("`#421 chip-states`: every toggle chip is pressed by one rule, from aria-pressed, as Unread only always was, and the Threads view's are named Main channel and Unpack msgs", async () => {
+  // One rule for every chip with aria-pressed, for every device, in the accent.
+  const pressed = cssRules(CSS_UNCONDITIONAL, '.chip[aria-pressed="true"]').join("\n");
+  assert.match(pressed, /border-color:\s*var\(--accent\)/, "a pressed chip is not ringed in the accent");
+  assert.match(pressed, /color:\s*var\(--ink\)/, "a pressed chip's words are not in the ink");
+  assert.match(pressed, /background:\s*color-mix\(in srgb, var\(--accent\) 18%, var\(--panel\)\)/,
+    "a pressed chip is not tinted in the accent");
+  // Negative control: a chip at rest is the quiet chip, nothing of the accent about it.
+  const rest = cssBlock(".chip");
+  assert.match(rest, /border:\s*1px solid var\(--edge\)/);
+  assert.doesNotMatch(rest, /accent/, "a chip at rest wears the accent");
+  // No chip of the heading has a pressed rule of its own to drift from the shared one (Main messages had none).
+  for (const id of HEADING_TOGGLES) {
+    assert.doesNotMatch(CSS_CODE, new RegExp(`#${id}\\[aria-pressed`), `#${id} has a pressed rule of its own`);
+    const tag = new RegExp(`<button\\s+id="${id}"[^>]*>`).exec(HTML_CODE)[0];
+    assert.match(tag, /class="chip"/, `#${id} is not a chip`);
+    assert.match(tag, /aria-pressed="false"/, `#${id} does not start unpressed`);
+  }
+  // The names, the phone keeping "Main" alone.
+  assert.match(HTML_CODE, /id="side-main"[^>]*>Main<span class="chip-more"> channel<\/span><\/button>/);
+  assert.match(HTML_CODE, /id="side-unpack"[^>]*>Unpack msgs<\/button>/);
+  assert.doesNotMatch(HTML_CODE, />Main<span class="chip-more"> messages|>Unpack all</, "an old name is still on a chip");
+  const { page } = await mainMessagesPage();
+  const keys = page.el("keyboard-keys").text();
+  assert.ok(keys.includes("Main channel") && keys.includes("Unpack msgs"), "the ? help does not use the new names");
+  assert.ok(!keys.includes("Main messages:") && !keys.includes("Unpack all:"), "the ? help still uses an old name");
+  // Each toggle says its state in aria-pressed, both ways, which is all the rule reads.
+  for (const id of HEADING_TOGGLES) {
+    const chip = page.el(id);
+    assert.equal(chip.hidden, false, `#${id} is not offered over the Threads view's cards`);
+    assert.equal(chip.getAttribute("aria-pressed"), "false");
+    await chip.click();
+    await page.settle();
+    assert.equal(chip.getAttribute("aria-pressed"), "true", `#${id} pressed does not say so`);
+    await chip.click();
+    await page.settle();
+    assert.equal(chip.getAttribute("aria-pressed"), "false", `#${id} let go does not say so`);
+  }
 });
 
 test("`#281 view-keys` x `#279 thread-card-focus`: the thread list's cards are two columns' cards — a click highlights one without leaving the list, the highlight goes on through Ctrl+4, and its replies button or → opens its thread across the window", async () => {
@@ -76059,11 +76108,11 @@ async function unpackPage(storage = null) {
   return { page, data };
 }
 
-test("`#404 threads-unpack-all`: Unpack all is a toggle beside Unread only, off means cards alone, u is in the help", async () => {
+test("`#404 threads-unpack-all`: Unpack msgs is a toggle beside Unread only, off means cards alone, u is in the help", async () => {
   assertMarkupContains("side-heading", "side-unpack");
   const tag = /<button\s+id="side-unpack"[^>]*>/.exec(HTML_CODE)[0];
   assert.match(tag, /aria-pressed="false"/);
-  assert.match(HTML_CODE, /id="side-unpack"[^>]*>Unpack all<\/button>/);
+  assert.match(HTML_CODE, /id="side-unpack"[^>]*>Unpack msgs<\/button>/);
   const { page } = await unpackPage();
   const toggle = page.el("side-unpack");
   assert.equal(toggle.hidden, false, "the toggle is not offered over the cards");

@@ -1255,14 +1255,14 @@ steps:
       rss_baseline_bytes: 1073741824
 
   # `#419 threads-view-main-messages` in the browser engine, at 1280x800 with a mouse and 393x852 by touch:
-  # the Threads view's heading (title, Unread only, Unpack all, Main messages) on the search glass's row,
-  # its middle level with the glass's and every chip ending before it; Main messages putting the main
+  # the Threads view's heading (title, Unread only, Unpack msgs, Main channel) on the search glass's row,
+  # its middle level with the glass's and every chip ending before it; Main channel putting the main
   # channel's messages among the cards in time order and its box last; a reply on an old main-channel
   # message opening directly under it, the rows after it below, the box at the foot giving way to it so
   # one message box is on screen, and coming back on Cancel. Measured on 2026-10-22: about 6s wall.
   - group: check
     job: threads-main-browser
-    desc: the Threads view's chips on the search glass's row, Main messages among the cards with the main channel's box last, and a reply under one of them moving the one box, in current Chromium at 1280x800 and 393x852
+    desc: the Threads view's chips on the search glass's row, Main channel among the cards with the main channel's box last, and a reply under one of them moving the one box, in current Chromium at 1280x800 and 393x852
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/threads_main_browser.py
     jobs_flag: ""

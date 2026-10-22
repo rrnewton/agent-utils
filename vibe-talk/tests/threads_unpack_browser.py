@@ -3,7 +3,7 @@
 
 `#404 threads-unpack-all` and `#405 root-under-summary`. The owner, 2026-10-21: in All, **N replies**
 bridges one thread at a time and bridging another breaks the first; he wants every thread chained at
-once. In the Threads view (Cmd+3), **Unpack all** (key u) draws each thread's messages under its card
+once. In the Threads view (Cmd+3), **Unpack msgs** (key u) draws each thread's messages under its card
 in the bridged style, respecting Show / Collapse / Hide read; and under a summarized card the raw root
 is the first child. The fake-DOM suite pins what is drawn; this proves where it is drawn and in what
 colour, that the bridge is continuous, and what unpacking forty threads costs.
@@ -12,12 +12,12 @@ It serves the checked-out page and the fake API of tests/two_column_browser.py �
 summarised — with the summarised thread's root and first two replies, and one raw thread's first two
 replies, already Done on the server.
 
-At each size and scheme: sign in, All, the thread list from the picker -> three cards, Unpack all
+At each size and scheme: sign in, All, the thread list from the picker -> three cards, Unpack msgs
 offered and unpressed, no unpacked row (negative control) -> press it: every card gains its messages,
 the summarised block starting with its root as a bridged child in the thread's colour, a raw block
 with no root row (negative control), each bridge's spine left of its boxes and continuous over the
 block -> Collapse read: each block's two read replies are one grey line joined to its spine -> Hide
-read: read replies gone from every block, the summarised root still first -> Show read, Unpack all
+read: read replies gone from every block, the summarised root still first -> Show read, Unpack msgs
 off: cards alone again -> u (desk) or the chip (phone) on, reload: still on -> `#411
 thread-view-row-padding`: every unpacked row's header buttons stand at least as far inside its top
 border as the nearest of All's (before, 0px: the rows had no box). No horizontal overflow and no page
@@ -31,7 +31,7 @@ puts it back; Enter opens and folds the selected row; : and ; collapse and expan
 every unpacked row, saying so; under Collapse read the block's run is the run line every list draws,
 which Enter on it opens. Negative control: before any of it, ↓ over the cards packed goes card to card.
 
-Then, at the desk in the dark, a channel of forty threads: the time from pressing Unpack all to every
+Then, at the desk in the dark, a channel of forty threads: the time from pressing Unpack msgs to every
 block drawn, and the row count, said in the notes.
 
 Pass --screenshots DIR to keep a PNG of each state; --web-root DIR for another copy of the page.
@@ -220,8 +220,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
     page = desk.page
     phone_thread_list(desk)
     toggle = page.locator("#side-unpack")
-    desk.check(toggle.is_visible(), "Unpack all is not offered over the thread list")
-    desk.check(toggle.get_attribute("aria-pressed") == "false", "Unpack all starts pressed")
+    desk.check(toggle.is_visible(), "Unpack msgs is not offered over the thread list")
+    desk.check(toggle.get_attribute("aria-pressed") == "false", "Unpack msgs starts pressed")
     desk.check(page.evaluate("() => document.querySelectorAll('#side-cards > li[data-unpack-thread]').length") == 0,
                "rows are unpacked before the toggle is pressed")
     desk.shot("1-packed")
@@ -288,7 +288,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
     page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
     desk.wait_for("() => document.getElementById('screen-main').getAttribute('data-columns') === 'list'"
                   f" && document.querySelectorAll('#side-cards > li[data-unpack-thread=\"{RUNNER}\"]').length >= 9",
-                  "a reload forgot Unpack all")
+                  "a reload forgot Unpack msgs")
     desk.shot("6-reloaded-unpacked")
     # `#411 thread-view-row-padding`. The owner: in the thread view "the Reply '...' and Done buttons are
     # touching the top border of the message box and this is not happening in the All view with the
