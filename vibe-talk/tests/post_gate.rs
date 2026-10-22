@@ -778,7 +778,6 @@ async fn the_read_scope_tool_list_is_unchanged() {
         [
             "recent_activity",
             "list_channels",
-            "digest_channel",
             "read_page",
             "count_messages",
             "find_message",

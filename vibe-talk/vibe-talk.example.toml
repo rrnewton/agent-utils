@@ -250,6 +250,19 @@ backend = "elevenlabs"
 # Environment: VIBE_TALK_SPEAKABLE (true/false — an unreadable value refuses to start)
 enabled = true
 
+# [owner] tells the voice agent which messages are YOURS, so it never reads you your own words back.
+# Every message line a model reads attributes yours to "the user (<name>)" instead of your display
+# name, and its instructions say not to read those aloud or summarise them unless you ask.
+#
+# Your accounts are, together: every provider's owner_user_id (above, or in a [[providers]] entry)
+# and user_ids here, for any other account that is yours. So with owner_user_id set, `name` is all
+# this section needs. The account this server posts as is NOT counted unless you list it here: if
+# your coding agents post through that same account, listing it would hide their messages from the
+# voice agent. Absent, nothing is attributed to a name, and owner_user_id is still recognised.
+# [owner]
+# name = "Ada Lovelace"        # one line, at most 80 characters; unset, "the user"
+# user_ids = ["U0OLDACCOUNT"]  # extra account ids that are yours; never an empty string
+
 [elevenlabs]
 # Optional: the Discord half of this server works without them. Set BOTH to use the app's calls and
 # GET /api/v1/signed-url, which is how you talk to an agent that has "Enable Authentication"

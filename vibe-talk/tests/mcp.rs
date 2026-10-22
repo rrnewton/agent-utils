@@ -274,7 +274,7 @@ async fn the_read_token_is_not_even_told_the_posting_tool_exists() {
     assert_eq!(status, StatusCode::OK);
     let listing = body["result"]["tools"].to_string();
     assert!(!listing.contains("post_reply"), "{listing}");
-    assert!(listing.contains("digest_channel"), "{listing}");
+    assert!(listing.contains("read_page"), "{listing}");
     assert!(listing.contains("find_message"), "{listing}");
 }
 
@@ -313,16 +313,16 @@ async fn no_tool_description_claims_a_read_state_the_bot_cannot_have() {
         }
     }
     // The positive half, so the guard cannot be satisfied by emptying every description.
-    let digest = tools
+    let catch_up = tools
         .iter()
-        .find(|t| t["name"] == "digest_channel")
-        .expect("digest_channel is offered");
+        .find(|t| t["name"] == "recent_activity")
+        .expect("recent_activity is offered");
     assert!(
-        digest["description"]
+        catch_up["description"]
             .as_str()
             .expect("a description")
             .contains("most recent messages"),
-        "digest_channel must still say what it actually covers: {digest}"
+        "recent_activity must still say what it actually covers: {catch_up}"
     );
 }
 
@@ -366,7 +366,7 @@ async fn the_owners_stored_transcript_is_not_reachable_by_a_model() {
         );
     }
     // The control, so this cannot pass on an empty listing.
-    assert!(listing.contains("digest_channel"), "{listing}");
+    assert!(listing.contains("recent_activity"), "{listing}");
 }
 
 #[tokio::test]
@@ -873,14 +873,13 @@ async fn a_full_handshake_then_list_then_call_works_over_the_endpoint() {
         vec![
             "recent_activity",
             "list_channels",
-            "digest_channel",
             "read_page",
             "count_messages",
             "find_message",
             "read_message",
             "post_reply"
         ],
-        "the write credential sees exactly the eight implemented tools"
+        "the write credential is offered exactly the seven listed tools"
     );
 
     let (_status, found) = rpc(
