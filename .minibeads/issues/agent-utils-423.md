@@ -1,12 +1,13 @@
 ---
 title: 'back-key-consistency: Ctrl/Cmd+[ is Back and Ctrl/Cmd+] is Forward in every view'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-22T13:54:12.612138147+00:00
-updated_at: 2026-10-22T13:54:12.612138147+00:00
+updated_at: 2026-10-22T16:06:12.200728101+00:00
+closed_at: 2026-10-22T16:06:12.200727991+00:00
 ---
 
 # Description

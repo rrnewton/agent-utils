@@ -1,12 +1,13 @@
 ---
 title: 'threads-sort-toggle: order the Threads view''s cards by latest update or by thread creation'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-22T14:18:50.042170004+00:00
-updated_at: 2026-10-22T14:18:50.042170004+00:00
+updated_at: 2026-10-22T16:06:12.204011637+00:00
+closed_at: 2026-10-22T16:06:12.204011547+00:00
 ---
 
 # Description

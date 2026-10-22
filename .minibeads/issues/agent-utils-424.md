@@ -1,12 +1,13 @@
 ---
 title: 'threads-main-own-center: the owner''s main-channel rows in the Threads view stand centred'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-22T13:54:26.740740906+00:00
-updated_at: 2026-10-22T13:54:26.740740906+00:00
+updated_at: 2026-10-22T16:06:12.198002777+00:00
+closed_at: 2026-10-22T16:06:12.198002637+00:00
 ---
 
 # Description

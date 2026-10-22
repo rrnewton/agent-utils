@@ -1,12 +1,13 @@
 ---
 title: 'composer-key-stay: Ctrl/Cmd+S keeps the view when the view has a message box'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-22T13:53:49.087025110+00:00
-updated_at: 2026-10-22T13:53:49.087025110+00:00
+updated_at: 2026-10-22T16:06:12.194906082+00:00
+closed_at: 2026-10-22T16:06:12.194905972+00:00
 ---
 
 # Description

@@ -1,12 +1,13 @@
 ---
 title: 'threads-main-own-sent: the owner''s message just sent to the main channel shows among the Threads view''s main rows'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-22T15:21:14.720695056+00:00
-updated_at: 2026-10-22T15:21:14.720695056+00:00
+updated_at: 2026-10-22T16:06:12.206947169+00:00
+closed_at: 2026-10-22T16:06:12.206947039+00:00
 ---
 
 # Description

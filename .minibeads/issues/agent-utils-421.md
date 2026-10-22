@@ -1,12 +1,13 @@
 ---
 title: 'chip-states: the Threads view''s heading chips show on and off alike, and are renamed Main channel and Unpack msgs'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-22T13:53:49.074082653+00:00
-updated_at: 2026-10-22T13:53:49.074082653+00:00
+updated_at: 2026-10-22T16:06:12.191688034+00:00
+closed_at: 2026-10-22T16:06:12.191687924+00:00
 ---
 
 # Description
