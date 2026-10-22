@@ -592,6 +592,14 @@ CONFIG_HEADER = (
 # already is and rewriting that relocates rather than repairs.
 _CONFIG_REPAIR_UPDATABLE = frozenset({"schema", "max_active_slots"})
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# The agent-name rule the session tooling (agentctl) applies to every name it registers, and
+# therefore every name its liveness probe can judge: a lowercase letter, then lowercase letters,
+# digits or hyphens, 32 characters at most, and never the reserved directory name. A slot
+# recorded under any other name names an agent that can never be started, never be reported
+# alive or dead, and so never be proven free: create, adopt and transfer-owner refuse such a
+# name when it is supplied, instead of recording a slot only a special removal path can retire.
+AGENT_NAME_RE = re.compile(r"[a-z][a-z0-9-]{0,31}\Z")
+AGENT_NAME_RESERVED = "archive"
 REMOTE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -1505,6 +1513,25 @@ def _validate_name(value: str, label: str) -> str:
     if not NAME_RE.fullmatch(value):
         raise Refusal(
             f"invalid {label} {value!r}; use 1-64 letters, digits, '.', '_', or '-'"
+        )
+    return value
+
+
+def _agent_name_usable(value: str) -> bool:
+    """Whether the session tooling could ever register, and its probe judge, this agent name."""
+
+    return bool(AGENT_NAME_RE.fullmatch(value)) and value != AGENT_NAME_RESERVED
+
+
+def _validate_agent_name(value: str) -> str:
+    if not _agent_name_usable(value):
+        raise Refusal(
+            f"invalid agent {value!r}; agent names must start with a lowercase letter and "
+            "contain 1-32 lowercase letters, digits or hyphens, and 'archive' is reserved. "
+            "state: REFUSED -- no slot or lifecycle record was changed. remedy: choose a "
+            "name the session tooling can register; any other name could never be reported "
+            "alive or dead by its liveness probe, so a slot recorded under it could never "
+            "be proven free"
         )
     return value
 
@@ -23413,6 +23440,109 @@ def _recorded_attested_stop(
     return found
 
 
+# Coordinator-attested removal of a slot no agent was ever started in, whose recorded agent
+# name the liveness authority cannot judge at all.
+#
+# Before create refused them, a slot could be recorded under a name the session tooling can
+# never register (capital letters, say): its liveness probe answers a usage error for such a
+# name forever, so remove could only ever report the authority unverifiable, and the
+# attested-stop path above cannot stand in, because it needs the authority's exact no-record
+# answer about a name it can judge and an owner generation proven dead. When no agent was
+# ever started in the slot there is no owner to prove dead -- the proof is the negative space
+# in wrkslots' own records: no owner is recorded now, and no event for this slot generation
+# ever recorded one. remove accepts the coordinator's explicit attestation on exactly that
+# evidence, plus the name being one the tooling cannot use, the authority answering
+# unverifiable rather than alive, and the heartbeat TTL expired. Every guard that protects
+# work still runs. The basis is an active-state action, like the attested stop's, so older
+# clients and the read-only wrkslotsd replay accept the history unchanged.
+NEVER_STARTED_ACTION = "unjudgeable-agent-never-started-attested"
+NEVER_STARTED_BASIS = "coordinator-attested-never-started-agent"
+
+
+def _slot_never_had_owner(
+    record: ActiveRecord, events: Sequence[Mapping[str, object]]
+) -> bool:
+    """Whether no owner was ever bound to this slot generation.
+
+    The current record must name no owner, and no active-state event for this slot and
+    generation may carry a record snapshot naming one: create writes the first snapshot and
+    adopt/transfer-owner each write one when they bind, so an owner that ever existed left
+    one behind.
+    """
+
+    if record.owner is not None:
+        return False
+    for event in events:
+        if event.get("kind") != "active-state-recorded":
+            continue
+        payload = _as_mapping(event["payload"], "active-state-recorded payload")
+        if payload.get("slot") != record.slot:
+            continue
+        snapshot = payload.get("record")
+        if (
+            isinstance(snapshot, Mapping)
+            and snapshot.get("generation") == record.generation
+            and snapshot.get("owner") is not None
+        ):
+            return False
+    return True
+
+
+def _never_started_evidence(
+    record: ActiveRecord,
+    attested: _AttestedStop,
+    *,
+    coordinator: ProcessIdentity,
+    owner_detail: str,
+    age: float,
+) -> dict[str, object]:
+    return {
+        "basis": NEVER_STARTED_BASIS,
+        "generation": record.generation,
+        "agent": record.agent,
+        "owner": _identity_to_obj(record.owner),
+        "owner_state": "absent",
+        "owner_detail": owner_detail,
+        "actor": _identity_to_obj(coordinator),
+        "coordinator_authorized": True,
+        "heartbeat_age_seconds": int(age),
+        "heartbeat_ttl_seconds": record.heartbeat_ttl_seconds,
+        "registered_liveness": "unverifiable",
+        "registered_liveness_detail": attested.liveness_detail,
+        "note": attested.note,
+    }
+
+
+def _recorded_never_started(
+    record: ActiveRecord, events: Sequence[Mapping[str, object]]
+) -> _AttestedStop | None:
+    """The never-started attestation remove durably recorded for this exact generation."""
+
+    found: _AttestedStop | None = None
+    for event in events:
+        if event.get("kind") != "active-state-recorded":
+            continue
+        payload = _as_mapping(event["payload"], "active-state-recorded payload")
+        if payload.get("action") != NEVER_STARTED_ACTION or payload.get("slot") != record.slot:
+            continue
+        evidence = _as_mapping(payload.get("evidence"), "never-started evidence")
+        if (
+            evidence.get("basis") == NEVER_STARTED_BASIS
+            and evidence.get("generation") == record.generation
+            and evidence.get("agent") == record.agent
+            and evidence.get("coordinator_authorized") is True
+            and evidence.get("owner") is None
+        ):
+            found = _AttestedStop(
+                note=_as_str(evidence.get("note"), "never-started note"),
+                liveness_detail=_as_str(
+                    evidence.get("registered_liveness_detail"),
+                    "never-started liveness detail",
+                ),
+            )
+    return found
+
+
 # Discarding a stale second attachment of a slot's image (#350
 # wrkslots-foreign-mount-ns).
 #
@@ -25704,6 +25834,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
     config = _load_new_slot_config(args, "worktree creation")
     _validate_name(args.slot, "slot")
     _validate_name(args.agent, "agent")
+    _validate_agent_name(args.agent)
     if not args.task or not args.purpose:
         raise Refusal("task and purpose must be non-empty")
     owner = (
@@ -26896,6 +27027,7 @@ def _cmd_adopt(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
     _validate_name(args.agent, "agent")
+    _validate_agent_name(args.agent)
     owner = _capture_caller_process(args.owner_pid, "owner")
     task_scope = _task_scope_from_args(args, owner)
     with _mutation_locks(config, args.wait_lock):
@@ -26993,6 +27125,7 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
     _validate_name(args.agent, "agent")
+    _validate_agent_name(args.agent)
     successor = _read_process_identity(args.owner_pid)
     with _mutation_locks(config, args.wait_lock):
         _refuse_partial_state(config)
@@ -37560,15 +37693,29 @@ def _cmd_remove_in_scope(
     proof_manifest = getattr(args, "validation_proof_manifest", None)
     completed_record = getattr(args, "completed_record", None)
     attest_agent: str | None = getattr(args, "attest_agent_stopped", None)
+    never_started_agent: str | None = getattr(args, "attest_agent_never_started", None)
     attest_note: str | None = getattr(args, "attest_note", None)
-    if (attest_agent is None) != (attest_note is None):
+    if attest_agent is not None and never_started_agent is not None:
         raise Refusal(
-            "--attest-agent-stopped and --attest-note must be supplied together. "
+            "--attest-agent-stopped and --attest-agent-never-started are two different "
+            "statements and cannot be supplied together. "
             "state: REFUSED -- no checkout was salvaged or removed"
         )
+    attesting_as: str | None = None
+    attesting_flag: str | None = None
     if attest_agent is not None:
-        assert attest_note is not None
-        _validate_name(attest_agent, "agent")
+        attesting_as, attesting_flag = attest_agent, "--attest-agent-stopped"
+    elif never_started_agent is not None:
+        attesting_as, attesting_flag = never_started_agent, "--attest-agent-never-started"
+    if (attesting_as is None) != (attest_note is None):
+        raise Refusal(
+            "--attest-agent-stopped or --attest-agent-never-started and --attest-note "
+            "must be supplied together. "
+            "state: REFUSED -- no checkout was salvaged or removed"
+        )
+    if attesting_as is not None:
+        assert attest_note is not None and attesting_flag is not None
+        _validate_name(attesting_as, "agent")
         if (
             not attest_note.strip()
             or attest_note != " ".join(attest_note.split())
@@ -37581,7 +37728,7 @@ def _cmd_remove_in_scope(
             )
         if not args.coordinator_authorized:
             raise Refusal(
-                "--attest-agent-stopped is the coordinator's statement and requires "
+                f"{attesting_flag} is the coordinator's statement and requires "
                 "--coordinator-authorized. state: REFUSED -- no checkout was salvaged or "
                 "removed"
             )
@@ -37594,7 +37741,7 @@ def _cmd_remove_in_scope(
             or getattr(args, "_retirement_candidate", None) is not None
         ):
             raise Refusal(
-                "--attest-agent-stopped applies only to one explicit remove of an agent "
+                f"{attesting_flag} applies only to one explicit remove of an agent "
                 "slot; retire-pending, remove-agent-batch and validation removal never "
                 "accept it"
             )
@@ -37750,6 +37897,14 @@ def _cmd_remove_in_scope(
                 f"{record.slot} is a {record.slot_type} slot recorded for agent "
                 f"{record.agent}. state: REFUSED -- no checkout was salvaged or removed"
             )
+        if never_started_agent is not None and (
+            record.slot_type != "agent" or record.agent != never_started_agent
+        ):
+            raise Refusal(
+                f"--attest-agent-never-started names agent {never_started_agent}, but "
+                f"slot {record.slot} is a {record.slot_type} slot recorded for agent "
+                f"{record.agent}. state: REFUSED -- no checkout was salvaged or removed"
+            )
         retirement_candidate = getattr(args, "_retirement_candidate", None)
         if retirement_candidate is not None:
             if not isinstance(retirement_candidate, _RetirementCandidate):
@@ -37874,6 +38029,7 @@ def _cmd_remove_in_scope(
             )
         consent_liveness: tuple[str, str] | None = None
         attested_stop: _AttestedStop | None = None
+        attested_never_started: _AttestedStop | None = None
         if live_validate_owner:
             if handoff_writer is None:
                 _assert_caller_process(coordinator, "validate owner")
@@ -37896,22 +38052,75 @@ def _cmd_remove_in_scope(
                     and owner_state == "dead"
                     and not owner_unrecorded
                 )
-                if not attestable:
+                # A name the session tooling cannot use can never be judged at all, so
+                # neither the ordinary gate nor the attested stop can ever pass. Only the
+                # negative space in wrkslots' own records can prove such a slot free: no
+                # owner recorded now, none ever recorded for this generation, and the
+                # authority answering unverifiable rather than alive.
+                never_started_proven = (
+                    answer.state == "unverifiable"
+                    and record.owner is None
+                    and not _agent_name_usable(record.agent)
+                    and _slot_never_had_owner(
+                        record, _load_events(config, record.machine)
+                    )
+                )
+                if never_started_agent is not None:
+                    if not never_started_proven:
+                        raise Refusal(
+                            f"cannot remove {record.slot}: "
+                            "--attest-agent-never-started applies only when no owner "
+                            "was ever recorded for this slot generation, the recorded "
+                            f"agent name {record.agent!r} is one the session tooling "
+                            "cannot use, and the registered liveness authority answers "
+                            "unverifiable rather than alive. state: REFUSED -- no "
+                            "checkout was salvaged or removed"
+                        )
+                    assert attest_note is not None
+                    attested_never_started = _AttestedStop(
+                        note=attest_note, liveness_detail=answer.detail
+                    )
+                    consent_liveness = (answer.state, answer.detail)
+                elif not attestable:
+                    if attest_agent is None and never_started_proven:
+                        raise Refusal(
+                            f"cannot remove {record.slot}: its recorded agent name "
+                            f"{record.agent!r} is one the session tooling cannot use, "
+                            "so the registered liveness authority can never judge "
+                            f"it ({answer.detail}). state: REFUSED -- no checkout "
+                            "was salvaged or removed. remedy: no owner was ever "
+                            "recorded for this slot generation, so if the coordinator "
+                            "knows no agent was ever started in it, rerun this one "
+                            "explicit remove with --coordinator-authorized "
+                            f"--attest-agent-never-started {record.agent} "
+                            "--attest-note TEXT stating that basis; the attestation "
+                            "is recorded in the event log, and the heartbeat "
+                            "time-to-live, process-use, Git and salvage checks "
+                            "still run"
+                        )
                     _refuse_registered_liveness(answer.state, answer.detail)
-                if attest_agent is None:
+                elif attest_agent is None:
                     _refuse_registered_liveness(
                         answer.state, answer.detail, attest_agent=record.agent
                     )
-                assert attest_note is not None
-                attested_stop = _AttestedStop(
-                    note=attest_note, liveness_detail=answer.detail
-                )
-                consent_liveness = (answer.state, answer.detail)
+                else:
+                    assert attest_note is not None
+                    attested_stop = _AttestedStop(
+                        note=attest_note, liveness_detail=answer.detail
+                    )
+                    consent_liveness = (answer.state, answer.detail)
             elif attest_agent is not None:
                 print(
                     "NOTE: --attest-agent-stopped was not needed: the registered "
                     "liveness authority reports the agent dead; no attestation was "
                     "recorded",
+                    file=sys.stderr,
+                )
+            elif never_started_agent is not None:
+                print(
+                    "NOTE: --attest-agent-never-started was not needed: the "
+                    "registered liveness authority reports the agent dead; no "
+                    "attestation was recorded",
                     file=sys.stderr,
                 )
         else:
@@ -38132,6 +38341,24 @@ def _cmd_remove_in_scope(
                 ),
                 require_repository=False,
             )
+        elif attested_never_started is not None:
+            # Same reason as for the attested stop: durable before salvage,
+            # and recovery resumes only this exact attestation.
+            state = _replace_record(state, record)
+            _write_active_state(
+                config,
+                state,
+                action=NEVER_STARTED_ACTION,
+                slot=record.slot,
+                evidence=_never_started_evidence(
+                    record,
+                    attested_never_started,
+                    coordinator=coordinator,
+                    owner_detail=detail,
+                    age=age,
+                ),
+                require_repository=False,
+            )
         _write_event_file(
             config,
             record.machine,
@@ -38185,6 +38412,7 @@ def _cmd_remove_in_scope(
                 (
                     owner_release is None
                     and attested_stop is None
+                    and attested_never_started is None
                     and (owner_state == "dead" or owner_unrecorded)
                 )
                 or (
@@ -38209,10 +38437,15 @@ def _cmd_remove_in_scope(
                     )
                     + (
                         ", so have it restore its recorded branch and remote first"
-                        if attested_stop is None
+                        if attested_stop is None and attested_never_started is None
                         else "; a coordinator's attestation that an unregistered agent "
                         "stopped is not the authority's 'dead', so restore the recorded "
                         "branch and remote first, or remove without "
+                        "--archive-drifted-checkouts"
+                        if attested_never_started is None
+                        else "; a coordinator's attestation that no agent was ever "
+                        "started is not the authority's 'dead', so restore the "
+                        "recorded branch and remote first, or remove without "
                         "--archive-drifted-checkouts"
                     )
                 )
@@ -38288,6 +38521,14 @@ def _cmd_remove_in_scope(
                         else {
                             "basis": ATTESTED_STOP_BASIS,
                             "attestation_note": attested_stop.note,
+                        }
+                    ),
+                    **(
+                        {}
+                        if attested_never_started is None
+                        else {
+                            "basis": NEVER_STARTED_BASIS,
+                            "attestation_note": attested_never_started.note,
                         }
                     ),
                     **(
@@ -42141,12 +42382,36 @@ def _recover_finish(
             attested_recovery = True
         else:
             _refuse_registered_liveness(answer.state, answer.detail)
+    never_started_recovery = False
+    if (
+        owner_consent is None
+        and owner_release is None
+        and not live_validate_owner
+        and current.slot_type == "agent"
+        and not validate_complete
+        and current.owner is None
+        and not _agent_name_usable(current.agent)
+        and _recorded_never_started(current, _load_events(config, current.machine))
+        is not None
+        and _slot_never_had_owner(current, _load_events(config, current.machine))
+    ):
+        # Resume a never-started removal only while the authority still cannot judge the
+        # name and no owner has appeared since. An alive answer refuses; a later "dead"
+        # needs no attestation and takes the ordinary path.
+        answer = _registered_liveness_answer(config, current)
+        if answer.state == "dead":
+            liveness_answered_dead = True
+        elif answer.state == "unverifiable":
+            never_started_recovery = True
+        else:
+            _refuse_registered_liveness(answer.state, answer.detail)
     if live_validate_owner:
         _assert_recovery_processes(coordinator, processes, "validate owner")
     elif (
         owner_consent is None
         and owner_release is None
         and not attested_recovery
+        and not never_started_recovery
         and not liveness_answered_dead
     ):
         _assert_owner_liveness(
@@ -42192,6 +42457,14 @@ def _recover_finish(
                 "only that it has no record of the agent, and a coordinator's "
                 "attestation does not archive drift. state: REFUSED -- preserve it and "
                 "do not resume deletion"
+            )
+        if never_started_recovery:
+            raise Refusal(
+                f"slot {current.slot} removal archived recorded-checkout drift, which "
+                "requires the registered liveness authority's 'dead'; it cannot judge "
+                "the recorded agent name at all, and a coordinator's attestation does "
+                "not archive drift. state: REFUSED -- preserve it and do not resume "
+                "deletion"
             )
         if owner_release is not None:
             # A release let recovery skip the registered liveness command above.
@@ -61084,14 +61357,21 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "(reason=no-agentctl-record) can be removed on the coordinator's explicit "
             "attestation (--coordinator-authorized --attest-agent-stopped AGENT --attest-note "
             "TEXT), recorded in the event log before anything is salvaged; every other check "
-            "still runs."
+            "still runs. A slot recorded under an agent name the session tooling cannot use, "
+            "in which no agent was ever started (no owner recorded now or ever for this "
+            "generation, heartbeat TTL expired, liveness unverifiable rather than alive), can "
+            "likewise be removed on the coordinator's attestation with "
+            "--attest-agent-never-started AGENT instead."
         ),
         epilog=(
             "examples:\n"
             "  wrkslots remove slot01 --coordinator-pid $$ --expected-generation 3\n"
             "  wrkslots remove slot01 --coordinator-pid $$ --expected-generation 1 \\\n"
             "      --coordinator-authorized --attest-agent-stopped hold-slot01 \\\n"
-            "      --attest-note 'placeholder hold name; no process ever ran under it'"
+            "      --attest-note 'placeholder hold name; no process ever ran under it'\n"
+            "  wrkslots remove slot02 --coordinator-pid $$ --expected-generation 1 \\\n"
+            "      --coordinator-authorized --attest-agent-never-started Legacy-Name \\\n"
+            "      --attest-note 'slot created under an unusable name; no agent was ever started in it'"
         ),
         formatter_class=_HelpFormatter,
     )
@@ -61178,6 +61458,25 @@ usage or audit gate unknown, 3 fail-closed refusal.
         ),
     )
     remove.add_argument(
+        "--attest-agent-never-started",
+        metavar="AGENT",
+        help=(
+            "the coordinator's statement that no agent was ever started in this slot. Used "
+            "only for a slot recorded under an agent name the session tooling cannot use "
+            "(not 1-32 lowercase letters, digits or hyphens starting with a letter), so the "
+            "registered liveness command can never judge it and answers unverifiable rather "
+            "than alive; no owner is recorded for the slot now and none was ever recorded "
+            "for this generation, and the heartbeat time-to-live has expired. Then the "
+            "statement stands in for the command's 'dead', and is recorded in the event log "
+            "before anything is salvaged. Requires --coordinator-authorized and "
+            "--attest-note, and cannot be combined with --attest-agent-stopped. Every "
+            "process-use, handoff, hold, Git and salvage check still runs, and "
+            "--archive-drifted-checkouts still needs the command's own 'dead'. Agent slots "
+            "only; retire-pending and remove-agent-batch never accept it (default: not "
+            "given, so such a slot is refused with this rerun named)"
+        ),
+    )
+    remove.add_argument(
         "--discard-stale-image-copy",
         action="store_true",
         help=(
@@ -61204,10 +61503,11 @@ usage or audit gate unknown, 3 fail-closed refusal.
         metavar="TEXT",
         help=(
             "one line of at most 1024 characters saying how the coordinator knows the "
-            "agent stopped, for example 'in-process subagent; its task returned at "
-            "10:02Z'; recorded in the event log before anything is salvaged or removed. "
-            "Required with --attest-agent-stopped and meaningless without it (default: "
-            "not given)"
+            "agent stopped, or that no agent was ever started, for example 'in-process "
+            "subagent; its task returned at 10:02Z'; recorded in the event log before "
+            "anything is salvaged or removed. Required with --attest-agent-stopped or "
+            "--attest-agent-never-started and meaningless without one (default: not "
+            "given)"
         ),
     )
     remove.add_argument(

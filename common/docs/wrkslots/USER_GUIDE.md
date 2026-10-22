@@ -74,11 +74,16 @@ type, task and purpose, owner process identity, coordinator history, heartbeat t
    "Removing a slot whose agent was never registered" below. The attestation replaces only the
    command's "dead"; the owner must still be proven dead, the time-to-live expired, and every other
    check still runs.
-9. Before removing an agent slot, `remove` publishes unpushed commits and tracked and ordinary
+9. A slot recorded before that refusal existed, under a name the session tooling cannot use and in
+   which no agent was ever started (no owner recorded now or ever for its generation), has one
+   documented way out once its time-to-live has expired: the coordinator attests that no agent was
+   ever started in it with `--attest-agent-never-started`. See the end of "Removing a slot whose
+   agent was never registered" below. Every other check still runs.
+10. Before removing an agent slot, `remove` publishes unpushed commits and tracked and ordinary
    untracked files outside configured regenerable cache paths to the recorded remote. It never
    uploads gitignored content. It records and rechecks the exact remote ref and commit before
    deletion. A validate slot skips this step.
-10. `recover` lets any later participant complete an interrupted create or removal from the durable
+11. `recover` lets any later participant complete an interrupted create or removal from the durable
    history. It is not tied to the participant that began the operation.
 
 Run `wrkslots quickstart` for copyable commands and `wrkslots COMMAND --help` for exact effects and
@@ -118,6 +123,12 @@ wrkslots config convert --to yaml      # or: --to json
 `init --config-format json` still creates a JSON file.
 
 ## Coordinator assignment and creation
+
+An agent name must be one the session tooling can register: a lowercase letter, then lowercase
+letters, digits or hyphens, 32 characters at most, and never the reserved name `archive`.
+`create`, `adopt`, and `transfer-owner` refuse any other `--agent` value, because the liveness
+probe could never report such an agent alive or dead and a slot recorded under it could never be
+proven free.
 
 `create`, `register`, and `import-existing --apply` require both `--slot-type` and
 `--coordinator-authorized`. Omitting either refuses before any worktree or lifecycle record changes
@@ -848,8 +859,44 @@ reclaim evidence repeats the basis and the note. An interrupted attested removal
 `recover` only while that exact attestation is in the event log and the command still answers the
 no-record line (or "dead"); a later registration under the name refuses.
 
-A slot with no recorded owner whose agent was never registered is not covered: its owner cannot be
-proven dead, so it still needs the command's "dead".
+A slot with no recorded owner whose agent was never registered is not covered by the attestation
+above: its owner cannot be proven dead, so it still needs the command's "dead" — unless its
+recorded name is one the tooling cannot judge at all, the case below.
+
+### A slot no agent was ever started in, under a name that cannot be judged
+
+Before `create` refused them, a slot could be recorded under an agent name the session tooling can
+never register — capital letters, say. The liveness command answers a usage error for such a name
+forever, so it can never say "no record" (the attestation above cannot stand in) and never "dead".
+When no agent was ever started in the slot, the proof that it is free is the negative space in
+wrkslots' own records, and plain `remove` refuses naming this rerun:
+
+```sh
+wrkslots remove SLOT --coordinator-pid $$ --expected-generation N --coordinator-authorized \
+    --attest-agent-never-started AGENT --attest-note 'created under an unusable name; no agent was ever started in it'
+```
+
+`remove` accepts that statement only when all of these hold:
+
+- the recorded agent name is not one the session tooling can use (not a lowercase letter followed
+  by lowercase letters, digits or hyphens within 32 characters, or the reserved `archive`);
+- no owner is recorded for the slot, and no event for this slot generation ever recorded one —
+  `create` writes the first record snapshot and `adopt`/`transfer-owner` write one when they
+  bind, so an owner that ever existed left one behind;
+- the registered liveness command answers unverifiable rather than alive;
+- the heartbeat time-to-live has expired;
+- `--coordinator-authorized`, `--attest-agent-never-started AGENT` naming exactly the slot's
+  recorded agent, and `--attest-note TEXT` are all given, for one explicit `remove` of an agent
+  slot. It cannot be combined with `--attest-agent-stopped`; `retire-pending`,
+  `remove-agent-batch` and validation removal do not accept either flag.
+
+Every other guard runs unchanged, exactly as for the attested stop, including the process-use
+census (which refuses if some process is in fact working in the checkout) and salvage of the
+slot's branch. The attestation is durable before anything is salvaged: an
+`active-state-recorded` event with action `unjudgeable-agent-never-started-attested` carries the
+basis `coordinator-attested-never-started-agent`. An interrupted removal resumes under `recover`
+only while that exact attestation is in the event log, no owner has appeared since, and the
+command still answers unverifiable (or "dead").
 
 ## Remove a batch of agent slots
 

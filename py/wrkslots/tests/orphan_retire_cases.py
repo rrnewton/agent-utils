@@ -463,5 +463,283 @@ def test_bound_unregistered_verdict(stdout: bytes, stderr: bytes, expected: bool
     assert (verdict is not None) is expected
 
 
+# --------------------------------------------------- agent names, and slots never started in
+
+#: A name recorded before create refused unusable ones: capitals the probe can never judge.
+LEGACY_AGENT = "Legacy-Name"
+NEVER_STARTED_NOTE = "slot created under an unusable name; no agent was ever started in it"
+
+
+def _plant_legacy_agent(project: Path, agent: str = LEGACY_AGENT) -> None:
+    """Rewrite slot01's recorded agent to a legacy unusable name, owner untouched.
+
+    Simulates a slot created before create refused such names: the rewrite is an ordinary
+    active-state write, exactly what an old create would have left behind.
+    """
+
+    config = w._load_config(project, "testhost")
+    state = w._load_active(config, require_repository=False)
+    record = w._find_record(state, "slot01")
+    state = w._replace_record(state, dataclasses.replace(record, agent=agent))
+    w._write_active_state(
+        config,
+        state,
+        action="test-legacy-agent-recorded",
+        slot="slot01",
+        evidence={"planted_legacy_agent": agent},
+        require_repository=False,
+    )
+
+
+def _never_started_remove(
+    project: Path,
+    *,
+    agent: str = LEGACY_AGENT,
+    note: str = NEVER_STARTED_NOTE,
+) -> subprocess.CompletedProcess[str]:
+    return t.command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--no-lock-budget",
+        "--attest-agent-never-started",
+        agent,
+        "--attest-note",
+        note,
+    )
+
+
+def _never_started_events(project: Path) -> list[Mapping[str, object]]:
+    return [
+        event
+        for event in _events(project)
+        if event["kind"] == "active-state-recorded"
+        and w._as_mapping(event["payload"], "payload")["action"] == w.NEVER_STARTED_ACTION
+    ]
+
+
+def test_create_adopt_and_transfer_refuse_agent_names_the_tooling_cannot_use(
+    tmp_path: Path,
+) -> None:
+    """The same rule the session tooling applies, at every entry point that records a name."""
+
+    project, _repository, _remote = t.make_project(tmp_path)
+    for bad in ("Legacy-Name", "1agent", "agent_name", "agent.name", "a" * 33, "archive"):
+        refused = t.create(project, agent=bad, bind_owner=False)
+        assert refused.returncode == 3, (bad, refused.stderr)
+        assert "agent names must start with a lowercase letter" in refused.stderr
+
+    created = t.create(project, bind_owner=False)
+    assert created.returncode == 0, created.stderr
+    refused = t.command(
+        project,
+        "adopt",
+        "slot01",
+        "--agent",
+        "Bad-Name",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+    assert refused.returncode == 3, refused.stderr
+    assert "agent names must start with a lowercase letter" in refused.stderr
+
+    adopted = t.command(
+        project,
+        "adopt",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+    assert adopted.returncode == 0, adopted.stderr
+    t.mark_owner_dead(project)
+    refused = t.command(
+        project,
+        "transfer-owner",
+        "slot01",
+        "--agent",
+        "Bad-Name",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+    assert refused.returncode == 3, refused.stderr
+    assert "agent names must start with a lowercase letter" in refused.stderr
+    # A usable name still transfers: the refusal above was the name, not the operation.
+    moved = t.command(
+        project,
+        "transfer-owner",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+    assert moved.returncode == 0, moved.stderr
+
+
+def test_never_started_slot_under_an_unjudgeable_name_removes_on_attestation(
+    tmp_path: Path,
+) -> None:
+    """The planted fixture of the real orphan: unusable name, never adopted, expired TTL."""
+
+    project, repository, _remote = t.make_project(tmp_path)
+    created = t.create(project, bind_owner=False)
+    assert created.returncode == 0, created.stderr
+    checkout = t.checkout(project)
+    shutil.copy(PROBE, project / "liveness.py")
+    (project / ".agentctl").mkdir()
+    t.expire_heartbeat(project)
+    _plant_legacy_agent(project)
+
+    plain = t.command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--no-lock-budget",
+    )
+    assert plain.returncode == 3, plain.stderr
+    assert "is one the session tooling cannot use" in plain.stderr
+    assert f"--attest-agent-never-started {LEGACY_AGENT}" in plain.stderr
+    _retained(project)
+
+    removed = _never_started_remove(project)
+    assert removed.returncode == 0, removed.stderr
+    assert t.active_slots(project) == []
+    assert not checkout.exists()
+
+    events = _events(project)
+    [attested] = _never_started_events(project)
+    evidence = _evidence(attested)
+    assert evidence["basis"] == w.NEVER_STARTED_BASIS
+    assert evidence["agent"] == LEGACY_AGENT
+    assert evidence["owner"] is None
+    assert evidence["owner_state"] == "absent"
+    assert evidence["coordinator_authorized"] is True
+    assert evidence["note"] == NEVER_STARTED_NOTE
+    assert evidence["registered_liveness"] == "unverifiable"
+    assert str(evidence["registered_liveness_detail"]) != ""
+    started = next(event for event in events if event["kind"] == "reclaim-started")
+    assert events.index(started) > events.index(attested)
+    reclaim = next(
+        event
+        for event in events
+        if event["kind"] == "active-state-recorded"
+        and w._as_mapping(event["payload"], "p")["action"] == "reclaim-evidence-recorded"
+    )
+    assert _evidence(reclaim)["basis"] == w.NEVER_STARTED_BASIS
+    assert _evidence(reclaim)["attestation_note"] == NEVER_STARTED_NOTE
+    del repository
+
+
+def test_never_started_attestation_refuses_when_an_owner_was_recorded(
+    tmp_path: Path,
+) -> None:
+    """An adopted slot later recorded under a legacy name keeps needing its owner proven."""
+
+    project, _repository, _remote = t.make_project(tmp_path)
+    assert t.create(project).returncode == 0
+    shutil.copy(PROBE, project / "liveness.py")
+    (project / ".agentctl").mkdir()
+    t.mark_owner_dead(project)
+    t.expire_heartbeat(project)
+    _plant_legacy_agent(project)
+    refused = _never_started_remove(project)
+    assert refused.returncode == 3, refused.stderr
+    assert "no owner was ever recorded" in refused.stderr
+    _retained(project)
+    assert _never_started_events(project) == []
+
+
+def test_never_started_attestation_refuses_a_judgeable_name(tmp_path: Path) -> None:
+    """A usable name keeps its ordinary paths; the attestation is for unjudgeable ones only."""
+
+    project, _repository, _remote = t.make_project(tmp_path)
+    assert t.create(project, bind_owner=False).returncode == 0
+    shutil.copy(PROBE, project / "liveness.py")
+    (project / ".agentctl").mkdir()
+    t.expire_heartbeat(project)
+    refused = _never_started_remove(project, agent="codex-1")
+    assert refused.returncode == 3, refused.stderr
+    assert "no owner was ever recorded" in refused.stderr
+    _retained(project)
+
+
+def test_never_started_attestation_refuses_alive_and_unexpired_and_bad_requests(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = t.make_project(tmp_path)
+    assert t.create(project, bind_owner=False).returncode == 0
+    shutil.copy(PROBE, project / "liveness.py")
+    (project / ".agentctl").mkdir()
+    _plant_legacy_agent(project)
+    base = (
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--no-lock-budget",
+    )
+
+    unexpired = _never_started_remove(project)
+    assert unexpired.returncode == 3, unexpired.stderr
+    assert "time-to-live has not expired" in unexpired.stderr
+
+    both = t.command(
+        project,
+        *base,
+        "--attest-agent-stopped",
+        LEGACY_AGENT,
+        "--attest-agent-never-started",
+        LEGACY_AGENT,
+        "--attest-note",
+        NEVER_STARTED_NOTE,
+    )
+    assert both.returncode == 3, both.stderr
+    assert "cannot be supplied together" in both.stderr
+
+    unauthorized = t.raw_command(
+        project,
+        *base,
+        "--attest-agent-never-started",
+        LEGACY_AGENT,
+        "--attest-note",
+        NEVER_STARTED_NOTE,
+    )
+    assert unauthorized.returncode == 3, unauthorized.stderr
+    assert "requires --coordinator-authorized" in unauthorized.stderr
+
+    other = _never_started_remove(project, agent="someone-else")
+    assert other.returncode == 3, other.stderr
+    assert f"recorded for agent {LEGACY_AGENT}" in other.stderr
+
+    t.expire_heartbeat(project)
+    t.write_liveness_output(
+        project, f"alive agent={LEGACY_AGENT} rc=1\n".encode(), b"", 1
+    )
+    alive = _never_started_remove(project)
+    assert alive.returncode == 3, alive.stderr
+    _retained(project)
+    assert _never_started_events(project) == []
+
+
 #: What test_lifecycle.py collects from this module.
 COLLECTED: tuple[str, ...] = tuple(name for name in sorted(globals()) if name.startswith("test_"))
