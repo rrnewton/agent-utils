@@ -649,11 +649,15 @@ def clear_walk(walk: Walk, lined: str) -> None:
                and abs(float(before["top"]) - float(after["top"])) <= 1,
                f"the reader moved: {before} then {after}")
     walk.check(m.found["clears"] == 0, "an X is left in the list with no bookmark")
-    # A control in a row notes that row as the selection, as the row's own buttons do; a tap draws no
-    # ring for it, and the X draws none of its own.
-    walk.check(isinstance(ringed, list) and isinstance(m.found["ringed"], list)
-               and set(m.found["ringed"]) <= set(ringed),
-               f"the X drew a selection ring: {ringed} then {m.found['ringed']}")
+    if walk.touch:
+        # A tap selects silently, as on the row's own buttons: no ring is drawn for the X.
+        walk.check(isinstance(ringed, list) and isinstance(m.found["ringed"], list)
+                   and set(m.found["ringed"]) <= set(ringed),
+                   f"the X's tap drew a selection ring: {ringed} then {m.found['ringed']}")
+    else:
+        # The mouse focused the X, which went with the line: the focus is on the message it was above,
+        # not fallen to the page's top.
+        walk.check(m.found["selected"] == lined, f"the focus fell to {m.found['selected']!r}, not the message")
     walk.check(m.found["lined"] == [], f"the line is still on {m.found['lined']}")
     undo = m.chip("undo-bookmark")
     walk.check(undo is not None, "no Undo after the X")

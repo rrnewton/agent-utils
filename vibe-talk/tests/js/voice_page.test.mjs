@@ -54783,7 +54783,7 @@ test("`#420 bookmark-clear`: the X on the line takes the bookmark away, here, on
   assert.equal(page.el("jump-bookmark").hidden, true);
 });
 
-test("`#420 bookmark-clear`: Undo puts the bookmark back, conditionally, for a few seconds, and only in its channel", async () => {
+test("`#420 bookmark-clear`: Undo puts the bookmark back, conditionally, for a few seconds, never over another device's", async () => {
   const page = await servedBookmarkPage(backlog(6));
   await bookmarkRow(page, bid(3));
   const undo = page.el("undo-bookmark");
@@ -54819,6 +54819,74 @@ test("`#420 bookmark-clear`: Undo puts the bookmark back, conditionally, for a f
   assert.equal(page.bookmark.anchor && page.bookmark.anchor.message_id, bid(4), "Undo moved a bookmark set on another device");
   assert.equal(page.bookmarkCalls.length, calls + 1);
   assert.equal(page.bookmarkCalls[calls].ifRevision !== undefined, true, "Undo was written unconditionally");
+});
+
+test("`#420 bookmark-clear`: Undo pressed while the removal is still on its way is written after it, on the revision it answered", async () => {
+  const page = await servedBookmarkPage(backlog(6));
+  await bookmarkRow(page, bid(2));
+  page.holdBookmarkWrites = true;
+  await tapBookmarkClear(page);
+  assert.equal(bookmarkAt(page), null);
+  await page.el("undo-bookmark").click();
+  await page.settle();
+  assert.deepStrictEqual(bookmarkAt(page), { id: bid(2), place: "above" }, "Undo did not draw the line at once");
+  page.holdBookmarkWrites = false;
+  for (const release of page.pendingBookmarkWrites.splice(0)) release();
+  await page.settle();
+  await page.settle();
+  const [removal, back] = page.bookmarkCalls.slice(-2);
+  assert.equal(removal.method, "DELETE");
+  assert.deepStrictEqual([back.method, back.body.message_id, back.ifRevision], ["PUT", bid(2), page.bookmark.revision - 1],
+    "Undo was not written on the revision the removal answered");
+  assert.equal(page.bookmark.anchor && page.bookmark.anchor.message_id, bid(2), "the server did not end with the bookmark back");
+  assert.deepStrictEqual(bookmarkAt(page), { id: bid(2), place: "above" }, "the removal's answer took the line away again");
+});
+
+test("`#420 bookmark-clear`: Undo is offered only in the removal's channel, goes with a new bookmark, and with the credential", async () => {
+  const page = await servedBookmarkPage(backlog(6), (p) => {
+    p.channels = [{ ...CHANNEL }, { ...OTHER_CHANNEL }];
+  });
+  const undo = page.el("undo-bookmark");
+  await bookmarkRow(page, bid(2));
+  await tapBookmarkClear(page);
+  assert.equal(undo.hidden, false);
+  await readChannel(page, OTHER_CHANNEL.id);
+  assert.equal(undo.hidden, true, "another channel offers to put this channel's bookmark back");
+  await readChannel(page, CHANNEL.id);
+  assert.equal(undo.hidden, false, "back in its channel within the few seconds, Undo is gone");
+
+  // A bookmark set since is the one kept, and Undo goes with the setting.
+  await bookmarkRow(page, bid(4));
+  assert.equal(undo.hidden, true, "Undo stayed up over a bookmark set since");
+  assert.deepStrictEqual(bookmarkAt(page), { id: bid(4), place: "above" });
+
+  // Another credential: nothing of the first one's is put back under it.
+  await tapBookmarkClear(page);
+  assert.equal(undo.hidden, false);
+  page.el("api-token").value = "write-token-bbbbbbbbbbbbbbbb";
+  await page.el("save-token").click();
+  await page.settle();
+  assert.equal(undo.hidden, true, "another credential is offered the first one's Undo");
+});
+
+test("`#420 bookmark-clear`: a removal that fails after Undo was pressed says nothing: the line shown is Undo's", async () => {
+  const page = await servedBookmarkPage(backlog(6));
+  await bookmarkRow(page, bid(2));
+  page.holdBookmarkWrites = true;
+  await tapBookmarkClear(page);
+  await page.el("undo-bookmark").click();
+  await page.settle();
+  page.bookmarkFailure = { status: 503, error: "store_unavailable", detail: "the store is restarting" };
+  const [removal] = page.pendingBookmarkWrites.splice(0, 1);
+  removal();
+  await page.settle();
+  assert.doesNotMatch(page.el("status").textContent, /not saved/, "a failure Undo already took back was said");
+  page.bookmarkFailure = null;
+  page.holdBookmarkWrites = false;
+  for (const release of page.pendingBookmarkWrites.splice(0)) release();
+  await page.settle();
+  assert.deepStrictEqual(bookmarkAt(page), { id: bid(2), place: "above" });
+  assert.equal(page.bookmark.anchor && page.bookmark.anchor.message_id, bid(2));
 });
 
 test("`#420 bookmark-clear`: a removal the server refuses comes back, with no Undo; Shift+B's removal offers Undo too, and Help says the X", async () => {

@@ -10866,7 +10866,7 @@ const KEYMAP = [
   {
     group: KEYS_MESSAGE, chords: [{ key: "b", shift: true }],
     does: "Bookmark: the line above this message. On the message just below it, take it away, as the X on its " +
-      "line does, with Undo after. Marks nothing Done",
+      "line does. Marks nothing Done",
     rowControls: ["row-bookmark-button"],
     run: (event, target) => bookmarkFromKeyboard(target),
   },
@@ -28179,7 +28179,8 @@ function sendBookmark(move, { conditional = false, after = null, quiet = false }
     // Short, for a phone's status line; the reason a write failed goes where every failure does.
     if (outcome === "moved" && mine && !quiet) {
       setStatus("Bookmark moved on another device.");
-    } else if (outcome === "failed" && problem && !quiet) {
+    } else if (outcome === "failed" && problem && !quiet && mine) {
+      // Only for the change still shown: one made since (Undo, say) has its own write, which says.
       setStatus("The bookmark was not saved.");
       showError(`The bookmark could not be saved: ${problem.detail || problem.message}`);
     }
@@ -28296,12 +28297,14 @@ function bookmarkLineOf(row) {
   clear.addEventListener("click", inThisColumn((event) => {
     // The row's own tap would fold the message or read it aloud; this tap is the X's.
     if (event) event.stopPropagation();
-    // Pressed from the keyboard: a click a key made counts no clicks (`detail`). A tap focuses the X
-    // too, and a tap on a touch screen draws no ring (`noteRow`).
-    const focused = Boolean(event) && event.detail === 0 && document.activeElement === clear;
+    const focused = document.activeElement === clear;
     removeBookmark(currentChannelId());
-    // The X goes with the line. A keyboard that pressed it is left on the message the line was above.
-    if (focused && row.parentNode === el("discord-log") && rowShown(row)) takeRow(sideActive ? sidePane : channelPane, row, true);
+    // The X goes with the line, and the focus would fall to the page's top: it goes to the message the
+    // line was above, ringed, as a key or the mouse selects. Not after a tap, which selects silently
+    // (`drawnBy`) and leaves no ring.
+    if (focused && drawnBy() && row.parentNode === el("discord-log") && rowShown(row)) {
+      takeRow(sideActive ? sidePane : channelPane, row, true);
+    }
   }));
   line.append(word, clear);
   row.bookmarkLine = line;
@@ -28494,6 +28497,8 @@ function toggleBookmarkAt(row) {
   const anchor = anchorOfRow(row, "above");
   if (!anchor) return;
   const move = stageBookmark(channel, anchor);
+  // A bookmark set since a removal is the one kept: Undo has nothing left to put back.
+  if (bookmarkUndo && bookmarkUndo.channel === channel) endBookmarkUndo();
   redrawBookmark();
   setStatus("Bookmarked. b comes back here.");
   guardQuietly(() => sendBookmark(move))();
