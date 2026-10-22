@@ -12,6 +12,15 @@ interface Window {
   navigation?: { readonly currentEntry: NavigationHistoryEntry | null };
 }
 
+interface Navigator {
+  /**
+   * `#429 keyboard-hides-bar`. The VirtualKeyboard API (Chrome 94 on), of which the page reads only the
+   * on-screen keyboard's height and hears when it changes. Absent in Safari and Firefox. Not yet in
+   * TypeScript's DOM library.
+   */
+  virtualKeyboard?: EventTarget & { readonly boundingRect: DOMRectReadOnly };
+}
+
 interface HTMLLIElement {
   /**
    * The message objects a rendered row stands for: one on an ordinary row, several on a combined
