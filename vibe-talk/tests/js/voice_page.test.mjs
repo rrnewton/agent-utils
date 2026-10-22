@@ -66125,7 +66125,7 @@ test("`#338 column-overscroll`: at a desk PgDn or Space at the foot of the right
 
   // THE CONTROLS. The room not counted as the foot: in it the reader is up the list.
   const notFoot = await run(brokenScript(
-    "  return area.scrollHeight - overscrollRoom(area) - area.scrollTop - (area.clientHeight || 0);\n",
+    "  return area.scrollHeight - room - area.scrollTop - (area.clientHeight || 0);\n",
     "  return area.scrollHeight - area.scrollTop - (area.clientHeight || 0);\n"));
   assert.deepStrictEqual(notFoot, { ...real, atNewest: false });
   // End and the chip landing where the room already is, rather than closing it: the reader stays in it.

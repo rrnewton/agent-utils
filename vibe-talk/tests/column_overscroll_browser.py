@@ -275,7 +275,7 @@ CONTROLS: tuple[Control, ...] = (
     ("no room drawn", "voice.css",
      (("  #side-scroll > #side-overscroll {\n    display: block;\n  }\n", ""),), ("WHEEL",)),
     ("the room not the foot", "voice.js",
-     (("  return area.scrollHeight - overscrollRoom(area) - area.scrollTop - (area.clientHeight || 0);\n",
+     (("  return area.scrollHeight - room - area.scrollTop - (area.clientHeight || 0);\n",
        "  return area.scrollHeight - area.scrollTop - (area.clientHeight || 0);\n"),), ("JUMP", "FOLLOW")),
     ("a follower in the room taken to the foot", "voice.js",
      (("    if (overscroll !== null && area.scrollTop >= footTop(area) - 0.5) return;\n", ""),), ("STILL",)),
