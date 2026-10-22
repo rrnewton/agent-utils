@@ -20,6 +20,66 @@ impl HarnessTui for CodexTui {
             .rev()
             .find(|r| !r.trim().is_empty())
             .map_or(String::new(), |r| r.trim().to_lowercase());
+        if footer.starts_with("enter submit")
+            && footer.contains("^] skip")
+            && (footer.contains("shift+→ main prompt")
+                || footer.contains("shift+right main prompt"))
+        {
+            // Async questions have a dedicated editor but no numbered Question header.
+            if let Some(first) = rows.iter().rposition(|row| {
+                matches!(
+                    row.trim(),
+                    "• Queued follow-up inputs" | "Queued follow-up inputs"
+                )
+            }) {
+                let last = rows.iter().rposition(|row| !row.trim().is_empty()).unwrap();
+                let mut parts: Vec<Vec<&str>> = Vec::new();
+                let mut part = Vec::new();
+                for row in &rows[first + 1..last] {
+                    if row.trim().is_empty() {
+                        if !part.is_empty() {
+                            parts.push(std::mem::take(&mut part));
+                        }
+                    } else {
+                        part.push(row.trim());
+                    }
+                }
+                if !part.is_empty() {
+                    parts.push(part);
+                }
+                if parts.len() >= 2 && parts.last().is_some_and(|part| part.len() == 1) {
+                    let editor = parts.pop().unwrap()[0]
+                        .trim()
+                        .trim_start_matches('›')
+                        .trim();
+                    let title = parts
+                        .iter()
+                        .map(|part| part.join("\n"))
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    if !title.is_empty()
+                        && !title
+                            .lines()
+                            .any(|row| row.trim().starts_with("Question ") && row.contains('/'))
+                    {
+                        return View::question(Question {
+                            text: title,
+                            options: vec![],
+                            selected: None,
+                            total: 1,
+                            collapsed: false,
+                            notes: false,
+                            draft: if editor == "Type your answer" {
+                                String::new()
+                            } else {
+                                editor.to_owned()
+                            },
+                        });
+                    }
+                }
+            }
+            return View::state(State::MenuOrPicker);
+        }
         let header = rows.iter().enumerate().rev().find_map(|(i, row)| {
             let h = row.trim().strip_prefix("Question ")?;
             let (index, rest) = h.split_once('/')?;

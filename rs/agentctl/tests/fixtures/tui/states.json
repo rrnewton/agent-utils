@@ -48,5 +48,20 @@
     "harness": "claude",
     "state": "unknown",
     "screen": "shell$\n"
+  },
+  {
+    "harness": "codex",
+    "state": "blocking_question",
+    "screen": "• Working (2s • esc to interrupt)\n\n• Queued follow-up inputs\n\n  Is there an admission map for these source fixtures?\n  I can continue drafting while it is prepared.\n\n  Type your answer\n\n  enter submit   ^] skip   shift+→ main prompt\n"
+  },
+  {
+    "harness": "codex",
+    "state": "blocking_question",
+    "screen": "• Working (2s • esc to interrupt)\n\n• Queued follow-up inputs\n\n  Is there an admission map for these source fixtures?\n  I can continue drafting while it is prepared.\n\n  A staged literal answer\n\n  enter submit   ^] skip   shift+→ main prompt\n"
+  },
+  {
+    "harness": "codex",
+    "state": "unknown",
+    "screen": "• Working (2s • esc to interrupt)\n\n• Queued follow-up inputs\n\n  Is there an admission map for these source fixtures?\n  I can continue drafting while it is prepared.\n\n  Type your answer\n\n  enter submit   ^] skip   shift+→ main prompt\n\nshell$\n"
   }
 ]

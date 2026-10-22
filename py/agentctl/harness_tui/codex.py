@@ -21,6 +21,22 @@ class CodexTui:
         rows = clean.splitlines()
         tail = "\n".join(rows[-16:]).lower()
         footer = next((row.strip().lower() for row in reversed(rows) if row.strip()), "")
+        if (footer.startswith("enter submit") and "^] skip" in footer
+                and ("shift+→ main prompt" in footer or "shift+right main prompt" in footer)):
+            # Async questions have a dedicated editor but no numbered Question header.
+            queued = [i for i, row in enumerate(rows)
+                      if row.strip() in ("• Queued follow-up inputs", "Queued follow-up inputs")]
+            if queued:
+                last = max(i for i, row in enumerate(rows) if row.strip())
+                parts = re.split(r"\n\s*\n", "\n".join(rows[queued[-1] + 1:last]).strip())
+                if len(parts) >= 2 and "\n" not in parts[-1]:
+                    editor = parts[-1].strip().removeprefix("›").strip()
+                    title = "\n\n".join("\n".join(line.strip() for line in part.splitlines())
+                                        for part in parts[:-1]).strip()
+                    if title and not re.search(r"(?m)^\s*Question \d+/\d+", title):
+                        draft = "" if editor == "Type your answer" else editor
+                        return View(State.QUESTION, Question(title, draft=draft))
+            return View(State.MENU)
         headers = list(re.finditer(r"(?m)^\s*Question (\d+)/(\d+) \(\d+ unanswered\)\s*$", clean))
         if headers and ("enter to submit answer" in footer or "enter to submit all" in footer):
             header = headers[-1]

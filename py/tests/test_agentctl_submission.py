@@ -1075,7 +1075,7 @@ def test_shared_state_snapshots() -> None:
     assert harness_tui("unknown") is None
 
 
-@pytest.mark.parametrize("kind", ["options", "freeform", "multi_question_first", "hidden_options_footer", "options_notes_visible"])
+@pytest.mark.parametrize("kind", ["options", "freeform", "async-freeform", "multi_question_first", "hidden_options_footer", "options_notes_visible"])
 def test_upstream_codex_snapshots(kind: str) -> None:
     view = adapter().classify((FIXTURES / f"codex-{kind}.txt").read_text())
     assert view.state == State.QUESTION
@@ -1085,7 +1085,7 @@ def test_upstream_codex_snapshots(kind: str) -> None:
         assert view.question.selected == 1
         assert adapter().answer_plan(view.question, 2, None).keys == ("Down",)
         assert adapter().answer_plan(view.question, None, "Alternative").keys == ("Down", "Down", "Down", "Tab")
-    elif kind == "freeform":
+    elif kind in ("freeform", "async-freeform"):
         assert adapter().answer_plan(view.question, None, "Details").text == "Details"
     else:
         with pytest.raises(ValueError):
@@ -1130,6 +1130,7 @@ class FormTerminal:
         value = text.removeprefix("\x1b[200~").removesuffix("\x1b[201~")
         self.screen = self.screen.replace("› Type your answer (optional)", "› " + value)
         self.screen = self.screen.replace("› Add notes", "› " + value)
+        self.screen = self.screen.replace("  Type your answer\n", "  " + value + "\n")
 
     def native_prompt(self, pane: str, text: str) -> None:
         raise AssertionError("answer must not use ordinary prompt delivery")
@@ -1148,13 +1149,31 @@ def test_option_answer_opens_navigates_and_verifies_dismissal(collapsed: bool) -
     assert not terminal.texts
 
 
-@pytest.mark.parametrize("kind", ["freeform", "options"])
+@pytest.mark.parametrize("kind", ["freeform", "async-freeform", "options"])
 def test_literal_text_answer(kind: str) -> None:
     terminal = FormTerminal(kind)
     assert answer(terminal, "w1:p1", adapter(), text="A literal answer", verify=lambda p: None,
                   sleep=terminal.sleep, monotonic=lambda: terminal.seconds)["answered"] is True
     assert terminal.keys.count("Enter") == 1
     assert terminal.texts == ["\x1b[200~A literal answer\x1b[201~"]
+
+
+def test_async_question_refuses_stale_capture_and_existing_answer() -> None:
+    screen = (FIXTURES / "codex-async-freeform.txt").read_text()
+    assert adapter().classify(screen + "\nshell$\n").state != State.QUESTION
+    terminal = FormTerminal("async-freeform")
+    terminal.screen = screen.replace("Type your answer", "Existing draft")
+    with pytest.raises(AgentDeliveryError):
+        answer(terminal, "w1:p1", adapter(), text="Replacement", verify=lambda p: None)
+    assert not terminal.texts and not terminal.keys
+
+
+def test_async_question_never_repeats_an_unacknowledged_submit() -> None:
+    terminal = FormTerminal("async-freeform", drop=True)
+    with pytest.raises(AgentPossiblySubmitted):
+        answer(terminal, "w1:p1", adapter(), text="Continue drafting", verify=lambda p: None,
+               sleep=terminal.sleep, monotonic=lambda: terminal.seconds)
+    assert terminal.keys == ["Enter"]
 
 
 def test_dropped_submit_is_uncertain_and_never_retried() -> None:

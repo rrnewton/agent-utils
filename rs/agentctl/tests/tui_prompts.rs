@@ -8,6 +8,7 @@ use agentctl::submission::GuardedInput;
 
 const OPTIONS: &str = include_str!("fixtures/tui/codex-options.txt");
 const FREEFORM: &str = include_str!("fixtures/tui/codex-freeform.txt");
+const ASYNC_FREEFORM: &str = include_str!("fixtures/tui/codex-async-freeform.txt");
 const WORKING: &str = "• Working (2s • esc to interrupt)\n»\n  GPT default · /work/project\n";
 
 #[test]
@@ -131,7 +132,8 @@ impl GuardedInput for Terminal {
             .screen
             .borrow()
             .replace("› Type your answer (optional)", &format!("› {value}"))
-            .replace("› Add notes", &format!("› {value}"));
+            .replace("› Add notes", &format!("› {value}"))
+            .replace("  Type your answer\n", &format!("  {value}\n"));
         *self.screen.borrow_mut() = screen;
         Ok(())
     }
@@ -169,7 +171,7 @@ fn option_answer_expands_selects_and_confirms() {
 
 #[test]
 fn free_text_and_other_option_use_literal_paste() {
-    for screen in [FREEFORM, OPTIONS] {
+    for screen in [FREEFORM, ASYNC_FREEFORM, OPTIONS] {
         let terminal = Terminal::new(screen);
         let result = agentctl::tui_prompts::answer(
             &terminal,
@@ -195,6 +197,25 @@ fn free_text_and_other_option_use_literal_paste() {
             ["\u{1b}[200~A literal answer\u{1b}[201~"]
         );
     }
+}
+
+#[test]
+fn async_question_refuses_stale_capture_and_existing_draft() {
+    let adapter = harness_tui(Some("codex")).unwrap();
+    assert_ne!(
+        adapter
+            .classify(&format!("{ASYNC_FREEFORM}\nshell$\n"))
+            .state,
+        State::BlockingQuestion
+    );
+    let question = adapter
+        .classify(&ASYNC_FREEFORM.replace("Type your answer", "Existing draft"))
+        .question
+        .unwrap();
+    assert!(adapter
+        .answer_plan(&question, None, Some("Replacement"))
+        .is_err());
+    assert_eq!(question.draft, "Existing draft");
 }
 
 #[test]
