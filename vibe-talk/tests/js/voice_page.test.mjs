@@ -778,7 +778,8 @@ class FakeElement {
    * its height.
    */
   isRowSeam() {
-    return this.tagName === "div" && this.hasClass("row-seam");
+    // A gap's line is a button since `#439 search-unmatched-separators`; a day's stays a div.
+    return this.hasClass("row-seam");
   }
 
   /** The room this element keeps above and below its box for the lines drawn in it. */
@@ -58946,8 +58947,9 @@ test("`#249 search-highlight`: a search draws a line in each gap it leaves, coun
   ]);
   const line = rows.find((li) => li.getAttribute("data-id") === "8").children[0];
   assert.equal(line.className, "row-seam", "the line is not the row's first child, ahead of its message");
-  assert.equal(line.getAttribute("role"), "separator", "the line is not a separator to a screen reader");
-  assert.match(line.getAttribute("aria-label"), /^2 unmatched messages( · .+)?$/);
+  // `#439 search-unmatched-separators`: a gap's line is pressed to show its run, as a run's line is.
+  assert.equal(line.tagName, "button", "a gap's line is not a control to a screen reader either");
+  assert.match(line.getAttribute("aria-label"), /^Show 2 unmatched messages( · .+)?$/);
   assert.equal(rows.find((li) => li.getAttribute("data-id") === "8").getAttribute("data-seam"), "gap");
   // A trailing gap is drawn below the last match; one message is said as one.
   await page.el("search-field").setValue("step 8");
@@ -58988,7 +58990,7 @@ test("`#249 search-highlight`: the Pinned list draws gaps only while a filter ch
   ]);
 });
 
-test("`#249 search-highlight`: a gap never meets a collapsed run, and the lines are drawn in room of their own, quietly, never as a control", async () => {
+test("`#249 search-highlight`: a gap never meets a collapsed run, and the lines are drawn in room of their own, quietly; a gap's is a control, a day's is not", async () => {
   const page = newPage();
   await signIn(page);
   const messages = authorChannel();
@@ -59008,7 +59010,10 @@ test("`#249 search-highlight`: a gap never meets a collapsed run, and the lines 
   const line = cssBlock("#discord-log .row-seam");
   assert.match(line, /position:\s*absolute/);
   assert.match(line, /bottom:\s*calc\(100% \+ 1px\)/);
-  assert.match(line, /pointer-events:\s*none/, "a stray tap could land on the line");
+  assert.match(line, /pointer-events:\s*none/, "a stray tap could land on a day's line");
+  // `#439 search-unmatched-separators`: but a gap's line is a button in that shape, and takes its tap.
+  assert.match(cssBlock("#discord-log button.row-seam"), /pointer-events:\s*auto/, "a gap's line takes no tap");
+  assert.match(cssBlock("#discord-log button.row-seam"), /cursor:\s*pointer/);
   assert.match(line, /color:\s*var\(--muted\)/);
   assert.match(line, /filter:\s*none !important/, "a receding row would drain the line with it");
   assert.match(cssBlock("#discord-log .row-seam::before"), /border-top:\s*1px dashed var\(--edge\)/);
@@ -59045,6 +59050,149 @@ test("`#249 search-highlight`: a redraw that changes nothing writes no line, and
   assert.equal(builtSince(page, 0, "div") > 0, true);
   assert.deepStrictEqual(page.el("discord-log").descendants().filter((node) => node.hasClass("row-seam")), lines,
     "the same search made its lines again");
+});
+
+test("`#439 search-unmatched-separators`: tapping an unmatched line shows that run, and only that run, until the search changes", async () => {
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, authorChannel());
+  await search(page, "deploy");
+  await page.settle();
+  const shownIds = () => rows.filter((li) => !li.hasClass("search-hidden")).map((li) => li.getAttribute("data-id"));
+  assert.deepStrictEqual(shownIds(), ["4", "8", "12"]);
+  // The gap above 8 stands for 5, 6 and 7. It is a button, as a collapsed run's line is.
+  const line = rows.find((li) => li.getAttribute("data-id") === "8").children
+    .find((kid) => kid.hasClass("row-seam") && !kid.hasClass("row-seam-below"));
+  assert.equal(line.tagName, "button", "an unmatched line is not a control a tap can open");
+  assert.match(line.getAttribute("aria-label"), /^Show 3 unmatched messages/);
+  await line.click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(), ["4", "5", "6", "7", "8", "12"], "the tap did not show exactly its run");
+  assert.deepStrictEqual(seamsOf(page), [
+    ["4", "… 3 unmatched messages …", null],
+    ["12", "… 3 unmatched messages …", null],
+  ], "another run's line moved, or the opened one stayed");
+  // What the bar counts does not change: shown is not matched.
+  assert.match(page.el("search-count").textContent, /^3 of 12 loaded$/);
+  // A trailing run opens from the line below its last match.
+  await page.el("search-field").setValue("step 8");
+  await page.settle();
+  assert.deepStrictEqual(shownIds(), ["8"], "changing the search kept a run the old one had opened");
+  const below = rows.find((li) => li.getAttribute("data-id") === "8").children
+    .find((kid) => kid.hasClass("row-seam") && kid.hasClass("row-seam-below"));
+  await below.click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(), ["8", "9", "10", "11", "12"]);
+  assert.deepStrictEqual(seamsOf(page), [["8", "… 7 unmatched messages …", null]]);
+});
+
+test("`#439 search-unmatched-separators`: with Collapse read and a search both on, a read run is one unmatched line, and closing the search collapses it again", async () => {
+  const page = newPage();
+  await signIn(page);
+  const messages = authorChannel();
+  for (const m of messages) if (Number(m.id) < 10) page.dealtWith.add(m.id);
+  const rows = await showDiscord(page, messages);
+  await chooseReadMode(page, "Collapse read");
+  assert.ok(collapsedRows(page).length > 0, "the fixture collapsed nothing");
+  await search(page, "deploy");
+  await page.settle();
+  // One line, the search's: no collapsed run stands beside a gap, read and unmatched alike.
+  assert.deepStrictEqual(collapsedRows(page), [], "a read run stayed collapsed under the search");
+  assert.deepStrictEqual(seamsOf(page).map(([id]) => id), ["4", "8", "12"]);
+  const line = rows.find((li) => li.getAttribute("data-id") === "8").children
+    .find((kid) => kid.hasClass("row-seam") && !kid.hasClass("row-seam-below"));
+  await line.click();
+  await page.settle();
+  assert.deepStrictEqual(rows.filter((li) => !li.hasClass("search-hidden")).map((li) => li.getAttribute("data-id")),
+    ["4", "5", "6", "7", "8", "12"], "the read messages the line stood for were not shown by it");
+  assert.deepStrictEqual(collapsedRows(page), [], "showing them collapsed them again under the search");
+  await page.el("search-toggle").click();
+  await page.settle();
+  assert.deepStrictEqual(seamsOf(page), [], "an unmatched line outlived the search");
+  assert.ok(collapsedRows(page).length > 0, "closing the search did not put Collapse read back");
+});
+
+test("`#439 search-unmatched-separators`: the search stays on screen and its lines are drawn inside a thread opened under it", async () => {
+  const page = await threadPage();
+  await search(page, "root");
+  await page.settle();
+  await pickThread(page, "thread:spaces/A/threads/one & two");
+  assert.equal(page.el("thread-heading").hidden, false, "the thread did not open");
+  assert.equal(page.el("search-field").hidden, false, "the search went off screen inside the thread");
+  assert.equal(page.el("search-count").hidden, false, "the count went with it");
+  assert.match(page.el("search-count").textContent, /^1 of 2 loaded$/, "the count does not speak for the thread");
+  assert.deepStrictEqual(seamsOf(page), [["201", null, "… 1 unmatched message …"]],
+    "no line in the thread says what the search leaves out of it");
+  const below = page.el("discord-log").children[0].children
+    .find((kid) => kid.hasClass("row-seam") && kid.hasClass("row-seam-below"));
+  await below.click();
+  await page.settle();
+  assert.deepStrictEqual(page.el("discord-log").children.filter((li) => !li.hasClass("search-hidden"))
+    .map((li) => li.getAttribute("data-id")), ["201", "202"], "the line did not show the thread's rest");
+});
+
+test("`#439 search-unmatched-separators`: among the cards a gap counts the messages in its threads, exactly or as at least, and opens", async () => {
+  const page = await threadPage();
+  await twoColumns(page);
+  const cards = page.el("side-cards").children;
+  assert.equal(cards.length, 2, "the fixture drew other than its two cards");
+  // The first thread is two messages, counted exactly; the second's count is not exact, and this
+  // page holds its root and one reply: at least two.
+  await search(page, "second");
+  await page.settle();
+  assert.deepStrictEqual(seamsOf(page, "side-cards"),
+    [["spaces/A/threads/another", "… 2 unmatched messages in 1 thread …", null]],
+    "the card the search keeps does not say what whole thread it skipped");
+  await page.el("search-field").setValue("first");
+  await page.settle();
+  assert.deepStrictEqual(seamsOf(page, "side-cards"),
+    [["spaces/A/threads/one & two", null, "… at least 2 unmatched messages in 1 thread …"]],
+    "an inexact thread is not counted as at least what this page holds of it");
+  const below = cards.find((li) => li.getAttribute("data-id") === "spaces/A/threads/one & two").children
+    .find((kid) => kid.hasClass("row-seam") && kid.hasClass("row-seam-below"));
+  assert.equal(below.tagName, "button", "a card gap's line is not a control");
+  assert.match(below.getAttribute("aria-label"), /^Show at least 2 unmatched messages in 1 thread$/);
+  await below.click();
+  await page.settle();
+  assert.deepStrictEqual(cards.filter((li) => !li.hasClass("search-hidden") && !li.hidden)
+    .map((li) => li.getAttribute("data-id")), ["spaces/A/threads/one & two", "spaces/A/threads/another"],
+    "the tap did not show the thread the line stood for");
+  assert.deepStrictEqual(seamsOf(page, "side-cards"), [], "the opened card's line stayed");
+  // The bar still counts matches, not what was shown by hand.
+  assert.match(page.el("search-count").textContent, /loaded|thread/);
+  await page.el("search-field").setValue("thread root");
+  await page.settle();
+  assert.deepStrictEqual(seamsOf(page, "side-cards"), [], "a card gap outlived a search that matches both cards");
+});
+
+test("`#439 search-unmatched-separators`: the Threads list in one column draws the same lines over its cards", async () => {
+  const page = await threadPage();
+  await page.el("channel-view-threads").click();
+  await page.settle();
+  const list = page.el("thread-list");
+  assert.equal(list.hidden, false);
+  await search(page, "First");
+  await page.settle();
+  assert.deepStrictEqual(list.children.filter((li) => !li.hasClass("search-hidden"))
+    .map((li) => li.getAttribute("data-context-id")), ["spaces/A/threads/one & two"]);
+  const first = list.children[0];
+  const below = first.children.find((kid) => kid.hasClass("row-seam") && kid.hasClass("row-seam-below"));
+  assert.ok(below, "no line under the kept card counts the thread left out");
+  assert.equal(lineText(below), "… at least 2 unmatched messages in 1 thread …");
+  assert.equal(first.getAttribute("data-seam-below"), "gap");
+  await below.click();
+  await page.settle();
+  assert.deepStrictEqual(list.children.filter((li) => !li.hasClass("search-hidden"))
+    .map((li) => li.getAttribute("data-context-id")),
+    ["spaces/A/threads/one & two", "spaces/A/threads/another"], "the tap did not show the other thread's card");
+  await page.el("search-toggle").click();
+  await page.settle();
+  assert.ok(list.children.every((li) => li.getAttribute("data-seam") !== "gap" && !li.hasAttribute("data-seam-below")),
+    "a card kept a gap's mark after the search closed");
+  // The stylesheet: a card keeps a gap's room above itself, and the line stands in it.
+  assert.match(cssBlock('#thread-list .thread-card[data-seam="gap"]'), /margin-top:\s*var\(--gap-room\)/);
+  assert.match(cssBlock("#side-cards .row-seam.card-seam"), /position:\s*absolute/);
+  assert.match(cssBlock("#side-cards .row-seam.card-seam::before"), /border-top:\s*1px dashed var\(--edge\)/);
 });
 
 test("`#249 search-highlight`: the cards of the right column are marked where the search finds them", async () => {
@@ -59146,7 +59294,7 @@ test("`#250 date-separators`: filtered to sparse hits, the days in each gap are 
   // Each side of the `·` is held together, so a narrow line breaks between the count and the days.
   assert.equal(rowWithId(page, "4").children[0].textContent, "…\u00a02\u00a0unmatched\u00a0messages\u00a0· Oct\u00a04\u00a0–\u2060\u00a06\u00a0…",
     "a gap's line can break inside its count or its days");
-  assert.equal(rowWithId(page, "4").children[0].getAttribute("aria-label"), "2 unmatched messages · Oct 4 – 6",
+  assert.equal(rowWithId(page, "4").children[0].getAttribute("aria-label"), "Show 2 unmatched messages · Oct 4 – 6",
     "a screen reader is read the no-break spaces");
   // A gap that crosses no day says none; one across a month says both months; one before the first
   // match says the days it reaches, as does one after the last.

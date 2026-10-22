@@ -4487,6 +4487,10 @@ function applySearch() {
     everywhere: new Map(LINK_KINDS.map(({ kind }) => [kind, 0])),
     matching: new Map(LINK_KINDS.map(({ kind }) => [kind, 0])),
   };
+  // `#439 search-unmatched-separators`. The runs the reader has opened under these very searches:
+  // shown where they stand, never counted as matched, and forgotten with any change of filter.
+  const opened = openedGapIds(false);
+  const openedCards = openedCardGaps(false);
   for (const id of SEARCH_LISTS) {
     // The call's transcript is the left column's. `#229 desktop-two-column`.
     if (sideActive && id === "transcript") continue;
@@ -4502,7 +4506,10 @@ function applySearch() {
       // no longer beside it, and it is never counted either way.
       const said = terms.length === 0 || (text !== null && terms.every((term) => text.includes(term)));
       const hit = said && (!links || shown > 0) && authorPasses(row, author);
-      setClassWord(row, "search-hidden", !hit);
+      const revealed = !hit && text !== null && (id === "thread-list"
+        ? openedCards !== null && openedCards.threads.has(String(row.getAttribute("data-context-id")))
+        : inOpenedGap(row, opened));
+      setClassWord(row, "search-hidden", !(hit || revealed));
       // `#249 search-highlight`. Where each term is, in the rows it lets through.
       markSearchHits(row, hit && text !== null ? marking : []);
       // A spoken yes drawn into the card it sent (`#269 approval-card-inline`) is not on screen, and
@@ -4539,6 +4546,8 @@ function applySearch() {
   // above has just shown — before the arrows, which reach across them.
   drawSeams(el("discord-log"));
   drawSeams(el("pinned-log"));
+  // `#439 search-unmatched-separators`. And among this column's thread cards, counting whole threads.
+  drawCardGaps(el("thread-list"));
   // `#214 reply-arrow`. What the reader can see directly above a reply is what its arrow is drawn
   // against, and the pass above has just decided that.
   renderReplyLinks();
@@ -5169,9 +5178,24 @@ function markSearchHits(row, terms) {
 // margins are fixed heights in the stylesheet, so nothing is measured (`#226`), and each row keeps
 // the words it was drawn with, so a pass that changes nothing writes nothing.
 //
-// IN THE CHANNEL'S LISTS ONLY — Main, All, a thread, in either column, and the Pinned list — which
-// are in time order. Not the Threads list or the cards, which are threads; not the call's transcript,
-// whose turns stand at its two sides; not the messages still being sent.
+// IN THE CHANNEL'S LISTS — Main, All, a thread, in either column, and the Pinned list — which are
+// in time order. Not the call's transcript, whose turns stand at its two sides; not the messages
+// still being sent.
+//
+// `#439 search-unmatched-separators`. A gap's line is a control, as a collapsed run's is: a tap on
+// it shows that run where it stands, the search kept, until any filter that chose the rows changes
+// — shown, not matched, so the bar's count does not move. And the same line stands among the thread
+// cards, in the Threads list and in two columns (`drawCardGaps`): there a card is a whole thread,
+// so its gap counts the messages in the threads it stands for, "… 15 unmatched messages in 3
+// threads …".
+//
+// ONE RULE WHEN A READ MODE AND THE SEARCH ARE BOTH ON: the search's. While a filter chooses rows
+// the read runs stand suspended as they always have (`readRunsSuspended`, `hidingRead`) — Collapse
+// read opens every run and Hide read steps aside on a service with threads — so a run that is both
+// read and unmatched is ONE line, the unmatched one, because the search is why it is not shown.
+// Opening it shows those messages, the read ones greyed as in Show read; closing the search puts
+// the read mode back. On a service without threads Hide read is a read of its own and stays: the
+// read messages are not in the list at all, and a gap counts what is loaded, as the bar does.
 
 /** Whether a filter is choosing rows: the search text, Links, or whose messages. */
 const rowsChosen = () => readRunsSuspended();
@@ -5197,13 +5221,117 @@ const lineLabel = (words) => words.replace(/…/g, "").replace(/\u2060/g, "").re
 /** What a gap's line says, and the days it reaches when it reaches any (`#250 date-separators`). */
 const gapWords = (count, days = "") => lineWords(`… ${count} unmatched message${count === 1 ? "" : "s"}`, days);
 
-/** The line on `row` above it (`below` false) or below it, made once and kept on it. */
-function seamLineOf(row, below) {
-  const held = below ? row.seamBelowLine : row.seamLine;
-  if (held) return held;
-  const line = document.createElement("div");
-  line.className = below ? "row-seam row-seam-below" : "row-seam";
-  line.setAttribute("role", "separator");
+// `#439 search-unmatched-separators`. The unmatched runs the reader has opened, in each view, as the
+// ids of their messages: as a collapsed run's opened state is kept (`openedReadRuns`), because the
+// rows are rebuilt under the reader. Held under the searches that chose the rows (`searchKey`) and
+// forgotten the moment any filter changes: an opened run is an act on THIS search's list, and a new
+// word typed is a new list. The thread cards keep theirs beside them (`openedCardGaps`).
+
+/**
+ * The opened runs of every view, under the searches as they stood when each was opened.
+ *
+ * @type {Map<string, Set<string>>}
+ */
+const openedGaps = new Map();
+
+/** The `searchKey` the opened runs belong to: a change of any filter forgets them all. */
+let openedGapsFor = "";
+
+/**
+ * This column's view's set of opened messages, or null when it has none and `create` does not ask
+ * for one. Read on every pass of the search; empty almost always, and the pass is then as it was.
+ *
+ * @param {boolean} create
+ * @returns {Set<string> | null}
+ */
+function openedGapIds(create) {
+  const searches = searchKey();
+  if (searches !== openedGapsFor) {
+    openedGaps.clear();
+    openedGapsFor = searches;
+  }
+  const key = JSON.stringify([viewKey(), sideActive, String(el("discord-channel").value)]);
+  const held = openedGaps.get(key) || null;
+  if (held || !create) return held;
+  const made = new Set();
+  openedGaps.set(key, made);
+  return made;
+}
+
+/** Whether `row` stands in an opened run: every message it holds was in one the reader opened. */
+function inOpenedGap(row, opened) {
+  if (!opened || opened.size === 0) return false;
+  const held = idsOf(row);
+  return held.length > 0 && held.every((id) => opened.has(id));
+}
+
+/**
+ * Open the unmatched run a gap's line on `row` stands for: above it (`below` false) the messages
+ * hidden before it, below it the ones hidden after it. The rows are the list's messages as
+ * `seamsFor` walks them. Returns the first row shown, for a keyboard's focus to land on, or null.
+ */
+function openSearchGap(row, below) {
+  const list = row.parentNode;
+  if (!list) return null;
+  const rows = /** @type {any[]} */ ([...list.children]).filter((one) => isMessageRow(one) && !one.hasAttribute("data-card"));
+  const at = rows.indexOf(row);
+  if (at < 0) return null;
+  const opened = openedGapIds(true);
+  if (!opened) return null;
+  let first = null;
+  const take = (one) => {
+    for (const id of idsOf(one)) opened.add(id);
+    if (first === null || !below) first = one;
+  };
+  if (below) {
+    for (let next = at + 1; next < rows.length && !rowShown(rows[next]); next += 1) take(rows[next]);
+  } else {
+    for (let next = at - 1; next >= 0 && !rowShown(rows[next]); next -= 1) take(rows[next]);
+  }
+  if (first === null) return null;
+  // The reader keeps their place, as opening a collapsed run keeps it: rows growth above them is
+  // the list's, not a jump in it. Only where this list is the one on screen.
+  if (currentScreen === "main" && currentView === "discord") preservingScroll(applySearch);
+  else applySearch();
+  return first;
+}
+
+/**
+ * The line on `row` above it (`below` false) or below it, made once and kept on it. A gap's line is
+ * a button (`#439 search-unmatched-separators`), as a collapsed run's is; a day's stays a separator.
+ * A row whose line changed kind — a filter closed over the same boundary — gets the other element.
+ */
+function seamLineOf(row, below, seam) {
+  const control = seam !== null && seam.kind === "gap";
+  let held = below ? row.seamBelowLine : row.seamLine;
+  if (held && (String(held.tagName).toLowerCase() === "button") !== control) {
+    if (held.parentNode === row) row.removeChild(held);
+    held = null;
+    if (below) row.seamBelowLine = null;
+    else row.seamLine = null;
+  }
+  if (held) {
+    held.gapCards = Boolean(seam && seam.cards);
+    return held;
+  }
+  const line = document.createElement(control ? "button" : "div");
+  line.className = (below ? "row-seam row-seam-below" : "row-seam") + (seam && seam.cards ? " card-seam" : "");
+  line.gapCards = Boolean(seam && seam.cards);
+  if (control) {
+    line.setAttribute("type", "button");
+    line.addEventListener("click", inThisColumn((event) => {
+      // The row's own tap would select or open it; this tap is the line's alone, as a run's is.
+      if (event) event.stopPropagation();
+      const focused = document.activeElement === line && line.matches(":focus-visible");
+      const first = line.gapCards ? openCardGap(row, below) : openSearchGap(row, below);
+      if (focused && first) {
+        first.setAttribute("tabindex", "-1");
+        first.focus({ preventScroll: true });
+      }
+    }));
+  } else {
+    line.setAttribute("role", "separator");
+  }
   if (below) row.seamBelowLine = line;
   else row.seamLine = line;
   return line;
@@ -5214,7 +5342,9 @@ function seamDrawn(row, seam, below) {
   const held = below ? row.seamBelowLine : row.seamLine;
   const drawn = Boolean(held && held.parentNode === row);
   if (!seam) return !drawn;
-  return drawn && held.textContent === seam.words && row.getAttribute(below ? "data-seam-below" : "data-seam") === seam.kind;
+  return drawn && held.textContent === seam.words && row.getAttribute(below ? "data-seam-below" : "data-seam") === seam.kind &&
+    (String(held.tagName).toLowerCase() === "button") === (seam.kind === "gap") &&
+    Boolean(held.gapCards) === Boolean(seam.cards);
 }
 
 /** Put `row`'s line above it, or below it, as `seam` says: `{kind, words}`, or null for none. */
@@ -5227,10 +5357,13 @@ function placeSeam(row, seam, below) {
     row.removeAttribute(attribute);
     return;
   }
-  const line = seamLineOf(row, below);
+  const line = seamLineOf(row, below, seam);
   if (line.textContent !== seam.words) {
     line.textContent = seam.words;
-    line.setAttribute("aria-label", lineLabel(seam.words));
+    // A gap's line is pressed, so its name says the act, as a collapsed run's title does.
+    const label = seam.kind === "gap" ? `Show ${lineLabel(seam.words)}` : lineLabel(seam.words);
+    line.setAttribute("aria-label", label);
+    if (seam.kind === "gap") line.setAttribute("title", label);
   }
   row.setAttribute(attribute, seam.kind);
   if (line.parentNode !== row) {
@@ -23219,6 +23352,10 @@ function threadCard(summary, tally) {
   const open = cardOpener("thread-card", sideCardReplies(choice, tally), sideCardUnread(choice, tally),
     inThisColumn(() => guardQuietly(() => enterCard(id, summary, row))()));
   row.append(button, open);
+  // `#439 search-unmatched-separators`. What a gap among these cards counts for this whole thread.
+  const size = cardMessageCount(choice, tally);
+  /** @type {any} */ (row).cardMessages = size.messages;
+  /** @type {any} */ (row).cardMessagesExact = size.exact;
   paintLitCard(row, id);
   // `#129 message-search`. A thread card is what stands in this list where messages stand in the
   // others, so the filter has to reach it or searching on the threads tab silently does nothing.
@@ -42175,6 +42312,26 @@ function sideCardReplies(choice, tally) {
   return count > 0 ? threadCount(count, choice.summary ? choice.summary.reply_count_exact : true) : "";
 }
 
+/**
+ * How many messages thread `choice` holds, the root counted, and whether the page knows exactly.
+ * `#439 search-unmatched-separators`: what a gap among the cards counts for a whole thread. Never
+ * more than is known: an inexact reported count is left out rather than rounded into a claim, and
+ * the count is then the replies this page holds and no more — which the line says as "at least".
+ * By the same rule as `sideCardReplies`, so a gap and the card it stands for never disagree where
+ * the count is exact.
+ *
+ * @returns {{messages: number, exact: boolean}}
+ */
+function cardMessageCount(choice, tally) {
+  const entry = tally.threads.get(choice.id);
+  const held = entry ? entry.held : 0;
+  const exactHeld = exactReplyCount(choice.id, choice.root, tally, choice.summary);
+  const reported = typeof choice.count === "number" ? choice.count : null;
+  const reportedExact = reported !== null && (choice.summary ? choice.summary.reply_count_exact !== false : true);
+  const replies = Math.max(held, exactHeld || 0, reportedExact ? reported : 0);
+  return { messages: replies + 1, exact: exactHeld !== null || reportedExact };
+}
+
 /** What the cards were last drawn from, so a pass that changes nothing draws nothing. */
 let sideCardsDrawn = "";
 
@@ -42206,12 +42363,13 @@ function renderSideCards() {
     age: briefAge(Number.isFinite(choice.at) ? choice.at : choice.started),
     replies: sideCardReplies(choice, tally),
     unread: sideCardUnread(choice, tally),
+    size: cardMessageCount(choice, tally),
   })).map((card) => ({ ...card, read: threadIsRead(card.choice, card.unread) }));
   const unpacked = unpackOnScreen();
   // `#419 threads-view-main-messages`. And the main channel's messages that are not threads, among them.
   const main = mainRowsOnScreen() ? mainRowMessages(new Set(cards.map(({ choice }) => choice.id))) : [];
-  const signature = JSON.stringify([order, readMode, readRunsSuspended(), unpacked, cards.map(({ choice, text, root, age, replies, unread, read }) =>
-    [choice.id, text, root, age, replies, unread, read,
+  const signature = JSON.stringify([order, readMode, readRunsSuspended(), unpacked, cards.map(({ choice, text, root, age, replies, unread, read, size }) =>
+    [choice.id, text, root, age, replies, unread, read, size.messages, size.exact,
       unpacked ? unpackSignature(choice, unpackHeldMessages(choice)) : ""]),
   main.map((message) => [String(message.id), stillToDo(message, channelCanon.dismissed)]),
   main.length ? [readMode, combineMessages, nowPlaying ? nowPlaying.id : "", pendingRead] : ""]);
@@ -42423,6 +42581,9 @@ function filterSideCards() {
   const allRows = /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children]);
   const rows = allRows.filter((row) => row.hasAttribute("data-card"));
   const replies = terms.length > 0 ? heldReplyText() : null;
+  // `#439 search-unmatched-separators`. The runs among the cards the reader has opened: shown, as in
+  // the channel's lists, but never counted among the matches the bar names.
+  const openedCards = openedCardGaps(false);
   let unread = 0;
   let shown = 0;
   /** @type {Map<string, boolean>} */
@@ -42430,21 +42591,23 @@ function filterSideCards() {
   for (const row of rows) {
     const text = row.getAttribute("data-search") || "";
     const fresh = !row.hasAttribute("data-thread-read");
+    const revealed = openedCards !== null && openedCards.threads.has(String(row.getAttribute("data-id")));
     // `#432 read-mode-unify`. Hide read takes a read thread out with its unpacked rows, as it takes a read
-    // message out of Main; a card in a folded run is hidden behind the run's line.
-    const kept = (!hidingRead() || fresh) && row.getAttribute("data-read-run") !== "member";
+    // message out of Main; a card in a folded run is hidden behind the run's line. A card in a run
+    // the reader opened from its unmatched line (`#439`) stands through either, while the search stands.
+    const kept = (((!hidingRead() || fresh) && row.getAttribute("data-read-run") !== "member") || revealed);
     const own = terms.every((term) => text.includes(term));
     const theirs = !own && replies ? replies.get(String(row.getAttribute("data-id"))) || "" : "";
     const inReplies = theirs !== "" && terms.every((term) => text.includes(term) || theirs.includes(term));
-    const said = own || inReplies;
+    const said = own || inReplies || revealed;
     if (row.hidden === kept) row.hidden = !kept;
     setClassWord(row, "search-hidden", !said);
     markReplyMatch(row, inReplies);
     // `#249 search-highlight`. And where, once the typing pauses (`markedQuery`): the card's own
     // words, whatever its replies matched.
-    markSearchHits(row, said ? marking : []);
+    markSearchHits(row, own || inReplies ? marking : []);
     if (fresh) unread += 1;
-    if (kept && said) shown += 1;
+    if (kept && (own || inReplies)) shown += 1;
     cardShown.set(String(row.getAttribute("data-id")), kept && said);
   }
   // `#419 threads-view-main-messages`. Main's messages among the cards: the read mode chose them as they
@@ -42452,11 +42615,13 @@ function filterSideCards() {
   // them by their words.
   for (const row of allRows) {
     if (!row.hasAttribute("data-main-row")) continue;
-    const kept = row.getAttribute("data-read-run") !== "member";
-    const said = terms.every((term) => (row.getAttribute("data-search") || "").includes(term));
+    const revealed = openedCards !== null && inOpenedGap(row, openedCards.ids);
+    const kept = row.getAttribute("data-read-run") !== "member" || revealed;
+    const matched = terms.every((term) => (row.getAttribute("data-search") || "").includes(term));
+    const said = matched || revealed;
     if (row.hidden === kept) row.hidden = !kept;
     setClassWord(row, "search-hidden", !said);
-    markSearchHits(row, said ? marking : []);
+    markSearchHits(row, matched ? marking : []);
   }
   // `#404 threads-unpack-all`. A card's unpacked block goes where its card goes, a row hidden in a
   // collapsed run of read messages staying hidden behind its line (`#407 unpack-row-parity`).
@@ -42476,8 +42641,152 @@ function filterSideCards() {
   if (threadListOnScreen()) sayCardCount();
   // `#262 search-load-older`. The way to their threads' older replies, as the search and All's reach say.
   renderRepliesSearch();
+  // `#439 search-unmatched-separators`. A line in each run the search leaves among the cards.
+  drawCardGaps(leftEl("side-cards"));
   // `#261 two-column-connectors`. The cards shown are what the links go to.
   scheduleColumnLinks();
+}
+
+// --- unmatched runs among the thread cards ------------------------------------------------------
+//
+// `#439 search-unmatched-separators`. The cards are threads, and a thread is a container of
+// messages: where the search leaves whole threads out between two it shows, the line counts the
+// MESSAGES in them — "… 15 unmatched messages in 3 threads …" — each thread's from what the page
+// knows of it (`cardMessageCount`), "at least" where a count is not exact. Main's own messages
+// among the cards (`#419 threads-view-main-messages`) count as themselves, and a run holding any
+// of them does not lay its whole count at the threads' door: it names no threads. A thread's
+// unpacked messages (`#404 threads-unpack-all`) go with their card and are already in its count.
+//
+// DRAWN WHILE SEARCH WORDS CHOOSE CARDS, in both lists of cards: the right column's and the thread
+// list's across the window (one list, `filterSideCards`), and the Threads list in one column
+// (`applySearch`). While words are typed the read modes over the cards stand suspended with the
+// messages' (`readRunsSuspended`, `hidingRead`), so a read thread the words leave out is counted
+// here under the one word "unmatched", as the channel's gaps count what Links and whose messages
+// leave out; Fold read's own lines over the cards (`foldCardRuns`) are the read runs', drawn only
+// with no search choosing. The line is the channel gap's own (`.row-seam`, on the card after its
+// run), and a tap opens its run the same way: shown, not matched, until the search changes.
+
+/** The opened runs among the cards, and the searches they belong to, as `openedGaps` keeps them. */
+let openedCardGapState = null;
+
+/**
+ * The opened card runs under the searches as they stand — thread ids, and the ids of Main's
+ * messages among the cards — or null when there are none and `create` does not ask for them.
+ * The read mode is in `searchKey`, since it chooses cards beside the words.
+ *
+ * @param {boolean} create
+ * @returns {{threads: Set<string>, ids: Set<string>} | null}
+ */
+function openedCardGaps(create) {
+  const key = JSON.stringify([searchKey(), String(el("discord-channel").value)]);
+  if (!openedCardGapState || openedCardGapState.key !== key) {
+    if (!create) return null;
+    openedCardGapState = { key, threads: new Set(), ids: new Set() };
+  }
+  return openedCardGapState;
+}
+
+/** What a gap among the cards says: its messages, and its threads when they are all it holds. */
+function cardGapWords(messages, threads, exact, onlyCards) {
+  const counted = `${exact ? "" : "at least "}${messages} unmatched message${messages === 1 ? "" : "s"}` +
+    (threads > 0 && onlyCards ? ` in ${threads} thread${threads === 1 ? "" : "s"}` : "");
+  return lineWords(`… ${counted}`, "");
+}
+
+/**
+ * `list`'s children as the groups a gap counts: a card with the messages unpacked under it, or one
+ * of Main's messages among the cards. Anything else ends a run and is left alone.
+ *
+ * @returns {Array<{head: any, card: boolean}>}
+ */
+function cardGapGroups(list) {
+  /** @type {Array<{head: any, card: boolean}>} */
+  const groups = [];
+  for (const row of /** @type {any[]} */ ([...list.children])) {
+    if (row.hasAttribute("data-unpack-thread")) continue;
+    if (row.hasAttribute("data-card") || classWords(row).includes("thread-card")) groups.push({ head: row, card: true });
+    else if (row.hasAttribute("data-main-row")) groups.push({ head: row, card: false });
+    else groups.push({ head: row, card: false, other: true });
+  }
+  return groups;
+}
+
+/** What one hidden group adds to its gap: its messages, its thread if it is one, its exactness. */
+function cardGapTally(group) {
+  if (group.card) {
+    const messages = typeof group.head.cardMessages === "number" ? group.head.cardMessages : 1;
+    return { messages, threads: 1, exact: group.head.cardMessagesExact !== false, onlyCards: true };
+  }
+  return { messages: Math.max(1, idsOf(group.head).length), threads: 0, exact: true, onlyCards: false };
+}
+
+/**
+ * Draw a line in each run the search leaves among `list`'s cards, and take away every one no
+ * longer wanted: `drawSeams` for a list of threads. Each card keeps the words it was drawn with
+ * (`placeSeam`), so a pass that changes nothing writes nothing, as among messages.
+ */
+function drawCardGaps(list) {
+  if (!list) return;
+  const searching = searchOpen && searchTerms(searchQuery).length > 0;
+  const groups = cardGapGroups(list);
+  /** @type {Map<any, {above: any, below: any}>} */
+  const wanted = new Map();
+  let run = null;
+  let last = null;
+  const line = (tally) => ({ kind: "gap", cards: true, words: cardGapWords(tally.messages, tally.threads, tally.exact, tally.onlyCards) });
+  for (const group of groups) {
+    if (group.other) {
+      run = null;
+      continue;
+    }
+    if (!rowShown(group.head)) {
+      const one = cardGapTally(group);
+      run = run === null ? one : {
+        messages: run.messages + one.messages, threads: run.threads + one.threads,
+        exact: run.exact && one.exact, onlyCards: run.onlyCards && one.onlyCards,
+      };
+      continue;
+    }
+    wanted.set(group.head, { above: searching && run !== null ? line(run) : null, below: null });
+    run = null;
+    last = group.head;
+  }
+  if (last !== null && searching && run !== null) wanted.get(last).below = line(run);
+  const none = { above: null, below: null };
+  for (const group of groups) {
+    const want = wanted.get(group.head) || none;
+    placeSeam(group.head, want.above, false);
+    placeSeam(group.head, want.below, true);
+  }
+}
+
+/**
+ * Open the run a card gap's line on `row` stands for, as `openSearchGap` opens a run of messages:
+ * its threads remembered, the cards filtered again where they stand. Returns its first card.
+ */
+function openCardGap(row, below) {
+  const list = row.parentNode;
+  if (!list) return null;
+  const groups = cardGapGroups(list);
+  const at = groups.findIndex((group) => group.head === row);
+  if (at < 0) return null;
+  const opened = openedCardGaps(true);
+  if (!opened) return null;
+  let first = null;
+  const take = (group) => {
+    if (group.card) opened.threads.add(cardThread(group.head));
+    else for (const id of idsOf(group.head)) opened.ids.add(id);
+    if (first === null || !below) first = group.head;
+  };
+  if (below) {
+    for (let next = at + 1; next < groups.length && !rowShown(groups[next].head); next += 1) take(groups[next]);
+  } else {
+    for (let next = at - 1; next >= 0 && !rowShown(groups[next].head); next -= 1) take(groups[next]);
+  }
+  if (first === null) return null;
+  if (list === leftEl("side-cards")) keepingCardPlace(filterSideCards);
+  else applySearch();
+  return first;
 }
 
 /**
@@ -43201,7 +43510,7 @@ function foldCardRuns(list) {
  * but the button under it, which goes into the thread and says how many replies it has and how many of
  * them are unread (`cardOpener`). Beside that, how long since the thread moved.
  */
-function sideCard({ choice, text, root, age, replies, unread, read }) {
+function sideCard({ choice, text, root, age, replies, unread, read, size }) {
   const row = document.createElement("li");
   row.className = "side-card-row";
   // `data-id` and `data-card`: the keys move through the cards as through messages, and know them apart.
@@ -43238,6 +43547,9 @@ function sideCard({ choice, text, root, age, replies, unread, read }) {
   // The thread's first message, which a copy of the card copies (`#296 copy-highlighted-message`). The
   // cards are drawn again whenever what they say changes, a first message arriving included.
   /** @type {any} */ (row).cardRoot = choice.root;
+  // `#439 search-unmatched-separators`. What a gap among the cards counts for this whole thread.
+  /** @type {any} */ (row).cardMessages = size ? size.messages : 1;
+  /** @type {any} */ (row).cardMessagesExact = size ? size.exact : false;
   paintLitCard(row, choice.id);
   // `#129 message-search`. A card stands in this list where messages stand in the others, so the
   // search reaches it, as it reaches the cards of the Threads list; and by its first message's words
