@@ -43116,10 +43116,11 @@ function drawCardGaps(list) {
     }
     if (!rowShown(group.head)) {
       const one = cardGapTally(group);
-      if (run === null) run = one;
+      const was = run;
+      if (was === null) run = one;
       else run = {
-        messages: run.messages + one.messages, threads: run.threads + one.threads,
-        exact: run.exact && one.exact, onlyCards: run.onlyCards && one.onlyCards,
+        messages: was.messages + one.messages, threads: was.threads + one.threads,
+        exact: was.exact && one.exact, onlyCards: was.onlyCards && one.onlyCards,
       };
       continue;
     }
