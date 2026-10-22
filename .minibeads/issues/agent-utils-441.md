@@ -1,13 +1,14 @@
 ---
 title: 'voice-honest-answers: the voice agent claims abilities it lacks and invents reasons for failures'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 - voice
 created_at: 2026-10-22T20:24:12.294133383+00:00
-updated_at: 2026-10-22T20:24:12.294133383+00:00
+updated_at: 2026-10-22T21:50:40.083863557+00:00
+closed_at: 2026-10-22T21:50:40.083863376+00:00
 ---
 
 # Description
