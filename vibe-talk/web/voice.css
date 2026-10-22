@@ -3273,8 +3273,8 @@ a.search-hit-link {
  * THE LINES BETWEEN ROWS. `#249 search-highlight`: where a filter choosing rows takes messages out
  * from between two it shows, a line stands in the gap, "… 12 unmatched messages …", in the collapsed
  * run's shape — the words between two dashed hairlines, quiet — because it is the same idea: messages
- * that are here, not shown. Unlike the run's it is not a control: the filter, not a tap, brings those
- * messages back, and the message the reader selects is kept where it is when it goes.
+ * that are here, not shown. `#439 search-unmatched-separators`: and it is a control as the run's is,
+ * a tap showing its run where it stands; a day's line stays no control, and takes no tap.
  *
  * Drawn as the bookmark's line is, in a margin the row under it keeps above its tile, so the list
  * holds nothing but messages; a gap after the last row shown is in a margin under that row. Fixed
@@ -3446,6 +3446,122 @@ a.search-hit-link {
 #side-cards .row-seam::after,
 #discord-log .row-seam::after,
 #pinned-log .row-seam::after {
+  content: "";
+  flex: 1 1 0;
+  min-width: 1rem;
+  border-top: 1px dashed var(--edge);
+}
+
+/*
+ * `#439 search-unmatched-separators`. A gap's line pressed: a button wearing the line's shape, its
+ * room its thumb's height, answering a tap and a keyboard as a collapsed run's line does. A day's
+ * line is no button and keeps the stillness above (`pointer-events: none`).
+ */
+#side-log button.row-seam,
+#side-cards button.row-seam,
+#discord-log button.row-seam,
+#pinned-log button.row-seam,
+#thread-list button.row-seam,
+#side-thread-list button.row-seam {
+  margin: 0;
+  padding: 0.25rem 0.5rem;
+  background: none;
+  border: none;
+  border-radius: 0.6rem;
+  font: inherit;
+  pointer-events: auto;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#side-log button.row-seam:active,
+#side-cards button.row-seam:active,
+#discord-log button.row-seam:active,
+#pinned-log button.row-seam:active,
+#thread-list button.row-seam:active,
+#side-thread-list button.row-seam:active,
+#side-log button.row-seam:focus-visible,
+#side-cards button.row-seam:focus-visible,
+#discord-log button.row-seam:focus-visible,
+#pinned-log button.row-seam:focus-visible,
+#thread-list button.row-seam:focus-visible,
+#side-thread-list button.row-seam:focus-visible {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--ink);
+}
+
+#side-log button.row-seam:focus-visible,
+#side-cards button.row-seam:focus-visible,
+#discord-log button.row-seam:focus-visible,
+#pinned-log button.row-seam:focus-visible,
+#thread-list button.row-seam:focus-visible,
+#side-thread-list button.row-seam:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/*
+ * `#439 search-unmatched-separators`. The same line among the thread cards: on the card after its
+ * run, in room that card keeps above itself, as a message keeps room for its line. A card is its
+ * thread's box, so the line is as wide as the card and no wider. Only gaps stand among cards —
+ * the cards are ordered by when their threads last moved, not ruled off by day.
+ */
+#thread-list,
+#side-thread-list {
+  --gap-room: max(2.25rem, calc(2.05rem * var(--msg-scale)));
+}
+
+#thread-list .thread-card,
+#side-thread-list .thread-card,
+#side-cards .side-card-row {
+  position: relative;
+}
+
+#thread-list .thread-card[data-seam="gap"],
+#side-thread-list .thread-card[data-seam="gap"],
+#side-cards .side-card-row[data-seam="gap"] {
+  margin-top: var(--gap-room);
+}
+
+#thread-list .thread-card[data-seam-below="gap"],
+#side-thread-list .thread-card[data-seam-below="gap"],
+#side-cards .side-card-row[data-seam-below="gap"] {
+  margin-bottom: var(--gap-room);
+}
+
+#thread-list .row-seam.card-seam,
+#side-thread-list .row-seam.card-seam,
+#side-cards .row-seam.card-seam {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + 1px);
+  height: var(--gap-room);
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  color: var(--muted);
+  font-size: calc(0.82rem * var(--msg-scale));
+  letter-spacing: 0.02em;
+  line-height: 1.15;
+  text-align: center;
+  filter: none !important;
+}
+
+#thread-list .row-seam.card-seam.row-seam-below,
+#side-thread-list .row-seam.card-seam.row-seam-below,
+#side-cards .row-seam.card-seam.row-seam-below {
+  top: calc(100% + 1px);
+  bottom: auto;
+}
+
+#thread-list .row-seam.card-seam::before,
+#side-thread-list .row-seam.card-seam::before,
+#side-cards .row-seam.card-seam::before,
+#thread-list .row-seam.card-seam::after,
+#side-thread-list .row-seam.card-seam::after,
+#side-cards .row-seam.card-seam::after {
   content: "";
   flex: 1 1 0;
   min-width: 1rem;
