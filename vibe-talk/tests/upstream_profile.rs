@@ -298,6 +298,15 @@ impl ChatClient for Recorder {
         self.note("owner_author_id");
         Some("owner".to_owned())
     }
+    fn upstream_url(
+        &self,
+        _channel: &ChannelId,
+        _id: &MessageId,
+        _thread: Option<&vibe_talk::threads::MessageThread>,
+    ) -> Option<String> {
+        self.note("upstream_url");
+        Some("https://example.test/link".to_owned())
+    }
     fn supports_threading(&self) -> bool {
         self.note("supports_threading");
         true
@@ -660,6 +669,11 @@ async fn every_method_reaches_the_wrapped_clients_own_override_and_each_upstream
     ran("self_author_id");
     assert_eq!(client.owner_author_id().as_deref(), Some("owner"));
     ran("owner_author_id");
+    assert_eq!(
+        client.upstream_url(&channel, &id, None).as_deref(),
+        Some("https://example.test/link")
+    );
+    ran("upstream_url");
     assert!(client.supports_threading());
     ran("supports_threading");
     assert!(client.replies_in_thread());

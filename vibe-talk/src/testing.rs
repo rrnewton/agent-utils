@@ -892,6 +892,15 @@ impl crate::chat::ChatClient for CountingChat {
         self.inner.owner_author_id()
     }
 
+    fn upstream_url(
+        &self,
+        channel: &crate::model::ChannelId,
+        id: &crate::model::MessageId,
+        thread: Option<&crate::threads::MessageThread>,
+    ) -> Option<String> {
+        self.inner.upstream_url(channel, id, thread)
+    }
+
     fn supports_threading(&self) -> bool {
         self.inner.supports_threading()
     }
