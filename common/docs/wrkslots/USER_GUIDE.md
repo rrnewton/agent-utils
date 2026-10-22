@@ -126,9 +126,11 @@ wrkslots config convert --to yaml      # or: --to json
 
 An agent name must be one the session tooling can register: a lowercase letter, then lowercase
 letters, digits or hyphens, 32 characters at most, and never the reserved name `archive`.
-`create`, `adopt`, and `transfer-owner` refuse any other `--agent` value, because the liveness
-probe could never report such an agent alive or dead and a slot recorded under it could never be
-proven free.
+`create`, `adopt`, `transfer-owner`, `register`, and live `import-existing` refuse any other
+`--agent` value, because the liveness probe could never report such an agent alive or dead and a
+slot recorded under it could never be proven free. The one deliberate exception is
+`import-existing --from-state-file`, which records the state file's agent verbatim to preserve
+the row it describes; such a slot keeps whatever removal paths its evidence allows.
 
 `create`, `register`, and `import-existing --apply` require both `--slot-type` and
 `--coordinator-authorized`. Omitting either refuses before any worktree or lifecycle record changes
@@ -882,7 +884,10 @@ wrkslots remove SLOT --coordinator-pid $$ --expected-generation N --coordinator-
   by lowercase letters, digits or hyphens within 32 characters, or the reserved `archive`);
 - no owner is recorded for the slot, and no event for this slot generation ever recorded one —
   `create` writes the first record snapshot and `adopt`/`transfer-owner` write one when they
-  bind, so an owner that ever existed left one behind;
+  bind, so an owner bound while the event log existed left one behind. A generation that
+  arrived through `state-imported` entered the log already formed, and an owner bound and
+  released before import left no trace in it; "never" is unknowable for such a generation
+  and the attestation refuses;
 - the registered liveness command answers unverifiable rather than alive;
 - the heartbeat time-to-live has expired;
 - `--coordinator-authorized`, `--attest-agent-never-started AGENT` naming exactly the slot's

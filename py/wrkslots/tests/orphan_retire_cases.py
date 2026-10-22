@@ -525,7 +525,7 @@ def _never_started_events(project: Path) -> list[dict[str, object]]:
 def test_create_adopt_and_transfer_refuse_agent_names_the_tooling_cannot_use(
     tmp_path: Path,
 ) -> None:
-    """The same rule the session tooling applies, at every entry point that records a name."""
+    """The session tooling's name rule, at create, adopt, transfer-owner, and register."""
 
     project, _repository, _remote = t.make_project(tmp_path)
     for bad in ("Legacy-Name", "1agent", "agent_name", "agent.name", "a" * 33, "archive"):
@@ -588,6 +588,27 @@ def test_create_adopt_and_transfer_refuse_agent_names_the_tooling_cannot_use(
         "1",
     )
     assert moved.returncode == 0, moved.stderr
+
+    refused = t.command(
+        project,
+        "register",
+        "slot02",
+        "--agent",
+        "Bad-Name",
+        "--task",
+        "task-slot02",
+        "--purpose",
+        "test registration refusal",
+        "--owner-pid",
+        str(os.getpid()),
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--verified-live",
+        "--repo",
+        "product=repo",
+    )
+    assert refused.returncode == 3, refused.stderr
+    assert "agent names must start with a lowercase letter" in refused.stderr
 
 
 def test_never_started_slot_under_an_unjudgeable_name_removes_on_attestation(
@@ -739,6 +760,66 @@ def test_never_started_attestation_refuses_alive_and_unexpired_and_bad_requests(
     assert alive.returncode == 3, alive.stderr
     _retained(project)
     assert _never_started_events(project) == []
+
+
+def test_never_started_attestation_refuses_an_owner_bound_then_released(
+    tmp_path: Path,
+) -> None:
+    """The current record is ownerless, but an earlier snapshot of the generation names one."""
+
+    project, _repository, _remote = t.make_project(tmp_path)
+    assert t.create(project).returncode == 0
+    config = w._load_config(str(project), "testhost")
+    state = w._load_active(config, require_repository=False)
+    record = w._find_record(state, "slot01")
+    state = w._replace_record(state, dataclasses.replace(record, owner=None))
+    w._write_active_state(
+        config,
+        state,
+        action="test-owner-released",
+        slot="slot01",
+        evidence={"released": True},
+        require_repository=False,
+    )
+    shutil.copy(PROBE, project / "liveness.py")
+    (project / ".agentctl").mkdir()
+    t.expire_heartbeat(project)
+    _plant_legacy_agent(project)
+    refused = _never_started_remove(project)
+    assert refused.returncode == 3, refused.stderr
+    assert "no owner was ever recorded" in refused.stderr
+    _retained(project)
+    assert _never_started_events(project) == []
+
+
+def test_slot_never_had_owner_reads_imported_state(tmp_path: Path) -> None:
+    """A generation present in `state-imported` cannot be proven ownerless from events."""
+
+    project, _repository, _remote = t.make_project(tmp_path)
+    assert t.create(project, bind_owner=False).returncode == 0
+    config = w._load_config(str(project), "testhost")
+    record = w._find_record(
+        w._load_active(config, require_repository=False), "slot01"
+    )
+    events = list(w._load_events(config, record.machine))
+    assert w._slot_never_had_owner(record, events) is True
+    for owner in (None, {"pid": 4242}):
+        imported = {
+            "kind": "state-imported",
+            "payload": {
+                "active": {
+                    "slots": [
+                        {"slot": "slot01", "generation": 1, "owner": owner}
+                    ]
+                }
+            },
+        }
+        assert w._slot_never_had_owner(record, [imported, *events]) is False, owner
+    other_generation = {
+        "kind": "state-imported",
+        "payload": {"active": {"slots": [{"slot": "slot01", "generation": 9, "owner": None}]}},
+    }
+    assert w._slot_never_had_owner(record, [other_generation, *events]) is True
 
 
 #: What test_lifecycle.py collects from this module.

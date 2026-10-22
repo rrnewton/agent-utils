@@ -23462,27 +23462,41 @@ NEVER_STARTED_BASIS = "coordinator-attested-never-started-agent"
 def _slot_never_had_owner(
     record: ActiveRecord, events: Sequence[Mapping[str, object]]
 ) -> bool:
-    """Whether no owner was ever bound to this slot generation.
+    """Whether no owner was ever bound to this slot generation, so far as events can prove.
 
-    The current record must name no owner, and no active-state event for this slot and
-    generation may carry a record snapshot naming one: create writes the first snapshot and
-    adopt/transfer-owner each write one when they bind, so an owner that ever existed left
-    one behind.
+    The current record must name no owner, and no event for this slot and generation may
+    carry a record snapshot naming one: create writes the first snapshot and
+    adopt/transfer-owner each write one when they bind, so an owner bound while the event
+    log existed left one behind. A generation that appears in a ``state-imported`` event
+    predates this machine's event log: an owner bound and released before import left no
+    trace in either kind, so "never" is unknowable for it and the answer is no.
     """
 
     if record.owner is not None:
         return False
     for event in events:
-        if event.get("kind") != "active-state-recorded":
+        kind = event.get("kind")
+        if kind == "state-imported":
+            payload = _as_mapping(event["payload"], "state-imported payload")
+            imported = _as_mapping(payload.get("active"), "imported active state")
+            for value in _as_list(imported.get("slots"), "imported active state.slots"):
+                snapshot = _as_mapping(value, "imported active state slot")
+                if (
+                    snapshot.get("slot") == record.slot
+                    and snapshot.get("generation") == record.generation
+                ):
+                    return False
+            continue
+        if kind != "active-state-recorded":
             continue
         payload = _as_mapping(event["payload"], "active-state-recorded payload")
         if payload.get("slot") != record.slot:
             continue
-        snapshot = payload.get("record")
+        recorded = payload.get("record")
         if (
-            isinstance(snapshot, Mapping)
-            and snapshot.get("generation") == record.generation
-            and snapshot.get("owner") is not None
+            isinstance(recorded, Mapping)
+            and recorded.get("generation") == record.generation
+            and recorded.get("owner") is not None
         ):
             return False
     return True
@@ -26661,6 +26675,7 @@ def _register_existing(
 ) -> ActiveRecord:
     _validate_name(args.slot, "slot")
     _validate_name(args.agent, "agent")
+    _validate_agent_name(args.agent)
     if not args.task or not args.purpose:
         raise Refusal("task and purpose must be non-empty")
     if not args.verified_live:
@@ -42383,6 +42398,11 @@ def _recover_finish(
         else:
             _refuse_registered_liveness(answer.state, answer.detail)
     never_started_recovery = False
+    never_started_events = (
+        _load_events(config, current.machine)
+        if current.owner is None and not _agent_name_usable(current.agent)
+        else ()
+    )
     if (
         owner_consent is None
         and owner_release is None
@@ -42391,9 +42411,8 @@ def _recover_finish(
         and not validate_complete
         and current.owner is None
         and not _agent_name_usable(current.agent)
-        and _recorded_never_started(current, _load_events(config, current.machine))
-        is not None
-        and _slot_never_had_owner(current, _load_events(config, current.machine))
+        and _recorded_never_started(current, never_started_events) is not None
+        and _slot_never_had_owner(current, never_started_events)
     ):
         # Resume a never-started removal only while the authority still cannot judge the
         # name and no owner has appeared since. An alive answer refuses; a later "dead"
