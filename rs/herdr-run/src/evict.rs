@@ -570,6 +570,7 @@ pub struct IdleSweep {
 /// end of a run passes a small one so housekeeping can never stretch a caller's command, and
 /// `exclude_pane_id` keeps that sweep from closing the very tab the run just used. A dry run
 /// judges shells exactly as [`survey`] does — without the pane lock — and closes nothing.
+#[allow(clippy::too_many_arguments)]
 pub fn retire_idle_tabs<A: HerdrApi + ?Sized>(
     client: &A,
     config: &Config,
@@ -1094,6 +1095,7 @@ mod tests {
 
     /// Plant one finished run: a record in scope for the default config, plus its completion
     /// marker aged to `finished_at` epoch seconds.
+    #[allow(clippy::too_many_arguments)]
     fn write_finished(
         project: &Path,
         run_id: &str,
