@@ -1,6 +1,6 @@
 ---
 title: 'voice-owner-identity: know which messages are the owner''s and never read them back to him'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
@@ -9,7 +9,8 @@ labels:
 depends_on:
   agent-utils-436: parent-child
 created_at: 2026-10-22T17:26:17.887356752+00:00
-updated_at: 2026-10-22T17:26:17.887356752+00:00
+updated_at: 2026-10-22T20:00:51.349490508+00:00
+closed_at: 2026-10-22T20:00:51.349490358+00:00
 ---
 
 # Description

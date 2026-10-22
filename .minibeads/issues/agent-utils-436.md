@@ -1,13 +1,14 @@
 ---
 title: 'voice-tool-audit: audit the chat tools and instructions the voice agent is given'
-status: open
+status: closed
 priority: 1
 issue_type: epic
 labels:
 - vibe-talk
 - voice
 created_at: 2026-10-22T17:26:15.898968128+00:00
-updated_at: 2026-10-22T17:26:15.898968128+00:00
+updated_at: 2026-10-22T20:00:51.352694931+00:00
+closed_at: 2026-10-22T20:00:51.352694821+00:00
 ---
 
 # Description

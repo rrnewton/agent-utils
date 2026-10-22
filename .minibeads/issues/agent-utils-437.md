@@ -1,6 +1,6 @@
 ---
 title: 'voice-full-text-catchup: hand the voice model the full text of recent messages for a catch-up'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
@@ -9,7 +9,8 @@ labels:
 depends_on:
   agent-utils-436: parent-child
 created_at: 2026-10-22T17:26:16.915485386+00:00
-updated_at: 2026-10-22T17:26:16.915485386+00:00
+updated_at: 2026-10-22T20:00:51.346141136+00:00
+closed_at: 2026-10-22T20:00:51.346140996+00:00
 ---
 
 # Description
