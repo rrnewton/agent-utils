@@ -4045,6 +4045,7 @@ a.search-hit-link {
    full-size button, and the owner asked for the larger size throughout. The two in the read group
    below are items of the menu too, and keep that size inside it. */
 .row-more-menu > button,
+.row-more-menu > a,
 .row-more-group > button,
 .row-more-group > .upstream-read-button {
   min-height: 2.75rem;
@@ -4057,6 +4058,17 @@ a.search-hit-link {
   font-size: 1rem;
   letter-spacing: normal;
   text-align: left;
+}
+
+/* `#409 open-upstream-link`. The one item that is a link, "Open in …": sized and coloured as
+   its neighbours above, and a flex item of the menu as they are, but still a link — no
+   underline in its rest state, as no button here has one, and its text set on the item's
+   lines as a button's is. */
+.row-more-menu > a {
+  display: flex;
+  align-items: center;
+  box-sizing: border-box;
+  text-decoration: none;
 }
 
 .row-more-menu > button[hidden],

@@ -753,8 +753,9 @@ declare namespace VibeTalk {
      */
     timestamp: string;
     /**
-     * The message's own address in the service it came from, for the page's "Copy link in
-     * \<service\>". `#408 copy-upstream-link`; see [`crate::upstream_url`].
+     * The message's own address in the service it came from, for the page's "Open in
+     * \<service\>" link. `#408 copy-upstream-link`, `#409 open-upstream-link`; see
+     * [`crate::upstream_url`].
      *
      * FORMED BY THIS SERVER when a message is served (`ops::stamp`, and the live stream's
      * rendering), from the parts the provider already holds, and absent wherever no address can

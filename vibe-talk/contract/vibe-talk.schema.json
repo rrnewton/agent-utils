@@ -699,7 +699,7 @@
           "type": "string"
         },
         "upstream_url": {
-          "description": "The message's own address in the service it came from, for the page's \"Copy link in\n\\<service\\>\". `#408 copy-upstream-link`; see [`crate::upstream_url`].\n\nFORMED BY THIS SERVER when a message is served (`ops::stamp`, and the live stream's\nrendering), from the parts the provider already holds, and absent wherever no address can\nbe formed — an unknown workspace or guild, an id of an unread shape — which the page\ndraws as no menu item rather than a disabled one. Never stored and never trusted from\nwhoever sent the message, for the reason [`Message::noise`] is not: it follows this\ndeployment's configuration, which a stored copy would outlive.",
+          "description": "The message's own address in the service it came from, for the page's \"Open in\n\\<service\\>\" link. `#408 copy-upstream-link`, `#409 open-upstream-link`; see\n[`crate::upstream_url`].\n\nFORMED BY THIS SERVER when a message is served (`ops::stamp`, and the live stream's\nrendering), from the parts the provider already holds, and absent wherever no address can\nbe formed — an unknown workspace or guild, an id of an unread shape — which the page\ndraws as no menu item rather than a disabled one. Never stored and never trusted from\nwhoever sent the message, for the reason [`Message::noise`] is not: it follows this\ndeployment's configuration, which a stored copy would outlive.",
           "type": [
             "string",
             "null"
