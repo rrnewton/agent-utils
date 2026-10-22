@@ -87,7 +87,7 @@ pub const PROMPT_ID: &str = "voice-agent-system";
 
 /// Bump this whenever any of the five prompt files changes, and update every pinned fingerprint
 /// below to match. The test that compares them is what makes the version mean something.
-pub const PROMPT_VERSION: u32 = 11;
+pub const PROMPT_VERSION: u32 = 12;
 
 /// The [`fingerprint`] of [`OWNER_INSTRUCTIONS_HEADING`] at [`PROMPT_VERSION`]. It reaches the
 /// agent only with the owner's instructions, so it is pinned on its own rather than inside a
@@ -95,13 +95,13 @@ pub const PROMPT_VERSION: u32 = 11;
 pub const PINNED_OWNER_HEADING_FINGERPRINT: &str = "fnv1a64:946b5fc6e4828976";
 
 /// The [`fingerprint`] of the read-only prompt at [`PROMPT_VERSION`].
-pub const PINNED_READ_FINGERPRINT: &str = "fnv1a64:a41031cc01443166";
+pub const PINNED_READ_FINGERPRINT: &str = "fnv1a64:d265099fe1644d8c";
 
 /// The [`fingerprint`] of the sending prompt that asks first, at [`PROMPT_VERSION`].
-pub const PINNED_WRITE_CONFIRM_FINGERPRINT: &str = "fnv1a64:fdb48ee0865b5abf";
+pub const PINNED_WRITE_CONFIRM_FINGERPRINT: &str = "fnv1a64:2161fd9a3df1cfb5";
 
 /// The [`fingerprint`] of the sending prompt that posts at once, at [`PROMPT_VERSION`].
-pub const PINNED_WRITE_DIRECT_FINGERPRINT: &str = "fnv1a64:31fb0cad75844cb0";
+pub const PINNED_WRITE_DIRECT_FINGERPRINT: &str = "fnv1a64:9fe563e91827207e";
 
 /// Which instructions follow the base: what this caller can do, and how the owner wants sends
 /// confirmed.
@@ -786,6 +786,42 @@ mod tests {
         assert!(
             !flat.contains("digest_channel"),
             "the prompt recommends a tool no model is offered: {flat}"
+        );
+    }
+
+    /// `#441 voice-honest-answers`. Asked how long a build took, the agent announced it was
+    /// "checking the build container logs", read a channel digest twice (both timed out), told the
+    /// owner it had tried to check the container's logs and blamed "the chat connection". Earlier
+    /// it sent a chat question to a web search. It can only read chat messages.
+    #[test]
+    fn the_base_prompt_names_its_one_ability_and_answers_only_from_what_it_read() {
+        let flat = SYSTEM_PROMPT
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for rule in [
+            "Your only window onto the work is the chat",
+            "that is all they do",
+            "You cannot open logs, files, build output, containers, machines, dashboards or any \
+             other system, and you cannot run anything",
+            "knows nothing about these channels",
+            "never that you are checking a log, a container or a system",
+            "Answer only from the text of messages you have read in this conversation",
+            "say which message the answer is in, by its author and local time",
+            "If the messages you have read do not hold the answer, say so plainly",
+            "never guess, estimate or fill the gap",
+            "say which tool it was and what it said",
+            "do not invent a cause, do not blame a connection",
+            "never say you tried anything you did not do",
+        ] {
+            assert!(
+                flat.contains(rule),
+                "the base prompt lost the rule containing {rule:?}"
+            );
+        }
+        assert!(
+            !flat.contains("Checking the channels"),
+            "the filler example should say what a read is: reading the messages"
         );
     }
 
