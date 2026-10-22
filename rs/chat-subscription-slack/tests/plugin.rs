@@ -1108,3 +1108,105 @@ fn a_dropped_line_before_the_barrier_cancels_the_proof() {
         "slack1:seq:151"
     );
 }
+
+/// A thread reply as the event stream carries it: the shape of the owner's reply captured on
+/// 2026-10-21 (identifiers, names and text replaced), whose thread root, a message with a file,
+/// the stream never carried (#415 slack-file-share-delivery).
+fn captured_reply(sequence: u64, ts: &str, root: &str) -> FakeStep {
+    FakeStep::Line(
+        json!({
+            "seq": sequence, "ts": 1.0, "type": "message.created", "source": "slack",
+            "iris_seq_id": sequence, "event_ts": 1_792_637_725_398_u64,
+            "payload": {
+                "event_id": "evt-0001", "source": "slack", "event_type": "message.created",
+                "entity_type": "message", "entity_id": format!("T0TEAM00001:{CHANNEL}:{ts}"),
+                "container_type": "channel", "container_id": format!("T0TEAM00001:{CHANNEL}"),
+                "actor_id": 1, "timestamp_ms": 1_792_637_725_398_u64,
+                "source_timestamp_ms": 1_792_637_725_398_u64, "ingested_at_ms": 1_792_637_726_000_u64,
+                "actor_name": "Owner",
+                "context": {
+                    "snippet": "a reply", "actor_name": "Owner",
+                    "actor": {"intern_fbid": 1, "display_name": "Owner", "workplace_id": 2, "actor_type": "HUMAN"},
+                    "ancestry": {
+                        "container": {"entity_type": "channel", "entity_id": CHANNEL},
+                        "parent": {"entity_type": "message", "entity_id": root}
+                    }
+                },
+                "viewer_relevance": {"is_actor_self": true, "is_mentioned": false, "is_direct": false},
+                "slack_message": {
+                    "team_id": "T0TEAM00001", "channel_id": CHANNEL, "message_ts": ts,
+                    "thread_ts": root, "slack_user_id": OWNER, "slack_event_id": "Ev0001",
+                    "app_id": "A0APP000001", "text": "Maybe just re-roll if too similar?",
+                    "channel_type": "channel", "blocks_json": "[]"
+                }
+            }
+        })
+        .to_string(),
+    )
+}
+
+#[test]
+fn a_reply_whose_thread_root_the_stream_never_carried_is_delivered_and_the_root_is_logged_once() {
+    let directory =
+        std::env::temp_dir().join(format!("slack-uncarried-root-test-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let log = directory.join("plugin.log");
+    let fake = FakeTransport::new();
+    fake.push_script(vec![
+        // Carried: a top-level message, then (the root with a file is never published) two
+        // replies in its thread, a reply in a carried thread, and one in a thread older than
+        // anything this stream carried, which an earlier run may well have delivered.
+        owner_message(
+            10,
+            "1792000900.000100",
+            None,
+            "an earlier top-level message",
+        ),
+        captured_reply(11, "1792000925.000300", "1792000909.000200"),
+        captured_reply(12, "1792000930.000400", "1792000909.000200"),
+        owner_message(
+            13,
+            "1792000940.000500",
+            Some("1792000900.000100"),
+            "in a carried thread",
+        ),
+        owner_message(
+            14,
+            "1792000950.000600",
+            Some("1792000850.000050"),
+            "in an older thread",
+        ),
+    ]);
+    let mut backend = make_backend(&fake);
+    let mut subscription = ChatSubscription::open(
+        &mut backend,
+        &request(None, json!({"diagnostics_log": log.to_str().unwrap()})),
+    )
+    .unwrap();
+    commit_next(&mut subscription);
+    commit_next(&mut subscription);
+    // The reply is a request as ever, routed to its thread.
+    let reply = commit_next(&mut subscription);
+    let message = single_message(&reply);
+    assert_eq!(message.text(), "Maybe just re-roll if too similar?");
+    assert_eq!(
+        message.thread_id().as_str(),
+        format!("{CHANNEL}/threads/1792000909.000200")
+    );
+    for _ in 12..=14 {
+        single_message(&commit_next(&mut subscription));
+    }
+    let text = std::fs::read_to_string(&log).unwrap();
+    std::fs::remove_dir_all(&directory).unwrap();
+    assert_eq!(
+        text.matches("whose root this stream never carried").count(),
+        1,
+        "{text}"
+    );
+    assert!(
+        text.contains("event 11: thread reply 1792000925.000300 (user U0OWNER0001) is in thread 1792000909.000200"),
+        "{text}"
+    );
+    assert!(!text.contains("thread 1792000900.000100,"), "{text}");
+    assert!(!text.contains("thread 1792000850.000050"), "{text}");
+}

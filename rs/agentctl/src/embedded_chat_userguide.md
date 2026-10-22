@@ -2028,6 +2028,17 @@ non-message events and invalid identities commit as checkpoints without
 feedback. The cursor advances in every case. Slack's `&amp;`, `&lt;` and `&gt;`
 escapes are undone.
 
+Messages the event stream never carries. The stream does not publish every
+message. On 2026-10-21 a message with an attached file reached no subscriber at
+all: the provider's queue held no event of any type for it, while a plain reply
+in its thread arrived as usual. Such a message never becomes a request, whatever
+its subtype, and the reply reaches the agent without it. When a reply arrives in
+a thread whose root the stream never carried, although the root is newer than a
+message it did carry, the plugin's diagnostics log names the root once, with the
+reply that revealed it. Nothing else changes: the reply is delivered as before,
+and no alarm is raised, since a root posted by a bot, which the stream does not
+carry either, looks the same.
+
 Cursor and recovery. The cursor is `slack1:seq:<n>`, the event stream's
 sequence number, or `slack1:since:<unix ms>` before the first event. A restart
 resumes the tail with `--catchup=<n>` (or `--since=<seconds>`) and skips events at
