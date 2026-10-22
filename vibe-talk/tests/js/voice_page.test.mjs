@@ -76057,6 +76057,87 @@ test("`#406 command-bar-one-row`: the view picker's tooltip names the open threa
   assert.equal(picker.title, general, "the tooltip still names a thread after leaving it");
 });
 
+// --- `#422 composer-key-stay` ---------------------------------------------------------------------------
+//
+// The owner, 2026-10-22: "when I press Cmd-S even if I have Main messages view on, it jumps to a DIFFERENT
+// view such as All (Cmd 2) or Two column (Cmd 4). That's unexpected. I would want to keep my view and just
+// enter the messages here." The rule in every view: the chord never changes the view when the view on
+// screen has a box. The thread list has one while Main channel is on (the main channel's, as its last
+// card) or a reply is open among its cards.
+
+test("`#422 composer-key-stay`: in the Threads view with Main channel on, Ctrl+S and Cmd+S go to the box at the foot of the cards and keep the view", async () => {
+  for (const fields of CHORDS) {
+    for (const where of ["a card", "a main-channel message", "the list", "the page body"]) {
+      const what = `${chordName(fields)} from ${where}`;
+      const { page } = await mainMessagesPage(new Map([[THREADS_MAIN_STORAGE, "on"]]));
+      assert.equal(page.el("channel-composer").parentNode, page.el("side-list"), "the premise is the box at the foot of the cards");
+      const target = where === "a card" ? page.el("side-cards").children.find((li) => li.hasAttribute("data-card"))
+        : where === "a main-channel message" ? page.el("side-cards").children.find((li) => li.hasAttribute("data-main-row"))
+          : where === "the list" ? page.el("side-scroll") : null;
+      await chordFrom(page, target, fields, what);
+      await page.settle();
+      assert.equal(page.el("screen-main").getAttribute("data-columns"), "list", `${what} left the Threads view`);
+      assert.equal(page.el("thread-select").value, "threads", `${what} changed the view`);
+      assert.equal(focused(page), page.el("channel-compose-text"), `${what} left the focus on ${focusName(page)}`);
+      assert.equal(page.el("channel-composer").parentNode, page.el("side-list"), `${what} took the box from the foot of the cards`);
+    }
+  }
+});
+
+test("`#422 composer-key-stay`: a reply open among the cards is the box the chord goes to, the Threads view kept, with Main channel on or off", async () => {
+  for (const main of ["on", "off"]) {
+    const { page } = await mainMessagesPage(new Map([[THREADS_MAIN_STORAGE, "on"]]));
+    const lone = page.el("side-cards").children.find((li) => li.getAttribute("data-id") === "200");
+    await replyButton(lone).click();
+    await page.settle();
+    assert.deepStrictEqual(inlineAnchors(page), ["side-cards:200"], "the premise is a reply open among the cards");
+    if (main === "off") {
+      // Main channel let go keeps the reply only where its row stays: here it goes with the row, so the
+      // reply is opened again on an unpacked row instead.
+      await page.el("reply-cancel").click();
+      await page.el("side-main").click();
+      await page.el("side-unpack").click();
+      await page.settle();
+      const unpacked = page.el("side-cards").children.find((li) => !li.hasAttribute("data-card") && !li.hasAttribute("data-main-row") && !li.hidden);
+      assert.ok(unpacked, "the premise is an unpacked row under a card");
+      await replyButton(unpacked).click();
+      await page.settle();
+      assert.equal(page.el("side-reply").hidden, false, "the premise is a reply open under an unpacked row");
+    }
+    await chordFrom(page, page.el("side-scroll"), { metaKey: true }, `Cmd+S, Main channel ${main}`);
+    await page.settle();
+    assert.equal(page.el("screen-main").getAttribute("data-columns"), "list", `Main channel ${main}: Cmd+S left the Threads view`);
+    assert.equal(focused(page), page.el("reply-text"), `Main channel ${main}: Cmd+S left the focus on ${focusName(page)}`);
+  }
+});
+
+test("`#422 composer-key-stay` negative control: with Main channel off and no reply, the Threads view has no box, and the chord still goes back to the view it was chosen from", async () => {
+  const { page } = await mainMessagesPage();
+  assert.equal(page.el("side-main").getAttribute("aria-pressed"), "false", "the premise is Main channel off");
+  await chordFrom(page, page.el("side-scroll"), { metaKey: true }, "Cmd+S, Main channel off");
+  await page.settle();
+  assert.notEqual(page.el("screen-main").getAttribute("data-columns"), "list", "with no box, Cmd+S stayed on the Threads view");
+  assert.equal(focused(page), page.el("channel-compose-text"));
+});
+
+test("`#422 composer-key-stay`: in Main, All, a thread and two columns, each with its box, the chord keeps the view", async () => {
+  for (const view of ["main", "flat"]) {
+    const page = await threadPage(view);
+    await chordFrom(page, page.el("scroll-area"), { metaKey: true }, `Cmd+S in ${view}`);
+    assert.equal(page.el("thread-select").value, view, `Cmd+S changed the view from ${view}`);
+    assert.equal(focused(page), page.el("channel-compose-text"));
+  }
+  const page = await threadPage("main");
+  const thread = page.el("thread-select").children.find((one) => String(one.value).startsWith("thread:"));
+  await pickThread(page, thread.value);
+  await chordFrom(page, page.el("scroll-area"), { metaKey: true }, "Cmd+S in a thread");
+  assert.equal(page.el("thread-select").value, thread.value, "Cmd+S left the thread");
+  assert.equal(focused(page), page.el("channel-compose-text"));
+  const { page: two } = await twoColumnServer();
+  await chordFrom(two, two.el("side-scroll"), { metaKey: true }, "Cmd+S in two columns");
+  assert.ok(inTwoColumns(two), "Cmd+S left two columns");
+});
+
 // --- unpack every thread under its card (#404 threads-unpack-all) and the root under a summary (#405) --
 //
 // The owner, 2026-10-21: bridging one thread in All breaks when another is bridged; he wants every

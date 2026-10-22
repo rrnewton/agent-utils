@@ -10327,10 +10327,17 @@ function composeFromKeyboard() {
  * whatever covered it has gone. In a message box on screen it stays, a reply open in that column or
  * not; on a column's chips, outside its scroller, it is that column's box. Ctrl+S is heard before any
  * element's own listener (`everywhere`).
+ *
+ * `#422 composer-key-stay`. The owner, 2026-10-22: "when I press Cmd-S even if I have Main messages view
+ * on, it jumps to a DIFFERENT view ... I would want to keep my view and just enter the messages here."
+ * The rule in every view: the chord never changes the view when the view on screen has a box. Main, All,
+ * a thread and two columns always have one. The thread list has one while Main channel puts the main
+ * channel's box at the foot of its cards (`#419`), or while a reply is open among them (`#410`): it is
+ * left only where it has neither. Settings and Help are screens over the view, not views, and are left.
  */
 function writeFromKeyboard() {
   if (currentScreen === "settings" || currentScreen === "help") closeSettings();
-  if (threadListOnScreen()) threadListBack();
+  if (threadListOnScreen() && !threadListHasBox()) threadListBack();
   const held = document.activeElement;
   // Already in a message box on screen: it stays there, even beside a reply open in its column.
   if (isComposer(held) && shownNode(held) && !behindThreadList(held) && !inColumnGone(held)) return true;
@@ -10343,6 +10350,14 @@ function writeFromKeyboard() {
     else pane = paneFor(held);
   }
   return inColumn(pane ? paneColumn(pane) : activeColumn, composeFromKeyboard);
+}
+
+/**
+ * Whether the thread list on screen holds a message box of its own (`#422 composer-key-stay`): the main
+ * channel's at the foot of the cards while Main channel is on (`placeMainCard`), or a reply open among them.
+ */
+function threadListHasBox() {
+  return threadListOnScreen() && (replyOnScreen() || mainRowsOnScreen());
 }
 
 /** ↑ in the box of the channel while it is empty: the newest message selected, as a preference of Slack has it. */
@@ -11023,7 +11038,9 @@ const KEYMAP = [
     group: KEYS_WRITING, chords: [{ key: "s", mod: true }], everywhere: true,
     does: "The message box, from anywhere: typing in the search, on a button, a thread card, Settings, Help or " +
       "the thread list too. In two columns, the box of the column you are in, or of the one with the selected " +
-      "message; Main's from the thread cards. With a reply open, its box, the one box drawn. " +
+      "message; Main's from the thread cards. With a reply open, its box, the one box drawn. It never changes " +
+      "the view when the view has a box: in the Thread list with Main channel on, the box at the foot of the " +
+      "cards; with neither that nor a reply there, back to the view the list was chosen from. " +
       "Never the Save page of the browser",
     controls: ["channel-compose-text", "reply-text", "compose-text"],
     repeats: true,
