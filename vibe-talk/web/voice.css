@@ -8398,7 +8398,18 @@ li.discord-message[data-root-child] > .reply-bridge {
    shrinking at every move; the owner: "I also don't like the cards expanding." So the card
    HIGHLIGHTED, by a press, shows it, and no other. Still the clamped height at least, so a short
    card does not shrink as it is highlighted. */
-.side-card-row[data-highlighted] > .side-card > .side-card-text {
+/*
+ * `#428 summary-cards-full`. A card saying a SUMMARY (`data-summarised-card`, from
+ * `cardIsSummarized` in web/voice.js) in the same rule, and for keeps: a summary is already the
+ * shortening, its length roughly chosen where it was made, so there is nothing left for a clamp
+ * to protect the reader from — only meaning for an ellipsis to cut. Summarised cards are drawn
+ * whole at every collapsed-lines count, 0 included; the count is for raw text, which is
+ * unbounded. Still the clamped height at least, as a highlighted card, so a short summary's card
+ * is the size of its neighbours. The card at the top of a thread is stated by id further down,
+ * where its phone rule has to be outranked.
+ */
+.side-card-row[data-highlighted] > .side-card > .side-card-text,
+.side-card-row[data-summarised-card] > .side-card > .side-card-text {
   display: block;
   -webkit-line-clamp: none;
   line-clamp: none;
@@ -8537,6 +8548,23 @@ li.discord-message[data-root-child] > .reply-bridge {
     line-clamp: max(1, min(var(--collapsed-lines), 2));
     height: calc(max(1, min(var(--collapsed-lines), 2)) * 1.35em);
   }
+}
+
+/*
+ * `#428 summary-cards-full`. The card at the top of a thread, summarised: whole at every width,
+ * stated by id so the phone's two lines above do not cut a summary either, and never under its
+ * clamped height, so a summary arriving where raw words stood grows the heading once, to what the
+ * summary needs, and no further moving follows it. Folded to a bar (`data-folded`, `#388
+ * thread-header-collapse`) it is the bar and nothing else, summary or not: that fold is the
+ * reader's own press on the card, kept as asked.
+ */
+:is(#thread-card, #side-thread-card)[data-summarised-card]:not([data-folded]) > .side-card > .side-card-text {
+  display: block;
+  -webkit-line-clamp: none;
+  line-clamp: none;
+  overflow: visible;
+  height: auto;
+  min-height: calc(max(1, var(--collapsed-lines)) * 1.35em);
 }
 
 /*

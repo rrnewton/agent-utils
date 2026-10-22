@@ -22,7 +22,9 @@ phone by touch:
   saved, and a reload keeps it -> scrolled up the list, the row being read stays where it was as
   the count changes, and at the newest line the reader stays on it -> in a thread and in rows
   unpacked under their cards the same count folds, and in the Threads view a raw card's text is the
-  count tall, one line at 0 (a card's text is its name) -> at 0 a tap on the row and Enter still
+  count tall, one line at 0 (a card's text is its name), while a summarised card -- and its heading
+  over its thread -- is drawn whole at every count (`#428 summary-cards-full`) -> at 0 a tap on the
+  row and Enter still
   open the message whole and fold it again, j and k still move the selection, reactions still
   show, and Reply still opens its box in the list -> no row is wider than the screen, and no page
   error at any step.
@@ -215,6 +217,9 @@ class Row(TypedDict):
     nextTop: float | None
     reactions: bool
     overflow: float
+    rootLines: str | None
+    status: str
+    stored: str | None
 
 
 # One row as the engine draws it: its fold, its body's box and line height, the clamp in force, and
@@ -327,7 +332,7 @@ class Walk:
         found: Row = self.page.evaluate(ROW_JS, [list_, ident])
         self.check(found is not None, f"row {ident} is not in {list_}")
         if self.report:
-            print(json.dumps({"at": self.label, "id": ident, **(found or {})}))
+            print(json.dumps({"at": self.label, "id": ident, **found}))
         return found
 
     def keys(self) -> list[Json]:
@@ -538,6 +543,10 @@ def keeper_and_views_walk(walk: Walk) -> None:
     card = page.evaluate(CARD_JS, RAW_THREAD)
     walk.check(card is not None and abs(card["height"] / card["lineHeight"] - 3) <= 0.3,
                f"a raw card is not 3 lines tall: {card}")
+    summarised_at_three = page.evaluate(CARD_JS, SUMMARISED)
+    walk.check(summarised_at_three is not None and summarised_at_three["whole"]
+               and summarised_at_three["clamp"] == "none",
+               f"`#428 summary-cards-full`: a summarised card is cut at 3 lines: {summarised_at_three}")
     # Unpacked thread rows fold by the same count.
     page.click("#side-unpack")
     walk.wait_for("() => !!document.querySelector('#side-cards li.discord-message[data-id=\"606\"] > .body.clamped')",
@@ -553,7 +562,30 @@ def keeper_and_views_walk(walk: Walk) -> None:
                f"at zero a raw card is not kept to its one naming line: {card}")
     unpacked = walk.row("606", "#side-cards")
     walk.check(unpacked["bodyHeight"] == 0, "at zero an unpacked row still draws its body")
+    # `#428 summary-cards-full`: the summarised card gives up no word at zero, where the raw card
+    # beside it is down to its one naming line (above), and its heading over its thread is whole.
+    summarised = page.evaluate(CARD_JS, SUMMARISED)
+    walk.check(summarised is not None and summarised["whole"] and summarised["clamp"] == "none"
+               and abs(summarised["height"] - summarised_at_three["height"]) <= 2,
+               f"at zero a summarised card shrank or was cut: {summarised} against {summarised_at_three}")
     walk.shot("6-threads-0-lines")
+    page.locator(f"#side-cards > li[data-id='{SUMMARISED}'] .side-card-open").click()
+    walk.wait_for("() => !document.getElementById('thread-heading').hidden",
+                  "the summarised thread did not open")
+    walk.settled()
+    heading = page.evaluate("""() => {
+        const text = document.querySelector('#thread-card .side-card-text');
+        return {whole: text.scrollHeight <= text.clientHeight + 1,
+                clamp: getComputedStyle(text).getPropertyValue('-webkit-line-clamp'),
+                said: text.textContent};
+    }""")
+    walk.check(heading["whole"] and heading["clamp"] == "none" and heading["said"].endswith("ships."),
+               f"at zero the summarised thread's heading card is cut: {heading}")
+    walk.shot("6b-summarised-thread-0-full")
+    page.keyboard.press("Escape")
+    walk.wait_for("() => document.getElementById('thread-heading').hidden",
+                  "Esc did not leave the summarised thread")
+    page.click("#side-scroll")
     # Into the raw thread: its rows fold by the count there, and at 0 they still open.
     page.locator(f"#side-cards > li[data-id='{RAW_THREAD}'] .side-card-open").click()
     walk.wait_for("() => !document.getElementById('thread-heading').hidden", "the thread did not open")
@@ -644,13 +676,19 @@ def main() -> int:
         for label, width, height, phone in sizes:
             api = FakeApi(web_root)
             with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-collapsed-lines-") as profile:
-                extra: Json = ({"user_agent": ("Mozilla/5.0 (Linux; Android 15; Pixel 7) AppleWebKit/537.36 "
-                                              "(KHTML, like Gecko) Chrome/151.0.0.0 Mobile Safari/537.36"),
-                                "device_scale_factor": 2.75, "is_mobile": True, "has_touch": True}
-                               if phone else {})
-                context = playwright.chromium.launch_persistent_context(
-                    profile, headless=True, executable_path=args.browser_executable,
-                    viewport={"width": width, "height": height}, color_scheme="dark", **extra)
+                if phone:
+                    context = playwright.chromium.launch_persistent_context(
+                        profile, headless=True, executable_path=args.browser_executable,
+                        viewport={"width": width, "height": height}, color_scheme="dark",
+                        user_agent=("Mozilla/5.0 (Linux; Android 15; Pixel 7) AppleWebKit/537.36 "
+                                    "(KHTML, like Gecko) Chrome/151.0.0.0 Mobile Safari/537.36"),
+                        device_scale_factor=2.75, is_mobile=True, has_touch=True,
+                    )
+                else:
+                    context = playwright.chromium.launch_persistent_context(
+                        profile, headless=True, executable_path=args.browser_executable,
+                        viewport={"width": width, "height": height}, color_scheme="dark",
+                    )
                 try:
                     context.route("**/*", api.route)
                     page = context.pages[0]

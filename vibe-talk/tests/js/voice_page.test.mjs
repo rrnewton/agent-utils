@@ -10162,6 +10162,79 @@ test("one count folds every list, thread cards keep a line at 0, and the hidden-
   assert.equal(row.getAttribute("data-collapsed"), "true", "a row does not fold again at zero lines");
 });
 
+// --- `#428 summary-cards-full` -------------------------------------------------------------------
+//
+// The owner, 2026-10-22: expanding and contracting summaries is a bug, not a feature — a summary is
+// already the shortening, eliding it with "…" cuts meaning, and only raw text of unbounded length
+// needs collapsed and expanded at all. Wherever a card says a summary it says it whole, at every
+// collapsed-lines count; raw cards keep the clamp and the count.
+
+test("a summarised thread card is marked and drawn whole at 0, 1 and 3 collapsed lines; a raw card still clamps", async () => {
+  const whole = cssBlockOutside(TWO_COLUMN_QUERY, ".side-card-row[data-summarised-card] > .side-card > .side-card-text");
+  assert.match(whole, /-webkit-line-clamp:\s*none/, "a summarised card is still clamped");
+  assert.match(whole, /(^|[^-])height:\s*auto/, "a summarised card is still a fixed height");
+  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, ".side-card-text"), /-webkit-line-clamp:\s*max\(1, var\(--collapsed-lines\)\)/,
+    "a raw card lost the reader's clamp");
+  // By id, so a phone's two-line heading cannot cut it either; `cssRules` cannot split the `:is()`.
+  assert.match(CSS_CODE,
+    /:is\(#thread-card, #side-thread-card\)\[data-summarised-card\]:not\(\[data-folded\]\) > \.side-card > \.side-card-text \{[^}]*-webkit-line-clamp:\s*none/,
+    "the summarised card at the top of a thread is still clamped");
+
+  const LONG_SUMMARY = "Overnight runner repaired and the lane is green again after two manual " +
+    "restarts, with the upload retry, the canary hold, the rollback drill timing and the " +
+    "timezone follow-up all filed";
+  const { page, data } = await twoColumnServer((_page, held) => {
+    Object.assign(held.threads[0], { display_name: "runner-repaired", summary: LONG_SUMMARY });
+  });
+  const [first, second] = data.threads;
+  const cardOf = (id) => page.el("side-cards").children.find((li) => li.getAttribute("data-id") === id);
+  assert.equal(cardPart(page, first.id, "side-card-text"), `runner-repaired: ${LONG_SUMMARY}`,
+    "the card does not say the whole summary");
+  for (const value of ["0", "1", "3"]) {
+    await page.el("collapsed-lines").setValue(value);
+    assert.equal(cardOf(first.id).hasAttribute("data-summarised-card"), true,
+      `at ${value} lines the summarised card is not marked whole`);
+    assert.equal(cardOf(second.id).hasAttribute("data-summarised-card"), false,
+      `at ${value} lines a raw card is marked whole`);
+    assert.equal(cardPart(page, first.id, "side-card-text"), `runner-repaired: ${LONG_SUMMARY}`,
+      `at ${value} lines the summary on the card changed`);
+  }
+  // Into the summarised thread: its heading card is the summary whole too, and the raw thread's is not.
+  await openerOf(cardRow(page, first.id)).click();
+  await page.settle();
+  assert.equal(page.el("side-thread-card").hasAttribute("data-summarised-card"), true,
+    "the card at the top of a summarised thread is not marked whole");
+  assert.equal(headerCard(page).text, `runner-repaired: ${LONG_SUMMARY}`);
+  await page.el("side-close").click();
+  await page.settle();
+  await openerOf(cardRow(page, second.id)).click();
+  await page.settle();
+  assert.equal(page.el("side-thread-card").hasAttribute("data-summarised-card"), false,
+    "the card at the top of a raw thread is marked whole");
+});
+
+test("a summarised row's summary is whole at 0, 1 and 3 collapsed lines, and More still opens the raw message", async () => {
+  const line = cssBlock(".summary-text");
+  assert.doesNotMatch(line, /line-clamp/, "a row's summary is clamped");
+  const page = newPage();
+  await signIn(page);
+  const rows = await showDiscord(page, [
+    message({ id: "4280000000000000001", content: longMessage("overnight") }),
+  ]);
+  await turnSummariesOn(page);
+  const row = rows[0];
+  for (const value of ["0", "1", "3"]) {
+    await page.el("collapsed-lines").setValue(value);
+    assert.equal(summaryLine(row).hidden, false, `at ${value} lines the summary is not on screen`);
+    assert.equal(summaryText(row), "a short line about 4280000000000000001",
+      `at ${value} lines the summary is not whole`);
+    assert.equal(bodyOf(row).hidden, true, `at ${value} lines the raw message shows under its summary`);
+  }
+  await foldButton(row).click();
+  assert.equal(bodyOf(row).hidden, false, "More no longer opens the raw message behind a summary");
+  assert.match(bodyOf(row).text(), /overnight/, "the opened row is not the original message");
+});
+
 // --- reading a message aloud ------------------------------------------------------------------
 //
 // The owner's ask: in the channel view Talk becomes READ; turn it on, tap a message, hear it, and
