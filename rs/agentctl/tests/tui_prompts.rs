@@ -10,7 +10,53 @@ const OPTIONS: &str = include_str!("fixtures/tui/codex-options.txt");
 const FREEFORM: &str = include_str!("fixtures/tui/codex-freeform.txt");
 const ASYNC_OPTIONS: &str = include_str!("fixtures/tui/codex-async-options.txt");
 const ASYNC_FREEFORM: &str = include_str!("fixtures/tui/codex-async-freeform.txt");
+const RATE_LIMIT: &str = include_str!("fixtures/tui/codex-rate-limit.txt");
 const WORKING: &str = "• Working (2s • esc to interrupt)\n»\n  GPT default · /work/project\n";
+
+#[test]
+fn rate_limit_reminder_requires_complete_unchanged_visible_menu() {
+    let adapter = harness_tui(Some("codex")).unwrap();
+    let q = adapter.classify(RATE_LIMIT).question.unwrap();
+    assert_eq!(q.selected, Some(1));
+    assert_eq!(q.options[1].text, "Keep current model");
+    assert_eq!(
+        adapter.answer_plan(&q, Some(2), None).unwrap().keys,
+        ["Down"]
+    );
+    for broken in [
+        RATE_LIMIT.replace("  2. Keep current model\n", ""),
+        RATE_LIMIT.replace("Keep current model\n", "Change current model\n"),
+        RATE_LIMIT.replace("  2.", "› 2."),
+        RATE_LIMIT.replace("gpt-6-luna for lower", "a different model for lower"),
+        RATE_LIMIT.replace("enter select · esc back", "enter confirm"),
+        format!("{RATE_LIMIT}\n»\n  GPT default · /work/project\n"),
+    ] {
+        assert_ne!(adapter.classify(&broken).state, State::BlockingQuestion);
+    }
+}
+
+#[test]
+fn rate_limit_guarded_answer_selects_current_model_once() {
+    for drop_submit in [false, true] {
+        let mut terminal = Terminal::new(RATE_LIMIT);
+        terminal.drop_submit = drop_submit;
+        let result = agentctl::tui_prompts::answer(
+            &terminal,
+            "pane",
+            harness_tui(Some("codex")).unwrap(),
+            (Some(2), None),
+            &|_| Ok(()),
+            &Runtime::default(),
+        );
+        if drop_submit {
+            assert_eq!(result.unwrap_err().exit_code(), 76);
+        } else {
+            assert_eq!(result.unwrap()["answered"], true);
+        }
+        assert_eq!(*terminal.keys.borrow(), ["Down", "Enter"]);
+        assert!(terminal.text.borrow().is_empty());
+    }
+}
 
 #[test]
 fn shared_state_corpus() {

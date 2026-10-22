@@ -20,6 +20,61 @@ impl HarnessTui for CodexTui {
             .rev()
             .find(|r| !r.trim().is_empty())
             .map_or(String::new(), |r| r.trim().to_lowercase());
+        if footer == "enter select · esc back" {
+            if let Some(first) = rows
+                .iter()
+                .rposition(|row| row.trim() == "Approaching rate limits")
+            {
+                let last = rows.iter().rposition(|row| !row.trim().is_empty()).unwrap();
+                let body: Vec<_> = rows[first + 1..last]
+                    .iter()
+                    .map(|row| row.trim())
+                    .filter(|row| !row.is_empty())
+                    .collect();
+                if body.len() == 4 {
+                    let model = body[0]
+                        .strip_prefix("Switch to ")
+                        .and_then(|row| row.strip_suffix(" for lower credit usage?"));
+                    let parsed: Option<Vec<_>> =
+                        body[1..].iter().map(|row| option_row(row, '›')).collect();
+                    if let (Some(model), Some(parsed)) = (model, parsed) {
+                        let valid_model = model
+                            .as_bytes()
+                            .first()
+                            .is_some_and(u8::is_ascii_alphanumeric)
+                            && model
+                                .bytes()
+                                .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c));
+                        let selected: Vec<_> = parsed
+                            .iter()
+                            .filter(|(_, selected)| *selected)
+                            .map(|(item, _)| item.number)
+                            .collect();
+                        if valid_model
+                            && parsed.iter().map(|(item, _)| item.number).eq([1, 2, 3])
+                            && selected.len() == 1
+                            && parsed[0].0.text.starts_with(&format!("Switch to {model} "))
+                            && parsed[1].0.text == "Keep current model"
+                            && parsed[2]
+                                .0
+                                .text
+                                .starts_with("Keep current model (never show again) ")
+                        {
+                            return View::question(Question {
+                                text: format!("Approaching rate limits\n{}", body[0]),
+                                options: parsed.into_iter().map(|(item, _)| item).collect(),
+                                selected: Some(selected[0]),
+                                total: 1,
+                                collapsed: false,
+                                notes: false,
+                                draft: String::new(),
+                            });
+                        }
+                    }
+                }
+            }
+            return View::state(State::MenuOrPicker);
+        }
         if footer.starts_with("enter submit")
             && footer.contains("^] skip")
             && (footer.contains("shift+→ main prompt")

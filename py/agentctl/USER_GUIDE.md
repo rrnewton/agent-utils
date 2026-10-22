@@ -891,7 +891,12 @@ pastes, or submits an answer. `answer` also opens a collapsed form if needed,
 then answers only if its layout is recognized.
 
 Both editions support default-keymap Codex single-question option and free-text
-forms, including asynchronous questions under Queued follow-up inputs. With `--text`, an option form must offer a visible "None of the above"
+forms, including asynchronous questions under Queued follow-up inputs. They also
+recognize the complete three-option "Approaching rate limits" reminder. Inspect
+the visible reminder with `prompts`, then explicitly choose its "Keep current
+model" option with `answer --option 2` to retain the model. No option is selected
+automatically; the same unchanged-screen and at-most-once submission guards apply.
+With `--text`, an option form must offer a visible "None of the above"
 entry; the adapter selects it and opens its empty notes editor. Claude Code's
 recognized single-question selection form supports `--option`; unknown free-text
 and multi-question forms require interactive attention. Pickers and permission

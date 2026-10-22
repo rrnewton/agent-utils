@@ -21,6 +21,23 @@ class CodexTui:
         rows = clean.splitlines()
         tail = "\n".join(rows[-16:]).lower()
         footer = next((row.strip().lower() for row in reversed(rows) if row.strip()), "")
+        if footer == "enter select · esc back":
+            rate_headings = [i for i, row in enumerate(rows) if row.strip() == "Approaching rate limits"]
+            if rate_headings:
+                rate_last = max(i for i, row in enumerate(rows) if row.strip())
+                rate_body = [row.strip() for row in rows[rate_headings[-1] + 1:rate_last] if row.strip()]
+                if len(rate_body) == 4:
+                    rate_model = re.fullmatch(r"Switch to ([A-Za-z0-9][A-Za-z0-9._-]*) for lower credit usage\?", rate_body[0])
+                    rate_parsed = [re.fullmatch(r"(›\s*)?(\d+)\.\s+(.+)", row) for row in rate_body[1:]]
+                    rate_options = tuple(Option(int(row[2]), row[3].strip()) for row in rate_parsed if row is not None)
+                    rate_selected = [int(row[2]) for row in rate_parsed if row is not None and row[1]]
+                    if (rate_model is not None and [item.number for item in rate_options] == [1, 2, 3]
+                            and len(rate_selected) == 1
+                            and rate_options[0].text.startswith("Switch to " + rate_model[1] + " ")
+                            and rate_options[1].text == "Keep current model"
+                            and rate_options[2].text.startswith("Keep current model (never show again) ")):
+                        return View(State.QUESTION, Question("Approaching rate limits\n" + rate_body[0], rate_options, rate_selected[0]))
+            return View(State.MENU)
         if (footer.startswith("enter submit") and "^] skip" in footer
                 and ("shift+→ main prompt" in footer or "shift+right main prompt" in footer)):
             # Async questions have a dedicated async_editor but no numbered Question header.

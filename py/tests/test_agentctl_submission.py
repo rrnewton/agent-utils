@@ -1143,7 +1143,7 @@ class FormTerminal:
         self.seconds += seconds
 
 
-@pytest.mark.parametrize("kind", ["options", "async-options"])
+@pytest.mark.parametrize("kind", ["options", "async-options", "rate-limit"])
 @pytest.mark.parametrize("collapsed", [False, True])
 def test_option_answer_opens_navigates_and_verifies_dismissal(collapsed: bool, kind: str) -> None:
     terminal = FormTerminal(kind, collapsed=collapsed)
@@ -1152,6 +1152,27 @@ def test_option_answer_opens_navigates_and_verifies_dismissal(collapsed: bool, k
     assert result["answered"] is True
     assert terminal.keys == (["shift+left"] if collapsed else []) + ["Down", "Enter"]
     assert not terminal.texts
+
+
+def test_rate_limit_reminder_requires_complete_unchanged_visible_menu() -> None:
+    screen = (FIXTURES / "codex-rate-limit.txt").read_text()
+    question = adapter().classify(screen).question
+    assert question is not None and question.selected == 1
+    assert question.options[1].text == "Keep current model"
+    for broken in (
+        screen.replace("  2. Keep current model\n", ""),
+        screen.replace("Keep current model\n", "Change current model\n"),
+        screen.replace("  2.", "› 2."),
+        screen.replace("gpt-6-luna for lower", "a different model for lower"),
+        screen.replace("enter select · esc back", "enter confirm"),
+        screen + "\n»\n  GPT default · /work/project\n",
+    ):
+        assert adapter().classify(broken).state != State.QUESTION
+    terminal = FormTerminal("rate-limit", drop=True)
+    with pytest.raises(AgentPossiblySubmitted):
+        answer(terminal, "w1:p1", adapter(), option=2, verify=lambda p: None,
+               sleep=terminal.sleep, monotonic=lambda: terminal.seconds)
+    assert terminal.keys == ["Down", "Enter"]
 
 
 @pytest.mark.parametrize("kind", ["freeform", "async-freeform", "options"])
