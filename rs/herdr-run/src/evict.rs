@@ -507,7 +507,10 @@ pub fn ttl_candidates(
             } else if ttl_seconds <= 0.0 {
                 (false, "the idle TTL is disabled".to_owned())
             } else if now - finished_at.expect("finish checked above") > ttl_seconds {
-                (true, "last run finished more than the idle TTL ago".to_owned())
+                (
+                    true,
+                    "last run finished more than the idle TTL ago".to_owned(),
+                )
             } else {
                 (false, "last run finished within the idle TTL".to_owned())
             };
@@ -1128,11 +1131,47 @@ mod tests {
         let old = world.tab("old", Some(101));
         let busy = world.tab("busy", None);
         let fresh = world.tab("fresh", Some(103));
-        write_finished(&world.project, "r1", &old, &format!("tab-{old}"), "alpha", NOW - 901.0, Some(0), true);
-        write_finished(&world.project, "r2", &busy, &format!("tab-{busy}"), "beta", NOW - 5000.0, Some(0), true);
-        write_finished(&world.project, "r3", &fresh, &format!("tab-{fresh}"), "gamma", NOW - 899.0, Some(0), true);
+        write_finished(
+            &world.project,
+            "r1",
+            &old,
+            &format!("tab-{old}"),
+            "alpha",
+            NOW - 901.0,
+            Some(0),
+            true,
+        );
+        write_finished(
+            &world.project,
+            "r2",
+            &busy,
+            &format!("tab-{busy}"),
+            "beta",
+            NOW - 5000.0,
+            Some(0),
+            true,
+        );
+        write_finished(
+            &world.project,
+            "r3",
+            &fresh,
+            &format!("tab-{fresh}"),
+            "gamma",
+            NOW - 899.0,
+            Some(0),
+            true,
+        );
 
-        let sweep = retire_idle_tabs(&world.fake, &world.config, "tester", NOW, false, None, None, &world.proc_root);
+        let sweep = retire_idle_tabs(
+            &world.fake,
+            &world.config,
+            "tester",
+            NOW,
+            false,
+            None,
+            None,
+            &world.proc_root,
+        );
         assert_eq!(sweep.closed.len(), 1);
         assert_eq!(sweep.closed[0].pane_id, old);
         assert_eq!(world.fake.closed(), vec![format!("tab-{old}")]);
@@ -1151,26 +1190,77 @@ mod tests {
         let edge = world.tab("edge", Some(101));
         let thinking = world.tab("thinking", Some(102));
         let old = world.tab("old", Some(103));
-        write_finished(&world.project, "r1", &edge, &format!("tab-{edge}"), "alpha", NOW - 900.0, Some(0), true);
-        write_finished(&world.project, "r2", &thinking, &format!("tab-{thinking}"), "beta", NOW - 5000.0, None, false);
-        write_finished(&world.project, "r3", &old, &format!("tab-{old}"), "gamma", NOW - 5000.0, Some(0), true);
+        write_finished(
+            &world.project,
+            "r1",
+            &edge,
+            &format!("tab-{edge}"),
+            "alpha",
+            NOW - 900.0,
+            Some(0),
+            true,
+        );
+        write_finished(
+            &world.project,
+            "r2",
+            &thinking,
+            &format!("tab-{thinking}"),
+            "beta",
+            NOW - 5000.0,
+            None,
+            false,
+        );
+        write_finished(
+            &world.project,
+            "r3",
+            &old,
+            &format!("tab-{old}"),
+            "gamma",
+            NOW - 5000.0,
+            Some(0),
+            true,
+        );
 
-        let dry = retire_idle_tabs(&world.fake, &world.config, "tester", NOW, true, None, None, &world.proc_root);
+        let dry = retire_idle_tabs(
+            &world.fake,
+            &world.config,
+            "tester",
+            NOW,
+            true,
+            None,
+            None,
+            &world.proc_root,
+        );
         assert!(dry.closed.is_empty());
         assert_eq!(dry.would_close.len(), 1);
         assert_eq!(dry.would_close[0].pane_id, old);
         assert!(world.fake.closed().is_empty());
         let kept: std::collections::HashMap<_, _> = dry.kept.into_iter().collect();
         assert_eq!(kept[&edge], "last run finished within the idle TTL");
-        assert_eq!(kept[&thinking], "1 run(s) for this pane have no recorded exit_code");
+        assert_eq!(
+            kept[&thinking],
+            "1 run(s) for this pane have no recorded exit_code"
+        );
 
         let disabled = Config {
             idle_tab_ttl_seconds: 0.0,
             ..world.config.clone()
         };
-        let sweep = retire_idle_tabs(&world.fake, &disabled, "tester", NOW, false, None, None, &world.proc_root);
+        let sweep = retire_idle_tabs(
+            &world.fake,
+            &disabled,
+            "tester",
+            NOW,
+            false,
+            None,
+            None,
+            &world.proc_root,
+        );
         assert!(sweep.closed.is_empty());
-        assert!(sweep.kept.iter().any(|(pane, reason)| pane == &old && reason == "the idle TTL is disabled"));
+        assert!(sweep
+            .kept
+            .iter()
+            .any(|(pane, reason)| pane == &old && reason == "the idle TTL is disabled"));
     }
 
     #[test]

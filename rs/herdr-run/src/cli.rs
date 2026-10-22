@@ -662,12 +662,16 @@ fn parse_subcommand(name: &str, rest: &[String]) -> Parsed<Option<Selected>> {
                 }
             }
             if positional > 0 {
-                return Err(format!("sweep: takes no positional arguments; got {positional}").into());
+                return Err(
+                    format!("sweep: takes no positional arguments; got {positional}").into(),
+                );
             }
             if !idle {
-                return Err("sweep: needs --idle (close tabs idle past idle_tab_ttl_seconds)"
-                    .to_owned()
-                    .into());
+                return Err(
+                    "sweep: needs --idle (close tabs idle past idle_tab_ttl_seconds)"
+                        .to_owned()
+                        .into(),
+                );
             }
             Ok(Some(Selected::Sweep(SweepOptions { dry_run })))
         }

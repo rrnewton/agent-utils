@@ -143,8 +143,7 @@ fn record_finish_time(record: &mut Value, directory: &Path) {
     if !finished {
         return;
     }
-    let Some(modified) = crate::retention::completion_modified(&directory.join("exit_code"))
-    else {
+    let Some(modified) = crate::retention::completion_modified(&directory.join("exit_code")) else {
         return;
     };
     let Ok(elapsed) = modified.duration_since(std::time::UNIX_EPOCH) else {
