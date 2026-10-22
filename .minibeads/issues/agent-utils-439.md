@@ -18,8 +18,8 @@ Message lists (Main, All, thread, Pinned, either column) already draw unmatched 
 
 # Design
 
-Reuse the seams pass (drawSeams/gapWords) and read-run idiom. Rule for both filters on: while a search filter chooses rows, read runs stay suspended as today (Collapse read opens, Hide read steps aside on threaded providers), so a read-and-unmatched run is ONE separator labelled unmatched; expanding it shows those messages (read ones greyed as usual); closing the search restores the read mode. Revealed runs are remembered by message id under the current search key and forgotten when the search changes. Card gaps count root+replies per whole thread from what the page knows, saying 'at least' when a reply count is not exact.
+Reuse the seams pass (drawSeams/gapWords) and read-run idiom. Rule for both filters on: while a search filter chooses rows, read runs stay suspended as today (Fold read opens, Hide read steps aside on threaded providers), so a read-and-unmatched run is ONE separator labelled unmatched; expanding it shows those messages (read ones greyed as usual); closing the search restores the read mode. Revealed runs are remembered by message id under the current search key and forgotten when the search changes. Card gaps count root+replies per whole thread from what the page knows, saying 'at least' when a reply count is not exact.
 
 # Acceptance Criteria
 
-Page tests: gap counts across runs incl. combined rows; expanding a gap (middle and trailing) and forgetting on search change; Collapse/Hide read + search together; search stays visible and gaps draw inside a thread; Threads list and two-column cards draw 'N unmatched messages in M threads' and expand. Chromium walk with screenshots at 393x852 and desktop clicking separators. make validate passes.
+Page tests: gap counts across runs incl. combined rows; expanding a gap (middle and trailing) and forgetting on search change; Fold/Hide read + search together; search stays visible and gaps draw inside a thread; Threads list and two-column cards draw 'N unmatched messages in M threads' and expand. Chromium walk with screenshots at 393x852 and desktop clicking separators. make validate passes.

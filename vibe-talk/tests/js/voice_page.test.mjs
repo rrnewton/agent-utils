@@ -59090,14 +59090,14 @@ test("`#439 search-unmatched-separators`: tapping an unmatched line shows that r
   assert.deepStrictEqual(seamsOf(page), [["8", "… 7 unmatched messages …", null]]);
 });
 
-test("`#439 search-unmatched-separators`: with Collapse read and a search both on, a read run is one unmatched line, and closing the search collapses it again", async () => {
+test("`#439 search-unmatched-separators`: with Fold read and a search both on, a read run is one unmatched line, and closing the search folds it again", async () => {
   const page = newPage();
   await signIn(page);
   const messages = authorChannel();
   for (const m of messages) if (Number(m.id) < 10) page.dealtWith.add(m.id);
   const rows = await showDiscord(page, messages);
-  await chooseReadMode(page, "Collapse read");
-  assert.ok(collapsedRows(page).length > 0, "the fixture collapsed nothing");
+  await chooseReadMode(page, "Fold read");
+  assert.ok(collapsedRows(page).length > 0, "the fixture folded nothing");
   await search(page, "deploy");
   await page.settle();
   // One line, the search's: no collapsed run stands beside a gap, read and unmatched alike.
@@ -59113,7 +59113,7 @@ test("`#439 search-unmatched-separators`: with Collapse read and a search both o
   await page.el("search-toggle").click();
   await page.settle();
   assert.deepStrictEqual(seamsOf(page), [], "an unmatched line outlived the search");
-  assert.ok(collapsedRows(page).length > 0, "closing the search did not put Collapse read back");
+  assert.ok(collapsedRows(page).length > 0, "closing the search did not put Fold read back");
 });
 
 test("`#439 search-unmatched-separators`: the search stays on screen and its lines are drawn inside a thread opened under it", async () => {
