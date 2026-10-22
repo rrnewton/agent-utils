@@ -20666,6 +20666,225 @@ test("hanging up mid-turn stores the best text of the turn that was in progress"
   assert.deepStrictEqual(storedTexts(page), ["you: Summarize the channel"]);
 });
 
+// --- a long voice turn opens and closes with a tap, and keeps its fold as it grows (#431) ---------
+//
+// `#431 voice-transcript-expand`. The owner, from a car: a long spoken reply's card was collapsed,
+// clipping the end, and tapping it did not open it. A transcript turn had no tap of its own (only
+// a channel row is its own fold control, `tapRow`), and a streamed turn was drawn again, folded, on
+// every frame.
+
+/** Sentences of one spoken answer, each a fragment of its own: together well past the fold. */
+const SPOKEN_FRAGMENTS = [
+  "The overnight run finished at four.",
+  "Three suites failed, all in the network layer.",
+  "The proxy timed out twice while fetching crates.",
+  "A retry fixed the first and the second is still red.",
+  "Nobody has touched the release branch since Tuesday.",
+  "The canary has been green for six hours now.",
+  "I would hold the tag until the network suite passes.",
+  "Want me to post that summary to the lead team channel?",
+  "I can also open an issue for the proxy timeouts.",
+  "Either way the deploy window closes at five tonight.",
+];
+
+/** The body of a turn's row. */
+const turnBody = (li) => li.descendants().find((node) => node.hasClass("body"));
+
+/** A tap on a turn's text, as a finger lands on it: the click reaches the row it is in. */
+const tapTurn = (li) => li.dispatch("click", { target: turnBody(li) });
+
+test("`#431 voice-transcript-expand`: a tap on a long turn's card opens it, and another tap closes it", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    await startTalking(page);
+    assistantSays(page, longMessage("spoken"));
+    const li = session_lines(page).at(-1);
+    assert.equal(li.getAttribute("data-collapsed"), "true", "a long reply did not arrive folded");
+    await tapTurn(li);
+    const opened = li.getAttribute("data-collapsed");
+    await tapTurn(li);
+    return { li, opened, closed: li.getAttribute("data-collapsed") };
+  };
+
+  const { li, opened, closed } = await run();
+  assert.equal(opened, "false", "a tap on the card did not open it");
+  assert.equal(closed, "true", "a second tap did not close it");
+  assert.equal(foldButton(li).getAttribute("aria-expanded"), "false", "the fold button misreports the tap's state");
+  assert.ok(turnBody(li).hasClass("clamped"), "closed, but the text is not clamped");
+
+  // The page before the fix: the card had no tap at all.
+  const control = await run(brokenScript("  if (fold) tapRow(li, fold, foldOnTap);\n  // Who said it", "  // Who said it"));
+  assert.equal(control.opened, "true", "with the card's tap removed it still opened, so this test cannot see the tap");
+});
+
+test("`#431 voice-transcript-expand`: a tap on the card is the fold button's own act, and a short turn has none", async () => {
+  // One path folds a row, as on a channel row (`tapRow`): the button keeps its scroll anchoring and
+  // its `aria-expanded`, and a tap that went round it would be a second way of folding to drift.
+  const page = newPage();
+  await startTalking(page);
+  assistantSays(page, longMessage("spoken"));
+  const li = session_lines(page).at(-1);
+  const fold = foldButton(li);
+  let presses = 0;
+  const press = fold.click.bind(fold);
+  fold.click = async () => {
+    presses += 1;
+    await press();
+  };
+  await tapTurn(li);
+  assert.equal(presses, 1, "the tap did not go through the fold button, the one path that folds a row");
+  assert.equal(li.getAttribute("data-collapsed"), "false");
+  // ...and a short turn, with nothing to fold, ignores a tap.
+  assistantSays(page, SHORT_MESSAGE);
+  const short = session_lines(page).at(-1);
+  await tapTurn(short);
+  assert.equal(short.getAttribute("data-collapsed"), null, "a tap marked a short turn");
+});
+
+test("`#431 voice-transcript-expand`: a streamed reply that grows past the fold is never folded under the reader", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    const socket = await startNeutralCall(page);
+    const seen = [];
+    let said = "";
+    for (const fragment of SPOKEN_FRAGMENTS) {
+      speech(socket, "assistant", 3, fragment, true);
+      said = `${said} ${fragment}`.trim();
+      const li = session_lines(page).at(-1);
+      seen.push({ chars: said.length, collapsed: li.getAttribute("data-collapsed") });
+    }
+    turnDone(socket, 3);
+    await page.settle();
+    return { page, seen };
+  };
+
+  const { page, seen } = await run();
+  assert.ok(seen.some((frame) => frame.chars <= COLLAPSE_OVER_CHARS), "the reply was never short, so it never grew past the fold");
+  assert.ok(seen.at(-1).chars > COLLAPSE_OVER_CHARS + 60, "the reply never grew well past the fold");
+  assert.deepStrictEqual(
+    seen.filter((frame) => frame.collapsed === "true").map((frame) => frame.chars),
+    [],
+    "the reply snapped closed while it was spoken"
+  );
+  const li = session_lines(page).at(-1);
+  assert.equal(session_lines(page).length, 1, "the reply was drawn as more than one row");
+  assert.ok(foldButton(li), "the long reply has no fold, so it cannot be closed either");
+  assert.equal(li.getAttribute("data-collapsed"), "false");
+  assert.ok(!turnBody(li).hasClass("clamped"), "the reply's end is clamped away");
+
+  const control = await run(brokenScript("    const onFold = keepTurnFold(entry.li, li);\n", "    const onFold = false;\n"));
+  assert.ok(
+    control.seen.some((frame) => frame.collapsed === "true"),
+    "with the fold not carried across frames the reply still never folded, so this test cannot see it"
+  );
+});
+
+test("`#431 voice-transcript-expand`: a fold the reader set holds while the reply goes on growing, and the view follows it", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    const socket = await startNeutralCall(page);
+    const area = page.el("scroll-area");
+    // Enough of a call above it that the list scrolls, so following the newest line is a real move.
+    for (let turn = 1; turn <= 6; turn += 1) {
+      speech(socket, "user", turn, `question ${turn}`, true);
+      speech(socket, "assistant", turn, longMessage(`answer ${turn}`), true);
+      turnDone(socket, turn);
+    }
+    assert.ok(area.scrollHeight > area.clientHeight * 2, "the call does not overflow its list");
+    const [first, ...rest] = SPOKEN_FRAGMENTS;
+    speech(socket, "assistant", 7, first, true);
+    for (const fragment of rest.slice(0, 7)) speech(socket, "assistant", 7, fragment, true);
+    const now = () => session_lines(page).at(-1);
+    // Whole as it grew past the fold (the test above), and so open: the reader's first tap closes it.
+    const states = [now().getAttribute("data-collapsed")];
+    // The reader closes it while it is still being spoken...
+    await tapTurn(now());
+    speech(socket, "assistant", 7, rest[7], true);
+    states.push(now().getAttribute("data-collapsed"));
+    // ...and a keyboard user, on its fold button, opens it again.
+    foldButton(now()).focus();
+    await foldButton(now()).click();
+    speech(socket, "assistant", 7, rest[8], true);
+    states.push(now().getAttribute("data-collapsed"));
+    return { page, area, states, focused: page.document.activeElement === foldButton(now()) };
+  };
+
+  const { area, states, focused } = await run();
+  assert.deepStrictEqual(states, ["false", "true", "false"], "a frame of the reply undid the reader's fold");
+  assert.ok(focused, "a frame of the reply took the focus off its fold button");
+  assert.ok(atBottomOf(area), "the view stopped following the newest line of the reply");
+
+  // The control carries no open fold: the last state is the one the reader opened, and it must be lost.
+  const control = await run(brokenScript("  if (!before || !isFolded(before)) setFolded(entry, false);", "  if (!before) setFolded(entry, false);"));
+  assert.equal(control.states[2], "true", "with the reader's open fold not carried it still held, so this proves nothing");
+});
+
+test("`#431 voice-transcript-expand`: opening the newest card by a tap keeps the reader on the newest line, and moves nothing scrolled up", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    await startTalking(page);
+    const area = fillTranscript(page);
+    // At the newest line, opening the newest card is the fold button's act, held by `preservingScroll`:
+    // the reader stays on the newest line, now the end of the card they opened.
+    await tapTurn(page.el("transcript").children.at(-1));
+    return { page, area };
+  };
+
+  const { page, area } = await run();
+  const rows = page.el("transcript").children;
+  assert.equal(rows.at(-1).getAttribute("data-collapsed"), "false", "the tap did not open the newest card");
+  assert.ok(atBottomOf(area), "opening the newest card left the newest line");
+
+  // Scrolled up, a card opened by a tap grows below its head: neither it nor the line above it moves.
+  // (A regression guard: this model has no browser scroll anchoring to move them; the Chromium walk,
+  // tests/voice_expand_browser.py, measures the same with it.)
+  area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) * 0.5);
+  const top = area.getBoundingClientRect().top;
+  const tapped = rows.find((li) => foldButton(li) && li.getAttribute("data-collapsed") === "true" &&
+    li.getBoundingClientRect().top > top + 40);
+  assert.ok(tapped, "no folded answer is on screen to tap");
+  const anchor = rows.find((li) => li.getBoundingClientRect().bottom > top);
+  const before = anchor.getBoundingClientRect().top;
+  const tappedBefore = tapped.getBoundingClientRect().top;
+  await tapTurn(tapped);
+  assert.equal(tapped.getAttribute("data-collapsed"), "false", "the tap did not open it");
+  assert.equal(anchor.getBoundingClientRect().top, before, "opening the card moved the line being read");
+  assert.equal(tapped.getBoundingClientRect().top, tappedBefore, "opening the card moved the card");
+
+  const control = await run(brokenScript("    preservingScroll(() => setFolded(entry, !isFolded(entry)));", "    setFolded(entry, !isFolded(entry));"));
+  assert.ok(!atBottomOf(control.area), "with the fold's scroll keeper removed the reader still stayed on the newest line, so this proves nothing");
+});
+
+test("`#431 voice-transcript-expand`: a long frozen send card opens on a tap, and stays open when the server's copy replaces it", async () => {
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    await recordingCall(page);
+    page.holdTurnPosts = true;
+    page.propose(proposal({ reply_to: null, text: longMessage("draft") }));
+    await page.settle();
+    page.expireTimers(2000);
+    await page.el("post-confirm-send").click();
+    await watchTurns(page);
+    const drawn = sentCards(page)[0];
+    const arrived = drawn.getAttribute("data-collapsed");
+    await tapTurn(drawn);
+    // The claim answers: the server's copy replaces the card the page drew (`correctSentCard`).
+    page.holdTurnPosts = false;
+    for (const release of page.pendingTurnPosts.splice(0)) release();
+    await watchTurns(page);
+    const filed = sentCards(page)[0];
+    return { arrived, replaced: filed !== drawn, after: filed.getAttribute("data-collapsed") };
+  };
+
+  const { arrived, replaced, after } = await run();
+  assert.equal(arrived, "true", "a long sent card did not arrive folded");
+  assert.ok(replaced, "the server's copy did not replace the card, so nothing here is tested");
+  assert.equal(after, "false", "the card the reader opened folded again when the server's copy replaced it");
+
+  const control = await run(brokenScript("  const onFold = keepTurnFold(li, fresh);\n", "  const onFold = false;\n"));
+  assert.equal(control.after, "true", "with the fold not carried the card still stayed open, so this proves nothing");
+});
+
 test("startup timing is posted ONCE, after the greeting, as phase numbers and nothing said", async () => {
   const page = newPage();
   const socket = await startNeutralCall(page, { greeting: true });

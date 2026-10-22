@@ -6098,7 +6098,12 @@ a.search-hit-link {
  * this page's rule is that a gesture is never the only way in: somebody arriving by keyboard tabs
  * to this and it appears. `clip` rather than `display: none` is what keeps it in the tab order at
  * all -- a hidden button is not focusable, and would have removed the keyboard path entirely.
+ *
+ * The call's transcript too (`#431 voice-transcript-expand`): a turn is opened by a tap on it as a
+ * channel row is, so it is the same row there, not one with a small pill on its metadata line that
+ * is the only part of the card a tap opens.
  */
+#transcript .fold,
 #side-log .fold,
 #side-cards .fold,
 #discord-log .fold,
@@ -6111,6 +6116,7 @@ a.search-hit-link {
   clip-path: inset(50%);
   white-space: nowrap;
 }
+#transcript .fold:focus-visible,
 #side-log .fold:focus-visible,
 #side-cards .fold:focus-visible,
 #discord-log .fold:focus-visible,

@@ -197,6 +197,16 @@ voice-call-drops-browser:
 voice-reconnect-browser:
 	python3 tests/voice_reconnect_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
+# `#431 voice-transcript-expand` in a real Chromium at 393x852 by touch and 1280x800 by mouse: a reply
+# streamed over a fake vibe-talk-v1 bridge grows past the fold and stays whole while the list follows
+# it; a tap on the card closes it and another opens it; a long reply that arrives whole arrives folded
+# and opens on a tap at the newest line; a fold set while the reply is spoken holds through its later
+# frames; scrolled up, a card opens where it stands. Pass WEB_ROOT=dir to run it against another copy
+# of the page, and SCREENSHOTS=dir to keep a PNG of each state.
+.PHONY: voice-expand-browser
+voice-expand-browser:
+	python3 tests/voice_expand_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
+
 # `#277 send-order` in a real Chromium against the real server binary, which posts through its real
 # provider client to a mock Google Chat bridge on loopback that fails A at once: B waits behind A,
 # saying so, and the bridge never sees it; A goes again under the same nonce and lands, then B;

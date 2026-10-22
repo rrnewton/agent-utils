@@ -1379,7 +1379,9 @@ def _act_one_expanded(driver: Driver) -> None:
         "window.__foldedHeight = li.querySelector('.body').getBoundingClientRect().height; "
         "return window.__foldedHeight; })()"
     )
-    driver.page.click("#fold-probe .fold")
+    # Opened as a reader opens it, by a tap on its text: the fold button is clipped for the keyboard
+    # in the transcript as on a channel row (`#431 voice-transcript-expand`).
+    driver.page.click("#fold-probe .body")
     driver.page.wait_for_function(
         "() => !!document.querySelector(\"#transcript > li[data-collapsed='false']\")", timeout=5_000
     )

@@ -6826,7 +6826,10 @@ function turnNode(who, text, atMs) {
   body.className = "body";
   body.textContent = text; // untrusted text: never innerHTML.
   li.append(meta, body);
-  foldable(li, meta, body, text);
+  // `#431 voice-transcript-expand`. The message is its own fold control, as a channel row is
+  // (`tapRow`): the owner, in a car, tapped a long reply's card and nothing opened.
+  const fold = foldable(li, meta, body, text);
+  if (fold) tapRow(li, fold, foldOnTap);
   // Who said it as well as what was said: on the transcript "assistant" is a real thing to look
   // for, and it is the word printed on the row.
   searchable(li, who, text);
@@ -13304,7 +13307,9 @@ function sentCardNode(turn) {
     open.addEventListener("click", () => void openSentMessage(detail));
     li.append(open);
   }
-  foldable(li, meta, body, text);
+  // A row of the transcript like any turn, opened by a tap on it as a turn is (`turnNode`).
+  const fold = foldable(li, meta, body, text);
+  if (fold) tapRow(li, fold, foldOnTap);
   searchable(li, "sent", channel, text);
   li.linkText = text;
   return li;
@@ -13408,9 +13413,12 @@ function correctSentCard(key, turn) {
   if (!drawn || !li || !li.parentNode) return;
   const fresh = sentCardNode(turn);
   const focused = document.activeElement === li;
+  // Opened by a tap, it stays open (`#431 voice-transcript-expand`), its fold button's focus with it.
+  const onFold = keepTurnFold(li, fresh);
   preservingScroll(() => li.replaceWith(fresh));
   drawn.li = fresh;
   if (focused) fresh.focus({ preventScroll: true });
+  if (onFold) /** @type {any} */ (fresh).foldEntry.fold.focus({ preventScroll: true });
   applySearch();
 }
 
@@ -17406,7 +17414,10 @@ function drawSpoken(entry) {
       if (value !== null) li.setAttribute(name, value);
     }
     if (entry.cut) li.setAttribute("data-cut", "");
+    const onFold = keepTurnFold(entry.li, li);
     entry.li.replaceWith(li);
+    // Without moving the list: a reader scrolled up the call is not taken back to the row each frame.
+    if (onFold) /** @type {any} */ (li).foldEntry.fold.focus({ preventScroll: true });
     entry.li = li;
     applySearch();
     followIfPinned(pinned);
@@ -17414,6 +17425,33 @@ function drawSpoken(entry) {
     entry.li = line(entry.who, text, entry.atMs);
     if (entry.cut) entry.li.setAttribute("data-cut", "");
   }
+}
+
+/**
+ * `#431 voice-transcript-expand`. A turn redrawn as it grows (`drawSpoken`) keeps the fold it had.
+ *
+ * A fresh row arrives folded when it is long, and a voice turn has no message id for `expandedIds`
+ * to carry its state by, so every frame of a streamed reply drew it folded again: a reply that grew
+ * past the fold threshold while it was spoken snapped closed under the reader, and one they had
+ * opened closed on the next frame. So the old row's state goes to the new one, by the one path that
+ * folds a row (`setFolded`):
+ *
+ *   * OPEN OR FOLDED, AS THE READER LEFT IT. The reader's own tap is the only thing that changes it.
+ *   * A TURN SHOWN WHOLE STAYS WHOLE. One that was short when drawn, and grew long, was never
+ *     folded, and folding it now would be the jump `#47 scrollback-stability` rules out: a long
+ *     message arrives folded, and is never folded after the reader has seen it whole. A streamed
+ *     reply therefore reads to its end while it is spoken, and a tap folds it like any other.
+ *
+ * Answers whether the focus is on the old row's fold button, which goes with it: the caller puts a
+ * keyboard user on the new one once it is on the page. Shared by the frozen send card the server's
+ * copy replaces (`correctSentCard`), which a tap opens as it opens a turn.
+ */
+function keepTurnFold(was, li) {
+  const entry = li.foldEntry;
+  if (!entry) return false;
+  const before = was.foldEntry;
+  if (!before || !isFolded(before)) setFolded(entry, false);
+  return Boolean(before) && document.activeElement === before.fold;
 }
 
 function spokenText(entry) {
@@ -33236,8 +33274,20 @@ async function readAloud(ids, from = null) {
  * It drives the fold BUTTON rather than the fold state, so there is exactly one path that folds a
  * row — the button keeps its scroll anchoring and its `aria-expanded`, and a keyboard user who
  * tabs to it gets the same act the tap performs.
+ *
+ * `act` is what the tap does once it is known to be meant for the row: a channel row's is
+ * `actOnRow`, which reads aloud in reading mode; a transcript row's (`#431 voice-transcript-expand`)
+ * is `foldOnTap` alone, since reading mode reads the CHANNEL's messages and a voice turn is not one.
  */
-function tapRow(li, fold) {
+function tapRow(li, fold, act = actOnRow) {
+  // A NEW PRESS ENDS ANY OLD GESTURE'S CLAIM on the click. A swipe that commits, or a hold, sets
+  // `suppressNextRowClick` for the click a browser sends after it, and a touch that ends in either
+  // often sends none: the flag then waited for the next tap on any row, and swallowed it — since
+  // `#431 voice-transcript-expand`, a first tap on a transcript card, after a swipe in the channel.
+  // A gesture on this press sets it again after this, as its pointerdown starts it.
+  li.addEventListener("pointerdown", () => {
+    suppressNextRowClick = false;
+  });
   li.addEventListener("click", inThisColumn((event) => {
     if (suppressNextRowClick) {
       suppressNextRowClick = false;
@@ -33260,7 +33310,7 @@ function tapRow(li, fold) {
     if (selection && String(selection) !== "") {
       return;
     }
-    actOnRow(li, fold, target ? blockTapped(li, target) : null);
+    act(li, fold, target ? blockTapped(li, target) : null);
   }));
 }
 
@@ -33310,8 +33360,16 @@ function actOnRow(li, fold, tapped = null) {
   // A SHORT message has no fold control, and that is fine: it is already whole. The handler is
   // still attached to every row, because reading mode has to reach a short message too — gating
   // this on foldability made the shortest messages the only ones that could not be read aloud.
-  // Nor while the row shows its links in place of its text (`#211 link-filter`): the text is not
-  // on screen to be folded, and a fold changed out of sight would surprise the reader later.
+  foldOnTap(li, fold);
+}
+
+/**
+ * The fold half of a tap on a row: the fold button pressed for it, so the tap and the button are one
+ * act. Shared by the channel's rows (`actOnRow`) and the transcript's (`#431 voice-transcript-expand`).
+ * Not while the row shows its links in place of its text (`#211 link-filter`): the text is not on
+ * screen to be folded, and a fold changed out of sight would surprise the reader later.
+ */
+function foldOnTap(li, fold) {
   if (fold && !showingLinks(li)) {
     fold.click();
   }
