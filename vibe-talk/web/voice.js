@@ -23362,7 +23362,7 @@ function readFilterKeeps(thread = channelView === "thread" ? openThreadChoice() 
   /** @type {ReplyTally | null} */
   let tally = null;
   return (message) => {
-    if (stillToDo(message)) return true;
+    if (stillToDo(message) || sentFromThisPage(message)) return true;
     if (keptRoot !== null && String(message.id) === keptRoot) return true;
     if (!counting) return false;
     if (tally === null) tally = replyTally();
@@ -25186,6 +25186,20 @@ function outgoingStatus(entry) {
   return `${prefix}Not sent. ${entry.detail}`;
 }
 
+/**
+ * `#430 threads-main-own-sent`. The messages this page has sent, by id, for as long as it is open. The
+ * owner, 2026-10-22, on a phone: "even when I've toggled Main on in thread list View on mobile. I still
+ * don't see the message that I just sent to the main channel." The owner's own messages count as read
+ * (`markOwnRead`), so under Hide read the Threads view's main rows, rebuilt through the read filter, left
+ * it out; Main showed it only because its live append skips that filter, until its next redraw. So a
+ * message sent from here is one the read filters keep (`readFilterKeeps`, `mainRowMessages`), in every
+ * list alike, for the rest of the page's life: what the reader has just said never vanishes as they say it.
+ */
+const sentFromHere = new Set();
+
+/** Whether `message` was sent from this page (`sentFromHere`). */
+const sentFromThisPage = (message) => sentFromHere.has(String(message.id));
+
 /** Only provider history/stream observations retire receipts; appending an ACK is not a read. */
 function observeOutgoingMessages(messages) {
   let changed = false;
@@ -26284,6 +26298,8 @@ async function dispatchOutgoingMessage(entry, job) {
     entry.parts = parts.map((part) => ({
       ...part, id: String(part.id), channel_id: entry.channel, content: String(part.content || ""),
     }));
+    // `#430 threads-main-own-sent`. Sent from here: the read filters keep it in sight from now on.
+    for (const part of entry.parts) sentFromHere.add(part.id);
     // `#263 post-split-per-provider`. The rest of a long post may have continued in its first
     // part's thread, where it is drawn rather than here; the receipt for it says which thread.
     if (!entry.threadId) entry.continueIn = entry.parts.slice(1).map(threadOf).find(Boolean) || entry.continueIn;
@@ -42423,7 +42439,7 @@ function mainRowMessages(carded) {
     if (!inView(message, "main", null) || channelCanon.removed.has(String(message.id)) || hiddenEmpty(message)) return false;
     const thread = threadOf(message);
     if (thread !== null && message.thread.is_root === true && carded.has(thread)) return false;
-    return !hidingRead() || stillToDo(message, channelCanon.dismissed);
+    return !hidingRead() || stillToDo(message, channelCanon.dismissed) || sentFromThisPage(message);
   });
   return inTimeOrder(messages, "timestamp");
 }
@@ -42492,10 +42508,16 @@ function mainRows(messages, tally) {
 function placeMainCard() {
   const box = leftEl("channel-composer");
   const list = leftEl("side-list");
+  // `#430 threads-main-own-sent`. And the outbox's receipts over it, as in Main: a send still on its
+  // way, or one that failed, is shown where it was sent from, not in the list hidden behind the cards.
+  const receipts = leftEl("outgoing-log");
   const wanted = mainRowsOnScreen();
   const there = box.parentNode === list;
-  if (wanted && !there) list.append(box);
-  else if (!wanted && there) leftEl("pane-discord").insertBefore(box, leftEl("column-reply"));
+  if (wanted && !there) list.append(receipts, box);
+  else if (!wanted && there) {
+    leftEl("pane-discord").insertBefore(box, leftEl("column-reply"));
+    leftEl("pane-discord").insertBefore(receipts, box);
+  }
   if (box.hasAttribute("data-main-card") !== wanted) box.toggleAttribute("data-main-card", wanted);
 }
 

@@ -62,7 +62,10 @@ four views are offered, in the view picker and on Ctrl+1 to Ctrl+4 (Cmd on a Mac
   **Reply** on one of those opens the reply under it in the list (`#410 inline-reply-editor`), starting
   its thread where the service starts one on a reply, rather than opening the thread view; the box at the
   foot is hidden while a reply is open and comes back when it goes. The chips sit on the row of the
-  search glass, the cards starting under it.
+  search glass, the cards starting under it. A message you send is among those rows at once, under Hide
+  read too (your own messages count as read there), and a send still on its way, or one that failed, shows
+  its receipt over the box at the foot (`#430 threads-main-own-sent`): every list keeps what you sent from
+  the page in sight for as long as the page is open.
   The last chip says the order of the cards, **Latest update** (each where its thread last moved, as
   always) or **Thread created** (each where its thread was started); a press, or key `d`, goes to the next
   order, kept on this device, the selected card staying in view (`#426 threads-sort-toggle`). Main channel's

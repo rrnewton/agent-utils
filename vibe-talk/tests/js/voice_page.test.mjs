@@ -76629,6 +76629,84 @@ test("`#423 back-key-consistency`: a place noted twice — two columns lost to a
   assert.notEqual(whereNow(page), narrowed, "Back stayed on the place it was on");
 });
 
+// --- `#430 threads-main-own-sent` ----------------------------------------------------------------------
+//
+// The owner, 2026-10-22, on a phone: "even when I've toggled Main on in thread list View on mobile. I still
+// don't see the message that I just sent to the main channel." Under Hide read the owner's own messages
+// count as read, and the Threads view's main rows, rebuilt through the read filter, left it out.
+
+/** The read mode button pressed until it says `words`. */
+async function readModeTo(page, words) {
+  const mode = { "Show read": "show", "Collapse read": "collapse", "Hide read": "hide" }[words];
+  for (let press = 0; press < 3 && page.el("todo-filter").getAttribute("data-read-mode") !== mode; press += 1) {
+    await page.el("todo-filter").click();
+    await page.settle();
+  }
+  assert.equal(page.el("todo-filter").getAttribute("data-read-mode"), mode, `the read mode button never said ${words}`);
+}
+
+/** Main's rows among the cards holding `words`, by id. */
+const mainRowsSaying = (page, words) => page.el("side-cards").children
+  .filter((li) => li.hasAttribute("data-main-row") && !li.hidden && li.text().includes(words)).map((li) => li.getAttribute("data-id"));
+
+test("`#430 threads-main-own-sent`: under Hide read, the message just sent from the box at the foot of the cards is among Main channel's rows at once, and stays through a redraw", async () => {
+  for (const mode of ["Hide read", "Show read"]) {
+    const { page } = await mainMessagesPage(new Map([[THREADS_MAIN_STORAGE, "on"]]));
+    await readModeTo(page, mode);
+    await page.el("channel-compose-text").setValue("just said to everyone");
+    await page.el("channel-send").click();
+    await page.settle();
+    assert.equal(page.el("screen-main").getAttribute("data-columns"), "list");
+    assert.equal(mainRowsSaying(page, "just said to everyone").length, 1, `${mode}: the message just sent is not among the main rows`);
+    // A redraw of the cards (Unpack msgs on and off) keeps it.
+    await page.el("side-unpack").click();
+    await page.el("side-unpack").click();
+    await page.settle();
+    assert.equal(mainRowsSaying(page, "just said to everyone").length, 1, `${mode}: a redraw of the cards lost the message just sent`);
+  }
+});
+
+test("`#430 threads-main-own-sent`: sent from Main under Hide read, it is among the Threads view's main rows, and still in Main after leaving and coming back", async () => {
+  const { page } = await mainMessagesPage(new Map([[THREADS_MAIN_STORAGE, "on"]]));
+  await readModeTo(page, "Hide read");
+  await pickThread(page, "main");
+  await page.el("channel-compose-text").setValue("said from Main");
+  await page.el("channel-send").click();
+  await page.settle();
+  const inMain = () => page.el("discord-log").children.filter((li) => li.text().includes("said from Main")).length;
+  assert.equal(inMain(), 1, "the premise: Main shows the message just sent");
+  await pickThread(page, "threads");
+  assert.equal(mainRowsSaying(page, "said from Main").length, 1, "the Threads view's main rows lack the message sent from Main");
+  await pickThread(page, "flat");
+  await pickThread(page, "main");
+  assert.equal(inMain(), 1, "Main redrawn under Hide read lost the message just sent");
+});
+
+test("`#430 threads-main-own-sent`: a send still on its way shows its receipt over the box at the foot of the cards, and the receipts go back under Main with the box", async () => {
+  const { page } = await mainMessagesPage(new Map([[THREADS_MAIN_STORAGE, "on"]]));
+  const receipts = page.el("outgoing-log");
+  assert.equal(receipts.parentNode, page.el("side-list"), "the receipts are not at the foot of the cards with the box");
+  assert.equal(page.el("side-list").children.at(-2), receipts, "the receipts are not just over the box");
+  let answer = null;
+  const posting = page.replyResponse;
+  page.replyResponse = (path, options) => new Promise((resolve) => { answer = () => resolve(posting(path, options)); });
+  await page.el("channel-compose-text").setValue("on its way");
+  const submitted = page.el("channel-send").click();
+  assert.equal(receipts.hidden, false, "a send on its way shows no receipt in the Threads view");
+  assert.ok(receipts.text().includes("on its way"), "the receipt does not say what is being sent");
+  assert.ok(answer, "the page never started the held post");
+  answer();
+  await submitted;
+  await page.settle();
+  assert.equal(mainRowsSaying(page, "on its way").length, 1, "the message sent is not among the main rows once it lands");
+  // Negative control: Main channel off, the box and its receipts back under Main, and no main rows.
+  await page.el("side-main").click();
+  await page.settle();
+  assert.equal(receipts.parentNode, page.el("pane-discord"), "the receipts stayed at the foot of the cards");
+  assert.equal(receipts.nextSibling, page.el("channel-composer"), "the receipts are not just over the box again");
+  assert.deepStrictEqual(mainRowsSaying(page, "on its way"), [], "with Main channel off, the message is among the cards");
+});
+
 // --- `#426 threads-sort-toggle` -----------------------------------------------------------------------
 //
 // The owner, 2026-10-22: "One toggle I DO think we should have at the top of the thread view is to order by

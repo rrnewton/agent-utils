@@ -11,6 +11,8 @@ The owner, 2026-10-22, of the Threads view (Cmd+3) after `#419 threads-view-main
 * `#424 threads-main-own-center`: the owner's main-channel rows among the cards looked like the previous
   thread's follow-ups; they are centred, at their width.
 * `#426 threads-sort-toggle`: "order by thread creation vs latest update", a chip saying the order.
+* `#430 threads-main-own-sent`: "I still don't see the message that I just sent to the main channel":
+  under Hide read the Threads view's main rows left the owner's own message out.
 * `#423 back-key-consistency`: "if I press Cmd-[ on the thread list view it jumps back to the Main view but
   it does NOT have kind of navigation (or back?) effect on other views". Ctrl/Cmd+[ and ] walk back and
   forward through the places visited, in every view.
@@ -35,7 +37,8 @@ threads), two of Main's messages (220 and 223) the owner's, from one loopback or
    tests cover Back at the start, Esc as a step back and a page opened on the thread list);
 5. the order chip: the cards by latest update (replica, canary, runner), the chip saying so; d -> by
    creation (runner, replica, canary), the chip "Thread created" ("Created" on a phone) and pressed, the
-   highlighted card still on screen; a reload keeps it; a press goes back; the four chips beside the glass.
+   highlighted card still on screen; a reload keeps it; a press goes back; the four chips beside the glass;
+6. Hide read, Main channel on: a message sent from the box at the foot is among the main rows at once.
 
 No page error and no sideways scroll at any step. Pass --screenshots DIR to keep a PNG of each state;
 --web-root DIR to run against another copy of the page (an older one fails it at the chips).
@@ -122,7 +125,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--screenshots", type=Path, help="directory to write one PNG per state into (default: none)")
     parser.add_argument("--port", type=int, default=0,
                         help="loopback port for the fake server (default: 0, any free port)")
-    parser.add_argument("--only", choices=("chips", "compose", "center", "back", "order"), action="append",
+    parser.add_argument("--only", choices=("chips", "compose", "center", "back", "order", "sent"), action="append",
                         help="run only these parts of the walk, repeatable (default: all of them)")
     parser.add_argument("--size", choices=[size[0] for size in SIZES], action="append",
                         help="walk only at these sizes, repeatable: desk is 1280x800, phone 393x852 (default: both)")
@@ -168,7 +171,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             desk = Desk(page, args.screenshots, f"threads-polish-{label}", width, height)
             page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             sign_in(desk)
-            parts = args.only or ["chips", "compose", "center", "back", "order"]
+            parts = args.only or ["chips", "compose", "center", "back", "order", "sent"]
             if "chips" in parts:
                 chips_walk(desk, touch)
             if "compose" in parts:
@@ -179,6 +182,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 back_walk(desk)
             if "order" in parts:
                 order_walk(desk, touch)
+            if "sent" in parts:
+                sent_walk(desk)
             check(not errors, f"{label}: the page threw: {errors}")
             context.close()
             return f"{version} at {width}x{height}: " + "; ".join(desk.notes)
@@ -465,6 +470,29 @@ def order_walk(desk: Desk, touch: bool) -> None:
     desk.check(page.evaluate(CARD_ORDER_JS) == updated, "a press did not put the cards back by latest update")
     desk.notes.append(f"cards by latest update {updated}, d by creation {created} with the highlighted card on screen, kept "
                       f"across a reload; four chips before the glass")
+
+
+
+def sent_walk(desk: Desk) -> None:
+    page = desk.page
+    to_threads(desk)
+    for _ in range(3):
+        if page.get_attribute("#todo-filter", "data-read-mode") == "hide":
+            break
+        page.click("#todo-filter")
+        desk.settled()
+    desk.check(page.get_attribute("#todo-filter", "data-read-mode") == "hide", "the read mode button never reached Hide read")
+    set_chip(desk, "side-main", True)
+    words = f"sent from the foot at {desk.width}px"
+    page.fill("#channel-compose-text", words)
+    page.click("#channel-send")
+    desk.wait_for(f"() => [...document.querySelectorAll('#side-cards > li[data-main-row]')].some((li) => li.innerText.includes({words!r}))",
+                  "under Hide read the message just sent is not among the main rows")
+    found = state(desk)
+    desk.check(found["layout"] == "list", f"sending left the Threads view: {found}")
+    desk.shot("6-own-sent-hide-read")
+    set_chip(desk, "side-main", False)
+    desk.notes.append("under Hide read the message sent from the foot box among the main rows at once")
 
 
 if __name__ == "__main__":
