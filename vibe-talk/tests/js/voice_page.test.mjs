@@ -5004,6 +5004,22 @@ const TUNING_BANDS = {
     "threads remembered across every channel. Under 120, a handful of busy channels push each " +
     "other's colours out; past two thousand it is mostly channels nobody opens, read and rewritten " +
     "whole each time a thread is first drawn"],
+  // `#414 thread-hue-spread`.
+  THREAD_HUE_APART: [40, 60,
+    "degrees of hue between a new thread's colour and its neighbours'. Under 40 two neighbours can " +
+    "be two shades of one colour at the page's fixed saturation and lightness; past 60 three " +
+    "neighbours can rule out every hue, and the re-roll stops promising anything"],
+  THREAD_HUE_BESIDE: [60, 120,
+    "degrees of hue asked between a new thread and the one drawn right before or after it, where it " +
+    "can be had. Under 60 three threads in a row can step along the wheel and read as a gradient; " +
+    "past 120 two such threads leave too little of the wheel for the rest to be asked at all"],
+  THREAD_HUE_NEIGHBOURS: [2, 4,
+    "threads either side of a new one in root order whose colours it avoids. Under two, three " +
+    "consecutive threads can still come out two alike; past four the neighbours outnumber what " +
+    "the minimum distance can keep apart"],
+  THREAD_HUE_RECENT: [2, 4,
+    "threads most recently given a colour whose colours a new one avoids. Under two, a view drawing " +
+    "new threads in its own order can still put two alike side by side; past four the same crowding"],
 };
 test("every number this page is tuned by stays inside a band that says what would be wrong", () => {
   for (const [name, [low, high, why]] of Object.entries(TUNING_BANDS)) {
@@ -33339,6 +33355,115 @@ test("`#396 thread-color-memory`: an ordinary reload, its saved rows drawn first
 
 /** Two threads, as `threadsOf` builds them. */
 const threadDataIds = () => threadsOf(["T-north", "T-south"]);
+
+// --- `#414 thread-hue-spread` ----------------------------------------------------------------------
+//
+// A new thread's colour stands clear of the threads drawn beside it. `threadsOf` posts its roots in
+// the order it is given the ids, so that order is the order All draws them in.
+
+/** The page's minimum hue distance between neighbours. */
+const HUE_APART = 45;
+
+/** The pre-`#414` page: a new thread takes the widest arc's middle, whoever is beside it. */
+const ignoresNeighbours = () => brokenScript("  hue = spreadThreadHue(hue, used, threadHueNeighbours(key));\n", "");
+
+/**
+ * The owner's case: a channel that remembers 24 threads, a day later, posts three more in a row.
+ * Returns the remembered threads' colours before and after, and the newcomers'.
+ */
+async function threeAfterTwentyFour(script = SCRIPT) {
+  const old = Array.from({ length: 24 }, (_, i) => `old-${i + 1}`);
+  const first = await threadsPage(threadsOf(old), new Map(), script);
+  const before = hueByThread(first);
+  await first.settle();
+  const fresh = ["new-a", "new-b", "new-c"];
+  const again = await reloadThreads(first.storage, threadsOf([...old, ...fresh]), script);
+  return { old, fresh, before, after: hueByThread(again) };
+}
+
+/** The closest two colours among `ids` that are within `window` places of each other in `order`. */
+function closestNeighbours(hues, order, window = 3) {
+  let closest = { apart: 360 };
+  order.forEach((id, i) => {
+    for (let j = i + 1; j <= i + window && j < order.length; j += 1) {
+      const apart = hueDistance(hues[id], hues[order[j]]);
+      if (apart < closest.apart) closest = { apart, pair: [id, order[j]] };
+    }
+  });
+  return closest;
+}
+
+test("`#414 thread-hue-spread`: three new threads in a row after 24 remembered ones are clearly apart, and the remembered keep theirs", async () => {
+  const { old, fresh, before, after } = await threeAfterTwentyFour();
+  for (const id of old) assert.equal(after[id], before[id], `${id}, remembered, changed colour when new threads arrived`);
+  const order = [...old, ...fresh];
+  // Each newcomer against every thread within three places of it, remembered or new.
+  for (const id of fresh) {
+    const at = order.indexOf(id);
+    for (const other of order.slice(Math.max(0, at - 3), at + 4)) {
+      if (other === id) continue;
+      assert.ok(hueDistance(after[id], after[other]) >= HUE_APART,
+        `${id} (${after[id]}) is ${hueDistance(after[id], after[other])}° from ${other} (${after[other]}), under ${HUE_APART}°`);
+    }
+  }
+  // The remembered threads were themselves given colours clear of their neighbours on the first page.
+  const { apart, pair } = closestNeighbours(before, old);
+  assert.ok(apart >= HUE_APART, `${pair} were drawn ${apart}° apart on the first page`);
+  // The control: the widest arc alone puts newcomers in the slivers between remembered colours.
+  const blind = await threeAfterTwentyFour(ignoresNeighbours());
+  const worst = closestNeighbours(blind.after, [...blind.old, ...blind.fresh]);
+  assert.ok(worst.apart < HUE_APART, `the premise: without the re-roll some neighbours come out alike (closest ${worst.apart}°)`);
+});
+
+test("`#414 thread-hue-spread`: the re-roll is deterministic: the same remembered colours drawn in the same order come out the same", async () => {
+  const one = await threeAfterTwentyFour();
+  const two = await threeAfterTwentyFour();
+  assert.deepStrictEqual(two.before, one.before, "the same 24 threads were coloured differently twice");
+  assert.deepStrictEqual(two.after, one.after, "the same newcomers were re-rolled to different colours twice");
+  // Replay the colours in the order they were given — the order All drew them in — and check each
+  // is the first of the documented order: the widest arc's middle, else whole degrees farthest from
+  // every colour given before it first, the lower hue on a tie; the first 45° from the three threads
+  // before it and 90° from the one right before it, else the first 45° from all three.
+  const order = [...one.old, ...one.fresh];
+  const hues = order.map((id) => Number(one.after[id]));
+  const nearest = (hue, among) => Math.min(360, ...among.map((other) => hueDistance(hue, other)));
+  let rerolled = 0;
+  hues.forEach((hue, i) => {
+    const given = hues.slice(0, i);
+    const sorted = given.slice().sort((a, b) => a - b);
+    let widest = -1;
+    let middle = 210;
+    sorted.forEach((at, k) => {
+      const next = k + 1 < sorted.length ? sorted[k + 1] : sorted[0] + 360;
+      if (next - at > widest) [widest, middle] = [next - at, (at + (next - at) / 2) % 360];
+    });
+    // Drawn in root order, its neighbours with a colour are the threads before it, which are also
+    // the ones given a colour last.
+    const near = hues.slice(Math.max(0, i - 3), i);
+    const beside = hues.slice(Math.max(0, i - 1), i);
+    const candidates = [middle, ...Array.from({ length: 360 }, (_, d) => d)
+      .sort((a, b) => nearest(b, given) - nearest(a, given) || a - b)];
+    const tiers = [(h) => nearest(h, near) >= HUE_APART && nearest(h, beside) >= 90, (h) => nearest(h, near) >= HUE_APART];
+    const expected = tiers.map((clears) => candidates.find(clears)).find((found) => found !== undefined);
+    assert.notEqual(expected, undefined, `the premise: some colour clears ${order[i]}'s neighbours`);
+    assert.equal(hue, expected, `${order[i]} was given ${hue}, not ${expected}, the first candidate clearing its neighbours`);
+    if (hue !== middle) rerolled += 1;
+  });
+  assert.ok(rerolled > 0, "the premise: some thread was re-rolled rather than given the widest arc");
+});
+
+test("`#414 thread-hue-spread`: eight threads posted in a row in a new channel all differ from their neighbours", async () => {
+  // With nothing remembered the widest arc alone already spreads them (210, 30, 120, 300, ...), and
+  // the page before `#414` passes this too: it guards against the re-roll making a new channel worse.
+  const ids = Array.from({ length: 8 }, (_, i) => `T-${i + 1}`);
+  const page = await threadsPage(threadsOf(ids));
+  const hues = hueByThread(page);
+  assert.equal(new Set(Object.values(hues)).size, 8, "eight threads did not get eight colours");
+  const { apart, pair } = closestNeighbours(hues, ids);
+  assert.ok(apart >= HUE_APART, `${pair} are ${apart}° apart, within three places of each other`);
+  const beside = closestNeighbours(hues, ids, 1);
+  assert.ok(beside.apart >= 90, `${beside.pair}, side by side, are ${beside.apart}° apart, under 90°`);
+});
 
 test("the normal composer lives after history and posts standalone messages without a reply target", async () => {
   const page = newPage();
