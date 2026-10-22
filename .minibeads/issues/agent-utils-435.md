@@ -1,13 +1,14 @@
 ---
 title: 'chat-reply-splitting: answer separate topics in separate chat replies'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - agentctl
 - chat
 created_at: 2026-10-22T17:20:51.434840695+00:00
-updated_at: 2026-10-22T17:20:51.434840695+00:00
+updated_at: 2026-10-22T17:32:50.425854240+00:00
+closed_at: 2026-10-22T17:32:50.425854100+00:00
 ---
 
 # Description
