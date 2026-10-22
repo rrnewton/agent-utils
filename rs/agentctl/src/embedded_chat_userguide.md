@@ -815,7 +815,10 @@ neither posted nor reported.
 Each request's prompt gives one reply ID, a short number, for every reply to
 that request: `001`, `002`, and so on, counting across all requests and past
 `999` with more digits. The prompt asks the agent to use the same two marker
-lines, and so the same ID, for every reply. The bridge assigns a number when it first writes
+lines, and so the same ID, for every reply, and invites several: progress
+updates during long work, and separate replies for separate topics, so that a
+message asking about three things gets three replies rather than one combined
+answer. The bridge assigns a number when it first writes
 a prompt that shows it, and never assigns it again: the next number is kept in
 `reply-aliases.json` in the state directory and saved before the prompt is
 written, so a restart, a crash, or a rollback to an earlier release and back
