@@ -1714,12 +1714,19 @@ def _muse14_status(harness: Harness, report: Report) -> None:
         report.require(f"primary/muse14/{label}/agent-status", all(
             isinstance(value := _json(outcome), dict) and value.get("agent_status") == expected
             for outcome in outcomes), f"expected {expected}: {outcomes!r}")
-    for label, screen in (("paused", headed), ("staged", headed_staged)):
+    for index, (label, screen) in enumerate((("paused", headed), ("staged", headed_staged))):
         _change(case, {"status": "done", "screen": screen})
         _pair(harness, report, case, f"primary/muse14/{label}/held", (
-            "send", "foreign", f"held while {label}", "--message-id", f"muse14-{label}",
+            "send", "foreign", f"held while {label}", "--message-id", f"{1 - index}-muse14-{label}",
             "--ready-timeout", "0", *_COMMON,
         ), 75)
+        # Test the declared queue chronology, not whether two wall-clock reads
+        # happened to move forward. Names deliberately sort opposite to arrival.
+        for root in (case.python_root, case.rust_root):
+            path = root / "registry/foreign/queue/inbox" / f"{1 - index}-muse14-{label}.json"
+            document = json.loads(path.read_text())
+            document["queued_at"] = 100.0 + index
+            path.write_text(json.dumps(document) + "\n")
     report.require("primary/muse14/held-without-input", all(
         not any(call[:2] in (["agent", "prompt"], ["pane", "send-text"], ["pane", "send-keys"])
                 for call in _fixture_calls(root))
