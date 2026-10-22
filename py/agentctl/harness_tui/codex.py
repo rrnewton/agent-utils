@@ -23,28 +23,29 @@ class CodexTui:
         footer = next((row.strip().lower() for row in reversed(rows) if row.strip()), "")
         if (footer.startswith("enter submit") and "^] skip" in footer
                 and ("shift+→ main prompt" in footer or "shift+right main prompt" in footer)):
-            # Async questions have a dedicated editor but no numbered Question header.
+            # Async questions have a dedicated async_editor but no numbered Question header.
             queued = [i for i, row in enumerate(rows)
                       if row.strip() in ("• Queued follow-up inputs", "Queued follow-up inputs")]
             if queued:
-                last = max(i for i, row in enumerate(rows) if row.strip())
-                parts = re.split(r"\n\s*\n", "\n".join(rows[queued[-1] + 1:last]).strip())
+                async_last = max(i for i, row in enumerate(rows) if row.strip())
+                parts = re.split(r"\n\s*\n", "\n".join(rows[queued[-1] + 1:async_last]).strip())
                 if len(parts) >= 2:
-                    title = "\n\n".join("\n".join(line.strip() for line in part.splitlines())
+                    async_title = "\n\n".join("\n".join(line.strip() for line in part.splitlines())
                                         for part in parts[:-1]).strip()
-                    if title and not re.search(r"(?m)^\s*Question \d+/\d+", title):
+                    if async_title and not re.search(r"(?m)^\s*Question \d+/\d+", async_title):
                         option_rows = [re.fullmatch(r"\s*(›\s*)?(\d+)\.\s+(.+)", line)
                                        for line in parts[-1].splitlines()]
-                        if all(option_rows):
-                            options = tuple(Option(int(row[2]), row[3].strip()) for row in option_rows)
-                            selected = [int(row[2]) for row in option_rows if row[1]]
-                            if (len(selected) == 1 and [item.number for item in options]
-                                    == list(range(1, len(options) + 1))):
-                                return View(State.QUESTION, Question(title, options, selected[0]))
+                        matched_rows = [row for row in option_rows if row is not None]
+                        if len(matched_rows) == len(option_rows):
+                            async_options = tuple(Option(int(row[2]), row[3].strip()) for row in matched_rows)
+                            async_selected = [int(row[2]) for row in matched_rows if row[1]]
+                            if (len(async_selected) == 1 and [item.number for item in async_options]
+                                    == list(range(1, len(async_options) + 1))):
+                                return View(State.QUESTION, Question(async_title, async_options, async_selected[0]))
                         elif not any(option_rows):
-                            editor = " ".join(line.strip() for line in parts[-1].splitlines()).removeprefix("›").strip()
-                            draft = "" if editor == "Type your answer" else editor
-                            return View(State.QUESTION, Question(title, draft=draft))
+                            async_editor = " ".join(line.strip() for line in parts[-1].splitlines()).removeprefix("›").strip()
+                            draft = "" if async_editor == "Type your answer" else async_editor
+                            return View(State.QUESTION, Question(async_title, draft=draft))
             return View(State.MENU)
         headers = list(re.finditer(r"(?m)^\s*Question (\d+)/(\d+) \(\d+ unanswered\)\s*$", clean))
         if headers and ("enter to submit answer" in footer or "enter to submit all" in footer):
