@@ -554,8 +554,15 @@ def keeper_and_views_walk(walk: Walk) -> None:
     walk.settled()
     unpacked = walk.row("606", "#side-cards")
     walk.body_lines(unpacked, 3, "an unpacked thread row")
+    labels_at = "() => [...document.querySelectorAll('#side-cards li.discord-message[data-id=\"606\"] .elided > span')].map((s) => s.textContent)"
+    at_three = walk.page.evaluate(labels_at)
     page.click("#side-scroll")
     for _ in range(3):
+        walk.more()
+    at_six = walk.page.evaluate(labels_at)
+    walk.check(at_three != at_six and len(at_three) > 0,
+               f"an unpacked row's hidden-word count was not recounted at six lines: {at_three} then {at_six}")
+    for _ in range(6):
         walk.fewer()
     card = page.evaluate(CARD_JS, RAW_THREAD)
     walk.check(card is not None and abs(card["height"] / card["lineHeight"] - 1) <= 0.3,
