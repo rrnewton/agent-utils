@@ -1,12 +1,13 @@
 ---
 title: 'read-mode-unify: one read mode (Show, Fold, Hide read) for every view, the Threads view''s cards included'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-22T16:08:18.578287706+00:00
-updated_at: 2026-10-22T16:08:18.578287706+00:00
+updated_at: 2026-10-22T18:34:44.678857426+00:00
+closed_at: 2026-10-22T18:34:44.678857206+00:00
 ---
 
 # Description
