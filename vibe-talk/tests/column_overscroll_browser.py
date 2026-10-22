@@ -95,9 +95,11 @@ CONTROL_SIZE = SIZES[1]
 # The thread of short replies, the channel's newest.
 ROOM = "spaces/A/threads/room"
 ROOM_REPLIES = 14
-# What its card says of it: long enough that the card cuts it at three lines at both sizes, so a press that
-# shows the card whole makes it taller (HIGHLIGHT).
-ROOM_SUMMARY = f"{SUMMARY} {SUMMARY}"
+# What its card says of it: its first message, raw and long enough that the card cuts it at the reader's
+# lines at both sizes, so a press that shows the card whole makes it taller (HIGHLIGHT). Raw on
+# purpose since `#428 summary-cards-full`: a card saying a summary is drawn whole unpressed, and a
+# press changes nothing about its height, which is the one change this walk has to measure.
+ROOM_WORDS = f"{SUMMARY} {SUMMARY}"
 # The short threads before it, so that the cards run more than a screen past the column at both sizes, and
 # how many of them a search for SEARCH_WORD finds: more than a column of cards at both sizes, so a room left
 # open over the search would still have somewhere to go.
@@ -224,7 +226,7 @@ class OverscrollApi(StabilityApi):
                 "summary": SUMMARY,
             })
         root_index = self.next_index
-        root = said(root_index, f"Message {200 + root_index}. A thread of short replies starts here.")
+        root = said(root_index, f"Message {200 + root_index}. {ROOM_WORDS}")
         root["thread"] = thread_record(ROOM, root_index, ROOM_REPLIES, True)
         self.messages.append(root)
         self.dismissed.add(str(root["id"]))
@@ -238,7 +240,7 @@ class OverscrollApi(StabilityApi):
         self.next_index = root_index + 1 + ROOM_REPLIES
         self.threads.append({
             "id": ROOM, "root": root, "title": "Thread", "reply_count": ROOM_REPLIES, "reply_count_exact": True,
-            "updated_at": last["timestamp"], "display_name": "short-thread", "summary": ROOM_SUMMARY,
+            "updated_at": last["timestamp"],
         })
 
 

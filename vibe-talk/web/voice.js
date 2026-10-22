@@ -16294,7 +16294,10 @@ const collapsedLinesWords = (n) =>
  */
 function refreshElisionLines() {
   elisionCounted.clear();
-  for (const id of FOLD_LISTS) {
+  // And the rows unpacked under their cards, and Main's among them (`#404`, `#419`): drawn into
+  // the cards' list rather than a column's log, so `FOLD_LISTS` never names them, and a label left
+  // there is a label claiming words a raised count has put on the screen.
+  for (const id of [...FOLD_LISTS, "side-cards"]) {
     for (const entry of foldsOf(document.getElementById(id))) {
       const fresh = foldedTextLine(entry.body, entry.foldText);
       const old = entry.elided;
@@ -16311,11 +16314,13 @@ function refreshElisionLines() {
 
 /**
  * Apply a new count and say, in Settings, whether it will survive a reload. Every collapsed row
- * on the page changes height at once, so the change is made between the scroll keepers of BOTH
- * columns (`captureScroll` and `restoreScroll`, `#47 scrollback-stability`): a reader scrolled up
- * either list keeps the message they are on, and a reader at the newest line stays on it. Off
- * the main screen — the slider's own home in Settings — there is no list on screen to hold, and
- * the count is simply put on.
+ * on the page changes height at once, so the change is made between the scroll keepers: both
+ * columns' lists (`captureScroll` and `restoreScroll`, `#47 scrollback-stability`) and, while the
+ * right column or the Threads view shows the thread cards instead of a thread, the cards' own
+ * (`keepingCardPlace`) — every raw card and every unpacked row under it changes height too. A
+ * reader scrolled up any list keeps the message or card they are on, and a reader at the newest
+ * line stays on it. Off the main screen — the slider's own home in Settings — there is no list on
+ * screen to hold, and the count is simply put on.
  */
 function collapsedLinesChanged(value) {
   const apply = () => {
@@ -16331,7 +16336,8 @@ function collapsedLinesChanged(value) {
   /** @type {Array<[typeof activeColumn, ReturnType<typeof captureScroll>]>} */
   const held = [[columns.main, inColumn(columns.main, captureScroll)]];
   if (sideShowing()) held.push([columns.side, inColumn(columns.side, captureScroll)]);
-  const n = apply();
+  let n = DEFAULT_COLLAPSED_LINES;
+  keepingCardPlace(() => { n = apply(); });
   for (const [column, mark] of held) inColumn(column, () => restoreScroll(mark));
   return n;
 }

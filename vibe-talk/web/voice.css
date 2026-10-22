@@ -8721,6 +8721,15 @@ li.discord-message[data-root-child] > .reply-bridge {
   min-height: calc(max(1, var(--collapsed-lines)) * 1.35em);
 }
 
+/* On a phone the least height is the phone heading's own — two lines at most, as a raw heading's —
+   so a one-line summary at a high count is not a mostly-empty block eight lines tall. The summary
+   itself is whole at every width; only the room kept under a shorter one follows the heading. */
+@media (max-width: 599.98px) {
+  :is(#thread-card, #side-thread-card)[data-summarised-card]:not([data-folded]) > .side-card > .side-card-text {
+    min-height: calc(max(1, min(var(--collapsed-lines), 2)) * 1.35em);
+  }
+}
+
 /*
  * `#388 thread-header-collapse`. FOLDED TO A BAR by a press on it (web/voice.js, `threadCardPressed`),
  * the owner's "thin colored bar. Just enough vertical height that you can see the inside color as well
