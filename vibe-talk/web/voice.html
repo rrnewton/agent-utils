@@ -686,14 +686,14 @@
                 cards: pressed, the cards are the threads with unread replies, by the rule of the chip
                 that says "N unread" or "N new" on a card. Kept on this device.
               -->
-              <button id="side-unread-only" class="chip" type="button" aria-pressed="false" title="Show only the threads with unread replies" hidden>Unread only</button>
+              <button id="side-unread-only" class="chip" type="button" aria-pressed="false" title="Show only the threads with unread replies" hidden>Unread<span class="chip-more"> only</span></button>
               <!--
                 `#404 threads-unpack-all`. The owner, 2026-10-21: bridging one thread in All breaks
                 when another is bridged; he wants every thread chained at once. In the Threads view
                 (Cmd+3) this toggle unpacks each thread's messages under its card, bridged as in
                 All. Only over the cards of the Threads view. Kept on this device; key u.
               -->
-              <button id="side-unpack" class="chip" type="button" aria-pressed="false" title="Show every thread's messages under its card" hidden>Unpack msgs</button>
+              <button id="side-unpack" class="chip" type="button" aria-pressed="false" title="Show every thread's messages under its card" hidden>Unpack<span class="chip-more"> msgs</span></button>
               <!--
                 `#419 threads-view-main-messages`. The owner, 2026-10-21: "we have room for one more button
                 -- a toggle to show Main msgs. When that is on we should see messages to the main channel
@@ -704,6 +704,15 @@
                 by the owner, 2026-10-22 (`#421 chip-states`).
               -->
               <button id="side-main" class="chip" type="button" aria-pressed="false" title="Show the main channel's messages that are not threads yet, and its message box at the foot" hidden>Main<span class="chip-more"> channel</span></button>
+              <!--
+                `#426 threads-sort-toggle`. The owner, 2026-10-22: "One toggle I DO think we should have at
+                the top of the thread view is to order by thread creation vs latest update ... start with
+                that and if we add more sort orders make it a drop down." It says the order the cards are
+                in, Latest update or Thread created, and a press goes on to the next. Only over the Threads
+                view's cards. Kept on this device; key d. On a phone it says "Latest" or "Created", and with four
+                chips beside the title its neighbours say "Unread" and "Unpack" there (web/voice.css).
+              -->
+              <button id="side-order" class="chip" type="button" aria-pressed="false" aria-label="Order: Latest update" title="In order of latest update: the threads by when each last moved. Press for thread created" hidden><span id="side-order-whole" class="chip-whole">Latest update</span><span id="side-order-short" class="chip-short">Latest</span></button>
               <!--
                 `#298 thread-card-header`. The owner, of the thread cards: "When I drill into a given
                 thread card to see the messages inside it, I would like to KEEP that same style ... the
@@ -2482,6 +2491,9 @@
                 box at the foot of the list as its last card: <strong>Reply</strong> or
                 <strong>Thread</strong> on one of those messages opens the reply under it, starting its
                 thread, and the box at the foot goes while the reply is open, so there is one box.
+                The last chip says the order of the cards, <strong>Latest update</strong> (where each
+                thread last moved) or <strong>Thread created</strong> (where it was started); a press, or
+                <kbd>d</kbd>, changes it, and it is remembered too.
                 <strong>Older threads…</strong> at its
                 top reads further back. A click on a card <strong>highlights</strong> it: it shows all
                 of it, and every other card's edge goes grey, until you click another card, the same one

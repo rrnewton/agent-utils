@@ -8688,10 +8688,20 @@ li.discord-message[data-root-child] > .reply-bridge {
   padding-inline-end: calc(var(--search-disc) + 1.1rem);
 }
 
-/* On a phone the chips say less, so the three and the title fit the row beside the glass. */
+/* `#426 threads-sort-toggle`. The order chip says its order whole, or on a phone (below) in a word. */
+#side-heading .chip-short {
+  display: none;
+}
+
+/* On a phone the chips say less, so they and the title fit the row beside the glass. */
 @media (max-width: 599px) {
-  #side-heading .chip-more {
+  #side-heading .chip-more,
+  #side-heading .chip-whole {
     display: none;
+  }
+
+  #side-heading .chip-short {
+    display: inline;
   }
 
   #side-heading .chip {

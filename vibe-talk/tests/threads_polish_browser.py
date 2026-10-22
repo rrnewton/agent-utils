@@ -10,6 +10,7 @@ The owner, 2026-10-22, of the Threads view (Cmd+3) after `#419 threads-view-main
   DIFFERENT view". The chord never changes the view when the view has a box.
 * `#424 threads-main-own-center`: the owner's main-channel rows among the cards looked like the previous
   thread's follow-ups; they are centred, at their width.
+* `#426 threads-sort-toggle`: "order by thread creation vs latest update", a chip saying the order.
 * `#423 back-key-consistency`: "if I press Cmd-[ on the thread list view it jumps back to the Main view but
   it does NOT have kind of navigation (or back?) effect on other views". Ctrl/Cmd+[ and ] walk back and
   forward through the places visited, in every view.
@@ -21,7 +22,7 @@ threads), two of Main's messages (220 and 223) the owner's, from one loopback or
 
 1. the three chips at rest look alike, each pressed looks like the others pressed and unlike at rest
    (border, background and words, as computed), and each says its state in aria-pressed; named Unread only,
-   Unpack msgs, and Main channel (Main on a phone);
+   Unpack msgs, and Main channel (Unread, Unpack and Main on a phone);
 2. Main channel on -> Cmd+S from a card: the focus in the box at the foot of the cards, the Threads view
    kept; Reply on a main-channel message, Cmd+S: the reply's box, still the Threads view; Main channel off
    -> Cmd+S goes back to the view the list was chosen from (negative control);
@@ -53,7 +54,7 @@ from typing import TYPE_CHECKING
 import offline_cache_browser as fixture
 from inline_reply_browser import ReplyColumnsApi, sign_in
 from offline_cache_browser import OWNER_ID, SPEAKERS, Json, check, handler_for
-from two_column_browser import CANARY, Desk
+from two_column_browser import CANARY, REPLICA, RUNNER, Desk
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType
@@ -121,7 +122,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--screenshots", type=Path, help="directory to write one PNG per state into (default: none)")
     parser.add_argument("--port", type=int, default=0,
                         help="loopback port for the fake server (default: 0, any free port)")
-    parser.add_argument("--only", choices=("chips", "compose", "center", "back"), action="append",
+    parser.add_argument("--only", choices=("chips", "compose", "center", "back", "order"), action="append",
                         help="run only these parts of the walk, repeatable (default: all of them)")
     parser.add_argument("--size", choices=[size[0] for size in SIZES], action="append",
                         help="walk only at these sizes, repeatable: desk is 1280x800, phone 393x852 (default: both)")
@@ -167,7 +168,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             desk = Desk(page, args.screenshots, f"threads-polish-{label}", width, height)
             page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             sign_in(desk)
-            parts = args.only or ["chips", "compose", "center", "back"]
+            parts = args.only or ["chips", "compose", "center", "back", "order"]
             if "chips" in parts:
                 chips_walk(desk, touch)
             if "compose" in parts:
@@ -176,6 +177,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 center_walk(desk)
             if "back" in parts:
                 back_walk(desk)
+            if "order" in parts:
+                order_walk(desk, touch)
             check(not errors, f"{label}: the page threw: {errors}")
             context.close()
             return f"{version} at {width}x{height}: " + "; ".join(desk.notes)
@@ -227,8 +230,9 @@ def chips_walk(desk: Desk, touch: bool) -> None:
     looks = {str(found["look"]) for found in rest.values()}
     desk.check(len(looks) == 1, f"the chips at rest do not look alike: {rest}")
     names = {name: str(found["text"]) for name, found in rest.items()}
-    desk.check(names == {"side-unread-only": "Unread only", "side-unpack": "Unpack msgs",
-                         "side-main": "Main" if touch else "Main channel"}, f"the chips' names: {names}")
+    desk.check(names == ({"side-unread-only": "Unread", "side-unpack": "Unpack", "side-main": "Main"} if touch else
+                         {"side-unread-only": "Unread only", "side-unpack": "Unpack msgs", "side-main": "Main channel"}),
+               f"the chips' names: {names}")
     pressed: dict[str, dict[str, object]] = {}
     for name in CHIPS:
         set_chip(desk, name, True)
@@ -401,6 +405,66 @@ def back_walk(desk: Desk) -> None:
     page.keyboard.press("Escape")
     desk.settled()
     desk.notes.append("Cmd+[ back through " + " <- ".join(reversed(walked)) + ", Cmd+] forward again; at the end it says so")
+
+
+
+CARD_ORDER_JS = "() => [...document.querySelectorAll('#side-cards > li[data-card]')].map((li) => li.getAttribute('data-id'))"
+
+# The order chip, the glass and the heading's other chips, as drawn.
+ORDER_CHIP_JS = """() => {
+    const box = (id) => { const n = document.getElementById(id); const r = n.getBoundingClientRect();
+        return {left: r.left, right: r.right, drawn: n.getClientRects().length > 0}; };
+    const chip = document.getElementById('side-order');
+    return {text: chip.innerText.trim(), label: chip.getAttribute('aria-label'), pressed: chip.getAttribute('aria-pressed'),
+            glass: box('search-toggle'), chips: ['side-unread-only', 'side-unpack', 'side-main', 'side-order'].map(box)};
+}"""
+
+
+def order_walk(desk: Desk, touch: bool) -> None:
+    page = desk.page
+    to_threads(desk)
+    updated, created = [REPLICA, CANARY, RUNNER], [RUNNER, REPLICA, CANARY]
+
+    def chip_state() -> dict[str, object]:
+        found = page.evaluate(ORDER_CHIP_JS)
+        assert isinstance(found, dict)
+        glass = found["glass"]
+        assert isinstance(glass, dict)
+        for one in found["chips"]:
+            assert isinstance(one, dict)
+            desk.check(one["drawn"] is True and float(one["right"]) <= float(glass["left"]) - 2 and float(one["left"]) >= 0,
+                       f"a chip of the heading runs into the glass or off the window: {found['chips']} beside {glass}")
+        return found
+
+    found = chip_state()
+    desk.check(page.evaluate(CARD_ORDER_JS) == updated, f"the cards are not by latest update: {page.evaluate(CARD_ORDER_JS)}")
+    desk.check(found["text"] == ("Latest" if touch else "Latest update") and found["label"] == "Order: Latest update"
+               and found["pressed"] == "false", f"the order chip at the default: {found}")
+    # The canary card highlighted, then d: by creation, the card still on screen.
+    page.click(f"#side-cards > li[data-id='{CANARY}'] .side-card")
+    desk.settled()
+    page.focus("#side-scroll")
+    page.keyboard.press("d")
+    desk.wait_for("() => document.getElementById('side-order').getAttribute('aria-pressed') === 'true'", "d did not change the order")
+    desk.settled()
+    found = chip_state()
+    desk.check(page.evaluate(CARD_ORDER_JS) == created, f"the cards are not by creation: {page.evaluate(CARD_ORDER_JS)}")
+    desk.check(found["text"] == ("Created" if touch else "Thread created") and found["label"] == "Order: Thread created",
+               f"the order chip by creation: {found}")
+    seen = page.evaluate(f"""() => {{ const a = document.getElementById('side-scroll').getBoundingClientRect();
+        const r = document.querySelector("#side-cards > li[data-id='{CANARY}']").getBoundingClientRect();
+        return r.bottom > a.top && r.top < a.bottom; }}""")
+    desk.check(seen is True, "the highlighted card went off screen when the order changed")
+    desk.shot("5-order-created")
+    page.reload(wait_until="load")
+    desk.wait_for("() => document.querySelectorAll('#side-cards > li[data-card]').length === 3", "the reload did not show the cards")
+    desk.settled()
+    desk.check(page.evaluate(CARD_ORDER_JS) == created, "a reload forgot the order")
+    page.click("#side-order")
+    desk.wait_for("() => document.getElementById('side-order').getAttribute('aria-pressed') === 'false'", "a press did not go back to latest update")
+    desk.check(page.evaluate(CARD_ORDER_JS) == updated, "a press did not put the cards back by latest update")
+    desk.notes.append(f"cards by latest update {updated}, d by creation {created} with the highlighted card on screen, kept "
+                      f"across a reload; four chips before the glass")
 
 
 if __name__ == "__main__":

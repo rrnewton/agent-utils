@@ -209,7 +209,7 @@ const ALL_CHANNELS = "*";
  *   | "save-voice-post-prefix" | "save-voice-system-prompt"
  *   | "search-in-all" | "search-toggle" | "send-text" | "side-clear-backlog" | "side-close" | "side-jump-newest"
  *   | "side-more-threads" | "side-older" | "side-search-replies" | "side-send" | "side-thread-card-text"
- *   | "side-main" | "side-unpack" | "side-unread-only" | "speaker"
+ *   | "side-main" | "side-order" | "side-unpack" | "side-unread-only" | "speaker"
  *   | "summarise" | "talk"
  *   | "thread-back" | "thread-card-text"
  *   | "todo-filter" | "undo-bookmark" | "undo-dismiss" | "undo-send-dismiss" | "upstream-clear-push"
@@ -1434,7 +1434,6 @@ function placeFromKeyboard(step) {
     if (currentScreen === "main") settleFocus();
     return true;
   }
-  setStatus(step < 0 ? "Nothing to go back to." : "Nothing to go forward to.");
   // Nothing noted behind, as after a reload or a change of channel that opened on something over a view
   // (the thread list, a thread opened from it): Back closes it as Esc does, onto what is under it.
   if (step < 0) {
@@ -1445,6 +1444,7 @@ function placeFromKeyboard(step) {
       return true;
     }
   }
+  setStatus(step < 0 ? "Nothing to go back to." : "Nothing to go forward to.");
   return true;
 }
 
@@ -11259,6 +11259,14 @@ const KEYMAP = [
       "threads, and its message box at the foot; Thread or Reply on one makes it a thread where it is",
     controls: ["side-main"],
     run: () => mainRowsFromKeyboard(),
+  },
+  // `#426 threads-sort-toggle`. d was free; it acts only over the Threads view's cards, as its chip does.
+  {
+    group: KEYS_VIEW, chords: [{ key: "d" }],
+    does: () => `In the Thread list, the order of the cards, in turn: ${THREAD_ORDER_NAMES.map((name) => THREAD_ORDERS[name].name).join(", ")}. ` +
+      "Main channel's messages stand among them by when they were posted",
+    controls: ["side-order"],
+    run: () => orderFromKeyboard(),
   },
   {
     group: KEYS_VIEW, chords: [{ key: "p", shift: true }],
@@ -41374,6 +41382,7 @@ function leaveThreadList(next = "one") {
   threadListShown = false;
   // `#419 threads-view-main-messages`. The main channel's box back under the left column's list.
   renderMainToggle();
+  renderOrderToggle();
   placeMainCard();
   // `#262 search-load-older`. The cards' walk for the search ends with the list, unless two columns
   // keep the cards beside Main.
@@ -41418,6 +41427,7 @@ function renderSideMode() {
   renderSideUnreadToggle();
   renderUnpackToggle();
   renderMainToggle();
+  renderOrderToggle();
   // `#262 search-load-older`. A thread selected over the cards ends their walk for the search, aborting
   // its read; the cards back are offered it again (`renderSideCards`).
   if (thread) renderRepliesSearch();
@@ -41555,7 +41565,9 @@ let sideCardsDrawn = "";
 function renderSideCards() {
   const list = leftEl("side-cards");
   const tally = replyTally();
-  const cards = threadChoices().reverse().map((choice) => ({
+  // `#426 threads-sort-toggle`. In the order chosen over the Threads view's cards, else the default.
+  const order = cardOrderOnScreen();
+  const cards = inThreadOrder(threadChoices(), order).map((choice) => ({
     choice,
     text: sideCardText(choice),
     root: sideCardRootText(choice),
@@ -41566,7 +41578,7 @@ function renderSideCards() {
   const unpacked = unpackOnScreen();
   // `#419 threads-view-main-messages`. And the main channel's messages that are not threads, among them.
   const main = mainRowsOnScreen() ? mainRowMessages(new Set(cards.map(({ choice }) => choice.id))) : [];
-  const signature = JSON.stringify([unpacked, cards.map(({ choice, text, root, age, replies, unread }) =>
+  const signature = JSON.stringify([order, unpacked, cards.map(({ choice, text, root, age, replies, unread }) =>
     [choice.id, text, root, age, replies, unread,
       unpacked ? unpackSignature(choice, unpackHeldMessages(choice)) : ""]),
   main.map((message) => [String(message.id), stillToDo(message, channelCanon.dismissed)]),
@@ -41591,7 +41603,7 @@ function renderSideCards() {
       // `#419 threads-view-main-messages`. Main's messages in the list's order: each run of them between
       // two cards, by when it was posted against when each card's thread last moved. Only they are drawn
       // as the right column's rows; the cards are drawn as before.
-      const runs = mainRunsAmong(main, cards.map((card) => cardTime(card.choice)));
+      const runs = mainRunsAmong(main, cards.map((card) => THREAD_ORDERS[order].time(card.choice)));
       const between = main.length ? inColumn(columns.side, () => {
         archivedIds = caughtUpDone(archivedIds, main.map((message) => String(message.id)));
         return runs.map((run) => mainRows(run, tally));
@@ -42276,6 +42288,125 @@ function mainRowsFromKeyboard() {
   if (!threadListOnScreen() || columns.side.mode !== "list") return false;
   setMainRowsShown(!mainRowsShown);
   setStatus(mainRowsShown ? "The main channel's messages among the threads." : "The threads alone.");
+  return true;
+}
+
+// --- the order of the Threads view's cards (#426 threads-sort-toggle) -----------------------------------
+//
+// The owner, 2026-10-22: "One toggle I DO think we should have at the top of the thread view is to order
+// by thread creation vs latest update. It could be a drop down on sort order or just a toggle button ...
+// Our other buttons up there are toggles so maybe start with that and if we add more sort orders make it
+// a drop down." So a chip beside Main channel, saying the order the cards are in: Latest update (each
+// card where its thread last moved, as they always were) or Thread created (where its first message was
+// posted). A press, or d, goes on to the next order in `THREAD_ORDERS`, kept on this device. The orders
+// are a table, not a flag: a third is one more entry, and the chip a menu then. Main channel's rows stand
+// among the cards by when they were posted, against each card's time in the order chosen. Only over the
+// Threads view's cards, as its neighbours are; two columns' cards stay by latest update.
+
+/** The device's choice of order for the Threads view's cards: a key of `THREAD_ORDERS`. */
+const THREAD_ORDER_KEY = "vibe-talk.voice.thread-order";
+
+/**
+ * The orders the Threads view's cards can be in, the first the default, in the order a press goes round
+ * them: what the chip says (whole, and on a phone), what its tooltip says a press does, and the time a
+ * card stands at, oldest first, the newest at the foot.
+ *
+ * @type {Record<string, {name: string, short: string, says: string, time: (choice: any) => number}>}
+ */
+const THREAD_ORDERS = {
+  updated: {
+    name: "Latest update", short: "Latest", says: "the threads by when each last moved",
+    time: (choice) => cardTime(choice),
+  },
+  created: {
+    name: "Thread created", short: "Created", says: "the threads by when each was started",
+    time: (choice) => (Number.isFinite(choice.started) ? choice.started : cardTime(choice)),
+  },
+};
+
+/** The orders' names, in the order a press goes round them. */
+const THREAD_ORDER_NAMES = Object.keys(THREAD_ORDERS);
+
+/** The order kept on this device, or the default where none is, or one this page no longer knows. */
+function storedThreadOrder() {
+  try {
+    const kept = localStorage.getItem(THREAD_ORDER_KEY);
+    return kept && Object.prototype.hasOwnProperty.call(THREAD_ORDERS, kept) ? kept : THREAD_ORDER_NAMES[0];
+  } catch (_error) {
+    return THREAD_ORDER_NAMES[0];
+  }
+}
+
+/** The order the Threads view's cards are in. */
+let threadOrder = storedThreadOrder();
+
+/** The order the cards on screen are drawn in: the one chosen over the Threads view's cards, else the default. */
+const cardOrderOnScreen = () => (threadListOnScreen() && columns.side.mode === "list" ? threadOrder : THREAD_ORDER_NAMES[0]);
+
+/** `choices` in order `order`, oldest first: the default as the thread list's read keeps them, any other by its time. */
+function inThreadOrder(choices, order) {
+  const oldest = [...choices].reverse();
+  if (order === THREAD_ORDER_NAMES[0]) return oldest;
+  const time = THREAD_ORDERS[order].time;
+  // Stable, so threads at the same time keep the default's order among them.
+  return oldest.map((choice, at) => ({ choice, at, when: time(choice) }))
+    .sort((a, b) => a.when - b.when || a.at - b.at).map((one) => one.choice);
+}
+
+/** The order chip: offered over the Threads view's cards, as Main channel is, saying the order they are in. */
+function renderOrderToggle() {
+  const button = leftEl("side-order");
+  const offered = columns.side.mode === "list" && threadListShown;
+  if (button.hidden === offered) button.hidden = !offered;
+  const order = THREAD_ORDERS[threadOrder];
+  const next = THREAD_ORDERS[THREAD_ORDER_NAMES[(THREAD_ORDER_NAMES.indexOf(threadOrder) + 1) % THREAD_ORDER_NAMES.length]];
+  // Pressed in any order but the default, as the other chips are pressed when they change the list.
+  const pressed = threadOrder === THREAD_ORDER_NAMES[0] ? "false" : "true";
+  if (button.getAttribute("aria-pressed") !== pressed) button.setAttribute("aria-pressed", pressed);
+  const label = `Order: ${order.name}`;
+  if (button.getAttribute("aria-label") !== label) button.setAttribute("aria-label", label);
+  const title = `In order of ${order.name.toLowerCase()}: ${order.says}. Press for ${next.name.toLowerCase()}`;
+  if (button.title !== title) button.title = title;
+  // The whole name, and on a phone the short one (web/voice.css).
+  setTextIfChanged(leftEl("side-order-whole"), order.name);
+  setTextIfChanged(leftEl("side-order-short"), order.short);
+}
+
+/**
+ * The reader pressed the order chip, or d: the next order, kept on this device, and the cards drawn in it,
+ * the selected card kept where it is on screen (`keepingCardPlace` keeps it where it shows; otherwise
+ * it is brought into view).
+ */
+function setThreadOrder(order) {
+  threadOrder = Object.prototype.hasOwnProperty.call(THREAD_ORDERS, order) ? order : THREAD_ORDER_NAMES[0];
+  try {
+    localStorage.setItem(THREAD_ORDER_KEY, threadOrder);
+  } catch (_error) {
+    // A browser that refuses storage still honours the choice for this session.
+  }
+  renderOrderToggle();
+  sideCardsDrawn = "";
+  if (!sideColumnUp()) return;
+  const mark = markOf(sidePane);
+  const selected = mark && mark.card !== false ? mark.id : null;
+  keepingCardPlace(renderSideColumn);
+  const row = selected === null ? null : paneRowFor(sidePane, selected, true);
+  if (!row || !rowShown(row)) return;
+  const area = leftEl("side-scroll").getBoundingClientRect();
+  const box = row.getBoundingClientRect();
+  if ((box.top < area.top || box.bottom > area.bottom) && typeof row.scrollIntoView === "function") {
+    row.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
+}
+
+/** The next order after the one the cards are in. */
+const nextThreadOrder = () => THREAD_ORDER_NAMES[(THREAD_ORDER_NAMES.indexOf(threadOrder) + 1) % THREAD_ORDER_NAMES.length];
+
+/** d, over the Threads view: the cards in the next order. Elsewhere, nothing. */
+function orderFromKeyboard() {
+  if (!threadListOnScreen() || columns.side.mode !== "list") return false;
+  setThreadOrder(nextThreadOrder());
+  setStatus(`Threads in order of ${THREAD_ORDERS[threadOrder].name.toLowerCase()}.`);
   return true;
 }
 
@@ -48950,8 +49081,11 @@ leftEl("side-unread-only").addEventListener("click", () => setSideUnreadOnly(!si
 // `#404 threads-unpack-all`. Every thread's messages under its card, in the Threads view.
 leftEl("side-unpack").addEventListener("click", () => setThreadsUnpacked(!threadsUnpacked));
 leftEl("side-main").addEventListener("click", () => setMainRowsShown(!mainRowsShown));
+// `#426 threads-sort-toggle`. The cards' order, in the Threads view.
+leftEl("side-order").addEventListener("click", () => setThreadOrder(nextThreadOrder()));
 renderUnpackToggle();
 renderMainToggle();
+renderOrderToggle();
 inColumn(columns.side, () => {
   el("channel-compose-text").addEventListener("input", inThisColumn(rememberChannelDraft));
   el("channel-send").addEventListener("click", inThisColumn(guardQuietly(sendChannelMessage)));

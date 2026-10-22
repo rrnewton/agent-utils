@@ -63,6 +63,11 @@ four views are offered, in the view picker and on Ctrl+1 to Ctrl+4 (Cmd on a Mac
   its thread where the service starts one on a reply, rather than opening the thread view; the box at the
   foot is hidden while a reply is open and comes back when it goes. The chips sit on the row of the
   search glass, the cards starting under it.
+  The last chip says the order of the cards, **Latest update** (each where its thread last moved, as
+  always) or **Thread created** (each where its thread was started); a press, or key `d`, goes to the next
+  order, kept on this device, the selected card staying in view (`#426 threads-sort-toggle`). Main channel's
+  messages stand among the cards by when they were posted in either order. The orders are a table, so a
+  third would make the chip a menu.
   Your own messages among them stand centred in the column, as wide as your messages always are, so they
   do not read as the last reply of the thread above (`#424 threads-main-own-center`); the agent's, and
   yours in every other list, are where they always were.

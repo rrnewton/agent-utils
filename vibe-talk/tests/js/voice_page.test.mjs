@@ -459,7 +459,7 @@ const FIXTURE_TREE = {
   "thread-heading": ["thread-card"],
   "thread-card": ["thread-card-text", "thread-card-age", "thread-card-count", "thread-back"],
   // `#298 thread-card-header`. Over a thread the heading is the thread's card, with the X in it.
-  "side-heading": ["side-title", "side-unread-only", "side-unpack", "side-main", "side-thread-card"],
+  "side-heading": ["side-title", "side-unread-only", "side-unpack", "side-main", "side-order", "side-thread-card"],
   "side-thread-card": ["side-thread-card-text", "side-thread-card-age", "side-thread-card-count", "side-close"],
   // `#338 column-overscroll`. Last, the room past the foot: no height, and so nothing in the layout, until the
   // page gives it one, which a test draws with `drawOverscroll`.
@@ -51716,7 +51716,7 @@ test("`#259 thread-list-unread-filter`: Unread only is a toggle on the right col
   assert.match(tag, /type="button"/);
   assert.match(tag, /title="Show only the threads with unread replies"/);
   assert.match(tag, /(?:^|\s)hidden(?=[\s>])/, "the toggle ships on screen, before the cards are");
-  assert.match(HTML_CODE, /id="side-unread-only"[^>]*>Unread only<\/button>/, "the toggle does not name itself");
+  assert.match(HTML_CODE, /id="side-unread-only"[^>]*>Unread<span class="chip-more"> only<\/span><\/button>/, "the toggle does not name itself");
   const head = HTML_CODE.slice(HTML_CODE.indexOf('id="side-heading"'));
   assert.ok(head.indexOf('id="side-title"') < head.indexOf('id="side-unread-only"'),
     "the toggle is not beside the heading it filters");
@@ -64528,7 +64528,7 @@ test("`#421 chip-states`: every toggle chip is pressed by one rule, from aria-pr
   }
   // The names, the phone keeping "Main" alone.
   assert.match(HTML_CODE, /id="side-main"[^>]*>Main<span class="chip-more"> channel<\/span><\/button>/);
-  assert.match(HTML_CODE, /id="side-unpack"[^>]*>Unpack msgs<\/button>/);
+  assert.match(HTML_CODE, /id="side-unpack"[^>]*>Unpack<span class="chip-more"> msgs<\/span><\/button>/);
   assert.doesNotMatch(HTML_CODE, />Main<span class="chip-more"> messages|>Unpack all</, "an old name is still on a chip");
   const { page } = await mainMessagesPage();
   const keys = page.el("keyboard-keys").text();
@@ -76629,6 +76629,107 @@ test("`#423 back-key-consistency`: a place noted twice — two columns lost to a
   assert.notEqual(whereNow(page), narrowed, "Back stayed on the place it was on");
 });
 
+// --- `#426 threads-sort-toggle` -----------------------------------------------------------------------
+//
+// The owner, 2026-10-22: "One toggle I DO think we should have at the top of the thread view is to order by
+// thread creation vs latest update ... start with that and if we add more sort orders make it a drop down."
+
+const THREAD_ORDER_STORAGE = "vibe-talk.voice.thread-order";
+
+/**
+ * Two threads started one after the other, the first answered last: by latest update "another" then
+ * "one & two", by creation the other way round. Main's 200 before them all, and 206 posted after
+ * "another" last moved and before "one & two" did.
+ */
+async function orderPage(storage = new Map()) {
+  const first = { id: "spaces/A/threads/one & two", root_message_id: "201", is_root: true, reply_count: 2, reply_count_exact: true };
+  const second = { id: "spaces/A/threads/another", root_message_id: "203", is_root: true, reply_count: 1, reply_count_exact: true };
+  const messages = [
+    message({ id: "200", content: "main channel announcement" }),
+    message({ id: "201", content: "first thread root", thread: first }),
+    message({ id: "202", content: "first thread answer", thread: { ...first, is_root: false } }),
+    message({ id: "203", content: "second thread root", thread: second }),
+    message({ id: "204", content: "second thread answer", thread: { ...second, is_root: false } }),
+    message({ id: "206", content: "main channel, between the threads' last moves" }),
+    message({ id: "205", content: "first thread, answered again", thread: { ...first, is_root: false } }),
+  ];
+  const summary = (thread, last) => ({ id: thread.id, root: messages.find((m) => m.id === thread.root_message_id),
+    title: thread.id, reply_count: thread.reply_count, reply_count_exact: true,
+    updated_at: messages.find((m) => m.id === last).timestamp });
+  const page = newPage(storage);
+  page.threadingSupported = true;
+  page.threads = [summary(second, "204"), summary(first, "205")];
+  page.messages = messages;
+  threadedService(page);
+  await signIn(page);
+  await showDiscord(page, messages);
+  await pickThread(page, "threads");
+  await page.settle();
+  return page;
+}
+
+const ONE = "card:spaces/A/threads/one & two";
+const ANOTHER = "card:spaces/A/threads/another";
+
+test("`#426 threads-sort-toggle`: the order chip says Latest update or Thread created, and the cards (and Main channel's messages among them) stand in that order", async () => {
+  const tag = /<button\s+id="side-order"[^>]*>/.exec(HTML_CODE)[0];
+  assert.match(tag, /class="chip"/);
+  assert.match(tag, /aria-pressed="false"/);
+  assertMarkupContains("side-heading", "side-order");
+  const page = await orderPage(new Map([[THREADS_MAIN_STORAGE, "on"]]));
+  const chip = page.el("side-order");
+  assert.equal(chip.hidden, false, "the order chip is not offered over the Threads view's cards");
+  assert.equal(chip.getAttribute("aria-keyshortcuts"), "D", "the chip does not name its key");
+  // The default, as the cards always were: by latest update (negative control for the order below).
+  assert.equal(chip.getAttribute("aria-label"), "Order: Latest update");
+  assert.equal(chip.getAttribute("aria-pressed"), "false");
+  assert.equal(page.el("side-order-whole").textContent, "Latest update");
+  assert.deepStrictEqual(cardsListed(page), ["main:200", ANOTHER, "main:206", ONE], "not in order of latest update");
+  await chip.click();
+  await page.settle();
+  assert.equal(chip.getAttribute("aria-label"), "Order: Thread created");
+  assert.equal(chip.getAttribute("aria-pressed"), "true", "a non-default order is not drawn pressed");
+  assert.equal(page.el("side-order-whole").textContent, "Thread created");
+  assert.equal(page.el("side-order-short").textContent, "Created");
+  assert.match(chip.title, /Press for latest update/);
+  assert.deepStrictEqual(cardsListed(page), ["main:200", ONE, ANOTHER, "main:206"],
+    "not in order of creation, Main's messages by their own time");
+  assert.equal(page.storage.get(THREAD_ORDER_STORAGE), "created", "the order was not kept on the device");
+  await chip.click();
+  await page.settle();
+  assert.deepStrictEqual(cardsListed(page), ["main:200", ANOTHER, "main:206", ONE], "round again is not latest update");
+});
+
+test("`#426 threads-sort-toggle`: d over the Threads view changes the order as the chip does, is in ? help, and the order is kept across a reload; elsewhere d does nothing", async () => {
+  const page = await orderPage();
+  assert.ok(page.el("keyboard-keys").text().includes("the order of the cards"), "the ? help does not list d");
+  await page.documentEvent("keydown", { key: "d" });
+  await page.settle();
+  assert.equal(page.el("side-order").getAttribute("aria-label"), "Order: Thread created", "d did not change the order");
+  assert.deepStrictEqual(cardsListed(page), [ONE, ANOTHER]);
+  assert.equal(page.el("status").textContent, "Threads in order of thread created.");
+  // Kept: a page opened on this device's storage draws the cards by creation from the start.
+  const again = await orderPage(new Map([[THREAD_ORDER_STORAGE, "created"]]));
+  assert.equal(again.el("side-order").getAttribute("aria-label"), "Order: Thread created", "a reload forgot the order");
+  assert.deepStrictEqual(cardsListed(again), [ONE, ANOTHER]);
+  // An order this page does not know is the default.
+  const unknown = await orderPage(new Map([[THREAD_ORDER_STORAGE, "alphabetical"]]));
+  assert.deepStrictEqual(cardsListed(unknown), [ANOTHER, ONE]);
+  // Negative control: d in All is nobody's, and changes no order.
+  await pickThread(page, "flat");
+  await page.documentEvent("keydown", { key: "d" });
+  await page.settle();
+  assert.equal(page.el("side-order").getAttribute("aria-label"), "Order: Thread created", "d in All changed the order");
+});
+
+test("`#426 threads-sort-toggle`: two columns' cards stay by latest update whatever the Threads view's order, and the chip is not offered there", async () => {
+  const { page } = await twoColumnServer(null, SCRIPT, new Map([[THREAD_ORDER_STORAGE, "created"]]));
+  assert.equal(page.el("side-order").hidden, true, "the order chip is offered over two columns' cards");
+  const ids = cardIds(page);
+  const updated = [...page.threads].sort((a, b) => Date.parse(a.updated_at) - Date.parse(b.updated_at)).map((one) => one.id);
+  assert.deepStrictEqual(ids.filter((id) => updated.includes(id)), updated, "two columns' cards are not by latest update");
+});
+
 // --- unpack every thread under its card (#404 threads-unpack-all) and the root under a summary (#405) --
 //
 // The owner, 2026-10-21: bridging one thread in All breaks when another is bridged; he wants every
@@ -76684,7 +76785,7 @@ test("`#404 threads-unpack-all`: Unpack msgs is a toggle beside Unread only, off
   assertMarkupContains("side-heading", "side-unpack");
   const tag = /<button\s+id="side-unpack"[^>]*>/.exec(HTML_CODE)[0];
   assert.match(tag, /aria-pressed="false"/);
-  assert.match(HTML_CODE, /id="side-unpack"[^>]*>Unpack msgs<\/button>/);
+  assert.match(HTML_CODE, /id="side-unpack"[^>]*>Unpack<span class="chip-more"> msgs<\/span><\/button>/);
   const { page } = await unpackPage();
   const toggle = page.el("side-unpack");
   assert.equal(toggle.hidden, false, "the toggle is not offered over the cards");
