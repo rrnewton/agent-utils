@@ -47,11 +47,8 @@ impl HarnessTui for CodexTui {
                 if !part.is_empty() {
                     parts.push(part);
                 }
-                if parts.len() >= 2 && parts.last().is_some_and(|part| part.len() == 1) {
-                    let editor = parts.pop().unwrap()[0]
-                        .trim()
-                        .trim_start_matches('›')
-                        .trim();
+                if parts.len() >= 2 {
+                    let editor = parts.pop().unwrap();
                     let title = parts
                         .iter()
                         .map(|part| part.join("\n"))
@@ -62,18 +59,49 @@ impl HarnessTui for CodexTui {
                             .lines()
                             .any(|row| row.trim().starts_with("Question ") && row.contains('/'))
                     {
+                        let parsed: Option<Vec<_>> =
+                            editor.iter().map(|row| option_row(row, '›')).collect();
+                        let (options, selected, draft) = if let Some(parsed) = parsed {
+                            let selected: Vec<_> = parsed
+                                .iter()
+                                .filter(|(_, selected)| *selected)
+                                .map(|(option, _)| option.number)
+                                .collect();
+                            if selected.len() != 1
+                                || !parsed
+                                    .iter()
+                                    .enumerate()
+                                    .all(|(index, (option, _))| option.number == index + 1)
+                            {
+                                return View::state(State::MenuOrPicker);
+                            }
+                            (
+                                parsed.into_iter().map(|(option, _)| option).collect(),
+                                Some(selected[0]),
+                                String::new(),
+                            )
+                        } else if editor.len() == 1 {
+                            let editor = editor[0].trim_start_matches('›').trim();
+                            (
+                                vec![],
+                                None,
+                                if editor == "Type your answer" {
+                                    String::new()
+                                } else {
+                                    editor.to_owned()
+                                },
+                            )
+                        } else {
+                            return View::state(State::MenuOrPicker);
+                        };
                         return View::question(Question {
                             text: title,
-                            options: vec![],
-                            selected: None,
+                            options,
+                            selected,
                             total: 1,
                             collapsed: false,
                             notes: false,
-                            draft: if editor == "Type your answer" {
-                                String::new()
-                            } else {
-                                editor.to_owned()
-                            },
+                            draft,
                         });
                     }
                 }

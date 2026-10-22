@@ -1,0 +1,12 @@
+• Working (2s • esc to interrupt)
+
+• Queued follow-up inputs
+
+  May the boundary companion use the required initial state?
+  The primary lifecycle keeps its paid action.
+
+  › 1. Keep the current proposal on hold
+    2. Allow the boundary companion only
+    3. Other
+
+  enter submit   ^] skip   shift+→ main prompt

@@ -8,6 +8,7 @@ use agentctl::submission::GuardedInput;
 
 const OPTIONS: &str = include_str!("fixtures/tui/codex-options.txt");
 const FREEFORM: &str = include_str!("fixtures/tui/codex-freeform.txt");
+const ASYNC_OPTIONS: &str = include_str!("fixtures/tui/codex-async-options.txt");
 const ASYNC_FREEFORM: &str = include_str!("fixtures/tui/codex-async-freeform.txt");
 const WORKING: &str = "• Working (2s • esc to interrupt)\n»\n  GPT default · /work/project\n";
 
@@ -329,4 +330,52 @@ fn inspection_stops_after_reveal_on_an_unknown_form() {
     ));
     assert_eq!(*terminal.keys.borrow(), ["shift+left"]);
     assert!(terminal.text.borrow().is_empty());
+}
+
+#[test]
+fn async_options_navigate_and_submit_at_most_once() {
+    for drop_submit in [false, true] {
+        let mut terminal = Terminal::new(ASYNC_OPTIONS);
+        terminal.drop_submit = drop_submit;
+        let result = agentctl::tui_prompts::answer(
+            &terminal,
+            "pane",
+            harness_tui(Some("codex")).unwrap(),
+            (Some(2), None),
+            &|_| Ok(()),
+            &Runtime::default(),
+        );
+        if drop_submit {
+            assert_eq!(result.unwrap_err().exit_code(), 76);
+        } else {
+            assert_eq!(result.unwrap()["answered"], true);
+        }
+        assert_eq!(*terminal.keys.borrow(), ["Down", "Enter"]);
+        assert!(terminal.text.borrow().is_empty());
+    }
+}
+
+#[test]
+fn async_options_refuse_incomplete_or_ambiguous_forms() {
+    for (old, new) in [
+        ("› 1.", "  1."),
+        ("    2.", "  › 2."),
+        ("    2.", "    4."),
+        ("    3. Other", "    … more options"),
+        ("    3. Other", "    3. Other\n    › Existing draft"),
+        ("shift+→ main prompt", "shift+→ main prompt\nshell$"),
+    ] {
+        let terminal = Terminal::new(&ASYNC_OPTIONS.replace(old, new));
+        assert!(agentctl::tui_prompts::answer(
+            &terminal,
+            "pane",
+            harness_tui(Some("codex")).unwrap(),
+            (Some(2), None),
+            &|_| Ok(()),
+            &Runtime::default(),
+        )
+        .is_err());
+        assert!(terminal.keys.borrow().is_empty());
+        assert!(terminal.text.borrow().is_empty());
+    }
 }

@@ -29,13 +29,22 @@ class CodexTui:
             if queued:
                 last = max(i for i, row in enumerate(rows) if row.strip())
                 parts = re.split(r"\n\s*\n", "\n".join(rows[queued[-1] + 1:last]).strip())
-                if len(parts) >= 2 and "\n" not in parts[-1]:
-                    editor = parts[-1].strip().removeprefix("›").strip()
+                if len(parts) >= 2:
                     title = "\n\n".join("\n".join(line.strip() for line in part.splitlines())
                                         for part in parts[:-1]).strip()
                     if title and not re.search(r"(?m)^\s*Question \d+/\d+", title):
-                        draft = "" if editor == "Type your answer" else editor
-                        return View(State.QUESTION, Question(title, draft=draft))
+                        option_rows = [re.fullmatch(r"\s*(›\s*)?(\d+)\.\s+(.+)", line)
+                                       for line in parts[-1].splitlines()]
+                        if all(option_rows):
+                            options = tuple(Option(int(row[2]), row[3].strip()) for row in option_rows)
+                            selected = [int(row[2]) for row in option_rows if row[1]]
+                            if (len(selected) == 1 and [item.number for item in options]
+                                    == list(range(1, len(options) + 1))):
+                                return View(State.QUESTION, Question(title, options, selected[0]))
+                        elif len(option_rows) == 1:
+                            editor = parts[-1].strip().removeprefix("›").strip()
+                            draft = "" if editor == "Type your answer" else editor
+                            return View(State.QUESTION, Question(title, draft=draft))
             return View(State.MENU)
         headers = list(re.finditer(r"(?m)^\s*Question (\d+)/(\d+) \(\d+ unanswered\)\s*$", clean))
         if headers and ("enter to submit answer" in footer or "enter to submit all" in footer):

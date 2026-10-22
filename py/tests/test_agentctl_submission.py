@@ -1075,7 +1075,7 @@ def test_shared_state_snapshots() -> None:
     assert harness_tui("unknown") is None
 
 
-@pytest.mark.parametrize("kind", ["options", "freeform", "async-freeform", "multi_question_first", "hidden_options_footer", "options_notes_visible"])
+@pytest.mark.parametrize("kind", ["options", "async-options", "freeform", "async-freeform", "multi_question_first", "hidden_options_footer", "options_notes_visible"])
 def test_upstream_codex_snapshots(kind: str) -> None:
     view = adapter().classify((FIXTURES / f"codex-{kind}.txt").read_text())
     assert view.state == State.QUESTION
@@ -1085,6 +1085,10 @@ def test_upstream_codex_snapshots(kind: str) -> None:
         assert view.question.selected == 1
         assert adapter().answer_plan(view.question, 2, None).keys == ("Down",)
         assert adapter().answer_plan(view.question, None, "Alternative").keys == ("Down", "Down", "Down", "Tab")
+    elif kind == "async-options":
+        assert [o.number for o in view.question.options] == [1, 2, 3]
+        assert view.question.selected == 1
+        assert adapter().answer_plan(view.question, 2, None).keys == ("Down",)
     elif kind in ("freeform", "async-freeform"):
         assert adapter().answer_plan(view.question, None, "Details").text == "Details"
     else:
@@ -1139,9 +1143,10 @@ class FormTerminal:
         self.seconds += seconds
 
 
+@pytest.mark.parametrize("kind", ["options", "async-options"])
 @pytest.mark.parametrize("collapsed", [False, True])
-def test_option_answer_opens_navigates_and_verifies_dismissal(collapsed: bool) -> None:
-    terminal = FormTerminal(collapsed=collapsed)
+def test_option_answer_opens_navigates_and_verifies_dismissal(collapsed: bool, kind: str) -> None:
+    terminal = FormTerminal(kind, collapsed=collapsed)
     result = answer(terminal, "w1:p1", adapter(), option=2, verify=lambda p: None,
                     sleep=terminal.sleep, monotonic=lambda: terminal.seconds)
     assert result["answered"] is True
@@ -1342,3 +1347,27 @@ def test_inspection_stops_after_reveal_if_the_form_is_unrecognized() -> None:
         inspect_question(terminal, "w1:p1", adapter(), verify=lambda p: None,
                          sleep=terminal.sleep, monotonic=lambda: terminal.seconds)
     assert terminal.keys == ["shift+left"] and not terminal.texts
+
+
+@pytest.mark.parametrize("old,new", [
+    ("› 1.", "  1."),
+    ("    2.", "  › 2."),
+    ("    2.", "    4."),
+    ("    3. Other", "    … more options"),
+    ("    3. Other", "    3. Other\n    › Existing draft"),
+    ("shift+→ main prompt", "shift+→ main prompt\nshell$"),
+])
+def test_async_options_refuse_incomplete_or_ambiguous_forms(old: str, new: str) -> None:
+    terminal = FormTerminal("async-options")
+    terminal.screen = terminal.screen.replace(old, new)
+    with pytest.raises(AgentDeliveryError):
+        answer(terminal, "w1:p1", adapter(), option=2, verify=lambda p: None)
+    assert not terminal.keys and not terminal.texts
+
+
+def test_async_options_never_repeat_uncertain_submit() -> None:
+    terminal = FormTerminal("async-options", drop=True)
+    with pytest.raises(AgentPossiblySubmitted):
+        answer(terminal, "w1:p1", adapter(), option=2, verify=lambda p: None,
+               sleep=terminal.sleep, monotonic=lambda: terminal.seconds)
+    assert terminal.keys == ["Down", "Enter"]
