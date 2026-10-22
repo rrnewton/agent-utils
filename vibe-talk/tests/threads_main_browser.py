@@ -3,15 +3,15 @@
 
 `#419 threads-view-main-messages`. The owner, 2026-10-21: in the Threads view (Cmd+3) the main channel's
 messages that are not threads were missing and nothing there posted to the main channel; its Unread only
-and Unpack all stood below the search glass when they would fit beside it. So the heading sits on the
-glass's row, and a third chip, Main messages, adds the main channel's messages among the cards and makes
+and Unpack msgs stood below the search glass when they would fit beside it. So the heading sits on the
+glass's row, and a third chip, Main channel, adds the main channel's messages among the cards and makes
 the main channel's box the last card; Reply on one of those messages opens the one inline reply under it
 (`#410 inline-reply-editor`), the box at the foot giving way to it. The fake-DOM suite
 (tests/js/voice_page.test.mjs) pins what is drawn and posted; this measures where it is drawn.
 
 It serves the checked-out page and the fake API of tests/two_column_browser.py (24 messages, three
 threads), from one loopback origin. At each size: sign in, the thread list from the picker -> the heading
-(title, Unread only, Unpack all, Main messages) on the glass's row: its middle level with the glass's
+(title, Unread only, Unpack msgs, Main channel) on the glass's row: its middle level with the glass's
 within a few pixels, every chip ending before the glass begins, nothing past the window's edge -> Main
 messages pressed: the main channel's messages among the cards in time order, the main channel's box the
 last thing in the list -> Reply on an old main-channel message mid-list: the reply's box directly under
@@ -155,10 +155,10 @@ def threads_walk(desk: Desk) -> None:
     desk.shot("1-heading")
     desk.notes.append(f"the heading's middle {middle:.1f}px, the glass's {(glass['top'] + glass['bottom']) / 2:.1f}px, three chips before it")
 
-    # Main messages: the main channel's messages among the cards, and its box last.
+    # Main channel: the main channel's messages among the cards, and its box last.
     page.click("#side-main")
     desk.wait_for("() => document.querySelectorAll('#side-cards > li[data-main-row]').length > 0",
-                  "Main messages put no main-channel message among the cards")
+                  "Main channel put no main-channel message among the cards")
     desk.settled()
     listed = page.evaluate(LIST_JS)
     assert isinstance(listed, dict)
@@ -199,7 +199,7 @@ def threads_walk(desk: Desk) -> None:
     listed = page.evaluate(LIST_JS)
     assert isinstance(listed, dict)
     desk.check("channel-compose-text" in listed["boxes"], f"the box at the foot did not come back: {listed['boxes']}")
-    desk.notes.append("Main messages among the cards and the box last; a reply under a main-channel message, the box "
+    desk.notes.append("Main channel among the cards and the box last; a reply under a main-channel message, the box "
                       "at the foot giving way and coming back")
 
 

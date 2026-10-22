@@ -48,7 +48,7 @@ four views are offered, in the view picker and on Ctrl+1 to Ctrl+4 (Cmd on a Mac
   at that end; **Older threads…** above the oldest card reads further back. Esc goes back to the view
   it was chosen from. A thread opened from a card opens across the window, the card moving up to
   head it; every thread opened across the window, however it was opened, is headed by its card, and
-  the card's × (or Esc, or ←) goes back to where it was opened from. **Unpack all** beside **Unread
+  the card's × (or Esc, or ←) goes back to where it was opened from. **Unpack msgs** beside **Unread
   only** (key `u`, kept on this device) draws every thread's messages under its card at once, in time
   order on a bridge in the thread's colour, as **N replies** gathers one thread in **All**; the read
   modes apply inside each thread, a collapsed run of read messages hanging off its bridge. The
@@ -56,7 +56,7 @@ four views are offered, in the view picker and on Ctrl+1 to Ctrl+4 (Cmd on a Mac
   and messages in reading order, every key about one message acts on the one selected, ; and : open
   and fold them, and → goes into its thread (`#407 unpack-row-parity`). A thread
   whose replies are not held yet is read as its card nears the screen, its newest page only.
-  **Main messages** beside them (key `a`, kept on this device, `#419 threads-view-main-messages`) adds the
+  **Main channel** beside them (key `a`, kept on this device, `#419 threads-view-main-messages`) adds the
   main channel's messages that are not threads yet, as message rows among the cards in the order they
   were posted, and makes the main channel's message box the last card at the foot. **Thread** or
   **Reply** on one of those opens the reply under it in the list (`#410 inline-reply-editor`), starting

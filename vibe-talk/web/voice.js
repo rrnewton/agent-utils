@@ -10960,7 +10960,7 @@ const KEYMAP = [
   // `#404 threads-unpack-all`. u was free; it acts only over the Threads view's cards, as its chip does.
   {
     group: KEYS_VIEW, chords: [{ key: "u" }],
-    does: "In the Thread list, Unpack all: every thread's messages under its card, bridged as in All, " +
+    does: "In the Thread list, Unpack msgs: every thread's messages under its card, bridged as in All, " +
       "or pack them away again. The read modes apply inside each thread",
     controls: ["side-unpack"],
     run: () => unpackFromKeyboard(),
@@ -10968,7 +10968,7 @@ const KEYMAP = [
   // `#419 threads-view-main-messages`. a was free; it acts only over the Threads view's cards, as its chip does.
   {
     group: KEYS_VIEW, chords: [{ key: "a" }],
-    does: "In the Thread list, Main messages: the main channel's messages that are not threads yet among the " +
+    does: "In the Thread list, Main channel: the main channel's messages that are not threads yet among the " +
       "threads, and its message box at the foot; Thread or Reply on one makes it a thread where it is",
     controls: ["side-main"],
     run: () => mainRowsFromKeyboard(),
@@ -41646,7 +41646,7 @@ function refilterSideCards() {
 // The owner, 2026-10-21: in All, **N replies** bridges one thread at a time — the children come up
 // to meet the parent, which stays put — and bridging another thread breaks the first. He wants
 // every thread chained at once in one stream. So in the Threads view (Cmd+3), which already lists
-// threads by last updated, **Unpack all** (key u) draws each thread's messages under its card, in
+// threads by last updated, **Unpack msgs** (key u; "Unpack all" until `#421 chip-states`) draws each thread's messages under its card, in
 // time order, joined by the same bridge All's gathering draws (`#215 reply-coalesce`), tinted by
 // the thread's colour. The read modes apply inside each block as they do in a thread: under
 // Collapse read a run of read rows is one grey line hanging off the spine by its own stub; under
@@ -41664,7 +41664,7 @@ const UNPACK_READS_AT_ONCE = 3;
 /** How far below the cards on screen a block starts its read, in px: about one screenful ahead. */
 const UNPACK_NEAR_PX = 400;
 
-/** Whether Unpack all is pressed, kept on this device. `#404 threads-unpack-all`. */
+/** Whether Unpack msgs is pressed, kept on this device. `#404 threads-unpack-all`. */
 function storedThreadsUnpacked() {
   try {
     return localStorage.getItem(THREADS_UNPACKED_KEY) === "on";
@@ -41697,7 +41697,7 @@ const cardIsSummarized = (choice) => {
 /** Whether unpacked blocks belong on screen: pressed, and the Threads view (Cmd+3) showing cards. */
 const unpackOnScreen = () => threadsUnpacked && threadListOnScreen() && columns.side.mode === "list";
 
-/** Unpack all: offered over the Threads view's cards, and pressed as the reader left it. */
+/** Unpack msgs: offered over the Threads view's cards, and pressed as the reader left it. */
 function renderUnpackToggle() {
   const button = leftEl("side-unpack");
   const offered = columns.side.mode === "list" && threadListShown;
@@ -41706,7 +41706,7 @@ function renderUnpackToggle() {
   if (button.getAttribute("aria-pressed") !== pressed) button.setAttribute("aria-pressed", pressed);
 }
 
-/** The reader pressed Unpack all, or u: kept on this device, and the cards drawn again. */
+/** The reader pressed Unpack msgs, or u: kept on this device, and the cards drawn again. */
 function setThreadsUnpacked(on) {
   threadsUnpacked = on;
   try {
@@ -41926,7 +41926,7 @@ async function readUnpackThread(id) {
 // can make them threads from there ... when we have Main messages turned on, we should also have the
 // Reply box (to main channel) as our implicit last card in our list."
 //
-//   * MAIN MESSAGES (key a), beside Unread only and Unpack all, over the Threads view's cards, kept on this
+//   * MAIN CHANNEL (key a; "Main messages" until `#421 chip-states`), beside Unread only and Unpack msgs, over the Threads view's cards, kept on this
 //     device. Pressed, the cards' list also holds the main channel's messages that head no thread a card
 //     stands for: what Main draws, less its threads' roots. Each is a message row, built and dressed by the
 //     code every list's rows are (`discordNode`, `dressChannelRow`), marked `data-main-row`, and placed
@@ -41937,14 +41937,14 @@ async function readUnpackThread(id) {
 //     inline-reply-editor`), bound for a new thread where the service starts one on a reply's say-so (the
 //     new-thread choice ticked; Slack threads every reply anyway), not the thread view.
 //   * THE MAIN CHANNEL'S BOX IS THE LAST CARD. The left column is Main behind the list (`leftColumnToMain`),
-//     so its box posts to the main channel: it is moved to the foot of the cards while Main messages is on
+//     so its box posts to the main channel: it is moved to the foot of the cards while Main channel is on
 //     (`placeMainCard`), and back when the list goes or the chip is let go. It is the one box: a reply
 //     opened anywhere hides it, and putting the reply down gives it back (`dockReply`).
 
-/** The device's choice of Main messages among the cards: "on", or anything else for cards alone. */
+/** The device's choice of Main channel among the cards: "on", or anything else for cards alone. */
 const THREADS_MAIN_KEY = "vibe-talk.voice.threads-main";
 
-/** Whether Main messages is pressed, kept on this device. `#419 threads-view-main-messages`. */
+/** Whether Main channel is pressed, kept on this device. `#419 threads-view-main-messages`. */
 function storedMainRows() {
   try {
     return localStorage.getItem(THREADS_MAIN_KEY) === "on";
@@ -41959,7 +41959,7 @@ let mainRowsShown = storedMainRows();
 /** Whether Main's messages belong on screen among the cards: pressed, and the Threads view showing cards. */
 const mainRowsOnScreen = () => mainRowsShown && threadListOnScreen() && columns.side.mode === "list";
 
-/** Main messages: offered over the Threads view's cards, as Unpack all is, and pressed as the reader left it. */
+/** Main channel: offered over the Threads view's cards, as Unpack msgs is, and pressed as the reader left it. */
 function renderMainToggle() {
   const button = leftEl("side-main");
   const offered = columns.side.mode === "list" && threadListShown;
@@ -41968,7 +41968,7 @@ function renderMainToggle() {
   if (button.getAttribute("aria-pressed") !== pressed) button.setAttribute("aria-pressed", pressed);
 }
 
-/** The reader pressed Main messages, or a: kept on this device, and the cards drawn again. */
+/** The reader pressed Main channel, or a: kept on this device, and the cards drawn again. */
 function setMainRowsShown(on) {
   mainRowsShown = on;
   try {

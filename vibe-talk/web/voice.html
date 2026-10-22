@@ -693,16 +693,17 @@
                 (Cmd+3) this toggle unpacks each thread's messages under its card, bridged as in
                 All. Only over the cards of the Threads view. Kept on this device; key u.
               -->
-              <button id="side-unpack" class="chip" type="button" aria-pressed="false" title="Show every thread's messages under its card" hidden>Unpack all</button>
+              <button id="side-unpack" class="chip" type="button" aria-pressed="false" title="Show every thread's messages under its card" hidden>Unpack msgs</button>
               <!--
                 `#419 threads-view-main-messages`. The owner, 2026-10-21: "we have room for one more button
                 -- a toggle to show Main msgs. When that is on we should see messages to the main channel
                 that are not (yet) threads and can make them threads from there." Pressed, the cards' list
                 also holds the main channel's messages that head no thread, among the cards in the list's
                 order, and ends in the main channel's box. Only over the Threads view's cards. Kept on this
-                device; key a. On a phone it says "Main" (web/voice.css).
+                device; key a. On a phone it says "Main" (web/voice.css). Named "Main channel", and Unpack all "Unpack msgs",
+                by the owner, 2026-10-22 (`#421 chip-states`).
               -->
-              <button id="side-main" class="chip" type="button" aria-pressed="false" title="Show the main channel's messages that are not threads yet, and its message box at the foot" hidden>Main<span class="chip-more"> messages</span></button>
+              <button id="side-main" class="chip" type="button" aria-pressed="false" title="Show the main channel's messages that are not threads yet, and its message box at the foot" hidden>Main<span class="chip-more"> channel</span></button>
               <!--
                 `#298 thread-card-header`. The owner, of the thread cards: "When I drill into a given
                 thread card to see the messages inside it, I would like to KEEP that same style ... the
@@ -2475,7 +2476,7 @@
                 window, newest activity at the bottom as in the channel, each as its name and summary
                 when they have been summarised, or else its first message, three lines at most;
                 <strong>Unread only</strong> beside its heading narrows the list to the threads with
-                unread replies, and is remembered on this device. <strong>Main messages</strong> beside it
+                unread replies, and is remembered on this device. <strong>Main channel</strong> beside it
                 (key <kbd>a</kbd>, remembered too) adds the main channel's messages that are not threads
                 yet, among the cards in the order they were posted, and puts the main channel's message
                 box at the foot of the list as its last card: <strong>Reply</strong> or

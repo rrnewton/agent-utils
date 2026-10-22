@@ -460,7 +460,7 @@ thread-header-collapse-browser:
 	python3 tests/thread_header_collapse_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#404 threads-unpack-all` and `#405 root-under-summary` in a real Chromium at 1280x800 with a mouse
-# and the keys and 393x852 by touch, in both schemes: Unpack all draws every thread's messages under
+# and the keys and 393x852 by touch, in both schemes: Unpack msgs draws every thread's messages under
 # its card on a bridge in the thread's colour, the summarised thread's root first as the card's child
 # and a raw thread with no root row; Collapse read folds each block's read run onto its spine and Hide
 # read leaves read replies out while keeping the summarised root; off is cards alone, and a reload
@@ -581,7 +581,7 @@ inline-reply-browser:
 	python3 tests/inline_reply_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#419 threads-view-main-messages` in a real Chromium at 1280x800 and 393x852: the Threads view's chips on
-# the search glass's row, Main messages among the cards with the main channel's box last, and a reply
+# the search glass's row, Main channel among the cards with the main channel's box last, and a reply
 # under one of them moving the one box. Pass WEB_ROOT=dir to run it against another copy of the page, and
 # SCREENSHOTS=dir to keep a PNG of each state.
 threads-main-browser:
