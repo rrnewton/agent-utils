@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keep a reading bookmark through a backlog in real Chromium, at 1280x800 and 412x915.
+"""Keep a reading bookmark through a backlog in real Chromium, at 1280x800 and 393x852.
 
 `#240 reading-bookmark`. The owner, catching up on a long backlog, wants to mark his place, reply to
 messages further down, jump back to where he was reading, mark things Done and have the bookmark
@@ -24,7 +24,11 @@ the row's own menu and buttons), the walk is:
   the page marks the message answered Done (`#256 reply-marks-read`) without moving the line, the
   reader where they were (`#410 inline-reply-editor`), and offers the chip -> jump back -> mark the message under the
   line Done (e, or its Done button): the line slides to the next message, the server holds that, and
-  on a desk the selection moves with it. No horizontal overflow and no page error at any step.
+  on a desk the selection moves with it -> press the X at the end of the line (`#420 bookmark-clear`):
+  a target at least 24px square at the line's right end, the line gone and the server's bookmark
+  with it, the message the reader was looking at where it was, and Undo offered -> Undo: the line
+  back where it was, on the server too -> the line at the top of the list, under the pill, and the X
+  again: the reader still where they were. No horizontal overflow and no page error at any step.
 
 Pass --screenshots DIR to keep a PNG of each step for review; --web-root DIR to run the same walk
 against another copy of the page.
@@ -328,7 +332,27 @@ MEASURE_JS = """(marked) => {
     ruleColour: rule ? rule.borderTopColor : null,
     ruleWidth: rule ? rule.borderTopWidth : null,
     ruleStyle: rule ? rule.borderTopStyle : null,
-    role: line ? line.getAttribute('role') : null,
+    role: line && line.querySelector(':scope > .bookmark-word')
+      ? line.querySelector(':scope > .bookmark-word').getAttribute('role') : null,
+    clear: box(line ? line.querySelector(':scope > .bookmark-clear') : null),
+    clears: document.querySelectorAll('#discord-log .bookmark-clear').length,
+    ringed: rows.filter((li) => li.getAttribute('data-selected') === 'true').map((li) => li.dataset.id),
+    clearName: line && line.querySelector(':scope > .bookmark-clear')
+      ? line.querySelector(':scope > .bookmark-clear').getAttribute('aria-label') : null,
+    clearTitle: line && line.querySelector(':scope > .bookmark-clear')
+      ? line.querySelector(':scope > .bookmark-clear').getAttribute('title') : null,
+    clearHit: (() => {
+      const x = line ? line.querySelector(':scope > .bookmark-clear') : null;
+      if (!x) return false;
+      const r = x.getBoundingClientRect();
+      const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      return Boolean(hit) && (hit === x || x.contains(hit));
+    })(),
+    anchor: (() => {
+      const edge = Math.max(area.getBoundingClientRect().top, floating);
+      const seen = rows.find((li) => li.getClientRects().length && li.getBoundingClientRect().bottom > edge);
+      return seen ? {id: seen.dataset.id, top: seen.getBoundingClientRect().top} : null;
+    })(),
     accent,
     floating,
     atEnd: area.scrollTop >= area.scrollHeight - area.clientHeight - 2,
@@ -586,6 +610,106 @@ def bookmark_walk(walk: Walk) -> None:
     walk.check(float(str(m.found["overflow"])) <= 0, "the page scrolls sideways")
     walk.shot("5-advanced")
     walk.notes.append("Done slid the line to the next message, on the server too")
+    clear_walk(walk, following)
+
+
+def clear_walk(walk: Walk, lined: str) -> None:
+    """`#420 bookmark-clear`: the X at the end of the line, Undo, and the X with the line at the top."""
+    page = walk.page
+    selector = "#discord-log > li[data-bookmark] > .bookmark-line > .bookmark-clear"
+    walk.scroll("const line = document.querySelector('#discord-log > li[data-bookmark] > .bookmark-line');"
+                " area.scrollTop += line.getBoundingClientRect().top - area.getBoundingClientRect().top"
+                " - area.clientHeight / 3;")
+    m = walk.measure(lined)
+    x, line = m.box("clear"), m.box("line")
+    walk.check(x is not None and line is not None, f"the line has no X: {m.found}")
+    assert x is not None and line is not None
+    walk.check(x["width"] >= 24 and x["height"] >= 24, f"the X is smaller than 24px: {x['width']:.0f}x{x['height']:.0f}")
+    walk.check(abs(line["right"] - x["right"]) <= 1, f"the X is not at the line's end: {x} {line}")
+    walk.check(x["top"] >= line["top"] - 1 and x["bottom"] <= line["bottom"] + 1, f"the X is outside the line's room: {x} {line}")
+    walk.check(m.found["clearHit"] is True, "a tap at the X's centre lands on something else")
+    walk.check(m.found["clearName"] == "Remove bookmark" and m.found["clearTitle"] == "Remove bookmark",
+               f"the X is named {m.found['clearName']!r}, titled {m.found['clearTitle']!r}")
+    walk.check(m.found["role"] == "separator", "the line's word is not a separator")
+    before = m.found["anchor"]
+    ringed = m.found["ringed"]
+    walk.shot("6-x")
+
+    walk.press(selector)
+    walk.wait_for("() => !document.querySelector('#discord-log > li[data-bookmark]')", "the X left the line")
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and walk.api.anchor_id() is not None:
+        page.wait_for_timeout(25)
+    walk.check(walk.api.anchor_id() is None, f"the server still holds {walk.api.anchor_id()}")
+    walk.check(walk.api.bookmark_writes[-1]["anchor"] is None, f"the last write was not a removal: {walk.api.bookmark_writes[-1]}")
+    walk.settled()
+    m = walk.measure(lined)
+    after = m.found["anchor"]
+    walk.check(isinstance(before, dict) and isinstance(after, dict) and before["id"] == after["id"]
+               and abs(float(before["top"]) - float(after["top"])) <= 1,
+               f"the reader moved: {before} then {after}")
+    walk.check(m.found["clears"] == 0, "an X is left in the list with no bookmark")
+    # A control in a row notes that row as the selection, as the row's own buttons do; a tap draws no
+    # ring for it, and the X draws none of its own.
+    walk.check(isinstance(ringed, list) and isinstance(m.found["ringed"], list)
+               and set(m.found["ringed"]) <= set(ringed),
+               f"the X drew a selection ring: {ringed} then {m.found['ringed']}")
+    walk.check(m.found["lined"] == [], f"the line is still on {m.found['lined']}")
+    undo = m.chip("undo-bookmark")
+    walk.check(undo is not None, "no Undo after the X")
+    assert undo is not None
+    for other in m.chips():
+        if other is undo or other == undo:
+            continue
+        walk.check(other["right"] <= undo["left"] or undo["right"] <= other["left"]
+                   or other["bottom"] <= undo["top"] or undo["bottom"] <= other["top"],
+                   f"a chip overlaps Undo: {other} {undo}")
+    walk.check(float(str(m.found["overflow"])) <= 0, "the page scrolls sideways")
+    walk.shot("7-cleared")
+    walk.notes.append(f"the X ({x['width']:.0f}x{x['height']:.0f}px) took the line away, on the server too, "
+                      "the reader where they were, Undo offered")
+
+    before = m.found["anchor"]
+    walk.press("#undo-bookmark")
+    walk.wait_for("(id) => { const li = document.querySelector('#discord-log > li[data-bookmark]');"
+                  " return li && li.dataset.id === id; }", "Undo did not put the line back", lined)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and walk.api.anchor_id() != lined:
+        page.wait_for_timeout(25)
+    walk.check(walk.api.anchor_id() == lined, f"the server holds {walk.api.anchor_id()} after Undo")
+    walk.check(isinstance(walk.api.bookmark_writes[-1].get("if_revision"), int), "Undo was not conditional")
+    walk.settled()
+    m = walk.measure(lined)
+    after = m.found["anchor"]
+    walk.check(isinstance(before, dict) and isinstance(after, dict) and before["id"] == after["id"]
+               and abs(float(before["top"]) - float(after["top"])) <= 1,
+               f"Undo moved the reader: {before} then {after}")
+    walk.check(m.chip("undo-bookmark") is None, "Undo stayed up after it was used")
+    walk.shot("8-undone")
+    walk.notes.append("Undo put it back where it was")
+
+    # The line at the top of the list, just under the pill: the room it leaves is above the reader.
+    walk.scroll("const line = document.querySelector('#discord-log > li[data-bookmark] > .bookmark-line');"
+                f" area.scrollTop += line.getBoundingClientRect().top - {float(str(m.found['floating']))} - 2;")
+    m = walk.measure(lined)
+    before = m.found["anchor"]
+    if walk.touch:
+        walk.press(selector)
+    else:
+        # From the keyboard: Tab reaches the X, Enter presses it, and the focus lands on the message.
+        page.focus(selector)
+        page.keyboard.press("Enter")
+    walk.wait_for("() => !document.querySelector('#discord-log > li[data-bookmark]')", "the X at the top left the line")
+    walk.settled()
+    m = walk.measure(lined)
+    after = m.found["anchor"]
+    walk.check(isinstance(before, dict) and isinstance(after, dict) and before["id"] == after["id"]
+               and abs(float(before["top"]) - float(after["top"])) <= 1,
+               f"the X at the top moved the reader: {before} then {after}")
+    if not walk.touch:
+        walk.check(m.found["selected"] == lined, f"Enter on the X left the focus on {m.found['selected']}, not the message")
+    walk.shot("9-cleared-at-top")
+    walk.notes.append("the X with the line at the top of the list left the reader where they were")
 
 
 def serve(api: FakeApi, web_root: Path) -> tuple[ThreadingHTTPServer, threading.Thread, str]:
@@ -629,7 +753,7 @@ def main() -> int:
     if args.screenshots is not None:
         args.screenshots.mkdir(parents=True, exist_ok=True)
     web_root = args.web_root.resolve()
-    sizes = (("1280x800", 1280, 800, False), ("412x915", 412, 915, True))
+    sizes = (("1280x800", 1280, 800, False), ("393x852", 393, 852, True))
     report: list[str] = []
     with sync_playwright() as playwright:
         for size, width, height, phone in sizes:

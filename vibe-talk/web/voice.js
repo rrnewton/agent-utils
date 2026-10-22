@@ -212,7 +212,7 @@ const ALL_CHANNELS = "*";
  *   | "side-main" | "side-unpack" | "side-unread-only" | "speaker"
  *   | "summarise" | "talk"
  *   | "thread-back" | "thread-card-text"
- *   | "todo-filter" | "undo-dismiss" | "undo-send-dismiss" | "upstream-clear-push"
+ *   | "todo-filter" | "undo-bookmark" | "undo-dismiss" | "undo-send-dismiss" | "upstream-clear-push"
  *   | "upstream-clear-save" | "view-switch"} id
  * @returns {HTMLButtonElement}
  */
@@ -3745,6 +3745,8 @@ function renderScrollTools() {
   el("back-to-reply").hidden = currentView !== "discord" || replyReturnRow() === null;
   // `#193 compose-draft-loss`. The way back from a Dismiss in the outbox, on the channel only.
   renderSendUndo();
+  // `#420 bookmark-clear`. ...and from taking the bookmark away, in its own channel.
+  renderBookmarkUndo();
   // `#129 message-search`. Re-derived from the lists, exactly like everything above it: whatever
   // just changed a list has to leave the filter true of it. See `applySearch` for why this hangs
   // off the one function every mutation already ends with rather than off its own call sites.
@@ -10863,7 +10865,8 @@ const KEYMAP = [
   },
   {
     group: KEYS_MESSAGE, chords: [{ key: "b", shift: true }],
-    does: "Bookmark: the line above this message. On the message just below it, take it away. Marks nothing Done",
+    does: "Bookmark: the line above this message. On the message just below it, take it away, as the X on its " +
+      "line does, with Undo after. Marks nothing Done",
     rowControls: ["row-bookmark-button"],
     run: (event, target) => bookmarkFromKeyboard(target),
   },
@@ -28042,6 +28045,8 @@ function forgetBookmarks() {
   bookmarks.clear();
   bookmarkDrawn.main = null;
   bookmarkDrawn.side = null;
+  // Nor is a removal of the other credential's put back under this one (`#420 bookmark-clear`).
+  endBookmarkUndo();
 }
 
 /** Redraw the line and the chip in every column, after the bookmark changed. */
@@ -28264,14 +28269,41 @@ function bookmarkTarget() {
   return last ? { row: last, place: "below" } : null;
 }
 
-/** The line on `row`, made once and kept on it, as a collapsed run's is (`readRunLine`). */
+/**
+ * The line on `row`, made once and kept on it, as a collapsed run's is (`readRunLine`): the word, a
+ * separator to a screen reader, and the X at the line's end that takes the bookmark away (`#420
+ * bookmark-clear`). The X is a sibling of the word, never inside a separator, whose children a
+ * screen reader does not reach. It acts in the column the row was drawn in.
+ */
 function bookmarkLineOf(row) {
   if (row.bookmarkLine) return row.bookmarkLine;
   const line = document.createElement("div");
   line.className = "bookmark-line";
-  line.setAttribute("role", "separator");
-  line.setAttribute("aria-label", "Bookmark");
-  line.textContent = "Bookmark";
+  const word = document.createElement("span");
+  word.className = "bookmark-word";
+  word.setAttribute("role", "separator");
+  word.setAttribute("aria-label", "Bookmark");
+  word.textContent = "Bookmark";
+  const clear = document.createElement("button");
+  clear.className = "bookmark-clear";
+  clear.setAttribute("type", "button");
+  clear.setAttribute("aria-label", BOOKMARK_CLEAR_NAME);
+  clear.setAttribute("title", BOOKMARK_CLEAR_NAME);
+  const mark = document.createElement("span");
+  mark.className = "bookmark-clear-mark";
+  mark.setAttribute("aria-hidden", "true");
+  clear.append(mark);
+  clear.addEventListener("click", inThisColumn((event) => {
+    // The row's own tap would fold the message or read it aloud; this tap is the X's.
+    if (event) event.stopPropagation();
+    // Pressed from the keyboard: a click a key made counts no clicks (`detail`). A tap focuses the X
+    // too, and a tap on a touch screen draws no ring (`noteRow`).
+    const focused = Boolean(event) && event.detail === 0 && document.activeElement === clear;
+    removeBookmark(currentChannelId());
+    // The X goes with the line. A keyboard that pressed it is left on the message the line was above.
+    if (focused && row.parentNode === el("discord-log") && rowShown(row)) takeRow(sideActive ? sidePane : channelPane, row, true);
+  }));
+  line.append(word, clear);
   row.bookmarkLine = line;
   return line;
 }
@@ -28455,13 +28487,86 @@ function bookmarkAbove(row) {
 function toggleBookmarkAt(row) {
   const channel = currentChannelId();
   if (!channel || !row) return;
-  const removing = row.parentNode === el("discord-log") && bookmarkAbove(row);
-  const anchor = removing ? null : anchorOfRow(row, "above");
-  if (!removing && !anchor) return;
+  if (row.parentNode === el("discord-log") && bookmarkAbove(row)) {
+    removeBookmark(channel);
+    return;
+  }
+  const anchor = anchorOfRow(row, "above");
+  if (!anchor) return;
   const move = stageBookmark(channel, anchor);
   redrawBookmark();
-  setStatus(removing ? "Bookmark removed." : "Bookmarked. b comes back here.");
+  setStatus("Bookmarked. b comes back here.");
   guardQuietly(() => sendBookmark(move))();
+}
+
+// `#420 bookmark-clear`. The owner, 2026-10-22: "Right now if we place a bookmark I don't see any way
+// to remove it. It should have a little X on the bookmark line." Shift+B and the row's ⋯ item took it
+// away already, on the message right under the line only; the X is on the line itself. Every removal
+// offers Undo for BOOKMARK_UNDO_MS, the way a Dismiss in the outbox does (`renderSendUndo`): an X a
+// thumb can reach is an X a thumb can hit by accident, and the place it marked is the reader's.
+
+/** The X's name, its tooltip too. */
+const BOOKMARK_CLEAR_NAME = "Remove bookmark";
+/** How long the Undo chip offers to put a removed bookmark back. */
+const BOOKMARK_UNDO_MS = 10000;
+/**
+ * The removal the Undo chip takes back while it is up: the channel, where the line was, the removal's
+ * own staged change (`stageBookmark`), and the chip's timer.
+ *
+ * @type {{channel: string, anchor: VibeTalk.BookmarkAnchor, token: object, timer: any} | null}
+ */
+let bookmarkUndo = null;
+
+/**
+ * Take this channel's bookmark away, here at once and then on the server, with Undo offered: the X on
+ * the line, Shift+B and the ⋯ item on the message right under it. The reader stays where they are:
+ * the line goes as every redraw of it does (`placeBookmarkLine`).
+ */
+function removeBookmark(channel) {
+  const before = bookmarkAnchor(channel);
+  if (!channel || !before) return;
+  const move = stageBookmark(channel, null);
+  if (bookmarkUndo) clearTimeout(bookmarkUndo.timer);
+  bookmarkUndo = { channel, anchor: before, token: move.token, timer: setTimeout(endBookmarkUndo, BOOKMARK_UNDO_MS) };
+  redrawBookmark();
+  renderBookmarkUndo();
+  setStatus("Bookmark removed. Undo puts it back.");
+  guardQuietly(async () => {
+    // Not saved, and so taken back already (`sendBookmark`): there is nothing to undo.
+    const outcome = await sendBookmark(move);
+    if (outcome !== "saved" && bookmarkUndo && bookmarkUndo.token === move.token) endBookmarkUndo();
+  })();
+}
+
+function endBookmarkUndo() {
+  if (bookmarkUndo) clearTimeout(bookmarkUndo.timer);
+  bookmarkUndo = null;
+  renderBookmarkUndo();
+}
+
+/** The Undo chip for a removed bookmark: up while it can be put back, in the channel it was in. */
+function renderBookmarkUndo() {
+  const chip = leftEl("undo-bookmark");
+  const shown = bookmarkUndo !== null && currentView === "discord" && bookmarkUndo.channel === currentChannelId();
+  if (chip.hidden === shown) chip.hidden = !shown;
+}
+
+/**
+ * Undo: the bookmark back where it was, unless one has been set since. Conditional, so it never moves
+ * a bookmark another device set meanwhile; that one is kept, and said (`sendBookmark`).
+ */
+function undoBookmarkRemoval() {
+  const undo = bookmarkUndo;
+  if (!undo) return;
+  endBookmarkUndo();
+  if (bookmarkAnchor(undo.channel)) {
+    setStatus("A bookmark was set since; it stays.");
+    return;
+  }
+  const move = stageBookmark(undo.channel, undo.anchor);
+  redrawBookmark();
+  setStatus("Bookmark put back.");
+  guardQuietly(() => sendBookmark(move, { conditional: true }))();
 }
 
 /** Shift+B on the selected message. */
@@ -32452,6 +32557,10 @@ function swipeable(li, messages) {
     // `#215 reply-coalesce`. Nor on the X beside the bridge of gathered replies, for the same reason.
     const ungather = childByClass(li, "reply-ungather");
     if (ungather && nodeWithin(ungather, event.target)) {
+      return;
+    }
+    // `#420 bookmark-clear`. Nor on the bookmark line's X; the line itself takes no taps.
+    if (li.bookmarkLine && nodeWithin(li.bookmarkLine, event.target)) {
       return;
     }
     // `#228 reply-visible`. Nor on the circle at the row's corner, the way down to a reply.
@@ -48475,6 +48584,8 @@ renderDismissedSends();
 el("undo-send-dismiss").addEventListener("click", () => {
   if (sendUndo) putBackDismissedSend(sendUndo.id);
 });
+// `#420 bookmark-clear`.
+el("undo-bookmark").addEventListener("click", undoBookmarkRemoval);
 el("forget-dismissed-sends").addEventListener("click", forgetDismissedSends);
 try {
   const saved = JSON.parse(localStorage.getItem(CHANNEL_DRAFTS_KEY) || "{}");

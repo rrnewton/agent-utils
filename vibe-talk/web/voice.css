@@ -3072,7 +3072,8 @@ a.search-hit-link {
  *
  * It is drawn IN A MARGIN the row under it keeps above its tile, positioned against the row, so the
  * list holds nothing but message rows. The previous row's own margin collapses into this one, so
- * the line is exactly the gap between the two. It is not a control: a stray tap cannot clear it.
+ * the line is exactly the gap between the two. The line is not a control: a stray tap on it clears
+ * nothing. Only the X at its end does (`#420 bookmark-clear`, below), with Undo after it.
  */
 #side-log,
 #side-cards,
@@ -3140,6 +3141,80 @@ a.search-hit-link {
   flex: 1 1 0;
   min-width: 1rem;
   border-top: 2px solid var(--accent);
+}
+
+/*
+ * THE X. `#420 bookmark-clear`: "a little X on the bookmark line". At the line's end, after its right
+ * rule (`order`, as the rule is the line's `::after`), a touch target square in the line's own room,
+ * at least 24px whatever the root size, its X drawn on an empty span as the gathered replies' X is.
+ * The one part of the line that takes a tap.
+ */
+#side-log .bookmark-clear,
+#side-cards .bookmark-clear,
+#discord-log .bookmark-clear {
+  order: 1;
+  position: relative;
+  flex: none;
+  width: max(24px, 1.75rem);
+  height: max(24px, 1.75rem);
+  margin: 0;
+  padding: 0;
+  background: none;
+  border: none;
+  border-radius: 0.5rem;
+  color: var(--accent);
+  pointer-events: auto;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  cursor: pointer;
+}
+
+#side-log .bookmark-clear-mark,
+#side-cards .bookmark-clear-mark,
+#discord-log .bookmark-clear-mark {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+#side-log .bookmark-clear-mark::before,
+#side-cards .bookmark-clear-mark::before,
+#discord-log .bookmark-clear-mark::before,
+#side-log .bookmark-clear-mark::after,
+#side-cards .bookmark-clear-mark::after,
+#discord-log .bookmark-clear-mark::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 0.8rem;
+  height: 2px;
+  border-radius: 1px;
+  background: currentColor;
+  transform: translate(-50%, -50%) rotate(45deg);
+}
+
+#side-log .bookmark-clear-mark::after,
+#side-cards .bookmark-clear-mark::after,
+#discord-log .bookmark-clear-mark::after {
+  transform: translate(-50%, -50%) rotate(-45deg);
+}
+
+#side-log .bookmark-clear:hover,
+#side-cards .bookmark-clear:hover,
+#discord-log .bookmark-clear:hover,
+#side-log .bookmark-clear:active,
+#side-cards .bookmark-clear:active,
+#discord-log .bookmark-clear:active {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+#side-log .bookmark-clear:focus-visible,
+#side-cards .bookmark-clear:focus-visible,
+#discord-log .bookmark-clear:focus-visible {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 

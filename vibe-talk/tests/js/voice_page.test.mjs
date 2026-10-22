@@ -4412,6 +4412,10 @@ const TUNING_BANDS = {
     "how long the Undo chip offers to take back a Dismiss in the outbox (#193 compose-draft-loss). " +
     "Under eight seconds a reader who has just seen what they did is still finding the chip; past " +
     "thirty it sits over the list long after anyone would think of it as the way back"],
+  BOOKMARK_UNDO_MS: [5000, 20000,
+    "how long the Undo chip offers to put back a bookmark taken away (#420 bookmark-clear): the X on " +
+    "its line, Shift+B, the row's item. Under five seconds a thumb that hit the X by accident has not " +
+    "found the chip; past twenty it sits over the list long after the place was let go on purpose"],
   DISMISSED_SENDS_LIMIT: [3, 25,
     "how many dismissed sends Settings keeps (#193 compose-draft-loss). Fewer, and a morning of " +
     "failed sends cleared in one go pushes out the one wanted back; more, and the list is a second " +
@@ -11967,7 +11971,8 @@ test("THE BOOKMARK is set from the details sheet too, kept on the server, and dr
   assert.deepStrictEqual(bookmarkAt(page), { id: "1000000000000000002", place: "above" },
     "the line is not drawn above the message it was set on");
   assert.equal(rowState(page, 0).bookmark, null, "a second row carries the line");
-  const line = bookmarkAt(page, "discord-log", true);
+  // The line's word is the separator, and the X beside it is not inside it (`#420 bookmark-clear`).
+  const line = bookmarkAt(page, "discord-log", true).children.find((node) => node.className === "bookmark-word");
   assert.equal(line.getAttribute("role"), "separator", "the line is not a separator to a screen reader");
   assert.equal(line.getAttribute("aria-label"), "Bookmark");
   assert.deepStrictEqual(page.bookmarkCalls.map((call) => [call.method, call.body.message_id, call.ifRevision]),
@@ -54691,6 +54696,177 @@ test("`#240 reading-bookmark`: in two columns the left draws the line, the right
   assert.equal(bookmarkAt(page, "side-log"), null, "the right column drew the line on a thread that does not hold it");
   await press(page, page.el("side-scroll"), "b");
   assert.equal(selectedId(page), "203", "b from the right column did not go to the left column's line");
+});
+
+// --- the X on the bookmark's line (#420 bookmark-clear) -----------------------------------------
+//
+// The owner, 2026-10-22: "Right now if we place a bookmark I don't see any way to remove it. It
+// should have a little X on the bookmark line." tests/bookmark_browser.py presses it in Chromium,
+// where the line's room is laid out and the reader's place can really move.
+
+/** The X on the line in `list`, or null when no line is drawn. */
+function bookmarkClearOf(page, list = "discord-log") {
+  const line = bookmarkAt(page, list, true);
+  return line ? line.children.find((node) => node.className === "bookmark-clear") || null : null;
+}
+
+/** Every X on a line in `list`, drawn or not: one row carries the line at most. */
+const bookmarkClears = (page, list = "discord-log") =>
+  page.el(list).descendants().filter((node) => node.className === "bookmark-clear");
+
+/**
+ * A tap on the X as a browser delivers it: to the X, then, unless something stopped it, up to the
+ * row, whose own handler would fold the message or read it aloud (as `tapArrow` does for the arrow).
+ */
+async function tapBookmarkClear(page, list = "discord-log") {
+  const x = bookmarkClearOf(page, list);
+  assert.ok(x, "the line has no X");
+  let row = x;
+  while (row && row.tagName !== "li" && row.tagName !== "LI") row = row.parentNode;
+  let stopped = false;
+  const event = { target: x, stopPropagation: () => { stopped = true; } };
+  await x.dispatch("click", event);
+  if (!stopped && row) await row.dispatch("click", event);
+  await page.settle();
+  return stopped;
+}
+
+/** The saved copy of the channel on this device, as a page opened offline would draw it. */
+const savedScope = (page) => {
+  const raw = page.storage.get(MESSAGE_CACHE_KEY);
+  const scopes = raw ? JSON.parse(raw).scopes : {};
+  return Object.values(scopes)[0] || null;
+};
+
+test("`#420 bookmark-clear`: the X on the line takes the bookmark away, here, on the server and in the saved copy, and the reader stays put", async () => {
+  const page = await servedBookmarkPage(backlog(6));
+  assert.deepStrictEqual(bookmarkClears(page), [], "an X is drawn with no bookmark");
+  await bookmarkRow(page, bid(2));
+  assert.deepStrictEqual(bookmarkAt(page), { id: bid(2), place: "above" });
+  assert.equal(savedScope(page).bookmark.anchor.message_id, bid(2), "the premise: the device keeps the bookmark");
+  const x = bookmarkClearOf(page);
+  assert.ok(x, "the line carries no X");
+  assert.equal(x.tagName.toLowerCase(), "button");
+  assert.equal(x.getAttribute("type"), "button");
+  assert.equal(x.getAttribute("aria-label"), "Remove bookmark", "the X has no name for a screen reader");
+  assert.equal(x.getAttribute("title"), "Remove bookmark", "the X has no tooltip");
+  // The word is the separator; the X beside it, never inside one, whose children a screen reader skips.
+  const line = bookmarkAt(page, "discord-log", true);
+  const word = line.children.find((node) => node.getAttribute("role") === "separator");
+  assert.ok(word && word.getAttribute("aria-label") === "Bookmark", "the line's word is not a separator named Bookmark");
+  assert.equal(line.getAttribute("role"), null, "the X is inside a separator");
+
+  const area = page.el("scroll-area");
+  area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) / 2);
+  const scrolled = area.scrollTop;
+  const lined = rowHoldingId(page, bid(2));
+  const top = lined.getBoundingClientRect().top;
+  const calls = page.bookmarkCalls.length;
+  const folded = rowStates(page);
+  const stopped = await tapBookmarkClear(page);
+
+  assert.equal(stopped, true, "the X's tap went on to the row, which folds it or reads it aloud");
+  assert.equal(bookmarkAt(page), null, "the X left the line");
+  assert.deepStrictEqual(bookmarkClears(page), [], "the X stayed with no bookmark");
+  assert.deepStrictEqual(page.bookmarkCalls.slice(calls).map((call) => [call.method, call.ifRevision]), [["DELETE", undefined]],
+    "the removal was not written to the server, unconditionally, once");
+  assert.equal(page.bookmark.anchor, null, "the server still holds the bookmark");
+  assert.equal(savedScope(page).bookmark.anchor, null, "the device's saved copy still draws the line offline");
+  assert.equal(area.scrollTop, scrolled, "taking the line away moved the list");
+  assert.equal(rowHoldingId(page, bid(2)).getBoundingClientRect().top, top, "the message under the line moved");
+  assert.deepStrictEqual(rowStates(page), folded, "the X's tap folded, selected or marked a row");
+  assert.deepStrictEqual(page.dismissCalls, [], "removing the bookmark marked something Done");
+  assert.match(statusText(page), /Bookmark removed/);
+  // b now has nowhere to go, and says how to set one.
+  await page.el("jump-bookmark").click();
+  await page.settle();
+  assert.equal(page.el("jump-bookmark").hidden, true);
+});
+
+test("`#420 bookmark-clear`: Undo puts the bookmark back, conditionally, for a few seconds, and only in its channel", async () => {
+  const page = await servedBookmarkPage(backlog(6));
+  await bookmarkRow(page, bid(3));
+  const undo = page.el("undo-bookmark");
+  assert.equal(undo.hidden, true, "Undo is offered with nothing removed");
+  await tapBookmarkClear(page);
+  assert.equal(undo.hidden, false, "no Undo after the X");
+  const revision = page.bookmark.revision;
+  await undo.click();
+  await page.settle();
+  assert.deepStrictEqual(bookmarkAt(page), { id: bid(3), place: "above" }, "Undo did not put the line back where it was");
+  assert.equal(page.bookmark.anchor && page.bookmark.anchor.message_id, bid(3), "the server did not get it back");
+  const back = page.bookmarkCalls[page.bookmarkCalls.length - 1];
+  assert.deepStrictEqual([back.method, back.body.message_id, back.ifRevision], ["PUT", bid(3), revision],
+    "Undo was not written conditionally on the removal's revision");
+  assert.equal(undo.hidden, true, "Undo stayed up after it was used");
+  assert.ok(bookmarkClearOf(page), "the line came back without its X");
+
+  // The chip goes by itself after BOOKMARK_UNDO_MS.
+  await tapBookmarkClear(page);
+  assert.equal(undo.hidden, false);
+  assert.equal(page.expireTimers(sourceConstant("BOOKMARK_UNDO_MS")), 1, "no timer was armed to take Undo away");
+  await page.settle();
+  assert.equal(undo.hidden, true, "Undo stayed up past its few seconds");
+  assert.equal(bookmarkAt(page), null);
+
+  // Another device set one meanwhile: Undo keeps that one.
+  await bookmarkRow(page, bid(1));
+  await tapBookmarkClear(page);
+  page.moveBookmarkElsewhere({ message_id: bid(4), place: "above", timestamp: page.messages[4].timestamp });
+  const calls = page.bookmarkCalls.length;
+  await undo.click();
+  await page.settle();
+  assert.equal(page.bookmark.anchor && page.bookmark.anchor.message_id, bid(4), "Undo moved a bookmark set on another device");
+  assert.equal(page.bookmarkCalls.length, calls + 1);
+  assert.equal(page.bookmarkCalls[calls].ifRevision !== undefined, true, "Undo was written unconditionally");
+});
+
+test("`#420 bookmark-clear`: a removal the server refuses comes back, with no Undo; Shift+B's removal offers Undo too, and Help says the X", async () => {
+  const page = await servedBookmarkPage(backlog(6));
+  await bookmarkRow(page, bid(2));
+  page.bookmarkFailure = { status: 503, error: "store_unavailable", detail: "the store is restarting" };
+  await tapBookmarkClear(page);
+  assert.deepStrictEqual(bookmarkAt(page), { id: bid(2), place: "above" }, "a refused removal left the line gone");
+  assert.equal(page.el("undo-bookmark").hidden, true, "Undo is offered for a removal that did not happen");
+  page.bookmarkFailure = null;
+
+  const keys = await keyboardPageAtTop(tallChannel(8));
+  await bookmarkRow(keys, "3");
+  await press(keys, keys.el("scroll-area"), "ArrowDown");
+  await pressHere(keys, "j");
+  await pressHere(keys, "j");
+  assert.equal(selectedId(keys), "3");
+  await pressHere(keys, "B", { shiftKey: true });
+  await keys.settle();
+  assert.equal(bookmarkAt(keys), null, "Shift+B on the message under the line did not take it away");
+  assert.equal(keys.el("undo-bookmark").hidden, false, "Shift+B's removal offers no Undo");
+  assert.match(keys.el("keyboard-keys").text(), /the X on its line/, "Help does not say the line's X does the same");
+});
+
+test("`#420 bookmark-clear`: the X on the right column's line takes the bookmark away in both columns", async () => {
+  const { page } = await twoColumnServer();
+  await threadBadge(rowWithId(page, "201")).click();
+  await page.settle();
+  await bookmarkRow(page, "202", "side-log");
+  assert.deepStrictEqual(bookmarkAt(page, "side-log"), { id: "202", place: "above" });
+  assert.ok(bookmarkAt(page), "the premise: the left column draws the line too");
+  assert.equal(await tapBookmarkClear(page, "side-log"), true, "the X's tap went on to the row");
+  assert.equal(bookmarkAt(page, "side-log"), null, "the right column kept its line");
+  assert.equal(bookmarkAt(page), null, "the left column kept its line");
+  assert.equal(page.bookmark.anchor, null);
+  assert.equal(page.el("undo-bookmark").hidden, false, "no Undo after the right column's X");
+});
+
+test("`#420 bookmark-clear`: the X is a touch target in the line's room, the one part of the line that takes a tap", () => {
+  const x = cssBlock("#discord-log .bookmark-clear");
+  assert.match(x, /width:\s*max\(24px, 1\.75rem\)/, "the X is narrower than a 24px touch target");
+  assert.match(x, /height:\s*max\(24px, 1\.75rem\)/, "the X is shorter than a 24px touch target");
+  assert.match(x, /pointer-events:\s*auto/, "the line's pointer-events: none reaches the X");
+  assert.match(x, /order:\s*1/, "the X is not at the line's end, after its right-hand rule");
+  assert.match(cssBlock("#discord-log .bookmark-line"), /pointer-events:\s*none/, "the line itself takes taps");
+  for (const list of ["side-log", "side-cards"]) {
+    assert.match(cssBlock(`#${list} .bookmark-clear`), /pointer-events:\s*auto/, `the X in #${list} is not drawn`);
+  }
 });
 
 test("`#240 reading-bookmark`: reply, and b goes back to where you were reading", async () => {
