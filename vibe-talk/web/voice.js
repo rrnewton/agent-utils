@@ -5224,7 +5224,7 @@ function markSearchHits(row, terms) {
 // threads …".
 //
 // ONE RULE WHEN A READ MODE AND THE SEARCH ARE BOTH ON: the search's. While a filter chooses rows
-// the read runs stand suspended as they always have (`readRunsSuspended`, `hidingRead`) — Collapse
+// the read runs stand suspended as they always have (`readRunsSuspended`, `hidingRead`) — Fold
 // read opens every run and Hide read steps aside on a service with threads — so a run that is both
 // read and unmatched is ONE line, the unmatched one, because the search is why it is not shown.
 // Opening it shows those messages, the read ones greyed as in Show read; closing the search puts
