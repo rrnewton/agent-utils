@@ -1993,6 +1993,20 @@ let dismissedSends = [];
  */
 let dismissedPopout = null;
 /**
+ * `#443 undo-key-general`. The order undoable acts were done in, for the one undo key to take the
+ * newest back first. Every offer an Undo chip makes is stamped from this as it is made — a Done
+ * (`lastDismissal`), a send dismissed from the outbox (`sendUndo`), a bookmark taken away
+ * (`bookmarkUndo`) — and a stamp is never reused, so two offers up at once always have an order.
+ */
+let undoSeq = 0;
+
+/** The next undo stamp: later acts stamp higher. */
+function nextUndoAt() {
+  undoSeq += 1;
+  return undoSeq;
+}
+
+/**
  * The dismissal the Undo chip takes back while it is up: the entry's id, its wait for an automatic
  * send if it had one, and the chip's timer.
  */
@@ -10819,11 +10833,44 @@ function filterFromKeyboard(which) {
   return true;
 }
 
-/** z: undo the last Done, as the Undo chip does. */
+/**
+ * `#443 undo-key-general`. Every undo still on offer, newest first, each with the act its chip
+ * performs — the chip's own click, word for word, so the key and the chip can never disagree about
+ * what Undo does. An offer counts while its chip is up: a Done while `lastDismissal` stands, a
+ * dismissed send while its copy is held, a removed bookmark in the channel it was removed in (its
+ * chip is drawn nowhere else, and undoing another channel's removal from here would move a line
+ * the reader is not looking at). Stamped as each was made (`nextUndoAt`); an offer a build from
+ * before the stamps left standing has none, and counts oldest.
+ *
+ * @returns {Array<() => void>}
+ */
+function liveUndos() {
+  /** @type {Array<{at: number, run: () => void}>} */
+  const held = [];
+  if (lastDismissal !== null) {
+    held.push({ at: lastDismissal.at || 0, run: () => guardQuietly(undoDismissal)() });
+  }
+  if (sendUndo && dismissedSends.some((item) => item.entry.id === sendUndo.id)) {
+    held.push({ at: sendUndo.at || 0, run: () => { if (sendUndo) putBackDismissedSend(sendUndo.id); } });
+  }
+  if (bookmarkUndo && bookmarkUndo.channel === currentChannelId()) {
+    held.push({ at: bookmarkUndo.at || 0, run: undoBookmarkRemoval });
+  }
+  return held.sort((a, b) => b.at - a.at).map(({ run }) => run);
+}
+
+/**
+ * z, and Ctrl+Z (Cmd+Z on a Mac) outside a text field: undo the newest thing that can still be
+ * taken back, whatever kind it is — a Done, a send dismissed from the outbox, a bookmark taken
+ * away. The owner: "if we have an undo keystroke it should be a general undo action that applies
+ * to anything that we can undo and anything that pops up an undo chip." Pressed again it takes the
+ * next one back, while its chip is still up.
+ */
 function undoFromKeyboard() {
   if (!channelOnScreen()) return false;
-  if (lastDismissal === null) setStatus("Nothing to undo.");
-  else guardQuietly(undoDismissal)();
+  const [newest] = liveUndos();
+  if (!newest) setStatus("Nothing to undo.");
+  else newest();
   return true;
 }
 
@@ -11453,9 +11500,21 @@ const KEYMAP = [
   },
   {
     group: KEYS_MESSAGE, chords: [{ key: "z" }],
-    does: "Undo the last Done",
-    controls: ["undo-dismiss"],
+    does: "Undo the newest thing that can still be taken back — a Done, a send dismissed from the outbox, " +
+      "or a bookmark taken away — whichever was done last, as its Undo chip does. Pressed again it takes " +
+      "the next one back, while its chip is still up",
+    controls: ["undo-dismiss", "undo-send-dismiss", "undo-bookmark"],
     run: () => undoFromKeyboard(),
+  },
+  // `#443 undo-key-general`. The same undo on the chord every other program uses for it. Chrome has
+  // no page-level Ctrl+Z of its own, so nothing is given up for it — except in a text field, where
+  // the chord is the browser's undo of what was typed and this binding steps aside for it.
+  {
+    group: KEYS_MESSAGE, chords: [{ key: "z", mod: true }],
+    does: () => `Undo, as z. In a message box or the search, ${modKeyName()}+Z stays the browser's ` +
+      "undo of what was typed",
+    controls: ["undo-dismiss", "undo-send-dismiss", "undo-bookmark"],
+    run: (event, target) => (isTextField(target) ? false : undoFromKeyboard()),
   },
   {
     group: KEYS_MESSAGE, chords: [{ key: "r" }],
@@ -27440,7 +27499,7 @@ function dismissOutgoingMessage(id) {
     identity: waiting.identity, retriesUsed: entry.retriesUsed || 0 } : null;
   dropOutgoing(id);
   if (sendUndo) clearTimeout(sendUndo.timer);
-  sendUndo = { id, hold, timer: setTimeout(endSendUndo, SEND_UNDO_MS) };
+  sendUndo = { id, hold, at: nextUndoAt(), timer: setTimeout(endSendUndo, SEND_UNDO_MS) };
   renderSendUndo();
   renderDismissedSends();
   setStatus(kept
@@ -29543,7 +29602,7 @@ const BOOKMARK_UNDO_MS = 10000;
  * The removal the Undo chip takes back while it is up: the channel, where the line was, the removal's
  * own staged change (`stageBookmark`), and the chip's timer.
  *
- * @type {{channel: string, anchor: VibeTalk.BookmarkAnchor, token: object, timer: any} | null}
+ * @type {{channel: string, anchor: VibeTalk.BookmarkAnchor, token: object, at: number, timer: any} | null}
  */
 let bookmarkUndo = null;
 
@@ -29557,7 +29616,7 @@ function removeBookmark(channel) {
   if (!channel || !before) return;
   const move = stageBookmark(channel, null);
   if (bookmarkUndo) clearTimeout(bookmarkUndo.timer);
-  bookmarkUndo = { channel, anchor: before, token: move.token, timer: setTimeout(endBookmarkUndo, BOOKMARK_UNDO_MS) };
+  bookmarkUndo = { channel, anchor: before, token: move.token, at: nextUndoAt(), timer: setTimeout(endBookmarkUndo, BOOKMARK_UNDO_MS) };
   redrawBookmark();
   renderBookmarkUndo();
   setStatus("Bookmark removed. Undo puts it back.");
@@ -38199,7 +38258,8 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
   // changed only while it still offers this Done — not once the reader has pressed Undo, or made another
   // Done, while it was being saved, when it came back offering to put back a message already back.
   const act = Symbol("done");
-  lastDismissal = { channel, messages: requested, bump, name, act };
+  const at = nextUndoAt();
+  lastDismissal = { channel, messages: requested, bump, name, act, at };
   const offered = () => lastDismissal !== null && lastDismissal.act === act;
   // Before anything here changes, so that what the server holds is known if it refuses (`#326`).
   noteInboxWrite(requested);
@@ -38280,7 +38340,7 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
     // A move staged before a slip that came ahead of the write: taken back as a refused Done's is.
     const unsent = sent ? null : move;
     if (unsent) guardQuietly(() => sendBookmark(unsent, { conditional: true, after: Promise.resolve(false) }))();
-    if (offered()) lastDismissal = landed.length > 0 ? { channel, messages: landed.slice(), bump: null } : previousDismissal;
+    if (offered()) lastDismissal = landed.length > 0 ? { channel, messages: landed.slice(), bump: null, at } : previousDismissal;
     // Taken back in the column it was made in, and in the other. `#229 desktop-two-column`.
     inColumn(column, () => {
       for (const id of added) if (back.has(id)) archivedIds.delete(id);
@@ -38310,7 +38370,7 @@ async function dismissMessages(body, bump = body.messages ? singleDoneBump(body.
   // What the server stored, less what was put back from its row meanwhile.
   if (offered()) {
     const still = new Set(lastDismissal.messages);
-    lastDismissal = { channel, messages: stored.filter((id) => still.has(id) || !requested.includes(id)), bump, name, act };
+    lastDismissal = { channel, messages: stored.filter((id) => still.has(id) || !requested.includes(id)), bump, name, act, at };
   }
   const count = stored.length;
   setStatus(

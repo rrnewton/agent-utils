@@ -7429,7 +7429,7 @@ from, so it cannot name a key the page does not answer.
 | Home, End | The top of the list or its newest message, and select it |
 | `e`, or Ctrl+E (Cmd+E) | Done or not Done; marked Done, the ring moves on to the next unread below. The chord does it from a message box or the search too, where `e` is typed: on the message the keys act on, the box keeping the focus and the draft (on a Mac, Ctrl+E in a box is the box's own end of line, so there it is Cmd+E) |
 | Shift+E | Read and collapse: the selected message marked Done, as `e` marks it, and read in the chat service too where it can be, as a sent reply marks what it answers; then folded, the ring staying on it — under Fold read, on the "… read messages …" line of a run it joins; under Hide read, on the next message, as it goes. Never puts a message back |
-| `z` | Undo the last Done |
+| `z`, or Ctrl+Z (Cmd+Z) | Undo the newest thing that can still be taken back — a Done, a send dismissed from the outbox, or a bookmark taken away — whichever was done last, as its Undo chip does; pressed again, the next one, while its chip is still up. In a message box or the search, Ctrl+Z stays the browser's undo of what was typed |
 | Shift+B | Put the bookmark just above the selected message; on the message right under it, take it away |
 | `r`, `p`, `s`, `.`, `i` | Reply, pin, read aloud, the ⋯ menu, the message details |
 | Ctrl+C (Cmd+C) or `y` | Copy the highlighted message, all of its text as written; on a thread card, its first message. With text selected, or in a text box, Ctrl+C is the browser's copy as ever (see below) |

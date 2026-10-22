@@ -56388,6 +56388,114 @@ test("`#420 bookmark-clear`: the X is a touch target in the line's room, the one
   }
 });
 
+// --- `#443 undo-key-general` ---------------------------------------------------------------------
+//
+// The owner: an undo keystroke should be a general undo, for anything that can be undone and
+// anything that pops up an undo chip. Three chips exist — Done's, a dismissed send's, a removed
+// bookmark's — and z (and Ctrl+Z / Cmd+Z outside a text field) takes back whichever was done last,
+// then the next, exactly as that chip's click does.
+
+test("`#443 undo-key-general`: z undoes the newest undoable act first, then the next, chip and key agreeing", async () => {
+  const page = await servedBookmarkPage(backlog(6));
+  await bookmarkRow(page, bid(3));
+  // Done first, the bookmark's removal second: z takes the removal back, then the Done.
+  const row = rowHoldingId(page, bid(2));
+  await doneButton(row).click();
+  await page.settle();
+  assert.deepStrictEqual(page.dismissCalls.map((call) => call.messages), [[bid(2)]], "the premise: nothing was marked Done");
+  assert.equal(page.el("undo-dismiss").hidden, false, "Done offered no Undo");
+  await tapBookmarkClear(page);
+  assert.equal(page.el("undo-bookmark").hidden, false, "the removal offered no Undo");
+  await press(page, page.el("scroll-area"), "z");
+  await page.settle();
+  assert.deepStrictEqual(bookmarkAt(page), { id: bid(3), place: "above" }, "z did not take the newest act (the removal) back first");
+  assert.equal(page.el("undo-bookmark").hidden, true, "the bookmark chip stayed up after z used it");
+  assert.equal(page.el("undo-dismiss").hidden, false, "the Done chip went with the bookmark's undo");
+  assert.deepStrictEqual(page.restoreCalls, [], "z undid the Done under the removal");
+  await press(page, page.el("scroll-area"), "z");
+  await page.settle();
+  assert.deepStrictEqual(page.restoreCalls.map((call) => call.messages), [[bid(2)]], "a second z did not undo the Done");
+  assert.equal(page.el("undo-dismiss").hidden, true, "the Done chip stayed up after z used it");
+  await press(page, page.el("scroll-area"), "z");
+  await page.settle();
+  assert.equal(statusText(page), "Nothing to undo.", "a third z, with every chip down, did not say so");
+
+  // The other way round: removal first, Done second, and z takes the Done back first.
+  await tapBookmarkClear(page);
+  await doneButton(rowHoldingId(page, bid(4))).click();
+  await page.settle();
+  await press(page, page.el("scroll-area"), "z");
+  await page.settle();
+  assert.deepStrictEqual(page.restoreCalls.at(-1)?.messages, [bid(4)], "z did not take the newest act (the Done) back first");
+  assert.equal(bookmarkAt(page), null, "the bookmark came back under its own undo");
+  await press(page, page.el("scroll-area"), "z");
+  await page.settle();
+  assert.deepStrictEqual(bookmarkAt(page), { id: bid(3), place: "above" }, "a second z did not put the bookmark back");
+});
+
+test("`#443 undo-key-general`: a dismissed send is in the same newest-first order as a Done", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "44301", content: "read this first" })]);
+  const failed = await failedSend(page, "not yet, on second thoughts");
+  await outgoingDismiss(failed).click();
+  await page.settle();
+  assert.equal(page.el("undo-send-dismiss").hidden, false, "the premise: the dismiss offered no Undo");
+  await doneButton(channelRow(page, "44301")).click();
+  await page.settle();
+  // The Done is the newest: z restores it and leaves the send dismissed; a second z puts the send back.
+  await press(page, page.el("scroll-area"), "z");
+  await page.settle();
+  assert.equal(channelRow(page, "44301").getAttribute("data-archived"), "false", "z did not undo the newest act (the Done)");
+  assert.equal(outgoingRows(page).length, 0, "the send came back under the Done's undo");
+  await press(page, page.el("scroll-area"), "z");
+  await page.settle();
+  assert.equal(outgoingRows(page).length, 1, "a second z did not put the dismissed send back");
+  assert.equal(page.el("undo-send-dismiss").hidden, true, "the send chip stayed up after z used it");
+});
+
+test("`#443 undo-key-general`: Ctrl+Z and Cmd+Z undo as z, never in a text field, and Help lists both", async () => {
+  const page = await servedBookmarkPage(backlog(6));
+  await bookmarkRow(page, bid(3));
+  await tapBookmarkClear(page);
+  assert.equal(page.el("undo-bookmark").hidden, false, "the premise: no removal to undo");
+  let event = await press(page, page.el("scroll-area"), "z", { ctrlKey: true });
+  await page.settle();
+  assert.equal(event.defaulted, false, "Ctrl+Z on the list was left to the browser");
+  assert.deepStrictEqual(bookmarkAt(page), { id: bid(3), place: "above" }, "Ctrl+Z did not undo the removal");
+  await tapBookmarkClear(page);
+  event = await press(page, page.el("scroll-area"), "z", { metaKey: true });
+  await page.settle();
+  assert.equal(event.defaulted, false, "Cmd+Z on the list was left to the browser");
+  assert.deepStrictEqual(bookmarkAt(page), { id: bid(3), place: "above" }, "Cmd+Z did not undo the removal");
+  // In the message box and the search the chord is the browser's undo of typing: not taken.
+  await tapBookmarkClear(page);
+  assert.equal(page.el("undo-bookmark").hidden, false, "the premise: no removal to undo from a field");
+  await page.el("channel-compose-text").setValue("typed words");
+  event = await press(page, page.el("channel-compose-text"), "z", { ctrlKey: true });
+  await page.settle();
+  assert.equal(event.defaulted, true, "Ctrl+Z in the message box was taken from the box");
+  assert.equal(bookmarkAt(page), null, "Ctrl+Z in the message box put the bookmark back");
+  assert.equal(page.el("channel-compose-text").value, "typed words", "the chord touched the draft");
+  await press(page, page.el("scroll-area"), "/");
+  event = await press(page, page.el("search-field"), "z", { metaKey: true });
+  await page.settle();
+  assert.equal(event.defaulted, true, "Cmd+Z in the search was taken from the search");
+  assert.equal(bookmarkAt(page), null, "Cmd+Z in the search put the bookmark back");
+
+  const listed = page.el("keyboard-keys").descendants()
+    .filter((node) => node.tagName === "kbd").map((node) => node.textContent);
+  assert.ok(listed.includes("z"), `z is not in the list of keys: ${listed.join(", ")}`);
+  assert.ok(listed.includes("Ctrl+Z"), "Ctrl+Z is not in the list of keys, next to z");
+  const said = page.el("keyboard-keys").text();
+  assert.match(said, /Undo the newest thing that can still be taken back/, "the list does not say undo is general");
+  assert.match(said, /stays the browser's/, "the list does not say the chord leaves a text field's undo alone");
+  for (const chip of ["undo-dismiss", "undo-send-dismiss", "undo-bookmark"]) {
+    assert.equal(page.el(chip).getAttribute("aria-keyshortcuts"), "Z Control+Z Meta+Z",
+      `#${chip} does not say both undo keys to a screen reader`);
+  }
+});
+
 test("`#240 reading-bookmark`: reply, and b goes back to where you were reading", async () => {
   const page = await keyboardPageAtTop(tallChannel(30));
   await bookmarkRow(page, "4");
