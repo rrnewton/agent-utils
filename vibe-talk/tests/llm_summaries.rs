@@ -276,6 +276,7 @@ fn message(id: &str, content: &str) -> Message {
 impl Threads {
     fn summary(&self, n: usize) -> ThreadSummary {
         ThreadSummary {
+            hue: None,
             id: THREADS[n].to_owned(),
             root: Some(message(
                 &format!("root-{n}"),

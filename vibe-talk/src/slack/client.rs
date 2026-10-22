@@ -795,6 +795,7 @@ impl Raw {
         let is_root = thread_ts == self.ts;
         let reply_count = is_root.then(|| self.reply_count());
         let thread = Some(MessageThread {
+            hue: None,
             root_message_id: ids::message_id_from_ts(&thread_ts),
             id: thread_ts,
             is_root,

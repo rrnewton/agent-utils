@@ -527,6 +527,27 @@ pub async fn ingest_event(
             jiff::Timestamp::now().as_millisecond(),
         );
     }
+    // `#427 server-thread-hues`. Nor is the thread's colour an adapter's to supply: ingestion is
+    // one of the ways this server first learns of a thread, so a live arrival colours the thread
+    // here — at write scope, the server's own act under the adapter credential, which already
+    // offers what it publishes to the durable message cache — and the colour then rides the hub's
+    // tail to every subscriber. A HISTORICAL delivery only carries a colour already assigned,
+    // for the poller's seeding reason (`live::poll_once`): catch-up history is what a browser's
+    // one seeding offer must still be able to win for. A delete's tombstone has no thread and
+    // colours nothing.
+    if kind != crate::live::LiveKind::Delete {
+        ops::attach_message_hues(
+            &state,
+            if historical {
+                crate::auth::Scope::Read
+            } else {
+                crate::auth::Scope::Write
+            },
+            &channel_id,
+            std::slice::from_mut(&mut message),
+        )
+        .await;
+    }
     // `#191 read-aloud-first-lag`: a recently fetched copy no longer says what the message says.
     if kind != crate::live::LiveKind::Create {
         state.read_ahead.forget(&channel_id, &message.id);
@@ -1564,7 +1585,9 @@ pub async fn messages(
     Path(channel_id): Path<String>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Json<MessagesResponse>, ApiError> {
-    let window = ops::messages(&state, caller, &channel_id, query.limit).await?;
+    let mut window = ops::messages(&state, caller, &channel_id, query.limit).await?;
+    // `#427 server-thread-hues`: each message carries its thread's colour.
+    ops::attach_message_hues(&state, caller, &window.channel.id, &mut window.messages).await;
     let dismissed = ops::dismissed_within(&state, &window.channel.id, &window.messages).await?;
     Ok(Json(MessagesResponse {
         complete: window.is_whole_channel(),
@@ -1669,6 +1692,9 @@ pub async fn page(
             &mut step.messages,
         );
     }
+    // `#427 server-thread-hues`: each message carries its thread's colour, rendered or not — it
+    // is a number, not a second copy of the body, and the read that meets a thread colours it.
+    ops::attach_message_hues(&state, caller, &step.channel.id, &mut step.messages).await;
     let dismissed = ops::dismissed_within(&state, &step.channel.id, &step.messages).await?;
     let pins_revision = ops::pins_revision(&state, &step.channel.id).await;
     let bookmark = ops::bookmark_state(&state, &step.channel.id).await;
@@ -1753,6 +1779,10 @@ pub async fn timeline(
         limit,
     };
     let (channel, mut page) = ops::timeline(&state, caller, &channel_id, &request).await?;
+    // `#427 server-thread-hues`. Here beside the rendering, for its reason: this route's only
+    // reader is the page. A write-scope read colours threads it is the first to meet; a
+    // read-scope one only carries colours already assigned, and the page falls back for the rest.
+    ops::attach_page_hues(&state, caller, &channel.id, &mut page).await;
     // `#217 markdown-blocks`. Here and not in `ops::timeline`: this route's only reader is the
     // page, and the operation under it is shared with paths toward a model.
     crate::render::fill_page(&state.config, &state.headings, &channel, &mut page);
@@ -1880,7 +1910,7 @@ pub async fn message_by_id(
     Path((channel_id, message_id)): Path<(String, String)>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Json<MessageResponse>, ApiError> {
-    let (channel, message) = ops::message_by_id_scoped(
+    let (channel, mut message) = ops::message_by_id_scoped(
         &state,
         caller,
         &channel_id,
@@ -1889,6 +1919,14 @@ pub async fn message_by_id(
         query.thread_id.as_deref(),
     )
     .await?;
+    // `#427 server-thread-hues`: the message carries its thread's colour.
+    ops::attach_message_hues(
+        &state,
+        caller,
+        &channel.id,
+        std::slice::from_mut(&mut message),
+    )
+    .await;
     Ok(Json(MessageResponse {
         channel,
         message,
@@ -2607,7 +2645,7 @@ pub async fn ask(
 /// that rather than leaving it to be misread as an instant request.
 pub async fn stream(
     State(state): State<AppState>,
-    _scope: ReadScope,
+    ReadScope(caller): ReadScope,
     headers: HeaderMap,
     Path(channel_id): Path<String>,
 ) -> Result<Response, ApiError> {
@@ -2618,11 +2656,13 @@ pub async fn stream(
         .filter(|value| !value.is_empty())
         .map(|value| crate::model::MessageId(value.to_owned()));
     let (channel, subscription) = ops::watch(&state, &channel_id, after.as_ref())?;
-    let body =
-        axum::response::sse::Sse::new(crate::live::events(subscription, state.clone(), channel))
-            .keep_alive(
-                axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)),
-            );
+    let body = axum::response::sse::Sse::new(crate::live::events(
+        subscription,
+        state.clone(),
+        channel,
+        caller,
+    ))
+    .keep_alive(axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)));
     Ok((
         [
             (header::CACHE_CONTROL, "no-store"),
@@ -2650,7 +2690,7 @@ pub async fn stream(
 /// cursor it cannot resume from answered with `event: reset`.
 pub async fn stream_all(
     State(state): State<AppState>,
-    _scope: ReadScope,
+    ReadScope(caller): ReadScope,
     headers: HeaderMap,
 ) -> Response {
     let after = headers
@@ -2659,10 +2699,11 @@ pub async fn stream_all(
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let subscription = state.live.subscribe_all(after);
-    let body = axum::response::sse::Sse::new(crate::live::all_events(subscription, state.clone()))
-        .keep_alive(
-            axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)),
-        );
+    let body =
+        axum::response::sse::Sse::new(crate::live::all_events(subscription, state.clone(), caller))
+            .keep_alive(
+                axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)),
+            );
     (
         [
             (header::CACHE_CONTROL, "no-store"),
@@ -3375,6 +3416,7 @@ pub const PURGED: &[&str] = &[
     "noise_exemptions",
     "pins",
     "bookmarks",
+    "thread_hues",
     "voice_settings",
     "voice_prompt",
     "voice_post_prefix",
@@ -3950,6 +3992,8 @@ pub async fn todo(
     Query(query): Query<LimitQuery>,
 ) -> Result<Response, ApiError> {
     let mut todo = ops::todo(&state, caller, &channel_id, query.limit).await?;
+    // `#427 server-thread-hues`: each message carries its thread's colour.
+    ops::attach_message_hues(&state, caller, &todo.channel.id, &mut todo.messages).await;
     crate::render::fill(
         &state.config,
         &state.headings,
@@ -4126,6 +4170,7 @@ fn fill_pin_links<'p>(
             .thread_id
             .as_deref()
             .map(|id| crate::threads::MessageThread {
+                hue: None,
                 id: id.to_owned(),
                 root_message_id: None,
                 is_root: pin.snapshot.thread_root,
@@ -4331,6 +4376,116 @@ pub async fn clear_bookmark(
 ) -> Result<Response, ApiError> {
     let (channel, change) = ops::set_bookmark(&state, &channel_id, None, query.if_revision).await?;
     Ok(bookmark_answered(channel, change))
+}
+
+/// One colour a browser remembers, offered to seed this server's. `#427 server-thread-hues`.
+#[derive(Debug, Deserialize)]
+pub struct ThreadHueSeed {
+    /// The thread, in its channel-scoped opaque id.
+    pub thread_id: String,
+    /// The colour the browser draws it in, in degrees of hue: a whole number, or a fractional
+    /// one from the page's own arithmetic before `#427`, which is rounded to the nearest degree.
+    pub hue: f64,
+    /// When its root message was posted, ISO-8601, when the browser has the root to hand.
+    #[serde(default)]
+    pub root_at: Option<String>,
+    /// When the browser last drew the thread, in Unix milliseconds: the order the seeds take, so
+    /// "most recently assigned" here reads as "most recently drawn" did there.
+    #[serde(default)]
+    pub last_drawn_ms: Option<i64>,
+}
+
+/// A browser's remembered colours for one channel, offered once. `#427 server-thread-hues`.
+#[derive(Debug, Deserialize)]
+pub struct ThreadHueSeedRequest {
+    /// The colours on offer, at most [`MAX_THREAD_HUE_SEEDS`].
+    pub hues: Vec<ThreadHueSeed>,
+}
+
+/// How many colours one seeding may offer: one channel's whole kept memory, which is what the
+/// store keeps of a channel. A body past it is refused whole rather than trimmed, because which
+/// third of a channel's colours to keep is not this route's to guess.
+pub const MAX_THREAD_HUE_SEEDS: usize = crate::store::MAX_THREAD_HUES_PER_CHANNEL;
+
+/// The largest seeding body: [`MAX_THREAD_HUE_SEEDS`] offers, each a thread id at its own
+/// ceiling, a hue and two instants, in JSON — with room to spare, and still one small request.
+pub const THREAD_HUE_SEED_BODY_BYTES: usize = 512_000;
+
+/// The answer to a seeding: what was taken, and the colours as they now stand.
+#[derive(Debug, Serialize)]
+pub struct ThreadHueSeedResponse {
+    /// The channel seeded.
+    pub channel: ChannelInfo,
+    /// How many of the offered colours were taken: the rest named threads already coloured.
+    pub seeded: u64,
+    /// Every hue the channel now has, by thread id — the page adopts these, its own included
+    /// where they were taken and this server's where it had decided first.
+    pub hues: std::collections::BTreeMap<String, u16>,
+}
+
+/// `POST /api/v1/channels/{channel_id}/thread-hues` — offer the colours this browser remembers.
+///
+/// WRITE scope, and NO MCP TOOL, for the `#39` reason that runs through this file: it writes
+/// durable state every device reads back. The migration from `#396 thread-color-memory`, where
+/// each browser kept its own colours: the first write-scope page to offer them files them for
+/// every thread the server has not coloured yet, so what the owner sees today is what every
+/// device sees from then on. First writer wins — a second device's different memory recolours
+/// nothing — and the answer hands back the colours as they stand, so the offering page adopts
+/// the server's where it had decided first.
+pub async fn seed_thread_hues(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path(channel_id): Path<String>,
+    Json(request): Json<ThreadHueSeedRequest>,
+) -> Result<Json<ThreadHueSeedResponse>, ApiError> {
+    if request.hues.len() > MAX_THREAD_HUE_SEEDS {
+        return Err(ApiError::bad_request(format!(
+            "at most {MAX_THREAD_HUE_SEEDS} thread colours may be offered at once"
+        )));
+    }
+    let mut seeds: Vec<(crate::thread_hues::HueRef, u16, i64)> = Vec::new();
+    for offered in request.hues {
+        crate::store::validate_thread_hue_id(&offered.thread_id)
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        if !offered.hue.is_finite() || !(0.0..360.0).contains(&offered.hue) {
+            return Err(ApiError::bad_request(
+                "a hue must be at least 0 and under 360 degrees",
+            ));
+        }
+        // The page's hues could be fractional; the server's are whole degrees (see
+        // `crate::thread_hues`). Round rather than truncate, and keep 359.5 and up inside the
+        // wheel by wrapping to 0, the colour it names.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let hue = (offered.hue.round() as i64).rem_euclid(360) as u16;
+        let root_at_ms = offered
+            .root_at
+            .as_deref()
+            .and_then(crate::clock::instant_ms);
+        seeds.push((
+            crate::thread_hues::HueRef {
+                thread_id: offered.thread_id,
+                root_at_ms,
+            },
+            hue,
+            offered.last_drawn_ms.unwrap_or(i64::MIN),
+        ));
+    }
+    // Oldest drawn first, as the browser handed its colours out: assignment order here is what
+    // later threads' "most recently assigned" reads.
+    seeds.sort_by(|a, b| (a.2, &a.0.thread_id).cmp(&(b.2, &b.0.thread_id)));
+    let seeds: Vec<(crate::thread_hues::HueRef, u16)> = seeds
+        .into_iter()
+        .map(|(wanted, hue, _drawn)| (wanted, hue))
+        .collect();
+    let (channel, seeded, rows) = ops::seed_thread_hues(&state, &channel_id, &seeds).await?;
+    Ok(Json(ThreadHueSeedResponse {
+        channel,
+        seeded,
+        hues: rows
+            .into_iter()
+            .map(|row| (row.thread_id, row.hue))
+            .collect(),
+    }))
 }
 
 /// One message, summarised.

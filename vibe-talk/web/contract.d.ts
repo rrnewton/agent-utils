@@ -846,6 +846,19 @@ declare namespace VibeTalk {
    */
   interface MessageThread {
     /**
+     * The thread's colour, in whole degrees of hue (`0..360`), as THIS server assigned it.
+     * `#427 server-thread-hues`; see [`crate::thread_hues`].
+     *
+     * FORMED BY THIS SERVER when a message is served to the page (and on the live stream's way
+     * out), from the durable assignment — never trusted from a provider, a bridge or an
+     * adapter, whose copies are overwritten, and absent where no assignment exists for the
+     * thread yet: an older bridge's answer, a read-scope caller meeting a thread the server has
+     * not coloured, a deployment with no store. Absent is the page's cue to fall back to its own
+     * algorithm for that thread, as every page did before `#427`; present, it is the colour on
+     * every device, and the page never recolours it.
+     */
+    hue?: number | null;
+    /**
      * Opaque thread identifier, scoped to the configured channel.
      */
     id: string;
@@ -1521,6 +1534,13 @@ declare namespace VibeTalk {
      * the thread drifts, so the reader always finds it under the same name. Absent until named.
      */
     display_name?: string | null;
+    /**
+     * The thread's colour, in whole degrees of hue (`0..360`). `#427 server-thread-hues`; the
+     * same value its messages carry in [`MessageThread::hue`], repeated here so a thread card
+     * is coloured even when its root could not be read with it. Absent under the same
+     * conditions.
+     */
+    hue?: number | null;
     /**
      * Opaque identifier used for reading or posting to this thread.
      */

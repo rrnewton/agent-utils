@@ -1163,6 +1163,7 @@ impl HttpSlackClient {
             .into_iter()
             .next();
         ThreadSummary {
+            hue: None,
             id: root.ts.clone(),
             title: title(root, message.as_ref()),
             root: message,

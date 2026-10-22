@@ -19631,6 +19631,10 @@ function coverView(arriving, older, hasMore, notice, view = channelView, thread 
  */
 function foldTimelinePage(payload, older, view = channelView, thread = selectedThreadId, held = null) {
   const channel = String(el("discord-channel").value);
+  // `#427 server-thread-hues`: the colours this read carries, taken before anything it brought
+  // is drawn, so its rows never show a fallback colour the server has already decided.
+  noteServerThreadHuesIn(payload.messages || [],
+    [...(payload.threads || []), payload.thread].filter(Boolean), channel);
   if (channelCanon.channel !== channel) {
     loadCanon(channel);
     // Copies of another store say nothing of this one's.
@@ -19850,6 +19854,9 @@ function staleAsOf(payload) {
  * `unchangedDeltas`, which is what lets a refresh with nothing new draw nothing (`rowsAsDrawn`).
  */
 function foldTimelineDelta(payload, sent, view = channelView, thread = selectedThreadId) {
+  // `#427 server-thread-hues`: a delta's new threads carry their colours, as a page's do.
+  noteServerThreadHuesIn(payload.messages || [],
+    [...(payload.threads || []), payload.thread].filter(Boolean));
   const key = viewKey(view, thread);
   const cover = channelCanon.views.get(key);
   if (!cover || !sent || cover.newest !== sent) return false;
@@ -19970,6 +19977,9 @@ function deltaSideState(thread) {
 function foldLiveMessage(message, live = false, replayed = false, read = null) {
   const channel = String(el("discord-channel").value);
   if (channelCanon.channel !== channel) loadCanon(channel);
+  // `#427 server-thread-hues`: a live message carries its thread's colour, taken before it is
+  // drawn — a thread met first through the stream is the server's colour from its first row.
+  noteServerThreadHuesIn([message], [], channel);
   const id = String(message.id);
   const held = channelCanon.messages.find((candidate) => String(candidate.id) === id);
   let kept = !threadOf(message) && threadOf(held) ? { ...message, thread: held.thread } : message;
@@ -20084,6 +20094,9 @@ function loadCanon(channel) {
     channelCanon.views.set(key, { ...cover, live: false, cursor: null });
   }
   restoreSavedBookmark(channel, entry.bookmark);
+  // `#427 server-thread-hues`: the saved rows were saved as they were served, colours on them,
+  // so a reload draws the server's colours before any read lands — not this browser's fallback.
+  noteServerThreadHuesIn(channelCanon.messages, channelCanon.threads, String(channel), true);
   entry.usedAt = Date.now();
   writeMessageCache(cache, String(channel));
 }
@@ -21364,6 +21377,14 @@ function saveThreadHues() {
 /** Put back `channel`'s remembered colours, after storing what was drawn of the last one. */
 function restoreThreadHues(channel) {
   saveThreadHues();
+  // The server's colours for another channel are not this one's (`#427 server-thread-hues`) —
+  // unless a read of THIS channel noted them already, which a step back folded before its first
+  // row was drawn can have done: those stand.
+  if (String(channel) !== serverHuesChannel) {
+    serverThreadHues.clear();
+    serverHuesProvisional.clear();
+    serverHuesChannel = String(channel) || null;
+  }
   // Already this channel's: what is on screen keeps its colours, remembered or not.
   if (String(channel) === threadColorsChannel) return;
   threadColors.clear();
@@ -21373,6 +21394,164 @@ function restoreThreadHues(channel) {
   if (!threadColorsChannel) return;
   for (const [id, [hue]] of Object.entries((readThreadHues() || {})[threadHueScope(channel)] || {})) {
     threadColors.set(id, hue);
+  }
+  // The server's word over this browser's memory, where a read brought both.
+  for (const [id, hue] of serverThreadHues) threadColors.set(id, hue);
+}
+
+// `#427 server-thread-hues`. The server now decides each thread's colour, once, as it first
+// learns of the thread, and every message's thread record and every thread summary carries it
+// (`hue`). This page uses the server's colour whenever one arrives — the same colour on every
+// device — and the algorithm below, `#396`'s memory and `#414`'s spread, is now only the
+// fallback for a thread the server has not coloured: an older server, a read-token page meeting
+// a thread nobody with the write token has read yet, a deployment with no store. An assigned
+// thread is never recoloured here: a server hue replaces a fallback one the moment it arrives,
+// and after that nothing on this page moves it.
+/** The server's colours for the channel on screen, by thread id. */
+const serverThreadHues = new Map();
+/** The channel id `serverThreadHues` holds the colours of, or null before any arrive. */
+let serverHuesChannel = null;
+/**
+ * Colours in `serverThreadHues` that came only from this device's saved rows, not yet from the
+ * server in this load. Provisional, because the saved copy is the one that can be stale: after
+ * an operator purge the server colours afresh, and its first read must be able to replace what
+ * a reload drew from its cache rather than be refused by it for the whole load.
+ */
+const serverHuesProvisional = new Set();
+
+/**
+ * Take the server's colour for one thread. The first one taken from the server stands: it never
+ * recolours, so a different second value from a read or the stream is not a newer truth but a
+ * copy from somewhere stale, and believing it would recolour a thread on screen. A provisional
+ * colour — one only this device's saved rows carried — yields to the first the server itself
+ * sends in this load, for the purge reason above. Mirrored into `threadColors` at once, so a
+ * fallback colour handed out for another thread is measured against it.
+ */
+function noteServerThreadHue(id, hue, channel = String(el("discord-channel").value), provisional = false) {
+  if (!channel || !Number.isFinite(hue) || hue < 0 || hue >= 360) return;
+  if (channel !== serverHuesChannel) {
+    serverThreadHues.clear();
+    serverHuesProvisional.clear();
+    serverHuesChannel = channel;
+  }
+  const key = String(id);
+  if (!key) return;
+  if (serverThreadHues.has(key) && (provisional || !serverHuesProvisional.has(key))) return;
+  serverThreadHues.set(key, hue);
+  if (provisional) serverHuesProvisional.add(key);
+  else serverHuesProvisional.delete(key);
+  if (channel === threadColorsChannel) threadColors.set(key, hue);
+}
+
+/** Take the server's colours off a batch of messages and thread summaries, roots included. */
+function noteServerThreadHuesIn(messages, summaries, channel = String(el("discord-channel").value), provisional = false) {
+  for (const summary of summaries || []) {
+    if (!summary) continue;
+    if (typeof summary.hue === "number") noteServerThreadHue(summary.id, summary.hue, channel, provisional);
+    if (summary.root && summary.root.thread && typeof summary.root.thread.hue === "number") {
+      noteServerThreadHue(summary.root.thread.id, summary.root.thread.hue, channel, provisional);
+    }
+  }
+  for (const message of messages || []) {
+    if (message && message.thread && typeof message.thread.hue === "number") {
+      noteServerThreadHue(message.thread.id, message.thread.hue, channel, provisional);
+    }
+  }
+}
+
+/** Where "this channel's colours were offered to the server" is remembered, by scope. */
+const THREAD_HUES_SEEDED_KEY = "vibe-talk.thread-hues-seeded";
+/** Scopes offered, or being offered, in this page: one attempt per load, failure included. */
+const threadHuesSeedTried = new Set();
+/**
+ * The offer in flight, by scope. Both columns load a channel at once, and the second load must
+ * wait for the first's offer rather than read past it — a read that reached the server first
+ * would colour those threads itself, and the offer would arrive to find them decided.
+ */
+const threadHuesSeeding = new Map();
+
+/** The scopes whose colours a server has taken, as {scope: when}. Unreadable is none taken. */
+function readSeededScopes() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(THREAD_HUES_SEEDED_KEY) || "null");
+    if (stored && typeof stored === "object" && stored.v === 1 &&
+        stored.scopes && typeof stored.scopes === "object" && !Array.isArray(stored.scopes)) {
+      return stored.scopes;
+    }
+  } catch (_error) {
+    // Storage refused: the offer is simply made again on a later load, and taken-or-not it
+    // changes nothing already decided on the server.
+  }
+  return Object.create(null);
+}
+
+function markSeededScope(scope) {
+  const scopes = readSeededScopes();
+  scopes[scope] = Date.now();
+  try {
+    localStorage.setItem(THREAD_HUES_SEEDED_KEY, JSON.stringify({ v: 1, scopes }));
+  } catch (_error) {
+    // As `saveThreadHues`: the session's own record (`threadHuesSeedTried`) still holds.
+  }
+}
+
+/**
+ * Offer this browser's remembered colours for `channel` to the server, once — the migration
+ * that lets the colours drawn today survive `#427`. Write token only: the route files durable
+ * state, and a read-token page has nothing to file with. Issued at sign-in and on a channel
+ * change, before either flow sends a read or opens the stream — deliberately NOT awaited inside
+ * a read, whose counting and column bookkeeping are sequenced to the breath a read is sent in
+ * (`apiDecoded`, `abandoned.number`) and broke under a wait inserted there. First writer wins
+ * on the server either way, so an offer that lands after a read coloured a thread simply does
+ * not move that one; the answer's colours are adopted here, so a thread the server had coloured
+ * first takes its colour on this page too.
+ *
+ * Never fails its caller: an older server (no route), a server with no store, a lost connection
+ * — each leaves the page exactly as it was, to be offered again on a later load.
+ */
+async function seedServerThreadHues(channel) {
+  const wanted = String(channel || "");
+  if (!wanted || tokenScope !== "write") return;
+  const scope = threadHueScope(wanted);
+  const inFlight = threadHuesSeeding.get(scope);
+  if (inFlight) return inFlight;
+  if (threadHuesSeedTried.has(scope) || readSeededScopes()[scope] !== undefined) return;
+  const remembered = (readThreadHues() || {})[scope];
+  if (!remembered || Object.keys(remembered).length === 0) return;
+  threadHuesSeedTried.add(scope);
+  const offering = offerThreadHues(wanted, scope, remembered);
+  threadHuesSeeding.set(scope, offering);
+  try {
+    await offering;
+  } finally {
+    threadHuesSeeding.delete(scope);
+  }
+}
+
+/** The offer itself: one POST, its colours adopted. `seedServerThreadHues` shares it. */
+async function offerThreadHues(wanted, scope, remembered) {
+  const roots = new Map();
+  for (const summary of channelCanon.channel === wanted ? channelCanon.threads : []) {
+    if (summary && summary.root) roots.set(String(summary.id), summary.root.timestamp);
+  }
+  const hues = Object.entries(remembered).map(([threadId, [hue, drawn]]) => {
+    const offered = { thread_id: threadId, hue, last_drawn_ms: drawn };
+    const rootAt = roots.get(threadId);
+    if (typeof rootAt === "string") offered.root_at = rootAt;
+    return offered;
+  });
+  let answer;
+  try {
+    answer = await api(`/api/v1/channels/${encodeURIComponent(wanted)}/thread-hues`,
+      { method: "POST", body: { hues } });
+  } catch (_error) {
+    return;
+  }
+  markSeededScope(scope);
+  if (answer && answer.hues && typeof answer.hues === "object") {
+    for (const [id, hue] of Object.entries(answer.hues)) {
+      if (typeof hue === "number") noteServerThreadHue(id, hue, wanted);
+    }
   }
 }
 
@@ -21392,6 +21571,14 @@ function threadHue(id) {
       threadHuesSaveOwed = true;
       Promise.resolve().then(saveThreadHues);
     }
+  }
+  // `#427 server-thread-hues`: the server's colour, whenever one has arrived for this thread.
+  // What follows — the remembered colours and the widest arc — is only for a thread it has not
+  // coloured.
+  const assigned = serverHuesChannel === channel ? serverThreadHues.get(key) : undefined;
+  if (assigned !== undefined) {
+    threadColors.set(key, assigned);
+    return assigned;
   }
   if (threadColors.has(key)) return threadColors.get(key);
   // Split the largest unused arc: the next thread gets the most separated available color.
@@ -35001,6 +35188,8 @@ async function loadOlderPage(signal) {
       throw error;
     }
     if (generation !== discordLoadGeneration || channel !== el("discord-channel").value) return;
+    // `#427 server-thread-hues`: the step back's colours, before its rows are built.
+    noteServerThreadHuesIn(payload.messages || [], [], String(channel));
     observeOutgoingMessages(payload.messages || []);
     const list = el("discord-log");
     const arriving = glom(payload.messages || []).map(discordNode);
@@ -35731,6 +35920,8 @@ async function loadDiscord(options) {
  * @param {ReturnType<typeof landedReadPosition>} at
  */
 function drawChannelPage(payload, area, at) {
+  // `#427 server-thread-hues`: this walk's messages carry their threads' colours too.
+  noteServerThreadHuesIn(payload.messages || [], []);
   const loaded = applyNewestPage(payload);
   // Inline, at the head of the list, rather than on the transient strip. `#63
   // status-line-placement`: this is a standing fact about what you are looking at, and the strip
@@ -48376,6 +48567,12 @@ function applyClientConfig(config) {
   applyVoicePostPrefix(config.voice_post_prefix);
   // `#208 persistent-cache`. After `tokenScope` as well: only a write token is shown the group.
   applyServerCache(config.message_cache);
+  // `#427 server-thread-hues`: this browser's remembered colours for the channel up are offered
+  // to the server now — the token's scope is known, the picker holds its channel, and no read
+  // or stream of it has gone out yet, so the offer is issued before anything that could colour
+  // those threads itself. Not awaited: sign-in does not wait on a colour offer, and the reads
+  // that follow carry the server's answer either way (first writer wins there).
+  void seedServerThreadHues(select.value);
   // Started here rather than when the Discord view opens: PUSH TWO is the point of it, and an
   // arriving message has to be able to reach a call that is happening on the OTHER tab. Following
   // only the visible view would mean the relay was off precisely while the reader was talking.
@@ -49264,6 +49461,9 @@ function changeSelectedChannel() {
   channelContexts.clear();
   // `#396 thread-color-memory`. The channel's own colours, as this device last drew them.
   restoreThreadHues(el("discord-channel").value);
+  // `#427 server-thread-hues`: and offered to the server, as at sign-in — issued before this
+  // channel's first read below, not awaited by it.
+  void seedServerThreadHues(el("discord-channel").value);
   el("thread-list").replaceChildren();
   restoreChannelComposer();
   discordMoreAbove = false;

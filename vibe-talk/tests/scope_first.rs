@@ -443,6 +443,14 @@ fn inventory() -> Vec<Route> {
             Write,
             Query("?if_revision=5", "?if_revision=soon"),
         ),
+        // `#427 server-thread-hues`: a browser offers the thread colours it remembers, at write
+        // scope only — it files durable state every device reads back.
+        route(
+            "POST",
+            "/api/v1/channels/{channel_id}/thread-hues",
+            Write,
+            Json(r#"{"hues":[{"thread_id":"t1","hue":210}]}"#),
+        ),
     ]
 }
 

@@ -3587,6 +3587,7 @@ async fn post_each(
                         // It roots that thread now, whether or not the provider's answer for a
                         // message that had no replies yet said so; the page draws it as one.
                         one.thread = Some(crate::threads::MessageThread {
+                            hue: None,
                             id: thread.clone(),
                             root_message_id: Some(one.id.clone()),
                             is_root: true,
@@ -4402,6 +4403,190 @@ pub async fn bookmark_state(
             None
         }
     }
+}
+
+// --- thread hues -------------------------------------------------------------------------------
+//
+// `#427 server-thread-hues`. The colour of each thread is decided here, once, as threads are met
+// (see [`crate::thread_hues`]), kept in the store, and stamped onto what the page is served —
+// every message's thread record and every thread summary — by the two `attach_*` functions below.
+// Their callers are the routes only the page reads (the timeline, the history walk, the message
+// list and lookup), ingestion, and the live stream on its way out; a path toward a model never
+// asks, because a hue says nothing to it.
+
+/// The threads a batch of messages and summaries speaks of, each once, with its root's instant
+/// where the batch itself shows it: a root message's own time, else the root id's snowflake time
+/// where the id is one. Root times gather over the whole batch first, so a reply whose root is
+/// also in the batch is placed by it even when the reply is read first.
+pub(crate) fn hue_refs_of<'m>(
+    messages: impl IntoIterator<Item = &'m Message>,
+    summaries: &[crate::threads::ThreadSummary],
+    heading: Option<&crate::threads::ThreadSummary>,
+) -> Vec<crate::thread_hues::HueRef> {
+    let mut roots: std::collections::BTreeMap<String, Option<i64>> =
+        std::collections::BTreeMap::new();
+    let mut note = |id: &str, at: Option<i64>| {
+        let held = roots.entry(id.to_owned()).or_insert(at);
+        if held.is_none() {
+            *held = at;
+        }
+    };
+    for summary in summaries.iter().chain(heading) {
+        note(
+            &summary.id,
+            summary.root.as_ref().and_then(Message::created_ms),
+        );
+        if let Some(root) = &summary.root {
+            if let Some(thread) = &root.thread {
+                note(&thread.id, root.created_ms());
+            }
+        }
+    }
+    for message in messages {
+        let Some(thread) = &message.thread else {
+            continue;
+        };
+        let at = if thread.is_root {
+            message.created_ms()
+        } else {
+            thread
+                .root_message_id
+                .as_ref()
+                .and_then(MessageId::created_at_ms)
+        };
+        note(&thread.id, at);
+    }
+    roots
+        .into_iter()
+        .map(|(thread_id, root_at_ms)| crate::thread_hues::HueRef {
+            thread_id,
+            root_at_ms,
+        })
+        .collect()
+}
+
+/// The hues for `refs`' channel as they stand after colouring what `caller` may colour.
+///
+/// Write scope assigns ([`crate::store::StateStore::ensure_thread_hues`]); read scope only reads
+/// what is assigned, because no read-scope credential ever writes anything durable — an
+/// uncoloured thread is then served without a hue and the page falls back for it, as it does
+/// against an older server. SOFT, for [`pins_revision`]'s reason: a channel read must not fail
+/// because its colours could not be read or filed, so a store error leaves every hue absent and
+/// is logged, never answered as the read's error.
+///
+/// The common read colours nothing new, and it stays a read: what is stored is looked at first,
+/// and the assigning write runs only when a thread in `refs` has no colour yet or its root time
+/// is still to be filled in. Live events go out one at a time through here, and a write per
+/// message to say "unchanged" would be the stream's whole cost.
+pub(crate) async fn hues_for(
+    state: &AppState,
+    caller: crate::auth::Scope,
+    channel: &ChannelId,
+    refs: &[crate::thread_hues::HueRef],
+) -> std::collections::BTreeMap<String, u16> {
+    if refs.is_empty() {
+        return std::collections::BTreeMap::new();
+    }
+    let held = match state.store.thread_hues(channel).await {
+        Ok(rows) => rows,
+        Err(crate::store::StoreError::Unavailable(_)) => {
+            return std::collections::BTreeMap::new();
+        }
+        Err(error) => {
+            tracing::warn!(%error, "could not read the threads' colours for a channel read");
+            return std::collections::BTreeMap::new();
+        }
+    };
+    let settled = refs.iter().all(|wanted| {
+        held.iter().any(|row| {
+            row.thread_id == wanted.thread_id
+                && (wanted.root_at_ms.is_none() || row.root_at_ms.is_some())
+        })
+    });
+    if settled || caller < crate::auth::Scope::Write {
+        return held
+            .into_iter()
+            .map(|row| (row.thread_id, row.hue))
+            .collect();
+    }
+    match state.store.ensure_thread_hues(channel, refs).await {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|row| (row.thread_id, row.hue))
+            .collect(),
+        Err(crate::store::StoreError::Unavailable(_)) => std::collections::BTreeMap::new(),
+        Err(error) => {
+            tracing::warn!(%error, "could not colour the threads for a channel read");
+            held.into_iter()
+                .map(|row| (row.thread_id, row.hue))
+                .collect()
+        }
+    }
+}
+
+/// Stamp each message's thread colour from `hues`, overwriting whatever a provider or a bridge
+/// put there: the colour is this server's to give (`#427 server-thread-hues`), as the spoken
+/// forms are. A thread the map does not name is served with no hue, never with somebody else's.
+pub(crate) fn stamp_hues(messages: &mut [Message], hues: &std::collections::BTreeMap<String, u16>) {
+    for message in messages {
+        if let Some(thread) = &mut message.thread {
+            thread.hue = hues.get(&thread.id).copied();
+        }
+    }
+}
+
+/// Colour a timeline page's messages, thread cards and thread heading for the page. See the
+/// section note above. Called by the timeline route, the one reader of a whole page.
+pub async fn attach_page_hues(
+    state: &AppState,
+    caller: crate::auth::Scope,
+    channel: &ChannelId,
+    page: &mut crate::threads::TimelinePage,
+) {
+    let refs = hue_refs_of(&page.messages, &page.threads, page.thread.as_ref());
+    let hues = hues_for(state, caller, channel, &refs).await;
+    stamp_hues(&mut page.messages, &hues);
+    for summary in page.threads.iter_mut().chain(page.thread.iter_mut()) {
+        summary.hue = hues.get(&summary.id).copied();
+        if let Some(root) = &mut summary.root {
+            stamp_hues(std::slice::from_mut(root), &hues);
+        }
+    }
+}
+
+/// Colour a batch of messages for the page: the history walk, the message list and lookup, one
+/// ingested or live message. See [`attach_page_hues`].
+pub async fn attach_message_hues(
+    state: &AppState,
+    caller: crate::auth::Scope,
+    channel: &ChannelId,
+    messages: &mut [Message],
+) {
+    let refs = hue_refs_of(&*messages, &[], None);
+    let hues = hues_for(state, caller, channel, &refs).await;
+    stamp_hues(messages, &hues);
+}
+
+/// Take a browser's remembered colours for one channel's uncoloured threads, returning the
+/// channel, how many were taken, and the channel's hues as they then stand. Write scope (the
+/// route's extractor, as everywhere). `#427 server-thread-hues`: the migration that lets the
+/// colours the owner already sees (`#396 thread-color-memory`) survive the move here — first
+/// writer wins, so a thread this server coloured first keeps its colour and says so in the hues
+/// handed back.
+///
+/// # Errors
+///
+/// [`OpError::UnknownChannel`] outside the allowlist; [`OpError::Store`] when no store is
+/// configured, an id or hue is refused, or the write fails.
+pub async fn seed_thread_hues(
+    state: &AppState,
+    channel_id: &str,
+    seeds: &[(crate::thread_hues::HueRef, u16)],
+) -> Result<(ChannelInfo, u64, Vec<crate::thread_hues::AssignedHue>), OpError> {
+    let channel = allowed(state, channel_id).await?;
+    let taken = state.store.seed_thread_hues(&channel.id, seeds).await?;
+    let hues = state.store.thread_hues(&channel.id).await?;
+    Ok((channel, taken, hues))
 }
 
 /// What happened when a summary was asked for.

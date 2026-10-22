@@ -40,6 +40,7 @@ pub(crate) fn message(id: &str, author: &str, content: &str, created_ms: i64) ->
 pub(crate) fn reply(id: &str, thread: &str, content: &str, created_ms: i64) -> Message {
     Message {
         thread: Some(MessageThread {
+            hue: None,
             id: thread.to_owned(),
             root_message_id: Some(MessageId(thread.to_owned())),
             is_root: false,

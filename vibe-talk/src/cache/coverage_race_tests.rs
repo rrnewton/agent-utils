@@ -107,6 +107,7 @@ fn decide_shape(
 fn root(id: &str, created_ms: i64, replies: u64) -> Message {
     let mut root = message(id, "ada", "root", created_ms);
     root.thread = Some(crate::threads::MessageThread {
+        hue: None,
         id: id.to_owned(),
         root_message_id: Some(MessageId(id.to_owned())),
         is_root: true,

@@ -84,6 +84,7 @@ fn message(
     Message {
         edited_timestamp: None,
         thread: thread.map(|t| MessageThread {
+            hue: None,
             id: format!("t{t}"),
             root_message_id: None,
             is_root: false,

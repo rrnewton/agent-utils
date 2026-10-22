@@ -120,6 +120,18 @@ pub struct MessageThread {
     pub reply_count: Option<u64>,
     /// Whether the reply count is exact rather than a provider estimate.
     pub reply_count_exact: bool,
+    /// The thread's colour, in whole degrees of hue (`0..360`), as THIS server assigned it.
+    /// `#427 server-thread-hues`; see [`crate::thread_hues`].
+    ///
+    /// FORMED BY THIS SERVER when a message is served to the page (and on the live stream's way
+    /// out), from the durable assignment — never trusted from a provider, a bridge or an
+    /// adapter, whose copies are overwritten, and absent where no assignment exists for the
+    /// thread yet: an older bridge's answer, a read-scope caller meeting a thread the server has
+    /// not coloured, a deployment with no store. Absent is the page's cue to fall back to its own
+    /// algorithm for that thread, as every page did before `#427`; present, it is the colour on
+    /// every device, and the page never recolours it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hue: Option<u16>,
 }
 
 /// One thread in the thread list, independent of the underlying provider's channel model.
@@ -145,6 +157,12 @@ pub struct ThreadSummary {
     /// summarised. See [`thread_summary_due`] for when it is refreshed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// The thread's colour, in whole degrees of hue (`0..360`). `#427 server-thread-hues`; the
+    /// same value its messages carry in [`MessageThread::hue`], repeated here so a thread card
+    /// is coloured even when its root could not be read with it. Absent under the same
+    /// conditions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hue: Option<u16>,
 }
 
 /// Whether a thread with `messages` messages, last summarised at `last` messages, is due again.

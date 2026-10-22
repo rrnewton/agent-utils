@@ -264,6 +264,8 @@ fn state_pieces_with(
     let message_cache = Arc::new(crate::cache::Sink::off());
     let live = Arc::new(crate::live::LiveHub::new());
     live.attach_cache(Arc::clone(&message_cache));
+    // As `main` attaches it: the poller colours threads as it meets them. `#427 server-thread-hues`.
+    live.attach_store(Arc::clone(&store));
     // `#331 resume-on-websocket`. Nothing asked yet: a test that needs the bridge's answer asks for
     // it (`BridgeHello::ask`), so the moment it arrives is the test's, not a background task's.
     let voice_bridge = Arc::new(crate::voice_bridge::BridgeHello::for_config(&config));
@@ -1362,6 +1364,7 @@ pub fn with_recent_timing(mut state: AppState, timing: crate::recent::Timing) ->
         crate::recent::RecentWindows::with_timing(timing),
     ));
     live.attach_cache(Arc::clone(&state.message_cache));
+    live.attach_store(Arc::clone(&state.store));
     state.live = Arc::new(live);
     state
 }

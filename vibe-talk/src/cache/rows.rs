@@ -260,6 +260,7 @@ mod tests {
         let mut message = crate::cache::fixtures::message("1", "a", "x", 5);
         assert_eq!(thread_id(&message), None);
         message.thread = Some(MessageThread {
+            hue: None,
             id: "t1".to_owned(),
             root_message_id: Some(MessageId("1".to_owned())),
             is_root: true,

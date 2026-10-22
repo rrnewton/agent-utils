@@ -315,6 +315,23 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#427 server-thread-hues` in the browser engine: two browser contexts — two devices — each
+  # remembering the same six threads in different colours, both drawn in the colours the first
+  # device offered the server and the server took, and a reload of the second drawing them still.
+  - group: check
+    job: server-thread-hues-browser
+    desc: two browser contexts drawing the same threads in the server's colours in current Chromium at a 1280x800 desk
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/server_thread_hues_browser.py
+    jobs_flag: ""
+    timeout: 120
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 15
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#242 rich-headers` in the browser engine: each headed row's tag, title and time drawn whole —
   # beside the time and the buttons where the list is wide enough, as the row's first line where it
   # is not — the words they restate hidden and every one of them in the header, a combined row's

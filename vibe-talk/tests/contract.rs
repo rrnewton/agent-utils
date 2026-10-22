@@ -91,6 +91,7 @@ fn message(id: &str) -> Message {
 fn threaded_message(id: &str) -> Message {
     Message {
         thread: Some(MessageThread {
+            hue: None,
             id: "t1".into(),
             root_message_id: Some(MessageId("200".into())),
             is_root: false,
@@ -144,6 +145,7 @@ fn threaded_message(id: &str) -> Message {
 
 fn thread_summary(root: Option<Message>) -> ThreadSummary {
     ThreadSummary {
+        hue: None,
         id: "t1".into(),
         root,
         title: "a thread".into(),

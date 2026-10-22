@@ -586,6 +586,7 @@ mod tests {
 
     fn summary(id: &str, at: &str) -> ThreadSummary {
         ThreadSummary {
+            hue: None,
             id: id.to_owned(),
             root: None,
             title: format!("thread {id}"),

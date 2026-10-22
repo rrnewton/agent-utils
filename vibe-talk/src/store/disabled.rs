@@ -290,6 +290,29 @@ impl StateStore for DisabledStore {
         refuse()
     }
 
+    async fn thread_hues(
+        &self,
+        _: &ChannelId,
+    ) -> Result<Vec<crate::thread_hues::AssignedHue>, StoreError> {
+        refuse()
+    }
+
+    async fn ensure_thread_hues(
+        &self,
+        _: &ChannelId,
+        _: &[crate::thread_hues::HueRef],
+    ) -> Result<Vec<crate::thread_hues::AssignedHue>, StoreError> {
+        refuse()
+    }
+
+    async fn seed_thread_hues(
+        &self,
+        _: &ChannelId,
+        _: &[(crate::thread_hues::HueRef, u16)],
+    ) -> Result<u64, StoreError> {
+        refuse()
+    }
+
     async fn purge_everything(&self) -> Result<(), StoreError> {
         refuse()
     }

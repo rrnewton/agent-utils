@@ -178,6 +178,7 @@ async fn a_reply_in_an_existing_thread_reaches_the_live_stream_within_one_poll_f
     assert_eq!(
         reply.message.thread,
         Some(MessageThread {
+            hue: None,
             id: root.clone(),
             root_message_id: message_id_from_ts(&root),
             is_root: false,

@@ -92,6 +92,8 @@ struct State {
     /// Channel to its bookmark, cleared ones included, as the real table keeps a row for a cleared
     /// bookmark so its revision goes on growing. `#240 reading-bookmark`.
     bookmarks: BTreeMap<String, Bookmark>,
+    /// Channel to its assigned thread hues, in assignment order. `#427 server-thread-hues`.
+    thread_hues: BTreeMap<String, Vec<crate::thread_hues::AssignedHue>>,
     next_summary_seq: u64,
     fail_next: Option<String>,
     appended: usize,
@@ -1153,9 +1155,104 @@ impl StateStore for FakeStore {
         Ok(())
     }
 
+    async fn thread_hues(
+        &self,
+        channel: &ChannelId,
+    ) -> Result<Vec<crate::thread_hues::AssignedHue>, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        Ok(state
+            .thread_hues
+            .get(channel.as_str())
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn ensure_thread_hues(
+        &self,
+        channel: &ChannelId,
+        refs: &[crate::thread_hues::HueRef],
+    ) -> Result<Vec<crate::thread_hues::AssignedHue>, StoreError> {
+        for wanted in refs {
+            super::validate_thread_hue_id(&wanted.thread_id)?;
+        }
+        let mut state = self.lock();
+        armed(&mut state)?;
+        let held = state
+            .thread_hues
+            .entry(channel.as_str().to_owned())
+            .or_default();
+        for wanted in refs {
+            if let Some(row) = held
+                .iter_mut()
+                .find(|row| row.thread_id == wanted.thread_id && row.root_at_ms.is_none())
+            {
+                row.root_at_ms = wanted.root_at_ms;
+            }
+        }
+        let fresh = crate::thread_hues::assign_new(held, refs);
+        held.extend(fresh);
+        *held = super::trim_thread_hues(std::mem::take(held));
+        Ok(held.clone())
+    }
+
+    async fn seed_thread_hues(
+        &self,
+        channel: &ChannelId,
+        seeds: &[(crate::thread_hues::HueRef, u16)],
+    ) -> Result<u64, StoreError> {
+        for (wanted, hue) in seeds {
+            super::validate_thread_hue_id(&wanted.thread_id)?;
+            if *hue >= 360 {
+                return Err(StoreError::BadId(
+                    "a hue must be under 360 degrees".to_owned(),
+                ));
+            }
+        }
+        let mut state = self.lock();
+        armed(&mut state)?;
+        let held = state
+            .thread_hues
+            .entry(channel.as_str().to_owned())
+            .or_default();
+        let mut next_seq = held.iter().map(|row| row.seq).max().unwrap_or(0) + 1;
+        let mut inserted: Vec<String> = Vec::new();
+        for (wanted, hue) in seeds {
+            // A seed for a coloured thread recolours nothing; it may still teach its root time,
+            // as an ensuring ref does.
+            if let Some(row) = held
+                .iter_mut()
+                .find(|row| row.thread_id == wanted.thread_id)
+            {
+                if row.root_at_ms.is_none() {
+                    row.root_at_ms = wanted.root_at_ms;
+                }
+                continue;
+            }
+            held.push(crate::thread_hues::AssignedHue {
+                thread_id: wanted.thread_id.clone(),
+                hue: *hue,
+                root_at_ms: wanted.root_at_ms,
+                seq: next_seq,
+            });
+            inserted.push(wanted.thread_id.clone());
+            next_seq += 1;
+        }
+        *held = super::trim_thread_hues(std::mem::take(held));
+        // What the bound dropped in the same write was not taken, whatever was inserted.
+        Ok(u64::try_from(
+            inserted
+                .iter()
+                .filter(|id| held.iter().any(|row| &row.thread_id == *id))
+                .count(),
+        )
+        .unwrap_or(0))
+    }
+
     async fn purge_everything(&self) -> Result<(), StoreError> {
         let mut state = self.lock();
         armed(&mut state)?;
+        state.thread_hues.clear();
         state.upstream_clear.clear();
         state.conversations.clear();
         state.marks.clear();

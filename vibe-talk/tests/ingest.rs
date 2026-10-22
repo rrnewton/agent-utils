@@ -483,6 +483,18 @@ async fn a_pushed_thread_record_reaches_the_page_exactly_as_it_was_sent() {
         "reply_count": 2,
         "reply_count_exact": true,
     });
+    // `#427 server-thread-hues`: one field on the record IS this server's to form — the thread's
+    // colour, assigned here as the thread is first learnt of (210, the first hue, for the first
+    // thread in the channel) — as the spoken forms and the rendered body already are. Everything
+    // the adapter sent stands beside it, exactly.
+    let coloured = json!({
+        "id": "thread-one",
+        "root_message_id": "10",
+        "is_root": false,
+        "reply_count": 2,
+        "reply_count_exact": true,
+        "hue": 210,
+    });
     for (event_id, id, record) in [
         ("event-threaded-create", "11", Some(&thread)),
         ("event-unthreaded-create", "12", None),
@@ -504,7 +516,7 @@ async fn a_pushed_thread_record_reaches_the_page_exactly_as_it_was_sent() {
             held.thread
                 .as_ref()
                 .map(|kept| serde_json::to_value(kept).expect("serializes")),
-            record.cloned(),
+            record.map(|_| coloured.clone()),
             "the hub did not keep the thread record {event_id} was pushed with"
         );
         let text = read_events(&mut body, 1).await;
@@ -516,7 +528,7 @@ async fn a_pushed_thread_record_reaches_the_page_exactly_as_it_was_sent() {
         assert_eq!(payload["message"]["id"], id);
         assert_eq!(
             payload["message"].get("thread"),
-            record,
+            record.map(|_| &coloured),
             "the page was not sent the thread record {event_id} was pushed with"
         );
     }
@@ -540,7 +552,7 @@ async fn a_pushed_thread_record_reaches_the_page_exactly_as_it_was_sent() {
         .find_map(|line| line.strip_prefix("data:"))
         .map(|json| serde_json::from_str(json.trim()).expect("json"))
         .expect("a data line");
-    assert_eq!(payload["message"]["thread"], thread);
+    assert_eq!(payload["message"]["thread"], coloured);
 }
 
 #[tokio::test]

@@ -762,6 +762,7 @@ mod tests {
     fn root(id: &str, at: i64, replies: u64) -> Message {
         Message {
             thread: Some(MessageThread {
+                hue: None,
                 id: id.to_owned(),
                 root_message_id: Some(MessageId(id.to_owned())),
                 is_root: true,
@@ -1004,6 +1005,7 @@ mod tests {
     #[test]
     fn a_thread_list_gives_thread_records_and_roots_as_rows() {
         let summary = |id: &str, replies: u64| ThreadSummary {
+            hue: None,
             id: id.to_owned(),
             root: Some(root(id, T, replies)),
             title: "t".to_owned(),

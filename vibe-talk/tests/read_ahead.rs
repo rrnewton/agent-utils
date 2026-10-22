@@ -56,6 +56,7 @@ fn message(id: &str, thread: Option<&str>) -> Message {
         content_html: String::new(),
         noise: false,
         thread: thread.map(|thread| MessageThread {
+            hue: None,
             id: thread.to_owned(),
             root_message_id: None,
             is_root: false,

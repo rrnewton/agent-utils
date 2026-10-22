@@ -57,6 +57,7 @@ fn thread_message(id: &str, n: i64, content: &str) -> Message {
         content_html: String::new(),
         noise: false,
         thread: Some(MessageThread {
+            hue: None,
             id: THREAD.to_owned(),
             root_message_id: Some(MessageId("t0".to_owned())),
             is_root: id == "t0",

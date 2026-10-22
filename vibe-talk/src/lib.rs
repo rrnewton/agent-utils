@@ -93,6 +93,7 @@ pub mod store;
 pub mod summarize;
 pub mod summary;
 pub mod testing;
+pub mod thread_hues;
 pub mod threads;
 pub mod timeline_forward;
 pub mod untrusted;

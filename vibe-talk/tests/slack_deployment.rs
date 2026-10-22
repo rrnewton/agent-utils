@@ -322,10 +322,12 @@ async fn a_slack_message_nobody_has_answered_can_have_its_thread_started_from_th
         .find(|message| message["content"] == "first")
         .expect("the message nobody has answered")
         .clone();
+    // `#427 server-thread-hues`: the one field this server forms on the record, its thread's
+    // colour — 210, the first hue, for the channel's earliest thread.
     assert_eq!(
         message["thread"],
         json!({"id": first, "root_message_id": message["id"], "is_root": true,
-            "reply_count": 0, "reply_count_exact": true}),
+            "reply_count": 0, "reply_count_exact": true, "hue": 210}),
         "{message}"
     );
 

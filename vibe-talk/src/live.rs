@@ -322,6 +322,11 @@ pub struct LiveHub {
     /// persistent-cache`; see [`crate::cache::sink`]. Attached once, by whoever builds the server
     /// ([`LiveHub::attach_cache`]); a hub with none attached offers nothing.
     cache: std::sync::OnceLock<std::sync::Arc<crate::cache::Sink>>,
+    /// The durable store, for the colours of threads the poller is the first to meet. `#427
+    /// server-thread-hues`. Attached once like the cache ([`LiveHub::attach_store`]); a hub with
+    /// none attached colours nothing itself, and the stream's way out and the next write-scope
+    /// read colour its threads instead.
+    store: std::sync::OnceLock<std::sync::Arc<dyn crate::store::StateStore>>,
     /// The reaction set last seen for each recent message, per channel, oldest-noted first: an
     /// entry of `None` is a KNOWN message no copy has reported reactions for yet, which is what
     /// tells its first reaction apart from a message never seen. `#378 live-reactions`; see
@@ -371,6 +376,7 @@ impl LiveHub {
             upstream_clear: std::sync::Arc::new(crate::upstream_clear::Candidates::new()),
             recent,
             cache: std::sync::OnceLock::new(),
+            store: std::sync::OnceLock::new(),
             reaction_memory: Mutex::new(BTreeMap::new()),
             updates: std::sync::atomic::AtomicU64::new(0),
         }
@@ -388,6 +394,22 @@ impl LiveHub {
     #[must_use]
     pub fn message_cache(&self) -> Option<&std::sync::Arc<crate::cache::Sink>> {
         self.cache.get()
+    }
+
+    /// File this hub's thread colours in `store` from now on. `#427 server-thread-hues`.
+    ///
+    /// Once per hub, like the cache: a second store is ignored. The server attaches its one
+    /// store before anything is published, so the poller colours a thread in the tick it first
+    /// reads a message of it — a server act, under the poller's own standing, as its message
+    /// cache fills are.
+    pub fn attach_store(&self, store: std::sync::Arc<dyn crate::store::StateStore>) {
+        let _ = self.store.set(store);
+    }
+
+    /// The store this hub colours threads in, if one is attached.
+    #[must_use]
+    pub fn store(&self) -> Option<&std::sync::Arc<dyn crate::store::StateStore>> {
+        self.store.get()
     }
 
     /// Each channel's held window. `#210 voice-catchup-speed`.
@@ -996,6 +1018,7 @@ pub fn events(
     subscription: Subscription,
     app: AppState,
     channel: ChannelInfo,
+    caller: crate::auth::Scope,
 ) -> impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>
 {
     struct State {
@@ -1012,6 +1035,15 @@ pub fn events(
         /// out back to back on attach, and two store reads for each would be the attach's whole
         /// cost for no change in the answer.
         replay_noise: Option<crate::noise::NoiseFilter>,
+        /// Who is listening, for the colours of threads met on the way out (`#427
+        /// server-thread-hues`): a write-scope subscriber's stream colours a thread nobody has
+        /// coloured yet — one that arrived by a path that does not colour, or before a store was
+        /// attached — and a read-scope one only carries colours already assigned, as every read
+        /// does. Polled and ingested arrivals are coloured before they are published, so this
+        /// is the backstop, not the usual path.
+        caller: crate::auth::Scope,
+        /// The burst's colours, decided once for the whole tail, as `replay_noise` is.
+        replay_hues: Option<std::collections::BTreeMap<String, u16>>,
     }
     let markup = crate::render::markup_for(&app.config, &channel);
     let start = State {
@@ -1023,6 +1055,8 @@ pub fn events(
         channel: channel.id,
         markup,
         replay_noise: None,
+        caller,
+        replay_hues: None,
     };
     futures_util::stream::unfold(start, |mut state| async move {
         if state.reset_on_attach {
@@ -1034,6 +1068,21 @@ pub fn events(
             if state.replay_noise.is_none() {
                 state.replay_noise =
                     Some(crate::noise::filter_for(&state.app, &state.channel).await);
+                // The whole burst's colours in one deciding, this first event included.
+                let refs = crate::ops::hue_refs_of(
+                    std::iter::once(&held.message)
+                        .chain(state.replay.iter().map(|live| &live.message)),
+                    &[],
+                    None,
+                );
+                state.replay_hues = Some(
+                    crate::ops::hues_for(&state.app, state.caller, &state.channel, &refs).await,
+                );
+            }
+            if let Some(hues) = &state.replay_hues {
+                if held.kind != LiveKind::Delete {
+                    crate::ops::stamp_hues(std::slice::from_mut(&mut held.message), hues);
+                }
             }
             if let Some(noise) = &state.replay_noise {
                 judge(noise, &state.app, &state.channel, state.markup, &mut held);
@@ -1045,6 +1094,15 @@ pub fn events(
         }
         match state.receiver.recv().await {
             Ok(mut live) => {
+                if live.kind != LiveKind::Delete {
+                    crate::ops::attach_message_hues(
+                        &state.app,
+                        state.caller,
+                        &state.channel,
+                        std::slice::from_mut(&mut live.message),
+                    )
+                    .await;
+                }
                 let noise = crate::noise::filter_for(&state.app, &state.channel).await;
                 judge(&noise, &state.app, &state.channel, state.markup, &mut live);
                 Some((Ok(message_event(&live, false)), state))
@@ -1079,6 +1137,7 @@ pub fn events(
 pub fn all_events(
     subscription: AllSubscription,
     app: AppState,
+    caller: crate::auth::Scope,
 ) -> impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>
 {
     struct State {
@@ -1088,6 +1147,7 @@ pub fn all_events(
         reset_on_attach: bool,
         done: bool,
         app: AppState,
+        caller: crate::auth::Scope,
     }
     let start = State {
         start: subscription.start,
@@ -1096,6 +1156,7 @@ pub fn all_events(
         reset_on_attach: subscription.reset_on_attach,
         done: false,
         app,
+        caller,
     };
     futures_util::stream::unfold(start, |mut state| async move {
         if state.reset_on_attach {
@@ -1126,6 +1187,15 @@ pub fn all_events(
             return Some((Ok(axum::response::sse::Event::default().id(cursor)), state));
         };
         let mut live = arrival.live;
+        if live.kind != LiveKind::Delete {
+            crate::ops::attach_message_hues(
+                &state.app,
+                state.caller,
+                &channel.id,
+                std::slice::from_mut(&mut live.message),
+            )
+            .await;
+        }
         let noise = crate::noise::filter_for(&state.app, &channel.id).await;
         let markup = crate::render::markup_for(&state.app.config, &channel);
         judge(&noise, &state.app, &channel.id, markup, &mut live);
@@ -1264,6 +1334,53 @@ pub struct Tick {
     pub changed: usize,
 }
 
+/// Colour the threads `messages` belong to, in the hub's store, and stamp the colours on.
+/// `#427 server-thread-hues`.
+///
+/// The poller is one of the ways this server first learns of a thread, so the assignment is made
+/// here, as a message arrives — the poller's own server act, like its message-cache fills — and
+/// what is published then already carries the colour. Soft, like every other colouring: a hub
+/// with no store attached, or a store that refuses, publishes the messages uncoloured, and the
+/// stream's way out or the next write-scope read colours their threads then.
+async fn colour_threads(hub: &LiveHub, channel: &ChannelId, messages: &mut [Message]) {
+    let Some(store) = hub.store() else { return };
+    let refs = crate::ops::hue_refs_of(&*messages, &[], None);
+    if refs.is_empty() {
+        return;
+    }
+    // The common tick colours nothing new, and it stays a read — as `ops::hues_for` keeps a
+    // settled read one — rather than a write transaction per poll page to say "unchanged".
+    if let Ok(held) = store.thread_hues(channel).await {
+        let settled = refs.iter().all(|wanted| {
+            held.iter().any(|row| {
+                row.thread_id == wanted.thread_id
+                    && (wanted.root_at_ms.is_none() || row.root_at_ms.is_some())
+            })
+        });
+        if settled {
+            let hues: std::collections::BTreeMap<String, u16> = held
+                .into_iter()
+                .map(|row| (row.thread_id, row.hue))
+                .collect();
+            crate::ops::stamp_hues(messages, &hues);
+            return;
+        }
+    }
+    match store.ensure_thread_hues(channel, &refs).await {
+        Ok(rows) => {
+            let hues: std::collections::BTreeMap<String, u16> = rows
+                .into_iter()
+                .map(|row| (row.thread_id, row.hue))
+                .collect();
+            crate::ops::stamp_hues(messages, &hues);
+        }
+        Err(crate::store::StoreError::Unavailable(_)) => {}
+        Err(error) => {
+            tracing::warn!(%error, "could not colour the threads a live read met");
+        }
+    }
+}
+
 /// Read one channel once, publishing whatever is newer than `cursor`.
 ///
 /// **The first tick seeds and publishes nothing.** `cursor` starts as `None`, and on that tick
@@ -1357,6 +1474,11 @@ pub async fn poll_once(
             }
             None => chat.fetch_recent(channel, limit).await?,
         };
+        // `#427 server-thread-hues`. The seed deliberately colours NOTHING: it is existing
+        // history, exactly what it must not present as newly arrived, and a browser may still
+        // hold the colours those threads were drawn in before the server decided them — its
+        // one seeding offer, made before its first read, has to be able to win for them. They
+        // are coloured by that first write-scope read, or by the walk when they next arrive.
         // `#378 live-reactions`. The seed learns where reactions stand, so the first refresh
         // after it can tell a set that moved from one never seen.
         for message in &messages {
@@ -1429,6 +1551,11 @@ pub async fn poll_once(
         replies_behind |= behind;
         reported_changed.extend(changed);
         sort_oldest_first(&mut messages);
+        // `#427 server-thread-hues`: colour their threads before anything is published, so what
+        // goes out already carries its colour and the hub's tail keeps it.
+        colour_threads(hub, channel, &mut messages).await;
+        let mut replies = replies;
+        colour_threads(hub, channel, &mut replies).await;
         let full = messages.len() >= page_size;
         let before = at;
         if fill.is_some() {

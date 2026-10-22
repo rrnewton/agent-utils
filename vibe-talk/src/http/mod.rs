@@ -420,6 +420,15 @@ fn routes(state: AppState) -> Router {
                 .put(api::set_bookmark)
                 .delete(api::clear_bookmark),
         )
+        // `#427 server-thread-hues`. A browser offers the thread colours it remembers from
+        // before the server decided them, once, for the threads the server has not coloured.
+        // WRITE scope and NO MCP TOOL, for the `#39` reason above. Reading the colours needs no
+        // route of its own: every message and thread summary carries its thread's hue.
+        .route(
+            "/api/v1/channels/{channel_id}/thread-hues",
+            post(api::seed_thread_hues)
+                .layer(DefaultBodyLimit::max(api::THREAD_HUE_SEED_BODY_BYTES)),
+        )
         // One path, three methods: POST carries the whole protocol, and GET/DELETE — which exist
         // in the spec for server-initiated streams and session teardown — are refused plainly
         // because this endpoint is stateless and has nothing to push.

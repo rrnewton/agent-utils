@@ -807,6 +807,16 @@
     "MessageThread": {
       "description": "Thread membership attached to a message without conflating it with a reply reference.",
       "properties": {
+        "hue": {
+          "description": "The thread's colour, in whole degrees of hue (`0..360`), as THIS server assigned it.\n`#427 server-thread-hues`; see [`crate::thread_hues`].\n\nFORMED BY THIS SERVER when a message is served to the page (and on the live stream's way\nout), from the durable assignment — never trusted from a provider, a bridge or an\nadapter, whose copies are overwritten, and absent where no assignment exists for the\nthread yet: an older bridge's answer, a read-scope caller meeting a thread the server has\nnot coloured, a deployment with no store. Absent is the page's cue to fall back to its own\nalgorithm for that thread, as every page did before `#427`; present, it is the colour on\nevery device, and the page never recolours it.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "id": {
           "description": "Opaque thread identifier, scoped to the configured channel.",
           "type": "string"
@@ -1744,6 +1754,16 @@
           "description": "A short hyphenated name for the thread, chosen once by a summariser and then kept even if\nthe thread drifts, so the reader always finds it under the same name. Absent until named.",
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "hue": {
+          "description": "The thread's colour, in whole degrees of hue (`0..360`). `#427 server-thread-hues`; the\nsame value its messages carry in [`MessageThread::hue`], repeated here so a thread card\nis coloured even when its root could not be read with it. Absent under the same\nconditions.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": [
+            "integer",
             "null"
           ]
         },

@@ -1795,6 +1795,7 @@ mod tests {
     #[test]
     fn a_thread_is_due_when_unnamed_and_then_on_the_schedule() {
         let thread = |replies: Option<u64>| ThreadSummary {
+            hue: None,
             id: "t".to_owned(),
             root: None,
             title: String::new(),
@@ -1856,6 +1857,7 @@ mod tests {
             sentence_below_cap: false,
         };
         let active_at = |seconds: i64| ThreadSummary {
+            hue: None,
             id: "t".to_owned(),
             root: None,
             title: String::new(),
@@ -1878,6 +1880,7 @@ mod tests {
             "quiet since it was written: left to age"
         );
         let unparseable = ThreadSummary {
+            hue: None,
             updated_at: "yesterday".to_owned(),
             ..active_at(0)
         };

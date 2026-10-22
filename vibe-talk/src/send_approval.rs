@@ -873,6 +873,7 @@ mod tests {
             .iter()
             .map(|inside| Message {
                 thread: inside.map(|is_root| crate::threads::MessageThread {
+                    hue: None,
                     id: "t1".to_owned(),
                     root_message_id: None,
                     is_root,

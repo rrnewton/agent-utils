@@ -371,6 +371,28 @@ pub const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE turns ADD COLUMN detail TEXT;
     ",
+    // v18 — the colour of each thread, assigned here. `#427 server-thread-hues`.
+    //
+    // ONE new table and nothing else, for the reason v10 gives. Two ids, a hue, the root's
+    // instant where known, and the order assignments were made in — no message text, so like
+    // `dismissals` it is bounded by a count (`super::MAX_THREAD_HUES_PER_CHANNEL`, the oldest
+    // assignment going first) and never by an age. `hue` is whole degrees, checked into the
+    // wheel here so a value outside it cannot be stored even by a hand-edited file's next write.
+    //
+    // This step's place in the ladder is all that numbers it; the tests find it by what it does.
+    "
+    CREATE TABLE thread_hues (
+        channel_id   TEXT    NOT NULL,
+        thread_id    TEXT    NOT NULL,
+        hue          INTEGER NOT NULL CHECK (hue >= 0 AND hue < 360),
+        root_at_ms   INTEGER,
+        seq          INTEGER NOT NULL,
+        assigned_at_ms INTEGER NOT NULL,
+        PRIMARY KEY (channel_id, thread_id)
+    ) STRICT;
+
+    CREATE INDEX thread_hues_by_assignment ON thread_hues (channel_id, seq);
+    ",
 ];
 
 /// A [`StateStore`] backed by one SQLite file.
@@ -679,6 +701,87 @@ fn bump_pin_revision(
         )
         .map_err(backend)?;
     Ok(next)
+}
+
+/// This channel's thread hues, in assignment order, inside the caller's connection or
+/// transaction. `#427 server-thread-hues`.
+fn thread_hue_rows(
+    connection: &Connection,
+    channel: &str,
+) -> Result<Vec<crate::thread_hues::AssignedHue>, StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT thread_id, hue, root_at_ms, seq FROM thread_hues
+             WHERE channel_id = ?1 ORDER BY seq",
+        )
+        .map_err(backend)?;
+    let rows = statement
+        .query_map([channel], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(backend)?;
+    let mut held = Vec::new();
+    for row in rows {
+        let (thread_id, hue, root_at_ms, seq) = row.map_err(backend)?;
+        held.push(crate::thread_hues::AssignedHue {
+            thread_id,
+            hue: u16::try_from(hue).map_err(|_| {
+                StoreError::Backend(format!("stored thread hue {hue} is outside the wheel"))
+            })?,
+            root_at_ms,
+            seq,
+        });
+    }
+    Ok(held)
+}
+
+/// File one assignment. A plain insert: the caller decided inside the same transaction that the
+/// thread has no row, and a conflict here would be that decision undone — an error to surface,
+/// never a colour to overwrite. `#427 server-thread-hues`.
+fn insert_thread_hue(
+    connection: &Connection,
+    channel: &str,
+    row: &crate::thread_hues::AssignedHue,
+    at_ms: i64,
+) -> Result<(), StoreError> {
+    connection
+        .execute(
+            "INSERT INTO thread_hues (channel_id, thread_id, hue, root_at_ms, seq, assigned_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                channel,
+                row.thread_id,
+                i64::from(row.hue),
+                row.root_at_ms,
+                row.seq,
+                at_ms
+            ],
+        )
+        .map_err(backend)?;
+    Ok(())
+}
+
+/// Forget a channel's oldest assignments past [`super::MAX_THREAD_HUES_PER_CHANNEL`], in the
+/// caller's transaction: the same rows [`super::trim_thread_hues`] drops from the list it
+/// returns, so the table and the answer cannot disagree. `#427 server-thread-hues`.
+fn trim_thread_hue_table(connection: &Connection, channel: &str) -> Result<(), StoreError> {
+    connection
+        .execute(
+            "DELETE FROM thread_hues WHERE channel_id = ?1 AND thread_id IN (
+                 SELECT thread_id FROM thread_hues WHERE channel_id = ?1 ORDER BY seq DESC
+                 LIMIT -1 OFFSET ?2)",
+            rusqlite::params![
+                channel,
+                i64::try_from(super::MAX_THREAD_HUES_PER_CHANNEL).unwrap_or(i64::MAX)
+            ],
+        )
+        .map_err(backend)?;
+    Ok(())
 }
 
 /// This channel's bookmark, inside the caller's connection or transaction. `#240 reading-bookmark`.
@@ -2234,9 +2337,145 @@ impl StateStore for SqliteStore {
         .await
     }
 
+    async fn thread_hues(
+        &self,
+        channel: &ChannelId,
+    ) -> Result<Vec<crate::thread_hues::AssignedHue>, StoreError> {
+        let channel = channel.clone();
+        self.with_connection(move |connection| thread_hue_rows(connection, channel.as_str()))
+            .await
+    }
+
+    async fn ensure_thread_hues(
+        &self,
+        channel: &ChannelId,
+        refs: &[crate::thread_hues::HueRef],
+    ) -> Result<Vec<crate::thread_hues::AssignedHue>, StoreError> {
+        for wanted in refs {
+            super::validate_thread_hue_id(&wanted.thread_id)?;
+        }
+        let channel = channel.clone();
+        let refs = refs.to_vec();
+        self.with_connection(move |connection| {
+            // The read, the decision and the writes under one transaction and the connection
+            // lock, so two callers colouring the same new thread cannot decide apart.
+            let transaction = connection.transaction().map_err(backend)?;
+            let mut held = thread_hue_rows(&transaction, channel.as_str())?;
+            // A root time learnt late is filled in where the row has none: no colour moves.
+            for wanted in &refs {
+                if wanted.root_at_ms.is_some() {
+                    transaction
+                        .execute(
+                            "UPDATE thread_hues SET root_at_ms = ?3
+                             WHERE channel_id = ?1 AND thread_id = ?2 AND root_at_ms IS NULL",
+                            rusqlite::params![
+                                channel.as_str(),
+                                wanted.thread_id,
+                                wanted.root_at_ms
+                            ],
+                        )
+                        .map_err(backend)?;
+                    if let Some(row) = held
+                        .iter_mut()
+                        .find(|row| row.thread_id == wanted.thread_id && row.root_at_ms.is_none())
+                    {
+                        row.root_at_ms = wanted.root_at_ms;
+                    }
+                }
+            }
+            let fresh = crate::thread_hues::assign_new(&held, &refs);
+            let now = now_ms();
+            for row in &fresh {
+                insert_thread_hue(&transaction, channel.as_str(), row, now)?;
+            }
+            held.extend(fresh);
+            let kept = super::trim_thread_hues(held);
+            trim_thread_hue_table(&transaction, channel.as_str())?;
+            transaction.commit().map_err(backend)?;
+            Ok(kept)
+        })
+        .await
+    }
+
+    async fn seed_thread_hues(
+        &self,
+        channel: &ChannelId,
+        seeds: &[(crate::thread_hues::HueRef, u16)],
+    ) -> Result<u64, StoreError> {
+        for (wanted, hue) in seeds {
+            super::validate_thread_hue_id(&wanted.thread_id)?;
+            if *hue >= 360 {
+                return Err(StoreError::BadId(
+                    "a hue must be under 360 degrees".to_owned(),
+                ));
+            }
+        }
+        let channel = channel.clone();
+        let seeds = seeds.to_vec();
+        self.with_connection(move |connection| {
+            let transaction = connection.transaction().map_err(backend)?;
+            let held = thread_hue_rows(&transaction, channel.as_str())?;
+            let mut next_seq = held.iter().map(|row| row.seq).max().unwrap_or(0) + 1;
+            let now = now_ms();
+            let mut inserted: Vec<String> = Vec::new();
+            let mut known: Vec<String> = held.iter().map(|row| row.thread_id.clone()).collect();
+            for (wanted, hue) in &seeds {
+                if known.contains(&wanted.thread_id) {
+                    // No recolour; a root time the row lacks is still learnt, as in ensure.
+                    if wanted.root_at_ms.is_some() {
+                        transaction
+                            .execute(
+                                "UPDATE thread_hues SET root_at_ms = ?3
+                                 WHERE channel_id = ?1 AND thread_id = ?2 AND root_at_ms IS NULL",
+                                rusqlite::params![
+                                    channel.as_str(),
+                                    wanted.thread_id,
+                                    wanted.root_at_ms
+                                ],
+                            )
+                            .map_err(backend)?;
+                    }
+                    continue;
+                }
+                insert_thread_hue(
+                    &transaction,
+                    channel.as_str(),
+                    &crate::thread_hues::AssignedHue {
+                        thread_id: wanted.thread_id.clone(),
+                        hue: *hue,
+                        root_at_ms: wanted.root_at_ms,
+                        seq: next_seq,
+                    },
+                    now,
+                )?;
+                known.push(wanted.thread_id.clone());
+                inserted.push(wanted.thread_id.clone());
+                next_seq += 1;
+            }
+            trim_thread_hue_table(&transaction, channel.as_str())?;
+            // What the bound dropped in the same write was not taken, whatever was inserted.
+            let kept = thread_hue_rows(&transaction, channel.as_str())?;
+            let taken = u64::try_from(
+                inserted
+                    .iter()
+                    .filter(|id| kept.iter().any(|row| &row.thread_id == *id))
+                    .count(),
+            )
+            .unwrap_or(0);
+            transaction.commit().map_err(backend)?;
+            Ok(taken)
+        })
+        .await
+    }
+
     async fn purge_everything(&self) -> Result<(), StoreError> {
         self.with_connection(|connection| {
             let transaction = connection.transaction().map_err(backend)?;
+            // The threads' colours with everything else: a thread read afterwards is coloured
+            // afresh, by the same policy in the order threads arrive. `#427 server-thread-hues`.
+            transaction
+                .execute("DELETE FROM thread_hues", [])
+                .map_err(backend)?;
             // Every channel back to off, which is the shipped default and what no row means.
             transaction
                 .execute("DELETE FROM upstream_clear", [])
@@ -6172,6 +6411,12 @@ mod tests {
         }
         // The bundled SQLite is new enough for `DROP COLUMN`, as the README requires.
         let connection = Connection::open(&file).expect("open for the rollback");
+        // Newest first, as the README has it: a file at this build is past the detail step, and
+        // each later step is undone by its own note before this one is reached. The one later
+        // step there is adds a table, dropped here as its note says.
+        connection
+            .execute_batch("DROP TABLE IF EXISTS thread_hues;")
+            .expect("undo the thread-hues step");
         let pasted: String = statements.iter().map(|line| format!("{line}\n")).collect();
         connection
             .execute_batch(&pasted)
@@ -6233,6 +6478,166 @@ mod tests {
             .append_turn(&id("spoken"), &sent(8, "and again"))
             .await
             .expect("a record row after upgrading again");
+    }
+
+    // --- `#427 server-thread-hues` -----------------------------------------------------------
+
+    fn hue_ref(id: &str, root_at_ms: Option<i64>) -> crate::thread_hues::HueRef {
+        crate::thread_hues::HueRef {
+            thread_id: id.to_owned(),
+            root_at_ms,
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_hues_survive_a_restart_and_are_never_recoloured() {
+        let dir = TempDir::new("thread-hues-restart");
+        let channel = ChannelId("chan".to_owned());
+        let first = {
+            let store = store(&dir, Retention::default());
+            let given = store
+                .ensure_thread_hues(
+                    &channel,
+                    &[hue_ref("t1", Some(100)), hue_ref("t2", Some(200))],
+                )
+                .await
+                .expect("colour");
+            assert_eq!(given.len(), 2);
+            given
+        };
+        // Reopened — a restart — the colours stand, and asking again colours only the new one.
+        let store = store(&dir, Retention::default());
+        let again = store
+            .ensure_thread_hues(
+                &channel,
+                &[
+                    hue_ref("t2", Some(200)),
+                    hue_ref("t1", Some(100)),
+                    hue_ref("t3", Some(300)),
+                ],
+            )
+            .await
+            .expect("colour again");
+        assert_eq!(again.len(), 3);
+        assert_eq!(
+            again[..2],
+            first[..],
+            "a restart or a re-ask recoloured a thread"
+        );
+        // Another channel's colours are its own, from the first hue.
+        let other = store
+            .ensure_thread_hues(
+                &ChannelId("elsewhere".to_owned()),
+                &[hue_ref("t1", Some(100))],
+            )
+            .await
+            .expect("other channel");
+        assert_eq!(other[0].hue, crate::thread_hues::FIRST_HUE);
+        // A root time learnt late is filled in without touching the colour.
+        let filled = store
+            .ensure_thread_hues(&channel, &[hue_ref("t3", Some(300))])
+            .await
+            .expect("fill");
+        assert_eq!(filled[2], again[2]);
+    }
+
+    #[tokio::test]
+    async fn seeded_hues_are_taken_once_and_the_purge_takes_them_back() {
+        let dir = TempDir::new("thread-hues-seed");
+        let store = store(&dir, Retention::default());
+        let channel = ChannelId("chan".to_owned());
+        let taken = store
+            .seed_thread_hues(
+                &channel,
+                &[
+                    (hue_ref("t1", Some(100)), 12),
+                    (hue_ref("t2", Some(200)), 200),
+                ],
+            )
+            .await
+            .expect("seed");
+        assert_eq!(taken, 2);
+        // A second offer — another device's different memory — takes nothing already decided,
+        // and files only what is new.
+        let taken = store
+            .seed_thread_hues(
+                &channel,
+                &[(hue_ref("t1", Some(100)), 99), (hue_ref("t3", None), 300)],
+            )
+            .await
+            .expect("seed again");
+        assert_eq!(taken, 1);
+        let held = store.thread_hues(&channel).await.expect("read");
+        assert_eq!(held[0].hue, 12, "the second seeding recoloured a thread");
+        assert_eq!(held[2].hue, 300);
+        assert_eq!(
+            held[2].seq, 3,
+            "seeds take assignment order in the order given"
+        );
+        // A hue outside the wheel is refused whole.
+        assert!(matches!(
+            store
+                .seed_thread_hues(&channel, &[(hue_ref("t4", None), 360)])
+                .await,
+            Err(StoreError::BadId(_))
+        ));
+        store.purge_everything().await.expect("purge");
+        assert!(store.thread_hues(&channel).await.expect("read").is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_oldest_assignment_goes_first_at_the_bound() {
+        let dir = TempDir::new("thread-hues-bound");
+        let store = store(&dir, Retention::default());
+        let channel = ChannelId("chan".to_owned());
+        let total = super::super::MAX_THREAD_HUES_PER_CHANNEL + 5;
+        let seeds: Vec<(crate::thread_hues::HueRef, u16)> = (0..total)
+            .map(|i| {
+                (
+                    hue_ref(&format!("t{i}"), Some(i64::try_from(i).expect("small"))),
+                    u16::try_from(i % 360).expect("small"),
+                )
+            })
+            .collect();
+        store
+            .seed_thread_hues(&channel, &seeds)
+            .await
+            .expect("seed many");
+        let held = store.thread_hues(&channel).await.expect("read");
+        assert_eq!(held.len(), super::super::MAX_THREAD_HUES_PER_CHANNEL);
+        assert_eq!(
+            held[0].thread_id, "t5",
+            "the five oldest assignments were not the ones dropped"
+        );
+        assert_eq!(
+            held.last().map(|row| row.thread_id.as_str()),
+            Some(format!("t{}", total - 1).as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_from_before_thread_hues_upgrades_with_none() {
+        // A database at the version before the thread_hues step opens, upgrades, and colours
+        // from the first hue: the step adds an empty table and touches nothing else.
+        let dir = TempDir::new("thread-hues-upgrade");
+        let file = dir.path().join("state").join("vibe-talk.sqlite3");
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("dir");
+        let at = MIGRATIONS
+            .iter()
+            .position(|step| step.contains("CREATE TABLE thread_hues"))
+            .expect("the step exists");
+        {
+            let connection = Connection::open(&file).expect("open");
+            migrate_through(&connection, &MIGRATIONS[..at]).expect("migrate to before hues");
+        }
+        let store = SqliteStore::open(&file, Retention::default()).expect("upgrade");
+        let channel = ChannelId("chan".to_owned());
+        assert!(store.thread_hues(&channel).await.expect("read").is_empty());
+        let given = store
+            .ensure_thread_hues(&channel, &[hue_ref("t1", Some(1))])
+            .await
+            .expect("colour");
+        assert_eq!(given[0].hue, crate::thread_hues::FIRST_HUE);
     }
 
     #[tokio::test]

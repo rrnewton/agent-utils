@@ -1522,6 +1522,71 @@ pub fn next_pin_revision(previous: i64, now_ms: i64) -> i64 {
     previous.saturating_add(1).max(now_ms)
 }
 
+// --- thread hues --------------------------------------------------------------------------------
+//
+// `#427 server-thread-hues`. The colour of each thread, assigned by this server once (see
+// [`crate::thread_hues`]) and kept here so every device draws the same thread the same colour and
+// a restart changes nothing. A row is two ids, a number and two instants — no message text, like
+// a dismissal — which is why, like the dismissal table, it is bounded by a count and never by an
+// age: an age limit would recolour a thread the owner last opened a month ago for no reason he
+// could see, which is the very thing a kept colour exists to prevent.
+
+/// How many thread hues one channel keeps.
+///
+/// **At the bound, colouring another thread forgets the OLDEST assignment in that channel** —
+/// oldest by when it was assigned, in the same write. That is the pin table's rule, for its
+/// reason: the newest act is the one being looked at. A forgotten thread that is read again is
+/// coloured afresh by the same deterministic policy, which may not be the colour it had: "never
+/// changes once assigned" holds while the assignment is kept, and this bound is what keeping
+/// means. It is set far above a channel's living threads — a channel would need 256 threads
+/// coloured before the first could be forgotten — and a row is a few dozen bytes, so the whole
+/// table stays smaller than one long message per channel.
+///
+/// Fixed rather than a [`Retention`] setting, for [`MAX_PINS_PER_CHANNEL`]'s reason: the bound is
+/// part of what the assignment promises, and an operator lowering it would recolour threads
+/// nobody chose to recolour.
+pub const MAX_THREAD_HUES_PER_CHANNEL: usize = 256;
+
+/// The longest thread id a hue may be kept under, in bytes: the ceiling the timeline route
+/// already puts on a `thread_id`, for the same reason — it is an opaque, provider-shaped string,
+/// and anything longer was not served by one.
+pub const MAX_THREAD_HUE_ID_BYTES: usize = 1024;
+
+/// Refuse a thread id no hue may be kept under: empty after trimming, over
+/// [`MAX_THREAD_HUE_ID_BYTES`], or carrying a control character — the timeline route's own test
+/// for the same identifier, so a thread the page may open is a thread the store may colour and
+/// the two cannot drift apart.
+///
+/// # Errors
+///
+/// [`StoreError::BadId`] naming what was wrong, without echoing the caller's text.
+pub fn validate_thread_hue_id(raw: &str) -> Result<(), StoreError> {
+    if raw.trim().is_empty()
+        || raw.len() > MAX_THREAD_HUE_ID_BYTES
+        || raw.chars().any(char::is_control)
+    {
+        return Err(StoreError::BadId(
+            "a thread id must be a non-empty thread identifier".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Keep from `rows` (one channel's hues, any order) only the newest
+/// [`MAX_THREAD_HUES_PER_CHANNEL`] by assignment order, returning the survivors in assignment
+/// order. Shared by every backend so the bound means the same thing in each.
+#[must_use]
+pub fn trim_thread_hues(
+    rows: Vec<crate::thread_hues::AssignedHue>,
+) -> Vec<crate::thread_hues::AssignedHue> {
+    let mut rows = rows;
+    rows.sort_by_key(|row| row.seq);
+    if rows.len() > MAX_THREAD_HUES_PER_CHANNEL {
+        rows.drain(..rows.len() - MAX_THREAD_HUES_PER_CHANNEL);
+    }
+    rows
+}
+
 /// Why a store operation could not be carried out.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -2276,6 +2341,69 @@ pub trait StateStore: Send + Sync {
         channel: &ChannelId,
         attempt: &UpstreamClearAttempt,
     ) -> Result<(), StoreError>;
+
+    /// Every thread hue kept for one channel, in assignment order. `#427 server-thread-hues`.
+    ///
+    /// The whole channel rather than a lookup per thread: the table is bounded by
+    /// [`MAX_THREAD_HUES_PER_CHANNEL`], and whoever serves a page needs the neighbours as well
+    /// as the threads on it. Read scope may call this — it writes nothing, and a thread with no
+    /// row here is simply one this server has not coloured yet.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a read
+    /// failure.
+    async fn thread_hues(
+        &self,
+        channel: &ChannelId,
+    ) -> Result<Vec<crate::thread_hues::AssignedHue>, StoreError>;
+
+    /// Colour every thread in `refs` that has no hue in `channel` yet, and return the channel's
+    /// hues as they then stand, in assignment order. `#427 server-thread-hues`.
+    ///
+    /// The decision ([`crate::thread_hues::assign_new`]) is made against the rows as they stand
+    /// INSIDE the write, so two callers colouring the same new thread at once cannot come away
+    /// with two colours: the second reads the first's row and assigns nothing. A ref naming a
+    /// coloured thread never recolours it; it may fill in that thread's root time where the row
+    /// has none, which changes no colour and only makes later neighbours truer. Bounded by
+    /// [`MAX_THREAD_HUES_PER_CHANNEL`] in the same write, the oldest assignment going first.
+    ///
+    /// **A durable write**, and so never made on behalf of a read-scope caller: a read token
+    /// meeting an uncoloured thread is served it without a hue, and the page falls back, exactly
+    /// as a generated summary is not filed for one ([`crate::ops::summarize_message`]).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::BadId`] for a
+    /// thread id [`validate_thread_hue_id`] refuses; [`StoreError::Backend`] on a write failure.
+    async fn ensure_thread_hues(
+        &self,
+        channel: &ChannelId,
+        refs: &[crate::thread_hues::HueRef],
+    ) -> Result<Vec<crate::thread_hues::AssignedHue>, StoreError>;
+
+    /// Take colours a browser had already chosen (`seeds`, each a thread, its hue, and the order
+    /// the browser last drew in, oldest first) for threads this server has not coloured, and
+    /// return how many were taken. `#427 server-thread-hues`, the migration from `#396
+    /// thread-color-memory`: the colours the owner already sees survive the move to the server.
+    ///
+    /// First writer wins, exactly as assignment does: a seed for a coloured thread is ignored,
+    /// never a recolour, so seeding from a second device — or the same one twice — changes
+    /// nothing already decided. Seeds take assignment order in the order given, so "most
+    /// recently assigned" for later threads reads as the browser's "most recently drawn" did.
+    /// Bounded like [`StateStore::ensure_thread_hues`]. **Write scope only**, for the same
+    /// reason every durable write here is.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::BadId`] for a
+    /// thread id [`validate_thread_hue_id`] refuses or a hue outside `0..360`;
+    /// [`StoreError::Backend`] on a write failure.
+    async fn seed_thread_hues(
+        &self,
+        channel: &ChannelId,
+        seeds: &[(crate::thread_hues::HueRef, u16)],
+    ) -> Result<u64, StoreError>;
 
     /// Erase everything this store holds.
     ///

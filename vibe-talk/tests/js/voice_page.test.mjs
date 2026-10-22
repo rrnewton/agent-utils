@@ -2046,6 +2046,14 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       if (after !== null && Number(after) !== page.sendsThrough) return answer();
       return new Promise((resolve) => page.proposalWaiters.push(() => resolve(answer())));
     },
+    /**
+     * `#427 server-thread-hues`. Every offer of this browser's remembered colours, parsed, and
+     * the little server that answers it. By default an older server with no such route, as every
+     * fixture here played before `#427` — so the `#396` tests go on measuring this browser's own
+     * memory undisturbed. A `#427` test replaces `threadHueSeed` with a server that takes them.
+     */
+    hueSeedOffers: [],
+    threadHueSeed: async () => json(404, { error: "not_found", detail: "no such route" }),
     timeline: async (path) => {
       const url = new URL(path, "http://fixture.test");
       const view = url.searchParams.get("view");
@@ -2942,6 +2950,10 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       }
       if (String(path).startsWith("/api/v1/post-proposals")) {
         return page.postProposals(String(path), options);
+      }
+      if (/\/thread-hues$/.test(String(path))) {
+        page.hueSeedOffers.push(JSON.parse(options.body));
+        return page.threadHueSeed(path, options);
       }
       if (/\/timeline\?/.test(String(path))) {
         page.timelineCalls.push(String(path));
@@ -33463,6 +33475,130 @@ test("`#414 thread-hue-spread`: eight threads posted in a row in a new channel a
   assert.ok(apart >= HUE_APART, `${pair} are ${apart}° apart, within three places of each other`);
   const beside = closestNeighbours(hues, ids, 1);
   assert.ok(beside.apart >= 90, `${beside.pair}, side by side, are ${beside.apart}° apart, under 90°`);
+});
+
+// --- `#427 server-thread-hues` -------------------------------------------------------------------
+//
+// The server decides each thread's colour and every message and summary carries it. The page
+// draws that colour, never a locally remembered or freshly computed one, for every thread that
+// carries one; a thread without one keeps the `#396`/`#414` behaviour above. This browser's own
+// remembered colours are offered to the server once, before the first read that could colour
+// those threads itself.
+
+/** `threadsOf` with the server's colours on the threads `hues` names, records and cards alike. */
+function threadsWithServerHues(ids, hues) {
+  const data = threadsOf(ids);
+  for (const held of data.messages) {
+    if (hues[held.thread.id] !== undefined) held.thread.hue = hues[held.thread.id];
+  }
+  for (const summary of data.threads) {
+    if (hues[summary.id] !== undefined) summary.hue = hues[summary.id];
+  }
+  return data;
+}
+
+test("`#427 server-thread-hues`: a thread is drawn in the server's colour, over this browser's memory", async () => {
+  // This browser remembers T-north as 5 (a red); the server says 200 (a blue). The server wins,
+  // which is the point: every device now draws the one colour.
+  const store = new Map();
+  const first = await threadsPage(threadsOf(["T-north", "T-south"]), store);
+  await first.settle();
+  const scope = Object.keys(JSON.parse(store.get(THREAD_HUES_KEY)).channels)[0];
+  const memory = JSON.parse(store.get(THREAD_HUES_KEY));
+  memory.channels[scope]["T-north"] = [5, Date.now()];
+  memory.channels[scope]["T-south"] = [190, Date.now()];
+  store.set(THREAD_HUES_KEY, JSON.stringify(memory));
+  const page = await reloadThreads(store,
+    threadsWithServerHues(["T-north", "T-south"], { "T-north": 200, "T-south": 80 }));
+  assert.deepStrictEqual(hueByThread(page), { "T-north": "200", "T-south": "80" },
+    "the page drew its remembered colours over the server's");
+  // And a reload against an older server — no hues carried — keeps them now, because they were
+  // drawn and remembered as this browser's.
+  await page.settle();
+  const again = await reloadThreads(store, threadsOf(["T-south", "T-north"]));
+  assert.deepStrictEqual(hueByThread(again), { "T-north": "200", "T-south": "80" },
+    "the server's colours did not survive as this browser's memory");
+});
+
+test("`#427 server-thread-hues`: a thread the server has not coloured falls back, clear of the coloured ones", async () => {
+  // Only T-north carries a hue — a read-token page meeting threads before any write-scope read
+  // coloured the rest. T-south is coloured here, by the local algorithm, measured against the
+  // server's colour rather than over it.
+  const page = await threadsPage(
+    threadsWithServerHues(["T-north", "T-south"], { "T-north": 200 }));
+  const hues = hueByThread(page);
+  assert.equal(hues["T-north"], "200");
+  assert.ok(hueDistance(hues["T-south"], 200) >= 90,
+    `the fallback colour ${hues["T-south"]} sits beside the server's 200`);
+  // Once the server colours T-south, its word replaces the fallback on the next read.
+  const next = await reloadThreads(page.storage,
+    threadsWithServerHues(["T-north", "T-south"], { "T-north": 200, "T-south": 310 }));
+  assert.deepStrictEqual(hueByThread(next), { "T-north": "200", "T-south": "310" },
+    "a fallback colour stood against the server's later assignment");
+});
+
+test("`#427 server-thread-hues`: this browser's colours are offered to the server once, before the read", async () => {
+  const first = await threadsPage(threadsOf(["T-north", "T-south"]));
+  await first.settle();
+  const before = hueByThread(first);
+  assert.equal(first.hueSeedOffers.length, 0, "the premise: nothing was remembered to offer");
+  // A reload with a server that takes the offer. The timeline is replaced with one that answers
+  // as that server then would — the offered colours, rounded, on every record — which is also
+  // how the test knows the offer landed first: a read that coloured first would not carry them.
+  const taken = new Map();
+  const page = newPage(first.storage, SCRIPT, (p) => {
+    p.threadingSupported = true;
+    p.threadHueSeed = async (_path, options) => {
+      const offered = JSON.parse(options.body).hues;
+      for (const one of offered) taken.set(one.thread_id, Math.round(one.hue) % 360);
+      return json(200, { channel: p.channels[0], seeded: offered.length, hues: Object.fromEntries(taken) });
+    };
+    const serve = p.timeline;
+    p.timeline = async (path, options) => {
+      p.messages = threadsWithServerHues(["T-north", "T-south"], Object.fromEntries(taken)).messages;
+      p.threads = threadsWithServerHues(["T-north", "T-south"], Object.fromEntries(taken)).threads;
+      return serve(path, options);
+    };
+  });
+  first.storage.delete(MESSAGE_CACHE_KEY);
+  await reopenedChannel(page);
+  assert.equal(page.hueSeedOffers.length, 1, "the colours were not offered exactly once");
+  const offered = Object.fromEntries(page.hueSeedOffers[0].hues.map((one) => [one.thread_id, one.hue]));
+  assert.deepStrictEqual(offered, { "T-north": Number(before["T-north"]), "T-south": Number(before["T-south"]) },
+    "what was offered is not what this browser drew");
+  const after = hueByThread(page);
+  for (const id of ["T-north", "T-south"]) {
+    assert.equal(Number(after[id]), Math.round(Number(before[id])) % 360,
+      `${id}'s colour did not survive the move to the server`);
+  }
+  // Once taken, never offered again — not on the next load either.
+  const again = newPage(first.storage, SCRIPT, (p) => {
+    p.threadingSupported = true;
+    p.threads = threadsWithServerHues(["T-north", "T-south"], Object.fromEntries(taken)).threads;
+    p.messages = threadsWithServerHues(["T-north", "T-south"], Object.fromEntries(taken)).messages;
+  });
+  first.storage.delete(MESSAGE_CACHE_KEY);
+  await reopenedChannel(again);
+  assert.equal(again.hueSeedOffers.length, 0, "the colours were offered a second time");
+  assert.deepStrictEqual(hueByThread(again), after);
+});
+
+test("`#427 server-thread-hues`: a read-token page offers nothing and an older server costs nothing", async () => {
+  const first = await threadsPage(threadsOf(["T-north", "T-south"]));
+  await first.settle();
+  const before = hueByThread(first);
+  // The same browser, read token: the route files durable state, so no offer is made at all —
+  // and the threads are drawn from this browser's memory as before `#427`.
+  const page = newPage(first.storage, SCRIPT, (p) => {
+    p.tokenScope = "read";
+    p.threadingSupported = true;
+    p.messages = threadsOf(["T-south", "T-north"]).messages;
+    p.threads = threadsOf(["T-south", "T-north"]).threads;
+  });
+  first.storage.delete(MESSAGE_CACHE_KEY);
+  await reopenedChannel(page);
+  assert.equal(page.hueSeedOffers.length, 0, "a read-token page offered colours");
+  assert.deepStrictEqual(hueByThread(page), before, "the read-token page recoloured its threads");
 });
 
 test("the normal composer lives after history and posts standalone messages without a reply target", async () => {

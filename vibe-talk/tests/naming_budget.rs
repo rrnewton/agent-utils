@@ -100,6 +100,7 @@ fn message(channel: &str, id: &str, content: &str) -> Message {
 fn summary_of(channel: &str, thread: &FakeThread) -> ThreadSummary {
     let second = thread.active_second;
     ThreadSummary {
+        hue: None,
         id: thread.id.clone(),
         root: Some(message(
             channel,

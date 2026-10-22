@@ -3767,6 +3767,18 @@ taking the file back too. **Take a copy of `storage.path` before an upgrade.** R
 is the simplest way back to an older build. The other way is to undo the newest steps by hand, with
 the server stopped, newest first; each step's note below says how.
 
+**Step 18 (`#427 server-thread-hues`)** only adds the `thread_hues` table — the colour this server
+assigned each thread, when its root was posted, and the order the colours were handed out — so with
+the server stopped it can be undone in place, losing nothing but the assignments (an older build
+colours threads in the browser again, and this build re-opened on the file would colour them afresh):
+
+```sh
+sqlite3 /path/to/vibe-talk.sqlite3 'DROP TABLE thread_hues; PRAGMA user_version = 17;'
+```
+
+Run that only on a file at version 18 (`PRAGMA user_version;` says), and only when the build being
+returned to predates the step.
+
 **Step 17 (`#270 voice-transcript-markers`)** added one nullable column, `turns.detail`, which holds
 what a transcript row records beyond words. It also brought two kinds of row: `sent`, a message the
 voice agent posted, and `marker`, which records a conversation's start or a draft that was not

@@ -607,6 +607,8 @@ async fn main() -> anyhow::Result<()> {
     // the hub offers it every change it publishes; with no cache behind it, that costs nothing.
     let message_cache = Arc::new(vibe_talk::cache::Sink::off());
     live.attach_cache(Arc::clone(&message_cache));
+    // `#427 server-thread-hues`: the poller colours a thread in the tick it first meets it.
+    live.attach_store(Arc::clone(&store));
     if config.ingest.enabled() {
         tracing::info!(
             events_route = "/api/v1/live/events",

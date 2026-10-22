@@ -101,6 +101,7 @@ impl Thread {
 
     fn summary(&self, channel: &ChannelId) -> ThreadSummary {
         ThreadSummary {
+            hue: None,
             id: self.id.clone(),
             root: Some(self.message(channel, 0)),
             title: format!("{} starts here", self.id),

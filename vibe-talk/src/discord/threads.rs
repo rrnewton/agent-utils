@@ -134,6 +134,7 @@ impl NativeThread {
 
     fn membership(&self, root: bool) -> MessageThread {
         MessageThread {
+            hue: None,
             id: self.id.clone(),
             root_message_id: Some(MessageId(self.id.clone())),
             is_root: root,
@@ -152,6 +153,7 @@ impl NativeThread {
             .map_err(|_| shape("thread activity timestamp is out of range"))?
             .to_string();
         Ok(ThreadSummary {
+            hue: None,
             id: self.id.clone(),
             root: None,
             title: self.title.clone(),
@@ -1652,6 +1654,7 @@ fn confirm_bridge_post(
         Some(_) => Ok(()),
         None => {
             message.thread = Some(MessageThread {
+                hue: None,
                 id: thread.to_owned(),
                 root_message_id: None,
                 is_root: false,
@@ -2811,6 +2814,7 @@ mod tests {
         assert_eq!(
             posted.thread,
             Some(MessageThread {
+                hue: None,
                 id: "opaque/thread".into(),
                 root_message_id: None,
                 is_root: false,
