@@ -1,12 +1,13 @@
 ---
 title: 'thread-card-pack-toggle: pack and unpack each thread from its card, and Unpack in three states'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-22T18:35:58.369181641+00:00
-updated_at: 2026-10-22T18:35:58.369181641+00:00
+updated_at: 2026-10-22T22:58:45.135646855+00:00
+closed_at: 2026-10-22T22:58:45.135646745+00:00
 ---
 
 # Description
