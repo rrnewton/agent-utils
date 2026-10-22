@@ -1441,6 +1441,30 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#425 collapsed-lines` in the browser engine, at 1280x800 with the keys and at 393x852 by touch: a
+  # folded long message's body in Main is 3 lines until Ctrl+( and Cmd+( step it to 1 and to 0 (the
+  # header alone, no gap where the body was, reactions still drawn) with the count said and the chord
+  # taken from the zoom, Ctrl+) back up to 6 and no past 8, by bracket and by digit place, never in
+  # the message box; the Settings slider and its - and + set the same count and a reload keeps it;
+  # the row being read holds its place as the count changes and the newest line is kept; the same
+  # count folds a thread's rows and rows unpacked under their cards, and a raw thread card is the
+  # count tall (one line at 0, a card's text being its name); at 0 a row still opens whole, the
+  # selection still moves and Reply still opens. The negative control requires an open body past
+  # every count. Served through Playwright's request routing, so it opens no port.
+  - group: check
+    job: collapsed-lines-browser
+    desc: collapsed messages at the reader's 0 to 8 lines in Main, a thread, unpacked rows and on thread cards, by Ctrl/Cmd+( and Ctrl/Cmd+) and by the Settings slider, the reader's place kept, in current Chromium at 1280x800 and 393x852
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/collapsed_lines_browser.py
+    jobs_flag: ""
+    timeout: 180
+    cpu_timeout: 90
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 30
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#245 done-feedback` in the browser engine: on a threaded channel at 1280x800, in the dark scheme and
   # the light one, a selected unread message is ringed solid in the accent and a selected read one
   # dashed in grey on the same lit surface, each at 3:1 or more against it, by computed style; e draws

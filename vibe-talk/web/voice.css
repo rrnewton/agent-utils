@@ -50,6 +50,14 @@
   --reply-gutter: 2.75rem;
   /* The reader's own type size for message text. Settings drives it; see `--msg-scale`. */
   --msg-scale: 1;
+  /* `#425 collapsed-lines`. How many lines a collapsed message shows, 0 to 8, the reader's own
+     per device: Settings drives it, and Ctrl+( and Ctrl+) (Cmd on a Mac) step it. One property
+     for every list the page draws, so Main, All, a thread in either column, rows unpacked under
+     their cards and the call's transcript cannot disagree. 0 is header only: web/voice.js also
+     states the value as `data-collapsed-lines` on the root, because a line clamp of 0 is no
+     clamp at all in a browser (it reads as none and shows every line), so the folded body is
+     hidden outright there instead. Overwritten per reader; see `applyCollapsedLines`. */
+  --collapsed-lines: 3;
   --dock: #191c22;
   --ok: #5bd98a;
   --idle: #6b7484;
@@ -3523,7 +3531,8 @@ a.search-hit-link {
   gap: 0.5rem;
 }
 
-.msg-scale-row #msg-scale {
+.msg-scale-row #msg-scale,
+.msg-scale-row #collapsed-lines {
   flex: 1 1 auto;
   min-width: 0;
   display: block;
@@ -3720,9 +3729,10 @@ a.search-hit-link {
 /*
  * `#47 scrollback-stability`. An agent answers in paragraphs, and ten of those in a row is a list
  * you cannot skim: finding the reply you remember means scrolling through the ones you do not. So
- * a long message ARRIVES showing its opening three lines, and opens on a tap.
+ * a long message ARRIVES showing its opening lines — three until the reader says otherwise
+ * (`#425 collapsed-lines`: `--collapsed-lines`, 0 to 8) — and opens on a tap.
  *
- * Three LINES, not a character budget, because what the reader is protected from is a wall of
+ * A count of LINES, not a character budget, because what the reader is protected from is a wall of
  * text and a wall is measured in lines. `-webkit-line-clamp` is the only way to say that in CSS
  * that Safari and Chromium both honour today; `line-clamp` is the standard property it is becoming
  * and is stated beside it so this stops needing the prefix on its own.
@@ -3733,9 +3743,21 @@ a.search-hit-link {
 .body.clamped {
   display: -webkit-box;
   -webkit-box-orient: vertical;
-  -webkit-line-clamp: 3;
-  line-clamp: 3;
+  -webkit-line-clamp: var(--collapsed-lines);
+  line-clamp: var(--collapsed-lines);
   overflow: hidden;
+}
+
+/*
+ * `#425 collapsed-lines`. Zero lines: no body text at all, and no room where it was. The fold's
+ * "(~N more words)" line goes with it — it is a line about the text, and a header-only row has
+ * given the text up; the counts come back with the first line. The row's header, its colour and
+ * its chips are untouched, and an OPEN message is untouched: this is only the clamped body, so
+ * expanding at 0 shows the message whole, as at any other count.
+ */
+:root[data-collapsed-lines="0"] .body.clamped,
+:root[data-collapsed-lines="0"] .elided {
+  display: none;
 }
 
 /*
@@ -8406,8 +8428,9 @@ li.discord-message[data-root-child] > .reply-bridge {
   pointer-events: none;
 }
 
-/* The threads, one card each, every card the same height: three lines of what the thread is
-   about, clamped with an ellipsis, then how long since it moved beside the button into it — save the
+/* The threads, one card each, every card the same height: the reader's collapsed lines of what the
+   thread is about (`--collapsed-lines`, three until they say otherwise, never under one on a card),
+   clamped with an ellipsis, then how long since it moved beside the button into it — save the
    card highlighted, which shows all of it (below). Edged in the thread's own colour, as its tag. */
 .side-cards {
   display: grid;
@@ -8501,30 +8524,41 @@ li.discord-message[data-root-child] > .reply-bridge {
   color: var(--muted);
 }
 
+/*
+ * `#425 collapsed-lines`. A card's text follows the reader's collapsed-lines count as a message's
+ * does, but never under ONE line: this text is the card's name — what a screen reader calls it
+ * and what tells one thread from another — and a list of nameless cards at 0 would be the count
+ * breaking the view it was only meant to tighten. The plain `var()` is stated first for a browser
+ * that takes no arithmetic in a clamp; at 0 such a browser unclamps, and the fixed height below,
+ * whose `max()` every browser takes, still holds the card to its one line.
+ */
 .side-card-text {
   display: -webkit-box;
   -webkit-box-orient: vertical;
-  -webkit-line-clamp: 3;
-  line-clamp: 3;
+  -webkit-line-clamp: var(--collapsed-lines);
+  -webkit-line-clamp: max(1, var(--collapsed-lines));
+  line-clamp: var(--collapsed-lines);
+  line-clamp: max(1, var(--collapsed-lines));
   overflow: hidden;
-  height: calc(3 * 1.35em);
+  height: calc(max(1, var(--collapsed-lines)) * 1.35em);
   line-height: 1.35;
   overflow-wrap: anywhere;
 }
 
-/* `#257 summary-truncation`, made `#277 thread-card-focus`. Three lines keep the list even, but a name
-   and a summary longer than three lines of this column were cut by the clamp with no way to read the
-   rest short of opening the thread, whose heading gives only the name. The card the reader was on
-   showed its whole text, and under a moving mouse that was a card growing and shrinking at every
-   move; the owner: "I also don't like the cards expanding." So the card HIGHLIGHTED, by a press,
-   shows it, and no other. Still three lines at least, so a short card does not shrink as it is. */
+/* `#257 summary-truncation`, made `#277 thread-card-focus`. An even number of lines keeps the list
+   even, but a name and a summary longer than those lines of this column were cut by the clamp with
+   no way to read the rest short of opening the thread, whose heading gives only the name. The card
+   the reader was on showed its whole text, and under a moving mouse that was a card growing and
+   shrinking at every move; the owner: "I also don't like the cards expanding." So the card
+   HIGHLIGHTED, by a press, shows it, and no other. Still the clamped height at least, so a short
+   card does not shrink as it is highlighted. */
 .side-card-row[data-highlighted] > .side-card > .side-card-text {
   display: block;
   -webkit-line-clamp: none;
   line-clamp: none;
   overflow: visible;
   height: auto;
-  min-height: calc(3 * 1.35em);
+  min-height: calc(max(1, var(--collapsed-lines)) * 1.35em);
 }
 
 .side-card-facts {
@@ -8570,7 +8604,8 @@ li.discord-message[data-root-child] > .reply-bridge {
  * so the heading gives up its rule and its least height, the card having its own border, and lines the
  * card up with the cards of the list under it.
  *
- * A FIXED HEIGHT: three lines of text, clamped as a list card's are, then a facts line as tall as the
+ * A FIXED HEIGHT: the reader's collapsed lines of text, clamped as a list card's are (two at most
+ * on a phone, below), then a facts line as tall as the
  * X, and never less than two lines of the count. So the card is the same height whatever it says, and
  * a summary or a count arriving after the thread opened moves nothing under the reader (`#280
  * scroll-stability`).
@@ -8644,13 +8679,17 @@ li.discord-message[data-root-child] > .reply-bridge {
   }
 }
 
-/* On a phone, over a thread across the window, two lines of it rather than three: the card is the
-   screen's heading there, and a third line is a line less of the thread. Still a fixed height. */
+/* On a phone, over a thread across the window, two lines of it rather than the reader's full count:
+   the card is the screen's heading there, and another line of it is a line less of the thread. Fewer
+   than two where the reader's count is fewer (`#425 collapsed-lines`), never under the one line a
+   card keeps for its name. Still a fixed height. */
 @media (max-width: 599.98px) {
   #thread-card:not([data-folded]) > .side-card > .side-card-text {
     -webkit-line-clamp: 2;
+    -webkit-line-clamp: max(1, min(var(--collapsed-lines), 2));
     line-clamp: 2;
-    height: calc(2 * 1.35em);
+    line-clamp: max(1, min(var(--collapsed-lines), 2));
+    height: calc(max(1, min(var(--collapsed-lines), 2)) * 1.35em);
   }
 }
 
