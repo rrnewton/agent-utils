@@ -180,6 +180,39 @@ fn a_discord_clients_links_come_from_its_configured_guild() {
     // No guild configured and none learned: no link, rather than a guessed one.
     let guildless = HttpDiscordClient::new(&discord_config(None)).expect("client");
     assert_eq!(guildless.upstream_url(&chan, &id, None), None);
+    // A thread reply links by its THREAD channel, as Discord's own copy-link writes it: a
+    // native thread read serves the reply under its parent channel's id, and a link naming
+    // the parent finds no such message there.
+    let thread = MessageThread {
+        id: "900000000000000004".to_owned(),
+        root_message_id: Some(MessageId("900000000000000004".to_owned())),
+        is_root: false,
+        reply_count: None,
+        reply_count_exact: false,
+    };
+    assert_eq!(
+        client.upstream_url(&chan, &id, Some(&thread)),
+        Some(format!(
+            "https://discord.com/channels/{guild}/900000000000000004/900000000000000003"
+        ))
+    );
+    // Its root, a message of the parent channel itself, links by the parent.
+    let root = MessageThread {
+        is_root: true,
+        ..thread
+    };
+    assert_eq!(
+        client.upstream_url(&chan, &id, Some(&root)),
+        Some(format!(
+            "https://discord.com/channels/{guild}/900000000000000002/900000000000000003"
+        ))
+    );
+    // Against a bridge — any API base that is not Discord itself — no discord.com address is
+    // formed from numeric ids, guild configured or not: they are the bridge's numbering.
+    let mut bridge = discord_config(Some(guild.to_owned()));
+    bridge.api_base = "http://127.0.0.1:9/api/v10".to_owned();
+    let bridged = HttpDiscordClient::new(&bridge).expect("client");
+    assert_eq!(bridged.upstream_url(&chan, &id, None), None);
 }
 
 #[test]

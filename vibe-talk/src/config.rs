@@ -592,8 +592,10 @@ pub struct DiscordConfig {
     pub owner_user_id: Option<String>,
     /// The Discord server (guild) these channels live in, when the operator has said it: what
     /// a message's Discord address needs for its first segment, for the page's "Copy link in
-    /// Discord". `#408 copy-upstream-link`. Unset, a link is formed only for a channel whose
-    /// server a head read has learned.
+    /// Discord". `#408 copy-upstream-link`. Only ever stamped onto a channel no head read has
+    /// placed — a learned server is that channel's own and stands over this — and only against
+    /// Discord itself, never a bridge. Unset, a link is formed only for a channel whose server
+    /// a head read has learned.
     pub guild_id: Option<String>,
     /// API base, so a test or a proxy can point elsewhere.
     pub api_base: String,

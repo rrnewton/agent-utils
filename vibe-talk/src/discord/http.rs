@@ -1269,8 +1269,18 @@ impl ChatClient for HttpDiscordClient {
     /// The two shapes are told apart by the ids themselves, as they never overlap: a Google
     /// Chat bridge's channels and threads are Chat resource names (`spaces/…`), which
     /// [`crate::upstream_url::google_chat_url`] forms the web client's address from, and
-    /// Discord's are snowflakes, whose address needs the guild — the configured one, or the
-    /// server a head read has learned this channel belongs to, and with neither, none.
+    /// Discord's are snowflakes, whose address needs the guild. A `discord.com` address is
+    /// formed only against Discord itself: a bridge for another service may present its own
+    /// numeric ids, and stamping Discord's host onto them would hand the reader a confident
+    /// link to a message that does not exist there.
+    ///
+    /// A thread reply's segment is its THREAD channel, as Discord's own copy-link writes it:
+    /// a native thread read serves its replies under the parent channel's id with the thread
+    /// in the thread record, and a link naming the parent finds no such message. The guild is
+    /// the server a head read has learned the channel belongs to — that channel's own, over a
+    /// configured one (a bot in two servers), and a channel a head read found in NO server (a
+    /// direct message) forms none however the guild is configured. A thread read as a channel
+    /// of its own is in no server's list either and forms none — absent, never wrong.
     fn upstream_url(
         &self,
         channel: &ChannelId,
@@ -1282,11 +1292,20 @@ impl ChatClient for HttpDiscordClient {
         {
             return Some(url);
         }
-        let guild = self
-            .guild_id
-            .clone()
-            .or_else(|| self.guilds.guild_of(channel.as_str()))?;
-        crate::upstream_url::discord_message_url(&guild, channel.as_str(), id.as_str())
+        if !crate::config::is_official_discord_api_base(&self.api_base) {
+            return None;
+        }
+        let in_thread = thread.is_some_and(|thread| !thread.is_root);
+        let segment = match thread.filter(|_| in_thread) {
+            Some(thread) if crate::upstream_url::is_snowflake(&thread.id) => thread.id.as_str(),
+            _ => channel.as_str(),
+        };
+        let guild = match self.guilds.home_of(channel.as_str()) {
+            Some(heads::Home::Server(guild)) => Some(guild),
+            Some(heads::Home::Alone) if !in_thread => None,
+            _ => self.guild_id.clone(),
+        }?;
+        crate::upstream_url::discord_message_url(&guild, segment, id.as_str())
     }
 
     fn supports_threading(&self) -> bool {
@@ -2255,6 +2274,45 @@ mod tests {
             unserved: Unserved::default(),
             limiter: RateLimiter::new(),
         }
+    }
+
+    #[test]
+    fn a_learned_guild_stands_over_the_configured_one_and_a_dm_has_none() {
+        // `#408 copy-upstream-link`: the guild a head read learned is the channel's own; the
+        // configured one is only for a channel no head read has placed, and never for a
+        // channel in no server at all.
+        let mut client = bridge_client("https://discord.com/api/v10".to_owned(), false);
+        client.guild_id = Some("900000000000000001".to_owned());
+        let id = MessageId("900000000000000003".to_owned());
+        let other_server = ChannelId("900000000000000002".to_owned());
+        client.guilds.note(
+            other_server.as_str(),
+            heads::Home::Server("900000000000000099".to_owned()),
+        );
+        assert_eq!(
+            client.upstream_url(&other_server, &id, None),
+            Some(
+                "https://discord.com/channels/900000000000000099/900000000000000002/900000000000000003"
+                    .to_owned()
+            ),
+            "the learned server did not stand over the configured guild"
+        );
+        let dm = ChannelId("900000000000000005".to_owned());
+        client.guilds.note(dm.as_str(), heads::Home::Alone);
+        assert_eq!(
+            client.upstream_url(&dm, &id, None),
+            None,
+            "a direct-message channel got a guild link"
+        );
+        let unplaced = ChannelId("900000000000000006".to_owned());
+        assert_eq!(
+            client.upstream_url(&unplaced, &id, None),
+            Some(
+                "https://discord.com/channels/900000000000000001/900000000000000006/900000000000000003"
+                    .to_owned()
+            ),
+            "the configured guild did not cover an unplaced channel"
+        );
     }
 
     /// Answer one request on a loopback socket with `response`, handing back what was asked.

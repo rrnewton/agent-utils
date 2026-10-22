@@ -35,7 +35,7 @@ use crate::model::{ChannelId, MessageId};
 
 /// Where a channel's head is read from, once the channel has been seen.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Home {
+pub(super) enum Home {
     /// Its server's channel list.
     Server(String),
     /// Only the channel itself: a thread, which no server channel list holds, or a channel of no
@@ -60,6 +60,20 @@ impl GuildCache {
             Some(Home::Server(guild)) => Some(guild),
             _ => None,
         }
+    }
+
+    /// Where `channel`'s head lives, once a head read has learned it, a channel of no server
+    /// included: what tells a configured guild apart from a direct-message channel it must not
+    /// be stamped onto. `#408 copy-upstream-link`.
+    pub(super) fn home_of(&self, channel: &str) -> Option<Home> {
+        self.get(channel)
+    }
+
+    /// Note where a channel's head lives without reading it, for a test of what the cache's word
+    /// decides. The only writer besides a head read itself.
+    #[cfg(test)]
+    pub(super) fn note(&self, channel: &str, home: Home) {
+        self.set(channel, home);
     }
 
     fn set(&self, channel: &str, home: Home) {

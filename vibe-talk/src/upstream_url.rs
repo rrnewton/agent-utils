@@ -66,10 +66,16 @@ pub fn slack_permalink(
     }
     let ts = crate::slack::ids::canonical_ts(ts)?;
     let segment: String = ts.chars().filter(|ch| *ch != '.').collect();
+    // A permalink segment is ten second digits and six microsecond digits — what Slack mints,
+    // and what this server reads back (`slack::ids`' permalink parser). A `ts` of any other
+    // length is provider data of no shape Slack would resolve, so it forms nothing.
+    if segment.len() != 16 {
+        return None;
+    }
     let mut url = format!("{origin}/archives/{conversation}/p{segment}");
     if let Some(root) = thread_root_ts {
         let root = crate::slack::ids::canonical_ts(root)?;
-        if root == ts {
+        if root == ts || root.replace('.', "").len() != 16 {
             return None;
         }
         url.push_str(&format!("?thread_ts={root}&cid={conversation}"));
@@ -79,7 +85,7 @@ pub fn slack_permalink(
 
 /// Whether `id` is a Discord snowflake: 17 to 20 digits, the lengths Discord mints. A shorter
 /// run of digits is some other provider's numbering and forms no Discord address.
-fn is_snowflake(id: &str) -> bool {
+pub(crate) fn is_snowflake(id: &str) -> bool {
     (17..=20).contains(&id.len()) && id.bytes().all(|byte| byte.is_ascii_digit())
 }
 
@@ -116,6 +122,8 @@ fn encode_segment(segment: &str) -> String {
 fn chat_segment(segment: &str) -> Option<&str> {
     let segment = segment.trim();
     if segment.is_empty()
+        || segment == "."
+        || segment == ".."
         || segment.len() > 128
         || segment.contains('/')
         || segment.chars().any(char::is_control)
@@ -125,11 +133,16 @@ fn chat_segment(segment: &str) -> Option<&str> {
     Some(segment)
 }
 
-/// The id in a resource name's segment after `kind/`: `spaces/AAA` under `spaces` gives `AAA`,
-/// and a name running on (`spaces/AAA/threads/BBB`) gives none — the segment asked for is the
-/// whole remainder or it is not this kind of name.
+/// The remainder of a resource name after `kind/`: `spaces/AAA/threads/BBB` under `spaces`
+/// gives `AAA/threads/BBB`, for the caller to read its own segment out of.
 fn resource_id<'n>(name: &'n str, kind: &str) -> Option<&'n str> {
     name.strip_prefix(kind)?.strip_prefix('/')
+}
+
+/// The space a resource name or a channel id names: the one segment after `spaces/`, whether
+/// the name runs on (`spaces/AAA/threads/BBB`, a channel narrowed to one thread) or not.
+fn space_of(name: &str) -> Option<&str> {
+    resource_id(name, "spaces").map(|rest| rest.split('/').next().unwrap_or(rest))
 }
 
 /// A Google Chat message's web-client address, from the resource names a bridge presents: its
@@ -146,17 +159,33 @@ pub fn google_chat_url(
     let from_message = resource_id(message_id, "spaces")
         .and_then(|rest| rest.split_once("/messages/"))
         .map(|(space, segment)| (space, Some(segment)));
+    // The space the message was SERVED in and the one its own name claims must agree: parts
+    // from two spaces form no link, rather than one into a space the reader is not looking at.
+    let channel_space = space_of(channel_id).and_then(chat_segment);
+    if let (Some(served), Some((claimed, _))) = (channel_space, from_message) {
+        if chat_segment(claimed) != Some(served) {
+            return None;
+        }
+    }
     let (space, segment) = match from_message {
         Some(found) => found,
-        None => (resource_id(channel_id, "spaces")?, None),
+        None => (channel_space?, None),
     };
     let space = chat_segment(space)?;
     let base = format!("https://chat.google.com/room/{}", encode_segment(space));
-    let thread_id = thread.and_then(|thread| {
-        resource_id(&thread.id, "spaces")
-            .and_then(|rest| rest.strip_prefix(space)?.strip_prefix("/threads/"))
-            .or_else(|| (!thread.id.contains('/')).then_some(thread.id.as_str()))
-    });
+    // A channel narrowed to one thread (`spaces/{space}/threads/{thread}`) names the thread
+    // its messages are in where a copy carries no thread record of its own.
+    let scoped_thread = resource_id(channel_id, "spaces")
+        .and_then(|rest| rest.strip_prefix(space)?.strip_prefix("/threads/"))
+        .filter(|thread| !thread.contains('/'));
+    let thread_id = thread
+        .and_then(|thread| {
+            resource_id(&thread.id, "spaces")
+                .and_then(|rest| rest.strip_prefix(space)?.strip_prefix("/threads/"))
+                .filter(|thread| !thread.contains('/'))
+                .or_else(|| (!thread.id.contains('/')).then_some(thread.id.as_str()))
+        })
+        .or(scoped_thread);
     let thread_link = |thread: &str| format!("{base}/{}", encode_segment(thread));
     let url = match (
         segment.and_then(chat_segment),
@@ -270,6 +299,16 @@ mod tests {
             ),
             None
         );
+        // A ts no permalink segment holds (eleven second digits) is no shape Slack resolves.
+        assert_eq!(
+            slack_permalink(
+                "https://acme.slack.com",
+                "C0123ABCD",
+                "17000000000.000100",
+                None
+            ),
+            None
+        );
     }
 
     #[test]
@@ -362,6 +401,23 @@ mod tests {
         assert_eq!(
             google_chat_url("spaces/AAAa1", "900000000000000003", Some(&other)),
             Some("https://chat.google.com/room/AAAa1".to_owned())
+        );
+        // A message name claiming another space than the channel it was served in: parts from
+        // two spaces form no link at all.
+        assert_eq!(
+            google_chat_url("spaces/AAAa1", "spaces/ZZZz9/messages/BBBb2.CCCc3", None),
+            None
+        );
+        // A `..` segment never escapes its place: refused as a segment, so the link degrades
+        // to the space's rather than resolving out of the room.
+        let dotted = a_thread("spaces/AAAa1/threads/..", false);
+        let made = google_chat_url("spaces/AAAa1", "900000000000000003", Some(&dotted))
+            .expect("the space's link");
+        assert_eq!(made, "https://chat.google.com/room/AAAa1");
+        // A channel narrowed to one thread names the thread its messages are in.
+        assert_eq!(
+            google_chat_url("spaces/AAAa1/threads/BBBb2", "900000000000000003", None),
+            Some("https://chat.google.com/room/AAAa1/BBBb2".to_owned())
         );
     }
 }

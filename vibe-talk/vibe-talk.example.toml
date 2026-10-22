@@ -145,7 +145,8 @@ live_poll_seconds = 0
 # -> Copy Server ID, with the same Developer Mode. It is what a message's own Discord address
 # (discord.com/channels/<guild>/<channel>/<message>) needs for its first part, so set it and each
 # row's menu offers "Copy link in Discord". Without it, the link is offered only for a channel
-# whose server a read has already learned.
+# whose server a read has already learned — and a learned server stands over this setting, so a
+# bot in two servers still links each channel into its own.
 # guild_id = "000000000000000000"
 
 # coding_agent_user_ids names the accounts your coding agents post as. The channel view draws each

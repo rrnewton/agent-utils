@@ -1058,10 +1058,14 @@ impl ChatClient for HttpSlackClient {
             self.learn_self(id);
             // `#408 copy-upstream-link`: `auth.test` also reports the workspace's own address,
             // which is where a message's permalink lives. Learned only where the configuration
-            // did not say one — the operator's word stands over the provider's.
+            // did not say one — the operator's word stands over the provider's — and only when
+            // it is a Slack host: whatever answers at the API base does not get to name the host
+            // of every link a reader copies. A bridge whose permalinks live elsewhere says so in
+            // the configuration (`workspace_url`), which is the operator's word to give.
             if let Some(reported) = value
                 .get("url")
                 .and_then(Value::as_str)
+                .filter(|url| ids::is_slack_link(url))
                 .and_then(crate::upstream_url::workspace_origin)
             {
                 let mut slot = self

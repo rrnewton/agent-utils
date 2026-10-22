@@ -10902,7 +10902,13 @@ const KEYMAP = [
     group: KEYS_MESSAGE, chords: [{ key: "l" }],
     does: () => `Copy its link in ${providerDescriptions.size > 1 ? "its chat service" : chatServiceName()}: the message's own address there, where the server could form one`,
     rowControls: ["row-copy-link-button"],
-    run: (event, target) => pressRowButton(target, "row-copy-link-button") !== null,
+    // `pressRowButton` answers "took" where it took the row's selection but found no button:
+    // that is this key not acted on, not a copy, so it is left to the browser like any
+    // unbound key rather than swallowed in silence.
+    run: (event, target) => {
+      const pressed = pressRowButton(target, "row-copy-link-button");
+      return pressed !== null && pressed !== "took";
+    },
   },
   {
     group: KEYS_VIEW, chords: [{ key: "h" }],
@@ -19208,7 +19214,12 @@ function mergeIntoCanon(field, arriving, older, hasMore, belongs, page = arrivin
     const held = heldCopies(arriving);
     arriving = arriving.map((item) => {
       const copy = held.get(String(item.id));
-      return copy && sameMessage(copy, item) ? copy : item;
+      if (copy && sameMessage(copy, item)) return copy;
+      // `#408 copy-upstream-link`: as in `foldLiveMessage`, a copy formed without the
+      // message's upstream address — a read answered before the server learned its workspace
+      // — does not take a held copy's away.
+      if (copy && copy.upstream_url && !item.upstream_url) return { ...item, upstream_url: copy.upstream_url };
+      return item;
     });
   }
   const incoming = new Set(arriving.map((item) => String(item.id)));
@@ -19510,8 +19521,17 @@ function foldTimelineDelta(payload, sent, view = channelView, thread = selectedT
   }
   // Never a message removed upstream after it was sent (`removedSince`, `#316 late-counts-resurrect`).
   const number = sentNumberOf(payload);
-  const arriving = (payload.messages || []).filter((message) => !removedSince(channelCanon, String(message.id), number));
-  const before = heldCopies(arriving);
+  const unfiltered = (payload.messages || []).filter((message) => !removedSince(channelCanon, String(message.id), number));
+  const before = heldCopies(unfiltered);
+  // `#408 copy-upstream-link`: as in `foldLiveMessage`, a copy formed without the message's
+  // upstream address does not take a held copy's away. Before anything compares or orders
+  // them, so the copy that is kept is the copy that is counted.
+  const arriving = unfiltered.map((message) => {
+    const held = before.get(String(message.id));
+    return held && held.upstream_url && !message.upstream_url
+      ? { ...message, upstream_url: held.upstream_url }
+      : message;
+  });
   const fresh = arriving.filter((message) => !sameMessage(before.get(String(message.id)), message));
   if (fresh.length) {
     const ids = new Set(fresh.map((message) => String(message.id)));
@@ -33250,10 +33270,18 @@ async function markReadThroughHere(row, upstreamId) {
 function upstreamServiceName(message) {
   for (const id of [message && message.channel_id, currentChannelId()]) {
     if (!id) continue;
+    const channel = knownChannels.find((candidate) => String(candidate.id) === String(id));
+    const key = channel && typeof channel.provider === "string" ? channel.provider : null;
+    // The channel picker's own words for the service (`serviceLabel`), which tell two services
+    // of one name apart by their key: two workspaces both called Slack must not offer the same
+    // label over different links.
+    if (key && providerDescriptions.has(key)) return serviceLabel(key);
     const provider = providerOfChannel(id);
     if (provider && typeof provider.name === "string" && provider.name.trim()) return provider.name.trim();
   }
-  return chatServiceName();
+  // No described provider for the channel: with several services the deployment's joined name
+  // ("Slack and Google Chat") names neither, so the item stays generic rather than wrong.
+  return providerDescriptions.size > 1 ? "the chat service" : chatServiceName();
 }
 
 /**
