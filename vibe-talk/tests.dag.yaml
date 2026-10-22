@@ -1274,6 +1274,27 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#421 chip-states`, `#422 composer-key-stay`, `#424 threads-main-own-center` and `#423
+  # back-key-consistency` in the browser engine, at 1280x800 with a mouse and 393x852 by touch: the
+  # Threads view's three chips alike at rest and alike pressed, unlike each other way; Cmd+S with Main
+  # channel on going to the box at the foot and then to an open reply, the Threads view kept, and with it
+  # off back to All; the owner's main row centred at its width, clear of the thread above, the agent's
+  # unchanged; Cmd+[ back through Main, All, two columns, the thread list, a thread and Settings, and Cmd+]
+  # forward again. Measured on 2026-10-22: about 9s wall.
+  - group: check
+    job: threads-polish-browser
+    desc: the Threads view's chips pressed alike, Cmd+S keeping it with Main channel on, the owner's main rows centred, and Cmd+[ and Cmd+] through the views, in current Chromium at 1280x800 and 393x852
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/threads_polish_browser.py
+    jobs_flag: ""
+    timeout: 120
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 9
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#300 reply-marks-read` in the browser engine, at 1280x800 in two columns with a mouse and the keys:
   # Reply docked in the left column on a Main message and in the right on a thread's reply, sent with
   # Enter, each marks the message it answers Done on the server, asks the provider to mark it

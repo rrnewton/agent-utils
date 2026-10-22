@@ -7379,6 +7379,7 @@ from, so it cannot name a key the page does not answer.
 | ← | Out of a thread, back to the message it was opened from; in two columns, back to Main on the left |
 | `[`, `]` | In two columns, the keys to the left column (Main) or the right one (the thread, or its list) |
 | Esc | Back (see above). In a message box with text in it, the first Esc leaves the box and keeps the draft; on the channel or thread picker, back to the messages |
+| Ctrl+[, Ctrl+] (Cmd on a Mac) | Back to where you were before, and forward again, in every view: Main, All, the thread list, two columns, a thread, Settings, Help (see below) |
 | Home, End | The top of the list or its newest message, and select it |
 | `e`, or Ctrl+E (Cmd+E) | Done or not Done; marked Done, the ring moves on to the next unread below. The chord does it from a message box or the search too, where `e` is typed: on the message the keys act on, the box keeping the focus and the draft (on a Mac, Ctrl+E in a box is the box's own end of line, so there it is Cmd+E) |
 | Shift+E | Read and collapse: the selected message marked Done, as `e` marks it, and read in the chat service too where it can be, as a sent reply marks what it answers; then folded, the ring staying on it — under Collapse read, on the "… read messages …" line of a run it joins; under Hide read, on the next message, as it goes. Never puts a message back |
@@ -7499,6 +7500,31 @@ can keep it from the box or let the browser's Save page open. `make -C vibe-talk
 composer-key-browser` presses it through CDP in a real Chromium at 1280x800: from a thread card, the
 right and left columns' selected messages, the search glass, the page body, the search field, both
 boxes with a draft, and the thread list.
+
+### Back and Forward
+
+`#423 back-key-consistency`. The owner found Cmd+[ went back from the thread list to Main but did
+nothing in the other views. On a Mac Cmd+[ is the browser's own Back, which vibe-talk gives a history
+entry only for what is open over a view (`#304 back-gesture-in-app`: the thread list, a thread, the
+right column's thread, a reply, Settings, Help, a menu), never for a switch between views. Now
+**Ctrl+[ (Cmd+[) goes back, and Ctrl+] (Cmd+]) forward**, from anywhere, through the places you have
+been on the channel since choosing it: the screen (the channel, Settings, Help) and, on the channel,
+the view (Main, All, the thread list, two columns) with the thread open in it, across the window or on
+the right. Every move to a new place, by any control, is noted after the place you are at and drops
+the places ahead of it, as a browser does; Back and Forward move along them. A place that cannot be
+shown any more (a thread gone, two columns in a window too narrow) is passed over. An open menu is
+closed first, and by Back a reply open in a list (its words kept as a draft). At either end the key
+says so and stays: it never leaves the app. Another channel starts afresh; on the call's view the keys
+say they have nothing to do.
+
+The thread list's old Back is the rule's special case, where the place before is the one under what is
+open: Back from a thread opened from the list goes to the list, from the list to the view it was chosen
+from, from the right column's thread to its cards, from Settings and Help to where you opened them,
+each by the same close Esc uses. The browser's own Back (its button, Alt+Left, a mouse button) and a
+phone's back gesture keep their `#304` meaning, closing what is open and then leaving the app, so a
+phone reader is never walked back through every view switch first. The page takes Ctrl/Cmd+[ and ]
+before any element's own listener, as it does Ctrl+S; the bare `[` and `]` still move between the two
+columns. `make -C vibe-talk threads-polish-browser` walks it in a real Chromium at 1280x800 and 393x852.
 
 ### Copying the highlighted message
 
