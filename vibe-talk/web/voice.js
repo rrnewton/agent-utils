@@ -5334,6 +5334,8 @@ function seamLineOf(row, below, seam) {
   const control = seam !== null && seam.kind === "gap";
   let held = below ? row.seamBelowLine : row.seamLine;
   if (held && (String(held.tagName).toLowerCase() === "button") !== control) {
+    // A keyboard tabbed onto the line going is left on its row by `placeSeam`, not on nothing.
+    if (document.activeElement === held) row.seamRefocus = true;
     if (held.parentNode === row) row.removeChild(held);
     held = null;
     if (below) row.seamBelowLine = null;
@@ -5341,6 +5343,8 @@ function seamLineOf(row, below, seam) {
   }
   if (held) {
     /** @type {any} */ (held).gapCards = Boolean(seam && seam.cards);
+    const classes = (below ? "row-seam row-seam-below" : "row-seam") + (seam && seam.cards ? " card-seam" : "");
+    if (held.className !== classes) held.className = classes;
     return held;
   }
   const line = document.createElement(control ? "button" : "div");
@@ -5382,8 +5386,13 @@ function placeSeam(row, seam, below) {
   const attribute = below ? "data-seam-below" : "data-seam";
   if (!seam) {
     const held = below ? row.seamBelowLine : row.seamLine;
+    const focused = held && document.activeElement === held;
     if (held && held.parentNode === row) row.removeChild(held);
     row.removeAttribute(attribute);
+    if (focused) {
+      row.setAttribute("tabindex", "-1");
+      row.focus({ preventScroll: true });
+    }
     return;
   }
   const line = seamLineOf(row, below, seam);
@@ -5402,6 +5411,12 @@ function placeSeam(row, seam, below) {
     // tabbed onto a row's Reply when midnight draws its day's rule would be left on nothing.
     if (below) row.append(line);
     else row.insertBefore(line, row.firstChild);
+  }
+  if (row.seamRefocus) {
+    row.seamRefocus = false;
+    const target = seam.kind === "gap" ? line : row;
+    target.setAttribute("tabindex", "-1");
+    target.focus({ preventScroll: true });
   }
 }
 
@@ -33949,6 +33964,13 @@ function swipeable(li, messages) {
     if (li.threadStrip && nodeWithin(li.threadStrip, event.target)) {
       return;
     }
+    // `#439 search-unmatched-separators`. Nor on a gap's line above or below the row, which shows
+    // its run: a finger there neither archives this message nor opens its details, and a hold
+    // there would leave `suppressNextRowClick` behind a click the line keeps to itself.
+    if ((li.seamLine && nodeWithin(li.seamLine, event.target)) ||
+      (li.seamBelowLine && nodeWithin(li.seamBelowLine, event.target))) {
+      return;
+    }
     active = true;
     startX = event.clientX;
     startY = event.clientY;
@@ -42692,9 +42714,16 @@ function cardMessageCount(choice, tally) {
   const held = entry ? entry.held : 0;
   const exactHeld = exactReplyCount(choice.id, choice.root, tally, choice.summary);
   const reported = typeof choice.count === "number" ? choice.count : null;
-  const reportedExact = reported !== null && (choice.summary ? choice.summary.reply_count_exact !== false : true);
-  const replies = Math.max(held, exactHeld || 0, reportedExact ? reported : 0);
-  return { messages: replies + 1, exact: exactHeld !== null || reportedExact };
+  // The count's own source decides its exactness, as `exactCount` decides it: the summary's flag
+  // where the count is the summary's, and the root record's where it is the record's — a
+  // summary-less thread can still carry a count its record says is not exact.
+  const reportedExact = reported !== null && (choice.summary
+    ? choice.summary.reply_count_exact !== false
+    : !(choice.root && choice.root.thread && choice.root.thread.reply_count_exact === false));
+  const known = Math.max(exactHeld === null ? -1 : exactHeld, reportedExact && reported !== null ? reported : -1);
+  // Exact only where an exact source accounts for every reply held: one gone stale below what
+  // this page holds says the thread has grown since, and how far is not known.
+  return { messages: Math.max(held, known) + 1, exact: known >= held && known >= 0 };
 }
 
 /** What the cards were last drawn from, so a pass that changes nothing draws nothing. */
@@ -43054,7 +43083,11 @@ let openedCardGapState = null;
  */
 function openedCardGaps(create) {
   const key = JSON.stringify([searchKey(), String(el("discord-channel").value)]);
-  if (!openedCardGapState || openedCardGapState.key !== key) {
+  // Forgotten the moment any filter changes, as among messages (`openedGapIds`): leaving the state
+  // behind a mismatched key would bring its runs back when the reader typed their way back to the
+  // same words, never having opened them under this search.
+  if (openedCardGapState && openedCardGapState.key !== key) openedCardGapState = null;
+  if (!openedCardGapState) {
     if (!create) return null;
     openedCardGapState = { key, threads: new Set(), ids: new Set() };
   }
@@ -43103,6 +43136,15 @@ function cardGapTally(group) {
 function drawCardGaps(list) {
   if (!list) return;
   const searching = searchOpen && searchTerms(searchQuery).length > 0;
+  if (!searching) {
+    // No grouping to do: only lines a closed search left behind come down, and on most passes
+    // there are none — an attribute each, asked on the way past.
+    for (const row of list.children) {
+      if (row.hasAttribute("data-seam")) placeSeam(row, null, false);
+      if (row.hasAttribute("data-seam-below")) placeSeam(row, null, true);
+    }
+    return;
+  }
   const groups = cardGapGroups(list);
   /** @type {Map<any, {above: any, below: any}>} */
   const wanted = new Map();
@@ -43156,9 +43198,9 @@ function openCardGap(row, below) {
     if (first === null || !below) first = group.head;
   };
   if (below) {
-    for (let next = at + 1; next < groups.length && !rowShown(groups[next].head); next += 1) take(groups[next]);
+    for (let next = at + 1; next < groups.length && !groups[next].other && !rowShown(groups[next].head); next += 1) take(groups[next]);
   } else {
-    for (let next = at - 1; next >= 0 && !rowShown(groups[next].head); next -= 1) take(groups[next]);
+    for (let next = at - 1; next >= 0 && !groups[next].other && !rowShown(groups[next].head); next -= 1) take(groups[next]);
   }
   if (first === null) return null;
   if (list === leftEl("side-cards")) keepingCardPlace(filterSideCards);
