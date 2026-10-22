@@ -1,10 +1,11 @@
 ---
 title: 'voice-transcript-expand: a long voice turn opens and closes with a tap, and stays as the reader left it while it grows'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-10-22T15:45:38.456437457+00:00
-updated_at: 2026-10-22T15:45:38.456437457+00:00
+updated_at: 2026-10-22T19:59:25.781899704+00:00
+closed_at: 2026-10-22T19:59:25.781899594+00:00
 ---
 
 # Description
