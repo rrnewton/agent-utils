@@ -18,8 +18,10 @@ the summarised block starting with its root as a bridged child in the thread's c
 with no root row (negative control), each bridge's spine left of its boxes and continuous over the
 block -> Collapse read: each block's two read replies are one grey line joined to its spine -> Hide
 read: read replies gone from every block, the summarised root still first -> Show read, Unpack all
-off: cards alone again -> u (desk) or the chip (phone) on, reload: still on. No horizontal overflow
-and no page error at any step.
+off: cards alone again -> u (desk) or the chip (phone) on, reload: still on -> `#411
+thread-view-row-padding`: every unpacked row's header buttons stand at least as far inside its top
+border as the nearest of All's (before, 0px: the rows had no box). No horizontal overflow and no page
+error at any step.
 
 `#407 unpack-row-parity`. At each desk size an unpacked row is then driven as a row of any other list
 is, with a real mouse and real keys: the mouse over an unpacked row lights it (one row lit on the page,
@@ -147,6 +149,16 @@ STATE_JS = """(threadId) => {
                 run: run ? {...box(run), text: run.textContent} : null};
     });
 }"""
+
+
+# `#411 thread-view-row-padding`. How far under each drawn message row's top border its header's first
+# button stands, in px, for the rows `selector` finds: the room the row's box gives the header.
+INSETS_JS = """(selector) => [...document.querySelectorAll(selector)].flatMap((li) => {
+    const button = [...li.querySelectorAll(':scope > .meta button')].find((one) => one.getClientRects().length > 0);
+    if (!button || li.getClientRects().length === 0) return [];
+    const border = parseFloat(getComputedStyle(li).borderTopWidth) || 0;
+    return [button.getBoundingClientRect().top - (li.getBoundingClientRect().top + border)];
+})"""
 
 
 # The selection as drawn: every row lit on the page, by list and id, and the lit row's ring.
@@ -278,11 +290,23 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                   f" && document.querySelectorAll('#side-cards > li[data-unpack-thread=\"{RUNNER}\"]').length >= 9",
                   "a reload forgot Unpack all")
     desk.shot("6-reloaded-unpacked")
+    # `#411 thread-view-row-padding`. The owner: in the thread view "the Reply '...' and Done buttons are
+    # touching the top border of the message box and this is not happening in the All view with the
+    # same messages rendered". An unpacked row's header stands as far inside its box as All's does.
+    unpacked = page.evaluate(INSETS_JS, "#side-cards > li.discord-message[data-unpack-thread]")
+    page.select_option("#thread-select", "flat")
+    desk.wait_for("() => document.querySelectorAll('#discord-log > li[data-id]').length === 24", "All did not come back")
+    desk.settled()
+    in_all = page.evaluate(INSETS_JS, "#discord-log > li.discord-message")
+    desk.check(len(unpacked) >= 9 and len(in_all) >= 9, f"too few rows measured: {len(unpacked)} unpacked, {len(in_all)} in All")
+    desk.check(min(unpacked) >= min(in_all) - 0.5 and min(unpacked) >= 4,
+               f"an unpacked row's header buttons stand {min(unpacked):.1f}px under its top border, All's {min(in_all):.1f}px")
+    desk.notes.append(f"header buttons {min(unpacked):.1f}px inside an unpacked row's top border, {min(in_all):.1f}px in All")
     overflow = page.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")
     desk.check(overflow <= 0, f"horizontal overflow of {overflow}px")
     desk.check(not errors, f"page errors: {errors}")
     page.context.close()
-    return f"{label}: unpacked, collapsed, hidden, packed and reloaded, no page error"
+    return f"{label}: unpacked, collapsed, hidden, packed and reloaded, no page error; " + "; ".join(desk.notes)
 
 
 def lit(desk: Desk) -> list[dict[str, object]]:

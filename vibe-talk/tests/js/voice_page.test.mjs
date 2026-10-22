@@ -76305,6 +76305,35 @@ test("`#404 threads-unpack-all`: Unpack all is a toggle beside Unread only, off 
   assert.equal(page.storage.get(UNPACK_STORAGE), "off");
 });
 
+test("`#411 thread-view-row-padding`: a row unpacked under its card has the message row's box, from the rule every list's rows take", async () => {
+  // The owner, 2026-10-21: in the thread view "the Reply '...' and Done buttons are touching the top
+  // border of the message box and this is not happening in the All view with the same messages
+  // rendered". The unpacked rows are in `ul.side-cards`, not a `.messages` list, so the base sheet's
+  // row box (padding, hairline, radius) never reached them. Chromium measures the header's room
+  // (tests/threads_unpack_browser.py); this pins that the one rule covers both.
+  const box = cssRules(BASE_CSS, ".side-cards > li.discord-message").join("\n");
+  assert.ok(box, "web/style.css gives an unpacked row no box");
+  assert.deepStrictEqual(cssRules(BASE_CSS, ".side-cards > li.discord-message"), cssRules(BASE_CSS, ".messages li").slice(0, 1),
+    "an unpacked row's box is not the rule every list's rows take");
+  assert.match(box, /padding:\s*0\.6rem 0\.7rem/);
+  assert.match(box, /(?<![-\w])border:\s*1px solid var\(--edge\)/);
+  assert.match(box, /border-radius:\s*0\.5rem/);
+  assert.match(HTML_CODE, /<ul id="side-cards" class="side-cards"/, "the cards' list is no longer .side-cards");
+  const { page } = await unpackPage();
+  await page.el("side-unpack").click();
+  await page.settle();
+  const rows = unpackRows(page, "spaces/A/threads/sum").filter((li) => li.hasAttribute("data-id"));
+  assert.ok(rows.length >= 3, "nothing was unpacked to measure");
+  for (const row of rows) assert.ok(row.className.split(/\s+/).includes("discord-message"), `${row.getAttribute("data-id")} is not a message row`);
+  // Negative controls: the cards are not message rows, so they keep their own box; and the rows of
+  // every .messages list keep the space under them, which the cards' list spaces by its gap.
+  for (const card of page.el("side-cards").children.filter((li) => li.hasAttribute("data-card"))) {
+    assert.ok(!card.className.split(/\s+/).includes("discord-message"), "a card took the message row's box");
+  }
+  assert.match(cssRules(BASE_CSS, ".messages li").join("\n"), /margin-bottom:\s*0\.5rem/);
+  assert.doesNotMatch(box, /margin-bottom/, "an unpacked row adds a margin to the cards' gap, and the bridge no longer joins");
+});
+
 test("`#404 threads-unpack-all` + `#405 root-under-summary`: every thread's messages under its card, bridged, summarized first with its root child and raw without a duplicate", async () => {
   const { page } = await unpackPage();
   await page.el("side-unpack").click();

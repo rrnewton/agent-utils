@@ -153,11 +153,19 @@ button[disabled] {
   padding: 0;
 }
 
-.messages li {
+/* A message row's box. `#411 thread-view-row-padding`: a thread's rows unpacked under its card in
+   the Threads view are message rows in a list of cards (`.side-cards`, web/voice.css), and take the
+   same box, so their header buttons sit as far inside the top border as in All. Their spacing is the
+   card list's gap, which the bridge between them is drawn across. */
+.messages li,
+.side-cards > li.discord-message {
   background: var(--panel);
   border: 1px solid var(--edge);
   border-radius: 0.5rem;
   padding: 0.6rem 0.7rem;
+}
+
+.messages li {
   margin-bottom: 0.5rem;
 }
 
