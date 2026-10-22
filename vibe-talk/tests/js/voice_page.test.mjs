@@ -4340,6 +4340,10 @@ const TUNING_BANDS = {
     "real stack short and leaves entries under the page that the gesture spends presses on; much higher " +
     "lets a damaged entry send the page back past the tab's start where the browser has no Navigation API " +
     "to say how far it may go (#304 back-gesture-in-app)"],
+  PLACES_KEPT: [20, 1000,
+    "how many places Ctrl/Cmd+[ can go back through: fewer cuts off a reader who has walked through the " +
+    "views and threads for a while, and Back stops short of where they began; far more holds a history " +
+    "nobody walks back through (#423 back-key-consistency)"],
   UPSTREAM_CLEAR_RECHECK_MS: [2000, 15000,
     "how often, after a Mark read now the server stopped waiting on, Settings asks what it came to: " +
     "sooner asks a server with nothing new to say, later leaves the line saying \"still waiting\" " +
@@ -76427,6 +76431,202 @@ test("`#424 threads-main-own-center`: the owner's main-channel rows among the Th
   const mainRows = page.el("side-cards").children.filter((li) => li.hasAttribute("data-main-row"));
   assert.ok(mainRows.length > 0 && mainRows.every((li) => li.className.split(/\s+/).includes("discord-message") && li.hasAttribute("data-who")),
     "the main channel's rows among the cards are not message rows with a speaker");
+});
+
+// --- `#423 back-key-consistency` ----------------------------------------------------------------------
+//
+// The owner, 2026-10-22: "if I press `Cmd-[` on the thread list view it jumps back to the Main view but it
+// does NOT have kind of navigation (or back?) effect on other views." Cmd+[ was the browser's Back, which
+// `#304` gives entries only for what is open over a view. Now Ctrl/Cmd+[ and ] go back and forward through
+// every place visited, the thread list's and a thread's Back being the special cases where the place before
+// is the one under them. tests/threads_polish_browser.py walks it in Chromium.
+
+/** Where the reader is: the screen, and on the channel the picker's choice and the layout. */
+const whereNow = (page) => {
+  const screen = page.el("frame-body").getAttribute("data-screen");
+  if (screen !== "main") return screen;
+  const layout = page.el("screen-main").getAttribute("data-columns");
+  return layout === "two" ? (page.el("side-pane").hidden ? "two" : "two+thread") : layout === "list" ? "threads" : page.el("thread-select").value;
+};
+
+/** Ctrl/Cmd+[ (`back`) or ] from `target`: the chord is the page's, never the browser's Back or Forward. */
+async function backKey(page, back = true, fields = { metaKey: true }, target = null) {
+  const event = await press(page, target || page.el("scroll-area"), back ? "[" : "]", fields);
+  assert.equal(event.defaulted, false, `${back ? "[" : "]"} was left to the browser, whose Back or Forward it is`);
+  await page.settle();
+  return event;
+}
+
+test("`#423 back-key-consistency`: Ctrl/Cmd+[ walks back through Main, All, the thread list, a thread opened from it and Settings, and ] forward again, in every view", async () => {
+  for (const fields of [{ metaKey: true }, { ctrlKey: true }]) {
+    const page = await threadPage("main");
+    const thread = threadData().threads[0].id;
+    const visits = ["main"];
+    await press(page, page.el("scroll-area"), "2", { ctrlKey: true });
+    visits.push("flat");
+    await press(page, page.el("scroll-area"), "3", { ctrlKey: true });
+    visits.push("threads");
+    await pickThread(page, `thread:${thread}`);
+    visits.push(`thread:${thread}`);
+    await press(page, page.el("scroll-area"), ",");
+    visits.push("settings");
+    assert.equal(whereNow(page), "settings", "the premise is Settings, last of the places");
+    for (let at = visits.length - 2; at >= 0; at -= 1) {
+      await backKey(page, true, fields);
+      assert.equal(whereNow(page), visits[at], `Back from ${visits[at + 1]} did not go to ${visits[at]}`);
+    }
+    // On to the start (the view the channel opened in came before Main): there it says so and stays
+    // (negative control: never out of the app), then Forward comes back to Main.
+    for (let press = 0; press < 3 && page.el("status").textContent !== "Nothing to go back to."; press += 1) {
+      await backKey(page, true, fields);
+    }
+    assert.equal(page.el("status").textContent, "Nothing to go back to.", "Back never reached the start");
+    assert.equal(page.el("frame-body").getAttribute("data-screen"), "main", "Back at the start left the channel");
+    const start = whereNow(page);
+    if (start !== "main") {
+      await backKey(page, false, fields);
+      assert.equal(whereNow(page), "main", `Forward from ${start}, where the channel opened, did not come back to Main`);
+    }
+    for (let at = 1; at < visits.length; at += 1) {
+      await backKey(page, false, fields);
+      assert.equal(whereNow(page), visits[at], `Forward from ${visits[at - 1]} did not go to ${visits[at]}`);
+    }
+    await backKey(page, false, fields);
+    assert.equal(whereNow(page), "settings");
+    assert.equal(page.el("status").textContent, "Nothing to go forward to.");
+  }
+});
+
+test("`#423 back-key-consistency`: the thread list's Back is the view it was chosen from, as Esc's is, and a thread's from the list is the list — the special cases of the rule", async () => {
+  for (const from of ["main", "flat"]) {
+    const page = await threadPage(from);
+    await press(page, page.el("scroll-area"), "3", { ctrlKey: true });
+    await backKey(page);
+    assert.equal(whereNow(page), from, `Back on the thread list did not go back to ${from}, where it was chosen from`);
+  }
+  // Esc from the same places goes to the same places (the rule's special case, not an exception).
+  const page = await threadPage("flat");
+  await press(page, page.el("scroll-area"), "3", { ctrlKey: true });
+  const thread = threadData().threads[1].id;
+  await pickThread(page, `thread:${thread}`);
+  await backKey(page);
+  assert.equal(whereNow(page), "threads", "Back from a thread opened from the list did not go back to the list");
+  await press(page, page.el("side-scroll"), "Escape");
+  await page.settle();
+  assert.equal(whereNow(page), "flat", "the premise: Esc on the list goes back to All");
+});
+
+test("`#423 back-key-consistency`: in two columns, the thread on the right and the cards are places; Help is a place over the view it was opened from", async () => {
+  const { page, data } = await twoColumnServer();
+  assert.equal(whereNow(page), "two");
+  await openerOf(cardRow(page, data.threads[0].id)).click();
+  await page.settle();
+  assert.equal(whereNow(page), "two+thread", "the premise is a thread on the right");
+  await press(page, page.el("side-scroll"), "?");
+  assert.equal(whereNow(page), "help");
+  await backKey(page, true, { metaKey: true }, page.el("screen-help"));
+  assert.equal(whereNow(page), "two+thread", "Back from Help did not go back to the thread on the right");
+  await backKey(page);
+  assert.equal(whereNow(page), "two", "Back from the thread on the right did not go back to its cards");
+  await backKey(page);
+  // The fixture's channel opens in All, and the layout button was pressed there.
+  assert.equal(whereNow(page), "flat", "Back from two columns did not go back to the view before them");
+  await backKey(page, false);
+  await backKey(page, false);
+  assert.equal(whereNow(page), "two+thread", "Forward did not open the thread on the right again");
+  await backKey(page, false);
+  assert.equal(whereNow(page), "help", "Forward did not open Help again");
+});
+
+test("`#423 back-key-consistency` negative controls: a new place drops the ones ahead; the bare [ and ] are still the columns' keys; a menu closes first; the call's view is no place", async () => {
+  const page = await threadPage("main");
+  await press(page, page.el("scroll-area"), "2", { ctrlKey: true });
+  await backKey(page);
+  assert.equal(whereNow(page), "main");
+  await press(page, page.el("scroll-area"), "3", { ctrlKey: true });
+  await backKey(page, false);
+  assert.equal(whereNow(page), "threads", "Forward after a new place went to a place it dropped");
+  assert.equal(page.el("status").textContent, "Nothing to go forward to.");
+  // The bare [ and ] are not Back and Forward.
+  await press(page, page.el("side-scroll"), "[");
+  await press(page, page.el("side-scroll"), "]");
+  assert.equal(whereNow(page), "threads", "the bare [ or ] moved through the places");
+  await backKey(page);
+  assert.equal(whereNow(page), "main");
+  // A menu open: Back closes it, and goes nowhere.
+  const row = page.el("discord-log").children.find((li) => li.getAttribute("data-id") === "200");
+  await rowMoreButton(row).click();
+  await page.settle();
+  const menuOpen = () => rowMoreMenu(row).hidden === false;
+  assert.ok(menuOpen(), "the premise is a menu open");
+  await backKey(page, false);
+  assert.ok(!menuOpen(), "Forward with a menu open did not close it");
+  assert.equal(whereNow(page), "main", "Forward with a menu open went on to a place");
+  // The call's view: the keys say so, and nothing moves.
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.equal(page.el("pane-discord").hidden, true, "the premise is the call's view");
+  await backKey(page);
+  assert.equal(page.el("pane-discord").hidden, true, "Back on the call's view left it");
+  assert.match(page.el("status").textContent, /the call has none/);
+  // The ? help lists both chords.
+  assert.ok(page.el("keyboard-keys").text().includes("+[ goes back to where you were before"), "the ? help does not list Back");
+});
+
+test("`#423 back-key-consistency`: Esc, the X or a Back button closing onto the place before is a step back — Cmd+[ then goes where Esc would have, and Forward opens it again", async () => {
+  const page = await threadPage("flat");
+  await press(page, page.el("scroll-area"), "3", { ctrlKey: true });
+  const thread = threadData().threads[0].id;
+  await pickThread(page, `thread:${thread}`);
+  await press(page, page.el("scroll-area"), "Escape");
+  await page.settle();
+  assert.equal(whereNow(page), "threads", "the premise: Esc from the thread goes back to the list");
+  await backKey(page);
+  assert.equal(whereNow(page), "flat", "Back after Esc did not go where Esc on the list goes");
+  await backKey(page, false);
+  await backKey(page, false);
+  assert.equal(whereNow(page), `thread:${thread}`, "Forward did not open again what Esc closed");
+  // Settings and Help: Esc from Help opened in Settings is a step back too.
+  await press(page, page.el("scroll-area"), ",");
+  await page.el("help-link-keyboard").click();
+  await page.settle();
+  assert.equal(whereNow(page), "help", "the premise is Help opened from Settings");
+  await press(page, page.el("screen-help"), "Escape");
+  await page.settle();
+  assert.equal(whereNow(page), "settings");
+  await backKey(page, true, { metaKey: true }, page.el("screen-settings"));
+  assert.equal(whereNow(page), `thread:${thread}`, "Back after Esc from Help reopened Help instead of leaving Settings");
+});
+
+test("`#423 back-key-consistency`: with nothing noted behind — a page opened on the thread list — Back closes it as Esc does, rather than saying there is nowhere to go", async () => {
+  const page = newPage(new Map([["vibe-talk.voice.columns", "list"]]));
+  const data = threadData();
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await page.settle();
+  assert.equal(whereNow(page), "threads", "the premise is a page opened on the thread list");
+  await backKey(page);
+  assert.notEqual(whereNow(page), "threads", "Back on a thread list the page opened on did nothing");
+  assert.notEqual(page.el("status").textContent, "Nothing to go back to.");
+  // Negative control: with nothing open over the view either, it says so.
+  const plain = await threadPage();
+  await backKey(plain);
+  assert.equal(plain.el("status").textContent, "Nothing to go back to.");
+});
+
+test("`#423 back-key-consistency`: a place noted twice — two columns lost to a narrow window and back — is passed over, never a Back that changes nothing", async () => {
+  const { page } = await twoColumnServer();
+  await press(page, page.el("scroll-area"), "3", { ctrlKey: true });
+  await press(page, page.el("scroll-area"), "4", { ctrlKey: true });
+  assert.equal(whereNow(page), "two");
+  // The window narrows: two columns give way to the layout they came from, the thread list.
+  await page.setDesk(false);
+  const narrowed = whereNow(page);
+  assert.notEqual(narrowed, "two", "the premise: a narrow window takes two columns away");
+  await backKey(page);
+  assert.notEqual(whereNow(page), narrowed, "Back stayed on the place it was on");
 });
 
 // --- unpack every thread under its card (#404 threads-unpack-all) and the root under a summary (#405) --

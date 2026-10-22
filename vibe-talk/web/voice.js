@@ -1021,6 +1021,12 @@ function scheduleBackSync() {
   if (!backStarted || backSyncDue) return;
   backSyncDue = true;
   Promise.resolve().then(() => {
+    // `#423 back-key-consistency`. Whatever moved the history, the place the reader is at now.
+    try {
+      notePlace();
+    } catch (_error) {
+      // A place that cannot be read is not noted: Back and Forward go on through the others.
+    }
     try {
       syncBackStack();
     } catch (_error) {
@@ -1187,6 +1193,259 @@ function startBackStack() {
   };
   for (const type of ["pointerup", "keydown", "click"]) document.addEventListener(type, touched, true);
   scheduleBackSync();
+}
+
+// --- Back and Forward through the places visited (#423 back-key-consistency) ---------------------
+//
+// The owner, 2026-10-22: "if I press `Cmd-[` on the thread list view it jumps back to the Main view but it
+// does NOT have kind of navigation (or back?) effect on other views." Cmd+[ on a Mac is the browser's own
+// Back, and the page bound nothing for it: the browser's Back closes what `#304` gives an entry (above),
+// which is the thread list, a thread, the right column's thread, a reply, Settings, Help and a menu, and
+// never a view switch, so in Main, All and two columns it had nothing of the page's to go back through.
+//
+// THE RULE. Ctrl/Cmd+[ goes Back and Ctrl/Cmd+] goes Forward, from anywhere, in every view and screen,
+// through the PLACES the reader has been on the channel since choosing it. A place is the screen (the
+// channel, Settings, Help) and, on the channel, the view (Main, All, the thread list, two columns) with
+// the thread open in it, across the window or on the right. Every move to a new place, by whatever
+// control (the view keys and picker, the layout button, a thread entered or left, Settings and Help and
+// their Back, the browser's Back), is noted after the place the reader is at, the places ahead of it
+// dropped, as a browser does (`notePlace`, heard where the history entries are kept in step,
+// `scheduleBackSync`); Back and Forward move along them and note none. Something open over a place that
+// closes onto it (Esc, the X, the browser's Back) is a step back, as Back would have been, with what
+// closed kept ahead for Forward. With nothing noted behind (a reload, another channel), Back closes what
+// is open over the view as Esc does. A place that cannot be shown any
+// more (a thread gone, two columns in a window too narrow, a channel that is one thread) is passed over.
+// An open menu is closed first, as Esc closes it, and by Back a reply open in a list too, its words kept
+// as a draft. At either end the key says so and does nothing more: it never leaves the app. Another
+// channel starts afresh. On the call's view, which is no place, the keys say so.
+//
+// THE SPECIAL CASES. `#304`'s closes are this rule where the place before is the one under what is open,
+// and Back goes there by the very close Esc uses: a thread entered from the thread list back to the list
+// (`leaveThread`), the list back to the view it was chosen from (`threadListBack`), the right column's
+// thread back to its cards (`closeSideByX`), Settings and Help back to where they were opened. So the
+// thread list's Back is no exception: Main, All and two columns simply gain theirs.
+//
+// WHAT STAYS. The browser's own Back (its button, Alt+Left, a mouse's) and the phone's back gesture keep
+// `#304`'s meaning, closing what is open and then leaving the app: a gesture that walked back through
+// every view switch would hold a phone reader in it. The page takes Ctrl/Cmd+[ and ] from the browser,
+// heard first at the window as Ctrl+S is (`onEverywhereKey`); the bare [ and ] still move between two
+// columns (`#229`).
+
+/** The most places kept: far more than a reader walks back through, and a bound on what is held. */
+const PLACES_KEPT = 100;
+/** The places visited on this channel, the first first. */
+let visited = /** @type {Place[]} */ ([]);
+/** Which of `visited` the reader is at. */
+let visitedAt = -1;
+/** A Back or Forward is arriving: what it lands on stands for the place it went to, and is noted as none. */
+let placeArriving = false;
+
+/**
+ * @typedef {{screen: "main", channel: string, layout: "one" | "list" | "two", view: string | null,
+ *   thread: string | null, origin: string | null, side: string | null}} ChannelPlace
+ * @typedef {ChannelPlace | {screen: "settings" | "help", channel: string, under: ChannelPlace | null,
+ *   from: string | null, entry: string | null}} Place
+ */
+
+/** The place on the channel now, read in the left column, whose state is the page's; null on the call's view. */
+function channelPlace() {
+  if (sideActive) return inColumn(columns.main, channelPlace);
+  if (currentView !== "discord") return null;
+  const channel = String(el("discord-channel").value || "");
+  if (!channel) return null;
+  /** @type {ChannelPlace} */
+  const place = { screen: "main", channel, layout: "one", view: null, thread: null, origin: null, side: null };
+  if (columnsShown) {
+    place.layout = "two";
+    const side = columns.side.mode === "thread" ? sideThreads.get(channel) : null;
+    place.side = side ? String(side.id) : null;
+  } else if (threadListShown) {
+    place.layout = "list";
+  } else {
+    place.view = channelView;
+    if (channelView === "thread") {
+      place.thread = selectedThreadId ? String(selectedThreadId) : null;
+      place.origin = threadOrigin || null;
+    }
+  }
+  return place;
+}
+
+/** The place the reader is at now: the channel's, or Settings or Help over the screen they were opened from. */
+function currentPlace() {
+  if (currentScreen === "main") return channelPlace();
+  if (currentScreen !== "settings" && currentScreen !== "help") return null;
+  const under = screenBeforeSettings === "main" ? channelPlace() : null;
+  const open = currentScreen === "help" ? helpEntries().find((entry) => entry.open) : null;
+  return {
+    screen: currentScreen, channel: String(el("discord-channel").value || ""), under,
+    from: currentScreen === "help" ? helpReturn : null, entry: open ? String(open.id).replace(/^help-/, "") : null,
+  };
+}
+
+/** What tells one place from another. A thread's origin says where its own Back goes, not where it is. */
+function visitKey(place) {
+  if (!place) return "";
+  if (place.screen !== "main") return `${place.screen}:${place.from || ""}:${visitKey(place.under)}`;
+  return [place.layout, place.view || "", place.thread || "", place.side || ""].join(":");
+}
+
+/** Note the place the reader is at, as the one after the place they were at, unless it is that place. */
+function notePlace() {
+  const place = currentPlace();
+  if (!place) return;
+  if (visited.length > 0 && visited[0].channel !== place.channel) {
+    visited = [];
+    visitedAt = -1;
+  }
+  if (visitedAt >= 0 && visitKey(visited[visitedAt]) === visitKey(place)) {
+    // The same place: what it says of itself kept fresh (a thread's way back, Help's open entry).
+    visited[visitedAt] = place;
+    return;
+  }
+  if (placeArriving && visitedAt >= 0) {
+    visited[visitedAt] = place;
+    return;
+  }
+  // What was open over the place before closed onto it (Esc, the X, the browser's Back, a Back button):
+  // a step back along the history, as Ctrl/Cmd+[ would have been, the place left kept ahead for Forward.
+  if (visitedAt > 0 && placeIsOver(visited[visitedAt]) && visitKey(visited[visitedAt - 1]) === visitKey(place)) {
+    visitedAt -= 1;
+    visited[visitedAt] = place;
+    return;
+  }
+  visited = visited.slice(0, visitedAt + 1);
+  visited.push(place);
+  if (visited.length > PLACES_KEPT) visited = visited.slice(visited.length - PLACES_KEPT);
+  visitedAt = visited.length - 1;
+}
+
+/**
+ * Whether `place` is open over another, something Esc closes onto the place under it: Settings, Help, the
+ * thread list, a thread opened from it, a thread on the right.
+ */
+function placeIsOver(place) {
+  if (place.screen !== "main") return true;
+  return place.layout === "list" || (place.layout === "two" && place.side !== null) ||
+    (place.layout === "one" && place.view === "thread" && place.origin === "list");
+}
+
+/** Whether channel place `place` can be shown now. */
+function channelPlaceShowable(place) {
+  if (!place) return true;
+  if (place.channel !== String(el("discord-channel").value || "")) return false;
+  if (place.layout === "two") return columnsFit && threadListOffered() && (!place.side || threadStillKnown(place.side));
+  if (place.layout === "list") return threadListOffered();
+  if (place.view === "thread") return Boolean(place.thread) && threadStillKnown(place.thread);
+  return place.view === "main" || threadingSupported;
+}
+
+/** Whether `place` can be shown now: its channel the one chosen, and what it shows still there. */
+function placeShowable(place) {
+  if (place.screen === "main") return channelPlaceShowable(place);
+  return place.channel === String(el("discord-channel").value || "") && channelPlaceShowable(place.under);
+}
+
+/**
+ * Put the channel on place `place`, by the close Esc uses where `place` is what is under what is open
+ * (see THE SPECIAL CASES), and by the views' own choosing for whatever is left to change.
+ *
+ * @param {ChannelPlace} place
+ */
+function showChannelPlace(place) {
+  if (sideActive) return inColumn(columns.main, () => showChannelPlace(place));
+  if (currentScreen !== "main" || currentView !== "discord") return undefined;
+  const now = channelPlace();
+  if (now && now.layout === "one" && now.view === "thread" && now.origin === "list" && place.layout === "list") leaveThread();
+  else if (now && now.layout === "list" && place.layout !== "list") threadListBack();
+  else if (now && now.layout === "two" && now.side && place.layout === "two" && !place.side) closeSideByX();
+  if (visitKey(channelPlace()) === visitKey(place)) return undefined;
+  if (place.layout === "list") {
+    chooseView("threads");
+  } else if (place.layout === "two") {
+    if (!columnsShown) chooseView("columns");
+    const shown = columns.side.mode === "thread" ? sideThreads.get(place.channel) : null;
+    if (place.side && (!shown || String(shown.id) !== place.side)) selectSideThread(place.side);
+    else if (!place.side && columns.side.mode === "thread") closeSideByX();
+  } else if (place.view === "thread") {
+    const id = String(place.thread);
+    if (place.origin === "list" && threadListOffered()) openThreadFromList(id);
+    else {
+      const summary = channelCanon.threads.find((held) => String(held.id) === id) || null;
+      chooseOneColumn({ view: "thread", thread: id, summary, origin: place.origin || defaultChannelView() });
+    }
+  } else {
+    chooseView(/** @type {"main" | "flat"} */ (place.view));
+  }
+  return undefined;
+}
+
+/** Go to place `place`: off the screens over the channel, the channel on the place under, and on to its screen. */
+function showPlace(place) {
+  if (currentScreen === "help" && visitKey(place) !== visitKey(currentPlace())) closeHelp();
+  const under = place.screen === "main" ? place : place.under;
+  if (currentScreen === "settings" && (place.screen === "main" || (place.screen === "help" && place.from !== "settings"))) {
+    closeSettings();
+  }
+  if (currentScreen === "main" && under) showChannelPlace(under);
+  if (place.screen === "settings" && currentScreen !== "settings") showScreen("settings");
+  if (place.screen === "help" && currentScreen !== "help") {
+    if (place.from === "settings" && currentScreen !== "settings") showScreen("settings");
+    helpReturn = currentScreen;
+    showHelp(place.entry);
+  }
+}
+
+/**
+ * Ctrl/Cmd+[ (`step` -1) and Ctrl/Cmd+] (+1): back to the place before, or forward to the place after. See
+ * the rule above. Always takes the chord, so it is never the browser's Back or Forward.
+ */
+function placeFromKeyboard(step) {
+  if (sideActive) return inColumn(columns.main, () => placeFromKeyboard(step));
+  const menus = openMenus();
+  if (menus.length > 0) {
+    closeOpenMenu(menus[menus.length - 1]);
+    return true;
+  }
+  if (currentScreen === "main" && currentView !== "discord") {
+    setStatus("Back and Forward go through the channel's views; the call has none.");
+    return true;
+  }
+  if (step < 0 && replyOnScreen()) {
+    closeReply();
+    settleFocus();
+    return true;
+  }
+  notePlace();
+  const here = visitKey(currentPlace());
+  for (let at = visitedAt + step; at >= 0 && at < visited.length; at += step) {
+    const place = visited[at];
+    // Passed over: what cannot be shown now, and the place the reader is at, noted twice where a window
+    // narrowed and widened again took two columns away and back.
+    if (!placeShowable(place) || visitKey(place) === here) continue;
+    placeArriving = true;
+    try {
+      visitedAt = at;
+      showPlace(place);
+      notePlace();
+    } finally {
+      placeArriving = false;
+    }
+    if (currentScreen === "main") settleFocus();
+    return true;
+  }
+  setStatus(step < 0 ? "Nothing to go back to." : "Nothing to go forward to.");
+  // Nothing noted behind, as after a reload or a change of channel that opened on something over a view
+  // (the thread list, a thread opened from it): Back closes it as Esc does, onto what is under it.
+  if (step < 0) {
+    const levels = backLevels().filter((tag) => tag !== "reply" && !tag.startsWith("menu:"));
+    if (levels.length > 0) {
+      closeBackLevel(levels[levels.length - 1]);
+      if (currentScreen === "main") settleFocus();
+      return true;
+    }
+  }
+  return true;
 }
 
 // --- screens ----------------------------------------------------------------------------------
@@ -10710,6 +10969,19 @@ const KEYMAP = [
       "on the channel or view picker, back to the messages",
     controls: ["close-settings", "close-help", "thread-back", "side-close"],
     run: (event, target) => onEscape(event, target),
+  },
+  {
+    // `#423 back-key-consistency`. Heard first, at the window, as Ctrl+S is (`onEverywhereKey`): on a Mac
+    // Cmd+[ and Cmd+] are the browser's own Back and Forward, which go back only through what `#304` gives
+    // an entry. These go back and forward through every place visited.
+    group: KEYS_PAGE, chords: [{ key: "[", mod: true }, { key: "]", mod: true }], everywhere: true,
+    does: () => `${modKeyName()}+[ goes back to where you were before, and ${modKeyName()}+] forward again, in every ` +
+      "view: Main, All, the thread list, two columns, a thread (across the window or on the right), Settings and " +
+      "Help. From a thread opened from the thread list, back to the list; from the list, to the view it was chosen " +
+      "from; from Settings or Help, to where you opened them. A menu closes first, and on Back a reply open in a " +
+      "list (its words kept). At either end it says so and stays. The browser's own Back and a phone's back " +
+      "gesture close what is open, as Esc does",
+    run: (event) => placeFromKeyboard(typedKey(event) === "]" ? 1 : -1),
   },
   {
     group: KEYS_PAGE, by: "browser",
