@@ -1,12 +1,13 @@
 ---
 title: 'bookmark-clear: an X on the bookmark''s line that takes it away, with Undo'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-22T13:44:39.504878077+00:00
-updated_at: 2026-10-22T13:44:39.504878077+00:00
+updated_at: 2026-10-22T15:19:19.968599349+00:00
+closed_at: 2026-10-22T15:19:19.968599219+00:00
 ---
 
 # Description
