@@ -7,6 +7,11 @@ is read one block at a time: the block being read is lit, and inside it the sent
 another block of it jumps there, Previous and Next and the Media Session's previoustrack, nexttrack,
 pause and play move through it, and the boundaries between blocks are heard without a gap.
 
+`#433 read-strip-low` and `#434 read-aloud-pause`: the strip sits directly on the chips row with
+no gap (measured, at 412x915, 393x852 and on a desk), and its Pause, the Read button and the
+media keys are one state — pausing by any of them holds the position, resuming by any other
+carries on from the held block.
+
 It serves the checked-out assets and a small fake API from one loopback origin. The fake voice
 behaves like the deployed one in the two ways the boundaries depend on: ONE session, so a block's
 audio cannot begin until the block before it has been generated, and audio at SPEAKING PACE, so
@@ -503,6 +508,14 @@ def main() -> int:
                     "() => document.getElementById('read-steer').hidden ? ''"
                     " : document.getElementById('read-steer-count').textContent"))
 
+            def strip_gap(page: Page) -> float:
+                # `#433 read-strip-low`: the strip's bottom edge against the chips row's top
+                # edge, in CSS pixels. Nothing but the two borders between them reads as 0.
+                return float(page.evaluate(
+                    "() => { const s = document.getElementById('read-steer').getBoundingClientRect();"
+                    " const t = document.getElementById('scroll-tools').getBoundingClientRect();"
+                    " return t.top - s.bottom; }"))
+
             def wait_position(page: Page, wanted: str, seconds: float = 10) -> None:
                 wait_for(lambda: position(page) == wanted, seconds,
                          f"the read never reached {wanted}; it shows {position(page)!r}")
@@ -547,6 +560,8 @@ def main() -> int:
                 check(lit_element(page).startswith("p:Where the overnight run got to."),
                       f"the first block is not the one lit: {lit_element(page)!r}")
                 check(author_line(page) == "reading 1 of 7", f"the row does not count the read: {author_line(page)!r}")
+                gap412 = strip_gap(page)
+                check(abs(gap412) <= 2, f"the strip floats {gap412:.1f}px off the chips row at 412x915 (`#433`)")
                 shot("1-first-block")
 
                 # 1b. Inside it, the sentence being said is lit, each in turn. `#379`.
@@ -638,9 +653,27 @@ def main() -> int:
                 check(page.evaluate("() => readAloudContext.currentTime") == paused_at,
                       "the audio clock ran on while paused")
                 check(position(page) == "6 of 7", f"pausing moved the read to {position(page)}")
-                page.evaluate("() => window.mediaProbe.handlers.play({action: 'play'})")
+                # `#434 read-aloud-pause`: the one state, said by every control. The media pause
+                # is the strip's Play and the Read button's Resume, and the strip resumes it.
+                check(page.text_content("#read-pause") == "Play",
+                      f"a media pause left the strip saying {page.text_content('#read-pause')!r}")
+                check(page.text_content("#read-aloud-label") == "Resume",
+                      f"a media pause left the Read button saying {page.text_content('#read-aloud-label')!r}")
+                shot("5b-paused")
+                press(page, "#read-pause", True)
                 wait_for(lambda: page.evaluate("() => readAloudContext.state") == "running", 2,
-                         "play did not start the audio clock again")
+                         "the strip's Play did not resume a media pause")
+                check(position(page) == "6 of 7", f"resuming moved the read to {position(page)}")
+                # And the Read button holds and resumes the same read, from the same block.
+                press(page, "#read-aloud", True)
+                wait_for(lambda: page.evaluate("() => readAloudContext.state") == "suspended", 2,
+                         "the Read button's Pause did not stop the audio clock")
+                check(page.text_content("#read-pause") == "Play",
+                      "the Read button's pause left the strip saying Pause")
+                press(page, "#read-aloud", True)
+                wait_for(lambda: page.evaluate("() => readAloudContext.state") == "running", 2,
+                         "the Read button's Resume did not start the audio clock again")
+                page.evaluate("() => window.mediaProbe.handlers.play({action: 'play'})")
                 states: object = page.evaluate("() => window.mediaProbe.states")
                 check(isinstance(states, list) and "paused" in states and states[-1] == "playing",
                       f"the media session was not told paused then playing: {states}")
@@ -672,6 +705,8 @@ def main() -> int:
                 wait_position(page, "1 of 7")
                 box = page.locator("#read-steer").bounding_box()
                 check(box is not None and box["width"] > 0, "the steering strip is not drawn on a desk")
+                gap_desk = strip_gap(page)
+                check(abs(gap_desk) <= 2, f"the strip floats {gap_desk:.1f}px off the chips row on a desk (`#433`)")
                 wait_position(page, "4 of 7", 15)
                 ahead_gaps = gaps_of(page)
                 ahead_worst = max(ahead_gaps, default=0)
@@ -681,15 +716,59 @@ def main() -> int:
                 wait_position(page, "5 of 7")
                 if args.screenshots:
                     page.screenshot(path=str(args.screenshots / "8-desk.png"))
-                page.click("#read-aloud")
+                press(page, f"{row} .body", False)
                 context.close()
 
-        print(f"{browser_version}: 7 blocks walked at 412x915 and on a desk. Block boundaries, voice"
+            # 9. At 393x852: the strip still hugs the chips row (`#433`), and its own Pause holds
+            # and resumes the read where it was held (`#434`).
+            with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
+                context, page = open_page(profile, 393, 852, True)
+                press(page, f"{row} .body", True)
+                wait_position(page, "1 of 7")
+                gap393 = strip_gap(page)
+                check(abs(gap393) <= 2, f"the strip floats {gap393:.1f}px off the chips row at 393x852 (`#433`)")
+                press(page, "#read-next", True)
+                wait_position(page, "2 of 7")
+                press(page, "#read-pause", True)
+                wait_for(lambda: page.evaluate("() => readAloudContext.state") == "suspended", 2,
+                         "the strip's Pause did not stop the audio clock at 393x852")
+                check(position(page) == "2 of 7", f"the strip's pause moved the read to {position(page)}")
+                check(page.text_content("#read-pause") == "Play", "the held strip does not offer Play")
+                check(page.text_content("#read-aloud-label") == "Resume",
+                      "the strip's pause left the Read button saying Pause")
+                # The status pill stacks over the strip rather than under its top edge (`#433`).
+                page.evaluate("() => setStatus('held at the second block')")
+                pill_gap = float(page.evaluate(
+                    "() => { const p = document.getElementById('status-line').getBoundingClientRect();"
+                    " const s = document.getElementById('read-steer').getBoundingClientRect();"
+                    " return s.top - p.bottom; }"))
+                check(pill_gap >= 4, f"the status pill stands {pill_gap:.1f}px into the strip at 393x852")
+                if args.screenshots:
+                    page.screenshot(path=str(args.screenshots / "9-phone-393-paused.png"))
+                press(page, "#read-pause", True)
+                wait_for(lambda: page.evaluate("() => readAloudContext.state") == "running", 2,
+                         "the strip's Play did not resume the read at 393x852")
+                check(position(page) == "2 of 7", f"the strip's resume moved the read to {position(page)}")
+                # At the foot of the list the last message scrolls clear of the strip: the room
+                # the composer keeps above itself grew by the strip's height (`#433`).
+                page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; }")
+                time.sleep(0.3)
+                cover = float(page.evaluate(
+                    f"() => {{ const last = document.querySelector('#discord-log > li[data-id=\"{SHORT}\"]').getBoundingClientRect();"
+                    " const s = document.getElementById('read-steer').getBoundingClientRect();"
+                    " return last.bottom - s.top; }"))
+                check(cover <= 2, f"at the foot the strip covers {cover:.1f}px of the last message")
+                press(page, f"{row} .body", True)
+                context.close()
+
+        print(f"{browser_version}: 7 blocks walked at 412x915, 393x852 and on a desk. Block boundaries, voice"
               f" first audio {round(FIRST_AUDIO_SECONDS * 1000)} ms: at speaking pace {pace_boundaries} ms"
               f" (worst {worst}); generating {AHEAD_PACE:g}x faster than it speaks, worst {ahead_worst} ms;"
               f" control with first audio {round(CONTROL_FIRST_AUDIO_SECONDS * 1000)} ms, worst {control_worst} ms."
-              " The first block's three sentences were lit in turn; highlight, k of n, tap-to-jump,"
-              " the timeline, Previous/Next and the media keys all move the read.")
+              f" The strip's gap over the chips row: {gap412:.1f}px at 412x915, {gap393:.1f}px at 393x852,"
+              f" {gap_desk:.1f}px on a desk. The first block's three sentences were lit in turn; highlight,"
+              " k of n, tap-to-jump, the timeline, Previous/Next, the media keys and Pause/Play by the"
+              " strip, the Read button and the media keys all move or hold the one read.")
         return 0
     finally:
         api.stopping.set()

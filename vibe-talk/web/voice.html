@@ -132,22 +132,6 @@
         <button id="dismiss-status" class="chip" type="button" aria-label="Dismiss">×</button>
       </div>
 
-      <!--
-        `#376 read-aloud-blocks`. Where a read of several blocks is, and the way through it: Previous,
-        "2 of 5", Next. Shown only while such a read plays, floating as the status line does and for
-        the same reason (nothing under the reader's thumb moves when it comes and goes). The media
-        keys a steering wheel or a headset sends do the same as its buttons.
-      -->
-      <div id="read-steer" role="group" aria-label="Reading position" hidden>
-        <button id="read-prev" class="read-steer-button" type="button" aria-label="Previous block">Previous</button>
-        <span id="read-steer-count" aria-live="polite"></span>
-        <button id="read-next" class="read-steer-button" type="button" aria-label="Next block">Next</button>
-        <!-- `#380 read-aloud-timeline`. The read as a line of its blocks, each as wide as it is long:
-             those heard, the one being read, those to come. A tap on one reads from there. Filled
-             by web/voice.js, one button a block. -->
-        <div id="read-timeline" role="group" aria-label="Blocks of the message"></div>
-      </div>
-
       <div id="screens">
         <!-- ------------------------------------------------------------------ sign-in screen -->
         <section id="screen-signin" class="screen" tabindex="-1" aria-label="Sign in">
@@ -948,6 +932,34 @@
             <button id="collapse-all" class="chip" type="button" hidden>
               <span id="collapse-all-label">Collapse all</span>
             </button>
+          </div>
+
+          <!--
+            `#376 read-aloud-blocks`. Where a read of several blocks is, and the way through it:
+            Previous, "2 of 5", Next. Shown only while such a read plays, floating as the status
+            line does and for the same reason (nothing under the reader's thumb moves when it
+            comes and goes). The media keys a steering wheel or a headset sends do the same as
+            its buttons.
+
+            `#434 read-aloud-pause`: and Pause, which is Play while the read is held. The same
+            state the Read button and the media keys drive, never a second opinion about it.
+
+            `#433 read-strip-low`: it stands directly on the chips row above (#scroll-tools, the
+            row with Collapse all and Expand all), as low as it can sit: under the thumb, with
+            the rest of the screen left to the messages above it. IN THIS SECTION, anchored to
+            #screen-main exactly as the chips are: anchored to #frame-body instead, its measured
+            hug was off by the send card's height whenever that card docked in the frame's third
+            row, because the two bottoms it measured between were not the same edge.
+          -->
+          <div id="read-steer" role="group" aria-label="Reading position" hidden>
+            <button id="read-prev" class="read-steer-button" type="button" aria-label="Previous block">Previous</button>
+            <button id="read-pause" class="read-steer-button" type="button" aria-label="Pause reading" aria-pressed="false">Pause</button>
+            <span id="read-steer-count" aria-live="polite"></span>
+            <button id="read-next" class="read-steer-button" type="button" aria-label="Next block">Next</button>
+            <!-- `#380 read-aloud-timeline`. The read as a line of its blocks, each as wide as it
+                 is long: those heard, the one being read, those to come. A tap on one reads from
+                 there. Filled by web/voice.js, one button a block. -->
+            <div id="read-timeline" role="group" aria-label="Blocks of the message"></div>
           </div>
         </section>
 

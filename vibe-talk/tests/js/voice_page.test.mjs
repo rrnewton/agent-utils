@@ -3896,6 +3896,11 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         if (changed) changed();
       },
       cancel() { this.cancellations += 1; },
+      pauses: 0,
+      resumes: 0,
+      paused: false,
+      pause() { this.pauses += 1; this.paused = true; },
+      resume() { this.resumes += 1; this.paused = false; },
       speak(utterance) {
         if (this.throwOnSpeak) throw new Error("speech engine failure");
         this.utterances.push(utterance);
@@ -11156,8 +11161,9 @@ test("THE MEDIA KEYS move the read: previoustrack, nexttrack, pause and play, ke
   await page.settle();
   assert.ok(!session.states.slice(statesBefore).includes("none"), `a jump let the media keys go: ${session.states}`);
 
-  // When the read stops, the keys, the title and the silence go with it.
-  await page.el("read-aloud").click();
+  // When the read stops, the keys, the title and the silence go with it. The media stop is the
+  // way used here: the Read button is Pause while a read plays (`#434 read-aloud-pause`).
+  session.handlers.stop();
   await page.settle();
   assert.equal(session.playbackState, "none");
   assert.equal(keeper.paused, true);
@@ -11183,6 +11189,157 @@ test("...and on a browser without Web Audio, pause and play pause and play the e
   page.mediaSession.handlers.play();
   await page.settle();
   assert.equal(reading.playCount, plays + 1, "play did not play the element again");
+});
+
+test("`#434 read-aloud-pause`: THE STRIP'S PAUSE, THE READ BUTTON AND THE MEDIA KEYS ARE ONE STATE", async () => {
+  // The owner: play/pause never reached the Read button, and the floating controller had none.
+  // One state path, said three ways: the strip's button, the Read button, the media session.
+  const { page, rows } = await blockedRead({ mediaSession: true });
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.equal(page.el("read-pause").text(), "Pause", "the strip offers no pause while a read plays");
+  assert.equal(page.el("read-aloud-label").text(), "Pause", "the Read button does not say Pause while a read plays");
+  assert.equal(page.el("read-steer-count").text(), "1 of 3");
+
+  // Pause from the strip: the clock stops, the position stays, every control agrees.
+  await page.el("read-pause").click();
+  await page.settle();
+  assert.equal(page.audio.state, "suspended", "the strip's Pause did not stop the audio clock");
+  assert.equal(page.el("read-steer-count").text(), "1 of 3", "pausing moved the read");
+  assert.equal(page.el("read-pause").text(), "Play", "the strip does not offer Play while paused");
+  assert.equal(page.el("read-aloud-label").text(), "Resume", "the Read button does not say Resume while paused");
+  assert.equal(page.mediaSession.playbackState, "paused", "the media session was not told of the strip's pause");
+
+  // Resume from the Read button: the same state, from the other control.
+  await page.el("read-aloud").click();
+  await page.settle();
+  assert.equal(page.audio.state, "running", "the Read button's Resume did not start the clock again");
+  assert.equal(page.el("read-pause").text(), "Pause");
+  assert.equal(page.el("read-aloud-label").text(), "Pause");
+  assert.equal(page.mediaSession.playbackState, "playing");
+
+  // Pause from a media key, resume from the strip: still the one state.
+  page.mediaSession.handlers.pause();
+  await page.settle();
+  assert.equal(page.el("read-pause").text(), "Play", "a media-key pause left the strip saying Pause");
+  assert.equal(page.el("read-aloud-label").text(), "Resume", "a media-key pause left the Read button saying Pause");
+  await page.el("read-pause").click();
+  await page.settle();
+  assert.equal(page.audio.state, "running", "the strip's Play did not resume a media-key pause");
+  assert.equal(page.mediaSession.playbackState, "playing");
+
+  // A jump made while held cues the next block up HELD: Next is not a Play nobody pressed.
+  await page.el("read-pause").click();
+  await page.settle();
+  assert.equal(page.audio.state, "suspended");
+  await page.el("read-next").click();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "2 of 3", "Next while held did not cue the next block");
+  assert.equal(page.audio.state, "suspended", "Next while held started the audio clock");
+  assert.equal(page.el("read-pause").text(), "Play", "the cued block is not held");
+  assert.equal(page.mediaSession.playbackState, "paused");
+  await page.el("read-pause").click();
+  await page.settle();
+  assert.equal(page.audio.state, "running", "Play did not start the cued block");
+
+  // Stopped, the Read button is the way out again and the strip is gone.
+  page.mediaSession.handlers.stop();
+  await page.settle();
+  assert.equal(page.el("read-steer").hidden, true, "the strip outlived the read");
+  assert.equal(page.el("read-aloud-label").text(), "Stop", "with nothing playing the Read button is not the way out");
+});
+
+test("`#434 read-aloud-pause`: a resume after the speech ticket ended re-prepares and reads the paused block again", async () => {
+  // A pause can outlive the ten-minute ticket (#368 speech-ticket-gone territory): resuming on the
+  // dead URL would fail the read part-way through. It prepares again and restarts the paused block.
+  const { page, rows } = await blockedRead({ mediaSession: true });
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  await page.el("read-next").click();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "2 of 3", "the premise: the read is not on its second block");
+  await page.el("read-pause").click();
+  await page.settle();
+  assert.equal(page.audio.state, "suspended", "the premise: the read is not paused");
+  const before = page.prepareCalls.length;
+  const streams = page.audioStreams.length;
+  page.speechTicketSuffix = "-again";
+  page.setClock(page.clock() + page.speechTicketTtlSeconds * 1000 + 1_000);
+  await page.el("read-pause").click();
+  await page.settle();
+  const again = page.prepareCalls.slice(before).filter((call) => (call.ids || []).includes(BLOCKED_ID)).length;
+  assert.ok(again >= 1, "the resume on an ended ticket prepared nothing again");
+  assert.ok(page.audioStreams.length > streams, "the resume asked for no audio again");
+  const resumed = page.audioStreams.at(-1);
+  assert.match(resumed.url, /-again\?/, `the resume played the URL whose ticket had ended: ${resumed.url}`);
+  assert.equal(blockOf(resumed.url), "1", "the resume did not restart the paused block");
+  assert.equal(page.el("read-steer-count").text(), "2 of 3", "the resume moved the read off the paused block");
+  assert.equal(page.audio.state, "running", "the resumed read is not playing");
+  assert.equal(page.el("read-pause").text(), "Pause");
+});
+
+test("`#434 read-aloud-pause`: the device voice pauses and resumes the same utterance, from the Read button", async () => {
+  const page = devicePage();
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: "1000000000000000001", content: "One short message." })]);
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.equal(page.deviceSpeech.utterances.length, 1, "the premise: nothing is being said");
+  assert.equal(page.el("read-aloud-label").text(), "Pause");
+  await page.el("read-aloud").click();
+  await page.settle();
+  assert.equal(page.deviceSpeech.pauses, 1, "Pause did not pause the device voice");
+  assert.equal(page.deviceSpeech.cancellations, 0, "Pause cancelled the utterance instead of holding it");
+  assert.equal(page.el("read-aloud-label").text(), "Resume");
+  assert.deepEqual(page.dismissCalls, [], "a paused read was archived as heard");
+  await page.el("read-aloud").click();
+  await page.settle();
+  assert.equal(page.deviceSpeech.resumes, 1, "Resume did not resume the device voice");
+  assert.equal(page.deviceSpeech.utterances.length, 1, "Resume re-spoke the message from the start");
+  page.deviceSpeech.utterances[0].end();
+  await page.settle();
+  assert.deepEqual(page.dismissCalls, [{ messages: ["1000000000000000001"] }], "the resumed read did not finish as heard");
+});
+
+test("`#434 read-aloud-pause`: stopping a held device-voice read leaves the engine unpaused for the next", async () => {
+  // An engine cancelled while paused can stay paused, and the next read would speak into that
+  // paused queue and die on its start watchdog. The mock models it: cancel keeps `paused`.
+  const page = devicePage();
+  await signIn(page);
+  const rows = await inReadingMode(page, [
+    message({ id: "1000000000000000001", content: "First held message.", timestamp: "2026-08-19T14:00:00Z" }),
+    message({ id: "1000000000000000002", author_id: "1000000000000000012", content: "Second message.", timestamp: "2026-08-19T14:01:00Z" }),
+  ]);
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  await page.el("read-aloud").click();
+  await page.settle();
+  assert.equal(page.deviceSpeech.paused, true, "the premise: the engine is not held");
+  await page.el("discord-log").children[0].dispatch("click", {});
+  await page.settle();
+  assert.equal(page.deviceSpeech.paused, false, "stopping the held read left the engine paused");
+  const spoken = page.deviceSpeech.utterances.length;
+  await page.el("discord-log").children[1].dispatch("click", {});
+  await page.settle();
+  assert.equal(page.deviceSpeech.utterances.length, spoken + 1, "the next read never reached the engine");
+  assert.equal(page.deviceSpeech.paused, false, "the next read is speaking into a paused engine");
+});
+
+test("`#433 read-strip-low`: the strip hugs the chips' measured height and the pill stacks over it", () => {
+  // The gap was a fixed 2.6rem kept for the status pill even while it was hidden. The strip now
+  // stands on the chips' own measured height, and what floats higher keeps room for the strip.
+  const strip = cssBlock("#read-steer");
+  assert.match(strip, /bottom:\s*calc\(var\(--chips-foot, 0\.5rem\) \+ var\(--scroll-tools-height, 0px\)\);/,
+    "the strip does not stand on the chips' measured top edge");
+  assert.doesNotMatch(strip, /2\.6rem/, "the fixed gap over the chips is still reserved");
+  assert.match(cssBlock("#status-line"), /bottom:[^;]*--read-steer-clearance/,
+    "the status pill does not stack over the strip and would cover it");
+  const own = cssRules(CSS_CODE, "#channel-composer").find((rule) => /margin-top:/.test(rule));
+  assert.match(own, /margin-top:[^;]*--read-steer-clearance/,
+    "the list's foot keeps no room for the strip, so its last message cannot scroll clear of it");
+  assert.match(SCRIPT_CODE, /"--scroll-tools-height"/, "nothing writes the chips' measured height");
+  assert.match(SCRIPT_CODE, /"--read-steer-clearance"[\s\S]*?\.observe\(el\("read-steer"\)\)/,
+    "nothing measures the strip for the room kept over it");
 });
 
 test("a read in blocks on a ticket with under five minutes left prepares the row again first", async () => {
@@ -11325,9 +11482,10 @@ test("THE SENTENCE BEING SAID is lit inside the block being read, by its share o
   page.expireTimers(150);
   await page.settle();
   assert.equal(litSentence(highlights), "One two three.", "the light did not follow the audio back");
-  // The block itself is still lit, and the sentence goes with the read.
+  // The block itself is still lit, and the sentence goes with the read. Stopped by a tap on the
+  // row being read, as ever: the Read button pauses a playing read now (`#434`).
   assert.equal(litBlock(page.el("discord-log").children[0]), "p:One two three. Four five six! Seven eight?");
-  await page.el("read-aloud").click();
+  await page.el("discord-log").children[0].dispatch("click", {});
   await page.settle();
   assert.equal(highlights.has("read-aloud-sentence"), false, "the sentence stayed lit after the read stopped");
   assert.equal(page.expireTimers(150), 0, "the page kept looking for a sentence with nothing being read");
@@ -11376,7 +11534,8 @@ test("THE TIMELINE shows the read's blocks as wide as they are long, marks where
   assert.deepEqual(line().map((button) => button.getAttribute("data-heard") !== null), [true, true, false],
     "the blocks before the one being read are not marked as passed");
 
-  await page.el("read-aloud").click();
+  // Stopped by a tap on the row being read: the Read button pauses a playing read now (`#434`).
+  await page.el("discord-log").children[0].dispatch("click", {});
   await page.settle();
   assert.equal(line().length, 0, "the timeline outlived the read");
 });
@@ -31719,6 +31878,14 @@ test("leaving Read aborts a streamed read and lets the audio output go, until th
   await page.settle();
   const audio = page.audio;
   assert.equal(audio.state, "running");
+  // `#434 read-aloud-pause`: the Read button first PAUSES a playing read — the response is held,
+  // not aborted — and stopping the read (a tap on its row) and then leaving aborts it as before.
+  await readButton(page).click();
+  await page.settle();
+  assert.equal(page.audioStreams[0].options.signal.aborted, false, "pausing aborted the response it only meant to hold");
+  assert.equal(audio.state, "suspended", "the pause did not stop the audio clock");
+  await rows[0].dispatch("click", {});
+  await page.settle();
   await readButton(page).click();
   await page.settle();
   assert.equal(page.audioStreams[0].options.signal.aborted, true, "the response outlived the mode");
@@ -32595,7 +32762,8 @@ test("the floating chips keep their height clear above the composer, and never s
   const rules = cssRules(CSS_CODE, "#channel-composer");
   const own = rules.find((rule) => /margin-top:/.test(rule));
   assert.ok(own, "the channel's box has no rule of its own for the chips' room");
-  assert.match(own, /margin-top:\s*var\(--scroll-tools-clearance, 0px\);/, "the composer keeps no room for the chips above itself");
+  // `#433 read-strip-low`: the room is the chips' and, while a read plays, the strip's over them.
+  assert.match(own, /margin-top:\s*calc\(var\(--scroll-tools-clearance, 0px\) \+ var\(--read-steer-clearance, 0px\)\);/, "the composer keeps no room for the chips above itself");
   assert.doesNotMatch(own, /padding-bottom:[^;]*--scroll-tools-clearance/, "the room is kept under the box as well");
   assert.match(SCRIPT_CODE, /new window\.ResizeObserver\([\s\S]*?"--scroll-tools-clearance"[\s\S]*?\.observe\(el\("scroll-tools"\)\)/,
     "nothing measures the chips any more");
@@ -32603,7 +32771,7 @@ test("the floating chips keep their height clear above the composer, and never s
   assert.match(cssBlock("#frame-body"), /--chips-foot:\s*max\(0\.5rem, calc\(var\(--composer-top, 0px\) \+ 0\.25rem\)\);/,
     "the chips' foot does not follow the message box's top edge");
   assert.match(cssRules(CSS_CODE, "#scroll-tools")[0], /bottom:\s*var\(--chips-foot, 0\.5rem\);/, "the chips stand on the foot of the list whatever is under them");
-  assert.match(cssBlock("#status-line"), /bottom:\s*calc\(var\(--chips-foot, 0\.5rem\) \+ var\(--scroll-tools-clearance, 0px\)\);/,
+  assert.match(cssBlock("#status-line"), /bottom:\s*calc\(var\(--chips-foot, 0\.5rem\) \+ var\(--scroll-tools-clearance, 0px\) \+ var\(--read-steer-clearance, 0px\)\);/,
     "the status pill does not rise with the chips, and stands on the box being typed in");
   // The edge is measured where it moves: on a scroll, a change of the list's geometry, and the room.
   assert.match(SCRIPT_CODE, /addEventListener\("scroll", \(\) => \{\s*(\/\/[^\n]*\n\s*)*placeChipsOverComposer\(\);/,

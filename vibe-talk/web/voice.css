@@ -1529,7 +1529,7 @@ a.search-hit-link {
      owner was typing a thread reply into. The composer keeps their measured height as room under
      itself — `--scroll-tools-clearance`, which web/voice.js sets from a ResizeObserver and which is
      zero when no chip is showing — so at the end of the list the chips float over that room. */
-  padding: 1rem 0.75rem calc(max(1rem, env(safe-area-inset-bottom)) + var(--scroll-tools-clearance, 0px));
+  padding: 1rem 0.75rem calc(max(1rem, env(safe-area-inset-bottom)) + var(--scroll-tools-clearance, 0px) + var(--read-steer-clearance, 0px));
   border-top: 1px solid var(--edge);
 }
 
@@ -1543,7 +1543,9 @@ a.search-hit-link {
    says something on the status pill at every turn, and there the pill floats in that room rather
    than over the newest line. */
 #channel-composer {
-  margin-top: var(--scroll-tools-clearance, 0px);
+  /* `#433 read-strip-low`: the read-aloud strip floats in this room over the chips while a read
+     plays, so the room grows by its measured height and the last message still scrolls clear. */
+  margin-top: calc(var(--scroll-tools-clearance, 0px) + var(--read-steer-clearance, 0px));
   padding-bottom: max(1rem, env(safe-area-inset-bottom));
 }
 
@@ -1683,7 +1685,7 @@ a.search-hit-link {
 #pane-discord:has(> #column-reply:not([hidden])),
 #side-pane:has(> #side-reply:not([hidden])),
 #side-list:has(> #side-reply:not([hidden])) {
-  padding-bottom: calc(max(1rem, env(safe-area-inset-bottom)) + var(--scroll-tools-clearance, 0px) + 2.4rem);
+  padding-bottom: calc(max(1rem, env(safe-area-inset-bottom)) + var(--scroll-tools-clearance, 0px) + var(--read-steer-clearance, 0px) + 2.4rem);
 }
 
 /* Grow at the start of the row, though it follows Send in the markup, as in the composers. */
@@ -3636,8 +3638,9 @@ a.search-hit-link {
      the list (`#status-line`, `bottom: 0.5rem` over the chips' room) and the call's view says
      something on it at every turn of a conversation — "Connected", "Sent." — so without this it lay
      across Send for six seconds after every message. It is a single line at least 1.9rem tall,
-     0.5rem off the list's foot: 2.4rem clears it. The channel's box shares everything else. */
-  padding-bottom: calc(max(1rem, env(safe-area-inset-bottom)) + var(--scroll-tools-clearance, 0px) + 2.4rem);
+     0.5rem off the list's foot: 2.4rem clears it. The channel's box shares everything else.
+     `#433 read-strip-low`: the pill stacks over the read-aloud strip, so its room grows with it. */
+  padding-bottom: calc(max(1rem, env(safe-area-inset-bottom)) + var(--scroll-tools-clearance, 0px) + var(--read-steer-clearance, 0px) + 2.4rem);
 }
 
 /* The idle screen's largest area is the empty transcript, so the invitation goes there rather
@@ -4525,7 +4528,8 @@ a.search-hit-link {
    same kind of thing — what was true a moment ago — and neither may cover a control. */
 #pull-refresh[data-edge="end"] {
   top: auto;
-  bottom: calc(var(--chips-foot, 0.5rem) + var(--scroll-tools-clearance, 0px));
+  /* `#433 read-strip-low`: over the read-aloud strip too, as the status pill stands. */
+  bottom: calc(var(--chips-foot, 0.5rem) + var(--scroll-tools-clearance, 0px) + var(--read-steer-clearance, 0px));
   transform: translate(-50%, calc(-1 * var(--pull-rise, 0px)));
 }
 
@@ -6187,7 +6191,10 @@ a.search-hit-link {
      stay outside the scrolling content, so showing a banner never moves the reader's place. On the
      chips, wherever they stand: over the channel's message box they rise with it (`--chips-foot`,
      `#245 done-feedback`), and the pill with them, so it is never over the box being typed in. */
-  bottom: calc(var(--chips-foot, 0.5rem) + var(--scroll-tools-clearance, 0px));
+  /* `#433 read-strip-low`: while the read-aloud strip is up the pill stands on it in turn
+     (`--read-steer-clearance`, its measured height), rather than the strip keeping a pill's
+     worth of empty room under itself on every frame the pill is not there. */
+  bottom: calc(var(--chips-foot, 0.5rem) + var(--scroll-tools-clearance, 0px) + var(--read-steer-clearance, 0px));
   width: max-content;
   max-width: calc(100% - 1.5rem);
   margin-inline: auto;
@@ -6208,21 +6215,28 @@ a.search-hit-link {
      0.8rem would be a fifth narrower than the control pane beneath it. */
 }
 
-/* `#376 read-aloud-blocks`. Previous, "2 of 5", Next, while a read of several blocks plays. Floating
-   above the status line's place for the reason the status line floats: coming and going, it moves
-   nothing under the reader's thumb. Only its buttons take taps; between them the row underneath can
-   still be tapped. Large targets, because the reader may be in a car. */
+/* `#376 read-aloud-blocks`. Previous, Pause, "2 of 5", Next, while a read of several blocks plays.
+   Floating for the reason the status line floats: coming and going, it moves nothing under the
+   reader's thumb. Only its buttons take taps; between them the row underneath can still be tapped.
+   Large targets, because the reader may be in a car.
+ *
+ * `#433 read-strip-low`. AS LOW AS IT CAN SIT: directly on the chips row, by its MEASURED height
+ * (`--scroll-tools-height`, written beside `--scroll-tools-clearance` by the same ResizeObserver),
+ * so it hugs that row as it wraps, empties, rises over the message box or is hidden away. It used
+ * to stand a fixed 2.6rem over the chips' room — the status pill's place, reserved on every frame
+ * though the pill is transient and usually absent — which reads as a hover and spends a strip of
+ * screen. The pill now stacks over the strip while both are up (`#status-line`). */
 #read-steer {
   position: absolute;
   z-index: 5;
   inset-inline: 0;
-  bottom: calc(var(--chips-foot, 0.5rem) + var(--scroll-tools-clearance, 0px) + 2.6rem);
+  bottom: calc(var(--chips-foot, 0.5rem) + var(--scroll-tools-height, 0px));
   width: max-content;
   max-width: calc(100% - 1.5rem);
   margin-inline: auto;
   display: flex;
   align-items: center;
-  gap: 0.6rem;
+  gap: 0.4rem;
   padding: 0.3rem 0.4rem;
   background: var(--panel);
   border: 1px solid var(--warn);
@@ -6277,7 +6291,9 @@ a.search-hit-link {
 .read-steer-button {
   pointer-events: auto;
   min-height: 2.75rem;
-  min-width: 6rem;
+  /* `#434 read-aloud-pause`: four targets and the count in one line on a narrow phone — at the
+     old 6rem the row wrapped under 375px and covered a taller strip of the list. */
+  min-width: 5rem;
   border-radius: 999px;
   border: 1px solid var(--warn);
   background: color-mix(in srgb, var(--warn) 18%, var(--panel));
@@ -6289,8 +6305,20 @@ a.search-hit-link {
   opacity: 0.45;
 }
 
+/* `#434 read-aloud-pause`. Pause, the control reached for without looking, filled stronger than
+   its neighbours; held (Play, pressed), it says so at a glance. Narrower than Previous and Next:
+   its word is shorter, and four targets and the count must still fit a phone in one line. */
+#read-pause {
+  min-width: 4rem;
+  background: color-mix(in srgb, var(--warn) 38%, var(--panel));
+}
+
+#read-pause[aria-pressed="true"] {
+  background: var(--warn);
+}
+
 #read-steer-count {
-  min-width: 4.5rem;
+  min-width: 3rem;
   text-align: center;
   font-variant-numeric: tabular-nums;
 }
@@ -6556,7 +6584,7 @@ a.search-hit-link {
 
 #screen-main[data-draft] #voice-composer {
   margin-top: 0;
-  padding-bottom: calc(max(0.5rem, env(safe-area-inset-bottom)) + var(--scroll-tools-clearance, 0px) + 2.4rem);
+  padding-bottom: calc(max(0.5rem, env(safe-area-inset-bottom)) + var(--scroll-tools-clearance, 0px) + var(--read-steer-clearance, 0px) + 2.4rem);
 }
 
 #screen-main[data-draft] #voice-composer,

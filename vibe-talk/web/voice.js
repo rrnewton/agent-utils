@@ -202,7 +202,7 @@ const ALL_CHANNELS = "*";
  *   | "msg-scale-larger" | "msg-scale-smaller"
  *   | "open-add-channel" | "open-browse-channels" | "open-help" | "open-settings"
  *   | "pair-confirm" | "pair-dismiss"
- *   | "pinned-filter" | "post-confirm-cancel" | "post-confirm-more" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-new" | "read-next" | "read-prev" | "read-speed" | "remove-channel"
+ *   | "pinned-filter" | "post-confirm-cancel" | "post-confirm-more" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-new" | "read-next" | "read-pause" | "read-prev" | "read-speed" | "remove-channel"
  *   | "rename-channel" | "reply-cancel" | "reply-send"
  *   | "reset-voice-post-prefix"
  *   | "restore-voice-system-prompt" | "save-alias" | "save-token" | "save-voice-instructions"
@@ -331,6 +331,10 @@ if (typeof window.ResizeObserver === "function") {
     const pinned = !landed && currentScreen === "main" && followsNewest(area);
     const room = height > 0 ? `calc(${height}px + 0.5rem)` : "0px";
     el("frame-body").style.setProperty("--scroll-tools-clearance", room);
+    // `#433 read-strip-low`. The row's height itself, without the half-rem the room keeps over
+    // it: the read-aloud strip stands on the row's top edge, with no gap, so it hugs the row as
+    // it wraps, empties or is hidden away.
+    el("frame-body").style.setProperty("--scroll-tools-height", `${height}px`);
     const screen = leftEl("screen-main");
     if (!screen.hidden) screen.style.setProperty("--scroll-tools-clearance", room);
     if (landed) placeEntryLanding(entryLanding.row, entryLanding.first);
@@ -338,6 +342,32 @@ if (typeof window.ResizeObserver === "function") {
     // The room the channel's box keeps for them is above it, so it moved with them.
     placeChipsOverComposer();
   }).observe(el("scroll-tools"));
+}
+
+// `#433 read-strip-low`. The read-aloud strip's own measured height is the room everything over
+// it keeps: the status pill stacks on it while both are up, and the list's foot keeps it so the
+// last message still scrolls clear. Zero while it is hidden (a `display: none` box measures
+// nothing), so none of that room is kept for a strip that is not there. Kept beside the chips'
+// measurement, and held on the hidden screen for the reason that one is (`#280`, above).
+if (typeof window.ResizeObserver === "function") {
+  new window.ResizeObserver(() => {
+    // The whole box, padding and border included: a content-box measure would leave what stacks
+    // over the strip standing that much into it. Half a rem over it is the air the pill keeps
+    // over whatever it stands on, stated here because the chips' room states it only while a
+    // chip is showing.
+    const height = el("read-steer").offsetHeight || 0;
+    const room = height > 0 ? `calc(${height}px + 0.5rem)` : "0px";
+    const area = el("scroll-area");
+    const landed = currentScreen === "main" && currentView === "discord" && entryLandingHolds();
+    const pinned = !landed && currentScreen === "main" && followsNewest(area);
+    el("frame-body").style.setProperty("--read-steer-clearance", room);
+    const screen = leftEl("screen-main");
+    if (!screen.hidden) screen.style.setProperty("--read-steer-clearance", room);
+    if (landed) placeEntryLanding(entryLanding.row, entryLanding.first);
+    if (pinned) area.scrollTop = area.scrollHeight;
+    // The strip floats in the same band as the chips over the channel's box, so it moved with it.
+    placeChipsOverComposer();
+  }).observe(el("read-steer"));
 }
 
 // `#245 done-feedback`. The chips float over the foot of the list, and the channel's message box is
@@ -376,7 +406,10 @@ function placeChipsOverComposer() {
       const edge = box.getBoundingClientRect();
       const cardEdge = carded ? card.getBoundingClientRect() : null;
       // The strip they float in at the foot: half a rem off it, the chips, and the pill over them.
-      const strip = rootFontPx() * (0.5 + CHIPS_PILL_REM) + leftEl("scroll-tools").getBoundingClientRect().height;
+      // `#433 read-strip-low`: and the read-aloud strip between them while a read is up.
+      const steer = el("read-steer");
+      const strip = rootFontPx() * (0.5 + CHIPS_PILL_REM) + leftEl("scroll-tools").getBoundingClientRect().height +
+        (steer && !steer.hidden ? steer.getBoundingClientRect().height + rootFontPx() * 0.5 : 0);
       const reaches = edge.bottom > foot - strip || (cardEdge !== null && cardEdge.bottom > foot - strip);
       if (reaches) top = Math.max(0, Math.round(foot - (cardEdge ? cardEdge.top : edge.top)));
     }
@@ -9097,11 +9130,12 @@ const channelPane = {
     (currentScreen === "main" && currentView === "discord" && !threadListShown &&
       (pinnedOnly || channelView !== "threads") ? shownChannelList() : null)),
   head: () => floatingClearance(leftEl("scroll-area")),
-  // The chips float over the foot of the list, and the status line floats over them: a row under
-  // either is under something.
+  // The chips float over the foot of the list, the read-aloud strip stands on them while a read
+  // plays (`#433 read-strip-low`), and the status line floats over both: a row under any is under
+  // something.
   foot: () => {
     const area = leftEl("scroll-area");
-    const over = ["scroll-tools", "status-line"].reduce((room, id) =>
+    const over = ["scroll-tools", "read-steer", "status-line"].reduce((room, id) =>
       room + (leftEl(id).hidden ? 0 : leftEl(id).getBoundingClientRect().height), 0);
     return area.getBoundingClientRect().top + (area.clientHeight || 0) - over;
   },
@@ -18974,7 +19008,11 @@ function renderControls() {
   // The session is VIRTUAL from the reader's perspective. The provider transport may be reused
   // between requests, but reconnects are deliberately invisible; this is still a mode the reader
   // turned on, so it needs a visible way out that looks like a way out.
-  el("read-aloud-label").textContent = readingMode ? "Stop" : "Read";
+  //
+  // `#434 read-aloud-pause`: while a read is actually playing the act is Pause, and while it is
+  // held it is Resume — the strip's Pause/Play and the media keys say the same, from the one
+  // state (`renderReadTransport`). With nothing playing it is "Stop" again, the way out above.
+  renderReadTransport();
   el("read-aloud").setAttribute("data-active", readingMode ? "true" : "false");
   // The state the READER cares about, on the control they pressed. Reset to a plain ready when the
   // mode is off, so a failure from the last session does not greet them on the next one.
@@ -31344,11 +31382,21 @@ function readWithBrowserSpeech(parts, id, ticket) {
   clearError();
   // Retain the current utterance as well as its listeners. Some engines otherwise lose events
   // after garbage collection, which would strand the row and its remaining chunks.
-  nowPlaying = { id, playback: "browser", audio: { pause: () => engine.cancel() }, urls: [],
-    utterance: null, speechTimer: null };
+  // `audio.pause` is what a STOP reaches it by: cancel, then unpause the engine — an engine left
+  // paused by a held read that was stopped would swallow the next read into a paused queue.
+  nowPlaying = { id, playback: "browser",
+    audio: { pause: () => { engine.cancel(); if (typeof engine.resume === "function") engine.resume(); } }, urls: [],
+    utterance: null, speechTimer: null, parts, chunk: 0, paused: false, stale: false, speechStarted: false,
+    pauseTransport: null, resumeTransport: null, rearmSpeech: null };
   const current = () => ticket === readingTicket && nowPlaying !== null && nowPlaying.id === id;
   const fail = (error) => {
     if (!current()) return;
+    // `#434 read-aloud-pause`: as for a streamed part, a failure under a hold is the resume's
+    // to repair (the held chunk is spoken again), not the end of a read only paused.
+    if (nowPlaying.paused) {
+      nowPlaying = { ...nowPlaying, stale: true };
+      return;
+    }
     stopReading();
     setReadState("failed");
     const detail = browserSpeechFailure(error);
@@ -31357,6 +31405,9 @@ function readWithBrowserSpeech(parts, id, ticket) {
   };
   const speakPart = (index) => {
     if (!current()) return;
+    // Where the read is, at chunk granularity: a resume that cannot simply resume the engine
+    // speaks this chunk again, and no other (`#434 read-aloud-pause`).
+    nowPlaying.chunk = index;
     const utterance = new window.SpeechSynthesisUtterance(chunks[index]);
     utterance.voice = voice;
     utterance.lang = voice.lang;
@@ -31370,6 +31421,7 @@ function readWithBrowserSpeech(parts, id, ticket) {
     };
     utterance.onstart = () => {
       if (!isCurrentPart()) return;
+      nowPlaying.speechStarted = true;
       watch(BROWSER_SPEECH_FINISH_MS, "speech-timeout");
       if (pendingRead === id) setStatus(`Reading with ${readAloudLabel}.`);
       pendingRead = null;
@@ -31388,6 +31440,12 @@ function readWithBrowserSpeech(parts, id, ticket) {
       }
     };
     nowPlaying.utterance = utterance;
+    nowPlaying.speechStarted = false;
+    // A resume re-arms the held part's watchdog, which the pause took down with the voice: the
+    // start watchdog for a part that never started, the finish one for a part under way.
+    nowPlaying.rearmSpeech = () => watch(
+      nowPlaying.speechStarted ? BROWSER_SPEECH_FINISH_MS : BROWSER_SPEECH_START_MS,
+      nowPlaying.speechStarted ? "speech-timeout" : "start-timeout");
     watch(BROWSER_SPEECH_START_MS, "start-timeout");
     try {
       engine.speak(utterance);
@@ -31395,7 +31453,41 @@ function readWithBrowserSpeech(parts, id, ticket) {
       fail("synthesis-failed");
     }
   };
+  // `#434 read-aloud-pause`. The device voice's share of the one pause path: the engine holds
+  // the utterance where it is, and its watchdog stops with it (an hour on pause is not a
+  // timeout). An engine with no pause is stopped at the chunk instead — its utterance is let go
+  // first, so the cancel is not read as this part ending — and the resume speaks that chunk
+  // again: the position kept, at the granularity the engine allows.
+  nowPlaying.pauseTransport = () => {
+    if (nowPlaying.speechTimer !== null) clearTimeout(nowPlaying.speechTimer);
+    nowPlaying.speechTimer = null;
+    if (typeof engine.pause === "function") {
+      engine.pause();
+    } else {
+      nowPlaying.utterance = null;
+      engine.cancel();
+    }
+  };
+  nowPlaying.resumeTransport = () => {
+    if (nowPlaying.utterance !== null && nowPlaying.stale !== true && typeof engine.resume === "function") {
+      engine.resume();
+      if (typeof nowPlaying.rearmSpeech === "function") nowPlaying.rearmSpeech();
+    } else {
+      // Let the held utterance go first, so the chunk is not spoken over it (an engine that can
+      // pause but not resume still holds it, paused, in its queue).
+      if (nowPlaying.utterance !== null) {
+        nowPlaying.utterance = null;
+        engine.cancel();
+        if (typeof engine.resume === "function") engine.resume();
+      }
+      nowPlaying.stale = false;
+      speakPart(nowPlaying.chunk || 0);
+    }
+  };
+  // An engine a stopped held read left paused must not swallow this one (see `audio.pause`).
+  if (engine.paused === true && typeof engine.resume === "function") engine.resume();
   speakPart(0);
+  renderReadTransport();
 }
 
 /**
@@ -31711,6 +31803,8 @@ function stopReading() {
   // and a jump to another block of it is still that read.
   if (!readJumping) releaseMediaSession();
   renderReadSteer();
+  // `#434 read-aloud-pause`: with nothing playing, Pause/Resume give the Read button back.
+  renderReadTransport();
   clearReadingSentence();
   if (speechTimer !== null && speechTimer !== undefined) clearTimeout(speechTimer);
   for (const player of players || [audio]) {
@@ -31863,6 +31957,9 @@ function readAloudAudioContext() {
   if (typeof ReadableStream === "undefined" || typeof AbortController !== "function") return null;
   const Context = window.AudioContext || window.webkitAudioContext;
   if (!Context) return null;
+  // A browser may close the context under a long-held read (`#434 read-aloud-pause`): a closed
+  // one never resumes, so the next read makes a fresh one rather than failing on it for good.
+  if (readAloudContext !== null && readAloudContext.state === "closed") readAloudContext = null;
   if (readAloudContext === null) {
     try {
       readAloudContext = new Context();
@@ -32481,12 +32578,13 @@ function showReadingPosition() {
   renderReadSteer();
 }
 
-/** The steering strip: Previous, "k of n", Next, while a read of several parts is playing. */
+/** The steering strip: Previous, Pause, "k of n", Next, while a read of several parts is playing. */
 function renderReadSteer() {
   const strip = el("read-steer");
   if (!strip) return;
   const position = readingPosition();
   strip.hidden = position === "";
+  renderReadTransport();
   renderReadTimeline();
   if (position === "") return;
   el("read-steer-count").textContent = position;
@@ -32541,9 +32639,12 @@ function jumpReading(index) {
   const segment = playing.segments[at];
   // The read goes on, only from elsewhere: its stop keeps the media keys and the audio output,
   // which a jump from a media key could not take back without a gesture.
+  // `#434 read-aloud-pause`: a jump made while held cues the block up HELD — Next on a steering
+  // wheel is not a Play the reader never pressed.
+  const hold = readingPaused();
   readJumping = true;
   try {
-    guardQuietly(() => readAloud(playing.parts, { part: segment.part, block: segment.block }))();
+    guardQuietly(() => readAloud(playing.parts, { part: segment.part, block: segment.block, hold }))();
   } finally {
     readJumping = false;
   }
@@ -32562,13 +32663,61 @@ function stepReading(delta) {
 }
 
 /**
+ * `#434 read-aloud-pause`. ONE STATE PATH for pausing a read. The strip's Pause/Play, the Read
+ * button (Pause while a read plays, Resume while it is held) and the media session's play/pause
+ * all come here and nowhere else, so the three can never disagree about whether the voice is
+ * held. `renderReadTransport` is its one rendering: every control that says the act reads it.
+ */
+function readingPaused() {
+  return nowPlaying !== null && nowPlaying.paused === true;
+}
+
+/** What every transport control says now, from the one state: strip, Read button, data hooks. */
+function renderReadTransport() {
+  const paused = readingPaused();
+  const hold = el("read-pause");
+  if (hold) {
+    hold.textContent = paused ? "Play" : "Pause";
+    hold.setAttribute("aria-label", paused ? "Play reading" : "Pause reading");
+    hold.setAttribute("aria-pressed", paused ? "true" : "false");
+    hold.disabled = nowPlaying === null;
+  }
+  const strip = el("read-steer");
+  if (strip) strip.setAttribute("data-paused", paused ? "true" : "false");
+  const button = el("read-aloud");
+  if (button) button.setAttribute("data-paused", paused ? "true" : "false");
+  const label = el("read-aloud-label");
+  if (label) {
+    label.textContent = !readingMode ? "Read"
+      : nowPlaying !== null ? (paused ? "Resume" : "Pause")
+      : "Stop";
+  }
+}
+
+/** Hold the read (`true`) or carry on from where it was held (`false`). The one path. */
+function setReadingPaused(paused) {
+  if (paused) pauseReading();
+  else resumeReading();
+}
+
+/** The toggle every Pause/Play control is. */
+function toggleReadingPaused() {
+  setReadingPaused(!readingPaused());
+}
+
+/**
  * Pause what is being read where it is, and carry on from there. Played through Web Audio, the
- * audio clock simply stops; played by an `<audio>` element, the element pauses.
+ * audio clock simply stops; played by an `<audio>` element, the element pauses; said by the
+ * device voice, the engine pauses (`pauseTransport`, its own because its timers are its own).
+ * The position — the block, and where in it the clock had got to — is kept entire.
  */
 function pauseReading() {
-  if (nowPlaying === null || nowPlaying.paused) return;
-  const audio = nowPlaying.audio;
-  if (audio && audio.hearsSpeech === true) {
+  const playing = nowPlaying;
+  if (playing === null || playing.paused) return;
+  const audio = playing.audio;
+  if (typeof playing.pauseTransport === "function") {
+    playing.pauseTransport();
+  } else if (audio && audio.hearsSpeech === true) {
     if (readAloudContext === null || typeof readAloudContext.suspend !== "function") return;
     readAloudContext.suspend().catch(() => {});
   } else if (audio && typeof audio.pause === "function") {
@@ -32576,23 +32725,92 @@ function pauseReading() {
   } else {
     return;
   }
-  nowPlaying = { ...nowPlaying, paused: true };
+  nowPlaying = { ...nowPlaying, paused: true, wasHeld: true };
   mediaSessionState("paused");
+  renderReadTransport();
+}
+
+/**
+ * Whether the read being held can no longer be carried on as it stands: a part failed while it
+ * was held, its audio context is gone, or the speech ticket its unplayed parts were asked for
+ * under has ended (`#368 speech-ticket-gone`, `#290 speech-ticket-refresh`). A pause may last
+ * the rest of a journey; the ticket lasts ten minutes.
+ */
+function heldReadStale(playing) {
+  if (playing.stale === true) return true;
+  const audio = playing.audio;
+  if (audio && audio.hearsSpeech === true &&
+      (readAloudContext === null || readAloudContext.state === "closed")) return true;
+  if (playing.streamed !== true || !Array.isArray(playing.parts)) return false;
+  if (!Array.isArray(playing.tickets)) {
+    return playing.parts.some((part) => preparedEntry(part) === null);
+  }
+  // The tickets AS CAPTURED for this read, for its unheard parts only: what is prepared now may
+  // have been re-minted under it (a scroll prepares again), and a fresh entry there says nothing
+  // about the dead URL this read would still fetch. A part already heard needs no ticket.
+  const now = speechDeadlineNow();
+  const ahead = new Set((Array.isArray(playing.segments) ? playing.segments.slice(Math.max(0, playing.segment || 0)) : [])
+    .map((segment) => segment.part));
+  for (const part of ahead) {
+    const ticket = playing.tickets[part];
+    if (!ticket) continue;
+    if (now.mono >= ticket.until.mono || now.wall >= ticket.until.wall) return true;
+    const entry = preparedEntry(playing.parts[part]);
+    if (entry === null || entry.url !== ticket.url) return true;
+  }
+  return false;
+}
+
+/**
+ * Carry a held read on by reading its held block again: a fresh ticket and a fresh voice
+ * session, asked for by the ordinary tap path, which prepares again whatever has ended. The
+ * reader hears that one block from its start rather than a failed read.
+ */
+function restartHeldBlock(playing) {
+  nowPlaying = { ...playing, paused: false, stale: false };
+  renderReadTransport();
+  const at = playing.segment;
+  if (Array.isArray(playing.segments) && playing.segments[at] && jumpReading(at)) return;
+  if (Array.isArray(playing.parts) && playing.parts.length > 0) {
+    guardQuietly(() => readAloud(playing.parts, { part: 0, block: null }))();
+  }
 }
 
 function resumeReading() {
-  if (nowPlaying === null || !nowPlaying.paused) return;
-  nowPlaying = { ...nowPlaying, paused: false };
-  const audio = nowPlaying.audio;
-  if (audio && audio.hearsSpeech === true) {
+  const playing = nowPlaying;
+  if (playing === null || !playing.paused) return;
+  // What it was held on has gone (see `heldReadStale`): read the held block again instead of
+  // resuming onto a dead URL or a closed context and failing the whole read. A transport that
+  // repairs itself (the device voice re-speaks its held chunk) is left to it.
+  if (typeof playing.resumeTransport !== "function" && heldReadStale(playing)) {
+    restartHeldBlock(playing);
+    return;
+  }
+  nowPlaying = { ...playing, paused: false };
+  const held = nowPlaying;
+  const heldTicket = readingTicket;
+  const audio = held.audio;
+  const again = () => {
+    // The resume itself was refused (a context a browser closed while held, an element whose
+    // source went): the same way back as a stale read, if this is still that very read — the
+    // attempt's ticket, not only its row, which a fresh read of it would also match.
+    if (nowPlaying !== null && nowPlaying.id === held.id && !nowPlaying.paused && readingTicket === heldTicket) {
+      restartHeldBlock(nowPlaying);
+    }
+  };
+  if (typeof held.resumeTransport === "function") {
+    held.resumeTransport();
+  } else if (audio && audio.hearsSpeech === true) {
     if (readAloudContext !== null && typeof readAloudContext.resume === "function") {
-      readAloudContext.resume().catch(() => {});
+      const begun = readAloudContext.resume();
+      if (begun && typeof begun.catch === "function") begun.catch(again);
     }
   } else if (audio && typeof audio.play === "function") {
     const begun = audio.play();
-    if (begun && typeof begun.catch === "function") begun.catch(() => {});
+    if (begun && typeof begun.catch === "function") begun.catch(again);
   }
   mediaSessionState("playing");
+  renderReadTransport();
 }
 
 /**
@@ -32962,6 +33180,20 @@ async function readAloud(ids, from = null) {
       if (ticket !== readingTicket) {
         return;
       }
+      // `#434 read-aloud-pause`: a part that fails while the read is HELD (its stream timed out
+      // under the pause, its ticket went) does not end the read the reader only paused. It is
+      // marked stale, and the resume reads the held block again on a fresh ticket.
+      if (nowPlaying !== null && nowPlaying.paused) {
+        nowPlaying = { ...nowPlaying, stale: true };
+        return;
+      }
+      // The same failure delivered just AFTER a resume (a frozen page delivering it late, a part
+      // fetched on resume from a captured URL that died under the hold): repair it the same way
+      // rather than ending a read whose only fault is having been paused.
+      if (nowPlaying !== null && nowPlaying.wasHeld && heldReadStale(nowPlaying)) {
+        restartHeldBlock(nowPlaying);
+        return;
+      }
       stopReading();
       setStatus("that message could not be played.");
     });
@@ -32973,7 +33205,11 @@ async function readAloud(ids, from = null) {
     sources.forEach((_source, at) => addPlayer(at));
   }
   // The same array the players are added to, so a stop reaches a part requested later.
-  nowPlaying = { id, audio: players[first], urls: objectUrls, players, parts, segments, segment: first, blocks };
+  // `streamed` and the tickets as captured travel with it: a held read's unplayed parts play
+  // from THESE URLs, not from whatever is prepared by resume time, so a resume after a long
+  // pause checks these deadlines (`heldReadStale`, `#434`).
+  const tickets = ready.map((entry) => (entry && entry.until ? { url: entry.url, until: entry.until } : null));
+  nowPlaying = { id, audio: players[first], urls: objectUrls, players, parts, segments, segment: first, blocks, streamed, tickets, paused: false };
   setReadState("ready");
   eachColumn(renderChannelRows);
   renderReadSteer();
@@ -32983,7 +33219,12 @@ async function readAloud(ids, from = null) {
   } else {
     releaseMediaSession();
   }
-  await startPlayer(first);
+  const begun = startPlayer(first);
+  // A jump made while held cues this block up held (`#434 read-aloud-pause`): the hold lands in
+  // the same tick the player starts, before a streamed part's cushion or an element's first
+  // sound can be heard.
+  if (from !== null && from.hold === true) pauseReading();
+  await begun;
 }
 
 /**
@@ -49269,7 +49510,18 @@ el("read-speed-range").addEventListener("input", () => {
 el("read-prev").addEventListener("click", () => { stepReading(-1); });
 el("read-next").addEventListener("click", () => { stepReading(1); });
 
+// `#434 read-aloud-pause`. The strip's own hold on the read, by the one state path.
+el("read-pause").addEventListener("click", () => { toggleReadingPaused(); });
+
 el("read-aloud").addEventListener("click", () => {
+  // `#434 read-aloud-pause`: while a read is playing or held, this button is its Pause/Resume —
+  // the strip's button and the media keys by another reach. Stopping the read itself stays where
+  // it always was (a tap on the row being read, the media stop), and leaving the mode is what
+  // this button does with nothing playing.
+  if (readingMode && nowPlaying !== null) {
+    toggleReadingPaused();
+    return;
+  }
   readingMode = !readingMode;
   // Turning it OFF stops what is playing. Leaving audio running under a reader who has just said
   // "not this any more" is the kind of thing that gets a tab muted and never opened again.
