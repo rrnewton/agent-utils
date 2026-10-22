@@ -2273,7 +2273,11 @@ function overscrollRoom(area) {
  * @param {HTMLElement} area
  */
 function footGap(area) {
-  return area.scrollHeight - overscrollRoom(area) - area.scrollTop - (area.clientHeight || 0);
+  // The room first: asking for it can close it (`overscrollRoom`), which takes its height out of
+  // the list and clamps where the reader stands — heights read before it would count the room
+  // twice, and a reader in it would measure a room's height short of the foot they are past.
+  const room = overscrollRoom(area);
+  return area.scrollHeight - room - area.scrollTop - (area.clientHeight || 0);
 }
 
 /**
@@ -2283,7 +2287,8 @@ function footGap(area) {
  * @param {HTMLElement} area
  */
 function footTop(area) {
-  return Math.max(0, area.scrollHeight - overscrollRoom(area) - (area.clientHeight || 0));
+  const room = overscrollRoom(area);
+  return Math.max(0, area.scrollHeight - room - (area.clientHeight || 0));
 }
 
 /** Close the room. Below the screen whenever the reader is not in it, so nothing on screen moves then. */
