@@ -144,7 +144,7 @@ pub struct SlackConfig {
     /// The most UTF-8 bytes one post may hold, as Slack is sent it, when configured.
     pub max_post_bytes: Option<usize>,
     /// The workspace's own address (`https://acme.slack.com`), when the operator has said it:
-    /// where a message's permalink lives, for the page's "Copy link in Slack". `#408
+    /// where a message's permalink lives, for the page's "Open in Slack" link. `#408
     /// copy-upstream-link`. Unset, the one `auth.test` reports is learned instead; with
     /// neither, no link is formed.
     pub workspace_url: Option<String>,

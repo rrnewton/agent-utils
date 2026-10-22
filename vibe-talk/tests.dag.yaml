@@ -845,17 +845,18 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
-  # `#408 copy-upstream-link` in the browser engine: the fake channel as Google Chat, its long question
-  # carrying its own address there as a served read would. At 1280x800 and 393x852 its ⋯ menu offers
-  # "Copy link in Google Chat" second under Copy text, wholly inside the window; the item and a real l
-  # put the address on the clipboard whole (read back with `clipboard-read` granted, a sentinel on it
-  # before the key) and the status pill says so; a message with no address offers no item and l copies
-  # nothing.
+  # `#408 copy-upstream-link` as `#409 open-upstream-link` leaves it, in the browser engine: the fake
+  # channel as Slack, its long question carrying its own address there as a served read would. At
+  # 1280x800 and 393x852 its ⋯ menu offers the "Open in Slack" link second under Copy text, wholly
+  # inside the window; the link and a real Shift+O open the address in a new page whose opener is
+  # null with this page unmoved; a real l puts the address on the clipboard whole (read back with
+  # `clipboard-read` granted, a sentinel on it before the key) and the status pill says so; a message
+  # with no address offers no item and neither key does anything.
   - group: check
-    job: copy-upstream-link-browser
-    desc: Copy link in Google Chat in the ⋯ menu copies the message's own address, by the item and by l, absent without one, read back from the clipboard in current Chromium at 1280x800 and 393x852
+    job: open-upstream-link-browser
+    desc: Open in Slack in the ⋯ menu opens the message's own address in a new page with no opener, by the link and by Shift+O, l copies it, absent without one, in current Chromium at 1280x800 and 393x852
     labels: [validation-vibe-talk]
-    cmd: cd vibe-talk && python3 tests/copy_upstream_link_browser.py
+    cmd: cd vibe-talk && python3 tests/open_upstream_link_browser.py
     jobs_flag: ""
     timeout: 90
     cpu_timeout: 45

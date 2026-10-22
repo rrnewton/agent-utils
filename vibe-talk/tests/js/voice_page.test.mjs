@@ -15907,8 +15907,9 @@ test("one ⋯ menu at a time, and a tap anywhere else or Escape closes it", asyn
   await page.documentEvent("keydown", { key: "Escape" });
   assert.equal(rowMoreMenu(rows[2]).hidden, true, "Escape left the menu open");
   // Every item in the menu is drawn the same, larger size — the two in the read group too, which
-  // `#206 pin-message` put one level down.
-  assert.match(CSS_CODE, /\.row-more-menu > button,\s*\.row-more-group > button,\s*\.row-more-group > \.upstream-read-button\s*\{[^}]*min-height: 2\.75rem/);
+  // `#206 pin-message` put one level down, and the one item that is a link (`#409
+  // open-upstream-link`) with them.
+  assert.match(CSS_CODE, /\.row-more-menu > button,\s*\.row-more-menu > a,\s*\.row-more-group > button,\s*\.row-more-group > \.upstream-read-button\s*\{[^}]*min-height: 2\.75rem/);
 });
 
 test("Mark read through here greys this row and everything above it, and empties Hide read at the newest", async () => {
@@ -16000,9 +16001,11 @@ test("Copy text in the ⋯ menu copies the whole row's text, and says so", async
   assert.equal(page.el("status").textContent, "This browser would not copy to the clipboard.");
 });
 
-test("Copy link in the ⋯ menu copies the message's own address in its service, and is absent without one", async () => {
-  // `#408 copy-upstream-link`. The address is the server's, carried on the message; the item is
-  // named for the message's provider and sits with the other copy.
+test("Open in the ⋯ menu links to the message's own address in its service, and is absent without one", async () => {
+  // `#408 copy-upstream-link` as `#409 open-upstream-link` leaves it. The address is the
+  // server's, carried on the message; the item is a real link to it, named for the message's
+  // provider and sitting with the copy. A pointer copies the address from the link itself;
+  // l still copies it for a keyboard, and Shift+O opens it.
   const page = newPage();
   await signIn(page);
   const address = "https://discord.com/channels/900000000000000001/900000000000000002/8000000000000000300";
@@ -16011,38 +16014,93 @@ test("Copy link in the ⋯ menu copies the message's own address in its service,
       timestamp: "2026-08-19T04:31:00.000Z" }),
     message({ id: "8000000000000000301", content: "without one", author: "ada", author_is_bot: false,
       timestamp: "2026-08-19T04:36:00.000Z" }),
+    // Addresses of no shape the server forms: the href is the one sink that is not plain text,
+    // so neither is offered, to open or to copy.
+    message({ id: "8000000000000000302", content: "with a script", author: "grace", author_is_bot: false,
+      upstream_url: "javascript:alert(1)", timestamp: "2026-08-19T04:41:00.000Z" }),
+    message({ id: "8000000000000000303", content: "with plain http", author: "hopper", author_is_bot: false,
+      upstream_url: "http://discord.com/channels/1/2/3", timestamp: "2026-08-19T04:46:00.000Z" }),
   ]);
-  assert.equal(rows.length, 2, "the fixture did not produce two rows");
+  assert.equal(rows.length, 4, "the fixture did not produce four rows");
   const items = rowMoreMenu(rows[0]).children;
   assert.deepStrictEqual(items.map((node) => node.className).slice(0, 2),
-    ["row-copy-button", "row-copy-link-button"], "the link is not with Copy text at the menu's head");
-  const link = rows[0].descendants().find((node) => node.className === "row-copy-link-button");
-  assert.equal(link.textContent, "Copy link in Discord");
-  assert.equal(link.getAttribute("aria-keyshortcuts"), "L", "a screen reader is not told the key");
-  assert.equal(rows[1].descendants().find((node) => node.className === "row-copy-link-button"), undefined,
-    "a message with no address was offered a copy of one");
+    ["row-copy-button", "row-open-link-button"], "the link is not with Copy text at the menu's head");
+  const link = rows[0].descendants().find((node) => node.className === "row-open-link-button");
+  assert.equal(String(link.tagName).toUpperCase(), "A", "the item is not a real link");
+  assert.equal(link.textContent, "Open in Discord");
+  assert.equal(link.getAttribute("href"), address, "the link does not hold the message's own address");
+  assert.equal(link.getAttribute("target"), "_blank", "the link does not open in a new tab");
+  assert.equal(link.getAttribute("rel"), "noopener noreferrer", "the opened page would hold this one");
+  assert.equal(link.getAttribute("aria-keyshortcuts"), "Shift+O", "a screen reader is not told the key");
+  assert.equal(rows[0].descendants().find((node) => node.className === "row-copy-link-button"), undefined,
+    "a separate Copy link item is still offered");
+  assert.equal(rows[1].descendants().find((node) => node.className === "row-open-link-button"), undefined,
+    "a message with no address was offered a way to one");
+  for (const row of rows.slice(2)) {
+    assert.equal(row.descendants().find((node) => node.className === "row-open-link-button"), undefined,
+      "an address of no formable shape was offered as a link");
+  }
 
+  // Choosing it shuts the menu and copies nothing: the opening is the browser's, on the link.
   await rowMoreButton(rows[0]).click();
   await link.click();
   await page.settle();
-  assert.equal(page.clipboard, address, "the address was not copied");
-  assert.equal(rowMoreMenu(rows[0]).hidden, true, "the ⋯ menu stayed open after copying");
-  assert.equal(page.el("status").textContent, "Copied the link in Discord.");
+  assert.equal(rowMoreMenu(rows[0]).hidden, true, "the ⋯ menu stayed open after choosing the link");
+  assert.equal(page.clipboard, undefined, "choosing the link copied the address");
 
-  // l does the same on the highlighted row, and the ? list says so.
+  // Shift+O presses the same link on the highlighted row: with the menu open, the press is
+  // what shuts it. (The opening itself is the Chromium walk's to see.) The keys that follow act
+  // on a row in sight, as they must: the reader is at the top of the list for them.
+  page.el("scroll-area").scrollTop = 0;
+  await rowMoreButton(rows[0]).click();
+  const opened = await press(page, rows[0], "O", { shiftKey: true });
+  assert.equal(opened.defaulted, false, "Shift+O was left to the browser on a row with a link");
+  assert.equal(rowMoreMenu(rows[0]).hidden, true, "Shift+O did not press the row's link");
+
+  // l copies the same address on the highlighted row, and the ? list says both keys.
   page.clipboard = undefined;
   await press(page, rows[0], "l");
   assert.equal(page.clipboard, address, "l did not copy the link");
   assert.equal(page.el("status").textContent, "Copied the link in Discord.");
   const listed = page.el("keyboard-keys").descendants().filter((node) => node.tagName === "kbd").map((node) => node.textContent);
   assert.ok(listed.includes("l"), `the list of keys does not name l: ${listed.join(" | ")}`);
-  const entry = page.el("keyboard-keys").descendants().find((node) => node.tagName === "kbd" && node.textContent === "l");
-  assert.match(entry.parentNode.text(), /Copy its link in Discord/);
+  assert.ok(listed.includes("Shift+O"), `the list of keys does not name Shift+O: ${listed.join(" | ")}`);
+  const copyEntry = page.el("keyboard-keys").descendants().find((node) => node.tagName === "kbd" && node.textContent === "l");
+  assert.match(copyEntry.parentNode.text(), /Copy its link in Discord/);
+  const openEntry = page.el("keyboard-keys").descendants().find((node) => node.tagName === "kbd" && node.textContent === "Shift+O");
+  assert.match(openEntry.parentNode.text(), /Open it in Discord/);
   // On the row with no address, l is nothing.
   page.clipboard = undefined;
   const event = await press(page, rows[1], "l");
   assert.equal(event.defaulted, true, "l was taken on a row with no link");
   assert.equal(page.clipboard, undefined);
+  const dead = await press(page, rows[1], "O", { shiftKey: true });
+  assert.equal(dead.defaulted, true, "Shift+O was taken on a row with no link");
+  const scripted = await press(page, rows[2], "l");
+  assert.equal(scripted.defaulted, true, "l was taken on a row whose address is a script");
+  assert.equal(page.clipboard, undefined, "l copied an address of no formable shape");
+
+  // In the menu itself the link is an item like the buttons: ↓ through the open menu lands on
+  // it, and Space presses it rather than scrolling the list under the open menu.
+  await rowMoreButton(rows[0]).click();
+  assert.equal(rowMoreMenu(rows[0]).hidden, false, "the ⋯ did not open the menu");
+  await press(page, rowMoreButton(rows[0]), "ArrowDown");
+  await press(page, focused(page), "ArrowDown");
+  assert.equal(focused(page), link, "↓ in the menu did not land on the Open link");
+  let defaulted = false;
+  await link.dispatch("keydown", { key: " ", preventDefault: () => { defaulted = true; } });
+  assert.equal(defaulted, true, "Space on the Open link was left to scroll");
+  await link.dispatch("keyup", { key: " ", preventDefault: () => {} });
+  await page.settle();
+  assert.equal(rowMoreMenu(rows[0]).hidden, true, "Space on the Open link did not press it");
+
+  // A long press on it is the phone's own (its copy-link menu), not the row's press-and-hold
+  // details: no hold timer is armed by a finger resting on the link.
+  await rows[0].dispatch("pointerdown",
+    { pointerId: 1, pointerType: "touch", clientX: 10, clientY: 10, target: link });
+  assert.equal(page.expireTimers(HOLD_MS), 0, "a finger on the link armed the row's hold");
+  assert.equal(rows[0].descendants().find((node) => node.className === "msg-details"), undefined,
+    "a long press on the link opened the row's details");
 });
 
 test("mark read through here targets the newest part without archiving the row", async () => {

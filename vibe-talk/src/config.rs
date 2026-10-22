@@ -591,8 +591,8 @@ pub struct DiscordConfig {
     /// Public: a user id is visible on every message that account has ever sent.
     pub owner_user_id: Option<String>,
     /// The Discord server (guild) these channels live in, when the operator has said it: what
-    /// a message's Discord address needs for its first segment, for the page's "Copy link in
-    /// Discord". `#408 copy-upstream-link`. Only ever stamped onto a channel no head read has
+    /// a message's Discord address needs for its first segment, for the page's "Open in
+    /// Discord" link. `#408 copy-upstream-link`. Only ever stamped onto a channel no head read has
     /// placed — a learned server is that channel's own and stands over this — and only against
     /// Discord itself, never a bridge. Unset, a link is formed only for a channel whose server
     /// a head read has learned.
@@ -771,7 +771,7 @@ pub struct SlackSettings {
     /// The most UTF-8 bytes one post may hold, as Slack is sent it, when the operator has said.
     pub max_post_bytes: Option<usize>,
     /// The workspace's own address (`https://acme.slack.com`), when the operator has said it:
-    /// where a message's permalink lives, for the page's "Copy link in Slack". `#408
+    /// where a message's permalink lives, for the page's "Open in Slack" link. `#408
     /// copy-upstream-link`; see [`crate::slack::SlackConfig::workspace_url`].
     pub workspace_url: Option<String>,
 }

@@ -9576,14 +9576,19 @@ function stepSelection(pane, node, direction, held = false) {
   return true;
 }
 
-/** The buttons in the open ⋯ menu that are shown, in order: what ↓ and ↑ move through there. */
+/**
+ * The items in the open ⋯ menu that are shown, in order: what ↓ and ↑ move through there. A link
+ * counts as the buttons do — "Open in …" is one (`#409 open-upstream-link`) — so the arrows can
+ * land on every item the eye can see.
+ */
 function menuItems() {
   if (!openRowMenu) return [];
   const items = [];
   const walk = (node) => {
     for (const kid of node.children || []) {
       if (kid.hidden) continue;
-      if (String(kid.tagName).toUpperCase() === "BUTTON" && kid !== openRowMenu.button) items.push(kid);
+      const tag = String(kid.tagName).toUpperCase();
+      if ((tag === "BUTTON" && kid !== openRowMenu.button) || tag === "A") items.push(kid);
       else walk(kid);
     }
   };
@@ -9957,6 +9962,27 @@ function detailsFromKeyboard(target) {
   const { row, took } = rowForAct(target);
   if (!row) return took;
   toggleMessageDetails(row, rowMessages(row));
+  return true;
+}
+
+/**
+ * l: copy the selected message's own address in its service — the address its ⋯ menu's
+ * "Open in …" link opens (`upstreamUrlOf`, the row's first constituent's, as the link is).
+ * `#408 copy-upstream-link`. The menu holds the link itself now (`#409 open-upstream-link`)
+ * and a pointer copies it from there; this key is how a keyboard does. On a row with no
+ * address the key is not acted on, as the menu offers nothing there: left to the browser
+ * like any unbound key rather than swallowed in silence.
+ */
+function copyLinkFromKeyboard(target) {
+  const { row } = rowForAct(target);
+  if (!row) return false;
+  const message = rowMessages(row)[0];
+  const url = upstreamUrlOf(message);
+  if (url === null) return false;
+  // The act the menu's item did when it was the copy, menu shut included: a copy asked with
+  // this row's menu open leaves the reader with the said status, not the menu over it.
+  if (openRowMenu && nodeWithin(row, openRowMenu.root)) openRowMenu.close();
+  guardQuietly(() => copyUpstreamLink(url, upstreamServiceName(message)))();
   return true;
 }
 
@@ -10897,16 +10923,27 @@ const KEYMAP = [
   },
   {
     // `#408 copy-upstream-link`. l was free as a bare letter (Shift+L is the links filter), and
-    // as one it never fires in a text field. On a row with no link to copy the button is not
-    // there to press and the key does nothing, as the menu offers nothing.
+    // as one it never fires in a text field. On a row with no link to copy the key does
+    // nothing, as the menu offers nothing. The menu's item for the address is the link itself
+    // now (`#409 open-upstream-link`), which a pointer can copy from; this key stays the
+    // keyboard's way to the same copy.
     group: KEYS_MESSAGE, chords: [{ key: "l" }],
     does: () => `Copy its link in ${providerDescriptions.size > 1 ? "its chat service" : chatServiceName()}: the message's own address there, where the server could form one`,
-    rowControls: ["row-copy-link-button"],
-    // `pressRowButton` answers "took" where it took the row's selection but found no button:
-    // that is this key not acted on, not a copy, so it is left to the browser like any
+    run: (event, target) => copyLinkFromKeyboard(target),
+  },
+  {
+    // `#409 open-upstream-link`. Shift+O: bare o opens or closes the message here, its shifted
+    // form opens it in its service — the ⋯ menu's "Open in …" link, pressed, so the opening is
+    // the link's own, in a new tab, exactly as a tap on it. On a row with no address the link
+    // is not there to press and the key is left alone, as l is.
+    group: KEYS_MESSAGE, chords: [{ key: "o", shift: true }],
+    does: () => `Open it in ${providerDescriptions.size > 1 ? "its chat service" : chatServiceName()}, in a new tab: the same address Copy its link copies, where the server could form one`,
+    rowControls: ["row-open-link-button"],
+    // `pressRowButton` answers "took" where it took the row's selection but found no link:
+    // that is this key not acted on, not an opening, so it is left to the browser like any
     // unbound key rather than swallowed in silence.
     run: (event, target) => {
-      const pressed = pressRowButton(target, "row-copy-link-button");
+      const pressed = pressRowButton(target, "row-open-link-button");
       return pressed !== null && pressed !== "took";
     },
   },
@@ -32380,6 +32417,12 @@ function swipeable(li, messages) {
     if (links && nodeWithin(links, event.target)) {
       return;
     }
+    // `#409 open-upstream-link`. Nor on the ⋯ menu's own link, for the same reason: a long press
+    // there is how a phone copies its address, which is what the link replaced a Copy item for.
+    const open = childByClass(li, "row-open-link-button");
+    if (open && nodeWithin(open, event.target)) {
+      return;
+    }
     holdTimer = setTimeout(() => {
       holdTimer = null;
       reset();
@@ -33103,26 +33146,42 @@ function discordNode(messages) {
     setMenu(false);
     guardQuietly(() => copyMessageText(content))();
   }));
-  // `#408 copy-upstream-link`. The message's own address in the service it came from, formed by
-  // the server and carried on the message: offered only where one came back, never shown
-  // disabled for a message with none. The FIRST constituent's, as the row's reply is: a combined
-  // row is one post in parts, and its link lands at its start.
-  const upstreamUrl =
-    typeof message.upstream_url === "string" && message.upstream_url !== ""
-      ? message.upstream_url
-      : null;
-  let copyLink = null;
+  // `#408 copy-upstream-link`, as `#409 open-upstream-link` leaves it. The message's own
+  // address in the service it came from, formed by the server and carried on the message:
+  // offered only where one came back, never shown disabled for a message with none. The FIRST
+  // constituent's, as the row's reply is: a combined row is one post in parts, and its link
+  // lands at its start.
+  //
+  // ONE item for it: a real link that opens the address, as the row's own links are
+  // (`linkList`). A new tab, which in the installed app leaves the app for the browser — or
+  // the service's own app, where the address hands over to one — rather than navigating this
+  // page away; and being a genuine link it keeps the browser's own right-click, long-press
+  // and copy-link-address, which is what copying the address is now. The click handler only
+  // shuts the menu; the opening is the link's, never a script's say-so. The l key still copies
+  // the address (`copyLinkFromKeyboard`): a keyboard has no right-click to copy it with.
+  const upstreamUrl = upstreamUrlOf(message);
+  let openLink = null;
   if (upstreamUrl !== null) {
     const linkService = upstreamServiceName(message);
-    copyLink = document.createElement("button");
-    copyLink.className = "row-copy-link-button";
-    copyLink.setAttribute("type", "button");
-    copyLink.setAttribute("title", `Copy a link to this message in ${linkService} to the clipboard`);
-    copyLink.textContent = `Copy link in ${linkService}`;
-    sayRowShortcut(copyLink, "row-copy-link-button");
-    copyLink.addEventListener("click", inThisColumn(() => {
-      setMenu(false);
-      guardQuietly(() => copyUpstreamLink(upstreamUrl, linkService))();
+    openLink = document.createElement("a");
+    openLink.className = "row-open-link-button";
+    openLink.setAttribute("href", upstreamUrl);
+    openLink.setAttribute("target", "_blank");
+    openLink.setAttribute("rel", "noopener noreferrer");
+    openLink.setAttribute("title", `Open this message in ${linkService}: ${upstreamUrl}`);
+    openLink.textContent = `Open in ${linkService}`;
+    sayRowShortcut(openLink, "row-open-link-button");
+    openLink.addEventListener("click", inThisColumn(() => setMenu(false)));
+    // Space presses it, as it presses every other item in the menu: a browser presses a button
+    // with Space and scrolls at a link, and in a menu the item is the item, whichever it is.
+    // On the upstroke, as a button's own press lands.
+    openLink.addEventListener("keydown", (event) => {
+      if (event.key === " " && !event.ctrlKey && !event.metaKey && !event.altKey) event.preventDefault();
+    });
+    openLink.addEventListener("keyup", inThisColumn((event) => {
+      if (event.key !== " " || event.ctrlKey || event.metaKey || event.altKey) return;
+      event.preventDefault();
+      openLink.click();
     }));
   }
   // `#202 read-through-here`. What the owner reached for the read marker to do: grey everything up
@@ -33191,9 +33250,9 @@ function discordNode(messages) {
   readCaption.setAttribute("aria-hidden", "true");
   readCaption.textContent = "Mark read";
   readGroup.append(readCaption, readThrough, upstreamRead);
-  // Copy text first, then its link where the message has one, then Pin: the two copies together,
-  // ahead of the acts that change anything.
-  menu.append(copy, ...(copyLink ? [copyLink] : []), pinItem, bookmarkItem, readGroup);
+  // Copy text first, then the way to the message in its service where it has one, then Pin:
+  // the copy and the link together, ahead of the acts that change anything.
+  menu.append(copy, ...(openLink ? [openLink] : []), pinItem, bookmarkItem, readGroup);
   more.append(moreButton, menu);
   acts.append(more);
   // `#50 todo-view`. The non-gestural way to say "dealt with", and the one a keyboard can reach.
@@ -33361,8 +33420,25 @@ async function markReadThroughHere(row, upstreamId) {
 }
 
 /**
+ * A message's own address in the service it came from, as the server formed it and the message
+ * carries it, or null where none came back. The one read of it: the ⋯ menu's "Open in …" link
+ * and the l key's copy both take the address from here, so the two are offered together and
+ * never disagree about it. `#408 copy-upstream-link`, `#409 open-upstream-link`.
+ *
+ * The address lands in an href, the one sink that is not plain text, so nothing is read here
+ * that `HTTP_ADDRESS` has not passed: the server forms only https addresses, and one of any
+ * other shape is no address to offer, to open or to copy.
+ *
+ * @param {any} message
+ */
+function upstreamUrlOf(message) {
+  const url = message && typeof message.upstream_url === "string" ? message.upstream_url : "";
+  return /^https:\/\//i.test(url) && !/\s/.test(url) && HTTP_ADDRESS.test(url) ? url : null;
+}
+
+/**
  * The service a message's own link points into, by name: its channel's provider's, for the
- * "Copy link in …" words. `#408 copy-upstream-link`.
+ * "Open in …" words. `#408 copy-upstream-link`.
  *
  * The provider of the channel the message was served in, or of the channel on screen where that
  * names none the page knows (a thread's own channel, a pin's): rows on screen belong to the
@@ -37218,10 +37294,12 @@ function syncPinnedList() {
   }
   const messages = pinnedMessages();
   // The heading too (`#242 rich-headers`): a plain body's HTML is "" with or without one, and a paren
-  // tag confirmed by a later read brings a heading to a message whose text has not changed.
+  // tag confirmed by a later read brings a heading to a message whose text has not changed. And its
+  // own address in its service (`#409 open-upstream-link`): a later read can form one for a message
+  // drawn without one, and its row gains the link only by being drawn again.
   const drawn = JSON.stringify([combineMessages, hideEmptyMessages, channelCanon.scope, threadingSupported,
     ...messages.map((m) => [m.id, m.timestamp, m.content, renderedHtmlOf(m), m.author, threadOf(m), isNoise(m),
-      keptByPin.has(m), reactionsDrawn(m), m.heading || null, editedDrawn(m)])]);
+      keptByPin.has(m), reactionsDrawn(m), m.heading || null, editedDrawn(m), upstreamUrlOf(m)])]);
   if (drawn === pinnedListDrawn) return;
   pinnedListDrawn = drawn;
   drawingPinnedRows = true;
@@ -47656,7 +47734,7 @@ function applyClientConfig(config) {
     el(id).textContent = chatProviderName || "Chat";
   }
   // `#408 copy-upstream-link`: the list of keys was said at first load, before any service was
-  // named; say it again now the names are known, so the copy-link key names its service.
+  // named; say it again now the names are known, so the link's keys name their service.
   renderKeyHints();
   // `#343 pwa-app-name`. What this deployment calls its app. The server already wrote it into the
   // title of the page it served; taking it from this answer as well keeps the title the name the

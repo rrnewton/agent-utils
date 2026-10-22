@@ -762,7 +762,8 @@ pub trait ChatClient: Send + Sync {
     }
 
     /// The address of the message `id` in `channel` in this provider's own service, for the
-    /// page's "Copy link in \<service\>". `#408 copy-upstream-link`; see
+    /// page's "Open in \<service\>" link. `#408 copy-upstream-link`, `#409
+    /// open-upstream-link`; see
     /// [`crate::upstream_url`].
     ///
     /// Formed from what this provider already knows — its configuration and what it has learned

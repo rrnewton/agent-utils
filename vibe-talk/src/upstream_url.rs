@@ -1,6 +1,7 @@
 //! A message's own address in the service it came from. `#408 copy-upstream-link`.
 //!
-//! The page's "Copy link in \<service\>" copies this. It is formed HERE, on the server, from the
+//! The page's "Open in \<service\>" link opens this, and its copy key copies it. It is formed
+//! HERE, on the server, from the
 //! parts a read already holds, because each service's shape is a fact about that service and the
 //! page should not guess at any of them. A part that cannot be read gives NO address rather than
 //! a plausible one: a copied link that opens the wrong place, or nowhere, is worse than no menu
