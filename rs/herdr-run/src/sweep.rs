@@ -97,6 +97,7 @@ pub fn load_run_records(config: &Config) -> Vec<Value> {
         match strict_json(&text) {
             Some(mut value) if value.is_object() => {
                 resolve_late_completion(&mut value, &directory);
+                record_finish_time(&mut value, &directory);
                 records.push(value);
             }
             _ => continue,
@@ -121,6 +122,37 @@ fn resolve_late_completion(record: &mut Value, directory: &Path) {
     };
     if let Some(object) = record.as_object_mut() {
         object.insert("exit_code".to_owned(), Value::from(code));
+    }
+}
+
+/// Note when this run finished, as `finished_at` epoch seconds, when that is knowable.
+///
+/// The idle-tab TTL ([`crate::evict::ttl_candidates`]) measures a tab's idleness from the finish
+/// of its last recorded run. The run ID's timestamp cannot serve: it is the run's START, and
+/// `duration_seconds` in a timed-out run's record stops at the timeout, before the command
+/// actually finished in the pane. The completion marker's mtime is written by the pane shell at
+/// the moment the command ended — the same reading retention ages the run by. A run whose
+/// marker is missing or invalid gets no `finished_at` and so can never look idle-expired: an
+/// unknown finish keeps its tab, exactly as an unknown anything keeps it everywhere else here.
+fn record_finish_time(record: &mut Value, directory: &Path) {
+    let finished = !matches!(record.get("exit_code"), None | Some(Value::Null));
+    let Some(object) = record.as_object_mut() else {
+        return;
+    };
+    object.remove("finished_at");
+    if !finished {
+        return;
+    }
+    let Some(modified) = crate::retention::completion_modified(&directory.join("exit_code"))
+    else {
+        return;
+    };
+    let Ok(elapsed) = modified.duration_since(std::time::UNIX_EPOCH) else {
+        return;
+    };
+    let finished = elapsed.as_secs() as f64 + f64::from(elapsed.subsec_nanos()) / 1_000_000_000.0;
+    if let Some(number) = serde_json::Number::from_f64(finished) {
+        object.insert("finished_at".to_owned(), Value::Number(number));
     }
 }
 
@@ -190,7 +222,7 @@ pub fn evidence_from_runs(
 ///
 /// The last record naming the pane wins: a pane id can be reused by a later incarnation, and the
 /// most recent run is the only one whose labels describe the tab as it is now.
-fn scope_of(
+pub(crate) fn scope_of(
     pane_id: &str,
     records: &[Value],
     config: &Config,

@@ -848,6 +848,7 @@ _SUBCOMMANDS: tuple[str, ...] = (
     "reap",
     "run",
     "status",
+    "sweep",
     "target",
     "userguide",
 )
@@ -868,6 +869,7 @@ _LOCAL_OPTIONS: dict[str, frozenset[str]] = {
     "status": frozenset({"--help"}),
     "target": frozenset({"--help", "--no-cache"}),
     "reap": frozenset({"--help"}),
+    "sweep": frozenset({"--help", "--idle", "--dry-run"}),
     "net-doctor": frozenset({"--help"}),
     "quickstart": frozenset({"--help"}),
     "userguide": frozenset({"--help"}),
@@ -914,6 +916,7 @@ _CONFIG_KEYS: tuple[str, ...] = (
     "deny_global",
     "deny_subcommand",
     "deny_subcommand_option",
+    "idle_tab_ttl_seconds",
     "max_panes",
     "prefixes",
     "probe_remote",
@@ -2564,6 +2567,73 @@ def _reap(harness: Harness, report: Report) -> None:
         f"the run directory named by byte 0xFF sorts last and must decide scope: {_describe(python)}",
     )
     harness.account_calls(report, "reap/byte-ordered-runs", case)
+
+
+def _sweep_idle(harness: Harness, report: Report) -> None:
+    """Compare the idle sweep's DOCUMENT and its refusals where no tab can close.
+
+    `sweep --idle` is the one subcommand that closes tabs on a lifetime rather than to make
+    room, so "both help texts list it" is not a cross-edition guarantee. These cases run it
+    against the fake Herdr behind the account-home shim, which has no workspace: the sweep must
+    close nothing, say why in `listing_error`, and still print its whole shape — byte for byte
+    in both editions, TTL included. Actual closes over live panes (expired idle, busy, split,
+    in flight, and the sweep at the end of a run) are paired in `e2e/sweep-*`; the pure expiry
+    verdicts are pinned by the shared golden corpus both editions' unit tests load.
+    """
+    if harness.account_unavailable(report, "sweep/all"):
+        return
+    empty = harness.case("sweep-empty", {".herdr-run.yaml": _REAP_CONFIG})
+    python, rust = harness.invoke(empty, ("sweep", "--idle"), account=True)
+    report.exact("sweep/empty-spool", python, rust, expected_rc=0)
+    report.require(
+        "sweep/empty-spool-shape",
+        python.stderr == ""
+        and '"considered": 0' in python.stdout
+        and '"closed": []' in python.stdout
+        and '"would_close": []' in python.stdout
+        and '"idle_tab_ttl_seconds": 900.0' in python.stdout
+        and "herdr has no workspace labelled" in python.stdout,
+        "an inert sweep must still print its own shape, its TTL, and why it could not list: "
+        f"{_describe(python)}",
+    )
+    harness.account_calls(report, "sweep/empty-spool", empty)
+
+    python, rust = harness.invoke(empty, ("sweep", "--idle", "--dry-run"), account=True)
+    report.exact("sweep/empty-spool-dry-run", python, rust, expected_rc=0)
+    report.require(
+        "sweep/empty-spool-dry-run-shape",
+        '"dry_run": true' in python.stdout and '"considered": 0' in python.stdout,
+        f"a dry run must say it is one and still close nothing: {_describe(python)}",
+    )
+    harness.account_calls(report, "sweep/empty-spool-dry-run", empty)
+
+    planted = harness.case(
+        "sweep-planted",
+        {
+            ".herdr-run.yaml": _REAP_CONFIG + "idle_tab_ttl_seconds: 0\n",
+            ".herdr-run/runs/20260819T000000-kvm-1/meta.json": _reap_record(
+                "w1:p1", _REAP_WORKSPACE
+            ),
+            ".herdr-run/runs/20260819T000000-kvm-1/exit_code": "0\n",
+        },
+    )
+    python, rust = harness.invoke(planted, ("sweep", "--idle"), account=True)
+    report.exact("sweep/disabled-and-unresolvable", python, rust, expected_rc=0)
+    report.require(
+        "sweep/disabled-and-unresolvable-shape",
+        '"idle_tab_ttl_seconds": 0.0' in python.stdout
+        and '"closed": []' in python.stdout
+        and "herdr has no workspace labelled" in python.stdout,
+        "a disabled TTL with an unresolvable workspace must close nothing and say both: "
+        f"{_describe(python)}",
+    )
+    harness.account_calls(report, "sweep/disabled-and-unresolvable", planted)
+
+    bare = harness.case("sweep-bare", {".herdr-run.yaml": _REAP_CONFIG})
+    python, rust = harness.invoke(bare, ("sweep",))
+    report.exact("sweep/needs-idle", python, rust, expected_rc=2)
+    python, rust = harness.invoke(bare, ("sweep", "--idle", "extra"))
+    report.exact("sweep/no-positional", python, rust, expected_rc=2)
 
 
 #: `status` fixtures run against the fake Herdr behind the account-home shim, never against a Herdr
@@ -4237,6 +4307,60 @@ def _e2e_run_and_report(harness: Harness, report: Report, shim: Path) -> None:
         expect=[(2, '"OUT_OF_SCOPE": 1')],
     )
 
+    # The idle lifetime: a tab whose last run finished past the TTL is closed under the cap's
+    # idle verdict, by `sweep --idle` on demand and by a later run's own bounded sweep. The
+    # finish a verdict reads is the completion marker's mtime, so ageing bob's marker is ageing
+    # his last finish -- the same plant the unit tests use, here over live panes.
+    def backdate_bob(edition: _E2EEdition) -> None:
+        runs = edition.project / ".spool" / "runs"
+        old = time.time() - 7200
+        for meta in sorted(runs.glob("*/meta.json")):
+            if json.loads(meta.read_text(encoding="utf-8")).get("agent") != "bob":
+                continue
+            os.utime(meta.parent / "exit_code", (old, old))
+
+    e2e.case(
+        "sweep-idle-ttl",
+        config,
+        [
+            _run_step(*a, "run", "printf 1", rc=0),
+            _run_step("--agent", "bob", "run", "printf 2", rc=0),
+            _do("age bob's last finish past the TTL", backdate_bob),
+            _run_step("sweep", "--idle", "--dry-run", rc=0),
+            _run_step("sweep", "--idle", rc=0),
+            _run_step("reap", rc=0),
+            _run_step(*a, "run", "printf 3", rc=0),
+        ],
+        expect=[
+            (3, '"would_close": 1'),
+            (4, '"closed": 1'),
+            (4, "retired idle tab"),
+            (5, '"GONE": 1'),
+        ],
+    )
+    e2e.case(
+        "sweep-at-the-end-of-a-run",
+        config,
+        [
+            _run_step("--agent", "bob", "run", "printf 2", rc=0),
+            _do("age bob's last finish past the TTL", backdate_bob),
+            _run_step(*a, "run", "printf 1", rc=0),
+            _run_step("sweep", "--idle", "--dry-run", rc=0),
+        ],
+        expect=[(2, "retired idle tab"), (3, '"would_close": 0')],
+    )
+    e2e.case(
+        "sweep-idle-ttl-disabled",
+        config + "idle_tab_ttl_seconds: 0\n",
+        [
+            _run_step("--agent", "bob", "run", "printf 2", rc=0),
+            _do("age bob's last finish past the TTL", backdate_bob),
+            _run_step("sweep", "--idle", rc=0),
+            _run_step(*a, "run", "printf 1", rc=0),
+        ],
+        expect=[(2, '"closed": 0'), (2, "the idle TTL is disabled")],
+    )
+
     # The pane cap: the least recently used idle tab makes room; a busy one never does.
     capped = config + "max_panes: 2\n"
     e2e.case(
@@ -4656,6 +4780,7 @@ def build_report(
         _status(harness, report)
         _documentation(harness, report)
         _reap(harness, report)
+        _sweep_idle(harness, report)
         _deleted_cwd(harness, report)
         _child_processes(harness, report)
         _sigchld_handed_over(harness, report)
@@ -4674,8 +4799,8 @@ def build_report(
         "protocol call, readiness rule, and record format, through both editions' unit tests"
     )
     report.notes.append(
-        "nothing reaches an installed Herdr: status/*, reap/*, unsafe-paths/*, and the status "
-        "calls in config/* and locale/* run against the fake Herdr behind the account-home shim, "
+        "nothing reaches an installed Herdr: status/*, reap/*, sweep/*, unsafe-paths/*, and the "
+        "status calls in config/* and locale/* run against the fake Herdr behind the account-home shim, "
         "with no workspace, and their Herdr calls are compared and must only read; the reap/* "
         "cases pair verdicts over planted records, and STALE, SHELL_ALIVE, GONE, and IN_FLIGHT "
         "over live panes are paired in e2e/reap-*"

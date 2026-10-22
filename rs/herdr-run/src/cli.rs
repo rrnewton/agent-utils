@@ -71,6 +71,10 @@ const SUBCOMMANDS: &[Subcommand] = &[
         summary: "report which command tabs are provably finished with",
     },
     Subcommand {
+        name: "sweep",
+        summary: "close command tabs idle past the configured TTL",
+    },
+    Subcommand {
         name: "net-doctor",
         summary: "smoke-test one scenario: a caller whose own network is blocked",
     },
@@ -90,6 +94,12 @@ struct Globals {
     config: Option<PathBuf>,
     agent: Option<String>,
     json: bool,
+}
+
+/// Options accepted only after `sweep`.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct SweepOptions {
+    dry_run: bool,
 }
 
 /// Options accepted only after `run`.
@@ -113,6 +123,7 @@ enum Selected {
     Config,
     Target { no_cache: bool },
     Reap,
+    Sweep(SweepOptions),
     NetDoctor,
     Quickstart,
     Userguide,
@@ -339,6 +350,15 @@ const SUBCOMMAND_OPTIONS: &[(&str, OptionTable)] = &[
         ],
     ),
     ("status", &[("--help", None), ("-h", None)]),
+    (
+        "sweep",
+        &[
+            ("--dry-run", None),
+            ("--help", None),
+            ("--idle", None),
+            ("-h", None),
+        ],
+    ),
     (
         "target",
         &[("--help", None), ("--no-cache", None), ("-h", None)],
@@ -621,6 +641,36 @@ fn parse_subcommand(name: &str, rest: &[String]) -> Parsed<Option<Selected>> {
             }
             Ok(Some(Selected::Target { no_cache: present }))
         }
+        // `--idle` names the one sweep there is, and is required rather than implied: a bare
+        // `sweep` that closed tabs would be a command whose whole effect is invisible in its
+        // own spelling, and the flag leaves room to sweep by some other measure later without
+        // changing what the bare word already meant.
+        "sweep" => {
+            let (mut idle, mut dry_run, mut positional) = (false, false, 0usize);
+            for token in rest {
+                if token == "--help" || token == "-h" {
+                    print_subcommand_help(name)?;
+                    return Ok(None);
+                }
+                match token.as_str() {
+                    "--idle" => idle = true,
+                    "--dry-run" => dry_run = true,
+                    _ if token.starts_with('-') => {
+                        return Err(local_argument_error(name, token).into());
+                    }
+                    _ => positional += 1,
+                }
+            }
+            if positional > 0 {
+                return Err(format!("sweep: takes no positional arguments; got {positional}").into());
+            }
+            if !idle {
+                return Err("sweep: needs --idle (close tabs idle past idle_tab_ttl_seconds)"
+                    .to_owned()
+                    .into());
+            }
+            Ok(Some(Selected::Sweep(SweepOptions { dry_run })))
+        }
         _ => Err(format!("unknown subcommand '{name}'").into()),
     }
 }
@@ -765,6 +815,7 @@ fn agent_blind_reason(subcommand: &str) -> Option<&'static str> {
         "check" => Some("it answers a policy question about a command and touches no pane"),
         "init" => Some("it writes a configuration file and touches no pane"),
         "reap" => Some("it reports on the whole workspace, not on one agent's tab"),
+        "sweep" => Some("it retires tabs across the whole workspace, not one agent's tab"),
         "quickstart" | "userguide" => Some("it prints a packaged document"),
         _ => None,
     }
@@ -782,9 +833,9 @@ fn agent_blind_error(subcommand: &str, reason: &str) -> String {
 /// parse of the output rather than at the flag — which is the worst place to find out, because the
 /// failure looks like malformed data rather than a rejected request.
 ///
-/// `config`, `target`, and `reap` are deliberately NOT here. They print JSON with or without the
-/// flag, so a caller who asks them for machine-readable output gets exactly that; the flag is
-/// redundant there, not disregarded.
+/// `config`, `target`, `reap`, and `sweep` are deliberately NOT here. They print JSON with or
+/// without the flag, so a caller who asks them for machine-readable output gets exactly that; the
+/// flag is redundant there, not disregarded.
 fn json_blind_reason(subcommand: &str) -> Option<&'static str> {
     match subcommand {
         "net-doctor" => Some("it prints a human diagnosis and a verdict, in prose"),
@@ -877,6 +928,7 @@ fn dispatch(invocation: Invocation) -> Result<i32> {
             command_target(&config, &resolve_agent(&invocation.globals)?, !no_cache)
         }
         Selected::Reap => command_reap(&config),
+        Selected::Sweep(options) => command_sweep(&config, &options),
         Selected::NetDoctor => command_net_doctor(&config, &resolve_agent(&invocation.globals)?),
         Selected::Quickstart | Selected::Userguide => Ok(0),
     }
@@ -1044,6 +1096,7 @@ fn command_config(config: &Config, agent: &str) -> Result<i32> {
         "deny_global": config.deny_global,
         "deny_subcommand": config.deny_subcommand,
         "deny_subcommand_option": config.deny_subcommand_option,
+        "idle_tab_ttl_seconds": config.idle_tab_ttl_seconds,
         "max_panes": config.max_panes,
         "prefixes": config.prefixes,
         "probe_remote": config.probe_remote,
@@ -1228,6 +1281,7 @@ fn run_command(config: &Config, agent: &str, json_output: bool, args: &RunOption
             output::write_labelled(1, error.partial_stdout().as_bytes(), "partial stdout")?;
             output::write_labelled(2, error.partial_stderr().as_bytes(), "partial stderr")?;
             output::diagnostic(&format!("herdr-run: {error}"));
+            sweep_idle_best_effort(&client, config, agent, &target.pane_id);
             return Ok(error.exit_code());
         }
         Err(error) => return audited_error(&log, agent, command, error),
@@ -1260,6 +1314,7 @@ fn run_command(config: &Config, agent: &str, json_output: bool, args: &RunOption
         output::stdout_bytes(&result.stdout)?;
         output::stderr_bytes(&result.stderr)?;
     }
+    sweep_idle_best_effort(&client, config, agent, &result.target.pane_id);
     Ok(result.exit_code)
 }
 
@@ -1393,6 +1448,92 @@ fn command_reap(config: &Config) -> Result<i32> {
     });
     print_json(&document)?;
     Ok(0)
+}
+
+fn retired_document(retired: &evict::RetiredTab) -> Value {
+    json!({
+        "agent": retired.agent,
+        "last_run": retired.last_run,
+        "last_run_at": retired.last_run.as_deref().and_then(evict::run_time),
+        "pane_id": retired.pane_id,
+        "reason": retired.reason,
+        "tab_id": retired.tab_id,
+    })
+}
+
+fn epoch_seconds_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |elapsed| elapsed.as_secs_f64())
+}
+
+/// Close the workspace's tabs that are idle past `idle_tab_ttl_seconds`.
+///
+/// The explicit form of the sweep a finished run performs in bounded form, for a timer or an
+/// operator. Unlike `reap` this ACTS: expiry only selects the candidates, and each close is
+/// still the cap's verdict — shell provably idle, taken under the pane lock immediately before
+/// `tab close` ([`evict::retire_idle_tabs`]). Every recorded pane that stays open carries its
+/// reason, because a sweep that closes nothing must say whether nothing was expired or
+/// everything expired was busy. A workspace herdr cannot list is reported in `listing_error`
+/// with nothing closed: from a timer, "no workspace yet" is a routine state, not a failure
+/// worth a nonzero exit.
+fn command_sweep(config: &Config, options: &SweepOptions) -> Result<i32> {
+    let client = HerdrClient::new(&config.broker)?;
+    let sweep = evict::retire_idle_tabs(
+        &client,
+        config,
+        "sweep",
+        epoch_seconds_now(),
+        options.dry_run,
+        None,
+        None,
+        Path::new("/proc"),
+    );
+    let document = json!({
+        "closed": sweep.closed.iter().map(retired_document).collect::<Vec<_>>(),
+        "counts": {
+            "closed": sweep.closed.len(),
+            "considered": sweep.closed.len() + sweep.would_close.len() + sweep.kept.len(),
+            "kept": sweep.kept.len(),
+            "would_close": sweep.would_close.len(),
+        },
+        "dry_run": options.dry_run,
+        "idle_tab_ttl_seconds": config.idle_tab_ttl_seconds,
+        "kept": sweep.kept.iter().map(|(pane_id, reason)| json!({"pane_id": pane_id, "reason": reason})).collect::<Vec<_>>(),
+        "listing_error": sweep.listing_error,
+        "workspace": config.workspace,
+        "would_close": sweep.would_close.iter().map(retired_document).collect::<Vec<_>>(),
+    });
+    print_json(&document)?;
+    Ok(0)
+}
+
+/// How many expired tabs one finished run may examine while sweeping opportunistically. Each
+/// examination probes a pane and scans `/proc`; the bound keeps housekeeping from ever
+/// stretching a caller's command, and leftovers are picked up by the next run or by
+/// `sweep --idle`.
+const OPPORTUNISTIC_SWEEP_LIMIT: usize = 4;
+
+/// Retire idle-expired tabs at the end of a run, without ever changing its result.
+///
+/// Pruned-on-write, like retention, so it cannot silently stop the way a timer can — but
+/// bounded ([`OPPORTUNISTIC_SWEEP_LIMIT`]) and never the tab the run just used. A failure to
+/// list the workspace is reported inside the sweep and ignored here, exactly as a failure to
+/// write the run's metadata is a warning beside a completed command.
+fn sweep_idle_best_effort(client: &HerdrClient, config: &Config, agent: &str, pane_id: &str) {
+    if config.idle_tab_ttl_seconds <= 0.0 {
+        return;
+    }
+    let _sweep = evict::retire_idle_tabs(
+        client,
+        config,
+        agent,
+        epoch_seconds_now(),
+        false,
+        Some(OPPORTUNISTIC_SWEEP_LIMIT),
+        Some(pane_id),
+        Path::new("/proc"),
+    );
 }
 
 /// The bound on `reap`'s candidate set, printed with every report.
@@ -1772,6 +1913,12 @@ fn subcommand_help_text(name: &str) -> String {
             text.push_str("\nReport which command tabs are provably finished with, and why every other one\nwas declined. Closes nothing.\n");
             text.push_str("\noptions:\n  -h, --help            show this help message and exit\n");
         }
+        "sweep" => {
+            text.push_str("usage: herdr-run [GLOBAL OPTIONS] sweep --idle [--dry-run]\n");
+            text.push_str("\nClose command tabs idle past idle_tab_ttl_seconds: every recorded run in the tab\nfinished, the last one more than the TTL ago, and its shell provably idle — the\nsame verdict the pane cap takes, under the pane lock, immediately before the\nclose. A tab running a command, holding a background job, locked by another\nrunner, or split into several panes is never closed. Tabs no run record names\nare left to 'reap'. Prints JSON: what closed, and why everything else stayed.\nWith idle_tab_ttl_seconds 0 the sweep is disabled and closes nothing. Runs also\nsweep a bounded number of tabs when they finish; this subcommand is the same\nsweep on demand, for a timer.\n");
+            text.push_str("\noptions:\n  -h, --help            show this help message and exit\n  --idle                sweep by idle lifetime (required; the only sweep there is)\n  --dry-run             judge every tab and report; close nothing\n");
+            text.push_str("\nExample:\n  herdr-run sweep --idle --dry-run\n");
+        }
         "net-doctor" => {
             text.push_str("usage: herdr-run [GLOBAL OPTIONS] net-doctor\n");
             text.push_str("\nSmoke-test one narrow scenario: a caller whose own network access is blocked,\nreaching the network through a pane that is not blocked. It runs one probe\ndirectly and again through the pane and compares the two. This is not a health\ncheck of the command as a whole.\n");
@@ -1907,17 +2054,35 @@ mod tests {
         let error = parse_args(&["--json", "check", "--dry-run", "git status"])
             .expect_err("check --dry-run");
         assert!(
-            error.contains("this is a 'run' option, not a 'check' option"),
+            error.contains("this is a 'run' or 'sweep' option, not a 'check' option"),
             "{error}"
         );
         let error = parse_args(&["target", "--dry-run"]).expect_err("target --dry-run");
         assert!(
-            error.contains("this is a 'run' option, not a 'target' option"),
+            error.contains("this is a 'run' or 'sweep' option, not a 'target' option"),
             "{error}"
         );
         // --no-cache belongs to two subcommands, and both must be named.
         let error = parse_args(&["--no-cache", "target"]).expect_err("global --no-cache");
         assert!(error.contains("'run' or 'target'"), "{error}");
+    }
+
+    #[test]
+    fn sweep_needs_idle_and_takes_no_positional_arguments() {
+        let error = parse_args(&["sweep"]).expect_err("bare sweep");
+        assert!(error.contains("sweep: needs --idle"), "{error}");
+        let error = parse_args(&["sweep", "--dry-run"]).expect_err("sweep without idle");
+        assert!(error.contains("sweep: needs --idle"), "{error}");
+        let error = parse_args(&["sweep", "--idle", "extra"]).expect_err("sweep positional");
+        assert!(
+            error.contains("sweep: takes no positional arguments; got 1"),
+            "{error}"
+        );
+        let invocation = parse_args(&["sweep", "--idle", "--dry-run"]).expect("sweep parses");
+        assert_eq!(
+            invocation.selected,
+            Selected::Sweep(SweepOptions { dry_run: true })
+        );
     }
 
     /// A global option a subcommand cannot observe must be refused, not accepted and ignored.
@@ -2134,7 +2299,7 @@ mod tests {
     fn every_subcommand_is_reachable_and_uniquely_named() {
         assert_eq!(
             subcommand_names(),
-            "check, config, init, net-doctor, quickstart, reap, run, status, target, userguide"
+            "check, config, init, net-doctor, quickstart, reap, run, status, sweep, target, userguide"
         );
         for subcommand in SUBCOMMANDS {
             assert!(

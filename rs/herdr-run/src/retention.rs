@@ -138,7 +138,10 @@ fn prune_runs_at(root: &Path, retention_days: u64, now: SystemTime) -> PruneResu
     result
 }
 
-fn completion_modified(path: &Path) -> Option<SystemTime> {
+/// The one definition of "when did this run finish": retention ages a run by it and the idle-tab
+/// TTL ([`crate::evict`]) measures idleness from it, so the two can never disagree about whether
+/// a run has finished at all.
+pub(crate) fn completion_modified(path: &Path) -> Option<SystemTime> {
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)

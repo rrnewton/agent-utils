@@ -43,6 +43,18 @@ pub const DEFAULT_MAX_PANES: u64 = 32;
 /// Largest accepted `max_panes`. A shared finite bound keeps the two implementations identical.
 pub const MAX_PANE_CAP: u64 = 1_000_000;
 
+/// Default idle lifetime of a finished command tab, in seconds.
+///
+/// The pane cap only closes a tab when a NEW tab needs its place, so without a lifetime every
+/// workspace fills to `max_panes` idle shells and stays there -- measured 2026-10-21, one host's
+/// server held 123 panes, 64 of them idle shells left by finished commands, and was unresponsive
+/// under load. A tab whose last recorded run finished longer ago than this, and whose shell is
+/// provably idle by the same rules the cap uses ([`crate::evict`]), is closed: opportunistically
+/// at the end of a run and by `sweep --idle`. Fifteen minutes is far longer than an agent pauses
+/// between commands in one piece of work, and a closed tab costs its agent one fresh shell,
+/// never its files.
+pub const DEFAULT_IDLE_TAB_TTL_SECONDS: f64 = 900.0;
+
 /// Cargo options refused in every argument position whatever `deny_global` says.
 ///
 /// A project that opts Cargo in must not be able to configure its way past them. The admission
@@ -102,6 +114,12 @@ pub struct Config {
     /// Checked only when a tab has to be created, so an agent that already has its tab is never
     /// locked out of it. A cap that can break work in progress is a cap that gets switched off.
     pub max_panes: u64,
+    /// Seconds a tab may sit idle after its last recorded run finished before it is closed, when
+    /// its shell is provably idle ([`crate::evict::retire_idle_tabs`]); `0` disables retirement.
+    ///
+    /// Only tabs a surviving run record names are considered, so the window `retention_days`
+    /// bounds applies here too.
+    pub idle_tab_ttl_seconds: f64,
     /// Maximum seconds to wait for a pane to become ready.
     pub ready_timeout_seconds: f64,
     /// Readiness policy: `both` or `process`.
@@ -209,6 +227,7 @@ impl Default for Config {
             timeout_seconds: 900.0,
             retention_days: crate::retention::RETENTION_DAYS,
             max_panes: DEFAULT_MAX_PANES,
+            idle_tab_ttl_seconds: DEFAULT_IDLE_TAB_TTL_SECONDS,
             ready_timeout_seconds: 0.0,
             readiness: "both".to_owned(),
             prompt_tail: None,
@@ -226,7 +245,7 @@ impl Default for Config {
 /// Public because it is also the definition of "every knob", which the generated
 /// `.herdr-run.yaml` has to cover for the user guide to be able to point at that file instead of
 /// restating it.
-pub const KNOWN_KEYS: [&str; 21] = [
+pub const KNOWN_KEYS: [&str; 22] = [
     "workspace",
     "tab_name",
     "cwd",
@@ -242,6 +261,7 @@ pub const KNOWN_KEYS: [&str; 21] = [
     "timeout_seconds",
     "retention_days",
     "max_panes",
+    "idle_tab_ttl_seconds",
     "ready_timeout_seconds",
     "readiness",
     "prompt_tail",
@@ -913,6 +933,9 @@ pub fn parse_config(
             "max_panes" => {
                 config.max_panes = require_bounded_count(value, &where_, MAX_PANE_CAP, "")?;
             }
+            "idle_tab_ttl_seconds" => {
+                config.idle_tab_ttl_seconds = require_seconds(value, &where_)?;
+            }
             "ready_timeout_seconds" => {
                 config.ready_timeout_seconds = require_seconds(value, &where_)?;
             }
@@ -996,6 +1019,7 @@ mod tests {
         // production constant would agree with any value the constant ever takes, including a
         // typo, and so would pin nothing at all.
         assert_eq!(config.max_panes, 32);
+        assert_eq!(config.idle_tab_ttl_seconds, 900.0);
         assert_eq!(config.readiness, "both");
         assert_eq!(config.broker, "direct");
     }
@@ -1032,16 +1056,21 @@ mod tests {
         found
     }
 
-    /// The guide restates two defaults in prose; those sentences must say what the code does.
+    /// The guide restates three defaults in prose; those sentences must say what the code does.
     #[test]
     fn user_guide_prose_defaults_are_the_built_in_defaults() {
-        let expected: &[(&str, &str, u64)] =
-            &[("retention_days", "four", 4), ("max_panes", "32", 32)];
+        let expected: &[(&str, &str, u64)] = &[
+            ("retention_days", "four", 4),
+            ("max_panes", "32", 32),
+            ("idle_tab_ttl_seconds", "900 seconds", 900),
+        ];
         let config = Config::default();
         for (key, _spelling, number) in expected {
             let actual = match *key {
                 "retention_days" => config.retention_days,
                 "max_panes" => config.max_panes,
+                // The exact float is asserted in the defaults test; here the prose number.
+                "idle_tab_ttl_seconds" => config.idle_tab_ttl_seconds as u64,
                 other => panic!("nothing reads the default for {other}"),
             };
             assert_eq!(
