@@ -46598,6 +46598,70 @@ def test_retained_handle_binds_checkout_and_source_checkout_even_when_nontermina
     wrkslots._assert_retained_handle_processes_dead(bindings)
 
 
+def test_retained_handle_census_over_the_former_4096_file_bound_still_binds_its_row(
+    tmp_path: Path,
+) -> None:
+    """A host's ordinary handle population does not refuse absent-row recovery.
+
+    On 2026-10-21 a production host held 4,117 ``*.json`` files under
+    ``ignored/validate/runs`` (3,073 run records and 1,044 service-result
+    sidecars), and the former 4,096-file census bound refused every
+    absent-row recovery there.  The count is a backstop, not the safety
+    rule: a census over more files than that must still read all of them
+    and bind the one handle, sorted last, that names the row.
+    """
+
+    project, repository, _remote = make_project(tmp_path)
+    made = create(
+        project,
+        slot="census-row",
+        agent="validate-a",
+        branch=None,
+        slot_type="validate",
+    )
+    assert made.returncode == 0, made.stderr
+    record = mark_recorded_owner_dead(project, "census-row")
+    make_validate_row_absent(project, repository, record)
+    config = wrkslots._load_config(str(project), "testhost")
+    paths = wrkslots._absent_validate_row_paths(config, record)
+    handles = project / "ignored" / "validate" / "runs"
+    handles.mkdir(parents=True, exist_ok=True)
+    unrelated = str(project / "worktrees" / "validate" / "unrelated")
+    population = 5_000
+    assert population > 4_096
+    for index in range(population):
+        name = f"validate-unrelated-{index:05d}"
+        (handles / f"{name}.json").write_text(
+            json.dumps({"checkout": unrelated, "unit": f"{name}.service"}),
+            encoding="utf-8",
+        )
+        if index % 4 == 0:
+            (handles / f"{name}.service-result.json").write_text(
+                json.dumps({"result": "success"}), encoding="utf-8"
+            )
+    related = handles / "zz-census-run.json"
+    related.write_text(
+        json.dumps(
+            {
+                "checkout": str(paths[-1]),
+                "unit": "zz-census-run.service",
+                "state": "running",
+                "process_identity": {
+                    "pid": 2_147_483_647,
+                    "start_ticks": 17,
+                    "boot_id": wrkslots._boot_id(Path("/proc")),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert len(list(handles.glob("*.json"))) > 4_096
+
+    bindings = wrkslots._retained_handles_for_absent_rows(config, ((record, paths),))
+
+    assert [handle.path for handle in bindings["census-row"]] == [related]
+
+
 def test_an_unrelated_retained_handle_over_one_mib_does_not_refuse_the_census(
     tmp_path: Path,
 ) -> None:
@@ -46635,10 +46699,10 @@ def test_retained_handle_enumeration_is_bounded_before_sorting(
     if bound == "count":
         (handles / "two.json").write_text("{}", encoding="utf-8")
         monkeypatch.setattr(wrkslots, "_RETAINED_HANDLE_COUNT_LIMIT", 1)
-        message = "file-count census bound"
+        message = rf"file-count census bound of 1 \*\.json files in {re.escape(str(handles))}$"
     elif bound == "bytes":
         monkeypatch.setattr(wrkslots, "_RETAINED_HANDLE_BYTES_LIMIT", 1)
-        message = "64 MiB census bound"
+        message = rf"0 MiB census bound in {re.escape(str(handles))}$"
     else:
         ticks = iter((0.0, 2.0))
         monkeypatch.setattr(wrkslots, "_RETAINED_HANDLE_CENSUS_SECONDS", 1.0)

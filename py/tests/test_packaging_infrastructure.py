@@ -941,9 +941,11 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # The two partial-clone containment cases of dev-hermit dh-6a8rf (a
     # blobless clone's search and recheck fetch commits only, and promisor
     # object-store detection) are mapped.
-    assert len(all_tests) == 2099
+    # The retained-handle census case of dev-hermit dh-9qy9v (more files than
+    # the former 4,096-file bound still bind their row) is mapped.
+    assert len(all_tests) == 2100
     assert len(ordinary) == 337
-    assert len(mapped) == 1762
+    assert len(mapped) == 1763
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {

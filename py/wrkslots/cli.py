@@ -606,8 +606,22 @@ HISTORICAL_ACTIVE_STATUSES = frozenset(
 )
 HISTORICAL_TASK_NOT_RECORDED = "no task recorded in worktree-state.json"
 HISTORICAL_PURPOSE_NOT_RECORDED = "no purpose recorded in worktree-state.json"
-_RETAINED_HANDLE_COUNT_LIMIT = 4096
-_RETAINED_HANDLE_BYTES_LIMIT = 64 * 1024 * 1024
+# The retained validation handle census reads every ``*.json`` file under
+# ``ignored/validate/runs`` in full, so these bounds limit its work, not
+# which handles it judges: reaching one refuses the recovery, and below them
+# every handle is still read, parsed and matched.  The time bound is the one
+# that tracks cost; the count and byte bounds are backstops against a
+# pathological directory, sized from measurement so that ordinary growth
+# does not reach them first.  On 2026-10-21 a production host held 4,117
+# such files (3,073 run records totalling 20,893,804 bytes and 1,044
+# service-result sidecars totalling 532,609 bytes), growing by about 50
+# files and 0.5 MB a day, and one census over them took 0.43 seconds at load
+# average 110.  The former 4,096-file bound, crossed that day, then refused
+# every absent-row recovery on that host.  At that rate 65,536
+# files take about 3.4 years and 256 MiB about 16 months, and a census of
+# either would take about 7 or 5 seconds, inside the 30-second time bound.
+_RETAINED_HANDLE_COUNT_LIMIT = 65536
+_RETAINED_HANDLE_BYTES_LIMIT = 256 * 1024 * 1024
 _RETAINED_HANDLE_CENSUS_SECONDS = 30.0
 # A retained handle whose change time is this close to the start of the
 # census that read it can be rewritten, bytes, size and times alike, within
@@ -52993,6 +53007,14 @@ def _retained_handle_clocks() -> tuple[int, int, int]:
     return realtime, realtime - after, realtime - before
 
 
+def _retained_handle_bytes_refusal(handles: Path) -> str:
+    return (
+        "retained validation handles exceed the "
+        f"{_RETAINED_HANDLE_BYTES_LIMIT // (1024 * 1024)} MiB census bound in "
+        f"{handles}"
+    )
+
+
 def _retained_handles_for_absent_rows(
     config: Config, rows: Sequence[tuple[ActiveRecord, tuple[Path, ...]]]
 ) -> Mapping[str, tuple[_RetainedValidationHandle, ...]]:
@@ -53049,7 +53071,9 @@ def _retained_handles_for_absent_rows(
                         continue
                     if len(handle_paths) >= _RETAINED_HANDLE_COUNT_LIMIT:
                         raise Refusal(
-                            "retained validation handles exceed the file-count census bound"
+                            "retained validation handles exceed the file-count census "
+                            f"bound of {_RETAINED_HANDLE_COUNT_LIMIT} *.json files in "
+                            f"{handles}"
                         )
                     metadata = directory_entry.stat(follow_symlinks=False)
                     path = handles / directory_entry.name
@@ -53062,9 +53086,7 @@ def _retained_handles_for_absent_rows(
                     # (2026-10-04).
                     total_bytes += metadata.st_size
                     if total_bytes > _RETAINED_HANDLE_BYTES_LIMIT:
-                        raise Refusal(
-                            "retained validation handles exceed the 64 MiB census bound"
-                        )
+                        raise Refusal(_retained_handle_bytes_refusal(handles))
                     handle_paths.append(path)
         except Refusal:
             raise
@@ -53100,7 +53122,7 @@ def _retained_handles_for_absent_rows(
             )
             total_bytes += len(contents)
             if total_bytes > _RETAINED_HANDLE_BYTES_LIMIT:
-                raise Refusal("retained validation handles exceed the 64 MiB census bound")
+                raise Refusal(_retained_handle_bytes_refusal(handles))
             if time.monotonic() >= deadline:
                 raise Refusal(
                     "retained validation handle census exceeded its time bound"
