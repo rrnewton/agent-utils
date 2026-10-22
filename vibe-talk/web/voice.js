@@ -205,7 +205,7 @@ const ALL_CHANNELS = "*";
  *   | "msg-scale-larger" | "msg-scale-smaller"
  *   | "open-add-channel" | "open-browse-channels" | "open-help" | "open-settings"
  *   | "pair-confirm" | "pair-dismiss"
- *   | "pinned-filter" | "post-confirm-cancel" | "post-confirm-more" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-new" | "read-next" | "read-pause" | "read-prev" | "read-speed" | "remove-channel"
+ *   | "pinned-filter" | "post-confirm-cancel" | "post-confirm-more" | "post-confirm-send" | "prompts-open" | "read-aloud" | "read-aloud-stop" | "read-new" | "read-next" | "read-pause" | "read-prev" | "read-speed" | "read-steer-grip" | "read-stop" | "remove-channel"
  *   | "rename-channel" | "reply-cancel" | "reply-send"
  *   | "reset-voice-post-prefix"
  *   | "restore-voice-system-prompt" | "save-alias" | "save-token" | "save-voice-instructions"
@@ -370,6 +370,8 @@ if (typeof window.ResizeObserver === "function") {
     if (pinned) area.scrollTop = area.scrollHeight;
     // The strip floats in the same band as the chips over the channel's box, so it moved with it.
     placeChipsOverComposer();
+    // `#442 read-strip-order`: a strip moved on a desk that grew is held inside the window again.
+    placeReadSteer();
   }).observe(el("read-steer"));
 }
 
@@ -32823,17 +32825,144 @@ function showReadingPosition() {
   renderReadSteer();
 }
 
-/** The steering strip: Previous, Pause, "k of n", Next, while a read of several parts is playing. */
+/** The steering strip: Previous, "k of n", Next, Pause, while a read of several parts is playing. */
 function renderReadSteer() {
   const strip = el("read-steer");
   if (!strip) return;
   const position = readingPosition();
+  const wasHidden = strip.hidden;
   strip.hidden = position === "";
   renderReadTransport();
   renderReadTimeline();
   if (position === "") return;
   el("read-steer-count").textContent = position;
   el("read-next").disabled = nowPlaying.segment + 1 >= nowPlaying.segments.length;
+  if (wasHidden) placeReadSteer();
+}
+
+/**
+ * `#442 read-strip-order`. ON A DESK THE STRIP CAN BE MOVED, by the grip at its left: the owner
+ * asked to drag "that little floating controller" off whatever it covers. Kept as an offset from
+ * where it docks (on the chips row), held inside the window, and remembered on this device. The
+ * stylesheet draws the grip, and applies the offset, only in the desk's regime; a phone keeps the
+ * strip docked under the thumb. Whether the grip is drawn is the one question asked here, so the
+ * layout stays the stylesheet's to decide (`#55 voice-desktop-app`).
+ */
+const READ_STEER_OFFSET_KEY = "vibe-talk.voice.read-steer-offset";
+/** @type {{ x: number, y: number } | null} */
+let readSteerOffset = storedReadSteerOffset();
+/** @type {{ x: number, y: number, from: { x: number, y: number } } | null} */
+let readSteerDrag = null;
+
+function storedReadSteerOffset() {
+  try {
+    const held = JSON.parse(localStorage.getItem(READ_STEER_OFFSET_KEY) || "null");
+    return held && Number.isFinite(held.x) && Number.isFinite(held.y) ? { x: held.x, y: held.y } : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function rememberReadSteerOffset() {
+  try {
+    if (readSteerOffset === null) localStorage.removeItem(READ_STEER_OFFSET_KEY);
+    else localStorage.setItem(READ_STEER_OFFSET_KEY, JSON.stringify(readSteerOffset));
+  } catch (_error) {
+    // The strip still stays where it was put on this page when storage is unavailable.
+  }
+}
+
+/** The strip can be moved where the stylesheet draws its grip: shown, on a desk. */
+function readSteerMovable() {
+  const grip = el("read-steer-grip");
+  return !el("read-steer").hidden && typeof grip.getClientRects === "function" && grip.getClientRects().length > 0;
+}
+
+/**
+ * Apply the reader's offset, held so the whole strip stays inside the window, and return what was
+ * applied. The docked place is measured, not assumed: the box as drawn less the offset in force.
+ */
+function placeReadSteer() {
+  const strip = el("read-steer");
+  if (readSteerOffset === null || !readSteerMovable()) {
+    strip.style.removeProperty("--read-steer-dx");
+    strip.style.removeProperty("--read-steer-dy");
+    strip.removeAttribute("data-moved");
+    return { x: 0, y: 0 };
+  }
+  const box = strip.getBoundingClientRect();
+  const left = box.left - (parseFloat(strip.style.getPropertyValue("--read-steer-dx")) || 0);
+  const top = box.top - (parseFloat(strip.style.getPropertyValue("--read-steer-dy")) || 0);
+  const root = document.documentElement;
+  const hold = (value, low, high) => Math.round(Math.min(Math.max(value, low), Math.max(low, high)));
+  const x = hold(readSteerOffset.x, -left, root.clientWidth - box.width - left);
+  const y = hold(readSteerOffset.y, -top, root.clientHeight - box.height - top);
+  strip.style.setProperty("--read-steer-dx", `${x}px`);
+  strip.style.setProperty("--read-steer-dy", `${y}px`);
+  strip.setAttribute("data-moved", "true");
+  return { x, y };
+}
+
+/** Move the strip to an offset from its docked place (`null`: dock it) and remember it. */
+function moveReadSteer(offset) {
+  // A strip gone (the read ended under the drag) or not movable here keeps the place remembered.
+  if (!readSteerMovable()) return;
+  readSteerOffset = offset;
+  if (offset !== null) readSteerOffset = placeReadSteer();
+  else placeReadSteer();
+  rememberReadSteerOffset();
+}
+
+function onReadGripDown(event) {
+  if (!event || (event.button !== undefined && event.button !== 0) || !readSteerMovable()) return;
+  readSteerDrag = { x: event.clientX, y: event.clientY, from: readSteerOffset || { x: 0, y: 0 } };
+  const grip = el("read-steer-grip");
+  if (event.pointerId !== undefined && grip.setPointerCapture) grip.setPointerCapture(event.pointerId);
+  if (event.preventDefault) event.preventDefault(); // no text selection while it is dragged
+}
+
+function onReadGripMove(event) {
+  if (!readSteerDrag || !event) return;
+  // A release this grip never heard of (outside the window, say) ends the drag here instead.
+  if (event.buttons === 0) {
+    onReadGripUp();
+    return;
+  }
+  readSteerOffset = {
+    x: readSteerDrag.from.x + event.clientX - readSteerDrag.x,
+    y: readSteerDrag.from.y + event.clientY - readSteerDrag.y,
+  };
+  placeReadSteer();
+}
+
+function onReadGripUp() {
+  if (!readSteerDrag) return;
+  readSteerDrag = null;
+  if (!readSteerMovable()) {
+    readSteerOffset = storedReadSteerOffset();
+    return;
+  }
+  // Stored where the drag ended, as the reading-width grip stores its width: once, not per frame.
+  moveReadSteer(readSteerOffset);
+}
+
+// The grip is a control a keyboard can use too: the arrows move it, Shift by more, Home docks it.
+function onReadGripKey(event) {
+  // Ctrl, Alt and Meta chords are the page's and the browser's (Ctrl+Home, Alt+Left), not the grip's.
+  if (!event || event.ctrlKey || event.altKey || event.metaKey || !readSteerMovable()) return;
+  const step = event.shiftKey ? 48 : 12;
+  const at = readSteerOffset || { x: 0, y: 0 };
+  const moves = {
+    ArrowLeft: () => ({ x: at.x - step, y: at.y }),
+    ArrowRight: () => ({ x: at.x + step, y: at.y }),
+    ArrowUp: () => ({ x: at.x, y: at.y - step }),
+    ArrowDown: () => ({ x: at.x, y: at.y + step }),
+    Home: () => null,
+  };
+  const next = moves[event.key];
+  if (!next) return;
+  if (event.preventDefault) event.preventDefault(); // the arrows would otherwise scroll the list
+  moveReadSteer(next());
 }
 
 /**
@@ -32888,6 +33017,7 @@ function jumpReading(index) {
   // wheel is not a Play the reader never pressed.
   const hold = readingPaused();
   readJumping = true;
+  readJumpPending = true;
   try {
     guardQuietly(() => readAloud(playing.parts, { part: segment.part, block: segment.block, hold }))();
   } finally {
@@ -32898,6 +33028,12 @@ function jumpReading(index) {
 
 /** True while `jumpReading` stops the read it is about to start again elsewhere. */
 let readJumping = false;
+/**
+ * `#442 read-strip-order`. True from a jump until the block jumped to plays or fails: the bar keeps
+ * Pause and Stop where they were through the wait, rather than giving the thumb's place to a Stop
+ * that leaves reading mode for the moment the next block is still being fetched.
+ */
+let readJumpPending = false;
 
 /** Previous (-1) or Next (+1). Previous on the first block starts it again. */
 function stepReading(delta) {
@@ -32931,12 +33067,22 @@ function renderReadTransport() {
   if (strip) strip.setAttribute("data-paused", paused ? "true" : "false");
   const button = el("read-aloud");
   if (button) button.setAttribute("data-paused", paused ? "true" : "false");
+  if (nowPlaying !== null || (pendingRead === null && !readJumping)) readJumpPending = false;
   const label = el("read-aloud-label");
   if (label) {
     label.textContent = !readingMode ? "Read"
-      : nowPlaying !== null ? (paused ? "Resume" : "Pause")
+      : readInProgress() ? (paused ? "Resume" : "Pause")
       : "Stop";
   }
+  // `#442 read-strip-order`. While Read is the read's Pause or Resume, the way out stands beside
+  // it; with nothing playing, Read is that way out itself and the second button would repeat it.
+  const stop = el("read-aloud-stop");
+  if (stop && button) stop.hidden = button.hidden || !readingMode || !readInProgress();
+}
+
+/** A read is playing or held, or moving to another of its blocks (`readJumpPending`). */
+function readInProgress() {
+  return nowPlaying !== null || readJumpPending;
 }
 
 /** Hold the read (`true`) or carry on from where it was held (`false`). The one path. */
@@ -49797,16 +49943,49 @@ el("read-next").addEventListener("click", () => { stepReading(1); });
 // `#434 read-aloud-pause`. The strip's own hold on the read, by the one state path.
 el("read-pause").addEventListener("click", () => { toggleReadingPaused(); });
 
+// `#442 read-strip-order`. The strip moved on a desk, by its grip: pointer, keys, double-click home.
+el("read-steer-grip").addEventListener("pointerdown", onReadGripDown);
+el("read-steer-grip").addEventListener("pointermove", onReadGripMove);
+el("read-steer-grip").addEventListener("pointerup", onReadGripUp);
+el("read-steer-grip").addEventListener("pointercancel", onReadGripUp);
+el("read-steer-grip").addEventListener("lostpointercapture", onReadGripUp);
+el("read-steer-grip").addEventListener("keydown", onReadGripKey);
+el("read-steer-grip").addEventListener("dblclick", () => { moveReadSteer(null); });
+if (typeof window.addEventListener === "function") window.addEventListener("resize", placeReadSteer);
+
 el("read-aloud").addEventListener("click", () => {
   // `#434 read-aloud-pause`: while a read is playing or held, this button is its Pause/Resume —
-  // the strip's button and the media keys by another reach. Stopping the read itself stays where
-  // it always was (a tap on the row being read, the media stop), and leaving the mode is what
-  // this button does with nothing playing.
-  if (readingMode && nowPlaying !== null) {
+  // the strip's button and the media keys by another reach. Leaving the mode is what this button
+  // does with nothing playing, and what Stop beside it and on the strip do while a read plays
+  // (`#442 read-strip-order`).
+  if (readingMode && readInProgress()) {
     toggleReadingPaused();
     return;
   }
-  readingMode = !readingMode;
+  setReadingMode(!readingMode);
+});
+
+/**
+ * `#442 read-strip-order`. Stop: the read ends AND reading mode is left, in one tap, by the path
+ * the Read button has always left it by. After #434 made Read the Pause of a read in progress, the
+ * only ways out were a tap on the row being read or the media keys' stop, which a reader holding a
+ * phone in a car does not find. The button pressed goes as the mode does, so focus goes to Read.
+ */
+function leaveReadingMode() {
+  const from = document.activeElement;
+  if (readingMode) setReadingMode(false);
+  else stopReading();
+  if (from && (from === el("read-stop") || from === el("read-aloud-stop"))) {
+    const read = el("read-aloud");
+    if (!read.hidden && typeof read.focus === "function") read.focus();
+  }
+}
+el("read-stop").addEventListener("click", leaveReadingMode);
+el("read-aloud-stop").addEventListener("click", leaveReadingMode);
+
+/** Turn reading mode on or off. The one path in and out of it, whichever control asked. */
+function setReadingMode(on) {
+  readingMode = on;
   // Turning it OFF stops what is playing. Leaving audio running under a reader who has just said
   // "not this any more" is the kind of thing that gets a tab muted and never opened again.
   if (!readingMode) {
@@ -49839,7 +50018,7 @@ el("read-aloud").addEventListener("click", () => {
   );
   renderControls();
   renderChannelRows();
-});
+}
 el("hang-up").addEventListener("click", stop);
 el("clear-view").addEventListener("click", onClear);
 // `guardQuietly`, not `guard`: erasing a stored record must never be able to hang up a live call.

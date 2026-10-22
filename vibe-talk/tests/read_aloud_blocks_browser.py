@@ -12,6 +12,12 @@ no gap (measured, at 412x915, 393x852 and on a desk), and its Pause, the Read bu
 media keys are one state — pausing by any of them holds the position, resuming by any other
 carries on from the held block.
 
+`#442 read-strip-order`: the strip reads Previous, k of n, Next, Pause, Stop, in one line, in the
+same order on screen as in the markup and for Tab, at 393x852, 375x812 and on a desk (where the
+grip that moves it comes first). While a read plays the bar's Read is its Pause with Stop on its left,
+also in the keyboard-up slim row (`#429`). Stop, on the strip or the bar, ends the read and leaves
+reading mode. On a desk the strip is dragged by its grip and a double-click on the grip docks it.
+
 It serves the checked-out assets and a small fake API from one loopback origin. The fake voice
 behaves like the deployed one in the two ways the boundaries depend on: ONE session, so a block's
 audio cannot begin until the block before it has been generated, and audio at SPEAKING PACE, so
@@ -47,7 +53,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, TypedDict, TypeVar
 from urllib.parse import parse_qs, unquote, urlsplit
 
 if TYPE_CHECKING:
@@ -133,6 +139,52 @@ MEDIA_PROBE = """(() => {
     set(value) { states.push(value); descriptor.set.call(session, value); },
   });
 })();"""
+
+# `#442 read-strip-order`. The strip's drawn controls (not its timeline line), in markup order and
+# in the order they stand left to right, and how far their middles stray from one line.
+STRIP_LAYOUT = """() => {
+  const strip = document.getElementById('read-steer');
+  const drawn = [...strip.children].filter((e) => e.id !== 'read-timeline' && e.getClientRects().length > 0);
+  const boxes = drawn.map((e) => [e.id, e.getBoundingClientRect()]);
+  const mids = boxes.map(([, b]) => (b.top + b.bottom) / 2);
+  return {
+    dom: drawn.map((e) => e.id),
+    seen: [...boxes].sort((a, b) => a[1].left - b[1].left).map(([id]) => id),
+    spread: Math.max(...mids) - Math.min(...mids),
+  };
+}"""
+
+STRIP_ORDER = ["read-prev", "read-steer-count", "read-next", "read-pause", "read-stop"]
+
+# The bar's Read (Pause while a read plays) and the Stop on its left: drawn, side by side, in one row,
+# Read keeping the edge under the thumb.
+BAR_LAYOUT = """() => {
+  const read = document.getElementById('read-aloud').getBoundingClientRect();
+  const stop = document.getElementById('read-aloud-stop');
+  const box = stop.getBoundingClientRect();
+  return {
+    label: document.getElementById('read-aloud-label').textContent,
+    drawn: stop.getClientRects().length > 0,
+    height: box.height,
+    beside: box.right <= read.left + 1,
+    row: Math.abs((box.top + box.bottom) / 2 - (read.top + read.bottom) / 2),
+    readWidth: read.width,
+    stopWidth: box.width,
+  };
+}"""
+
+
+class BarLayout(TypedDict):
+    """What `BAR_LAYOUT` measures."""
+
+    label: str
+    drawn: bool
+    height: float
+    beside: bool
+    row: float
+    readWidth: float  # noqa: N815 - the page's own camelCase keys
+    stopWidth: float  # noqa: N815
+
 
 # The gaps on the audio clock, in milliseconds, between consecutive sources still meant to play.
 GAPS = """() => {
@@ -516,6 +568,31 @@ def main() -> int:
                     " const t = document.getElementById('scroll-tools').getBoundingClientRect();"
                     " return t.top - s.bottom; }"))
 
+            def check_strip_order(page: Page, where: str, desk: bool = False) -> None:
+                # `#442 read-strip-order`: Previous, k of n, Next, Pause, Stop, in one line, the
+                # markup's order on screen. The grip that moves it is drawn on a desk only.
+                layout = page.evaluate(STRIP_LAYOUT)
+                want = (["read-steer-grip"] if desk else []) + STRIP_ORDER
+                check(layout["dom"] == want, f"the strip's markup at {where} is {layout['dom']}")
+                check(layout["seen"] == want, f"the strip at {where} reads {layout['seen']} left to right")
+                check(layout["spread"] <= 2, f"the strip wraps at {where}: its controls stray {layout['spread']:.1f}px")
+
+            def check_bar_stop(page: Page, where: str, tallest: float = 44) -> BarLayout:
+                # A phone's target is 44px at least; a desk's row is 2.25rem (36px) throughout.
+                bar: BarLayout = page.evaluate(BAR_LAYOUT)
+                check(bar["label"] in ("Pause", "Resume"), f"the bar's Read says {bar['label']!r} at {where}")
+                check(bar["drawn"] and bar["stopWidth"] >= 44 and bar["height"] >= tallest,
+                      f"no Stop target beside Read at {where}: {bar}")
+                check(bar["beside"] and bar["row"] <= 2, f"the bar's Stop is not beside its Pause at {where}: {bar}")
+                return bar
+
+            def check_mode_left(page: Page, where: str) -> None:
+                wait_for(lambda: page.text_content("#read-aloud-label") == "Read", 3,
+                         f"Stop at {where} left the Read button saying {page.text_content('#read-aloud-label')!r}")
+                check(page.get_attribute("#read-aloud", "data-active") == "false", f"Stop at {where} left reading mode on")
+                check(position(page) == "", f"Stop at {where} left the strip up")
+                check(page.is_hidden("#read-aloud-stop"), f"Stop at {where} left the bar's Stop up")
+
             def wait_position(page: Page, wanted: str, seconds: float = 10) -> None:
                 wait_for(lambda: position(page) == wanted, seconds,
                          f"the read never reached {wanted}; it shows {position(page)!r}")
@@ -714,9 +791,50 @@ def main() -> int:
                       f"with the voice running ahead a block boundary still ran {ahead_worst} ms: {ahead_gaps}")
                 press(page, "#read-next", False)
                 wait_position(page, "5 of 7")
+                check_strip_order(page, "a desk", desk=True)
+                bar_desk = check_bar_stop(page, "a desk", 36)
+                # The narrowest desk, where the dock is tightest: still Pause with Stop beside it.
+                page.set_viewport_size({"width": 900, "height": 800})
+                time.sleep(0.3)
+                check_strip_order(page, "a 900px desk", desk=True)
+                check_bar_stop(page, "a 900px desk", 36)
+                if args.screenshots:
+                    page.screenshot(path=str(args.screenshots / "8-desk-900.png"))
+                page.set_viewport_size({"width": 1280, "height": 800})
+                time.sleep(0.3)
+                # Tab meets them as they are seen (the count is not a stop).
+                page.focus("#read-prev")
+                for wanted in ("read-next", "read-pause", "read-stop"):
+                    page.keyboard.press("Tab")
+                    focused = page.evaluate("() => document.activeElement.id")
+                    check(focused == wanted, f"Tab from the strip reached {focused!r}, not {wanted!r}")
                 if args.screenshots:
                     page.screenshot(path=str(args.screenshots / "8-desk.png"))
-                press(page, f"{row} .body", False)
+                # Dragged by its grip, it goes where it is put and is remembered; a double-click
+                # on the grip docks it on the chips row again.
+                strip_before = page.locator("#read-steer").bounding_box()
+                grip_box = page.locator("#read-steer-grip").bounding_box()
+                check(strip_before is not None and grip_box is not None, "the strip or its grip is not drawn on a desk")
+                assert strip_before is not None and grip_box is not None
+                page.mouse.move(grip_box["x"] + grip_box["width"] / 2, grip_box["y"] + grip_box["height"] / 2)
+                page.mouse.down()
+                page.mouse.move(grip_box["x"] + grip_box["width"] / 2 - 300, grip_box["y"] + grip_box["height"] / 2 - 250, steps=6)
+                page.mouse.up()
+                strip_after = page.locator("#read-steer").bounding_box()
+                assert strip_after is not None
+                moved = (strip_after["x"] - strip_before["x"], strip_after["y"] - strip_before["y"])
+                check(abs(moved[0] + 300) <= 2 and abs(moved[1] + 250) <= 2, f"the dragged strip moved {moved}")
+                stored = page.evaluate("() => localStorage.getItem('vibe-talk.voice.read-steer-offset')")
+                check(bool(stored), "the dragged strip's place is not remembered")
+                if args.screenshots:
+                    page.screenshot(path=str(args.screenshots / "8-desk-moved.png"))
+                page.mouse.move(grip_box["x"] - 300 + grip_box["width"] / 2, grip_box["y"] - 250 + grip_box["height"] / 2)
+                page.dblclick("#read-steer-grip")
+                gap_docked = strip_gap(page)
+                check(abs(gap_docked) <= 2, f"a double-click left the strip {gap_docked:.1f}px off the chips row")
+                # Stop, on the strip: the read ends and reading mode is left, in one click.
+                press(page, "#read-stop", False)
+                check_mode_left(page, "the desk's strip")
                 context.close()
 
             # 9. At 393x852: the strip still hugs the chips row (`#433`), and its own Pause holds
@@ -727,6 +845,10 @@ def main() -> int:
                 wait_position(page, "1 of 7")
                 gap393 = strip_gap(page)
                 check(abs(gap393) <= 2, f"the strip floats {gap393:.1f}px off the chips row at 393x852 (`#433`)")
+                check_strip_order(page, "393x852")
+                bar393 = check_bar_stop(page, "393x852")
+                if args.screenshots:
+                    page.screenshot(path=str(args.screenshots / "9-phone-393.png"))
                 press(page, "#read-next", True)
                 wait_position(page, "2 of 7")
                 press(page, "#read-pause", True)
@@ -758,15 +880,51 @@ def main() -> int:
                     " const s = document.getElementById('read-steer').getBoundingClientRect();"
                     " return last.bottom - s.top; }"))
                 check(cover <= 2, f"at the foot the strip covers {cover:.1f}px of the last message")
-                press(page, f"{row} .body", True)
+                # The bar's Stop: the read ends and reading mode is left, in one tap (`#442`).
+                press(page, "#read-aloud-stop", True)
+                check_mode_left(page, "393x852's bar")
                 context.close()
 
-        print(f"{browser_version}: 7 blocks walked at 412x915, 393x852 and on a desk. Block boundaries, voice"
+            # 10. At 375x812, the narrow phone: the strip's five targets still stand in one line on
+            # the chips row, the bar has Pause and Stop side by side, the keyboard-up slim row keeps
+            # both (`#429`), and the strip's Stop leaves reading mode (`#442`).
+            with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
+                context, page = open_page(profile, 375, 812, True)
+                press(page, f"{row} .body", True)
+                wait_position(page, "1 of 7")
+                gap375 = strip_gap(page)
+                check(abs(gap375) <= 2, f"the strip floats {gap375:.1f}px off the chips row at 375x812")
+                check_strip_order(page, "375x812")
+                # A long message's count is two digits a side; the line still holds it.
+                wide = float(page.evaluate(
+                    "() => { const c = document.getElementById('read-steer-count'); const was = c.textContent;"
+                    " c.textContent = '12 of 12'; const f = (" + STRIP_LAYOUT + ")(); c.textContent = was;"
+                    " return f.spread; }"))
+                check(wide <= 2, f"a two-digit count wraps the strip at 375x812: its controls stray {wide:.1f}px")
+                bar375 = check_bar_stop(page, "375x812")
+                if args.screenshots:
+                    page.screenshot(path=str(args.screenshots / "10-phone-375.png"))
+                page.evaluate("() => { document.documentElement.dataset.keyboard = 'open'; }")
+                slim = check_bar_stop(page, "375x812 with the keyboard up")
+                check(page.is_hidden("#read-speed"), "the slim row kept Pace beside Pause and Stop")
+                if args.screenshots:
+                    page.screenshot(path=str(args.screenshots / "10-phone-375-keyboard-row.png"))
+                page.evaluate("() => { delete document.documentElement.dataset.keyboard; }")
+                press(page, "#read-stop", True)
+                check_mode_left(page, "375x812's strip")
+                context.close()
+
+        print(f"{browser_version}: 7 blocks walked at 412x915, 393x852, 375x812 and on a desk. Block boundaries, voice"
               f" first audio {round(FIRST_AUDIO_SECONDS * 1000)} ms: at speaking pace {pace_boundaries} ms"
               f" (worst {worst}); generating {AHEAD_PACE:g}x faster than it speaks, worst {ahead_worst} ms;"
               f" control with first audio {round(CONTROL_FIRST_AUDIO_SECONDS * 1000)} ms, worst {control_worst} ms."
               f" The strip's gap over the chips row: {gap412:.1f}px at 412x915, {gap393:.1f}px at 393x852,"
-              f" {gap_desk:.1f}px on a desk. The first block's three sentences were lit in turn; highlight,"
+              f" {gap_desk:.1f}px on a desk, {gap375:.1f}px at 375x812. Strip order Previous, k of n, Next, Pause,"
+              f" Stop in one line at 393, 375 and on a desk; the bar's Pause and Stop {bar375['readWidth']:.0f}px and"
+              f" {bar375['stopWidth']:.0f}px wide at 375 ({slim['readWidth']:.0f}/{slim['stopWidth']:.0f}px in the"
+              f" keyboard-up row), {bar393['readWidth']:.0f}/{bar393['stopWidth']:.0f}px at 393,"
+              f" {bar_desk['readWidth']:.0f}/{bar_desk['stopWidth']:.0f}px on a desk; dragged 300,250px and docked"
+              " again on a desk. The first block's three sentences were lit in turn; highlight,"
               " k of n, tap-to-jump, the timeline, Previous/Next, the media keys and Pause/Play by the"
               " strip, the Read button and the media keys all move or hold the one read.")
         return 0

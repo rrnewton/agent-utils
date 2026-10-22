@@ -11176,7 +11176,7 @@ const BLOCKED_ID = "1000000000000000001";
 
 /** A page in Read with one message of three blocks prepared as such, streamed into Web Audio. */
 async function blockedRead(options = {}) {
-  const page = newPage();
+  const page = newPage(options.store);
   page.enableStreamedAudio();
   page.enableAbort();
   if (options.mediaSession) page.enableMediaSession();
@@ -11614,6 +11614,202 @@ test("`#433 read-strip-low`: the strip hugs the chips' measured height and the p
   assert.match(SCRIPT_CODE, /"--scroll-tools-height"/, "nothing writes the chips' measured height");
   assert.match(SCRIPT_CODE, /"--read-steer-clearance"[\s\S]*?\.observe\(el\("read-steer"\)\)/,
     "nothing measures the strip for the room kept over it");
+});
+
+test("`#442 read-strip-order`: the strip reads Previous, k of n, Next, Pause, Stop, in the markup as on screen", () => {
+  // The owner: "(Previous) (Play) 1 of 4 (Next)" is awkward; Play/Pause goes right of Next, and
+  // Stop after it. In the markup, not by `order`, so Tab and a screen reader meet the controls as
+  // they are seen. The desk's grip comes first, at the strip's left.
+  const strip = HTML_CODE.slice(HTML_CODE.indexOf('id="read-steer"'), HTML_CODE.indexOf('id="read-timeline"'));
+  const ids = [...strip.matchAll(/\bid="(read-[\w-]+)"/g)].map((match) => match[1]);
+  assert.deepEqual(ids, ["read-steer", "read-steer-grip", "read-prev", "read-steer-count", "read-next", "read-pause", "read-stop"],
+    "the strip's controls are not the grip, Previous, the count, Next, Pause, then Stop");
+  assert.match(/<button id="read-stop"[^>]*>/.exec(HTML_CODE)[0], /aria-label="Stop reading"/, "the strip's Stop has no name");
+  for (const selector of ["#read-steer", ".read-steer-button", "#read-steer-grip", "#read-prev", "#read-steer-count", "#read-next", "#read-pause", "#read-stop"]) {
+    for (const rule of cssRules(CSS_CODE, selector)) {
+      assert.doesNotMatch(rule, /(^|[\s;])order:|row-reverse|direction:\s*rtl/,
+        `${selector} moves the strip's controls on screen away from their order in the markup`);
+    }
+  }
+});
+
+/** Reading mode is off: the Read button says Read and is not the way-out colour, nothing plays. */
+function assertReadingModeLeft(page, why) {
+  assert.equal(page.el("read-aloud-label").text(), "Read", `${why}: the Read button does not say Read`);
+  assert.equal(page.el("read-aloud").getAttribute("data-active"), "false", `${why}: reading mode is still on`);
+  assert.equal(page.el("read-steer").hidden, true, `${why}: the strip outlived the read`);
+  assert.equal(page.el("read-aloud-stop").hidden, true, `${why}: the bar's Stop outlived the read`);
+}
+
+test("`#442 read-strip-order`: the strip's Stop ends the read and leaves reading mode in one tap", async () => {
+  // The owner: once Read became Pause (`#434`) there was "no way then to STOP or exit read mode".
+  const { page, rows } = await blockedRead({ mediaSession: true });
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.equal(page.el("read-steer").hidden, false, "the premise: the strip is up");
+  page.el("read-stop").focus();
+  await page.el("read-stop").click();
+  await page.settle();
+  assertReadingModeLeft(page, "the strip's Stop");
+  assert.equal(page.document.activeElement, page.el("read-aloud"), "the focus went with the Stop that vanished");
+  assert.equal(page.mediaSession.playbackState, "none", "the media session still holds a stopped read");
+
+  // Held, too: Stop is not a Play, and a paused read stops the same way.
+  await page.el("read-aloud").click();
+  await page.settle();
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  await page.el("read-pause").click();
+  await page.settle();
+  assert.equal(page.el("read-aloud-label").text(), "Resume", "the premise: the read is held");
+  await page.el("read-stop").click();
+  await page.settle();
+  assertReadingModeLeft(page, "the strip's Stop on a held read");
+});
+
+test("`#442 read-strip-order`: Read is Pause with Stop beside it while a read plays, and only then", async () => {
+  const { page, rows } = await blockedRead();
+  assert.equal(page.el("read-aloud-stop").hidden, true, "Stop stands in the bar with reading mode on and nothing playing");
+  assert.equal(page.el("read-aloud-label").text(), "Stop", "the premise: with nothing playing Read is the way out");
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.equal(page.el("read-aloud-label").text(), "Pause");
+  assert.equal(page.el("read-aloud-stop").hidden, false, "a read plays and the bar has no Stop beside its Pause");
+  await page.el("read-aloud").click();
+  await page.settle();
+  assert.equal(page.el("read-aloud-label").text(), "Resume");
+  assert.equal(page.el("read-aloud-stop").hidden, false, "a held read lost the bar's Stop");
+  await page.el("read-aloud-stop").click();
+  await page.settle();
+  assertReadingModeLeft(page, "the bar's Stop");
+
+  // A message of one block has no strip; the bar's Stop is its one-tap way out.
+  await page.el("read-aloud").click();
+  await page.settle();
+  await rows[1].dispatch("click", {});
+  await page.settle();
+  assert.equal(page.el("read-steer").hidden, true, "the premise: a one-block read has no strip");
+  assert.equal(page.el("read-aloud-stop").hidden, false, "a one-block read has no Stop in the bar");
+  await page.el("read-aloud-stop").click();
+  await page.settle();
+  assertReadingModeLeft(page, "the bar's Stop on a one-block read");
+});
+
+test("`#442 read-strip-order`: a jump that waits for its block keeps Pause and Stop where they were", async () => {
+  // A ticket near its end makes a jump prepare again before the next block plays, and for that
+  // wait nothing is playing. The bar must not fold Stop away and turn Read into a Stop under the
+  // thumb meanwhile: a tap meant to pause would leave reading mode.
+  const page = newPage();
+  page.enableStreamedAudio();
+  page.speechBlocks[BLOCKED_ID] = BLOCKED_KINDS;
+  page.speechTicketTtlSeconds = 200;
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: BLOCKED_ID,
+    content: "The run finished.\n\n- the budget landed\n- the rewrite is a draft", content_html: BLOCKED_HTML })]);
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "1 of 3");
+  await page.el("read-next").click();
+  assert.equal(page.el("read-steer").hidden, true, "the premise: the jump is waiting, with nothing playing");
+  assert.equal(page.el("read-aloud-stop").hidden, false, "the bar's Stop folded away during the jump");
+  assert.equal(page.el("read-aloud-label").text(), "Pause", "Read turned into a Stop under the thumb during the jump");
+  await page.el("read-aloud").click();
+  assert.equal(page.el("read-aloud").getAttribute("data-active"), "true", "a tap on Pause during the jump left reading mode");
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "2 of 3", "the jump did not land");
+  assert.equal(page.el("read-aloud-stop").hidden, false);
+});
+
+test("`#442 read-strip-order`: the phone tile gives Stop a fourth column on Pause's left, only while it shows", () => {
+  // On Read's LEFT: Read, the Pause reached for without looking, keeps the edge under the thumb,
+  // so a blind tap to pause never lands on a Stop that has just appeared where Read was.
+  assert.match(cssBlock("#control-pane:has(#read-aloud-stop:not([hidden]))"),
+    /grid-template-columns:\s*3\.5rem 1fr 1fr 1fr;/, "the tile has no column for Stop");
+  const stop = cssBlock("#control-pane #read-aloud-stop");
+  assert.match(stop, /grid-column:\s*3;/, "Stop is not beside Pause, on its left");
+  assert.match(stop, /grid-row:\s*1 \/ span 2;/);
+  assert.match(cssBlock("#control-pane:has(#read-aloud-stop:not([hidden])) #read-aloud"), /grid-column:\s*4;/,
+    "Read gave up the edge under the thumb to Stop");
+  const pane = HTML_CODE.slice(HTML_CODE.indexOf('id="control-pane"'));
+  assert.ok(pane.indexOf('id="read-speed"') < pane.indexOf('id="read-aloud-stop"') &&
+    pane.indexOf('id="read-aloud-stop"') < pane.indexOf('id="read-aloud"'), "Stop is not between Pace and Read in the markup, so Tab reaches it out of order");
+  assert.match(/<button id="read-aloud-stop"[^>]*>/.exec(HTML_CODE)[0], /(?:^|\s)hidden(?=[\s>])/, "the bar's Stop ships on screen");
+});
+
+/** A strip whose drawn box follows the offset the page writes, as the desk's stylesheet applies it. */
+function deskStrip(page, { left = 450, top = 620, width = 380, height = 60, desk = true } = {}) {
+  const strip = page.el("read-steer");
+  page.el("read-steer-grip").getClientRects = () => (desk ? [{}] : []);
+  strip.getBoundingClientRect = () => {
+    const dx = desk ? parseFloat(strip.style.getPropertyValue("--read-steer-dx")) || 0 : 0;
+    const dy = desk ? parseFloat(strip.style.getPropertyValue("--read-steer-dy")) || 0 : 0;
+    return { left: left + dx, top: top + dy, right: left + dx + width, bottom: top + dy + height, width, height };
+  };
+  page.documentElement.clientWidth = 1280;
+  page.documentElement.clientHeight = 800;
+}
+
+const stripOffset = (page) => [
+  page.el("read-steer").style.getPropertyValue("--read-steer-dx"),
+  page.el("read-steer").style.getPropertyValue("--read-steer-dy"),
+];
+
+test("`#442 read-strip-order`: on a desk the strip is dragged by its grip, held in the window, and remembered", async () => {
+  const store = new Map();
+  const { page, rows } = await blockedRead({ store });
+  deskStrip(page);
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.deepEqual(stripOffset(page), ["", ""], "a strip never moved is not docked");
+  const grip = page.el("read-steer-grip");
+  await grip.dispatch("pointerdown", { button: 0, pointerId: 1, clientX: 460, clientY: 640 });
+  await grip.dispatch("pointermove", { pointerId: 1, clientX: 400, clientY: 340 });
+  assert.deepEqual(stripOffset(page), ["-60px", "-300px"], "the strip does not follow the pointer");
+  await grip.dispatch("pointerup", { pointerId: 1 });
+  assert.equal(page.el("read-steer").getAttribute("data-moved"), "true");
+  assert.match(store.get("vibe-talk.voice.read-steer-offset") || "", /"x":-60/, "the place is not remembered");
+
+  // Held inside the window: dragged far off its top-left corner, it stops at the corner.
+  await grip.dispatch("pointerdown", { button: 0, pointerId: 1, clientX: 400, clientY: 340 });
+  await grip.dispatch("pointermove", { pointerId: 1, clientX: -2000, clientY: -2000 });
+  await grip.dispatch("pointerup", { pointerId: 1 });
+  assert.deepEqual(stripOffset(page), ["-450px", "-620px"], "the strip left the window");
+  // The keyboard: an arrow moves it, Home docks it, as a double-click does.
+  await grip.dispatch("keydown", { key: "ArrowRight" });
+  assert.deepEqual(stripOffset(page), ["-438px", "-620px"], "ArrowRight did not move the strip");
+  await grip.dispatch("keydown", { key: "Home" });
+  assert.deepEqual(stripOffset(page), ["", ""], "Home did not dock the strip");
+  assert.equal(store.has("vibe-talk.voice.read-steer-offset"), false, "a docked strip still has a place remembered");
+  await grip.dispatch("keydown", { key: "ArrowUp", shiftKey: true });
+  assert.deepEqual(stripOffset(page), ["0px", "-48px"], "Shift+ArrowUp did not move the strip by the larger step");
+
+  // A reload puts it back where it was left, the next time a read shows it. (Only the strip's key
+  // carried over: the rest of this storage remembers the channel view, which `blockedRead` opens.)
+  const key = "vibe-talk.voice.read-steer-offset";
+  const again = await blockedRead({ store: new Map([[key, store.get(key)]]) });
+  deskStrip(again.page);
+  await again.rows[0].dispatch("click", {});
+  await again.page.settle();
+  assert.deepEqual(stripOffset(again.page), ["0px", "-48px"], "the strip forgot where it was put");
+  await again.page.el("read-steer-grip").dispatch("dblclick");
+  assert.deepEqual(stripOffset(again.page), ["", ""], "a double-click on the grip did not dock the strip");
+});
+
+test("`#442 read-strip-order`: a phone keeps the strip docked whatever a desk remembered", async () => {
+  const store = new Map([["vibe-talk.voice.read-steer-offset", JSON.stringify({ x: -100, y: -200 })]]);
+  const { page, rows } = await blockedRead({ store });
+  deskStrip(page, { desk: false });
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.deepEqual(stripOffset(page), ["", ""], "a phone's strip moved off the chips row");
+  await page.el("read-steer-grip").dispatch("pointerdown", { button: 0, pointerId: 1, clientX: 10, clientY: 10 });
+  await page.el("read-steer-grip").dispatch("pointermove", { pointerId: 1, clientX: 90, clientY: 90 });
+  assert.deepEqual(stripOffset(page), ["", ""], "a strip with no grip drawn was dragged");
+  // The stylesheet applies the offset, and draws the grip, only in the desk's regime.
+  assert.match(cssBlockIn(DESKTOP_QUERY, "#read-steer"), /translate:\s*var\(--read-steer-dx, 0px\) var\(--read-steer-dy, 0px\)/);
+  assert.doesNotMatch(cssBlockOutside(DESKTOP_QUERY, "#read-steer"), /translate/, "the offset applies on a phone");
+  assert.match(cssBlockOutside(DESKTOP_QUERY, "#read-steer-grip"), /display:\s*none/, "the grip is drawn on a phone");
+  assert.match(cssBlockIn(DESKTOP_QUERY, "#read-steer-grip"), /display:\s*inline-flex/);
 });
 
 test("a read in blocks on a ticket with under five minutes left prepares the row again first", async () => {
@@ -12255,10 +12451,14 @@ test("`#429 keyboard-hides-bar`: both rows go while the keyboard is up, only on 
     "the dock stays up over the keyboard with nothing playing");
   // The header the bar was moved to goes with it, but never Settings' way back.
   assert.match(body, /#topbar:has\(#control-bar-top > #control-bar\):not\(:has\(#close-settings:not\(\[hidden\]\), #close-help:not\(\[hidden\]\)\)\)/);
-  // A reading or a call keeps one slim row: its Stop or Hang up, and nothing else of the tile.
+  // A reading or a call keeps one slim row: its Stop or Hang up, and nothing else of the tile. A
+  // read playing makes Read its Pause, and Stop (`#442 read-strip-order`, hidden otherwise) stays.
   assert.match(body,
-    /:root\[data-keyboard="open"\]:has\(#pane-discord:not\(\[hidden\]\)\) #control-pane > :not\(#hang-up, #read-aloud\[data-active="true"\]\) \{\s*display:\s*none;\s*\}/,
+    /:root\[data-keyboard="open"\]:has\(#pane-discord:not\(\[hidden\]\)\) #control-pane > :not\(#hang-up, #read-aloud\[data-active="true"\], #read-aloud-stop\) \{\s*display:\s*none;\s*\}/,
     "the rest of the tile stays up beside Stop");
+  assert.match(body,
+    /:root\[data-keyboard="open"\]:has\(#pane-discord:not\(\[hidden\]\)\) #control-pane:has\(#read-aloud-stop:not\(\[hidden\]\)\) \{\s*grid-template-columns:\s*1fr 1fr;\s*\}/,
+    "a read playing leaves the slim row without Stop beside its Pause");
   assert.match(cssRules(body, ':root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-pane').join("\n"), /grid-template-rows:\s*2\.75rem/);
   // Nothing the box needs is in either bar: Send and Grow are the composers', in the list.
   for (const id of ["channel-send", "send-text", "reply-send"]) {

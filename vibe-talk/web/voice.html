@@ -943,6 +943,13 @@
 
             `#434 read-aloud-pause`: and Pause, which is Play while the read is held. The same
             state the Read button and the media keys drive, never a second opinion about it.
+            `#442 read-strip-order`: Pause comes after Next, and Stop last, in the markup as on
+            screen, so Tab and a screen reader meet the controls in the order they are seen.
+            Between Previous and the count, Pause split the position from the way through it.
+            Stop ends the read AND leaves reading mode, as the Read button's own way out does: one
+            tap, wherever the reader is looking. On a desk the grip at its left moves the strip
+            (drag, or the arrow keys; double-click or Home puts it back); a phone keeps it docked,
+            and the stylesheet does not draw the grip there.
 
             `#433 read-strip-low`: it stands directly on the chips row above (#scroll-tools, the
             row with Collapse all and Expand all), as low as it can sit: under the thumb, with
@@ -952,10 +959,21 @@
             row, because the two bottoms it measured between were not the same edge.
           -->
           <div id="read-steer" role="group" aria-label="Reading position" hidden>
+            <button id="read-steer-grip" type="button" aria-label="Move the reading controls"
+              title="Drag to move. Arrow keys move it too; double-click, or Home, puts it back on the chips row.">
+              <svg viewBox="0 0 8 16" aria-hidden="true" fill="currentColor">
+                <circle cx="2" cy="3" r="1.2" /><circle cx="6" cy="3" r="1.2" />
+                <circle cx="2" cy="8" r="1.2" /><circle cx="6" cy="8" r="1.2" />
+                <circle cx="2" cy="13" r="1.2" /><circle cx="6" cy="13" r="1.2" />
+              </svg>
+            </button>
             <button id="read-prev" class="read-steer-button" type="button" aria-label="Previous block">Previous</button>
-            <button id="read-pause" class="read-steer-button" type="button" aria-label="Pause reading" aria-pressed="false">Pause</button>
             <span id="read-steer-count" aria-live="polite"></span>
             <button id="read-next" class="read-steer-button" type="button" aria-label="Next block">Next</button>
+            <button id="read-pause" class="read-steer-button" type="button" aria-label="Pause reading" aria-pressed="false">Pause</button>
+            <button id="read-stop" class="read-steer-button" type="button" aria-label="Stop reading" title="Stop reading and leave reading mode">
+              <svg viewBox="0 0 16 16" aria-hidden="true" fill="currentColor"><rect x="3" y="3" width="10" height="10" rx="1.5" /></svg>
+            </button>
             <!-- `#380 read-aloud-timeline`. The read as a line of its blocks, each as wide as it
                  is long: those heard, the one being read, those to come. A tap on one reads from
                  there. Filled by web/voice.js, one button a block. -->
@@ -3553,6 +3571,18 @@
             Unset, a message is read at whatever pace the voice agent is configured with.
           </p>
         </div>
+
+        <!-- `#442 read-strip-order`. While a read plays, Read is its Pause (`#434`), so the way
+             out stands beside it: Stop ends the read and leaves reading mode in one tap. Shown
+             only then; with nothing playing, Read itself says Stop. On Read's LEFT, so Read, the
+             Pause reached for without looking, keeps the thumb's place at the edge, and a blind
+             tap to pause never lands on a Stop that has just appeared there. -->
+        <button id="read-aloud-stop" class="control control-read-stop" type="button" hidden>
+          <svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true" fill="currentColor">
+            <rect x="6" y="6" width="12" height="12" rx="2" />
+          </svg>
+          <span class="control-label">Stop</span>
+        </button>
 
         <!--
           Read-aloud. Sits where Talk sits and takes its place in the CHANNEL view: talking to the

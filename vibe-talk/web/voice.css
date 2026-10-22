@@ -6243,7 +6243,7 @@ a.search-hit-link {
      0.8rem would be a fifth narrower than the control pane beneath it. */
 }
 
-/* `#376 read-aloud-blocks`. Previous, Pause, "2 of 5", Next, while a read of several blocks plays.
+/* `#376 read-aloud-blocks`. Previous, "2 of 5", Next, Pause, Stop, while a read of several blocks plays.
    Floating for the reason the status line floats: coming and going, it moves nothing under the
    reader's thumb. Only its buttons take taps; between them the row underneath can still be tapped.
    Large targets, because the reader may be in a car.
@@ -6264,8 +6264,11 @@ a.search-hit-link {
   margin-inline: auto;
   display: flex;
   align-items: center;
-  gap: 0.4rem;
-  padding: 0.3rem 0.4rem;
+  /* `#442 read-strip-order`: a fifth target, Stop, and still one line on a 375px phone, with room
+     for a count of two-digit blocks ("12 of 12", a size down below): the air between them is what
+     gave way. Chromium at 375x812 measures that line 346px of the 351 it may take. */
+  gap: 0.25rem;
+  padding: 0.3rem;
   background: var(--panel);
   border: 1px solid var(--warn);
   border-radius: 999px;
@@ -6320,8 +6323,10 @@ a.search-hit-link {
   pointer-events: auto;
   min-height: 2.75rem;
   /* `#434 read-aloud-pause`: four targets and the count in one line on a narrow phone — at the
-     old 6rem the row wrapped under 375px and covered a taller strip of the list. */
-  min-width: 5rem;
+     old 6rem the row wrapped under 375px and covered a taller strip of the list. `#442
+     read-strip-order` added Stop, a fifth, and the words keep their room by losing padding. */
+  min-width: 4rem;
+  padding: 0 0.5rem;
   border-radius: 999px;
   border: 1px solid var(--warn);
   background: color-mix(in srgb, var(--warn) 18%, var(--panel));
@@ -6347,8 +6352,32 @@ a.search-hit-link {
 
 #read-steer-count {
   min-width: 3rem;
+  font-size: 0.9rem;
   text-align: center;
   font-variant-numeric: tabular-nums;
+}
+
+/* `#442 read-strip-order`. Stop, last: the read ends and reading mode is left. A square, as on any
+   player, so a fifth target still lets the strip stand in one line on a 375px phone; its name is
+   its `aria-label`. The way out, so in the way-out colour, as the Read button's Stop is. */
+#read-stop {
+  min-width: 2.75rem;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--warn);
+  color: var(--on-warn, #10131a);
+}
+
+#read-stop svg {
+  width: 1rem;
+  height: 1rem;
+}
+
+/* The grip that moves the strip: drawn on a desk only (below). A phone keeps the strip docked. */
+#read-steer-grip {
+  display: none;
 }
 
 /* The block being read, inside the row being read: the row's own colour, stronger. */
@@ -7171,6 +7200,26 @@ textarea {
   grid-row: 1 / span 2;
 }
 
+/* `#442 read-strip-order`. While a read plays, Read is its Pause and Stop stands beside it, both
+   under the thumb: the tile takes a fourth column for the time Stop is shown, and gives it back.
+   Stop takes the new column on Read's LEFT, so Read keeps the edge a thumb reaches for without
+   looking and a blind tap to pause never lands on Stop. At 375px each of the three wide columns
+   is still well over a 44px target. */
+#control-pane:has(#read-aloud-stop:not([hidden])) {
+  grid-template-columns: 3.5rem 1fr 1fr 1fr;
+}
+
+#control-pane:has(#read-aloud-stop:not([hidden])) #read-aloud {
+  grid-column: 4;
+}
+
+#control-pane #read-aloud-stop {
+  grid-column: 3;
+  grid-row: 1 / span 2;
+  background: var(--warn);
+  color: var(--on-warn, #10131a);
+}
+
 #control-pane #todo-filter {
   grid-column: 1;
   grid-row: 1 / span 2;
@@ -7290,15 +7339,29 @@ textarea {
     padding-bottom: calc(0.35rem + env(safe-area-inset-bottom));
   }
 
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-pane > :not(#hang-up, #read-aloud[data-active="true"]) {
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-pane > :not(#hang-up, #read-aloud[data-active="true"], #read-aloud-stop) {
     display: none;
   }
 
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-pane > :is(#hang-up, #read-aloud) {
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-pane > :is(#hang-up, #read-aloud, #read-aloud-stop) {
     grid-column: 1 / -1;
     grid-row: 1;
     flex-direction: row;
     gap: 0.4rem;
+  }
+
+  /* `#442 read-strip-order`. A read playing makes Read its Pause, so the slim row keeps Stop beside
+     it, half and half, on its left as in the tile: the sound is still a tap from stopping. */
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-pane:has(#read-aloud-stop:not([hidden])) {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-pane:has(#read-aloud-stop:not([hidden])) > #read-aloud {
+    grid-column: 2;
+  }
+
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-pane > #read-aloud-stop {
+    grid-column: 1;
   }
 }
 
@@ -7616,6 +7679,43 @@ textarea {
      the reading view says here what the phone tile already shows — Hide read, Pace, Read. */
   #control-pane:has(#read-aloud:not([hidden])) #speaker {
     display: none;
+  }
+
+  /* `#442 read-strip-order`. On a desk the read-aloud strip can be moved off what it covers, by the
+     grip at its left. web/voice.js keeps the offset, held inside the window; it is applied only
+     here, so a phone's strip stays docked on the chips row whatever was stored. */
+  #read-steer {
+    translate: var(--read-steer-dx, 0px) var(--read-steer-dy, 0px);
+  }
+
+  #read-steer-grip {
+    pointer-events: auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.5rem;
+    min-height: 2.75rem;
+    padding: 0;
+    border: none;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--muted);
+    cursor: grab;
+    touch-action: none;
+  }
+
+  #read-steer-grip:active {
+    cursor: grabbing;
+  }
+
+  #read-steer-grip:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+
+  #read-steer-grip svg {
+    width: 0.5rem;
+    height: 1rem;
   }
 
   /* Ordinary desktop controls: the icon and its word side by side, at reading size. The phone's
