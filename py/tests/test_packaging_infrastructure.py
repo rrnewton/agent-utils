@@ -910,6 +910,10 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # test_lifecycle.py collects from orphan_retire_cases.py (13 removal,
     # refusal and recovery cases with the real agentctl probe and nine verdict
     # parser cases), are mapped.
+    # The 5 agent-name cases collected from the same module (create, adopt and
+    # transfer-owner refusing a name the session tooling cannot use, and the
+    # never-started attested removal of a slot recorded under one, with its
+    # refusals) are mapped.
     # The 5 Git-repair isolation cases of #350 wrkslots-foreign-mount-ns, which
     # test_lifecycle.py collects from foreign_mount_ns_cases.py (three repairs of
     # one moved checkout, a removal and a rolled-back fence beside an emptied
@@ -943,9 +947,9 @@ def test_wrkslots_lifecycle_partitions_are_disjoint_and_complete() -> None:
     # object-store detection) are mapped.
     # The retained-handle census case of dev-hermit dh-9qy9v (more files than
     # the former 4,096-file bound still bind their row) is mapped.
-    assert len(all_tests) == 2100
+    assert len(all_tests) == 2105
     assert len(ordinary) == 337
-    assert len(mapped) == 1763
+    assert len(mapped) == 1768
     assert {
         node.split("::", 1)[1].split("[", 1)[0] for node in ordinary
     } == {
