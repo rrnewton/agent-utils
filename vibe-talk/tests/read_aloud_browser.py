@@ -560,17 +560,29 @@ def main() -> int:
                       f"something besides the message heard to its end was archived: {archived}")
                 shot("4-cut-off")
 
-                # 5. Leaving Read closes the response being read.
+                # 5. The Read button pauses and resumes the read (`#434 read-aloud-pause`), and
+                # stopping it closes the response being read.
                 tap(page, "301")
                 timing_of("ticket-301")
-                left = time.monotonic()
-                page.click("#read-aloud")
                 reopened = api.reads_of("301")[-1]
-                wait_for(lambda: reopened.closed is not None, 2, "leaving Read left the response open")
-                reopened_closed = closed_at(reopened, "leaving Read left the response open")
+                page.click("#read-aloud")
+                wait_for(lambda: page.evaluate("() => readAloudContext.state") == "suspended", 2,
+                         "the Read button's Pause did not stop the audio clock")
+                check(page.text_content("#read-aloud-label") == "Resume",
+                      f"a held read's button does not say Resume: {page.text_content('#read-aloud-label')!r}")
+                time.sleep(0.3)
+                check(reopened.closed is None, "pausing closed the response: the hold cut the read off")
+                page.click("#read-aloud")
+                wait_for(lambda: page.evaluate("() => readAloudContext.state") == "running", 2,
+                         "the Read button's Resume did not start the audio clock again")
+                left = time.monotonic()
+                tap(page, "301")
+                wait_for(lambda: reopened.closed is not None, 2, "stopping the read left the response open")
+                reopened_closed = closed_at(reopened, "stopping the read left the response open")
                 check(reopened_closed - left < 0.5,
-                      f"the response closed {reopened_closed - left:.2f} s after Read was left")
+                      f"the response closed {reopened_closed - left:.2f} s after the read stopped")
                 check(not reopened.finished, "the stopped read ran to its end")
+                page.click("#read-aloud")
                 shot("5-left-read")
 
                 # 6. A read that opens with silence: the first frame is audible at once, speech
@@ -585,7 +597,7 @@ def main() -> int:
                 check(abs(quiet_speech_ms - quiet_audible_ms - lead_ms) <= ONSET_TOLERANCE_MS,
                       f"speech was reported {quiet_speech_ms - quiet_audible_ms} ms after the first"
                       f" frame, but the read opens with {lead_ms} ms of silence: {quiet_start}")
-                page.click("#read-aloud")
+                tap(page, "305")
                 shot("6-speech-onset")
 
                 check(not errors, f"the page threw: {errors}")
