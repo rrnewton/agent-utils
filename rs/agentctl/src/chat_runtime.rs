@@ -7849,8 +7849,8 @@ call between them.",
             "{sent}The user's request arrived through the configured chat bridge.\n\
 {context}\n\
 {}\n\n\
-Complete this request using your normal instructions and tools. You may send one or multiple replies, including progress updates. \
-Include the line <CHAT_REPLY_{reply_id}> at the beginning of your response and end with </CHAT_REPLY_{reply_id}>. \
+Complete this request using your normal instructions and tools. You may send one or multiple replies, including progress updates; answer separate topics in \
+separate replies. Include the line <CHAT_REPLY_{reply_id}> at the beginning of your response and end with </CHAT_REPLY_{reply_id}>. \
 Lines between will be sent to the user as a chat message. {numbering}",
             record.message.text,
         );
@@ -19314,13 +19314,14 @@ mod tests {
         let prompts = target.submitted_prompts.lock().expect("prompt lock");
         assert_eq!(prompts.len(), 1);
         assert!(prompts[0].contains("one or multiple replies"));
-        // The owner's wording, with the marker lines written out whole. The thread limit is the
+        // The owner's wording, with the marker lines written out whole, plus the topic-splitting
+        // clause the owner asked for (#435 chat-reply-splitting). The thread limit is the
         // bridge's to enforce, and short updates are welcome, so the prompt does not state it.
         assert!(prompts[0].ends_with(
             "\n\nComplete this request using your normal instructions and tools. You may send one \
-or multiple replies, including progress updates. Include the line <CHAT_REPLY_001> at the \
-beginning of your response and end with </CHAT_REPLY_001>. Lines between will be sent to the user \
-as a chat message. Use the same two lines for every reply, with no tool call between them."
+or multiple replies, including progress updates; answer separate topics in separate replies. \
+Include the line <CHAT_REPLY_001> at the beginning of your response and end with </CHAT_REPLY_001>. \
+Lines between will be sent to the user as a chat message. Use the same two lines for every reply, with no tool call between them."
         ));
         assert!(!prompts[0].contains("messages to one chat thread"));
         assert!(!prompts[0].contains("combine short updates"));

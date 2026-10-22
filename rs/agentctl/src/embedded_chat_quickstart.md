@@ -101,8 +101,9 @@ thread's retained messages, oldest first; a request prompt for a reply in an
 existing thread prints this command, with absolute paths.
 
 Each request prompt gives the agent one short reply ID, such as `001`, for every
-reply to that request. The numbers count up across requests and are kept in
-`reply-aliases.json` in the state directory; one that the agent's pane shows
+reply to that request: progress updates, the result, and one reply per topic
+when a message asks about several things. The numbers count up across requests
+and are kept in `reply-aliases.json` in the state directory; one that the agent's pane shows
 when a request gets its number is skipped, and none is reused unless that file
 is deleted or replaced by an older copy, or the bridge gets a new state
 directory. A block under the number of a request whose prompt still waits in the

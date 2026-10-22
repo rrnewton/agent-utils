@@ -55,6 +55,28 @@ already sent is not sent again, so give each progress update new wording. Make n
 gave a numbered ID instead (`<CHAT_REPLY_<nonce>_1>`), add one to the number for
 each later reply, as the prompt says.
 
+## One request, several replies
+
+A request takes any number of replies. Use several whenever an answer divides
+by time or by topic:
+
+- **By time.** When the work will take a while, acknowledge the request at
+  once, send an update at each real step, and send the result as a reply of its
+  own.
+- **By topic.** When a message asks about three things, answer in three
+  medium-sized replies, one per topic, not one combined wall of text.
+
+Make each topic reply readable on its own, and open it by naming its topic.
+Every reply uses that request's marker lines (numbered as the prompt says) or
+its reply command, with new wording each time and one way of sending it.
+
+Send each topic's reply as soon as it is ready rather than all at the end.
+Several blocks in one output are posted only while the screen can show that
+output from its first row through each block's closing line; when they will not
+fit, send the later ones with the reply command. Keep it to a handful at a time:
+after 8 replies to one thread within a minute, the bridge holds that thread's
+next replies for at least 5 minutes.
+
 ## The reply command is the exception
 
 When the bridge runs with `--offer-reply-command`, the prompt also prints an

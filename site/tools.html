@@ -253,7 +253,7 @@
 <h4>Key capabilities</h4>
 <ul>
 <li>One bridge connects one configuration to one coordinator; attachments are not forwarded.</li>
-<li>Several replies per request are allowed, including progress updates.</li>
+<li>Several replies per request are allowed, including progress updates and one reply per topic.</li>
 <li>Restart-safe: requests and replies live in the bridge's state directory.</li>
 <li>In the Rust protocol, a provider gap stops the bridge rather than risking a silent loss; automatic reconnect after a gap is refused.</li>
 </ul>
