@@ -42320,8 +42320,9 @@ function setTextIfChanged(node, text) {
 
 /**
  * What a card says of its thread: "display_name: summary" when the summariser has named it and summed
- * it up, else the text of its first message, else its name. Whitespace is folded, so three lines show
- * three lines of words rather than a paragraph break.
+ * it up, else the text of its first message, else its name. Whitespace is folded, so a raw card's
+ * clamped lines show lines of words rather than a paragraph break; a summarised card's words are
+ * drawn whole besides (`#428 summary-cards-full`).
  */
 function sideCardText(choice) {
   const summary = choice.summary;
@@ -42403,6 +42404,9 @@ function renderSideCards() {
   const cards = inThreadOrder(threadChoices(), order).map((choice) => ({
     choice,
     text: sideCardText(choice),
+    // `#428 summary-cards-full`. With the text, so a summary arriving with the same words as the
+    // root's still redraws the card unclamped (below, and in the signature).
+    summarized: cardIsSummarized(choice),
     root: sideCardRootText(choice),
     age: briefAge(Number.isFinite(choice.at) ? choice.at : choice.started),
     replies: sideCardReplies(choice, tally),
@@ -42411,8 +42415,8 @@ function renderSideCards() {
   const unpacked = unpackOnScreen();
   // `#419 threads-view-main-messages`. And the main channel's messages that are not threads, among them.
   const main = mainRowsOnScreen() ? mainRowMessages(new Set(cards.map(({ choice }) => choice.id))) : [];
-  const signature = JSON.stringify([order, readMode, readRunsSuspended(), unpacked, cards.map(({ choice, text, root, age, replies, unread, read }) =>
-    [choice.id, text, root, age, replies, unread, read,
+  const signature = JSON.stringify([order, readMode, readRunsSuspended(), unpacked, cards.map(({ choice, text, summarized, root, age, replies, unread, read }) =>
+    [choice.id, text, summarized, root, age, replies, unread, read,
       unpacked ? unpackSignature(choice, unpackHeldMessages(choice)) : ""]),
   main.map((message) => [String(message.id), stillToDo(message, channelCanon.dismissed)]),
   main.length ? [readMode, combineMessages, nowPlaying ? nowPlaying.id : "", pendingRead] : ""]);
@@ -43402,12 +43406,15 @@ function foldCardRuns(list) {
  * but the button under it, which goes into the thread and says how many replies it has and how many of
  * them are unread (`cardOpener`). Beside that, how long since the thread moved.
  */
-function sideCard({ choice, text, root, age, replies, unread, read }) {
+function sideCard({ choice, text, summarized, root, age, replies, unread, read }) {
   const row = document.createElement("li");
   row.className = "side-card-row";
   // `data-id` and `data-card`: the keys move through the cards as through messages, and know them apart.
   row.setAttribute("data-id", choice.id);
   row.setAttribute("data-card", "");
+  // `#428 summary-cards-full`. The stylesheet draws such a card's text whole, at every
+  // collapsed-lines count: the summary is not raw text and is never clamped.
+  if (summarized) row.setAttribute("data-summarised-card", "");
   row.style.setProperty("--thread-hue", threadHue(choice.id));
   const button = document.createElement("button");
   button.className = "side-card";
@@ -43765,10 +43772,16 @@ function paintThreadCard(card, choice, tally) {
   const replies = sideCardReplies(choice, tally);
   const unread = sideCardUnread(choice, tally);
   const unanswered = threadUnanswered(choice, tally);
-  const signature = JSON.stringify([choice.id, text, age, replies, unread, unanswered]);
+  const summarized = cardIsSummarized(choice);
+  const signature = JSON.stringify([choice.id, text, summarized, age, replies, unread, unanswered]);
   if (threadCardsDrawn.get(card.id) === signature) return;
   threadCardsDrawn.set(card.id, signature);
   if (card.getAttribute("data-thread") !== choice.id) card.setAttribute("data-thread", choice.id);
+  // `#428 summary-cards-full`. As a list card's text, this card's summary, when that is what it says, is drawn whole.
+  if (summarized !== card.hasAttribute("data-summarised-card")) {
+    if (summarized) card.setAttribute("data-summarised-card", "");
+    else card.removeAttribute("data-summarised-card");
+  }
   const state = unanswered ? "start" : "open";
   if (card.getAttribute("data-thread-state") !== state) card.setAttribute("data-thread-state", state);
   const hue = String(threadHue(choice.id));
