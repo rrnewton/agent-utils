@@ -1,13 +1,14 @@
 ---
 title: 'search-unmatched-separators: show unmatched runs as expandable separators in every view'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 - ui
 created_at: 2026-10-22T17:31:52.391824357+00:00
-updated_at: 2026-10-22T17:31:52.391824357+00:00
+updated_at: 2026-10-22T23:45:05.225339087+00:00
+closed_at: 2026-10-22T23:45:05.225338976+00:00
 ---
 
 # Description
