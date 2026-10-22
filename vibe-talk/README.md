@@ -63,6 +63,9 @@ four views are offered, in the view picker and on Ctrl+1 to Ctrl+4 (Cmd on a Mac
   its thread where the service starts one on a reply, rather than opening the thread view; the box at the
   foot is hidden while a reply is open and comes back when it goes. The chips sit on the row of the
   search glass, the cards starting under it.
+  Your own messages among them stand centred in the column, as wide as your messages always are, so they
+  do not read as the last reply of the thread above (`#424 threads-main-own-center`); the agent's, and
+  yours in every other list, are where they always were.
   Wherever a card says a summary rather than the thread's first message — here and at the head of an
   open thread — that first message stands first under the card as its child, however read it is; a
   card that already is the first message gains no second copy (`#404 threads-unpack-all`,

@@ -1797,6 +1797,20 @@ a.search-hit-link {
 }
 
 /*
+ * `#424 threads-main-own-center`. The owner, 2026-10-22, of the Threads view with Main channel on: "my
+ * messages now look like they're follow ups to the prior thread because they look the same as the prior
+ * thread messages except without the colorful connector. I propose in this view we actually CENTER my
+ * messages to the main channel, keeping their current width, so their left edge is no longer lined up
+ * with the intra-thread messages." So there, and only on the main channel's rows among the cards
+ * (`data-main-row`), the owner's inset is split into halves either side: the same width, centred. The
+ * agent's main rows, and the owner's rows in every other list, keep the rule above. A desk restates it
+ * where it restates that rule.
+ */
+#side-cards li.discord-message[data-who="me"][data-main-row] {
+  margin-inline: calc(var(--speaker-inset) / 2);
+}
+
+/*
  * THE CODING AGENT'S MESSAGES ARE TILES, NOT CELLS.
  *
  * They are the thing this view exists to read, and they are long, so they get the whole width:
@@ -3264,6 +3278,12 @@ a.search-hit-link {
 #pinned-log li.discord-message[data-who="me"] {
   --row-inset-left: var(--speaker-inset);
   --row-inset-right: 0px;
+}
+
+/* `#424 threads-main-own-center`. Centred, as its margins are (above). */
+#side-cards li.discord-message[data-who="me"][data-main-row] {
+  --row-inset-left: calc(var(--speaker-inset) / 2);
+  --row-inset-right: calc(var(--speaker-inset) / 2);
 }
 
 #side-log li.discord-message[data-who="coder"],
@@ -7619,6 +7639,12 @@ textarea {
     margin-left: max(var(--reply-gutter), min(15%, 6rem));
   }
 
+  /* `#424 threads-main-own-center`. The owner's main-channel rows among the Threads view's cards, centred
+     at the width the rules above give them (see the unconditional rule). */
+  #side-cards li.discord-message[data-who="me"][data-main-row] {
+    margin-inline: calc(min(15%, 6rem) / 2);
+  }
+
   /* `#249 search-highlight` and `#250 date-separators`. The insets the lines between rows reach back
      across, as the margins just above give them on a desk. */
   #side-log li.discord-message[data-who="me"],
@@ -7626,6 +7652,11 @@ textarea {
   #discord-log li.discord-message[data-who="me"],
   #pinned-log li.discord-message[data-who="me"] {
     --row-inset-left: min(15cqw, 6rem);
+  }
+
+  #side-cards li.discord-message[data-who="me"][data-main-row] {
+    --row-inset-left: calc(min(15cqw, 6rem) / 2);
+    --row-inset-right: calc(min(15cqw, 6rem) / 2);
   }
 
   #side-log li.discord-message[data-who="coder"],
