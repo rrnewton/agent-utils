@@ -1,12 +1,13 @@
 ---
 title: 'herdr-run-idle-ttl: retire finished command tabs after an idle TTL'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - herdr-run
 created_at: 2026-10-22T02:50:57.716251599+00:00
-updated_at: 2026-10-22T02:50:57.716251599+00:00
+updated_at: 2026-10-22T05:48:21.554513207+00:00
+closed_at: 2026-10-22T05:48:21.554513007+00:00
 ---
 
 # Description

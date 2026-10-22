@@ -1,12 +1,13 @@
 ---
 title: 'wrkslots-agent-name-validation: refuse agent names the liveness probe cannot judge'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-10-22T02:50:57.751886867+00:00
-updated_at: 2026-10-22T02:50:57.751886867+00:00
+updated_at: 2026-10-22T05:48:21.554705788+00:00
+closed_at: 2026-10-22T05:48:21.554705708+00:00
 ---
 
 # Description
