@@ -695,6 +695,15 @@
               -->
               <button id="side-unpack" class="chip" type="button" aria-pressed="false" title="Show every thread's messages under its card" hidden>Unpack all</button>
               <!--
+                `#419 threads-view-main-messages`. The owner, 2026-10-21: "we have room for one more button
+                -- a toggle to show Main msgs. When that is on we should see messages to the main channel
+                that are not (yet) threads and can make them threads from there." Pressed, the cards' list
+                also holds the main channel's messages that head no thread, among the cards in the list's
+                order, and ends in the main channel's box. Only over the Threads view's cards. Kept on this
+                device; key a. On a phone it says "Main" (web/voice.css).
+              -->
+              <button id="side-main" class="chip" type="button" aria-pressed="false" title="Show the main channel's messages that are not threads yet, and its message box at the foot" hidden>Main<span class="chip-more"> messages</span></button>
+              <!--
                 `#298 thread-card-header`. The owner, of the thread cards: "When I drill into a given
                 thread card to see the messages inside it, I would like to KEEP that same style ... the
                 SAME colorful card move up to the top of the screen and KEEP its connector linkage over
@@ -2461,7 +2470,13 @@
                 window, newest activity at the bottom as in the channel, each as its name and summary
                 when they have been summarised, or else its first message, three lines at most;
                 <strong>Unread only</strong> beside its heading narrows the list to the threads with
-                unread replies, and is remembered on this device; <strong>Older threads…</strong> at its
+                unread replies, and is remembered on this device. <strong>Main messages</strong> beside it
+                (key <kbd>a</kbd>, remembered too) adds the main channel's messages that are not threads
+                yet, among the cards in the order they were posted, and puts the main channel's message
+                box at the foot of the list as its last card: <strong>Reply</strong> or
+                <strong>Thread</strong> on one of those messages opens the reply under it, starting its
+                thread, and the box at the foot goes while the reply is open, so there is one box.
+                <strong>Older threads…</strong> at its
                 top reads further back. A click on a card <strong>highlights</strong> it: it shows all
                 of it, and every other card's edge goes grey, until you click another card, the same one
                 again, or press <kbd>Esc</kbd>. The card's <strong>N replies · M unread</strong> opens

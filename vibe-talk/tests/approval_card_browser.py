@@ -75,9 +75,10 @@ uncovered and wholly on screen. This lays it out on three phones and measures:
      all, a reader 100px up All, Cmd+3 and then Esc or Cmd+2, is on the same row within a pixel.
  14. At the desk, a reader up the thread list's cards with the card docked under them, Ctrl+4 and
      Ctrl+3, is on the same card within a pixel, the list opened from Main and from two columns: 60,
-     160 and 300px up with the long draft (its card 246px tall), and 100px up with the short one. Two
-     columns' right column, which the card leaves, is that much taller, and each of them is at the
-     foot of the cards there or within the slack of it, which is checked. A reader who moves 200px up
+     160 and 260px up with the long draft (its card 246px tall), and 100px up with the short one. Two
+     columns' right column, which the card leaves, is that much taller (less the heading's row, which
+     the list draws on the search glass's row, `#419 threads-view-main-messages`), and each of them is
+     at the foot of the cards there or within the slack of it, which is checked. A reader who moves 200px up
      the cards in two columns is on the card they moved to after Ctrl+3, not back where they were in
      the list.
  15. A reader at the foot of Main or All who taps Send is at the foot still, with no jump, once the
@@ -1957,7 +1958,7 @@ def thread_list_cards_case(page: Page, url: str, voice: FakeVoice, api: FakeApi,
                   f"{where}: the premise, a reader {up}px up the cards {label}: {m['first']}, {m['sideGap']}px")
             return m
 
-        for serial, draft, ups in ((61, LONG_DRAFT, (60, 160, 300)), (62, SHORT_DRAFT, (100,))):
+        for serial, draft, ups in ((61, LONG_DRAFT, (60, 160, 260)), (62, SHORT_DRAFT, (100,))):
             words = "long" if draft is LONG_DRAFT else "short"
             propose(page, api, serial, draft)
             page.wait_for_timeout(HOLD_MS + 200)

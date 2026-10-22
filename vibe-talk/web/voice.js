@@ -209,7 +209,7 @@ const ALL_CHANNELS = "*";
  *   | "save-voice-post-prefix" | "save-voice-system-prompt"
  *   | "search-in-all" | "search-toggle" | "send-text" | "side-clear-backlog" | "side-close" | "side-jump-newest"
  *   | "side-more-threads" | "side-older" | "side-search-replies" | "side-send" | "side-thread-card-text"
- *   | "side-unpack" | "side-unread-only" | "speaker"
+ *   | "side-main" | "side-unpack" | "side-unread-only" | "speaker"
  *   | "summarise" | "talk"
  *   | "thread-back" | "thread-card-text"
  *   | "todo-filter" | "undo-dismiss" | "undo-send-dismiss" | "upstream-clear-push"
@@ -2006,7 +2006,8 @@ function lastColumnCard() {
   for (const list of lists) {
     const rows = [...list.children];
     for (let at = rows.length - 1; at >= 0; at -= 1) {
-      if (rows[at].hasAttribute("data-unpack-thread")) continue;
+      // `#419 threads-view-main-messages`: over the cards, the last card is a card, not a row among them.
+      if (rows[at].hasAttribute("data-unpack-thread") || rows[at].hasAttribute("data-main-row")) continue;
       if (rows[at].getBoundingClientRect().height > 0) return rows[at];
     }
   }
@@ -10960,6 +10961,14 @@ const KEYMAP = [
       "or pack them away again. The read modes apply inside each thread",
     controls: ["side-unpack"],
     run: () => unpackFromKeyboard(),
+  },
+  // `#419 threads-view-main-messages`. a was free; it acts only over the Threads view's cards, as its chip does.
+  {
+    group: KEYS_VIEW, chords: [{ key: "a" }],
+    does: "In the Thread list, Main messages: the main channel's messages that are not threads yet among the " +
+      "threads, and its message box at the foot; Thread or Reply on one makes it a thread where it is",
+    controls: ["side-main"],
+    run: () => mainRowsFromKeyboard(),
   },
   {
     group: KEYS_VIEW, chords: [{ key: "p", shift: true }],
@@ -22667,9 +22676,12 @@ function addThreadDecoration(meta, message, row, everyThread = false) {
   paintThreadBadge(badge, id, replies, unansweredRoot(message, replies, 0, null));
   // What the tag does is read when it is pressed, so a tag painted again since it was drawn does
   // what it now says.
-  badge.addEventListener("click", inThisColumn(() => guardQuietly(() => (
-    badge.getAttribute("data-thread-state") === "start" ? startThread(id) : openThread(id)
-  ))()));
+  badge.addEventListener("click", inThisColumn(() => guardQuietly(() => {
+    // `#419 threads-view-main-messages`. A main-channel message among the Threads view's cards is made a
+    // thread where it is: the reply opens under it, bound for its new thread, the view left as it is.
+    if (row.hasAttribute("data-main-row")) return openReply(rowMessages(row), row);
+    return badge.getAttribute("data-thread-state") === "start" ? startThread(id) : openThread(id);
+  })()));
   // `#224 keyboard-shortcuts`. → on the selected message presses it.
   sayRowShortcut(badge, "thread-badge");
   meta.append(badge);
@@ -27870,6 +27882,10 @@ function renderChannelRows() {
   // `#407 unpack-row-parity`. Whatever this pass was for — a read aloud starting or ending, a pin, a
   // reply sent — the rows unpacked under the cards are dressed again with it, as message rows.
   if (!sideActive) dressUnpackedRows();
+  // `#419 threads-view-main-messages`. Main's messages among the cards are Main's rows' messages: what
+  // changed them here (a message posted from the box at the foot, an arrival, a Done) is drawn there too.
+  // Drawn again only where something they draw changed (`renderSideCards`).
+  if (!sideActive && mainRowsOnScreen()) renderSideCards();
   // `#410 inline-reply-editor`. A reply open in the stream, under its row as the rows now stand; and
   // one waiting for its message, opened again once the message is drawn.
   if (replyDocked) placeInlineReply();
@@ -33049,7 +33065,7 @@ function discordNode(messages) {
   // the row's left, where nothing else on the row is. Not in the Pinned list (`#206 pin-message`):
   // that is a flat list of what was kept, drawn without the reply gutter, and what a pin answers is
   // the channel's business — the jump walks the channel's own views, which are not on screen there.
-  if (message.reply_to && !drawingPinnedRows) li.replaceChildren(replyArrow(li), ...li.children);
+  if (message.reply_to && !drawingPinnedRows && !drawingMainRows) li.replaceChildren(replyArrow(li), ...li.children);
   // The SAME call the voice transcript makes, on the same arguments, so the two lists cannot end
   // up with two idioms for the one behaviour. `#47 scrollback-stability`. The one extra argument
   // is the message id, which is what `#49 cached-summaries` keys a summary under — the transcript
@@ -33111,7 +33127,7 @@ function discordNode(messages) {
   // replies each row has (`renderReplyCounts`) finds the button without walking the row's text.
   li.replyButton = reply;
   // A row of the Pinned filter offers the way into its message's thread whatever view is under it.
-  addThreadDecoration(acts, message, li, drawingPinnedRows);
+  addThreadDecoration(acts, message, li, drawingPinnedRows || drawingMainRows);
   // A provider write, distinct from the reversible local Done/archive below. Most providers do
   // not expose this operation, so the server advertises it explicitly and the control stays out
   // of the interface unless the selected provider supports it.
@@ -33407,9 +33423,12 @@ async function markReadThroughHere(row, upstreamId) {
   // stack included, because that is what the item says it does and what the reader is looking at.
   // Gathering itself marks nothing. `#407 unpack-row-parity`: a thread unpacked under its card is that
   // thread's list, as in the thread: other threads' rows above it in the cards are not "above it".
+  // `#419 threads-view-main-messages`: and a main-channel message among the cards is the main channel's:
+  // only Main's messages above it there are "above it", not the threads' rows between them.
   const thread = row.getAttribute("data-unpack-thread");
+  const main = row.hasAttribute("data-main-row");
   const rows = [...(row.parentNode || el("discord-log")).children]
-    .filter((one) => thread === null || one.getAttribute("data-unpack-thread") === thread);
+    .filter((one) => (main ? one.hasAttribute("data-main-row") : thread === null || one.getAttribute("data-unpack-thread") === thread));
   const at = rows.indexOf(row);
   if (at < 0) return;
   const covered = rows.slice(0, at + 1).flatMap(idsOf);
@@ -38925,7 +38944,10 @@ function openReply(messages, from = null, quote = "", focus = true) {
   // from the last reply: the default is to answer where the message is. Only this message's own kept
   // draft brings its tick back (`draftStartsThread`) — or, where its thread has been answered since,
   // the thread it was bound for (`replyRoute`'s `into`).
-  const bound = drafts.has(String(message.id)) && draftStartsThread.has(String(message.id));
+  // `#419 threads-view-main-messages`. A main-channel message among the Threads view's cards is answered to
+  // make it a thread: bound for its new thread where the service starts one on the reply's say-so.
+  const starts = Boolean(from && from.hasAttribute("data-main-row"));
+  const bound = (drafts.has(String(message.id)) && draftStartsThread.has(String(message.id))) || starts;
   replyRouting = replyRoute(message, bound);
   el("reply-branch").checked = Boolean(replyRouting.branch) && bound;
   el("reply-branch-row").hidden = !replyRouting.branch;
@@ -40947,6 +40969,9 @@ function leaveThreadList(next = "one") {
   const held = listHeldPlace;
   listHeldPlace = null;
   threadListShown = false;
+  // `#419 threads-view-main-messages`. The main channel's box back under the left column's list.
+  renderMainToggle();
+  placeMainCard();
   // `#262 search-load-older`. The cards' walk for the search ends with the list, unless two columns
   // keep the cards beside Main.
   if (next !== "two") endRepliesWalk();
@@ -40989,10 +41014,13 @@ function renderSideMode() {
   if (!thread && !leftEl("side-jump-newest").hidden) leftEl("side-jump-newest").hidden = true;
   renderSideUnreadToggle();
   renderUnpackToggle();
+  renderMainToggle();
   // `#262 search-load-older`. A thread selected over the cards ends their walk for the search, aborting
   // its read; the cards back are offered it again (`renderSideCards`).
   if (thread) renderRepliesSearch();
   renderSideColumn();
+  // `#419 threads-view-main-messages`. The main channel's box at the foot of the cards, or back in its place.
+  placeMainCard();
   // What the links join, and what the glide follows, is the card at the top over a thread and the
   // cards in the list otherwise: a change of what the column shows is a new selection for both.
   noteLinkedSelection();
@@ -41133,9 +41161,13 @@ function renderSideCards() {
     unread: sideCardUnread(choice, tally),
   }));
   const unpacked = unpackOnScreen();
+  // `#419 threads-view-main-messages`. And the main channel's messages that are not threads, among them.
+  const main = mainRowsOnScreen() ? mainRowMessages(new Set(cards.map(({ choice }) => choice.id))) : [];
   const signature = JSON.stringify([unpacked, cards.map(({ choice, text, root, age, replies, unread }) =>
     [choice.id, text, root, age, replies, unread,
-      unpacked ? unpackSignature(choice, unpackHeldMessages(choice)) : ""])]);
+      unpacked ? unpackSignature(choice, unpackHeldMessages(choice)) : ""]),
+  main.map((message) => [String(message.id), stillToDo(message, channelCanon.dismissed)]),
+  main.length ? [readMode, combineMessages, nowPlaying ? nowPlaying.id : "", pendingRead] : ""]);
   const more = olderThreadsToRead();
   if (signature !== sideCardsDrawn) {
     sideCardsDrawn = signature;
@@ -41152,7 +41184,16 @@ function renderSideCards() {
         archivedIds = caughtUpDone(archivedIds, shown);
         return cards.map((card) => unpackBlock(card.choice, tally));
       }) : [];
-      list.replaceChildren(...cards.flatMap((card, at) => [sideCard(card), ...(unpacked ? blocks[at] : [])]));
+      const drawn = cards.map((card, at) => [sideCard(card), ...(unpacked ? blocks[at] : [])]);
+      // `#419 threads-view-main-messages`. Main's messages in the list's order: each run of them between
+      // two cards, by when it was posted against when each card's thread last moved. Only they are drawn
+      // as the right column's rows; the cards are drawn as before.
+      const runs = mainRunsAmong(main, cards.map((card) => cardTime(card.choice)));
+      const between = main.length ? inColumn(columns.side, () => {
+        archivedIds = caughtUpDone(archivedIds, main.map((message) => String(message.id)));
+        return runs.map((run) => mainRows(run, tally));
+      }) : runs.map(() => []);
+      list.replaceChildren(...drawn.flatMap((rows, at) => [...between[at], ...rows]), ...between[drawn.length]);
       filterSideCards();
     });
   } else {
@@ -41350,6 +41391,16 @@ function filterSideCards() {
     if (fresh) unread += 1;
     if (kept && said) shown += 1;
     cardShown.set(String(row.getAttribute("data-id")), kept && said);
+  }
+  // `#419 threads-view-main-messages`. Main's messages among the cards, by the cards' own rules: Unread
+  // only keeps those still to do, and the search finds them by their words.
+  for (const row of allRows) {
+    if (!row.hasAttribute("data-main-row")) continue;
+    const kept = !sideUnreadOnly || !rowIsRead(row);
+    const said = terms.every((term) => (row.getAttribute("data-search") || "").includes(term));
+    if (row.hidden === kept) row.hidden = !kept;
+    setClassWord(row, "search-hidden", !said);
+    markSearchHits(row, said ? marking : []);
   }
   // `#404 threads-unpack-all`. A card's unpacked block goes where its card goes, a row hidden in a
   // collapsed run of read messages staying hidden behind its line (`#407 unpack-row-parity`).
@@ -41753,6 +41804,167 @@ async function readUnpackThread(id) {
   }
 }
 
+// --- the main channel's messages among the cards (#419 threads-view-main-messages) -------------------
+//
+// The owner, 2026-10-21: "In Cmd-3 thread list view... we don't see the main channel messages that are
+// not yet threads, and we cannot send messages from this view to the main channel ... a toggle to show
+// Main msgs. When that is on we should see messages to the main channel that are not (yet) threads and
+// can make them threads from there ... when we have Main messages turned on, we should also have the
+// Reply box (to main channel) as our implicit last card in our list."
+//
+//   * MAIN MESSAGES (key a), beside Unread only and Unpack all, over the Threads view's cards, kept on this
+//     device. Pressed, the cards' list also holds the main channel's messages that head no thread a card
+//     stands for: what Main draws, less its threads' roots. Each is a message row, built and dressed by the
+//     code every list's rows are (`discordNode`, `dressChannelRow`), marked `data-main-row`, and placed
+//     among the cards in the list's order, a card where its thread last moved and a message where it was
+//     posted. Unread only keeps those still to do, the search finds them by their words, and Hide read
+//     leaves out the read ones, as it does in Main.
+//   * MADE A THREAD WHERE IT IS. Thread or Reply on one opens the reply in the list under it (`#410
+//     inline-reply-editor`), bound for a new thread where the service starts one on a reply's say-so (the
+//     new-thread choice ticked; Slack threads every reply anyway), not the thread view.
+//   * THE MAIN CHANNEL'S BOX IS THE LAST CARD. The left column is Main behind the list (`leftColumnToMain`),
+//     so its box posts to the main channel: it is moved to the foot of the cards while Main messages is on
+//     (`placeMainCard`), and back when the list goes or the chip is let go. It is the one box: a reply
+//     opened anywhere hides it, and putting the reply down gives it back (`dockReply`).
+
+/** The device's choice of Main messages among the cards: "on", or anything else for cards alone. */
+const THREADS_MAIN_KEY = "vibe-talk.voice.threads-main";
+
+/** Whether Main messages is pressed, kept on this device. `#419 threads-view-main-messages`. */
+function storedMainRows() {
+  try {
+    return localStorage.getItem(THREADS_MAIN_KEY) === "on";
+  } catch (_error) {
+    return false;
+  }
+}
+
+/** Whether the main channel's messages stand among the cards. */
+let mainRowsShown = storedMainRows();
+
+/** Whether Main's messages belong on screen among the cards: pressed, and the Threads view showing cards. */
+const mainRowsOnScreen = () => mainRowsShown && threadListOnScreen() && columns.side.mode === "list";
+
+/** Main messages: offered over the Threads view's cards, as Unpack all is, and pressed as the reader left it. */
+function renderMainToggle() {
+  const button = leftEl("side-main");
+  const offered = columns.side.mode === "list" && threadListShown;
+  if (button.hidden === offered) button.hidden = !offered;
+  const pressed = mainRowsShown ? "true" : "false";
+  if (button.getAttribute("aria-pressed") !== pressed) button.setAttribute("aria-pressed", pressed);
+}
+
+/** The reader pressed Main messages, or a: kept on this device, and the cards drawn again. */
+function setMainRowsShown(on) {
+  mainRowsShown = on;
+  try {
+    localStorage.setItem(THREADS_MAIN_KEY, on ? "on" : "off");
+  } catch (_error) {
+    // A browser that refuses storage still honours the choice for this session.
+  }
+  renderMainToggle();
+  sideCardsDrawn = "";
+  if (sideColumnUp()) keepingCardPlace(renderSideColumn);
+  placeMainCard();
+}
+
+/** a, over the Threads view: Main's messages among the cards, or the cards alone again. Elsewhere, nothing. */
+function mainRowsFromKeyboard() {
+  if (!threadListOnScreen() || columns.side.mode !== "list") return false;
+  setMainRowsShown(!mainRowsShown);
+  setStatus(mainRowsShown ? "The main channel's messages among the threads." : "The threads alone.");
+  return true;
+}
+
+/**
+ * The main channel's messages that head no thread a card stands for, oldest first, as Main draws them:
+ * the store's copies of Main's rows (`inView`), less the roots of `carded` and anything removed upstream,
+ * no empty message where those are hidden, and under Hide read only what is still to do.
+ *
+ * @param {Set<string>} carded the threads the cards stand for, by id
+ */
+function mainRowMessages(carded) {
+  if (channelCanon.channel !== String(el("discord-channel").value)) return [];
+  const messages = channelCanon.messages.filter((message) => {
+    if (!inView(message, "main", null) || channelCanon.removed.has(String(message.id)) || hiddenEmpty(message)) return false;
+    const thread = threadOf(message);
+    if (thread !== null && message.thread.is_root === true && carded.has(thread)) return false;
+    return !hidingRead() || stillToDo(message, channelCanon.dismissed);
+  });
+  return inTimeOrder(messages, "timestamp");
+}
+
+/** When a card's thread last moved, for its place among Main's messages: its newest activity, or its start. */
+function cardTime(choice) {
+  return Number.isFinite(choice.at) ? choice.at : Number.isFinite(choice.started) ? choice.started : 0;
+}
+
+/**
+ * Main's messages `main`, oldest first, cut into the runs that go before each of the cards whose times
+ * are `cards` (oldest first), and a last run after them all: `cards.length + 1` runs.
+ *
+ * @param {Array<any>} main
+ * @param {number[]} cards
+ * @returns {Array<Array<any>>}
+ */
+function mainRunsAmong(main, cards) {
+  /** @type {Array<Array<any>>} */
+  const runs = cards.map(() => []);
+  runs.push([]);
+  let card = 0;
+  for (const message of main) {
+    const at = timeOf(message, "timestamp");
+    while (card < cards.length && Number.isFinite(at) && cards[card] <= at) card += 1;
+    runs[card].push(message);
+  }
+  return runs;
+}
+
+/** While Main's rows are built: they offer the way into a thread, as All's do, and point at nothing. */
+let drawingMainRows = false;
+
+/**
+ * Main's messages `messages`, one run between two cards, as rows of the cards' list: built and dressed
+ * as every list's rows are, in the right column, whose list the keys and the mouse move them in.
+ *
+ * @param {Array<any>} messages
+ * @param {ReplyTally} tally
+ * @returns {HTMLElement[]}
+ */
+function mainRows(messages, tally) {
+  drawingMainRows = true;
+  let rows;
+  try {
+    rows = glom(messages).map((group) => {
+      const row = discordNode(group);
+      row.setAttribute("data-main-row", "");
+      row.className = `${row.className} main-row`;
+      return row;
+    });
+  } finally {
+    drawingMainRows = false;
+  }
+  const viewing = String(el("discord-channel").value);
+  const pass = { tally, answered: answeredBy(rows, viewing), viewing, inMain: false, inAll: false };
+  for (const row of rows) dressChannelRow(row, pass);
+  return rows;
+}
+
+/**
+ * The main channel's box as the last card of the list, while Main's messages are among the cards;
+ * back in its place under the left column's list otherwise. The box's draft and where it posts are the
+ * left column's, which is Main behind the list (`leftColumnToMain`).
+ */
+function placeMainCard() {
+  const box = leftEl("channel-composer");
+  const list = leftEl("side-list");
+  const wanted = mainRowsOnScreen();
+  const there = box.parentNode === list;
+  if (wanted && !there) list.append(box);
+  else if (!wanted && there) leftEl("pane-discord").insertBefore(box, leftEl("column-reply"));
+  if (box.hasAttribute("data-main-card") !== wanted) box.toggleAttribute("data-main-card", wanted);
+}
+
 /**
  * One card. Every string is text; nothing from the chat service is parsed as markup.
  *
@@ -41872,7 +42084,7 @@ function paintLitCard(row, id) {
 function paintLitCards() {
   for (const list of ["side-cards", "thread-list"]) {
     for (const row of /** @type {HTMLElement[]} */ ([...leftEl(list).children])) {
-      if (row.hasAttribute("data-unpack-thread")) continue;
+      if (row.hasAttribute("data-unpack-thread") || row.hasAttribute("data-main-row")) continue;
       paintLitCard(row, cardThread(row));
     }
   }
@@ -42031,7 +42243,7 @@ function cardForArrow(target) {
   const right = list === leftEl("side-cards");
   if (!list || (right && paneFor(target) !== sidePane)) return null;
   const rows = /** @type {HTMLElement[]} */ ([...list.children])
-    .filter((row) => !row.hasAttribute("data-unpack-thread") && rowShown(row));
+    .filter((row) => !row.hasAttribute("data-unpack-thread") && !row.hasAttribute("data-main-row") && rowShown(row));
   const held = rows.find((row) => row !== target && nodeWithin(row, target));
   if (held) return held;
   const keyed = right ? keyContext(target).row : null;
@@ -48332,7 +48544,9 @@ leftEl("side-search-replies").addEventListener("click", guardQuietly(repliesCont
 leftEl("side-unread-only").addEventListener("click", () => setSideUnreadOnly(!sideUnreadOnly));
 // `#404 threads-unpack-all`. Every thread's messages under its card, in the Threads view.
 leftEl("side-unpack").addEventListener("click", () => setThreadsUnpacked(!threadsUnpacked));
+leftEl("side-main").addEventListener("click", () => setMainRowsShown(!mainRowsShown));
 renderUnpackToggle();
+renderMainToggle();
 inColumn(columns.side, () => {
   el("channel-compose-text").addEventListener("input", inThisColumn(rememberChannelDraft));
   el("channel-send").addEventListener("click", inThisColumn(guardQuietly(sendChannelMessage)));

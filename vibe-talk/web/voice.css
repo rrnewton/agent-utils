@@ -8552,6 +8552,39 @@ li.discord-message[data-root-child] > .reply-bridge {
   padding-top: calc(var(--float-line) + var(--search-bar) / 2 + 0.35rem);
 }
 
+/*
+ * `#419 threads-view-main-messages`. THE HEADING ON THE GLASS'S ROW. The owner, 2026-10-21, of the
+ * Threads view: "buttons for Unread Only and Unpack Only... these are weirdly BELOW the Search icon when
+ * they should fit on the same row." So, the search shut, the heading is drawn on the floating line the
+ * glass sits on — its middle level with the glass's, its end clear of it — and the cards start under it,
+ * the row the heading took given back to them. Open, the search bar has the line, and the heading goes
+ * back under it (above).
+ */
+#screen-main[data-columns="list"]:not([data-searching]) > #side-column {
+  padding-top: max(0px, calc(var(--float-line) - 2.75rem / 2));
+}
+
+#screen-main[data-columns="list"]:not([data-searching]) #side-heading {
+  padding-inline-end: calc(var(--search-disc) + 1.1rem);
+}
+
+/* On a phone the chips say less, so the three and the title fit the row beside the glass. */
+@media (max-width: 599px) {
+  #side-heading .chip-more {
+    display: none;
+  }
+
+  #side-heading .chip {
+    padding-inline: 0.55rem;
+  }
+}
+
+/* `#419 threads-view-main-messages`. The main channel's box as the last card of the Threads view: the
+   composer, moved to the foot of the cards, with the cards' own spacing over it. */
+#channel-composer[data-main-card] {
+  margin-top: 0.45rem;
+}
+
 #screen-main[data-columns="list"] > #scroll-area,
 #screen-main[data-columns="list"] > #scroll-tools,
 #screen-main[data-columns="list"] #channel-freshness {

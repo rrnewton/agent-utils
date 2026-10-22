@@ -459,7 +459,7 @@ const FIXTURE_TREE = {
   "thread-heading": ["thread-card"],
   "thread-card": ["thread-card-text", "thread-card-age", "thread-card-count", "thread-back"],
   // `#298 thread-card-header`. Over a thread the heading is the thread's card, with the X in it.
-  "side-heading": ["side-title", "side-unread-only", "side-unpack", "side-thread-card"],
+  "side-heading": ["side-title", "side-unread-only", "side-unpack", "side-main", "side-thread-card"],
   "side-thread-card": ["side-thread-card-text", "side-thread-card-age", "side-thread-card-count", "side-close"],
   // `#338 column-overscroll`. Last, the room past the foot: no height, and so nothing in the layout, until the
   // page gives it one, which a test draws with `drawOverscroll`.
@@ -64126,6 +64126,128 @@ test("`#410 inline-reply-editor`: a reply open under a row unpacked among the ca
     "a column's own box stayed hidden after the reply went");
   assert.equal(JSON.parse(page.storage.get("vibe-talk.voice.drafts") || "{}")["703"], "about the unpacked row",
     "the reply's words were not kept as its draft");
+});
+
+// --- `#419 threads-view-main-messages` ----------------------------------------------------------------
+//
+// The owner, 2026-10-21: in the Threads view "we don't see the main channel messages that are not yet
+// threads, and we cannot send messages from this view to the main channel ... a toggle to show Main msgs
+// ... we should also have the Reply box (to main channel) as our implicit last card in our list".
+
+const THREADS_MAIN_STORAGE = "vibe-talk.voice.threads-main";
+
+/** What the cards' list holds, in order: "card:<thread>", "main:<id>" or "row:<id>". */
+const cardsListed = (page) => page.el("side-cards").children.map((li) => li.hasAttribute("data-card")
+  ? `card:${li.getAttribute("data-id")}` : li.hasAttribute("data-main-row") ? `main:${li.getAttribute("data-id")}` : `row:${li.getAttribute("data-id")}`);
+
+/** The fresh-message channel (two threads with replies, 200 on Main alone, 210 heading an empty thread) in the Threads view. */
+async function mainMessagesPage(storage = new Map()) {
+  const page = newPage(storage);
+  const data = freshMessageData();
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  page.messages = data.messages;
+  threadedService(page);
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await pickThread(page, "threads");
+  await page.settle();
+  return { page, data };
+}
+
+test("`#419 threads-view-main-messages`: Main messages, a toggle beside Unpack all, puts the main channel's messages that are not threads among the cards in the list's order, and its box at the foot", async () => {
+  assertMarkupContains("side-heading", "side-main");
+  assert.match(/<button\s+id="side-main"[^>]*>/.exec(HTML_CODE)[0], /aria-pressed="false"/);
+  const { page } = await mainMessagesPage();
+  const toggle = page.el("side-main");
+  assert.equal(toggle.hidden, false, "the toggle is not offered over the Threads view's cards");
+  assert.equal(toggle.getAttribute("aria-keyshortcuts"), "A", "the toggle does not name its key");
+  assert.ok(page.el("keyboard-keys").text().includes("Main messages"), "the ? help does not list the key");
+  // Off, as it starts: the cards alone, and the box where it was (negative control).
+  const off = cardsListed(page);
+  assert.ok(off.every((one) => one.startsWith("card:")), `off, the list holds more than cards: ${off}`);
+  assert.equal(page.el("channel-composer").parentNode, page.el("pane-discord"));
+  await page.documentEvent("keydown", { key: "a" });
+  await page.settle();
+  assert.equal(toggle.getAttribute("aria-pressed"), "true", "a did not show the main channel's messages");
+  assert.equal(page.storage.get(THREADS_MAIN_STORAGE), "on", "the choice was not kept on the device");
+  // 200 before both threads moved, 210 (a thread nobody has answered, so no card) after them; the roots
+  // of the carded threads, 201 and 203, are their cards.
+  assert.deepStrictEqual(cardsListed(page),
+    ["main:200", "card:spaces/A/threads/one & two", "card:spaces/A/threads/another", "main:210"],
+    "the main channel's messages are not among the cards in the list's order");
+  assert.equal(page.el("channel-composer").parentNode, page.el("side-list"), "the main channel's box is not the last card");
+  assert.equal(page.el("side-list").children.at(-1), page.el("channel-composer"));
+  // Done through here on a main-channel message covers Main's messages above it, not the threads between.
+  const last = page.el("side-cards").children.find((li) => li.getAttribute("data-id") === "210");
+  await last.descendants().find((node) => node.className === "row-read-through-button").click();
+  await page.settle();
+  assert.deepStrictEqual(page.dismissCalls.at(-1), { messages: ["200", "210"] },
+    "Through here on a main-channel message marked more than Main's messages above it");
+  await toggle.click();
+  await page.settle();
+  assert.ok(cardsListed(page).every((one) => one.startsWith("card:")), "off again left the main channel's messages");
+  assert.equal(page.el("channel-composer").parentNode, page.el("pane-discord"), "off again left the box at the foot of the cards");
+});
+
+test("`#419 threads-view-main-messages`: Thread or Reply on a main-channel message among the cards opens the reply under it, starting its thread, and the one box comes back to the foot after", async () => {
+  const { page, data } = await mainMessagesPage(new Map([[THREADS_MAIN_STORAGE, "on"]]));
+  const row = () => page.el("side-cards").children.find((li) => li.getAttribute("data-id") === "210");
+  assert.ok(row() && row().hasAttribute("data-main-row"), "the premise is 210 among the cards");
+  // Its grey Thread starts its thread where it is: the reply, under it, ticked to start the thread.
+  await threadBadge(row()).click();
+  await page.settle();
+  assert.equal(page.el("screen-main").getAttribute("data-columns"), "list", "Thread left the Threads view");
+  assert.equal(replyBoxAt(page), "right", "Thread did not open the reply among the cards");
+  assert.deepStrictEqual(inlineAnchors(page), ["side-cards:210"], "the reply is not under the message");
+  assert.equal(page.el("reply-branch").checked, true, "the reply is not bound for the message's new thread");
+  assert.equal(page.el("channel-composer").hidden, true, "the box at the foot is drawn beside the reply's");
+  distinctReplies(page);
+  await page.el("reply-text").setValue("first answer");
+  await page.el("reply-send").click();
+  await page.settle();
+  assert.deepStrictEqual(keyless(page.repliesPosted.at(-1).body),
+    { text: "first answer", reply_to: "210", thread_id: data.lone.id, keyed: false }, "the reply did not start 210's thread");
+  assert.equal(page.el("channel-composer").hidden, false, "the box at the foot did not come back");
+  assert.equal(page.el("channel-composer").parentNode, page.el("side-list"));
+  // Reply on 200, which heads no thread here: under it, and Cancel gives the box back.
+  const lone = page.el("side-cards").children.find((li) => li.getAttribute("data-id") === "200");
+  await replyButton(lone).click();
+  assert.deepStrictEqual(inlineAnchors(page), ["side-cards:200"]);
+  assert.equal(page.el("channel-composer").hidden, true);
+  await page.el("reply-cancel").click();
+  assert.equal(page.el("channel-composer").hidden, false);
+  // The box at the foot posts to the main channel.
+  await page.el("channel-compose-text").setValue("to everyone");
+  await page.el("channel-send").click();
+  await page.settle();
+  assert.deepStrictEqual(keyless(page.repliesPosted.at(-1).body), { text: "to everyone", keyed: false },
+    "the box at the foot did not post to the main channel");
+});
+
+test("`#419 threads-view-main-messages`: Unread only keeps the main-channel messages still to read, and the search finds them by their words", async () => {
+  const { page } = await mainMessagesPage(new Map([[THREADS_MAIN_STORAGE, "on"]]));
+  page.dealtWith.add("200");
+  await refreshDiscord(page, page.messages);
+  await page.settle();
+  const shownMain = () => page.el("side-cards").children.filter((li) => li.hasAttribute("data-main-row") && !li.hidden
+    && !li.hasClass("search-hidden")).map((li) => li.getAttribute("data-id"));
+  assert.deepStrictEqual(shownMain(), ["200", "210"], "the premise is both on the list");
+  await page.el("side-unread-only").click();
+  await page.settle();
+  assert.deepStrictEqual(shownMain(), ["210"], "Unread only kept a read main-channel message");
+  await page.el("side-unread-only").click();
+  await search(page, "brand-new");
+  assert.deepStrictEqual(shownMain(), ["210"], "the search did not find the main-channel message by its words");
+});
+
+test("`#419 threads-view-main-messages`: in the Threads view the heading is on the search glass's row, and goes back under the bar while the search is open", () => {
+  const shut = cssBlock('#screen-main[data-columns="list"]:not([data-searching]) > #side-column');
+  assert.match(shut, /padding-top:\s*max\(0px, calc\(var\(--float-line\) - 2\.75rem \/ 2\)\)/, "the heading is not on the glass's row");
+  assert.match(cssBlock('#screen-main[data-columns="list"]:not([data-searching]) #side-heading'), /padding-inline-end:\s*calc\(var\(--search-disc\)/,
+    "the heading's end is not clear of the glass");
+  assert.match(cssBlock('#screen-main[data-columns="list"][data-searching] > #side-column'), /var\(--search-bar\)/,
+    "the heading does not go back under the open search bar");
 });
 
 test("`#281 view-keys` x `#279 thread-card-focus`: the thread list's cards are two columns' cards — a click highlights one without leaving the list, the highlight goes on through Ctrl+4, and its replies button or → opens its thread across the window", async () => {

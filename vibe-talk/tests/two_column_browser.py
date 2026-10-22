@@ -18,8 +18,8 @@ desk size, with a mouse:
   columns side by side, inside the window, neither overlapping the other, each at least 440px wide;
   the view picker saying "Two columns" and the reading-width handle gone -> `#281 view-keys`: the
   picker chooses there, where `#231 two-column-polish` greyed it: the thread list chosen from it is the
-  right column alone, across the window, its heading clear of the search glass and the left column
-  out of sight; a real Ctrl+2 is one column in All, and a real Ctrl+4 two columns again; the right
+  right column alone, across the window, its heading on the search glass's row and clear of it
+  (`#419 threads-view-main-messages`), and the left column out of sight; a real Ctrl+2 is one column in All, and a real Ctrl+4 two columns again; the right
   column is one region, named "Thread list" -> the right column lists the
   threads as cards, newest activity at the foot (`#261 two-column-connectors`), every card the same
   height, the summarised one saying its name and summary, the long first message cut to three lines,
@@ -394,10 +394,15 @@ def columns_walk(desk: Desk) -> None:
     desk.check(page.evaluate("() => getComputedStyle(document.getElementById('scroll-area')).visibility") == "hidden",
                "the left column shows through the thread list")
     glass = page.locator("#search-toggle").bounding_box()
-    heading = page.locator("#side-heading").bounding_box()
-    assert glass is not None and heading is not None
-    desk.check(glass["y"] + glass["height"] <= heading["y"] + 1,
-               f"the search glass covers the thread list's heading: {glass} {heading}")
+    assert glass is not None
+    # `#419 threads-view-main-messages`: the heading is on the glass's row, its title and chips before it.
+    parts = page.evaluate("""() => [...document.getElementById('side-heading').children]
+        .filter((n) => !n.hidden && n.getClientRects().length > 0)
+        .map((n) => { const r = n.getBoundingClientRect(); return {id: n.id, left: r.left, right: r.right, top: r.top, bottom: r.bottom}; })""")
+    assert isinstance(parts, list)
+    for part in parts:
+        desk.check(part["right"] <= glass["x"] + 0.5 or part["top"] >= glass["y"] + glass["height"] - 0.5,
+                   f"the search glass covers the thread list's heading: {part} under {glass}")
     desk.check(not listed.drawn("grip"), "the reading-width handle is drawn over the thread list")
     desk.check(float(str(listed.value("overflow"))) <= 0, "the page scrolls sideways in the thread list")
     desk.check(listed.value("pressed") == "false", "the layout button still says two columns over the thread list")

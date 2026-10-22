@@ -56,6 +56,13 @@ four views are offered, in the view picker and on Ctrl+1 to Ctrl+4 (Cmd on a Mac
   and messages in reading order, every key about one message acts on the one selected, ; and : open
   and fold them, and → goes into its thread (`#407 unpack-row-parity`). A thread
   whose replies are not held yet is read as its card nears the screen, its newest page only.
+  **Main messages** beside them (key `a`, kept on this device, `#419 threads-view-main-messages`) adds the
+  main channel's messages that are not threads yet, as message rows among the cards in the order they
+  were posted, and makes the main channel's message box the last card at the foot. **Thread** or
+  **Reply** on one of those opens the reply under it in the list (`#410 inline-reply-editor`), starting
+  its thread where the service starts one on a reply, rather than opening the thread view; the box at the
+  foot is hidden while a reply is open and comes back when it goes. The chips sit on the row of the
+  search glass, the cards starting under it.
   Wherever a card says a summary rather than the thread's first message — here and at the head of an
   open thread — that first message stands first under the card as its child, however read it is; a
   card that already is the first message gains no second copy (`#404 threads-unpack-all`,

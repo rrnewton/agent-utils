@@ -448,7 +448,7 @@ steps:
   # at All's foot at it again with Send on screen, one 100 or 225px up All and one 100 to 380px up Main
   # on their row; and with no card up as the list comes, a draft arriving under it leaving a reader 40
   # or 100px up Main on their row behind the cards and back, and with none at all, one 100px up All on
-  # theirs (`#280`); and at 1280x800 a reader 60 to 300px up the list's cards, the card docked under them,
+  # theirs (`#280`); and at 1280x800 a reader 60 to 260px up the list's cards, the card docked under them,
   # on their card again by Ctrl+4 and Ctrl+3, though two columns put them at the foot of their cards, and
   # one who moved the cards in two columns where they moved to; and at 393x852 and 1280x800 a reader at
   # the foot of Main or All still there once the box takes back its room a second after Send, the sent
@@ -1251,6 +1251,26 @@ steps:
     hint:
       resources: {browser: 1}
       est_duration_s: 25
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  # `#419 threads-view-main-messages` in the browser engine, at 1280x800 with a mouse and 393x852 by touch:
+  # the Threads view's heading (title, Unread only, Unpack all, Main messages) on the search glass's row,
+  # its middle level with the glass's and every chip ending before it; Main messages putting the main
+  # channel's messages among the cards in time order and its box last; a reply on an old main-channel
+  # message opening directly under it, the rows after it below, the box at the foot giving way to it so
+  # one message box is on screen, and coming back on Cancel. Measured on 2026-10-22: about 6s wall.
+  - group: check
+    job: threads-main-browser
+    desc: the Threads view's chips on the search glass's row, Main messages among the cards with the main channel's box last, and a reply under one of them moving the one box, in current Chromium at 1280x800 and 393x852
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/threads_main_browser.py
+    jobs_flag: ""
+    timeout: 90
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 6
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
