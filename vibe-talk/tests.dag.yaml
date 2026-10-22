@@ -428,6 +428,27 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#431 voice-transcript-expand` in the browser engine, at 393x852 by touch and 1280x800 by mouse: a
+  # reply streamed a sentence a frame over a fake vibe-talk-v1 bridge grows past the fold and is never
+  # folded while spoken, the list following its newest line; a tap on the card closes it and another
+  # opens it; a long reply that arrives whole arrives folded and opens on a tap at the newest line; a
+  # fold the reader sets mid-reply holds through its later frames; scrolled up, a card opens without
+  # moving it or the row above. Served through Playwright's routing, so it opens no port. Measured on
+  # 2026-10-22: about 10s wall.
+  - group: check
+    job: voice-expand-browser
+    desc: a long voice turn opened and closed by a tap on its card, a streamed reply kept whole as it grows and a reader's fold kept across its frames, the reader's place kept, in current Chromium at 393x852 and 1280x800
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/voice_expand_browser.py
+    jobs_flag: ""
+    timeout: 120
+    cpu_timeout: 90
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 10
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#269 approval-card-inline` in the browser engine: the send card as the next message, in the list
   # on the call's view and the channel and docked on Settings, Send's centre at least 0.62 of the way
   # down a 393x852, 360x780 and 375x667 phone in every run (one and thirty rows, banner up or gone,
