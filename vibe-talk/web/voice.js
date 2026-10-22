@@ -20917,7 +20917,9 @@ const THREAD_HUES_KEY = "vibe-talk.thread-hues";
 const THREAD_HUES_VERSION = 1;
 /**
  * Threads remembered per channel. With 24 the widest arc left is at least 15° wide, so a new thread
- * lands at least 7.5° from a remembered one; it is this cap that keeps that floor.
+ * lands at least 7.5° from a remembered one; it is this cap that keeps that floor. A thread whose
+ * neighbours rule that arc out (`#414 thread-hue-spread`) is re-rolled to the farthest colour that
+ * clears them, which may be nearer a remembered thread drawn elsewhere.
  */
 const THREAD_HUES_PER_CHANNEL = 24;
 /** Threads remembered across every channel at once. */
@@ -21021,6 +21023,7 @@ function restoreThreadHues(channel) {
   if (String(channel) === threadColorsChannel) return;
   threadColors.clear();
   threadHuesSeen.clear();
+  threadHuesGiven.length = 0;
   threadColorsChannel = String(channel);
   if (!threadColorsChannel) return;
   for (const [id, [hue]] of Object.entries((readThreadHues() || {})[threadHueScope(channel)] || {})) {
@@ -21060,8 +21063,107 @@ function threadHue(id) {
       hue = (used[i] + widest / 2) % 360;
     }
   }
+  hue = spreadThreadHue(hue, used, threadHueNeighbours(key));
   threadColors.set(key, hue);
+  threadHuesGiven.push(key);
+  if (threadHuesGiven.length > THREAD_HUE_RECENT) threadHuesGiven.shift();
   return hue;
+}
+
+// `#414 thread-hue-spread`. The widest arc is the colour farthest from every thread the channel has,
+// but once `#396` remembers two dozen of them that arc can be 15° wide, and nothing kept the threads
+// drawn either side of a new one out of it: three consecutive roots came out three shades of one
+// colour. A new thread's colour must now stand clear of its neighbours, and is re-rolled if it does not.
+/**
+ * How far apart, in degrees of hue, a new thread's colour is kept from its neighbours'. 45° is one
+ * step of the eight hue families the eye names (red, orange, yellow, green, cyan, blue, violet,
+ * magenta) at the page's fixed 55% saturation and 50% lightness, so neighbours never share one: at
+ * 30° yellow-green and green, or two blues, still read as one colour at a 3px edge. It is also as far
+ * as can still be promised: eight neighbours spread 45° apart leave nothing that clears them all.
+ */
+const THREAD_HUE_APART = 45;
+/**
+ * How far, more strictly, from the thread drawn right before or after it, where it can be had. At 45°
+ * three threads in a row can still step along the wheel — blue, violet, magenta — and read as a
+ * gradient; a quarter turn puts blue beside magenta or green, which reads as unrelated.
+ */
+const THREAD_HUE_BESIDE = 90;
+/** Threads either side of a new one, in the order their roots were posted, whose colours it avoids. */
+const THREAD_HUE_NEIGHBOURS = 3;
+/** Threads given a colour most recently on this page whose colours a new one avoids too. */
+const THREAD_HUE_RECENT = 3;
+/** The threads last given a colour on this page, oldest first. Cleared with `threadColors`. */
+const threadHuesGiven = [];
+
+const hueApart = (a, b) => {
+  const apart = Math.abs(a - b) % 360;
+  return Math.min(apart, 360 - apart);
+};
+
+/**
+ * The colours of the threads drawn near `key`: those whose roots come just before and after its own
+ * in time — where All and Main draw them — and those last given a colour, which is the order any view
+ * drew its new threads in. Only threads with a colour count; one given its colour later avoids this
+ * one in turn. `beside` is the nearest of them: the closest root with a colour on either side, and
+ * the thread given a colour last.
+ */
+function threadHueNeighbours(key) {
+  const roots = new Map();
+  const noteRoot = (id, at) => {
+    if (id && Number.isFinite(at) && !(roots.get(id) <= at)) roots.set(id, at);
+  };
+  for (const summary of channelCanon.threads) {
+    if (summary && summary.root) noteRoot(String(summary.id), timeOf(summary.root, "timestamp"));
+  }
+  for (const message of channelCanon.messages) {
+    if (message && message.thread && message.thread.is_root) noteRoot(threadOf(message), timeOf(message, "timestamp"));
+  }
+  const near = [];
+  const beside = [];
+  const order = [...roots].sort((a, b) => a[1] - b[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)).map(([id]) => id);
+  const at = order.indexOf(key);
+  if (at >= 0) {
+    for (const step of [-1, 1]) {
+      let found = 0;
+      for (let i = at + step; i >= 0 && i < order.length && found < THREAD_HUE_NEIGHBOURS; i += step) {
+        if (!threadColors.has(order[i])) continue;
+        near.push(threadColors.get(order[i]));
+        if (found === 0) beside.push(threadColors.get(order[i]));
+        found += 1;
+      }
+    }
+  }
+  for (const given of threadHuesGiven) if (given !== key && threadColors.has(given)) near.push(threadColors.get(given));
+  const last = threadHuesGiven[threadHuesGiven.length - 1];
+  if (last !== undefined && last !== key && threadColors.has(last)) beside.push(threadColors.get(last));
+  return { near, beside };
+}
+
+/**
+ * `widest`, the widest arc's middle, if it clears the neighbours: `THREAD_HUE_APART` from every colour
+ * in `near` and `THREAD_HUE_BESIDE` from every one in `beside`. Else the re-roll: every whole degree is
+ * a candidate, the farthest from every colour in `used` first and the lower hue on a tie, so the same
+ * channel always re-rolls to the same colour, and the first that clears them wins. Where none does,
+ * the same again asking only `THREAD_HUE_APART` of every neighbour; where none does that either, the
+ * candidate farthest from its nearest neighbour.
+ */
+function spreadThreadHue(widest, used, { near, beside }) {
+  const clearance = (hue, of) => of.reduce((least, other) => Math.min(least, hueApart(hue, other)), 360);
+  const tiers = [
+    (hue) => clearance(hue, near) >= THREAD_HUE_APART && clearance(hue, beside) >= THREAD_HUE_BESIDE,
+    (hue) => clearance(hue, near) >= THREAD_HUE_APART,
+  ];
+  const spread = (hue) => clearance(hue, used);
+  const candidates = Array.from({ length: 360 }, (_, hue) => ({ hue, spread: spread(hue) }))
+    .sort((a, b) => b.spread - a.spread || a.hue - b.hue);
+  for (const clears of tiers) {
+    if (clears(widest)) return widest;
+    const first = candidates.find((candidate) => clears(candidate.hue));
+    if (first) return first.hue;
+  }
+  let best = candidates[0];
+  for (const candidate of candidates) if (clearance(candidate.hue, near) > clearance(best.hue, near)) best = candidate;
+  return best.hue;
 }
 
 function threadCount(count, exact) {
