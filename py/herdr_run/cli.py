@@ -19,6 +19,7 @@ import re
 import signal
 import subprocess
 import sys
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 
@@ -46,7 +47,7 @@ from herdr_run.errors import (
     Refused,
     RunTimeout,
 )
-from herdr_run.evict import describe_skipped, survey_workspace
+from herdr_run.evict import RetiredTab, describe_skipped, retire_idle_tabs, run_time, survey_workspace
 from herdr_run import output
 from herdr_run.readiness import assess, infer_prompt_tail
 from herdr_run.runner import RunResult, execute, read_output_bytes, write_meta
@@ -87,6 +88,7 @@ SUBCOMMANDS: tuple[tuple[str, str], ...] = (
     ("config", "print the fully resolved configuration as JSON"),
     ("target", "resolve this agent's pane and print its ids and readiness"),
     ("reap", "report which command tabs are provably finished with"),
+    ("sweep", "close command tabs idle past the configured TTL"),
     ("net-doctor", "smoke-test one scenario: a caller whose own network is blocked"),
     ("quickstart", "print the one-screen introduction"),
     ("userguide", "print the complete reference"),
@@ -135,6 +137,7 @@ SUBCOMMAND_OPTIONS: tuple[tuple[str, tuple[tuple[str, str | None], ...]], ...] =
         ),
     ),
     ("status", _HELP_OPTIONS),
+    ("sweep", (("--dry-run", None), ("--help", None), ("--idle", None), ("-h", None))),
     ("target", (("--help", None), ("--no-cache", None), ("-h", None))),
     ("userguide", _HELP_OPTIONS),
 )
@@ -161,6 +164,7 @@ _AGENT_BLIND: dict[str, str] = {
     "check": "it answers a policy question about a command and touches no pane",
     "init": "it writes a configuration file and touches no pane",
     "reap": "it reports on the whole workspace, not on one agent's tab",
+    "sweep": "it retires tabs across the whole workspace, not one agent's tab",
     "quickstart": "it prints a packaged document",
     "userguide": "it prints a packaged document",
 }
@@ -172,9 +176,9 @@ _AGENT_BLIND: dict[str, str] = {
 #: parse of the output rather than at the flag -- which is the worst place to find out, because the
 #: failure looks like corrupt data rather than a rejected request.
 #:
-#: ``config``, ``target``, and ``reap`` are deliberately absent. They print JSON with or without the
-#: flag, so a caller who asks them for machine-readable output gets exactly that; the flag is
-#: redundant there, not disregarded.
+#: ``config``, ``target``, ``reap``, and ``sweep`` are deliberately absent. They print JSON with or
+#: without the flag, so a caller who asks them for machine-readable output gets exactly that; the
+#: flag is redundant there, not disregarded.
 _JSON_BLIND: dict[str, str] = {
     "net-doctor": "it prints a human diagnosis and a verdict, in prose",
     "quickstart": "it prints a packaged document",
@@ -224,12 +228,20 @@ class _RunOptions:
 
 
 @dataclass(frozen=True)
+class _SweepOptions:
+    """Options accepted only after ``sweep``."""
+
+    dry_run: bool = False
+
+
+@dataclass(frozen=True)
 class _Invocation:
     """One fully parsed invocation."""
 
     globals: _Globals
     subcommand: str
     run: _RunOptions | None = None
+    sweep: _SweepOptions | None = None
     command: str | None = None
     force: bool = False
     upgrade: bool = False
@@ -525,6 +537,35 @@ def _parse_flag_only(name: str, rest: Sequence[str], flag: str) -> bool:
     return present
 
 
+def _parse_sweep(rest: Sequence[str]) -> _SweepOptions:
+    """Parse ``sweep``'s own arguments.
+
+    ``--idle`` names the one sweep there is, and is required rather than implied: a bare
+    ``sweep`` that closed tabs would be a command whose whole effect is invisible in its own
+    spelling, and the flag leaves room to sweep by some other measure later without changing
+    what the bare word already meant.
+    """
+    idle = dry_run = False
+    positional = 0
+    for token in rest:
+        if token in ("--help", "-h"):
+            _print_subcommand_help("sweep")
+            raise _EarlyExit()
+        if token == "--idle":
+            idle = True
+        elif token == "--dry-run":
+            dry_run = True
+        elif token.startswith("-"):
+            raise _UsageError(_local_argument_error("sweep", token))
+        else:
+            positional += 1
+    if positional:
+        raise _UsageError(f"sweep: takes no positional arguments; got {positional}")
+    if not idle:
+        raise _UsageError("sweep: needs --idle (close tabs idle past idle_tab_ttl_seconds)")
+    return _SweepOptions(dry_run=dry_run)
+
+
 def _parse_subcommand(name: str, rest: Sequence[str], globals_: _Globals) -> _Invocation:
     """Parse one subcommand's own arguments."""
     if name == "run":
@@ -543,6 +584,8 @@ def _parse_subcommand(name: str, rest: Sequence[str], globals_: _Globals) -> _In
         return _Invocation(
             globals_, name, no_cache=_parse_flag_only(name, rest, "--no-cache")
         )
+    if name == "sweep":
+        return _Invocation(globals_, name, sweep=_parse_sweep(rest))
     positional = _parse_bare(name, rest)
     if positional:
         raise _UsageError(
@@ -731,6 +774,24 @@ _SUBCOMMAND_HELP: dict[str, str] = {
         "was declined. Closes nothing.\n"
         "\noptions:\n"
         "  -h, --help            show this help message and exit\n"
+    ),
+    "sweep": (
+        "usage: herdr-run [GLOBAL OPTIONS] sweep --idle [--dry-run]\n"
+        "\nClose command tabs idle past idle_tab_ttl_seconds: every recorded run in the tab\n"
+        "finished, the last one more than the TTL ago, and its shell provably idle — the\n"
+        "same verdict the pane cap takes, under the pane lock, immediately before the\n"
+        "close. A tab running a command, holding a background job, locked by another\n"
+        "runner, or split into several panes is never closed. Tabs no run record names\n"
+        "are left to 'reap'. Prints JSON: what closed, and why everything else stayed.\n"
+        "With idle_tab_ttl_seconds 0 the sweep is disabled and closes nothing. Runs also\n"
+        "sweep a bounded number of tabs when they finish; this subcommand is the same\n"
+        "sweep on demand, for a timer.\n"
+        "\noptions:\n"
+        "  -h, --help            show this help message and exit\n"
+        "  --idle                sweep by idle lifetime (required; the only sweep there is)\n"
+        "  --dry-run             judge every tab and report; close nothing\n"
+        "\nExample:\n"
+        "  herdr-run sweep --idle --dry-run\n"
     ),
     "net-doctor": (
         "usage: herdr-run [GLOBAL OPTIONS] net-doctor\n"
@@ -1022,6 +1083,7 @@ def _cmd_config(config: Config, agent: str) -> int:
         "timeout_seconds": config.timeout_seconds,
         "retention_days": config.retention_days,
         "max_panes": config.max_panes,
+        "idle_tab_ttl_seconds": config.idle_tab_ttl_seconds,
         "ready_timeout_seconds": config.ready_timeout_seconds,
         "readiness": config.readiness,
         "prompt_tail": config.prompt_tail,
@@ -1199,6 +1261,88 @@ def _cmd_reap(config: Config, environ: Mapping[str, str]) -> int:
     }
     _emit_json(document)
     return 0
+
+
+def _retired_document(retired: RetiredTab) -> dict[str, object]:
+    return {
+        "pane_id": retired.pane_id,
+        "tab_id": retired.tab_id,
+        "agent": retired.agent,
+        "last_run": retired.last_run,
+        "last_run_at": run_time(retired.last_run) if retired.last_run is not None else None,
+        "reason": retired.reason,
+    }
+
+
+def _cmd_sweep(config: Config, environ: Mapping[str, str], options: _SweepOptions) -> int:
+    """Close the workspace's tabs that are idle past ``idle_tab_ttl_seconds``.
+
+    The explicit form of the sweep a finished run performs in bounded form, for a timer or an
+    operator. Unlike ``reap`` this ACTS: expiry only selects the candidates, and each close is
+    still the cap's verdict -- shell provably idle, taken under the pane lock immediately before
+    ``tab close`` (:func:`herdr_run.evict.retire_idle_tabs`). Every recorded pane that stays
+    open carries its reason, because a sweep that closes nothing must say whether nothing was
+    expired or everything expired was busy. A workspace herdr cannot list is reported in
+    ``listing_error`` with nothing closed: from a timer, "no workspace yet" is a routine state,
+    not a failure worth a nonzero exit.
+    """
+    sweep_result = retire_idle_tabs(
+        _client(config, environ),
+        config,
+        actor="sweep",
+        now=time.time(),
+        dry_run=options.dry_run,
+    )
+    document = {
+        "workspace": config.workspace,
+        "idle_tab_ttl_seconds": config.idle_tab_ttl_seconds,
+        "dry_run": options.dry_run,
+        "listing_error": sweep_result.listing_error,
+        "counts": {
+            "considered": len(sweep_result.closed) + len(sweep_result.would_close) + len(sweep_result.kept),
+            "closed": len(sweep_result.closed),
+            "would_close": len(sweep_result.would_close),
+            "kept": len(sweep_result.kept),
+        },
+        "closed": [_retired_document(tab) for tab in sweep_result.closed],
+        "would_close": [_retired_document(tab) for tab in sweep_result.would_close],
+        "kept": [
+            {"pane_id": pane_id, "reason": reason} for pane_id, reason in sweep_result.kept
+        ],
+    }
+    _emit_json(document)
+    return 0
+
+
+#: How many expired tabs one finished run may examine while sweeping opportunistically. Each
+#: examination probes a pane and scans ``/proc``; the bound keeps housekeeping from ever
+#: stretching a caller's command, and leftovers are picked up by the next run or by
+#: ``herdr-run sweep --idle``.
+_OPPORTUNISTIC_SWEEP_LIMIT = 4
+
+
+def _sweep_idle_best_effort(
+    client: HerdrClient, config: Config, agent: str, pane_id: str
+) -> None:
+    """Retire idle-expired tabs at the end of a run, without ever changing its result.
+
+    Pruned-on-write, like retention, so it cannot silently stop the way a timer can -- but
+    bounded (:data:`_OPPORTUNISTIC_SWEEP_LIMIT`) and never the tab the run just used. A failure
+    to tidy is a warning, exactly as a failure to write the run's metadata is.
+    """
+    if config.idle_tab_ttl_seconds <= 0:
+        return
+    try:
+        retire_idle_tabs(
+            client,
+            config,
+            actor=agent,
+            now=time.time(),
+            limit=_OPPORTUNISTIC_SWEEP_LIMIT,
+            exclude_pane_id=pane_id,
+        )
+    except Exception as exc:  # housekeeping: nothing it hits may mask a completed command
+        output.diagnostic(f"herdr-run: WARNING: idle tab sweep failed: {exc}")
 
 
 #: The scope disclaimer ``net-doctor`` prints before it does anything.
@@ -1443,6 +1587,7 @@ def _run_command(
         output.write_labelled(1, exc.partial_stdout.encode("utf-8"), "partial stdout")
         output.write_labelled(2, exc.partial_stderr.encode("utf-8"), "partial stderr")
         output.diagnostic(f"herdr-run: {exc}")
+        _sweep_idle_best_effort(client, config, agent, target.pane_id)
         return exc.exit_code
     except HerdrRunError as exc:
         _record_audit(log, agent, command, type(exc).__name__.upper(), str(exc))
@@ -1490,6 +1635,7 @@ def _run_command(
     else:
         output.stdout_bytes(stdout_bytes)
         output.stderr_bytes(stderr_bytes)
+    _sweep_idle_best_effort(client, config, agent, result.target.pane_id)
     return result.exit_code
 
 
@@ -1575,6 +1721,9 @@ def _dispatch(invocation: _Invocation, environ: Mapping[str, str]) -> int:
         )
     if invocation.subcommand == "reap":
         return _cmd_reap(config, environ)
+    if invocation.subcommand == "sweep":
+        assert invocation.sweep is not None
+        return _cmd_sweep(config, environ, invocation.sweep)
     if invocation.subcommand == "net-doctor":
         return _cmd_net_doctor(config, agent, environ)
     raise AssertionError(f"unhandled subcommand {invocation.subcommand!r}")

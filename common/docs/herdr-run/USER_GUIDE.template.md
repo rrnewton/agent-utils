@@ -82,6 +82,7 @@ herdr-run init --upgrade           # bring the one here up to date with this rel
 herdr-run target                   # resolve/bring up the pane; print ids and readiness
 herdr-run config                   # print the effective configuration as JSON
 herdr-run reap                     # report which command tabs are provably finished. Closes nothing.
+herdr-run sweep --idle             # close command tabs idle past idle_tab_ttl_seconds (--dry-run reports)
 herdr-run net-doctor               # smoke-test one narrow scenario (see below)
 herdr-run userguide                # this document
 ```
@@ -91,8 +92,8 @@ herdr-run userguide                # this document
 | Option | Effect |
 | --- | --- |
 | `--config PATH` | Use an explicit configuration file instead of the discovered one. Refused by `init`, `quickstart`, and `userguide`, which take no configuration file: `init` works on the one in the current directory, and the other two print a packaged document. |
-| `--agent NAME` | The agent this invocation speaks for; names its tab. Otherwise the first of `$HERDR_RUN_AGENT`, `$DG_AGENT_NAME`, and `$ORC_AGENT_NAME` that is non-empty once Unicode white space is trimmed from both ends (so a variable holding only U+3000 or U+00A0 is skipped like an empty one), else `unknown-agent`. An agent name, from the option or a variable, may contain no control character, no invisible character (a format character such as U+200B or U+202E, a default-ignorable code point such as U+034F or U+FE0F, a blank such as U+2800 or U+3164, or a space other than U+0020), and no noncharacter, private-use character, or code point Unicode 16.0 leaves unassigned, as listed for policy names under the configuration file; one that does is a configuration error (78). So is a variable that is not valid UTF-8, rather than being skipped, so an invocation never speaks for the next variable's agent by accident. Refused by `check`, `init`, `reap`, `quickstart`, and `userguide`, which name no tab. |
-| `--json` | Emit machine-readable output where the subcommand has one. Refused by `net-doctor`, `quickstart`, and `userguide`, whose only output is prose. `config`, `target`, and `reap` print JSON with or without it. |
+| `--agent NAME` | The agent this invocation speaks for; names its tab. Otherwise the first of `$HERDR_RUN_AGENT`, `$DG_AGENT_NAME`, and `$ORC_AGENT_NAME` that is non-empty once Unicode white space is trimmed from both ends (so a variable holding only U+3000 or U+00A0 is skipped like an empty one), else `unknown-agent`. An agent name, from the option or a variable, may contain no control character, no invisible character (a format character such as U+200B or U+202E, a default-ignorable code point such as U+034F or U+FE0F, a blank such as U+2800 or U+3164, or a space other than U+0020), and no noncharacter, private-use character, or code point Unicode 16.0 leaves unassigned, as listed for policy names under the configuration file; one that does is a configuration error (78). So is a variable that is not valid UTF-8, rather than being skipped, so an invocation never speaks for the next variable's agent by accident. Refused by `check`, `init`, `reap`, `sweep`, `quickstart`, and `userguide`, which name no tab. |
+| `--json` | Emit machine-readable output where the subcommand has one. Refused by `net-doctor`, `quickstart`, and `userguide`, whose only output is prose. `config`, `target`, `reap`, and `sweep` print JSON with or without it. |
 | `--version` | Print the version and exit. |
 | `--dump-surface` | Print every subcommand and option, with the value each option takes, as JSON, and exit. Meant for tools that check the command-line surface. |
 
@@ -615,6 +616,32 @@ never does. **`reap` closes nothing**; it prints the plan, with a reason
 for every pane it declined and a count for every verdict including the zeros, because "reaped 0
 because nothing was stale" and "reaped 0 because the detector is inert" are otherwise the same
 output.
+
+#### The idle lifetime
+
+Neither the cap nor `reap` ever closes a tab merely because its agent has gone away: the cap
+closes only to make room, and `reap` closes nothing at all. So without a lifetime every command
+workspace fills to `max_panes` idle shells and stays there for as long as the server runs.
+`idle_tab_ttl_seconds` (900 seconds by default) is that lifetime. A tab is retired when **every**
+recorded run in it finished, the last one more than the TTL ago — measured from the completion
+marker's mtime, the same reading retention ages a run by — and its shell passes the cap's idle
+verdict above, taken under the pane lock immediately before the close. Expiry only selects the
+candidates; it never authorises a close on its own, so a tab running a command, holding a
+background job, locked by another runner, or split into several panes is kept, with the reason
+reported.
+
+The candidate set is `reap`'s: panes a surviving run record names, in scope under the current
+configuration. A tab with no record is never retired this way; `reap` judges those, and the cap
+replaces them first. The retention bound applies equally: a tab whose records were pruned is
+invisible here.
+
+Retirement happens in two places. A finished `run` sweeps opportunistically — at most four
+expired tabs examined, never its own — so the cleanup happens as a side effect of the work that
+creates the tabs and cannot silently stop the way a timer can; a failure to sweep is a warning
+and never changes the run's result. `herdr-run sweep --idle` is the same sweep without the
+bound, for a timer or an operator; `--dry-run` judges every tab the way `reap`'s survey does —
+without the pane lock — and closes nothing. Both print a line per close on stderr and append a
+`RETIRED` entry to the audit log. Set `idle_tab_ttl_seconds: 0` to disable retirement entirely.
 
 ### Audit log
 

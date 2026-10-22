@@ -4,6 +4,11 @@ A new agent that needs a tab in a full workspace no longer has to wait for someb
 hand. Instead the tab whose last recorded ``herdr-run`` run is OLDEST is closed, provided its shell
 is provably idle, and the new tab takes its place.
 
+The same idle verdict also retires tabs on a lifetime (:func:`retire_idle_tabs`): a tab whose last
+recorded run finished more than ``idle_tab_ttl_seconds`` ago is closed even when the workspace is
+nowhere near the cap. Without that, the cap is the only closer, so every command workspace fills
+to ``max_panes`` idle shells and stays there for as long as the server runs.
+
 "Provably idle" is deliberately narrower than "looks quiet":
 
 * no other ``herdr-run`` holds the pane's lock (the runner holds it for a whole command);
@@ -25,6 +30,7 @@ Order comes from the run spool. Panes with no record at all -- tabs nobody has u
 from __future__ import annotations
 
 import fcntl
+import math
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -35,20 +41,25 @@ from herdr_run.config import Config
 from herdr_run.errors import HerdrRunError, HerdrUnavailable
 from herdr_run.readiness import ProcessSignal, assess_process
 from herdr_run.state import open_lock_file, pane_lock_path
-from herdr_run.sweep import load_run_records
-from herdr_run.textfmt import os_error_text, quote
+from herdr_run.sweep import _scope_of, load_run_records
+from herdr_run.textfmt import number_text, os_error_text, quote, quote_optional
 
 __all__ = [
     "Candidate",
     "Eviction",
+    "IdleSweep",
+    "RetiredTab",
     "SessionScan",
+    "TtlCandidate",
     "describe_skipped",
     "evict_one",
     "judge_idle",
     "lru_candidates",
     "parse_session_id",
+    "retire_idle_tabs",
     "run_time",
     "scan_session",
+    "ttl_candidates",
 ]
 
 #: How many skipped tabs a refusal names before summarising the rest as a count.
@@ -346,3 +357,257 @@ def describe_skipped(skipped: Sequence[tuple[str, str]]) -> str:
     if len(skipped) > _REFUSAL_DETAIL_LIMIT:
         parts.append(f"and {len(skipped) - _REFUSAL_DETAIL_LIMIT} more")
     return f"None of its {len(skipped)} tab(s) could be replaced: {'; '.join(parts)}."
+
+
+# --- idle lifetime: retire finished tabs after ``idle_tab_ttl_seconds`` ---------------------------
+#
+# The cap above only ever closes a tab to make room for a new one, so a workspace fills to
+# ``max_panes`` idle shells and stays there. Retirement is the deterministic counterpart: a tab
+# whose last recorded run FINISHED more than the TTL ago is closed as soon as anybody looks --
+# at the end of a run, or from ``herdr-run sweep --idle`` on a timer. Everything that makes the
+# cap safe makes this safe, and it reuses those exact parts rather than growing a second notion
+# of idle:
+#
+# * the candidate set is the panes a surviving run record names, in scope by the same
+#   re-derivation ``reap`` applies (:func:`herdr_run.sweep._scope_of`). A tab with no record is
+#   never a candidate here; ``reap`` judges those, and the cap replaces them first;
+# * a pane with ANY record lacking an exit code has work in flight and is kept -- ``reap``'s R1,
+#   read the same way, over every record. ``from_cache`` records count in full here: the flag
+#   says the TARGET came from the session cache, and the command still ran and finished in this
+#   pane, which is all a finish time needs;
+# * the finish is the completion marker's mtime, noted as ``finished_at`` by
+#   :func:`herdr_run.sweep.load_run_records`. A finish that cannot be read is unknown, and an
+#   unknown finish keeps the tab;
+# * the close itself is :func:`_try_evict`: unsplit tab, pane lock taken without waiting, idle
+#   verdict under that lock immediately before ``tab close``. Expiry is only ever the reason to
+#   LOOK; it never authorises the close on its own.
+
+
+@dataclass(frozen=True)
+class TtlCandidate:
+    """One live pane judged against the idle TTL, in listing order."""
+
+    pane_id: str
+    tab_id: str
+    #: Run ID of the pane's most recent recorded run, if any record names the pane.
+    last_run: str | None
+    #: Agent label of that run, if recorded.
+    agent: str | None
+    #: Number of panes the listing shows in this tab.
+    tab_panes: int
+    #: Whether any run record names this pane at all.
+    recorded: bool
+    #: When the most recent recorded run finished (epoch seconds), when knowable.
+    finished_at: float | None
+    #: Whether that finish is more than the TTL before ``now``.
+    expired: bool
+    #: Why the pane is or is not expired, recorded so a kept tab is never silent.
+    reason: str
+
+
+def ttl_candidates(
+    panes: Sequence[Pane],
+    records: Sequence[Mapping[str, object]],
+    *,
+    now: float,
+    ttl_seconds: float,
+) -> list[TtlCandidate]:
+    """Judge every listed pane against the idle TTL. Pure: no client, no clock of its own.
+
+    ``records`` must be oldest run first, as :func:`load_run_records` returns them, so the LAST
+    record naming a pane is its most recent run. A pane is expired only when every record naming
+    it recorded an exit code and the most recent one's ``finished_at`` is a finite number more
+    than ``ttl_seconds`` before ``now`` -- exactly at the boundary is within the TTL. Scope is
+    not judged here; :func:`retire_idle_tabs` applies it before anything may close.
+    """
+    candidates: list[TtlCandidate] = []
+    for pane in panes:
+        mine = [record for record in records if record.get("pane_id") == pane.pane_id]
+        tab_panes = sum(1 for other in panes if other.tab_id == pane.tab_id)
+        if not mine:
+            candidates.append(
+                TtlCandidate(pane.pane_id, pane.tab_id, None, None, tab_panes, False, None, False, "no recorded run")
+            )
+            continue
+        last = mine[-1]
+        run_id = last.get("run_id")
+        agent = last.get("agent")
+        finished = last.get("finished_at")
+        finished_at = (
+            float(finished)
+            if isinstance(finished, (int, float))
+            and not isinstance(finished, bool)
+            and math.isfinite(finished)
+            else None
+        )
+        unfinished = sum(1 for record in mine if record.get("exit_code") is None)
+        if unfinished:
+            expired, reason = False, f"{unfinished} run(s) for this pane have no recorded exit_code"
+        elif finished_at is None:
+            expired, reason = False, "the finish time of this pane's last recorded run is unknown"
+        elif ttl_seconds <= 0:
+            expired, reason = False, "the idle TTL is disabled"
+        elif now - finished_at > ttl_seconds:
+            expired, reason = True, "last run finished more than the idle TTL ago"
+        else:
+            expired, reason = False, "last run finished within the idle TTL"
+        candidates.append(
+            TtlCandidate(
+                pane_id=pane.pane_id,
+                tab_id=pane.tab_id,
+                last_run=run_id if isinstance(run_id, str) else None,
+                agent=agent if isinstance(agent, str) else None,
+                tab_panes=tab_panes,
+                recorded=True,
+                finished_at=finished_at,
+                expired=expired,
+                reason=reason,
+            )
+        )
+    return candidates
+
+
+@dataclass(frozen=True)
+class RetiredTab:
+    """One tab an idle sweep closed (or, in a dry run, would close), and why it may close."""
+
+    pane_id: str
+    tab_id: str
+    agent: str | None
+    last_run: str | None
+    reason: str
+
+
+@dataclass(frozen=True)
+class IdleSweep:
+    """What one idle sweep did. ``listing_error`` set means herdr could not list the workspace."""
+
+    closed: tuple[RetiredTab, ...]
+    would_close: tuple[RetiredTab, ...]
+    #: Recorded panes left open, in listing order, each with its reason.
+    kept: tuple[tuple[str, str], ...]
+    listing_error: str | None
+
+
+def retire_idle_tabs(
+    client: HerdrClient,
+    config: Config,
+    *,
+    actor: str,
+    now: float,
+    dry_run: bool = False,
+    limit: int | None = None,
+    exclude_pane_id: str | None = None,
+    proc_root: str = "/proc",
+) -> IdleSweep:
+    """Close every tab in ``config``'s workspace that is idle past the TTL.
+
+    Expired tabs are examined oldest finish first. ``limit`` bounds how many expired tabs one
+    sweep EXAMINES (each examination probes a pane and scans ``/proc``); the opportunistic sweep
+    at the end of a run passes a small one so housekeeping can never stretch a caller's command,
+    and ``exclude_pane_id`` keeps that sweep from closing the very tab the run just used. A dry
+    run judges shells exactly as :func:`survey` does -- without the pane lock -- and closes
+    nothing.
+    """
+    try:
+        workspace_id = client.workspace_id_for_label(config.workspace)
+        if workspace_id is None:
+            return IdleSweep((), (), (), f"herdr has no workspace labelled {quote(config.workspace)}")
+        panes = client.panes(workspace_id)
+    except HerdrRunError as exc:
+        return IdleSweep((), (), (), str(exc))
+    records = load_run_records(config)
+    verdicts = ttl_candidates(panes, records, now=now, ttl_seconds=config.idle_tab_ttl_seconds)
+
+    # First pass: scope and incarnation, which need no probing. Outcomes are keyed by pane so
+    # the kept list can be emitted in listing order even though expired tabs are examined in
+    # finish order.
+    kept_reasons: dict[str, str] = {}
+    expired: list[TtlCandidate] = []
+    for verdict in verdicts:
+        if not verdict.recorded or verdict.pane_id == exclude_pane_id:
+            continue
+        in_scope, recorded_tab, tab_label, workspace_label = _scope_of(verdict.pane_id, records, config)
+        if not in_scope:
+            kept_reasons[verdict.pane_id] = (
+                f"tab {quote_optional(tab_label)} in workspace "
+                f"{quote_optional(workspace_label)} is not one of ours"
+            )
+            continue
+        if recorded_tab is not None and recorded_tab != verdict.tab_id:
+            kept_reasons[verdict.pane_id] = (
+                f"pane was recorded in tab {quote(recorded_tab)} but is now in tab "
+                f"{quote(verdict.tab_id)}; refusing to guess"
+            )
+            continue
+        if verdict.expired:
+            expired.append(verdict)
+        else:
+            kept_reasons[verdict.pane_id] = verdict.reason
+
+    closed: list[RetiredTab] = []
+    would_close: list[RetiredTab] = []
+    examined = 0
+    for verdict in sorted(expired, key=lambda item: item.finished_at or 0.0):
+        if limit is not None and examined >= limit:
+            kept_reasons[verdict.pane_id] = f"not examined: this sweep's limit of {limit} tab(s) was reached"
+            continue
+        examined += 1
+        candidate = Candidate(
+            pane_id=verdict.pane_id,
+            tab_id=verdict.tab_id,
+            last_run=verdict.last_run,
+            agent=verdict.agent,
+            tab_panes=verdict.tab_panes,
+        )
+        retired = RetiredTab(verdict.pane_id, verdict.tab_id, verdict.agent, verdict.last_run, "")
+        if dry_run:
+            refusal = _require_unsplit(candidate)
+            if refusal is None:
+                idle, reason = _judge_shell(client, config, candidate, proc_root)
+                if idle:
+                    would_close.append(RetiredTab(retired.pane_id, retired.tab_id, retired.agent, retired.last_run, reason))
+                    continue
+                refusal = reason
+            kept_reasons[verdict.pane_id] = refusal
+            continue
+        outcome = _try_evict(client, config, candidate, proc_root)
+        if isinstance(outcome, Eviction):
+            done = RetiredTab(retired.pane_id, retired.tab_id, retired.agent, retired.last_run, outcome.reason)
+            closed.append(done)
+            _log_retirement(config, workspace_id, actor, done)
+        else:
+            kept_reasons[verdict.pane_id] = outcome
+
+    kept = tuple(
+        (verdict.pane_id, kept_reasons[verdict.pane_id])
+        for verdict in verdicts
+        if verdict.pane_id in kept_reasons
+    )
+    return IdleSweep(tuple(closed), tuple(would_close), kept, None)
+
+
+def _log_retirement(config: Config, workspace_id: str, actor: str, retired: RetiredTab) -> None:
+    last_run_at = run_time(retired.last_run) if retired.last_run is not None else None
+    output.diagnostic(
+        f"herdr-run: retired idle tab {retired.tab_id} (pane {retired.pane_id}, agent "
+        f"{retired.agent or 'unknown'}, last run {last_run_at or 'none recorded'}) idle past "
+        f"the {number_text(config.idle_tab_ttl_seconds)}s TTL"
+    )
+    path = audit.audit_path(config.project_root, config.spool_dir)
+    if not audit.record(
+        path,
+        agent=actor,
+        command=f"tab close {retired.tab_id}",
+        verdict="RETIRED",
+        detail=retired.reason,
+        fields={
+            "pane_id": retired.pane_id,
+            "tab_id": retired.tab_id,
+            "workspace_id": workspace_id,
+            "retired_agent": retired.agent,
+            "last_run": retired.last_run,
+            "last_run_at": last_run_at,
+        },
+    ):
+        output.diagnostic(f"herdr-run: WARNING: could not append audit record to {path}")

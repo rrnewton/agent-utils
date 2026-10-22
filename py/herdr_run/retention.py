@@ -34,6 +34,7 @@ __all__ = [
     "MAX_RETENTION_DAYS",
     "RETENTION_DAYS",
     "PruneResult",
+    "completion_mtime",
     "prune_runs",
     "runs_root",
 ]
@@ -147,7 +148,7 @@ def prune_runs(
         # `exit_code` is written only after redirection closes, so it is the completion marker.
         # Never age an active run by its allocation-time directory mtime: another pane may be
         # pruning concurrently, and a long-running command's spool must remain available.
-        mtime = _completion_mtime(os.path.join(path, "exit_code"))
+        mtime = completion_mtime(os.path.join(path, "exit_code"))
         if mtime is None:
             kept += 1
             continue
@@ -166,8 +167,13 @@ def prune_runs(
     return PruneResult(tuple(removed), kept, tuple(skipped))
 
 
-def _completion_mtime(path: str) -> float | None:
-    """Return a valid regular completion marker's mtime without following a symlink."""
+def completion_mtime(path: str) -> float | None:
+    """Return a valid regular completion marker's mtime without following a symlink.
+
+    The one definition of "when did this run finish": retention ages a run by it and the idle-tab
+    TTL (:mod:`herdr_run.evict`) measures idleness from it, so the two can never disagree about
+    whether a run has finished at all.
+    """
     flags = (
         os.O_RDONLY
         | getattr(os, "O_CLOEXEC", 0)

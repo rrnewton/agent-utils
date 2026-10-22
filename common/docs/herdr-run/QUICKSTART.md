@@ -62,7 +62,8 @@ herdr-run --agent release-agent run --timeout 60 'git push origin HEAD'
 4. **The pane may be shared with a human.** By default a busy pane is refused immediately rather
    than typed over. `run --wait-ready S` waits instead. Tabs are recycled the same carefully: once
    the workspace holds `max_panes` panes, a new agent's tab replaces the least-recently-used tab
-   whose shell is idle, and a tab running a command is never closed.
+   whose shell is idle, and a tab running a command is never closed. A tab idle past
+   `idle_tab_ttl_seconds` after its last run finished is retired under the same rules.
 
 5. **`spool_dir` holds real command output and must be git-ignored.** It defaults to
    `.herdr-run/`.

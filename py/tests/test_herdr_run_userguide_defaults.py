@@ -32,6 +32,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _GUIDE_DEFAULTS: tuple[tuple[str, str, int], ...] = (
     ("retention_days", "four", 4),
     ("max_panes", "32", 32),
+    ("idle_tab_ttl_seconds", "900 seconds", 900),
 )
 
 #: The prose shape the guide uses to restate a default: ``  `key` (value by default)  ``.

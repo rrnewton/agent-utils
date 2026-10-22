@@ -107,9 +107,9 @@ def test_invalid_cli_timeouts_are_rejected(
         (["run", "--agent", "a", "git status"], "this is a GLOBAL option"),
         (["run", "--config", "x.yaml", "git status"], "this is a GLOBAL option"),
         (["run", "--json", "git status"], "this is a GLOBAL option"),
-        (["check", "--dry-run", "git status"], "a 'run' option, not a 'check' option"),
+        (["check", "--dry-run", "git status"], "a 'run' or 'sweep' option, not a 'check' option"),
         (["reap", "--cwd", "/tmp"], "a 'run' option, not a 'reap' option"),
-        (["target", "--dry-run"], "a 'run' option, not a 'target' option"),
+        (["target", "--dry-run"], "a 'run' or 'sweep' option, not a 'target' option"),
     ],
 )
 def test_an_option_at_the_wrong_level_is_refused_and_says_which_level_it_belongs_to(
@@ -344,10 +344,26 @@ def test_every_subcommand_is_reachable_and_uniquely_named() -> None:
         "reap",
         "run",
         "status",
+        "sweep",
         "target",
         "userguide",
     ]
     assert all(summary for _name, summary in SUBCOMMANDS)
+
+
+def test_sweep_needs_idle_and_takes_no_positional_arguments(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["sweep"]) == 2
+    assert "sweep: needs --idle" in capsys.readouterr().err
+    assert main(["sweep", "--dry-run"]) == 2
+    assert "sweep: needs --idle" in capsys.readouterr().err
+    assert main(["sweep", "--idle", "extra"]) == 2
+    assert "sweep: takes no positional arguments; got 1" in capsys.readouterr().err
+    assert main(["sweep", "--help"]) == 0
+    help_out = capsys.readouterr().out
+    assert "--idle" in help_out and "--dry-run" in help_out
+    assert "idle_tab_ttl_seconds" in help_out
 
 
 def _option_block(text: str, header: str) -> str:

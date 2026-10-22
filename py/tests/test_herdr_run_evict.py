@@ -26,15 +26,18 @@ from herdr_run.evict import (
     Candidate,
     Eviction,
     SessionScan,
+    TtlCandidate,
     describe_skipped,
     evict_one,
     judge_idle,
     lru_candidates,
     parse_session_id,
+    retire_idle_tabs,
     run_time,
     scan_session,
     survey,
     survey_workspace,
+    ttl_candidates,
 )
 from herdr_run.readiness import assess_process
 from herdr_run.session import _enforce_pane_cap
@@ -95,6 +98,19 @@ def test_golden_session_id(stat: str, expected: int | None) -> None:
 def test_golden_refusal(case: dict[str, object]) -> None:
     skipped = [tuple(pair) for pair in cast(list[list[str]], case["skipped"])]
     assert describe_skipped(skipped) == case["expected"]  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("case", CASES["ttl"], ids=lambda case: case["name"])
+def test_golden_idle_ttl_verdicts(case: dict[str, object]) -> None:
+    panes = [Pane(pane_id=p, tab_id=t, workspace_id="w1") for p, t in case["panes"]]  # type: ignore[attr-defined]
+    got = ttl_candidates(
+        panes,
+        case["records"],  # type: ignore[arg-type]
+        now=cast(float, case["now"]),
+        ttl_seconds=cast(float, case["ttl_seconds"]),
+    )
+    expected = [TtlCandidate(**item) for item in case["expected"]]  # type: ignore[attr-defined]
+    assert got == expected
 
 
 # --- a small world: a workspace, a run spool, and a fake /proc ----------------------------------
@@ -378,3 +394,212 @@ def test_the_cap_stops_closing_when_the_listing_never_shrinks(tmp_path: Path) ->
         _enforce_pane_cap(cast(HerdrClient, sticky), config, "w1", "newcomer", str(world.proc))
     # One close per pane over the cap, plus the one that makes room: never an endless loop.
     assert sticky.closed_tabs == ["t-a", "t-a"]
+
+
+# --- the idle lifetime -----------------------------------------------------------------------------
+#
+# The finish a TTL verdict reads is the completion marker's mtime, so these plant a real
+# ``exit_code`` file beside each ``meta.json`` and set its mtime, then judge at a fixed ``now``.
+
+NOW = 1_800_000_000.0
+
+
+class TtlWorld(World):
+    """A world whose config names the fake's workspace, with finished-run planting."""
+
+    def __init__(self, tmp_path: Path, panes: list[str], *, ttl: float = 900.0) -> None:
+        super().__init__(tmp_path, panes)
+        self.config = dataclasses.replace(
+            self.config, workspace="commands", idle_tab_ttl_seconds=ttl
+        )
+
+    def finished(
+        self,
+        pane: str,
+        run_id: str,
+        agent: str,
+        finished_at: float,
+        *,
+        exit_code: int | None = 0,
+        marker: bool = True,
+        workspace: str = "commands",
+        tab_id: str | None = None,
+    ) -> None:
+        """Plant one run record, and its completion marker aged to ``finished_at``."""
+        directory = self.project / ".herdr-run" / "runs" / run_id
+        directory.mkdir(parents=True)
+        document = {
+            "agent": agent,
+            "pane_id": pane,
+            "run_id": run_id,
+            "exit_code": exit_code,
+            "tab": {"id": tab_id or f"t-{pane}", "label": agent},
+            "workspace": {"id": "w1", "label": workspace},
+        }
+        (directory / "meta.json").write_text(json.dumps(document))
+        if marker:
+            marker_path = directory / "exit_code"
+            marker_path.write_text(f"{0 if exit_code is None else exit_code}\n")
+            stamp = int(finished_at * 1_000_000_000)
+            os.utime(marker_path, ns=(stamp, stamp))
+
+    def retire(self, **kwargs: object):  # type: ignore[no-untyped-def]
+        return retire_idle_tabs(
+            cast(HerdrClient, self.fake),
+            self.config,
+            actor="tester",
+            now=NOW,
+            proc_root=str(self.proc),
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+
+def test_an_expired_idle_tab_is_retired_and_logged(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    world = TtlWorld(tmp_path, ["old", "fresh"])
+    world.idle("old")
+    world.idle("fresh")
+    world.finished("old", "20261001T090000-alpha-1", "alpha", NOW - 901)
+    world.finished("fresh", "20261001T100000-beta-2", "beta", NOW - 899)
+
+    result = world.retire()
+    assert [tab.pane_id for tab in result.closed] == ["old"]
+    assert world.fake.closed_tabs == ["t-old"]
+    assert result.kept == (("fresh", "last run finished within the idle TTL"),)
+    assert (
+        "herdr-run: retired idle tab t-old (pane old, agent alpha, last run "
+        "2026-10-01T09:00:00Z) idle past the 900s TTL"
+    ) in capsys.readouterr().err
+    [entry] = world.audit_entries()
+    assert entry["verdict"] == "RETIRED"
+    assert entry["agent"] == "tester"
+    assert entry["retired_agent"] == "alpha"
+    assert entry["last_run"] == "20261001T090000-alpha-1"
+
+
+def test_a_finish_exactly_at_the_ttl_boundary_keeps_the_tab(tmp_path: Path) -> None:
+    world = TtlWorld(tmp_path, ["edge"])
+    world.idle("edge")
+    world.finished("edge", "20261001T090000-alpha-1", "alpha", NOW - 900)
+    result = world.retire()
+    assert result.closed == ()
+    assert result.kept == (("edge", "last run finished within the idle TTL"),)
+
+
+def test_expired_but_busy_tabs_are_never_retired(tmp_path: Path) -> None:
+    world = TtlWorld(tmp_path, ["running", "jobs", "split-a"])
+    world.fake.workspaces["w1"].tabs["t-split"] = FakeTab(
+        "t-split", "split", "w1", ["left", "right"]
+    )
+    jobs_pid = world.idle("jobs", background=1)
+    world.idle("left")
+    world.idle("right")
+    # "running" stays in busy_panes from construction: its shell runs a command.
+    world.finished("running", "20261001T080000-a-1", "a", NOW - 5000)
+    world.finished("jobs", "20261001T080100-b-2", "b", NOW - 5000)
+    world.finished("left", "20261001T080200-c-3", "c", NOW - 5000, tab_id="t-split")
+
+    result = world.retire()
+    assert result.closed == ()
+    assert world.fake.closed_tabs == []
+    reasons = dict(result.kept)
+    assert reasons["running"] == "foreground pgid 200 != shell pid 100; running: git"
+    assert reasons["jobs"] == f"session {jobs_pid} still holds 1 other process(es): {jobs_pid + 1}"
+    assert reasons["left"] == "tab t-split holds 2 panes; only an unsplit tab is replaced"
+
+
+def test_a_locked_expired_tab_is_kept_without_probing(tmp_path: Path) -> None:
+    world = TtlWorld(tmp_path, ["held"])
+    world.idle("held")
+    world.finished("held", "20261001T090000-alpha-1", "alpha", NOW - 5000)
+    with state.open_lock_file(state.pane_lock_path("held")) as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = world.retire()
+    assert result.closed == ()
+    assert result.kept == (("held", "another herdr-run holds the pane lock"),)
+    assert world.fake.probed == []
+
+
+def test_an_unfinished_run_and_an_unrecorded_pane_are_left_alone(tmp_path: Path) -> None:
+    world = TtlWorld(tmp_path, ["thinking", "ghost"])
+    world.idle("thinking")
+    world.idle("ghost")
+    world.finished("thinking", "20261001T090000-alpha-1", "alpha", NOW - 5000)
+    world.finished(
+        "thinking", "20261001T100000-alpha-2", "alpha", NOW - 4000, exit_code=None, marker=False
+    )
+    result = world.retire()
+    assert result.closed == ()
+    # The unrecorded ghost pane is not a candidate at all: reap's population, not this one's.
+    assert result.kept == (
+        ("thinking", "1 run(s) for this pane have no recorded exit_code"),
+    )
+
+
+def test_a_late_completion_is_read_from_the_marker(tmp_path: Path) -> None:
+    world = TtlWorld(tmp_path, ["late"])
+    world.idle("late")
+    # Timed out when recorded (null exit code); the marker landed afterwards, long ago.
+    world.finished("late", "20261001T090000-alpha-1", "alpha", NOW - 5000, exit_code=None)
+    result = world.retire()
+    assert [tab.pane_id for tab in result.closed] == ["late"]
+
+
+def test_ttl_zero_disables_retirement(tmp_path: Path) -> None:
+    world = TtlWorld(tmp_path, ["ancient"], ttl=0.0)
+    world.idle("ancient")
+    world.finished("ancient", "20201001T090000-alpha-1", "alpha", NOW - 10_000_000)
+    result = world.retire()
+    assert result.closed == ()
+    assert result.kept == (("ancient", "the idle TTL is disabled"),)
+
+
+def test_a_dry_run_judges_and_closes_nothing(tmp_path: Path) -> None:
+    world = TtlWorld(tmp_path, ["old"])
+    world.idle("old")
+    world.finished("old", "20261001T090000-alpha-1", "alpha", NOW - 5000)
+    result = world.retire(dry_run=True)
+    assert result.closed == ()
+    assert [tab.pane_id for tab in result.would_close] == ["old"]
+    assert world.fake.closed_tabs == []
+    assert world.audit_entries() == []
+
+
+def test_the_limit_bounds_examination_oldest_finish_first(tmp_path: Path) -> None:
+    world = TtlWorld(tmp_path, ["newest", "oldest", "middle"])
+    for pane, run_id, age in (
+        ("newest", "20261001T120000-n-1", 1000),
+        ("oldest", "20261001T090000-o-2", 5000),
+        ("middle", "20261001T100000-m-3", 3000),
+    ):
+        world.idle(pane)
+        world.finished(pane, run_id, pane, NOW - age)
+    result = world.retire(limit=2)
+    assert [tab.pane_id for tab in result.closed] == ["oldest", "middle"]
+    assert result.kept == (
+        ("newest", "not examined: this sweep's limit of 2 tab(s) was reached"),
+    )
+
+
+def test_an_out_of_scope_record_and_the_excluded_pane_are_kept(tmp_path: Path) -> None:
+    world = TtlWorld(tmp_path, ["foreign", "mine"])
+    world.idle("foreign")
+    world.idle("mine")
+    world.finished(
+        "foreign", "20261001T090000-alpha-1", "alpha", NOW - 5000, workspace="someone-elses"
+    )
+    world.finished("mine", "20261001T090000-beta-2", "beta", NOW - 5000)
+    result = world.retire(exclude_pane_id="mine")
+    assert result.closed == ()
+    assert result.kept == (
+        ("foreign", 'tab "alpha" in workspace "someone-elses" is not one of ours'),
+    )
+
+
+def test_a_missing_workspace_reports_instead_of_closing(tmp_path: Path) -> None:
+    world = TtlWorld(tmp_path, ["old"])
+    world.config = dataclasses.replace(world.config, workspace="nowhere")
+    result = world.retire()
+    assert result.closed == ()
+    assert result.listing_error == 'herdr has no workspace labelled "nowhere"'

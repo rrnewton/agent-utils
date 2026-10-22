@@ -159,5 +159,14 @@ retention_days: 4
 # is never closed. `herdr-run reap` reports which tabs are provably finished with.
 max_panes: 32
 
+# Seconds a tab may sit idle after its last recorded run finished before it is closed; 0 disables
+# this. Only a tab a surviving run record names is considered, every recorded run in it must have
+# finished, and its shell must be provably idle by the same rules the pane cap uses, judged under
+# the pane lock immediately before the close -- a tab running a command, holding a background job,
+# locked by another runner, or split into several panes is never closed. Runs sweep a bounded
+# number of expired tabs when they finish; `herdr-run sweep --idle` is the same sweep on demand
+# (add `--dry-run` to judge without closing). Tabs no run record names are left to `reap`.
+idle_tab_ttl_seconds: 900
+
 # The remote `herdr-run net-doctor` probes with `git ls-remote`.
 probe_remote: https://github.com/git/git

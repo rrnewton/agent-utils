@@ -51,7 +51,7 @@ from herdr_run.config import Config
 from herdr_run.errors import HerdrRunError
 from herdr_run.identity import current_boot_id, probe_process
 from herdr_run.reap import PaneEvidence, ProcessIdentity, ReapPlan, evidence_from_runs, plan_reap
-from herdr_run.retention import runs_root
+from herdr_run.retention import completion_mtime, runs_root
 from herdr_run.runner import read_exit_code
 from herdr_run.session import tab_label_for
 from herdr_run.textfmt import quote, strict_json_loads
@@ -93,6 +93,7 @@ def load_run_records(config: Config) -> tuple[dict[str, object], ...]:
             continue
         record: dict[str, object] = document
         _resolve_late_completion(record, os.path.join(root, name))
+        _record_finish_time(record, os.path.join(root, name))
         records.append(record)
     return tuple(records)
 
@@ -113,6 +114,25 @@ def _resolve_late_completion(record: dict[str, object], directory: str) -> None:
     code = read_exit_code(os.path.join(directory, "exit_code"))
     if code is not None:
         record["exit_code"] = code
+
+
+def _record_finish_time(record: dict[str, object], directory: str) -> None:
+    """Note when this run finished, as ``finished_at`` epoch seconds, when that is knowable.
+
+    The idle-tab TTL (:func:`herdr_run.evict.ttl_candidates`) measures a tab's idleness from the
+    finish of its last recorded run. The run ID's timestamp cannot serve: it is the run's START,
+    and ``duration_seconds`` in a timed-out run's record stops at the timeout, before the command
+    actually finished in the pane. The completion marker's mtime is written by the pane shell at
+    the moment the command ended -- the same reading retention ages the run by. A run whose
+    marker is missing or invalid gets no ``finished_at`` and so can never look idle-expired: an
+    unknown finish keeps its tab, exactly as an unknown anything keeps it everywhere else here.
+    """
+    record.pop("finished_at", None)
+    if record.get("exit_code") is None:
+        return
+    finished = completion_mtime(os.path.join(directory, "exit_code"))
+    if finished is not None:
+        record["finished_at"] = finished
 
 
 def pane_ids_in(records: Iterable[dict[str, object]]) -> tuple[str, ...]:
