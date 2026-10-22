@@ -5311,19 +5311,19 @@ function seamLineOf(row, below, seam) {
     else row.seamLine = null;
   }
   if (held) {
-    held.gapCards = Boolean(seam && seam.cards);
+    /** @type {any} */ (held).gapCards = Boolean(seam && seam.cards);
     return held;
   }
   const line = document.createElement(control ? "button" : "div");
   line.className = (below ? "row-seam row-seam-below" : "row-seam") + (seam && seam.cards ? " card-seam" : "");
-  line.gapCards = Boolean(seam && seam.cards);
+  /** @type {any} */ (line).gapCards = Boolean(seam && seam.cards);
   if (control) {
     line.setAttribute("type", "button");
     line.addEventListener("click", inThisColumn((event) => {
       // The row's own tap would select or open it; this tap is the line's alone, as a run's is.
       if (event) event.stopPropagation();
       const focused = document.activeElement === line && line.matches(":focus-visible");
-      const first = line.gapCards ? openCardGap(row, below) : openSearchGap(row, below);
+      const first = /** @type {any} */ (line).gapCards ? openCardGap(row, below) : openSearchGap(row, below);
       if (focused && first) {
         first.setAttribute("tabindex", "-1");
         first.focus({ preventScroll: true });
@@ -42697,10 +42697,10 @@ function cardGapWords(messages, threads, exact, onlyCards) {
  * `list`'s children as the groups a gap counts: a card with the messages unpacked under it, or one
  * of Main's messages among the cards. Anything else ends a run and is left alone.
  *
- * @returns {Array<{head: any, card: boolean}>}
+ * @returns {Array<{head: any, card: boolean, other?: boolean}>}
  */
 function cardGapGroups(list) {
-  /** @type {Array<{head: any, card: boolean}>} */
+  /** @type {Array<{head: any, card: boolean, other?: boolean}>} */
   const groups = [];
   for (const row of /** @type {any[]} */ ([...list.children])) {
     if (row.hasAttribute("data-unpack-thread")) continue;
@@ -42741,7 +42741,8 @@ function drawCardGaps(list) {
     }
     if (!rowShown(group.head)) {
       const one = cardGapTally(group);
-      run = run === null ? one : {
+      if (run === null) run = one;
+      else run = {
         messages: run.messages + one.messages, threads: run.threads + one.threads,
         exact: run.exact && one.exact, onlyCards: run.onlyCards && one.onlyCards,
       };
