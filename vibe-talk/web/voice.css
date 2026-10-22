@@ -155,11 +155,11 @@
      never as a pin's chip or the bookmark's accent. */
   --hit-bg: #6b5410;
   --hit-ink: #fff4c7;
-  /* `#247 reply-continuity`. Behind the reply screen: the page's own colour with six parts in a
-     hundred of the accent in it, so the screen reads as a mode of the list rather than a page of its
-     own, and every row on it keeps its own surface. The owner: "MAYBE change the background color
-     subtly to indicate the shift." Mixed here per scheme, not with a colour function at the use
-     site, for the reason the tokens above give. */
+  /* `#247 reply-continuity`, `#410 inline-reply-editor`. Behind a reply's box in the stream: the page's
+     own colour with six parts in a hundred of the accent in it, so the box reads as a mode of the list
+     rather than a thing of its own. The owner: "MAYBE change the background color subtly to indicate
+     the shift." Mixed here per scheme, not with a colour function at the use site, for the reason the
+     tokens above give. */
   --reply-tint: #181e25;
   /* `#245 done-feedback`. The dashed ring of a selected READ message, beside the solid `--accent`
      ring of a selected unread one. In dark it is `--muted`, as light as the accent and plainly not
@@ -1561,84 +1561,17 @@ a.search-hit-link {
   display: none;
 }
 
-/* ------------------------------------------------------------------------ the reply screen -- */
+/* ---------------------------------------------------------------------------------- reply -- */
 /*
- * `#51 reply-view`. One elastic part and a block under it: the conversation the message being
- * answered is in (`#200 reply-context`), its length no more this page's decision than the message
- * was, and then the label, the box, the `#185 reply-new-thread` choice and destination, the buttons
- * and the state line, each a size of its own.
- *
- * `#247 reply-continuity`. The owner: "Reply jumps to a different view with different FONT SIZE.
- * This is jarring. When I press reply I want that same continuity of visual experience that we
- * want on other transitions ... I'd rather the top of the message I press Reply on to stay still
- * on the screen. Expand it below and truncate below that (moving up the text entry box
- * underneath)." So the screen is drawn as the list is, and moves nothing it does not have to:
- *
- *   * THE MESSAGE IS THE CHANNEL'S ROW, by the channel's renderer and the channel's rules, at the
- *     reader's text size: the speaker's tint and insets, the reply gutter and a gathered reply's
- *     indent where it had them (the rules below name #reply-target beside the lists). Unfolded,
- *     with the accent edge that tells it from the earlier messages over it.
- *   * THE CONVERSATION FILLS what the block under it leaves, by default. That is how much room
- *     there is, and `placeReplyMessage` measures it there. When the message, its top where it was
- *     on the list, ends inside that room, the script gives the conversation exactly the height that
- *     ends at the message's foot (`data-fit="message"`): the box comes up directly under it, and
- *     what came after it on the list is not on screen. It may still shrink, with the window or a
- *     phone's keyboard, but never below 4rem.
- *   * THE LIST'S GUTTER, 0.75rem inside the safe area, on the scroller itself as on #scroll-area,
- *     because the agent's full-bleed tile is measured against exactly that. On a desk the rows are
- *     held to the column #pane-discord is (the desktop block).
- *   * A TINT is the one thing that says "this is Reply" without moving anything: `--reply-tint`.
- *
- * A column of flex items, not the grid it was: the conversation is given a height of its own, and
- * the block under it is never squeezed.
+ * `#410 inline-reply-editor`. The reply's box: the label and who it answers, the box, the `#185
+ * reply-new-thread` choice and destination, the buttons and the state line, each a size of its own,
+ * a gap apart, a part that is hidden leaving no gap behind. Drawn in the stream, under the message it
+ * answers (below). There is no reply screen.
  */
-#screen-reply {
-  display: flex;
-  flex-direction: column;
-  gap: 0.4rem;
-  min-height: 0;
-  /* No top padding: every pixel of it would be a pixel more of the list's top under which a
-     message's top is clamped rather than kept. */
-  padding: 0 0 1rem;
-}
-
-/* `#247 reply-continuity`. Behind the whole screen, rows and gaps alike, in the scheme in force. */
-#frame-body[data-screen="reply"] {
-  background: var(--reply-tint);
-}
-
-/* Its OWN scroll, contained. A long message you are answering has to be readable while you write,
-   and reaching the end of it must not become a scroll of anything behind it — which on a phone is
-   how you end up losing the reply box under the keyboard. `#200 reply-context` widened it from the
-   message alone to the conversation it is in: ONE scroll, so reading back from the message is the
-   same gesture as reading the message, and never a second box inside the first. */
-#reply-scroll {
-  flex: 1 1 auto;
-  min-height: 4rem;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  -webkit-overflow-scrolling: touch;
-  padding-inline: calc(0.75rem + env(safe-area-inset-left)) calc(0.75rem + env(safe-area-inset-right));
-}
-
-#reply-scroll[data-fit="message"] {
-  flex: 0 1 auto;
-  min-height: min(4rem, var(--reply-fit, 4rem));
-}
-
-/* The room over the earlier messages that keeps the message where it was. None unless the script
-   says how much. */
-#reply-lead {
-  height: 0;
-}
-
-/* The block under the conversation, in the gutter the rows are, its parts a gap apart and a part
-   that is hidden leaving no gap behind. */
 .reply-compose {
   flex: none;
   display: grid;
   gap: 0.4rem;
-  margin-inline: calc(0.75rem + env(safe-area-inset-left)) calc(0.75rem + env(safe-area-inset-right));
 }
 
 /* "Your reply", and who it answers on the same line, at the far end. */
@@ -1650,87 +1583,14 @@ a.search-hit-link {
   gap: 0 0.75rem;
 }
 
-/* The message being answered is its own list of one row. No margin of a list's: the gap over it is
-   the earlier messages' own, as between two rows of the channel, and nothing hangs under it. */
-#reply-target {
-  margin: 0;
-}
-
-#reply-target li.discord-message {
-  margin-bottom: 0;
-}
-
-/* Over every speaker's edge (the extra id outweighs their rules, which come later in this file). */
-#screen-reply #reply-target li.discord-message[data-who] {
-  border-color: var(--accent);
-}
-
-/* The channel's row has its Reply, ⋯ and Done at the far end of this line, and they are a little
-   taller than its words. The rows here have none: they keep the line's height, so a row's text starts
-   where it did on the list, and the author and the time stay at the start of the line, where those
-   buttons left them, rather than being spread to its two ends (`.messages li .meta`, the call's). */
-#reply-context .meta,
-#reply-target .meta {
-  justify-content: flex-start;
-  min-height: calc(0.72rem * 1.45 + 0.1rem + 2px);
-}
-
-/* `#200 reply-context`. The title bar names the thread a reply goes into, and a thread's name can
-   be longer than a phone is wide. It was one line cut at the end, which is where the picker's
-   label keeps the name: on a 412px phone with the font at 130%, "Reply · 38w · 14 · A thre…".
-   The name is the part that identifies a thread, so it gets a line of its own and a second before
-   it is cut, under a smaller line for "Reply" and the facts, which is cut first. At a heading's
-   line height, one line of each fits the bar's own height, so only a long name makes the bar
-   taller, by its second line. `min-width: 0` lets the title shrink inside the bar's flex row,
-   which without it is as wide as the whole name. The other screens' titles are one word, and are
-   none of this. */
+/* The title bar's words, one word on Settings and on Help: shrinking inside the bar's flex row. */
 #topbar-title {
   min-width: 0;
   line-height: 1.2;
 }
 
-#topbar-title .title-lead {
-  display: block;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 0.8rem;
-  font-weight: 400;
-  color: var(--muted);
-}
-
-/* Two lines and then cut, by the same clamp a folded message uses. `overflow: hidden` is what makes
-   the clamp do anything, and `anywhere` breaks a name that is one long token instead of letting it
-   run past the edge under that clip. */
-#topbar-title .title-name {
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-  line-clamp: 2;
-  overflow: hidden;
-  overflow-wrap: anywhere;
-}
-
-#reply-context-more {
-  display: block;
-  margin: 0 auto 0.5rem;
-}
-
-#reply-context-state {
-  margin: 0 0 0.5rem;
-  text-align: center;
-}
-
-/* No margin of its own: its last row's, as between two rows of the channel, is the gap over the
-   message. `#247 reply-continuity`. It used to collapse into this one, until `#242 rich-headers` made
-   the list a size container, which keeps its rows' margins inside it, and the two added up to twice
-   the channel's gap. */
-#reply-context {
-  margin: 0;
-}
-
-/* `#247 reply-continuity`. Small and quiet beside its label: who is being answered, and the id the
-   answer goes to, in type a snowflake can be read in digit by digit. */
+/* Small and quiet beside its label: who is being answered, and the id the answer goes to, in type a
+   snowflake can be read in digit by digit. */
 #reply-target-meta {
   margin: 0;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -1748,6 +1608,101 @@ a.search-hit-link {
   border-radius: 0.4rem;
   font: inherit;
   resize: vertical;
+}
+
+/*
+ * `#410 inline-reply-editor`. A reply open IN THE STREAM, under the message it answers and the replies
+ * gathered under it, with the later messages below it. The owner, 2026-10-21: "our new Reply interface
+ * is just the existing inline-message editor (with Grow button) inserted in the stream." So it reads as
+ * the composers do — the box across, at the composers' size, Grow at the start of the row under it and
+ * Send at its end — on the reply's tint, in a row's own border and corners, as wide as the list's rows.
+ *
+ * Never a row of the list: web/voice.js names the row it goes under (`data-inline-reply`), and the box
+ * is drawn there by anchor positioning, the row keeping room under itself as tall as the box
+ * (`--inline-reply-room`, kept by an observer of the box). The box follows its row through every redraw,
+ * fold and arrival above it with no script. The list holding that row is the box's other anchor, for its
+ * width. Without anchor positioning, or with no row drawn to go under (`data-anchored` absent), the box
+ * is in the list's flow at its foot, where the column's own box was, which is hidden while it is open.
+ */
+#column-reply,
+#side-reply {
+  box-sizing: border-box;
+  margin: 0.25rem 0 0.5rem;
+  padding: 0.55rem 0.7rem 0.45rem;
+  background: var(--reply-tint);
+  border: 1px solid var(--edge);
+  border-radius: 0.5rem;
+  overflow-anchor: none;
+}
+
+#column-reply .reply-compose,
+#side-reply .reply-compose {
+  width: auto;
+  margin-inline: 0;
+}
+
+#column-reply .reply-label-row,
+#side-reply .reply-label-row {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+#column-reply #reply-text,
+#side-reply #reply-text {
+  width: 100%;
+  box-sizing: border-box;
+  font-size: max(1rem, 16px);
+}
+
+.reply-actions {
+  align-items: center;
+  justify-content: flex-end;
+}
+
+/* The lines under the box take only the room of what they say: the grid's gap is the space between
+   them, and the state line, a live region kept in the layout, is no height until it speaks. */
+#column-reply .reply-compose .hint,
+#side-reply .reply-compose .hint {
+  margin: 0;
+}
+
+/* The room the column's own box kept at the foot of the list for the chips, the status pill and the
+   phone's home bar (`#194`, `#245`, `#241`): kept by the list while a reply is open in it and that box
+   is hidden, so a reply under the newest message can still be scrolled clear of what floats over the
+   foot, as the box could. */
+#pane-discord:has(> #column-reply:not([hidden])),
+#side-pane:has(> #side-reply:not([hidden])),
+#side-list:has(> #side-reply:not([hidden])) {
+  padding-bottom: calc(max(1rem, env(safe-area-inset-bottom)) + var(--scroll-tools-clearance, 0px) + 2.4rem);
+}
+
+/* Grow at the start of the row, though it follows Send in the markup, as in the composers. */
+.reply-actions > .composer-grow {
+  order: -1;
+  margin-inline-end: auto;
+}
+
+@supports (anchor-name: --a) {
+  ol:has(> li[data-inline-reply]),
+  ul:has(> li[data-inline-reply]) {
+    anchor-name: --inline-reply-list;
+  }
+
+  li[data-inline-reply] {
+    anchor-name: --inline-reply-row;
+    margin-bottom: calc(0.75rem + var(--inline-reply-room, 0px)) !important;
+  }
+
+  #column-reply[data-anchored],
+  #side-reply[data-anchored] {
+    position: absolute;
+    z-index: 1;
+    position-anchor: --inline-reply-row;
+    top: calc(anchor(--inline-reply-row bottom) + 0.25rem);
+    left: anchor(--inline-reply-list left);
+    right: anchor(--inline-reply-list right);
+    margin: 0;
+  }
 }
 
 /* Sized like `.fold` beside it: a quiet control on the metadata row, not a second action
@@ -1824,9 +1779,7 @@ a.search-hit-link {
 #side-log li.discord-message[data-who="me"],
 #side-cards li.discord-message[data-who="me"],
 #discord-log li.discord-message[data-who="me"],
-#pinned-log li.discord-message[data-who="me"],
-#reply-context li.discord-message[data-who="me"],
-#reply-target li.discord-message[data-who="me"] {
+#pinned-log li.discord-message[data-who="me"] {
   background: var(--mine);
   border-color: var(--mine-edge);
   margin-left: var(--speaker-inset);
@@ -1856,9 +1809,7 @@ a.search-hit-link {
 #side-log li.discord-message[data-who="coder"],
 #side-cards li.discord-message[data-who="coder"],
 #discord-log li.discord-message[data-who="coder"],
-#pinned-log li.discord-message[data-who="coder"],
-#reply-context li.discord-message[data-who="coder"],
-#reply-target li.discord-message[data-who="coder"] {
+#pinned-log li.discord-message[data-who="coder"] {
   background: var(--theirs);
   margin-left: calc(-0.75rem - env(safe-area-inset-left));
   margin-right: calc(-0.75rem - env(safe-area-inset-right));
@@ -1882,14 +1833,10 @@ a.search-hit-link {
 #side-cards li.discord-message[data-who="human"],
 #discord-log li.discord-message[data-who="human"],
 #pinned-log li.discord-message[data-who="human"],
-#reply-context li.discord-message[data-who="human"],
-#reply-target li.discord-message[data-who="human"],
 #side-log li.discord-message[data-who="bot"],
 #side-cards li.discord-message[data-who="bot"],
 #discord-log li.discord-message[data-who="bot"],
-#pinned-log li.discord-message[data-who="bot"],
-#reply-context li.discord-message[data-who="bot"],
-#reply-target li.discord-message[data-who="bot"] {
+#pinned-log li.discord-message[data-who="bot"] {
   background: var(--third);
   border-color: var(--third-edge);
   margin-inline: calc(var(--speaker-inset) / 2);
@@ -2133,9 +2080,9 @@ a.search-hit-link {
 }
 
 /*
- * `#277 reply-in-column`. THE MESSAGE BEING ANSWERED by a reply open at the foot of its column: at full
- * strength, a read one included, edged in the accent as the reply screen edges it (`#reply-target`),
- * and with the accent's bar inside its left edge, so it is found at a glance among rows the selection's
+ * `#277 reply-in-column`, `#410 inline-reply-editor`. THE MESSAGE BEING ANSWERED by a reply open in its
+ * list: at full strength, a read one included, edged in the accent, and with the accent's bar inside its
+ * left edge, so it is found at a glance among rows the selection's
  * ring may also be round. Its place on the list is unchanged: it is the same row, marked.
  */
 #side-log li.discord-message[data-replying],
@@ -2238,8 +2185,7 @@ a.search-hit-link {
  */
 #side-log li.discord-message[data-is-reply="true"][data-who],
 #side-cards li.discord-message[data-is-reply="true"][data-who],
-#discord-log li.discord-message[data-is-reply="true"][data-who],
-#reply-target li.discord-message[data-is-reply="true"][data-who] {
+#discord-log li.discord-message[data-is-reply="true"][data-who] {
   margin-left: var(--reply-gutter);
   min-height: var(--reply-gutter);
 }
@@ -2248,8 +2194,7 @@ a.search-hit-link {
    one. */
 #side-log li.discord-message[data-is-reply="true"][data-who="coder"],
 #side-cards li.discord-message[data-is-reply="true"][data-who="coder"],
-#discord-log li.discord-message[data-is-reply="true"][data-who="coder"],
-#reply-target li.discord-message[data-is-reply="true"][data-who="coder"] {
+#discord-log li.discord-message[data-is-reply="true"][data-who="coder"] {
   padding-left: 0.4rem;
 }
 
@@ -2777,48 +2722,37 @@ a.search-hit-link {
  */
 #side-log li.discord-message[data-stack-under][data-who],
 #side-cards li.discord-message[data-stack-under][data-who],
-#discord-log li.discord-message[data-stack-under][data-who],
-#reply-target li.discord-message[data-stack-under][data-who] {
+#discord-log li.discord-message[data-stack-under][data-who] {
   min-height: var(--reply-gutter);
 }
-
 #side-log li.discord-message[data-stack-under="coder"][data-who],
 #side-cards li.discord-message[data-stack-under="coder"][data-who],
-#discord-log li.discord-message[data-stack-under="coder"][data-who],
-#reply-target li.discord-message[data-stack-under="coder"][data-who] {
+#discord-log li.discord-message[data-stack-under="coder"][data-who] {
   margin-left: calc(var(--reply-gutter) - 0.75rem - env(safe-area-inset-left));
 }
-
 #side-log li.discord-message[data-stack-under="me"][data-who],
 #side-cards li.discord-message[data-stack-under="me"][data-who],
-#discord-log li.discord-message[data-stack-under="me"][data-who],
-#reply-target li.discord-message[data-stack-under="me"][data-who] {
+#discord-log li.discord-message[data-stack-under="me"][data-who] {
   margin-left: calc(var(--speaker-inset) + var(--reply-gutter));
 }
-
 #side-log li.discord-message[data-stack-under="third"][data-who],
 #side-cards li.discord-message[data-stack-under="third"][data-who],
-#discord-log li.discord-message[data-stack-under="third"][data-who],
-#reply-target li.discord-message[data-stack-under="third"][data-who] {
+#discord-log li.discord-message[data-stack-under="third"][data-who] {
   margin-left: calc(var(--speaker-inset) / 2 + var(--reply-gutter));
 }
-
 #side-log li.discord-message[data-stack-under="reply"][data-who],
 #side-cards li.discord-message[data-stack-under="reply"][data-who],
 #discord-log li.discord-message[data-stack-under="reply"][data-who],
-#reply-target li.discord-message[data-stack-under="reply"][data-who],
 #side-log li.discord-message[data-stack-under="me-reply"][data-who],
 #side-cards li.discord-message[data-stack-under="me-reply"][data-who],
-#discord-log li.discord-message[data-stack-under="me-reply"][data-who],
-#reply-target li.discord-message[data-stack-under="me-reply"][data-who] {
+#discord-log li.discord-message[data-stack-under="me-reply"][data-who] {
   margin-left: calc(var(--reply-gutter) * 2);
 }
 
 /* The agent's tile keeps a left edge for its line to meet, as the agent's reply does. */
 #side-log li.discord-message[data-stack-under][data-who="coder"],
 #side-cards li.discord-message[data-stack-under][data-who="coder"],
-#discord-log li.discord-message[data-stack-under][data-who="coder"],
-#reply-target li.discord-message[data-stack-under][data-who="coder"] {
+#discord-log li.discord-message[data-stack-under][data-who="coder"] {
   padding-left: 0.4rem;
   border-left: 1px solid var(--edge);
   --reply-neutral-edge: transparent;
@@ -3556,7 +3490,6 @@ a.search-hit-link {
    inside them keeps its own. */
 #scroll-area:focus,
 #side-scroll:focus,
-#reply-scroll:focus,
 .screen:focus {
   outline: none;
 }
@@ -5186,7 +5119,7 @@ a.search-hit-link {
  * text as plain paragraphs. These rules are what make the two read like the chat service's own
  * client — round bullets with the text hanging clear of them, a gap at each blank line, headings a
  * little larger than the text, and code set apart — and they are the only rules that style
- * message text, so the channel, the reply screen, the pinned list and a message still being sent
+ * message text, so the channel, the cards, the pinned list and a message still being sent
  * all read alike.
  *
  * `white-space: normal`, against the `pre-wrap` the shared `.body` rule gives everything else:
@@ -5744,9 +5677,7 @@ a.search-hit-link {
 #side-log .meta,
 #side-cards .meta,
 #discord-log .meta,
-#pinned-log .meta,
-#reply-context .meta,
-#reply-target .meta {
+#pinned-log .meta {
   flex-wrap: wrap;
   row-gap: 0.15rem;
 }
@@ -5849,9 +5780,7 @@ a.search-hit-link {
 #side-log,
 #side-cards,
 #discord-log,
-#pinned-log,
-#reply-context,
-#reply-target {
+#pinned-log {
   container: rows / inline-size;
 }
 
@@ -6024,8 +5953,6 @@ a.search-hit-link {
  * not asking for a bigger Reply button. The base is a little under the old 0.95rem, because the
  * owner asked for slightly denser by default and the width reclaimed above pays for it.
  */
-#reply-context .body,
-#reply-target .body,
 #pinned-log .body,
 #pinned-log .summary-text,
 #side-log .body,
@@ -6039,7 +5966,6 @@ a.search-hit-link {
 
 /* `#244 elision-word-count`. The line under a folded body is measured in em of the body's text, so it
    is at the body's size; the label in it keeps its own small size (`.elided > span`). */
-#reply-context .elided,
 #pinned-log .elided,
 #side-log .elided,
 #side-cards .elided,
@@ -6058,8 +5984,7 @@ a.search-hit-link {
 #side-log .fold,
 #side-cards .fold,
 #discord-log .fold,
-#pinned-log .fold,
-#reply-context .fold {
+#pinned-log .fold {
   position: absolute;
   width: 1px;
   height: 1px;
@@ -6068,12 +5993,10 @@ a.search-hit-link {
   clip-path: inset(50%);
   white-space: nowrap;
 }
-
 #side-log .fold:focus-visible,
 #side-cards .fold:focus-visible,
 #discord-log .fold:focus-visible,
-#pinned-log .fold:focus-visible,
-#reply-context .fold:focus-visible {
+#pinned-log .fold:focus-visible {
   position: static;
   width: auto;
   height: auto;
@@ -6599,7 +6522,6 @@ a.search-hit-link {
    never taken for the reply's — a slip that would post the agent's draft instead. The same in two
    columns while a reply is open at the foot of one (`#277 reply-in-column`): its box and filled Send
    stand just under the list the card ends, or level with it in the other column. */
-#post-confirm[data-screen="reply"] #post-confirm-send,
 #post-confirm[data-beside-reply] #post-confirm-send {
   background: transparent;
   color: var(--accent);
@@ -7599,29 +7521,11 @@ textarea {
     outline-offset: 2px;
   }
 
-  /* The reply screen is read the same way the channel is, so it is held to the same column.
-     (#screen-signin and #screen-settings are deliberately NOT capped here: they are forms rather
-     than reading, and giving them a column is a separate judgement nobody has made yet.)
-
-     `#247 reply-continuity`. To the pixel: the conversation spans the window inside the list's
-     gutter, as #scroll-area does, and its rows are held to the reading width as #pane-discord's are,
-     in the same type, so a message wraps here where it wrapped there. The block under it is held to
-     the same column, and never wider than the window less the gutter. */
-  #reply-lead,
-  #reply-context,
-  #reply-target {
-    max-width: var(--reading-width);
-    margin-inline: auto;
-  }
-
-  .reply-compose {
-    width: min(var(--reading-width), 100% - 1.5rem);
-    margin-inline: auto;
-  }
-
-  /* And so do the two notices. A full-width strip over a narrow column is the same "phone layout
-     stretched sideways" this whole block exists to remove — it was there in the first capture of
-     it, which is what these review rounds are for. */
+  /* The two notices are held to the reading column too. A full-width strip over a narrow column is
+     the same "phone layout stretched sideways" this whole block exists to remove — it was there in
+     the first capture of it, which is what these review rounds are for. (#screen-signin and
+     #screen-settings are deliberately NOT capped here: they are forms rather than reading, and
+     giving them a column is a separate judgement nobody has made yet.) */
   #error-wrap,
   #connection-banner {
     max-width: var(--reading-width);
@@ -7673,36 +7577,26 @@ textarea {
   #side-log li.discord-message[data-who="me"],
   #side-cards li.discord-message[data-who="me"],
   #discord-log li.discord-message[data-who="me"],
-  #pinned-log li.discord-message[data-who="me"],
-  #reply-context li.discord-message[data-who="me"],
-  #reply-target li.discord-message[data-who="me"] {
+  #pinned-log li.discord-message[data-who="me"] {
     margin-left: min(15%, 6rem); /* a desk has the room a phone does not */
   }
-
   #side-log li.discord-message[data-who="coder"],
   #side-cards li.discord-message[data-who="coder"],
   #discord-log li.discord-message[data-who="coder"],
-  #pinned-log li.discord-message[data-who="coder"],
-  #reply-context li.discord-message[data-who="coder"],
-  #reply-target li.discord-message[data-who="coder"] {
+  #pinned-log li.discord-message[data-who="coder"] {
     /* A desk has the room, and a full-bleed tile a metre wide is the "phone layout stretched
        sideways" the whole block exists to remove. The inset comes back. */
     margin-left: 0;
     margin-right: var(--desk-agent-inset, min(15%, 6rem));
   }
-
   #side-log li.discord-message[data-who="human"],
   #side-cards li.discord-message[data-who="human"],
   #discord-log li.discord-message[data-who="human"],
   #pinned-log li.discord-message[data-who="human"],
-  #reply-context li.discord-message[data-who="human"],
-  #reply-target li.discord-message[data-who="human"],
   #side-log li.discord-message[data-who="bot"],
   #side-cards li.discord-message[data-who="bot"],
   #discord-log li.discord-message[data-who="bot"],
-  #pinned-log li.discord-message[data-who="bot"],
-  #reply-context li.discord-message[data-who="bot"],
-  #reply-target li.discord-message[data-who="bot"] {
+  #pinned-log li.discord-message[data-who="bot"] {
     margin-inline: var(--desk-third-inset, min(7%, 3rem));
   }
 
@@ -7711,8 +7605,7 @@ textarea {
      his side of the column. The arrow follows the box (`right: 100%`). */
   #side-log li.discord-message[data-is-reply="true"][data-who="me"],
   #side-cards li.discord-message[data-is-reply="true"][data-who="me"],
-  #discord-log li.discord-message[data-is-reply="true"][data-who="me"],
-  #reply-target li.discord-message[data-is-reply="true"][data-who="me"] {
+  #discord-log li.discord-message[data-is-reply="true"][data-who="me"] {
     margin-left: max(var(--reply-gutter), min(15%, 6rem));
   }
 
@@ -7762,22 +7655,17 @@ textarea {
      beside the stack's own rules. After the owner's reply, which they outrank in a stack. */
   #side-log li.discord-message[data-stack-under="coder"][data-who],
   #side-cards li.discord-message[data-stack-under="coder"][data-who],
-  #discord-log li.discord-message[data-stack-under="coder"][data-who],
-  #reply-target li.discord-message[data-stack-under="coder"][data-who] {
+  #discord-log li.discord-message[data-stack-under="coder"][data-who] {
     margin-left: var(--reply-gutter);
   }
-
   #side-log li.discord-message[data-stack-under="me"][data-who],
   #side-cards li.discord-message[data-stack-under="me"][data-who],
-  #discord-log li.discord-message[data-stack-under="me"][data-who],
-  #reply-target li.discord-message[data-stack-under="me"][data-who] {
+  #discord-log li.discord-message[data-stack-under="me"][data-who] {
     margin-left: calc(min(15%, 6rem) + var(--reply-gutter));
   }
-
   #side-log li.discord-message[data-stack-under="third"][data-who],
   #side-cards li.discord-message[data-stack-under="third"][data-who],
-  #discord-log li.discord-message[data-stack-under="third"][data-who],
-  #reply-target li.discord-message[data-stack-under="third"][data-who] {
+  #discord-log li.discord-message[data-stack-under="third"][data-who] {
     margin-left: calc(var(--desk-third-inset, min(7%, 3rem)) + var(--reply-gutter));
   }
 
@@ -7786,18 +7674,14 @@ textarea {
   #side-cards li.discord-message[data-read-run="head"][data-stack-under="third"][data-who] {
     margin-left: calc(var(--desk-third-inset, min(7%, 3rem)) + var(--reply-gutter)) !important;
   }
-
   #side-log li.discord-message[data-stack-under="reply"][data-who],
   #side-cards li.discord-message[data-stack-under="reply"][data-who],
-  #discord-log li.discord-message[data-stack-under="reply"][data-who],
-  #reply-target li.discord-message[data-stack-under="reply"][data-who] {
+  #discord-log li.discord-message[data-stack-under="reply"][data-who] {
     margin-left: calc(var(--reply-gutter) * 2);
   }
-
   #side-log li.discord-message[data-stack-under="me-reply"][data-who],
   #side-cards li.discord-message[data-stack-under="me-reply"][data-who],
-  #discord-log li.discord-message[data-stack-under="me-reply"][data-who],
-  #reply-target li.discord-message[data-stack-under="me-reply"][data-who] {
+  #discord-log li.discord-message[data-stack-under="me-reply"][data-who] {
     margin-left: calc(max(var(--reply-gutter), min(15%, 6rem)) + var(--reply-gutter));
   }
 
@@ -7917,7 +7801,8 @@ textarea {
      (0.45rem and 1px, top and bottom); measured in Chromium, 86px either way. */
   #screen-main[data-composer-grow]:not([data-draft]) #compose-text,
   #screen-main[data-composer-grow]:not([data-draft]) #channel-compose-text,
-  #screen-main[data-composer-grow] #side-compose-text {
+  #screen-main[data-composer-grow] #side-compose-text,
+  #screen-main[data-composer-grow] #reply-text {
     field-sizing: content;
     height: var(--composer-grow-height, auto);
     min-height: max(5rem, calc(3lh + 0.9rem + 2px));
@@ -7932,8 +7817,7 @@ textarea {
    block). First, so the later rules for the same elements win. */
 #side-column,
 #column-links,
-#column-toggle,
-#column-reply {
+#column-toggle {
   display: none;
 }
 
@@ -8166,48 +8050,6 @@ textarea {
     width: calc(100% - 1.2rem);
   }
 
-  /*
-   * `#277 reply-in-column`. A reply opened in either column is written at that column's foot, under
-   * its list, in the reply screen's own box (#reply-compose, moved here while it is open): the owner,
-   * "Reply in the right column or left column, whichever I clicked the reply button in." Its own row
-   * of the column's grid, so the list above it is shorter by the box and nothing else about either
-   * column changes: neither is covered, and the top of the list stays where it was. Tinted as the
-   * reply screen is, the one thing that says "this is Reply", with the hairline the lists' other
-   * edges have. The box spans the column, as its rows do (`#373 two-column-full-width`, below) —
-   * a thread's on the right from 2.5rem further in, beside the line from its root (`#385
-   * thread-line-overlap`), which never reaches down to the box.
-   */
-  #screen-main[data-columns="two"] > #column-reply {
-    display: block;
-    grid-column: 1;
-    grid-row: 4;
-  }
-
-  #side-reply {
-    grid-row: 4;
-  }
-
-  #column-reply,
-  #side-reply {
-    min-width: 0;
-    padding: 0.6rem 0 0.75rem;
-    border-top: 1px solid var(--edge);
-    background: var(--reply-tint);
-  }
-
-  /* `#373 two-column-full-width`. ...and as wide as its column's rows, less the gutter inside each edge. */
-  #column-reply .reply-compose,
-  #side-reply .reply-compose {
-    width: calc(100% - 1.5rem);
-  }
-
-  /* The box a reply is written in, dragged taller or in a short window, never takes the list over it
-     away: no taller than a quarter of the window (its own 5rem where that is less), so the list keeps
-     the rest of the column and the message answered stays in sight. Longer words scroll in the box. */
-  #column-reply #reply-text,
-  #side-reply #reply-text {
-    max-height: max(5rem, 25vh);
-  }
 }
 
 /*
@@ -8350,9 +8192,7 @@ li.discord-message[data-root-child] > .reply-bridge {
   position: absolute;
   z-index: 2;
   left: 50%;
-  /* Standing on a reply open at the foot of the column (`#277 reply-in-column`): web/voice.js writes
-     how far above the column's foot its top edge is, and 0 when there is none. */
-  bottom: calc(0.5rem + var(--side-reply-room, 0px));
+  bottom: 0.5rem;
   width: calc(min(var(--reading-width), 100%) - 1.2rem);
   transform: translateX(-50%);
   display: flex;

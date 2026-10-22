@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Press Enter in the reply screen in real Chromium: it sends by default, and is a new line when off.
+"""Press Enter in the reply box in real Chromium: it sends by default, and is a new line when off.
 
-`#225 enter-to-send`. The owner: in the channel Enter sent, and in the reply screen it was a new line
+`#225 enter-to-send`. The owner: in the channel Enter sent, and in the reply box it was a new line
 and sending took the mouse. Every message box now takes its Enter from one handler, and "Enter to
 send" on the Settings screen decides what that does: on (the default), Enter sends and Shift+Enter
 is a new line; off, Enter is a new line and Ctrl+Enter (Cmd+Enter on an Apple keyboard) sends. The
@@ -194,13 +194,13 @@ def main() -> int:
     reply = QUESTION["id"]
 
     def open_reply(page: Page) -> None:
-        """From wherever the page is, to the reply screen on the one message, with the box focused."""
+        """From wherever the page is, to Reply on the one message, its box open in the list and focused."""
         button = page.locator(f'#discord-log li[data-id="{reply}"] .reply-button').first
         if not button.is_visible():
             page.click("#view-switch")
         button.wait_for(state="visible", timeout=10_000)
         button.click()
-        page.locator("#screen-reply").wait_for(state="visible", timeout=5000)
+        page.locator("#column-reply").wait_for(state="visible", timeout=5000)
         page.click("#reply-text")
 
     def box(page: Page) -> object:
@@ -240,7 +240,7 @@ def main() -> int:
             check(not api.sent(), f"Shift+Enter posted: {api.sent()}")
             page.keyboard.press("Enter")
             posted(1, page)
-            page.locator("#screen-reply").wait_for(state="hidden", timeout=5000)
+            page.locator("#column-reply").wait_for(state="hidden", timeout=5000)
             check(api.sent() == [("first line\nsecond line", reply)],
                   f"Enter in the reply box did not post the reply once: {api.sent()}")
 
@@ -280,10 +280,10 @@ def main() -> int:
                   f"with Enter to send off, Enter did not put a new line in the reply box: {box(page)!r}")
             page.wait_for_timeout(300)
             check(len(api.sent()) == 1, f"with Enter to send off, Enter posted: {api.sent()}")
-            check(page.locator("#screen-reply").is_visible(), "Enter closed the reply screen")
+            check(page.locator("#column-reply").is_visible(), "Enter closed the reply")
             page.keyboard.press("Control+Enter")
             posted(2, page)
-            page.locator("#screen-reply").wait_for(state="hidden", timeout=5000)
+            page.locator("#column-reply").wait_for(state="hidden", timeout=5000)
             check(api.sent()[1:] == [("line one\nline two", reply)],
                   f"Ctrl+Enter in the reply box did not post the reply once: {api.sent()}")
             check(not errors, f"the page threw: {errors}")

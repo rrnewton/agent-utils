@@ -21,8 +21,9 @@ refused (`defaultPrevented`, read by a listener on the window after the page's o
   the channel picker focused: a bare "/" opens nothing, Ctrl+/ searches -> Settings, the focus in a
   text field with words in it: Settings left, the words as they were -> Help, opened by "?" -> two
   columns, the focus in the right column's message box with a draft -> a listener on the message box
-  that stops every key and refuses its default: the search still opens, the draft as it was -> the
-  Reply screen with a draft: left, and the reply opened again holds the draft -> single keys off: a
+  that stops every key and refuses its default: the search still opens, the draft as it was -> a
+  reply open in the list with words in its box: the search opens over it, the reply open with its
+  words (`#410 inline-reply-editor`) -> single keys off: a
   bare "/" opens nothing, Ctrl+/ searches -> Ctrl+Shift+? opens Help at the Keyboard entry, whose list
   names Ctrl+/ and Ctrl+?, and the glass and Help's link carry them in `aria-keyshortcuts` -> on a
   German layout's report of Ctrl+Shift+7 ("/"), the search -> a "/" sent as AltGr sends it (Ctrl and Alt
@@ -286,28 +287,28 @@ def past_a_listener_that_stops_it(walk: Walk) -> None:
 
 
 def from_reply(walk: Walk) -> None:
-    """The Reply screen with a draft: left with it kept, and the reply opened again holds it."""
+    """A reply open in the list with words in its box: Ctrl+/ there opens the search, the reply open under it."""
     page = walk.page
     page.focus("#scroll-area")
     kb.press(walk.cdp, "End")
     walk.settled()
     row = page.evaluate("() => document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.id : null")
     check(isinstance(row, str), f"fixture: End selected no message: {row!r}")
-    replied = walk.key("r")
-    check(replied["screen"] == "reply", f"fixture: r did not open the Reply screen: {replied}")
+    walk.key("r")
+    check(page.evaluate("() => !document.getElementById('column-reply').hidden"), "fixture: r did not open the reply in the list")
     page.fill("#reply-text", "reply words")
     page.focus("#reply-text")
     kb.press(walk.cdp, "Control+/")
-    searched(walk, "on the Reply screen")
+    searched(walk, "in the reply's box")
     walk.shot("chord-from-reply")
     close_search(walk)
-    page.click(f"#discord-log > li[data-id='{row}'] .reply-button")
-    page.wait_for_function("() => !document.getElementById('screen-reply').hidden", timeout=5000)
-    check(value(page, "reply-text") == "reply words", f"Ctrl+/ on Reply lost the draft: {value(page, 'reply-text')!r}")
+    # `#410 inline-reply-editor`: the reply is open in the list, and stays open under the search.
+    check(page.evaluate("() => !document.getElementById('column-reply').hidden"), "Ctrl+/ in the reply's box put the reply away")
+    check(value(page, "reply-text") == "reply words", f"Ctrl+/ in the reply's box lost its words: {value(page, 'reply-text')!r}")
     page.fill("#reply-text", "")
-    page.click("#close-reply")
-    page.wait_for_function("() => !document.getElementById('screen-main').hidden", timeout=5000)
-    walk.notes.append("on the Reply screen, Ctrl+/ left it for the search and the reply opened again held its draft")
+    page.click("#reply-cancel")
+    page.wait_for_function("() => document.getElementById('column-reply').hidden", timeout=5000)
+    walk.notes.append("in the reply's box Ctrl+/ opened the search over the list, the reply staying open with its words")
 
 
 def with_single_keys_off(walk: Walk) -> None:

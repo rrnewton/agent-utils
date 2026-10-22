@@ -20,9 +20,9 @@ the row's own menu and buttons), the walk is:
   scroll to the newest message: the Bookmark chip is up, pointing up; part way back, Newest and the
   Bookmark chip stand side by side on the bottom line, overlapping nothing -> jump (b, or a tap on
   the chip): the line at the top of the list under the floating pill, the message under it selected
-  on a desk, and the chip gone -> reply to a message further down: the reply screen, Send, and the
-  page goes to the newest message, marks the message answered Done (`#256 reply-marks-read`) without
-  moving the line, says b goes back, and offers the chip -> jump back -> mark the message under the
+  on a desk, and the chip gone -> reply to a message further down: the reply in the list, Send, and
+  the page marks the message answered Done (`#256 reply-marks-read`) without moving the line, the
+  reader where they were (`#410 inline-reply-editor`), and offers the chip -> jump back -> mark the message under the
   line Done (e, or its Done button): the line slides to the next message, the server holds that, and
   on a desk the selection moves with it. No horizontal overflow and no page error at any step.
 
@@ -526,8 +526,8 @@ def bookmark_walk(walk: Walk) -> None:
     walk.shot("3-jumped")
     walk.notes.append(("the chip" if walk.touch else "b") + " took the reader to the line under the pill")
 
-    # Reply to a message further down, from the reply screen, and come back. The message answered is
-    # Done once the reply is sent (`#256 reply-marks-read`); the line, above another message, stays.
+    # Reply to a message further down, in the list, and come back. The message answered is Done once the
+    # reply is sent (`#256 reply-marks-read`); the line, above another message, stays.
     answered = message_id(ANSWERED)
     answered_row = f"#discord-log > li[data-id='{answered}']"
     if walk.touch:
@@ -535,21 +535,24 @@ def bookmark_walk(walk: Walk) -> None:
     else:
         walk.press(f"{answered_row} .msg-author, {answered_row} .meta")
         page.keyboard.press("r")
-    walk.wait_for("() => !document.getElementById('screen-reply').hidden", "the reply screen did not open")
+    walk.wait_for("() => !document.getElementById('column-reply').hidden", "the reply did not open in the list")
     page.fill("#reply-text", "On it: I will check the cache and report back.")
     walk.press("#reply-send")
-    walk.wait_for("() => !document.getElementById('screen-main').hidden", "sending did not come back to the channel")
+    walk.wait_for("() => document.getElementById('column-reply').hidden", "sending did not put the reply's box away")
     walk.wait_for(f"() => document.querySelectorAll('#discord-log > li[data-id]').length === {COUNT + 1}",
                   "the reply was not drawn at the foot of the channel")
     walk.wait_for("(id) => { const li = [...document.querySelectorAll('#discord-log > li')]"
                   ".find((n) => n.dataset.id === id); return li && li.getAttribute('data-archived') === 'true'; }",
                   "the message answered was not drawn Done", answered)
-    walk.wait_for("() => document.getElementById('status').textContent === 'b goes back to your bookmark.'",
-                  "the page did not say b goes back after the reply")
     walk.settled()
     m = walk.measure(marked)
-    walk.check(m.found["atEnd"] is True, "sending did not go to the newest message")
-    walk.check(m.chip("jump-bookmark") is not None, "the way back is not offered after the reply")
+    # `#410 inline-reply-editor`. The reply was written in the list, and sending it moved nothing: the
+    # line is still on screen where the reader left it. Down to the newest, the way back is offered.
+    walk.check(m.box("line") is not None, "sending the reply took the reader away from the line")
+    page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; }")
+    walk.wait_for("() => !document.getElementById('jump-bookmark').hidden", "down at the newest, the way back is not offered")
+    walk.settled()
+    m = walk.measure(marked)
     walk.check(len(walk.api.replies) == 1 and walk.api.replies[0].get("reply_to") == answered,
                f"the reply did not answer the message it was opened on: {walk.api.replies}")
     walk.check(answered in walk.api.dismissed and marked not in walk.api.dismissed,

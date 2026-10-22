@@ -1,12 +1,13 @@
 ---
 title: 'inline-reply-editor: Reply opens in the stream under the message and its replies, one box at a time'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-22T02:42:17.865917915+00:00
-updated_at: 2026-10-22T02:42:17.865917915+00:00
+updated_at: 2026-10-22T05:38:07.447992901+00:00
+closed_at: 2026-10-22T05:38:07.447992630+00:00
 ---
 
 # Description

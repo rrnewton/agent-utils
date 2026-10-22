@@ -1559,7 +1559,8 @@ def _act_connection_failed(driver: Driver) -> None:
     driver.settle(200)
 
 
-# `#51 reply-view`. The reply screen, opened on a real seeded channel message.
+# `#51 reply-view`, since `#410 inline-reply-editor` a reply open in the list: the reply's box, opened on
+# a real seeded channel message, under it in the stream.
 #
 # Both states are self-contained and run everywhere: the phone is where a reply is actually typed,
 # and the thing most likely to be wrong on it -- the message you are answering pushing the text box
@@ -2352,8 +2353,8 @@ def _act_help_sections(driver: Driver) -> None:
 def _act_reply_view(driver: Driver) -> None:
     _act_whole_channel(driver)
     # Park in the middle of the channel, and record it. The round trip below is then a MEASURED
-    # claim about the reader's position rather than a hope -- and it is one no unit test can make,
-    # because the reset a browser performs on a hidden element's scrollTop is a browser fact.
+    # claim about the reader's position rather than a hope: putting a reply in the list down moves
+    # nothing, which only a browser that lays the box out can say.
     driver.js(
         "(() => { const a = document.getElementById('scroll-area'); "
         "a.scrollTop = Math.round((a.scrollHeight - a.clientHeight) * 0.5); "
@@ -2371,17 +2372,23 @@ def _act_reply_view(driver: Driver) -> None:
         "li.id = 'reply-probe'; return li.id; })()"
     )
     driver.page.click("#reply-probe .reply-button")
-    driver.page.wait_for_function("() => window.__visible('screen-reply')", timeout=5_000)
+    driver.page.wait_for_function("() => window.__visible('column-reply')", timeout=5_000)
+    driver.settle(200)
+    # Where the list stands with the reply open: moved, on a short phone, as far as shows the box.
+    driver.js(
+        "(() => { window.__openedAt = document.getElementById('scroll-area').scrollTop; "
+        "return window.__openedAt; })()"
+    )
     driver.click("reply-cancel")
-    driver.page.wait_for_function("() => window.__visible('pane-discord')", timeout=5_000)
+    driver.page.wait_for_function("() => !window.__visible('column-reply')", timeout=5_000)
     driver.settle(200)
     driver.js(
         "(() => { window.__returnedTo = document.getElementById('scroll-area').scrollTop; "
         "return window.__returnedTo; })()"
     )
-    # ...and open it again, because THAT is the screen this state is a picture of.
+    # ...and open it again, because THAT is the reply this state is a picture of.
     driver.page.click("#reply-probe .reply-button")
-    driver.page.wait_for_function("() => window.__visible('screen-reply')", timeout=5_000)
+    driver.page.wait_for_function("() => window.__visible('column-reply')", timeout=5_000)
     driver.js(
         "(() => { const t = document.getElementById('reply-text'); t.value = "
         "'looking now — the arm64 runner was wedged, not busy'; "
@@ -2485,9 +2492,16 @@ def _act_reply_long_target(driver: Driver) -> None:
     # row cannot be brought up the screen -- there is nothing below it to scroll. Its controls
     # therefore sit on the scroll area's bottom edge, where Playwright's own hit test lands on the
     # list rather than on the button. State 18 is where a real pointer clicks a reply control; this
-    # state is about what the reply SCREEN does with a message longer than the frame.
+    # state is about what the reply in the list does with a message longer than the frame.
+    # Opened first, as a reader opens a long message to read it before answering: a folded one is a few
+    # lines, and the box under it would prove nothing about a long target.
+    driver.js(
+        "(() => { const row = document.getElementById('reply-probe'); "
+        "if (row.getAttribute('data-collapsed') === 'true') row.querySelector('.fold').click(); return true; })()"
+    )
+    driver.settle(150)
     driver.js("(() => { document.querySelector('#reply-probe .reply-button').click(); })()")
-    driver.page.wait_for_function("() => window.__visible('screen-reply')", timeout=5_000)
+    driver.page.wait_for_function("() => window.__visible('column-reply')", timeout=5_000)
     driver.settle(250)
 
 
@@ -3027,10 +3041,10 @@ def _act_failed_send_and_draft(driver: Driver) -> None:
     # `#377 compact-collapsed-rows`. A collapsed row on a phone draws no Reply until it is opened: pressed
     # as r presses it, so the row stays as the reader left it, collapsed, with its Draft on the header.
     driver.js("(() => { document.querySelector('#draft-probe .reply-button').click(); return true; })()")
-    driver.page.wait_for_function("() => window.__visible('screen-reply')", timeout=5_000)
+    driver.page.wait_for_function("() => window.__visible('column-reply')", timeout=5_000)
     driver.page.fill("#reply-text", DRAFT_REPLY_TEXT)
-    driver.click("close-reply")
-    driver.page.wait_for_function("() => window.__visible('pane-discord')", timeout=5_000)
+    driver.click("reply-cancel")
+    driver.page.wait_for_function("() => !window.__visible('column-reply')", timeout=5_000)
     driver.js(
         "(() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; "
         "if (window.__visible('status-line')) document.getElementById('dismiss-status').click(); "
@@ -4469,50 +4483,58 @@ SCENES: tuple[Scene, ...] = (
     ),
     Scene(
         name="18-reply-view",
-        what="answering one channel message, with a draft in the box",
+        what="answering one channel message in the list, with a draft in the box",
         act=_act_reply_view,
         expect=(
-            ("the reply screen is up", "window.__visible('screen-reply')"),
+            ("the reply is open in the list", "window.__visible('column-reply') && window.__visible('pane-discord')"),
             (
                 "it names the message being answered, by id",
                 "/id \\d{5,}/.test(window.__text('reply-target-meta'))",
             ),
             (
-                "the dock is gone: those controls act on the call, not on this",
-                "!window.__visible('control-pane')",
+                "the box is directly under the message answered",
+                "(() => { const row = document.getElementById('reply-probe').getBoundingClientRect(); "
+                "const box = document.getElementById('column-reply').getBoundingClientRect(); "
+                "return box.top - row.bottom >= -1 && box.top - row.bottom <= 9; })()",
             ),
-            ("there is a way back in the header", "window.__visible('close-reply')"),
+            ("one message box: the channel's is hidden", "!window.__visible('channel-composer')"),
             ("the draft really is in the box", "document.getElementById('reply-text').value.length > 10"),
-            # THE measured claim, and the reason this state parks mid-scroll first: leaving to
-            # reply and coming back lands on the same line. A browser is allowed to reset a hidden
-            # element's scrollTop to zero, which is exactly what no unit test can reproduce.
+            # THE measured claim, and the reason this state parks mid-scroll first: putting a reply in
+            # the list down leaves the reader on the line they were on with it open, and opening it
+            # moved the list, if at all, only up (to show the box under the message).
             (
-                "leaving to reply and coming back landed on the same line",
-                "window.__parkedAt > 0 && Math.abs(window.__returnedTo - window.__parkedAt) <= 4",
+                "putting the reply down left the reader on the same line, and opening it moved nothing down",
+                "window.__parkedAt > 0 && Math.abs(window.__returnedTo - window.__openedAt) <= 4 "
+                "&& window.__openedAt >= window.__parkedAt - 4",
             ),
         ),
     ),
     Scene(
         name="19-reply-view-long-target",
-        what="a target longer than the frame — the conversation pane scrolls, and the box stays reachable",
+        what="a target longer than the frame — the list moves to show the box, which stays reachable",
         act=_act_reply_long_target,
         # PHONES ONLY, and this is a scoping decision rather than an oversight. The property is
-        # that a message longer than the frame scrolls inside its own box instead of pushing the
-        # reply control off the bottom -- and at 1440x900, with the column capped at 72 characters,
-        # a message short enough for Discord to accept simply is not long enough to reach the foot
-        # of the screen. Photographing it there would capture a box that happens to fit and call it
-        # evidence. State 18 is the desktop picture of this screen.
+        # that a message longer than the frame does not push the reply control off the bottom -- and
+        # at 1440x900, with the column capped at 72 characters, a message short enough for Discord to
+        # accept simply is not long enough to reach the foot of the screen. Photographing it there
+        # would capture a box that happens to fit and call it evidence. State 18 is the desktop
+        # picture of a reply in the list.
         profiles=PHONE_PROFILES,
         expect=(
-            ("the reply screen is up", "window.__visible('screen-reply')"),
-            # The whole content of this picture: the message being answered overflows the reply
-            # screen's conversation pane rather than the screen, so the thing you type into is still
-            # there. Since `#200 reply-context` the message and the earlier ones above it scroll
-            # TOGETHER in #reply-scroll; the message no longer scrolls inside a box of its own.
+            ("the reply is open in the list", "window.__visible('column-reply')"),
+            # The whole content of this picture: a message a good part of the frame tall, with the box
+            # under it still on screen, the list having moved only as far as shows it whole, so the
+            # thing you type into is there (`#410 inline-reply-editor`).
             (
-                "the message being answered overflows the conversation pane, not the screen",
-                "(() => { const t = document.getElementById('reply-scroll'); "
-                "return t.scrollHeight > t.clientHeight + 10; })()",
+                "the message being answered is a long one, over a third of the frame",
+                "(() => { const t = document.getElementById('reply-probe').getBoundingClientRect(); "
+                "return t.height > window.innerHeight / 3; })()",
+            ),
+            (
+                "the box is directly under it",
+                "(() => { const t = document.getElementById('reply-probe').getBoundingClientRect(); "
+                "const b = document.getElementById('column-reply').getBoundingClientRect(); "
+                "return b.top - t.bottom >= -1 && b.top - t.bottom <= 9; })()",
             ),
             (
                 "the reply box and its Send control are still on screen, above the frame's foot",
@@ -7133,7 +7155,7 @@ def check_state_controls() -> list[str]:
         "15-desktop-wide-column": DESKTOP_PROFILES,
         # `#51 reply-view`. Phones only: at desktop width a message short enough for Discord to
         # accept does not reach the foot of the screen, so the state would photograph a box that
-        # happens to fit and file it as evidence that a long one scrolls.
+        # happens to fit and file it as evidence that a long one leaves the box reachable.
         "19-reply-view-long-target": PHONE_PROFILES,
         # `#56 message-hover-highlight`. Chromium's page.hover() in a touch context can produce a
         # hover state, so without this the scene would run on both iPhone profiles and CERTIFY a
@@ -7248,12 +7270,11 @@ def check_state_controls() -> list[str]:
         # its presence, because a fix that simply stopped reporting failures would satisfy 16.
         "16-suspended-recoverable": "!window.__visible('error')",
         "17-connection-failed": "window.__visible('error')",
-        # `#51 reply-view`. 18 is pinned to the ROUND TRIP -- a browser is allowed to reset a
-        # hidden element's scrollTop to zero, so "coming back lands on the same line" is a browser
-        # fact no unit test can reproduce, and it is the only interesting thing in that frame that
-        # is not simply "a form is on screen". 19 is pinned to the target overflowing its own box.
+        # `#51 reply-view`, `#410 inline-reply-editor`. 18 is pinned to the ROUND TRIP -- opening a
+        # reply in the list and putting it down leaves the reader on the same line, a layout fact no
+        # unit test can reproduce. 19 is pinned to the target being a long one, the box under it.
         "18-reply-view": "__returnedTo",
-        "19-reply-view-long-target": "scrollHeight > t.clientHeight",
+        "19-reply-view-long-target": "t.height > window.innerHeight / 3",
         # `#56 message-hover-highlight`. Pinned to the pixel-affecting property. Pinning it to the
         # row being hovered would be satisfied with the rule deleted, which is the whole failure
         # this state exists to catch -- there is nothing else in the repository that can see it.

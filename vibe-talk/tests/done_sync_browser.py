@@ -53,7 +53,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import offline_cache_browser as fixture
 from offline_cache_browser import CACHE_KEY, TOKEN, Json, check, handler_for
-from reply_in_column_browser import place_row, reply_button
+from inline_reply_browser import place_row, reply_button
 from reply_marks_read_browser import MarkerApi, drawn_read
 from two_column_browser import CANARY, RUNNER, THREAD_ROWS, Desk
 from view_switch_browser import PHONE, SwitchApi
@@ -400,7 +400,7 @@ def held_send(desk: Desk, api: HeldDoneApi, message_id: str, refuse: bool) -> No
     desk.check(api.held == held + 1, f"{where}: the Done did not reach the server")
     button = reply_button(desk, "left", message_id)
     page.mouse.click(button["x"], button["y"])
-    desk.wait_for("() => document.querySelector('.reply-compose').parentElement.id === 'column-reply'",
+    desk.wait_for("() => !document.getElementById('column-reply').hidden",
                   f"{where}: the box did not open in the column")
     before = len(api.posted())
     page.keyboard.type(f"answering {message_id} while its Done is saved")

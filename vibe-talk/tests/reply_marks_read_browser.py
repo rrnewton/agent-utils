@@ -11,7 +11,7 @@ keep it forward and ask once. The fake-DOM suite (tests/js/voice_page.test.mjs) 
 drives the two the owner uses on a desk with a real mouse and keyboard, where the box is docked in a
 column (`#277 reply-in-column`) and the thread opens on the right.
 
-It serves the checked-out page and the fake API of tests/reply_in_column_browser.py — a channel taller
+It serves the checked-out page and the fake API of tests/inline_reply_browser.py — a channel taller
 than the window with three threads, one message more heading a thread nobody has answered, as Google
 Chat names one for every message — whose provider can move its read marker, from one loopback origin.
 At 1280x800, in two columns, the runner's thread on the right:
@@ -41,7 +41,7 @@ from typing import TYPE_CHECKING
 
 import offline_cache_browser as fixture
 from offline_cache_browser import CHANNEL, Json, check, handler_for, thread_of
-from reply_in_column_browser import ReplyColumnsApi, open_columns, place_row, reply_button
+from inline_reply_browser import ReplyColumnsApi, open_columns, place_row, reply_button
 from two_column_browser import RUNNER, Desk
 
 if TYPE_CHECKING:
@@ -239,13 +239,13 @@ def docked_reply(desk: Desk, api: MarkerApi, column: str, message_id: str) -> No
     button = reply_button(desk, column, message_id)
     page.mouse.click(button["x"], button["y"])
     mount = "column-reply" if column == "left" else "side-reply"
-    desk.wait_for(f"() => document.querySelector('.reply-compose').parentElement.id === '{mount}'",
+    desk.wait_for(f"() => !document.getElementById('{mount}').hidden && document.querySelector('.reply-compose').parentElement.id === '{mount}'",
                   f"{where}: the box did not open in the column")
     before = len(api.posted())
     page.keyboard.type(f"answering {message_id}")
     desk.shot(f"{column}-reply-open")
     page.keyboard.press("Enter")
-    desk.wait_for(f"() => document.querySelector('.reply-compose').parentElement.id !== '{mount}'",
+    desk.wait_for(f"() => document.getElementById('{mount}').hidden",
                   f"{where}: Enter did not send the reply and put the box back")
     for _ in range(200):
         if len(api.posted()) > before:

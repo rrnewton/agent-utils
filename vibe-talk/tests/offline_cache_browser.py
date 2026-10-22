@@ -318,7 +318,7 @@ class FakeApi:
 
     def post(self, path: str, body: Json) -> tuple[int, Json]:
         """A POST to `path` with its JSON body, as status and answer. None is served here; a walk that
-        writes (`tests/reply_in_column_browser.py`, its replies and Done) answers its own."""
+        writes (`tests/inline_reply_browser.py`, its replies and Done) answers its own."""
         return 404, {"error": "not_found", "detail": "not served by this check"}
 
     def summary(self, message_id: str) -> tuple[int, Json]:
