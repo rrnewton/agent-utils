@@ -1797,6 +1797,20 @@ a.search-hit-link {
 }
 
 /*
+ * `#424 threads-main-own-center`. The owner, 2026-10-22, of the Threads view with Main channel on: "my
+ * messages now look like they're follow ups to the prior thread because they look the same as the prior
+ * thread messages except without the colorful connector. I propose in this view we actually CENTER my
+ * messages to the main channel, keeping their current width, so their left edge is no longer lined up
+ * with the intra-thread messages." So there, and only on the main channel's rows among the cards
+ * (`data-main-row`), the owner's inset is split into halves either side: the same width, centred. The
+ * agent's main rows, and the owner's rows in every other list, keep the rule above. A desk restates it
+ * where it restates that rule.
+ */
+#side-cards li.discord-message[data-who="me"][data-main-row] {
+  margin-inline: calc(var(--speaker-inset) / 2);
+}
+
+/*
  * THE CODING AGENT'S MESSAGES ARE TILES, NOT CELLS.
  *
  * They are the thing this view exists to read, and they are long, so they get the whole width:
@@ -3341,6 +3355,12 @@ a.search-hit-link {
   --row-inset-right: 0px;
 }
 
+/* `#424 threads-main-own-center`. Centred, as its margins are (above). */
+#side-cards li.discord-message[data-who="me"][data-main-row] {
+  --row-inset-left: calc(var(--speaker-inset) / 2);
+  --row-inset-right: calc(var(--speaker-inset) / 2);
+}
+
 #side-log li.discord-message[data-who="coder"],
 #side-cards li.discord-message[data-who="coder"],
 #discord-log li.discord-message[data-who="coder"],
@@ -3365,6 +3385,15 @@ a.search-hit-link {
 #side-cards li.discord-message[data-is-reply="true"][data-who],
 #discord-log li.discord-message[data-is-reply="true"][data-who] {
   --row-inset-left: var(--reply-gutter);
+}
+
+/* `#424 threads-main-own-center`. The owner's main-channel row that is a reply, among the Threads view's
+   cards: centred too, its arrow keeping a whole gutter on the left, so the same gutter on the right. A
+   desk, whose inset is wider than the gutter, restates it. */
+#side-cards li.discord-message[data-is-reply="true"][data-who="me"][data-main-row] {
+  margin-inline: var(--reply-gutter);
+  --row-inset-left: var(--reply-gutter);
+  --row-inset-right: var(--reply-gutter);
 }
 
 #side-log li.discord-message[data-seam][data-bookmark="above"] > .row-seam:not(.row-seam-below),
@@ -7694,6 +7723,12 @@ textarea {
     margin-left: max(var(--reply-gutter), min(15%, 6rem));
   }
 
+  /* `#424 threads-main-own-center`. The owner's main-channel rows among the Threads view's cards, centred
+     at the width the rules above give them (see the unconditional rule). */
+  #side-cards li.discord-message[data-who="me"][data-main-row] {
+    margin-inline: calc(min(15%, 6rem) / 2);
+  }
+
   /* `#249 search-highlight` and `#250 date-separators`. The insets the lines between rows reach back
      across, as the margins just above give them on a desk. */
   #side-log li.discord-message[data-who="me"],
@@ -7701,6 +7736,11 @@ textarea {
   #discord-log li.discord-message[data-who="me"],
   #pinned-log li.discord-message[data-who="me"] {
     --row-inset-left: min(15cqw, 6rem);
+  }
+
+  #side-cards li.discord-message[data-who="me"][data-main-row] {
+    --row-inset-left: calc(min(15cqw, 6rem) / 2);
+    --row-inset-right: calc(min(15cqw, 6rem) / 2);
   }
 
   #side-log li.discord-message[data-who="coder"],
@@ -7733,6 +7773,14 @@ textarea {
   #side-cards li.discord-message[data-is-reply="true"][data-who="me"],
   #discord-log li.discord-message[data-is-reply="true"][data-who="me"] {
     --row-inset-left: max(var(--reply-gutter), min(15cqw, 6rem));
+  }
+
+  /* `#424 threads-main-own-center`. The owner's main-channel reply among the cards, centred at the width
+     his replies have here, never with less than the arrow's gutter either side. */
+  #side-cards li.discord-message[data-is-reply="true"][data-who="me"][data-main-row] {
+    margin-inline: max(var(--reply-gutter), calc(min(15%, 6rem) / 2));
+    --row-inset-left: max(var(--reply-gutter), calc(min(15cqw, 6rem) / 2));
+    --row-inset-right: max(var(--reply-gutter), calc(min(15cqw, 6rem) / 2));
   }
 
   /* `#215 reply-coalesce`. Gathered replies hang one gutter in from their parent's left edge, and

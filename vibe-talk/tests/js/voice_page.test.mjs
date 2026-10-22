@@ -76383,6 +76383,52 @@ test("`#422 composer-key-stay`: in Main, All, a thread and two columns, each wit
   assert.ok(inTwoColumns(two), "Cmd+S left two columns");
 });
 
+// --- `#424 threads-main-own-center` ----------------------------------------------------------------------
+//
+// The owner, 2026-10-22: "my messages now look like they're follow ups to the prior thread ... I propose in
+// this view we actually CENTER my messages to the main channel, keeping their current width, so their left
+// edge is no longer lined up with the intra-thread messages." tests/threads_polish_browser.py measures it.
+
+const OWN_MAIN_ROW = '#side-cards li.discord-message[data-who="me"][data-main-row]';
+
+test("`#424 threads-main-own-center`: the owner's main-channel rows among the Threads view's cards split his inset into halves either side, on a phone and at a desk, and nothing else moves", async () => {
+  // A phone: the owner's inset, halved either side, so the width is the one his rows have everywhere.
+  const phone = cssRules(CSS_UNCONDITIONAL, OWN_MAIN_ROW).join("\n");
+  assert.match(phone, /margin-inline:\s*calc\(var\(--speaker-inset\) \/ 2\)/, "the owner's main row is not centred at his width");
+  assert.match(phone, /--row-inset-left:\s*calc\(var\(--speaker-inset\) \/ 2\)/);
+  assert.match(phone, /--row-inset-right:\s*calc\(var\(--speaker-inset\) \/ 2\)/);
+  assert.match(cssBlock('#side-cards li.discord-message[data-who="me"]'), /margin-left:\s*var\(--speaker-inset\)/,
+    "the owner's width rule is not the inset the halves are of");
+  // A desk: its own inset, halved, after (so over) the owner's reply rule of the same weight.
+  const desk = cssBlockIn(DESKTOP_QUERY, OWN_MAIN_ROW);
+  assert.match(desk, /margin-inline:\s*calc\(min\(15%, 6rem\) \/ 2\)/);
+  assert.match(desk, /--row-inset-left:\s*calc\(min\(15cqw, 6rem\) \/ 2\)/);
+  const body = mediaBody(DESKTOP_QUERY);
+  assert.ok(body.indexOf(OWN_MAIN_ROW) > body.indexOf('#side-cards li.discord-message[data-is-reply="true"][data-who="me"]'),
+    "the owner's reply rule comes after the centring and wins it at a desk");
+  // A reply among them (a main-channel message answering another) is centred too, outranking the reply rules
+  // of the same lists, its arrow keeping a whole gutter on the left: the same gutter on the right on a phone,
+  // and at a desk the larger of that and half the owner's inset.
+  const reply = '#side-cards li.discord-message[data-is-reply="true"][data-who="me"][data-main-row]';
+  assert.match(cssRules(CSS_UNCONDITIONAL, reply).join("\n"), /margin-inline:\s*var\(--reply-gutter\)/,
+    "the owner's main-channel reply is not centred on a phone");
+  assert.match(cssBlockIn(DESKTOP_QUERY, reply), /margin-inline:\s*max\(var\(--reply-gutter\), calc\(min\(15%, 6rem\) \/ 2\)\)/,
+    "the owner's main-channel reply is not centred at a desk");
+  // Negative controls: the selector is the Threads view's main rows and the owner's alone — never the agent's,
+  // never another list, never a row without data-main-row.
+  for (const selector of ['#side-cards li.discord-message[data-who="coder"][data-main-row]',
+    '#discord-log li.discord-message[data-who="me"][data-main-row]', '#side-log li.discord-message[data-who="me"][data-main-row]']) {
+    assert.equal(cssRules(CSS_CODE, selector).length, 0, `${selector} has a rule`);
+  }
+  assert.doesNotMatch(cssRules(CSS_UNCONDITIONAL, '#side-cards li.discord-message[data-who="me"]').join("\n"), /margin-inline/,
+    "the owner's rows everywhere are centred");
+  // The page marks the rows the selector reads: the main channel's among the cards, the owner's by data-who.
+  const { page } = await mainMessagesPage(new Map([[THREADS_MAIN_STORAGE, "on"]]));
+  const mainRows = page.el("side-cards").children.filter((li) => li.hasAttribute("data-main-row"));
+  assert.ok(mainRows.length > 0 && mainRows.every((li) => li.className.split(/\s+/).includes("discord-message") && li.hasAttribute("data-who")),
+    "the main channel's rows among the cards are not message rows with a speaker");
+});
+
 // --- unpack every thread under its card (#404 threads-unpack-all) and the root under a summary (#405) --
 //
 // The owner, 2026-10-21: bridging one thread in All breaks when another is bridged; he wants every
