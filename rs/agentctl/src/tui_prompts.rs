@@ -40,7 +40,7 @@ impl Answering<'_> {
                 q.text != expected.text
                     || q.options != expected.options
                     || q.total != expected.total
-                    || !q.draft.is_empty()
+                    || q.draft != expected.draft
             }) {
                 return Err(fail("screen changed or question has a draft; inspect agentctl prompts before answering"));
             }

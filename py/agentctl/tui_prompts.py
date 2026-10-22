@@ -79,7 +79,7 @@ def answer(
             view = observe()
             q = view.question
             if q is not None and (q.text != expected.text or q.options != expected.options
-                                  or q.total != expected.total or q.draft):
+                                  or q.total != expected.total or q.draft != expected.draft):
                 raise AgentDeliveryError("screen changed or question has a draft; inspect agentctl prompts before answering")
             if (view.state == State.QUESTION and q is not None and not q.collapsed
                     and (selected is None or q.selected == selected)

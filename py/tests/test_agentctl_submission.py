@@ -1371,3 +1371,44 @@ def test_async_options_never_repeat_uncertain_submit() -> None:
         answer(terminal, "w1:p1", adapter(), option=2, verify=lambda p: None,
                sleep=terminal.sleep, monotonic=lambda: terminal.seconds)
     assert terminal.keys == ["Down", "Enter"]
+
+
+@pytest.mark.parametrize("drop", [False, True])
+def test_explicit_matching_wrapped_draft_is_confirmed_without_retyping(drop: bool) -> None:
+    terminal = FormTerminal("async-freeform", drop=drop)
+    terminal.screen = terminal.screen.replace("Type your answer", "Keep the paid lifecycle and\n  prepare separate boundary companions.")
+    text = "Keep the paid lifecycle and prepare separate boundary companions."
+    if drop:
+        with pytest.raises(AgentPossiblySubmitted):
+            answer(terminal, "w1:p1", adapter(), text=text, verify=lambda p: None,
+                   sleep=terminal.sleep, monotonic=lambda: terminal.seconds)
+    else:
+        assert answer(terminal, "w1:p1", adapter(), text=text, verify=lambda p: None,
+                      sleep=terminal.sleep, monotonic=lambda: terminal.seconds)["answered"]
+    assert terminal.keys == ["Enter"] and not terminal.texts
+
+
+def test_wrapped_freeform_paste_is_verified_before_single_submit() -> None:
+    class Wrapped(FormTerminal):
+        def send_text(self, pane: str, text: str) -> None:
+            super().send_text(pane, text)
+            self.screen = self.screen.replace("paid lifecycle and prepare", "paid lifecycle and\n  prepare")
+    terminal = Wrapped("async-freeform")
+    assert answer(terminal, "w1:p1", adapter(), text="Keep the paid lifecycle and prepare companions.",
+                  verify=lambda p: None, sleep=terminal.sleep, monotonic=lambda: terminal.seconds)["answered"]
+    assert terminal.keys == ["Enter"] and len(terminal.texts) == 1
+
+
+def test_matching_draft_changed_before_submit_is_refused() -> None:
+    class Changed(FormTerminal):
+        reads = 0
+        def read_screen(self, pane: str) -> str:
+            self.reads += 1
+            if self.reads == 2:
+                self.screen = self.screen.replace("Exact answer", "Different draft")
+            return super().read_screen(pane)
+    terminal = Changed("async-freeform")
+    terminal.screen = terminal.screen.replace("Type your answer", "Exact answer")
+    with pytest.raises(AgentDeliveryError):
+        answer(terminal, "w1:p1", adapter(), text="Exact answer", verify=lambda p: None)
+    assert not terminal.keys and not terminal.texts

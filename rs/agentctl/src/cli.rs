@@ -215,7 +215,7 @@ struct Answer {
     /// One-based option number printed by prompts
     #[arg(long, value_name = "N")]
     option: Option<usize>,
-    /// Literal single-line answer for a supported empty free-text form
+    /// Literal single-line answer for a supported empty or identical-draft free-text form
     #[arg(long, value_name = "TEXT")]
     text: Option<String>,
 }

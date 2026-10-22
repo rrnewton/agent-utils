@@ -379,3 +379,46 @@ fn async_options_refuse_incomplete_or_ambiguous_forms() {
         assert!(terminal.text.borrow().is_empty());
     }
 }
+
+#[test]
+fn matching_wrapped_draft_is_confirmed_without_retyping() {
+    for drop_submit in [false, true] {
+        let mut terminal = Terminal::new(&ASYNC_FREEFORM.replace(
+            "Type your answer",
+            "Keep the paid lifecycle and\n  prepare separate boundary companions.",
+        ));
+        terminal.drop_submit = drop_submit;
+        let result = agentctl::tui_prompts::answer(
+            &terminal,
+            "pane",
+            harness_tui(Some("codex")).unwrap(),
+            (
+                None,
+                Some("Keep the paid lifecycle and prepare separate boundary companions."),
+            ),
+            &|_| Ok(()),
+            &Runtime::default(),
+        );
+        if drop_submit {
+            assert_eq!(result.unwrap_err().exit_code(), 76);
+        } else {
+            assert_eq!(result.unwrap()["answered"], true);
+        }
+        assert_eq!(*terminal.keys.borrow(), ["Enter"]);
+        assert!(terminal.text.borrow().is_empty());
+    }
+    let terminal = Terminal::new(
+        &ASYNC_FREEFORM.replace("Type your answer", "Someone else's\n  existing draft"),
+    );
+    assert!(agentctl::tui_prompts::answer(
+        &terminal,
+        "pane",
+        harness_tui(Some("codex")).unwrap(),
+        (None, Some("Replacement")),
+        &|_| Ok(()),
+        &Runtime::default(),
+    )
+    .is_err());
+    assert!(terminal.keys.borrow().is_empty());
+    assert!(terminal.text.borrow().is_empty());
+}

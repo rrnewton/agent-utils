@@ -80,8 +80,9 @@ impl HarnessTui for CodexTui {
                                 Some(selected[0]),
                                 String::new(),
                             )
-                        } else if editor.len() == 1 {
-                            let editor = editor[0].trim_start_matches('›').trim();
+                        } else if editor.iter().all(|row| option_row(row, '›').is_none()) {
+                            let editor_text = editor.join(" ");
+                            let editor = editor_text.trim_start_matches('›').trim();
                             (
                                 vec![],
                                 None,
@@ -223,7 +224,7 @@ impl HarnessTui for CodexTui {
             .filter(|t| !t.trim().is_empty() && !t.chars().any(char::is_control))
             .ok_or("--text must be nonempty single-line text without terminal controls")?;
         if q.options.is_empty() {
-            if q.total != 1 || q.collapsed || !q.draft.is_empty() || q.notes {
+            if q.total != 1 || q.collapsed || q.notes || (!q.draft.is_empty() && q.draft != text) {
                 return Err(
                     "free-text question is not empty or has an unsupported layout".to_owned(),
                 );
@@ -231,7 +232,7 @@ impl HarnessTui for CodexTui {
             return Ok(AnswerPlan {
                 submit_key: "Enter",
                 keys: vec![],
-                text: Some(text.to_owned()),
+                text: q.draft.is_empty().then(|| text.to_owned()),
                 selected: None,
             });
         }

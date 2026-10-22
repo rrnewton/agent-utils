@@ -196,7 +196,7 @@ def parser() -> argparse.ArgumentParser:
         "agentctl answer reviewer --option 2", named=True)
     selection = answer.add_mutually_exclusive_group(required=True)
     selection.add_argument("--option", type=_bounded_uint, metavar="N", help="one-based option number printed by prompts")
-    selection.add_argument("--text", metavar="TEXT", help="literal single-line answer for a supported empty free-text form")
+    selection.add_argument("--text", metavar="TEXT", help="literal single-line answer for a supported empty or identical-draft free-text form")
     read = command("read", "Read a terminal snapshot or a headless transcript/answer.",
         "agentctl read reviewer --lines 100", named=True)
     read.add_argument("--lines", type=_bounded_uint, default=500, metavar="COUNT", help="maximum tail/snapshot lines (default: 500)")

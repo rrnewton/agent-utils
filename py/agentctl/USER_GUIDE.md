@@ -891,12 +891,17 @@ pastes, or submits an answer. `answer` also opens a collapsed form if needed,
 then answers only if its layout is recognized.
 
 Both editions support default-keymap Codex single-question option and free-text
-forms. With `--text`, an option form must offer a visible "None of the above"
+forms, including asynchronous questions under Queued follow-up inputs. With `--text`, an option form must offer a visible "None of the above"
 entry; the adapter selects it and opens its empty notes editor. Claude Code's
 recognized single-question selection form supports `--option`; unknown free-text
 and multi-question forms require interactive attention. Pickers and permission
-dialogs are not answered by these commands. Existing drafts, hidden options,
-multiple questions, remapped submission hints, and unfamiliar layouts are refused.
+dialogs are not answered by these commands. Hidden options, multiple questions,
+remapped submission hints, and unfamiliar layouts are refused. Existing drafts
+are never overwritten. For a Codex free-text form only, an explicit `--text`
+identical to the complete visible draft confirms that answer without retyping it.
+Wrapped text is joined at visible word boundaries and must still match exactly.
+Inspect the pane before explicitly confirming a staged answer; never automatically
+repeat an answer whose submission was uncertain. A different draft is refused.
 
 `--option N` uses the one-based number printed on screen; `--text TEXT` is literal,
 nonempty, single-line text without terminal controls. Exactly one is required.

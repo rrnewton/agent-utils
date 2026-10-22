@@ -41,8 +41,8 @@ class CodexTui:
                             if (len(selected) == 1 and [item.number for item in options]
                                     == list(range(1, len(options) + 1))):
                                 return View(State.QUESTION, Question(title, options, selected[0]))
-                        elif len(option_rows) == 1:
-                            editor = parts[-1].strip().removeprefix("›").strip()
+                        elif not any(option_rows):
+                            editor = " ".join(line.strip() for line in parts[-1].splitlines()).removeprefix("›").strip()
                             draft = "" if editor == "Type your answer" else editor
                             return View(State.QUESTION, Question(title, draft=draft))
             return View(State.MENU)
@@ -105,9 +105,9 @@ class CodexTui:
         if text is None or not text.strip() or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in text):
             raise ValueError("--text must be nonempty single-line text without terminal controls")
         if not question.options:
-            if question.total != 1 or question.collapsed or question.draft or question.notes:
+            if question.total != 1 or question.collapsed or question.notes or (question.draft and question.draft != text):
                 raise ValueError("free-text question is not empty or has an unsupported layout")
-            return AnswerPlan((), "Enter", text=text)
+            return AnswerPlan((), "Enter", text=None if question.draft else text)
         other = next((item.number for item in question.options if item.text.startswith("None of the above")), None)
         if other is None:
             raise ValueError("this question has no visible free-text option; choose --option")
