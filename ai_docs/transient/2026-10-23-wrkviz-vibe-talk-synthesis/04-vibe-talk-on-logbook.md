@@ -1,5 +1,12 @@
 # Appendix 4: vibe-talk on `logbook`
 
+> **Update 2026-10-23 (`#455 vibe-talk-next-plan`).** Part of the master plan,
+> [`../2026-10-23-vibe-talk-next/README.md`](../2026-10-23-vibe-talk-next/README.md), which links
+> here for the detail of the cutover (milestone 0.4.0). Terms follow its
+> [terminology](../2026-10-23-vibe-talk-next/TERMINOLOGY.md). This appendix's C1 to C6 are cutover
+> steps; the replication model's C1 to C9 are a different list, and the master plan always says
+> which it means.
+
 Part of `#449 wrkviz-vibe-talk-synthesis`. How vibe-talk's store, message cache and summarizers move
 onto the shared crate without losing a guarantee, in phases that can each be deployed and rolled
 back on their own.

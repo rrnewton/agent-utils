@@ -1,5 +1,14 @@
 # wrkviz + vibe-talk: one store for what the agents say and do
 
+> **Update 2026-10-23 (`#455 vibe-talk-next-plan`).** This proposal is now part of the master plan,
+> [`../2026-10-23-vibe-talk-next/README.md`](../2026-10-23-vibe-talk-next/README.md), which keeps
+> the overview and links back here for the detail. Terms were changed in place to the plan's
+> [terminology](../2026-10-23-vibe-talk-next/TERMINOLOGY.md): the "side-agent helper" is **quick
+> research** in the **Ask panel**, the "assistant core" is the **research** service with a quick and
+> a deep depth, and a push corpus is a **briefing**. The phased plan (M0 to M8) and the questions
+> are superseded where marked: the milestones are now versions, and the questions are consolidated
+> there.
+
 2026-10-23. Design proposal for `#449 wrkviz-vibe-talk-synthesis`; nothing here is implemented.
 A working note for the owner to decide on. The questions are at the end; the appendices hold the
 inventory, the Rust type sketches and the measurements.
@@ -7,7 +16,7 @@ inventory, the Rust type sketches and the measurements.
 ## Answers first
 
 **Where is the side-agent proposal?** `ai_docs/transient/2026-10-22-side-agent-helper.md` (on
-`main` since `4fd6aed3`). It proposes a push-fed text helper behind an icon at the top of the page:
+`main` since `4fd6aed3`). It proposes push-fed quick research behind an icon at the top of the page (the Ask panel):
 server-built context of every thread plus the last 24 hours in full, Messages API with prompt
 caching, structured answers with validated citations, a highlight action and a draft action, off by
 default. Phase 3 there lets the voice agent ask it; appendix 9 here extends that into the research
@@ -53,7 +62,7 @@ are vibe-talk's.
                 vibe-talk server              wrkviz CLI (Rust)      weekly reports
          Voice │ Channel │ Work tab           archives, query, serve   draft → owner review
          voice agent ──research──▶ research agent (server-side, tools over both layers)
-         availability bar, side-agent helper
+         availability bar, Ask panel
 ```
 
 **One storage component** owns items, cursors, summaries, freshness, topics, search and export, for
@@ -113,12 +122,19 @@ the summarizer ladder and search are shared (appendix 2).
 10. **The research agent** (appendix 9). "Research for me X" makes the voice agent call `research`,
     which returns in under a second; a server-side agent with read-only tools over chat, transcripts
     and search digs for 15 seconds to 3 minutes, shows its steps on the page, and comes back as a
-    short spoken answer plus a cited written one. Same core as the side-agent helper, in a tool-loop
-    mode, running under a server-held capability the owner configures (a voice call holds only the
+    short spoken answer plus a cited written one. Same service as the Ask panel's quick research,
+    at its deep depth (a tool loop), running under a server-held capability the owner configures (a voice call holds only the
     read token). An eval harness (the hosted path from `smoke-agent.py`, plus a new `vibe-talk-v1`
     driver) measures what the voice model can actually do.
 
 ## Phased plan
+
+> **Superseded in part, 2026-10-23 (`#455 vibe-talk-next-plan`).** The master plan replaces this
+> table with versioned milestones: M0 stays M0; M1 and most of M2 are 0.4.0; M2's voice part and M3
+> are 0.5.0; M4 is W1; M5 is W2 and 0.6.0; M6 and M7 are 0.7.0; M8 is W3. It also moves the Ask
+> panel's quick research ahead, as 0.2.0, because it needs no new storage, and puts the replication
+> changes (0.3.0) before the cutover. The table stands as the detail of what each milestone
+> contains.
 
 Sizes: S is days, M one to two weeks, L several weeks, of one agent's focused work, with review.
 Each milestone is landable alone.
@@ -128,7 +144,7 @@ Each milestone is landable alone.
 | M0 | **Measure and decide**: the owner's answers below; the voice eval harness, tasks 2 and 8; `count_tokens` on a real chat day; the cache's per-consumer miss counts; the posting-join rate on a real week; Haiku 5.5 on wrkviz's model-comparison plan | S | — | The numbers the defaults rest on |
 | M1 | **`logbook` core**: ids, spans, buckets, `Item<M>`, `ChatMeta`, `Fenced`, `MessagesApi` backend moved out of vibe-talk; artifacts and receipts; vibe-talk's summaries become artifacts (cutover C1, C2) | M | M0 decisions 1 to 3 | Shared types and model client, receipts for chat |
 | M2 | **Chat history and the bar**: the cache becomes `ChatStore` (C3); backfill walk and watermarks (C4); tallies, freshness; `chat-hour` and `chat-day` rollups on demand (C5); thread and term topics; the availability bar; voice start push (P1 to P4) and the `summaries` and `topics` tools | M to L | M1 | **The first thing you would feel**: a voice call that knows the vocabulary and says how much it knows |
-| M3 | **Research agent on chat**: assistant core, research mode with chat tools, `research` / `research_status` / `research_cancel`, the page card, silent result push (`context` frame on the bridge, `contextual_update` hosted); the side-agent helper's P1 on the same core | M | M2 | "Research for me X" over chat history |
+| M3 | **Research agent on chat**: the research service, deep depth with chat tools, `research` / `research_status` / `research_cancel`, the page card, silent result push (`context` frame on the bridge, `contextual_update` hosted); the Ask panel's quick research (P1) on the same service | M | M2 | "Research for me X" over chat history |
 | M4 | **Transcripts in Rust**: `TranscriptMeta`, Claude and Codex sources with byte cursors (subagents included), groups, phases, the posting join; wrkviz `index`, `query`, `serve` in Rust over old archives | L | M1 | Both layers in one store on the agents' host |
 | M5 | **Work tab**: schema-3 export in Rust (differential-tested), the static delivery handler in Rust, the third view, per-channel mapping by join and configuration, capability levels and redaction | L | M4 | The timeline on the phone |
 | M6 | **Research reaches transcripts**; nightly batches for phases and names within a budget; daily technical rollups | M | M3, M4 | Deep answers about what the agents did |
@@ -158,10 +174,14 @@ because it turns the voice agent's weakness into a hand-off instead of a wrong a
 
 ## Questions for the owner
 
+> **Superseded in part, 2026-10-23 (`#455 vibe-talk-next-plan`).** Consolidated, with every other
+> plan document's questions, in the master plan's last section. Q1 is B1, Q2 is A3, Q3 is C3, Q4 is
+> D2, Q5 is D3, Q6 to Q9 are G1, G2, F1 and G4, Q10 is C7, Q11 is H1, Q12 is G3, and Q13 is F2.
+
 1. **Order.** Is M2 (chat summaries, the bar, the voice start push) then M3 (research over chat) the
    right first value, ahead of the Work tab and the port?
 2. **Where the crate lives.** `rs/logbook` in the Rust workspace, with vibe-talk's container built from
-   the repository root, or inside `vibe-talk/`? (The name `logbook` is a placeholder too.)
+   the repository root, or inside `vibe-talk/`? (The name `logbook` is a placeholder too; the master plan's terminology proposes keeping it.)
 3. **Default models.** Haiku 5.5 for hourly chat rollups and topic suggestions, Sonnet 5.5 for
    research and reports? Should phase summaries move from the Codex CLI to the API?
 4. **History.** May chosen channels keep their messages beyond the cache's 90 days (the `archive`
@@ -201,5 +221,5 @@ because it turns the voice agent's weakness into a hand-off instead of a wrong a
 | [06-summarization-policy.md](06-summarization-policy.md) | Automatic versus on-demand versus batch; costs on real volumes; controls |
 | [07-weekly-reports.md](07-weekly-reports.md) | Inputs, configuration, pipeline, format, review |
 | [08-voice-context-and-bar.md](08-voice-context-and-bar.md) | Push and pull at start and at fully ready, latencies, the availability bar mock |
-| [09-research-agent.md](09-research-agent.md) | Tools, hand-off, relation to the helper, model comparison, measuring the voice model |
+| [09-research-agent.md](09-research-agent.md) | Tools, hand-off, relation to quick research, model comparison, measuring the voice model |
 | [10-measurements.md](10-measurements.md) | Every measured number, with its script and output |

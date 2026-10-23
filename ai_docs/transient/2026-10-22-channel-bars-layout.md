@@ -1,5 +1,11 @@
 # channel-bars-layout: rethinking the channel view's two bottom bars (proposal)
 
+> **Update 2026-10-23 (`#455 vibe-talk-next-plan`).** Part of the master plan,
+> [`2026-10-23-vibe-talk-next/README.md`](2026-10-23-vibe-talk-next/README.md). Terms follow its
+> [terminology](2026-10-23-vibe-talk-next/TERMINOLOGY.md). This proposal is on its UI track,
+> independent of the data model; its questions are group I of the consolidated list. Nothing here is
+> superseded.
+
 [opus 5.5] A proposal for the owner. Nothing here is implemented. Written on 2026-10-22, after
 `#429 keyboard-hides-bar`, and with the `mu-readstrip` lane in mind (it moves the floating read-aloud
 strip down onto the bottom controls row, with no gap, and gives it Play/Pause).

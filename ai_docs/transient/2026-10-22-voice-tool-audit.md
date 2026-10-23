@@ -1,5 +1,11 @@
 # Voice tool audit: what the voice agent is given, and three failures from the car
 
+> **Update 2026-10-23 (`#455 vibe-talk-next-plan`).** Part of the master plan,
+> [`2026-10-23-vibe-talk-next/README.md`](2026-10-23-vibe-talk-next/README.md). Terms follow its
+> [terminology](2026-10-23-vibe-talk-next/TERMINOLOGY.md). The voice agent's next steps (a start
+> briefing, summaries by tool, the research hand-off, the eval harness) are milestone 0.5.0. Nothing
+> here is superseded.
+
 2026-10-22. `#436 voice-tool-audit` (umbrella), `#437 voice-full-text-catchup`, `#438
 voice-owner-identity`. Working note. The forensics below were read from the logs of one deployed
 instance (read-only: no service was restarted, reconfigured or connected to); host names, channel

@@ -1,5 +1,12 @@
 # Appendix 9: A server-side research agent the voice agent hands questions to
 
+> **Update 2026-10-23 (`#455 vibe-talk-next-plan`).** Part of the master plan,
+> [`../2026-10-23-vibe-talk-next/README.md`](../2026-10-23-vibe-talk-next/README.md), which links
+> here for the detail of deep research and the voice hand-off (milestone 0.5.0). Terms follow its
+> [terminology](../2026-10-23-vibe-talk-next/TERMINOLOGY.md). The "helper mode" and "research mode"
+> below are research's quick and deep **depths**, and one research log in the Ask panel holds the
+> answers to questions asked in the panel and by voice.
+
 Part of `#449 wrkviz-vibe-talk-synthesis`. Added at the owner's request on 2026-10-23:
 
 > One potential architecture is that we could develop our smarter server-side side agent as our kind
@@ -50,14 +57,14 @@ owner configures, not the caller's token, with two limits on that escalation:
 | `landed(span, repos?)` | Commits and pull requests that landed, with titles | Deterministic facts for "did X actually land?" |
 
 It has **no write tools**: it cannot post, mark read, run commands or reach the network. Its outputs
-are an answer and citations, as the side-agent helper's are.
+are an answer and citations, as quick research's are.
 
 ### Making pull-based access safe from "only part of the picture"
 
-The owner rejected tool-pull for the side-agent helper because a model choosing what to read can miss
+The owner rejected tool-pull for quick research (then the side-agent helper) because a model choosing what to read can miss
 things. For research, pull is unavoidable (the history is too big to push), so three mitigations:
 
-1. **Seeded with a push.** Every research job starts with the helper's push corpus for the scope: the
+1. **Seeded with a push.** Every research job starts with the briefing quick research uses for the scope: the
    topic list, the thread index and the newest-message index (appendix 8, P2 to P4). The agent knows
    what exists before it searches.
 2. **Coverage is part of the answer.** The structured result must say what was searched ("chat:
@@ -94,6 +101,11 @@ when it's back." The job runs on the server whether or not the call continues.
 
 ### While it runs
 
+> **Superseded in part, 2026-10-23 (`#455 vibe-talk-next-plan`).** The master plan keeps the
+> research card in the Voice view for a voice-started job, and also files every answer, with its
+> written part and citations, in the Ask panel's research log, so there is one history of research
+> answers.
+
 - **On the page**: a research card in the voice transcript, updated by server-sent events, listing
   steps as they happen ("searched chat for 'runner lock': 12 hits", "read thread runner-wedged",
   "opened the coordinator's 10:42 phase"), with Cancel.
@@ -123,7 +135,7 @@ when it's back." The job runs on the server whether or not the call continues.
   citation opens the Work tab at that phase).
 - **After the call ended**: the result is kept; the page shows a badge; the next call's start push
   includes "Research results waiting: the runner lock (finished 14:05)".
-- It is never posted to a channel. A draft reply, if wanted, goes through the helper's draft action
+- It is never posted to a channel. A draft reply, if wanted, goes through the Ask panel's draft action
   and the owner's Send.
 
 ### Latency budget
@@ -136,21 +148,21 @@ when it's back." The job runs on the server whether or not the call continues.
 | Each model step, Sonnet-class, warm prompt cache | 2 to 8 s (estimate) |
 | Each tool call against the local store | milliseconds (appendix 8 measurements); remote transcripts add the transport's round trip |
 
-## Relation to the push-fed side-agent helper
+## Relation to quick research (the push-fed side-agent helper)
 
-| | Side-agent helper (`2026-10-22-side-agent-helper.md`) | Research agent |
+| | Quick depth, the Ask panel (`2026-10-22-side-agent-helper.md`) | Deep depth (this appendix) |
 |---|---|---|
 | Purpose | Completeness over a bounded window: "where was the answer to X?" | Depth over unbounded history: "why did X happen, and did it land?" |
-| Context | Pushed: every thread, full text of the last N hours, appended as messages arrive | Pulled with tools, seeded with the helper's push |
+| Context | Pushed: every thread, full text of the last N hours, appended as messages arrive | Pulled with tools, seeded with a briefing |
 | Turn shape | One model call per question, warm prompt cache, seconds | A tool-using loop, tens of seconds to minutes, asynchronous |
 | Reaches transcripts | No | Yes, by capability level |
 | Outputs | Answer, citations, highlight, draft | Answer, citations, coverage |
 
-**Same brain, two modes.** Both are one server-side "assistant core": the Messages API backend, the
-corpus renderer, the fence, the owner marking, citation validation and structured output. The helper
-mode keeps a push-fed transcript; the research mode runs a tool loop. The helper can escalate ("this
-needs the transcripts; research it?"), and the side-agent proposal's phase 3 `ask_helper` becomes
-`research(depth: "quick")` answered from the helper's warm session when one exists. Building the
+**One service, two depths** (first written as "same brain, two modes"). Both are one server-side
+research service: the Messages API backend, the briefing builder, the fence, the owner marking, citation validation and structured output. The quick
+depth keeps a push-fed transcript; the deep depth runs a tool loop. Quick can escalate ("this
+needs the transcripts; research it?"), and the Ask panel proposal's phase 3 `ask_helper` became
+`research(depth: "quick")`, answered from the panel's warm session when one exists. Building the
 core once and the two modes on it is less code than two agents and keeps their rules identical.
 
 ## The voice model versus a server-side model
@@ -164,7 +176,7 @@ What is known from this repository and the voice-tool audit, and what is not:
 | Tool calling | Runtime limits logged: `max_iter=5`, `timeout=30s`, `tool_timeout=15s`; calls of one turn run **sequentially** | Vendor-managed; per-tool timeouts | Reliable parallel tool use; no runtime cap but ours | Same; better at multi-step plans and precise citation |
 | Observed failures | Invented abilities and causes, used a runtime web search for a chat question, read ids and tool names aloud (prompt v10); TTS runaway on technical sentences (synthesizer, not the LLM) | — | Unmeasured here | Unmeasured here |
 | Latency | Must answer in conversational time: first audio within about a second; a tool round trip is a pause the owner hears | Same | 1 to 5 s per step (estimate) | 2 to 8 s per step (estimate) |
-| Cost | Self-hosted: fixed cost, no per-token bill | Per minute of conversation | ~$0.002 per warm question on a 100 k corpus (side-agent doc) | ~$0.025 per warm question; a deep research job of ~300 k input tokens with caching ~$0.10 to $0.40 (estimate) |
+| Cost | Self-hosted: fixed cost, no per-token bill | Per minute of conversation | ~$0.002 per warm question on a 100 k briefing (`2026-10-22-side-agent-helper.md`) | ~$0.025 per warm question; a deep research job of ~300 k input tokens with caching ~$0.10 to $0.40 (estimate) |
 | Best use | Talking, orientation from a small pushed picture, deciding to delegate | Same | Topic suggestions, hourly rollups, quick research | Deep research, weekly reports, phase summaries where precision matters |
 
 The asymmetry is the reason for the design: the voice side's context and tool loop are the scarce,

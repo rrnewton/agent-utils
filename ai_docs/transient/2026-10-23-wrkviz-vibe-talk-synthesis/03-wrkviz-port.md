@@ -1,5 +1,10 @@
 # Appendix 3: A feature-complete Rust port of wrkviz on `logbook`
 
+> **Update 2026-10-23 (`#455 vibe-talk-next-plan`).** Part of the master plan,
+> [`../2026-10-23-vibe-talk-next/README.md`](../2026-10-23-vibe-talk-next/README.md), which links
+> here for the detail of the wrkviz port (its milestones W1 to W3). Terms follow its
+> [terminology](../2026-10-23-vibe-talk-next/TERMINOLOGY.md).
+
 Part of `#449 wrkviz-vibe-talk-synthesis`. The port is `rs/wrkviz`, a CLI over the `logbook` crate
 (appendix 2). It is done when every row below is either ported or deliberately dropped, and when the
 Python and Rust editions produce byte-identical website data from the same archive (the

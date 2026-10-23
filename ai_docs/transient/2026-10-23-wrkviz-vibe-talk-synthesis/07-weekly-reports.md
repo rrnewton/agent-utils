@@ -1,5 +1,10 @@
 # Appendix 7: Weekly project reports
 
+> **Update 2026-10-23 (`#455 vibe-talk-next-plan`).** Part of the master plan,
+> [`../2026-10-23-vibe-talk-next/README.md`](../2026-10-23-vibe-talk-next/README.md), which links
+> here for the detail of weekly reports (milestone 0.7.0). Terms follow its
+> [terminology](../2026-10-23-vibe-talk-next/TERMINOLOGY.md).
+
 Part of `#449 wrkviz-vibe-talk-synthesis`. An automatic weekly draft that merges several channels,
 and the transcripts behind them, into one product update. The owner's case: separate channels with
 separate agent teams on different machines, and one update posted to an internal team feed that must

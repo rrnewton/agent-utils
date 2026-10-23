@@ -1,5 +1,11 @@
 # Appendix 1: Inventory of wrkviz and vibe-talk
 
+> **Update 2026-10-23 (`#455 vibe-talk-next-plan`).** Part of the master plan,
+> [`../2026-10-23-vibe-talk-next/README.md`](../2026-10-23-vibe-talk-next/README.md), which links
+> here for the detail of the inventory. Terms follow its
+> [terminology](../2026-10-23-vibe-talk-next/TERMINOLOGY.md). References to the side-agent proposal
+> now name the Ask panel or quick research.
+
 Part of `#449 wrkviz-vibe-talk-synthesis`. Read from the tree at `c5b149d5` (2026-10-23). Paths are
 relative to the repository root. "Measured" numbers say where they came from; everything else is
 read from the code.
@@ -199,7 +205,7 @@ answering within 2.5 s for a held channel and 8 s cold (`recent.rs:102-107`).
 ### Thread names are the topic slugs
 
 The thread slug (`runner-wedged`, `cache-key-rewrite`) is already the shared terminology the owner
-wants the voice agent to use; the side-agent proposal builds its catch-up around exactly these names.
+wants the voice agent to use; the Ask panel proposal builds its briefing around exactly these names.
 They are per thread, though: there is no grouping of threads into workstreams, and no slug that spans
 channels or reaches the transcript layer.
 
@@ -267,4 +273,4 @@ the summary-availability bar can copy.
 | Reports | Weekly plain-language rollup exists per team | None | wrkviz's weekly rollup is a report seed |
 | Remote hosts | Local paths only; fetching is external | Chat is remote by nature | No transcript transport |
 | Muse transcripts | Not ingested | — | Gap |
-| Side-agent helper | — | Proposed only (`2026-10-22-side-agent-helper.md`) | Unbuilt |
+| Ask panel and quick research (first called the side-agent helper) | — | Proposed only (`2026-10-22-side-agent-helper.md`) | Unbuilt |

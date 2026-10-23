@@ -1,6 +1,12 @@
 # Appendix 2: The shared component, `logbook`
 
-Part of `#449 wrkviz-vibe-talk-synthesis`. `logbook` is a placeholder name for one Rust crate that
+> **Update 2026-10-23 (`#455 vibe-talk-next-plan`).** Part of the master plan,
+> [`../2026-10-23-vibe-talk-next/README.md`](../2026-10-23-vibe-talk-next/README.md), which links
+> here for the detail of logbook's types. Terms follow its
+> [terminology](../2026-10-23-vibe-talk-next/TERMINOLOGY.md). The name `logbook` is proposed for
+> adoption (owner question A3).
+
+Part of `#449 wrkviz-vibe-talk-synthesis`. `logbook` (a placeholder name when written; the master plan proposes keeping it) is one Rust crate that
 owns item storage, ingestion cursors, summarization, freshness, topics, search and timeline export,
 for chat messages and for agent transcripts alike. Nothing here is implemented; the sketches are
 meant to be close enough to compile that the type decisions can be argued with.

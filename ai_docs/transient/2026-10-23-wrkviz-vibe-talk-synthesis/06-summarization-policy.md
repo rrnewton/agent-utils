@@ -1,5 +1,10 @@
 # Appendix 6: Summarization policy and costs
 
+> **Update 2026-10-23 (`#455 vibe-talk-next-plan`).** Part of the master plan,
+> [`../2026-10-23-vibe-talk-next/README.md`](../2026-10-23-vibe-talk-next/README.md), which links
+> here for the detail of summarization policy and costs. Terms follow its
+> [terminology](../2026-10-23-vibe-talk-next/TERMINOLOGY.md).
+
 Part of `#449 wrkviz-vibe-talk-synthesis`. The owner's rule: **deterministic work is automatic;
 work that spends tokens runs on demand or in configured batches.** This appendix says which step is
 which, what each costs on real volumes, and the controls.
@@ -30,11 +35,11 @@ which, what each costs on real volumes, and the controls.
 | Transcript hourly and daily technical rollups | model | **batch**, nightly |
 | Plain-language rollups and weekly reports | model | **batch**, weekly, plus **on demand** "draft now" |
 | Workstream topic suggestions | model | **batch**, weekly |
-| Research agent and side-agent helper | model | **on demand** only |
+| Research, quick and deep (the Ask panel, the voice agent's `research` tool) | model | **on demand** only |
 
 ## Costs
 
-List prices per million tokens, first-party, as tabulated in the side-agent doc; the deployments
+List prices per million tokens, first-party, as tabulated in `2026-10-22-side-agent-helper.md`; the deployments
 reach models through a gateway whose prices may differ. All figures in this section are estimates
 built from the measured volumes above, not measured bills.
 

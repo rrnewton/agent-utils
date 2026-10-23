@@ -1,5 +1,10 @@
 # Appendix 10: Measurements, with the scripts that made them
 
+> **Update 2026-10-23 (`#455 vibe-talk-next-plan`).** Part of the master plan,
+> [`../2026-10-23-vibe-talk-next/README.md`](../2026-10-23-vibe-talk-next/README.md), which links
+> here for the detail of the measurements. Terms follow its
+> [terminology](../2026-10-23-vibe-talk-next/TERMINOLOGY.md).
+
 Part of `#449 wrkviz-vibe-talk-synthesis`. Every number this proposal calls "measured" came from one
 of the runs below, on 2026-10-23, on the host where the coding agents run. All were read-only:
 nothing was written outside `/tmp`, no service was contacted, and the private archive was read from

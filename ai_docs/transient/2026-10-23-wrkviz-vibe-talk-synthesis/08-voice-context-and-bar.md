@@ -1,5 +1,11 @@
 # Appendix 8: Voice agent context, and the summary-availability bar
 
+> **Update 2026-10-23 (`#455 vibe-talk-next-plan`).** Part of the master plan,
+> [`../2026-10-23-vibe-talk-next/README.md`](../2026-10-23-vibe-talk-next/README.md), which links
+> here for the detail of voice briefings and the availability bar (milestones 0.4.0 and 0.5.0).
+> Terms follow its [terminology](../2026-10-23-vibe-talk-next/TERMINOLOGY.md). What is pushed at
+> session start or at fully ready is a **briefing** in the plan's terms.
+
 Part of `#449 wrkviz-vibe-talk-synthesis`. What the voice agent is handed when a call opens, what it
 is handed once server-side summaries are fully ready, which of those are pushed and which it pulls,
 how long each preparation takes, and the floating bar that shows the owner how much is loaded.
@@ -27,7 +33,7 @@ will be no slower. Model latencies are **estimates** unless marked measured.
 | P2 | Topic list: slugs and one-sentence descriptions of threads active in the window (from stored thread names), plus accepted workstreams | deterministic read of stored names | under 2 ms (estimate; same order as P1) | 20 to 40 threads a day, ~40 tokens each, ~1.5 k | start |
 | P3 | Index of the newest messages: id, local time, author, first 160 characters (as `digest` does) | deterministic | **1.3 ms** measured for all 450 of a day (87 KB, ~22 k tokens, so the push takes only the newest ~15) | ~0.7 k for 15 lines | start |
 | P4 | Summaries of closed hours that are already caught up (from earlier batches or calls) | deterministic read | ~1 ms (estimate) | ~150 tokens an hour; push at most 4 (~0.6 k) | start |
-| P5 | Full text of the window | deterministic | **6 ms** measured for a day (665 KB, ~150 k tokens) | too big for a voice model; **never pushed**; this is the research agent's and the helper's input | start (pull only) |
+| P5 | Full text of the window | deterministic | **6 ms** measured for a day (665 KB, ~150 k tokens) | too big for a voice model; **never pushed**; this is research's input | start (pull only) |
 | P6 | Missing hourly rollups for the window, per channel | model, on demand | **estimate** 2 to 5 s per call on a Haiku-class model with ~4 k input; a median day has ~40 active channel-hours; at 4 calls in flight, ~20 to 50 s cold. Warm (only the current hour missing): ~5 s | ~150 tokens per channel-hour | fully ready |
 | P7 | A 24-hour narrative from the hourly rollups ("today, in three sentences per workstream") | model, on demand | **estimate** 4 to 10 s after P6 | ~400 to 800 tokens | fully ready |
 | P8 | Workstream topics with today's status line each | model, batch | precomputed nightly or weekly; at call time a read (~1 ms) | ~40 tokens each | start, if a batch ran |
@@ -62,7 +68,7 @@ numbers on the real gateway.
 The reasoning:
 
 - **Push what makes the first answer right**: the shared vocabulary (topic slugs), how much is known,
-  and the very newest messages. The side-agent design and the voice-tool audit both trace the voice
+  and the very newest messages. The Ask panel design and the voice-tool audit both trace the voice
   agent's worst answers to what it was handed, and a model that knows the slugs can say "the
   runner-wedged thread" the way the page does.
 - **Pull what is large or narrow.** A voice model's context and tool reliability are the scarce
