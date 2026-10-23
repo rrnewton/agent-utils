@@ -1,10 +1,11 @@
 ---
 title: 'collapsed-lines: let the reader choose how many lines a collapsed message shows'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 created_at: 2026-10-22T14:04:42.430576459+00:00
-updated_at: 2026-10-22T14:04:42.430576459+00:00
+updated_at: 2026-10-23T01:36:43.327587995+00:00
+closed_at: 2026-10-23T01:36:43.327587995+00:00
 ---
 
 # Description

@@ -1,10 +1,11 @@
 ---
 title: 'undo-key-general: one undo key for every undoable action'
-status: open
+status: closed
 priority: 2
 issue_type: task
 created_at: 2026-10-22T20:57:14.658544359+00:00
-updated_at: 2026-10-22T20:57:14.658544359+00:00
+updated_at: 2026-10-23T01:36:43.338626584+00:00
+closed_at: 2026-10-23T01:36:43.338626584+00:00
 ---
 
 # Description

@@ -1,10 +1,11 @@
 ---
 title: 'summary-cards-full: always show an AI summary in full'
-status: open
+status: closed
 priority: 2
 issue_type: task
 created_at: 2026-10-22T14:37:18.460223346+00:00
-updated_at: 2026-10-22T14:37:18.460223346+00:00
+updated_at: 2026-10-23T01:36:43.333378289+00:00
+closed_at: 2026-10-23T01:36:43.333378289+00:00
 ---
 
 # Description
