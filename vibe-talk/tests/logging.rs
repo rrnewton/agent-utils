@@ -1705,6 +1705,7 @@ async fn the_message_cache_switch_logs_numbers_and_never_an_id_or_a_word_it_held
         mentions: Vec::new(),
         upstream_url: None,
         op_key: None,
+        observed_ms: None,
         thread: None,
         id: id.clone(),
         channel_id: ChannelId(READ_CHANNEL.to_owned()),

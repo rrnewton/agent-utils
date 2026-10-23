@@ -1281,6 +1281,11 @@ impl LiveHub {
         replaces: Option<&Message>,
         check: CreatedCheck,
     ) -> Published {
+        // This copy's version on this server's clock: when the read that found it began, or now
+        // for a change pushed to this server. `#473 replication-c7-server-versions`.
+        let observed_ms = read
+            .as_ref()
+            .map_or_else(crate::store::now_ms, crate::cache::ReadStart::observed_ms);
         let mut feeds = lock(&self.feeds);
         // A correction overtaken under this lock publishes nothing: the held window — raw
         // copies, as a serve hands back — now holds a copy of the message that is neither
@@ -1380,6 +1385,8 @@ impl LiveHub {
                 sink.offer_push(channel, &live, producer, read);
             }
         }
+        // Stamped for readers only, after the cache and the held window took the copy as found.
+        live.message.observed_ms.get_or_insert(observed_ms);
         feed.tail.push_back(live.clone());
         while feed.tail.len() > REPLAY_TAIL {
             feed.tail.pop_front();
@@ -3564,6 +3571,21 @@ mod tests {
     }
 
     #[test]
+    fn a_published_copy_carries_its_version_for_readers() {
+        // `#473 replication-c7-server-versions`.
+        let channel = ChannelId("1111".to_owned());
+        let hub = hub_for(&channel);
+        let before = crate::store::now_ms();
+        hub.publish(&channel, message(&channel, 10, "m"));
+        let replay = hub.subscribe(&channel, None).replay;
+        let observed = replay
+            .last()
+            .and_then(|live| live.message.observed_ms)
+            .expect("a version");
+        assert!(observed >= before);
+    }
+
+    #[test]
     fn any_cursor_missing_from_the_tail_forces_a_reset_instead_of_resuming_over_a_gap() {
         let channel = ChannelId("1111".to_owned());
         let hub = hub_for(&channel);
@@ -3861,6 +3883,7 @@ mod tests {
             mentions: Vec::new(),
             upstream_url: None,
             op_key: None,
+            observed_ms: None,
         }
     }
 }

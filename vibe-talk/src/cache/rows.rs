@@ -248,6 +248,7 @@ pub(crate) fn reconstruct(
         mentions: extra.mentions,
         upstream_url: None,
         op_key: extra.op_key,
+        observed_ms: None,
     }
 }
 

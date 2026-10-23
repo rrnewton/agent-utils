@@ -441,6 +441,15 @@ pub struct ReadStart {
     observed_ms: i64,
 }
 
+impl ReadStart {
+    /// The local time the read began, by the cache's clock: the version of what it found.
+    /// `#473 replication-c7-server-versions`.
+    #[must_use]
+    pub fn observed_ms(&self) -> i64 {
+        self.observed_ms
+    }
+}
+
 /// One upstream read's permission to offer what it sees, taken by [`Sink::begin`] before the read
 /// starts.
 ///
@@ -2257,6 +2266,7 @@ mod tests {
             mentions: Vec::new(),
             upstream_url: None,
             op_key: None,
+            observed_ms: None,
             thread: None,
             id: crate::model::MessageId::at_time_ms(at),
             channel_id: channel.clone(),

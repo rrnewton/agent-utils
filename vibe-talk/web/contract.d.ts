@@ -693,6 +693,17 @@ declare namespace VibeTalk {
      */
     noise?: boolean;
     /**
+     * This copy's version on this server's clock, in Unix milliseconds: when the observation
+     * that produced it began — a read's start (or the instant its answer was complete to, when it
+     * came from a memory that says so), the arrival of a live change, the provider's answer to
+     * this server's own post. `#473 replication-c7-server-versions`; the replication model's
+     * rule 2, the same clock the message cache orders copies by. Set where a copy is served, never
+     * at read: a page compares two copies of a message by it, with
+     * [`Message::edited_timestamp`] first, instead of by when it sent the reads that brought
+     * them. Absent from an older server, and on paths that have not said.
+     */
+    observed_ms?: number | null;
+    /**
      * The operation key this message was posted with, where its provider carries one invisibly
      * and returned it on this copy: exactly the key handed to the post
      * ([`crate::chat::ChatClient::post_message_keyed`]). `#465 replication-c6-op-key-marker`. Provider-neutral,
@@ -1727,6 +1738,13 @@ declare namespace VibeTalk {
      */
     notice: string | null;
     /**
+     * When the read this page answers began, on this server's clock, in Unix milliseconds — or
+     * the instant it is complete to, when that is earlier (`as_of`). `#473
+     * replication-c7-server-versions`. Every copy it carries is at least this new; a copy a page
+     * holds that was observed before it is older than this page.
+     */
+    observed_ms?: number | null;
+    /**
      * The revision this channel's pins are at. `#206 pin-message`.
      *
      * On every read, newest page and delta alike, so a refresh that already happens is what tells
@@ -1749,6 +1767,14 @@ declare namespace VibeTalk {
      * Entries on this page, never a channel-wide total.
      */
     returned: number;
+    /**
+     * On a newest page only: messages created before this instant, provider time in Unix
+     * milliseconds, were listed by the read if they were there, so one a page holds from before
+     * [`TimelinePage::observed_ms`] that this page lacks is gone. Anything created at or after
+     * it is in the unsettled band: a provider may list a message late, so its absence proves
+     * nothing. The replication model's rule 4. `#473 replication-c7-server-versions`.
+     */
+    settled_below_ms?: number | null;
     /**
      * The selected thread, for the thread view. Outside it, the one thread a channel registered as
      * a single conversation is scoped to: that channel has no child threads (`has_threads` is

@@ -829,6 +829,7 @@ fn a_push_that_loses_the_race_to_a_read_is_known_under_the_feed_lock() {
         mentions: Vec::new(),
         upstream_url: None,
         op_key: None,
+        observed_ms: None,
         thread: None,
     };
     let now = jiff::Timestamp::now().as_millisecond();

@@ -2751,6 +2751,19 @@ complete, when it is serving data it could not bring up to date just now; vibe-t
 the page, which then says the service is slow instead of claiming the list is current. Absent
 means "now".
 
+**Every timeline page and every copy on it carries its version on this server's clock** (`#473
+replication-c7-server-versions`). `observed_ms`, on the page and on each message, is when the read
+that produced it began, in Unix milliseconds, or the instant its `as_of` says it is complete to
+when that is earlier; a message from the stream carries when the read that found it began, or when
+the change reached this server, and a message this server posted carries when the post was asked
+for. A newest page also carries `settled_below_ms`: messages created before it were listed if they
+were there, so one held from before the page's `observed_ms` that the page lacks is gone; one
+created at or after it is in the unsettled band, where a provider may list a message late, and its
+absence proves nothing. A page served from the message cache carries each row's own observation and
+the cache's settled stretch. A step back and a delta carry no `settled_below_ms`: they prove no
+absence. These are the server's own versions (the replication model's rules 2 and 4), for a client
+to order two copies of a message by, rather than by when it sent the reads that brought them.
+
 Every backend can be read forward through vibe-talk's own route, bridge or not. For one that issues
 no `next_after` of its own, vibe-talk issues a generic cursor — the newest provider timestamp
 served, a two-minute overlap below it, and the entries already delivered inside that overlap — and

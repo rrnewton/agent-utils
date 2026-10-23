@@ -911,6 +911,7 @@ pub fn parse_message(value: &serde_json::Value) -> Result<Message, ChatError> {
         mentions: Vec::new(),
         upstream_url: None,
         op_key: None,
+        observed_ms: None,
     })
 }
 
