@@ -205,6 +205,24 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 536870912
 
+  # `#457 settings-server-side` in the browser engine, on two devices at once: one seeds the
+  # server from its local choice, the other takes that choice on load, and a change on one
+  # converges on the still-open other from the live stream, while a Screen and keys choice
+  # never leaves its device. Measured on 2026-10-23: about 6s wall.
+  - group: check
+    job: settings-sync-browser
+    desc: two devices share one server settings document and converge live, in current Chromium
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/settings_sync_browser.py
+    jobs_flag: ""
+    timeout: 120
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 6
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#369 pairing-link` in the browser engine: a fresh phone-sized browser opens a pairing link, the
   # code leaves the address and is redeemed once in a request body without a bearer token, the token is
   # stored and the main screen comes up; a second fresh browser opening the same link is told it expired

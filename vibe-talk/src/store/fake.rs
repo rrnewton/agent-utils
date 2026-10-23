@@ -76,6 +76,9 @@ struct State {
     /// The owner's tag for what the voice agent posts; `None` until he saves one, `Some("")` for
     /// none at all. `#303 voice-post-prefix`.
     post_prefix: Option<String>,
+    /// Synced client settings by key: value and when the server took it.
+    /// `#457 settings-server-side`.
+    client_settings: BTreeMap<String, (String, i64)>,
     /// `(channel, message)` to `(when it was exempted, insertion order)`: the "not noise" list,
     /// with enough of the real table's shape to reproduce its count bound and its eviction order.
     noise_exemptions: BTreeMap<(String, String), (i64, u64)>,
@@ -699,6 +702,63 @@ impl StateStore for FakeStore {
         Ok(ask)
     }
 
+    async fn client_settings(
+        &self,
+    ) -> Result<Vec<crate::client_settings::SyncedSetting>, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        Ok(state
+            .client_settings
+            .iter()
+            .map(
+                |(key, (value, updated_ms))| crate::client_settings::SyncedSetting {
+                    key: key.clone(),
+                    value: Some(value.clone()),
+                    updated_ms: *updated_ms,
+                },
+            )
+            .collect())
+    }
+
+    async fn apply_client_settings(
+        &self,
+        set: &[(String, Option<String>)],
+        seed: &[(String, String)],
+    ) -> Result<Vec<crate::client_settings::SyncedSetting>, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        let now = super::now_ms();
+        for (key, value) in seed {
+            state
+                .client_settings
+                .entry(key.clone())
+                .or_insert_with(|| (value.clone(), now));
+        }
+        for (key, value) in set {
+            match value {
+                Some(value) => {
+                    state
+                        .client_settings
+                        .insert(key.clone(), (value.clone(), now));
+                }
+                None => {
+                    state.client_settings.remove(key);
+                }
+            }
+        }
+        Ok(state
+            .client_settings
+            .iter()
+            .map(
+                |(key, (value, updated_ms))| crate::client_settings::SyncedSetting {
+                    key: key.clone(),
+                    value: Some(value.clone()),
+                    updated_ms: *updated_ms,
+                },
+            )
+            .collect())
+    }
+
     async fn owner_prompt(&self) -> Result<Option<OwnerPrompt>, StoreError> {
         let mut state = self.lock();
         armed(&mut state)?;
@@ -1263,6 +1323,7 @@ impl StateStore for FakeStore {
         state.ask_before_send = None;
         state.owner_prompt = None;
         state.post_prefix = None;
+        state.client_settings.clear();
         state.noise_exemptions.clear();
         state.pins.clear();
         state.pin_revisions.clear();

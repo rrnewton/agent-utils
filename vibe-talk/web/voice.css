@@ -695,6 +695,15 @@ a.search-hit-link {
  * above it says where it starts, which is all a row needs. The border, the fill and the corners
  * move from the group to the section, so a group inside a section draws none of its own.
  */
+/* `#457 settings-server-side`. The one per-device section says so beside its title,
+   small and faint: a fact to notice once, not a thing to read every time. */
+.settings-scope-note {
+  margin-left: 0.45em;
+  font-size: 0.72em;
+  font-weight: 400;
+  opacity: 0.55;
+}
+
 .settings-section {
   margin: 0 0 1rem;
   padding: 0.6rem 0.8rem 0.2rem;

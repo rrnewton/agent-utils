@@ -420,6 +420,23 @@ declare namespace VibeTalk {
   }
 
   /**
+   * The owner's synced client settings: every setting outside Settings' Screen and keys
+   * section, held on this server for all his devices. `#457 settings-server-side`.
+   *
+   * The body of `GET` and `PUT /api/v1/client-settings`, and of the `settings` event on
+   * the live streams, where it carries only the entries that changed. A key the owner
+   * has never set on any device is absent, which is the shipped default's turn; an entry
+   * whose `value` is null says the key was forgotten. `updated_ms` is this server's
+   * clock when it took the value — per-key last-writer-wins compares it.
+   */
+  interface ClientSettings {
+    /**
+     * The settings held, or the ones that changed, by key.
+     */
+    settings: SyncedSetting[];
+  }
+
+  /**
    * A confirmed proposal, posted.
    */
   interface CommittedPostResponse {
@@ -1526,6 +1543,26 @@ declare namespace VibeTalk {
   }
 
   /**
+   * One synced setting as the server holds it: the key, its value (`None` in a write
+   * means "forget it", the owner's choice returning to the shipped default), and when
+   * the server took it, on its own clock — the stamp per-key last-writer-wins compares.
+   */
+  interface SyncedSetting {
+    /**
+     * The `localStorage` key, one of [`SYNCED_KEYS`].
+     */
+    key: string;
+    /**
+     * When the server accepted this value, milliseconds since the Unix epoch.
+     */
+    updated_ms: number;
+    /**
+     * The exact string the page keeps under that key, or `None` for no value held.
+     */
+    value: string | null;
+  }
+
+  /**
    * One thread in the thread list, independent of the underlying provider's channel model.
    */
   interface ThreadSummary {
@@ -2213,6 +2250,7 @@ declare namespace VibeTalk {
     VoicePostPrefix: VoicePostPrefix;
     MessageCacheStatus: MessageCacheStatus;
     MessageCacheRequest: MessageCacheRequest;
+    ClientSettings: ClientSettings;
   }
 
   /** A contract type a peer may extend with new `type` tags. */

@@ -393,6 +393,27 @@ pub const MIGRATIONS: &[&str] = &[
 
     CREATE INDEX thread_hues_by_assignment ON thread_hues (channel_id, seq);
     ",
+    // v19 — the owner's synced client settings. `#457 settings-server-side`.
+    //
+    // ONE new table and nothing else, for the reason v10 gives. A row per setting the
+    // owner has actually chosen on some device: its `localStorage` key, the exact string
+    // the page keeps under it, and when this server took it, which is the stamp per-key
+    // last-writer-wins compares. No row means never chosen, so the shipped default
+    // stands; nothing seeds a default here, for the reason `voice_settings` gives. Not
+    // covered by an age limit, for that table's reason; the purge does reach it. The
+    // values are the owner's own choices — short strings the page writes, bounded by
+    // `crate::client_settings::MAX_VALUE_BYTES` before they arrive — and no channel
+    // text is ever kept here.
+    //
+    // This step's place in the ladder is all that numbers it; the tests find it by what
+    // it does.
+    "
+    CREATE TABLE client_settings (
+        key        TEXT    PRIMARY KEY,
+        value      TEXT    NOT NULL,
+        updated_ms INTEGER NOT NULL
+    ) STRICT;
+    ",
 ];
 
 /// A [`StateStore`] backed by one SQLite file.
@@ -482,6 +503,31 @@ fn hex(content_hash: u64) -> String {
 
 fn backend(error: rusqlite::Error) -> StoreError {
     StoreError::Backend(error.to_string())
+}
+
+/// The whole synced-settings document, by key. `#457 settings-server-side`. One reader
+/// for the read and for a write's answer, so the two can never describe the document
+/// differently.
+fn read_client_settings(
+    connection: &Connection,
+) -> Result<Vec<crate::client_settings::SyncedSetting>, StoreError> {
+    let mut statement = connection
+        .prepare("SELECT key, value, updated_ms FROM client_settings ORDER BY key ASC")
+        .map_err(backend)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(crate::client_settings::SyncedSetting {
+                key: row.get(0)?,
+                value: Some(row.get(1)?),
+                updated_ms: row.get(2)?,
+            })
+        })
+        .map_err(backend)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(backend)?);
+    }
+    Ok(out)
 }
 
 /// Apply every migration this file has not seen yet.
@@ -1791,6 +1837,64 @@ impl StateStore for SqliteStore {
         .await
     }
 
+    async fn client_settings(
+        &self,
+    ) -> Result<Vec<crate::client_settings::SyncedSetting>, StoreError> {
+        self.with_connection(|connection| read_client_settings(connection))
+            .await
+    }
+
+    async fn apply_client_settings(
+        &self,
+        set: &[(String, Option<String>)],
+        seed: &[(String, String)],
+    ) -> Result<Vec<crate::client_settings::SyncedSetting>, StoreError> {
+        let set = set.to_vec();
+        let seed = seed.to_vec();
+        self.with_connection(move |connection| {
+            let transaction = connection.transaction().map_err(backend)?;
+            // One stamp for the whole write: it arrived as one act, and two keys it
+            // carried have no order between them worth inventing.
+            let now = now_ms();
+            for (key, value) in &seed {
+                // First writer wins: a held row is another device's earlier seed or a
+                // real choice, and neither is this device's stale local value to move.
+                transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO client_settings (key, value, updated_ms)
+                         VALUES (?1, ?2, ?3)",
+                        rusqlite::params![key, value, now],
+                    )
+                    .map_err(backend)?;
+            }
+            for (key, value) in &set {
+                match value {
+                    Some(value) => transaction
+                        .execute(
+                            "INSERT INTO client_settings (key, value, updated_ms)
+                             VALUES (?1, ?2, ?3)
+                             ON CONFLICT(key) DO UPDATE SET
+                                value      = excluded.value,
+                                updated_ms = excluded.updated_ms",
+                            rusqlite::params![key, value, now],
+                        )
+                        .map_err(backend)?,
+                    // Forgotten: no row is the shipped default's turn again.
+                    None => transaction
+                        .execute(
+                            "DELETE FROM client_settings WHERE key = ?1",
+                            rusqlite::params![key],
+                        )
+                        .map_err(backend)?,
+                };
+            }
+            let out = read_client_settings(&transaction)?;
+            transaction.commit().map_err(backend)?;
+            Ok(out)
+        })
+        .await
+    }
+
     async fn noise_exemptions(&self, channel: &ChannelId) -> Result<Vec<MessageId>, StoreError> {
         let channel = channel.clone();
         self.with_connection(move |connection| {
@@ -2532,6 +2636,11 @@ impl StateStore for SqliteStore {
             // Back to the shipped tag on what the voice agent posts. `#303 voice-post-prefix`.
             transaction
                 .execute("DELETE FROM voice_post_prefix", [])
+                .map_err(backend)?;
+            // Every synced setting back to its shipped default, which is what no row
+            // means. `#457 settings-server-side`.
+            transaction
+                .execute("DELETE FROM client_settings", [])
                 .map_err(backend)?;
             transaction.commit().map_err(backend)
         })
@@ -5018,6 +5127,97 @@ mod tests {
             reopened.ask_before_send().await.expect("read"),
             None,
             "the purge left a choice behind instead of restoring the configured default"
+        );
+    }
+
+    #[tokio::test]
+    async fn synced_settings_seed_once_overwrite_stamp_and_forget() {
+        // `#457 settings-server-side`. The whole contract of the table in one walk: a
+        // seed fills a key nobody holds and never moves one somebody does (first
+        // writer wins, so a stale device cannot clobber), a set overwrites and is
+        // stamped by this server, a forget removes the row (the default's turn), and
+        // all of it survives a restart and dies with the purge.
+        let dir = TempDir::new("sqlite-client-settings");
+        let file = dir.path().join("state").join("vibe-talk.sqlite3");
+        let key = "vibe-talk.voice.combine".to_owned();
+        {
+            let store = SqliteStore::open(&file, Retention::default()).expect("open");
+            assert!(store.client_settings().await.expect("read").is_empty());
+            let seeded = store
+                .apply_client_settings(&[], &[(key.clone(), "0".into())])
+                .await
+                .expect("seed");
+            assert_eq!(seeded.len(), 1);
+            assert_eq!(seeded[0].value.as_deref(), Some("0"));
+            assert!(seeded[0].updated_ms > 0, "the server stamped the seed");
+            let reseeded = store
+                .apply_client_settings(&[], &[(key.clone(), "1".into())])
+                .await
+                .expect("reseed");
+            assert_eq!(
+                reseeded[0].value.as_deref(),
+                Some("0"),
+                "a second device's seed moved a held value"
+            );
+            assert_eq!(reseeded[0].updated_ms, seeded[0].updated_ms);
+            let set = store
+                .apply_client_settings(&[(key.clone(), Some("1".into()))], &[])
+                .await
+                .expect("set");
+            assert_eq!(set[0].value.as_deref(), Some("1"));
+            assert!(
+                set[0].updated_ms >= seeded[0].updated_ms,
+                "a later write carries an older stamp"
+            );
+            store
+                .apply_client_settings(&[(key.clone(), None)], &[])
+                .await
+                .expect("forget");
+            assert!(
+                store.client_settings().await.expect("read").is_empty(),
+                "a forgotten key kept its row"
+            );
+            store
+                .apply_client_settings(&[], &[(key.clone(), "0".into())])
+                .await
+                .expect("seed again");
+        }
+        let reopened = SqliteStore::open(&file, Retention::default()).expect("reopen");
+        let held = reopened.client_settings().await.expect("read back");
+        assert_eq!(held.len(), 1, "the choice did not survive a restart");
+        assert_eq!(held[0].value.as_deref(), Some("0"));
+        reopened.purge_everything().await.expect("purge");
+        assert!(
+            reopened.client_settings().await.expect("read").is_empty(),
+            "the purge left a synced setting behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_client_settings_table_arrives_on_a_file_at_the_previous_schema_empty() {
+        // The step found by what it does, like its neighbours: a file one step behind
+        // opens with no settings held — every choice still the shipped default's.
+        let dir = TempDir::new("sqlite-client-settings-migrate");
+        let file = dir.path().join("vibe-talk.sqlite3");
+        let at = MIGRATIONS
+            .iter()
+            .position(|step| step.contains("CREATE TABLE client_settings"))
+            .expect("the step exists");
+        {
+            let connection = Connection::open(&file).expect("open old database");
+            for migration in &MIGRATIONS[..at] {
+                connection
+                    .execute_batch(migration)
+                    .expect("apply old schema");
+            }
+            connection
+                .pragma_update(None, "user_version", i64::try_from(at).expect("small"))
+                .expect("stamp old version");
+        }
+        let upgraded = SqliteStore::open(&file, Retention::default()).expect("upgrade");
+        assert!(
+            upgraded.client_settings().await.expect("read").is_empty(),
+            "the upgrade invented a choice"
         );
     }
 

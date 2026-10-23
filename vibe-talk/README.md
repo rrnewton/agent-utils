@@ -3811,6 +3811,19 @@ taking the file back too. **Take a copy of `storage.path` before an upgrade.** R
 is the simplest way back to an older build. The other way is to undo the newest steps by hand, with
 the server stopped, newest first; each step's note below says how.
 
+**Step 19 (`#457 settings-server-side`)** only adds the `client_settings` table — the owner's
+synced settings (every Settings section but Screen and keys), one row per choice actually made,
+with when this server took it — so with the server stopped it can be undone in place, losing
+nothing but those choices (an older build keeps them on each device again, where each browser
+still holds its own copy):
+
+```sh
+sqlite3 /path/to/vibe-talk.sqlite3 'DROP TABLE client_settings; PRAGMA user_version = 18;'
+```
+
+Run that only on a file at version 19 (`PRAGMA user_version;` says), and only when the build being
+returned to predates the step.
+
 **Step 18 (`#427 server-thread-hues`)** only adds the `thread_hues` table — the colour this server
 assigned each thread, when its root was posted, and the order the colours were handed out — so with
 the server stopped it can be undone in place, losing nothing but the assignments (an older build

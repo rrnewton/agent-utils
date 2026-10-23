@@ -2054,6 +2054,41 @@ pub trait StateStore: Send + Sync {
     /// write failure.
     async fn set_post_prefix(&self, prefix: Option<&str>) -> Result<Option<String>, StoreError>;
 
+    /// Every synced client setting the server holds, by key. `#457 settings-server-side`;
+    /// see [`crate::client_settings`].
+    ///
+    /// An absent key means the owner has never set it on any device, so the shipped
+    /// default stands — never seeded, for the reason [`StateStore::post_prefix`] gives.
+    /// Not covered by [`Retention`]: an age limit would silently put back a choice the
+    /// owner replaced. The purge does reach it, as it reaches every owner choice.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a read
+    /// failure.
+    async fn client_settings(
+        &self,
+    ) -> Result<Vec<crate::client_settings::SyncedSetting>, StoreError>;
+
+    /// Apply one page's settings write, returning the whole document as now stored.
+    ///
+    /// `set` overwrites per key (a `None` value forgets the key), stamped with this
+    /// server's clock at the moment of the write — per-key last-writer-wins, the server
+    /// serializing. `seed` fills only keys the server does not hold: the one-time
+    /// migration of a device's local values, first writer wins, so a stale device can
+    /// never clobber a value another device already put here. The caller has validated
+    /// both ([`crate::client_settings::validate`]).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a
+    /// write failure.
+    async fn apply_client_settings(
+        &self,
+        set: &[(String, Option<String>)],
+        seed: &[(String, String)],
+    ) -> Result<Vec<crate::client_settings::SyncedSetting>, StoreError>;
+
     /// The messages in this channel the owner has said are NOT noise, whatever the rules say.
     ///
     /// The ids alone, for the same reason [`StateStore::dismissals`] returns ids alone.

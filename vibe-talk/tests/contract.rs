@@ -14,11 +14,11 @@ use std::path::PathBuf;
 
 use serde_json::{json, Value};
 use vibe_talk::contract::{
-    ApiErrorBody, BookmarkResponse, ClientConfigResponse, CommittedPostResponse, LiveDeleteEvent,
-    LiveDelivery, LiveMessageEvent, LiveResetEvent, MessageCacheRequest, MessageCacheStatus,
-    MessagesResponse, NoiseRules, PendingPost, PendingPostResponse, PinChangeResponse,
-    PinsResponse, ProposalSettled, ProviderDescription, ReplayUnavailable, ReplyDismissals,
-    TimelineResponse, TokenScope, TranscriptRole, UpstreamClearAttemptView,
+    ApiErrorBody, BookmarkResponse, ClientConfigResponse, ClientSettings, CommittedPostResponse,
+    LiveDeleteEvent, LiveDelivery, LiveMessageEvent, LiveResetEvent, MessageCacheRequest,
+    MessageCacheStatus, MessagesResponse, NoiseRules, PendingPost, PendingPostResponse,
+    PinChangeResponse, PinsResponse, ProposalSettled, ProviderDescription, ReplayUnavailable,
+    ReplyDismissals, TimelineResponse, TokenScope, TranscriptRole, UpstreamClearAttemptView,
     UpstreamClearNowOutcome, UpstreamClearNowResponse, UpstreamClearState, VibeTalkV1ClientFrame,
     VibeTalkV1ServerFrame, VoicePostPrefix, VoicePromptSettings, VoiceSend, VoiceSettings,
 };
@@ -1024,6 +1024,22 @@ fn samples() -> Value {
         ],
         // `#264 voice-send-approval`: asking and saved, sending at once, and a server that keeps
         // no settings and so always asks.
+        // `#457 settings-server-side`: held, forgotten (null), and none at all.
+        "ClientSettings": [
+            to(&ClientSettings { settings: vec![
+                vibe_talk::client_settings::SyncedSetting {
+                    key: "vibe-talk.voice.mark-own-read".into(),
+                    value: Some("0".into()),
+                    updated_ms: 1_700_000_000_000,
+                },
+                vibe_talk::client_settings::SyncedSetting {
+                    key: "vibe-talk.voice.combine".into(),
+                    value: None,
+                    updated_ms: 1_700_000_001_000,
+                },
+            ]}),
+            to(&ClientSettings { settings: vec![] }),
+        ],
         "VoiceSettings": [
             to(&VoiceSettings { ask_before_send: true, changeable: true }),
             to(&VoiceSettings { ask_before_send: false, changeable: true }),

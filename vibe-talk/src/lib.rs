@@ -51,6 +51,7 @@ pub mod agent_backend;
 pub mod auth;
 pub mod cache;
 pub mod chat;
+pub mod client_settings;
 pub mod clock;
 pub mod config;
 pub mod contract;

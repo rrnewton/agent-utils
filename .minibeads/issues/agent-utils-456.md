@@ -1,12 +1,12 @@
 ---
 title: 'vibe-talk-0-1-0: tag the deployed baseline as version 0.1.0'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
 - vibe-talk
 created_at: 2026-10-23T14:37:47.185025955+00:00
-updated_at: 2026-10-23T14:37:47.185025955+00:00
+updated_at: 2026-10-23T14:47:52.578037434+00:00
 ---
 
 # Description

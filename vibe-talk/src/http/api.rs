@@ -1126,6 +1126,113 @@ pub async fn set_voice_settings(
     Ok(no_store(Json(settings)))
 }
 
+/// `GET /api/v1/client-settings` — the owner's synced settings as the server holds
+/// them. `#457 settings-server-side`.
+///
+/// READ scope, as with [`voice_settings`]: what a page needs to draw itself the way
+/// its owner left it on another device. With no store configured it answers 503
+/// `storage_not_configured` rather than an empty document, so the page keeps its
+/// local values and says why they are not syncing instead of seeding into nothing.
+pub async fn client_settings(
+    State(state): State<AppState>,
+    _scope: ReadScope,
+) -> Result<Response, ApiError> {
+    let settings = state.store.client_settings().await?;
+    Ok(no_store(Json(crate::contract::ClientSettings { settings })))
+}
+
+/// One page's synced-settings write. `#457 settings-server-side`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientSettingsRequest {
+    /// Choices to store, replacing what the server holds per key; a null value
+    /// forgets the key, back to its shipped default.
+    #[serde(default)]
+    pub set: Vec<crate::client_settings::SyncedSetting>,
+    /// This device's local values offered only where the server holds none: the
+    /// one-time migration, first writer wins.
+    #[serde(default)]
+    pub seed: Vec<crate::client_settings::SyncedSetting>,
+}
+
+/// `PUT /api/v1/client-settings` — store the owner's synced settings.
+/// `#457 settings-server-side`.
+///
+/// WRITE scope, and — as with [`set_voice_settings`] — NO TOOL reaches it: how the
+/// owner's messages are marked and shown is his to set, and a model that could
+/// change it could hide messages from the person it reports to. `updated_ms` in the
+/// request is ignored: the server stamps the write with its own clock, which is
+/// what makes per-key last-writer-wins a statement about one clock rather than
+/// about whichever device's clock runs fast. The answer is the whole document as
+/// now stored — what a seeding page needs to learn which of its seeds another
+/// device beat it to — and the changed entries go out on both live streams so
+/// other open pages converge without a reload.
+pub async fn set_client_settings(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Json(request): Json<ClientSettingsRequest>,
+) -> Result<Response, ApiError> {
+    let set: Vec<(String, Option<String>)> = request
+        .set
+        .into_iter()
+        .map(|entry| (entry.key, entry.value))
+        .collect();
+    let seed: Vec<(String, Option<String>)> = request
+        .seed
+        .into_iter()
+        .map(|entry| (entry.key, entry.value))
+        .collect();
+    crate::client_settings::validate(&set)
+        .map_err(|refusal| ApiError::bad_request(refusal.to_string()))?;
+    crate::client_settings::validate(&seed)
+        .map_err(|refusal| ApiError::bad_request(refusal.to_string()))?;
+    if set
+        .iter()
+        .any(|(key, _)| seed.iter().any(|(other, _)| other == key))
+    {
+        return Err(ApiError::bad_request(
+            "a key cannot be both set and seeded in one write",
+        ));
+    }
+    // A seed with no value seeds nothing; only held values cross.
+    let seed: Vec<(String, String)> = seed
+        .into_iter()
+        .filter_map(|(k, v)| v.map(|v| (k, v)))
+        .collect();
+    let before = state.store.client_settings().await?;
+    let settings = state.store.apply_client_settings(&set, &seed).await?;
+    // What actually changed, for the pages already open: an entry whose stored value
+    // moved, and a forgotten key said as a null value under its old stamp's key.
+    let mut changed: Vec<crate::client_settings::SyncedSetting> = settings
+        .iter()
+        .filter(|entry| {
+            !before.iter().any(|held| {
+                held.key == entry.key
+                    && held.value == entry.value
+                    && held.updated_ms == entry.updated_ms
+            })
+        })
+        .cloned()
+        .collect();
+    for held in &before {
+        if !settings.iter().any(|entry| entry.key == held.key) {
+            changed.push(crate::client_settings::SyncedSetting {
+                key: held.key.clone(),
+                value: None,
+                // Past every stamp a page could hold for this key, so its
+                // newer-than check takes the forgetting.
+                updated_ms: settings
+                    .iter()
+                    .map(|e| e.updated_ms)
+                    .max()
+                    .unwrap_or(held.updated_ms),
+            });
+        }
+    }
+    state.live.publish_settings(changed);
+    Ok(no_store(Json(crate::contract::ClientSettings { settings })))
+}
+
 /// The noise rules for client-config, or `None` when a configured store cannot say what they are.
 ///
 /// Absent rather than an error: client-config is what signs the page in, and a store fault must

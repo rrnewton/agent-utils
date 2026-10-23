@@ -387,6 +387,15 @@ fn routes(state: AppState) -> Router {
             "/api/v1/voice-settings",
             get(api::voice_settings).put(api::set_voice_settings),
         )
+        // `#457 settings-server-side`. The owner's synced settings: everything in
+        // Settings outside Screen and keys, kept here for all his devices. READ scope
+        // to see them, WRITE scope to change them, and NO MCP TOOL, for the `#39`
+        // reason on the alias above made sharper — these decide how his messages are
+        // marked and shown.
+        .route(
+            "/api/v1/client-settings",
+            get(api::client_settings).put(api::set_client_settings),
+        )
         // `#272 voice-agent-instructions`. The owner's additional instructions and his edited
         // system prompt. READ scope to see them, as the assembled prompt is; WRITE scope to change
         // them — and NO MCP TOOL, because a model that could rewrite its own instructions could

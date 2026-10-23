@@ -449,6 +449,13 @@ pub struct LiveHub {
     /// [`LiveHub::reactions_changed`]. Taken only under the feed lock or on its own, never the
     /// other way round.
     reaction_memory: Mutex<BTreeMap<ChannelId, ReactionSets>>,
+    /// Synced client settings changed by some page, for every other open page.
+    /// `#457 settings-server-side`. Carried on the same streams as messages — a second
+    /// connection per page is what `#226 page-energy-profile` keeps the page from
+    /// holding — as an event of their own name, never as a message. No replay tail:
+    /// a page that reconnects re-reads the whole document, which is one small GET,
+    /// so a change missed here is a delay and never a divergence.
+    settings: broadcast::Sender<Vec<crate::client_settings::SyncedSetting>>,
     /// How many reaction updates and corrections this hub has published: the uniqueness of
     /// their event ids. A subscriber resumes after the LAST event of the id it names, so an
     /// update or correction reusing its message's create id would silently swallow everything
@@ -475,6 +482,7 @@ impl LiveHub {
     pub fn with_recent(recent: std::sync::Arc<crate::recent::RecentWindows>) -> Self {
         let (hint_generation, _receiver) = watch::channel(0);
         let (all_sender, _) = broadcast::channel(ALL_BROADCAST_CAPACITY);
+        let (settings_sender, _) = broadcast::channel(16);
         let mut epoch = [0_u8; 8];
         getrandom::fill(&mut epoch)
             .expect("the system CSPRNG must be available to name a live hub");
@@ -496,6 +504,7 @@ impl LiveHub {
             recent,
             cache: std::sync::OnceLock::new(),
             store: std::sync::OnceLock::new(),
+            settings: settings_sender,
             reaction_memory: Mutex::new(BTreeMap::new()),
             updates: std::sync::atomic::AtomicU64::new(0),
         }
@@ -529,6 +538,27 @@ impl LiveHub {
     #[must_use]
     pub fn store(&self) -> Option<&std::sync::Arc<dyn crate::store::StateStore>> {
         self.store.get()
+    }
+
+    /// Tell every open page that these synced settings changed. `#457
+    /// settings-server-side`. Called after the store has taken the write, with the
+    /// entries as stored (their server stamps included); a page applies an entry only
+    /// when its stamp is newer than the one it last agreed with the server, so the
+    /// writing page hearing its own change back is a no-op.
+    pub fn publish_settings(&self, changed: Vec<crate::client_settings::SyncedSetting>) {
+        if changed.is_empty() {
+            return;
+        }
+        // No subscriber is not an error: nobody is open to tell.
+        let _ = self.settings.send(changed);
+    }
+
+    /// Settings changes from now on, for one stream to carry.
+    #[must_use]
+    pub fn subscribe_settings(
+        &self,
+    ) -> broadcast::Receiver<Vec<crate::client_settings::SyncedSetting>> {
+        self.settings.subscribe()
     }
 
     /// Each channel's held window. `#210 voice-catchup-speed`.
@@ -1462,6 +1492,12 @@ pub const EVENT_MESSAGE_DELETE: &str = "message_delete";
 /// resuming short would be the silent drop this whole design exists to rule out.
 pub const EVENT_RESET: &str = "reset";
 
+/// The SSE event name a synced-settings change carries, on both streams.
+/// `#457 settings-server-side`. Its data is a `ClientSettings` holding only the
+/// entries that changed. It carries no stream `id`: it is not part of either
+/// stream's message order, and a cursor must never be moved by it.
+pub const EVENT_SETTINGS: &str = "settings";
+
 /// Turn one [`Subscription`] into the body of a Server-Sent Events response.
 ///
 /// The replay tail goes out first, oldest first, then everything live. Each event carries an
@@ -1515,8 +1551,12 @@ pub fn events(
         caller: crate::auth::Scope,
         /// The burst's colours, decided once for the whole tail, as `replay_noise` is.
         replay_hues: Option<std::collections::BTreeMap<String, u16>>,
+        /// Synced-settings changes to carry between messages (`#457
+        /// settings-server-side`): the other thing every open page must hear.
+        settings_receiver: broadcast::Receiver<Vec<crate::client_settings::SyncedSetting>>,
     }
     let markup = crate::render::markup_for(&app.config, &channel);
+    let settings_receiver = app.live.subscribe_settings();
     let start = State {
         replay: subscription.replay.into_iter().collect(),
         receiver: subscription.receiver,
@@ -1528,6 +1568,7 @@ pub fn events(
         replay_noise: None,
         caller,
         replay_hues: None,
+        settings_receiver,
     };
     futures_util::stream::unfold(start, |mut state| async move {
         if state.reset_on_attach {
@@ -1563,7 +1604,25 @@ pub fn events(
         if state.done {
             return None;
         }
-        match state.receiver.recv().await {
+        // Messages and settings changes, whichever comes first. A settings receiver
+        // that fell behind loses only settings frames — the page re-reads the whole
+        // document when it reconnects or refocuses — so lag there is skipped, never
+        // the reset a lagged message receiver earns.
+        let live = loop {
+            tokio::select! {
+                message = state.receiver.recv() => break message,
+                settings = state.settings_receiver.recv() => {
+                    match settings {
+                        Ok(changed) => return Some((Ok(settings_event(changed)), state)),
+                        Err(broadcast::error::RecvError::Lagged(_))
+                        | Err(broadcast::error::RecvError::Closed) => {
+                            state.settings_receiver = state.app.live.subscribe_settings();
+                        }
+                    }
+                }
+            }
+        };
+        match live {
             Ok(mut live) => {
                 if live.kind != LiveKind::Delete {
                     crate::ops::attach_message_hues(
@@ -1619,7 +1678,9 @@ pub fn all_events(
         done: bool,
         app: AppState,
         caller: crate::auth::Scope,
+        settings_receiver: broadcast::Receiver<Vec<crate::client_settings::SyncedSetting>>,
     }
+    let settings_receiver = app.live.subscribe_settings();
     let start = State {
         start: subscription.start,
         replay: subscription.replay.into_iter().collect(),
@@ -1628,6 +1689,7 @@ pub fn all_events(
         done: false,
         app,
         caller,
+        settings_receiver,
     };
     futures_util::stream::unfold(start, |mut state| async move {
         if state.reset_on_attach {
@@ -1644,7 +1706,24 @@ pub fn all_events(
         } else if state.done {
             return None;
         } else {
-            match state.receiver.recv().await {
+            // As in `events`: settings changes ride this stream too, and lag on
+            // their receiver is skipped rather than reset.
+            let next = loop {
+                tokio::select! {
+                    arrival = state.receiver.recv() => break arrival,
+                    settings = state.settings_receiver.recv() => {
+                        match settings {
+                            Ok(changed) => return Some((Ok(settings_event(changed)), state)),
+                            Err(broadcast::error::RecvError::Lagged(_))
+                            | Err(broadcast::error::RecvError::Closed) => {
+                                state.settings_receiver =
+                                    state.app.live.subscribe_settings();
+                            }
+                        }
+                    }
+                }
+            };
+            match next {
                 Ok(arrival) => (arrival, false),
                 Err(broadcast::error::RecvError::Lagged(missed)) => {
                     state.done = true;
@@ -1765,6 +1844,23 @@ fn reset_event(missed: u64) -> axum::response::sse::Event {
     axum::response::sse::Event::default()
         .event(EVENT_RESET)
         .data(data)
+}
+
+fn settings_event(
+    changed: Vec<crate::client_settings::SyncedSetting>,
+) -> axum::response::sse::Event {
+    axum::response::sse::Event::default()
+        .event(EVENT_SETTINGS)
+        .json_data(crate::contract::ClientSettings { settings: changed })
+        // Plain strings and one integer per entry: serialization cannot fail. If it
+        // ever could, a page re-reads the document on its next focus or reconnect,
+        // so a reset — which would end the message stream too — is far too much;
+        // an empty change list is the honest nothing.
+        .unwrap_or_else(|_| {
+            axum::response::sse::Event::default()
+                .event(EVENT_SETTINGS)
+                .data("{\"settings\":[]}")
+        })
 }
 
 fn lock<T>(cell: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

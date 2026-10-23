@@ -1,12 +1,12 @@
 ---
 title: 'settings-server-side: every setting outside Screen and keys is stored on the server and shared by all devices'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
 - vibe-talk
 created_at: 2026-10-23T14:37:51.126953072+00:00
-updated_at: 2026-10-23T14:37:51.126953072+00:00
+updated_at: 2026-10-23T15:32:55.803634925+00:00
 ---
 
 # Description

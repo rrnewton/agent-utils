@@ -399,6 +399,14 @@ fn inventory() -> Vec<Route> {
             Write,
             Json(r#"{"ask_before_send":true}"#),
         ),
+        // `#457 settings-server-side`.
+        route("GET", "/api/v1/client-settings", Read, Nothing),
+        route(
+            "PUT",
+            "/api/v1/client-settings",
+            Write,
+            Json(r#"{"set":[{"key":"vibe-talk.voice.combine","value":"0","updated_ms":0}]}"#),
+        ),
         // `#272 voice-agent-instructions`.
         route("GET", "/api/v1/voice-prompt", Read, Nothing),
         route(

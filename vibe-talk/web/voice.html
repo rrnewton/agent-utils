@@ -1053,6 +1053,8 @@
               <section class="settings-section" id="settings-server" aria-labelledby="settings-server-title">
                 <h2 id="settings-server-title">Server</h2>
                 <p id="settings-server-host" class="settings-server-host"></p>
+                <!-- `#457 settings-server-side`. Quiet by design: it speaks only while a change is still on its way to the server, or cannot get there. -->
+                <p id="settings-sync-state" class="hint" aria-live="polite" hidden></p>
               </section>
               <div class="settings-head-actions">
                 <button id="fold-settings-all" class="secondary" type="button">Expand all</button>
@@ -1574,6 +1576,55 @@
                     else to the line above it, which is why those two can hold the focus (`tabindex="-1"`,
                     not a Tab stop).
                   -->
+                  <section class="settings-group">
+                    <div class="group-head">
+                      <h3 title="How many opening lines a collapsed long message shows. 0 is its header alone."><button class="fold-toggle" id="fold-collapsed-lines" type="button" aria-expanded="false" aria-controls="fold-collapsed-lines-body">Collapsed message lines</button></h3>
+                      <button class="help-link" id="help-link-collapsed-lines" type="button" data-help="collapsed-lines" aria-label="About collapsed message lines" title="How many opening lines a collapsed long message shows. 0 is its header alone.">?</button>
+                    </div>
+                    <div class="fold-body" id="fold-collapsed-lines-body" hidden="until-found">
+                      <!--
+                        `#425 collapsed-lines`. How much of a folded long message is on show, in
+                        lines of its opening: 3 until the reader says otherwise, 0 to 8. 0 is the
+                        header alone — who, when, and the row's chips and buttons, with no text
+                        under them. One count for every list (Main, All, a thread in either
+                        column, threads unpacked, the call's transcript), stated once as
+                        `--collapsed-lines` in web/voice.css; thread cards keep one line at 0,
+                        their text being the card's name. The − and + step one line each, as the
+                        text size's do, and the keys Ctrl+( and Ctrl+) (Cmd on a Mac) step it from
+                        the lists. Under Messages since `#457 settings-server-side` and kept on the server for every
+                        device: it decides how much of a message is shown, not how this screen
+                        is laid out, so it is not one of Screen and keys' per-device choices.
+                      -->
+                      <div class="msg-scale-row">
+                        <button
+                          id="collapsed-lines-smaller"
+                          class="secondary step-button"
+                          type="button"
+                          aria-label="Fewer collapsed lines"
+                          aria-controls="collapsed-lines"
+                          title="Fewer collapsed lines"
+                        >−</button>
+                        <input
+                          id="collapsed-lines"
+                          type="range"
+                          min="0"
+                          max="8"
+                          step="1"
+                          aria-label="collapsed message lines"
+                        />
+                        <button
+                          id="collapsed-lines-larger"
+                          class="secondary step-button"
+                          type="button"
+                          aria-label="More collapsed lines"
+                          aria-controls="collapsed-lines"
+                          title="More collapsed lines"
+                        >+</button>
+                      </div>
+                      <p id="collapsed-lines-state" class="hint" aria-live="polite"></p>
+                    </div>
+                  </section>
+
                   <section class="settings-group" id="dismissed-group">
                     <div class="group-head">
                       <h3 title="Messages you dismissed from the outbox unsent, kept on this device for a week in case you want one back."><button class="fold-toggle" id="fold-dismissed" type="button" aria-expanded="false" aria-controls="fold-dismissed-body">Recently dismissed</button></h3>
@@ -1880,7 +1931,7 @@
               </section>
 
               <section class="settings-section" id="settings-screen" aria-labelledby="settings-screen-title">
-                <h2 id="settings-screen-title"><button class="fold-toggle" id="fold-settings-screen" type="button" aria-expanded="false" aria-controls="fold-settings-screen-body">Screen and keys</button></h2>
+                <h2 id="settings-screen-title"><button class="fold-toggle" id="fold-settings-screen" type="button" aria-expanded="false" aria-controls="fold-settings-screen-body">Screen and keys</button><span class="settings-scope-note">(client side)</span></h2>
                 <div class="fold-body" id="fold-settings-screen-body" hidden="until-found">
                   <section class="settings-group">
                     <div class="group-head">
@@ -1946,52 +1997,6 @@
                     </div>
                   </section>
 
-                  <section class="settings-group">
-                    <div class="group-head">
-                      <h3 title="How many opening lines a collapsed long message shows. 0 is its header alone."><button class="fold-toggle" id="fold-collapsed-lines" type="button" aria-expanded="false" aria-controls="fold-collapsed-lines-body">Collapsed message lines</button></h3>
-                      <button class="help-link" id="help-link-collapsed-lines" type="button" data-help="collapsed-lines" aria-label="About collapsed message lines" title="How many opening lines a collapsed long message shows. 0 is its header alone.">?</button>
-                    </div>
-                    <div class="fold-body" id="fold-collapsed-lines-body" hidden="until-found">
-                      <!--
-                        `#425 collapsed-lines`. How much of a folded long message is on show, in
-                        lines of its opening: 3 until the reader says otherwise, 0 to 8. 0 is the
-                        header alone — who, when, and the row's chips and buttons, with no text
-                        under them. One count for every list (Main, All, a thread in either
-                        column, threads unpacked, the call's transcript), stated once as
-                        `--collapsed-lines` in web/voice.css; thread cards keep one line at 0,
-                        their text being the card's name. The − and + step one line each, as the
-                        text size's do, and the keys Ctrl+( and Ctrl+) (Cmd on a Mac) step it from
-                        the lists. Kept on this device only, like the text size beside it.
-                      -->
-                      <div class="msg-scale-row">
-                        <button
-                          id="collapsed-lines-smaller"
-                          class="secondary step-button"
-                          type="button"
-                          aria-label="Fewer collapsed lines"
-                          aria-controls="collapsed-lines"
-                          title="Fewer collapsed lines"
-                        >−</button>
-                        <input
-                          id="collapsed-lines"
-                          type="range"
-                          min="0"
-                          max="8"
-                          step="1"
-                          aria-label="collapsed message lines"
-                        />
-                        <button
-                          id="collapsed-lines-larger"
-                          class="secondary step-button"
-                          type="button"
-                          aria-label="More collapsed lines"
-                          aria-controls="collapsed-lines"
-                          title="More collapsed lines"
-                        >+</button>
-                      </div>
-                      <p id="collapsed-lines-state" class="hint" aria-live="polite"></p>
-                    </div>
-                  </section>
 
                   <section class="settings-group">
                     <div class="group-head">
@@ -2859,8 +2864,9 @@
                 A long message arrives <strong>collapsed</strong>: its opening lines, and a tap
                 (or its <strong>More</strong>) shows the rest. How many opening lines that is —
                 <strong>0 to 8, 3 until you say otherwise</strong> — is
-                <strong>Collapsed message lines</strong> in Settings, under Screen and keys, kept
-                on this device. It is the same count in every view: Main, All, a thread in either
+                <strong>Collapsed message lines</strong> in Settings, under Messages. It is kept on
+                the server for every device (`#457 settings-server-side`); it used to sit under
+                Screen and keys, kept on this device only. It is the same count in every view: Main, All, a thread in either
                 column, messages unpacked under their thread cards, and the call's transcript.
                 Thread cards follow it too, but keep one line at 0: their text is the card's name.
               </p>

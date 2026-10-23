@@ -535,7 +535,7 @@ const literal = (text) => String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
  * it, which is matched around them.
  */
 const settingsHeading = (level, text = "([^<]+)") =>
-  `<h${level}\\b[^>]*>(?:<button class="fold-toggle"[^>]*>)?${text}(?:</button>)?</h${level}>`;
+  `<h${level}\\b[^>]*>(?:<button class="fold-toggle"[^>]*>)?${text}(?:</button>)?(?:<span class="settings-scope-note">[^<]*</span>)?</h${level}>`;
 
 /** The words of every Settings heading of `level` in `html`, in order. */
 const settingsHeadings = (html, level) => [...html.matchAll(new RegExp(settingsHeading(level), "g"))].map((m) => m[1]);
@@ -569,7 +569,7 @@ function settingsGroup(heading, html = HTML) {
  * so the closing tag is found by counting rather than by the first one met.
  */
 function settingsSection(title, html = HTML) {
-  const head = new RegExp(`<h2 id="(settings-[a-z-]+)-title"[^>]*>(?:<button class="fold-toggle"[^>]*>)?${literal(title)}(?:</button>)?</h2>`).exec(html);
+  const head = new RegExp(`<h2 id="(settings-[a-z-]+)-title"[^>]*>(?:<button class="fold-toggle"[^>]*>)?${literal(title)}(?:</button>)?(?:<span class="settings-scope-note">[^<]*</span>)?</h2>`).exec(html);
   assert.ok(head, `web/voice.html has no settings section titled "${title}"`);
   const opens = html.indexOf(`<section class="settings-section" id="${head[1]}"`);
   assert.ok(opens > 0 && opens < head.index, `"${title}" does not head a settings section`);
@@ -5153,6 +5153,12 @@ const TUNING_BANDS = {
     "threads either side of a new one in root order whose colours it avoids. Under two, three " +
     "consecutive threads can still come out two alike; past four the neighbours outnumber what " +
     "the minimum distance can keep apart"],
+  // `#457 settings-server-side`.
+  SETTINGS_SYNC_MS: [250, 10000,
+    "how often this device's settings are compared with the server's document and what moved is " +
+    "pushed. Under a quarter of a second a dragged slider is a request per frame's worth of " +
+    "comparisons all day; past ten seconds a choice made here is not on the other device the " +
+    "owner picks up next, and a failed save waits that long to retry"],
   THREAD_HUE_RECENT: [2, 4,
     "threads most recently given a colour whose colours a new one avoids. Under two, a view drawing " +
     "new threads in its own order can still put two alike side by side; past four the same crowding"],
@@ -10117,8 +10123,9 @@ test("the − and + are thumb-sized squares that never wrap off the slider's row
 // The owner, 2026-10-22: collapsed cards are 3 lines tall by default; the default stays 3, but it
 // should be adjustable to 1 line or 4 lines or whatever, in Settings and by a keystroke not likely
 // to be hit accidentally — Cmd+( and Cmd+) — and, the same day, all the way down to ZERO lines,
-// header and colour and metadata only, without breaking anything. One count, 0 to 8, kept per
-// device, stated once as `--collapsed-lines` for every list. tests/collapsed_lines_browser.py
+// header and colour and metadata only, without breaking anything. One count, 0 to 8, stated
+// once as `--collapsed-lines` for every list. Kept per device then; since `#457
+// settings-server-side` it sits under Messages and the server keeps it for every device. tests/collapsed_lines_browser.py
 // measures what a real Chromium draws at 0, 1, 3 and 6.
 
 const COLLAPSED_LINES_STORE = "vibe-talk.voice.collapsed-lines";
@@ -10148,7 +10155,7 @@ test("Collapsed message lines is a Settings slider of 0 to 8 with a − and a +,
   }
 });
 
-test("the collapsed-lines count applies at once, is kept per device, clamps at 0 and 8, and a blank store is not zero", async () => {
+test("the collapsed-lines count applies at once, is kept, clamps at 0 and 8, and a blank store is not zero", async () => {
   const page = newPage();
   await signIn(page);
   await page.el("open-settings").click();
@@ -62772,13 +62779,19 @@ test("`#271 settings-groups`: the Messages section holds the message options, an
   // `#349 channel-settings-all` moved Who is who here, out of the per-channel box, and `#402
   // who-is-who-channel-box` put it back there.
   // `#386 hide-empty-messages` put Empty messages beside Mark-read automatically, the owner's place for it.
+  // `#457 settings-server-side` moved Collapsed message lines here from Screen and keys:
+  // it decides how much of a message is shown, so the server keeps it for every device,
+  // and Screen and keys is the one per-device section.
   assert.deepStrictEqual(messages, ["Your own messages", "Mark-read automatically", "Empty messages", "Combining messages",
-    "Rich headers", "Recently dismissed"]);
+    "Rich headers", "Collapsed message lines", "Recently dismissed"]);
   for (const agentGroup of ["Sending", "Instructions", "Resuming", "Arriving messages during a call",
     "Reading full messages in channel view"]) {
     assert.ok(!messages.includes(agentGroup), `"${agentGroup}" is in Messages`);
   }
-  assert.deepStrictEqual(groupsIn("Screen and keys"), ["Text size", "Reading width", "Collapsed message lines", "Control bar", "Typing", "Keyboard"]);
+  assert.deepStrictEqual(groupsIn("Screen and keys"), ["Text size", "Reading width", "Control bar", "Typing", "Keyboard"]);
+  // `#457 settings-server-side`: the one per-device section says so beside its title.
+  assert.match(HTML, /<h2 id="settings-screen-title"><button class="fold-toggle" id="fold-settings-screen"[^>]*>Screen and keys<\/button><span class="settings-scope-note">\(client side\)<\/span><\/h2>/,
+    "Screen and keys does not say (client side) beside its title");
   assert.deepStrictEqual(groupsIn("Storage and connection"),
     ["Stored conversations", "Saved messages on this server", "Token", "Connection status"]);
   // The per-channel box is its own section, with its `?` beside the section's title.
@@ -64051,7 +64064,7 @@ function foldProblems(html, css, script) {
     }
     const slug = `settings-${id}`;
     folds.push(slug);
-    const toggle = new RegExp(`<h2 id="settings-${id}-title"[^>]*><button class="fold-toggle" id="fold-${slug}" type="button" aria-expanded="false" aria-controls="fold-${slug}-body">[^<]+</button></h2>`);
+    const toggle = new RegExp(`<h2 id="settings-${id}-title"[^>]*><button class="fold-toggle" id="fold-${slug}" type="button" aria-expanded="false" aria-controls="fold-${slug}-body">[^<]+</button>(?:<span class="settings-scope-note">[^<]*</span>)?</h2>`);
     if (!toggle.test(section)) problems.push(`${slug}'s title is not the button that folds it`);
     const body = new RegExp(`</h2>(?:\\s*<button class="help-link"[^>]*>\\?</button>\\s*</div>)?\\s*<div class="fold-body" id="fold-${slug}-body" hidden="until-found">`);
     if (!body.test(section)) problems.push(`${slug}'s body is not right under its title, hidden until found`);

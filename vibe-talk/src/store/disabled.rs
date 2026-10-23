@@ -167,6 +167,22 @@ impl StateStore for DisabledStore {
         refuse()
     }
 
+    async fn client_settings(
+        &self,
+    ) -> Result<Vec<crate::client_settings::SyncedSetting>, StoreError> {
+        // A refusal, not an empty document: an empty answer would tell the page the
+        // server holds nothing and invite it to seed into a store that cannot keep it.
+        refuse()
+    }
+
+    async fn apply_client_settings(
+        &self,
+        _: &[(String, Option<String>)],
+        _: &[(String, String)],
+    ) -> Result<Vec<crate::client_settings::SyncedSetting>, StoreError> {
+        refuse()
+    }
+
     async fn owner_prompt(&self) -> Result<Option<OwnerPrompt>, StoreError> {
         // A refusal, not `Ok(None)`, for the noise rules' reason: Settings must not believe it
         // could save. `voice_prompt::current` applies the shipped prompt by name.

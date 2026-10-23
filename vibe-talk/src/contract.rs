@@ -390,6 +390,20 @@ pub struct VoiceSettings {
     pub changeable: bool,
 }
 
+/// The owner's synced client settings: every setting outside Settings' Screen and keys
+/// section, held on this server for all his devices. `#457 settings-server-side`.
+///
+/// The body of `GET` and `PUT /api/v1/client-settings`, and of the `settings` event on
+/// the live streams, where it carries only the entries that changed. A key the owner
+/// has never set on any device is absent, which is the shipped default's turn; an entry
+/// whose `value` is null says the key was forgotten. `updated_ms` is this server's
+/// clock when it took the value — per-key last-writer-wins compares it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ClientSettings {
+    /// The settings held, or the ones that changed, by key.
+    pub settings: Vec<crate::client_settings::SyncedSetting>,
+}
+
 /// The message cache, as Settings shows it: whether it is on, why it is not, and how much it
 /// holds. `#208 persistent-cache`.
 ///
@@ -1183,6 +1197,8 @@ fn roots(generator: &mut schemars::SchemaGenerator) -> Vec<schemars::Schema> {
         // reason.
         generator.subschema_for::<MessageCacheStatus>(),
         generator.subschema_for::<MessageCacheRequest>(),
+        // `#457 settings-server-side`. Appended, for the same reason.
+        generator.subschema_for::<ClientSettings>(),
     ]
 }
 

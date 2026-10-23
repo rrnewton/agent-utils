@@ -11998,7 +11998,7 @@ const KEYMAP = [
     group: KEYS_VIEW, chords: [{ key: "(", mod: true }], repeats: true,
     does: () => `One line fewer in every collapsed message everywhere: ${MIN_COLLAPSED_LINES} to ` +
       `${MAX_COLLAPSED_LINES} lines, ${MIN_COLLAPSED_LINES} the header alone. ${modKeyName()}+( is ` +
-      `${modKeyName()}+Shift+9. Kept on this device, as Collapsed message lines in Settings, and ` +
+      `${modKeyName()}+Shift+9. Kept on the server for every device, as Collapsed message lines in Settings, and ` +
       "never taken in a text field, where it types its bracket",
     controls: ["collapsed-lines"],
     run: (event, target) => collapsedLinesFromKeyboard(-1, target),
@@ -37544,6 +37544,14 @@ const READ_RUN_MIN_ROWS = 2;
 let readMode = "show";
 
 /**
+ * The read mode's own kept copy, for the server (`#457 settings-server-side`). The mode itself
+ * lives in the UI-state record with the view it belongs to; this mirror is written wherever the
+ * mode changes, so the settings sync can carry the mode — a messaging choice — without carrying
+ * the view record (this window's place in a channel, which is navigation, not a setting).
+ */
+const READ_MODE_KEY = "vibe-talk.voice.read-mode";
+
+/**
  * The runs of read messages the reader has opened, per view (`viewKey`), as the ids of the messages
  * in them. Ids, because the rows are rebuilt by every read; and a run with any opened message in it
  * stays open as it grows, so a message that joins it later is recorded too. Forgotten when the mode
@@ -39255,6 +39263,11 @@ function setReadMode(mode) {
     // Kept across a reload, as the reader left it. `#189 restore-ui-state`.
     uiStateSettled = true;
     saveUiState();
+    try {
+      localStorage.setItem(READ_MODE_KEY, mode);
+    } catch (_error) {
+      // The UI-state record above is the restore; this copy is only the sync's.
+    }
     disarmBacklog();
     // An undo belongs to the act it undoes, and leaving the view is the reader moving on. Keeping
     // it would offer to restore messages into a list they are no longer looking at. Showing or
@@ -43914,14 +43927,14 @@ const THREADS_UNPACKED_KEY = "vibe-talk.voice.threads-unpacked";
 //
 //   * UNPACK, THREE WAYS: Pack all, Unpack unread (a thread with any unread message unpacked, a read one
 //     packed, by `threadIsRead`), Unpack all; the chip says which, and a press or u goes on to the next.
-//     Kept on this device. Only in Unpack unread is a read card's colour strip grey, by the very rule that
+//     Kept on the server for every device (`#457 settings-server-side`). Only in Unpack unread is a read card's colour strip grey, by the very rule that
 //     greys the other cards while one is highlighted (web/voice.css).
 //   * EACH THREAD, THREE WAYS, in the Threads view only: a click on its card, or Enter or o on it, goes
 //     collapsed (three lines) -> whole, nothing unpacked -> whole with its messages unpacked -> collapsed.
 //     A summarized card (`#405`), written to fit, skips the middle state: whole and three lines are the
 //     same card. The Threads view highlights no card and dims none; two columns keep `#277`'s highlight.
 //   * A THREAD'S CHOICE OUTRANKS UNPACK for that thread until Unpack is pressed again, which gives every
-//     thread of the channel back to it. Kept on this device with Unpack (`THREAD_CARD_STATES_KEY`).
+//     thread of the channel back to it. Kept on the server with Unpack (`THREAD_CARD_STATES_KEY`, `#457 settings-server-side`).
 //   * PACKED IN PLACE: the up triangle in the first unpacked row's gutter, where All's bridge has its X, or
 //     ^ on a thread's card or row, packs it, its card held where it is on the screen; a thread read under
 //     Unpack unread packs where it is too (`keepingCardPlace`), its card staying in the list.
@@ -43950,7 +43963,7 @@ const UNPACK_READS_AT_ONCE = 3;
 /** How far below the cards on screen a block starts its read, in px: about one screenful ahead. */
 const UNPACK_NEAR_PX = 400;
 
-/** Unpack's state, kept on this device; an older page's "on" and "off" mean Unpack all and Pack all. */
+/** Unpack's state, kept on the server (`#457 settings-server-side`); an older page's "on" and "off" mean Unpack all and Pack all. */
 function storedUnpackMode() {
   try {
     const kept = localStorage.getItem(THREADS_UNPACKED_KEY);
@@ -43970,7 +43983,7 @@ const CARD_STATES = ["collapsed", "expanded", "unpacked"];
 /** The threads' own choices, `channel\nthread` -> "collapsed", "expanded" or "unpacked", the most recent last. */
 const threadCardStates = storedThreadCardStates();
 
-/** The threads' choices kept on this device, or none where they cannot be read. */
+/** The threads' choices as kept (`#457 settings-server-side`), or none where they cannot be read. */
 function storedThreadCardStates() {
   /** @type {Map<string, string>} */
   const states = new Map();
@@ -43987,7 +44000,7 @@ function storedThreadCardStates() {
   return states;
 }
 
-/** Keep the threads' choices on this device, the most recent `THREAD_CARD_STATES_KEPT`. */
+/** Keep the threads' choices, the most recent `THREAD_CARD_STATES_KEPT`. */
 function keepThreadCardStates() {
   try {
     localStorage.setItem(THREAD_CARD_STATES_KEY, JSON.stringify([...threadCardStates].slice(-THREAD_CARD_STATES_KEPT)));
@@ -44055,7 +44068,7 @@ function renderUnpackToggle() {
 const nextUnpackMode = () => UNPACK_MODES[(UNPACK_MODES.indexOf(unpackMode) + 1) % UNPACK_MODES.length];
 
 /**
- * The reader pressed Unpack, or u: its next state, kept on this device, every thread of the channel given
+ * The reader pressed Unpack, or u: its next state, kept, every thread of the channel given
  * back to it (their own choices let go), and the cards drawn again where the reader is.
  */
 function setUnpackMode(mode) {
@@ -44403,7 +44416,7 @@ async function readUnpackThread(id) {
 /** The device's choice of Main channel among the cards: "on", or anything else for cards alone. */
 const THREADS_MAIN_KEY = "vibe-talk.voice.threads-main";
 
-/** Whether Main channel is pressed, kept on this device. `#419 threads-view-main-messages`. */
+/** Whether Main channel is pressed, kept on the server (`#457 settings-server-side`). `#419 threads-view-main-messages`. */
 function storedMainRows() {
   try {
     return localStorage.getItem(THREADS_MAIN_KEY) === "on";
@@ -44427,7 +44440,7 @@ function renderMainToggle() {
   if (button.getAttribute("aria-pressed") !== pressed) button.setAttribute("aria-pressed", pressed);
 }
 
-/** The reader pressed Main channel, or a: kept on this device, and the cards drawn again. */
+/** The reader pressed Main channel, or a: kept, and the cards drawn again. */
 function setMainRowsShown(on) {
   mainRowsShown = on;
   try {
@@ -44456,7 +44469,7 @@ function mainRowsFromKeyboard() {
 // Our other buttons up there are toggles so maybe start with that and if we add more sort orders make it
 // a drop down." So a chip beside Main channel, saying the order the cards are in: Latest update (each
 // card where its thread last moved, as they always were) or Thread created (where its first message was
-// posted). A press, or d, goes on to the next order in `THREAD_ORDERS`, kept on this device. The orders
+// posted). A press, or d, goes on to the next order in `THREAD_ORDERS`, kept on the server (`#457 settings-server-side`). The orders
 // are a table, not a flag: a third is one more entry, and the chip a menu then. Main channel's rows stand
 // among the cards by when they were posted, against each card's time in the order chosen. Only over the
 // Threads view's cards, as its neighbours are; two columns' cards stay by latest update.
@@ -44485,7 +44498,7 @@ const THREAD_ORDERS = {
 /** The orders' names, in the order a press goes round them. */
 const THREAD_ORDER_NAMES = Object.keys(THREAD_ORDERS);
 
-/** The order kept on this device, or the default where none is, or one this page no longer knows. */
+/** The order as kept, or the default where none is, or one this page no longer knows. */
 function storedThreadOrder() {
   try {
     const kept = localStorage.getItem(THREAD_ORDER_KEY);
@@ -44531,7 +44544,7 @@ function renderOrderToggle() {
 }
 
 /**
- * The reader pressed the order chip, or d: the next order, kept on this device, and the cards drawn in it,
+ * The reader pressed the order chip, or d: the next order, kept, and the cards drawn in it,
  * the selected card kept where it is on screen (`keepingCardPlace` keeps it where it shows; otherwise
  * it is brought into view).
  */
@@ -47529,6 +47542,12 @@ function onStreamFrame(frame) {
     refreshQuietly(() => loadDiscord({ keepPosition: true, reason: "reset" }))();
     return;
   }
+  // `#457 settings-server-side`. A settings change from another device, carried on this
+  // stream between messages: it is about no channel and carries no cursor of its own.
+  if (frame.event === "settings") {
+    onSettingsFrame(frame);
+    return;
+  }
   if (!frame.data) {
     return;
   }
@@ -48593,6 +48612,10 @@ function onWatchAllFrame(frame) {
     watchAllLastEventId = null;
     if (canSendText() && relayMode() !== "off") reportUnrelayed([], "gap");
     return "reset";
+  }
+  if (frame.event === "settings") {
+    onSettingsFrame(frame);
+    return undefined;
   }
   if (frame.event !== "message" || !frame.data) return undefined;
   let payload = null;
@@ -50700,6 +50723,9 @@ async function signIn() {
   // After the screen is up, never before: restoring is a convenience, and a store that is slow or
   // absent must not hold the interface hostage. Not awaited for the same reason.
   loadStoredConversation();
+  // `#457 settings-server-side`. The token is proven, so the settings sync may read with it:
+  // it could not start at load, where a saved token is only a claim `/client-config` tests.
+  startSettingsSync();
   return true;
 }
 
@@ -50867,6 +50893,11 @@ async function pairingFailed(sentence) {
 }
 
 function forgetToken() {
+  // `#457 settings-server-side`. The next credential is unproven until `signIn` proves it,
+  // and the archive was agreed under this one: both go, and the settings read fresh.
+  settingsSyncProven = false;
+  settingsSyncReady = false;
+  syncedArchive.clear();
   clearError();
   // Before the token goes, not after: the stream holds a bearer credential open, and a signed-out
   // page that is still receiving one channel's messages is the leak this control exists to close.
@@ -50879,6 +50910,353 @@ function forgetToken() {
   setTokenState(NO_TOKEN_YET);
   setStatus("token forgotten");
   showScreen("signin");
+}
+
+// --- settings kept on the server (`#457 settings-server-side`) ----------------------------------
+//
+// Every setting outside Settings' Screen and keys section lives on the server, shared by all the
+// owner's devices; that one section — text size, reading width, the control bar, typing and the
+// keyboard — stays on this device and says "(client side)" beside its title. The full inventory
+// and its reasons are in `src/client_settings.rs`; `SYNCED_SETTING_KEYS` below must name the same
+// set as the server's list, and a server test reads this file to hold them together.
+//
+// HOW IT SYNCS, in the replication model's terms (`ai_docs/transient/2026-10-23-replication-model.md`):
+// `localStorage` stays this device's replica — every existing reader and writer above is unchanged,
+// which is what keeps a setting working offline and at first paint. This section is the update
+// detector and reconciler between that replica and the server: `syncedArchive` is the state both
+// sides last agreed on, a short timer compares the replica against it and pushes what moved, and
+// what another device moved arrives on the live streams as a `settings` event (and by re-read on
+// focus and reconnect). Per-key last-writer-wins on the SERVER's stamp: a remote entry is applied
+// only when its `updated_ms` is newer than the archive's, and a local change still on its way is
+// left to land after it, which is the same rule the server applied in arrival order. First load
+// after this shipped seeds the server from this device's values where it holds none — and only
+// there, so the second device to load can never clobber the first one's choices with its stale
+// copies. A failed push keeps the local value, says so quietly in Settings, and retries on the
+// timer, because the replica still differs from the archive until the server takes it.
+
+/** Every `localStorage` key whose setting the server keeps. Keep beside `SYNCED_KEYS` in
+ * `src/client_settings.rs` — a test there compares the two lists. */
+const SYNCED_SETTING_KEYS = [
+  "vibe-talk.voice.resume",
+  "vibe-talk.voice.relay",
+  "vibe-talk.voice.read-audio-source",
+  "vibe-talk.voice.read-speed",
+  "vibe-talk.voice.prompts",
+  "vibe-talk.voice.mic",
+  "vibe-talk.voice.read-mode",
+  "vibe-talk.voice.mark-own-read",
+  "vibe-talk.voice.hide-empty",
+  "vibe-talk.voice.combine",
+  "vibe-talk.voice.rich-headers",
+  "vibe-talk.voice.collapsed-lines",
+  "vibe-talk.voice.hidden-link-kinds",
+  "vibe-talk.voice.threads-unpacked",
+  "vibe-talk.voice.thread-card-states",
+  "vibe-talk.voice.threads-main",
+  "vibe-talk.voice.thread-order",
+  "vibe-talk.voice.thread-card-folded",
+];
+
+/** How often the replica is compared with the archive. A settings write is a human act; a second
+ * and a half is prompt, and far cheaper than asking on every keystroke of a dragged slider. */
+const SETTINGS_SYNC_MS = 1750;
+
+/**
+ * What this page and the server last agreed, by key: the value (null for none held) and the
+ * server's stamp for it. The whole sync is the difference between this and `localStorage`.
+ *
+ * @type {Map<string, {value: string | null, updatedMs: number}>}
+ */
+const syncedArchive = new Map();
+
+/** Whether the first read of the server's document has landed: until it has, nothing is pushed,
+ * so a load cannot overwrite another device's newer choice with this one's not-yet-checked copy. */
+let settingsSyncReady = false;
+
+/** Whether a push or read is on the wire now, so the timer never stacks a second one on it. */
+let settingsSyncBusy = false;
+
+/** False once the server has said it has no such route or no store: settings stay local, unsynced
+ * and unretried, rather than asking a question with a permanent answer every second and a half. */
+let settingsSyncSupported = true;
+
+/** Whether the sync's timer is armed: armed once, by the first proven sign-in. */
+let settingsSyncStarted = false;
+
+/** Whether the token now held has been proved by a `/client-config` answer. Nothing reads with
+ * an unproven token (`signIn`'s rule for the channel, the same for settings): the sync waits
+ * behind the same proof, and signing out un-proves it. */
+let settingsSyncProven = false;
+
+/** This device's kept value for a synced key, or null where it holds none. */
+function localSettingValue(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch (_error) {
+    return null;
+  }
+}
+
+/** Keep a synced value on this device, or forget it, exactly as the setting's own writer would. */
+function keepLocalSetting(key, value) {
+  try {
+    if (value === null) localStorage.removeItem(key);
+    else localStorage.setItem(key, value);
+  } catch (_error) {
+    // A browser that refuses storage honours the applied value for this session only.
+  }
+}
+
+/**
+ * Put one synced key's kept value into force, through the same stored-and-apply pair its own
+ * control ends in, so a change from another device lands exactly as one made here would. Called
+ * only after `localStorage` holds the new value. One key failing must not stop the rest.
+ */
+function applySyncedSetting(key) {
+  try {
+    switch (key) {
+      case READ_MODE_KEY: {
+        const held = localSettingValue(key);
+        if (held !== null) setReadMode(held);
+        break;
+      }
+      case MARK_OWN_KEY: applyMarkOwnRead(storedMarkOwnRead()); break;
+      case HIDE_EMPTY_KEY: applyHideEmptyMessages(storedHideEmptyMessages()); break;
+      case COMBINE_KEY: applyCombineMessages(storedCombineMessages()); break;
+      case RICH_HEADERS_KEY: applyRichHeaders(storedRichHeaders()); break;
+      case COLLAPSED_LINES_KEY:
+        applyCollapsedLines(storedCollapsedLines());
+        refreshElisionLines();
+        break;
+      case READ_SPEED_KEY: applyReadSpeed(storedReadSpeed()); break;
+      case READ_AUDIO_SOURCE_KEY: setReadAudioSource(storedReadAudioSource(), false); break;
+      case MIC_SETTINGS_KEY: {
+        const held = storedMicSettings();
+        for (const [id, name] of MIC_TOGGLES) {
+          /** @type {HTMLInputElement} */ (el(id)).checked = held[name];
+        }
+        break;
+      }
+      case PROMPTS_KEY: {
+        const held = storedPrompts();
+        for (const entry of CANNED_PROMPTS) {
+          const field = el(entry.field);
+          // A field being typed in is its typist's replica: the next keystroke writes it back
+          // and pushes it, which is last-writer-wins with the writer still writing.
+          if (document.activeElement !== field) {
+            /** @type {HTMLTextAreaElement} */ (field).value = held[entry.key];
+          }
+        }
+        break;
+      }
+      case RESUME_KEY:
+        /** @type {HTMLInputElement} */ (el("resume-toggle")).checked = resumeWanted();
+        break;
+      case RELAY_KEY: renderReadNew(); break;
+      case LINK_KINDS_KEY:
+        hiddenLinkKinds = storedHiddenLinkKinds();
+        renderLinkKinds();
+        break;
+      case THREADS_UNPACKED_KEY:
+        // Not `setUnpackMode`: that is the reader's press, which also gives every thread of the
+        // channel back to Unpack — a remote change of the default must not throw away the
+        // per-thread choices that sync beside it.
+        unpackMode = storedUnpackMode();
+        renderUnpackToggle();
+        sideCardsDrawn = "";
+        if (sideColumnUp()) renderSideColumn();
+        break;
+      case THREAD_CARD_STATES_KEY: {
+        const held = storedThreadCardStates();
+        threadCardStates.clear();
+        for (const [name, state] of held) threadCardStates.set(name, state);
+        sideCardsDrawn = "";
+        if (sideColumnUp()) renderSideColumn();
+        break;
+      }
+      case THREADS_MAIN_KEY: setMainRowsShown(storedMainRows()); break;
+      case THREAD_ORDER_KEY: setThreadOrder(storedThreadOrder()); break;
+      case THREAD_CARD_FOLD_KEY: setThreadCardFolded(storedThreadCardFolded()); break;
+      default: break;
+    }
+  } catch (_error) {
+    // The value is kept regardless; the next load applies it through the ordinary restore.
+  }
+}
+
+/** Settings' quiet word about the sync: silent while it is keeping up. */
+function renderSettingsSyncState(text) {
+  const line = el("settings-sync-state");
+  if (!line) return;
+  line.hidden = !text;
+  if (text && line.textContent !== text) line.textContent = text;
+}
+
+/**
+ * Take entries the server holds — a read's whole document, a write's answer, a stream frame's
+ * changes — into the archive, and into this device where they are newer than what it agreed.
+ * With `whole`, a synced key absent from the entries is one the server does not hold.
+ *
+ * @param {Array<{key: string, value: string | null, updated_ms: number}>} entries
+ * @param {boolean} whole
+ */
+function takeServerSettings(entries, whole) {
+  const seen = new Set();
+  for (const entry of entries) {
+    if (!SYNCED_SETTING_KEYS.includes(entry.key)) continue;
+    seen.add(entry.key);
+    const agreed = syncedArchive.get(entry.key);
+    if (agreed && entry.updated_ms < agreed.updatedMs) continue;
+    const local = localSettingValue(entry.key);
+    const pendingLocal = agreed && local !== agreed.value;
+    syncedArchive.set(entry.key, { value: entry.value, updatedMs: entry.updated_ms });
+    // A local change the server has not taken yet stands: it lands after this entry and wins
+    // by the same arrival rule, and taking the remote value now would lose it silently.
+    if (pendingLocal || local === entry.value) continue;
+    keepLocalSetting(entry.key, entry.value);
+    applySyncedSetting(entry.key);
+  }
+  if (whole) {
+    for (const key of SYNCED_SETTING_KEYS) {
+      if (!seen.has(key) && !syncedArchive.has(key)) {
+        syncedArchive.set(key, { value: null, updatedMs: 0 });
+      }
+    }
+  }
+}
+
+/** Whether this refusal is the permanent kind: no such route, or no store to keep settings in. */
+function settingsSyncRefused(error) {
+  return !!error && (error.status === 404 || error.code === "storage_not_configured");
+}
+
+/**
+ * One reconciliation pass: read the server's document until the first one lands (seeding it from
+ * this device where it holds none), then push whatever this device moved since the archive.
+ * Failures keep every local value and are retried by the timer that calls this.
+ */
+async function syncSettingsOnce() {
+  if (settingsSyncBusy || !settingsSyncSupported || !settingsSyncProven || !token()) return;
+  settingsSyncBusy = true;
+  try {
+    if (!settingsSyncReady) {
+      const held = await apiDecoded("ClientSettings", "/api/v1/client-settings");
+      takeServerSettings(held.settings, true);
+      settingsSyncReady = true;
+      // The one-time migration: this device's values, offered only where the server holds
+      // none. Seeds ride the first push below as their own list, never as sets.
+      const seed = [];
+      for (const key of SYNCED_SETTING_KEYS) {
+        const agreed = syncedArchive.get(key);
+        const local = localSettingValue(key);
+        if (agreed && agreed.value === null && local !== null) {
+          seed.push({ key, value: local, updated_ms: 0 });
+        }
+      }
+      if (seed.length > 0) {
+        const answer = await apiDecoded("ClientSettings", "/api/v1/client-settings", {
+          method: "PUT",
+          body: { set: [], seed },
+        });
+        // The whole document back: a seed another device beat this one to arrives here as
+        // that device's value, and replaces the stale local copy it outraced.
+        takeServerSettings(answer.settings, true);
+      }
+      renderSettingsSyncState("");
+      return;
+    }
+    const set = [];
+    for (const key of SYNCED_SETTING_KEYS) {
+      const agreed = syncedArchive.get(key);
+      const local = localSettingValue(key);
+      if (!agreed || local !== agreed.value) {
+        set.push({ key, value: local, updated_ms: 0 });
+      }
+    }
+    if (set.length === 0) {
+      renderSettingsSyncState("");
+      return;
+    }
+    renderSettingsSyncState("Settings are being saved to the server…");
+    const answer = await apiDecoded("ClientSettings", "/api/v1/client-settings", {
+      method: "PUT",
+      body: { set, seed: [] },
+    });
+    takeServerSettings(answer.settings, true);
+    renderSettingsSyncState("");
+  } catch (error) {
+    if (settingsSyncRefused(error)) {
+      settingsSyncSupported = false;
+      renderSettingsSyncState(
+        "This server does not keep settings, so yours stay on this device.");
+      return;
+    }
+    renderSettingsSyncState(
+      "Settings are kept on this device for now — saving to the server will retry.");
+  } finally {
+    settingsSyncBusy = false;
+  }
+}
+
+/** Re-read the document, for the moments a missed stream frame could hide in: refocus, reconnect. */
+async function refreshServerSettings() {
+  if (settingsSyncBusy || !settingsSyncSupported || !settingsSyncReady || !settingsSyncProven || !token()) return;
+  settingsSyncBusy = true;
+  try {
+    const held = await apiDecoded("ClientSettings", "/api/v1/client-settings");
+    takeServerSettings(held.settings, true);
+  } catch (_error) {
+    // The timer's next pass and the stream both carry this; a failed re-read says nothing new.
+  } finally {
+    settingsSyncBusy = false;
+  }
+}
+
+/**
+ * One `settings` frame off either live stream: another device's change, or this one's own
+ * heard back, which the archive's stamps make a no-op. Unreadable frames are dropped, as
+ * every stream frame this page cannot read is.
+ */
+function onSettingsFrame(frame) {
+  if (!frame.data) return;
+  let payload = null;
+  try {
+    payload = JSON.parse(frame.data);
+  } catch (_error) {
+    return;
+  }
+  if (!VibeTalkContract.is("ClientSettings", payload)) return;
+  takeServerSettings(payload.settings, false);
+}
+
+/** Start keeping this device's replica and the server's document in agreement. Called from
+ * `signIn` once the token is proven, never before: settings are read with the same credential
+ * as everything else, and an unproven one reads nothing. */
+function startSettingsSync() {
+  settingsSyncProven = true;
+  if (settingsSyncStarted) {
+    syncSettingsOnce().catch(() => {});
+    return;
+  }
+  settingsSyncStarted = true;
+  guardQuietly(syncSettingsOnce)();
+  // Self-rescheduling rather than an interval, as the poll above is: a slow pass can
+  // never stack a second one on itself.
+  const tick = () => {
+    syncSettingsOnce()
+      .catch(() => {})
+      .then(() => setTimeout(tick, SETTINGS_SYNC_MS));
+  };
+  setTimeout(tick, SETTINGS_SYNC_MS);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) refreshServerSettings().catch(() => {});
+  });
+  window.addEventListener("focus", () => {
+    refreshServerSettings().catch(() => {});
+  });
+  window.addEventListener("online", () => {
+    syncSettingsOnce().catch(() => {});
+  });
 }
 
 // --- wiring ------------------------------------------------------------------------------------
@@ -52334,6 +52712,11 @@ setPlacement(storedPlacement());
 if (savedUi) {
   readMode = savedReadMode(savedUi);
   todoMode = readMode === "hide";
+  try {
+    localStorage.setItem(READ_MODE_KEY, readMode);
+  } catch (_error) {
+    // As in `setReadMode`: the record just read is the restore either way.
+  }
 }
 showView("voice");
 renderEmptyState();
@@ -52362,3 +52745,4 @@ if (pairingCode !== null) {
 // `#304 back-gesture-in-app`. Last, with every part of the page defined: the history kept in step with
 // what is open, from the screen the page opened on.
 startBackStack();
+

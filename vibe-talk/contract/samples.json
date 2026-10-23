@@ -370,6 +370,25 @@
       "version": "0.0.0"
     }
   ],
+  "ClientSettings": [
+    {
+      "settings": [
+        {
+          "key": "vibe-talk.voice.mark-own-read",
+          "updated_ms": 1700000000000,
+          "value": "0"
+        },
+        {
+          "key": "vibe-talk.voice.combine",
+          "updated_ms": 1700000001000,
+          "value": null
+        }
+      ]
+    },
+    {
+      "settings": []
+    }
+  ],
   "CommittedPostResponse": [
     {
       "parts": [

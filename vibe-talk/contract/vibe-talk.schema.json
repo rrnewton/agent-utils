@@ -397,6 +397,22 @@
       ],
       "type": "object"
     },
+    "ClientSettings": {
+      "description": "The owner's synced client settings: every setting outside Settings' Screen and keys\nsection, held on this server for all his devices. `#457 settings-server-side`.\n\nThe body of `GET` and `PUT /api/v1/client-settings`, and of the `settings` event on\nthe live streams, where it carries only the entries that changed. A key the owner\nhas never set on any device is absent, which is the shipped default's turn; an entry\nwhose `value` is null says the key was forgotten. `updated_ms` is this server's\nclock when it took the value — per-key last-writer-wins compares it.",
+      "properties": {
+        "settings": {
+          "description": "The settings held, or the ones that changed, by key.",
+          "items": {
+            "$ref": "#/$defs/SyncedSetting"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "settings"
+      ],
+      "type": "object"
+    },
     "CommittedPostResponse": {
       "description": "A confirmed proposal, posted.",
       "properties": {
@@ -1747,6 +1763,33 @@
       ],
       "type": "object"
     },
+    "SyncedSetting": {
+      "description": "One synced setting as the server holds it: the key, its value (`None` in a write\nmeans \"forget it\", the owner's choice returning to the shipped default), and when\nthe server took it, on its own clock — the stamp per-key last-writer-wins compares.",
+      "properties": {
+        "key": {
+          "description": "The `localStorage` key, one of [`SYNCED_KEYS`].",
+          "type": "string"
+        },
+        "updated_ms": {
+          "description": "When the server accepted this value, milliseconds since the Unix epoch.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "value": {
+          "description": "The exact string the page keeps under that key, or `None` for no value held.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "key",
+        "value",
+        "updated_ms"
+      ],
+      "type": "object"
+    },
     "ThreadSummary": {
       "description": "One thread in the thread list, independent of the underlying provider's channel model.",
       "properties": {
@@ -2962,6 +3005,9 @@
     },
     {
       "$ref": "#/$defs/MessageCacheRequest"
+    },
+    {
+      "$ref": "#/$defs/ClientSettings"
     }
   ],
   "description": "Generated from vibe-talk/src/contract.rs by `make -C vibe-talk contract`. Do not edit.",
