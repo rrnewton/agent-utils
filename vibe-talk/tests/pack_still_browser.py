@@ -23,10 +23,13 @@ size: sign in, the Threads view, Unpack all, at the foot ->
    for the first frame and through the gap's hold, then moving only up, to where it is laid out; the list
    scrolled past its foot into room as tall as it takes (frames at the hold and mid-slide kept);
 2. a reply arriving in the last thread while the room is open: the card does not move, the room shrinks;
-3. the reader scrolling up 60px: the room 60px shorter; scrolling to the end: back no further than they
-   were; up past the room: it is gone, and the end is the foot of the rows again;
-4. the card unpacked again (whole, then unpacked): its top the same in every frame, the first card after it
-   drawn where it was in the first frame and moving only down;
+3. the reader scrolling up 60px: the room 60px shorter; scrolling to the end twelve times, and at a desk
+   six turns of the wheel: back no further than they were (a pixel's rounding), the room never taller; up
+   past the room: it is gone, and the end is the foot of the rows again;
+4. at the foot, the card unpacked and packed again (the room open), then unpacked from inside the room
+   (whole, then unpacked): its top the same in every frame, the first card after it drawn where it was in
+   the first frame and moving only down, and no room left at all; at a desk the wheel at the foot then
+   opens none;
 5. up the list, a card near the top packed by its triangle: its top unchanged and no room opened;
 6. a reader who asks for reduced motion (a context of its own): the card packed at the foot stays still,
    and no animation runs.
@@ -259,7 +262,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 if motion == "reduce":
                     reduced_walk(desk)
                 else:
-                    still_walk(desk, api)
+                    still_walk(desk, api, touch)
                 check(not errors, f"{label}: the page threw: {errors}")
                 context.close()
                 notes.extend(desk.notes)
@@ -315,7 +318,7 @@ def frames_of(watched: object) -> tuple[Json, list[Json]]:
     return before, frames
 
 
-def still_walk(desk: Desk, api: StillApi) -> None:
+def still_walk(desk: Desk, api: StillApi, touch: bool) -> None:
     page = desk.page
     target = page.evaluate(TARGET_JS, False)
     desk.check(isinstance(target, str), "no card other than the last shows whole and unpacked at the foot")
@@ -389,10 +392,27 @@ def still_walk(desk: Desk, api: StillApi) -> None:
         page.wait_for_timeout(200)
         up = still(desk, card)
         desk.check(abs(num(up["room"]) - (room - 60)) <= 1, f"scrolling up 60px left {up['room']}px of {room}px of room")
-        page.evaluate("() => { const a = document.getElementById('side-scroll'); a.scrollTop = a.scrollHeight; }")
-        page.wait_for_timeout(200)
-        down = still(desk, card)
-        desk.check(num(down["scrollTop"]) <= top - 60 + 1, f"scrolling down went back into the room: {top - 60} -> {down['scrollTop']}")
+        # Down to the end again and again, and by the wheel at a desk: never further than the reader was, and
+        # the room never taller (the browser rounds the scroll range, so a room fitted up to the reader each
+        # time would leave a pixel more to scroll, and grow).
+        downs: list[Json] = []
+        for _ in range(12):
+            page.evaluate("() => { const a = document.getElementById('side-scroll'); a.scrollTop = a.scrollHeight; }")
+            page.wait_for_timeout(60)
+            downs.append(still(desk, card))
+        if not touch:
+            box = page.locator("#side-scroll").bounding_box()
+            assert box is not None
+            page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+            for _ in range(6):
+                page.mouse.wheel(0, 120)
+                page.wait_for_timeout(250)
+                downs.append(still(desk, card))
+        furthest = max(num(d["scrollTop"]) for d in downs)
+        tallest = max(num(d["room"]) for d in downs)
+        desk.check(furthest <= top - 60 + 1, f"scrolling down went back into the room: {top - 60} -> {furthest}")
+        desk.check(tallest <= num(up["room"]), f"scrolling down grew the room: {up['room']} -> {tallest}")
+        desk.check(all(abs(num(d["top"]) - num(before["card"])) <= 61 for d in downs), "scrolling down moved the card past where it was")
         page.evaluate("(by) => { document.getElementById('side-scroll').scrollTop -= by; }", room)
         page.wait_for_timeout(200)
         page.evaluate("() => { const a = document.getElementById('side-scroll'); a.scrollTop = a.scrollHeight; }")
@@ -403,11 +423,19 @@ def still_walk(desk: Desk, api: StillApi) -> None:
     else:
         desk.check(False, f"the premise: the room after the reply is too short to scroll in ({room}px)")
 
-    # 4. Unpacked again: whole, then unpacked; still in every frame, the card after it down only.
-    page.evaluate("(id) => document.querySelector(`#side-cards > li[data-card][data-id='${id}']`)"
-                  ".scrollIntoView({block: 'center'})", card)
-    desk.settled()
-    page.evaluate("(id) => document.querySelector(`#side-cards > li[data-card][data-id='${id}'] .side-card`).click()", card)
+    # 4. Unpacked again from inside the room: at the foot, unpacked and packed again (the room open), then
+    # whole and unpacked; still in every frame, the card after it down only, and the room gone to the pixel.
+    press = "(id) => document.querySelector(`#side-cards > li[data-card][data-id='${id}'] .side-card`).click()"
+    page.evaluate(press, card)
+    page.evaluate(press, card)
+    page.wait_for_timeout(500)
+    page.evaluate("() => { const a = document.getElementById('side-scroll'); a.scrollTop = a.scrollHeight; }")
+    page.wait_for_timeout(300)
+    page.evaluate(press, card)
+    page.wait_for_timeout(600)
+    inside = still(desk, card)
+    desk.check(inside["state"] == "collapsed" and num(inside["room"]) > 0, f"packed at the foot again, no room held the card: {inside}")
+    page.evaluate(press, card)
     desk.settled()
     page.wait_for_timeout(500)
     watched = page.evaluate(WATCH_JS, {"id": card, "ms": 700})
@@ -421,8 +449,19 @@ def still_walk(desk: Desk, api: StillApi) -> None:
     desk.check(all(b >= a - 0.5 for a, b in zip(tops, tops[1:], strict=False)), f"the card after it did not move only down: {tops}")
     desk.check(tops[-1] > num(before["next"]) + 20 and any(tops[0] + 1 < t < tops[-1] - 1 for t in tops),
                f"the card after it did not slide down off the rows: {tops}")
+    desk.check(num(opened["room"]) == 0, f"unpacked from inside the room, {opened['room']}px of it is left")
     desk.shot("6-unpacked")
-    desk.notes.append(f"unpacked: the card still to {worst:.1f}px, the next card slid down {tops[-1] - tops[0]:.0f}px")
+    if not touch:
+        # The room gone, the wheel at the foot has the column's own room past it again (`#338`), and no other.
+        page.evaluate("() => { const a = document.getElementById('side-scroll'); a.scrollTop = a.scrollHeight; }")
+        page.wait_for_timeout(400)
+        for _ in range(4):
+            page.mouse.wheel(0, 120)
+            page.wait_for_timeout(250)
+        wheeled = still(desk, card)
+        desk.check(num(wheeled["room"]) == 0, f"the wheel at the foot opened room held for a card: {wheeled}")
+    desk.notes.append(f"unpacked from inside the room: the card still to {worst:.1f}px, the next card slid down "
+                      f"{tops[-1] - tops[0]:.0f}px, the room gone")
 
     # 5. Up the list: a card near the head packed by its triangle stays, with no room.
     page.evaluate("() => { document.getElementById('side-scroll').scrollTop = 0; }")
