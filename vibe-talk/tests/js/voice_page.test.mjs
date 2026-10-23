@@ -463,7 +463,7 @@ const FIXTURE_TREE = {
   "side-thread-card": ["side-thread-card-text", "side-thread-card-age", "side-thread-card-count", "side-close"],
   // `#338 column-overscroll`. Last, the room past the foot: no height, and so nothing in the layout, until the
   // page gives it one, which a test draws with `drawOverscroll`.
-  "side-scroll": ["side-search-empty", "side-list", "side-pane", "side-overscroll"],
+  "side-scroll": ["side-search-empty", "side-list", "side-pane", "side-overscroll", "side-overextend"],
   "side-list": ["side-list-state", "side-more-threads", "side-cards"],
   "side-pane": [
     "side-summary",
@@ -4084,6 +4084,13 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
    * from its card in the list, and `--column-glide: smooth`. Left out of the ordinary fixture, whose
    * stylesheet says nothing, so that no card moves in a test that is not about it.
    */
+  /**
+   * `#460 pack-gap-slide`. A stylesheet saying the custom properties `said` (by name) on every element, as
+   * web/voice.css says the pack slide's durations on #screen-main; nothing else.
+   */
+  page.sayStyle = (said) => {
+    context.window.getComputedStyle = () => ({ fontSize: "16px", getPropertyValue: (name) => said[name] || "" });
+  };
   page.allowCardFlight = () => {
     context.window.getComputedStyle = () => ({
       fontSize: "16px",
@@ -66949,9 +66956,10 @@ test("`#338 column-overscroll`: the room past the right column's foot is drawn a
     "the room is drawn outside the desktop block too");
   assert.match(cssRules(CSS_UNCONDITIONAL, "#side-overscroll").join("\n"), /display:\s*none/,
     "the room is not taken away everywhere else");
-  // The last child of #side-scroll, by the fixture's tree, which is checked against the markup as it is
-  // built: the scroller closes after it, and the column's jump follows.
-  assert.match(HTML_CODE, /<div id="side-overscroll" aria-hidden="true"><\/div>\s*<\/div>\s*<div id="side-tools"/,
+  // The last child of #side-scroll but the room a packed card holds (`#459 pack-keeps-card-still`), by the
+  // fixture's tree, which is checked against the markup as it is built: the scroller closes after them, and
+  // the column's jump follows.
+  assert.match(HTML_CODE, /<div id="side-overscroll" aria-hidden="true"><\/div>\s*(?:<!--[\s\S]*?-->\s*)?<div id="side-overextend" aria-hidden="true"><\/div>\s*<\/div>\s*<div id="side-tools"/,
     "the room is not the last thing in the right column's scroller, or is not hidden from assistive technology");
   const { page } = await manyThreadColumns(4, (p) => p.enableResizeObserver());
   const room = page.el("side-overscroll");
@@ -79079,6 +79087,295 @@ test("`#440 thread-card-pack-toggle`: the triangle in the first unpacked row's g
   assert.deepStrictEqual(cardSays(reading.page, RAW), ["collapsed", false], "a thread read under Unpack unread stayed unpacked");
   assert.equal(card.hidden, false, "a thread read under Unpack unread went from the list");
   assert.equal(card.hasAttribute("data-thread-read"), true, "the read thread's card does not say so, so it is not greyed");
+});
+
+// --- a card packed or unpacked where it stands stays still (#459 pack-keeps-card-still) ---------------------
+//
+// The owner, 2026-10-23: packing a thread card a few threads from the foot of the Threads view made it jump
+// to the bottom of the screen, because the list would not scroll past its end. "In the specific case of
+// packing threads I would really like the thread card I act on by clicking to STAY STILL, even if that means
+// the collapsed child messages leave a big VOID on the screen ... if I scroll up I cannot scroll back down to
+// the overextended state." The model clamps a position set past the end as a browser does, so a card put back
+// past the foot without the room is measurably moved; tests/pack_still_browser.py walks it in Chromium.
+
+/** `count` threads of `replies` short replies each, the newest last. */
+function stillThreads(count, replies) {
+  const messages = [];
+  const threads = [];
+  for (let i = 0; i < count; i += 1) {
+    const id = `spaces/A/threads/s${i}`;
+    const rootId = String(800 + 10 * i);
+    const record = { id, root_message_id: rootId, is_root: true, reply_count: replies, reply_count_exact: true };
+    const root = message({ id: rootId, content: `still thread ${i} root`, thread: record });
+    messages.push(root);
+    for (let r = 1; r <= replies; r += 1) {
+      messages.push(message({ id: String(800 + 10 * i + r), content: `thread ${i} reply ${r}`, thread: { ...record, is_root: false } }));
+    }
+    threads.push({ id, root, title: `Thread ${i}`, reply_count: replies, reply_count_exact: true, updated_at: messages.at(-1).timestamp });
+  }
+  return { messages, threads };
+}
+
+/** The Threads view over `stillThreads`, every thread unpacked (Unpack all), opened at its foot. */
+async function stillPage(arrange = null, script = SCRIPT, { count = 8, replies = 1, mode = "all" } = {}) {
+  const data = stillThreads(count, replies);
+  const page = newPage(new Map([[UNPACK_STORAGE, mode]]), script, arrange);
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  page.messages = data.messages;
+  const server = forwardTimeline(page);
+  for (const one of data.messages) page.dealtWith.add(one.id);
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await pickThread(page, "threads");
+  await page.settle();
+  return { page, server, data };
+}
+
+/** The room the page gave past the foot to hold a card still, in px: 0 while it is closed. */
+const overextendPx = (page) => Number.parseFloat(page.el("side-overextend").style.height || "0") || 0;
+
+/** The ids of the cards, in order, the newest thread last. */
+const stillCardIds = (page) => page.el("side-cards").children.filter((li) => li.hasAttribute("data-card")).map((li) => li.getAttribute("data-id"));
+
+/** The card nearest the top of the right column that shows whole on screen, other than the last. */
+const stillTarget = (page) => {
+  const area = page.el("side-scroll");
+  return stillCardIds(page).slice(0, -1).find((id) => {
+    const box = cardRow(page, id).getBoundingClientRect();
+    return box.top >= 0 && box.bottom <= area.clientHeight;
+  }) || null;
+};
+
+/** Scroll the right column to `top`, as the reader would, and let the page hear of it. */
+const scrollStill = async (page, top) => {
+  const area = page.el("side-scroll");
+  area.scrollTop = top;
+  await area.dispatch("scroll");
+  await page.settle();
+};
+
+/** Pack thread `id` by `way` — a click on its card, Enter or o on it, ^ or its triangle on its first row. */
+async function packBy(page, id, way) {
+  const first = unpackRows(page, id)[0];
+  if (way === "click") await cardOf(page, id).click();
+  else if (way === "Enter" || way === "o") {
+    // Round from unpacked: collapsed is the next state.
+    await press(page, cardRow(page, id), way);
+  } else if (way === "^") await press(page, first, "^");
+  else await first.children.find((node) => String(node.className).split(/\s+/).includes("unpack-pack")).click();
+  await page.settle();
+}
+
+test("`#459 pack-keeps-card-still`: a card packed at the foot of the Threads view — by a click, Enter, o, ^ or its triangle — stays exactly where it is, the list scrolled past its foot into room that holds it; unpacked again it stays and the room goes", async () => {
+  const run = async (script, way = "click") => {
+    const { page } = await stillPage(null, script);
+    const side = page.el("side-scroll");
+    const out = { foot: sideAtFoot(page) };
+    const id = stillTarget(page);
+    assert.ok(id, "the premise: a card other than the last shows whole at the foot");
+    assert.ok(unpackRows(page, id).length > 0, "the premise: the thread is unpacked");
+    const top = () => cardRow(page, id).getBoundingClientRect().top;
+    const before = top();
+    await packBy(page, id, way);
+    out.packed = cardRow(page, id).getAttribute("data-card-state") === "collapsed" && unpackRows(page, id).length === 0;
+    out.moved = top() - before;
+    out.room = overextendPx(page) > 0;
+    // Past the foot: the reader is at the end the room makes, which is the newest line to every rule.
+    out.atNewest = page.pure("atBottom")(side);
+    // Unpacked again in two presses (whole, then unpacked): the card where it was, the rows back in the room.
+    await cardOf(page, id).click();
+    await page.settle();
+    await cardOf(page, id).click();
+    await page.settle();
+    out.unpacked = unpackRows(page, id).length > 0;
+    out.movedBack = top() - before;
+    out.roomGone = overextendPx(page) === 0;
+    return out;
+  };
+  const want = { foot: true, packed: true, moved: 0, room: true, atNewest: true, unpacked: true, movedBack: 0, roomGone: true };
+  for (const way of ["click", "Enter", "o", "^", "triangle"]) {
+    assert.deepStrictEqual(await run(SCRIPT, way), want, `packed by ${way}`);
+  }
+  // THE CONTROL. No room past the foot: the browser's clamp takes the card down the screen, as the owner saw.
+  const clamped = await run(brokenScript("  closeOverscroll();\n  sizeOverextend(area, top);\n  area.scrollTop = top;\n",
+    "  closeOverscroll();\n  area.scrollTop = top;\n"));
+  assert.ok(clamped.moved > 0, `the control: without the room the packed card did not move (${clamped.moved})`);
+  assert.equal(clamped.room, false);
+});
+
+test("`#459 pack-keeps-card-still`: up the list a packed card stays where it is with no room needed; Pack all with a card selected holds that card, past the foot where it takes that, and with none keeps the reader's place as before", async () => {
+  // Up the list: the reader scrolled to the head, a card there packed.
+  const { page } = await stillPage();
+  await scrollStill(page, 0);
+  const head = stillCardIds(page)[1];
+  const before = cardRow(page, head).getBoundingClientRect().top;
+  await packBy(page, head, "click");
+  assert.equal(cardRow(page, head).getBoundingClientRect().top, before, "a card packed up the list moved");
+  assert.equal(overextendPx(page), 0, "room was opened past the foot for a card up the list");
+  // Pack all with a card selected at the foot: that card held.
+  const run = async (script) => {
+    const chip = await stillPage(null, script);
+    const id = stillTarget(chip.page);
+    // Selected by the keys: up to the row above it and back down onto it.
+    await press(chip.page, cardRow(chip.page, id), "ArrowUp");
+    await press(chip.page, focused(chip.page), "ArrowDown");
+    assert.equal(focused(chip.page), cardRow(chip.page, id), "the premise: the card is selected");
+    const top = () => cardRow(chip.page, id).getBoundingClientRect().top;
+    const was = top();
+    await chip.page.el("side-unpack").click();
+    await chip.page.settle();
+    return { packedAll: chip.page.el("side-unpack").text() === "Pack all" && unpackRows(chip.page, id).length === 0,
+      moved: top() - was, room: overextendPx(chip.page) > 0 };
+  };
+  assert.deepStrictEqual(await run(SCRIPT), { packedAll: true, moved: 0, room: true });
+  // THE CONTROL. Pack all keeping the reader's place as any change does: at the foot, the foot, and the card moves.
+  const placeOnly = await run(brokenScript("  if (still !== null) keepingCardStill(still, renderSideColumn);\n  else keepingCardPlace(renderSideColumn);",
+    "  keepingCardPlace(renderSideColumn);"));
+  assert.ok(placeOnly.moved !== 0, "the control: Pack all keeping only the reader's place left the card where it was");
+});
+
+test("`#459 pack-keeps-card-still`: the room is one way — scrolling up takes it away under the reader, scrolling down never goes back into it, and once up past it it is closed and the foot is where the wheel stops", async () => {
+  const run = async (script) => {
+    const { page } = await stillPage(null, script);
+    const side = page.el("side-scroll");
+    await packBy(page, stillTarget(page), "click");
+    const room = overextendPx(page);
+    assert.ok(room > 40, `the premise: the pack left room past the foot (${room}px)`);
+    const out = {};
+    const end = side.scrollTop;
+    await scrollStill(page, end - 30);
+    out.shrank = room - overextendPx(page);
+    await scrollStill(page, side.scrollHeight);
+    out.backDown = side.scrollTop - (end - 30);
+    await scrollStill(page, side.scrollTop - room);
+    out.closed = overextendPx(page) === 0;
+    await scrollStill(page, side.scrollHeight);
+    out.footIsEnd = side.scrollTop === side.scrollHeight - side.clientHeight && overextendPx(page) === 0;
+    return out;
+  };
+  assert.deepStrictEqual(await run(SCRIPT), { shrank: 30, backDown: 0, closed: true, footIsEnd: true });
+  // THE CONTROL. The room not fitted as the reader scrolls: they scroll straight back down into it.
+  const kept = await run(brokenScript("  // `#459 pack-keeps-card-still`. The room held for a card goes as the reader goes up out of it.\n  fitOverextend(area);\n", ""));
+  assert.ok(kept.backDown > 0, "the control: with the room left standing, the reader could not scroll back into it");
+});
+
+test("`#459 pack-keeps-card-still`: a reply arriving while the room is open fills it and does not move the reader; one taller than the room takes them on to the foot by what is left over", async () => {
+  const run = async (script) => {
+    // A taller column and two replies a thread, so the room the pack leaves is taller than one reply.
+    const { page, server, data } = await stillPage((p) => {
+      p.el("side-scroll").clientHeight = 2 * SCROLL_VIEWPORT_PX;
+    }, script, { replies: 2 });
+    const side = page.el("side-scroll");
+    const id = stillTarget(page);
+    await packBy(page, id, "click");
+    const top = () => cardRow(page, id).getBoundingClientRect().top;
+    const before = top();
+    const room = overextendPx(page);
+    const last = data.threads.at(-1).root;
+    await liveReply(page, server, last, "899");
+    const out = { moved: top() - before, filled: overextendPx(page) < room };
+    // Replies until what came is taller than the room: the reader at the foot of the rows, the room closed.
+    for (let n = 0; n < 12 && overextendPx(page) > 0; n += 1) await liveReply(page, server, last, String(900 + n));
+    out.closed = overextendPx(page) === 0;
+    out.atFoot = side.scrollTop === side.scrollHeight - side.clientHeight;
+    return out;
+  };
+  assert.deepStrictEqual(await run(SCRIPT), { moved: 0, filled: true, closed: true, atFoot: true });
+  // THE CONTROL. The foot followed as if the room were not there: the reply yanks the view up by its height.
+  const yanked = await run(brokenScript("  if (overextendRoom(area) > 0) {\n    fitOverextend(area);\n    if (overextend !== null) return;\n  }\n", ""));
+  assert.ok(yanked.moved < 0, `the control: following the foot through the room did not move the card (${yanked.moved})`);
+});
+
+// --- the gap a packed thread leaves, held and then closed (#460 pack-gap-slide) ----------------------------
+//
+// The owner, 2026-10-23: "when I pack a thread it could leave a gap in the message stream for a moment, and
+// the cards below slide up into position rather than jumping instantaneously." The model has no frames, so
+// these hold what the page asks of the browser: which items it animates, from where, for how long, and that
+// the layout under the motion is the one there is without it. tests/pack_still_browser.py watches it drawn.
+
+const PACK_STYLE = { "--pack-gap-hold": "200ms", "--pack-slide": "260ms" };
+
+/**
+ * Run `body` with `Element.animate` in the model, every call recorded: the element, its keyframes and
+ * timing, and whether it was ended. The model has none otherwise, which the page treats as reduced motion.
+ */
+async function withAnimate(body) {
+  const motions = [];
+  FakeElement.prototype.animate = function animate(keyframes, options) {
+    const listeners = new Map();
+    const motion = {
+      element: this, keyframes, options, ended: false,
+      addEventListener: (type, fn) => listeners.set(type, fn),
+      finish() {
+        motion.ended = true;
+        if (listeners.has("finish")) listeners.get("finish")();
+      },
+    };
+    motions.push(motion);
+    return motion;
+  };
+  try {
+    return await body(motions);
+  } finally {
+    delete FakeElement.prototype.animate;
+  }
+}
+
+test("`#460 pack-gap-slide`: packed, what is after the thread on the screen is drawn where it was, holds, then slides up home; unpacked, it slides down off the thread's rows as they fade in; under reduced motion nothing moves and the layout is the same", async () => {
+  const run = async (said) => withAnimate(async (motions) => {
+    const { page } = await stillPage((p) => p.sayStyle(said));
+    const id = stillTarget(page);
+    const after = stillCardIds(page).at(-1);
+    const items = () => page.el("side-cards").children.filter((li) => li.getAttribute("data-id") === after || li.getAttribute("data-unpack-thread") === after);
+    const was = items().map((li) => li.getBoundingClientRect().top);
+    await packBy(page, id, "click");
+    const out = {
+      packed: motions.map((m) => [m.element === cardRow(page, after) ? "card" : "row", m.keyframes.map((k) => k.transform),
+        m.keyframes.map((k) => k.offset ?? null), m.options.duration]),
+      // Frame 0: each drawn where it was before the pack.
+      fromWhereItWas: motions.every((m, at) => {
+        const shift = Number(/translateY\((-?[\d.]+)px\)/.exec(m.keyframes[0].transform)[1]);
+        return m.element.getBoundingClientRect().top + shift === was[at];
+      }),
+      layout: items().map((li) => li.getBoundingClientRect().top),
+    };
+    // A wheel on the list ends the slide at once.
+    await page.el("side-scroll").dispatch("wheel", { deltaY: 0, timeStamp: 0 });
+    out.wheelEnded = motions.length === 0 || motions.every((m) => m.ended);
+    // Unpacked again: whole (nothing below moves), then unpacked.
+    motions.length = 0;
+    await cardOf(page, id).click();
+    await page.settle();
+    out.whole = motions.length;
+    await cardOf(page, id).click();
+    await page.settle();
+    out.unpacked = motions.map((m) => [m.element.getAttribute("data-unpack-thread") === id ? "own row" : m.element === cardRow(page, after) ? "card" : "row",
+      m.keyframes.map((k) => k.transform ?? `opacity ${k.opacity}`), m.options.duration]);
+    // Made in the page's realm: compared as plain data.
+    return JSON.parse(JSON.stringify(out));
+  });
+  const moving = await run(PACK_STYLE);
+  const hold = 200 / 460;
+  assert.deepStrictEqual(moving.packed, [
+    ["card", ["translateY(100px)", "translateY(100px)", "none"], [null, hold, null], 460],
+    ["row", ["translateY(100px)", "translateY(100px)", "none"], [null, hold, null], 460],
+  ], "the pack did not hold the cards below where they were and slide them up");
+  assert.equal(moving.fromWhereItWas, true, "the first frame does not draw the cards below where they were");
+  assert.equal(moving.wheelEnded, true, "a turn of the wheel did not end the slide");
+  assert.equal(moving.whole, 0, "the card shown whole slid what is below it, which did not move");
+  assert.deepStrictEqual(moving.unpacked, [
+    ["card", ["translateY(-100px)", "none"], 260],
+    ["row", ["translateY(-100px)", "none"], 260],
+    ["own row", ["opacity 0", "opacity 1"], 260],
+  ], "the unpack did not slide the cards below down off the thread's rows");
+  // Reduced motion: the stylesheet's 0ms, and nothing animated; the layout exactly as with the motion.
+  const still = await run({ "--pack-gap-hold": "0ms", "--pack-slide": "0ms" });
+  assert.deepStrictEqual([still.packed, still.unpacked], [[], []], "under reduced motion something moved");
+  assert.deepStrictEqual(still.layout, moving.layout, "the motion changed the layout it settles on");
+  // The stylesheet: the durations on #screen-main, and 0 under reduced motion.
+  assert.match(CSS_CODE, /#screen-main \{\s*--pack-gap-hold: 200ms;\s*--pack-slide: 260ms;\s*\}/);
+  assert.match(CSS_CODE, /@media \(prefers-reduced-motion: reduce\) \{\s*#screen-main \{\s*--pack-gap-hold: 0ms;\s*--pack-slide: 0ms;\s*\}\s*\}/);
 });
 
 test("`#411 thread-view-row-padding`: a row unpacked under its card has the message row's box, from the rule every list's rows take", async () => {

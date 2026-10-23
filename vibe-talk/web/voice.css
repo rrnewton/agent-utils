@@ -8709,6 +8709,15 @@ li.discord-message[data-root-child] > .reply-bridge {
   pointer-events: none;
 }
 
+/* `#459 pack-keeps-card-still`. The room past the foot that holds a packed card still: on a phone and at a
+   desk alike, with no height until web/voice.js gives it one (`keepingCardStill`). Blank, so never the
+   browser's scroll anchor. */
+#side-overextend {
+  height: 0;
+  pointer-events: none;
+  overflow-anchor: none;
+}
+
 #side-tools {
   position: absolute;
   z-index: 2;
@@ -9118,6 +9127,24 @@ li.discord-message[data-root-child] > .reply-bridge {
   #pane-discord[data-arriving],
   #side-pane[data-arriving] {
     animation: none;
+  }
+}
+
+/*
+ * `#460 pack-gap-slide`. A thread packed in the Threads view leaves its gap for a moment, and what is below it
+ * on the screen slides up into place; unpacked, what is below slides down off its rows as they come in. The
+ * script draws it with a transform alone over the cards as they now stand (`slideIntoPlace`) and reads how
+ * long from here: the gap's hold, and the slide. Under reduced motion both are 0, and nothing moves.
+ */
+#screen-main {
+  --pack-gap-hold: 200ms;
+  --pack-slide: 260ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #screen-main {
+    --pack-gap-hold: 0ms;
+    --pack-slide: 0ms;
   }
 }
 
