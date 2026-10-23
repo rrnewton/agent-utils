@@ -428,6 +428,34 @@ def record_capture(path: Path, data: bytes, label: str) -> Verdict:
 # =================================================================================================
 
 
+#: `#472 gate-flake-hardening`. Every explicit wait in the walk (`wait_for_function(...,
+#: timeout=...)`) is a deadline for a state the page is to reach, never a measure of how fast it gets
+#: there, so each is stretched by this much: on a host running several validation gates at once a
+#: fresh load took more than the 10 s it was given to show the control pane. A state that is never
+#: reached still fails, only later.
+WAIT_PATIENCE = 3
+
+#: How long a scene's expectations are looked at again, all together, before it is called unreached.
+EXPECT_WAIT_S = 5.0
+
+
+def _patient_waits(page: Page) -> None:
+    """Stretch every explicit `wait_for_function` deadline on `page` by `WAIT_PATIENCE`."""
+    wait = page.wait_for_function
+
+    def patient(
+        expression: str,
+        *,
+        arg: object = None,
+        timeout: float | None = None,
+        polling: float | Literal["raf"] | None = None,
+    ) -> object:
+        stretched = None if timeout is None else timeout * WAIT_PATIENCE
+        return wait(expression, arg=arg, timeout=stretched, polling=polling)
+
+    setattr(page, "wait_for_function", patient)
+
+
 class Unreachable(Exception):
     """A state's expectations did not hold, so nothing was captured for it."""
 
@@ -962,6 +990,7 @@ class Driver:
         # exactly this. Collected per page and reported by name at the first capture.
         self.page_errors: list[str] = []
         page.on("pageerror", lambda error: self.page_errors.append(str(error).splitlines()[0]))
+        _patient_waits(page)
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.out_dir = out_dir
@@ -1055,15 +1084,27 @@ class Driver:
                 "matter how it looks",
                 "; ".join(dict.fromkeys(self.page_errors))[:400],
             )
-        for description, expression in scene.expect:
-            try:
-                held = bool(self.js(expression))
-            except Exception as error:  # a broken expression is a failed expectation, loudly
-                raise Unreachable(
-                    scene.name, description, f"the check itself errored: {error}"
-                ) from error
-            if not held:
-                raise Unreachable(scene.name, description, f"check: {expression}")
+        # Every expectation at once, looked at again until they all hold or `EXPECT_WAIT_S` has
+        # gone by: a state a loaded host brings late is still the state, and is what is captured;
+        # one never reached is reported by the first expectation that did not hold.
+        deadline = time.monotonic() + EXPECT_WAIT_S
+        while True:
+            unmet: tuple[str, str] | None = None
+            for description, expression in scene.expect:
+                try:
+                    held = bool(self.js(expression))
+                except Exception as error:  # a broken expression is a failed expectation, loudly
+                    raise Unreachable(
+                        scene.name, description, f"the check itself errored: {error}"
+                    ) from error
+                if not held:
+                    unmet = (description, expression)
+                    break
+            if unmet is None:
+                break
+            if time.monotonic() >= deadline:
+                raise Unreachable(scene.name, unmet[0], f"check: {unmet[1]}")
+            self.page.wait_for_timeout(100)
 
         animations: Literal["allow", "disabled"]
         if scene.animation_offset_ms is not None:
