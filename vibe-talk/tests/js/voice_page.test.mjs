@@ -33302,7 +33302,13 @@ const threadBadge = (row) => row.descendants().find((node) => node.className ===
 
 // Outgoing rows are deliberately separate from provider-confirmed history. These helpers only
 // inspect the rendered controls and durable browser state; none calls the implementation directly.
-const outgoingRows = (page) => page.el("outgoing-log").children;
+const outgoingRows = (page) => [...inPlaceRows(page), ...page.el("outgoing-log").children];
+/**
+ * `#467 inline-send-in-place`. The outbox's rows drawn where a reply's box was, under the row it
+ * answers, in the left column (`placeOutgoingInPlace`): in the order drawn.
+ */
+const inPlaceRows = (page, pane = "pane-discord") =>
+  page.el(pane).children.filter((node) => node.hasClass && node.hasClass("outgoing-inplace")).flatMap((group) => group.children);
 const outgoingRetry = (row) => row.descendants().find((node) => node.hasClass("outgoing-retry"));
 const outgoingDismiss = (row) => row.descendants().find((node) => node.hasClass("outgoing-dismiss"));
 const savedOutgoing = (page) => JSON.parse(page.storage.get("vibe-talk.outgoing-messages") || "[]");
@@ -66177,18 +66183,22 @@ async function tallReplyColumnsPage(script = SCRIPT) {
   return { page, data };
 }
 
-test("`#277 reply-in-column`: a reply sent from a column that does not go says so where the reader is — the status line, aloud, and that column's Newest chip reading Reply not sent until the reader has been down to the row with Retry", async () => {
+test("`#277 reply-in-column` with `#467 inline-send-in-place`: a reply sent from a column that does not go stays where it was written, with Retry, and the status line says so aloud", async () => {
+  // `#277 reply-in-column` told the reader where the row with Retry was, at the foot of the column,
+  // with the column's Newest chip as the way down. `#467 inline-send-in-place`: the row is drawn where
+  // the reply's box was, under the message it answers, where the reader is; the status line still says
+  // it aloud, and no chip leads anywhere.
   const { page } = await tallReplyColumnsPage();
   const left = page.el("scroll-area");
   const right = page.el("side-scroll");
   assert.ok(left.scrollHeight > left.clientHeight * 2 && right.scrollHeight > right.clientHeight * 2,
     "the columns are too short to stand part way up, so this proves nothing");
   assert.match(HTML_CODE, /<span id="status" role="status" aria-live="polite">/, "the status line is not a live region");
-  for (const [column, row, area, jump, label, answer, said] of [
+  for (const [column, row, area, jump, label, answer, said, pane] of [
     ["left", () => rowWithId(page, "200"), left, "jump-newest", "jump-newest-label", errorResponse(422, "chat_error", "Google Chat returned HTTP 400"),
-      { chip: "Reply not sent", status: /^Your reply was not sent\. Retry is at the foot of the left column\.$/ }],
+      { status: /^Your reply was not sent\. Retry is under the message it answers\.$/ }, "pane-discord"],
     ["right", () => sideRow(page, "202"), right, "side-jump-newest", "side-jump-newest-label", errorResponse(502, "chat_error", "Google Chat returned HTTP 502"),
-      { chip: "Reply unconfirmed", status: /^Your reply may not have been posted\. Check it at the foot of the right column\.$/ }],
+      { status: /^Your reply may not have been posted\. Check it under the message it answers\.$/ }, "side-pane"],
   ]) {
     area.scrollTop = 0;
     await area.dispatch("scroll");
@@ -66200,25 +66210,14 @@ test("`#277 reply-in-column`: a reply sent from a column that does not go says s
     await page.settle();
     assert.equal(replyBoxAt(page), "closed", `${column}: Send left the box in the column`);
     assert.equal(area.scrollTop, 0, `${column}: Send moved the column`);
-    // Where the reader is: the status line, which a screen reader hears.
     assert.equal(page.el("status-line").hidden, false, `${column}: the status line said nothing of the failure`);
     assert.match(page.el("status").textContent, said.status, `${column}: the status line said the wrong thing`);
-    // The way down, saying why: the column's Newest chip, in the outbox's orange.
-    assert.equal(page.el(jump).hidden, false, `${column}: no way down to the reply that did not go`);
-    assert.equal(page.el(label).textContent, said.chip, `${column}: the chip does not say the reply did not go`);
-    assert.ok(page.el(jump).hasAttribute("data-unsent"), `${column}: the chip is not marked as a reply not sent`);
-    assert.match(page.el(jump).getAttribute("aria-label"), /^Jump to your reply, which (was not sent|may not have been posted)/);
-    const host = column === "left" ? page.el("outgoing-log") : page.el("side-outgoing-log");
-    const held = host.children.find((one) => one.descendants().some((node) => node.textContent === "this will not go"));
-    assert.ok(held && outgoingRetry(held), `${column}: no outbox row with Retry for the chip to lead to`);
-    // Down to it: the chip takes the reader to the foot, where the row is, and goes back to saying Newest.
-    await page.el(jump).click();
+    const held = inPlaceRows(page, pane).find((one) => one.descendants().some((node) => node.textContent === "this will not go"));
+    assert.ok(held && outgoingRetry(held), `${column}: the reply that did not go is not where it was written, with Retry`);
+    assert.ok(!page.el(jump).hasAttribute("data-unsent"), `${column}: the chip leads down to a row the reader is at`);
+    assert.notEqual(page.el(label).textContent, "Reply not sent", `${column}: the chip names a reply drawn where the reader is`);
+    await outgoingDismiss(held).click();
     await page.settle();
-    assert.ok(atBottomOf(area), `${column}: the chip did not go down to the foot of the list`);
-    assert.equal(page.el(jump).hasAttribute("data-unsent"), false, `${column}: the chip still says the reply did not go, down by it`);
-    area.scrollTop = 0;
-    await area.dispatch("scroll");
-    assert.equal(page.el(label).textContent, "Newest", `${column}: once seen, the failure still holds the chip`);
     page.replyResponse = undefined;
   }
 
@@ -73434,7 +73433,7 @@ test("`#277 reply-in-column` with `#269 approval-card-inline`: a reply open at t
     "the control marked the card all the same, so this test cannot see the mark go missing");
 });
 
-test("`#277 reply-in-column` with `#269 approval-card-inline`: the left column's jump names a reply of its own that did not go before the draft below it, and the draft once that reply has been seen", async () => {
+test("`#277 reply-in-column` with `#269 approval-card-inline` and `#467 inline-send-in-place`: a reply of its own that did not go stays where it was written, and the jump goes on naming the draft below", async () => {
   const page = await draftInTwoColumns(SCRIPT, tallColumns);
   const area = page.el("scroll-area");
   const label = page.el("jump-newest-label");
@@ -73447,15 +73446,10 @@ test("`#277 reply-in-column` with `#269 approval-card-inline`: the left column's
   await page.el("reply-text").setValue("this will not go");
   await page.el("reply-send").click();
   await page.settle();
-  // Both wait at the foot. The draft was said when it appeared and counts down on its own card; the
-  // reply's Retry is said nowhere else, so the jump names it first.
-  assert.equal(label.textContent, "Reply not sent", "a draft below hid the reply that did not go");
-  assert.match(page.el("jump-newest").getAttribute("aria-label"), /^Jump to your reply, which was not sent/);
-  await page.el("jump-newest").click();
-  await page.settle();
-  area.scrollTop = 0;
-  await area.dispatch("scroll");
-  assert.equal(label.textContent, "Draft to send", "once the reply was seen, the jump forgot the draft still below");
+  // The reply's Retry is where the reader wrote it, under the message it answers, not at the foot.
+  const held = inPlaceRows(page).find((one) => one.descendants().some((node) => node.textContent === "this will not go"));
+  assert.ok(held && outgoingRetry(held), "the reply that did not go is not where it was written");
+  assert.equal(label.textContent, "Draft to send", "a reply drawn where the reader is took the jump from the draft below");
   assert.equal(page.el("jump-newest").getAttribute("aria-label"), "Jump to the draft waiting to be sent");
 });
 
@@ -80218,7 +80212,7 @@ test("`#466 reply-promotes-thread`: in two columns the thread a reply on its way
   assert.equal(tagOf(rowOf(page, "210")).text, "Thread(1)");
   await threadBadge(rowOf(page, "210")).click();
   await page.settle();
-  const right = () => page.el("side-outgoing-log").children;
+  const right = () => [...inPlaceRows(page, "side-pane"), ...page.el("side-outgoing-log").children];
   assert.equal(right().length, 1, "the thread on the right does not show the reply on its way");
   assert.match(right()[0].text(), /the first answer to 210/);
   finish(json(200, { posted: mine, parts: [mine] }));
@@ -80226,4 +80220,86 @@ test("`#466 reply-promotes-thread`: in two columns the thread a reply on its way
   await page.settle();
   assert.equal(right().length, 0, "the reply stayed in the outbox on the right once it was there");
   assert.ok(sideIds(page).includes(mine.id), `the reply is not drawn in its thread on the right: ${sideIds(page)}`);
+});
+
+// --- `#467 inline-send-in-place` -------------------------------------------------------------------
+//
+// The owner: "The compose box jumps to where it should be, in situ in the thread... But then the
+// little 'Sending..' box, the one that would show Retry if it fails, jumps back down to the BOTTOM,
+// not where the compose box was."
+
+/** The row of `pane`'s list named as the anchor an in-place row is drawn under, and that row's group. */
+function inPlaceAnchor(page, pane = "pane-discord") {
+  const group = page.el(pane).children.find((node) => node.hasClass && node.hasClass("outgoing-inplace"));
+  if (!group) return null;
+  const name = group.style.getPropertyValue("position-anchor");
+  const list = page.el(pane).children.find((node) => node.tagName === "OL" && node.children.some((row) =>
+    row.style.getPropertyValue("anchor-name") === name));
+  const row = list ? list.children.find((one) => one.style.getPropertyValue("anchor-name") === name) : null;
+  return { group, name, row };
+}
+
+for (const view of ["thread", "flat"]) {
+  test(`\`#467 inline-send-in-place\`: in ${view === "thread" ? "a thread" : "All"}, a reply sent from the box in the stream stays where the box was until it is drawn there itself`, async () => {
+    const page = await threadPage(view === "thread" ? "main" : "flat");
+    if (view === "thread") {
+      await threadBadge(page.el("discord-log").children[1]).click();
+      await page.settle();
+    }
+    const target = view === "thread" ? "202" : "203";
+    const finish = delayedReply(page);
+    await replyButton(rowOf(page, target)).click();
+    assert.ok(replyInStream(page), "the premise is the box in the stream");
+    await page.el("reply-text").setValue("answered where I read it");
+    const sent = page.el("reply-send").click();
+    await page.settle();
+    assert.equal(page.el("outgoing-log").children.length, 0, "the reply went to the foot of the list");
+    const placed = inPlaceRows(page);
+    assert.equal(placed.length, 1, "the reply is not drawn where its box was");
+    assert.match(placed[0].text(), /answered where I read it/);
+    assert.equal(placed[0].getAttribute("data-send-state"), "sending");
+    const anchor = inPlaceAnchor(page);
+    assert.ok(anchor && anchor.row, "the reply's row is named to no row of the list");
+    assert.ok(anchor.row.hasAttribute("data-outgoing-anchor"), "the row it is under keeps no room for it");
+    const rows = page.el("discord-log").children;
+    assert.ok(rows.indexOf(anchor.row) >= rows.indexOf(rowOf(page, target)),
+      "the reply is not under the message it answers, or what is gathered under it");
+    const parent = page.messages.find((held) => held.id === target);
+    const mine = message({ id: "9467000000000000001", content: "answered where I read it", reply_to: target,
+      ...(parent.thread ? { thread: { ...parent.thread, is_root: false } } : {}) });
+    page.messages = [...page.messages, mine];
+    finish(json(200, { posted: mine }));
+    await sent;
+    await page.settle();
+    assert.equal(inPlaceRows(page).length, 0, "the reply's row stayed beside the reply itself");
+    assert.ok(shownIds(page).includes(mine.id), "the reply is not drawn");
+    assert.equal(page.el("discord-log").children.filter((row) => row.hasAttribute("data-outgoing-anchor")).length, 0,
+      "a row still keeps room for a reply that is drawn");
+  });
+}
+
+test("`#467 inline-send-in-place`: a message sent from the box at the foot keeps its row at the foot", async () => {
+  const page = await threadPage("main");
+  delayedReply(page);
+  await page.el("channel-compose-text").setValue("to the main channel");
+  page.el("channel-send").click();
+  await page.settle();
+  assert.equal(inPlaceRows(page).length, 0, "a message from the foot was drawn under some row");
+  assert.equal(page.el("outgoing-log").children.length, 1, "a message from the foot is not at the foot");
+});
+
+test("`#467 inline-send-in-place`: a reply that does not go stays where it was written, with Retry, and Retry sends it from there", async () => {
+  const page = await threadPage("flat");
+  page.replyResponse = errorResponse(422, "chat_error", "Google Chat returned HTTP 400");
+  await replyButton(rowOf(page, "203")).click();
+  await page.el("reply-text").setValue("not this time");
+  await page.el("reply-send").click();
+  await page.settle();
+  const row = inPlaceRows(page)[0];
+  assert.ok(row && outgoingRetry(row), "the reply that did not go is not where it was written, with Retry");
+  page.replyResponse = errorResponse(422, "chat_error", "Google Chat returned HTTP 400");
+  await outgoingRetry(row).click();
+  await page.settle();
+  assert.equal(page.repliesPosted.length, 2);
+  assert.equal(inPlaceRows(page).length, 1, "Retry moved the reply's row");
 });

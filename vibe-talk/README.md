@@ -7495,6 +7495,20 @@ filter, open the reply's box in that list, in one column or two, on a phone as o
 - **It follows its row.** The box is drawn under its row by the stylesheet (anchor positioning), the row
   keeping room under itself as tall as the box, so it stays under it through a fold, a read run, an
   older page or a live message above it, and a resize.
+- **Sent, its row stays where the box was** (`#467 inline-send-in-place`). The owner: "the little
+  'Sending..' box, the one that would show Retry if it fails, jumps back down to the BOTTOM, not where
+  the compose box was." A reply sent from the box in the list is drawn under the same row, saying how it
+  goes ("Sending…", "Posting part 2 of 3…", or "Not sent" with Retry, Edit and Dismiss), in whichever list
+  of either column draws that message, until the reply itself is drawn, and the status line says where
+  its Retry is. Drawn by the same anchor positioning, its row keeping room for it. A message sent from the
+  box at the foot keeps its row at the foot.
+- **A reply starts its thread at once** (`#466 reply-promotes-thread`). Where a reply is a thread reply
+  (Slack), the message it answers reads as that thread's root the moment the reply is sent: its tag says
+  Thread(1) in the thread's colour, the Threads view has a card for the thread, and the thread shows the
+  reply on its way. All of it comes from the outbox, nothing is written into the message's own copy, and
+  a reply that was not sent keeps it, with Retry, until it is dismissed. The page's own post is not
+  taken away by a read that does not carry it yet, for ten minutes, unless it hears that the post was
+  removed (an interim rule until the server says how new each copy is).
 
 A column that changes under an open reply (another channel, thread or view) puts it away as a draft; so
 do Ctrl+1 to Ctrl+3 pressed while it is open, while Ctrl+4, two columns already, leaves it open (`#281

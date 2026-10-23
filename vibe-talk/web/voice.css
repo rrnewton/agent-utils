@@ -1317,7 +1317,8 @@ a.search-hit-link {
 /* Local sends live beside the confirmed history until their provider IDs arrive. They look like
    the reader's own messages, but carry delivery state instead of actions on a server message. */
 #side-outgoing-log .outgoing-message,
-#outgoing-log .outgoing-message {
+#outgoing-log .outgoing-message,
+.outgoing-inplace .outgoing-message {
   background: var(--mine);
   border-color: var(--mine-edge);
   margin-left: var(--speaker-inset);
@@ -1326,7 +1327,8 @@ a.search-hit-link {
 }
 
 #side-outgoing-log .msg-text,
-#outgoing-log .msg-text {
+#outgoing-log .msg-text,
+.outgoing-inplace .msg-text {
   white-space: pre-wrap;
   font-size: calc(0.88rem * var(--msg-scale));
 }
@@ -1710,6 +1712,30 @@ a.search-hit-link {
 .reply-actions > .composer-grow {
   order: -1;
   margin-inline-end: auto;
+}
+
+/*
+ * `#467 inline-send-in-place`. A reply sent from the box in the stream, drawn where the box was: under
+ * the row it answers (`data-outgoing-anchor`, named `--outgoing-N` by web/voice.js on both), that row
+ * keeping room under itself as tall as the rows drawn there (`--outgoing-room`). As wide as that row.
+ * Without anchor positioning they are drawn after the list, at its foot.
+ */
+.outgoing-inplace {
+  margin: 0;
+}
+
+@supports (anchor-name: --a) {
+  li[data-outgoing-anchor] {
+    margin-bottom: calc(0.75rem + var(--outgoing-room, 0px)) !important;
+  }
+
+  .outgoing-inplace {
+    position: absolute;
+    z-index: 1;
+    top: calc(anchor(bottom) + 0.25rem);
+    left: anchor(left);
+    right: anchor(right);
+  }
 }
 
 @supports (anchor-name: --a) {

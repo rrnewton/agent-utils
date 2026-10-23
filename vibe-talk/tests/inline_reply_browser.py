@@ -34,8 +34,20 @@ At 393x852 by touch, All: Reply on an old message mid-stream: the box under the 
 later rows below -> Send: posted, the box gone and the channel's box back, the row not moved.
 
 Then, in two columns, the service refusing a reply sent from the right column: the column not moved, the
-status line saying the reply was not sent and that its Retry is at the foot of the right column, and that
-column's Newest chip reading "Reply not sent". And the view keys pressed in a reply open on the left: a
+status line saying the reply was not sent and that its Retry is under the message it answers, and the row
+with Retry drawn there, directly under the row the box was under (`#467 inline-send-in-place`), with no
+Newest chip leading down to it.
+
+`#467 inline-send-in-place`, at 1280x800 in All: a reply sent from the box in the stream while the service
+holds its post: its "Sending…" row directly under the row the box was under, as wide as that row, the rows
+after it moved down by it and no more, the row answered not moved; the post answered: the row gone, and
+nothing above it moved.
+
+`#466 reply-promotes-thread`, at 1280x800 on a Slack-like service, where every message heads a thread of its
+own nobody has answered and a reply is posted in it: Reply on such a message in Main, sent while the post is
+held: the message's tag reads Thread(1) at once, in a thread's colour, the "Sending…" row under it; its tag
+opens the thread, which shows that row under its root; the post answered, the reply is drawn in the thread
+and the row is gone; back on Main the tag still reads Thread(1). And the view keys pressed in a reply open on the left: a
 real Ctrl+4 leaves it open, its words and the focus in the box; Ctrl+2 is All in one column with the reply
 put down, its words the row's draft.
 
@@ -85,9 +97,14 @@ class ReplyColumnsApi(ColumnsApi):
         # kept apart from those posted.
         self.refusing: tuple[int, Json] | None = None
         self.refused: list[Json] = []
+        # While set, a reply's post waits for it before it is answered, as a slow chat service's does.
+        self.holding: threading.Event | None = None
 
     def post(self, path: str, body: Json) -> tuple[int, Json]:
         if path.endswith("/reply"):
+            holding = self.holding
+            if holding is not None:
+                holding.wait(timeout=30)
             with self.lock:
                 if self.refusing is not None:
                     self.refused.append(body)
@@ -99,8 +116,13 @@ class ReplyColumnsApi(ColumnsApi):
                 reply_to = body.get("reply_to")
                 posted = said(100 + len(self.replies), str(body.get("text", "")), "me",
                               str(reply_to) if reply_to else None)
+                if root is None and reply_to and self.replies_in_thread:
+                    # Slack's server posts a reply in the thread of the message it answers.
+                    root = next((m for m in self.messages if str(m["id"]) == str(reply_to)
+                                 and thread_of(m).get("is_root") is True), None)
                 if root is not None:
-                    posted["thread"] = {**thread_of(root), "is_root": False}
+                    posted["thread"] = {**thread_of(root), "is_root": False, "reply_count": None,
+                                        "reply_count_exact": False}
                 self.messages.append(posted)
                 return 200, {"posted": posted, "parts": [posted]}
         if path.endswith("/dismiss"):
@@ -110,6 +132,8 @@ class ReplyColumnsApi(ColumnsApi):
                 self.dismissed.update(done)
             return 200, {"dismissed": done}
         return super().post(path, body)
+
+    replies_in_thread = False
 
     def timeline(self, query: dict[str, list[str]]) -> Json:
         answer = super().timeline(query)
@@ -122,6 +146,24 @@ class ReplyColumnsApi(ColumnsApi):
     def posted(self) -> list[Json]:
         with self.lock:
             return list(self.replies)
+
+
+class SlackLikeApi(ReplyColumnsApi):
+    """`#466 reply-promotes-thread`. The same channel on a service like Slack: a message in no thread heads
+    a thread of its own nobody has answered (its ts the thread's id, a count of none, exact), and a reply
+    to it is posted in that thread."""
+
+    replies_in_thread = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        for row in self.messages:
+            if not thread_of(row):
+                row["thread"] = {"id": f"ts-{row['id']}", "root_message_id": row["id"], "is_root": True,
+                                 "reply_count": 0, "reply_count_exact": True}
+
+    def client_config(self, scope: str) -> Json:
+        return {**super().client_config(scope), "replies_in_thread": True}
 
 
 # The open reply and what is around it: the row answered, the rows after it, the box, which message
@@ -163,6 +205,134 @@ MEASURE_JS = """([list, id]) => {
 }"""
 
 
+# `#467 inline-send-in-place`. The rows drawn where a reply's box was, the row they are named to, the row
+# after that one, the row `id` answered, and how far its scroller is down.
+IN_PLACE_JS = """([list, id]) => {
+    const box = (node) => {
+        if (!node || !node.getClientRects().length) return null;
+        const r = node.getBoundingClientRect();
+        return {left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height};
+    };
+    const log = document.getElementById(list);
+    const group = [...log.parentNode.children].find((node) => node.classList.contains('outgoing-inplace')) || null;
+    const name = group ? group.style.getPropertyValue('position-anchor') : '';
+    const rows = [...log.children];
+    const anchor = name ? rows.find((li) => li.style.getPropertyValue('anchor-name') === name) || null : null;
+    const after = anchor ? rows.slice(rows.indexOf(anchor) + 1).find((li) => li.getClientRects().length > 0) : null;
+    const row = rows.find((li) => (li.getAttribute('data-ids') || li.getAttribute('data-id') || '').split(' ').includes(id));
+    const scroller = document.getElementById(list === 'discord-log' ? 'scroll-area' : 'side-scroll');
+    return {
+        group: box(group), text: group ? group.textContent : '', anchor: box(anchor),
+        anchorId: anchor ? anchor.getAttribute('data-id') : null, after: box(after), row: box(row),
+        anchored: rows.filter((li) => li.hasAttribute('data-outgoing-anchor')).length,
+        foot: document.getElementById(list === 'discord-log' ? 'outgoing-log' : 'side-outgoing-log').children.length,
+        listTop: scroller.scrollTop, overflow: document.documentElement.scrollWidth - window.innerWidth,
+    };
+}"""
+
+
+def in_place(desk: Desk, list_id: str, message_id: str) -> Json:
+    found = desk.page.evaluate(IN_PLACE_JS, [list_id, message_id])
+    assert isinstance(found, dict)
+    return found
+
+
+def check_in_place(desk: Desk, found: Json, where: str, words: str) -> None:
+    """A reply's row where its box was: directly under the row it is named to, as wide, rows after below."""
+    desk.check(found["group"] is not None, f"{where}: the reply's row is not drawn where its box was: {found}")
+    desk.check(words in str(found["text"]), f"{where}: the row there says {found['text']!r}")
+    desk.check(number(found, "foot") == 0, f"{where}: the reply's row is at the foot of the list as well")
+    group, anchor = rect(found, "group"), rect(found, "anchor")
+    gap = group["top"] - anchor["bottom"]
+    desk.check(UNDER_PX[0] - 1 <= gap <= UNDER_PX[1] + 1, f"{where}: the row is {gap:.1f}px under its row, not directly under it")
+    desk.check(abs(group["left"] - anchor["left"]) <= 1 and abs(group["right"] - anchor["right"]) <= 1,
+               f"{where}: the row is not as wide as the row it is under: {group} {anchor}")
+    if found["after"] is not None:
+        after = rect(found, "after")
+        desk.check(after["top"] >= group["bottom"] - 0.5,
+                   f"{where}: the next row is at {after['top']:.1f}, under the reply's row ending at {group['bottom']:.1f}")
+        desk.check(after["top"] - group["bottom"] <= 16, f"{where}: a gap of {after['top'] - group['bottom']:.1f}px under the reply's row")
+    desk.check(number(found, "overflow") <= 0, f"{where}: the page scrolls sideways")
+
+
+def send_held(desk: Desk, api: ReplyColumnsApi, words: str) -> threading.Event:
+    """Type `words` in the open reply and send it while the service holds its post; answer the hold."""
+    held = threading.Event()
+    api.holding = held
+    desk.page.keyboard.type(words)
+    desk.page.click("#reply-send")
+    desk.wait_for("() => document.getElementById('column-reply').hidden && document.getElementById('side-reply').hidden",
+                  "sending did not put the reply's box away")
+    desk.settled()
+    return held
+
+
+def in_place_walk(desk: Desk, api: ReplyColumnsApi) -> None:
+    """`#467 inline-send-in-place` in All: the reply's row where its box was, until it is answered."""
+    sign_in(desk)
+    target = "205"
+    before = place(desk, "discord-log", target, 0.3)
+    press_reply(desk, "discord-log", target)
+    held = send_held(desk, api, "answered right here")
+    try:
+        found = in_place(desk, "discord-log", target)
+        check_in_place(desk, found, "on its way", "Sending")
+        desk.check(abs(rect(found, "row")["top"] - rect(before, "row")["top"]) <= 1, "sending moved the row answered")
+        desk.shot("2-in-place-sending")
+    finally:
+        held.set()
+        api.holding = None
+    desk.wait_for("() => !document.querySelector('.outgoing-inplace')", "the reply's row stayed once the post was answered")
+    desk.settled()
+    landed = in_place(desk, "discord-log", target)
+    desk.check(number(landed, "anchored") == 0, "a row still keeps room for a reply that went")
+    desk.check(abs(rect(landed, "row")["top"] - rect(before, "row")["top"]) <= 1, "the reply landing moved the row answered")
+    desk.notes.append(f"in All, a reply on {target} sent from the box in the stream: its row directly under the row, "
+                      "the rows after it below, nothing moved as it went")
+
+
+def promotes_walk(desk: Desk, api: ReplyColumnsApi) -> None:
+    """`#466 reply-promotes-thread` on a Slack-like service, in Main and the thread the reply starts."""
+    page = desk.page
+    sign_in(desk)
+    page.select_option("#thread-select", "main")
+    desk.wait_for("() => document.getElementById('thread-select').value === 'main'", "Main did not open")
+    desk.settled()
+    target = "205"
+    tag = f"#discord-log > li[data-id='{target}'] .thread-badge"
+    desk.check(page.eval_on_selector(tag, "(n) => n.getAttribute('data-thread-state')") == "start",
+               "the premise is a message nobody has answered")
+    place(desk, "discord-log", target, 0.3)
+    press_reply(desk, "discord-log", target)
+    held = send_held(desk, api, "the first answer to it")
+    try:
+        state = page.eval_on_selector(tag, "(n) => ({state: n.getAttribute('data-thread-state'), text: n.textContent,"
+                                      " hue: n.style.getPropertyValue('--thread-hue')})")
+        desk.check(state["state"] == "open" and state["text"] == "Thread(1)" and state["hue"] != "",
+                   f"on its way: the message answered is not a thread with one reply: {state}")
+        check_in_place(desk, in_place(desk, "discord-log", target), "on its way in Main", "Sending")
+        desk.shot("3-promoted-main")
+        page.click(tag)
+        desk.wait_for(f"() => document.getElementById('thread-select').value === 'thread:ts-{target}'",
+                      "the tag did not open the thread the reply starts")
+        desk.settled()
+        check_in_place(desk, in_place(desk, "discord-log", target), "on its way in its thread", "Sending")
+        desk.shot("4-promoted-thread")
+    finally:
+        held.set()
+        api.holding = None
+    desk.wait_for("() => !document.querySelector('.outgoing-inplace')"
+                  " && document.querySelectorAll('#discord-log > li[data-id]').length === 2",
+                  "the reply was not drawn in its thread once its post was answered")
+    page.select_option("#thread-select", "main")
+    desk.wait_for("() => document.getElementById('thread-select').value === 'main'", "Main did not open again")
+    desk.settled()
+    after = page.eval_on_selector(tag, "(n) => n.textContent")
+    desk.check(after == "Thread(1)", f"sent: the message answered reads {after!r}")
+    desk.notes.append(f"on a Slack-like service, a reply to {target} in Main made it Thread(1) at once, its row under "
+                      "it there and in the thread it opened, then the reply itself in the thread")
+
+
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--browser-executable", default=os.environ.get("VIBE_TALK_CHROMIUM"),
@@ -192,15 +362,17 @@ def main() -> int:
         report.append(run(playwright.chromium, args, "view-keys", DESK, False, view_keys_walk))
         report.append(run(playwright.chromium, args, "collapse-from-all", DESK, False, collapse_from_all))
         report.append(run(playwright.chromium, args, "collapse-from-main", DESK, False, collapse_from_main))
+        report.append(run(playwright.chromium, args, "in-place", DESK, False, in_place_walk))
+        report.append(run(playwright.chromium, args, "promotes", DESK, False, promotes_walk, SlackLikeApi))
     for line in report:
         print(line)
     return 0
 
 
 def run(chromium: BrowserType, args: argparse.Namespace, label: str, size: tuple[int, int], touch: bool,
-        walk: Callable[[Desk, ReplyColumnsApi], None]) -> str:
+        walk: Callable[[Desk, ReplyColumnsApi], None], api_class: type[ReplyColumnsApi] = ReplyColumnsApi) -> str:
     """One walk, against a fresh fake API and a fresh browser profile."""
-    api = ReplyColumnsApi()
+    api = api_class()
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api))
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -512,12 +684,15 @@ def refused_walk(desk: Desk, api: ReplyColumnsApi) -> None:
     after = measure(desk, "side-log", "206")
     desk.check(abs(number(after, "listTop") - number(opened, "listTop")) <= 1, "refused: Send moved the column")
     status = str(page.evaluate("() => document.getElementById('status').textContent"))
-    desk.check(status == "Your reply was not sent. Retry is at the foot of the right column.", f"refused: the status line says {status!r}")
-    chip = page.evaluate("() => ({shown: document.getElementById('side-jump-newest').getClientRects().length > 0,"
-                         " text: document.getElementById('side-jump-newest-label').textContent})")
-    desk.check(chip["shown"] is True and chip["text"] == "Reply not sent", f"refused: the right column's chip is {chip}")
+    desk.check(status == "Your reply was not sent. Retry is under the message it answers.", f"refused: the status line says {status!r}")
+    # `#467 inline-send-in-place`. The row with Retry where the box was, and no chip leading down to it.
+    check_in_place(desk, in_place(desk, "side-log", "206"), "refused", "Not sent")
+    desk.check(page.evaluate("() => !!document.querySelector('.outgoing-inplace .outgoing-retry')"),
+               "refused: the row where the box was offers no Retry")
+    chip = page.evaluate("() => document.getElementById('side-jump-newest-label').textContent")
+    desk.check(chip != "Reply not sent", "refused: the right column's chip leads down to a row the reader is at")
     desk.shot("1-refused")
-    desk.notes.append(f"a refused reply from the right column: the column unmoved, {status!r}, the chip {chip['text']!r}")
+    desk.notes.append(f"a refused reply from the right column: the column unmoved, {status!r}, its Retry where the box was")
 
 
 def view_keys_walk(desk: Desk, api: ReplyColumnsApi) -> None:

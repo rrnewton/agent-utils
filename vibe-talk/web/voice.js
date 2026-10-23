@@ -26498,17 +26498,102 @@ function renderOutgoingMessages() {
     searchable(row, "You", text);
     // `#211 link-filter`. A message you sent can hold a link like any other.
     row.linkText = String(text);
+    /** @type {any} */ (row).outgoingEntry = entry;
     rows.push(row);
   }
   if (retired) persistOutgoingMessages();
-  host.replaceChildren(...rows);
+  // `#467 inline-send-in-place`. A reply sent from the box in the stream stays where the box was.
+  const foot = placeOutgoingInPlace(rows);
+  host.replaceChildren(...foot);
   // Nor over the Pinned filter, which shows pinned messages and nothing else. `#206 pin-message`.
-  host.hidden = rows.length === 0 || pinnedOnly;
+  host.hidden = foot.length === 0 || pinnedOnly;
   // `#228 reply-visible`. A reply of the owner's counts on the Reply of the message it answers from
   // the moment it is queued, and that count changes as it lands, fails or is dismissed: counted
   // again when the outbox's replies have changed since the counts were drawn. Not on a pass over
   // the rows, which has just counted them.
   if (outgoingReplyKey() !== countedOutgoingKey) renderReplyCounts();
+}
+
+// --- a reply's row where its box was ----------------------------------------------------------------
+//
+// `#467 inline-send-in-place`. The owner: "The compose box jumps to where it should be, in situ in the
+// thread... But then the little 'Sending..' box, the one that would show Retry if it fails, jumps back
+// down to the BOTTOM, not where the compose box was. This should provide better continuity."
+//
+// A reply sent from the box in the stream (`#410 inline-reply-editor`) keeps its row there: under the
+// message it answered and what is gathered under it (`anchorUnder`), in whichever list of the column
+// draws that message — a thread, Main, All, the rows unpacked under the Threads view's cards, either
+// column — saying how it goes ("Sending…", "Posting part 2 of 3…", or "Not sent" with Retry and Edit),
+// until the reply itself is drawn in its place, which retires the row as it always has. A message sent
+// from the box at the foot keeps its row at the foot, where it was written. Drawn as the box is: never
+// a row of the list, but named to its row by an anchor of its own (`--outgoing-N`), that row keeping
+// room under itself as tall as what is drawn there, so the rows after it move down by that and no
+// more, and nothing jumps when the reply takes its place. Without anchor positioning it is drawn after
+// the list, at its foot. Not under the row the open reply's box is drawn under: that one place holds
+// one thing, and the row goes to the foot until the box moves on.
+
+/** By column, the rows named as anchors on its last pass, and the lists of rows drawn under them. */
+const outgoingInPlaceDrawn = new Map();
+
+/**
+ * Put each of `rows` — the outbox's rows for the column being worked on — whose entry was sent from the
+ * box in the stream under the row that box was under, and answer the rest, for the foot.
+ *
+ * @param {HTMLElement[]} rows
+ * @returns {HTMLElement[]}
+ */
+function placeOutgoingInPlace(rows) {
+  const drawn = outgoingInPlaceDrawn.get(activeColumn) || { anchors: [], groups: [] };
+  for (const anchor of drawn.anchors) {
+    anchor.removeAttribute("data-outgoing-anchor");
+    anchor.style.removeProperty("anchor-name");
+    anchor.style.removeProperty("--outgoing-room");
+  }
+  for (const group of drawn.groups) if (group.parentNode) group.parentNode.removeChild(group);
+  const lists = [el(pinnedOnly ? "pinned-log" : "discord-log")];
+  if (activeColumn === columns.side && columns.side.mode !== "thread") lists.push(leftEl("side-cards"));
+  /** @type {Map<HTMLElement, {list: HTMLElement, rows: HTMLElement[]}>} */
+  const under = new Map();
+  /** @type {HTMLElement[]} */
+  const foot = [];
+  for (const row of rows) {
+    const entry = /** @type {any} */ (row).outgoingEntry;
+    let found = null;
+    if (entry && entry.inPlace) {
+      for (const list of lists) {
+        const anchor = shownNode(list) ? anchorUnder(list, String(entry.inPlace)) : null;
+        if (anchor) {
+          found = { list, anchor };
+          break;
+        }
+      }
+    }
+    if (!found || found.anchor === inlineAnchor || found.anchor.hasAttribute("data-inline-reply")) {
+      foot.push(row);
+      continue;
+    }
+    const held = under.get(found.anchor) || { list: found.list, rows: [] };
+    held.rows.push(row);
+    under.set(found.anchor, held);
+  }
+  const next = { anchors: [], groups: [] };
+  let n = 0;
+  for (const [anchor, { list, rows: placed }] of under) {
+    const name = `--outgoing-${activeColumn === columns.side ? "side" : "main"}-${n++}`;
+    const group = document.createElement("ol");
+    group.className = "messages outgoing-inplace";
+    group.setAttribute("aria-label", "Outgoing reply");
+    group.style.setProperty("position-anchor", name);
+    group.append(...placed);
+    /** @type {HTMLElement} */ (list.parentNode).append(group);
+    anchor.setAttribute("data-outgoing-anchor", "");
+    anchor.style.setProperty("anchor-name", name);
+    anchor.style.setProperty("--outgoing-room", `${Math.ceil(group.getBoundingClientRect().height || 0)}px`);
+    next.anchors.push(anchor);
+    next.groups.push(group);
+  }
+  outgoingInPlaceDrawn.set(activeColumn, next);
+  return foot;
 }
 
 /** The outbox's rows in every column showing messages: what the outbox did is no one column's. `#229`. */
@@ -41464,6 +41549,9 @@ async function sendReply() {
   const branch = route.branch && el("reply-branch").checked ? route.branch : null;
   const completion = queueOutgoingMessage({
     channel, threadId: branch || route.into || route.thread, replyTo: String(target.id), text,
+    // `#467 inline-send-in-place`. Sent from the box in the stream: its row is drawn where that box was,
+    // under the message it answers, until the reply itself is drawn (`placeOutgoingInPlace`).
+    ...(replyDocked ? { inPlace: String(target.id) } : {}),
     // `#300 reply-marks-read`. A targeted reply marks the message it answers, wherever it goes.
     marksRead: String(target.id),
     // Not where to post yet: the send reads the channel first. See `placeReplyTarget`.
@@ -41484,7 +41572,11 @@ async function sendReply() {
   // answered turns Done where it stands (`markAnsweredDone`), which says the reply went, and the reply
   // joins what Reply gathered under it as it lands. A reply that does not go says so where the reader
   // is, the outbox row that offers Retry being down at the column's foot (`reportColumnReply`).
-  if (replyDocked) leaveDockedReply(String(target.id), { sent: true });
+  if (replyDocked) {
+    leaveDockedReply(String(target.id), { sent: true });
+    // `#467 inline-send-in-place`. Its row takes the place the box has just left.
+    renderOutgoingEverywhere();
+  }
   await completion;
 }
 
@@ -41658,11 +41750,23 @@ function gatherForReply(list) {
  * @param {HTMLElement} list
  */
 function inlineReplyAnchor(list) {
-  if (!replyTarget) return null;
-  const id = String(replyTarget.id);
+  return replyTarget ? anchorUnder(list, String(replyTarget.id), replyTarget) : null;
+}
+
+/**
+ * The row of `list` a box answering message `id` (`message`, else its copy on the row) is drawn under,
+ * by `inlineReplyAnchor`'s rule: the last drawn row of what is gathered under it, or its own row. Null
+ * where its row is not drawn.
+ *
+ * @param {HTMLElement} list
+ * @param {string} id
+ * @param {any} [message]
+ */
+function anchorUnder(list, id, message = null) {
   const rows = /** @type {HTMLElement[]} */ ([...list.children]);
   const own = rows.find((row) => idsOf(row).includes(id));
   if (!own || !rowShown(own)) return null;
+  const answered = message || rowMessages(own).find((held) => String(held.id) === id) || null;
   const after = rows.slice(rows.indexOf(own) + 1);
   let last = own;
   const block = own.getAttribute("data-unpack-thread");
@@ -41670,7 +41774,7 @@ function inlineReplyAnchor(list) {
   let under;
   if (block !== null) {
     under = (row) => own.hasAttribute("data-root-child") && row.getAttribute("data-unpack-thread") === block;
-  } else if (list === el("discord-log") && rootOfOpenThread(replyTarget)) {
+  } else if (list === el("discord-log") && answered && rootOfOpenThread(answered)) {
     under = () => true;
   } else {
     const replies = repliesTo(id, rows.flatMap(rowMessages));
@@ -41938,6 +42042,18 @@ function reportColumnReply(entry) {
     setStatus(waiting.offline
       ? "Your reply is not sent yet: this device is offline. It goes when the connection is back."
       : "Your reply is not sent yet. The page tries again in a moment.");
+    return;
+  }
+  // `#467 inline-send-in-place`. Drawn where it was written, under the message it answers: said so, and
+  // no way down to a row the reader is already at.
+  const placed = (outgoingInPlaceDrawn.get(column) || { groups: [] }).groups
+    .some((group) => [...group.children].some((row) => /** @type {any} */ (row).outgoingEntry === entry));
+  if (placed) {
+    setStatus(entry.state === "failed"
+      ? entry.postedCount > 0
+        ? "Only part of your reply was sent. Retry the rest under the message it answers."
+        : "Your reply was not sent. Retry is under the message it answers."
+      : "Your reply may not have been posted. Check it under the message it answers.");
     return;
   }
   // Where the row is: in the column it was sent from while that column shows where it went.
