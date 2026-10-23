@@ -79263,8 +79263,10 @@ test("`#459 pack-keeps-card-still`: the room is one way — scrolling up takes i
 test("`#459 pack-keeps-card-still`: a reply arriving while the room is open fills it and does not move the reader; one taller than the room takes them on to the foot by what is left over", async () => {
   const run = async (script) => {
     // A taller column and two replies a thread, so the room the pack leaves is taller than one reply.
+    // The foot keeper's observer too, told of the rows' new size as a browser tells it.
     const { page, server, data } = await stillPage((p) => {
       p.el("side-scroll").clientHeight = 2 * SCROLL_VIEWPORT_PX;
+      p.enableResizeObserver();
     }, script, { replies: 2 });
     const side = page.el("side-scroll");
     const id = stillTarget(page);
@@ -79274,6 +79276,8 @@ test("`#459 pack-keeps-card-still`: a reply arriving while the room is open fill
     const room = overextendPx(page);
     const last = data.threads.at(-1).root;
     await liveReply(page, server, last, "899");
+    page.resized(page.el("side-list"));
+    await page.settle();
     const out = { moved: top() - before, filled: overextendPx(page) < room };
     // Replies until what came is taller than the room: the reader at the foot of the rows, the room closed.
     for (let n = 0; n < 12 && overextendPx(page) > 0; n += 1) await liveReply(page, server, last, String(900 + n));
@@ -79285,6 +79289,24 @@ test("`#459 pack-keeps-card-still`: a reply arriving while the room is open fill
   // THE CONTROL. The foot followed as if the room were not there: the reply yanks the view up by its height.
   const yanked = await run(brokenScript("  if (overextendRoom(area) > 0) {\n    fitOverextend(area);\n    if (overextend !== null) return;\n  }\n", ""));
   assert.ok(yanked.moved < 0, `the control: following the foot through the room did not move the card (${yanked.moved})`);
+});
+
+test("`#459 pack-keeps-card-still`: a card partly above the screen is held exactly where it is, not brought down to the screen's top", async () => {
+  // Partly above the screen, up the list: packed where it stands, its top still 20px over the edge.
+  const partly = async (script) => {
+    const { page } = await stillPage(null, script);
+    const id = stillCardIds(page)[2];
+    const area = page.el("side-scroll");
+    await scrollStill(page, area.scrollTop + cardRow(page, id).getBoundingClientRect().top + 20);
+    const before = cardRow(page, id).getBoundingClientRect().top;
+    assert.equal(before, -20, "the premise: the card's top is 20px above the screen");
+    await packBy(page, id, "click");
+    return cardRow(page, id).getBoundingClientRect().top - before;
+  };
+  assert.equal(await partly(SCRIPT), 0, "a card partly above the screen moved as it was packed");
+  const clamped = await partly(brokenScript("  const before = box ? (box.bottom <= stage ? stage : box.top) : null;",
+    "  const before = box ? Math.max(box.top, stage) : null;"));
+  assert.equal(clamped, 20, "the control: held at the screen's top, the card did not come down by what was above it");
 });
 
 // --- the gap a packed thread leaves, held and then closed (#460 pack-gap-slide) ----------------------------

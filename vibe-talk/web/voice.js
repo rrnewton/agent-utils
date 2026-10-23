@@ -2572,7 +2572,9 @@ function closeOverextend() {
 
 /**
  * Give `area` the room past its foot that lets it scroll to `top`, and no more: closed where it already
- * scrolls that far without it. How far it scrolls without it is measured from where the room starts, the
+ * scrolls that far without it. Fitting it again (`fit`) never makes it taller, and closes it within a pixel
+ * of the foot: the end of the rows is fractional and the browser rounds the scroll range, so a room fitted
+ * up to wherever the reader stands could leave them a pixel more to scroll each time, and grow under them. How far it scrolls without it is measured from where the room starts, the
  * end of the rows as laid out, rather than from `scrollHeight`, which counts the rows sliding into a gap
  * (`#460 pack-gap-slide`) where they are drawn: fitted by that, the room would be short by the slide, and
  * the browser's clamp would take the reader up as the slide ended.
@@ -2580,15 +2582,16 @@ function closeOverextend() {
  * @param {HTMLElement} area
  * @param {number} top
  */
-function sizeOverextend(area, top) {
+function sizeOverextend(area, top, fit = false) {
   overextendRoom(area);
   const pad = typeof window.getComputedStyle === "function"
     ? parseFloat(window.getComputedStyle(area).paddingBottom) || 0 : 0;
   const end = area.scrollTop + leftEl("side-overextend").getBoundingClientRect().top -
     area.getBoundingClientRect().top - (area.clientTop || 0);
   const furthest = end + pad - (area.clientHeight || 0);
-  const px = Math.ceil(top - furthest);
-  if (px < 1) {
+  const want = top - furthest;
+  const px = fit && overextend !== null ? Math.min(overextend.px, Math.ceil(want)) : Math.ceil(want);
+  if (px < 1 || (fit && want < 1)) {
     closeOverextend();
     return;
   }
@@ -2605,13 +2608,13 @@ function sizeOverextend(area, top) {
  * @param {HTMLElement} area
  */
 function fitOverextend(area) {
-  if (overextendRoom(area) > 0) sizeOverextend(area, area.scrollTop);
+  if (overextendRoom(area) > 0) sizeOverextend(area, area.scrollTop, true);
 }
 
 /**
  * Run `change` to the cards with thread `id`'s card held exactly where it is on the screen, past the foot
- * of the list where that is what it takes. A card above the screen — ^ pressed deep in its unpacked
- * block — is held at the top of it instead, so what is left is never a screen of blank room. Whether the
+ * of the list where that is what it takes. A card wholly above the screen — ^ pressed deep in its
+ * unpacked block — is held at the top of it instead, so what is left is never a screen of blank room. Whether the
  * card was held: not where it was not drawn before, or is not after.
  *
  * @param {string} id
@@ -2622,8 +2625,9 @@ function keepingCardStill(id, change, slide = false) {
   // A slide still running is ended first: everything is measured where it is laid out.
   finishPackSlide();
   const row = cardRow(id);
-  const before = row && rowShown(row)
-    ? Math.max(row.getBoundingClientRect().top, area.getBoundingClientRect().top) : null;
+  const box = row && rowShown(row) ? row.getBoundingClientRect() : null;
+  const stage = area.getBoundingClientRect().top;
+  const before = box ? (box.bottom <= stage ? stage : box.top) : null;
   const next = slide && row ? itemAfterBlock(row) : null;
   const was = next ? { key: slideKey(next), top: next.getBoundingClientRect().top } : null;
   change();
@@ -2656,7 +2660,7 @@ function keepingCardStill(id, change, slide = false) {
 // one there would have been without it. Only what is on the screen moves, and by no more than its height,
 // so a long thread packed costs one screenful of motion. Not for Pack all, whose threads each leave a gap
 // of their own; not while a reply is open under a row, whose box is anchored to it; and ended at once by
-// the reader's own wheel, touch, press or key on the list, or another pack.
+// the reader's own wheel or key on the list, any redraw of the cards, or another pack.
 
 /** The slides running, to end them (`finishPackSlide`). @type {Set<Animation>} */
 const packSlides = new Set();
@@ -52232,9 +52236,10 @@ leftEl("side-scroll").addEventListener("wheel", (/** @type {WheelEvent} */ event
   if (typeof area.scrollBy === "function") area.scrollBy({ top: px, behavior: "smooth" });
   else area.scrollTop += px;
 }, PASSIVE);
-// `#460 pack-gap-slide`. The reader's own wheel, touch, press or key on the list ends a slide at once: what
-// they act on is where it is laid out. Not a scroll, which the page's own place-keeping makes too.
-for (const type of ["wheel", "touchstart", "pointerdown", "keydown"]) {
+// `#460 pack-gap-slide`. The reader's own wheel or key on the list ends a slide at once: what they act on is
+// where it is laid out. Not a scroll, which the page's own place-keeping makes too; nor a press or a touch,
+// whose click lands on what was under the pointer as it went down, which ending the slide would move.
+for (const type of ["wheel", "keydown"]) {
   leftEl("side-scroll").addEventListener(type, finishPackSlide, PASSIVE);
 }
 // ...and goes back below the screen as the reader goes back up past the foot, or once they have rested at
