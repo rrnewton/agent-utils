@@ -205,7 +205,7 @@ wins, a push never revives a deletion, absence deletes only inside a listing's p
 below the unsettled band. The send log joins by key: a repeat of a key gets the original outcome,
 never a second post. A restart keeps it once C5 lands.
 
-**The owner's decisions on sends (2026-10-23).**
+**The owner's decisions (2026-10-23).**
 
 - **Look upstream before Retry (C6): yes.** After an uncertain single-part send on Slack, the server
   reads the destination before it offers Retry.
@@ -224,6 +224,18 @@ never a second post. A restart keeps it once C5 lands.
 
   Where a transport (a bridge, an adapter) does not pass the mechanism through, the server falls back
   to C6's text match and says so in its diagnostics.
+- **Settings follow the data model.** Anything that touches the messaging data model (what counts as
+  read, like "own messages count as read") is server-side and synced; presentation (text size and
+  the like) stays on the device. The owner would like the split to match Settings' top-level groups:
+  "Screen and keys" is the one client-side section, marked "(client side)" in small, faint type after
+  its title, and every other section is server-side. This resolves F9; the implementation lane is
+  mu-settings.
+- **A thread whose root was deleted upstream** but whose replies remain is kept, with a "message
+  removed" root (race R3). In the owner's words: "Deleting and editing are not the focus of
+  vibe-talk; continually moving forward at a fast pace is."
+- **Undo on one device versus Done on another**: last action wins, per message (the coordinator's
+  call; the owner had no preference). Done stays a server-serialized set, so F7 is accepted as
+  designed and C9 drops the observed-remove variant.
 
 **What remains, and where it lands.** C1 to C9 are the replication model's changes. Synthesis
 appendix 4's steps are a different list, always written here as "cutover C1" to "cutover C6".
@@ -238,7 +250,9 @@ appendix 4's steps are a different list, always written here as "cutover C1" to 
 | C6 | after an uncertain single-part send, look upstream before offering Retry, matching on the operation-key marker where the provider carries one | 0.3.0 Sync (owner: yes) |
 | C7 | send the server's versions to the page; retire read-send order | 0.3.0 Sync |
 | C8 | the served root counts its own posted reply | 0.3.0, or drop |
-| C9 | hue eviction, read-mark epochs, observed-remove Done | 0.3.0, as answered (E7) |
+| C9 | hue eviction and read-mark epochs; Done stays last-action-wins (E7 answered) | 0.3.0 Sync |
+| R3 | keep a thread whose root was deleted upstream, drawn with a "message removed" root | 0.3.0 Sync |
+| F9 | read-affecting settings move to the server; Settings marks its one client-side section | 0.1.x, mu-settings lane |
 | §8 | model-based property tests on server and page | 0.3.0; required for 1.0 |
 
 ## Summaries, briefings and research on the same data
@@ -315,9 +329,8 @@ component's history, so vibe-talk needs namespaced tags.
 - **Tags** `vibe-talk-vX.Y.Z` on `main`, with `vibe-talk/Cargo.toml` bumped in the same commit
   (`vibe-talk: release 0.2.0`). The health route and `vibe-talk --version` already report the Cargo
   version, so once it is bumped a deployment says what it runs.
-- **`0.1.0`: today's deployed state**, tagged retroactively on the commit currently deployed (the
-  coordinator knows which; if the two deployments differ, the older one). No code change but the
-  Cargo bump on `main`.
+- **`0.1.0`: today's deployed state.** The coordinator is tagging it on 2026-10-23, and near-term
+  fixes continue as 0.1.x. No code change but the Cargo bump on `main`.
 - **`0.1.x`: patch releases** for work inside the current architecture, which is what the in-flight
   lanes are: the send dedupe and reply-promotes-thread, the Slack tail ingest and backfill, UI polish.
   A deploy of new code bumps the patch.
@@ -440,16 +453,21 @@ channel-bars, TA = thread-list-animation, 03 = synthesis appendix 3, new = this 
   (synthesis appendix 2).
 - **The speech synthesizer's runaway** belongs to the private voice stack, not this repository
   (voice audit).
-- **Sends (E1 to E4).** Owner, 2026-10-23: look upstream before Retry; a failed reply to a removed
-  message goes in the gap in Main, with the outbox foot as fallback; Edit mints a new key and warns,
-  and is never refused; an invisible operation-key marker wherever the provider carries one. See
-  "Sync and replication".
+- **Sync and replication (E1 to E7).** Owner, 2026-10-23: look upstream before Retry; a failed
+  reply to a removed message goes in the gap in Main, with the outbox foot as fallback; Edit mints a
+  new key and warns, and is never refused; an invisible operation-key marker wherever the provider
+  carries one; settings that touch the messaging data model are server-side and only "Screen and
+  keys" stays on the device; a thread whose root was deleted is kept with a "message removed" root;
+  Undo versus Done across devices is last-action-wins (the coordinator's call). See "Sync and
+  replication".
 
 ### A. Names and versions
 
 1. ★ Adopt the terminology in TERMINOLOGY.md? (new)
-2. ★ The version scheme: `vibe-talk-v0.1.0` tagged on the deployed commit, one minor per milestone
-   from 0.2.0, and 1.0 meaning frozen contracts and proven sync rather than every feature? (new)
+2. ★ The version scheme. Settled: 0.1.0 is tagged now, fixes continue as 0.1.x, and "the big work
+   is 0.2". Still open: does each later milestone get its own minor (0.3.0 Sync, 0.4.0 logbook, …),
+   as proposed here, or does 0.2 cover more of the plan? And is 1.0 frozen contracts and proven
+   sync rather than every feature? (new)
 3. ★ (before 0.4.0) Is `logbook` the crate's name, and does it live in `rs/logbook` with vibe-talk's
    container built from the repository root, or inside `vibe-talk/`? (SY Q2)
 
@@ -499,12 +517,11 @@ channel-bars, TA = thread-list-animation, 03 = synthesis appendix 3, new = this 
    wherever the provider carries it invisibly. Still open: should the agents' posting tools stamp the
    same kind of id, so the posting join is exact rather than a normalized text match? It is the same
    mechanism. (RM Q4, synthesis 02 "Joining the two layers")
-5. Should read-affecting per-device settings ("own messages count as read", and perhaps pack and
-   fold state) sync through the server? (RM Q5)
-6. When a thread's root is deleted upstream but replies remain, keep the thread with a "message
-   removed" root, or drop it? (RM Q6)
-7. Does Undo on one device need to leave a Done made on another device (an observed-remove set), or
-   is last-action-wins fine? (RM Q7)
+5. Answered 2026-10-23: anything touching the messaging data model is server-side; presentation
+   stays on the device, ideally as one Settings group, "Screen and keys", marked "(client side)".
+   (RM Q5)
+6. Answered 2026-10-23: keep the thread with a "message removed" root. (RM Q6)
+7. Answered 2026-10-23 (the coordinator's call): last action wins, per message. (RM Q7)
 
 ### F. The voice agent
 
