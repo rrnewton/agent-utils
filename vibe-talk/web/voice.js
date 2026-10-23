@@ -2649,8 +2649,8 @@ function keepingCardStill(id, change, slide = false) {
 // exactly as without any motion (`keepingCardStill`); then everything below the thread on the screen is
 // drawn, by a transform alone, where it was, and let go: after `--pack-gap-hold` it slides home over
 // `--pack-slide`, both on #screen-main in web/voice.css, and 0 for a reader whose system asks for less
-// motion, when nothing moves at all. Unpacked, the thread's rows fade in under the cards sliding down off
-// them, with no hold. Nothing is laid out again and nothing waits: every measure after the slide is the
+// motion, when nothing moves at all. Unpacked, the thread's rows fade in as the cards slide down from under
+// them, with no hold; the card and its rows are drawn over what slides (`slideOver`), so it never covers them. Nothing is laid out again and nothing waits: every measure after the slide is the
 // one there would have been without it. Only what is on the screen moves, and by no more than its height,
 // so a long thread packed costs one screenful of motion. Not for Pack all, whose threads each leave a gap
 // of their own; not while a reply is open under a row, whose box is anchored to it; and ended at once by
@@ -2658,6 +2658,21 @@ function keepingCardStill(id, change, slide = false) {
 
 /** The slides running, to end them (`finishPackSlide`). @type {Set<Animation>} */
 const packSlides = new Set();
+
+/**
+ * The card a slide is for and its own rows, drawn over what slides (`data-slide-over`): what is below starts
+ * where it was, over the room the card or its rows just took, and would cover them, and take a press meant
+ * for them, until it had slid away.
+ *
+ * @type {Set<HTMLElement>}
+ */
+const slideOver = new Set();
+
+/** The slides ended or done: the card and its rows drawn in the list's order again. */
+function endSlideOver() {
+  for (const item of slideOver) item.removeAttribute("data-slide-over");
+  slideOver.clear();
+}
 
 /** A duration the stylesheet says on #screen-main, in ms: 0 where it says none (`cardFlightMs`). */
 function screenMotionMs(name) {
@@ -2671,6 +2686,7 @@ function screenMotionMs(name) {
 function finishPackSlide() {
   for (const motion of [...packSlides]) motion.finish();
   packSlides.clear();
+  endSlideOver();
 }
 
 /** What an item of the cards is across a redraw, which draws every item anew: its kind and its id. */
@@ -2731,10 +2747,19 @@ function slideIntoPlace(row, was) {
   const play = (/** @type {HTMLElement} */ item, /** @type {Keyframe[]} */ keyframes) => {
     const motion = item.animate(keyframes, { duration: total });
     packSlides.add(motion);
-    const done = () => packSlides.delete(motion);
+    const done = () => {
+      packSlides.delete(motion);
+      if (packSlides.size === 0) endSlideOver();
+    };
     motion.addEventListener("finish", done);
     motion.addEventListener("cancel", done);
   };
+  const id = row.getAttribute("data-id");
+  for (const item of [row, .../** @type {HTMLElement[]} */ ([...leftEl("side-cards").children])
+    .filter((one) => one.getAttribute("data-unpack-thread") === id)]) {
+    item.setAttribute("data-slide-over", "");
+    slideOver.add(item);
+  }
   for (const item of items) {
     const box = item.getBoundingClientRect();
     // On the screen where it is drawn from, or where it comes to: the rest neither seen nor moved.
@@ -2742,9 +2767,8 @@ function slideIntoPlace(row, was) {
     if (Math.max(box.bottom, box.bottom + shift) <= stage.top) continue;
     play(item, frames);
   }
-  // Unpacked, the thread's own rows come in under the cards sliding off them.
+  // Unpacked, the thread's own rows fade in as the cards slide down from under them.
   if (moved < 0) {
-    const id = row.getAttribute("data-id");
     for (const item of /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children])) {
       if (item.getAttribute("data-unpack-thread") !== id || !rowShown(item)) continue;
       const box = item.getBoundingClientRect();

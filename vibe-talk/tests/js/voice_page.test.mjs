@@ -79242,10 +79242,13 @@ test("`#460 pack-gap-slide`: packed, what is after the thread on the screen is d
         return m.element.getBoundingClientRect().top + shift === was[at];
       }),
       layout: items().map((li) => li.getBoundingClientRect().top),
+      // The card drawn over what slides while it slides, so nothing covers it or takes its press.
+      over: cardRow(page, id).hasAttribute("data-slide-over"),
     };
     // A wheel on the list ends the slide at once.
     await page.el("side-scroll").dispatch("wheel", { deltaY: 0, timeStamp: 0 });
     out.wheelEnded = motions.length === 0 || motions.every((m) => m.ended);
+    out.overEnded = !page.el("side-cards").children.some((li) => li.hasAttribute("data-slide-over"));
     // Unpacked again: whole (nothing below moves), then unpacked.
     motions.length = 0;
     await cardOf(page, id).click();
@@ -79266,6 +79269,8 @@ test("`#460 pack-gap-slide`: packed, what is after the thread on the screen is d
   ], "the pack did not hold the cards below where they were and slide them up");
   assert.equal(moving.fromWhereItWas, true, "the first frame does not draw the cards below where they were");
   assert.equal(moving.wheelEnded, true, "a turn of the wheel did not end the slide");
+  assert.deepStrictEqual([moving.over, moving.overEnded], [true, true], "the card is not drawn over what slides while it slides, and only then");
+  assert.match(cssBlock("#side-cards > [data-slide-over]"), /position:\s*relative;\s*z-index:\s*1;/, "nothing draws the card over what slides");
   assert.equal(moving.whole, 0, "the card shown whole slid what is below it, which did not move");
   assert.deepStrictEqual(moving.unpacked, [
     ["card", ["translateY(-100px)", "none"], 260],
@@ -79274,7 +79279,7 @@ test("`#460 pack-gap-slide`: packed, what is after the thread on the screen is d
   ], "the unpack did not slide the cards below down off the thread's rows");
   // Reduced motion: the stylesheet's 0ms, and nothing animated; the layout exactly as with the motion.
   const still = await run({ "--pack-gap-hold": "0ms", "--pack-slide": "0ms" });
-  assert.deepStrictEqual([still.packed, still.unpacked], [[], []], "under reduced motion something moved");
+  assert.deepStrictEqual([still.packed, still.unpacked, still.over], [[], [], false], "under reduced motion something moved");
   assert.deepStrictEqual(still.layout, moving.layout, "the motion changed the layout it settles on");
   // The stylesheet: the durations on #screen-main, and 0 under reduced motion.
   assert.match(CSS_CODE, /#screen-main \{\s*--pack-gap-hold: 200ms;\s*--pack-slide: 260ms;\s*\}/);

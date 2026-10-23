@@ -27,7 +27,8 @@ size: sign in, the Threads view, Unpack all, at the foot ->
    six turns of the wheel: back no further than they were (a pixel's rounding), the room never taller; up
    past the room: it is gone, and the end is the foot of the rows again;
 4. at the foot, the card unpacked and packed again (the room open), then unpacked from inside the room
-   (whole, then unpacked): its top the same in every frame, the first card after it drawn where it was in
+   (whole, then unpacked; the foot of the card shown whole under the pointer while what is below slides
+   down from over it): its top the same in every frame, the first card after it drawn where it was in
    the first frame and moving only down, and no room left at all; at a desk the wheel at the foot then
    opens none;
 5. up the list, a card near the top packed by its triangle: its top unchanged and no room opened;
@@ -435,7 +436,17 @@ def still_walk(desk: Desk, api: StillApi, touch: bool) -> None:
     page.wait_for_timeout(600)
     inside = still(desk, card)
     desk.check(inside["state"] == "collapsed" and num(inside["room"]) > 0, f"packed at the foot again, no room held the card: {inside}")
-    page.evaluate(press, card)
+    # Shown whole: the card grows, and what is below slides down from over its foot; the card is drawn over it
+    # all the while, so a press at its foot lands on it (a tap on its replies button entered the next thread).
+    hit = page.evaluate("""(id) => {
+        const card = () => document.querySelector(`#side-cards > li[data-card][data-id='${id}']`);
+        card().querySelector('.side-card').click();
+        const r = card().getBoundingClientRect();
+        const under = document.elementFromPoint(r.left + r.width / 2, r.bottom - 6);
+        return {sliding: document.getAnimations().length, ours: Boolean(under && card().contains(under))};
+    }""", card)
+    assert isinstance(hit, dict)
+    desk.check(bool(hit["ours"]), f"while what is below slid, the foot of the card shown whole was under something else: {hit}")
     desk.settled()
     page.wait_for_timeout(500)
     watched = page.evaluate(WATCH_JS, {"id": card, "ms": 700})
