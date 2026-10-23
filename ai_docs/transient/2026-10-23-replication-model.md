@@ -548,6 +548,12 @@ applied to our own operation. If the provider path can carry an opaque marker (S
 `chat.postMessage` documents a `metadata` field), put `k` there and match on it instead of on text
 (Q4).
 
+> **2026-10-23:** the owner approved C6 and the marker (question 4). Per provider: Slack carries the
+> key in message `metadata`, so the read matches on it; Google Chat's client-assigned message id
+> makes the post itself idempotent upstream, so Retry needs no read; Discord's `nonce` with
+> `enforce_nonce` deduplicates a repeat inside the provider's window, and the read covers older
+> attempts. A transport that does not pass the mechanism through falls back to the text match.
+
 **C7. Send S's versions to the page.** (F3)
 Add `observed_ms` (and the existing `edited_timestamp`) per message copy, and per newest page the
 stretch it proves (the unsettled band's start, as `scope_head.unsettled_from_ms` already records).
@@ -648,6 +654,14 @@ Done, put back, reload, switch view, lose the HTTP answer, deliver or replay a s
   asserts the reply is visible in some view in every frame from Send to settled.
 
 ## 9. Questions for the owner
+
+> **Answered in part, 2026-10-23 (`#455 vibe-talk-next-plan`).** The owner: (1) yes, look upstream
+> before offering Retry; (2) the gap in Main, with the outbox foot as fallback; (3) Edit mints a new
+> key and warns that the old message may be in the channel, and is never refused; (4) yes to an
+> invisible operation-key marker wherever the provider carries one: Slack message `metadata`
+> (`event_type`, `event_payload`), Google Chat's client-assigned message ids, Discord's `nonce` with
+> `enforce_nonce`. Questions 5 to 7 remain open. The master plan's "Sync and replication" section
+> records how each answer lands.
 
 1. **After an uncertain send on Slack, should the server look for the message upstream before
    offering Retry (C6)?** It costs one read per uncertain send, and it is the only way to make Retry

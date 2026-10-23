@@ -66,20 +66,20 @@ proven correctness, not for feature completeness. See "Versions".
         │ live push and tail      │ reads, relist, backfill   ▲ keyed posts         │ byte cursors
         ▼                         ▼                           │                     ▼
  ┌─ vibe-talk server ─────────────────────────────────────────┼─────────────────────────────────┐
- │  ingest ── Batch<ChatMeta> ──┐                             │   ┌─ owner store ─────────────┐  │
- │                              ▼                             │   │ send log (key → outcome)  │  │
- │  ┌─ logbook ───────────────────────────────────────────┐  └───│ Done, bookmarks, hues,    │  │
- │  │ chat store              transcript store            │      │ pins, settings, read marks│  │
- │  │  rows, tombstones        events, agents, phases     │      │ voice turns, research log │  │
- │  │  coverage, watermarks    cursors (append-only)      │      └───────────────────────────┘  │
+ │  ingest ── Batch<ChatMeta> ──┐                             │   ┌─ owner store ─────────────┐ │
+ │                              ▼                             │   │ send log (key → outcome)  │ │
+ │  ┌─ logbook ───────────────────────────────────────────┐   └───│ Done, bookmarks, hues,    │ │
+ │  │ chat store              transcript store            │       │ pins, settings, read marks│ │
+ │  │  rows, tombstones        events, agents, phases     │       │ voice turns, research log │ │
+ │  │  coverage, watermarks    cursors (append-only)      │       └───────────────────────────┘ │
  │  │  versions, change_seq                               │                                     │
  │  │ artifacts: summaries + receipts   topics   search   │                                     │
  │  └──┬────────────┬──────────────┬──────────────┬───────┘                                     │
  │     │serve rule  │history       │history       │export (schema 3)                            │
  │     ▼            ▼              ▼              ▼                                             │
  │  pages, SSE   summarizer     briefing ───▶ research: quick (one call) | deep (job, tools)    │
- │               (the ladder)                  Messages API, citations checked against logbook   │
- └──────┬──────────────────────────┬──────────────────────────────┬──────────────┬─────────────┘
+ │               (the ladder)                  Messages API, citations checked against logbook  │
+ └──────┬──────────────────────────┬──────────────────────────────┬──────────────┬──────────────┘
         │ HTTP + SSE: versions,    │ MCP: chat tools, summaries,  │ research API │ /work/<ch>/
         │ client_key, ops          │ topics, research             │              │
         ▼                          ▼                              ▼              ▼
@@ -205,6 +205,26 @@ wins, a push never revives a deletion, absence deletes only inside a listing's p
 below the unsettled band. The send log joins by key: a repeat of a key gets the original outcome,
 never a second post. A restart keeps it once C5 lands.
 
+**The owner's decisions on sends (2026-10-23).**
+
+- **Look upstream before Retry (C6): yes.** After an uncertain single-part send on Slack, the server
+  reads the destination before it offers Retry.
+- **A failed reply whose message was removed upstream** (race R2) is drawn in the gap in Main where
+  the message was, with the outbox foot as the fallback.
+- **Edit of a message that may already have posted** mints a new key (the send log stays
+  append-only) and warns that the old message may already be in the channel. Edit is never refused.
+- **An invisible operation-key marker: yes**, wherever the provider carries one invisibly. vibe-talk
+  puts the key on every post through whatever the transport exposes:
+
+  | Provider | Mechanism | What it gives the send log |
+  |---|---|---|
+  | Slack | message `metadata` (`event_type`, `event_payload`): invisible in the client, returned by the API when metadata is requested | C6 matches on the key, not on the text |
+  | Google Chat | a client-assigned message id | upstream idempotency: a repeat of the id cannot post twice, so Retry is safe without a read |
+  | Discord | `nonce` with `enforce_nonce` | upstream deduplication of a repeat inside the provider's nonce window; the read covers anything older |
+
+  Where a transport (a bridge, an adapter) does not pass the mechanism through, the server falls back
+  to C6's text match and says so in its diagnostics.
+
 **What remains, and where it lands.** C1 to C9 are the replication model's changes. Synthesis
 appendix 4's steps are a different list, always written here as "cutover C1" to "cutover C6".
 
@@ -215,7 +235,7 @@ appendix 4's steps are a different list, always written here as "cutover C1" to 
 | C3 | resolve unconfirmed keyed sends on page load | 0.1.x, cl-dedupe lane |
 | C4 | reply-promotes-thread as a derived overlay, after reproducing F2, with C7's interim receipt fix for R9 | 0.1.x, cl-dedupe lane |
 | C5 | persist the send log in the owner store | 0.3.0 Sync |
-| C6 | after an uncertain single-part send, look upstream before offering Retry | 0.3.0, if the owner agrees (E1) |
+| C6 | after an uncertain single-part send, look upstream before offering Retry, matching on the operation-key marker where the provider carries one | 0.3.0 Sync (owner: yes) |
 | C7 | send the server's versions to the page; retire read-send order | 0.3.0 Sync |
 | C8 | the served root counts its own posted reply | 0.3.0, or drop |
 | C9 | hue eviction, read-mark epochs, observed-remove Done | 0.3.0, as answered (E7) |
@@ -339,7 +359,7 @@ work with review. Every milestone is landable and deployable alone.
 | `0.1.0` | **Baseline** | tag | — | a name for what is deployed | — |
 | `0.1.x` | **In-flight lanes** | — | — | send dedupe (C1 to C3), reply-promotes-thread (C4), the Slack tail ingest, relist and backfill, UI polish | replication C1 to C4 |
 | `0.2.0` | **Ask**: quick research over chat, the Ask panel | M | 0.1.x ingest and backfill; the cache on (shadow) where it runs; M0 (scope, span, model) | the briefing builder; `[research]` config and API; structured answers with validated citations; highlight and draft; off by default, lit while active, push-fed; the research log | side-agent P1, P2 |
-| `0.3.0` | **Sync**: one copy, correctly replicated | M | 0.1.x (C1 to C4) | the send log persisted (C5); the server's versions to the page (C7); C6, C8, C9 as answered; the property tests; serve on for the newest page where M0's shadow shows it safe | replication C5 to C9, §8 |
+| `0.3.0` | **Sync**: one copy, correctly replicated | M | 0.1.x (C1 to C4) | the send log persisted (C5); the server's versions to the page (C7); C6 with the operation-key marker per provider; C8, C9 as answered; the property tests; serve on for the newest page where M0's shadow shows it safe | replication C5 to C9, §8 |
 | `0.4.0` | **logbook and the chat ladder** | L | 0.3.0 (the version contract is final before the module moves); M0 (crate location, models, budget) | the crate; `Fenced` and the Messages API backend moved; summaries as artifacts with receipts; the cache becomes the chat store; watermarks and freshness; `chat-hour` and `chat-day` on demand; thread and term topics; the availability bar; spend line and daily ceiling | synthesis M1, most of M2; cutover C1 to C5 |
 | `0.5.0` | **Voice, briefed and delegating; deep research on chat** | M to L | 0.2.0, 0.4.0 | the start briefing; `summaries`, `topics`; the `context` frame; `research`, `research_status`, `research_cancel`; deep research jobs over chat with steps, cancel and checked coverage; prompt v13; the eval harness as an opt-in suite with a capability card per voice model | synthesis M2 (voice part), M3; side-agent P3 |
 | W1 | **Transcripts in Rust** (wrkviz track) | L | 0.4.0 (the crate exists) | `TranscriptMeta`; Claude and Codex sources with byte cursors, subagents included; groups and phases; the posting join; `wrkviz index`, `query`, `serve` over old archives | synthesis M4 |
@@ -360,15 +380,16 @@ exists, and it can run in parallel with 0.5.0 on another agent.
 **Dependencies:**
 
 ```
- M0 ─────────────┬───────────────┬───────────────────┐
-                 ▼               ▼                   ▼
- 0.1.x ──▶ 0.2.0 Ask        0.3.0 Sync ──▶ 0.4.0 logbook + ladder ──▶ W1 ──▶ W2 ──▶ 0.6.0 Work tab
-   │           │                                 │                     │      │           │
-   └───────────┼─────────────▶ (0.3.0)           ▼                     │      └──▶ W3     │
-               └──────────────────────────▶ 0.5.0 voice + deep ────────┴─────────▶ 0.7.0 ◀┘
-                                                 │
-                                                 ▼
-                                               1.0.0
+ M0, measure and decide: feeds every milestone that waits on a ★ question
+
+ 0.1.x lanes ─┬─────────────────▶ 0.2.0 Ask ───────────────────┐
+              │                                                ▼
+              └─▶ 0.3.0 Sync ─▶ 0.4.0 logbook + ladder ─────▶ 0.5.0 voice + deep ─▶ 1.0.0
+                                  │                            │
+                                  ▼                            ▼
+                                  W1 ─▶ W2 ─▶ 0.6.0 Work tab ▶ 0.7.0 transcripts, batches, reports
+                                         │
+                                         └─▶ W3 wrkviz parity
 ```
 
 0.2.0 and 0.3.0 can run in parallel on two agents. So can 0.5.0 and W1.
@@ -412,13 +433,17 @@ channel-bars, TA = thread-list-animation, 03 = synthesis appendix 3, new = this 
   terms; never replies to fed messages.** Owner, in the side-agent request (SA "What the owner asked
   for").
 - **The voice agent may hand questions to research**, on a phrase like "research for me X" (SA Q7).
-  Owner, 2026-10-23 (synthesis appendix 9). What remains open is the detail in C7 below.
+  Owner, 2026-10-23 (synthesis appendix 9). What remains open is the detail in question C7 below.
 - **Deterministic work is automatic; token-spending work runs on demand or in batches.** Owner
   (synthesis appendix 6).
 - **The store is generic over a precise metadata type for chat and for transcripts.** Owner
   (synthesis appendix 2).
 - **The speech synthesizer's runaway** belongs to the private voice stack, not this repository
   (voice audit).
+- **Sends (E1 to E4).** Owner, 2026-10-23: look upstream before Retry; a failed reply to a removed
+  message goes in the gap in Main, with the outbox foot as fallback; Edit mints a new key and warns,
+  and is never refused; an invisible operation-key marker wherever the provider carries one. See
+  "Sync and replication".
 
 ### A. Names and versions
 
@@ -467,16 +492,13 @@ channel-bars, TA = thread-list-animation, 03 = synthesis appendix 3, new = this 
 
 ### E. Sync and replication
 
-1. After an uncertain send on Slack, look for the message upstream before offering Retry (C6)?
-   (RM Q1)
-2. Which view holds a failed reply whose message was removed upstream: the gap in Main, with the
-   outbox foot as fallback? (RM Q2)
-3. Edit of a message that may already have posted: a new message with a warning, or refuse Edit
-   until the outcome is known? (RM Q3)
-4. **An invisible id in provider metadata.** May vibe-talk put its operation key on the messages it
-   posts (for exact C6), and may the agents' posting tools stamp an id (for an exact posting join),
-   where the provider allows message metadata? Other integrations could see it. (RM Q4, synthesis 02
-   "Joining the two layers")
+1. Answered 2026-10-23: yes, look upstream before offering Retry (C6). (RM Q1)
+2. Answered 2026-10-23: the gap in Main, with the outbox foot as fallback. (RM Q2)
+3. Answered 2026-10-23: a new key and a warning; never refuse Edit. (RM Q3)
+4. **An invisible id in provider metadata.** Answered 2026-10-23 for vibe-talk's own posts: yes,
+   wherever the provider carries it invisibly. Still open: should the agents' posting tools stamp the
+   same kind of id, so the posting join is exact rather than a normalized text match? It is the same
+   mechanism. (RM Q4, synthesis 02 "Joining the two layers")
 5. Should read-affecting per-device settings ("own messages count as read", and perhaps pack and
    fold state) sync through the server? (RM Q5)
 6. When a thread's root is deleted upstream but replies remain, keep the thread with a "message
