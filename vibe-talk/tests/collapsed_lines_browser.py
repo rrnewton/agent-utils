@@ -480,7 +480,8 @@ def lines_walk(walk: Walk) -> None:
     # Home by the slider, which says it is saved; a reload keeps it.
     page.click("#open-settings")
     walk.wait_for("() => !document.getElementById('screen-settings').hidden", "Settings did not open")
-    page.click("#fold-settings-screen")
+    # Under Messages since `#457 settings-server-side`, where the server keeps it.
+    page.click("#fold-settings-messages")
     page.click("#fold-collapsed-lines")
     page.locator("#collapsed-lines").focus()
     page.keyboard.press("Home")
