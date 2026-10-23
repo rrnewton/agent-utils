@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-next-plan: one terminology and one master plan for storage, sync, summaries, research, voice and the Work tab'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
 - vibe-talk
 - design
 created_at: 2026-10-23T14:19:52.136237406+00:00
-updated_at: 2026-10-23T14:19:52.136237406+00:00
+updated_at: 2026-10-23T14:37:40.939944789+00:00
+closed_at: 2026-10-23T14:37:40.939944659+00:00
 ---
 
 # Description
