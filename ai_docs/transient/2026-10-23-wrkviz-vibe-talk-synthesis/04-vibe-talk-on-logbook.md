@@ -66,7 +66,7 @@ Each phase is shippable alone, keeps today's tests green, and has a switch to go
    the `summaries` table is read as a fallback and copied on first touch (a re-key, as `#208
    summary-keep` did once). Receipts start. Rollback: the table is still there and still written
    for one release.
-3. **C3: the cache file becomes `ChatStore`.** The cache schema (`cache/schema.rs`, three steps) is
+3. **C3: the cache file becomes `ChatStore`.** (2026-10-23: in the master plan this step also adds the append-only version table and makes `message` the projection of the fact log; see its "Storage core".) The cache schema (`cache/schema.rs`, three steps) is
    already close to `logbook`'s chat tables; a migration step 4 adds the generic columns (item
    family, `observed`, body kind) rather than copying data. The writer, sequencer, readers and
    barrier move as they are. Serve stays off where it is off. Rollback: schema compat value keeps

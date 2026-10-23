@@ -158,6 +158,11 @@ for histories where every answer S gives is at least as new as every earlier one
 
 ### 4.1 Message rows: a versioned observation register per id (three-party)
 
+> **2026-10-23 (`#455 vibe-talk-next-plan`):** in the master plan's "Storage core", each observation
+> below is an immutable fact in logbook's append-only log, and this register is the fold over an
+> item's facts; rule 4's absences are written as tombstone facts naming the listing that proved
+> them.
+
 For each message id `m`, S holds `(v, x)`, where `x` is either a row or a tombstone and `v` is a
 version. Versions are ordered lexicographically:
 

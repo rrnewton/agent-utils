@@ -50,6 +50,12 @@ under three rules, each of which the earlier documents already found separately:
    the operation fails. That is the replication model's §5, and it needs nothing from the store but
    the versions of rule 2.
 
+Underneath all three, logbook stores **facts, not rows**: an append-only log of versions,
+tombstones and listings, of which every current state is a projection. Chat is mutable upstream and
+transcripts are not, so the log takes chat's view, and transcripts become its degenerate case (one
+version per event, never edited or deleted). Summaries key on the content versions they read, so an
+edited message or hour goes stale and is rebuilt. See "Storage core" below.
+
 The detail is in "The one data model" and "Sync and replication" below.
 
 **API over CLI for research.** Settled by the owner on 2026-10-23: research calls the Messages API
@@ -72,9 +78,9 @@ proven correctness, not for feature completeness. See "Versions".
  │                              ▼                             │   │ send log (key → outcome)  │ │
  │  ┌─ logbook ───────────────────────────────────────────┐   └───│ Done, bookmarks, hues,    │ │
  │  │ chat store              transcript store            │       │ pins, settings, read marks│ │
- │  │  rows, tombstones        events, agents, phases     │       │ voice turns, research log │ │
+ │  │  versions, tombstones    events, agents, phases     │       │ voice turns, research log │ │
  │  │  coverage, watermarks    cursors (append-only)      │       └───────────────────────────┘ │
- │  │  versions, change_seq                               │                                     │
+ │  │  projection, log seq                                │                                     │
  │  │ artifacts: summaries + receipts   topics   search   │                                     │
  │  └──┬────────────┬──────────────┬──────────────┬───────┘                                     │
  │     │serve rule  │history       │history       │export (schema 3)                            │
@@ -108,7 +114,7 @@ Two boundaries matter more than any box:
 | Component | Responsibility | Interface (sketch) | Detail |
 |---|---|---|---|
 | **Ingest** | Turn every provider observation into a batch: live pushes (`POST /api/v1/live/events`, the Slack tail `POST /api/v1/live/tail`), the poller, reads made for pages and tools, the relist, the backfill walk | `Source<ChatMeta>::poll(cursor, budget) -> Batch`; every batch carries `read_began` and a `Claim` (listing with coverage, prefix, or sighting) | synthesis 02 "Sources"; replication §4.1 |
-| **Chat store** (logbook) | Rows, tombstones, coverage, heads, threads, FTS; the merge rules of `cache/merge.rs`; watermarks; change counters | `apply(Batch)`, idempotent with the cursor in the same transaction; `serve(read) -> Served \| Miss(reason)` (the strict rule); `range`, `get`, `search`, `watermark`, `tallies`, `erase`, each taking a `Capability` | synthesis 02 "The store", 04 |
+| **Chat store** (logbook) | An append-only log of versioned facts (versions, tombstones, listings) and its materialized projection (rows, heads, threads, FTS); the merge rules of `cache/merge.rs` as the fold; watermarks | `apply(Batch)`, idempotent with the cursor in the same transaction; `serve(read) -> Served \| Miss(reason)` (the strict rule); `range`, `get`, `search`, `watermark`, `tallies`, `erase`, each taking a `Capability` | synthesis 02 "The store", 04 |
 | **Transcript store** (logbook) | Normalized agent events, the agents side table, phases, cursors with prefix digests | the same `Store<M>` trait with `Claim::Prefix`; `groups(source, span)` | synthesis 02, 03 |
 | **Summarizer** | The ladder: message one-liner, thread name and sentence, chat hour and day, agent phase and lifetime, rollups, reports; scheduling and the daily ceiling | `Summarizer::stage(unit) -> Staged` (deterministic), `ModelBackend::run(jobs) -> artifacts + receipt`; `freshness(unit) -> Absent \| CaughtUp \| Behind \| Unproven` | synthesis 02 "Summaries", 06 |
 | **Briefing builder** | Deterministic, fenced, owner-marked rendering of a scope and span: topics, thread index, availability line, newest messages, full text grouped by thread within a budget; append-only so a provider prompt cache survives | `briefing(scope, span, budget, cap) -> Briefing { fenced, fed_ids, bounds_sentence, token_estimate }`; `append(new batch) -> Fenced` (thread-grouped, edits as correction lines) | side-agent "Context strategy"; synthesis 08 P1 to P5 |
@@ -127,11 +133,11 @@ Every piece of state has exactly one home and one authority.
 
 | Class | Authority | Home | Replicas | Merge |
 |---|---|---|---|---|
-| Message existence, content, edits, deletions, reactions, thread membership | the provider | chat store | page replica | versioned register per id, epoch tombstones, absence only from a listing over a proven stretch (replication §4.1, §4.2) |
-| Agent transcript events | the vendor log file | transcript store | the wrkviz archive; Work tab exports | append-only prefix with a digest; a rewrite is refused (synthesis 02) |
+| Message existence, content, edits, deletions, reactions, thread membership | the provider | chat store | page replica | a fold over the item's versioned facts: versioned register, epoch tombstones, absence only from a listing over a proven stretch ("Storage core"; replication §4.1, §4.2) |
+| Agent transcript events | the vendor log file | transcript store | the wrkviz archive; Work tab exports | the degenerate fact log: one version per event, an append-only prefix with a digest; a rewrite is refused (synthesis 02) |
 | Sends | the provider holds the truth; the key names the operation | send log in the owner store (in memory on the `#448 send-dedupe` branch, persisted by C5) | the page's outbox | grow-only map key → produced ids, plus monotone "attempted" and "refused" bits (replication §4.3) |
 | Done, bookmarks, hues, pins, settings, read marks | the server, serializing the owner's intents | owner store | page | per class, as today: idempotent sets with a read-your-writes overlay, compare-and-set revisions, first-writer-wins (replication §4.4, §4.5) |
-| Summaries, topics, search index, tallies, exports | derived | logbook artifacts and indexes | none needed | content-addressed by exact input; freshness by `change_seq`; never synchronized, only recomputed (replication §4.6) |
+| Summaries, topics, search index, tallies, exports | derived | logbook artifacts and indexes | none needed | content-addressed by exact input; freshness by the input digest of the content versions read; never synchronized, only recomputed (replication §4.6) |
 | Research log, voice turns | the owner's conversation | owner store | page | append-only |
 | Optimistic display (phantom rows, pending counts, a new thread's card and colour) | nobody: derived | none | computed on each page | `provider state ⊔ pending operations ⊔ known replies` at projection time (replication §5) |
 
@@ -142,7 +148,7 @@ each one honest about its authority and its age.
 
 | Cache | Holds | Authority | Version or key | Plan |
 |---|---|---|---|---|
-| **Chat store** (today's message cache) | provider messages, up to 90 days and 256 MB by default | provider | per-row version; per-source `change_seq`; coverage | becomes logbook's chat store (cutover C3); the one server copy; modes off, shadow, serve |
+| **Chat store** (today's message cache) | provider messages, up to 90 days and 256 MB by default | provider | the fact log's `seq`; content versions `(id, hash)`; listings | becomes logbook's chat store (cutover C3); the one server copy; modes off, shadow, serve |
 | **Page replica** (`channelCanon`, `localStorage`) | a trimmed copy of the chat store and owner state | chat store | read-send order today; the server's versions after C7 | stays; merges like the server (C7) |
 | **Held recent windows** (`recent.rs`) | about 50 messages a channel, in memory | provider, through reads | read time | stays for the voice agent's deadlines; later reads the chat store when its watermark is fresh |
 | **Slack Flat memory**, bridge caches | recent pages, up to 15 minutes | provider | must report `as_of` | rule: every answer from memory reports its true age (replication §4.1) |
@@ -150,6 +156,228 @@ each one honest about its authority and its age.
 | **Summary artifacts** | model outputs | derived | summarizer id and version, schema, backend, exact payload | logbook artifacts with receipts (cutover C2); never paid for twice |
 | **Timeline exports** | schema-3 files per channel and team | derived | byte-idempotent rebuild | Work tab |
 | **Provider prompt cache** | the prefix of a research briefing | the model provider | byte-identical prefix; 5 min or 1 h | briefings are append-only; a session restarts with a fresh briefing past about 60 % of context |
+
+## Storage core: a log of versioned facts, with current state derived
+
+### The insight
+
+The owner, 2026-10-23: "There is a fundamental difference in the data model here: the cache has to
+hold multiple versions of an upstream data model that's mutable. Everything we did with wrkviz so
+far assumed immutable, append-only data with no concept of edits or deletes at all. So if we were
+going to share one backend data model, it would probably have to take the more complex view of
+mutable data, still with purely functional append-only representations (edits, message versions,
+tombstones)."
+
+The two halves of logbook start from opposite assumptions:
+
+| | Agent transcripts (wrkviz) | Chat (vibe-talk's message cache) |
+|---|---|---|
+| Upstream | append-only files; a rewrite is an error | mutable: edits, deletions, reactions, reply counts that rise and fall |
+| How it is learned | in order, by byte cursor | out of order, from pushes, reads, listings and memories of different ages |
+| Stored today as | the events themselves (immutable `raw/team.json`, append guards) | current rows, overwritten by the merge rules, plus a tombstone table and coverage intervals |
+| What "deleted" means | never happens (wrkviz refuses it), except Orc task notes, which wrkviz freezes | a tombstone, or absence from a listing over a proven stretch |
+
+One backend has to take the chat view, because it contains the transcript view as a special case
+and not the other way round. It keeps wrkviz's discipline by making the *representation* purely
+functional: **logbook's core is an append-only log of versioned facts, and every current state
+(the rows a page is served, the text a summary reads, the timeline an export draws) is a projection
+of that log.**
+
+### Facts
+
+A fact is one thing the store learned. It is written once and never changed.
+
+```rust
+/// One entry in a store's log. Immutable once appended.
+pub struct Fact<M: Metadata> {
+    /// Position in this store's log: strictly increasing, gap-free, the store's only clock for
+    /// "what changed since". Appendix 2's `change_seq` is this number.
+    pub seq: u64,
+    pub source: SourceId,
+    /// When the observation that produced it STARTED, on the server's clock (`read_began`), or
+    /// the provider's `as_of` if older; a push is observed at arrival (replication §4.1).
+    pub observed: Millis,
+    pub what: FactKind<M>,
+}
+
+pub enum FactKind<M: Metadata> {
+    /// A version of an item: its content and metadata as one observation saw them. A field the
+    /// observation could not see is `Unobserved` in `meta` and never erases a known value.
+    Version { id: ItemId, at: Millis, edited: Option<Millis>, body: Body, meta: M, how: Seen },
+    /// The item is gone upstream: an explicit delete, or absence from a listing that proved its
+    /// stretch (`AbsentFrom` names that listing's fact, so the reason is auditable).
+    Tombstone { id: ItemId, deleted: Millis, cause: DeleteCause },
+    /// A chat listing proved a stretch of a scope at `observed`: what it held, and that nothing
+    /// else existed there then. `complete` is false where the provider's listings omit messages.
+    Listing { scope: ChatScope, interval: Interval, complete: bool, held: ListingDigest },
+    /// A transcript source's newline-complete prefix was read through this cursor.
+    Prefix { through: Cursor },
+}
+
+pub enum Seen { Push, Read, Listing, OwnPost { client_key: Option<Arc<str>> } }
+pub enum DeleteCause { Event, AbsentFrom { listing: u64 } }
+```
+
+Three rules keep the log small and the projection pure:
+
+1. **The log records changes in what is known, not every sighting.** A re-observation that brings
+   the same content and the same metadata appends nothing new (the listing that saw it is its own
+   fact). An edit, a deletion, a reaction change, a whole body confirming a partial push (rule 5),
+   or a changed reply count each append exactly one fact.
+2. **Derived deletions are written as facts.** When a listing proves a stretch, the writer appends a
+   `Tombstone { cause: AbsentFrom }` for each held item the listing could see and lacked, in the
+   same transaction. The projection is then a fold over facts alone, and anyone can see why a
+   message vanished.
+3. **A content version has an identity:** `(ItemId, ContentHash)`, the hash of the normalized body.
+   Summaries, citations and exports name versions, never "the message".
+
+### Current state is a fold, and the fold is the merge
+
+`current(id) = ⊔ { facts about id }`, where ⊔ is exactly the join the replication model proves
+sound and `cache/merge.rs` already implements. The join is commutative, associative and idempotent
+(replication §4.1), so the projection does not depend on the order in which facts arrived, which is
+the whole point for a source observed out of order.
+
+| Merge rule today (`cache/merge.rs`, replication §4.1) | In the fact log |
+|---|---|
+| Rule 1: a provider edit time orders versions | among `Version` facts for an id, the higher `edited` wins |
+| Rule 2: otherwise the observation's start time orders them | then the higher `observed` wins (`seq` breaks exact ties) |
+| Rule 3: a tombstone beats a row unless a read begun after the deletion revives it; a push never revives | a `Version` with `how = Read` and `observed > deleted` outranks the `Tombstone`; nothing else does |
+| Rule 4: absence from an exhaustive listing deletes, bounded by coverage and the unsettled band | the `Listing` fact plus the `Tombstone { AbsentFrom }` facts the writer derived from it under the same bounds |
+| Rule 5: a pushed snippet never wins; a read confirms a partial body | a `Version` with `partial` never outranks a whole one of which it is a prefix; the confirming read appends the whole version |
+| Other fields follow the newer observation; a copy lacking a field never erases it | the fold joins each field separately, skipping `Unobserved` |
+| Thread membership is write-once; reply counts derive from replies | `thread` is joined as ⊥ < `thread(T)`; the count is a projection over replies, never a stored number to overwrite (replication §4.2) |
+
+The projection is **materialized** (today's `message` table becomes it), updated on every append,
+and **rebuildable**: dropping it and refolding the log must give the same table. That is a strong
+property test, and it joins the replication model's §8 list.
+
+The same assumption as today still carries the soundness: a read begun after the provider applied
+a change reflects it. Every memory that answers a read must therefore report its true age, now as
+the fact's `observed`.
+
+### Agent transcripts are the degenerate case
+
+A transcript event is one `Version` fact, appended in order by a `Prefix` cursor, with no later
+version and no tombstone. Its projection is the identity, and its fold has nothing to merge. So:
+
+- wrkviz's **append guard** becomes an invariant of the transcript store: a second `Version` for a
+  transcript `ItemId`, or a prefix whose digest changed, is **refused**, not recorded.
+- The **Orc task notes** that upstream deletes are the one place transcripts are mutable. wrkviz
+  already keeps them frozen with tombstones; in fact terms that is a `Tombstone` under the
+  transcript store's retention policy, which keeps the body.
+- The **archive stays the durable record.** `raw/team.json` is the projection of a team's
+  transcript facts, written byte-identically, and `ArchiveDir` reads an existing archive as a fact
+  source. Nothing is copied twice: for transcripts the archive *is* the log, and SQLite is its index
+  (synthesis 03's principle 3).
+
+### Summaries key on content versions
+
+A summary's input is the set of content versions its unit covers. That set, and nothing else,
+decides whether the summary is current:
+
+```rust
+/// What a stage read: the content versions of the summarizable items in the unit, in order,
+/// plus the filters it applied. Recorded in the artifact, compared at freshness time.
+pub struct InputDigest(Digest);  // hash of [(ItemId, ContentHash)] ++ tombstoned ids ++ filters_digest
+
+fn freshness(unit: &Unit, art: Option<&ArtifactMeta>, store: &impl Store) -> Freshness {
+    let Some(art) = art else { return Freshness::Absent };
+    // Cheap pre-check: was anything touching the unit's span appended since the stage?
+    let touched = !store.facts_since(art.staged_at_seq, &unit.sources, Some(unit.span)).is_empty();
+    // Exact check: do the content versions the unit covers now differ from what was staged?
+    if touched && store.input_digest(unit) != art.input_digest {
+        return Freshness::Behind { since: art.made_at };
+    }
+    // Same input; green only if the watermark proves the span complete (appendix 2).
+    if store.span_proven(unit, art) { Freshness::CaughtUp } else { Freshness::Unproven }
+}
+```
+
+- **An edit makes its summaries stale.** Message m in the 10:00 hour is edited, so the hour's set
+  now holds `(m, h2)` instead of `(m, h1)`. The digest differs, the hour is `Behind`, and the
+  re-stage renders a different payload, which is a new artifact.
+- **A deletion does the same**: the tombstoned id leaves the set.
+- **A revert costs nothing.** If the edit is undone and m is back at `(m, h1)`, the digest equals
+  the old one, and the old artifact is current again with no model call.
+- **A per-message one-liner is the smallest case**: its key is today's `(policy version, content
+  hash)`, which is a content-version key already.
+- **Thread names are deliberately sticky.** The slug is chosen once and kept (`THREAD_RULE`), so the
+  thread's name artifact is selected first-written and never re-keyed by later versions, while its
+  sentence follows the digest. That stickiness is a selection policy, not an exception to keying.
+- **Noise rules** enter through the filters digest, as in appendix 2.
+- **The facts' `seq` replaces clock comparisons** for "what changed since", and the digest replaces
+  counts for "is it the same input": a late edit to a closed hour is caught however the clocks
+  disagree.
+
+### wrkviz's content-addressed artifacts, unchanged
+
+An artifact is already immutable and addressed by its exact model payload, summarizer id and
+version, schema and backend (wrkviz's cache identity). The fact log only makes the payload a pure
+function of content versions:
+
+```
+content versions in the unit ──stage (deterministic)──▶ payload ──hash──▶ artifact id
+                                                            │
+                                                            └─▶ model call only on a miss
+```
+
+So an artifact never goes stale itself. It remains the right summary *of the versions it names*,
+and freshness is only the question whether the unit still covers those versions. A projection (the
+current summary of a unit) points at the newest compatible artifact, as wrkviz's projections do.
+For transcripts, which never change, artifacts go stale only when an open phase is extended by new
+events, which wrkviz already records as a `contiguous-extension` frontier.
+
+### How this reconciles with `Store<M: Metadata>` and the merge rules
+
+| Appendix 2 (as sketched) | With the fact log |
+|---|---|
+| `Store::apply(Batch)`, idempotent, cursor in the same transaction | unchanged signature: `apply` appends the facts the batch implies (versions for changed items, tombstones from `removed` and from the listing's absences, the `Listing` or `Prefix` claim) and updates the projection, in one transaction. Applying the same batch twice appends nothing (rule 1) |
+| `Item<M>` with `observed` and `edited` | the projected current version of an item |
+| `get`, `range`, `groups`, `tallies` | read the projection |
+| `watermark` | derived from `Listing` and `Prefix` facts |
+| `Watermark::change_seq` | the log position `seq` |
+| `erase` | unchanged: see "What append-only does not mean" below |
+| — | **new** `history(id) -> Vec<Fact<M>>`: every version and tombstone of one item |
+| — | **new** `facts_since(seq, sources, span?)`: the change feed. It drives freshness, the availability bar's live updates, the page's SSE stream, and quick research's append-only briefing, whose "edits as correction lines" are this feed rendered |
+
+The replication model needs no change of substance: its §4.1 register is the fold, its tombstones
+with epochs are `Tombstone` facts with `observed`, and its rule 4 is rule 2 above. The page replica
+can later fold the same facts (C7 sends `observed` and `edited`, which is most of a fact), so the
+page and the server would merge by one join instead of two.
+
+### What append-only does not mean
+
+Append-only is a statement about meaning, not a promise to keep every byte. vibe-talk's privacy
+guarantees win wherever they conflict:
+
+- **A deleted message keeps only its id and times.** When a `Tombstone` is appended, the bodies of
+  all that item's earlier `Version` facts are erased in the same transaction (with `secure_delete`,
+  as today). The facts remain as skeletons, `(id, content hash, times)`, so ordering, revival and
+  summary keys still work, and the text is gone.
+- **Superseded versions of an edited message** keep their body only while something may need it
+  (a current artifact staged from it, a short window for revert), then become skeletons. How long
+  is an owner question (D4); the archive class could keep full edit history if wanted.
+- **Access loss, removal from the allowlist and the purge** erase facts and projection alike, as
+  the cache does now. Retention bounds (90 days, 256 MB) apply to facts by item age.
+- **Summaries of erased text** are orphaned and swept, as `cache/orphans.rs` does today.
+
+### Cost and migration
+
+Chat volume is a few hundred message events a day across the busiest deployment's channels, and
+edits are a fraction of those, so a version table is small. Transcripts add no new storage, since
+the archive is their log. The cutover is incremental:
+
+1. **Cutover C3** gains one table: an append-only `item_version` (and `listing` from today's
+   `coverage`), written by the cache writer in the same transaction as the row update it already
+   computes. The `message` table stays and becomes the materialized projection, and `tombstone`
+   stays as the tombstone facts.
+2. A **refold test**: rebuild the projection from the log and compare it with the live table, run
+   in the gate over the cache's existing race and coverage tests.
+3. **Summaries switch to input digests** with cutover C2 (summaries as artifacts). Today's
+   `(version, content hash)` keys carry over unchanged for one-liners.
+4. **`facts_since` replaces ad hoc change signals** (the writer's events, the hub's diff memory)
+   one consumer at a time.
 
 ## Live serving: the chat store's modes and the ingest work
 
@@ -273,7 +501,7 @@ whether the question is fixed:
 | Question | fixed per summarizer | none: it is context | the owner's, verbatim |
 | Spends tokens | yes, scheduled and budgeted | no | yes, only when asked |
 | Cached as | a content-addressed artifact | provider prompt cache, by prefix | the research log (the answer), not reused as truth |
-| Freshness | `change_seq` and watermarks (`CaughtUp`, `Behind`, `Unproven`) | states its bounds in words | states what it read (`coverage`) and up to when |
+| Freshness | the input digest of the content versions read, and watermarks (`CaughtUp`, `Behind`, `Unproven`) | states its bounds in words | states what it read (`coverage`) and up to when |
 
 **Quick versus deep.** The owner's two preferences for open questions do not conflict once depth is
 a parameter. The Ask panel's default is quick: push-fed, append-only, every thread in scope named,
@@ -336,9 +564,9 @@ component's history, so vibe-talk needs namespaced tags.
 - **Tags** `vibe-talk-vX.Y.Z` on `main`, with `vibe-talk/Cargo.toml` bumped in the same commit
   (`vibe-talk: release 0.2.0`). The health route and `vibe-talk --version` already report the Cargo
   version, so once it is bumped a deployment says what it runs.
-- **`0.1.0`: today's deployed state.** The coordinator is tagging it on 2026-10-23, and near-term
-  fixes continue as 0.1.x. The tag goes on the `main` commit that bumps `Cargo.toml` to `0.1.0`, so
-  the health route and `--version` report it. The deployed commits still report `0.0.1`, and the
+- **`0.1.0`: today's deployed state.** Tagged `vibe-talk-v0.1.0` on 2026-10-23 at `3574c78e`, the
+  `main` commit that bumps `Cargo.toml` (`#456 vibe-talk-0-1-0`); near-term fixes continue as
+  0.1.x. The health route and `--version` report it. The deployed commits still report `0.0.1`, and the
   release note records which commit each deployment runs.
 - **`0.1.x`: patch releases** for work inside the current architecture, which is what the in-flight
   lanes are: the send dedupe and reply-promotes-thread, the Slack tail ingest and backfill, UI polish.
@@ -382,7 +610,7 @@ work with review. Every milestone is landable and deployable alone.
 | `0.1.x` | **In-flight lanes** | — | — | send dedupe (C1 to C3), reply-promotes-thread (C4), the Slack tail ingest, relist and backfill, UI polish | replication C1 to C4 |
 | `0.2.0` | **Ask**: quick research over chat, the Ask panel | M | 0.1.x ingest and backfill; the cache on (shadow) where it runs; M0 (scope, span, model) | a minimal per-channel `complete_through`; the briefing builder; `[research]` config and API; structured answers with validated citations; highlight and draft; off by default, lit while active, push-fed; the research log (kept or dropped per question C6) | side-agent P1, P2 |
 | `0.3.0` | **Sync**: one copy, correctly replicated | M | 0.1.x (C1 to C4) | the send log persisted (C5); the server's versions to the page (C7); C6 with the operation-key marker per provider; C8, C9 as answered; the property tests; serve on for the newest page where M0's shadow shows it safe | replication C5 to C9, §8 |
-| `0.4.0` | **logbook and the chat ladder** | L | 0.3.0 (the version contract is final before the module moves); M0 (crate location, models, budget) | the crate; `Fenced` and the Messages API backend moved; summaries as artifacts with receipts; the cache becomes the chat store; watermarks and freshness; `chat-hour` and `chat-day` on demand; thread and term topics; the availability bar; spend line and daily ceiling; the opt-in `archive` retention class if D2 says yes | synthesis M1, most of M2; cutover C1 to C5 (cutover C4's walk is already built in 0.1.x; 0.4.0 adds its watermarks) |
+| `0.4.0` | **logbook and the chat ladder** | L | 0.3.0 (the version contract is final before the module moves); M0 (crate location, models, budget) | the crate; `Fenced` and the Messages API backend moved; summaries as artifacts with receipts; the cache becomes the chat store: a versioned-fact log with its projection and a refold test; summaries keyed by input digests; watermarks and freshness; `chat-hour` and `chat-day` on demand; thread and term topics; the availability bar; spend line and daily ceiling; the opt-in `archive` retention class if D2 says yes | synthesis M1, most of M2; cutover C1 to C5 (cutover C4's walk is already built in 0.1.x; 0.4.0 adds its watermarks) |
 | `0.5.0` | **Voice, briefed and delegating; deep research on chat** | M to L | 0.2.0, 0.4.0 | the start briefing; `summaries`, `topics`; the `context` frame; `research`, `research_status`, `research_cancel`; deep research jobs over chat with steps, cancel and checked coverage; prompt v13; the eval harness as an opt-in suite with a capability card per voice model; older chat history through deep research (beyond 90 days only with `archive`) | synthesis M2 (voice part), M3; side-agent P3, P4 |
 | W1 | **Transcripts in Rust** (wrkviz track) | L | 0.4.0's crate and store core (cutover C1 to C3) | `TranscriptMeta`; Claude and Codex sources with byte cursors, subagents included; groups and phases; the posting join; `wrkviz index`, `query`, `serve` over old archives | synthesis M4 |
 | W2 | **Schema-3 export in Rust** | M | W1 | the export, differential-tested against Python; the delivery handler as a reusable Rust module | synthesis M5 (first half) |
@@ -440,6 +668,7 @@ transcript citation in a research answer opens the Work tab at that phase (synth
 | Token spend creeps | A daily ceiling, split into automatic, batch and on-demand shares. Estimates before batches. Receipts for chat too. A spend line in Settings and the bar. |
 | Transcripts leak through a phone | Summaries-only by default, the write token for more, payload redaction, per-channel scoping, `no-store`. Voice-started jobs return only a short spoken answer. |
 | The in-flight lanes conflict with the cutover | Land cl-ingest and cl-dedupe before 0.4.0 starts. The cutover begins from `main`, not from a branch. |
+| The fact log grows, or keeps text it should not | The log records changes, not sightings. A tombstone erases the bodies of every earlier version at once. Superseded bodies become skeletons after D4's window. Retention bounds apply to facts by age. The refold test proves the projection. |
 | Terminology drifts back | Config, API, tool and module names follow TERMINOLOGY.md from the first commit (`[research]`, `/api/v1/research`, `research` tool, `logbook::chat`). No `helper` name ships. |
 | Version tags collide with the repository's other tags | Namespaced `vibe-talk-v` tags. |
 
@@ -522,6 +751,10 @@ channel-bars, TA = thread-list-animation, 03 = synthesis appendix 3, new = this 
    Haiku 5.5, $20 on Sonnet 5.5, estimated) or only phases someone will look at? Thread naming runs
    automatically today, an exception to the on-demand rule that synthesis 06 proposes to keep under
    the ceiling: keep it? (SA Q3 ceiling, SY Q5, 06)
+4. ★ (before 0.4.0) **Superseded text.** How long does an edited message's earlier text stay in the
+   store before only its hash and times remain: until no current summary rests on it, a fixed window,
+   or never kept (the `archive` class could keep full edit history)? A deleted message's text goes
+   at once in every case. (new, "Storage core")
 
 ### E. Sync and replication
 

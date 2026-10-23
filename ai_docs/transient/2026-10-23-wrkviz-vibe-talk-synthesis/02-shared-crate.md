@@ -208,6 +208,12 @@ scanning events, exactly as wrkviz's spine does.
 
 ## The store
 
+> **2026-10-23 (`#455 vibe-talk-next-plan`):** the master plan's "Storage core" section makes this
+> store an append-only log of versioned facts (versions, tombstones, listings, prefixes) with
+> current state as a materialized projection. `apply` keeps its signature and appends the facts a
+> batch implies; `Item<M>` is the projected current version; `change_seq` is the log position;
+> `history(id)` and `facts_since(seq)` are added.
+
 ```rust
 /// One store holds one family. A deployment has a ChatStore and a TranscriptStore, possibly in
 /// one SQLite file with per-family tables, possibly in two (decided per deployment).
@@ -407,6 +413,11 @@ receipts. wrkviz's immutable-artifact discipline (never overwrite at a different
 point at the best compatible artifact; old versions stay readable) is kept as is.
 
 ### Freshness: is a summary "caught up" with its range?
+
+> **2026-10-23 (`#455 vibe-talk-next-plan`):** the master plan keys freshness on an input digest of
+> the content versions `(ItemId, ContentHash)` a stage read, with the change counter as a cheap
+> pre-check. The predicate below is the same in outcome, except that a reverted edit makes the old
+> artifact current again instead of `Behind`.
 
 The owner's green box border needs one precise predicate:
 
