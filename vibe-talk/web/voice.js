@@ -2299,7 +2299,7 @@ function footGap(area) {
   // The room first: asking for it can close it (`overscrollRoom`), which takes its height out of
   // the list and clamps where the reader stands — heights read before it would count the room
   // twice, and a reader in it would measure a room's height short of the foot they are past.
-  const room = overscrollRoom(area);
+  const room = overscrollRoom(area) + overextendRoom(area);
   return area.scrollHeight - room - area.scrollTop - (area.clientHeight || 0);
 }
 
@@ -2310,7 +2310,7 @@ function footGap(area) {
  * @param {HTMLElement} area
  */
 function footTop(area) {
-  const room = overscrollRoom(area);
+  const room = overscrollRoom(area) + overextendRoom(area);
   return Math.max(0, area.scrollHeight - room - (area.clientHeight || 0));
 }
 
@@ -2403,6 +2403,9 @@ function openOverscroll(area) {
     waitOverscrollIdle();
     return true;
   }
+  // `#459 pack-keeps-card-still`. Not over the room a card held where it stood left: the reader is past
+  // the foot already, and that room only ever gives way.
+  if (overextendRoom(area) > 0) return false;
   if (!overscrollOffered() || footGap(area) > 1) return false;
   const px = overscrollFit(area);
   if (px < 1) return false;
@@ -2482,6 +2485,12 @@ function holdOverscrollReader(area) {
  * @param {HTMLElement} area
  */
 function followFoot(area) {
+  // `#459 pack-keeps-card-still`. A reader in the room a card held where it stood left past the foot stays
+  // exactly where they are while what came fits in it; what does not takes them on to the foot.
+  if (overextendRoom(area) > 0) {
+    fitOverextend(area);
+    if (overextend !== null) return;
+  }
   if (overscrollRoom(area) > 0) {
     fitOverscroll(area);
     if (overscroll !== null && area.scrollTop >= footTop(area) - 0.5) return;
@@ -2497,8 +2506,248 @@ function followFoot(area) {
  * @param {HTMLElement} area
  */
 function toFoot(area) {
+  // `#459 pack-keeps-card-still`. Out of the room a card held where it stood left, too.
+  if (area === leftEl("side-scroll")) closeOverextend();
   if (area === leftEl("side-scroll")) closeOverscroll();
   area.scrollTop = area.scrollHeight;
+}
+
+// --- room past the foot held for a card packed where it stands -------------------------------------
+//
+// `#459 pack-keeps-card-still`. The owner, 2026-10-23: packing a thread card a few threads from the foot of
+// the Threads view made it jump to the bottom of the screen, because the list would not scroll past its
+// end to leave it where it was. "In the specific case of packing threads I would really like the thread
+// card I act on by clicking to STAY STILL, even if that means the collapsed child messages leave a big
+// VOID on the screen and show us 'past the end' by a larger margin. I'm OK with the scroll wheel stopping
+// where it does now ... if I scroll up I cannot scroll back down to the overextended state."
+//
+// So the card acted on is put back where it was on the screen (`keepingCardStill`), and where that is
+// further down the list than it now scrolls, #side-overextend, the last thing in the scroller, is given
+// the height that makes it reachable: blank room past the foot, under the void the packed messages left.
+//
+// ONE WAY. The room is only ever as tall as the reader stands past the foot of the rows, fitted again at
+// every scroll, every change of the rows' size and every redraw (`fitOverextend`): scrolling up takes it
+// away under the reader, so they cannot scroll back down into it; rows arriving at the foot fill it, and
+// the reader is not moved while it lasts (`followFoot`); and another pack makes it as tall as that pack
+// needs, never the sum of the two. The reader's own scrolling never opens it, and the room the wheel
+// opens past the foot (`#338 column-overscroll`) is closed as it opens and not opened over it. Like that
+// room it is the foot while it is open (`footGap`), and it closes as the reader goes back up past the
+// foot, when the column shows something else, and by the reader's own way to the newest line (`toFoot`).
+
+/**
+ * The room open past the foot for a card held where it stood: its height in px and what the column showed
+ * as it was opened (`overscrollContext`). Null while closed.
+ *
+ * @type {{px: number, context: string} | null}
+ */
+let overextend = null;
+
+/**
+ * How far `area` scrolls past the foot for a card held where it stood, else 0; closed here, before
+ * anything measures by it, where the column shows something else (as `overscrollRoom`).
+ *
+ * @param {HTMLElement} area
+ */
+function overextendRoom(area) {
+  if (overextend === null || area !== leftEl("side-scroll")) return 0;
+  if (overextend.context !== overscrollContext() || !sideColumnUp()) {
+    closeOverextend();
+    return 0;
+  }
+  return overextend.px;
+}
+
+/** Close the room held for a card. */
+function closeOverextend() {
+  if (overextend === null) return;
+  overextend = null;
+  leftEl("side-overextend").style.height = "";
+}
+
+/**
+ * Give `area` the room past its foot that lets it scroll to `top`, and no more: closed where it already
+ * scrolls that far without it. How far it scrolls without it is measured from where the room starts, the
+ * end of the rows as laid out, rather than from `scrollHeight`, which counts the rows sliding into a gap
+ * (`#460 pack-gap-slide`) where they are drawn: fitted by that, the room would be short by the slide, and
+ * the browser's clamp would take the reader up as the slide ended.
+ *
+ * @param {HTMLElement} area
+ * @param {number} top
+ */
+function sizeOverextend(area, top) {
+  overextendRoom(area);
+  const pad = typeof window.getComputedStyle === "function"
+    ? parseFloat(window.getComputedStyle(area).paddingBottom) || 0 : 0;
+  const end = area.scrollTop + leftEl("side-overextend").getBoundingClientRect().top -
+    area.getBoundingClientRect().top - (area.clientTop || 0);
+  const furthest = end + pad - (area.clientHeight || 0);
+  const px = Math.ceil(top - furthest);
+  if (px < 1) {
+    closeOverextend();
+    return;
+  }
+  if (overextend === null) overextend = { px, context: overscrollContext() };
+  overextend.px = px;
+  const room = leftEl("side-overextend");
+  if (room.style.height !== `${px}px`) room.style.height = `${px}px`;
+}
+
+/**
+ * Fit the room held for a card to where the reader of `area` now stands: as far past the foot as they are,
+ * so a reader who went up has it taken from under them, and rows that came at the foot take its place.
+ *
+ * @param {HTMLElement} area
+ */
+function fitOverextend(area) {
+  if (overextendRoom(area) > 0) sizeOverextend(area, area.scrollTop);
+}
+
+/**
+ * Run `change` to the cards with thread `id`'s card held exactly where it is on the screen, past the foot
+ * of the list where that is what it takes. A card above the screen — ^ pressed deep in its unpacked
+ * block — is held at the top of it instead, so what is left is never a screen of blank room. Whether the
+ * card was held: not where it was not drawn before, or is not after.
+ *
+ * @param {string} id
+ * @param {() => void} change
+ */
+function keepingCardStill(id, change, slide = false) {
+  const area = leftEl("side-scroll");
+  // A slide still running is ended first: everything is measured where it is laid out.
+  finishPackSlide();
+  const row = cardRow(id);
+  const before = row && rowShown(row)
+    ? Math.max(row.getBoundingClientRect().top, area.getBoundingClientRect().top) : null;
+  const next = slide && row ? itemAfterBlock(row) : null;
+  const was = next ? { key: slideKey(next), top: next.getBoundingClientRect().top } : null;
+  change();
+  const now = cardRow(id);
+  if (before === null || !now || !rowShown(now)) return false;
+  const top = area.scrollTop + now.getBoundingClientRect().top - before;
+  // The wheel's room past the foot is fitted to the last card and closed above the foot on its own
+  // schedule, either of which would move the card; this room stands in for it.
+  closeOverscroll();
+  sizeOverextend(area, top);
+  area.scrollTop = top;
+  if (was) slideIntoPlace(now, was);
+  return true;
+}
+
+// --- the gap a packed thread leaves, held and then closed (#460 pack-gap-slide) -------------------------
+//
+// The owner, 2026-10-23, after `#459 pack-keeps-card-still`: "when I pack a thread it could leave a gap in
+// the message stream for a moment, and the cards below slide up into position rather than jumping
+// instantaneously." Unpack is the mirror: the thread opens in place and the cards below slide down.
+//
+// A FLIP over the settled layout, as the drill-in's flight is (`flyThreadCard`) and as
+// ai_docs/transient/2026-10-22-thread-list-animation.md proposes for the list (its step 1, the gap that
+// holds and then closes). The cards are redrawn, the packed card held still and the reader's place kept
+// exactly as without any motion (`keepingCardStill`); then everything below the thread on the screen is
+// drawn, by a transform alone, where it was, and let go: after `--pack-gap-hold` it slides home over
+// `--pack-slide`, both on #screen-main in web/voice.css, and 0 for a reader whose system asks for less
+// motion, when nothing moves at all. Unpacked, the thread's rows fade in under the cards sliding down off
+// them, with no hold. Nothing is laid out again and nothing waits: every measure after the slide is the
+// one there would have been without it. Only what is on the screen moves, and by no more than its height,
+// so a long thread packed costs one screenful of motion. Not for Pack all, whose threads each leave a gap
+// of their own; not while a reply is open under a row, whose box is anchored to it; and ended at once by
+// the reader's own wheel, touch, press or key on the list, or another pack.
+
+/** The slides running, to end them (`finishPackSlide`). @type {Set<Animation>} */
+const packSlides = new Set();
+
+/** A duration the stylesheet says on #screen-main, in ms: 0 where it says none (`cardFlightMs`). */
+function screenMotionMs(name) {
+  const style = typeof window.getComputedStyle === "function" ? window.getComputedStyle(leftEl("screen-main")) : null;
+  const said = style ? String(style.getPropertyValue(name)).trim() : "";
+  const parsed = /^(\d+(?:\.\d+)?)(ms|s)$/.exec(said);
+  return parsed ? Number(parsed[1]) * (parsed[2] === "s" ? 1000 : 1) : 0;
+}
+
+/** End every slide at once: everything drawn where it is laid out. */
+function finishPackSlide() {
+  for (const motion of [...packSlides]) motion.finish();
+  packSlides.clear();
+}
+
+/** What an item of the cards is across a redraw, which draws every item anew: its kind and its id. */
+function slideKey(item) {
+  return JSON.stringify([item.tagName, item.id || "", item.hasAttribute("data-card"), item.getAttribute("data-unpack-thread") || "",
+    item.getAttribute("data-id") || item.getAttribute("data-ids") || ""]);
+}
+
+/**
+ * The items drawn after card `row`'s thread, in order: the cards' items after its unpacked rows, then
+ * what follows the cards in their list (Main's box, `#419 threads-view-main-messages`). Only those shown.
+ *
+ * @param {HTMLElement} row
+ * @returns {HTMLElement[]}
+ */
+function itemsAfterBlock(row) {
+  const id = row.getAttribute("data-id");
+  const cards = leftEl("side-cards");
+  const items = /** @type {HTMLElement[]} */ ([...cards.children]);
+  const after = items.slice(items.indexOf(row) + 1).filter((item) => item.getAttribute("data-unpack-thread") !== id);
+  const below = /** @type {HTMLElement[]} */ ([...leftEl("side-list").children]).slice([...leftEl("side-list").children].indexOf(cards) + 1);
+  return [...after, ...below].filter((item) => rowShown(item) &&
+    (typeof item.getClientRects !== "function" || item.getClientRects().length > 0));
+}
+
+/** The first item drawn after card `row`'s thread, or null. @param {HTMLElement} row */
+function itemAfterBlock(row) {
+  return itemsAfterBlock(row)[0] || null;
+}
+
+/**
+ * Card `row` was just packed or unpacked and held still, and the first item after its thread stood at
+ * `was.top` before: draw everything after the thread on the screen where it was, hold it there a moment
+ * (packed), and let it slide home.
+ *
+ * @param {HTMLElement} row
+ * @param {{key: string, top: number}} was
+ */
+function slideIntoPlace(row, was) {
+  const slideMs = screenMotionMs("--pack-slide");
+  if (slideMs <= 0 || replyDocked || document.hidden) return;
+  const items = itemsAfterBlock(row);
+  if (!items.length || typeof items[0].animate !== "function" || slideKey(items[0]) !== was.key) return;
+  const area = leftEl("side-scroll");
+  const stage = area.getBoundingClientRect();
+  const height = area.clientHeight || stage.height;
+  const moved = was.top - items[0].getBoundingClientRect().top;
+  if (Math.abs(moved) < 1) return;
+  const shift = Math.sign(moved) * Math.min(Math.abs(moved), height);
+  // Packed, the gap holds first; unpacked, the room opens at once.
+  const holdMs = moved > 0 ? screenMotionMs("--pack-gap-hold") : 0;
+  const total = holdMs + slideMs;
+  const ease = "cubic-bezier(0.2, 0, 0, 1)";
+  const from = `translateY(${shift}px)`;
+  const frames = holdMs > 0
+    ? [{ transform: from }, { transform: from, offset: holdMs / total, easing: ease }, { transform: "none" }]
+    : [{ transform: from, easing: ease }, { transform: "none" }];
+  const play = (/** @type {HTMLElement} */ item, /** @type {Keyframe[]} */ keyframes) => {
+    const motion = item.animate(keyframes, { duration: total });
+    packSlides.add(motion);
+    const done = () => packSlides.delete(motion);
+    motion.addEventListener("finish", done);
+    motion.addEventListener("cancel", done);
+  };
+  for (const item of items) {
+    const box = item.getBoundingClientRect();
+    // On the screen where it is drawn from, or where it comes to: the rest neither seen nor moved.
+    if (Math.min(box.top, box.top + shift) >= stage.bottom) break;
+    if (Math.max(box.bottom, box.bottom + shift) <= stage.top) continue;
+    play(item, frames);
+  }
+  // Unpacked, the thread's own rows come in under the cards sliding off them.
+  if (moved < 0) {
+    const id = row.getAttribute("data-id");
+    for (const item of /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children])) {
+      if (item.getAttribute("data-unpack-thread") !== id || !rowShown(item)) continue;
+      const box = item.getBoundingClientRect();
+      if (box.bottom <= stage.top || box.top >= stage.bottom) continue;
+      play(item, [{ opacity: 0, easing: ease }, { opacity: 1 }]);
+    }
+  }
 }
 
 /** The list the reader is actually looking at. Both panes share one scrolling element. */
@@ -43061,6 +43310,8 @@ function sameCardPlace(one, other) {
  * @param {() => void} change
  */
 function keepingCardPlace(change) {
+  // `#460 pack-gap-slide`. A slide is ended first, so the place is read where the cards are laid out.
+  finishPackSlide();
   const anchor = cardAnchor();
   change();
   placeCardAnchor(anchor);
@@ -43087,6 +43338,8 @@ function rememberCardPlace() {
 function openSideCards() {
   // A place held for the way back to the thread list is not one in cards opened afresh (`listCardsHeld`).
   listCardsHeld = null;
+  // Nor the room past the foot held for a card packed in them (`#459 pack-keeps-card-still`).
+  closeOverextend();
   columns.side.mode = "list";
   cardsOpening = true;
   try {
@@ -43625,7 +43878,31 @@ function setUnpackMode(mode) {
   keepThreadCardStates();
   renderUnpackToggle();
   sideCardsDrawn = "";
-  if (sideColumnUp()) keepingCardPlace(renderSideColumn);
+  if (!sideColumnUp()) return;
+  // `#459 pack-keeps-card-still`. The card the reader is plainly on held still, as one packed by itself is;
+  // with none, their place kept as for any change to the cards.
+  const still = stillCardOnScreen();
+  if (still !== null) keepingCardStill(still, renderSideColumn);
+  else keepingCardPlace(renderSideColumn);
+}
+
+/**
+ * The card the reader is plainly on in the cards: the highlighted one (`#277 thread-card-focus`), else the
+ * selected one, while it is on screen. Null for none, as with the selection on an unpacked row.
+ */
+function stillCardOnScreen() {
+  if (!sideColumnUp() || columns.side.mode !== "list") return null;
+  const area = leftEl("side-scroll");
+  const top = area.getBoundingClientRect().top;
+  const foot = top + (area.clientHeight || 0);
+  const mark = markOf(sidePane);
+  for (const id of [litCard(), mark && mark.card ? mark.id : null]) {
+    const row = id === null ? null : cardRow(id);
+    if (!row || !rowShown(row)) continue;
+    const box = row.getBoundingClientRect();
+    if (box.bottom > top && box.top < foot) return id;
+  }
+  return null;
 }
 
 /** u, over the Threads view: Unpack's next state. Elsewhere, nothing. */
@@ -43638,22 +43915,21 @@ function unpackFromKeyboard() {
 
 /**
  * Thread `id` drawn `state` by its own choice, outranking Unpack until it is pressed again, kept on this
- * device; the cards drawn again with its card held where it is on the screen (`row`, as drawn now).
+ * device; the cards drawn again with its card held exactly where it is on the screen, past the foot of
+ * the list where that is what it takes (`keepingCardStill`, `#459 pack-keeps-card-still`).
  */
-function setCardState(id, state, row) {
+function setCardState(id, state) {
   const key = cardStateKey(id);
   threadCardStates.delete(key);
   threadCardStates.set(key, state);
   keepThreadCardStates();
-  const area = leftEl("side-scroll");
-  const before = row && row.parentNode && rowShown(row) ? row.getBoundingClientRect().top : null;
-  sideCardsDrawn = "";
-  renderSideColumn();
-  // The card is drawn anew: the selection, its Tab stop and its focus go to the new one.
-  keepSelection();
-  const now = cardRow(id);
-  if (before === null || !now || !rowShown(now)) return;
-  area.scrollTop += now.getBoundingClientRect().top - before;
+  // `#460 pack-gap-slide`: what is below the thread slides into its new place.
+  keepingCardStill(id, () => {
+    sideCardsDrawn = "";
+    renderSideColumn();
+    // The card is drawn anew: the selection, its Tab stop and its focus go to the new one.
+    keepSelection();
+  }, true);
 }
 
 /** Thread `id`'s card in the cards on screen, or null. */
@@ -43671,7 +43947,7 @@ function cycleCardState(choice, row) {
   const now = String(row.getAttribute("data-card-state") || "collapsed");
   const at = order.indexOf(now);
   const next = at < 0 ? "unpacked" : order[(at + 1) % order.length];
-  setCardState(choice.id, next, row);
+  setCardState(choice.id, next);
   setStatus(next === "unpacked" ? "Thread unpacked under its card." : next === "expanded" ? "Card shown whole." : "Thread packed.");
 }
 
@@ -43680,9 +43956,8 @@ function cycleCardState(choice, row) {
  * there was one to pack.
  */
 function packThread(id) {
-  const row = cardRow(id);
-  if (!row) return false;
-  setCardState(id, "collapsed", row);
+  if (!cardRow(id)) return false;
+  setCardState(id, "collapsed");
   setStatus("Thread packed.");
   return true;
 }
@@ -51475,9 +51750,10 @@ if (typeof window.ResizeObserver === "function") {
     }, 0);
   });
   // Not the room past the foot itself, which only this page sizes: a size it is given while an observer
-  // of its neighbours is being told of theirs is one the browser could not report in the same frame.
+  // of its neighbours is being told of theirs is one the browser could not report in the same frame. Nor
+  // the room held for a card (`#459 pack-keeps-card-still`), for the same reason.
   for (const box of [leftEl("side-scroll"), ...leftEl("side-scroll").children]) {
-    if (box !== leftEl("side-overscroll")) sideGeometry.observe(box);
+    if (box !== leftEl("side-overscroll") && box !== leftEl("side-overextend")) sideGeometry.observe(box);
   }
 }
 /**
@@ -51702,6 +51978,9 @@ if (typeof window.ResizeObserver === "function") {
   };
   area.addEventListener("scroll", () => note(), { passive: true });
   const footKeeper = new window.ResizeObserver(() => {
+    // `#459 pack-keeps-card-still`. The room held for a card fitted to the rows first: what came at the foot
+    // takes its place, before anything that follows the foot measures it.
+    fitOverextend(area);
     // `#338 column-overscroll`. A reader in the room past the foot, the last card changing size under them.
     holdOverscrollReader(area);
     const was = footing;
@@ -51712,8 +51991,11 @@ if (typeof window.ResizeObserver === "function") {
     }
     note(context);
   });
-  // Not the room past the foot (`#338 column-overscroll`), which is the page's own and no content.
-  for (const box of area.children) if (box !== leftEl("side-overscroll")) footKeeper.observe(box);
+  // Not the room past the foot (`#338 column-overscroll`), nor the room held for a card (`#459
+  // pack-keeps-card-still`), which are the page's own and no content.
+  for (const box of area.children) {
+    if (box !== leftEl("side-overscroll") && box !== leftEl("side-overextend")) footKeeper.observe(box);
+  }
 }
 // `#214 reply-arrow`. Where an arrow meets the row directly above it is layout, and layout changes
 // without a redraw: the window resized or turned, the reading column dragged, the reader's type
@@ -51784,6 +52066,11 @@ leftEl("side-scroll").addEventListener("wheel", (/** @type {WheelEvent} */ event
   if (typeof area.scrollBy === "function") area.scrollBy({ top: px, behavior: "smooth" });
   else area.scrollTop += px;
 }, PASSIVE);
+// `#460 pack-gap-slide`. The reader's own wheel, touch, press or key on the list ends a slide at once: what
+// they act on is where it is laid out. Not a scroll, which the page's own place-keeping makes too.
+for (const type of ["wheel", "touchstart", "pointerdown", "keydown"]) {
+  leftEl("side-scroll").addEventListener(type, finishPackSlide, PASSIVE);
+}
 // ...and goes back below the screen as the reader goes back up past the foot, or once they have rested at
 // the foot without going into it (`waitOverscrollIdle`). A reader in it is noted where they have the last
 // card, for `holdOverscrollReader`.
@@ -51791,6 +52078,8 @@ leftEl("side-scroll").addEventListener("scroll", (/** @type {Event | undefined} 
   const area = leftEl("side-scroll");
   // A browser's scroll event always carries its time; the page suite fires its scroll listeners with none.
   const at = event ? event.timeStamp : -Infinity;
+  // `#459 pack-keeps-card-still`. The room held for a card goes as the reader goes up out of it.
+  fitOverextend(area);
   if (footGap(area) > 1) overscrollFootSince = null;
   else if (overscrollFootSince === null) overscrollFootSince = at;
   if (overscroll === null || overscrollRoom(area) === 0) return;

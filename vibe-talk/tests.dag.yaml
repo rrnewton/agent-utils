@@ -1353,6 +1353,23 @@ steps:
       resources: {browser: 1}
       est_duration_s: 9
 
+  # `#459 pack-keeps-card-still` and `#460 pack-gap-slide` in the browser engine, at 1280x800 with a mouse and
+  # 393x852 by touch: a card packed at the foot of the Threads view by a click, its top the same in every
+  # frame, held past the foot in room that a live reply fills and that scrolling up takes away for good; the
+  # card after it held through the gap's hold and then moving only up; unpacked, the mirror; up the list no
+  # room; under reduced motion no animation. Measured on 2026-10-23: about 16s wall.
+  - group: check
+    job: pack-still-browser
+    desc: a thread card packed or unpacked in the Threads view still in every frame, past the foot where it takes that, and what is below sliding into the gap, in current Chromium at 1280x800 and 393x852
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/pack_still_browser.py
+    jobs_flag: ""
+    timeout: 150
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 16
+
   # `#429 keyboard-hides-bar` in the browser engine, at 393x852 by touch with the on-screen keyboard
   # simulated as Chrome on Android lays it out (the viewport 336px shorter): a focused box alone keeps both
   # bars; the keyboard up takes the control bar and the dock away and the list reaches the window's foot,

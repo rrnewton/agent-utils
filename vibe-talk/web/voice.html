@@ -791,6 +791,14 @@
                 Nothing to read or press, so hidden from assistive technology.
               -->
               <div id="side-overscroll" aria-hidden="true"></div>
+              <!--
+                `#459 pack-keeps-card-still`. Blank room past the foot for a thread card packed where it stands:
+                the owner, "I would really like the thread card I act on by clicking to STAY STILL, even if
+                that means the collapsed child messages leave a big VOID on the screen". No height until a
+                pack would otherwise move the card, when web/voice.js gives it what holds the card still
+                (`keepingCardStill`); it gives way as the reader scrolls up and as new rows fill it.
+              -->
+              <div id="side-overextend" aria-hidden="true"></div>
             </div>
             <div id="side-tools">
               <button id="side-jump-newest" class="chip" type="button" aria-label="Jump to the newest message" hidden>

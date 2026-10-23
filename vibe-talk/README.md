@@ -57,8 +57,13 @@ four views are offered, in the view picker and on Ctrl+1 to Ctrl+4 (Cmd on a Mac
   card also packs and unpacks its own thread: a click on it (or Enter or `o`) goes three lines → the
   card whole → whole with its messages unpacked → three lines, a card that says a summary going two
   ways; the ▲ in the first unpacked message's gutter (where All's bridge has its ×), or `^`, packs the
-  thread with its card kept where it is. A thread's own choice outranks Unpack until Unpack is pressed
-  again, and both are kept on this device. The Threads view highlights no card and dims none, as All
+  thread with its card kept where it is. However it is packed or unpacked, the card stays exactly where it
+  is on the screen, even at the foot of the list (`#459 pack-keeps-card-still`): the list then scrolls
+  past its end, leaving blank room where the messages were, which gives way as you scroll up (scrolling
+  down never goes back into it) and as new messages fill it; Unpack does the same for the selected card.
+  The gap a packed thread leaves holds for a moment and what is below slides up into it; unpacked, what
+  is below slides down (`#460 pack-gap-slide`; nothing moves under the system's reduced motion). A
+  thread's own choice outranks Unpack until Unpack is pressed again, and both are kept on this device. The Threads view highlights no card and dims none, as All
   and two columns do (`#277`); a click there is the pack toggle. The read
   modes apply inside each thread, a collapsed run of read messages hanging off its bridge. The
   unpacked messages are message rows like any other: the mouse lights them, ↓/↑ and j/k walk cards
@@ -7695,6 +7700,8 @@ phone's back gesture keep their `#304` meaning, closing what is open and then le
 phone reader is never walked back through every view switch first. The page takes Ctrl/Cmd+[ and ]
 before any element's own listener, as it does Ctrl+S; the bare `[` and `]` still move between the two
 columns. `make -C vibe-talk threads-polish-browser` walks it in a real Chromium at 1280x800 and 393x852.
+`make -C vibe-talk pack-still-browser` walks a card packed and unpacked in place (`#459
+pack-keeps-card-still`, `#460 pack-gap-slide`) frame by frame in a real Chromium at 1280x800 and 393x852.
 
 ### Copying the highlighted message
 
