@@ -36217,7 +36217,8 @@ test("a reply placed in a thread waits behind an answer already on its way there
   await page.settle();
   assert.equal(page.repliesPosted.length, 1,
     "the placed reply overtook the answer queued before it for the same thread");
-  assert.match(outgoingRows(page)[1].text(), /Waiting to send/, "the reply was not placed and held");
+  const placed = outgoingRows(page).find((row) => /an answer that had to find its thread first/.test(row.text()));
+  assert.match(placed ? placed.text() : "", /Waiting to send/, "the reply was not placed and held");
 
   answers[0]();
   await page.settle();
@@ -80184,6 +80185,9 @@ test("`#466 reply-promotes-thread`: a reply on its way makes the message it answ
   assert.equal(outgoingRows(page).length, 0, "the reply is drawn twice, as itself and as its row in the outbox");
   await pickThread(page, "main");
   assert.equal(tagOf(rowOf(page, "210")).text, "Thread(1)", "the count changed as the reply landed");
+  // Its card stays, held up by the reply now in the store, before any read of the Threads list names it.
+  await pickThread(page, "threads");
+  assert.ok(cardIdsOf(page).includes(data.lone.id), "the new thread's card went as the reply landed");
 });
 
 test("`#466 reply-promotes-thread`: a reply that was not sent keeps its thread, with Retry, until it is dismissed", async () => {
@@ -80302,4 +80306,37 @@ test("`#467 inline-send-in-place`: a reply that does not go stays where it was w
   await page.settle();
   assert.equal(page.repliesPosted.length, 2);
   assert.equal(inPlaceRows(page).length, 1, "Retry moved the reply's row");
+});
+
+test("`#466 reply-promotes-thread`: the stream's copy of a reply still on its way is counted once, not with its send", async () => {
+  const { page, data, mine, finish, sent } = await promotingPage();
+  assert.equal(tagOf(rowOf(page, "210")).text, "Thread(1)");
+  const key = posted(page)[0].idempotency_key;
+  await deliver(page, page.stream(), sseMessage(mine, { self_posted: true, client_key: key }));
+  await page.settle();
+  assert.equal(tagOf(rowOf(page, "210")).text, "Thread(1)", "the reply on its way was counted twice, as itself and its send");
+  finish(json(200, { posted: mine, parts: [mine] }));
+  await sent;
+  await page.settle();
+  assert.equal(tagOf(rowOf(page, "210")).text, "Thread(1)");
+  assert.ok(data);
+});
+
+test("`#467 inline-send-in-place`: the row is drawn straight after the list, and not under the Pinned filter", async () => {
+  const page = await threadPage("flat");
+  delayedReply(page);
+  await replyButton(rowOf(page, "203")).click();
+  await page.el("reply-text").setValue("where it was written");
+  page.el("reply-send").click();
+  await page.settle();
+  const pane = page.el("pane-discord").children;
+  const at = pane.indexOf(page.el("discord-log"));
+  assert.ok(pane[at + 1] && pane[at + 1].hasClass("outgoing-inplace"),
+    "the reply's row is not straight after the list, where it is drawn without anchor positioning");
+  await page.el("pinned-filter").click();
+  await page.settle();
+  assert.equal(inPlaceRows(page).length, 0, "the reply's row is drawn under the Pinned filter");
+  await page.el("pinned-filter").click();
+  await page.settle();
+  assert.equal(inPlaceRows(page).length, 1, "the reply's row did not come back with the list");
 });

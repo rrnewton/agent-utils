@@ -4945,6 +4945,8 @@ function applySearch() {
   el("search-empty").hidden = empty;
   // `#410 inline-reply-editor`. A reply open in the stream: under its row while the search shows it.
   if (replyDocked) placeInlineReply();
+  // `#467 inline-send-in-place`. And a reply's row where its box was, while the search shows that row.
+  else placeRowsInPlaceAgain();
 }
 
 /**
@@ -23582,8 +23584,11 @@ function threadIndex() {
   const byId = new Map();
   if (!threadingSupported || channelCanon.channel !== String(el("discord-channel").value)) return byId;
   // `#466 reply-promotes-thread`. The threads sends in the outbox are going into, and when the newest
-  // was written: a root a send answers is a thread to read, as new as that send.
+  // was written: a root a send answers is a thread to read, as new as that send. And so is one whose
+  // reply the store holds, whatever its count still says: the reply just sent, before any read says so.
   const pending = pendingThreadTimes();
+  const answered = new Set(channelCanon.messages.filter((held) => threadOf(held) && held.thread.is_root !== true)
+    .map((held) => String(held.thread.id)));
   for (const summary of channelCanon.threads) {
     const id = String(summary.id);
     if (id !== channelCanon.scope) byId.set(id, threadChoice(id, summary));
@@ -23598,7 +23603,9 @@ function threadIndex() {
       // A root nobody has answered is not offered as a thread to read, as the server's own thread
       // list leaves it out: on a provider that names a thread for every message, that would be
       // every recent message. Opened from its tag on All, it is still offered while it is open.
-      if (root && (root.thread.reply_count !== 0 || pending.has(id))) byId.set(id, threadChoice(id, null, root));
+      if (root && (root.thread.reply_count !== 0 || pending.has(id) || answered.has(id))) {
+        byId.set(id, threadChoice(id, null, root));
+      }
       continue;
     }
     if (Number.isFinite(at)) known.at = Number.isFinite(known.at) ? Math.max(known.at, at) : at;
@@ -26168,6 +26175,8 @@ async function loadOlderTimeline(signal) {
 
 /** Save before clearing an editor; storage refusal never prevents an intentional send. */
 function persistOutgoingMessages() {
+  // `#466 reply-promotes-thread`: what `pendingByThread` worked out is stale.
+  outboxVersion += 1;
   try {
     const encoded = JSON.stringify([...outgoingMessages.values()]);
     outgoingStorageOkay = storedExactly(OUTGOING_KEY, encoded);
@@ -26521,19 +26530,40 @@ function renderOutgoingMessages() {
 // down to the BOTTOM, not where the compose box was. This should provide better continuity."
 //
 // A reply sent from the box in the stream (`#410 inline-reply-editor`) keeps its row there: under the
-// message it answered and what is gathered under it (`anchorUnder`), in whichever list of the column
-// draws that message — a thread, Main, All, the rows unpacked under the Threads view's cards, either
-// column — saying how it goes ("Sending…", "Posting part 2 of 3…", or "Not sent" with Retry and Edit),
+// message it answered and what is gathered under it (`anchorUnder`), in the column's list when it draws
+// that message — a thread, Main, All, in either column — saying how it goes ("Sending…", "Posting part 2
+// of 3…", or "Not sent" with Retry and Edit),
 // until the reply itself is drawn in its place, which retires the row as it always has. A message sent
 // from the box at the foot keeps its row at the foot, where it was written. Drawn as the box is: never
 // a row of the list, but named to its row by an anchor of its own (`--outgoing-N`), that row keeping
 // room under itself as tall as what is drawn there, so the rows after it move down by that and no
 // more, and nothing jumps when the reply takes its place. Without anchor positioning it is drawn after
 // the list, at its foot. Not under the row the open reply's box is drawn under: that one place holds
-// one thing, and the row goes to the foot until the box moves on.
+// one thing, and the row goes to the foot until the box moves on (`placeInlineReply` places them again
+// as the box opens and goes). Elsewhere, where the message is not drawn — another list, the cards, a
+// search that hides it (whose pass places them again) — and under the Pinned filter, at the foot.
 
 /** By column, the rows named as anchors on its last pass, and the lists of rows drawn under them. */
 const outgoingInPlaceDrawn = new Map();
+
+/** The row each list drawn in place is named to, for `outgoingRoomWatch`. */
+const outgoingRoomAnchors = new WeakMap();
+
+/** The room under `anchor`: the height of `group`, drawn there, in px. */
+function fitOutgoingRoom(group, anchor) {
+  const room = `${Math.ceil(group.getBoundingClientRect().height || 0)}px`;
+  if (anchor.style.getPropertyValue("--outgoing-room") !== room) anchor.style.setProperty("--outgoing-room", room);
+}
+
+/** Keeps each row's room as tall as what is drawn under it through a resize or a reflow, as the box's is. */
+const outgoingRoomWatch = typeof window.ResizeObserver === "function"
+  ? new window.ResizeObserver((entries) => {
+    for (const { target } of entries) {
+      const anchor = outgoingRoomAnchors.get(target);
+      if (anchor) fitOutgoingRoom(/** @type {HTMLElement} */ (target), anchor);
+    }
+  })
+  : null;
 
 /**
  * Put each of `rows` — the outbox's rows for the column being worked on — whose entry was sent from the
@@ -26549,9 +26579,17 @@ function placeOutgoingInPlace(rows) {
     anchor.style.removeProperty("anchor-name");
     anchor.style.removeProperty("--outgoing-room");
   }
-  for (const group of drawn.groups) if (group.parentNode) group.parentNode.removeChild(group);
-  const lists = [el(pinnedOnly ? "pinned-log" : "discord-log")];
-  if (activeColumn === columns.side && columns.side.mode !== "thread") lists.push(leftEl("side-cards"));
+  for (const group of drawn.groups) {
+    if (outgoingRoomWatch) outgoingRoomWatch.unobserve(group);
+    if (group.parentNode) group.parentNode.removeChild(group);
+  }
+  // Not under the Pinned filter, which shows pinned messages and nothing else (`#206 pin-message`): the
+  // rows go to the foot, which is hidden there.
+  if (pinnedOnly) {
+    outgoingInPlaceDrawn.set(activeColumn, { anchors: [], groups: [] });
+    return rows;
+  }
+  const lists = [el("discord-log")];
   /** @type {Map<HTMLElement, {list: HTMLElement, rows: HTMLElement[]}>} */
   const under = new Map();
   /** @type {HTMLElement[]} */
@@ -26585,10 +26623,13 @@ function placeOutgoingInPlace(rows) {
     group.setAttribute("aria-label", "Outgoing reply");
     group.style.setProperty("position-anchor", name);
     group.append(...placed);
-    /** @type {HTMLElement} */ (list.parentNode).append(group);
+    // Straight after the list: where it is drawn without anchor positioning, the list's foot.
+    /** @type {HTMLElement} */ (list.parentNode).insertBefore(group, list.nextSibling);
     anchor.setAttribute("data-outgoing-anchor", "");
     anchor.style.setProperty("anchor-name", name);
-    anchor.style.setProperty("--outgoing-room", `${Math.ceil(group.getBoundingClientRect().height || 0)}px`);
+    fitOutgoingRoom(group, anchor);
+    outgoingRoomAnchors.set(group, anchor);
+    if (outgoingRoomWatch) outgoingRoomWatch.observe(group);
     next.anchors.push(anchor);
     next.groups.push(group);
   }
@@ -26646,50 +26687,74 @@ let drawnPendingThreads = "";
 function outgoingThreadOf(entry) {
   if (entry.continueIn) return String(entry.continueIn);
   if (entry.threadId) return String(entry.threadId);
-  if (!entry.replyTo || entry.channel !== String(el("discord-channel").value) ||
+  const viewing = String(el("discord-channel").value);
+  if (!entry.replyTo || entry.channel !== viewing || channelCanon.channel !== viewing ||
       !channelRepliesInThread(entry.channel)) return null;
-  const answered = heldMessage(entry.replyTo);
+  // The store as it stands, never loaded from here: this runs in the passes that draw it.
+  const answered = channelCanon.messages.find((held) => String(held.id) === String(entry.replyTo));
   const record = answered ? heldThreadRecord(answered) : null;
   return record ? String(record.id) : null;
 }
 
-/** The sends in the outbox for the channel on screen that count in thread `thread`, not yet sent. */
-function pendingInto(thread) {
+/**
+ * By thread of the channel on screen, the sends in the outbox counting in it — not yet sent, and not yet
+ * seen on the stream (`noteOutgoingEcho`), whose copy the store then holds and counts — and when the
+ * newest was written. Worked out once for each change of the outbox, the store's messages or the
+ * channel, and not for every row of every pass that asks (`pendingInto`).
+ *
+ * @returns {Map<string, {count: number, at: number}>}
+ */
+function pendingByThread() {
   const viewing = String(el("discord-channel").value);
-  let count = 0;
+  const key = `${viewing} ${outboxVersion} ${channelCanon.channel} ${channelCanon.messages.length}`;
+  if (pendingCache.key === key) return pendingCache.threads;
+  /** @type {Map<string, {count: number, at: number}>} */
+  const threads = new Map();
   for (const entry of outgoingMessages.values()) {
-    if (entry.channel !== viewing || entry.state === "sent" || !entry.remaining) continue;
-    if (outgoingThreadOf(entry) === String(thread)) count += 1;
+    if (entry.channel !== viewing || entry.state === "sent" || !entry.remaining || entry.echoed) continue;
+    const thread = outgoingThreadOf(entry);
+    if (thread === null) continue;
+    const held = threads.get(thread) || { count: 0, at: 0 };
+    threads.set(thread, { count: held.count + 1, at: Math.max(held.at, Number(entry.createdAt) || 0) });
   }
-  return count;
+  pendingCache = { key, threads };
+  return threads;
+}
+
+/** `pendingByThread`'s last answer, and what it was worked out for. */
+let pendingCache = { key: "", threads: /** @type {Map<string, {count: number, at: number}>} */ (new Map()) };
+
+/** Moved by every change of the outbox (`persistOutgoingMessages`), for `pendingByThread`. */
+let outboxVersion = 0;
+
+/** The sends in the outbox for the channel on screen that count in thread `thread`. */
+function pendingInto(thread) {
+  const held = pendingByThread().get(String(thread));
+  return held ? held.count : 0;
 }
 
 /** The threads of the channel on screen sends in the outbox go into, each with when its newest was written. */
 function pendingThreadTimes() {
-  const viewing = String(el("discord-channel").value);
-  /** @type {Map<string, number>} */
-  const times = new Map();
-  for (const entry of outgoingMessages.values()) {
-    if (entry.channel !== viewing || entry.state === "sent" || !entry.remaining) continue;
-    const thread = outgoingThreadOf(entry);
-    if (thread === null) continue;
-    const at = Number(entry.createdAt) || 0;
-    times.set(thread, Math.max(times.get(thread) || 0, at));
-  }
-  return times;
+  return new Map([...pendingByThread()].map(([thread, { at }]) => [thread, at]));
 }
 
 /** Which threads of the channel on screen have sends counting in them, and how many: for redraws. */
 function pendingThreadsKey() {
   const viewing = String(el("discord-channel").value);
-  /** @type {Map<string, number>} */
-  const counts = new Map();
-  for (const entry of outgoingMessages.values()) {
-    if (entry.channel !== viewing || entry.state === "sent" || !entry.remaining) continue;
-    const thread = outgoingThreadOf(entry);
-    if (thread !== null) counts.set(thread, (counts.get(thread) || 0) + 1);
-  }
-  return [viewing, ...[...counts].sort().map(([thread, count]) => `${thread}=${count}`)].join(" ");
+  return [viewing, ...[...pendingByThread()].sort().map(([thread, { count }]) => `${thread}=${count}`)].join(" ");
+}
+
+/**
+ * The stream has shown this server's copy of a post made for entry `id` (its `client_key`): the store
+ * holds it now and counts it in its thread, so the entry no longer does (`pendingByThread`). Not saved:
+ * a reload asks the server instead (`settleUnconfirmedSends`).
+ */
+function noteOutgoingEcho(id) {
+  const entry = outgoingMessages.get(id);
+  if (!entry || entry.state === "sent" || entry.echoed) return;
+  entry.echoed = true;
+  outboxVersion += 1;
+  renderOutgoingEverywhere();
 }
 
 /**
@@ -26703,16 +26768,26 @@ function withPendingThreads(summaries) {
   const viewing = String(el("discord-channel").value);
   /** @type {Map<string, any>} */
   const added = new Map();
-  for (const entry of [...outgoingMessages.values()].reverse()) {
-    if (entry.channel !== viewing || entry.state === "sent" || !entry.remaining) continue;
-    const thread = outgoingThreadOf(entry);
-    if (thread === null || listed.has(thread) || added.has(thread)) continue;
+  // The threads sends are going into, and those a reply sent from here is held in, before a read of the
+  // Threads list names them.
+  /** @type {Array<[string, number]>} */
+  const starting = [...pendingThreadTimes()];
+  if (channelCanon.channel === viewing) {
+    for (const held of channelCanon.messages) {
+      if (threadOf(held) && held.thread.is_root !== true && sentFromThisPage(held)) {
+        starting.push([String(held.thread.id), sentFromHereAt.get(String(held.id)) || timeOf(held, "timestamp")]);
+      }
+    }
+  }
+  starting.sort((a, b) => b[1] - a[1]);
+  for (const [thread, at] of starting) {
+    if (listed.has(thread) || added.has(thread)) continue;
     const root = channelCanon.messages.find((held) => threadOf(held) === thread && held.thread.is_root === true);
     if (!root) continue;
     added.set(thread, {
       id: thread, title: "", root, display_name: null, summary: null, hue: root.thread.hue ?? null,
       reply_count: null, reply_count_exact: false, complete: false,
-      updated_at: new Date(entry.createdAt || Date.now()).toISOString(),
+      updated_at: new Date(at || Date.now()).toISOString(),
     });
   }
   return added.size ? [...added.values(), ...summaries] : summaries;
@@ -41807,6 +41882,18 @@ function placeInlineReply() {
   if (anchor !== null && !anchor.hasAttribute("data-inline-reply")) anchor.setAttribute("data-inline-reply", "");
   if (mount.hasAttribute("data-anchored") !== (anchor !== null)) mount.toggleAttribute("data-anchored", anchor !== null);
   fitInlineRoom();
+  // `#467 inline-send-in-place`. A reply's row drawn where the box now is goes to the foot, and back.
+  placeRowsInPlaceAgain();
+}
+
+/** Draw the outbox's rows again in every column where any was sent from the box in the stream. */
+function placeRowsInPlaceAgain() {
+  for (const entry of outgoingMessages.values()) {
+    if (entry.inPlace) {
+      eachColumn(renderOutgoingMessages);
+      return;
+    }
+  }
 }
 
 /** The room under the anchor row: the height of the box drawn there, in px. */
@@ -47983,7 +48070,10 @@ function onStreamFrame(frame) {
   }
   receiveLiveMessage(payload.message, payload.self_posted, payload.replayed, payload.from_tail);
   // `#468 send-dedupe`. This server's copy of a post it made for one of this page's keys.
-  if (payload.self_posted && typeof payload.client_key === "string") settleFromServer(payload.client_key);
+  if (payload.self_posted && typeof payload.client_key === "string") {
+    noteOutgoingEcho(payload.client_key);
+    settleFromServer(payload.client_key);
+  }
 }
 
 let liveMutationRefreshRunning = false;
@@ -48246,6 +48336,9 @@ function takeThreadRecord(message) {
  */
 function noteLiveRemoval(channel, id) {
   liveRemovalsSeen.set(String(channel), (liveRemovalsSeen.get(String(channel)) || 0) + 1);
+  // `#466 reply-promotes-thread`. Heard of in any channel: a post of this page's removed upstream is no
+  // longer kept against reads that do not carry it (`ownPostStands`).
+  sentFromHereAt.delete(String(id));
   if (channelCanon.channel !== String(channel)) return;
   noteRemoved(channelCanon, String(id));
   // `#315 removed-reply-target`. A reply open on it says so now, not when the read behind this lands,
