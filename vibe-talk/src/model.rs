@@ -320,6 +320,16 @@ pub struct Message {
     /// say, and a copy without it never takes away one another copy brought.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub op_key: Option<String>,
+    /// This copy's version on this server's clock, in Unix milliseconds: when the observation
+    /// that produced it began — a read's start (or the instant its answer was complete to, when it
+    /// came from a memory that says so), the arrival of a live change, the provider's answer to
+    /// this server's own post. `#473 replication-c7-server-versions`; the replication model's
+    /// rule 2, the same clock the message cache orders copies by. Set where a copy is served, never
+    /// at read: a page compares two copies of a message by it, with
+    /// [`Message::edited_timestamp`] first, instead of by when it sent the reads that brought
+    /// them. Absent from an older server, and on paths that have not said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_ms: Option<i64>,
 }
 
 /// Who one user mention names. `#318 slack-mention-names`; see [`Message::mentions`].
@@ -612,6 +622,7 @@ mod tests {
             mentions: Vec::new(),
             upstream_url: None,
             op_key: None,
+            observed_ms: None,
         }
     }
 

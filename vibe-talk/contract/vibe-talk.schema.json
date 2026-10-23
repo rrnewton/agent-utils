@@ -679,6 +679,14 @@
           "description": "Whether the owner's noise rules call this message read already. `#196 auto-read-noise`.\n\nDECIDED BY THIS SERVER EVERY TIME the message is served, from its current text, by\n[`crate::noise::NoiseFilter::mark`]; it is never stored and never trusted from whoever\nsent the message. That is what lets an edited placeholder come back as unread, and a\nremoved rule un-hide everything it caught, without a single record having to change.\n\nThe page reads this flag rather than matching the text itself, so there is one predicate\nand it is the server's. Absent means `false`, which is also what an older server meant.",
           "type": "boolean"
         },
+        "observed_ms": {
+          "description": "This copy's version on this server's clock, in Unix milliseconds: when the observation\nthat produced it began — a read's start (or the instant its answer was complete to, when it\ncame from a memory that says so), the arrival of a live change, the provider's answer to\nthis server's own post. `#473 replication-c7-server-versions`; the replication model's\nrule 2, the same clock the message cache orders copies by. Set where a copy is served, never\nat read: a page compares two copies of a message by it, with\n[`Message::edited_timestamp`] first, instead of by when it sent the reads that brought\nthem. Absent from an older server, and on paths that have not said.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "op_key": {
           "description": "The operation key this message was posted with, where its provider carries one invisibly\nand returned it on this copy: exactly the key handed to the post\n([`crate::chat::ChatClient::post_message_keyed`]). `#465 replication-c6-op-key-marker`. Provider-neutral,\nso nothing that reads it needs to know where it came from\n([`crate::chat::ChatClient::op_key_carrier`] says whether a provider returns it at all).\nABSENT IS \"NONE CARRIED\": a message nobody keyed, or one from a provider or path that cannot\nsay, and a copy without it never takes away one another copy brought.",
           "type": [
@@ -2004,6 +2012,14 @@
             "null"
           ]
         },
+        "observed_ms": {
+          "description": "When the read this page answers began, on this server's clock, in Unix milliseconds — or\nthe instant it is complete to, when that is earlier (`as_of`). `#473\nreplication-c7-server-versions`. Every copy it carries is at least this new; a copy a page\nholds that was observed before it is older than this page.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "pins_revision": {
           "description": "The revision this channel's pins are at. `#206 pin-message`.\n\nOn every read, newest page and delta alike, so a refresh that already happens is what tells\na page another device pinned or unpinned something; the page reads `/pins` again only when\nthis differs from the revision of the list it holds. Absent when the store cannot say — no\nstorage configured, or a failing one — and from an older server.",
           "format": "int64",
@@ -2028,6 +2044,14 @@
           "format": "uint",
           "minimum": 0,
           "type": "integer"
+        },
+        "settled_below_ms": {
+          "description": "On a newest page only: messages created before this instant, provider time in Unix\nmilliseconds, were listed by the read if they were there, so one a page holds from before\n[`TimelinePage::observed_ms`] that this page lacks is gone. Anything created at or after\nit is in the unsettled band: a provider may list a message late, so its absence proves\nnothing. The replication model's rule 4. `#473 replication-c7-server-versions`.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "thread": {
           "anyOf": [

@@ -543,6 +543,9 @@ pub async fn generic_since<C: ChatClient + ?Sized>(
                 removed_threads: Vec::new(),
             }),
             as_of: newest.as_of,
+            // The newest page this delta was cut from: as new as it. A delta proves no absence.
+            observed_ms: newest.observed_ms,
+            settled_below_ms: None,
         },
         position,
     })
@@ -582,6 +585,7 @@ mod tests {
             mentions: Vec::new(),
             upstream_url: None,
             op_key: None,
+            observed_ms: None,
         }
     }
 

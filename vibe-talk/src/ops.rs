@@ -516,7 +516,17 @@ fn may_serve(state: &AppState, caller: crate::auth::Scope) -> bool {
 /// way a provider's `as_of` is. Stamp and mark the messages as an upstream read's are; keep an
 /// unstamped copy for the refresh's corrections, which compare like with like.
 fn served_messages(view: &View) -> (Vec<Message>, Option<String>) {
-    let messages = view.rows.iter().map(|row| row.message.clone()).collect();
+    // Each copy's version is the observation that set it, as the cache holds it. `#473
+    // replication-c7-server-versions`.
+    let messages = view
+        .rows
+        .iter()
+        .map(|row| {
+            let mut message = row.message.clone();
+            message.observed_ms = Some(row.observed_ms);
+            message
+        })
+        .collect();
     let as_of = view
         .head
         .map(|head| crate::clock::iso_from_ms(head.head_ms));
@@ -1431,6 +1441,13 @@ pub async fn timeline(
                     let mut page = crate::threads::TimelinePage {
                         messages: raw,
                         has_threads: view.has_threads,
+                        // `#473 replication-c7-server-versions`: as new as the latest read of
+                        // the scope's newest end the file records, and proving what that read's
+                        // settled stretch proved.
+                        observed_ms: view
+                            .head_checked_ms
+                            .or(view.head.map(|head| head.head_listed_ms)),
+                        settled_below_ms: view.head.map(|head| head.unsettled_from_ms),
                         // Never a claim that the scope's start is here: the cache's coverage
                         // is clipped at its age limit, so older history upstream is unknown
                         // to it. With no `next_before` the page reads this as "more above:
@@ -1462,6 +1479,9 @@ pub async fn timeline(
         }
     }
     let fill = state.message_cache.begin_for(caller, &channel.id);
+    // When the read began, on this server's clock: the page's version. `#473
+    // replication-c7-server-versions`.
+    let began_ms = crate::store::now_ms();
     let (mut page, position) = match resumed {
         Some(Forward::Native(own)) => {
             backend.after = Some(own);
@@ -1496,6 +1516,11 @@ pub async fn timeline(
         };
         Some(forward::encode(&channel.id, request.view, thread, &next)?)
     };
+    version_page(
+        &mut page,
+        began_ms,
+        timeline_read == crate::cache::observe::TimelineRead::Newest,
+    );
     // One filter for the whole page, thread roots included: a root that is itself a placeholder
     // is drawn as one, in the thread list as much as in the conversation.
     let noise = crate::noise::filter_for(state, &channel.id).await;
@@ -1530,6 +1555,33 @@ pub async fn timeline(
             .note_real_page(&channel.id, request.view, thread);
     }
     Ok((channel, page))
+}
+
+/// Give `page`, read upstream from `began_ms`, its version on this server's clock, and every copy on
+/// it that has none the same. `#473 replication-c7-server-versions`, the replication model's C7.
+///
+/// The version is when the read began, or the instant its answer says it is complete to (`as_of`,
+/// a provider's memory answering) when that is earlier: a read reflects the provider at some instant
+/// after it began, and taking the start never claims more than it saw. A newest page also says where
+/// its proven stretch ends: a provider may list a message up to [`crate::cache::coverage::SETTLE_MS`]
+/// after its own timestamp, so only messages created before the version less that are proven absent
+/// by not being on it. A step back, or a delta, proves no absence.
+fn version_page(page: &mut crate::threads::TimelinePage, began_ms: i64, newest: bool) {
+    let observed = page
+        .as_of
+        .as_deref()
+        .and_then(crate::clock::instant_ms)
+        .map_or(began_ms, |complete| complete.min(began_ms));
+    page.observed_ms = Some(observed);
+    page.settled_below_ms = newest.then(|| observed - crate::cache::coverage::SETTLE_MS);
+    let roots = page
+        .threads
+        .iter_mut()
+        .chain(page.thread.iter_mut())
+        .filter_map(|summary| summary.root.as_mut());
+    for message in page.messages.iter_mut().chain(roots) {
+        message.observed_ms.get_or_insert(observed);
+    }
 }
 
 /// One speakable line per recent message, and what was left out of it.
@@ -3944,6 +3996,9 @@ async fn post_each(
         match sent {
             Ok(mut one) => {
                 stamp(state, std::slice::from_mut(&mut one));
+                // Its version: the provider took it after this part was asked for. `#473
+                // replication-c7-server-versions`.
+                one.observed_ms.get_or_insert(began_ms);
                 // Remember that WE posted this, before anything can observe it. `#44 live-push`:
                 // the poller will see it in a few seconds, and relaying it into the live
                 // conversation would make the agent hear its own reply as new information.

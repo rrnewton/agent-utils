@@ -855,6 +855,7 @@ impl Raw {
             upstream_url: None,
             // The operation key a keyed post filed in its metadata. `#465 replication-c6-op-key-marker`.
             op_key: op_key_of(&self.value),
+            observed_ms: None,
         })
     }
 }

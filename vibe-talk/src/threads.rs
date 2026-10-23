@@ -230,6 +230,19 @@ pub struct TimelinePage {
     /// serving data it could not bring up to date just now. Absent means now.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub as_of: Option<String>,
+    /// When the read this page answers began, on this server's clock, in Unix milliseconds — or
+    /// the instant it is complete to, when that is earlier (`as_of`). `#473
+    /// replication-c7-server-versions`. Every copy it carries is at least this new; a copy a page
+    /// holds that was observed before it is older than this page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_ms: Option<i64>,
+    /// On a newest page only: messages created before this instant, provider time in Unix
+    /// milliseconds, were listed by the read if they were there, so one a page holds from before
+    /// [`TimelinePage::observed_ms`] that this page lacks is gone. Anything created at or after
+    /// it is in the unsettled band: a provider may list a message late, so its absence proves
+    /// nothing. The replication model's rule 4. `#473 replication-c7-server-versions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_below_ms: Option<i64>,
 }
 
 impl TimelinePage {

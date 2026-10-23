@@ -474,6 +474,7 @@ pub async fn ingest_event(
                 mentions: Vec::new(),
                 upstream_url: None,
                 op_key: None,
+                observed_ms: None,
             };
             (crate::live::LiveKind::Delete, channel_id, tombstone)
         }

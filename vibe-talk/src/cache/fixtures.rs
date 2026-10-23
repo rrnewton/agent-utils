@@ -34,6 +34,7 @@ pub(crate) fn message(id: &str, author: &str, content: &str, created_ms: i64) ->
         mentions: Vec::new(),
         upstream_url: None,
         op_key: None,
+        observed_ms: None,
     }
 }
 

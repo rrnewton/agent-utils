@@ -2612,6 +2612,7 @@ mod tests {
             mentions: Vec::new(),
             upstream_url: None,
             op_key: None,
+            observed_ms: None,
         };
         let line = untrusted::model_line(&mine, &owner, None);
         assert!(

@@ -1837,6 +1837,9 @@ pub fn newer_than_trimmed(
             removed_threads: Vec::new(),
         }),
         as_of: page.as_of,
+        // The newest page this delta was cut from: as new as it. A delta proves no absence.
+        observed_ms: page.observed_ms,
+        settled_below_ms: None,
     }
 }
 
@@ -2434,6 +2437,7 @@ mod lookup_tests {
             mentions: Vec::new(),
             upstream_url: None,
             op_key: None,
+            observed_ms: None,
         }
     }
 
@@ -2770,6 +2774,7 @@ mod threads_tests {
             mentions: Vec::new(),
             upstream_url: None,
             op_key: None,
+            observed_ms: None,
         }
     }
 
