@@ -1605,7 +1605,12 @@ steps:
     jobs_flag: ""
     jobs_env: CARGO_BUILD_JOBS
     deps: [build.release]
-    cpu_timeout: 1800
+    # Measured 2026-10-23 on the loaded validation host: a passing run used 1789 s of CPU, and
+    # runs since were killed at the old 1800 s budget while the page suite (node
+    # tests/js/voice_page.test.mjs, 450 to 530 s of CPU by itself) was still running. 2700 s
+    # leaves room for ordinary growth. Splitting the page suites into their own step would be
+    # the better fix: each would then get a budget of its own.
+    cpu_timeout: 2700
     hint:
       est_duration_s: 180
       classification: cpu-bound
