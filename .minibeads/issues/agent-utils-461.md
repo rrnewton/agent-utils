@@ -1,12 +1,13 @@
 ---
 title: 'upstream-link-native: Open in Slack must answer the browser''s own right-click and long-press'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-23T14:54:18.475013663+00:00
-updated_at: 2026-10-23T14:54:18.475013663+00:00
+updated_at: 2026-10-23T15:45:46.988123815+00:00
+closed_at: 2026-10-23T15:45:46.988123685+00:00
 ---
 
 # Description
