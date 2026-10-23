@@ -719,6 +719,34 @@ pub struct ReadMark {
     pub last_read: MessageId,
     /// When the mark was set, in milliseconds since the Unix epoch.
     pub marked_at_ms: i64,
+    /// The channel's read-mark epoch: 0 until the mark is first forgotten, then a larger number
+    /// at each forget. A mark naming an older epoch is not applied
+    /// ([`StateStore::mark_read_at`]). `#458 replication-c9-lattice-fixes`.
+    #[serde(default)]
+    pub epoch: i64,
+}
+
+/// The outcome of one read-mark write. `#458 replication-c9-lattice-fixes`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadMarkChange {
+    /// False when the write named an epoch the channel has moved past, so nothing was written.
+    pub applied: bool,
+    /// The mark as it now stands; `None` only for a write that was not applied to a channel whose
+    /// mark was forgotten.
+    pub mark: Option<ReadMark>,
+    /// The channel's epoch as it now stands.
+    pub epoch: i64,
+}
+
+/// Whether a read-mark write naming `if_epoch` may be applied to a channel at `epoch`: always
+/// when it names none, otherwise only when it names the current one. Shared by every backend.
+///
+/// The mark is a lexicographic `(epoch, max)` register: within an epoch it only moves forward,
+/// and a forget moves to the next epoch. A mark based on what the channel held before a forget
+/// names the old epoch and is refused, so it cannot re-advance a mark the owner cleared.
+#[must_use]
+pub fn read_mark_epoch_admits(epoch: i64, if_epoch: Option<i64>) -> bool {
+    if_epoch.is_none_or(|expected| expected == epoch)
 }
 
 /// Longest channel alias this server will store, in characters.
@@ -1535,10 +1563,10 @@ pub fn next_pin_revision(previous: i64, now_ms: i64) -> i64 {
 ///
 /// **At the bound, colouring another thread forgets the OLDEST assignment in that channel** —
 /// oldest by when it was assigned, in the same write. That is the pin table's rule, for its
-/// reason: the newest act is the one being looked at. A forgotten thread that is read again is
-/// coloured afresh by the same deterministic policy, which may not be the colour it had: "never
-/// changes once assigned" holds while the assignment is kept, and this bound is what keeping
-/// means. It is set far above a channel's living threads — a channel would need 256 threads
+/// reason: the newest act is the one being looked at. A forgotten thread is kept as a tombstone
+/// ([`MAX_THREAD_HUE_TOMBSTONES_PER_CHANNEL`]), and read again it is given back the colour it had
+/// (`#458 replication-c9-lattice-fixes`); only a thread past both bounds is coloured afresh, by
+/// the same deterministic policy. It is set far above a channel's living threads — a channel would need 256 threads
 /// coloured before the first could be forgotten — and a row is a few dozen bytes, so the whole
 /// table stays smaller than one long message per channel.
 ///
@@ -1572,6 +1600,18 @@ pub fn validate_thread_hue_id(raw: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// How many evicted thread hues one channel remembers, so a thread read again after the
+/// [`MAX_THREAD_HUES_PER_CHANNEL`] bound forgot it is given back the colour it had. `#458
+/// replication-c9-lattice-fixes`.
+///
+/// A hue is a write-once register: the first colour a thread is given is its colour. Eviction
+/// alone would reset an old thread to "never coloured", and the next read would colour it afresh,
+/// possibly differently — the one way a kept colour could change. A tombstone is the thread id,
+/// its hue and its place in the order, so sixteen times the live bound is still a few hundred
+/// kilobytes at worst per channel, and a thread must fall out of both lists before its colour can
+/// change.
+pub const MAX_THREAD_HUE_TOMBSTONES_PER_CHANNEL: usize = 16 * MAX_THREAD_HUES_PER_CHANNEL;
+
 /// Keep from `rows` (one channel's hues, any order) only the newest
 /// [`MAX_THREAD_HUES_PER_CHANNEL`] by assignment order, returning the survivors in assignment
 /// order. Shared by every backend so the bound means the same thing in each.
@@ -1579,12 +1619,77 @@ pub fn validate_thread_hue_id(raw: &str) -> Result<(), StoreError> {
 pub fn trim_thread_hues(
     rows: Vec<crate::thread_hues::AssignedHue>,
 ) -> Vec<crate::thread_hues::AssignedHue> {
+    bound_thread_hues(rows).0
+}
+
+/// [`trim_thread_hues`], also returning what the bound evicted, oldest first: the rows a backend
+/// keeps as tombstones. `#458 replication-c9-lattice-fixes`.
+#[must_use]
+pub fn bound_thread_hues(
+    rows: Vec<crate::thread_hues::AssignedHue>,
+) -> (
+    Vec<crate::thread_hues::AssignedHue>,
+    Vec<crate::thread_hues::AssignedHue>,
+) {
     let mut rows = rows;
     rows.sort_by_key(|row| row.seq);
-    if rows.len() > MAX_THREAD_HUES_PER_CHANNEL {
-        rows.drain(..rows.len() - MAX_THREAD_HUES_PER_CHANNEL);
+    let evicted = if rows.len() > MAX_THREAD_HUES_PER_CHANNEL {
+        rows.drain(..rows.len() - MAX_THREAD_HUES_PER_CHANNEL)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    (rows, evicted)
+}
+
+/// Keep from `tombstones` (one channel's evicted hues, any order) only the newest
+/// [`MAX_THREAD_HUE_TOMBSTONES_PER_CHANNEL`] by assignment order, in that order.
+#[must_use]
+pub fn trim_thread_hue_tombstones(
+    tombstones: Vec<crate::thread_hues::AssignedHue>,
+) -> Vec<crate::thread_hues::AssignedHue> {
+    let mut tombstones = tombstones;
+    tombstones.sort_by_key(|row| row.seq);
+    if tombstones.len() > MAX_THREAD_HUE_TOMBSTONES_PER_CHANNEL {
+        tombstones.drain(..tombstones.len() - MAX_THREAD_HUE_TOMBSTONES_PER_CHANNEL);
     }
-    rows
+    tombstones
+}
+
+/// The rows that give back their old colours to the threads in `refs` that `held` does not colour
+/// but `tombstones` remembers, each at the next place in the assignment order after `held`'s, in
+/// the order `refs` names them. `#458 replication-c9-lattice-fixes`. The caller files them as live
+/// rows and drops their tombstones before [`crate::thread_hues::assign_new`] colours the rest,
+/// so the first colour a thread was given stays its colour. A root time the tombstone lacks is
+/// taken from the ref.
+#[must_use]
+pub fn revive_thread_hues(
+    held: &[crate::thread_hues::AssignedHue],
+    tombstones: &[crate::thread_hues::AssignedHue],
+    refs: &[crate::thread_hues::HueRef],
+) -> Vec<crate::thread_hues::AssignedHue> {
+    let mut next_seq = held.iter().map(|row| row.seq).max().unwrap_or(0) + 1;
+    let mut revived: Vec<crate::thread_hues::AssignedHue> = Vec::new();
+    for wanted in refs {
+        if held.iter().any(|row| row.thread_id == wanted.thread_id)
+            || revived.iter().any(|row| row.thread_id == wanted.thread_id)
+        {
+            continue;
+        }
+        if let Some(gone) = tombstones
+            .iter()
+            .find(|row| row.thread_id == wanted.thread_id)
+        {
+            revived.push(crate::thread_hues::AssignedHue {
+                thread_id: gone.thread_id.clone(),
+                hue: gone.hue,
+                root_at_ms: gone.root_at_ms.or(wanted.root_at_ms),
+                seq: next_seq,
+            });
+            next_seq += 1;
+        }
+    }
+    revived
 }
 
 /// Why a store operation could not be carried out.
@@ -1780,14 +1885,47 @@ pub trait StateStore: Send + Sync {
         &self,
         channel: &ChannelId,
         upto: &MessageId,
-    ) -> Result<ReadMark, StoreError>;
+    ) -> Result<ReadMark, StoreError> {
+        let change = self.mark_read_at(channel, upto, None).await?;
+        change.mark.ok_or_else(|| {
+            StoreError::Backend("an unconditional read mark was not applied".to_owned())
+        })
+    }
 
-    /// Drop this server's read mark for a channel, making the whole window unread again.
+    /// [`StateStore::mark_read`], applied only if `if_epoch` is `None` or names the channel's
+    /// current read-mark epoch ([`read_mark_epoch_admits`]). `#458 replication-c9-lattice-fixes`.
+    ///
+    /// # Errors
+    ///
+    /// As [`StateStore::mark_read`]. A refused epoch is not an error: it is
+    /// [`ReadMarkChange::applied`] false, with the mark and epoch as they stand.
+    async fn mark_read_at(
+        &self,
+        channel: &ChannelId,
+        upto: &MessageId,
+        if_epoch: Option<i64>,
+    ) -> Result<ReadMarkChange, StoreError>;
+
+    /// Drop this server's read mark for a channel, making the whole window unread again, and move
+    /// the channel to its next read-mark epoch, which is returned: a mark sent later that names the
+    /// old epoch is refused rather than putting the forgotten mark back. The next epoch is
+    /// [`next_pin_revision`] of the last, so it is past every epoch handed out even after a purge.
     ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] when there was no mark, plus the errors above.
-    async fn forget_read_mark(&self, channel: &ChannelId) -> Result<(), StoreError>;
+    async fn forget_read_mark(&self, channel: &ChannelId) -> Result<i64, StoreError>;
+
+    /// Every channel's read-mark epoch that is not 0, in channel order: a channel forgotten since
+    /// it was last marked has an epoch and no mark, and a caller about to mark it needs the epoch.
+    /// A purge forgets them all, so after one every channel is at 0 again, and a mark sent before
+    /// the purge that names 0 is applied. `#458 replication-c9-lattice-fixes`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on
+    /// failure.
+    async fn read_mark_epochs(&self) -> Result<Vec<(ChannelId, i64)>, StoreError>;
 
     /// Every channel alias the operator has set, in channel order. `#39 channel-alias`.
     ///
@@ -2410,7 +2548,9 @@ pub trait StateStore: Send + Sync {
     /// with two colours: the second reads the first's row and assigns nothing. A ref naming a
     /// coloured thread never recolours it; it may fill in that thread's root time where the row
     /// has none, which changes no colour and only makes later neighbours truer. Bounded by
-    /// [`MAX_THREAD_HUES_PER_CHANNEL`] in the same write, the oldest assignment going first.
+    /// [`MAX_THREAD_HUES_PER_CHANNEL`] in the same write, the oldest assignment going first, to
+    /// the channel's tombstones; a ref naming a tombstoned thread is given back its old colour
+    /// ([`revive_thread_hues`]) before anything new is coloured.
     ///
     /// **A durable write**, and so never made on behalf of a read-scope caller: a read token
     /// meeting an uncoloured thread is served it without a hue, and the page falls back, exactly
@@ -2432,7 +2572,8 @@ pub trait StateStore: Send + Sync {
     /// thread-color-memory`: the colours the owner already sees survive the move to the server.
     ///
     /// First writer wins, exactly as assignment does: a seed for a coloured thread is ignored,
-    /// never a recolour, so seeding from a second device — or the same one twice — changes
+    /// never a recolour, and a seed for a tombstoned one gives back the tombstone's colour rather
+    /// than the seed's, so seeding from a second device — or the same one twice — changes
     /// nothing already decided. Seeds take assignment order in the order given, so "most
     /// recently assigned" for later threads reads as the browser's "most recently drawn" did.
     /// Bounded like [`StateStore::ensure_thread_hues`]. **Write scope only**, for the same
@@ -3062,5 +3203,160 @@ mod tests {
             preview_for(&Turn::now(Speaker::You, "what happened?")),
             "what happened?"
         );
+    }
+}
+
+/// `#458 replication-c9-lattice-fixes`: the checks every backend must pass, run by each backend's
+/// own tests so the two cannot drift apart.
+#[cfg(test)]
+pub(crate) mod lattice_checks {
+    use super::{StateStore, MAX_THREAD_HUES_PER_CHANNEL};
+    use crate::model::{ChannelId, MessageId};
+    use crate::thread_hues::HueRef;
+
+    fn hue_ref(id: &str, at: i64) -> HueRef {
+        HueRef {
+            thread_id: id.to_owned(),
+            root_at_ms: Some(at),
+        }
+    }
+
+    /// A colour evicted at the bound comes back unchanged when its thread is read again, by
+    /// assignment or by a seed, and only the purge forgets it.
+    pub(crate) async fn evicted_hues_come_back(store: &dyn StateStore) {
+        let channel = ChannelId("chan".to_owned());
+        let first = store
+            .ensure_thread_hues(&channel, &[hue_ref("old", 1), hue_ref("seeded", 2)])
+            .await
+            .expect("colour the first threads");
+        let old = first[0].hue;
+        let seeded = first[1].hue;
+        // Push both out with a run of newer threads, a batch at a time as pages would.
+        let newer: Vec<HueRef> = (0..MAX_THREAD_HUES_PER_CHANNEL)
+            .map(|i| hue_ref(&format!("t{i}"), 10 + i64::try_from(i).expect("small")))
+            .collect();
+        for batch in newer.chunks(32) {
+            store
+                .ensure_thread_hues(&channel, batch)
+                .await
+                .expect("colour newer");
+        }
+        let held = store.thread_hues(&channel).await.expect("read");
+        assert_eq!(held.len(), MAX_THREAD_HUES_PER_CHANNEL);
+        assert!(
+            !held
+                .iter()
+                .any(|row| row.thread_id == "old" || row.thread_id == "seeded"),
+            "the oldest assignments were not the ones evicted"
+        );
+        // Read again: the old colour, not a fresh one, at the newest place in the order.
+        let again = store
+            .ensure_thread_hues(&channel, &[hue_ref("old", 1)])
+            .await
+            .expect("colour again");
+        let back = again
+            .iter()
+            .find(|row| row.thread_id == "old")
+            .expect("the evicted thread is coloured again");
+        assert_eq!(back.hue, old, "an evicted thread was recoloured");
+        assert_eq!(
+            back.seq,
+            again.iter().map(|row| row.seq).max().expect("rows"),
+            "a revived colour takes the newest place, so it is the last to be evicted again"
+        );
+        // A seed for an evicted thread gives back its first colour, not the seed's, in the
+        // place the seeds were given in.
+        let other = (seeded + 180) % 360;
+        let taken = store
+            .seed_thread_hues(
+                &channel,
+                &[(hue_ref("brand-new", 3), 77), (hue_ref("seeded", 2), other)],
+            )
+            .await
+            .expect("seed");
+        assert_eq!(taken, 1, "only the new thread's seed is taken");
+        let held = store.thread_hues(&channel).await.expect("read");
+        let row = |id: &str| {
+            held.iter()
+                .find(|row| row.thread_id == id)
+                .cloned()
+                .expect("coloured")
+        };
+        assert_eq!(
+            row("seeded").hue,
+            seeded,
+            "a seed recoloured an evicted thread"
+        );
+        assert_eq!(row("brand-new").hue, 77);
+        assert!(
+            row("brand-new").seq < row("seeded").seq,
+            "seeds take assignment order in the order given"
+        );
+        // The purge forgets tombstones too: the first thread read afterwards is the first hue.
+        store.purge_everything().await.expect("purge");
+        let fresh = store
+            .ensure_thread_hues(&channel, &[hue_ref("t5", 1)])
+            .await
+            .expect("colour after purge");
+        assert_eq!(fresh[0].hue, crate::thread_hues::FIRST_HUE);
+    }
+
+    /// A forget moves the channel to a later epoch; a mark naming the old epoch is not applied,
+    /// one naming the new epoch or none is.
+    pub(crate) async fn a_stale_mark_cannot_undo_a_forget(store: &dyn StateStore) {
+        let channel = ChannelId("1111111111".to_owned());
+        let early = MessageId("1000000000000000100".to_owned());
+        let later = MessageId("1000000000000000200".to_owned());
+        let marked = store
+            .mark_read_at(&channel, &later, Some(0))
+            .await
+            .expect("mark at epoch 0");
+        assert!(marked.applied);
+        assert_eq!(marked.epoch, 0);
+        let epoch = store.forget_read_mark(&channel).await.expect("forget");
+        assert!(epoch > 0, "a forget did not move the epoch");
+        assert!(store.read_mark(&channel).await.expect("read").is_none());
+        assert_eq!(
+            store.read_mark_epochs().await.expect("epochs"),
+            [(channel.clone(), epoch)],
+            "a forgotten channel's epoch is listed with no mark"
+        );
+        // The stale mark, sent before the forget was seen.
+        let stale = store
+            .mark_read_at(&channel, &later, Some(0))
+            .await
+            .expect("stale mark");
+        assert!(!stale.applied, "a stale mark re-advanced a forgotten one");
+        assert_eq!(stale.mark, None);
+        assert_eq!(stale.epoch, epoch);
+        // Within the new epoch the mark is a max-register again, from nothing.
+        let fresh = store
+            .mark_read_at(&channel, &early, Some(epoch))
+            .await
+            .expect("fresh mark");
+        assert!(fresh.applied);
+        let mark = fresh.mark.expect("a mark");
+        assert_eq!(mark.last_read, early);
+        assert_eq!(mark.epoch, epoch);
+        let back = store
+            .mark_read(&channel, &MessageId("1000000000000000050".to_owned()))
+            .await
+            .expect("unconditional mark");
+        assert_eq!(back.last_read, early, "a mark moved backwards");
+        assert_eq!(
+            store.read_marks().await.expect("marks")[0].epoch,
+            epoch,
+            "the listing lost the epoch"
+        );
+        // A second forget moves on again.
+        let next = store
+            .forget_read_mark(&channel)
+            .await
+            .expect("forget again");
+        assert!(next > epoch);
+        assert!(matches!(
+            store.forget_read_mark(&channel).await,
+            Err(super::StoreError::NotFound)
+        ));
     }
 }

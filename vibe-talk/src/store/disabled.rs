@@ -83,11 +83,20 @@ impl StateStore for DisabledStore {
         refuse()
     }
 
-    async fn mark_read(&self, _: &ChannelId, _: &MessageId) -> Result<ReadMark, StoreError> {
+    async fn mark_read_at(
+        &self,
+        _: &ChannelId,
+        _: &MessageId,
+        _: Option<i64>,
+    ) -> Result<super::ReadMarkChange, StoreError> {
         refuse()
     }
 
-    async fn forget_read_mark(&self, _: &ChannelId) -> Result<(), StoreError> {
+    async fn forget_read_mark(&self, _: &ChannelId) -> Result<i64, StoreError> {
+        refuse()
+    }
+
+    async fn read_mark_epochs(&self) -> Result<Vec<(ChannelId, i64)>, StoreError> {
         refuse()
     }
 

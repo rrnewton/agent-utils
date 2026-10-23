@@ -3898,6 +3898,11 @@ pub struct MarkReadRequest {
     pub message_id: String,
     /// Selected thread, when the message came from a thread timeline.
     pub thread_id: Option<String>,
+    /// The epoch of the mark the caller last saw (`read_epoch` in `/inbox`, `epoch` here). When
+    /// given and the mark has been forgotten since, nothing is written and `applied` is false.
+    /// `#458 replication-c9-lattice-fixes`.
+    #[serde(default)]
+    pub epoch: Option<i64>,
 }
 
 /// The mark after the move.
@@ -3906,8 +3911,13 @@ pub struct MarkReadResponse {
     /// The channel it is about.
     pub channel: ChannelInfo,
     /// The mark as it now stands. Not necessarily what was asked for: a mark never moves
-    /// backwards, so a stale client is told where the mark really is.
-    pub mark: ReadMark,
+    /// backwards, so a stale client is told where the mark really is. `null` only when the mark
+    /// was not applied and the channel has none.
+    pub mark: Option<ReadMark>,
+    /// False when the request named an epoch the channel has moved past.
+    pub applied: bool,
+    /// The channel's read-mark epoch as it now stands.
+    pub epoch: i64,
     /// See [`crate::store::INBOX_NOTICE`]. Repeated on the mutating route too, because this is
     /// exactly where someone expects the Discord badge to clear.
     pub read_state_notice: &'static str,
@@ -4243,15 +4253,18 @@ pub async fn mark_read(
     Path(channel_id): Path<String>,
     Json(request): Json<MarkReadRequest>,
 ) -> Result<Response, ApiError> {
-    let (channel, mark) = ops::mark_read(
+    let (channel, change) = ops::mark_read(
         &state,
         &channel_id,
         &crate::model::MessageId(request.message_id),
+        request.epoch,
     )
     .await?;
     Ok(no_store(Json(MarkReadResponse {
         channel,
-        mark,
+        mark: change.mark,
+        applied: change.applied,
+        epoch: change.epoch,
         read_state_notice: crate::store::INBOX_NOTICE,
     })))
 }
@@ -4262,9 +4275,10 @@ pub async fn forget_read_mark(
     _scope: WriteScope,
     Path(channel_id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let channel = ops::forget_read_mark(&state, &channel_id).await?;
+    let (channel, epoch) = ops::forget_read_mark(&state, &channel_id).await?;
     Ok(no_store(Json(serde_json::json!({
         "channel": channel,
+        "epoch": epoch,
         "read_state_notice": crate::store::INBOX_NOTICE,
     }))))
 }

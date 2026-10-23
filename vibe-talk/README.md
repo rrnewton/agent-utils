@@ -3811,6 +3811,18 @@ taking the file back too. **Take a copy of `storage.path` before an upgrade.** R
 is the simplest way back to an older build. The other way is to undo the newest steps by hand, with
 the server stopped, newest first; each step's note below says how.
 
+**Step 20 (`#458 replication-c9-lattice-fixes`)** only adds two tables: `thread_hue_tombstones`, the
+colours the per-channel bound evicted, so a thread read again gets its colour back, and
+`read_mark_epochs`, which lets a forgotten read mark refuse a stale mark sent after the forget. With
+the server stopped it can be undone in place, losing nothing but those memories (an evicted thread
+may be coloured afresh, and a stale mark is applied again, as before the step):
+
+```sh
+sqlite3 /path/to/vibe-talk.sqlite3 'DROP TABLE thread_hue_tombstones; DROP TABLE read_mark_epochs; PRAGMA user_version = 19;'
+```
+
+Run that only on a file at version 20, and only when the build being returned to predates the step.
+
 **Step 19 (`#457 settings-server-side`)** only adds the `client_settings` table — the owner's
 synced settings (every Settings section but Screen and keys), one row per choice actually made,
 with when this server took it — so with the server stopped it can be undone in place, losing
@@ -4542,8 +4554,8 @@ own adapter-only token; every other route uses the read/write tokens described a
 | GET | `/api/v1/channels/{id}/todo?limit=&reason=` | read | the recent window MINUS what has been dealt with; `window` and `complete` say how big the window was and whether it is the whole channel, and `window_from` when its oldest message was sent |
 | POST | `/api/v1/channels/{id}/dismiss` | **write** | `{messages:[…]}` (at most 1,000 ids), or `{through:id, limit:n}` — mark as dealt with; answers the exact set it changed. Send back the `limit` you read `/todo` with, or `through` is resolved against the default window and clears more than you displayed |
 | POST | `/api/v1/channels/{id}/restore` | **write** | `{messages:[…]}` (at most 1,000 ids) — the undo, restoring exactly that set |
-| POST | `/api/v1/channels/{id}/read` | **write** | move this server's read mark forward |
-| DELETE | `/api/v1/channels/{id}/read` | **write** | drop this server's read mark |
+| POST | `/api/v1/channels/{id}/read` | **write** | `{message_id, epoch?}` — move this server's read mark forward. `epoch` is the `read_epoch` `/inbox` gave (or the last answer's `epoch`): a mark forgotten since has moved to a later epoch, and the request then writes nothing and answers `applied: false` with the mark and epoch as they stand, so a stale mark cannot undo a forget. Without `epoch` it always applies |
+| DELETE | `/api/v1/channels/{id}/read` | **write** | drop this server's read mark and move the channel to its next read-mark `epoch`, which it answers |
 | POST | `/api/v1/channels/{id}/upstream-read` | **write** | `{message_id:"…", thread_id?, after_reply?}` — ask an explicitly capable provider to move its monotone read cursor through that message; thread behavior is provider-defined. `thread_id` is checked to hold the message. `after_reply: true` is the page asking because a reply it sent answered the message (`#300 reply-marks-read`), or because Shift+E read and collapsed it (`#295 shift-e-read-collapse`): the provider is not asked for a message this server has already marked through, nor one before it, and the answer's `outcome` says `marked`, `already_marked` or `behind`; or `thread_channel` or `scope_unknown`, asking nothing, where the provider's cursor covers more than the channel (one thread of a larger space) or the provider cannot say whether it does. Without it the provider is always asked |
 | GET | `/api/v1/channels/{id}/upstream-clear` | read | whether this server clears the channel's unread state in the provider's own client as it ingests messages, and what it last did; see "Clearing unread automatically" |
 | PUT | `/api/v1/channels/{id}/upstream-clear` | **write** | `{mode:"off"\|"dry_run"\|"on"}` — set it. Turning it on pushes nothing by itself; the next message that arrives is pushed. Refused for a channel whose provider cannot do it |

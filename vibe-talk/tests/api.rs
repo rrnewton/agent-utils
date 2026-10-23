@@ -2101,6 +2101,78 @@ async fn the_inbox_says_on_every_answer_that_this_read_state_is_local() {
 }
 
 #[tokio::test]
+async fn a_stale_read_mark_naming_the_old_epoch_cannot_undo_a_forget() {
+    // `#458 replication-c9-lattice-fixes`.
+    let (harness, _store) = store_harness();
+    let route = format!("/api/v1/channels/{WRITE_CHANNEL}/read");
+    let mark = |epoch: serde_json::Value| serde_json::json!({"message_id": "1000000000000000200", "epoch": epoch});
+    let (status, payload) = call(
+        &harness,
+        "POST",
+        &route,
+        Some(WRITE_TOKEN),
+        Some(mark(0.into())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(payload["applied"], true, "{payload}");
+    assert_eq!(payload["epoch"], 0, "{payload}");
+    let (status, payload) = call(&harness, "DELETE", &route, Some(WRITE_TOKEN), None).await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    let epoch = payload["epoch"]
+        .as_i64()
+        .expect("the forget answers its epoch");
+    assert!(epoch > 0, "{payload}");
+    let (status, payload) = call(
+        &harness,
+        "POST",
+        &route,
+        Some(WRITE_TOKEN),
+        Some(mark(0.into())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(
+        payload["applied"], false,
+        "a stale mark re-advanced a forgotten one: {payload}"
+    );
+    assert!(payload["mark"].is_null(), "{payload}");
+    assert_eq!(payload["epoch"], epoch, "{payload}");
+    let (_status, payload) = call(&harness, "GET", "/api/v1/inbox", Some(READ_TOKEN), None).await;
+    let entry = payload["channels"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|entry| entry["channel"]["id"] == WRITE_CHANNEL)
+        .expect("the writable channel")
+        .clone();
+    assert!(entry["last_read"].is_null(), "{payload}");
+    assert_eq!(
+        entry["read_epoch"], epoch,
+        "a forgotten channel must show its epoch, so a caller can mark it again: {payload}"
+    );
+    let (_status, payload) = call(
+        &harness,
+        "POST",
+        &route,
+        Some(WRITE_TOKEN),
+        Some(mark(epoch.into())),
+    )
+    .await;
+    assert_eq!(payload["applied"], true, "{payload}");
+    assert_eq!(payload["mark"]["epoch"], epoch, "{payload}");
+    let (_status, payload) = call(&harness, "GET", "/api/v1/inbox", Some(READ_TOKEN), None).await;
+    let entry = payload["channels"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|entry| entry["channel"]["id"] == WRITE_CHANNEL)
+        .expect("the writable channel")
+        .clone();
+    assert_eq!(entry["read_epoch"], epoch, "{payload}");
+}
+
+#[tokio::test]
 async fn a_read_mark_outside_the_allowlist_is_refused_like_every_other_channel_call() {
     let (harness, _store) = store_harness();
     let (status, payload) = call(

@@ -414,6 +414,32 @@ pub const MIGRATIONS: &[&str] = &[
         updated_ms INTEGER NOT NULL
     ) STRICT;
     ",
+    // v20 — evicted thread hues, and read-mark epochs. `#458 replication-c9-lattice-fixes`.
+    //
+    // `thread_hue_tombstones` holds what the `thread_hues` bound evicted, so a thread read again
+    // is given back its colour (`super::MAX_THREAD_HUE_TOMBSTONES_PER_CHANNEL`, the oldest
+    // assignment going first). Same columns, same reasoning: no message text, bounded by count.
+    //
+    // `read_mark_epochs` makes forgetting a read mark a step forward rather than a loss of
+    // memory: a forget bumps the channel's epoch, and a mark that names an older epoch is not
+    // applied. One row per channel ever forgotten, bounded by the allowlist like `read_marks`.
+    "
+    CREATE TABLE thread_hue_tombstones (
+        channel_id   TEXT    NOT NULL,
+        thread_id    TEXT    NOT NULL,
+        hue          INTEGER NOT NULL CHECK (hue >= 0 AND hue < 360),
+        root_at_ms   INTEGER,
+        seq          INTEGER NOT NULL,
+        PRIMARY KEY (channel_id, thread_id)
+    ) STRICT;
+
+    CREATE INDEX thread_hue_tombstones_by_assignment ON thread_hue_tombstones (channel_id, seq);
+
+    CREATE TABLE read_mark_epochs (
+        channel_id TEXT    PRIMARY KEY NOT NULL,
+        epoch      INTEGER NOT NULL
+    ) STRICT;
+    ",
 ];
 
 /// A [`StateStore`] backed by one SQLite file.
@@ -812,19 +838,139 @@ fn insert_thread_hue(
     Ok(())
 }
 
-/// Forget a channel's oldest assignments past [`super::MAX_THREAD_HUES_PER_CHANNEL`], in the
-/// caller's transaction: the same rows [`super::trim_thread_hues`] drops from the list it
-/// returns, so the table and the answer cannot disagree. `#427 server-thread-hues`.
+/// This channel's read-mark epoch, 0 when it was never forgotten, inside the caller's connection
+/// or transaction. `#458 replication-c9-lattice-fixes`.
+fn read_mark_epoch(connection: &Connection, channel: &ChannelId) -> Result<i64, StoreError> {
+    connection
+        .query_row(
+            "SELECT epoch FROM read_mark_epochs WHERE channel_id = ?1",
+            [channel.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(backend)
+        .map(|found| found.unwrap_or(0))
+}
+
+/// This channel's read mark with its epoch, inside the caller's connection or transaction.
+fn read_mark_row(
+    connection: &Connection,
+    channel: &ChannelId,
+) -> Result<Option<ReadMark>, StoreError> {
+    let epoch = read_mark_epoch(connection, channel)?;
+    connection
+        .query_row(
+            "SELECT last_read_message_id, marked_at_ms FROM read_marks WHERE channel_id = ?1",
+            [channel.as_str()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(backend)
+        .map(|found| {
+            found.map(|(last_read, marked_at_ms)| ReadMark {
+                channel: channel.clone(),
+                last_read: MessageId(last_read),
+                marked_at_ms,
+                epoch,
+            })
+        })
+}
+
+/// This channel's thread hue tombstones, oldest first, inside the caller's connection or
+/// transaction. `#458 replication-c9-lattice-fixes`.
+fn thread_hue_tombstone_rows(
+    connection: &Connection,
+    channel: &str,
+) -> Result<Vec<crate::thread_hues::AssignedHue>, StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT thread_id, hue, root_at_ms, seq FROM thread_hue_tombstones
+             WHERE channel_id = ?1 ORDER BY seq",
+        )
+        .map_err(backend)?;
+    let rows = statement
+        .query_map([channel], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(backend)?;
+    let mut held = Vec::new();
+    for row in rows {
+        let (thread_id, hue, root_at_ms, seq) = row.map_err(backend)?;
+        held.push(crate::thread_hues::AssignedHue {
+            thread_id,
+            hue: u16::try_from(hue).map_err(|_| {
+                StoreError::Backend(format!("stored thread hue {hue} is outside the wheel"))
+            })?,
+            root_at_ms,
+            seq,
+        });
+    }
+    Ok(held)
+}
+
+/// Give back their old colours to the threads in `refs` this channel has a tombstone for and no
+/// live row, in the caller's transaction: filed as live rows at the next places in the order, their
+/// tombstones dropped. Returns the rows filed. `#458 replication-c9-lattice-fixes`.
+fn revive_thread_hue_rows(
+    connection: &Connection,
+    channel: &str,
+    held: &[crate::thread_hues::AssignedHue],
+    refs: &[crate::thread_hues::HueRef],
+    at_ms: i64,
+) -> Result<Vec<crate::thread_hues::AssignedHue>, StoreError> {
+    let tombstones = thread_hue_tombstone_rows(connection, channel)?;
+    let revived = super::revive_thread_hues(held, &tombstones, refs);
+    for row in &revived {
+        connection
+            .execute(
+                "DELETE FROM thread_hue_tombstones WHERE channel_id = ?1 AND thread_id = ?2",
+                rusqlite::params![channel, row.thread_id],
+            )
+            .map_err(backend)?;
+        insert_thread_hue(connection, channel, row, at_ms)?;
+    }
+    Ok(revived)
+}
+
+/// Move a channel's oldest assignments past [`super::MAX_THREAD_HUES_PER_CHANNEL`] to its
+/// tombstones, and forget its oldest tombstones past
+/// [`super::MAX_THREAD_HUE_TOMBSTONES_PER_CHANNEL`], in the caller's transaction: the same rows
+/// [`super::bound_thread_hues`] and [`super::trim_thread_hue_tombstones`] drop from the lists
+/// they return, so the tables and the answer cannot disagree. `#427 server-thread-hues`, `#458
+/// replication-c9-lattice-fixes`.
 fn trim_thread_hue_table(connection: &Connection, channel: &str) -> Result<(), StoreError> {
+    let live = i64::try_from(super::MAX_THREAD_HUES_PER_CHANNEL).unwrap_or(i64::MAX);
+    let kept = i64::try_from(super::MAX_THREAD_HUE_TOMBSTONES_PER_CHANNEL).unwrap_or(i64::MAX);
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO thread_hue_tombstones
+                 (channel_id, thread_id, hue, root_at_ms, seq)
+             SELECT channel_id, thread_id, hue, root_at_ms, seq FROM thread_hues
+             WHERE channel_id = ?1 AND thread_id IN (
+                 SELECT thread_id FROM thread_hues WHERE channel_id = ?1 ORDER BY seq DESC
+                 LIMIT -1 OFFSET ?2)",
+            rusqlite::params![channel, live],
+        )
+        .map_err(backend)?;
     connection
         .execute(
             "DELETE FROM thread_hues WHERE channel_id = ?1 AND thread_id IN (
                  SELECT thread_id FROM thread_hues WHERE channel_id = ?1 ORDER BY seq DESC
                  LIMIT -1 OFFSET ?2)",
-            rusqlite::params![
-                channel,
-                i64::try_from(super::MAX_THREAD_HUES_PER_CHANNEL).unwrap_or(i64::MAX)
-            ],
+            rusqlite::params![channel, live],
+        )
+        .map_err(backend)?;
+    connection
+        .execute(
+            "DELETE FROM thread_hue_tombstones WHERE channel_id = ?1 AND thread_id IN (
+                 SELECT thread_id FROM thread_hue_tombstones WHERE channel_id = ?1
+                 ORDER BY seq DESC LIMIT -1 OFFSET ?2)",
+            rusqlite::params![channel, kept],
         )
         .map_err(backend)?;
     Ok(())
@@ -1297,33 +1443,18 @@ impl StateStore for SqliteStore {
 
     async fn read_mark(&self, channel: &ChannelId) -> Result<Option<ReadMark>, StoreError> {
         let channel = channel.clone();
-        self.with_connection(move |connection| {
-            connection
-                .query_row(
-                    "SELECT last_read_message_id, marked_at_ms FROM read_marks
-                     WHERE channel_id = ?1",
-                    [channel.as_str()],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-                )
-                .optional()
-                .map_err(backend)
-                .map(|found| {
-                    found.map(|(last_read, marked_at_ms)| ReadMark {
-                        channel,
-                        last_read: MessageId(last_read),
-                        marked_at_ms,
-                    })
-                })
-        })
-        .await
+        self.with_connection(move |connection| read_mark_row(connection, &channel))
+            .await
     }
 
     async fn read_marks(&self) -> Result<Vec<ReadMark>, StoreError> {
         self.with_connection(|connection| {
             let mut statement = connection
                 .prepare(
-                    "SELECT channel_id, last_read_message_id, marked_at_ms FROM read_marks
-                     ORDER BY channel_id ASC",
+                    "SELECT m.channel_id, m.last_read_message_id, m.marked_at_ms,
+                            COALESCE(e.epoch, 0)
+                     FROM read_marks m LEFT JOIN read_mark_epochs e USING (channel_id)
+                     ORDER BY m.channel_id ASC",
                 )
                 .map_err(backend)?;
             let rows = statement
@@ -1332,6 +1463,7 @@ impl StateStore for SqliteStore {
                         channel: ChannelId(row.get::<_, String>(0)?),
                         last_read: MessageId(row.get::<_, String>(1)?),
                         marked_at_ms: row.get::<_, i64>(2)?,
+                        epoch: row.get::<_, i64>(3)?,
                     })
                 })
                 .map_err(backend)?;
@@ -1340,11 +1472,12 @@ impl StateStore for SqliteStore {
         .await
     }
 
-    async fn mark_read(
+    async fn mark_read_at(
         &self,
         channel: &ChannelId,
         upto: &MessageId,
-    ) -> Result<ReadMark, StoreError> {
+        if_epoch: Option<i64>,
+    ) -> Result<super::ReadMarkChange, StoreError> {
         let numeric = upto.numeric().ok_or_else(|| {
             StoreError::BadId(format!(
                 "{upto:?} is not a message snowflake, so this server cannot order it"
@@ -1355,11 +1488,24 @@ impl StateStore for SqliteStore {
         let channel = channel.clone();
         let upto = upto.clone();
         self.with_connection(move |connection| {
+            // The epoch check and the write under one transaction, so a forget cannot land between
+            // them.
+            let transaction = connection.transaction().map_err(backend)?;
+            let epoch = read_mark_epoch(&transaction, &channel)?;
+            if !super::read_mark_epoch_admits(epoch, if_epoch) {
+                let mark = read_mark_row(&transaction, &channel)?;
+                transaction.commit().map_err(backend)?;
+                return Ok(super::ReadMarkChange {
+                    applied: false,
+                    mark,
+                    epoch,
+                });
+            }
             let at = now_ms();
             // Monotonic: `WHERE excluded.last_read_numeric > last_read_numeric` keeps a stale
             // client from dragging the mark backwards and re-unreading messages the owner has
             // already been shown.
-            connection
+            transaction
                 .execute(
                     "INSERT INTO read_marks
                         (channel_id, last_read_message_id, last_read_numeric, marked_at_ms)
@@ -1372,27 +1518,22 @@ impl StateStore for SqliteStore {
                     rusqlite::params![channel.as_str(), upto.as_str(), numeric, at],
                 )
                 .map_err(backend)?;
-            connection
-                .query_row(
-                    "SELECT last_read_message_id, marked_at_ms FROM read_marks
-                     WHERE channel_id = ?1",
-                    [channel.as_str()],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-                )
-                .map_err(backend)
-                .map(|(last_read, marked_at_ms)| ReadMark {
-                    channel,
-                    last_read: MessageId(last_read),
-                    marked_at_ms,
-                })
+            let mark = read_mark_row(&transaction, &channel)?;
+            transaction.commit().map_err(backend)?;
+            Ok(super::ReadMarkChange {
+                applied: true,
+                mark,
+                epoch,
+            })
         })
         .await
     }
 
-    async fn forget_read_mark(&self, channel: &ChannelId) -> Result<(), StoreError> {
+    async fn forget_read_mark(&self, channel: &ChannelId) -> Result<i64, StoreError> {
         let channel = channel.clone();
         self.with_connection(move |connection| {
-            let removed = connection
+            let transaction = connection.transaction().map_err(backend)?;
+            let removed = transaction
                 .execute(
                     "DELETE FROM read_marks WHERE channel_id = ?1",
                     [channel.as_str()],
@@ -1401,7 +1542,35 @@ impl StateStore for SqliteStore {
             if removed == 0 {
                 return Err(StoreError::NotFound);
             }
-            Ok(())
+            let epoch =
+                super::next_pin_revision(read_mark_epoch(&transaction, &channel)?, now_ms());
+            transaction
+                .execute(
+                    "INSERT INTO read_mark_epochs (channel_id, epoch) VALUES (?1, ?2)
+                     ON CONFLICT(channel_id) DO UPDATE SET epoch = excluded.epoch",
+                    rusqlite::params![channel.as_str(), epoch],
+                )
+                .map_err(backend)?;
+            transaction.commit().map_err(backend)?;
+            Ok(epoch)
+        })
+        .await
+    }
+
+    async fn read_mark_epochs(&self) -> Result<Vec<(ChannelId, i64)>, StoreError> {
+        self.with_connection(|connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT channel_id, epoch FROM read_mark_epochs WHERE epoch != 0
+                     ORDER BY channel_id ASC",
+                )
+                .map_err(backend)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((ChannelId(row.get::<_, String>(0)?), row.get::<_, i64>(1)?))
+                })
+                .map_err(backend)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(backend)
         })
         .await
     }
@@ -2526,8 +2695,12 @@ impl StateStore for SqliteStore {
                     }
                 }
             }
-            let fresh = crate::thread_hues::assign_new(&held, &refs);
             let now = now_ms();
+            // A thread the bound evicted gets its old colour back, never a new one.
+            let revived =
+                revive_thread_hue_rows(&transaction, channel.as_str(), &held, &refs, now)?;
+            held.extend(revived);
+            let fresh = crate::thread_hues::assign_new(&held, &refs);
             for row in &fresh {
                 insert_thread_hue(&transaction, channel.as_str(), row, now)?;
             }
@@ -2558,8 +2731,9 @@ impl StateStore for SqliteStore {
         self.with_connection(move |connection| {
             let transaction = connection.transaction().map_err(backend)?;
             let held = thread_hue_rows(&transaction, channel.as_str())?;
-            let mut next_seq = held.iter().map(|row| row.seq).max().unwrap_or(0) + 1;
             let now = now_ms();
+            let tombstones = thread_hue_tombstone_rows(&transaction, channel.as_str())?;
+            let mut next_seq = held.iter().map(|row| row.seq).max().unwrap_or(0) + 1;
             let mut inserted: Vec<String> = Vec::new();
             let mut known: Vec<String> = held.iter().map(|row| row.thread_id.clone()).collect();
             for (wanted, hue) in &seeds {
@@ -2580,19 +2754,36 @@ impl StateStore for SqliteStore {
                     }
                     continue;
                 }
+                // A seed for a thread the bound evicted gives back its old colour, not the
+                // seed's, at the seed's own place in the order: first writer wins across eviction
+                // too. Not counted as taken. `#458 replication-c9-lattice-fixes`.
+                let gone = tombstones
+                    .iter()
+                    .find(|row| row.thread_id == wanted.thread_id);
+                if gone.is_some() {
+                    transaction
+                        .execute(
+                            "DELETE FROM thread_hue_tombstones
+                             WHERE channel_id = ?1 AND thread_id = ?2",
+                            rusqlite::params![channel.as_str(), wanted.thread_id],
+                        )
+                        .map_err(backend)?;
+                }
                 insert_thread_hue(
                     &transaction,
                     channel.as_str(),
                     &crate::thread_hues::AssignedHue {
                         thread_id: wanted.thread_id.clone(),
-                        hue: *hue,
-                        root_at_ms: wanted.root_at_ms,
+                        hue: gone.map_or(*hue, |row| row.hue),
+                        root_at_ms: gone.and_then(|row| row.root_at_ms).or(wanted.root_at_ms),
                         seq: next_seq,
                     },
                     now,
                 )?;
                 known.push(wanted.thread_id.clone());
-                inserted.push(wanted.thread_id.clone());
+                if gone.is_none() {
+                    inserted.push(wanted.thread_id.clone());
+                }
                 next_seq += 1;
             }
             trim_thread_hue_table(&transaction, channel.as_str())?;
@@ -2619,6 +2810,9 @@ impl StateStore for SqliteStore {
             transaction
                 .execute("DELETE FROM thread_hues", [])
                 .map_err(backend)?;
+            transaction
+                .execute("DELETE FROM thread_hue_tombstones", [])
+                .map_err(backend)?;
             // Every channel back to off, which is the shipped default and what no row means.
             transaction
                 .execute("DELETE FROM upstream_clear", [])
@@ -2628,6 +2822,11 @@ impl StateStore for SqliteStore {
                 .map_err(backend)?;
             transaction
                 .execute("DELETE FROM read_marks", [])
+                .map_err(backend)?;
+            // Epochs too: the next forget takes its epoch from the clock, past every one handed
+            // out before, and a mark naming an old one is refused against 0.
+            transaction
+                .execute("DELETE FROM read_mark_epochs", [])
                 .map_err(backend)?;
             transaction
                 .execute("DELETE FROM summaries", [])
@@ -6663,11 +6862,12 @@ mod tests {
         // The bundled SQLite is new enough for `DROP COLUMN`, as the README requires.
         let connection = Connection::open(&file).expect("open for the rollback");
         // Newest first, as the README has it: a file at this build is past the detail step, and
-        // each later step is undone by its own note before this one is reached. The later
-        // steps there are add a table each, dropped here as their notes say.
+        // each later step is undone by its own note before this one is reached. The later steps
+        // there are add tables, dropped here as their notes say.
         connection
             .execute_batch(
-                "DROP TABLE IF EXISTS client_settings; DROP TABLE IF EXISTS thread_hues;",
+                "DROP TABLE IF EXISTS thread_hue_tombstones; DROP TABLE IF EXISTS read_mark_epochs;
+                 DROP TABLE IF EXISTS client_settings; DROP TABLE IF EXISTS thread_hues;",
             )
             .expect("undo the later steps");
         let pasted: String = statements.iter().map(|line| format!("{line}\n")).collect();
@@ -6865,6 +7065,37 @@ mod tests {
         assert_eq!(
             held.last().map(|row| row.thread_id.as_str()),
             Some(format!("t{}", total - 1).as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn evicted_hues_come_back_and_a_stale_mark_cannot_undo_a_forget() {
+        let dir = TempDir::new("c9-lattice");
+        let store = store(&dir, Retention::default());
+        super::super::lattice_checks::evicted_hues_come_back(&store).await;
+        super::super::lattice_checks::a_stale_mark_cannot_undo_a_forget(&store).await;
+        // Both survive a restart: they are rows, not memory.
+        let channel = ChannelId("1111111111".to_owned());
+        store
+            .mark_read(&channel, &MessageId("1000000000000000300".to_owned()))
+            .await
+            .expect("mark");
+        let epoch = store
+            .read_mark(&channel)
+            .await
+            .expect("read")
+            .expect("mark")
+            .epoch;
+        drop(store);
+        let store = self::store(&dir, Retention::default());
+        assert_eq!(
+            store
+                .read_mark(&channel)
+                .await
+                .expect("read")
+                .expect("mark")
+                .epoch,
+            epoch
         );
     }
 

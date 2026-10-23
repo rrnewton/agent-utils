@@ -700,10 +700,14 @@ async fn the_purge_names_every_table_the_store_empties_and_the_message_cache() {
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
                 .collect();
-            // As a reader of the answer knows them: a pin's revision counter is part of the pins.
+            // As a reader of the answer knows them: a pin's revision counter is part of the pins,
+            // a read mark's epoch part of the read marks, and an evicted hue part of the hues
+            // (`#458 replication-c9-lattice-fixes`).
             match table.as_str() {
                 "channel_aliases" => "aliases".to_owned(),
                 "pin_revisions" => "pins".to_owned(),
+                "read_mark_epochs" => "read_marks".to_owned(),
+                "thread_hue_tombstones" => "thread_hues".to_owned(),
                 _ => table,
             }
         })

@@ -4122,6 +4122,10 @@ pub struct InboxEntry {
     pub last_read: Option<MessageId>,
     /// When the mark was set, in milliseconds since the Unix epoch.
     pub marked_at_ms: Option<i64>,
+    /// The channel's read-mark epoch, to send back with the next mark so a forget made meanwhile
+    /// is not undone (`#458 replication-c9-lattice-fixes`): 0 until the mark is first forgotten,
+    /// and shown after a forget too, when there is no mark.
+    pub read_epoch: i64,
 }
 
 /// Inbox state for every configured channel, in configuration order. Read scope.
@@ -4135,15 +4139,21 @@ pub struct InboxEntry {
 /// [`OpError::Store`] when no store is configured, or the read fails.
 pub async fn inbox(state: &AppState) -> Result<Vec<InboxEntry>, OpError> {
     let marks = state.store.read_marks().await?;
+    let epochs = state.store.read_mark_epochs().await?;
     Ok(state
         .listed_configured_channels()
         .into_iter()
         .map(|channel| {
             let mark = marks.iter().find(|m| m.channel == channel.id);
+            let read_epoch = epochs
+                .iter()
+                .find(|(id, _)| *id == channel.id)
+                .map_or(0, |(_, epoch)| *epoch);
             InboxEntry {
                 channel,
                 last_read: mark.map(|m| m.last_read.clone()),
                 marked_at_ms: mark.map(|m| m.marked_at_ms),
+                read_epoch,
             }
         })
         .collect())
@@ -4157,7 +4167,9 @@ pub async fn inbox(state: &AppState) -> Result<Vec<InboxEntry>, OpError> {
 /// token.
 ///
 /// Goes through [`allowed`] like every other channel operation, so a snowflake outside the
-/// configuration cannot be used to grow the store one row at a time.
+/// configuration cannot be used to grow the store one row at a time. `if_epoch`, when given, is
+/// the epoch of the mark the caller last saw: a forget made since moves the channel past it, and
+/// the mark is then not applied (`#458 replication-c9-lattice-fixes`).
 ///
 /// # Errors
 ///
@@ -4167,10 +4179,14 @@ pub async fn mark_read(
     state: &AppState,
     channel_id: &str,
     upto: &MessageId,
-) -> Result<(ChannelInfo, crate::store::ReadMark), OpError> {
+    if_epoch: Option<i64>,
+) -> Result<(ChannelInfo, crate::store::ReadMarkChange), OpError> {
     let channel = allowed(state, channel_id).await?;
-    let mark = state.store.mark_read(&channel.id, upto).await?;
-    Ok((channel, mark))
+    let change = state
+        .store
+        .mark_read_at(&channel.id, upto, if_epoch)
+        .await?;
+    Ok((channel, change))
 }
 
 /// Drop this server's read mark for one channel, making its whole window unread again. Write
@@ -4180,10 +4196,13 @@ pub async fn mark_read(
 ///
 /// [`OpError::UnknownChannel`] outside the allowlist; [`OpError::Store`] when there was no mark,
 /// when no store is configured, or when the write fails.
-pub async fn forget_read_mark(state: &AppState, channel_id: &str) -> Result<ChannelInfo, OpError> {
+pub async fn forget_read_mark(
+    state: &AppState,
+    channel_id: &str,
+) -> Result<(ChannelInfo, i64), OpError> {
     let channel = allowed(state, channel_id).await?;
-    state.store.forget_read_mark(&channel.id).await?;
-    Ok(channel)
+    let epoch = state.store.forget_read_mark(&channel.id).await?;
+    Ok((channel, epoch))
 }
 
 // --- the to-do view: which messages have NOT been dealt with -------------------------------------

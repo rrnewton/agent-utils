@@ -55,6 +55,9 @@ struct FakeSummary {
 struct State {
     conversations: BTreeMap<String, Vec<Turn>>,
     marks: BTreeMap<String, (MessageId, u64, i64)>,
+    /// Channel to its read-mark epoch; absent is `0`, as a missing row is in the real store.
+    /// `#458 replication-c9-lattice-fixes`.
+    read_epochs: BTreeMap<String, i64>,
     summaries: BTreeMap<(String, String, String, String), FakeSummary>,
     /// `(channel, message)` to `(snowflake, when it was dismissed)`. The same shape the real
     /// table has, so the count bound and the ordering can be reproduced rather than assumed.
@@ -97,6 +100,8 @@ struct State {
     bookmarks: BTreeMap<String, Bookmark>,
     /// Channel to its assigned thread hues, in assignment order. `#427 server-thread-hues`.
     thread_hues: BTreeMap<String, Vec<crate::thread_hues::AssignedHue>>,
+    /// Channel to the hues its bound evicted, oldest first. `#458 replication-c9-lattice-fixes`.
+    thread_hue_tombstones: BTreeMap<String, Vec<crate::thread_hues::AssignedHue>>,
     next_summary_seq: u64,
     fail_next: Option<String>,
     appended: usize,
@@ -417,6 +422,11 @@ impl StateStore for FakeStore {
                 channel: channel.clone(),
                 last_read: last_read.clone(),
                 marked_at_ms: *at,
+                epoch: state
+                    .read_epochs
+                    .get(channel.as_str())
+                    .copied()
+                    .unwrap_or(0),
             }))
     }
 
@@ -430,15 +440,17 @@ impl StateStore for FakeStore {
                 channel: ChannelId(channel.clone()),
                 last_read: last_read.clone(),
                 marked_at_ms: *at,
+                epoch: state.read_epochs.get(channel).copied().unwrap_or(0),
             })
             .collect())
     }
 
-    async fn mark_read(
+    async fn mark_read_at(
         &self,
         channel: &ChannelId,
         upto: &MessageId,
-    ) -> Result<ReadMark, StoreError> {
+        if_epoch: Option<i64>,
+    ) -> Result<super::ReadMarkChange, StoreError> {
         let numeric = upto.numeric().ok_or_else(|| {
             StoreError::BadId(format!(
                 "{upto:?} is not a message snowflake, so this server cannot order it"
@@ -446,6 +458,25 @@ impl StateStore for FakeStore {
         })?;
         let mut state = self.lock();
         armed(&mut state)?;
+        let state = &mut *state;
+        let epoch = state
+            .read_epochs
+            .get(channel.as_str())
+            .copied()
+            .unwrap_or(0);
+        let mark_of = |entry: &(MessageId, u64, i64)| ReadMark {
+            channel: channel.clone(),
+            last_read: entry.0.clone(),
+            marked_at_ms: entry.2,
+            epoch,
+        };
+        if !super::read_mark_epoch_admits(epoch, if_epoch) {
+            return Ok(super::ReadMarkChange {
+                applied: false,
+                mark: state.marks.get(channel.as_str()).map(mark_of),
+                epoch,
+            });
+        }
         let at = now_ms();
         let entry = state
             .marks
@@ -454,21 +485,37 @@ impl StateStore for FakeStore {
         if numeric > entry.1 {
             *entry = (upto.clone(), numeric, at);
         }
-        Ok(ReadMark {
-            channel: channel.clone(),
-            last_read: entry.0.clone(),
-            marked_at_ms: entry.2,
+        Ok(super::ReadMarkChange {
+            applied: true,
+            mark: Some(mark_of(entry)),
+            epoch,
         })
     }
 
-    async fn forget_read_mark(&self, channel: &ChannelId) -> Result<(), StoreError> {
+    async fn forget_read_mark(&self, channel: &ChannelId) -> Result<i64, StoreError> {
         let mut state = self.lock();
         armed(&mut state)?;
         state
             .marks
             .remove(channel.as_str())
-            .map(|_| ())
-            .ok_or(StoreError::NotFound)
+            .ok_or(StoreError::NotFound)?;
+        let epoch = state
+            .read_epochs
+            .entry(channel.as_str().to_owned())
+            .or_insert(0);
+        *epoch = super::next_pin_revision(*epoch, now_ms());
+        Ok(*epoch)
+    }
+
+    async fn read_mark_epochs(&self) -> Result<Vec<(ChannelId, i64)>, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        Ok(state
+            .read_epochs
+            .iter()
+            .filter(|(_, epoch)| **epoch != 0)
+            .map(|(channel, epoch)| (ChannelId(channel.clone()), *epoch))
+            .collect())
     }
 
     async fn added_channels(&self) -> Result<Vec<crate::store::AddedChannel>, StoreError> {
@@ -1274,8 +1321,13 @@ impl StateStore for FakeStore {
         }
         let mut state = self.lock();
         armed(&mut state)?;
+        let state = &mut *state;
         let held = state
             .thread_hues
+            .entry(channel.as_str().to_owned())
+            .or_default();
+        let tombstones = state
+            .thread_hue_tombstones
             .entry(channel.as_str().to_owned())
             .or_default();
         for wanted in refs {
@@ -1286,9 +1338,10 @@ impl StateStore for FakeStore {
                 row.root_at_ms = wanted.root_at_ms;
             }
         }
+        revive_fake_hues(held, tombstones, refs);
         let fresh = crate::thread_hues::assign_new(held, refs);
         held.extend(fresh);
-        *held = super::trim_thread_hues(std::mem::take(held));
+        bound_fake_hues(held, tombstones);
         Ok(held.clone())
     }
 
@@ -1307,8 +1360,13 @@ impl StateStore for FakeStore {
         }
         let mut state = self.lock();
         armed(&mut state)?;
+        let state = &mut *state;
         let held = state
             .thread_hues
+            .entry(channel.as_str().to_owned())
+            .or_default();
+        let tombstones = state
+            .thread_hue_tombstones
             .entry(channel.as_str().to_owned())
             .or_default();
         let mut next_seq = held.iter().map(|row| row.seq).max().unwrap_or(0) + 1;
@@ -1325,16 +1383,27 @@ impl StateStore for FakeStore {
                 }
                 continue;
             }
+            // A seed for a thread the bound evicted gives back its old colour at the seed's own
+            // place, and is not taken.
+            let gone = tombstones
+                .iter()
+                .position(|row| row.thread_id == wanted.thread_id)
+                .map(|at| tombstones.remove(at));
             held.push(crate::thread_hues::AssignedHue {
                 thread_id: wanted.thread_id.clone(),
-                hue: *hue,
-                root_at_ms: wanted.root_at_ms,
+                hue: gone.as_ref().map_or(*hue, |row| row.hue),
+                root_at_ms: gone
+                    .as_ref()
+                    .and_then(|row| row.root_at_ms)
+                    .or(wanted.root_at_ms),
                 seq: next_seq,
             });
-            inserted.push(wanted.thread_id.clone());
+            if gone.is_none() {
+                inserted.push(wanted.thread_id.clone());
+            }
             next_seq += 1;
         }
-        *held = super::trim_thread_hues(std::mem::take(held));
+        bound_fake_hues(held, tombstones);
         // What the bound dropped in the same write was not taken, whatever was inserted.
         Ok(u64::try_from(
             inserted
@@ -1349,9 +1418,11 @@ impl StateStore for FakeStore {
         let mut state = self.lock();
         armed(&mut state)?;
         state.thread_hues.clear();
+        state.thread_hue_tombstones.clear();
         state.upstream_clear.clear();
         state.conversations.clear();
         state.marks.clear();
+        state.read_epochs.clear();
         state.summaries.clear();
         state.dismissals.clear();
         state.aliases.clear();
@@ -1369,10 +1440,41 @@ impl StateStore for FakeStore {
     }
 }
 
+/// [`super::revive_thread_hues`] applied to the fake's lists, as the real store applies it to its
+/// tables.
+fn revive_fake_hues(
+    held: &mut Vec<crate::thread_hues::AssignedHue>,
+    tombstones: &mut Vec<crate::thread_hues::AssignedHue>,
+    refs: &[crate::thread_hues::HueRef],
+) {
+    let revived = super::revive_thread_hues(held, tombstones, refs);
+    tombstones.retain(|gone| !revived.iter().any(|row| row.thread_id == gone.thread_id));
+    held.extend(revived);
+}
+
+/// The live bound, with what it evicts kept as tombstones under their own bound.
+fn bound_fake_hues(
+    held: &mut Vec<crate::thread_hues::AssignedHue>,
+    tombstones: &mut Vec<crate::thread_hues::AssignedHue>,
+) {
+    let (kept, evicted) = super::bound_thread_hues(std::mem::take(held));
+    *held = kept;
+    tombstones.retain(|gone| !evicted.iter().any(|row| row.thread_id == gone.thread_id));
+    tombstones.extend(evicted);
+    *tombstones = super::trim_thread_hue_tombstones(std::mem::take(tombstones));
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::Speaker;
     use super::*;
+
+    #[tokio::test]
+    async fn evicted_hues_come_back_and_a_stale_mark_cannot_undo_a_forget() {
+        let store = FakeStore::new();
+        super::super::lattice_checks::evicted_hues_come_back(&store).await;
+        super::super::lattice_checks::a_stale_mark_cannot_undo_a_forget(&store).await;
+    }
 
     fn id(text: &str) -> ConversationId {
         ConversationId::parse(text).expect("valid id")
