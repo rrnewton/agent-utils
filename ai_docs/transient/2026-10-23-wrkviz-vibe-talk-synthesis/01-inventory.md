@@ -8,7 +8,7 @@ read from the code.
 
 wrkviz turns coding-agent transcripts into a durable, version-controllable archive with paid
 summaries and a static Perfetto-style timeline website. It is the transcript half of the owner's
-picture. Its contract document is `py/wrkviz/ARCHITECTURE.md` (1,379 lines); the operator guide is
+picture. Its contract document is `py/wrkviz/ARCHITECTURE.md` (1,378 lines); the operator guide is
 `py/wrkviz/USER_GUIDE.md`.
 
 ### Storage: a directory archive, not a database
@@ -77,7 +77,7 @@ from its bootstrap and usage receipts by `/tmp` scripts on 2026-10-23):
 | Rollups | 56 hourly, 26 daily, 4 weekly, 4 monthly, 4 quarterly |
 | Phase/rollup jobs | 2,425 in 1,194 batches; 43.3 M input and 3.8 M output tokens; 17.9 k input and 1.6 k output per job on average |
 | Naming jobs | 640 in 242 batches; 8.9 M input, 0.27 M output |
-| Single-job latency | phase via Codex CLI p50 20.2 s, p90 27.9 s; via `claude --print` p50 24.2 s, p90 58.3 s |
+| Single-job latency | phase and rollup jobs (the `cache` receipts hold both, mostly phases) via Codex CLI p50 20.2 s, p90 27.9 s; via `claude --print` p50 24.2 s, p90 58.3 s |
 
 That is about 8,300 transcript events a day, two orders of magnitude more than the chat layer.
 
@@ -123,7 +123,7 @@ One file, `0600`, `secure_delete`, a `user_version` migration ladder (`sqlite.rs
 Tables: `conversations` and `turns` (voice transcripts), `read_marks`, `summaries`, `dismissals`,
 `channel_aliases`, `added_channels`, `noise_rules`, `noise_exemptions`, `hidden_channels`, `pins`,
 `pin_revisions`, `upstream_clear`, `bookmarks`, `voice_settings`, `voice_prompt`,
-`voice_post_prefix`, `thread_hues` (`#427`, `sqlite.rs:384`). Behind the `StateStore` trait
+`voice_post_prefix`, `thread_hues` (`#427 server-thread-hues`, `sqlite.rs:384`). Behind the `StateStore` trait
 (`store/mod.rs:1634`, about 60 methods) with a fake and a disabled implementation. **It holds no
 message text** except summaries, which are keyed `(policy version, channel, message id, content
 hash)` (`sqlite.rs:81`) so an edit invalidates one row and a policy change invalidates all.
@@ -141,37 +141,43 @@ a dropped offer marks its channel suspect; access refusals erase. Defaults: 90 d
 (`config.rs:204`). It fills from write-scope reads and the live feed; it never fills from a
 read-scope caller (`cache/grant.rs`).
 
-**It serves almost nothing yet, and on Slack that is by design.** The coordinator reports
-`serve = false` on the Slack deployment with 2 of 299 evaluated reads servable. Reading the rules
-in `cache/shadow.rs` explains why without assuming a bug:
+**It serves almost nothing yet on Slack.** The coordinator reports `serve = false` on the Slack
+deployment with 2 of 299 evaluated reads servable. Reading the rules in `cache/shadow.rs` explains
+most of that without assuming a bug; the one part that more filling would fix is point 4.
 
 1. **Windows** (`messages`, `digest`, `todo`, `bankruptcy`, `speech`) need a fresh head (listed in
    the last 15 s, 60 s with a live feed) *and* current claims under the window (`newest`,
    `shadow.rs` around line 700). `current()` passes only when the claims were re-listed inside the
    reuse period or the feed carried every edit and deletion since (`fed_since`), and `fed_since`
    requires `Feed::Deletions`, which only a bridge has: Slack's feed is `AdditionsOnly`
-   (`shadow.rs`, `Feed::of`). So on Slack a window is servable only when the same stretch was listed
-   upstream within the last minute, which is when the server already has it in memory. They count
-   as `stale_head`. And windows on Slack are never serve-eligible anyway (`serve_eligible`,
-   requirement (c): a Slack window upstream carries thread replies the cache holds only in their
-   threads).
-2. **Pages and counts** need complete coverage, and Slack's coverage is never complete
-   (`incomplete`).
-3. **A message by id or a summary's message** is servable on Slack only within two hours of its home
-   scope's revalidation (`REVALIDATED_ADDITIONS_ONLY_MS`); otherwise it is counted
-   `needs_existence_check`, not `would_serve`.
-4. **Timeline pages** of Main are eligible, but the Threads and All views are never asked, a thread's
-   page is ineligible, and a Main page needs coverage of `limit` rows down from the head plus a
-   vouched band (`gap` otherwise).
-5. **What fills it** is only write-scope reads and pushes. A voice agent holding the read token
-   fills nothing, and after a restart the feed vouches for nothing from before it.
+   (`Feed::of`). So on Slack a window would be servable only when the same stretch was listed
+   upstream within the last minute; otherwise it counts as `stale_head`. Windows on Slack are not
+   serve-eligible in any case (`serve_eligible`, requirement (c): a Slack window upstream carries
+   thread replies the cache holds only in their threads).
+2. **Pages and counts** need complete coverage, and a Slack listing is never complete: a Slack
+   client omits a message with no author (`cache/observe.rs`, `Shape::complete`), so they count as
+   `incomplete`.
+3. **A message by id, a summary's message, a page and a count** are shadow-only on every provider
+   in this milestone (`serve_eligible`, `shadow.rs:351-362`). On Slack the shadow rule would serve a
+   message by id only within two hours of its home scope's revalidation
+   (`REVALIDATED_ADDITIONS_ONLY_MS`) and otherwise counts it `needs_existence_check`.
+4. **The newest Main timeline page is the one Slack read that can be served**, and its rule needs
+   no fresh head (`needs_fresh = false`, `shadow.rs:534`; "however old its head", module note). It
+   needs coverage of `limit` rows down from the head and a vouched band, and misses as `gap` when
+   the cache has not held that much. The Threads and All views are never asked and a thread's page
+   is ineligible. **These misses are what filling closes**, and the server-started fills that would
+   do it are declared but unbuilt: `[message_cache] backfill` defaults to `adaptive`
+   (`config.rs:266`), yet nothing calls `ServerFill::Backfill` or `ServerFill::Refresher`
+   (`cache/grant.rs`). Today the cache fills only from write-scope reads, the live poller, ingest
+   pushes, the server's own posts and the voice call-start warm-up; a voice agent's own tool reads,
+   under the read token, fill nothing.
 
 This is inferred from the code. The diagnostics report's per-consumer miss counts
-(`message_cache.shadow[].misses`, `src/diagnostics.rs:175`) would confirm which reason dominates.
-The lesson for the synthesis: **serving a read instantly and having a complete history are
-different requirements.** The cache's rules are tuned for the first (never show a deleted message
-as current). Summaries, timelines and reports need the second, which a periodic, verified backfill
-gives without any of the serve-time freshness rules.
+(`message_cache.shadow[].misses`, `src/diagnostics.rs:175`) would confirm which reason dominates,
+and are an M0 measurement. The lesson for the synthesis: **serving a read instantly and having a
+complete history are different requirements.** The cache's rules are tuned for the first (never
+show a deleted message as current). Summaries, timelines and reports need the second, which the
+unbuilt backfill walk gives without any of the serve-time freshness rules (appendix 2).
 
 ### Summarization (`src/summarize/`, `src/summary.rs`)
 
@@ -184,9 +190,10 @@ gives without any of the serve-time freshness rules.
 
 The `digest_channel` MCP tool that failed for the owner is that `digest`: one upstream window read
 with no deadline and no held copy, so behind a slow adapter it outlived the voice runtime's 15 s tool
-limit. Since `#437 voice-full-text-catchup` it is unlisted (`listed: false`, `mcp/mod.rs:246`); the
+limit. Since `#437 voice-full-text-catchup` it is unlisted (`listed: false`, `mcp/mod.rs:275`); the
 REST route remains for the page. `recent_activity` now carries full text from the held recent
-window with a 32 KB budget, 10 messages per channel or 30 for one channel (`ops.rs:1572-1584`),
+window with a 32 KB budget (`MAX_ACTIVITY_BYTES`, `mcp/protocol.rs:990`), 10 messages per channel
+or 30 for one channel (`ops.rs:1572-1584`),
 answering within 2.5 s for a held channel and 8 s cold (`recent.rs:102-107`).
 
 ### Thread names are the topic slugs
@@ -220,7 +227,7 @@ only as a turn (`notice`), which the agent answers aloud.
 
 ### Web app
 
-`web/voice.html` and `web/voice.js` (51,803 lines). The top bar has **one two-position switch**,
+`web/voice.html` and `web/voice.js` (55,469 lines together; `voice.js` alone is 51,803). The top bar has **one two-position switch**,
 Voice and Channel (`voice.html`, `#view-switch`); the channel view has Main, Threads and All tabs.
 A third "Work" view means turning the switch into a three-way segmented control. The page already
 has floating strips (the read-aloud `#read-steer` strip of `#376`/`#433`, the search glass), which

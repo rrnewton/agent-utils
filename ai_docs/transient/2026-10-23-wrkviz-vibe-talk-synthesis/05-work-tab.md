@@ -29,12 +29,12 @@ everything the agents are doing without an SSH terminal".
 ```
 
 - **Chat lanes on top**: the channel's main timeline as dots, and each active thread as a bar in its
-  thread hue (`#427 thread_hues`, so colours match the Threads view), labelled with its slug.
+  thread hue (`#427 server-thread-hues`, so colours match the Threads view), labelled with its slug.
 - **Agent lanes below**: the coordinator and its subagents from the transcripts mapped to this
   channel, rendered by the existing wrkviz browser app (phases, lifetime blocks, aggregate bins by
   zoom level, exactly as `ARCHITECTURE.md` specifies).
 - **Edges between layers**: a chat message joined to the agent that posted it (`posted_by`, the
-  exact join in appendix 2) draws a short connector from the agent's phase to the dot; an owner
+  posting join in appendix 2) draws a short connector from the agent's phase to the dot; an owner
   message that an agent received as a prompt draws one the other way.
 - **Tapping** a phase opens its summary card and, with the transcript capability, its transcript;
   tapping a chat dot opens the message in the Channel view (the existing jump-to-message).
@@ -47,8 +47,8 @@ still a useful hour-by-hour picture with the hourly summaries attached.
 
 Three ways, in order of preference:
 
-1. **Discovered by the exact join.** Any transcript session whose tool calls posted a message to
-   this channel (content hash match, appendix 2) is a candidate. The server lists candidates in
+1. **Discovered by the posting join.** Any transcript session whose tool calls posted a message to
+   this channel (normalized match, appendix 2) is a candidate. The server lists candidates in
    Settings ("These agent sessions post to this channel: coordinator on build-box-a, started Oct 21.
    Show them in Work?"), and the owner accepts. Subagents follow their coordinator.
 2. **Declared**, in configuration, as wrkviz's project config does today:

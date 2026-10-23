@@ -41,7 +41,7 @@ store's summaries. A weekly report the owner approved is the owner's document an
 | Allowlist | Route snapshot; sweep of removed channels | `Capability.sources`; `Erase::Source` on removal (mirror) or freeze (archive) |
 | Untrusted text | `untrusted::fenced`, private prompt fields | `Staged::payload: Fenced`, constructible only through the fence; the module moves into `logbook` and vibe-talk re-exports it |
 | Owner identity | `[owner]`, "the user (Name)" lines | `Author::Owner` set at ingest from the same configuration; every renderer for a model marks it the same way |
-| Noise rules | Evaluated at serve time on current text, never recorded | Unchanged: noise is a serve-time flag. Summarizers call the same predicate at stage time and skip noise items, so a placeholder like `_Working…_` never reaches a model. Changing a rule changes staged payloads, so affected summaries become `Behind`, which is the correct reading |
+| Noise rules | Evaluated at serve time on current text, never recorded | Unchanged: noise is a serve-time flag. Summarizers call the same predicate at stage time and skip noise items, so a placeholder like `_Working…_` never reaches a model, and freshness counts only summarizable items. Each artifact records a digest of the rules it was staged under, so changing a rule makes the affected summaries `Behind` through that digest (appendix 2) |
 | Access loss | Block at once, erase on confirmation | Same machinery for mirror sources; freeze for archive sources |
 | Privacy at rest | `secure_delete`, FTS secure-delete, id-and-time tombstones, logs without text | `SqliteStore` opens every connection with the same pragmas; the source test that forbids `INSERT OR` moves with it |
 | Single tenant | One owner per store | Unchanged; the transcript store is the owner's too |
@@ -64,8 +64,10 @@ Each phase is shippable alone, keeps today's tests green, and has a switch to go
    family, `observed`, body kind) rather than copying data. The writer, sequencer, readers and
    barrier move as they are. Serve stays off where it is off. Rollback: schema compat value keeps
    the old code able to open the file read-only; the cache is disposable in any case.
-4. **C4: backfill and watermarks.** The backfill walk (appendix 2) advances `complete_through` per
-   channel; tallies and freshness become available. This is what the availability bar and hourly
+4. **C4: backfill and watermarks.** Implement the backfill walk vibe-talk already declares
+   (`[message_cache] backfill = "adaptive"`, `ServerFill::Backfill`, `ServerFill::Refresher`, none of
+   which has a caller today); it advances `complete_through` per channel (`AsListed` on Slack), and
+   tallies and freshness become available. It should also lift the cache's Main-page serve rate. This is what the availability bar and hourly
    summaries need, and it is independent of serving. Rollback: turn the walk off.
 5. **C5: hourly and daily chat rollups, topics.** New summarizers (`chat-hour`, `chat-day`) and
    thread topics; the voice context and the bar use them (appendix 8). Rollback: configuration.
@@ -75,9 +77,11 @@ Each phase is shippable alone, keeps today's tests green, and has a switch to go
 
 - Every existing cache test (`cache/tests.rs`, `race_tests.rs`, `coverage_race_tests.rs`,
   `privacy_tests.rs`, `shadow_tests.rs`) moves with the module and must pass unchanged.
-- The equivalence harness used for M5 (every upstream and summarizer call identical with the cache
-  absent and disabled, about 1,450 steps over five fakes) is rerun at C1, C2 and C3: moving code
-  must not change a single upstream call.
+- The equivalence harness used for `#208 persistent-cache`'s cache-fill milestone (every upstream and
+  summarizer call identical with the cache absent and disabled, about 1,450 steps over five fakes) is
+  imported into the tree (today it lives in a private scratch directory, per `#297
+  cache-coverage-races`) and rerun at C1, C2 and C3: moving code must not change a single upstream
+  call.
 - A summary-continuity test: at C2, a message whose `(policy version, content hash)` row exists in
   the old table resolves to that summary (copied into an artifact marked `legacy_storage`, as
   wrkviz marks its legacy cache hits) with no model call, so no summary is paid for twice at

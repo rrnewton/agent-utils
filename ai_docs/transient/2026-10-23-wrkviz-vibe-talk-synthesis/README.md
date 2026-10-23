@@ -68,16 +68,18 @@ the summarizer ladder and search are shared (appendix 2).
    artifact cache with receipts, five summary levels and a fast static timeline; it lacks a server,
    chat, Muse, remote transport and labels. vibe-talk has the chat side, the Messages API client, the
    privacy and scope rules, thread slugs, and a message cache that serves almost nothing on Slack.
-   That last one is by design: its serve rule requires a feed that carries deletions or a listing
-   from the last minute, and Slack's feed carries additions only, so instant serving and complete
-   history are different requirements and should be built separately.
+   Mostly that follows from its rules: windows need a feed that carries deletions or a listing from
+   the last minute, and Slack's feed carries additions only. The one servable Slack read, the newest
+   Main page, misses because the cache has not been filled far enough, and the backfill that would
+   fill it is declared in configuration but not built. Instant serving and complete history are
+   different requirements and should be built separately.
 2. **The shared crate, `logbook`** (appendix 2). `Store<M: Metadata>`, `Source<M>` with byte or
    provider cursors, a `Claim`/`Watermark` model that keeps chat's strict serve rule and adds an
    eventual "complete through" for summaries, a `Unit` ladder from one message to a weekly report,
    `Summarizer` and `ModelBackend` traits with wrkviz's content-addressed artifacts, a precise
    `Freshness` (absent, caught up, behind, unproven), topics and labels, `Capability`-guarded
-   access, and the exact chat-to-transcript join (an agent's posted message appears verbatim in its
-   own tool call). SQLite for the working store; wrkviz's archive files stay the durable record.
+   access, and a chat-to-transcript join (an agent's posted message appears, after normalization, in
+   its own posting tool call; never inferred from timing). SQLite for the working store; wrkviz's archive files stay the durable record.
 3. **The wrkviz port** (appendix 3). A parity checklist row by row, with archive compatibility as
    the contract, a payload-identity test so not one cached summary is paid for twice, a
    byte-for-byte build differential, and a migration that reads old archives in place and indexes
@@ -88,7 +90,7 @@ the summarizer ladder and search are shared (appendix 2).
    unchanged. A new opt-in `archive` retention class keeps history for reports without weakening the
    disposable `mirror` default. Six cutover steps, each reversible.
 5. **The Work tab** (appendix 5). The wrkviz timeline per channel, with chat lanes on top in thread
-   colours and the agents below, joined by exact edges; served by vibe-talk with wrkviz's delivery
+   colours and the agents below, joined where the posting join matches; served by vibe-talk with wrkviz's delivery
    rules; transcripts local, pulled over SSH by byte range, or from a small read-only agent.
    Transcript access has three levels (summaries, events, payloads), defaults to summaries, needs the
    write token above that, and redacts payloads.
@@ -102,7 +104,7 @@ the summarizer ladder and search are shared (appendix 2).
    checked against the facts, and reviewed by you in the app. Never posted automatically.
 8. **Voice context** (appendix 8). At call start, push what makes the first answer right and costs
    milliseconds from the store: the availability line, the topic slugs, the newest messages and any
-   caught-up hour summaries. At "fully ready" (estimated 30 to 50 s cold, about 5 s warm), push a
+   caught-up hour summaries. At "fully ready" (estimated 20 to 50 s cold, about 5 s warm), push a
    short day narrative silently and leave hourly detail to a `summaries` tool. The bridge protocol
    needs a new capability-gated `context` frame for a silent mid-call push.
 9. **The availability bar** (appendix 8). "in the last [1] day the last [5] hours are summarized,
@@ -112,7 +114,9 @@ the summarizer ladder and search are shared (appendix 2).
     which returns in under a second; a server-side agent with read-only tools over chat, transcripts
     and search digs for 15 seconds to 3 minutes, shows its steps on the page, and comes back as a
     short spoken answer plus a cited written one. Same core as the side-agent helper, in a tool-loop
-    mode. A harness built on `smoke-agent.py` measures what the voice model can actually do.
+    mode, running under a server-held capability the owner configures (a voice call holds only the
+    read token). An eval harness (the hosted path from `smoke-agent.py`, plus a new `vibe-talk-v1`
+    driver) measures what the voice model can actually do.
 
 ## Phased plan
 
@@ -121,11 +125,11 @@ Each milestone is landable alone.
 
 | # | Milestone | Size | Depends on | Delivers |
 |---|---|---|---|---|
-| M0 | **Measure and decide**: the owner's answers below; the voice eval harness, tasks 2 and 8; `count_tokens` on a real chat day; the cache's per-consumer miss counts; Haiku 5.5 on wrkviz's model-comparison plan | S | — | The numbers the defaults rest on |
+| M0 | **Measure and decide**: the owner's answers below; the voice eval harness, tasks 2 and 8; `count_tokens` on a real chat day; the cache's per-consumer miss counts; the posting-join rate on a real week; Haiku 5.5 on wrkviz's model-comparison plan | S | — | The numbers the defaults rest on |
 | M1 | **`logbook` core**: ids, spans, buckets, `Item<M>`, `ChatMeta`, `Fenced`, `MessagesApi` backend moved out of vibe-talk; artifacts and receipts; vibe-talk's summaries become artifacts (cutover C1, C2) | M | M0 decisions 1 to 3 | Shared types and model client, receipts for chat |
 | M2 | **Chat history and the bar**: the cache becomes `ChatStore` (C3); backfill walk and watermarks (C4); tallies, freshness; `chat-hour` and `chat-day` rollups on demand (C5); thread and term topics; the availability bar; voice start push (P1 to P4) and the `summaries` and `topics` tools | M to L | M1 | **The first thing you would feel**: a voice call that knows the vocabulary and says how much it knows |
 | M3 | **Research agent on chat**: assistant core, research mode with chat tools, `research` / `research_status` / `research_cancel`, the page card, silent result push (`context` frame on the bridge, `contextual_update` hosted); the side-agent helper's P1 on the same core | M | M2 | "Research for me X" over chat history |
-| M4 | **Transcripts in Rust**: `TranscriptMeta`, Claude and Codex sources with byte cursors (subagents included), groups, phases, the exact join; wrkviz `index`, `query`, `serve` in Rust over old archives | L | M1 | Both layers in one store on the agents' host |
+| M4 | **Transcripts in Rust**: `TranscriptMeta`, Claude and Codex sources with byte cursors (subagents included), groups, phases, the posting join; wrkviz `index`, `query`, `serve` in Rust over old archives | L | M1 | Both layers in one store on the agents' host |
 | M5 | **Work tab**: schema-3 export in Rust (differential-tested), the static delivery handler in Rust, the third view, per-channel mapping by join and configuration, capability levels and redaction | L | M4 | The timeline on the phone |
 | M6 | **Research reaches transcripts**; nightly batches for phases and names within a budget; daily technical rollups | M | M3, M4 | Deep answers about what the agents did |
 | M7 | **Weekly reports** across channels and hosts | M | M2, M6 | A reviewed product-update draft every Friday |
@@ -142,7 +146,7 @@ because it turns the voice agent's weakness into a hand-off instead of a wrong a
 | Risk | Mitigation |
 |---|---|
 | The port re-pays for summaries because staged payloads differ by a byte | Payload-identity tests per summarizer before any Rust `summarize` runs (appendix 3) |
-| Moving the message cache breaks its hard-won race and privacy guarantees | Move the module unchanged with its tests; rerun the M5 equivalence harness at each cutover step |
+| Moving the message cache breaks its hard-won race and privacy guarantees | Move the module unchanged with its tests; import `#208 persistent-cache`'s cache-fill equivalence harness (today in a private scratch directory) and rerun it at each cutover step |
 | History retention changes vibe-talk's privacy stance | `archive` is opt-in per channel; the purge stays total; summaries follow their sources (appendix 4) |
 | Serving transcripts to a phone leaks secrets | Summaries-only default, write token for more, payload redaction, per-channel scoping, `no-store` (appendix 5) |
 | The voice model is weaker than assumed, or its context smaller | Measure first (M0); keep the push small; delegate to research |
@@ -176,7 +180,9 @@ because it turns the voice agent's weakness into a hand-off instead of a wrong a
 9. **Labels.** Was the labels or label-suggestions work started anywhere outside this repository? Are
    workstream topics (suggested weekly, accepted by you) the labels you had in mind?
 10. **Research hand-off.** Is "research …" plus an offer when `recent_activity` falls short the right
-    trigger? Should research results ever be read out unasked when they arrive mid-call?
+    trigger? Should research results ever be read out unasked when they arrive mid-call? And may a
+    research job started from a voice call read transcript events (not just summaries), given that
+    only its short spoken answer reaches the call and the cited written answer is shown on the page?
 11. **Reports.** Which channels and teams make up the product update, what day and time, and which
     audience (plain, technical or both)?
 12. **Muse.** Where does Muse keep its session transcripts, so they can be ingested?
@@ -188,7 +194,7 @@ because it turns the voice agent's weakness into a hand-off instead of a wrong a
 | File | Contents |
 |---|---|
 | [01-inventory.md](01-inventory.md) | What wrkviz and vibe-talk have, with code references; the cache-coverage analysis; overlaps and gaps |
-| [02-shared-crate.md](02-shared-crate.md) | `logbook`: traits and types in Rust, freshness, topics, the exact join, storage choice |
+| [02-shared-crate.md](02-shared-crate.md) | `logbook`: traits and types in Rust, freshness, topics, the posting join, storage choice |
 | [03-wrkviz-port.md](03-wrkviz-port.md) | Parity checklist, migration path, what to drop, tests |
 | [04-vibe-talk-on-logbook.md](04-vibe-talk-on-logbook.md) | What moves, retention classes, guarantees, phased cutover |
 | [05-work-tab.md](05-work-tab.md) | The third tab, mapping channels to transcripts, transport, security and privacy |

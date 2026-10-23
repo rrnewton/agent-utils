@@ -9,7 +9,7 @@ how long each preparation takes, and the floating bar that shows the owner how m
 1. **Session start.** The call must open as fast as it does today: the page fetches the assembled
    prompt (`GET /api/v1/voice-agent` on a deployment-managed bridge) or opens the hosted agent's
    socket, and the greeting follows. Anything pushed here has to be ready in **about 100 ms of server
-   time** and small enough not to slow the model's first turn (a budget of about **3 k tokens**,
+   time** and small enough not to slow the model's first turn (a budget of about **4 k tokens**,
    proposed).
 2. **Fully ready.** Some seconds to a minute later, the on-demand summaries for the window the owner
    chose are caught up. The agent can now give a real overview.
@@ -25,14 +25,18 @@ will be no slower. Model latencies are **estimates** unless marked measured.
 |---|---|---|---|---|---|
 | P1 | Availability status: messages per hour for the window, which hours are caught up, newest message per channel | deterministic | **0.6 ms** measured (48 h of hourly counts and watermarks, all channels) | ~100 tokens | start |
 | P2 | Topic list: slugs and one-sentence descriptions of threads active in the window (from stored thread names), plus accepted workstreams | deterministic read of stored names | under 2 ms (estimate; same order as P1) | 20 to 40 threads a day, ~40 tokens each, ~1.5 k | start |
-| P3 | Index of the newest messages: id, local time, author, first 120 characters | deterministic | **1.3 ms** measured for all 450 of a day (87 KB, ~22 k tokens, so the push takes only the newest ~15) | ~1.2 k for 15 lines | start |
-| P4 | Summaries of closed hours that are already caught up (from earlier batches or calls) | deterministic read | ~1 ms (estimate) | ~150 tokens an hour; push at most 6 | start |
+| P3 | Index of the newest messages: id, local time, author, first 160 characters (as `digest` does) | deterministic | **1.3 ms** measured for all 450 of a day (87 KB, ~22 k tokens, so the push takes only the newest ~15) | ~0.7 k for 15 lines | start |
+| P4 | Summaries of closed hours that are already caught up (from earlier batches or calls) | deterministic read | ~1 ms (estimate) | ~150 tokens an hour; push at most 4 (~0.6 k) | start |
 | P5 | Full text of the window | deterministic | **6 ms** measured for a day (665 KB, ~150 k tokens) | too big for a voice model; **never pushed**; this is the research agent's and the helper's input | start (pull only) |
-| P6 | Missing hourly rollups for the window, per channel | model, on demand | **estimate** 2 to 5 s per call on a Haiku-class model with ~4 k input; a median day has ~40 active channel-hours; at 4 calls in flight, ~30 to 50 s cold. Warm (only the current hour missing): ~5 s | ~150 tokens per channel-hour | fully ready |
+| P6 | Missing hourly rollups for the window, per channel | model, on demand | **estimate** 2 to 5 s per call on a Haiku-class model with ~4 k input; a median day has ~40 active channel-hours; at 4 calls in flight, ~20 to 50 s cold. Warm (only the current hour missing): ~5 s | ~150 tokens per channel-hour | fully ready |
 | P7 | A 24-hour narrative from the hourly rollups ("today, in three sentences per workstream") | model, on demand | **estimate** 4 to 10 s after P6 | ~400 to 800 tokens | fully ready |
 | P8 | Workstream topics with today's status line each | model, batch | precomputed nightly or weekly; at call time a read (~1 ms) | ~40 tokens each | start, if a batch ran |
 | P9 | Transcript-layer summaries (agent phases) | model, batch | **measured** 20 to 24 s median per phase job through a coding CLI (usage receipts); not for call time | — | never at call time |
 | P10 | Today's upstream chat read of every channel (the call-start read-ahead, as today) | network | **measured** 1.9 to 5.7 s per channel when the adapter is quiet; 14 to 20 s and timeouts when busy (voice-tool audit) | — | warms the held copy; not pushed |
+
+The start push adds up to about 3.3 k tokens (P1 0.1 k, P2 1.5 k, P3 0.7 k, P4 0.6 k, P8 about
+0.4 k for ten workstreams), inside the proposed 4 k budget; the budget itself waits on the voice
+model's measured context ceiling (appendix 9, task 2).
 
 What this says: everything the start push needs (P1 to P4, P8) is **milliseconds** if it comes from
 the store, and **tens of seconds** if it has to come from upstream reads (P10) or new model calls
@@ -50,7 +54,7 @@ numbers on the real gateway.
 | P1 availability status | **push**, one line | **push** an updated line (part of the ready notice) | — |
 | P2 topic list | **push** | push only the topics that changed | `topics` tool (new) |
 | P3 newest-message index | **push** the newest ~15 lines | — | `recent_activity` (full text, exists) |
-| P4 caught-up hour summaries | **push** up to 6 | — | `summaries` tool (new) |
+| P4 caught-up hour summaries | **push** up to 4 | — | `summaries` tool (new) |
 | P6 hourly rollups | — | **pull**, announced: the ready notice says they exist | `summaries(hours, channel)` |
 | P7 24-hour narrative | — | **push**, in the ready notice, at most ~800 tokens | `summaries(level="day")` |
 | P5 full text | never | never | `recent_activity`, `read_page`, `read_message`; or ask the research agent |
@@ -83,8 +87,8 @@ The start push carries a status line such as:
 
 ```
 [summaries as of 14:32] Window: the last 1 day. Ready: the last 5 hours (43 messages), and the
-thread list. Preparing: 19 earlier hours, expected within about a minute. Until then, answer from
-recent_activity and say that fuller summaries are on the way.
+thread list. Preparing: 12 earlier hours (7 more had no messages), expected within about a
+minute. Until then, answer from recent_activity and say that fuller summaries are on the way.
 ```
 
 The system prompt (a version 13 rule) tells the agent to begin answering at once from what it has,
@@ -124,12 +128,12 @@ movable on a desk, dismissible. It states, live:
 │              │ 1 │▾▴            ┃ 5 ┃                               │
 │              └───┘              ┗━━━┛  containing ┏━━━━┓ messages    │
 │                                                    ┃ 43 ┃            │
-│                                                    ┗━━━━┛  ◌ 19 more │
+│                                                    ┗━━━━┛  ◌ 12 more │
 └──────────────────────────────────────────────────────────────────────┘
    [1]  the window, set by the owner (stepper; 1 to 7 days); plain border
    [5]  consecutive caught-up hours counting back from now; max 24 × days
    [43] messages inside those hours
-   ◌ 19 more   hours still preparing (spinner); absent when nothing is pending
+   ◌ 12 more   hours still being summarized (spinner); absent when nothing is pending
 ```
 
 Border colours (drawn as the box outline, with a text equivalent for screen readers):
@@ -145,23 +149,29 @@ The day box never turns green: it is a setting, not a measurement.
 
 ### Expanded (tap ⋯)
 
+The same moment as above, 14:32: the last five hours (10:00 to now) are caught up; twelve hours are
+being summarized; seven overnight hours had no messages.
+
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  in the last [1] day the last [5] hours are summarized, containing   │
-│  [43] messages                                                  ⌃  ✕ │
-│                                                                      │
-│  15  16  17  18  19  20  21  22  23  00  01  02 ... 10  11  12  13 14│
-│  ■   ■   ◌   ◌   ·   ·   ·   ·   ·   ·   ·   ◌  ...  ◌   ■   ■   ■  ■│
-│                                                                      │
-│  ■ caught up   ▣ behind   ◌ preparing   · no messages   □ not asked  │
-│                                                                      │
-│  build-lane     5/5 hours   31 msgs   ●                              │
-│  infra          5/5 hours   12 msgs   ●                              │
-│  research       2/5 hours    0 msgs   ◌                              │
-│                                                                      │
-│  Model: Haiku 5.5   Today: 214 k tokens, about $0.03   [Summarize all]│
-└──────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  in the last [1] day the last [5] hours are summarized, containing [43]      │
+│  messages                                                              ⌃  ✕ │
+│                                                                              │
+│  15 16 17 18 19 20 21 22 23 00 01 02 03 04 05 06 07 08 09 10 11 12 13 14     │
+│  ◌  ◌  ◌  ◌  ◌  ◌  ·  ·  ·  ·  ·  ·  ·  ◌  ◌  ◌  ◌  ◌  ◌  ■  ■  ■  ■  ■      │
+│                                                                              │
+│  ■ caught up   ▣ behind   ◌ being summarized   · no messages   □ not asked   │
+│                                                                              │
+│  build-lane    last 5 h caught up    31 msgs   ●                             │
+│  infra         last 5 h caught up    12 msgs   ●                             │
+│  research      no messages in the window       ●                             │
+│                                                                              │
+│  Model: Haiku 5.5   Today: 214 k tokens, about $0.03         [Summarize all] │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
+
+Once the twelve hours land, the empty hours count as caught up too, so the run reaches all 24
+hours and both boxes turn green.
 
 ### The numbers, precisely
 

@@ -21,8 +21,18 @@ written answer with citations on the page.
 
 ## The research agent's tools
 
-All read-only, all through `logbook` with the caller's `Capability` (appendix 2), all returning
-fenced, owner-marked text with ids the server can validate.
+All read-only, all through `logbook` with a `Capability` (appendix 2), all returning fenced,
+owner-marked text with ids the server can validate.
+
+**Whose capability.** A voice call holds the read token, which reaches transcript summaries at most
+(appendix 5). A research job therefore runs under a **server-held research capability** that the
+owner configures, not the caller's token, with two limits on that escalation:
+
+- `research.from_voice` sets what a job started from a voice call may read: `summaries` by default,
+  or `events` if the owner opts in. Payloads are never reachable from a voice-started job.
+- What flows back is limited by where it goes: the voice call receives only the short `spoken`
+  answer; the `written` answer with transcript citations is shown only to a page holding the write
+  token. A job started from that page may use the deployment's full transcript level.
 
 | Tool | What it reads | Notes |
 |---|---|---|
@@ -36,7 +46,7 @@ fenced, owner-marked text with ids the server can validate.
 | `read_events(agent, span, kinds, limit)` | Raw normalized events of one agent | Subagents included |
 | `read_tool_payload(call)` | A tool call's input or output, redacted | Requires `payloads`; off by default |
 | `owner_prompts(span, teams?)` | The owner's own prompts, verbatim | From the prompt projection |
-| `who_posted(message)` | The agent phase that posted a chat message | The exact join (appendix 2) |
+| `who_posted(message)` | The agent phase that posted a chat message | The posting join (appendix 2); absent when unmatched |
 | `landed(span, repos?)` | Commits and pull requests that landed, with titles | Deterministic facts for "did X actually land?" |
 
 It has **no write tools**: it cannot post, mark read, run commands or reach the network. Its outputs
@@ -165,12 +175,15 @@ unmeasured resources, and the server side's are plentiful and measurable.
 A capability card per voice model, measured by a repeatable harness rather than inferred from
 incidents.
 
-**Harness.** Extend `vibe-talk/scripts/smoke-agent.py`, which already drives a real agent headlessly
-by text (`user_message` on the hosted backend; the `prompt` frame does the same on a `vibe-talk-v1`
-bridge) and checks this server's access log for tool calls. Point it at a vibe-talk **test** server
-backed by the fake chat provider and a fixture corpus with known answers (a synthetic day built by the
-ported `synthetic.py`, plus a recorded, redacted real day). It costs voice minutes and is opt-in, as
-the smoke script is today; running it against the production bridge needs the owner's go-ahead.
+**Harness.** Two drivers. For the hosted backend, reuse `vibe-talk/scripts/smoke-agent.py`, which
+already drives a real agent headlessly by text (`user_message`) and checks this server's access log
+for tool calls; pointing that agent at a test server needs a second agent (or a changed MCP URL) in
+the vendor console. For the deployment-managed stack, whose limits are the unknown ones, **a new
+driver** is needed: a small `vibe-talk-v1` client that opens a session, sends typed `prompt` frames
+and reads `turn_complete` and the transcript events. Both run against a vibe-talk **test** server
+backed by the fake chat provider and a fixture corpus with known answers (a synthetic day built by
+the ported `synthetic.py`, plus a recorded, redacted real day). It costs voice minutes and is opt-in,
+as the smoke script is today; running it against the production stack needs the owner's go-ahead.
 
 **Tasks** (each a few dozen fixtures, scored automatically where possible and by a server-side judge
 model with spot checks otherwise):

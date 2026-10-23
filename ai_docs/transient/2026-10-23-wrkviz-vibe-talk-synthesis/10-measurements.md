@@ -53,7 +53,8 @@ name_cache  batches 242   jobs 640   input 8,855,902   output 271,700    in/job 
             batch latency median 18.0 s  p90 30.3 s
 ```
 
-Single-job batches only, split by backend (`receipts2.py`, the same loop filtered on
+Single-job batches only, split by backend (the `cache` receipts hold phase and rollup jobs alike,
+mostly phases) (`receipts2.py`, the same loop filtered on
 `len(input_hashes) == 1` and `backend`):
 
 ```

@@ -163,7 +163,7 @@ pub struct ChatMeta {
     pub author_is_bot: bool,
     pub home_scope: ChatScope,           // Main | Flat | Thread
     pub reactions: Vec<Reaction>,
-    /// The agent session that posted it, when an exact join found one (below).
+    /// The agent session that posted it, when the join below found one.
     pub posted_by: Option<ItemId>,
 }
 
@@ -255,12 +255,19 @@ pub enum Claim {
 pub struct Watermark {
     /// Every item before this instant is held (for chat: as of the latest verifying listing).
     pub complete_through: Option<Millis>,
+    /// What "complete" means for this source: `Exact` for an append-only transcript prefix and
+    /// for a provider whose listings omit nothing; `AsListed` for Slack, whose history listings
+    /// leave out messages with no author (`cache/observe.rs`, `Shape::complete`).
+    pub completeness: Completeness,
     /// The newest item held.
     pub newest: Option<Millis>,
     /// When the store last verified `complete_through` against the source.
     pub verified_at: Millis,
     /// Doubt: an offer was dropped, an access refusal is pending, and so on.
     pub doubt: Option<Doubt>,
+    /// The store's change counter for this source: bumped by every applied create, edit and
+    /// tombstone. Freshness compares it, never clocks.
+    pub change_seq: u64,
 }
 ```
 
@@ -268,8 +275,17 @@ pub struct Watermark {
 keeps the strict `shadow::decide` rule over `Claim::Listing`, unchanged. Summaries, timelines and
 reports use only `Watermark::complete_through`, which a periodic **backfill walk** advances for a
 chat source (page back through history until it meets held coverage, a few calls per channel per
-hour), and which a summarizer compares against its own input watermark to decide freshness. That
-gives archive completeness on Slack, whose feed vibe-talk's serve rule rightly distrusts.
+hour), and which freshness checks (below). vibe-talk already declares this walk without
+implementing it: `[message_cache] backfill`, default `adaptive` ("fetch older history while nothing
+else is using the provider, one call at a time", `config.rs:266`), and the fill kinds
+`ServerFill::Backfill` and `ServerFill::Refresher` (`cache/grant.rs`) have no caller yet. Building
+them is the first step of cutover C4 (appendix 4), and more filling is also what would close the
+coverage gaps behind the Main timeline's misses (appendix 1).
+
+On Slack a walk inherits the listings' one omission (messages with no author, which are join and
+system notices rather than anyone's words), so its watermark is `AsListed`: complete as far as
+Slack's history lists, which is the honest meaning of "complete" for summaries there. The serve rule
+keeps treating Slack as incomplete, as it must.
 
 ## Sources
 
@@ -326,7 +342,9 @@ pub enum Audience { Technical, PlainLanguage }
 ```
 
 ```rust
-/// A registered summarizer: wrkviz's summary_registry entries, as types.
+/// A registered summarizer: wrkviz's summary_registry entries, as types. Not object-safe (it
+/// has associated consts and a type), so the registry is an enum over the registered summarizers,
+/// or holds an erased `dyn StageJobs` wrapper; either way the IDs and versions stay constants.
 pub trait Summarizer: Send + Sync {
     const ID: &'static str;              // "phase-work-summary", "chat-hour", ...
     const VERSION: u32;                  // bump on any model-visible change
@@ -342,9 +360,17 @@ pub struct Staged {
     pub payload: Fenced,                 // only constructible through untrusted::fenced
     pub depends_on: Vec<ArtifactId>,
     pub coverage: Coverage,              // per-channel requested/provided, wrkviz's rule
-    /// The newest item the payload saw, per source: what freshness compares against.
-    pub input_watermark: BTreeMap<SourceId, Millis>,
-    pub items_seen: u32,
+    /// The store's state the payload was staged from, per source (below).
+    pub staged_from: BTreeMap<SourceId, StagedFrom>,
+    /// The noise rules and other serve-time predicates the stage applied, as a digest.
+    pub filters_digest: Digest,
+}
+
+/// Recorded per source at staging, under the store's read transaction.
+pub struct StagedFrom {
+    pub change_seq: u64,                 // Watermark::change_seq at staging
+    pub as_of: Millis,                   // store time of that read
+    pub summarizable_seen: u32,          // items the payload included (noise excluded)
 }
 
 /// A model behind one call or one batch. vibe-talk's Messages API client becomes one impl;
@@ -361,8 +387,8 @@ pub struct Artifact<O> {
     pub id: ArtifactId,
     pub unit: Unit,
     pub output: O,
-    pub input_watermark: BTreeMap<SourceId, Millis>,
-    pub items_seen: u32,
+    pub staged_from: BTreeMap<SourceId, StagedFrom>,
+    pub filters_digest: Digest,
     pub coverage: Coverage,
     pub frontier: Frontier,              // ProjectStart | ContiguousExtension | IsolatedBackfill
     pub receipt: ReceiptId,              // tokens, latency, backend, model; one per batch
@@ -392,25 +418,63 @@ pub enum Freshness {
     Unproven,
 }
 
-pub fn freshness(unit_span: Span, art: Option<&ArtifactMeta>, held: &Tally, wm: &Watermark,
-                 now: Millis) -> Freshness
-{
+/// The current state of a unit's span, from the store, at the moment of asking.
+pub struct Held {
+    pub change_seq: u64,        // highest change_seq of any item in the span (creates, edits,
+                                // tombstones), per source; one entry per source in the unit
+    pub summarizable: u32,      // non-noise items in the span now
+}
+
+pub fn freshness(
+    unit_span: Span,
+    art: Option<&ArtifactMeta>,
+    held: &BTreeMap<SourceId, Held>,
+    wms: &BTreeMap<SourceId, Watermark>,
+    filters_digest: Digest,
+) -> Freshness {
     let Some(art) = art else { return Freshness::Absent };
-    if held.items > art.items_seen || held.newest_change > art.input_watermark_max() {
-        return Freshness::Behind { new_items: held.items.saturating_sub(art.items_seen),
-                                   since: art.input_watermark_max() };
+    // A changed noise rule changes what a stage would include: re-stage.
+    if art.filters_digest != filters_digest {
+        return Freshness::Behind { new_items: 0, since: art.made_at };
     }
-    match wm.complete_through {
-        // The current hour is complete up to now, not up to its end.
-        Some(t) if t >= unit_span.end.min(now) => Freshness::CaughtUp,
-        _ => Freshness::Unproven,
+    // Behind: anything in the span changed after the stage read it. Sequence numbers, not
+    // clocks, so an edit's local time and a message's provider time are never compared.
+    for (source, now) in held {
+        let Some(then) = art.staged_from.get(source) else {
+            return Freshness::Behind { new_items: now.summarizable, since: art.made_at };
+        };
+        if now.change_seq > then.change_seq {
+            return Freshness::Behind {
+                new_items: now.summarizable.saturating_sub(then.summarizable_seen),
+                since: then.as_of,
+            };
+        }
     }
+    // Caught up with what is held; is what is held the whole span (up to the stage)?
+    for (source, then) in &art.staged_from {
+        let Some(wm) = wms.get(source) else { return Freshness::Unproven };
+        let needed = unit_span.end.min(then.as_of);       // the current hour: up to the stage
+        let proven = wm.doubt.is_none()
+            && wm.complete_through.is_some_and(|t| t >= needed);
+        if !proven {
+            return Freshness::Unproven;
+        }
+    }
+    Freshness::CaughtUp
 }
 ```
 
-`held.newest_change` counts edits and tombstones as changes, so an edited message makes its hour
-`Behind`. A closed hour whose summary is `CaughtUp` stays so until an edit, which is rare; the
-current hour is by definition `Behind` whenever a message arrives after its summary.
+Three consequences, each deliberate:
+
+- **Noise does not hold an hour behind.** Only `summarizable` items are counted, and a `_Working…_`
+  placeholder is excluded at staging and in the count alike. A changed noise rule is caught by
+  `filters_digest`, not by counts.
+- **An edit or deletion makes its hour `Behind`** through the change sequence, whatever the clocks
+  say. A closed hour whose summary is `CaughtUp` stays so until such a change, which is rare.
+- **The current hour can be green.** Its summary needs the span proven only up to the moment it was
+  staged (`then.as_of`); it stays `CaughtUp` until the next message bumps the sequence, and then is
+  `Behind` until re-staged (the bar's debounce is in appendix 8). A unit over several sources (a
+  report's week) is caught up only when every source is.
 
 ## Topics, slugs and labels
 
@@ -503,15 +567,26 @@ The schema is unchanged, so the existing browser app reads a Rust-written archiv
 export as a team whose "agents" are threads (or one lane per author), with message events and no
 tool calls; appendix 5 describes the joined view.
 
-## The exact join between the two layers
+## Joining the two layers: which agent posted a chat message
 
-A chat message posted by a coding agent appears verbatim in that agent's transcript, as the input
-of the tool call that posted it (an `agentctl chat reply`, a provider CLI, an MCP `post_reply`).
-After normalizing whitespace, the message's content hash matches the hashed text inside the call's
-input, within a few seconds of the message's time. That gives `ChatMeta::posted_by` without any
-guessing from timing or prose, in keeping with wrkviz's refusal to infer lineage from proximity. A
-message with no match stays unjoined. It is the link that lets the Work tab jump from a chat message
-to the agent phase that wrote it.
+A chat message posted by a coding agent appears in that agent's transcript as the input of the tool
+call that posted it (an `agentctl chat reply`, a provider CLI, an MCP `post_reply`). The text is not
+always byte-identical by the time the provider lists it: Slack mrkdwn escaping and mention markup,
+the `#303 voice-post-prefix` tag, and long messages split into several posts all transform it. So the
+join is a **normalized match**, tried in order:
+
+1. **Normalized hash.** Strip markup and mention syntax, a configured post prefix and whitespace on
+   both sides, then compare content hashes, within a few seconds of the message's time and only
+   against posting tool calls of agents mapped to that channel.
+2. **Chunk match.** A message that is one chunk of a longer post matches when its normalized text is
+   a contiguous slice of one posting call's input, in order with its sibling chunks.
+3. **Self-tag.** Agents that sign their posts (`#242 rich-headers` lifts a `[who-am-i]` tag into the
+   header row) narrow the candidate agents before matching.
+
+Never by timing or prose resemblance alone, in keeping with wrkviz's refusal to infer lineage from
+proximity: a message no step matches stays unjoined. The join rate on a real week is an M0
+measurement; if it is low, the posting tools can stamp an id in an invisible field the provider
+keeps (Slack `metadata`, a Discord nonce) to make the join exact going forward.
 
 ## Storage choice
 
