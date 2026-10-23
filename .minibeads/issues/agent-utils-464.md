@@ -1,6 +1,6 @@
 ---
 title: 'slack-tail-shapes: accept the record shapes the Slack tail really writes, and log why one is refused'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - slack
 - live
 created_at: 2026-10-23T16:34:02.784667734+00:00
-updated_at: 2026-10-23T16:34:02.784667734+00:00
+updated_at: 2026-10-23T16:34:14.516577826+00:00
+closed_at: 2026-10-23T16:34:14.516577646+00:00
 ---
 
 # Description
@@ -18,3 +19,7 @@ updated_at: 2026-10-23T16:34:02.784667734+00:00
 # Acceptance Criteria
 
 The captured record shape and its variants are published or ignored through /api/v1/live/tail, never refused; a refusal leaves one WARN line naming the field and rule and none of the record's text.
+
+# Notes
+
+[opus 5.5] Delivered: the workspace-prefixed container is read, records with nothing to publish are ignored rather than refused, and every refusal is logged at WARN by field and rule. Unverified: the reaction record's payload is still not interpreted (a reaction wakes the poller), and the fix has not yet run against the live stream.
