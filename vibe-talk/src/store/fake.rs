@@ -58,6 +58,8 @@ struct State {
     /// Channel to its read-mark epoch; absent is `0`, as a missing row is in the real store.
     /// `#458 replication-c9-lattice-fixes`.
     read_epochs: BTreeMap<String, i64>,
+    /// Key to `(record, at_ms)`. `#471 replication-c5-post-keys`.
+    post_keys: BTreeMap<String, (String, i64)>,
     summaries: BTreeMap<(String, String, String, String), FakeSummary>,
     /// `(channel, message)` to `(snowflake, when it was dismissed)`. The same shape the real
     /// table has, so the count bound and the ordering can be reproduced rather than assumed.
@@ -505,6 +507,41 @@ impl StateStore for FakeStore {
             .or_insert(0);
         *epoch = super::next_pin_revision(*epoch, now_ms());
         Ok(*epoch)
+    }
+
+    async fn keep_post_key(&self, key: &str, record: &str, at_ms: i64) -> Result<(), StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        state
+            .post_keys
+            .insert(key.to_owned(), (record.to_owned(), at_ms));
+        let floor = at_ms - super::POST_KEY_KEEP_MS;
+        state.post_keys.retain(|_, (_, at)| *at >= floor);
+        while state.post_keys.len() > super::MAX_POST_KEYS {
+            let oldest = state
+                .post_keys
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(key, _)| key.clone());
+            match oldest {
+                Some(key) => drop(state.post_keys.remove(&key)),
+                None => break,
+            }
+        }
+        Ok(())
+    }
+
+    async fn kept_post_keys(&self, since_ms: i64) -> Result<Vec<(String, i64)>, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        let mut kept: Vec<(String, i64)> = state
+            .post_keys
+            .values()
+            .filter(|(_, at)| *at >= since_ms)
+            .cloned()
+            .collect();
+        kept.sort_by_key(|(_, at)| *at);
+        Ok(kept)
     }
 
     async fn read_mark_epochs(&self) -> Result<Vec<(ChannelId, i64)>, StoreError> {
@@ -1423,6 +1460,7 @@ impl StateStore for FakeStore {
         state.conversations.clear();
         state.marks.clear();
         state.read_epochs.clear();
+        state.post_keys.clear();
         state.summaries.clear();
         state.dismissals.clear();
         state.aliases.clear();
@@ -1474,6 +1512,7 @@ mod tests {
         let store = FakeStore::new();
         super::super::lattice_checks::evicted_hues_come_back(&store).await;
         super::super::lattice_checks::a_stale_mark_cannot_undo_a_forget(&store).await;
+        super::super::lattice_checks::post_keys_are_kept_and_bounded(&FakeStore::new()).await;
     }
 
     fn id(text: &str) -> ConversationId {

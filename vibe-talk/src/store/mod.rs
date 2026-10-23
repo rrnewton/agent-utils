@@ -1612,6 +1612,14 @@ pub fn validate_thread_hue_id(raw: &str) -> Result<(), StoreError> {
 /// change.
 pub const MAX_THREAD_HUE_TOMBSTONES_PER_CHANNEL: usize = 16 * MAX_THREAD_HUES_PER_CHANNEL;
 
+/// How long a settled keyed post is kept in the store, in milliseconds: the send log's own
+/// [`crate::post_keys::KEEP`]. `#471 replication-c5-post-keys`.
+pub const POST_KEY_KEEP_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// The most settled keyed posts the store keeps: the send log's own
+/// [`crate::post_keys::MAX_KEPT`].
+pub const MAX_POST_KEYS: usize = crate::post_keys::MAX_KEPT;
+
 /// Keep from `rows` (one channel's hues, any order) only the newest
 /// [`MAX_THREAD_HUES_PER_CHANNEL`] by assignment order, returning the survivors in assignment
 /// order. Shared by every backend so the bound means the same thing in each.
@@ -1926,6 +1934,29 @@ pub trait StateStore: Send + Sync {
     /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on
     /// failure.
     async fn read_mark_epochs(&self) -> Result<Vec<(ChannelId, i64)>, StoreError>;
+
+    /// File what one keyed post settled as, under its key, replacing what the key named before.
+    /// `#471 replication-c5-post-keys`; see [`crate::post_keys::Kept`]. `record` is that record as
+    /// JSON, opaque here. In the same write, records older than [`POST_KEY_KEEP_MS`] before `at_ms`
+    /// are forgotten, and the oldest past [`MAX_POST_KEYS`].
+    ///
+    /// A record holds the owner's own words, as a transcript turn does, which is why it is bounded
+    /// by age as well as by count, and why the purge takes it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a
+    /// write failure.
+    async fn keep_post_key(&self, key: &str, record: &str, at_ms: i64) -> Result<(), StoreError>;
+
+    /// Every keyed post filed at or after `since_ms`, as `(record, at_ms)`, oldest first.
+    /// `#471 replication-c5-post-keys`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on
+    /// failure.
+    async fn kept_post_keys(&self, since_ms: i64) -> Result<Vec<(String, i64)>, StoreError>;
 
     /// Every channel alias the operator has set, in channel order. `#39 channel-alias`.
     ///
@@ -3299,6 +3330,45 @@ pub(crate) mod lattice_checks {
             .await
             .expect("colour after purge");
         assert_eq!(fresh[0].hue, crate::thread_hues::FIRST_HUE);
+    }
+
+    /// The send log's settled posts are filed by key, replaced by a later filing of the key,
+    /// bounded by age, read back oldest first, and taken by the purge. `#471
+    /// replication-c5-post-keys`.
+    pub(crate) async fn post_keys_are_kept_and_bounded(store: &dyn StateStore) {
+        let now = 1_790_000_000_000;
+        store
+            .keep_post_key("a", "{\"first\":1}", now - 10)
+            .await
+            .expect("file a");
+        store
+            .keep_post_key("b", "{\"b\":1}", now - 5)
+            .await
+            .expect("file b");
+        store
+            .keep_post_key("a", "{\"first\":2}", now)
+            .await
+            .expect("file a again");
+        assert_eq!(
+            store.kept_post_keys(0).await.expect("read"),
+            [
+                ("{\"b\":1}".to_owned(), now - 5),
+                ("{\"first\":2}".to_owned(), now)
+            ],
+            "a later filing replaces the key's record"
+        );
+        assert_eq!(store.kept_post_keys(now).await.expect("read").len(), 1);
+        // A day later the old ones go in the same write.
+        store
+            .keep_post_key("c", "{}", now + super::POST_KEY_KEEP_MS + 1)
+            .await
+            .expect("file c");
+        assert_eq!(
+            store.kept_post_keys(0).await.expect("read"),
+            [("{}".to_owned(), now + super::POST_KEY_KEEP_MS + 1)]
+        );
+        store.purge_everything().await.expect("purge");
+        assert!(store.kept_post_keys(0).await.expect("read").is_empty());
     }
 
     /// A forget moves the channel to a later epoch; a mark naming the old epoch is not applied,

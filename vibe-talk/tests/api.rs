@@ -1921,6 +1921,7 @@ async fn the_purge_route_erases_all_three_records_and_leaves_the_store_usable() 
             "voice_prompt",
             "voice_post_prefix",
             "client_settings",
+            "post_keys",
             "message_cache"
         ]),
         "the answer has to name what it erased: {payload}"

@@ -22,7 +22,7 @@ use crate::model::ChannelInfo;
 pub const REASON_MAX_CHARS: usize = 300;
 
 /// A provider's refusal of one part of a post. `#444 send-refusal-reason`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct SendRefusal {
     /// The provider's HTTP status, a 4xx.
     pub status: u16,

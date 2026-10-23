@@ -100,6 +100,14 @@ impl StateStore for DisabledStore {
         refuse()
     }
 
+    async fn keep_post_key(&self, _: &str, _: &str, _: i64) -> Result<(), StoreError> {
+        refuse()
+    }
+
+    async fn kept_post_keys(&self, _: i64) -> Result<Vec<(String, i64)>, StoreError> {
+        refuse()
+    }
+
     async fn channel_aliases(&self) -> Result<Vec<ChannelAlias>, StoreError> {
         refuse()
     }

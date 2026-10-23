@@ -203,6 +203,29 @@ fn added_channel_info(row: &AddedChannel, providers: &ChatRouter) -> ChannelInfo
 }
 
 impl AppState {
+    /// Take back the send log's settled posts the store kept (`#471 replication-c5-post-keys`),
+    /// so a repeat of a post that landed before a restart is answered with its answer and posts
+    /// nothing. Read once at startup. A record that no longer parses is skipped.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::store::StoreError`] when the store cannot be read; the send log is then empty, as
+    /// it was before the store kept it.
+    pub async fn restore_post_keys(&self) -> Result<usize, crate::store::StoreError> {
+        let now = crate::store::now_ms();
+        let rows = self
+            .store
+            .kept_post_keys(now - crate::store::POST_KEY_KEEP_MS)
+            .await?;
+        let kept: Vec<crate::post_keys::Kept> = rows
+            .into_iter()
+            .filter_map(|(record, _)| serde_json::from_str(&record).ok())
+            .collect();
+        let count = kept.len();
+        self.post_keys.restore(kept, now);
+        Ok(count)
+    }
+
     /// Restore channels previously added from inside the app into the live allowlist.
     ///
     /// The store is read once at startup. Keeping this operation on [`AppState`] makes the same

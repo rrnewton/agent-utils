@@ -1,11 +1,15 @@
-//! `#465 replication-c6-op-key-marker`, part 2. The owner, 2026-10-23: after an uncertain send,
-//! look upstream before offering Retry. A part whose answer was lost after the provider took it is
-//! looked for in its destination: found by its key, it landed, and the send is answered as posted,
-//! with nothing posted twice. Related: `#468 send-dedupe`.
+//! The send log beyond one process and one answer, related to `#468 send-dedupe`.
+//!
+//! - `#465 replication-c6-op-key-marker`, part 2. The owner, 2026-10-23: after an uncertain send,
+//!   look upstream before offering Retry. A part whose answer was lost after the provider took it
+//!   is looked for in its destination: found by its key, it landed, and the send is answered as
+//!   posted, with nothing posted twice.
+//! - `#471 replication-c5-post-keys`. What a keyed post landed as is filed in the store, so a
+//!   repeat after a restart is answered with it and posts nothing.
 //!
 //! Against the loopback Slack fake (which keeps a post's metadata, as a transport passing it
-//! through would) and the in-memory provider with a readable carrier. Matching by words is the
-//! pure `ops::match_uncertain_part`, tested at the end.
+//! through would) and the in-memory provider. Matching by words is the pure
+//! `ops::match_uncertain_part`, tested at the end.
 
 mod slack_fake;
 
@@ -133,6 +137,40 @@ async fn a_slack_post_whose_answer_was_lost_is_found_by_its_key_and_answered_as_
     .await;
     assert_eq!(status, StatusCode::OK, "{again}");
     assert_eq!(fake.calls("chat.postMessage"), 1, "Retry posted it twice");
+}
+
+#[tokio::test]
+async fn a_repeat_after_a_restart_is_answered_from_the_store_and_posts_nothing() {
+    let fake = Fake::start(fixture(vec![]), 50).await;
+    let state = slack(&fake).await;
+    let words = json!({ "text": "deploying now", "idempotency_key": KEY });
+    let (status, first) = call(&state, &reply(), words.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(fake.calls("chat.postMessage"), 1);
+    // A restart: the same store, an empty send log, read back as the server does at start.
+    let mut restarted = state.clone();
+    restarted.post_keys = Arc::new(vibe_talk::post_keys::PostKeys::new());
+    assert_eq!(restarted.restore_post_keys().await.expect("restored"), 1);
+    let (status, again) = call(&restarted, &reply(), words).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(
+        again["parts"], first["parts"],
+        "answered with the first post"
+    );
+    assert_eq!(
+        fake.calls("chat.postMessage"),
+        1,
+        "a repeat after a restart posted it again"
+    );
+    // Other words under the same key are still refused, after the restart as before it.
+    let (status, reused) = call(
+        &restarted,
+        &reply(),
+        json!({ "text": "something else", "idempotency_key": KEY }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{reused}");
+    assert_eq!(fake.calls("chat.postMessage"), 1);
 }
 
 #[tokio::test]

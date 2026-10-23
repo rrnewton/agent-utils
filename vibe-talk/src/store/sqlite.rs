@@ -440,6 +440,21 @@ pub const MIGRATIONS: &[&str] = &[
         epoch      INTEGER NOT NULL
     ) STRICT;
     ",
+    // v21 — the send log's settled posts. `#471 replication-c5-post-keys`.
+    //
+    // One row per idempotency key: what the post it names came to, as the send log's own JSON
+    // record (`crate::post_keys::Kept`), and when. It holds the owner's own words, as `turns`
+    // does, so it is bounded by age (`super::POST_KEY_KEEP_MS`) as well as by count
+    // (`super::MAX_POST_KEYS`), both in the write that files a row, and the purge takes it.
+    "
+    CREATE TABLE post_keys (
+        key    TEXT    PRIMARY KEY NOT NULL,
+        record TEXT    NOT NULL,
+        at_ms  INTEGER NOT NULL
+    ) STRICT;
+
+    CREATE INDEX post_keys_by_age ON post_keys (at_ms);
+    ",
 ];
 
 /// A [`StateStore`] backed by one SQLite file.
@@ -1553,6 +1568,52 @@ impl StateStore for SqliteStore {
                 .map_err(backend)?;
             transaction.commit().map_err(backend)?;
             Ok(epoch)
+        })
+        .await
+    }
+
+    async fn keep_post_key(&self, key: &str, record: &str, at_ms: i64) -> Result<(), StoreError> {
+        let key = key.to_owned();
+        let record = record.to_owned();
+        self.with_connection(move |connection| {
+            let transaction = connection.transaction().map_err(backend)?;
+            transaction
+                .execute(
+                    "INSERT INTO post_keys (key, record, at_ms) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(key) DO UPDATE SET record = excluded.record,
+                        at_ms = excluded.at_ms",
+                    rusqlite::params![key, record, at_ms],
+                )
+                .map_err(backend)?;
+            transaction
+                .execute(
+                    "DELETE FROM post_keys WHERE at_ms < ?1",
+                    [at_ms - super::POST_KEY_KEEP_MS],
+                )
+                .map_err(backend)?;
+            transaction
+                .execute(
+                    "DELETE FROM post_keys WHERE key IN (
+                         SELECT key FROM post_keys ORDER BY at_ms DESC LIMIT -1 OFFSET ?1)",
+                    [i64::try_from(super::MAX_POST_KEYS).unwrap_or(i64::MAX)],
+                )
+                .map_err(backend)?;
+            transaction.commit().map_err(backend)
+        })
+        .await
+    }
+
+    async fn kept_post_keys(&self, since_ms: i64) -> Result<Vec<(String, i64)>, StoreError> {
+        self.with_connection(move |connection| {
+            let mut statement = connection
+                .prepare("SELECT record, at_ms FROM post_keys WHERE at_ms >= ?1 ORDER BY at_ms ASC")
+                .map_err(backend)?;
+            let rows = statement
+                .query_map([since_ms], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(backend)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(backend)
         })
         .await
     }
@@ -2827,6 +2888,11 @@ impl StateStore for SqliteStore {
             // out before, and a mark naming an old one is refused against 0.
             transaction
                 .execute("DELETE FROM read_mark_epochs", [])
+                .map_err(backend)?;
+            // The send log's settled posts hold the owner's words: they go with the transcripts.
+            // `#471 replication-c5-post-keys`.
+            transaction
+                .execute("DELETE FROM post_keys", [])
                 .map_err(backend)?;
             transaction
                 .execute("DELETE FROM summaries", [])
@@ -6866,8 +6932,9 @@ mod tests {
         // there are add tables, dropped here as their notes say.
         connection
             .execute_batch(
-                "DROP TABLE IF EXISTS thread_hue_tombstones; DROP TABLE IF EXISTS read_mark_epochs;
-                 DROP TABLE IF EXISTS client_settings; DROP TABLE IF EXISTS thread_hues;",
+                "DROP TABLE IF EXISTS post_keys; DROP TABLE IF EXISTS thread_hue_tombstones;
+                 DROP TABLE IF EXISTS read_mark_epochs; DROP TABLE IF EXISTS client_settings;
+                 DROP TABLE IF EXISTS thread_hues;",
             )
             .expect("undo the later steps");
         let pasted: String = statements.iter().map(|line| format!("{line}\n")).collect();
@@ -7074,6 +7141,7 @@ mod tests {
         let store = store(&dir, Retention::default());
         super::super::lattice_checks::evicted_hues_come_back(&store).await;
         super::super::lattice_checks::a_stale_mark_cannot_undo_a_forget(&store).await;
+        super::super::lattice_checks::post_keys_are_kept_and_bounded(&store).await;
         // Both survive a restart: they are rows, not memory.
         let channel = ChannelId("1111111111".to_owned());
         store

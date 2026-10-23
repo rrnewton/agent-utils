@@ -773,6 +773,18 @@ async fn main() -> anyhow::Result<()> {
         }
         Err(error) => tracing::warn!(%error, "could not restore the hidden configured channels"),
     }
+    // `#471 replication-c5-post-keys`. The send log's settled posts, so a repeat of one that
+    // landed before this restart is answered rather than posted again.
+    match state.restore_post_keys().await {
+        Ok(restored) => {
+            if restored > 0 {
+                tracing::info!(posts = restored, "restored the send log's settled posts");
+            }
+        }
+        // No store is a deployment that never set `storage.path`: nothing to restore.
+        Err(vibe_talk::store::StoreError::Unavailable(_)) => {}
+        Err(error) => tracing::warn!(%error, "could not restore the send log's settled posts"),
+    }
     state.refresh_routes();
     // `#331 resume-on-websocket`. The first hello, in the background so a slow bridge never holds
     // the server's start; client-config asks again when this answer is old.

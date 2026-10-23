@@ -3645,6 +3645,26 @@ fn remembered_answer(
     }
 }
 
+/// File `kept` in the store. A failure is logged, never the post's: it landed, and only a repeat
+/// after a restart loses the answer. `#471 replication-c5-post-keys`.
+async fn keep_post_key(state: &AppState, kept: &crate::post_keys::Kept) {
+    let filed = match serde_json::to_string(kept) {
+        Ok(record) => match state
+            .store
+            .keep_post_key(kept.key(), &record, kept.at_ms)
+            .await
+        {
+            // No store configured: the send log is in memory only, as it always was there.
+            Ok(()) | Err(crate::store::StoreError::Unavailable(_)) => Ok(()),
+            Err(error) => Err(error.to_string()),
+        },
+        Err(error) => Err(error.to_string()),
+    };
+    if let Err(error) = filed {
+        tracing::warn!(%error, "a settled post was not filed in the store; a restart forgets it");
+    }
+}
+
 /// What of `result` to remember under its key: a post that landed, wholly or in part. Not one
 /// that posted nothing — refused, or its only part's answer lost — which sending again must try
 /// afresh. See [`crate::post_keys`].
@@ -3827,7 +3847,18 @@ async fn post_parts(
     let progress = claim.as_ref().map(crate::post_keys::Pending::progress);
     let result = post_each(&state, posting, progress.as_deref()).await;
     if let Some(claim) = claim {
-        claim.settle(to_remember(&result));
+        let remembered = to_remember(&result);
+        // `#471 replication-c5-post-keys`: what it landed as is filed in the store too, so a
+        // repeat after a restart is answered with it rather than posted again.
+        let kept = remembered.clone().map(|outcome| crate::post_keys::Kept {
+            fingerprint: claim.fingerprint().clone(),
+            outcome,
+            at_ms: crate::store::now_ms(),
+        });
+        claim.settle(remembered);
+        if let Some(kept) = kept {
+            keep_post_key(&state, &kept).await;
+        }
     }
     let send_seq = settle.and_then(|settle| settle.file(&state, &result));
     drop(turn);

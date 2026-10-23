@@ -34,9 +34,12 @@
 //! asks it after a send whose answer never came back (`POST .../reply/outcome`), and while a slow
 //! send is under way, to say which part is being posted.
 //!
-//! In memory, for [`KEEP`], at most [`MAX_KEPT`] posts. Not kept across a restart: a restart ends
-//! every post in flight anyway, and a page that asks afterwards is told the post is unknown, which
-//! leaves its send unconfirmed exactly as it was before this memory existed.
+//! For [`KEEP`], at most [`MAX_KEPT`] posts, in memory and in the store (`#471
+//! replication-c5-post-keys`): what a post landed as is filed there when it settles ([`Kept`]) and
+//! read back at start ([`PostKeys::restore`]), so a repeat after a restart is answered with the
+//! first post's answer and posts nothing. A post in flight at a restart is not kept: it ended with
+//! the process, and a page that asks afterwards is told it is unknown, which leaves its send
+//! unconfirmed, as it must.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -56,7 +59,7 @@ pub const MAX_KEPT: usize = 4096;
 /// One post as its caller asked for it: the key, and everything the key was given for. The memory
 /// is by key; the rest says whether a later request under it repeats this post, continues it, or
 /// reuses the key for something else.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Fingerprint {
     key: String,
     channel: String,
@@ -86,7 +89,7 @@ impl Fingerprint {
 }
 
 /// What a remembered post came to.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Outcome {
     /// Every part landed.
     Posted {
@@ -102,7 +105,7 @@ pub enum Outcome {
 }
 
 /// The facts of a post that landed in part; see [`crate::ops::OpError::PartiallyPosted`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[allow(missing_docs)]
 pub struct Partial {
     pub posted: usize,
@@ -114,6 +117,27 @@ pub struct Partial {
     pub uncertain: bool,
     pub refusal: Option<crate::send_refusal::SendRefusal>,
     pub first: Option<Message>,
+}
+
+/// What the store keeps of one settled post: the post its key names, what it came to, and when,
+/// in Unix milliseconds. `#471 replication-c5-post-keys`. It holds the owner's own words, as the
+/// transcript does, and only for [`KEEP`].
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Kept {
+    /// The post the key names.
+    pub fingerprint: Fingerprint,
+    /// What it came to.
+    pub outcome: Outcome,
+    /// When it settled.
+    pub at_ms: i64,
+}
+
+impl Kept {
+    /// The key this record is filed under.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.fingerprint.key
+    }
 }
 
 /// How far a post in flight has got.
@@ -261,6 +285,12 @@ pub struct Pending {
 }
 
 impl Pending {
+    /// The post this claim is for.
+    #[must_use]
+    pub fn fingerprint(&self) -> &Fingerprint {
+        &self.fingerprint
+    }
+
     /// How far the post has got, for [`PostKeys::lookup`] to report.
     #[must_use]
     pub fn progress(&self) -> Arc<Progress> {
@@ -398,6 +428,40 @@ impl PostKeys {
         }
     }
 
+    /// Take back what the store kept (`#471 replication-c5-post-keys`): each post settled within
+    /// [`KEEP`] before `now_ms`, oldest first, so a key filed twice keeps its later answer. A key
+    /// already remembered or in flight here is left as it is: what this process knows is newer.
+    pub fn restore(&self, kept: Vec<Kept>, now_ms: i64) {
+        let mut kept = kept;
+        kept.sort_by_key(|record| record.at_ms);
+        let mut slots = self.lock();
+        let now = Instant::now();
+        let mut restored: HashMap<String, Slot> = HashMap::new();
+        for record in kept {
+            let age = Duration::from_millis(u64::try_from(now_ms - record.at_ms).unwrap_or(0));
+            if age >= self.keep {
+                continue;
+            }
+            let Some(at) = now.checked_sub(age) else {
+                continue;
+            };
+            restored.insert(
+                record.fingerprint.key.clone(),
+                Slot {
+                    fingerprint: record.fingerprint,
+                    state: State::Done {
+                        outcome: Arc::new(record.outcome),
+                        at,
+                    },
+                },
+            );
+        }
+        for (key, slot) in restored {
+            slots.entry(key).or_insert(slot);
+        }
+        self.prune(&mut slots);
+    }
+
     /// How many posts are remembered or in flight.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -460,6 +524,46 @@ mod tests {
             refusal: None,
             first: None,
         })
+    }
+
+    #[test]
+    fn a_restored_post_is_known_and_an_old_one_or_a_newer_claim_is_not_replaced() {
+        // `#471 replication-c5-post-keys`.
+        let keys = Arc::new(PostKeys::new());
+        let now = 1_790_000_000_000;
+        let kept = |key: &str, text: &str, posted: usize, at_ms: i64| Kept {
+            fingerprint: fingerprint(key, text),
+            outcome: partial(posted),
+            at_ms,
+        };
+        // A claim made in this process before the restore is left alone.
+        let Claim::Mine(_held) = keys.claim(fingerprint("live", "now")) else {
+            panic!("a fresh post was not the caller's");
+        };
+        keys.restore(
+            vec![
+                kept("k", "hello", 1, now - 1_000),
+                kept("old", "gone", 1, now - 25 * 60 * 60 * 1000),
+                kept("live", "now", 2, now - 1_000),
+            ],
+            now,
+        );
+        assert!(matches!(
+            keys.claim(fingerprint("k", "hello")),
+            Claim::Known(outcome) if matches!(outcome.as_ref(), Outcome::Partial(p) if p.posted == 1)
+        ));
+        assert!(matches!(
+            keys.claim(fingerprint("old", "gone")),
+            Claim::Mine(_)
+        ));
+        assert!(matches!(
+            keys.claim(fingerprint("live", "now")),
+            Claim::Wait(_)
+        ));
+        // The record round-trips as the store keeps it.
+        let record = serde_json::to_string(&kept("k", "hello", 1, now)).expect("JSON");
+        let back: Kept = serde_json::from_str(&record).expect("parses");
+        assert_eq!(back.key(), "k");
     }
 
     #[tokio::test]
