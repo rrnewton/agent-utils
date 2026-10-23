@@ -4528,6 +4528,11 @@ const TUNING_BANDS = {
   OUTGOING_PROGRESS_MS: [1000, 5000,
     "how often a slow send asks which part is going (#448 send-dedupe). Faster spends a request a " +
     "moment on words; slower and a three-part post is half done before the row says so"],
+  OWN_POST_GRACE_MS: [60000, 1800000,
+    "how long the page's own post is kept though a page of the channel does not carry it (#466 " +
+    "reply-promotes-thread). Under a minute a lagging chat service still takes the owner's reply away " +
+    "as they look for it; past half an hour a reply deleted in another app without a removal the page " +
+    "hears of stays drawn that long"],
   OUTGOING_RETRY_FIRST_MS: [2000, 15000,
     "the wait before a lost send goes again on its own (#195 send-resilience). Under a couple of " +
     "seconds it lands on the same slow moment that lost it; past fifteen the reader has already " +
@@ -37156,7 +37161,7 @@ test("a sent receipt retires when provider history arrives even if To do hides t
   assert.equal(savedOutgoing(page).length, 0, "filtered history never acknowledged the durable send record");
 });
 
-test("an older in-flight poll cannot erase a sent message after its live confirmation retires the receipt", async () => {
+test("an older in-flight poll cannot erase a sent message, and only a read sent after it retires its receipt", async () => {
   const page = newPage();
   const stream = await withLiveChannel(page, []);
   const finishPost = delayedReply(page);
@@ -37182,14 +37187,19 @@ test("an older in-flight poll cannot erase a sent message after its live confirm
   page.messages = [posted];
   await deliver(page, stream, sseMessage(posted));
   assert.match(page.el("pane-discord").text(), /confirmed while the old read waited/);
-  assert.equal(savedOutgoing(page).length, 0, "the live confirmation did not retire the receipt");
-  // This response describes the instant before the send. Its late arrival must not erase both
-  // the acknowledged row and the durable fallback that the newer live observation just retired.
+  // `#466 reply-promotes-thread`. The stream's copy does not retire the receipt: the read it asks
+  // for may be answered from older state. Held, it is not drawn while the message itself is.
+  assert.equal(savedOutgoing(page).length, 1, "the stream's copy retired the receipt");
+  assert.equal(outgoingRows(page).length, 0, "the receipt was drawn beside the message it stands for");
+  // This response describes the instant before the send. Its late arrival must not erase the
+  // acknowledged row, nor the receipt kept for it.
   finishOldPage(json(200, { channel: CHANNEL, messages: [], has_more: false, complete: true }));
   await page.settle();
   assert.match(page.el("pane-discord").text(), /confirmed while the old read waited/,
     "an older in-flight page erased the message after its live confirmation");
   assert.equal(shownIds(page).filter((id) => id === posted.id).length, 1);
+  // The read the stream's copy asked for, sent after the post and carrying it, has retired it.
+  assert.equal(savedOutgoing(page).length, 0, "no read carrying the message retired its receipt");
 });
 
 // --- `#19 channel-browser` ------------------------------------------------------------------------
@@ -68847,6 +68857,14 @@ function brokenScriptEach(...patches) {
 
 /** A negative control: a placing read of All folded whatever the store has gained, lost or replaced since it was sent. */
 const FOLD_OVER_ANY_STORE = ["  const unchanged = heldAsSent(canon, read.held);\n", "  const unchanged = true;\n"];
+/** `#466 reply-promotes-thread`: a newest page taking the page's own fresh post out by its absence. */
+const OWN_POST_FORGOTTEN = ["function ownPostStands(id) {\n", "function ownPostStands(id) {\n  return false;\n"];
+
+/** `script` with one more thing broken on purpose, as `brokenScript` breaks one. */
+function brokenAlso(script, [find, replace]) {
+  assert.ok(script.includes(find), `the negative control patches ${JSON.stringify(find)}, which is not there`);
+  return script.replace(find, replace);
+}
 /** A negative control: a read of All for Main's counts speaking for every message held when it lands. */
 const COUNTS_SPEAK_FOR_ALL = ["    held: heldNow(channelCanon) };", "    held: null };"];
 /** A negative control: a read bringing back a message removed upstream after it was sent (`#316 late-counts-resurrect`). */
@@ -69788,7 +69806,9 @@ for (const gained of ["own send", "poll"]) {
 
     // THE CONTROL, as round 3 did: folded over whatever the store gained since it was sent, the page
     // takes the message out as deleted.
-    const control = await run(brokenScript(...FOLD_OVER_ANY_STORE));
+    // The page's own fresh post is kept by `ownPostStands` too, so for it that goes as well.
+    const broken = brokenScript(...FOLD_OVER_ANY_STORE);
+    const control = await run(gained === "own send" ? brokenAlso(broken, OWN_POST_FORGOTTEN) : broken);
     assert.ok(!shownIds(control.page).includes(control.id) && savedMessage(control.page, control.id) === null,
       "the placing page left the message alone anyway, so this test cannot see it");
   });
@@ -72599,7 +72619,8 @@ test("`#316 late-counts-resurrect`: a read of All for Main's counts does not bri
 // never reported it, and the message stayed on Main, and saved, until the next newest page fifteen
 // minutes on. A removal replayed from the stream's tail asks for no read at all.
 const REMOVED_LEFT_TO_ITS_READ = [
-  "    answers: (message) => removedSince(canon, String(message.id), number) || !held || older(String(message.id)),\n",
+  "    answers: (message) => removedSince(canon, String(message.id), number) ||\n" +
+  "      ((!held || older(String(message.id))) && (canon.removed.has(String(message.id)) || !ownPostStands(message.id))),\n",
   "    answers: (message) => !removedSince(canon, String(message.id), number) && (!held || older(String(message.id))),\n"];
 
 for (const removal of ["after", "before", "tail"]) {
@@ -80031,4 +80052,39 @@ test("`#468 send-dedupe`: a send left unconfirmed by a closed page is asked abou
   assert.equal(saved.state, "unconfirmed");
   assert.ok(saved.detail, "the unconfirmed send lost what was said of it");
   assert.equal(saved.detail, savedOutgoing(page)[0].detail, "asking changed what is said of the send");
+});
+
+// --- `#466 reply-promotes-thread`: the owner's reply that vanished --------------------------------
+//
+// The owner, on Slack: "the message I was replying to was a main-channel root message that was not yet
+// a thread ... my sent message disappeared, and I didn't see it anywhere on the screen." Reproduced
+// here before it was fixed: the stream's copy of the reply asked for a newest page of All, sent after
+// the post and answered from state without the reply, which took it out as deleted upstream.
+
+test("`#466 reply-promotes-thread`: a newest page answered from older state does not take away the reply just sent", async () => {
+  const { page, data } = await freshMessagePage((p) => { p.repliesInThread = true; });
+  assert.equal(page.el("thread-select").value, "flat", "the premise is All");
+  const mine = message({ id: "9466000000000000001", content: "my answer to the fresh message",
+    thread: { id: data.lone.id, root_message_id: "210", is_root: false, reply_count: null, reply_count_exact: false } });
+  // Posted, but the service's reads do not show it yet: a bridge or a memory answering from older state.
+  page.replyResponse = async () => json(200, { posted: mine, parts: [mine] });
+  await replyButton(rowOf(page, "210")).click();
+  await page.el("reply-text").setValue("my answer to the fresh message");
+  await page.el("reply-send").click();
+  await page.settle();
+  assert.ok(shownIds(page).includes(mine.id), "the reply was not drawn as it was sent");
+  const reads = page.timelineCalls.length;
+  await deliver(page, page.stream(), sseMessage(mine, { self_posted: true }));
+  await page.settle();
+  assert.ok(page.timelineCalls.length > reads, "the premise is a read the stream's copy asks for");
+  assert.ok(shownIds(page).includes(mine.id), "a page without the reply took it away");
+  await reReadChannel(page);
+  assert.ok(shownIds(page).includes(mine.id), "the next stale page took it away");
+  await pickThread(page, "main");
+  assert.equal(tagOf(rowOf(page, "210")).text, "Thread(1)", "the message answered went back to starting a thread");
+  // A removal the page is told of still takes it away.
+  await pickThread(page, "flat");
+  await deliver(page, page.stream(), sseDelete("del-9466", CHANNEL.id, mine.id));
+  await page.settle();
+  assert.ok(!shownIds(page).includes(mine.id), "a reply removed upstream stayed drawn");
 });

@@ -1929,6 +1929,10 @@ const OUTGOING_TIMEOUT_MS = 60000;
 const OUTGOING_OUTCOME_MS = 120000;
 const OUTGOING_OUTCOME_WAIT_S = 20;
 const OUTGOING_PROGRESS_MS = 2000;
+// `#466 reply-promotes-thread`. How long a message this page posted is kept though a page of the
+// channel does not carry it (`ownPostStands`): a chat service answering from older state catches up
+// within seconds, and a reply deleted upstream meanwhile still goes by the removal the page is told of.
+const OWN_POST_GRACE_MS = 600000;
 // `#195 send-resilience`. A send whose answer was lost goes out again on its own after the first
 // wait, then after each wait this many times the last, never more than the longest — 3 s, 6 s,
 // 12 s, 20 s, 20 s, 20 s — and then a person decides. Each wait counts from when the attempt that
@@ -20654,7 +20658,8 @@ function pageFold(canon, payload, held) {
       return !newerPageSpeaksFor(canon, message, number);
     },
     /** @param {any} message */
-    answers: (message) => removedSince(canon, String(message.id), number) || !held || older(String(message.id)),
+    answers: (message) => removedSince(canon, String(message.id), number) ||
+      ((!held || older(String(message.id))) && (canon.removed.has(String(message.id)) || !ownPostStands(message.id))),
   };
 }
 
@@ -26312,6 +26317,43 @@ const sentFromHere = new Set();
 /** Whether `message` was sent from this page (`sentFromHere`). */
 const sentFromThisPage = (message) => sentFromHere.has(String(message.id));
 
+/**
+ * `#466 reply-promotes-thread`. When each message this page sent was acknowledged, by id: see
+ * `ownPostStands`.
+ *
+ * @type {Map<string, number>}
+ */
+const sentFromHereAt = new Map();
+
+/**
+ * Whether message `id` is one this page posted within OWN_POST_GRACE_MS: a page that does not carry
+ * it is not evidence that it is gone.
+ *
+ * THE OWNER'S REPLY VANISHED. Sent to a Slack message nobody had answered, it was drawn, then gone
+ * from every view, and the message it answered went back to "start a thread": "my sent message
+ * disappeared, and I didn't see it anywhere on the screen." Reproduced: the stream's copy of the
+ * reply asks for a newest page of All (`reason=live`), sent after the post, and the chat service
+ * answered it from state that did not have the reply yet — a bridge's lag, Slack's own Flat memory of
+ * a thread that had no replies (`#282 slack-flat-skip`). That page carries the message answered with
+ * a count of none, so it answers for its whole thread (`allPageAnswersFor`) and took the reply out as
+ * deleted upstream; nothing was left to draw it, the receipt having gone as the reply was drawn. The
+ * page orders copies by when its reads were sent, which is sound only while every answer is at
+ * least as new as every earlier one (replication model, R9 and F3). Until the server says how new
+ * each copy is (C7), this page's own fresh post is taken out only once it is told of its removal
+ * (`noteRemoved`), never by its absence from a page alone.
+ *
+ * INTERIM, for R9 only. Once the page orders copies by the server's `observed_ms` and a newest page's
+ * `settled_below_ms` (C7's page part), no stale page can drop a copy observed after it began, and this
+ * and the receipt rule in `receiveLiveMessage` can go back to being display aids.
+ */
+function ownPostStands(id) {
+  const at = sentFromHereAt.get(String(id));
+  if (at === undefined) return false;
+  if (Date.now() - at < OWN_POST_GRACE_MS) return true;
+  sentFromHereAt.delete(String(id));
+  return false;
+}
+
 /** Only provider history/stream observations retire receipts; appending an ACK is not a read. */
 function observeOutgoingMessages(messages) {
   let changed = false;
@@ -27481,7 +27523,10 @@ async function dispatchOutgoingMessage(entry, job) {
       ...part, id: String(part.id), channel_id: entry.channel, content: String(part.content || ""),
     }));
     // `#430 threads-main-own-sent`. Sent from here: the read filters keep it in sight from now on.
-    for (const part of entry.parts) sentFromHere.add(part.id);
+    for (const part of entry.parts) {
+      sentFromHere.add(part.id);
+      sentFromHereAt.set(part.id, Date.now());
+    }
     // `#263 post-split-per-provider`. The rest of a long post may have continued in its first
     // part's thread, where it is drawn rather than here; the receipt for it says which thread.
     if (!entry.threadId) entry.continueIn = entry.parts.slice(1).map(threadOf).find(Boolean) || entry.continueIn;
@@ -47720,7 +47765,10 @@ function refreshAfterLiveMutation() {
 function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
   // `#337 voice-relay-silent`. How it came, for whether a call that may have missed it hears it.
   const arrival = { fromTail: fromTail === true, resumed: liveAttachResumed };
-  observeOutgoingMessages([message]);
+  // `#466 reply-promotes-thread`. Not observed from here: a sent receipt stays until a READ carries
+  // its parts. The stream's copy is newer than any read on the wire only in having arrived, and the
+  // read it asks for may be answered from older state without them (`ownPostStands`). INTERIM, for
+  // the replication model's R9, until C7's page part orders copies by the server's versions.
   // The other free way to learn which account is ours: the server marks what IT posted, so the
   // author of a self-posted message is this bridge by construction. Done before the channel guard
   // below, because the fact is true regardless of which channel the reader happens to be looking
