@@ -10543,8 +10543,8 @@ function detailsFromKeyboard(target) {
 /**
  * l: copy the selected message's own address in its service — the address its ⋯ menu's
  * "Open in …" link opens (`upstreamUrlOf`, the row's first constituent's, as the link is).
- * `#408 copy-upstream-link`. The menu holds the link itself now (`#409 open-upstream-link`)
- * and a pointer copies it from there; this key is how a keyboard does. On a row with no
+ * `#408 copy-upstream-link`. The menu holds the link and its Copy item (`#409`, `#461`);
+ * this key is how a keyboard does the same copy. On a row with no
  * address the key is not acted on, as the menu offers nothing there: left to the browser
  * like any unbound key rather than swallowed in silence.
  */
@@ -11600,6 +11600,7 @@ const KEYMAP = [
     // keyboard's way to the same copy.
     group: KEYS_MESSAGE, chords: [{ key: "l" }],
     does: () => `Copy its link in ${providerDescriptions.size > 1 ? "its chat service" : chatServiceName()}: the message's own address there, where the server could form one`,
+    rowControls: ["row-copy-link-button"],
     run: (event, target) => copyLinkFromKeyboard(target),
   },
   {
@@ -34853,15 +34854,17 @@ function discordNode(messages) {
   // constituent's, as the row's reply is: a combined row is one post in parts, and its link
   // lands at its start.
   //
-  // ONE item for it: a real link that opens the address, as the row's own links are
-  // (`linkList`). A new tab, which in the installed app leaves the app for the browser — or
-  // the service's own app, where the address hands over to one — rather than navigating this
-  // page away; and being a genuine link it keeps the browser's own right-click, long-press
-  // and copy-link-address, which is what copying the address is now. The click handler only
-  // shuts the menu; the opening is the link's, never a script's say-so. The l key still copies
-  // the address (`copyLinkFromKeyboard`): a keyboard has no right-click to copy it with.
+  // A real link that opens the address, as the row's own links are (`linkList`). A new tab,
+  // which in the installed app leaves the app for the browser — or the service's own app, where
+  // the address hands over to one — rather than navigating this page away; and being a genuine
+  // link it keeps the browser's own right-click and copy-link-address where the browser offers
+  // them (a right-button press reaches an unprevented `contextmenu` on the anchor with the menu
+  // still open: tests/open_upstream_link_browser.py). The click handler only shuts the menu; the
+  // opening is the link's, never a script's say-so. The Copy item under it (`#461`) and the l key
+  // (`copyLinkFromKeyboard`) copy the same address where no such browser menu can be counted on.
   const upstreamUrl = upstreamUrlOf(message);
   let openLink = null;
+  let copyLink = null;
   if (upstreamUrl !== null) {
     const linkService = upstreamServiceName(message);
     openLink = document.createElement("a");
@@ -34883,6 +34886,21 @@ function discordNode(messages) {
       if (event.key !== " " || event.ctrlKey || event.metaKey || event.altKey) return;
       event.preventDefault();
       openLink.click();
+    }));
+    // `#461 upstream-link-native`. The copy as its own item again, beside the link it copies.
+    // Where the browser gives the link its own right-click or long-press menu the item is a
+    // second way to the same clipboard; where it does not — a long press that only taps through
+    // on a phone, an installed app with no link menu of its own — it is the only one. The same
+    // copy the l key makes (`copyUpstreamLink`), of the same address.
+    copyLink = document.createElement("button");
+    copyLink.className = "row-copy-link-button";
+    copyLink.setAttribute("type", "button");
+    copyLink.setAttribute("title", `Copy this message's address in ${linkService} to the clipboard: ${upstreamUrl}`);
+    copyLink.textContent = `Copy ${linkService} link`;
+    sayRowShortcut(copyLink, "row-copy-link-button");
+    copyLink.addEventListener("click", inThisColumn(() => {
+      setMenu(false);
+      guardQuietly(() => copyUpstreamLink(upstreamUrl, linkService))();
     }));
   }
   // `#202 read-through-here`. What the owner reached for the read marker to do: grey everything up
@@ -34951,9 +34969,10 @@ function discordNode(messages) {
   readCaption.setAttribute("aria-hidden", "true");
   readCaption.textContent = "Mark read";
   readGroup.append(readCaption, readThrough, upstreamRead);
-  // Copy text first, then the way to the message in its service where it has one, then Pin:
-  // the copy and the link together, ahead of the acts that change anything.
-  menu.append(copy, ...(openLink ? [openLink] : []), pinItem, bookmarkItem, readGroup);
+  // Copy text first, then the ways to the message in its service where it has one — open it,
+  // copy its address — then Pin: the copies and the link together, ahead of the acts that
+  // change anything.
+  menu.append(copy, ...(openLink ? [openLink] : []), ...(copyLink ? [copyLink] : []), pinItem, bookmarkItem, readGroup);
   more.append(moreButton, menu);
   acts.append(more);
   // `#50 todo-view`. The non-gestural way to say "dealt with", and the one a keyboard can reach.

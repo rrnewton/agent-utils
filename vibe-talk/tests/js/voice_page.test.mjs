@@ -17130,8 +17130,9 @@ test("Open in the ⋯ menu links to the message's own address in its service, an
   ]);
   assert.equal(rows.length, 4, "the fixture did not produce four rows");
   const items = rowMoreMenu(rows[0]).children;
-  assert.deepStrictEqual(items.map((node) => node.className).slice(0, 2),
-    ["row-copy-button", "row-open-link-button"], "the link is not with Copy text at the menu's head");
+  assert.deepStrictEqual(items.map((node) => node.className).slice(0, 3),
+    ["row-copy-button", "row-open-link-button", "row-copy-link-button"],
+    "the link and its Copy are not with Copy text at the menu's head");
   const link = rows[0].descendants().find((node) => node.className === "row-open-link-button");
   assert.equal(String(link.tagName).toUpperCase(), "A", "the item is not a real link");
   assert.equal(link.textContent, "Open in Discord");
@@ -17139,8 +17140,15 @@ test("Open in the ⋯ menu links to the message's own address in its service, an
   assert.equal(link.getAttribute("target"), "_blank", "the link does not open in a new tab");
   assert.equal(link.getAttribute("rel"), "noopener noreferrer", "the opened page would hold this one");
   assert.equal(link.getAttribute("aria-keyshortcuts"), "Shift+O", "a screen reader is not told the key");
-  assert.equal(rows[0].descendants().find((node) => node.className === "row-copy-link-button"), undefined,
-    "a separate Copy link item is still offered");
+  // `#461 upstream-link-native`: beside the link, its Copy as an item of its own, for the
+  // contexts whose long-press or installed-app menu cannot be counted on to offer the
+  // browser's copy-link-address. It says `l` to a screen reader, as the key makes the same copy.
+  const copyLink = rows[0].descendants().find((node) => node.className === "row-copy-link-button");
+  assert.ok(copyLink, "no Copy link item beside the link");
+  assert.equal(copyLink.textContent, "Copy Discord link");
+  assert.equal(copyLink.getAttribute("aria-keyshortcuts"), "L", "a screen reader is not told the Copy item's key");
+  assert.equal(rows[1].descendants().find((node) => node.className === "row-copy-link-button"), undefined,
+    "a message with no address was offered a copy of one");
   assert.equal(rows[1].descendants().find((node) => node.className === "row-open-link-button"), undefined,
     "a message with no address was offered a way to one");
   for (const row of rows.slice(2)) {
@@ -17154,6 +17162,15 @@ test("Open in the ⋯ menu links to the message's own address in its service, an
   await page.settle();
   assert.equal(rowMoreMenu(rows[0]).hidden, true, "the ⋯ menu stayed open after choosing the link");
   assert.equal(page.clipboard, undefined, "choosing the link copied the address");
+
+  // The Copy item puts the same address on the clipboard and shuts the menu, as l does.
+  await rowMoreButton(rows[0]).click();
+  await copyLink.click();
+  await page.settle();
+  assert.equal(page.clipboard, address, "the Copy item did not copy the address");
+  assert.equal(page.el("status").textContent, "Copied the link in Discord.");
+  assert.equal(rowMoreMenu(rows[0]).hidden, true, "the ⋯ menu stayed open after the Copy item");
+  page.clipboard = undefined;
 
   // Shift+O presses the same link on the highlighted row: with the menu open, the press is
   // what shuts it. (The opening itself is the Chromium walk's to see.) The keys that follow act

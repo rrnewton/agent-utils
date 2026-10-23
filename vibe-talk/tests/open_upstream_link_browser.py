@@ -4,7 +4,7 @@
 `#408 copy-upstream-link` as `#409 open-upstream-link` leaves it. The owner, 2026-10-22: "can't we JUST
 have a hyperlink that says 'Open in Slack' and then you can right-click / copy link it in the browser?"
 The server forms the address and carries it on the message (`upstream_url`); the menu holds one real
-hyperlink to it, "Open in <service>", only where an address came back, and no Copy link item. The fake-DOM
+hyperlink to it, "Open in <service>", only where an address came back, with "Copy <service> link" under it (`#461`). The fake-DOM
 suite (tests/js/voice_page.test.mjs) pins the link's presence, absence and attributes; it lays nothing out,
 opens nothing and touches no real clipboard, so it cannot say whether the menu still fits a phone, whether
 the link opens a new page holding nothing of this one, or whether the `l` key's copy lands whole. This
@@ -16,14 +16,21 @@ one thread (209) an `upstream_url`, as a served read of a Slack channel would. E
 carries none. The Slack address itself is answered locally (a route fulfils it): what is under test is
 which address the new page is opened at and what it can see of this page, never Slack's own answer.
 
+`#461 upstream-link-native`: beside the link stands "Copy Slack link" again. The link itself was
+verified native — a right-button press reaches an unprevented `contextmenu` on the anchor with the
+menu still open, which this walk now presses for real — but a phone's long press and an installed
+app's menus cannot be counted on to offer copy-link-address, so the copy is an item once more.
+
 At 1280x800 and at 393x852, the same walk:
 
   the channel opened in All -> the long question's ⋯ menu opened with the mouse: the "Open in Slack"
-  link second under Copy text, holding the address with target and rel as served, the whole menu inside
-  the window, no sideways scroll -> the link followed: a new page at the address whose `opener` is null,
+  link second under Copy text and "Copy Slack link" under it, holding the address with target and rel
+  as served, the whole menu inside the window, no sideways scroll -> a real right-button press on
+  the link: a `contextmenu` on the anchor, not prevented, the menu still open -> the Copy item:
+  the clipboard holds the address -> the link followed: a new page at the address whose `opener` is null,
   this page where it was, the menu shut, nothing copied -> the question highlighted by the keys and a
   real `l` pressed through CDP: the clipboard holds the address whole and the status pill says so ->
-  a real Shift+O: the same new page -> a message with no address: its ⋯ menu offers no such item, `l`
+  a real Shift+O: the same new page -> a message with no address: its ⋯ menu offers neither item, `l`
   on it highlighted copies nothing and Shift+O opens nothing.
 
 No page error at any step. Pass --screenshots DIR to keep a PNG of the open menu at each size.
@@ -281,10 +288,10 @@ class Reader:
         items = opened["items"]
         assert isinstance(items, list)
         self.check(bool(opened["open"]), f"the ⋯ menu did not open: {opened}")
-        self.check([item["className"] for item in items[:2]] == ["row-copy-button", "row-open-link-button"],
-                   f"the link is not second under Copy text: {items}")
-        self.check(all(item["className"] != "row-copy-link-button" for item in items),
-                   f"a separate Copy link item is still offered: {items}")
+        self.check([item["className"] for item in items[:3]] == ["row-copy-button", "row-open-link-button", "row-copy-link-button"],
+                   f"the link and its Copy are not under Copy text: {items}")
+        self.check(items[2]["text"] == "Copy Slack link" and items[2]["tag"] == "BUTTON",
+                   f"the Copy item is not named for its service: {items}")
         link = items[1]
         self.check(link["text"] == "Open in Slack", f"the item is not named for its service: {items}")
         self.check(link["tag"] == "A" and link["href"] == ADDRESS and link["target"] == "_blank"
@@ -295,7 +302,36 @@ class Reader:
         self.check(float(str(opened["overflow"])) <= 0, "the page scrolls sideways with the menu open")
         self.desk.shot("1-menu")
         self.desk.notes.append("the ⋯ menu offered the \"Open in Slack\" link second under Copy text, "
-                               "wholly inside the window")
+                               "\"Copy Slack link\" under it, wholly inside the window")
+
+        # A real right-button press on the link: the browser's own menu is native UI this walk
+        # cannot read, but its precondition is page-visible — a contextmenu event on the anchor
+        # itself, not prevented, with the ⋯ menu still open around it (`#461`).
+        page.evaluate("() => { window.__probeCm = [];"
+                      " document.addEventListener('contextmenu', (e) => window.__probeCm.push("
+                      "{cls: e.target.className, prevented: e.defaultPrevented}), true); }")
+        link_box = page.locator(f"#discord-log > li[data-id='{QUESTION_ID}'] .row-open-link-button").bounding_box()
+        assert link_box is not None
+        page.mouse.move(link_box["x"] + link_box["width"] / 2, link_box["y"] + link_box["height"] / 2)
+        page.mouse.down(button="right")
+        page.wait_for_timeout(300)
+        probed = page.evaluate(f"() => ({{cm: window.__probeCm,"
+                               f" open: !document.querySelector('#discord-log > li[data-id=\"{QUESTION_ID}\"] .row-more-menu').hidden}})")
+        page.mouse.up(button="right")
+        self.check(probed["cm"] == [{"cls": "row-open-link-button", "prevented": False}],
+                   f"a right-click on the link reached no native contextmenu: {probed}")
+        self.check(bool(probed["open"]), "a right-click shut the ⋯ menu under the browser's own menu")
+        self.desk.notes.append("a right-click on the link reached an unprevented contextmenu on the anchor")
+
+        # The Copy item: the clipboard holds the address, as l leaves it.
+        page.evaluate("(text) => navigator.clipboard.writeText(text)", SENTINEL)
+        page.locator(f"#discord-log > li[data-id='{QUESTION_ID}'] .row-copy-link-button").click()
+        self.desk.settled()
+        self.check(self.clipboard() == ADDRESS, "the Copy item did not copy the address")
+        self.check(not self.menu(QUESTION_ID)["open"], "the ⋯ menu stayed open after the Copy item")
+        page.locator(menu_button).click()
+        self.desk.settled()
+        self.desk.notes.append("the Copy item copied the same address")
 
         # Following it opens the address in a new page, copies nothing, and shuts the menu.
         page.evaluate("(text) => navigator.clipboard.writeText(text)", SENTINEL)
@@ -323,7 +359,7 @@ class Reader:
         plain = self.menu(PLAIN_ID)
         plain_items = plain["items"]
         assert isinstance(plain_items, list)
-        self.check(all(item["className"] != "row-open-link-button" for item in plain_items),
+        self.check(all(item["className"] not in ("row-open-link-button", "row-copy-link-button") for item in plain_items),
                    f"a message with no address was offered one: {plain_items}")
         self.key("Escape")
         self.highlight(PLAIN_ID)
