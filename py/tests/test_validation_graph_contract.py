@@ -876,6 +876,24 @@ def test_the_rust_suites_run_past_a_failing_test_binary() -> None:
     assert all("--no-fail-fast" in shlex.split(step.cmd) for step in rust_tests)
 
 
+def test_the_app_page_suite_runs_once_beside_the_rust_suites() -> None:
+    # `#472 gate-flake-hardening`: the page suite's harness is skipped by the unit step and run by
+    # its own, so neither step pays for it twice and neither loses it.
+    by_tag = dag_from_path(REPO_ROOT / "validation.dag.yaml").by_tag()
+    unit = shlex.split(by_tag["vibe-talk.test.unit"].cmd)
+    page = shlex.split(by_tag["vibe-talk.test.page"].cmd)
+    harness = (REPO_ROOT / "vibe-talk/tests/voice_page.rs").read_text(encoding="utf-8")
+    assert "fn the_voice_page_suite_passes()" in harness
+    # Skipped by its exact name: libtest's --skip is otherwise a substring, and would skip any test
+    # whose name contained it in every binary, run by no step at all.
+    assert unit[unit.index("--skip") + 1] == "the_voice_page_suite_passes" and "--exact" in unit
+    assert page[page.index("--test") + 1] == "voice_page" and "--skip" not in page
+    assert "--no-fail-fast" in page
+    assert "vibe-talk.build.tests" in by_tag["vibe-talk.test.page"].deps
+    assert "vibe-talk.build.tests" in by_tag["vibe-talk.test.unit"].deps
+    assert "vibe-talk.test.page" not in by_tag["vibe-talk.test.unit"].deps
+
+
 # ---- `#361 python-minimum-timeout` --------------------------------------------------------------
 
 PY310_SHARDS = 6

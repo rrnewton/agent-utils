@@ -1629,28 +1629,78 @@ steps:
 
   # ---- suites that need it ----------------------------------------------------------------------
   #
-  # `cargo test` runs the Rust tests AND both page suites through their own harnesses, so each page
-  # suite has one owner in the complete graph rather than being paid for twice. --no-fail-fast: by
-  # default cargo stops at the first failing test binary, so one red binary hid every later one.
-  - group: test
-    job: unit
-    desc: the Rust suites, and the page suites through their harnesses
+  # The test binaries, built once for the two steps that run them (`test.unit`, `test.page`), so that
+  # neither builds them inside its own box and budget while the other waits on cargo's build lock.
+  # `cargo test --release` builds the dependencies again with the dev-dependencies' features, so this
+  # is most of what `test.unit` used to spend before its first test ran.
+  - group: build
+    job: tests
+    desc: the release test binaries the Rust and page suites run
     labels: [validation-vibe-talk]
-    cmd: cd vibe-talk && python3 ../scripts/case_timings.py run-cargo -- cargo test --release --locked --no-fail-fast
+    cmd: cd vibe-talk && cargo test --release --locked --no-run
     jobs_flag: ""
     jobs_env: CARGO_BUILD_JOBS
     deps: [build.release]
-    # Measured 2026-10-23 on the loaded validation host: a passing run used 1789 s of CPU, and
-    # runs since were killed at the old 1800 s budget while the page suite (node
-    # tests/js/voice_page.test.mjs, 450 to 530 s of CPU by itself) was still running. 2700 s
-    # leaves room for ordinary growth. Splitting the page suites into their own step would be
-    # the better fix: each would then get a budget of its own.
-    cpu_timeout: 2700
+    # Measured 2026-10-23 on the validation host, after a change to the page the binaries embed:
+    # 73 to 104 s wall, 1000 to 1160 s of CPU and a 6.1 GiB peak. About twice the CPU.
+    cpu_timeout: 2400
     hint:
-      est_duration_s: 180
+      est_duration_s: 100
+      classification: cpu-bound
+      preferred_inner_jobs: 16
+      rss_baseline_bytes: 6442450944
+
+  # `cargo test` runs the Rust tests AND the page suites through their own harnesses, so each page
+  # suite has one owner in the complete graph rather than being paid for twice. --no-fail-fast: by
+  # default cargo stops at the first failing test binary, so one red binary hid every later one.
+  #
+  # The app page's suite (tests/voice_page.rs, which runs node tests/js/voice_page.test.mjs) is the
+  # one exception: it is skipped here, by its exact name, and run by `test.page` below, still through
+  # its harness (`#472 gate-flake-hardening`). It alone is single-threaded node work of 450 to 740 s
+  # CPU on the loaded validation host, and run-cargo runs the test binaries one after another, so
+  # inside this step it was most of the wall time and a third of the CPU budget, and runs were
+  # killed at the budget while it was still going. Apart, the two run side by side and each budget
+  # is its own. Run alone, `cargo test` (and `make test`) still runs every suite.
+  - group: test
+    job: unit
+    desc: the Rust suites, and the contract's page suite through its harness
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 ../scripts/case_timings.py run-cargo -- cargo test --release --locked --no-fail-fast -- --skip the_voice_page_suite_passes --exact
+    jobs_flag: ""
+    jobs_env: CARGO_BUILD_JOBS
+    deps: [build.tests]
+    # Measured 2026-10-23 on the loaded validation host: a passing run that built the test binaries
+    # and ran the page suite as well used 1789 s of CPU, and runs since were killed at the old 1800 s
+    # budget while that suite was still running; 2700 s was the stopgap (185b2539). Running the
+    # built binaries without it: 37 s wall, 39 s of CPU and a 442 MiB peak. The budget is for a
+    # loaded host, and a test binary that spins.
+    cpu_timeout: 600
+    hint:
+      est_duration_s: 40
       classification: cpu-bound
       preferred_inner_jobs: 8
-      rss_baseline_bytes: 3221225472
+      rss_baseline_bytes: 1073741824
+
+  # The app page's suite, through its harness: `the_voice_page_suite_passes` in tests/voice_page.rs
+  # runs node tests/js/voice_page.test.mjs and holds it to a floor of collected tests.
+  - group: test
+    job: page
+    desc: the app page's suite, node over web/voice.js through its cargo-test harness
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 ../scripts/case_timings.py run-cargo -- cargo test --release --locked --no-fail-fast --test voice_page
+    jobs_flag: ""
+    jobs_env: CARGO_BUILD_JOBS
+    deps: [build.tests]
+    # Measured 2026-10-23 on the loaded validation host: node alone, 552 s of CPU over 546 s wall
+    # and a 4.0 GiB peak; this step, 641 s wall and 742 s of CPU (the collector's threads too) and
+    # 2.9 GiB in its box. About twice the CPU, and a baseline over the peak.
+    cpu_timeout: 1500
+    hint:
+      est_duration_s: 640
+      classification: cpu-bound
+      # node is one thread of JavaScript plus its collector's.
+      preferred_inner_jobs: 2
+      rss_baseline_bytes: 5368709120
 
   # `#277 send-order` in the browser engine, against the real server binary and its real provider
   # client: a mock Google Chat bridge on loopback fails A at once; B waits behind A, saying so, and
