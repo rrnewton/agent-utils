@@ -17497,6 +17497,24 @@ test("`#462 webapp-deep-links`: a link opens its view and thread over the restor
   assert.ok(page.pure("deepLinkFocus !== null"), "the focus a link brought was dropped");
 });
 
+test("`#462 webapp-deep-links`: a reader who chooses a view while the link is still landing is not chased by it", async () => {
+  const data = threadData();
+  const page = newPage(new Map(), SCRIPT, (p) => {
+    p.enableHistory();
+    p.setAddress({ search: "?c=1110000000000000001&v=thread&t=spaces%2FA%2Fthreads%2Fanother" });
+  });
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  // The reader picks All before the link's waits have run out: their choice stands.
+  page.el("thread-select").value = "flat";
+  await page.el("thread-select").dispatch("change");
+  await untilDeepLink(page, () => page.pure("deepLinkApplied") === true);
+  assert.equal(page.el("thread-select").value, "flat", "the link overrode the reader's own choice");
+  assert.equal(page.el("thread-heading").hidden, true, "the link opened its thread over the reader");
+});
+
 test("`#462 webapp-deep-links`: each view round-trips, voice is refused politely, garbage is ignored", async () => {
   const cases = [
     ["main", "main"], ["all", "flat"], ["threads", "threads"],

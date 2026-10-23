@@ -1410,6 +1410,18 @@ function placeShowable(place) {
  */
 function showChannelPlace(place) {
   if (sideActive) return inColumn(columns.main, () => showChannelPlace(place));
+  // Arriving, not choosing: Back and Forward, and a link being applied. `#462 webapp-deep-links`.
+  const wasShowing = deepLinkShowing;
+  deepLinkShowing = true;
+  try {
+    return showChannelPlaceWithin(place);
+  } finally {
+    deepLinkShowing = wasShowing;
+  }
+}
+
+/** `showChannelPlace`, with `#462 webapp-deep-links`'s arriving-not-choosing already noted. */
+function showChannelPlaceWithin(place) {
   if (currentScreen !== "main" || currentView !== "discord") return undefined;
   const now = channelPlace();
   if (now && now.layout === "one" && now.view === "thread" && now.origin === "list" && place.layout === "list") leaveThread();
@@ -1555,6 +1567,23 @@ let deepLinkWritten = null;
 /** Opening from a link, done at most once a load; and one attempt of it at a time. */
 let deepLinkApplied = false;
 let deepLinkApplying = false;
+/**
+ * Choices of view the reader made (`noteDeepLinkReaderMove`), and how many stood when applying
+ * first began: a reader who has chosen since the link opened is not chased by it, however the
+ * places history happens to read by the time the channel's first read lands. Places arrived at
+ * (`showChannelPlace` — Back, Forward, the link's own showing) and the channel's opening view
+ * are not choices and never count.
+ */
+let deepLinkReaderMoves = 0;
+/** @type {number | null} */
+let deepLinkStartMoves = null;
+/** True while a place is being arrived at rather than chosen; see `showChannelPlace`. */
+let deepLinkShowing = false;
+
+/** Note a choice of view the reader made, for `applyDeepLink` to lose to. */
+function noteDeepLinkReaderMove() {
+  if (!placeArriving && !deepLinkShowing) deepLinkReaderMoves += 1;
+}
 
 /**
  * The address's query as a name-to-value map, read without `URLSearchParams`: the page runs in
@@ -1617,10 +1646,25 @@ function deepLinkRefText(ref) {
 }
 
 /** The link the page opened by, read from the query once; null for a plain open. */
+/** The query this tab last wrote itself, kept across a reload in session storage; "" for none. */
+function deepLinkSelfWritten() {
+  try {
+    return window.sessionStorage.getItem("vibe-talk.deep-link-written") || "";
+  } catch (_error) {
+    return "";
+  }
+}
+
 function deepLinkFromAddress() {
   if (deepLinkWanted !== undefined) return deepLinkWanted;
   deepLinkWanted = null;
   try {
+    // An address this tab wrote itself (a reload standing on it) is not a link arriving: the
+    // restored state already says the same place, and applying it again would only race the
+    // reopen. A link from anywhere else — another tab, another app, a pasted address — has
+    // no such mark in this tab's session and applies.
+    const standingQuery = String(window.location.search || "").replace(/^\?/, "");
+    if (standingQuery && standingQuery === deepLinkSelfWritten()) return null;
     const params = deepLinkParams(window.location.search || "");
     const channel = deepLinkPart(params, "c");
     const saidView = deepLinkPart(params, "v");
@@ -1680,6 +1724,11 @@ function syncDeepLinkAddress() {
   try {
     history.replaceState(history.state, "", address);
     deepLinkWritten = address;
+    try {
+      window.sessionStorage.setItem("vibe-talk.deep-link-written", query);
+    } catch (_error) {
+      // No session store: a reload then re-reads the address as a link, as before it was marked.
+    }
   } catch (_error) {
     // A host that refuses the address keeps the page; only its link is stale.
   }
@@ -1713,6 +1762,10 @@ async function waitForDeepLink(ready) {
 async function applyDeepLink() {
   const wanted = deepLinkFromAddress();
   if (!wanted || deepLinkApplied || deepLinkApplying) return;
+  // How many views the reader had chosen when applying first began, taken once: an attempt
+  // that gives up and is kicked again by the very choice that should defeat it must not take
+  // that choice as its starting point.
+  if (deepLinkStartMoves === null) deepLinkStartMoves = deepLinkReaderMoves;
   deepLinkApplying = true;
   try {
   // Until the channel itself is on screen: applied over sign-in or the call view, the page's
@@ -1762,10 +1815,14 @@ async function applyDeepLink() {
   // the places history, not only the standing place — a reader who went elsewhere and came
   // back has still chosen since the link opened.
   const stood = channelPlace();
-  const moved = visitedAt !== startVisit.at || visited.length !== startVisit.length ||
+  const moved = deepLinkReaderMoves !== deepLinkStartMoves ||
+    visitedAt !== startVisit.at || visited.length !== startVisit.length ||
     (startPlace && stood && visitKey(stood) !== visitKey(startPlace));
   if (moved && !(place && stood && visitKey(stood) === visitKey(place))) return;
-  if (place && channelPlaceShowable(place)) {
+  // Already there — the opening decision (or the reader) put this place on: showing it again
+  // would only redraw and re-read under a settled reader.
+  const standing = Boolean(place && stood && visitKey(stood) === visitKey(place));
+  if (!standing && place && channelPlaceShowable(place)) {
     showChannelPlace(place);
   } else if (place && place.view === "thread" && place.thread) {
     // Not yet known is not gone: a thread named before its channel was read opens by id, and
@@ -22227,6 +22284,23 @@ function threadStillKnown(id) {
  */
 function openingChannelView() {
   const channel = String(el("discord-channel").value);
+  // `#462 webapp-deep-links`. A link's one-column view is decided HERE, with every other
+  // opening decision, not put on later over the reopened one: an async apply racing the
+  // reopen flow yanks a reader who has already settled. Layout views and the message
+  // landing still apply after (`applyDeepLink`), and only until the link is applied.
+  if (!deepLinkApplied) {
+    const wanted = deepLinkFromAddress();
+    const wantedChannel = wanted && ((wanted.message && wanted.message.channel) || wanted.channel);
+    if (wanted && (!wantedChannel || wantedChannel === channel)) {
+      const thread = wanted.thread || (wanted.message && wanted.message.thread) || null;
+      if (wanted.view === "main") return { view: "main", thread: null, summary: null, origin: "main" };
+      if (wanted.view === "all") return { view: "flat", thread: null, summary: null, origin: "main" };
+      if ((wanted.view === "thread" || (!wanted.view && thread)) && thread && threadingSupported) {
+        const summary = channelCanon.threads.find((held) => String(held.id) === thread) || null;
+        return { view: "thread", thread, summary: summary || null, origin: "main" };
+      }
+    }
+  }
   const chosen = threadingSupported ? chosenView(channel) : undefined;
   const fallback = defaultChannelView();
   if (chosen && chosen.channelView === "thread" && !threadStillKnown(chosen.thread.id)) {
@@ -23241,6 +23315,7 @@ async function readBehindSwitch() {
  * another width (`leftColumnPlace`). Read here, after it, the place is not the one the reader had.
  */
 async function changeChannelView(view, threadId = null, summary = null, origin = null, before = null) {
+  noteDeepLinkReaderMove();
   // `#277 reply-in-column`. The list a reply open in this column answers a message of is going.
   if (replyDocked && activeColumn === replyColumn) putDockedReplyAway();
   // Before the view goes: where the reader is, and how current what they are reading is — what a
@@ -43671,6 +43746,7 @@ function keepLayoutBefore() {
 function setLayout(layout, back = false) {
   // From the left column, whichever column asked: the layout changes what the left column shows.
   if (sideActive) return inColumn(columns.main, () => setLayout(layout, back));
+  noteDeepLinkReaderMove();
   if (layout === "list" && layoutChosen !== "list" && !back) noteListBefore();
   if (layout !== "two") layoutBeforeColumns = layout;
   layoutChosen = layout;
@@ -43772,6 +43848,7 @@ function toggleColumns() {
  * @param {"main" | "flat" | "threads" | "columns"} which
  */
 function chooseView(which) {
+  noteDeepLinkReaderMove();
   if (which !== "main" && !threadingSupported) {
     setStatus("No threads here: Main is all of it.");
     renderThreadSelect();
@@ -43807,6 +43884,7 @@ function chooseView(which) {
  */
 function chooseOneColumn(target) {
   if (sideActive) return inColumn(columns.main, () => chooseOneColumn(target));
+  noteDeepLinkReaderMove();
   oneColumnWanted = target;
   setLayout("one");
   // Already one column: no change of layout showed it.
@@ -46347,6 +46425,7 @@ function showSideList() {
  * behind, landing on its first unread, exactly as a thread opens in one column.
  */
 function selectSideThread(id, summary = null) {
+  noteDeepLinkReaderMove();
   const thread = String(id);
   const channel = String(el("discord-channel").value);
   if (!columnsShown || !channel) return undefined;
