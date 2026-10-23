@@ -9148,6 +9148,14 @@ li.discord-message[data-root-child] > .reply-bridge {
   }
 }
 
+/* `#460 pack-gap-slide`. While what is below slides, the card it slides for and that card's rows are drawn over
+   it: sliding down from where it was, it would otherwise cover the room the card or its rows just took, and
+   take a press meant for them. */
+#side-cards > [data-slide-over] {
+  position: relative;
+  z-index: 1;
+}
+
 #side-more-threads {
   margin: 0 auto 0.6rem;
   display: block;
