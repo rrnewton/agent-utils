@@ -1,12 +1,13 @@
 ---
 title: 'pack-keeps-card-still: a card packed or unpacked in the Threads view stays exactly where it is on screen'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-23T14:51:03.243544781+00:00
-updated_at: 2026-10-23T14:51:03.243544781+00:00
+updated_at: 2026-10-23T18:38:10.309521495+00:00
+closed_at: 2026-10-23T18:38:10.309521325+00:00
 ---
 
 # Description

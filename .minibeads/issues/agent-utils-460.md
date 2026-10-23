@@ -1,6 +1,6 @@
 ---
 title: 'pack-gap-slide: a packed thread''s gap holds a moment and the cards below slide up into it'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
@@ -8,7 +8,8 @@ labels:
 depends_on:
   agent-utils-459: related
 created_at: 2026-10-23T14:51:05.190803835+00:00
-updated_at: 2026-10-23T14:51:05.190803835+00:00
+updated_at: 2026-10-23T18:38:10.312680136+00:00
+closed_at: 2026-10-23T18:38:10.312680005+00:00
 ---
 
 # Description
