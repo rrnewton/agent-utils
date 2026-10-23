@@ -13848,6 +13848,43 @@ async function scatteredPage(count = 2) {
   return page;
 }
 
+test("a long post's first part, a root by then, is one row with its continuation in its thread (#463)", async () => {
+  // Slack posts a long message as its first part in the channel and the rest as replies in that
+  // part's thread, about three seconds apart. The root used to stand alone, so the post read as
+  // separate messages; a root still never joins the row above it, nor a reply in another thread.
+  const at = (seconds) => new Date(MESSAGE_DAY.getTime() + seconds * 1000).toISOString();
+  const post = { id: "1792765680.753759", root_message_id: "701", is_root: true, reply_count: 3,
+    reply_count_exact: true };
+  const other = { id: "1792765690.000100", root_message_id: "704", is_root: true, reply_count: 1,
+    reply_count_exact: true };
+  const messages = [
+    message({ id: "701", content: "state replication model", thread: post, timestamp: at(0), ...OWNER }),
+    message({ id: "702", content: "part two", thread: { ...post, is_root: false }, timestamp: at(3), ...OWNER }),
+    message({ id: "703", content: "part three", thread: { ...post, is_root: false }, timestamp: at(6), ...OWNER }),
+    message({ id: "704", content: "a new thread", thread: other, timestamp: at(8), ...OWNER }),
+    message({ id: "705", content: "in the channel", timestamp: at(9), ...OWNER }),
+    message({ id: "706", content: "an answer", thread: { ...post, is_root: false }, timestamp: at(10), ...ALICE }),
+    message({ id: "707", content: "the other thread", thread: { ...other, is_root: false }, timestamp: at(11),
+      ...OWNER }),
+  ];
+  const page = newPage();
+  page.threadingSupported = true;
+  page.threads = [
+    { id: post.id, root: messages[0], title: "Replication", reply_count: 3, reply_count_exact: true,
+      updated_at: messages[5].timestamp },
+    { id: other.id, root: messages[3], title: "Other", reply_count: 1, reply_count_exact: true,
+      updated_at: messages[6].timestamp },
+  ];
+  await signIn(page);
+  await showDiscord(page, messages);
+  assert.equal(page.el("thread-select").value, "flat", "the channel did not open in All");
+  assert.deepStrictEqual(page.el("discord-log").children.map((li) => li.getAttribute("data-ids")),
+    ["701 702 703", "704", "705", "706", "707"]);
+  const first = page.el("discord-log").children[0];
+  assert.match(bodyOf(first).text(), /state replication model\s*part two\s*part three/,
+    "the combined row does not show the whole post in order");
+});
+
 /** The N replies chip on a row. */
 const gatherChip = (page, id) => threadButton(rowWithId(page, id));
 

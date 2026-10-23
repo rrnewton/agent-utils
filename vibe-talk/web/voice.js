@@ -34299,6 +34299,11 @@ function fullLocalAt(at) {
 //     queue with nothing on screen able to reach it.
 //   * A REPLY GOES TO THE FIRST. The group is a primary message with a tail, and Discord will
 //     thread the answer under whichever id it is given; the first is the one a reader means.
+//   * A THREAD'S ROOT MAY HEAD A ROW, NEVER JOIN ONE. A long post to Slack or Google Chat is its
+//     first part in the channel and the rest as replies in that part's thread, seconds apart, so
+//     the first part is a root before anyone answers it: the root and its author's replies inside
+//     the window are one post. A root joining the row above would bury its thread inside another
+//     message, and a reply in some other thread is never part of it (`#463 slack-text-fidelity`).
 
 /** How close two messages have to be to be shown as one. */
 const GLOM_WINDOW_MS = 5000;
@@ -34340,8 +34345,7 @@ function joinsGroup(previous, message) {
   if (!combineMessages || !previous) {
     return false;
   }
-  if (threadOf(previous) !== threadOf(message) ||
-      (previous.thread && previous.thread.is_root) || (message.thread && message.thread.is_root)) {
+  if (threadOf(previous) !== threadOf(message) || (message.thread && message.thread.is_root)) {
     return false;
   }
   if (String(previous.author_id || "") !== String(message.author_id || "")) {

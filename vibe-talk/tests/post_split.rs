@@ -343,6 +343,11 @@ const TEAM: &str = "C0000MAIN1";
 /// A Slack deployment assembled from configuration as `main` assembles one, against the fake,
 /// taking `max_post_chars` in one message: a bridge in front of Slack, as the fake's address is.
 async fn slack(fake: &Fake, max_post_chars: usize) -> AppState {
+    slack_sized(fake, &format!("max_post_chars = {max_post_chars}")).await
+}
+
+/// [`slack`] with `size` as the provider's post-size lines, which may be none.
+async fn slack_sized(fake: &Fake, size: &str) -> AppState {
     let text = format!(
         r#"
 [auth]
@@ -354,7 +359,7 @@ key = "slack"
 kind = "slack"
 api_base = "{base}"
 token = "{TOKEN}"
-max_post_chars = {max_post_chars}
+{size}
 
 [[channels]]
 id = "{TEAM}"
@@ -437,6 +442,73 @@ async fn a_slack_post_over_its_limit_is_one_message_with_the_rest_in_its_thread(
         .map(|part| part["content"].as_str().unwrap_or_default())
         .collect();
     assert_eq!(rejoined, text);
+}
+
+/// Slack's text as written: the three entities it escapes, decoded once, `&amp;` last.
+fn unescaped(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// `#463 slack-text-fidelity`. A long message pasted with block quotes, through a bridge that says
+/// nothing about its size: cut to Slack's recommended 4,000 bytes as sent, not 2,000 characters,
+/// at a paragraph, each part escaped exactly once and keeping its line breaks.
+#[tokio::test]
+async fn a_long_quoted_slack_post_through_a_bridge_is_cut_at_paragraphs_and_escaped_once() {
+    let fake = Fake::start(slack_fixture(), 20).await;
+    let state = slack_sized(&fake, "").await;
+    let mut text = String::new();
+    for n in 1..=14 {
+        text.push_str(&format!(
+            "> {n}. Should the server look for the message upstream before offering Retry? It \
+             costs one read per uncertain send, and it is the only way to make Retry safe.\n\n\
+             Yes, that sounds good: R&D said <x> -> y is fine, and Vec<Option<T>> stays as typed. \
+             The rest of this answer is ordinary prose, long enough that the post must be cut \
+             somewhere, and the only good place to cut it is between two paragraphs.\n\n"
+        ));
+    }
+    let text = text.trim_end().to_owned();
+    assert!(text.len() > 4_000, "the fixture would not be cut");
+    let (status, answer) = call(&state, &team_reply(), json!({ "text": text })).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let sent: Vec<String> = fake
+        .requests("chat.postMessage")
+        .iter()
+        .map(|params| params["text"].clone())
+        .collect();
+    assert_eq!(
+        sent.len(),
+        2,
+        "not cut to 4,000 bytes as sent: {:?}",
+        sent.iter().map(String::len).collect::<Vec<_>>()
+    );
+    for part in &sent {
+        assert!(
+            part.len() <= 4_000,
+            "a part is over 4,000 bytes as sent: {}",
+            part.len()
+        );
+        assert!(part.contains('\n'), "a part lost its line breaks: {part:?}");
+        assert!(
+            part.contains("\n\n&gt; "),
+            "a later quote lost its line: {part:?}"
+        );
+        assert!(
+            !part.contains("&amp;gt;") && !part.contains("&amp;lt;") && !part.contains("&amp;amp;"),
+            "a part was escaped twice: {part:?}"
+        );
+        assert!(part.contains("R&amp;D said &lt;x&gt; -&gt; y"), "{part:?}");
+    }
+    assert!(
+        sent[0].ends_with("\n\n"),
+        "the first part was not cut at a paragraph"
+    );
+    let rejoined: String = sent.iter().map(|part| unescaped(part)).collect();
+    assert_eq!(
+        rejoined, text,
+        "the parts, decoded once, are not the text as typed"
+    );
 }
 
 #[tokio::test]

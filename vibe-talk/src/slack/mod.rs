@@ -108,6 +108,16 @@ pub const DEFAULT_SLACK_API_BASE: &str = "https://slack.com/api";
 /// there.
 pub const SLACK_DEFAULT_POST_CHARS: usize = 39_000;
 
+/// The most UTF-8 bytes one post through a bridge in front of Slack is cut to, unless configured
+/// otherwise. `#463 slack-text-fidelity`.
+///
+/// Slack recommends keeping a message under 4,000 characters, and a bridge that posts through a
+/// command-line client's mrkdwn body is held to 4,000 bytes there, counted on the text as sent:
+/// escapes and all, as [`crate::chat::PostEscaping::HtmlEntities`] counts it. In bytes, so the
+/// cut is safe for such a bridge whatever the script; for ASCII it is twice the 2,000 characters
+/// bridges were cut to before, which split a long message into twice as many parts as needed.
+pub const SLACK_BRIDGE_DEFAULT_POST_BYTES: usize = 4_000;
+
 /// Whether `api_base` is Slack's own Web API rather than a bridge in front of it.
 #[must_use]
 pub fn is_official_slack_api_base(api_base: &str) -> bool {
@@ -159,9 +169,9 @@ impl SlackConfig {
     ///
     /// Slack itself takes [`SLACK_DEFAULT_POST_CHARS`] unless configured, and never more than
     /// [`SLACK_MAX_TEXT_CHARS`]. A bridge takes what the operator said it accepts
-    /// (`max_post_chars`, `max_post_bytes`), and when the operator said nothing, 2000 characters:
-    /// the most any bridge has been sent since posts were first split, so an upgrade never sends a
-    /// bridge a longer post than it has accepted before.
+    /// (`max_post_chars`, `max_post_bytes`), and when the operator said nothing,
+    /// [`SLACK_BRIDGE_DEFAULT_POST_BYTES`]: what Slack recommends for one message, and what a bridge
+    /// posting mrkdwn through a command-line client accepts.
     #[must_use]
     pub fn post_limit(&self) -> crate::chat::PostLimit {
         let official = is_official_slack_api_base(&self.api_base);
@@ -170,12 +180,15 @@ impl SlackConfig {
             Some(max) if official => Some(max.min(SLACK_MAX_TEXT_CHARS)),
             Some(max) => Some(max),
             None if official => Some(SLACK_DEFAULT_POST_CHARS),
-            None if !stated => Some(crate::discord::http::DISCORD_MAX_CONTENT_LEN),
             None => None,
+        };
+        let max_bytes = match self.max_post_bytes {
+            None if !official && !stated => Some(SLACK_BRIDGE_DEFAULT_POST_BYTES),
+            stated_bytes => stated_bytes,
         };
         crate::chat::PostLimit {
             max_chars,
-            max_bytes: self.max_post_bytes,
+            max_bytes,
             escaping: crate::chat::PostEscaping::HtmlEntities,
         }
     }

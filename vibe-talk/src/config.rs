@@ -3774,7 +3774,8 @@ provider = "slack"
             }
         );
 
-        // A Slack bridge that says nothing, and one that says it takes four thousand bytes.
+        // A Slack bridge that says nothing is cut to what Slack recommends for one message, in
+        // bytes as sent (`#463 slack-text-fidelity`); one that says what it takes is held to that.
         let bridged = MULTI.replace(
             "kind = \"slack\"\n",
             "kind = \"slack\"\napi_base = \"http://127.0.0.1:18766/api\"\n",
@@ -3782,16 +3783,26 @@ provider = "slack"
         let cfg = Config::from_toml_and_env(&bridged, &env(&[])).expect("a Slack bridge");
         assert_eq!(
             slack_post_limit(&cfg, "slack"),
-            PostLimit::chars(2000).escaped(PostEscaping::HtmlEntities)
+            PostLimit::bytes(crate::slack::SLACK_BRIDGE_DEFAULT_POST_BYTES)
+                .escaped(PostEscaping::HtmlEntities)
         );
         let text = bridged.replace(
             "live_poll_seconds = 15",
-            "live_poll_seconds = 15\nmax_post_bytes = 4000",
+            "live_poll_seconds = 15\nmax_post_bytes = 3000",
         );
         let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("a Slack bridge limit");
         assert_eq!(
             slack_post_limit(&cfg, "slack"),
-            PostLimit::bytes(4000).escaped(PostEscaping::HtmlEntities)
+            PostLimit::bytes(3000).escaped(PostEscaping::HtmlEntities)
+        );
+        let text = bridged.replace(
+            "live_poll_seconds = 15",
+            "live_poll_seconds = 15\nmax_post_chars = 12000",
+        );
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("a Slack bridge limit");
+        assert_eq!(
+            slack_post_limit(&cfg, "slack"),
+            PostLimit::chars(12_000).escaped(PostEscaping::HtmlEntities)
         );
     }
 

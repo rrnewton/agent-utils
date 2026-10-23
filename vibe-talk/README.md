@@ -504,7 +504,10 @@ under [Configuration](#configuration)). When a message to the channel itself sti
 Google Chat and Slack post the first part in the channel and the rest as replies in that part's
 thread; Discord posts the parts one after another, and only the first answers the message you
 replied to. A message sent into a thread keeps every part in that thread. If a part fails, the
-unsent rest is retried into the same thread (`#263 post-split-per-provider`).
+unsent rest is retried into the same thread (`#263 post-split-per-provider`). With **Show
+messages sent seconds apart as one** on, the page shows the parts as one row again: the first
+part, a thread's root by then, heads a row with its author's replies in its own thread that came
+within five seconds of each other (`#463 slack-text-fidelity`).
 
 **A refused message says why.** When the chat service refuses a message (an HTTP 4xx answer), its
 row in the outbox says **Not sent** and gives the reason in plain words, for example "Google Chat
@@ -2521,8 +2524,9 @@ does not apply to the provider's kind is refused by name.
 A Slack provider measures a message as Slack is sent it, after `&`, `<` and `>` become `&amp;`,
 `&lt;` and `&gt;`. Pointed at Slack itself it takes 39,000 characters unless configured, a margin
 under the 40,000 past which Slack truncates, and refuses a `max_post_chars` above 40,000. Pointed
-at a bridge it takes what `max_post_chars` and `max_post_bytes` say, and 2,000 characters when
-neither is set.
+at a bridge it takes what `max_post_chars` and `max_post_bytes` say, and 4,000 bytes when neither
+is set: what Slack recommends for one message, and what a bridge posting mrkdwn through a
+command-line client accepts in one (`#463 slack-text-fidelity`).
 
 How a deployment with several providers behaves:
 

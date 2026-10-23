@@ -177,6 +177,8 @@ live_poll_seconds = 0
 # upstream_clear = false         # offer "Clear unread in Slack" in Settings; needs a user token
 # workspace_url = "https://acme.slack.com"   # where "Open in Slack" points; unset, Slack's
 #                                # own auth.test answer is used when it reports one
+# max_post_bytes = 4000          # the most one post may hold, counted after & < > are escaped;
+#                                # Slack itself: 39,000 characters unless set, a bridge: 4,000 bytes
 
 [auth]
 # Credentials THIS server demands of its callers. Not Discord's, not ElevenLabs'.
