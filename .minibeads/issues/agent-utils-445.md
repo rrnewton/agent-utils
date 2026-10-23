@@ -1,13 +1,14 @@
 ---
 title: 'gchat-mention-defuse: defuse mention syntax in posts to a Google Chat bridge instead of having them refused'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 - send
 created_at: 2026-10-23T01:16:57.709043305+00:00
-updated_at: 2026-10-23T01:16:57.709043305+00:00
+updated_at: 2026-10-23T01:36:49.370298565+00:00
+closed_at: 2026-10-23T01:36:49.370298565+00:00
 ---
 
 # Description

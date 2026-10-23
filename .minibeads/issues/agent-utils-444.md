@@ -1,13 +1,14 @@
 ---
 title: 'send-refusal-reason: say why the chat service refused a send, and never call a refusal unconfirmed'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 - send
 created_at: 2026-10-23T01:16:47.176098728+00:00
-updated_at: 2026-10-23T01:16:47.176098728+00:00
+updated_at: 2026-10-23T01:36:49.362352666+00:00
+closed_at: 2026-10-23T01:36:49.362352666+00:00
 ---
 
 # Description
