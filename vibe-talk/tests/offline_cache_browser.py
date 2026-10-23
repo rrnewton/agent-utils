@@ -1834,7 +1834,7 @@ MENU_JS = """({list, id, upstream}) => {""" + FLOAT_HELPERS_JS + """
     const menu = row && row.querySelector('.row-more-menu');
     if (!menu || !shown(menu)) return {problems: [`row ${id}'s ⋯ menu is not open`], items: []};
     const names = [...menu.children].filter(shown).map((e) => e.className);
-    if (names.join(' ') !== 'row-copy-button row-pin-button row-bookmark-button row-more-group') problems.push(`the menu holds ${names.join(', ')}`);
+    if (names.join(' ') !== 'row-copy-button row-copy-deep-link-button row-pin-button row-bookmark-button row-more-group') problems.push(`the menu holds ${names.join(', ')}`);
     const group = menu.querySelector('.row-more-group');
     const caption = group && group.querySelector('.row-more-caption');
     if (!caption || !shown(caption) || caption.textContent !== 'Mark read') problems.push('the read group has no caption');
@@ -4147,7 +4147,10 @@ def links_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
             opened_page = tab.value
             opened_page.wait_for_load_state()
             check(opened_page.url == "https://example.org/diff/7", f"{label}: the tap opened {opened_page.url}")
-            check(page.url == f"http://127.0.0.1:{server.server_port}/",
+            # `#462 webapp-deep-links`: the app's own address carries its place as a query now;
+            # what must not move is the page itself — same origin, same path.
+            check(page.url.startswith(f"http://127.0.0.1:{server.server_port}/?") or
+                  page.url == f"http://127.0.0.1:{server.server_port}/",
                   f"{label}: the tap navigated the app itself to {page.url}")
             opened_page.close()
             after = page.evaluate("() => { const row = document.querySelector('#discord-log > li[data-id=\"200\"]');"

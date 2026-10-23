@@ -1735,10 +1735,13 @@ async function applyDeepLink() {
   }
   if (currentView !== "discord") showView("discord");
   const channel = String(el("discord-channel").value);
+  const startPlace = channelPlace();
   // The channel's own first read decides its opening view as it lands; a place put on before
-  // it would be decided over. Wait for a read to have landed, then put the link's place on.
+  // it would be decided over. Wait for that read, then put the link's place on — unless the
+  // reader has navigated for themselves meanwhile: a link opened the page, it does not chase
+  // a reader who has already gone somewhere of their own choosing.
   await waitForDeepLink(() => String(el("discord-channel").value) !== channel ||
-    (timelineReadsStarted > 0 && !discordFetchInFlight));
+    (timelineReadsStarted > 0 && channelCanon.views.has(viewKey())));
   if (String(el("discord-channel").value) !== channel) return;
   const thread = wanted.thread || (wanted.message && wanted.message.thread) || null;
   /** @type {ChannelPlace | null} */
@@ -1754,6 +1757,10 @@ async function applyDeepLink() {
   } else if (wanted.view === "main") {
     place = { screen: "main", channel, layout: "one", view: "main", thread: null, origin: null, side: null };
   }
+  // The reader moved while the read was coming: the link loses, quietly.
+  const stood = channelPlace();
+  if (startPlace && stood && visitKey(stood) !== visitKey(startPlace) &&
+      !(place && visitKey(stood) === visitKey(place))) return;
   if (place && channelPlaceShowable(place)) {
     showChannelPlace(place);
   } else if (place && place.view === "thread" && place.thread) {
@@ -51824,6 +51831,20 @@ function forgetToken() {
   syncedArchive.clear();
   settingsAtStart.clear();
   clearError();
+  // `#462 webapp-deep-links`: signing out forgets where the reader was, address included — a
+  // reload after it must not reopen the signed-out reader's place from the query alone.
+  deepLinkWanted = null;
+  deepLinkFocus = null;
+  deepLinkApplied = true;
+  try {
+    const history = backHistory();
+    if (history && typeof window === "object" && window.location) {
+      history.replaceState(history.state, "", window.location.pathname || "/");
+      deepLinkWritten = window.location.pathname || "/";
+    }
+  } catch (_error) {
+    // The address keeps its query; the token is still forgotten.
+  }
   // Before the token goes, not after: the stream holds a bearer credential open, and a signed-out
   // page that is still receiving one channel's messages is the leak this control exists to close.
   stopChannelStream();
