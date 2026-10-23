@@ -41160,8 +41160,11 @@ function reportColumnReply(entry) {
   const named = columnsShown ? (column === columns.side ? "the right column" : "the left column") : "the list";
   const drawn = (column === columns.main || sideShowing()) && inColumn(column, () => outboxRow(entry.id) !== null);
   const where = drawn ? `at the foot of ${named}` : "with it where it was sent";
+  // A refusal after some parts went (`#444 send-refusal-reason`) is failed too, and part of it is in.
   setStatus(entry.state === "failed"
-    ? `Your reply was not sent. Retry is ${where}.`
+    ? entry.postedCount > 0
+      ? `Only part of your reply was sent. Retry the rest ${where}.`
+      : `Your reply was not sent. Retry is ${where}.`
     : `Your reply may not have been posted. Check it ${where}.`);
   unseenColumnReplies[column.name] = entry.id;
   if (drawn) inColumn(column, renderJumpNewest);

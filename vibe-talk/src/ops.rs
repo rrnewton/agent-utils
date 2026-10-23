@@ -3509,16 +3509,9 @@ async fn ready_to_post(
     // not Discord's: cut at Discord's 2000 characters, a long message to Google Chat, which takes
     // sixteen times that, arrived as three. `#263 post-split-per-provider`.
     let limit = state.chat.post_limit(&info.id);
-    // `#445 gchat-mention-defuse`. Mention syntax the provider would refuse is made inert first,
-    // before the cut, so what it adds counts toward the limit — and the text a 207 hands back is
-    // the defused text, which defusing again leaves as it is, so a retry is cut and keyed alike.
-    let defused = if state.chat.defuses_mentions(&info.id) {
-        crate::mention_defuse::defuse(text)
-    } else {
-        std::borrow::Cow::Borrowed(text)
-    };
+    let defuse = state.chat.defuses_mentions(&info.id);
+    let (defused, parts) = cut_post(text, &limit, defuse);
     let text: &str = &defused;
-    let parts = crate::discord::split::split_within(text, &limit);
     if parts.is_empty() {
         return Err(OpError::Chat(ChatError::Refused(
             "message content is empty".to_owned(),
@@ -3539,8 +3532,42 @@ async fn ready_to_post(
         reply_to,
         thread_id: thread_id.map(str::to_owned),
         limit,
+        defuse,
     };
     Ok((posting, turn))
+}
+
+/// The parts `text` is posted as through a provider whose limit is `limit`, and the text they were
+/// cut from: `text` itself, or — where the provider defuses mentions, `defuse` — `text` defused.
+///
+/// `#445 gchat-mention-defuse`. Defused before the cut, so what that adds counts toward the limit,
+/// and each part again after it: a cut through an unbroken run can leave a part that starts with
+/// `@word` whose `@` followed a letter in the whole text, which the provider, checking each part
+/// on its own, takes for a mention. That second joiner can take such a part one character past the
+/// limit, and only then. Defusing is idempotent, so the text a 207 hands back, cut again here, is
+/// cut and keyed as it was. Every caller that needs to know how a post was cut — the post itself,
+/// a 207's remainder, the send memory's report — cuts it here.
+#[must_use]
+pub fn cut_post<'a>(
+    text: &'a str,
+    limit: &crate::chat::PostLimit,
+    defuse: bool,
+) -> (std::borrow::Cow<'a, str>, Vec<String>) {
+    if !defuse {
+        return (
+            std::borrow::Cow::Borrowed(text),
+            crate::discord::split::split_within(text, limit),
+        );
+    }
+    let defused = crate::mention_defuse::defuse(text);
+    let parts = crate::discord::split::split_within(&defused, limit)
+        .into_iter()
+        .map(|part| match crate::mention_defuse::defuse(&part) {
+            std::borrow::Cow::Borrowed(_) => part,
+            std::borrow::Cow::Owned(again) => again,
+        })
+        .collect();
+    (defused, parts)
 }
 
 /// One post, cut in parts and ready to go: everything [`post_parts`] needs, owned, so the task that
@@ -3553,6 +3580,8 @@ struct Posting {
     reply_to: Option<MessageId>,
     thread_id: Option<String>,
     limit: crate::chat::PostLimit,
+    /// Whether the post was defused as it was cut; see [`cut_post`].
+    defuse: bool,
 }
 
 /// Post every part of `posting` in order, holding the destination's `turn` until the provider has
@@ -3586,6 +3615,7 @@ async fn post_each(
         reply_to,
         thread_id,
         limit,
+        defuse,
     } = posting;
     let thread_id = thread_id.as_deref();
     let mut posted: Vec<Message> = Vec::new();
@@ -3658,7 +3688,8 @@ async fn post_each(
                 // once their draft is cleared — and where it belongs, which after the first part
                 // of a continued post is that part's thread rather than the conversation.
                 let replying = reply_to.is_some() && continuation.is_none();
-                let (unsent, resumable) = unsent_remainder(&text, &parts, index, replying, &limit);
+                let (unsent, resumable) =
+                    unsent_remainder(&text, &parts, index, replying, &limit, defuse);
                 // `#444 send-refusal-reason`. Why, in the log and to the caller: a provider's
                 // refusal said why, and the same text sent again is refused the same way.
                 let refusal = crate::send_refusal::SendRefusal::of(&cause, part);
@@ -3776,7 +3807,8 @@ pub fn part_keys(key: &str, parts: &[String]) -> Vec<String> {
 ///   to the thread the 207 names, without the reply target, exactly as the part that failed did,
 ///   so the caller passes `replying` false for it.
 ///
-/// `limit` is the one the post was cut to, so the remainder is cut the same way.
+/// `limit` is the one the post was cut to, and `defuse` whether it was defused as it was cut
+/// ([`cut_post`]), so the remainder is cut the same way.
 ///
 /// False here leaves the 207 to the reader, which is what every 207 was before keys existed.
 fn unsent_remainder(
@@ -3785,12 +3817,13 @@ fn unsent_remainder(
     index: usize,
     replying: bool,
     limit: &crate::chat::PostLimit,
+    defuse: bool,
 ) -> (String, bool) {
     if index == 0 {
         return (text.to_owned(), true);
     }
     let unsent = parts[index..].join("");
-    let again = crate::discord::split::split_within(&unsent, limit);
+    let again = cut_post(&unsent, limit, defuse).1;
     let resumable = !replying
         && again.first() == Some(&parts[index])
         && !again.iter().any(|part| parts[..index].contains(part));
@@ -5901,6 +5934,37 @@ mod tests {
     /// and every part one could fail at: sending the unsent text again asks for the part that
     /// failed under its own words and key, and keys nothing as a part already posted, which a
     /// provider honouring keys would silently drop.
+    /// `#445 gchat-mention-defuse`. Every part goes defused, even one a cut through an unbroken
+    /// run left starting with an `@word` whose `@` followed a letter in the whole text; the words
+    /// are the text's own; and a remainder cut again is the parts it was cut into.
+    #[test]
+    fn a_defused_post_is_defused_in_every_part_wherever_it_is_cut() {
+        use crate::mention_defuse::{first_notifying, WORD_JOINER};
+        let limit = crate::chat::PostLimit::chars(500);
+        let mut cut_before_at = false;
+        for run in 480..520 {
+            let text = format!("{}@word and @more <users/1>", "a".repeat(run));
+            let (defused, parts) = cut_post(&text, &limit, true);
+            assert!(parts.len() > 1, "{run}: the fixture did not split");
+            for part in &parts {
+                assert_eq!(first_notifying(part), None, "{run}: {part:?}");
+            }
+            cut_before_at |= parts[1].starts_with('@');
+            assert_eq!(parts.concat().replace(WORD_JOINER, ""), text, "{run}");
+            assert_eq!(
+                cut_post(&defused, &limit, true).1,
+                parts,
+                "{run}: cut again differently"
+            );
+            let (unsent, _) = unsent_remainder(&defused, &parts, 0, false, &limit, true);
+            assert_eq!(cut_post(&unsent, &limit, true).1, parts, "{run}");
+        }
+        assert!(cut_before_at, "no run was cut just before its @");
+        // Not asked to defuse, the text is cut as written.
+        let (kept, parts) = cut_post("@word", &limit, false);
+        assert_eq!((kept.as_ref(), parts), ("@word", vec!["@word".to_owned()]));
+    }
+
     #[test]
     fn a_resumable_remainder_asks_for_the_failed_part_as_the_same_request() {
         use crate::chat::{PostEscaping, PostLimit};
@@ -5948,7 +6012,8 @@ mod tests {
             assert!(parts.len() > 2, "{name}: the fixture did not split");
             let keys = part_keys("outgoing-key", &parts);
             for index in 0..parts.len() {
-                let (unsent, resumable) = unsent_remainder(text, &parts, index, false, limit);
+                let (unsent, resumable) =
+                    unsent_remainder(text, &parts, index, false, limit, false);
                 if index == 0 {
                     assert_eq!(
                         &unsent, text,
@@ -5992,8 +6057,8 @@ mod tests {
         // A reply's remainder would go again with the reply target on its first part.
         let text = prose(700);
         let parts = split_within(&text, &discord);
-        assert!(!unsent_remainder(&text, &parts, 1, true, &discord).1);
-        assert!(unsent_remainder(&text, &parts, 0, true, &discord).1);
+        assert!(!unsent_remainder(&text, &parts, 1, true, &discord, false).1);
+        assert!(unsent_remainder(&text, &parts, 0, true, &discord, false).1);
     }
 
     // --- `#190 voice-agent-tools` ----------------------------------------------------------------
