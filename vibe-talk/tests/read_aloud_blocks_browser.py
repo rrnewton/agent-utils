@@ -104,15 +104,21 @@ SPEAKING_PACE = 1.0
 AHEAD_PACE = 2.0
 # Slack on every measured boundary, for scheduling and a loaded machine.
 SLACK_MS = 60
+# A pause between two pieces of one block, as the voice sent them, long enough to say the host held the
+# voice up: four pieces' worth. An underrun inside a block needs its piece half a second late (the
+# page's cushion), so a host that caused one shows a pause like this on the voice's side.
+STALL_S = 0.2
 # At speaking pace a block cannot be generated before its turn, so a boundary is the next block's own
-# first-audio wait and no longer: the page spends none of its cushion on it, and adds nothing.
-GAP_AT_PACE_MOST_MS = round(FIRST_AUDIO_SECONDS * 1000) + SLACK_MS
+# first-audio wait (`voice_wait_ms`) and no longer: the page spends none of its cushion on it, and adds
+# nothing.
 # A voice that runs ahead has the next block waiting before the current one ends: no gap.
 GAP_AHEAD_MOST_MS = SLACK_MS
 # The control's boundaries must show its slow first audio, or the harness cannot see a gap.
 CONTROL_GAP_AT_LEAST_MS = round(CONTROL_FIRST_AUDIO_SECONDS * 1000) - 300
 
-# Records every Web Audio source the page starts: when it was due and how long it lasts.
+# Records every Web Audio source the page starts: when it was due, how long it lasts, the audio clock
+# when it was started (when its piece had arrived and been decoded), and its sample rate, which says
+# which block it is from (`rate_of`).
 SOURCE_PROBE = """(() => {
   const proto = window.AudioBufferSourceNode && AudioBufferSourceNode.prototype;
   if (!proto) return;
@@ -120,7 +126,8 @@ SOURCE_PROBE = """(() => {
   window.readAloudProbe = { sources };
   const start = proto.start;
   proto.start = function (when = 0, ...rest) {
-    sources.push({ due: when, until: when + (this.buffer ? this.buffer.duration : 0), stopped: false });
+    sources.push({ due: when, until: when + (this.buffer ? this.buffer.duration : 0), stopped: false,
+                   at: this.context.currentTime, rate: this.buffer ? this.buffer.sampleRate : 0 });
     const probe = sources[sources.length - 1];
     const stop = this.stop;
     this.stop = function (...args) { probe.stopped = true; return stop.apply(this, args); };
@@ -192,27 +199,52 @@ class BarLayout(TypedDict):
     stopWidth: float  # noqa: N815
 
 
-# The gaps on the audio clock, in milliseconds, between consecutive sources still meant to play.
+# The gaps on the audio clock, in milliseconds, between consecutive sources still meant to play: each
+# whether it is a block boundary (the two are from different blocks, by their sample rates), the block
+# the later one is from, and, inside a block, whether it is an underrun -- the piece after it was
+# scheduled only once the audio before it had run out (`#472 gate-flake-hardening`).
 GAPS = """() => {
   const sources = window.readAloudProbe.sources.filter((s) => !s.stopped).sort((a, b) => a.due - b.due);
   const gaps = [];
   for (let at = 1; at < sources.length; at += 1) {
-    gaps.push(Math.round((sources[at].due - sources[at - 1].until) * 1000));
+    const before = sources[at - 1], next = sources[at];
+    const boundary = before.rate !== next.rate;
+    gaps.push({ ms: Math.round((next.due - before.until) * 1000), boundary, rate: next.rate,
+                underrun: !boundary && next.at >= before.until - 0.006 });
   }
   return gaps;
 }"""
 
 
-def wav_header() -> bytes:
+@dataclass(frozen=True)
+class Gap:
+    """One gap `GAPS` measured."""
+
+    ms: int
+    boundary: bool
+    rate: int
+    underrun: bool
+
+    @property
+    def block(self) -> int:
+        return (self.rate - RATE) // 8
+
+
+def rate_of(block: int | None) -> int:
+    """The sample rate block `block` is said at: each its own, so the page's sources say which they are from."""
+    return RATE + 8 * (block or 0)
+
+
+def wav_header(rate: int) -> bytes:
     # Unknown length, as the server streams it.
     return (b"RIFF" + struct.pack("<I", 0xFFFFFFFF) + b"WAVEfmt "
-            + struct.pack("<IHHIIHH", 16, 1, 1, RATE, RATE * 2, 2, 16)
+            + struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16)
             + b"data" + struct.pack("<I", 0xFFFFFFFF))
 
 
-def tone(start_sample: int, samples: int, pitch: float) -> bytes:
+def tone(start_sample: int, samples: int, pitch: float, rate: int) -> bytes:
     return struct.pack(f"<{samples}h", *(
-        int(6000 * math.sin(2 * math.pi * pitch * (start_sample + i) / RATE)) for i in range(samples)))
+        int(6000 * math.sin(2 * math.pi * pitch * (start_sample + i) / rate)) for i in range(samples)))
 
 
 def message(index: int, message_id: str, content: str, html: str) -> Json:
@@ -241,6 +273,21 @@ class Read:
     opened: float
     closed: float | None = None
     finished: bool = False
+    # When its first and its latest piece of audio were sent, and how often the host held it up between
+    # two pieces (`STALL_S`).
+    first_sent: float | None = None
+    last_sent: float | None = None
+    stalls: int = 0
+
+
+def voice_wait_ms(before: Read, after: Read) -> int:
+    """The voice's own first-audio wait at the boundary between two reads, as it really took it: from when
+    it could have begun the second -- the first sent whole and the second asked for -- to its first audio.
+    On a calm host this is `first_audio`; on a loaded one the voice's sleep and its hand-over run long, and
+    the boundary the page hears with them. Nothing the page does late is counted in it: a page that asked
+    late moves `opened`, and one that schedules late moves only the gap."""
+    assert before.last_sent is not None and after.first_sent is not None
+    return round((after.first_sent - max(before.last_sent, after.opened)) * 1000)
 
 
 @dataclass
@@ -391,13 +438,14 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
                 self.wfile.flush()
 
             try:
-                chunk(wav_header())
+                rate = rate_of(block)
+                chunk(wav_header(rate))
                 if not api.take_turn(read):
                     raise OSError("cut off before its turn")
                 time.sleep(api.first_audio)
                 began = time.monotonic()
-                total = int(seconds * RATE)
-                per = RATE * CHUNK_MS // 1000
+                total = int(seconds * rate)
+                per = rate * CHUNK_MS // 1000
                 pitch = 300 + 40 * (block or 0)
                 sent = 0
                 # AT SPEAKING PACE (or `pace` times it): each piece no sooner than that.
@@ -405,9 +453,15 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
                     if api.cut_off(read):
                         raise OSError("cut off by a newer selection")
                     count = min(per, total - sent)
-                    chunk(tone(sent, count, pitch))
+                    chunk(tone(sent, count, pitch, rate))
+                    now = time.monotonic()
+                    if read.last_sent is not None and now - read.last_sent > STALL_S:
+                        read.stalls += 1
+                    read.last_sent = now
+                    if read.first_sent is None:
+                        read.first_sent = now
                     sent += count
-                    delay = began + sent / RATE / api.pace - time.monotonic()
+                    delay = began + sent / rate / api.pace - time.monotonic()
                     if delay > 0:
                         time.sleep(delay)
                 api.end_turn(read)
@@ -492,11 +546,33 @@ def check(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
-def gaps_of(page: Page) -> list[int]:
+def gaps_of(page: Page) -> list[Gap]:
     found: object = page.evaluate(GAPS)
-    if not isinstance(found, list) or not all(isinstance(gap, int) for gap in found):
+    if not isinstance(found, list) or not all(isinstance(gap, dict) for gap in found):
         raise AssertionError(f"the page returned no gaps: {found!r}")
-    return [int(gap) for gap in found]
+    return [Gap(int(gap["ms"]), bool(gap["boundary"]), int(gap["rate"]), bool(gap["underrun"])) for gap in found]
+
+
+def boundaries(gaps: list[Gap]) -> list[int]:
+    """The gaps at the block boundaries: what the walks are about."""
+    return [gap.ms for gap in gaps if gap.boundary]
+
+
+def check_within_blocks(gaps: list[Gap], reads: list[Read], where: str) -> int:
+    """Inside a block the audio is continuous, but for an underrun the host caused: the page scheduled a
+    piece only after the audio before it had run out, AND the voice was held up sending that block at
+    least as often (`Read.stalls`). A page that holds pieces back, or schedules them late, with the voice
+    on time, still fails. Says how many there were."""
+    late = [gap for gap in gaps if not gap.boundary and gap.ms > SLACK_MS]
+    check(all(gap.underrun for gap in late),
+          f"{where}: a block's audio was given a gap though its next piece was there in time: {late}")
+    for block in sorted({gap.block for gap in late}):
+        stalls = max((r.stalls for r in reads if r.message_id == LONG and r.block == block), default=0)
+        underruns = sum(1 for gap in late if gap.block == block)
+        check(underruns <= stalls,
+              f"{where}: block {block + 1} ran out {underruns} time(s) inside it, but the voice was held up"
+              f" sending it only {stalls} time(s), so the page was late with audio it had: {late}")
+    return len(late)
 
 
 def main() -> int:
@@ -621,9 +697,9 @@ def main() -> int:
                 wait_position(page, "3 of 7", 15)
                 control_gaps = gaps_of(page)
                 context.close()
-            control_worst = max(control_gaps, default=0)
+            control_worst = max(boundaries(control_gaps), default=0)
             check(control_worst >= CONTROL_GAP_AT_LEAST_MS,
-                  f"with first audio {CONTROL_FIRST_AUDIO_SECONDS} s the worst gap was {control_worst} ms"
+                  f"with first audio {CONTROL_FIRST_AUDIO_SECONDS} s the worst boundary was {control_worst} ms"
                   f" ({control_gaps}), so this harness cannot see a gap and proves nothing")
 
             api.first_audio = FIRST_AUDIO_SECONDS
@@ -673,15 +749,21 @@ def main() -> int:
                       f"the nested item is not the one lit: {lit_element(page)!r}")
                 shot("2-nested-item")
                 natural_gaps = gaps_of(page)
-                worst = max(natural_gaps, default=0)
-                check(len(natural_gaps) > 0, "no audio was scheduled")
-                check(worst <= GAP_AT_PACE_MOST_MS,
-                      f"a block boundary ran {worst} ms with nothing to play, more than the voice's own"
-                      f" {round(FIRST_AUDIO_SECONDS * 1000)} ms first-audio wait: {natural_gaps}")
-                pace_boundaries = sorted(gap for gap in natural_gaps if gap > 0)
+                worst = max(boundaries(natural_gaps), default=0)
+                check(len(boundaries(natural_gaps)) >= 3, f"not three block boundaries were scheduled: {natural_gaps}")
                 boundary_reads = [r for r in api.reads_of(LONG) if r.block in (0, 1, 2, 3)]
                 check([r.block for r in boundary_reads] == [0, 1, 2, 3],
                       f"the blocks were not each asked for once, in order: {[r.block for r in boundary_reads]}")
+                # Each boundary against the voice's own wait there: `FIRST_AUDIO_SECONDS` on a calm host,
+                # longer where the host held the voice up (`#472 gate-flake-hardening`).
+                waits = [max(round(FIRST_AUDIO_SECONDS * 1000), voice_wait_ms(before, after))
+                         for before, after in zip(boundary_reads, boundary_reads[1:])]
+                for gap, wait in zip(boundaries(natural_gaps), waits):
+                    check(gap <= wait + SLACK_MS,
+                          f"a block boundary ran {gap} ms with nothing to play, more than the voice's own"
+                          f" {wait} ms first-audio wait there: {natural_gaps}")
+                underruns = check_within_blocks(natural_gaps, api.reads_of(LONG), "at speaking pace")
+                pace_boundaries = sorted(gap for gap in boundaries(natural_gaps) if gap > 0)
                 check(len({r.selection for r in boundary_reads}) == 1,
                       "the blocks of one read were asked for under different selections, so each cut off the last")
 
@@ -784,6 +866,7 @@ def main() -> int:
             # 8. On a desk, with a voice that generates faster than it speaks: the strip is there,
             # the boundaries have no gap at all, and Next moves the read.
             api.pace = AHEAD_PACE
+            ahead_from = len(api.reads_of(LONG))
             with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
                 context, page = open_page(profile, 1280, 800, False)
                 press(page, f"{row} .body", False)
@@ -794,9 +877,11 @@ def main() -> int:
                 check(abs(gap_desk) <= 2, f"the strip floats {gap_desk:.1f}px off the chips row on a desk (`#433`)")
                 wait_position(page, "4 of 7", 15)
                 ahead_gaps = gaps_of(page)
-                ahead_worst = max(ahead_gaps, default=0)
+                ahead_worst = max(boundaries(ahead_gaps), default=0)
+                check(len(boundaries(ahead_gaps)) >= 3, f"not three block boundaries were scheduled: {ahead_gaps}")
                 check(ahead_worst <= GAP_AHEAD_MOST_MS,
                       f"with the voice running ahead a block boundary still ran {ahead_worst} ms: {ahead_gaps}")
+                underruns += check_within_blocks(ahead_gaps, api.reads_of(LONG)[ahead_from:], "running ahead")
                 press(page, "#read-next", False)
                 wait_position(page, "5 of 7")
                 check_strip_order(page, "a desk", desk=True)
@@ -990,8 +1075,9 @@ def main() -> int:
 
         print(f"{browser_version}: 7 blocks walked at 412x915, 393x852, 375x812 and on a desk. Block boundaries, voice"
               f" first audio {round(FIRST_AUDIO_SECONDS * 1000)} ms: at speaking pace {pace_boundaries} ms"
-              f" (worst {worst}); generating {AHEAD_PACE:g}x faster than it speaks, worst {ahead_worst} ms;"
-              f" control with first audio {round(CONTROL_FIRST_AUDIO_SECONDS * 1000)} ms, worst {control_worst} ms."
+              f" (worst {worst}, the voice's waits {waits} ms); generating {AHEAD_PACE:g}x faster than it speaks, worst {ahead_worst} ms;"
+              f" control with first audio {round(CONTROL_FIRST_AUDIO_SECONDS * 1000)} ms, worst {control_worst} ms;"
+              f" {underruns} underrun(s) inside a block, the host late with the audio."
               f" The strip's gap over the chips row: {gap412:.1f}px at 412x915, {gap393:.1f}px at 393x852,"
               f" {gap_desk:.1f}px on a desk, {gap375:.1f}px at 375x812. Strip order Previous, k of n, Next, Pause,"
               f" Stop in one line at 393, 375 and on a desk; the bar's Pause and Stop {bar375['readWidth']:.0f}px and"

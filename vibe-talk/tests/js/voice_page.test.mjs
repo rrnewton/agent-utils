@@ -12124,18 +12124,23 @@ test("THE SENTENCE BEING SAID is lit inside the block being read, by its share o
   assert.equal(page.expireTimers(150), 1, "nothing looked for the sentence being said");
   await page.settle();
   assert.equal(litSentence(highlights), "One two three.");
+  // 1.4 s has arrived, and 1.36 s of it said: half the estimate, where by what has arrived it would
+  // be nearly all of it.
+  page.audio.currentTime = 0.6;
+  stream.controller.bytes(pcm(...new Array(1200).fill(0x2000)));
+  await page.settle();
   page.audio.currentTime = 0.5 + 1.36;
   page.expireTimers(150);
   await page.settle();
   assert.equal(litSentence(highlights), "Four five six!", "the estimate did not move the light on");
-  // All of it arrives, before the first part has run out: one second long. Its length is now the
+  // All of it arrives, before the first part has run out: two seconds long. Its length is now the
   // audio's own.
   page.audio.currentTime = 0.6;
-  stream.controller.bytes(pcm(...new Array(800).fill(0x2000)));
+  stream.controller.bytes(pcm(...new Array(600).fill(0x2000)));
   await page.settle();
   stream.controller.drop();
   await page.settle();
-  page.audio.currentTime = 0.5 + 0.95;
+  page.audio.currentTime = 0.5 + 1.9;
   page.expireTimers(150);
   await page.settle();
   assert.equal(litSentence(highlights), "Seven eight?");
@@ -12150,6 +12155,42 @@ test("THE SENTENCE BEING SAID is lit inside the block being read, by its share o
   await page.settle();
   assert.equal(highlights.has("read-aloud-sentence"), false, "the sentence stayed lit after the read stopped");
   assert.equal(page.expireTimers(150), 0, "the page kept looking for a sentence with nothing being read");
+});
+
+test("a stall in the middle of a block holds the sentence light through the silence, and it never runs ahead", async () => {
+  // `#472 gate-flake-hardening`. On a loaded host the browser check saw the light reach the third
+  // sentence and go back to the second: an underrun's silence was counted as speech.
+  const { page, rows, highlights } = await sentencedRead();
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  const stream = page.audioStreams[0];
+  const look = async (at) => {
+    page.audio.currentTime = at;
+    page.expireTimers(150);
+    await page.settle();
+    return litSentence(highlights);
+  };
+  // A fifth of a second, due at 0.5 s, runs out at 0.7 s, and nothing more comes until 1.5 s: the
+  // clock runs on through a silence nobody has measured yet, and 0.2 s of speech is still the first
+  // sentence, not the second the clock alone reaches.
+  stream.controller.bytes(joined(wavHeader(1000, 1), pcm(...new Array(200).fill(0x2000))));
+  await page.settle();
+  assert.equal(await look(1.5), "One two three.", "the light ran on into the stall");
+  // The next piece comes at 1.5 s, due a doubled lead later, at 2.5 s: 1.8 s of silence after 0.2 s of
+  // speech. 0.55 s said of an estimated 2.72 s is the first sentence still.
+  stream.controller.bytes(pcm(...new Array(600).fill(0x2000)));
+  await page.settle();
+  assert.equal(await look(2.85), "One two three.", "the light ran on through the silence");
+  // The rest arrives, 2.72 s of speech in all, and the block is whole. Its length is its speech,
+  // not its speech and the silence: nothing goes back, and each sentence comes as it is said.
+  page.audio.currentTime = 2.9;
+  stream.controller.bytes(pcm(...new Array(1920).fill(0x2000)));
+  await page.settle();
+  stream.controller.drop();
+  await page.settle();
+  assert.equal(await look(2.9), "One two three.", "the block's arrival moved the light");
+  assert.equal(await look(4.1), "Four five six!", "1.8 s of 2.72 s said is the second sentence");
+  assert.equal(await look(4.5), "Seven eight?", "2.2 s of 2.72 s said is the third sentence");
 });
 
 test("a block of one sentence lights no sentence, and a browser without the highlight API looks for none", async () => {

@@ -33120,6 +33120,9 @@ function streamingPlayer(url, context, clock = readClock()) {
   // Where this part's audio begins and ends on the audio clock, as far as it has arrived.
   let firstAt = null;
   let lastEnd = 0;
+  // Where on the audio clock this part fell silent between its first sample and its last, each
+  // `[from, to]`: its underruns. `#472 gate-flake-hardening`.
+  const gaps = [];
   let lead = STREAM_START_LEAD_SECONDS;
 
   const silence = () => {
@@ -33166,7 +33169,9 @@ function streamingPlayer(url, context, clock = readClock()) {
     } else if (clock.playAt < now + 0.005) {
       // An underrun: start again a longer lead ahead.
       lead = Math.min(STREAM_MAX_LEAD_SECONDS, lead * 2);
+      const ranOut = clock.playAt;
       clock.playAt = now + lead;
+      if (firstAt !== null) gaps.push([Math.max(ranOut, firstAt), clock.playAt]);
     }
     const playAt = clock.playAt;
     node.start(playAt);
@@ -33313,10 +33318,11 @@ function streamingPlayer(url, context, clock = readClock()) {
     hearsSpeech: true,
     /**
      * `#379 read-aloud-sentences`. Where this part plays on the audio clock: when its first sample
-     * is due (null before any is), when what has arrived ends, and whether that is all of it.
+     * is due (null before any is), when what has arrived ends, whether that is all of it, and the
+     * silences an underrun left in between (`silentBefore`).
      */
     timeline() {
-      return { startsAt: firstAt, endsAt: lastEnd, finished: finished && waiting.length === 0 };
+      return { startsAt: firstAt, endsAt: lastEnd, finished: finished && waiting.length === 0, gaps: gaps.slice() };
     },
     addEventListener(type, fn) {
       if (!listeners.has(type)) listeners.set(type, []);
@@ -33510,7 +33516,19 @@ function learnSpeakingRate(player, segment, blocks) {
   const chars = listed && Number(listed.chars);
   const timeline = player.timeline();
   if (!chars || chars < 40 || !timeline.finished || timeline.startsAt === null) return;
-  learnedSecondsPerChar = (timeline.endsAt - timeline.startsAt) / chars;
+  learnedSecondsPerChar = (timeline.endsAt - timeline.startsAt - silentBefore(timeline, timeline.endsAt)) / chars;
+}
+
+/**
+ * How long a part's audio clock ran with nothing to play before `at`, from its first sample: the
+ * underruns, which say nothing. `#472 gate-flake-hardening`: counted as speech, a stall in the
+ * middle of a block moved the light on through the silence, then BACK a sentence once the block had
+ * arrived whole and its length was the audio's own, gaps and all.
+ */
+function silentBefore(timeline, at) {
+  let silent = 0;
+  for (const [from, to] of timeline.gaps || []) silent += Math.max(0, Math.min(to, at) - from);
+  return silent;
 }
 
 /**
@@ -33600,9 +33618,13 @@ function showReadingSentence() {
   const chars = Number(listed && listed.chars) || sentences.reduce((sum, one) => sum + one.length, 0);
   const pace = readSpeed === null ? 1 : readSpeed / 100;
   const perChar = learnedSecondsPerChar === null ? READ_SECONDS_PER_CHAR / pace : learnedSecondsPerChar;
-  const arrived = timeline.endsAt - timeline.startsAt;
+  const arrived = timeline.endsAt - timeline.startsAt - silentBefore(timeline, timeline.endsAt);
   const length = timeline.finished ? arrived : Math.max(arrived, chars * perChar);
-  const through = Math.min(1, Math.max(0, (readAloudContext.currentTime - timeline.startsAt) / length));
+  // Nothing past the end of what has arrived has been said: the clock running on into a stall is
+  // silence before its gap is known, which only the next piece's arrival records.
+  const heard = Math.min(readAloudContext.currentTime, timeline.endsAt);
+  const said = heard - timeline.startsAt - silentBefore(timeline, heard);
+  const through = Math.min(1, Math.max(0, said / length));
   const total = sentences.reduce((sum, one) => sum + one.length, 0);
   let reached = 0;
   let index = sentences.length - 1;
