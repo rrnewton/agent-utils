@@ -59,7 +59,8 @@
 //! There is no Events API or Socket Mode connection: new messages arrive through the server's
 //! ordinary bounded live polling, which reads a conversation's main timeline and the new replies of
 //! the threads rooted on its newest page whose root moved (`#307 slack-reply-live`,
-//! `slack/live.rs`). A reply's edit or deletion, and a reply in a thread rooted further back, are
+//! `slack/live.rs`), and, where an adapter tails Slack's own event stream, as that stream's records
+//! with their text, normalized here as a read would be (`#452 slack-live-ingest`, `slack/tail.rs`). A reply's edit or deletion, and a reply in a thread rooted further back, are
 //! read when the thread, Flat or the newest messages are read.
 //!
 //! An emoji written in a message is Slack's short name between colons, and a standard one is read
@@ -88,6 +89,7 @@ mod mentions;
 pub mod mrkdwn;
 mod range;
 mod reactions;
+pub mod tail;
 mod threads;
 mod timeline;
 

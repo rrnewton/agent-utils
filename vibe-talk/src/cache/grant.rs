@@ -61,6 +61,11 @@ pub enum ServerFill {
     Poller,
     /// Changes an authenticated provider adapter pushed to the ingest routes.
     Ingest,
+    /// New messages a provider's own event stream delivered with their text (`#452
+    /// slack-live-ingest`). Offered as an adapter's push, whose text a later read proves whole,
+    /// but never as a feed that vouches for what it did not report: the stream carries no edits,
+    /// deletions or other bots' posts.
+    Stream,
     /// The messages this server posted itself.
     OwnPost,
     /// A scheduled read that keeps spans already held current.
@@ -73,9 +78,10 @@ pub enum ServerFill {
 
 impl ServerFill {
     /// Every kind, in declaration order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Poller,
         Self::Ingest,
+        Self::Stream,
         Self::OwnPost,
         Self::Refresher,
         Self::Backfill,
@@ -88,6 +94,7 @@ impl ServerFill {
         match self {
             Self::Poller => "poller",
             Self::Ingest => "ingest",
+            Self::Stream => "stream",
             Self::OwnPost => "own-post",
             Self::Refresher => "refresher",
             Self::Backfill => "backfill",
@@ -179,6 +186,7 @@ mod tests {
             HashSet::from([
                 "poller",
                 "ingest",
+                "stream",
                 "own-post",
                 "refresher",
                 "backfill",

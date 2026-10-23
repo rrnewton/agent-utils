@@ -387,6 +387,32 @@ pub(crate) fn prepared_body(
     }
 }
 
+/// Prepare one message arriving on the live path for its readers, as an adapter's event and a
+/// provider's pushed stream record both are: whatever arrived in the server-owned fields is
+/// overwritten, the spoken time and body are filled in, so a page relays it with no second round
+/// trip, and its thread is coloured at `scope` (`#427 server-thread-hues`). `#452
+/// slack-live-ingest`.
+///
+/// The rendered body and its heading are cleared: only this server's renderer writes HTML a page
+/// inserts, and it does so on the way out to each page (`live::judge`).
+pub(crate) async fn prepare_arrival(
+    state: &AppState,
+    scope: crate::auth::Scope,
+    channel: &ChannelId,
+    message: &mut Message,
+) {
+    message.content_html = String::new();
+    message.heading = None;
+    message.spoken_time = crate::clock::spoken(&message.timestamp, &state.config.timezone);
+    message.spoken_content = prepared_body(
+        state,
+        &message.content,
+        &message.mentions,
+        jiff::Timestamp::now().as_millisecond(),
+    );
+    attach_message_hues(state, scope, channel, std::slice::from_mut(message)).await;
+}
+
 /// One fetched window of a channel, and what it took to fetch it.
 ///
 /// The `limit` is carried alongside the messages for one reason: without it, `messages.len()` is

@@ -1882,10 +1882,15 @@ async fn a_pollers_publish_never_undoes_an_edit_or_a_deletion_learned_while_its_
             );
         }
 
-        // The walk comes back later still, and publishes the message as it read it.
+        // The walk comes back later still, and publishes the message as it read it — unless the
+        // live feed has published its deletion meanwhile, which the hub remembers: a deleted
+        // message is not news again (`#452 slack-live-ingest`).
         clock.advance(MINUTE);
         drop(release);
-        assert_eq!(poll.await.expect("joined").expect("polled"), 1);
+        assert_eq!(
+            poll.await.expect("joined").expect("polled"),
+            usize::from(!bridge)
+        );
         if bridge {
             assert!(
                 tombstoned(&d.cache, &read_chan(), &fresh),

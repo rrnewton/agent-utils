@@ -415,6 +415,11 @@ pub struct ProviderProfile {
     key: String,
     name: String,
     tallies: Mutex<Tallies>,
+    /// How many operations other than the backfill's are running against the provider now, and
+    /// when the last of them ended. `#453 cache-backfill`: the backfill reads only while the
+    /// provider is otherwise idle ([`ProviderProfile::idle_for`]).
+    foreground: AtomicU64,
+    foreground_ended: Mutex<Option<Instant>>,
 }
 
 impl std::fmt::Debug for ProviderProfile {
@@ -431,6 +436,8 @@ impl ProviderProfile {
         Self {
             key: key.to_owned(),
             name: name.to_owned(),
+            foreground: AtomicU64::new(0),
+            foreground_ended: Mutex::new(None),
             tallies: Mutex::new(Tallies {
                 operations: BTreeMap::new(),
                 shim_calls: BTreeMap::new(),
@@ -446,6 +453,44 @@ impl ProviderProfile {
     #[must_use]
     pub fn key(&self) -> &str {
         &self.key
+    }
+
+    /// How long the provider has had no operation running other than the backfill's: `None`
+    /// while one runs, and the time since the process started counting when none has. `#453
+    /// cache-backfill`.
+    #[must_use]
+    pub fn idle_for(&self) -> Option<Duration> {
+        if self.foreground.load(Ordering::Acquire) > 0 {
+            return None;
+        }
+        let ended = *self
+            .foreground_ended
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        Some(ended.map_or(Duration::MAX, |ended| ended.elapsed()))
+    }
+
+    /// Run `work` counted as foreground use of the provider, unless the running task reads for
+    /// the backfill. `#453 cache-backfill`.
+    async fn foreground<F: std::future::Future>(&self, work: F) -> F::Output {
+        if ReadReason::current() == ReadReason::Backfill {
+            return work.await;
+        }
+        self.foreground.fetch_add(1, Ordering::AcqRel);
+        // Ended whether the work finishes or is dropped half way.
+        struct Ended<'p>(&'p ProviderProfile);
+        impl Drop for Ended<'_> {
+            fn drop(&mut self) {
+                *self
+                    .0
+                    .foreground_ended
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
+                self.0.foreground.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let _ended = Ended(self);
+        work.await
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Tallies> {
@@ -697,6 +742,17 @@ impl UpstreamProfile {
         let created = Arc::new(ProviderProfile::new(key, name));
         providers.push(Arc::clone(&created));
         created
+    }
+
+    /// The profile filed under provider `key`, when there is one.
+    #[must_use]
+    pub fn find(&self, key: &str) -> Option<Arc<ProviderProfile>> {
+        self.providers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|profile| profile.key == key)
+            .cloned()
     }
 
     fn all(&self) -> Vec<Arc<ProviderProfile>> {
@@ -1091,6 +1147,15 @@ impl Rows for Message {
     }
 }
 
+impl Rows for Option<Message> {
+    fn rows(&self) -> usize {
+        usize::from(self.is_some())
+    }
+    fn messages(&self) -> impl Iterator<Item = &Message> {
+        self.iter()
+    }
+}
+
 impl Rows for crate::threads::TimelinePage {
     fn rows(&self) -> usize {
         self.messages.len() + self.threads.len()
@@ -1348,7 +1413,7 @@ impl ProfiledClient {
             self.profile.record_reason(operation, ReadReason::current());
         }
         let timer = self.profile.start(Series::Operation, operation);
-        let result = timer.run(work).await;
+        let result = self.profile.foreground(timer.run(work)).await;
         match &result {
             Ok(value) => {
                 timer.finish(Outcome::Ok, value.rows());
@@ -1597,6 +1662,26 @@ impl ChatClient for ProfiledClient {
 
     fn polls_thread_replies(&self, channel: &ChannelId) -> bool {
         self.inner.polls_thread_replies(channel)
+    }
+
+    fn takes_pushed_messages(&self, channel: &ChannelId) -> bool {
+        self.inner.takes_pushed_messages(channel)
+    }
+
+    /// Timed: normalizing a pushed message may look its author up upstream. `#452
+    /// slack-live-ingest`.
+    async fn pushed_message(
+        &self,
+        channel: &ChannelId,
+        raw: serde_json::Value,
+    ) -> Result<Option<Message>, ChatError> {
+        self.timed(
+            "pushed_message",
+            Direction::Read,
+            About::channel(channel),
+            self.inner.pushed_message(channel, raw),
+        )
+        .await
     }
 
     async fn fetch_live(

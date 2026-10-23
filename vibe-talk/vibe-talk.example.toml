@@ -188,15 +188,23 @@ read_token = "REPLACE-ME-at-least-24-characters"
 write_token = "REPLACE-ME-different-and-at-least-24-characters"
 
 # Optional provider-neutral input for an external adapter. Leave this whole section absent to
-# disable both POST /api/v1/live/events and POST /api/v1/live/hints. The token is deliberately
-# separate from both browser credentials and must be at least 24 characters. Both routes still
-# accept only channels from the allowlist below.
+# disable POST /api/v1/live/events, POST /api/v1/live/hints and /api/v1/live/tail. The token is
+# deliberately separate from both browser credentials and must be at least 24 characters. Every
+# route still accepts only channels from the allowlist below.
 #
 # Full pushed events remain a second source and are refused for a provider with
 # live_poll_seconds. Content-free hints MAY be combined with polling: they wake its one existing
-# cursor rather than publishing a second copy. Environment: VIBE_TALK_INGEST_TOKEN
+# cursor rather than publishing a second copy. A Slack provider's own stream records, text
+# included, go to /api/v1/live/tail and may be combined with polling too: the poller and the
+# records publish each message once between them (#452 slack-live-ingest).
+# Environment: VIBE_TALK_INGEST_TOKEN
 # [ingest]
 # token = "REPLACE-ME-third-distinct-token-at-least-24-characters"
+# relist_seconds = 0                # 0 (off) or 30 to 86400: how often each channel whose
+#                                   # provider takes stream records has its newest page and its
+#                                   # recently active threads read again, for the edits, deletions
+#                                   # and other bots' posts the stream never carries
+# relist_threads = 4                # 0 to 16: recently active threads a relist reads per channel
 
 # Channels this server may touch. This list is an ALLOWLIST: a channel that is not here cannot be
 # read or posted to through the API even with a valid token, however many channels the bot is in.
@@ -412,7 +420,9 @@ enabled = true
 # max_days = 90                     # 1 to 365, counted by each message's own time. 0 is refused,
 #                                   # not read as unlimited
 # max_megabytes = 256               # 16 to 4096: the file and its -wal and -shm together
-# backfill = "adaptive"             # "adaptive" or "off". No effect in this build
+# backfill = "adaptive"             # "adaptive": walk each cached channel's newest pages back
+#                                   # into the cache while its provider is otherwise idle, one
+#                                   # page at a time (#453 cache-backfill). "off": no such reads
 # timeline_fallback_ms = 10000      # 1000 to 60000. No effect in this build
 #
 # A conversation the provider keeps for less time can have its own age limit:

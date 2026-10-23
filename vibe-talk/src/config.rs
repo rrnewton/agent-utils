@@ -978,9 +978,26 @@ pub struct AuthConfig {
 /// Authentication for provider-neutral live-event and change-hint ingestion.
 #[derive(Debug, Default)]
 pub struct IngestConfig {
-    /// Dedicated bearer token. `None` means both live-adapter routes are disabled.
+    /// Dedicated bearer token. `None` means every live-adapter route is disabled.
     pub token: Option<Secret>,
+    /// How often, in seconds, each channel a provider's event stream feeds has its newest page
+    /// and its recently active threads read again, to publish the edits and deletions the stream
+    /// never carries. `0` (the default) turns the relist off. `#452 slack-live-ingest`; see
+    /// [`crate::relist`].
+    pub relist_seconds: u64,
+    /// The most recently active threads of one channel each relist reads, besides its newest
+    /// page.
+    pub relist_threads: usize,
 }
+
+/// The shortest relist interval the configuration accepts, in seconds.
+pub const MIN_RELIST_SECONDS: u64 = 30;
+/// The longest relist interval the configuration accepts, in seconds: a day.
+pub const MAX_RELIST_SECONDS: u64 = 86_400;
+/// Default `[ingest] relist_threads`.
+pub const DEFAULT_RELIST_THREADS: usize = 4;
+/// The most threads one relist of a channel may read.
+pub const MAX_RELIST_THREADS: usize = 16;
 
 impl IngestConfig {
     /// Whether an adapter may deliver events or change hints to this server.
@@ -1275,6 +1292,8 @@ struct FileAuth {
 #[serde(deny_unknown_fields)]
 struct FileIngest {
     token: Option<Secret>,
+    relist_seconds: Option<u64>,
+    relist_threads: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1514,6 +1533,26 @@ impl Config {
                 });
             }
         }
+        // `#452 slack-live-ingest`. The relist reads every channel a provider's stream feeds
+        // once an interval, forever, so its floor is a rate limit's and its ceiling a day's.
+        let relist_seconds = file.ingest.relist_seconds.unwrap_or(0);
+        if relist_seconds != 0
+            && !(MIN_RELIST_SECONDS..=MAX_RELIST_SECONDS).contains(&relist_seconds)
+        {
+            return Err(ConfigError::Invalid {
+                field: "ingest.relist_seconds".to_owned(),
+                detail: format!(
+                    "must be 0 (off) or from {MIN_RELIST_SECONDS} to {MAX_RELIST_SECONDS} seconds"
+                ),
+            });
+        }
+        let relist_threads = file.ingest.relist_threads.unwrap_or(DEFAULT_RELIST_THREADS);
+        if relist_threads > MAX_RELIST_THREADS {
+            return Err(ConfigError::Invalid {
+                field: "ingest.relist_threads".to_owned(),
+                detail: format!("must be from 0 to {MAX_RELIST_THREADS}"),
+            });
+        }
         // Full pushed EVENTS and polling remain mutually exclusive PER CHANNEL: the event route
         // refuses a polled provider's channels below. The token may nevertheless coexist with a
         // polling provider because `/live/hints` carries no message — it wakes that provider's
@@ -1585,6 +1624,8 @@ impl Config {
             },
             ingest: IngestConfig {
                 token: ingest_token,
+                relist_seconds,
+                relist_threads,
             },
             channels,
             read_aloud: ReadAloudConfig {

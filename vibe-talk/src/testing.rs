@@ -1078,6 +1078,18 @@ impl crate::chat::ChatClient for CountingChat {
         self.inner.polls_thread_replies(channel)
     }
 
+    fn takes_pushed_messages(&self, channel: &crate::model::ChannelId) -> bool {
+        self.inner.takes_pushed_messages(channel)
+    }
+
+    async fn pushed_message(
+        &self,
+        channel: &crate::model::ChannelId,
+        raw: serde_json::Value,
+    ) -> Result<Option<crate::model::Message>, crate::chat::ChatError> {
+        self.inner.pushed_message(channel, raw).await
+    }
+
     async fn fetch_live(
         &self,
         channel: &crate::model::ChannelId,

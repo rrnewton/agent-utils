@@ -613,9 +613,10 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(
             events_route = "/api/v1/live/events",
             hints_route = "/api/v1/live/hints",
+            tail_route = "/api/v1/live/tail",
             "live adapter input is ON: an authenticated provider adapter may publish normalized \
-             events for unpolled channels or wake a polled channel's authoritative cursor with \
-             a content-free change hint"
+             events for unpolled channels, post its provider's own stream records with their \
+             text, or wake a polled channel's authoritative cursor with a content-free change hint"
         );
     }
     for entry in providers.entries() {
@@ -787,6 +788,33 @@ async fn main() -> anyhow::Result<()> {
                 std::time::Duration::from_secs(entry.live_poll_seconds),
             ));
         }
+    }
+    // `#452 slack-live-ingest`. The relist reads each channel a provider's event stream feeds
+    // again on its interval, for the edits and deletions the stream never carries.
+    if state.config.ingest.relist_seconds > 0 {
+        tracing::info!(
+            interval_seconds = state.config.ingest.relist_seconds,
+            threads = state.config.ingest.relist_threads,
+            "the relist is ON: each channel of a provider that takes pushed messages has its newest              page and its recently active threads read again on this interval"
+        );
+        tokio::spawn(vibe_talk::relist::relist_forever(
+            state.clone(),
+            std::time::Duration::from_secs(state.config.ingest.relist_seconds),
+            live_limit,
+            state.config.ingest.relist_threads,
+        ));
+    }
+    // `#453 cache-backfill`. Walks each cached channel's history into the message cache while
+    // its provider is otherwise idle; returns at once with `backfill = "off"`.
+    if state
+        .message_cache
+        .lifecycle()
+        .is_some_and(|lifecycle| lifecycle.configured())
+    {
+        tokio::spawn(vibe_talk::relist::backfill_forever(
+            state.clone(),
+            live_limit,
+        ));
     }
     // `#232 upstream-mark-read`. Only a provider that can clear its own unread state gets the
     // loop; it is off for every channel until the owner sets one in Settings.

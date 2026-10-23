@@ -101,6 +101,12 @@ pub enum ReadReason {
     /// The server: telling whether moving a channel's provider read marker after a reply would
     /// clear more than the channel holds. `#300 reply-marks-read`.
     ReplyMark,
+    /// The server: reading a channel's newest page and its recently active threads again, for the
+    /// edits and deletions a provider's event stream never carries. `#452 slack-live-ingest`.
+    Relist,
+    /// The server: walking a channel's older history to fill the message cache. `#453
+    /// cache-backfill`.
+    Backfill,
     /// A reason was given, but it is not one the page sends.
     Other,
     /// No reason was given at all.
@@ -108,7 +114,7 @@ pub enum ReadReason {
 }
 
 /// Every reason, in declaration order. For tests and documentation.
-pub const ALL: [ReadReason; 26] = [
+pub const ALL: [ReadReason; 28] = [
     ReadReason::Enter,
     ReadReason::Poll,
     ReadReason::Live,
@@ -133,6 +139,8 @@ pub const ALL: [ReadReason; 26] = [
     ReadReason::Shadow,
     ReadReason::Tool,
     ReadReason::ReplyMark,
+    ReadReason::Relist,
+    ReadReason::Backfill,
     ReadReason::Other,
     ReadReason::Untagged,
 ];
@@ -166,6 +174,8 @@ impl ReadReason {
             Self::Shadow => "shadow",
             Self::Tool => "tool",
             Self::ReplyMark => "reply-mark",
+            Self::Relist => "relist",
+            Self::Backfill => "backfill",
             Self::Other => "other",
             Self::Untagged => "untagged",
         }

@@ -186,6 +186,12 @@ fn routes(state: AppState) -> Router {
         .route("/api/v1/client-config", get(api::client_config))
         .route("/api/v1/live/events", post(api::ingest_event))
         .route("/api/v1/live/hints", post(api::ingest_hint))
+        // `#452 slack-live-ingest`. The ingest credential, not a browser token: an adapter posts
+        // its provider's stream records here, and asks which conversations to tail.
+        .route(
+            "/api/v1/live/tail",
+            post(api::ingest_tail).get(api::tail_channels),
+        )
         // READ scope. It reports configuration health and never a credential, it writes nothing
         // durable, and it always answers 200 — the report is the answer, so a failing check is
         // not an HTTP failure. See `api::diagnostics`.

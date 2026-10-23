@@ -118,6 +118,14 @@ fn inventory() -> Vec<Route> {
             Ingest,
             OwnJson(r#"{"channel_id":"3333333333333333333"}"#),
         ),
+        // `#452 slack-live-ingest`: a provider's stream records, and what to tail.
+        route(
+            "POST",
+            "/api/v1/live/tail",
+            Ingest,
+            OwnJson(r#"{"type":"HEARTBEAT"}"#),
+        ),
+        route("GET", "/api/v1/live/tail", Ingest, Nothing),
         route("GET", "/api/v1/diagnostics", Read, Nothing),
         route("GET", "/api/v1/signed-url", Write, Nothing),
         // `#369 pairing-link`.

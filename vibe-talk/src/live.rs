@@ -11,6 +11,12 @@
 //! receive content-free `/api/v1/live/hints`: a hint merely wakes its existing cursor, while the
 //! periodic interval remains the recovery path, so it is not a second producer.
 //!
+//! A Slack provider's own event-stream records, text included, are the one producer allowed
+//! beside the poller (`/api/v1/live/tail`, `#452 slack-live-ingest`; see [`crate::live_tail`]):
+//! the hub remembers the messages it created ([`CREATED_MEMORY`]), so whichever of the record and
+//! the poller's read comes second publishes nothing new, and a read that says more than the
+//! record goes out as an update.
+//!
 //! # The built-in Discord source is bounded POLLING, not a Gateway connection
 //!
 //! Discord's real-time mechanism is the Gateway, and this server does not use it. It keeps a
@@ -168,6 +174,39 @@ pub const MAX_EVENT_ID_BYTES: usize = 256;
 /// Namespace that keeps an adapter's numeric event id from being mistaken for a message cursor.
 const INGEST_EVENT_PREFIX: &str = "push:";
 
+/// How many created messages per channel the hub remembers, with the copy each was published
+/// with. `#452 slack-live-ingest`.
+///
+/// Two producers may now publish the same new message: a provider's event stream pushes it with
+/// its text, and the poller's walk forward reads it again moments later. Whichever comes second
+/// finds it here and publishes nothing new: the poller's copy goes out as an update only when it
+/// says something the pushed one did not (a file, a reaction, a name the stream did not carry).
+/// A window over the recently created messages, not a record: the poller follows the stream by
+/// one poll interval, and a channel creates far fewer than this many messages in one.
+pub const CREATED_MEMORY: usize = 512;
+
+/// How old a pushed message may be, by its own id, and still be published as news before the
+/// poller has seeded the channel. `#452 slack-live-ingest`.
+///
+/// After the seed, the poller's cursor decides first: anything at or behind it is history the
+/// page already read or the poller already published. Before it, nothing says what a page has
+/// read, so only a message this recent is news; an older one is a stream replaying its history
+/// after a restart, and is left to reads.
+pub const PUSH_NEWS_MS: i64 = 2 * 60 * 1000;
+
+/// How old a pushed message may be, by its own id, and still be published as news at all.
+/// `#452 slack-live-ingest`.
+///
+/// A stream resuming from a position an hour back replays messages newer than the poller's
+/// cursor only if the poller has not walked that far, and older than the hub's memory of what it
+/// created: without this bound they would go out again as news. A record this late is left to
+/// the poller, whose walk publishes what it never saw.
+pub const PUSH_STALE_MS: i64 = 15 * 60 * 1000;
+
+/// How many threads per channel the relist remembers as recently active. `#452
+/// slack-live-ingest`.
+pub const ACTIVE_THREAD_MEMORY: usize = 32;
+
 /// How many messages per channel the hub remembers reaction sets for. `#378 live-reactions`.
 ///
 /// The diff memory behind the poller's reaction refresh: a window over the recently visible
@@ -256,6 +295,73 @@ struct Feed {
     tail: VecDeque<LiveMessage>,
     dedupe_order: VecDeque<String>,
     dedupe: BTreeSet<String>,
+    /// The recently created messages, oldest first, with the copy each was last published with,
+    /// or `None` once its deletion was ([`CREATED_MEMORY`]). `#452 slack-live-ingest`. A deleted
+    /// one is remembered too, so a late copy of it is never published as news again.
+    created_order: VecDeque<MessageId>,
+    created: BTreeMap<MessageId, Option<Message>>,
+}
+
+/// Where the poller stands in one channel. `#452 slack-live-ingest`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PollerCursor {
+    /// What it seeded from: everything at or behind it, thread replies included, is history.
+    seed: u64,
+    /// The newest of the channel's own messages it has walked to. A thread reply is placed by
+    /// its own thread, not by this: one behind it may not have been published yet.
+    walked: u64,
+}
+
+/// What became of a create a producer offered the hub. `#452 slack-live-ingest`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Published {
+    /// It went out as a new message.
+    New,
+    /// The message was already out; this copy said something more, and went out as an update.
+    Updated,
+    /// The message was already out, and this copy said nothing new: nothing was published.
+    Known,
+    /// A pushed message at or behind the poller's cursor, or too old to be news: history a page
+    /// reads, never announced.
+    History,
+}
+
+/// How a create is checked against the messages already created. `#452 slack-live-ingest`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CreatedCheck {
+    /// Not checked: the producer is the only one that can publish it (an adapter's typed event,
+    /// a correction, an update). A create is still remembered.
+    Unchecked,
+    /// A provider's event stream pushed it: a message already out is not published again.
+    Pushed,
+    /// A read found it: a message already out is published again only as an update, and only
+    /// when this copy differs.
+    Read,
+}
+
+/// Whether two copies of one message say the same thing to a reader. `#452 slack-live-ingest`.
+///
+/// What only this server adds is left out: the spoken forms, the rendered body, a thread's
+/// colour and a link, which every copy is given on its way to a reader anyway. So is a root's
+/// reply count, which different reads of one root report differently and every new reply moves:
+/// comparing it would publish an update per reply, and could go back and forth between reads. A
+/// copy that says nothing about reactions (a pushed one) agrees with any set, since absent is
+/// "not seen".
+fn same_to_a_reader(held: &Message, read: &Message) -> bool {
+    let thread = |message: &Message| {
+        message
+            .thread
+            .as_ref()
+            .map(|thread| (thread.id.clone(), thread.is_root))
+    };
+    held.content == read.content
+        && held.author == read.author
+        && held.author_id == read.author_id
+        && held.author_is_bot == read.author_is_bot
+        && held.edited_timestamp == read.edited_timestamp
+        && held.mentions == read.mentions
+        && thread(held) == thread(read)
+        && (read.reactions.is_none() || held.reactions == read.reactions)
 }
 
 /// One event as the stream of every channel carries it: its place in the hub's single order of
@@ -301,6 +407,16 @@ struct AllFeed {
 /// of them goes stale.
 pub struct LiveHub {
     feeds: Mutex<BTreeMap<ChannelId, Feed>>,
+    /// The poller's cursor in each channel, from its seed on: every message at or behind it is
+    /// history a page has read or the poller has published. `#452 slack-live-ingest`; see
+    /// [`LiveHub::publish_pushed`].
+    seeded: Mutex<BTreeMap<ChannelId, PollerCursor>>,
+    /// Channels whose next relist was asked for early: a stream that lost records. `#452
+    /// slack-live-ingest`; see [`crate::relist`].
+    relist_wanted: Mutex<BTreeSet<ChannelId>>,
+    /// The threads each channel's stream recently pushed a reply in, newest last, with when.
+    /// `#452 slack-live-ingest`: what the relist reads besides each channel's newest page.
+    active_threads: Mutex<BTreeMap<ChannelId, VecDeque<(String, i64)>>>,
     /// Every channel's events in the one order they were published, for a page in a call. `#337
     /// voice-relay-silent`. Taken only while `feeds` is held, so that order is the feeds' order.
     all: Mutex<AllFeed>,
@@ -364,6 +480,9 @@ impl LiveHub {
             .expect("the system CSPRNG must be available to name a live hub");
         Self {
             feeds: Mutex::new(BTreeMap::new()),
+            seeded: Mutex::new(BTreeMap::new()),
+            relist_wanted: Mutex::new(BTreeSet::new()),
+            active_threads: Mutex::new(BTreeMap::new()),
             all: Mutex::new(AllFeed {
                 sender: all_sender,
                 tail: VecDeque::new(),
@@ -635,12 +754,15 @@ impl LiveHub {
     /// now, so an edit or a deletion the cache learned of while the read was on its way back is not
     /// undone by it, and an erase made meanwhile drops it as it drops the read's own offers.
     /// `#208 persistent-cache`.
+    ///
+    /// A message a provider's event stream already pushed is not published again (`#452
+    /// slack-live-ingest`): this copy goes out as an update only when it says more.
     fn publish_read(
         &self,
         channel: &ChannelId,
         message: Message,
         read: Option<crate::cache::ReadStart>,
-    ) {
+    ) -> Published {
         let self_posted = self.is_self_posted(&message.id);
         let live = LiveMessage {
             event_id: message.id.as_str().to_owned(),
@@ -649,7 +771,7 @@ impl LiveHub {
             message,
             self_posted,
         };
-        self.publish_inner(channel, live, false, read);
+        self.publish_inner(channel, live, false, read, CreatedCheck::Read)
     }
 
     /// Publish one thread reply a provider read apart from the channel's own timeline, and
@@ -673,7 +795,7 @@ impl LiveHub {
         channel: &ChannelId,
         message: Message,
         read: Option<crate::cache::ReadStart>,
-    ) {
+    ) -> Published {
         let self_posted = self.is_self_posted(&message.id);
         let live = LiveMessage {
             event_id: message.id.as_str().to_owned(),
@@ -682,7 +804,275 @@ impl LiveHub {
             message,
             self_posted,
         };
-        self.publish_to_feed(channel, live, false, read);
+        self.publish_checked(channel, live, false, read, CreatedCheck::Read)
+    }
+
+    /// Publish one new message a provider's own event stream pushed with its text, without
+    /// reading it again. `#452 slack-live-ingest`.
+    ///
+    /// Published as the poller would publish the same message — its id as its event id, a thread
+    /// reply (`reply`) not offered for clearing unread, as [`LiveHub::publish_reply`] — so that a
+    /// page cannot tell the two producers apart, and the poller's later read of it publishes
+    /// nothing new ([`CREATED_MEMORY`]). Offered to the message cache as an adapter's push, whose
+    /// text a later read proves whole (merge rule 5), under [`crate::cache::ServerFill::Stream`],
+    /// which never lets the provider's feed vouch for what the stream did not carry.
+    ///
+    /// Not published at all when the message is already out ([`Published::Known`]), or is
+    /// history ([`Published::History`], [`LiveHub::is_history`]): at or behind the poller's
+    /// cursor, older than [`PUSH_STALE_MS`], or, before any seed, older than [`PUSH_NEWS_MS`] at
+    /// `now_ms`. A stream replays its
+    /// recent history when it resumes, and a page has already read that history; announcing it
+    /// again would relay old words into a live conversation as news.
+    pub fn publish_pushed(
+        &self,
+        channel: &ChannelId,
+        message: Message,
+        reply: bool,
+        now_ms: i64,
+    ) -> Published {
+        if self.is_history(channel, &message.id, reply, now_ms) {
+            return Published::History;
+        }
+        if reply {
+            if let Some(thread) = message.thread.as_ref() {
+                self.note_thread_activity(channel, &thread.id, now_ms);
+            }
+        }
+        let self_posted = self.is_self_posted(&message.id);
+        let live = LiveMessage {
+            event_id: message.id.as_str().to_owned(),
+            kind: LiveKind::Create,
+            historical: false,
+            message,
+            self_posted,
+        };
+        if reply {
+            self.publish_checked(channel, live, true, None, CreatedCheck::Pushed)
+        } else {
+            self.publish_inner(channel, live, true, None, CreatedCheck::Pushed)
+        }
+    }
+
+    /// Publish what a relist of one scope of `channel` found changed: each message readers were
+    /// given that the listing holds differently, as an update, and each that lies inside the
+    /// listing's span and is gone from it, as a deletion. `#452 slack-live-ingest`; see
+    /// [`crate::relist`].
+    ///
+    /// `thread` is the thread the listing read, or `None` for the channel's own timeline, which
+    /// lists thread roots and the messages nobody answered, never a reply: only those can be
+    /// missing from it. What readers were given is the hub's own: the copies it published
+    /// ([`CREATED_MEMORY`]) and the channel's held window. The span runs from the listing's
+    /// oldest message up to `proven_until_ms` (provider time), or to its newest message when
+    /// that is later: a newest page lists everything from its oldest message to the instant its
+    /// read began, and the caller holds that instant back by a settling margin, so a message
+    /// created just before the read, which the provider may not list yet, is never taken for a
+    /// deleted one. A message the provider leaves out of every read (one with no author) is never
+    /// one readers were given. An empty listing proves nothing, and deletes nothing.
+    ///
+    /// An update is not offered to the message cache, which the relist's own read already
+    /// offered whole; a deletion is, as a push, since a listing that may leave messages out is
+    /// no proof of a deletion to the cache. Each is checked under the feed lock against the copy
+    /// it replaces, as a correction is, so a newer copy is never put back.
+    pub fn publish_relisted(
+        &self,
+        channel: &ChannelId,
+        listed: &[Message],
+        thread: Option<&str>,
+        proven_until_ms: i64,
+    ) -> (usize, usize) {
+        let in_scope = |message: &Message| match thread {
+            None => message.thread.as_ref().is_none_or(|held| held.is_root),
+            Some(thread) => message
+                .thread
+                .as_ref()
+                .is_some_and(|held| held.id == thread),
+        };
+        let span = listed
+            .iter()
+            .filter(|message| in_scope(message))
+            .filter_map(|message| message.id.numeric())
+            .fold(None, |span: Option<(u64, u64)>, id| match span {
+                None => Some((id, id)),
+                Some((low, high)) => Some((low.min(id), high.max(id))),
+            })
+            .map(|(low, high)| {
+                let proven = MessageId::at_time_ms(proven_until_ms)
+                    .numeric()
+                    .unwrap_or(0);
+                (low, high.max(proven))
+            });
+        // The held window's copy wins where both have one: it is the copy a correction is
+        // checked against below.
+        let (mut given, deleted): (BTreeMap<MessageId, Message>, BTreeSet<MessageId>) =
+            lock(&self.feeds)
+                .get(channel)
+                .map(|feed| {
+                    let given = feed
+                        .created
+                        .iter()
+                        .filter_map(|(id, held)| Some((id.clone(), held.clone()?)))
+                        .collect();
+                    let deleted = feed
+                        .created
+                        .iter()
+                        .filter(|(_, held)| held.is_none())
+                        .map(|(id, _)| id.clone())
+                        .collect();
+                    (given, deleted)
+                })
+                .unwrap_or_default();
+        for message in self
+            .recent
+            .snapshot(channel)
+            .held
+            .map(|held| held.messages)
+            .unwrap_or_default()
+        {
+            if !deleted.contains(&message.id) {
+                given.insert(message.id.clone(), message);
+            }
+        }
+        let listed_ids: BTreeSet<&MessageId> = listed.iter().map(|message| &message.id).collect();
+        let mut changes: Vec<(LiveKind, Message, Message)> = Vec::new();
+        for message in listed {
+            if let Some(held) = given.get(&message.id) {
+                if !same_to_a_reader(held, message) {
+                    changes.push((LiveKind::Update, message.clone(), held.clone()));
+                }
+            }
+        }
+        if let Some((low, high)) = span {
+            for (id, held) in &given {
+                let inside = id.numeric().is_some_and(|id| id >= low && id <= high);
+                if inside && in_scope(held) && !listed_ids.contains(id) {
+                    changes.push((LiveKind::Delete, held.clone(), held.clone()));
+                }
+            }
+        }
+        let (mut updates, mut deletes) = (0, 0);
+        for (kind, message, held) in changes {
+            let self_posted = kind != LiveKind::Delete && self.is_self_posted(&message.id);
+            let at = self
+                .updates
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            let live = LiveMessage {
+                event_id: format!("{}~r{}-{at}", message.id.as_str(), self.epoch),
+                kind,
+                historical: false,
+                message,
+                self_posted,
+            };
+            let offer = kind == LiveKind::Delete;
+            let published = self.publish_to_feed_offering(
+                channel,
+                live,
+                false,
+                None,
+                offer,
+                Some(&held),
+                CreatedCheck::Unchecked,
+            );
+            if published == Published::New {
+                match kind {
+                    LiveKind::Delete => deletes += 1,
+                    _ => updates += 1,
+                }
+            }
+        }
+        (updates, deletes)
+    }
+
+    /// Whether a pushed message `id` of `channel` is history rather than news at `now_ms`: at or
+    /// behind the poller's cursor, older than [`PUSH_STALE_MS`], or, before the poller has seeded
+    /// the channel, older than [`PUSH_NEWS_MS`]. `#452 slack-live-ingest`; see
+    /// [`LiveHub::publish_pushed`]. An id that does not order is never news.
+    ///
+    /// For a thread reply (`reply`) only the seed counts, not how far the poller has walked the
+    /// channel's own messages since: a reply posted just before a message the poller has
+    /// already walked past may still be unpublished, and in a thread rooted beyond the newest page
+    /// the poller would never publish it.
+    #[must_use]
+    pub fn is_history(
+        &self,
+        channel: &ChannelId,
+        id: &MessageId,
+        reply: bool,
+        now_ms: i64,
+    ) -> bool {
+        let Some(age) = id.created_at_ms().map(|at| now_ms.saturating_sub(at)) else {
+            return true;
+        };
+        match (lock(&self.seeded).get(channel).copied(), id.numeric()) {
+            (_, None) => true,
+            (Some(cursor), Some(numeric)) => {
+                let behind = if reply { cursor.seed } else { cursor.walked };
+                numeric <= behind || age > PUSH_STALE_MS
+            }
+            (None, Some(_)) => age > PUSH_NEWS_MS,
+        }
+    }
+
+    /// Record the cursor the poller seeded `channel` from, or has walked forward to since: it
+    /// only ever moves forward. `#452 slack-live-ingest`.
+    pub fn note_poller_cursor(&self, channel: &ChannelId, cursor: u64) {
+        let mut cursors = lock(&self.seeded);
+        let held = cursors.entry(channel.clone()).or_insert(PollerCursor {
+            seed: cursor,
+            walked: cursor,
+        });
+        held.walked = held.walked.max(cursor);
+    }
+
+    /// The newest of `channel`'s own messages the poller has walked to, once it has seeded the
+    /// channel.
+    #[must_use]
+    pub fn poller_cursor(&self, channel: &ChannelId) -> Option<u64> {
+        lock(&self.seeded).get(channel).map(|cursor| cursor.walked)
+    }
+
+    /// Forget the poller's cursor in `channel`: it is off the list, and seeds again if it comes
+    /// back.
+    pub fn forget_seeded(&self, channel: &ChannelId) {
+        lock(&self.seeded).remove(channel);
+    }
+
+    /// Ask for `channel`'s next relist now rather than at its interval. `#452 slack-live-ingest`.
+    pub fn request_relist(&self, channel: &ChannelId) {
+        lock(&self.relist_wanted).insert(channel.clone());
+    }
+
+    /// Take every channel whose relist was asked for early.
+    #[must_use]
+    pub fn take_relist_requests(&self) -> BTreeSet<ChannelId> {
+        std::mem::take(&mut *lock(&self.relist_wanted))
+    }
+
+    /// Remember that a reply was just pushed in `thread` of `channel`, at `now_ms`.
+    pub fn note_thread_activity(&self, channel: &ChannelId, thread: &str, now_ms: i64) {
+        let mut active = lock(&self.active_threads);
+        let threads = active.entry(channel.clone()).or_default();
+        threads.retain(|(held, _)| held != thread);
+        threads.push_back((thread.to_owned(), now_ms));
+        while threads.len() > ACTIVE_THREAD_MEMORY {
+            threads.pop_front();
+        }
+    }
+
+    /// The threads of `channel` a reply was pushed in at or after `since_ms`, most recent first.
+    #[must_use]
+    pub fn active_threads(&self, channel: &ChannelId, since_ms: i64) -> Vec<String> {
+        lock(&self.active_threads)
+            .get(channel)
+            .map(|threads| {
+                threads
+                    .iter()
+                    .rev()
+                    .filter(|(_, at)| *at >= since_ms)
+                    .map(|(thread, _)| thread.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Publish one event delivered by an external adapter.
@@ -705,7 +1095,7 @@ impl LiveHub {
             message,
             self_posted,
         };
-        self.publish_inner(channel, live, true, None)
+        self.publish_inner(channel, live, true, None, CreatedCheck::Unchecked) == Published::New
     }
 
     fn publish_inner(
@@ -714,18 +1104,19 @@ impl LiveHub {
         live: LiveMessage,
         deduplicate: bool,
         read: Option<crate::cache::ReadStart>,
-    ) -> bool {
+        check: CreatedCheck,
+    ) -> Published {
         // Both producers reach this, so it is where a created message is noted for clearing at
         // its provider: one map update and a wake-up, after the feed lock is released.
         let created = (live.kind == LiveKind::Create)
             .then(|| (live.message.id.clone(), live.message.timestamp.clone()));
-        if !self.publish_to_feed(channel, live, deduplicate, read) {
-            return false;
+        let published = self.publish_checked(channel, live, deduplicate, read, check);
+        if published == Published::New {
+            if let Some((id, timestamp)) = created {
+                self.upstream_clear.offer_parts(channel, &id, &timestamp);
+            }
         }
-        if let Some((id, timestamp)) = created {
-            self.upstream_clear.offer_parts(channel, &id, &timestamp);
-        }
-        true
+        published
     }
 
     /// Publish a correction of a message a reader may already have been shown: an edit or a
@@ -766,7 +1157,15 @@ impl LiveHub {
             message,
             self_posted,
         };
-        self.publish_to_feed_offering(channel, live, false, None, false, Some(served_as));
+        self.publish_to_feed_offering(
+            channel,
+            live,
+            false,
+            None,
+            false,
+            Some(served_as),
+            CreatedCheck::Unchecked,
+        );
     }
 
     fn publish_to_feed(
@@ -776,21 +1175,46 @@ impl LiveHub {
         deduplicate: bool,
         read: Option<crate::cache::ReadStart>,
     ) -> bool {
-        self.publish_to_feed_offering(channel, live, deduplicate, read, true, None)
+        self.publish_to_feed_offering(
+            channel,
+            live,
+            deduplicate,
+            read,
+            true,
+            None,
+            CreatedCheck::Unchecked,
+        ) == Published::New
     }
 
-    /// `replaces`, for a correction, is the copy readers were shown: when the held window has
-    /// since taken a different copy of the message, the correction publishes nothing, rather
-    /// than putting an older text back over it.
-    fn publish_to_feed_offering(
+    fn publish_checked(
         &self,
         channel: &ChannelId,
         live: LiveMessage,
         deduplicate: bool,
         read: Option<crate::cache::ReadStart>,
+        check: CreatedCheck,
+    ) -> Published {
+        self.publish_to_feed_offering(channel, live, deduplicate, read, true, None, check)
+    }
+
+    /// `replaces`, for a correction, is the copy readers were shown: when the held window has
+    /// since taken a different copy of the message, the correction publishes nothing, rather
+    /// than putting an older text back over it.
+    ///
+    /// `check` says how a create is held against the messages already created (`#452
+    /// slack-live-ingest`), under the feed lock, so a push and a read of the same message racing
+    /// each other publish it once.
+    #[allow(clippy::too_many_arguments)]
+    fn publish_to_feed_offering(
+        &self,
+        channel: &ChannelId,
+        mut live: LiveMessage,
+        deduplicate: bool,
+        read: Option<crate::cache::ReadStart>,
         offer_to_cache: bool,
         replaces: Option<&Message>,
-    ) -> bool {
+        check: CreatedCheck,
+    ) -> Published {
         let mut feeds = lock(&self.feeds);
         // A correction overtaken under this lock publishes nothing: the held window — raw
         // copies, as a serve hands back — now holds a copy of the message that is neither
@@ -806,18 +1230,59 @@ impl LiveHub {
                 })
                 .is_some_and(|now| now != replaces && *now != live.message);
             if overtaken {
-                return false;
+                return Published::Known;
             }
         }
         let feed = feeds.entry(channel.clone()).or_insert_with(new_feed);
         if deduplicate {
             if !feed.dedupe.insert(live.event_id.clone()) {
-                return false;
+                return Published::Known;
             }
             feed.dedupe_order.push_back(live.event_id.clone());
             while feed.dedupe_order.len() > INGEST_DEDUPE_MEMORY {
                 if let Some(evicted) = feed.dedupe_order.pop_front() {
                     feed.dedupe.remove(&evicted);
+                }
+            }
+        }
+        let mut outcome = Published::New;
+        if live.kind == LiveKind::Create && check != CreatedCheck::Unchecked {
+            if let Some(held) = feed.created.get(&live.message.id) {
+                let Some(held) = held else {
+                    // Deleted since: a late copy brings nothing back.
+                    return Published::Known;
+                };
+                if check == CreatedCheck::Pushed || same_to_a_reader(held, &live.message) {
+                    return Published::Known;
+                }
+                // A read's copy of a message a push already put out, saying more than the push
+                // did: an update, under an id of its own, as a reaction update is.
+                let at = self
+                    .updates
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                live.event_id = format!("{}~u{}-{at}", live.message.id.as_str(), self.epoch);
+                live.kind = LiveKind::Update;
+                outcome = Published::Updated;
+            }
+        }
+        let remembered = match live.kind {
+            LiveKind::Delete => Some(None),
+            LiveKind::Create => Some(Some(live.message.clone())),
+            LiveKind::Update => None,
+        };
+        if let Some(held) = feed.created.get_mut(&live.message.id) {
+            if live.kind == LiveKind::Delete {
+                *held = None;
+            } else if held.is_some() {
+                *held = Some(live.message.clone());
+            }
+        } else if let Some(remembered) = remembered {
+            feed.created.insert(live.message.id.clone(), remembered);
+            feed.created_order.push_back(live.message.id.clone());
+            while feed.created_order.len() > CREATED_MEMORY {
+                if let Some(evicted) = feed.created_order.pop_front() {
+                    feed.created.remove(&evicted);
                 }
             }
         }
@@ -837,7 +1302,11 @@ impl LiveHub {
         // what a correction says was in the cache's queue before the correction was checked.
         if offer_to_cache {
             if let Some(sink) = self.cache.get() {
-                let producer = if deduplicate {
+                // `#452 slack-live-ingest`: a stream's push vouches for no feed, since the stream
+                // carries no edits or deletions.
+                let producer = if check == CreatedCheck::Pushed {
+                    crate::cache::ServerFill::Stream
+                } else if deduplicate {
                     crate::cache::ServerFill::Ingest
                 } else {
                     crate::cache::ServerFill::Poller
@@ -866,7 +1335,7 @@ impl LiveHub {
             let _ = all.sender.send(arrival);
         }
         let _ = feed.sender.send(live);
-        true
+        outcome
     }
 
     /// Attach to a channel, replaying what was published after `after`.
@@ -974,6 +1443,8 @@ fn new_feed() -> Feed {
         tail: VecDeque::new(),
         dedupe_order: VecDeque::new(),
         dedupe: BTreeSet::new(),
+        created_order: VecDeque::new(),
+        created: BTreeMap::new(),
     }
 }
 
@@ -1487,18 +1958,21 @@ pub async fn poll_once(
         // Seed. `unwrap_or(0)` rather than leaving the cursor unset: an EMPTY channel is a
         // perfectly good starting point, and leaving it `None` would make the next tick seed
         // again and publish nothing for as long as the channel stayed quiet.
-        *cursor = Some(
-            messages
-                .iter()
-                .filter_map(|m| m.id.numeric())
-                .max()
-                .unwrap_or(0),
-        );
+        let seed = messages
+            .iter()
+            .filter_map(|m| m.id.numeric())
+            .max()
+            .unwrap_or(0);
+        *cursor = Some(seed);
+        // `#452 slack-live-ingest`: what a provider's event stream pushes at or behind this is
+        // history this read has just seen, and never news.
+        hub.note_poller_cursor(channel, seed);
         return Ok(Tick::default());
     };
 
     let page_size = usize::from(limit.max(1));
     let mut published = 0;
+    let mut updated = 0_usize;
     let mut at = seen;
     let mut backlog = false;
     let mut replies_behind = false;
@@ -1537,6 +2011,7 @@ pub async fn poll_once(
                 // where the tick started would republish it, and the page cannot tell a
                 // republished message from a new one once it has scrolled away.
                 *cursor = Some(at);
+                hub.note_poller_cursor(channel, at);
                 // `#378 live-reactions`. So did the reaction changes an earlier page reported:
                 // the provider already advanced its own memory past them, so leaving them
                 // unpublished here would lose them until the set moved again.
@@ -1586,12 +2061,18 @@ pub async fn poll_once(
         arrivals.sort_by_key(|(id, _, _)| *id);
         for (_, message, reply) in arrivals {
             published_ids.insert(message.id.clone());
-            if reply {
-                hub.publish_reply_read(channel, message, read_start.clone());
+            let outcome = if reply {
+                hub.publish_reply_read(channel, message, read_start.clone())
             } else {
-                hub.publish_read(channel, message, read_start.clone());
+                hub.publish_read(channel, message, read_start.clone())
+            };
+            // `#452 slack-live-ingest`. A message the provider's event stream already pushed is
+            // not news a second time; a copy of it that says more went out as an update.
+            match outcome {
+                Published::New => published += 1,
+                Published::Updated => updated += 1,
+                Published::Known | Published::History => {}
             }
-            published += 1;
         }
         // `at == before` means the page held nothing this cursor can move past — an empty answer,
         // or one made entirely of ids that do not parse. Walking again would fetch the same page
@@ -1605,6 +2086,7 @@ pub async fn poll_once(
         }
     }
     *cursor = Some(at);
+    hub.note_poller_cursor(channel, at);
     if let Some(fill) = fill {
         let after_ms = MessageId(seen.to_string()).created_at_ms();
         fill.offer_forward(
@@ -1621,7 +2103,7 @@ pub async fn poll_once(
     // somebody is watching the channel, since an unwatched channel's next ordinary read brings
     // the same sets. A refresh that fails loses nothing and fails nothing: the cursor already
     // stands where the walk put it, and the next tick diffs again.
-    let mut changed = 0_usize;
+    let mut changed = updated;
     // A provider's own report is trusted outright: it diffed against ITS memory, which may hold
     // messages (a full newest page, pre-seed thread replies) the hub's smaller window never
     // learned. Gating it on the hub's memory would drop exactly those updates, permanently:
@@ -1840,7 +2322,13 @@ async fn poll_loop_with_channels(
         // Removal is durable state, not a pause. If the same channel is added later it must seed
         // from Discord again instead of resuming an old cursor and publishing the intervening
         // history as if it had just arrived.
-        cursors.retain(|channel, _| current.contains(channel));
+        cursors.retain(|channel, _| {
+            let kept = current.contains(channel);
+            if !kept {
+                hub.forget_seeded(channel);
+            }
+            kept
+        });
         failures.retain(|channel, _| current.contains(channel));
         behind.retain(|channel, _| current.contains(channel));
         replies_behind.retain(|channel, _| current.contains(channel));
