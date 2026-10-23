@@ -304,6 +304,15 @@ def main() -> int:
                       "device A kept B's value but its checkbox did not follow")
                 check(api.value_of(COMBINE) == "0", f"B's change was not pushed: {api.document()}")
 
+                # B forgets it (back to the shipped default): A forgets it too, checkbox
+                # and all — the forget carries a stamp past the value it forgets.
+                page_b.evaluate("(key) => localStorage.removeItem(key)", COMBINE)
+                wait(page_a, f"() => localStorage.getItem({json.dumps(COMBINE)}) === null",
+                     "device A never forgot what B forgot")
+                check(page_a.evaluate("() => document.getElementById('combine-messages').checked") is True,
+                      "device A's checkbox did not return to the default on a forget")
+                check(api.value_of(COMBINE) is None, f"the forget was not pushed: {api.document()}")
+
                 # The one per-device section says so, and collapsed lines sits with Messages.
                 placed = page_a.evaluate("""() => {
                     const heading = document.getElementById('settings-screen-title');
@@ -336,7 +345,7 @@ def main() -> int:
         server.server_close()
         thread.join()
     print("two devices, one settings document: A seeded the server, B took A's choice on load, "
-          "A converged on B's change from the stream, text size never left A, and Screen and keys "
+          "A converged on B's change and B's forget from the stream, text size never left A, and Screen and keys "
           "says (client side) with Collapsed message lines under Messages")
     return 0
 

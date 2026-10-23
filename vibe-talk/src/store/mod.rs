@@ -2070,7 +2070,10 @@ pub trait StateStore: Send + Sync {
         &self,
     ) -> Result<Vec<crate::client_settings::SyncedSetting>, StoreError>;
 
-    /// Apply one page's settings write, returning the whole document as now stored.
+    /// Apply one page's settings write, returning the whole document as now stored and
+    /// the entries that write actually changed — a forgotten key among them as a `None`
+    /// value under the write's own stamp. Both are decided inside the write, so a
+    /// second writer landing beside this one cannot be mistaken for part of it.
     ///
     /// `set` overwrites per key (a `None` value forgets the key), stamped with this
     /// server's clock at the moment of the write — per-key last-writer-wins, the server
@@ -2087,7 +2090,13 @@ pub trait StateStore: Send + Sync {
         &self,
         set: &[(String, Option<String>)],
         seed: &[(String, String)],
-    ) -> Result<Vec<crate::client_settings::SyncedSetting>, StoreError>;
+    ) -> Result<
+        (
+            Vec<crate::client_settings::SyncedSetting>,
+            Vec<crate::client_settings::SyncedSetting>,
+        ),
+        StoreError,
+    >;
 
     /// The messages in this channel the owner has said are NOT noise, whatever the rules say.
     ///

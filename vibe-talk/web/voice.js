@@ -47540,6 +47540,8 @@ function onStreamFrame(frame) {
     if (!watchAllAttached && canSendText() && relayMode() !== "off") reportUnrelayed([], "gap");
     setStatus("the live feed fell behind — re-reading the channel.");
     refreshQuietly(() => loadDiscord({ keepPosition: true, reason: "reset" }))();
+    // `#457 settings-server-side`. The same gap could hide a settings frame: re-read.
+    refreshServerSettings().catch(() => {});
     return;
   }
   // `#457 settings-server-side`. A settings change from another device, carried on this
@@ -48609,6 +48611,7 @@ async function readWatchAll(generation) {
 function onWatchAllFrame(frame) {
   if (frame.id) watchAllLastEventId = frame.id;
   if (frame.event === "reset") {
+    refreshServerSettings().catch(() => {});
     watchAllLastEventId = null;
     if (canSendText() && relayMode() !== "off") reportUnrelayed([], "gap");
     return "reset";
@@ -50897,7 +50900,9 @@ function forgetToken() {
   // and the archive was agreed under this one: both go, and the settings read fresh.
   settingsSyncProven = false;
   settingsSyncReady = false;
+  settingsSyncSupported = true;
   syncedArchive.clear();
+  settingsAtStart.clear();
   clearError();
   // Before the token goes, not after: the stream holds a bearer credential open, and a signed-out
   // page that is still receiving one channel's messages is the leak this control exists to close.
@@ -50961,6 +50966,15 @@ const SYNCED_SETTING_KEYS = [
  * and a half is prompt, and far cheaper than asking on every keystroke of a dragged slider. */
 const SETTINGS_SYNC_MS = 1750;
 
+/** The largest value the server keeps for one setting, in characters to its bytes: the
+ * server's `MAX_VALUE_BYTES`, mirrored so an oversized value is left local here rather
+ * than refused there in a batch with everything else. */
+const SETTINGS_VALUE_MAX = 64 * 1024;
+
+/** Passes between whole re-reads of the document while nothing local moved: about a
+ * minute at `SETTINGS_SYNC_MS`, the backstop behind the stream. */
+const SETTINGS_REREAD_PASSES = 34;
+
 /**
  * What this page and the server last agreed, by key: the value (null for none held) and the
  * server's stamp for it. The whole sync is the difference between this and `localStorage`.
@@ -50987,6 +51001,21 @@ let settingsSyncStarted = false;
  * an unproven token (`signIn`'s rule for the channel, the same for settings): the sync waits
  * behind the same proof, and signing out un-proves it. */
 let settingsSyncProven = false;
+
+/**
+ * This device's values as the sync first saw them, taken in `startSettingsSync` before the
+ * first read goes out. A key that moves after that and before the read lands is a change in
+ * flight, protected like any other; one that never moved is a migration candidate, and the
+ * server's held value rightly wins over it.
+ *
+ * @type {Map<string, string | null>}
+ */
+const settingsAtStart = new Map();
+
+/** Reconciliation passes since the document was last re-read whole: a missed stream frame
+ * (a lagged settings receiver is skipped, never reset) is healed by a slow re-read, not left
+ * to whenever the reader next refocuses the page. */
+let settingsPassesSinceRead = 0;
 
 /** This device's kept value for a synced key, or null where it holds none. */
 function localSettingValue(key) {
@@ -51016,8 +51045,8 @@ function applySyncedSetting(key) {
   try {
     switch (key) {
       case READ_MODE_KEY: {
-        const held = localSettingValue(key);
-        if (held !== null) setReadMode(held);
+        // None kept is the shipped default's turn, as everywhere: Show read.
+        setReadMode(localSettingValue(key) || "show");
         break;
       }
       case MARK_OWN_KEY: applyMarkOwnRead(storedMarkOwnRead()); break;
@@ -51093,6 +51122,23 @@ function renderSettingsSyncState(text) {
 }
 
 /**
+ * After a remote value is applied, the archive adopts what this page actually kept. Several
+ * settings canonicalize as they apply — a clamped pace, an order this page no longer knows
+ * read as the default, a read-aloud voice this device cannot offer kept as its own — and
+ * the canonical form is THIS page's reading, not a new choice: pushing it back would move
+ * every other device's setting merely because this one opened. A forget is kept a forget:
+ * an apply that writes its default back does not resurrect the key.
+ */
+function adoptAppliedSetting(key, value, updatedMs) {
+  if (value === null) {
+    keepLocalSetting(key, null);
+    syncedArchive.set(key, { value: null, updatedMs });
+    return;
+  }
+  syncedArchive.set(key, { value: localSettingValue(key), updatedMs });
+}
+
+/**
  * Take entries the server holds — a read's whole document, a write's answer, a stream frame's
  * changes — into the archive, and into this device where they are newer than what it agreed.
  * With `whole`, a synced key absent from the entries is one the server does not hold.
@@ -51108,26 +51154,49 @@ function takeServerSettings(entries, whole) {
     const agreed = syncedArchive.get(entry.key);
     if (agreed && entry.updated_ms < agreed.updatedMs) continue;
     const local = localSettingValue(entry.key);
-    const pendingLocal = agreed && local !== agreed.value;
-    syncedArchive.set(entry.key, { value: entry.value, updatedMs: entry.updated_ms });
     // A local change the server has not taken yet stands: it lands after this entry and wins
-    // by the same arrival rule, and taking the remote value now would lose it silently.
+    // by the same arrival rule, and taking the remote value now would lose it silently. On
+    // the first read there is no agreement yet, so "changed" is against the snapshot.
+    const pendingLocal = agreed
+      ? local !== agreed.value
+      : settingsAtStart.has(entry.key) && local !== settingsAtStart.get(entry.key);
+    syncedArchive.set(entry.key, { value: entry.value, updatedMs: entry.updated_ms });
     if (pendingLocal || local === entry.value) continue;
     keepLocalSetting(entry.key, entry.value);
     applySyncedSetting(entry.key);
+    adoptAppliedSetting(entry.key, entry.value, entry.updated_ms);
   }
   if (whole) {
+    settingsPassesSinceRead = 0;
     for (const key of SYNCED_SETTING_KEYS) {
-      if (!seen.has(key) && !syncedArchive.has(key)) {
+      if (seen.has(key)) continue;
+      // Absent from the whole document: the server does not hold it — never set, or
+      // forgotten, or purged. A key this page agreed a value for is forgotten here too,
+      // which is also what stops the page that forgot it asking again every pass.
+      const agreed = syncedArchive.get(key);
+      if (!agreed) {
+        // No agreement yet: this is the first read, and a local value here is the
+        // migration's seed, not something a forget is clearing.
         syncedArchive.set(key, { value: null, updatedMs: 0 });
+        continue;
       }
+      const local = localSettingValue(key);
+      const pendingLocal = local !== agreed.value;
+      syncedArchive.set(key, { value: null, updatedMs: agreed.updatedMs });
+      if (pendingLocal || local === null) continue;
+      keepLocalSetting(key, null);
+      applySyncedSetting(key);
+      adoptAppliedSetting(key, null, agreed.updatedMs);
     }
   }
 }
 
 /** Whether this refusal is the permanent kind: no such route, or no store to keep settings in. */
 function settingsSyncRefused(error) {
-  return !!error && (error.status === 404 || error.code === "storage_not_configured");
+  // No route, no store, a token that may only read, or a write the server will never
+  // take as written: asking again in two seconds gets the same answer forever.
+  return !!error && (error.status === 404 || error.status === 400 || error.status === 403 ||
+    error.code === "storage_not_configured");
 }
 
 /**
@@ -51166,15 +51235,29 @@ async function syncSettingsOnce() {
       return;
     }
     const set = [];
+    let tooLarge = false;
     for (const key of SYNCED_SETTING_KEYS) {
       const agreed = syncedArchive.get(key);
       const local = localSettingValue(key);
       if (!agreed || local !== agreed.value) {
+        // One value over the server's limit refused whole would stop every other
+        // setting syncing behind it: it stays local, the rest still go.
+        if (local !== null && local.length > SETTINGS_VALUE_MAX) {
+          tooLarge = true;
+          continue;
+        }
         set.push({ key, value: local, updated_ms: 0 });
       }
     }
     if (set.length === 0) {
-      renderSettingsSyncState("");
+      settingsPassesSinceRead += 1;
+      if (settingsPassesSinceRead >= SETTINGS_REREAD_PASSES) {
+        const held = await apiDecoded("ClientSettings", "/api/v1/client-settings");
+        takeServerSettings(held.settings, true);
+      }
+      renderSettingsSyncState(tooLarge
+        ? "One setting is too large for the server to keep, so it stays on this device."
+        : "");
       return;
     }
     renderSettingsSyncState("Settings are being saved to the server…");
@@ -51239,6 +51322,7 @@ function startSettingsSync() {
     return;
   }
   settingsSyncStarted = true;
+  for (const key of SYNCED_SETTING_KEYS) settingsAtStart.set(key, localSettingValue(key));
   guardQuietly(syncSettingsOnce)();
   // Self-rescheduling rather than an interval, as the poll above is: a slow pass can
   // never stack a second one on itself.

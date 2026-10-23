@@ -5159,6 +5159,10 @@ const TUNING_BANDS = {
     "pushed. Under a quarter of a second a dragged slider is a request per frame's worth of " +
     "comparisons all day; past ten seconds a choice made here is not on the other device the " +
     "owner picks up next, and a failed save waits that long to retry"],
+  SETTINGS_REREAD_PASSES: [10, 200,
+    "settings passes between whole re-reads of the server's settings document while nothing " +
+    "local moved. Under ten the document is re-read far oftener than a missed stream frame " +
+    "needs; past two hundred a change whose frame was missed can sit unseen for minutes"],
   THREAD_HUE_RECENT: [2, 4,
     "threads most recently given a colour whose colours a new one avoids. Under two, a view drawing " +
     "new threads in its own order can still put two alike side by side; past four the same crowding"],

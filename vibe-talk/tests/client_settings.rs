@@ -224,7 +224,41 @@ async fn a_change_is_published_to_the_pages_already_open() {
     assert_eq!(changed[0].value.as_deref(), Some("0"));
     assert!(changed[0].updated_ms > 0);
 
-    // A write that changes nothing publishes nothing.
+    // A forget is published too, as no value under a stamp past the value's own —
+    // the only shape a page's newer-than check can take.
+    let (status, _body) = send(
+        &harness,
+        "PUT",
+        Some(WRITE_TOKEN),
+        Some(json!({ "set": [{ "key": KEY, "value": Value::Null, "updated_ms": 0 }] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let forgotten = tokio::time::timeout(std::time::Duration::from_secs(5), listening.recv())
+        .await
+        .expect("the forget was published")
+        .expect("the hub is open");
+    assert_eq!(forgotten.len(), 1);
+    assert_eq!(forgotten[0].key, KEY);
+    assert_eq!(forgotten[0].value, None);
+    assert!(
+        forgotten[0].updated_ms > changed[0].updated_ms,
+        "the forget is not stamped past the value it forgets"
+    );
+
+    // A write that changes nothing publishes nothing: the key set again, a seed for
+    // it then finds it held and loses.
+    let (status, _body) = send(
+        &harness,
+        "PUT",
+        Some(WRITE_TOKEN),
+        Some(json!({ "set": [{ "key": KEY, "value": "0", "updated_ms": 0 }] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), listening.recv())
+        .await
+        .expect("the re-set was published");
     let (status, _body) = send(
         &harness,
         "PUT",

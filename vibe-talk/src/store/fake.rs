@@ -724,29 +724,64 @@ impl StateStore for FakeStore {
         &self,
         set: &[(String, Option<String>)],
         seed: &[(String, String)],
-    ) -> Result<Vec<crate::client_settings::SyncedSetting>, StoreError> {
+    ) -> Result<
+        (
+            Vec<crate::client_settings::SyncedSetting>,
+            Vec<crate::client_settings::SyncedSetting>,
+        ),
+        StoreError,
+    > {
         let mut state = self.lock();
         armed(&mut state)?;
-        let now = super::now_ms();
+        // Strictly past every stamp already handed out, as the real store's is: a
+        // wall clock stepped backwards must not make a new write look older.
+        let held_max = state
+            .client_settings
+            .values()
+            .map(|(_, stamp)| *stamp)
+            .max()
+            .unwrap_or(0);
+        let now = super::now_ms().max(held_max + 1);
+        let mut changed = Vec::new();
         for (key, value) in seed {
-            state
-                .client_settings
-                .entry(key.clone())
-                .or_insert_with(|| (value.clone(), now));
+            if !state.client_settings.contains_key(key) {
+                state
+                    .client_settings
+                    .insert(key.clone(), (value.clone(), now));
+                changed.push(crate::client_settings::SyncedSetting {
+                    key: key.clone(),
+                    value: Some(value.clone()),
+                    updated_ms: now,
+                });
+            }
         }
         for (key, value) in set {
             match value {
                 Some(value) => {
+                    let held = state.client_settings.get(key).map(|(v, _)| v.clone());
                     state
                         .client_settings
                         .insert(key.clone(), (value.clone(), now));
+                    if held.as_ref() != Some(value) {
+                        changed.push(crate::client_settings::SyncedSetting {
+                            key: key.clone(),
+                            value: Some(value.clone()),
+                            updated_ms: now,
+                        });
+                    }
                 }
                 None => {
-                    state.client_settings.remove(key);
+                    if state.client_settings.remove(key).is_some() {
+                        changed.push(crate::client_settings::SyncedSetting {
+                            key: key.clone(),
+                            value: None,
+                            updated_ms: now,
+                        });
+                    }
                 }
             }
         }
-        Ok(state
+        let document = state
             .client_settings
             .iter()
             .map(
@@ -756,7 +791,8 @@ impl StateStore for FakeStore {
                     updated_ms: *updated_ms,
                 },
             )
-            .collect())
+            .collect();
+        Ok((document, changed))
     }
 
     async fn owner_prompt(&self) -> Result<Option<OwnerPrompt>, StoreError> {

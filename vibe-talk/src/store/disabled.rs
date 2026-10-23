@@ -179,7 +179,13 @@ impl StateStore for DisabledStore {
         &self,
         _: &[(String, Option<String>)],
         _: &[(String, String)],
-    ) -> Result<Vec<crate::client_settings::SyncedSetting>, StoreError> {
+    ) -> Result<
+        (
+            Vec<crate::client_settings::SyncedSetting>,
+            Vec<crate::client_settings::SyncedSetting>,
+        ),
+        StoreError,
+    > {
         refuse()
     }
 

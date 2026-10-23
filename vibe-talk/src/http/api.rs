@@ -1199,36 +1199,7 @@ pub async fn set_client_settings(
         .into_iter()
         .filter_map(|(k, v)| v.map(|v| (k, v)))
         .collect();
-    let before = state.store.client_settings().await?;
-    let settings = state.store.apply_client_settings(&set, &seed).await?;
-    // What actually changed, for the pages already open: an entry whose stored value
-    // moved, and a forgotten key said as a null value under its old stamp's key.
-    let mut changed: Vec<crate::client_settings::SyncedSetting> = settings
-        .iter()
-        .filter(|entry| {
-            !before.iter().any(|held| {
-                held.key == entry.key
-                    && held.value == entry.value
-                    && held.updated_ms == entry.updated_ms
-            })
-        })
-        .cloned()
-        .collect();
-    for held in &before {
-        if !settings.iter().any(|entry| entry.key == held.key) {
-            changed.push(crate::client_settings::SyncedSetting {
-                key: held.key.clone(),
-                value: None,
-                // Past every stamp a page could hold for this key, so its
-                // newer-than check takes the forgetting.
-                updated_ms: settings
-                    .iter()
-                    .map(|e| e.updated_ms)
-                    .max()
-                    .unwrap_or(held.updated_ms),
-            });
-        }
-    }
+    let (settings, changed) = state.store.apply_client_settings(&set, &seed).await?;
     state.live.publish_settings(changed);
     Ok(no_store(Json(crate::contract::ClientSettings { settings })))
 }

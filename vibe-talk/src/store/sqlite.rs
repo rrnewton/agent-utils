@@ -1848,14 +1848,29 @@ impl StateStore for SqliteStore {
         &self,
         set: &[(String, Option<String>)],
         seed: &[(String, String)],
-    ) -> Result<Vec<crate::client_settings::SyncedSetting>, StoreError> {
+    ) -> Result<
+        (
+            Vec<crate::client_settings::SyncedSetting>,
+            Vec<crate::client_settings::SyncedSetting>,
+        ),
+        StoreError,
+    > {
         let set = set.to_vec();
         let seed = seed.to_vec();
         self.with_connection(move |connection| {
             let transaction = connection.transaction().map_err(backend)?;
-            // One stamp for the whole write: it arrived as one act, and two keys it
-            // carried have no order between them worth inventing.
-            let now = now_ms();
+            // One stamp for the whole write, strictly past every stamp already handed
+            // out: the write arrived as one act, and a wall clock stepped backwards
+            // must not make it look older than what every page already agreed.
+            let held_max: i64 = transaction
+                .query_row(
+                    "SELECT COALESCE(MAX(updated_ms), 0) FROM client_settings",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(backend)?;
+            let now = now_ms().max(held_max + 1);
+            let before = read_client_settings(&transaction)?;
             for (key, value) in &seed {
                 // First writer wins: a held row is another device's earlier seed or a
                 // real choice, and neither is this device's stale local value to move.
@@ -1888,9 +1903,33 @@ impl StateStore for SqliteStore {
                         .map_err(backend)?,
                 };
             }
-            let out = read_client_settings(&transaction)?;
+            let document = read_client_settings(&transaction)?;
             transaction.commit().map_err(backend)?;
-            Ok(out)
+            // What this write changed, decided against the document as it stood inside
+            // the same transaction: a changed or new entry as stored, and a forgotten
+            // key as no value under THIS write's stamp — past any stamp a page could
+            // hold for it, so its newer-than check takes the forgetting.
+            let mut changed: Vec<crate::client_settings::SyncedSetting> = document
+                .iter()
+                .filter(|entry| {
+                    !before.iter().any(|held| {
+                        held.key == entry.key
+                            && held.value == entry.value
+                            && held.updated_ms == entry.updated_ms
+                    })
+                })
+                .cloned()
+                .collect();
+            for held in &before {
+                if !document.iter().any(|entry| entry.key == held.key) {
+                    changed.push(crate::client_settings::SyncedSetting {
+                        key: held.key.clone(),
+                        value: None,
+                        updated_ms: now,
+                    });
+                }
+            }
+            Ok((document, changed))
         })
         .await
     }
@@ -5143,24 +5182,30 @@ mod tests {
         {
             let store = SqliteStore::open(&file, Retention::default()).expect("open");
             assert!(store.client_settings().await.expect("read").is_empty());
-            let seeded = store
+            let (seeded, seeded_changed) = store
                 .apply_client_settings(&[], &[(key.clone(), "0".into())])
                 .await
                 .expect("seed");
+            assert_eq!(
+                seeded_changed.len(),
+                1,
+                "the seed was not the change it made"
+            );
             assert_eq!(seeded.len(), 1);
             assert_eq!(seeded[0].value.as_deref(), Some("0"));
             assert!(seeded[0].updated_ms > 0, "the server stamped the seed");
-            let reseeded = store
+            let (reseeded, reseeded_changed) = store
                 .apply_client_settings(&[], &[(key.clone(), "1".into())])
                 .await
                 .expect("reseed");
+            assert!(reseeded_changed.is_empty(), "a seed that lost was a change");
             assert_eq!(
                 reseeded[0].value.as_deref(),
                 Some("0"),
                 "a second device's seed moved a held value"
             );
             assert_eq!(reseeded[0].updated_ms, seeded[0].updated_ms);
-            let set = store
+            let (set, _) = store
                 .apply_client_settings(&[(key.clone(), Some("1".into()))], &[])
                 .await
                 .expect("set");
@@ -5169,10 +5214,16 @@ mod tests {
                 set[0].updated_ms >= seeded[0].updated_ms,
                 "a later write carries an older stamp"
             );
-            store
+            let (_, forgotten) = store
                 .apply_client_settings(&[(key.clone(), None)], &[])
                 .await
                 .expect("forget");
+            assert_eq!(forgotten.len(), 1);
+            assert_eq!(forgotten[0].value, None);
+            assert!(
+                forgotten[0].updated_ms > set[0].updated_ms,
+                "a forget is not stamped past the value it forgets"
+            );
             assert!(
                 store.client_settings().await.expect("read").is_empty(),
                 "a forgotten key kept its row"
