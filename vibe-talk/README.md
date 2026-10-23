@@ -5054,7 +5054,13 @@ the adapter can instead post each record of `slack.conversation tail --output=js
 
 The server checks every field before it uses any (a conversation, `ts`, user, bot, app, team and
 subtype id each of its Slack shape, the conversation named consistently, the text at most 40,000
-characters, the record at most 168,192 bytes) and names only the field when it refuses one. A message
+characters, the record at most 168,192 bytes) and names only the field when it refuses one: the
+answer and a WARN line in the log say the field and the rule it broke (`field="slack_user_id"
+rule="is not a Slack user id"`), never a value. The stream's `container_id` is the workspace and
+the conversation (`T…:C…`); a bare conversation id is read too, and fields the server does not use
+are ignored. A well-formed record with nothing to publish is acknowledged as `ignored`, never
+refused: a client notice with no sequence number, a creation with no Slack message, a system event
+such as a join, a reaction that names no conversation, and kinds the server does not read. A message
 record becomes the `conversations.history` object a read would have returned and goes through the
 same normalization, author lookup, mention names and thread mapping included, so a later read of
 it is the same message; its text is untrusted third-party text, as a read's is. It is published to

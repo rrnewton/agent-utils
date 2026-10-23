@@ -716,14 +716,35 @@ pub async fn ingest_tail(
                 ),
             )
         })?;
-    let value: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|_| ApiError::bad_request("the stream record is not valid JSON"))?;
-    let record = crate::slack::tail::parse(&value)
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    // Every refusal is said at WARN, by the field and the rule it broke and never by a value,
+    // so an operator can tell which shape the stream wrote without any of its text in the log.
+    let value: serde_json::Value = serde_json::from_slice(&body).map_err(|error| {
+        tracing::warn!(
+            field = "record",
+            rule = "is not valid JSON",
+            line = error.line(),
+            column = error.column(),
+            "refused a stream record as malformed"
+        );
+        ApiError::bad_request("the stream record is not valid JSON")
+    })?;
+    let record = crate::slack::tail::parse(&value).map_err(|error| {
+        tracing::warn!(
+            field = error.field,
+            rule = error.rule,
+            "refused a stream record as malformed"
+        );
+        ApiError::bad_request(error.to_string())
+    })?;
     let outcome = crate::live_tail::ingest(&state, record, jiff::Timestamp::now().as_millisecond())
         .await
         .map_err(|error| match error {
             ChatError::Shape(_) => {
+                tracing::warn!(
+                    field = "slack_message",
+                    rule = "is not a message the provider's reads recognize",
+                    "refused a stream record as malformed"
+                );
                 ApiError::bad_request("the stream record is not a message this provider reads")
             }
             other => ApiError::from(OpError::Chat(other)),

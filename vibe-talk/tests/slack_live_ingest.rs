@@ -480,6 +480,176 @@ async fn records_are_checked_and_authenticated_before_anything_is_published() {
     assert!(published(&state).is_empty());
 }
 
+/// A record in the shape the stream was captured writing: the container names the workspace and
+/// the conversation, and the payload carries fields this server does not read. `#452
+/// slack-live-ingest`, the follow-up to the first deployment, where such a record was refused.
+fn captured(seq: u64, ts: &str, slack_extra: Value) -> Value {
+    let mut slack = json!({
+        "team_id": "T0000TEAM", "channel_id": CH, "message_ts": ts,
+        "slack_user_id": "UGRACE001", "slack_event_id": "Ev0001", "app_id": "A0APP000001",
+        "text": "a captured shape", "channel_type": "channel", "blocks_json": "[]"
+    });
+    for (key, value) in slack_extra.as_object().expect("an object") {
+        slack[key] = value.clone();
+    }
+    json!({
+        "seq": seq, "ts": 1.0, "type": "message.created", "source": "slack",
+        "iris_seq_id": seq, "event_ts": 1_792_637_725_398_u64,
+        "payload": {
+            "event_id": "evt-0001", "source": "slack", "event_type": "message.created",
+            "entity_type": "message", "entity_id": format!("T0000TEAM:{CH}:{ts}"),
+            "container_type": "channel", "container_id": format!("T0000TEAM:{CH}"),
+            "actor_id": 1, "actor_name": "Grace",
+            "context": {"snippet": "a captured shape"},
+            "viewer_relevance": {"is_actor_self": false},
+            "slack_message": slack
+        }
+    })
+}
+
+#[tokio::test]
+async fn the_shapes_the_stream_really_writes_are_published_or_ignored_never_refused() {
+    let capture = vibe_talk::testing::LogCapture::info_only();
+    let fake = Fake::start(fixture(), 20).await;
+    let state = deployment(&fake, "");
+    seeded(&state).await;
+    let root = fake.with(|fake| fake.history[CH][4]["ts"].as_str().expect("ts").to_owned());
+    let cases: Vec<(&str, Value, &str)> = vec![
+        (
+            "a message",
+            captured(100, &now_ts(0, 1_001), json!({})),
+            "published",
+        ),
+        (
+            "a reply",
+            captured(101, &now_ts(0, 1_002), json!({"thread_ts": root})),
+            "published",
+        ),
+        (
+            "a broadcast",
+            captured(
+                102,
+                &now_ts(0, 1_003),
+                json!({"thread_ts": root, "subtype": "thread_broadcast"}),
+            ),
+            "published",
+        ),
+        (
+            "a bot's post",
+            captured(
+                103,
+                &now_ts(0, 1_004),
+                json!({"slack_user_id": null, "bot_id": "B0BOT00001", "subtype": "bot_message"}),
+            ),
+            "published",
+        ),
+        (
+            "a file share",
+            captured(104, &now_ts(0, 1_005), json!({"subtype": "file_share"})),
+            "published",
+        ),
+        (
+            "a join",
+            captured(105, &now_ts(0, 1_006), json!({"subtype": "channel_join"})),
+            "ignored",
+        ),
+        (
+            "a creation with no Slack message",
+            json!({"type": "message.created", "iris_seq_id": 106,
+                "payload": {"container_id": format!("T0000TEAM:{CH}")}}),
+            "ignored",
+        ),
+        (
+            "a reaction",
+            json!({"type": "reaction.created", "iris_seq_id": 107,
+                "payload": {"event_type": "reaction.created",
+                    "container_id": format!("T0000TEAM:{CH}"), "reaction": "eyes"}}),
+            "hinted",
+        ),
+        (
+            "a reaction naming no conversation",
+            json!({"type": "reaction.deleted", "iris_seq_id": 108, "payload": {}}),
+            "ignored",
+        ),
+        ("a client notice", json!({"type": "SUBSCRIBED"}), "ignored"),
+        (
+            "another kind",
+            json!({"type": "conversation.updated", "iris_seq_id": 109,
+                "payload": {"container_id": format!("T0000TEAM:{CH}")}}),
+            "ignored",
+        ),
+    ];
+    for (what, record, outcome) in cases {
+        let (status, body) = post(&state, &record).await;
+        assert!(status.is_success(), "{what}: {status} {body}");
+        assert_eq!(body["outcome"], outcome, "{what}: {body}");
+    }
+    let creates = published(&state)
+        .into_iter()
+        .filter(|live| live.kind == LiveKind::Create)
+        .count();
+    assert_eq!(
+        creates, 5,
+        "every message, reply, broadcast, bot post and file share"
+    );
+    assert!(
+        !capture.text().contains("refused a stream record"),
+        "{}",
+        capture.text()
+    );
+}
+
+#[tokio::test]
+async fn a_refused_record_is_logged_by_field_and_rule_and_never_by_its_text() {
+    let capture = vibe_talk::testing::LogCapture::info_only();
+    let fake = Fake::start(fixture(), 20).await;
+    let state = deployment(&fake, "");
+    let secret = "PRIVATE-WORDS-MUST-NOT-BE-LOGGED";
+    let refused = captured(
+        200,
+        &now_ts(0, 2_001),
+        json!({"slack_user_id": secret, "text": secret}),
+    );
+    let (status, _) = post(&state, &refused).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let mut elsewhere = captured(201, &now_ts(0, 2_002), json!({"text": secret}));
+    elsewhere["payload"]["container_id"] = json!("T0000TEAM:C0000OTHR2");
+    let (status, _) = post(&state, &elsewhere).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = send(
+        &state,
+        "POST",
+        Some(INGEST_TOKEN),
+        "application/json",
+        format!("{{\"text\": \"{secret}").into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let logged = capture.text();
+    let warnings: Vec<&str> = logged
+        .lines()
+        .filter(|line| line.contains("WARN") && line.contains("refused a stream record"))
+        .collect();
+    assert_eq!(warnings.len(), 3, "{logged}");
+    assert!(
+        warnings[0].contains("field=\"slack_user_id\""),
+        "{}",
+        warnings[0]
+    );
+    assert!(
+        warnings[0].contains("is not a Slack user id"),
+        "{}",
+        warnings[0]
+    );
+    assert!(
+        warnings[1].contains("field=\"container_id\""),
+        "{}",
+        warnings[1]
+    );
+    assert!(warnings[2].contains("is not valid JSON"), "{}", warnings[2]);
+    assert!(!logged.contains(secret), "{logged}");
+}
+
 #[tokio::test]
 async fn a_gap_relists_every_fed_channel_and_a_reaction_wakes_the_poller() {
     let fake = Fake::start(fixture(), 20).await;

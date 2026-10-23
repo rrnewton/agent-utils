@@ -105,7 +105,11 @@ pub async fn ingest(
     now_ms: i64,
 ) -> Result<TailOutcome, ChatError> {
     match record {
-        TailRecord::Control | TailRecord::Other { .. } => Ok(TailOutcome::Ignored),
+        TailRecord::Control => Ok(TailOutcome::Ignored),
+        TailRecord::Other { sequence, why } => {
+            tracing::debug!(sequence, why, "a stream record with nothing to publish");
+            Ok(TailOutcome::Ignored)
+        }
         TailRecord::Gap { .. } => {
             // A gap names sequence numbers, never a conversation: every channel the stream
             // feeds may have lost a message, so each is read forward from its cursor now, and
