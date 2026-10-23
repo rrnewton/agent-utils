@@ -4461,6 +4461,18 @@ const TUNING_BANDS = {
     "real stack short and leaves entries under the page that the gesture spends presses on; much higher " +
     "lets a damaged entry send the page back past the tab's start where the browser has no Navigation API " +
     "to say how far it may go (#304 back-gesture-in-app)"],
+  DEEP_LINK_PART_MAX: [128, 4096,
+    "the longest query value a deep link may carry: a real upstream id runs to a few dozen characters " +
+    "(a bridged service's resource names the longest), so lower refuses ids a provider legitimately " +
+    "forms; far higher lets an id padded to absurdity through into the address the page then keeps " +
+    "rewriting (#462 webapp-deep-links; the server refuses an upstream address past 512 bytes on the " +
+    "same reasoning)"],
+  DEEP_LINK_WAITS: [40, 2400,
+    "how long opening from a link waits, in 50 ms waits, for sign-in and a first read: at the low end " +
+    "two seconds is a slow phone's sign-in on a poor connection, and giving up there opens the " +
+    "restored view over the link's; at the high end two minutes is past any answer coming, and " +
+    "applying the link then would yank a reader who has long since navigated for themselves " +
+    "(#462 webapp-deep-links)"],
   PLACES_KEPT: [20, 1000,
     "how many places Ctrl/Cmd+[ can go back through: fewer cuts off a reader who has walked through the " +
     "views and threads for a while, and Back stops short of where they began; far more holds a history " +
