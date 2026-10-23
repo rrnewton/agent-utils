@@ -9119,7 +9119,7 @@ li.discord-message[data-root-child] > .reply-bridge {
 .thread-card-header[data-flying] {
   position: relative;
   z-index: 3;
-  animation: card-flight var(--card-flight) cubic-bezier(0.2, 0, 0, 1);
+  animation: card-flight var(--card-flight) cubic-bezier(0.2, 0, 0, 1) backwards;
 }
 
 #pane-discord[data-arriving],

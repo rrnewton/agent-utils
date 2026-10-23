@@ -55277,6 +55277,12 @@ test("`#298 thread-card-header`: a thread across the window is headed by the sam
     "the card does not start where its card in the list was, by a transform alone");
   assert.match(CSS_CODE, /@keyframes thread-arrive \{\s*from \{\s*opacity: 0;\s*\}\s*\}/);
   assert.match(cssBlockOutside(TWO_COLUMN_QUERY, ".thread-card-header[data-flying]"), /animation:\s*card-flight var\(--card-flight\)/);
+  // `#472 gate-flake-hardening`. Held where it starts until it starts: a busy browser can draw a frame
+  // between the move being set and its clock starting, and without the fill that frame showed the
+  // card at its place, before it flew there from the list.
+  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, ".thread-card-header[data-flying]"),
+    /animation:\s*card-flight var\(--card-flight\) cubic-bezier\([^)]*\) backwards;/,
+    "the card at the top can be drawn at its place before it moves");
   assert.match(cssBlockOutside(TWO_COLUMN_QUERY, "#pane-discord[data-arriving]"), /animation:\s*thread-arrive /);
   assert.match(CSS_CODE, /@media \(prefers-reduced-motion: reduce\) \{\s*#screen-main \{\s*--card-flight: 0ms;\s*\}\s*\.thread-card-header\[data-flying\],\s*#pane-discord\[data-arriving\],\s*#side-pane\[data-arriving\] \{\s*animation: none;/,
     "the card moves, or the thread fades, for a reader who asked for less motion");
