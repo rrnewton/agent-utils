@@ -95,8 +95,14 @@ research_status(job_id) -> { status, steps_done, last_step, elapsed_seconds, say
 research_cancel(job_id) -> { status: "cancelled" }
 ```
 
+> **Superseded in part, 2026-10-23 (`#455 vibe-talk-next-plan`).** in the master plan's terms,
+> `depth: "quick"` is research's quick depth: one model call over a briefing, answered from the Ask
+> panel's warm session when there is one, in seconds. What this appendix first called a quick job (a
+> few searches and reads in a tool loop) is a deep job with a small budget. The latency table below
+> is read that way.
+
 `research` returns at once (well inside the runtime's 15 s tool limit) with a sentence to speak:
-"I've sent that to the research assistant. Quick questions take about half a minute; I'll tell you
+"I've sent that to research. A quick answer takes a few seconds, a deeper one longer; I'll tell you
 when it's back." The job runs on the server whether or not the call continues.
 
 ### While it runs
@@ -143,7 +149,8 @@ when it's back." The job runs on the server whether or not the call continues.
 | Step | Budget |
 |---|---|
 | `research` acknowledgement | under 1 s (a job record and a queue push) |
-| Quick job (a few searches and reads, one model loop on a fast model) | target 15 to 30 s; cap 60 s (estimate) |
+| Quick depth (one call over a briefing, warm prompt cache) | a few seconds (estimate) |
+| Small deep job (a few searches and reads, one model loop on a fast model; first written as "quick job") | target 15 to 30 s; cap 60 s (estimate) |
 | Deep job (transcripts included) | target 1 to 2 min; cap 3 min (estimate) |
 | Each model step, Sonnet-class, warm prompt cache | 2 to 8 s (estimate) |
 | Each tool call against the local store | milliseconds (appendix 8 measurements); remote transcripts add the transport's round trip |
@@ -163,7 +170,7 @@ research service: the Messages API backend, the briefing builder, the fence, the
 depth keeps a push-fed transcript; the deep depth runs a tool loop. Quick can escalate ("this
 needs the transcripts; research it?"), and the Ask panel proposal's phase 3 `ask_helper` became
 `research(depth: "quick")`, answered from the panel's warm session when one exists. Building the
-core once and the two modes on it is less code than two agents and keeps their rules identical.
+service once and the two depths on it is less code than two agents and keeps their rules identical.
 
 ## The voice model versus a server-side model
 

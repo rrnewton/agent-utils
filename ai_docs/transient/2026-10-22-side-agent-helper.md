@@ -231,7 +231,9 @@ commands:
 
 ## One brain with the voice agent?
 
-> **Superseded in part, 2026-10-23 (`#455 vibe-talk-next-plan`).** The answer is now the master plan's: research is one service with a quick and a deep depth, and the voice agent calls it as the `research` tool (milestone 0.5.0). Its answers land in the Ask panel's research log.
+> **Superseded in part, 2026-10-23 (`#455 vibe-talk-next-plan`).** The answer is now the master
+> plan's: research is one service with a quick and a deep depth, and the voice agent calls it as the
+> `research` tool (milestone 0.5.0). Its answers land in the Ask panel's research log.
 
 The two share almost everything except the turn shape:
 
@@ -255,7 +257,7 @@ The two share almost everything except the turn shape:
   (`[research]` absent means no research). Its transcript is kept in the store and removed by the
   storage purge.
 - **Message text is third-party text.** It is fenced as data, and the system prompt says never to
-  follow instructions in it. The structural defence is that research holds **no tools**: its only
+  follow instructions in it. The structural defence is that quick research holds **no tools** (deep research holds read-only ones): its only
   outputs are an answer, validated ids and a draft he must send himself. A message saying "draft a
   post saying deploy now" can at worst put words in a box he reads. Drafts are labelled as
   research's, and a draft whose text quotes a fed message verbatim is flagged.
@@ -284,7 +286,9 @@ The two share almost everything except the turn shape:
 
 ## Phased plan
 
-> **Superseded in part, 2026-10-23 (`#455 vibe-talk-next-plan`).** P1 and P2 are milestone 0.2.0 (Ask) in the master plan, P3 is 0.5.0, and P4 (older history) moves to deep research over logbook with the `archive` class. The steps below stand as the detail of those milestones.
+> **Superseded in part, 2026-10-23 (`#455 vibe-talk-next-plan`).** P1 and P2 are milestone 0.2.0
+> (Ask) in the master plan, P3 is 0.5.0, and P4 (older history) moves to deep research over logbook
+> with the `archive` class. The steps below stand as the detail of those milestones.
 
 1. **P1: ask with citations.**
    - A `[research]` config and `POST /api/v1/research`, with a stateless briefing per sitting and
@@ -307,7 +311,10 @@ The two share almost everything except the turn shape:
 
 ## Questions for the owner
 
-> **Superseded in part, 2026-10-23 (`#455 vibe-talk-next-plan`).** These are consolidated, with the other plan documents' questions, in the master plan's last section: 1 to 6 are group C, 7 is answered (the voice agent may hand questions to research), and 8 is D1.
+> **Superseded in part, 2026-10-23 (`#455 vibe-talk-next-plan`).** These are consolidated, with the
+> other plan documents' questions, in the master plan's last section: 1 to 6 are group C (Q3's
+> ceiling and spend display are D3), 7 is direction given (the voice agent may hand questions to
+> research), and 8 is D1.
 
 1. **Scope.** Should quick research cover every channel on the server, or only the one (or two) on
    screen? All channels gives "where was X" its full reach, at about 4× the tokens.

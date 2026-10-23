@@ -31,15 +31,17 @@ under three rules, each of which the earlier documents already found separately:
 1. **One copy, two read contracts.** The chat store holds each message once. *Serving* a page read
    from it uses the strict serve rule (today's `shadow::decide`): answer only what a live read would
    answer as well. *History* (summaries, research, the Work tab, reports) uses a separate, eventual
-   contract: a per-channel watermark, `complete_through`, advanced by the backfill walk. The rows are
-   the same; only the predicate differs. Conflating the two contracts is why the cache served
-   almost nothing on Slack (synthesis appendix 1).
+   contract: a per-channel watermark, `complete_through`, advanced by the backfill walk (a minimal
+   per-channel form arrives with 0.2.0, the full watermark and freshness with 0.4.0). The rows are
+   the same; only the predicate differs. Synthesis appendix 1 draws the lesson: serving a read
+   instantly and holding a complete history are different requirements, and should be built
+   separately.
 2. **One version per row, shipped to every consumer.** A row's version is the provider's edit time
-   where there is one, else the server's read-start time (`observed_ms`). Each source also has a
-   change counter (`change_seq`). The server already merges by these. The plan sends them to the page
-   (C7), so the page's copy becomes a true replica of the chat store, and summaries and exports judge
-   freshness by the counter, never by clocks. Every memory that answers a read reports its true age
-   (`as_of`).
+   where there is one, else the server's read-start time (`observed_ms`). The server already merges
+   by these. logbook adds a per-source change counter (`change_seq`). The plan sends the versions to
+   the page (C7), so the page's copy becomes a true replica of the chat store, and summaries and
+   exports judge freshness by the counter, never by clocks. Every memory that answers a read reports
+   its true age (`as_of`).
 3. **Writes are operations, not state.** vibe-talk writes nothing to messages upstream except posts.
    A post is an operation in a **send log** keyed by its idempotency key, held in the owner store. A
    fast local update, such as a reply that promotes its message into a thread, is a **derived
@@ -78,7 +80,7 @@ proven correctness, not for feature completeness. See "Versions".
  │     │serve rule  │history       │history       │export (schema 3)                            │
  │     ▼            ▼              ▼              ▼                                             │
  │  pages, SSE   summarizer     briefing ───▶ research: quick (one call) | deep (job, tools)    │
- │               (the ladder)                  Messages API, citations checked against logbook  │
+ │               (the ladder)                  Messages API, cites only what it was fed or read │
  └──────┬──────────────────────────┬──────────────────────────────┬──────────────┬──────────────┘
         │ HTTP + SSE: versions,    │ MCP: chat tools, summaries,  │ research API │ /work/<ch>/
         │ client_key, ops          │ topics, research             │              │
@@ -110,8 +112,8 @@ Two boundaries matter more than any box:
 | **Transcript store** (logbook) | Normalized agent events, the agents side table, phases, cursors with prefix digests | the same `Store<M>` trait with `Claim::Prefix`; `groups(source, span)` | synthesis 02, 03 |
 | **Summarizer** | The ladder: message one-liner, thread name and sentence, chat hour and day, agent phase and lifetime, rollups, reports; scheduling and the daily ceiling | `Summarizer::stage(unit) -> Staged` (deterministic), `ModelBackend::run(jobs) -> artifacts + receipt`; `freshness(unit) -> Absent \| CaughtUp \| Behind \| Unproven` | synthesis 02 "Summaries", 06 |
 | **Briefing builder** | Deterministic, fenced, owner-marked rendering of a scope and span: topics, thread index, availability line, newest messages, full text grouped by thread within a budget; append-only so a provider prompt cache survives | `briefing(scope, span, budget, cap) -> Briefing { fenced, fed_ids, bounds_sentence, token_estimate }`; `append(new batch) -> Fenced` (thread-grouped, edits as correction lines) | side-agent "Context strategy"; synthesis 08 P1 to P5 |
-| **Research** | Open questions. Quick: one call over a briefing, warm cache. Deep: a read-only tool loop over logbook, seeded with a briefing, budgeted, as a job | `POST /api/v1/research {question, scope?, depth, origin}` → `{job_id}` at once; SSE `research.step` / `research.done`; `Answer { written, spoken?, citations[], coverage, actions[], answerable }`. Every id is checked against logbook (deep) or the fed ids (quick); deep `coverage` is checked against the job's tool log | side-agent "UI-control protocol"; synthesis 09 |
-| **Ask panel** | The UI for research: research log, citation chips, highlight, draft; off by default, lit while active, "catching up" while the briefing warms | consumes the research API and SSE; highlight = jump-to-message with a flash; draft = fill the named composer, never send | side-agent "UI" |
+| **Research** | Open questions. Quick: one call over a briefing, warm cache. Deep: a read-only tool loop over logbook, seeded with a briefing, budgeted, as a job | `POST /api/v1/research {question, scope?, depth, origin}` → `{job_id}` at once; SSE `research.step` / `research.done`; `Answer { written, spoken?, citations[], coverage, actions[], answerable }`. Every cited id must be one the session was fed (quick) or that the job actually read, per its tool log (deep); deep `coverage` is checked against the same log | side-agent "UI-control protocol"; synthesis 09 |
+| **Ask panel** | The UI for research: research log, citation chips, highlight, draft; off by default, lit while active, showing "Catching up" (a UI label) while its briefing is built and warmed | consumes the research API and SSE; highlight = jump-to-message with a flash; draft = fill the named composer, never send | side-agent "UI" |
 | **Voice agent** | Talking, orientation from a small briefing, delegation | system prompt v13 with a start briefing; MCP tools `recent_activity`, `read_page`, `find_message`, `read_message`, `count_messages`, `post_reply`, plus `summaries`, `topics`, `research`, `research_status`, `research_cancel`; a silent `context` bridge frame (hosted: `contextual_update`) | synthesis 08, 09; voice audit |
 | **Serving layer** | Pages, deltas and the SSE stream for the page replica | each copy carries `observed_ms` and `edited`; each newest page carries the stretch it proves (C7); a self-posted stream event carries `client_key` (C2); `POST …/reply {idempotency_key}`, `POST …/reply/outcome` | replication §7 |
 | **Page replica** | The page's copy of the chat store and owner state, plus the outbox | `projection(replica, outbox) -> rows + phantoms per scope`; merges copies by the server's versions (after C7) | replication §4.1, §5 |
@@ -127,7 +129,7 @@ Every piece of state has exactly one home and one authority.
 |---|---|---|---|---|
 | Message existence, content, edits, deletions, reactions, thread membership | the provider | chat store | page replica | versioned register per id, epoch tombstones, absence only from a listing over a proven stretch (replication §4.1, §4.2) |
 | Agent transcript events | the vendor log file | transcript store | the wrkviz archive; Work tab exports | append-only prefix with a digest; a rewrite is refused (synthesis 02) |
-| Sends | the provider holds the truth; the key names the operation | send log in the owner store (in memory today, persisted by C5) | the page's outbox | grow-only map key → produced ids, plus monotone "attempted" and "refused" bits (replication §4.3) |
+| Sends | the provider holds the truth; the key names the operation | send log in the owner store (in memory on the `#448 send-dedupe` branch, persisted by C5) | the page's outbox | grow-only map key → produced ids, plus monotone "attempted" and "refused" bits (replication §4.3) |
 | Done, bookmarks, hues, pins, settings, read marks | the server, serializing the owner's intents | owner store | page | per class, as today: idempotent sets with a read-your-writes overlay, compare-and-set revisions, first-writer-wins (replication §4.4, §4.5) |
 | Summaries, topics, search index, tallies, exports | derived | logbook artifacts and indexes | none needed | content-addressed by exact input; freshness by `change_seq`; never synchronized, only recomputed (replication §4.6) |
 | Research log, voice turns | the owner's conversation | owner store | page | append-only |
@@ -156,7 +158,7 @@ The cache has three modes, set by `[message_cache] enabled` and `serve`:
 | Mode | Config | Fills | Answers reads | Use |
 |---|---|---|---|---|
 | off | `enabled = false` (shipped default) | no | no | today on the busiest deployment |
-| shadow | `enabled = true`, `serve = false` | yes | no; records per consumer what it *would* have served and why not | measure before serving |
+| shadow | `enabled = true`, `serve = false` | yes | no page read; records per consumer what it *would* have served and why not. History consumers (briefings, summaries) still read it under the history contract | measure before serving; enough for research and summaries |
 | serve | `enabled = true`, `serve = true` | yes | the newest timeline page at once (refreshed in the background) and a fresh newest window, where the serve rule proves them | after the shadow shows a servable rate and no wrong answers |
 
 **What the in-flight ingest lane changes** (`#452 slack-live-ingest` and `#453 cache-backfill`,
@@ -181,7 +183,11 @@ deployment with a cache open starts backfill reads on upgrade.
    and no wrong answers. Windows on Slack stay unservable by rule (its feed carries no deletions).
    That is correct, and nothing in this plan depends on it.
 4. History needs no serve mode: the backfill and watermarks give summaries, briefings and the Work
-   tab their "complete through" without touching the serve rule.
+   tab their "complete through" without touching the serve rule. The built walk does not yet record
+   how far back it has proven a channel complete, so 0.2.0 adds a minimal per-channel
+   `complete_through` (from the walk's reach and the coverage intervals it listed). That lets a
+   briefing state its bounds and say when the cache is behind. 0.4.0 replaces it with the full
+   `Watermark` and freshness.
 
 ## Sync and replication
 
@@ -202,8 +208,8 @@ retries, edits or dismisses it.
 
 **Server merges.** The chat store joins every batch with the rules of `cache/merge.rs`: newer version
 wins, a push never revives a deletion, absence deletes only inside a listing's proven stretch and
-below the unsettled band. The send log joins by key: a repeat of a key gets the original outcome,
-never a second post. A restart keeps it once C5 lands.
+below the unsettled band. On the `#448 send-dedupe` branch, the send log joins by key: a repeat of a
+key gets the original outcome, never a second post. A restart keeps it once C5 lands.
 
 **The owner's decisions (2026-10-23).**
 
@@ -278,10 +284,11 @@ tool log. Quick escalates to deep only by asking ("This needs older history or t
 Research it properly?"), never silently.
 
 **One research log.** Every research answer, whether asked in the panel or by voice, is kept in the
-owner store's research log and shown in the Ask panel. A voice-started job also shows its steps as a
-card in the Voice view, and its short spoken answer is offered at the next pause in the call. That
-replaces the synthesis's separate "research card" history with one log, which answers "where was
-the answer to X?" for research answers too.
+owner store's research log and shown in the Ask panel. Whether the log outlives switching research
+off is question C6; the plan assumes it is kept, and drops it on switch-off if the owner says so. A
+voice-started job also shows its steps as a card in the Voice view, and its short spoken answer is
+offered at the next pause in the call. That replaces the synthesis's separate "research card"
+history with one log, which answers "where was the answer to X?" for research answers too.
 
 ## The voice agent
 
@@ -292,9 +299,9 @@ abilities). What this plan adds, in order of value:
 1. **Delegation (0.5.0).** The `research` tool and a v13 trigger rule: "research …", "dig into …", or
    an offer when `recent_activity` falls short. The job runs on the server, and the call carries on.
 2. **A start briefing (0.5.0).** The topic list, the availability line, the newest index and any
-   caught-up hour summaries, all read from logbook in milliseconds, about 3.3 k tokens against a
-   proposed 4 k budget (synthesis 08). The voice agent can then say "the runner-wedged thread" the way
-   the page does.
+   caught-up hour summaries, all read from logbook in milliseconds, about 2.9 k tokens against a
+   proposed 4 k budget (synthesis 08; 3.3 k once batch-made workstream topics exist). The voice
+   agent can then say "the runner-wedged thread" the way the page does.
 3. **Summaries by tool and a "fully ready" push (0.5.0).** `summaries` and `topics` tools; a short day
    narrative pushed silently through a new capability-gated `context` frame (owner question F1),
    offered at a pause.
@@ -330,7 +337,9 @@ component's history, so vibe-talk needs namespaced tags.
   (`vibe-talk: release 0.2.0`). The health route and `vibe-talk --version` already report the Cargo
   version, so once it is bumped a deployment says what it runs.
 - **`0.1.0`: today's deployed state.** The coordinator is tagging it on 2026-10-23, and near-term
-  fixes continue as 0.1.x. No code change but the Cargo bump on `main`.
+  fixes continue as 0.1.x. The tag goes on the `main` commit that bumps `Cargo.toml` to `0.1.0`, so
+  the health route and `--version` report it. The deployed commits still report `0.0.1`, and the
+  release note records which commit each deployment runs.
 - **`0.1.x`: patch releases** for work inside the current architecture, which is what the in-flight
   lanes are: the send dedupe and reply-promotes-thread, the Slack tail ingest and backfill, UI polish.
   A deploy of new code bumps the patch.
@@ -338,13 +347,13 @@ component's history, so vibe-talk needs namespaced tags.
   change configuration or the page's storage format, with a migration and a note in the README's
   upgrade section.
 - **logbook** and **wrkviz (Rust)** carry their own crate versions. logbook stays `0.x` and
-  unpublished. The Rust wrkviz reaches `1.0` when the Python edition is retired, as agentctl did.
+  unpublished. The Rust wrkviz reaches `1.0` when the Python edition is retired.
 
 **What justifies `1.0.0`:** a promise about what exists, not a feature count.
 
 1. **Frozen contracts** with a written deprecation policy: the configuration file, HTTP API v1, the
-   MCP tool manifest, and the `vibe-talk-v1` bridge protocol (with the `context` frame).
-2. **Data safety.** Every store migration is tested as an upgrade from every release since `0.2.0`.
+   MCP tool manifest, and the `vibe-talk-v1` bridge protocol (with the `context` frame, if F1 adds it).
+2. **Data safety.** Every store migration is tested as an upgrade from every release since `0.1.0`.
    Purge, retention and access-loss erasure are tested end to end, and the `archive` class is
    decided.
 3. **Sync proven.** The replication properties of §8 run in the gate on server and page. Sends are
@@ -371,24 +380,26 @@ work with review. Every milestone is landable and deployable alone.
 | — | **M0 Measure and decide** | S | — | the owner's answers to the blocking questions (marked ★ below); `count_tokens` on a real day's briefing; the shadow's miss counts per consumer with the relist on; the voice eval harness, tasks 2 and 8; the posting-join rate on a real week; Haiku 5.5 on wrkviz's model-comparison plan | synthesis M0 |
 | `0.1.0` | **Baseline** | tag | — | a name for what is deployed | — |
 | `0.1.x` | **In-flight lanes** | — | — | send dedupe (C1 to C3), reply-promotes-thread (C4), the Slack tail ingest, relist and backfill, UI polish | replication C1 to C4 |
-| `0.2.0` | **Ask**: quick research over chat, the Ask panel | M | 0.1.x ingest and backfill; the cache on (shadow) where it runs; M0 (scope, span, model) | the briefing builder; `[research]` config and API; structured answers with validated citations; highlight and draft; off by default, lit while active, push-fed; the research log | side-agent P1, P2 |
+| `0.2.0` | **Ask**: quick research over chat, the Ask panel | M | 0.1.x ingest and backfill; the cache on (shadow) where it runs; M0 (scope, span, model) | a minimal per-channel `complete_through`; the briefing builder; `[research]` config and API; structured answers with validated citations; highlight and draft; off by default, lit while active, push-fed; the research log (kept or dropped per question C6) | side-agent P1, P2 |
 | `0.3.0` | **Sync**: one copy, correctly replicated | M | 0.1.x (C1 to C4) | the send log persisted (C5); the server's versions to the page (C7); C6 with the operation-key marker per provider; C8, C9 as answered; the property tests; serve on for the newest page where M0's shadow shows it safe | replication C5 to C9, §8 |
-| `0.4.0` | **logbook and the chat ladder** | L | 0.3.0 (the version contract is final before the module moves); M0 (crate location, models, budget) | the crate; `Fenced` and the Messages API backend moved; summaries as artifacts with receipts; the cache becomes the chat store; watermarks and freshness; `chat-hour` and `chat-day` on demand; thread and term topics; the availability bar; spend line and daily ceiling | synthesis M1, most of M2; cutover C1 to C5 |
-| `0.5.0` | **Voice, briefed and delegating; deep research on chat** | M to L | 0.2.0, 0.4.0 | the start briefing; `summaries`, `topics`; the `context` frame; `research`, `research_status`, `research_cancel`; deep research jobs over chat with steps, cancel and checked coverage; prompt v13; the eval harness as an opt-in suite with a capability card per voice model | synthesis M2 (voice part), M3; side-agent P3 |
-| W1 | **Transcripts in Rust** (wrkviz track) | L | 0.4.0 (the crate exists) | `TranscriptMeta`; Claude and Codex sources with byte cursors, subagents included; groups and phases; the posting join; `wrkviz index`, `query`, `serve` over old archives | synthesis M4 |
+| `0.4.0` | **logbook and the chat ladder** | L | 0.3.0 (the version contract is final before the module moves); M0 (crate location, models, budget) | the crate; `Fenced` and the Messages API backend moved; summaries as artifacts with receipts; the cache becomes the chat store; watermarks and freshness; `chat-hour` and `chat-day` on demand; thread and term topics; the availability bar; spend line and daily ceiling; the opt-in `archive` retention class if D2 says yes | synthesis M1, most of M2; cutover C1 to C5 (cutover C4's walk is already built in 0.1.x; 0.4.0 adds its watermarks) |
+| `0.5.0` | **Voice, briefed and delegating; deep research on chat** | M to L | 0.2.0, 0.4.0 | the start briefing; `summaries`, `topics`; the `context` frame; `research`, `research_status`, `research_cancel`; deep research jobs over chat with steps, cancel and checked coverage; prompt v13; the eval harness as an opt-in suite with a capability card per voice model; older chat history through deep research (beyond 90 days only with `archive`) | synthesis M2 (voice part), M3; side-agent P3, P4 |
+| W1 | **Transcripts in Rust** (wrkviz track) | L | 0.4.0's crate and store core (cutover C1 to C3) | `TranscriptMeta`; Claude and Codex sources with byte cursors, subagents included; groups and phases; the posting join; `wrkviz index`, `query`, `serve` over old archives | synthesis M4 |
 | W2 | **Schema-3 export in Rust** | M | W1 | the export, differential-tested against Python; the delivery handler as a reusable Rust module | synthesis M5 (first half) |
 | `0.6.0` | **Work tab** | L | W2 | the third view; channel-to-team mapping by join, configuration and the agentctl registry; capability levels and redaction; "Summarize this view" with an estimate | synthesis M5 (second half) |
 | `0.7.0` | **Research reaches transcripts; batches; reports** | M to L | 0.5.0, W1, 0.6.0 | research tools over transcripts within the capability; nightly batches for phases and agent names within the budget; daily technical rollups; weekly reports drafted and reviewed in the app | synthesis M6, M7 |
-| W3 | **wrkviz parity** | L | W2 | SSH pull and the read-only agent; Orc and Claude-history sources; Muse; losslessness for Claude and Orc; workstream topics; the Python edition retired | synthesis M8; side-agent P4 (older history) moves here as transcripts plus archive |
+| W3 | **wrkviz parity** | L | W2 | SSH pull and the read-only agent; Orc and Claude-history sources; Muse; losslessness for Claude and Orc; workstream topics; the Python edition retired | synthesis M8 |
 | `1.0.0` | **Contracts and proof** | M | 0.5.0 at least | the criteria in "Versions" | — |
 
 **Why this order.** Ask comes first because it is the most-requested value and needs no new storage:
 thread names, the Messages API client and the fence exist, and the ingest lane fills the cache. It
-reads through a narrow read interface that the chat store implements now and logbook implements
+reads through a narrow read interface that today's message cache implements now and logbook implements
 after the move. Sync comes before the logbook cutover so that the module moves once, with its
 version contract final. Voice comes after both, because a briefed voice agent needs the ladder and
-topics (0.4.0), and delegation needs research (0.2.0). The wrkviz track starts once the crate
-exists, and it can run in parallel with 0.5.0 on another agent.
+topics (0.4.0), and delegation needs research (0.2.0). The wrkviz track needs the crate and its
+store core (cutover C1 to C3), not the ladder, so it can start part way through 0.4.0 and run in
+parallel with 0.5.0 on another agent. 0.7.0 waits for the Work tab as well as W1 because a
+transcript citation in a research answer opens the Work tab at that phase (synthesis 09).
 
 **Dependencies:**
 
@@ -438,21 +449,23 @@ Deduplicated from all the documents above, and grouped. ★ marks a question tha
 milestone. Sources: SA = side-agent, SY = synthesis README, RM = replication model, CB =
 channel-bars, TA = thread-list-animation, 03 = synthesis appendix 3, new = this plan.
 
-### Already answered (recorded so nobody asks again)
+### Already answered, or direction given (recorded so nobody asks again)
 
 - **API or SDK, not a coding-agent CLI, for the research backend.** Owner, 2026-10-23.
 - **Quick research is push-fed, not tool-pull; two UI powers only (highlight, draft); off by default;
   a lit icon while active; a bulk catch-up on reactivation; grouped by thread in the page's own
   terms; never replies to fed messages.** Owner, in the side-agent request (SA "What the owner asked
   for").
-- **The voice agent may hand questions to research**, on a phrase like "research for me X" (SA Q7).
-  Owner, 2026-10-23 (synthesis appendix 9). What remains open is the detail in question C7 below.
+- **Direction given, not a settled decision: the voice agent may hand questions to research**, on a
+  phrase like "research for me X" (SA Q7). The owner floated it as "one potential architecture" on
+  2026-10-23 (synthesis appendix 9), and the plan builds on it. What remains open is the detail in
+  question C7 below.
 - **Deterministic work is automatic; token-spending work runs on demand or in batches.** Owner
   (synthesis appendix 6).
 - **The store is generic over a precise metadata type for chat and for transcripts.** Owner
   (synthesis appendix 2).
-- **The speech synthesizer's runaway** belongs to the private voice stack, not this repository
-  (voice audit).
+- **The speech synthesizer's runaway** belongs to the private voice stack, not this repository.
+  This is the voice audit's finding, not an owner answer, recorded so it is not asked again.
 - **Sync and replication (E1 to E7).** Owner, 2026-10-23: look upstream before Retry; a failed
   reply to a removed message goes in the gap in Main, with the outbox foot as fallback; Edit mints a
   new key and warns, and is never refused; an invisible operation-key marker wherever the provider
@@ -499,14 +512,16 @@ channel-bars, TA = thread-list-animation, 03 = synthesis appendix 3, new = this 
 ### D. Storage, history and budget
 
 1. ★ **The cache on.** May the cache be enabled in shadow on every deployment where research or
-   summaries will run, and serve be turned on per deployment once the shadow proves it? (SA Q8,
-   extended)
+   summaries will run, and serve be turned on per deployment once the shadow proves it? And for 1.0,
+   should serve be on *by default* for the reads the shadow proves (criterion 4)? (SA Q8, extended;
+   new)
 2. **History.** May chosen channels keep their messages beyond the cache's 90 days (the `archive`
    class), and is an approved weekly report kept when the messages it summarizes are erased? (SY Q4)
 3. ★ (before 0.4.0) **Budget.** What daily token ceiling? Should the spend show in the Ask panel and
    the availability bar? Should nightly batches summarize every transcript phase (about $1 a day on
-   Haiku 5.5, $20 on Sonnet 5.5, estimated) or only phases someone will look at? (SA Q3 ceiling, SY
-   Q5)
+   Haiku 5.5, $20 on Sonnet 5.5, estimated) or only phases someone will look at? Thread naming runs
+   automatically today, an exception to the on-demand rule that synthesis 06 proposes to keep under
+   the ceiling: keep it? (SA Q3 ceiling, SY Q5, 06)
 
 ### E. Sync and replication
 
@@ -529,6 +544,8 @@ channel-bars, TA = thread-list-animation, 03 = synthesis appendix 3, new = this 
    ready? May the bridge protocol gain a `context` frame? (SY Q8)
 2. ★ (for M0) **The eval harness.** May it run against the deployed voice stack (it costs voice
    minutes), or only against a test bridge? (SY Q13)
+3. (before 1.0) **Eval thresholds.** What scores should research and the voice agent reach for 1.0
+   (for example trigger precision and recall, the honesty tasks)? (new)
 
 ### G. Transcripts, the Work tab and wrkviz
 
@@ -554,7 +571,8 @@ channel-bars, TA = thread-list-animation, 03 = synthesis appendix 3, new = this 
   whether the read panel remembers being open (Q3); whether two taps to listen are deliberate enough
   (Q4); audio source in the panel or in Settings (Q5); the keyboard-up control (Q6); whether to fold
   the panel when reading stops (Q7); whether the Talk tile joins the rework (Q8).
-- **thread-list-animation:** the gap's timing and fade (TA Q1); which side closes the gap (Q2);
+- **thread-list-animation:** the gap's timing and fade, and whether going back to the list replays a
+  card leaving after its thread was read from inside (TA Q1); which side closes the gap (Q2);
   arrival from far above, and an "arrived below" pointer (Q3); following the highlighted card, and
   holding a thread still while you type an inline reply (Q4); reduced-motion highlight (Q5); scope,
   and a separate motion switch (Q6); how visible "behind" should be (Q7).

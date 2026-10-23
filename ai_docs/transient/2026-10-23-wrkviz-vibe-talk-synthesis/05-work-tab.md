@@ -119,4 +119,4 @@ phone over the internet is a new exposure, so the default is the narrowest usefu
 | Session hygiene | The Work tab's API responses are `private, no-store`; the phone's offline cache (`#18 offline-message-cache`) does not keep transcript data |
 
 The open question is the default level for a deployment the owner reaches from a phone over the
-public internet (question 6 in the main proposal).
+public internet (question 6 in the main proposal; master plan G1).

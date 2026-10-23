@@ -38,7 +38,7 @@ made by a plain Messages API call to Haiku (`src/summarize/`).
 the closest pieces are a retired glossary summarizer and an empty "supported semantic concepts"
 input that every phase and rollup prompt reserves for exactly this. vibe-talk has no label
 suggestions; its thread slugs are the nearest thing. If either was started elsewhere, it has not
-landed here (question 9). Appendix 2 designs both as one topics-and-labels feature.
+landed here (question 9; master plan G4). Appendix 2 designs both as one topics-and-labels feature.
 
 **One correction about wrkviz.** It is not a database and it does not summarize each message. It is
 a directory archive (JSON, seekable gzip JSONL, content-addressed artifacts) with summaries per
@@ -157,6 +157,11 @@ experience you described (a voice agent that starts immediately, says what is re
 terms), and it creates the store, watermarks and freshness that everything later needs. M3 is next
 because it turns the voice agent's weakness into a hand-off instead of a wrong answer.
 
+> **Superseded in part, 2026-10-23 (`#455 vibe-talk-next-plan`).** the master plan builds the Ask
+> panel's quick research first (0.2.0) and the replication changes next (0.3.0), then this M1 and M2
+> (0.4.0) and M3 (0.5.0). The reasons above still explain why the chat ladder and the voice hand-off
+> come before the port.
+
 ## Risks
 
 | Risk | Mitigation |
@@ -170,7 +175,7 @@ because it turns the voice agent's weakness into a hand-off instead of a wrong a
 | Token spend creeps | Daily ceiling, estimates before batches, receipts and a visible spend line (appendix 6) |
 | Remote transcript transport is fragile or slow | Co-located first; byte-range pulls with prefix digests; refusal, not silent gaps |
 | Two editions of wrkviz drift during the port | Differential tests in the gate; retire Python per family, not all at once |
-| Scope: this is a large program | Every milestone is useful alone; M2 and M3 deliver most of the felt value without the port |
+| Scope: this is a large program | Every milestone is useful alone; M2 and M3 deliver most of the felt value without the port (in the master plan: 0.2.0 to 0.5.0) |
 
 ## Questions for the owner
 

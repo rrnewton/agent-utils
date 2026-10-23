@@ -4,7 +4,8 @@
 > [`../2026-10-23-vibe-talk-next/README.md`](../2026-10-23-vibe-talk-next/README.md), which links
 > here for the detail of voice briefings and the availability bar (milestones 0.4.0 and 0.5.0).
 > Terms follow its [terminology](../2026-10-23-vibe-talk-next/TERMINOLOGY.md). What is pushed at
-> session start or at fully ready is a **briefing** in the plan's terms.
+> session start is a **briefing** in the plan's terms; the fully-ready push (P6, P7) is a
+> **summary**, and a briefing may carry stored summaries (P4).
 
 Part of `#449 wrkviz-vibe-talk-synthesis`. What the voice agent is handed when a call opens, what it
 is handed once server-side summaries are fully ready, which of those are pushed and which it pulls,

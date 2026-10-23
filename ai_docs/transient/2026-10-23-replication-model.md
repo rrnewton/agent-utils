@@ -4,7 +4,8 @@
 > [`2026-10-23-vibe-talk-next/README.md`](2026-10-23-vibe-talk-next/README.md). Terms follow its
 > [terminology](2026-10-23-vibe-talk-next/TERMINOLOGY.md). It maps this document's changes to
 > milestones: C1 to C4 are the cl-dedupe lane (0.1.x); C5 to C9 and the §8 tests are 0.3.0 (Sync).
-> The questions are group E of its consolidated list. Nothing here is superseded.
+> The questions are group E of its consolidated list. One plan change: C7's interim receipt fix for
+> R9 moves into the C4 lane.
 
 Working design, 2026-10-23. Not user documentation. `#454 replication-model`.
 
@@ -658,14 +659,14 @@ Done, put back, reload, switch view, lose the HTTP answer, deliver or replay a s
 
 ## 9. Questions for the owner
 
-> **Answered, 2026-10-23 (`#455 vibe-talk-next-plan`).** The owner: (1) yes, look upstream
-> before offering Retry; (2) the gap in Main, with the outbox foot as fallback; (3) Edit mints a new
-> key and warns that the old message may be in the channel, and is never refused; (4) yes to an
+> **Answered, 2026-10-23 (`#455 vibe-talk-next-plan`).** The owner: (1) yes, look upstream before
+> offering Retry; (2) the gap in Main, with the outbox foot as fallback; (3) Edit mints a new key
+> and warns that the old message may be in the channel, and is never refused; (4) yes to an
 > invisible operation-key marker wherever the provider carries one: Slack message `metadata`
 > (`event_type`, `event_payload`), Google Chat's client-assigned message ids, Discord's `nonce` with
-> `enforce_nonce`; (5) anything touching the messaging data model is server-side, presentation
-> stays on the device, ideally as one Settings group ("Screen and keys", marked "client side");
-> (6) keep a thread whose root was deleted, with a "message removed" root; (7) no preference, and the
+> `enforce_nonce`; (5) anything touching the messaging data model is server-side, presentation stays
+> on the device, ideally as one Settings group ("Screen and keys", marked "client side"); (6) keep a
+> thread whose root was deleted, with a "message removed" root; (7) no preference, and the
 > coordinator chose last-action-wins per message. The master plan's "Sync and replication" section
 > records how each answer lands.
 

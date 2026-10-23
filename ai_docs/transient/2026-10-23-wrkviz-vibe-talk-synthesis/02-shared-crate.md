@@ -46,7 +46,7 @@ vibe-talk/             depends on ../rs/logbook by path (appendix 4)
 vibe-talk is its own Cargo workspace and its container builds from `vibe-talk/` alone
 (`Containerfile`, `COPY Cargo.toml Cargo.lock ./`). A path dependency on `rs/logbook` therefore
 means building the image from the repository root. That is a small change, but it is a decision for
-the owner (question 2 in the main proposal); the alternative, the crate inside `vibe-talk/`, makes
+the owner (question 2 in the main proposal; master plan A3); the alternative, the crate inside `vibe-talk/`, makes
 the wrkviz port depend on vibe-talk's tree.
 
 ## Identity, time and spans

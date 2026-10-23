@@ -15,8 +15,8 @@ still be right?
 
 | Term | What it is | What it is not |
 |---|---|---|
-| **logbook** | The storage layer: one Rust crate holding what was said and done. A **chat store** (`Store<ChatMeta>`, provider messages, tombstones, coverage, watermarks) and a **transcript store** (`Store<TranscriptMeta>`, agent events), plus summaries, topics and search over both. The chat store is the server's one copy of provider messages: it is *the* cache. | Not the owner's own state (read marks, Done, bookmarks, hues, settings, the send log), which stays in vibe-talk's **owner store** (today's `StateStore`, unchanged). |
-| **chat store** | logbook's half for chat. Replaces "message cache" once today's `src/cache/` moves into logbook (cutover C3). Until then "message cache" still names the code that exists. Its modes are **off**, **shadow** (fills and measures, answers nothing) and **serve** (also answers reads it can prove current). | Not a second copy beside the cache. There is one. |
+| **logbook** | The storage layer: one Rust crate holding what was said and done. A **chat store** (`Store<ChatMeta>`, provider messages, tombstones, coverage, watermarks) and a **transcript store** (`Store<TranscriptMeta>`, agent events), plus summaries, topics and search over both. The chat store is the server's one durable copy of provider messages: it is *the* cache. (Short-lived memories, such as the held recent windows, sit in front of it and report their age.) | Not the owner's own state (read marks, Done, bookmarks, hues, settings, the send log), which stays in vibe-talk's **owner store** (today's `StateStore`, unchanged). |
+| **chat store** | logbook's half for chat. Replaces "message cache" once today's `src/cache/` moves into logbook (cutover C3). Until then "message cache" still names the code that exists. Its modes are **off**, **shadow** (fills and measures, and answers no page read; history consumers such as briefings and summaries still read it) and **serve** (also answers page reads it can prove current). | Not a second durable copy beside the cache. There is one. |
 | **summary**, made by **the summarizer** | A model-written artifact about a **fixed unit**: one long message, a thread's name and sentence, an hour, a day, an agent phase, an agent's lifetime, a week's report. Its input is staged deterministically from logbook, it is content-addressed and cached, and it is rebuilt only when its input changes. It spends tokens, on a schedule (automatic, on demand, or batch) and within a budget. The **summary ladder** is the set of units, message to report. | Never answers a question. A summary of the runner-wedged thread is the same text whoever asks. |
 | **briefing** | A deterministic, fenced rendering of what logbook holds for a scope and a span: topic list, thread index with names and sentences, availability line, newest messages, and (when the budget allows) full text grouped by thread. Building one spends no tokens. | Not a summary (no model writes it) and not a prompt by itself: it is the context a model is handed. |
 | **research** | The open-ended question-answering service on the server ("where was X decided?", "what was decided for X?", "did X land?"). Messages API, no write tools, answers with validated citations and a statement of what it read. Two depths: **quick** (one model call over a briefing, warm prompt cache, seconds) and **deep** (a read-only tool loop over logbook, seeded with a briefing, tens of seconds to minutes, run as a **research job**). "Research agent" is acceptable shorthand for the service as a whole. | Not a summarizer (it takes arbitrary questions) and not a UI. Never posts. |
@@ -26,7 +26,8 @@ still be right?
 | **availability bar** (unchanged) | The floating strip saying how much of the chosen window is summarized and caught up. | — |
 
 Three words keep their existing narrow meanings: **catch-up** is the voice agent's
-`recent_activity` read of recent full text; **digest** is the deterministic 160-character line format
+`recent_activity` read of recent full text (the Ask panel's "Catching up" is only a UI label for
+building and warming its briefing); **digest** is the deterministic 160-character line format
 (`summary.rs`), not a summary; **search** is the deterministic full-text index, which research uses
 as one tool.
 
@@ -44,8 +45,9 @@ as one tool.
 - **Never touches the Work tab or transcripts directly.** Transcript content reaches a call only as
   research's short spoken answer, within the capability the owner set.
 
-The dividing line for any question, by voice or in the panel: **if it names a unit (this thread, the
-last hour, today), it is a summary; if it asks something about the content, it is research.**
+The dividing line for any question, by voice or in the panel: **a fixed question about a unit
+("what happened today?", "what is this thread about?") is a summary; any other question is research,
+even when it is about one thread ("what was decided in this thread?").**
 
 ## Rejected alternatives
 

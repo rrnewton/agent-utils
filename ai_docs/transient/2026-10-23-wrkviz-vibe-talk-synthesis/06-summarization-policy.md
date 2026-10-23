@@ -22,7 +22,7 @@ which, what each costs on real volumes, and the controls.
 
 | Step | Kind | When it runs |
 |---|---|---|
-| Chat live feed into the store; transcript polls by cursor; backfill walk of chat history | deterministic | **automatic**: feed continuously, transcripts every minute, backfill hourly per channel |
+| Chat live feed into the store; transcript polls by cursor; backfill walk of chat history | deterministic | **automatic**: feed continuously, transcripts every minute, backfill hourly per channel (as built in `#453 cache-backfill`: up to 20 pages a channel every six hours, while the provider is idle) |
 | Indexing (FTS), tallies per hour, activity bins, watermarks, freshness, the exact chat-to-transcript join | deterministic | **automatic**, after each apply |
 | Thread topics (from thread names) and term topics (issue slugs) | deterministic | **automatic** |
 | Timeline export per channel; archive build | deterministic | **automatic** every few minutes while anyone is watching, otherwise hourly |

@@ -38,7 +38,7 @@ promises honest:
 Summaries and reports are derived third-party text either way. They follow their sources: a summary
 whose input rows are erased is orphaned and deleted, as `cache/orphans.rs` already does for the
 store's summaries. A weekly report the owner approved is the owner's document and is kept (question
-4 for the owner).
+4 for the owner; master plan D2).
 
 ## Guarantees, and where each lands
 
@@ -76,6 +76,12 @@ Each phase is shippable alone, keeps today's tests green, and has a switch to go
    which has a caller today); it advances `complete_through` per channel (`AsListed` on Slack), and
    tallies and freshness become available. It should also lift the cache's Main-page serve rate. This is what the availability bar and hourly
    summaries need, and it is independent of serving. Rollback: turn the walk off.
+
+> **2026-10-23 (`#455 vibe-talk-next-plan`):** the walk itself is built in the 0.1.x ingest lane
+> (`#453 cache-backfill`): adaptive, a page at a time while the provider is idle, up to 20 pages a
+> channel, every six hours. On the fake provider the backfill alone did not lift the newest-page
+> serve rate; the relist of `#452 slack-live-ingest` did (0 of 10 to 10 of 10). What remains of this
+> step is the watermark: a minimal per-channel `complete_through` in 0.2.0, the full one in 0.4.0.
 5. **C5: hourly and daily chat rollups, topics.** New summarizers (`chat-hour`, `chat-day`) and
    thread topics; the voice context and the bar use them (appendix 8). Rollback: configuration.
 6. **C6: the Work tab** (appendix 5) and the transcript store, in the same process or beside it.

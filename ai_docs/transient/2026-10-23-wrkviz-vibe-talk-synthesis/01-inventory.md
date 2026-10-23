@@ -178,6 +178,11 @@ most of that without assuming a bug; the one part that more filling would fix is
    pushes, the server's own posts and the voice call-start warm-up; a voice agent's own tool reads,
    under the read token, fill nothing.
 
+> **2026-10-23 (`#455 vibe-talk-next-plan`):** the backfill walk has since been built in the ingest
+> lane (`#453 cache-backfill`), and on the fake provider it was the relist of `#452
+> slack-live-ingest`, not the backfill, that lifted the newest-page shadow rate from 0 of 10 to 10
+> of 10. The backfill adds older history, which watermarks and summaries need.
+
 This is inferred from the code. The diagnostics report's per-consumer miss counts
 (`message_cache.shadow[].misses`, `src/diagnostics.rs:175`) would confirm which reason dominates,
 and are an M0 measurement. The lesson for the synthesis: **serving a read instantly and having a
