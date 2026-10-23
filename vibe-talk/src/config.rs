@@ -761,6 +761,21 @@ impl DiscordConfig {
             escaping: crate::chat::PostEscaping::Verbatim,
         }
     }
+
+    /// Whether posts through this provider go with their mention syntax defused. `#445
+    /// gchat-mention-defuse`; see [`crate::mention_defuse`].
+    ///
+    /// A bridge serving Google Chat, as its markup says, and nothing else. Google Chat turns
+    /// `<users/…>` in a post into a mention that notifies that person, and a bridge for it refuses
+    /// a post holding such syntax, a bare `@word` included, rather than risk it; the words read
+    /// the same defused, so there is nothing for an operator to choose. Discord itself and any
+    /// other bridge post the text as written: Discord's own `<@id>` mentions are deliberate, and
+    /// governed by `allowed_mentions`.
+    #[must_use]
+    pub fn defuses_mentions(&self) -> bool {
+        !is_official_discord_api_base(&self.api_base)
+            && self.markup == crate::render::Markup::GoogleChat
+    }
 }
 
 /// Which bridge endpoint answers a read of a channel's most recent messages. `#208

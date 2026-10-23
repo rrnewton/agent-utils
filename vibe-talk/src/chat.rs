@@ -1258,6 +1258,16 @@ pub trait ChatClient: Send + Sync {
         PostLimit::chars(crate::discord::http::DISCORD_MAX_CONTENT_LEN)
     }
 
+    /// Whether a post to `channel` has its mention syntax made inert before it is cut in parts
+    /// and sent. `#445 gchat-mention-defuse`; see [`crate::mention_defuse`].
+    ///
+    /// False, the default, posts the text as written. A provider that refuses a post holding
+    /// syntax it could expand into a mention, rather than notify someone, says true, and its posts
+    /// go with that syntax defused instead of coming back refused.
+    fn defuses_mentions(&self, _channel: &ChannelId) -> bool {
+        false
+    }
+
     /// The thread the rest of a post that had to be cut continues in, once its first part,
     /// `first`, was posted to the conversation itself. `#263 post-split-per-provider`.
     ///

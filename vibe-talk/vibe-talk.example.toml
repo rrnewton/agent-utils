@@ -42,7 +42,8 @@ bind = "0.0.0.0:8080"
 # this to "Google Chat"; the HTTP wire format and existing configuration keys stay the same.
 provider_name = "Discord"
 # How the service writes message text, for the page's renderer: "discord", or "google-chat" for a
-# bridge serving Google Chat, where *a* is bold and a link may arrive as <https://...|label>.
+# bridge serving Google Chat, where *a* is bold and a link may arrive as <https://...|label>,
+# and where @name and <users/...> in a post are sent with a word joiner so nobody is notified.
 # markup = "discord"
 # The most one message may hold. A longer one is cut into parts. Discord itself takes 2000
 # characters and never more. A bridge takes what is set here, and 2000 characters when neither is

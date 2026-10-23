@@ -119,6 +119,9 @@ struct State {
     upstream_clear_failures: VecDeque<ChatError>,
     upstream_clear_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
     upstream_clear_flips_dry_run: bool,
+    /// Whether posts go with their mention syntax defused, as a Google Chat bridge's do. `#445
+    /// gchat-mention-defuse`.
+    defuses_mentions: bool,
     next_id: u64,
     /// Author display name -> snowflake, so one author keeps one id and two authors never share
     /// one. A fake that handed every author the same id would let a test pass while the server
@@ -361,6 +364,12 @@ impl FakeDiscord {
     /// does not keep the contract would. The cursor still moves only for a real push.
     pub fn flip_upstream_dry_run_answers(&self) {
         self.lock().upstream_clear_flips_dry_run = true;
+    }
+
+    /// Say that posts here go with their mention syntax defused, as a Google Chat bridge's do.
+    /// `#445 gchat-mention-defuse`.
+    pub fn defuse_mentions(&self) {
+        self.lock().defuses_mentions = true;
     }
 
     /// Hold every automatic clear until the returned semaphore is given a permit per call, so a
@@ -649,6 +658,10 @@ impl FakeDiscord {
 impl ChatClient for FakeDiscord {
     fn provider_name(&self) -> &str {
         "Discord"
+    }
+
+    fn defuses_mentions(&self, _channel: &ChannelId) -> bool {
+        self.lock().defuses_mentions
     }
 
     fn supports_channel_registration(&self) -> bool {

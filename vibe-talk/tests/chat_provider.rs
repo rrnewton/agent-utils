@@ -577,3 +577,141 @@ async fn a_remainder_that_would_be_cut_differently_is_not_offered_as_resumable()
     );
     task.abort();
 }
+
+/// A bridge that records every post's body and answers it: with a 400 whose body is `refuse`,
+/// when given, else with the post as posted.
+async fn answering_bridge(
+    refuse: Option<&'static str>,
+) -> (
+    String,
+    Arc<std::sync::Mutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let bodies: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("loopback");
+    let base = format!("http://{}", listener.local_addr().expect("address"));
+    let seen = Arc::clone(&bodies);
+    let app = axum::Router::new().fallback(move |body: axum::body::Bytes| {
+        let seen = Arc::clone(&seen);
+        async move {
+            let value: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let content = value["content"].as_str().unwrap_or_default().to_owned();
+            seen.lock().expect("bodies").push(value);
+            if let Some(body) = refuse {
+                return (StatusCode::BAD_REQUEST, body.to_owned());
+            }
+            let message = serde_json::json!({
+                "id": "9001", "channel_id": WRITE_CHANNEL, "content": content,
+                "timestamp": "2026-10-22T18:08:00Z",
+                "author": {"id": "7", "username": "bridge", "bot": true},
+            });
+            (StatusCode::OK, message.to_string())
+        }
+    });
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+    (base, bodies, task)
+}
+
+async fn reply_through(
+    base: String,
+    markup: vibe_talk::render::Markup,
+    text: &str,
+) -> (StatusCode, Value) {
+    let mut config = testing::config();
+    let discord = config.discord_mut().expect("discord provider");
+    discord.api_base = base;
+    discord.provider_name = "Google Chat".to_owned();
+    discord.markup = markup;
+    let (mut state, _) = testing::state();
+    state.replace_chat(Arc::new(HttpDiscordClient::new(discord).expect("client")));
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/channels/{WRITE_CHANNEL}/reply"))
+        .header("authorization", format!("Bearer {WRITE_TOKEN}"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({ "text": text }).to_string()))
+        .expect("request");
+    let response = router(state).oneshot(request).await.expect("response");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    (status, serde_json::from_slice(&bytes).expect("json"))
+}
+
+/// `#444 send-refusal-reason`. A bridge's 400 comes back as a 207 that says nothing was posted,
+/// certainly, that sending it again is no use, and why — in the bridge's words and the reader's —
+/// and the refusal is logged at WARN with its reason and size, never the words.
+#[tokio::test]
+async fn a_refused_post_says_why_and_is_logged_without_its_words() {
+    const REASON: &str = "content contains mention syntax that Google Chat would expand";
+    let capture = testing::LogCapture::info_only();
+    let (base, bodies, task) = answering_bridge(Some(
+        r#"{"message": "content contains mention syntax that Google Chat would expand"}"#,
+    ))
+    .await;
+    let text = "> @Ada Lovelace said the vault code is 4417\n\nagreed";
+    let (status, answer) = reply_through(base, vibe_talk::render::Markup::Discord, text).await;
+    assert_eq!(status, StatusCode::MULTI_STATUS, "{answer}");
+    assert_eq!(answer["posted"], 0, "{answer}");
+    assert_eq!(answer["uncertain"], false, "{answer}");
+    assert_eq!(answer["retryable"], false, "{answer}");
+    assert_eq!(answer["refusal"]["status"], 400, "{answer}");
+    assert_eq!(answer["refusal"]["reason"], REASON, "{answer}");
+    assert_eq!(
+        answer["refusal"]["explanation"], "it contains @Ada, which would notify someone",
+        "{answer}"
+    );
+    // Not a Google Chat bridge by its markup, so the text went as written.
+    assert_eq!(bodies.lock().expect("bodies")[0]["content"], text);
+
+    let logged = capture.text();
+    let line = logged
+        .lines()
+        .find(|line| line.contains("refused a post"))
+        .unwrap_or_else(|| panic!("no refusal line in:\n{logged}"));
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains("status=400"), "{line}");
+    assert!(line.contains("place=\"main\""), "{line}");
+    assert!(line.contains(REASON), "{line}");
+    assert!(
+        line.contains(&format!("content_bytes={}", text.len())),
+        "{line}"
+    );
+    assert!(line.contains(&format!("channel={WRITE_CHANNEL}")), "{line}");
+    assert!(
+        !logged.contains("vault code"),
+        "the post's words were logged:\n{logged}"
+    );
+    task.abort();
+}
+
+/// `#445 gchat-mention-defuse`. A bridge serving Google Chat is sent its mention syntax defused —
+/// a word joiner after the `@` and after the `<` — and every other provider the words as written.
+#[tokio::test]
+async fn a_google_chat_bridge_is_sent_mentions_defused_and_no_other_is() {
+    let text = "> @Ada said so\n\ncc <users/123>, mail ada@example.com";
+    let (base, bodies, task) = answering_bridge(None).await;
+    let (status, answer) = reply_through(base, vibe_talk::render::Markup::GoogleChat, text).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let sent = bodies.lock().expect("bodies")[0]["content"]
+        .as_str()
+        .expect("content")
+        .to_owned();
+    assert_eq!(
+        sent,
+        "> @\u{2060}Ada said so\n\ncc <\u{2060}users/123>, mail ada@example.com"
+    );
+    task.abort();
+
+    let (base, bodies, task) = answering_bridge(None).await;
+    let (status, answer) = reply_through(base, vibe_talk::render::Markup::Discord, text).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(bodies.lock().expect("bodies")[0]["content"], text);
+    task.abort();
+}

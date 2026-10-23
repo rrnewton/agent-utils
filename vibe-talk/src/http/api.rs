@@ -2206,6 +2206,13 @@ pub struct PartialReplyResponse {
     /// `posted` counts only the parts known to have landed. `#270 voice-transcript-markers`: with
     /// `posted` 0 this is a post nobody can confirm, not one that certainly failed.
     pub uncertain: bool,
+    /// The provider's refusal of the part that failed, when it refused it. `#444
+    /// send-refusal-reason`. Present only for a 4xx, which says the part was certainly not posted
+    /// and that sending the same text again is refused the same way: `status`, the provider's own
+    /// `reason`, and `explanation`, that reason in the reader's words, which the page puts after
+    /// "<service> refused this message: ".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<crate::send_refusal::SendRefusal>,
     /// On the commit route only: which proposal this was.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub serial: Option<u64>,
@@ -2227,6 +2234,7 @@ impl PartialReplyResponse {
                 resumable,
                 thread_id,
                 uncertain,
+                refusal,
                 ..
             } => Ok(Self {
                 error: "partially_posted",
@@ -2237,6 +2245,7 @@ impl PartialReplyResponse {
                 resumable,
                 thread_id,
                 uncertain,
+                refusal: refusal.map(|refusal| *refusal),
                 serial: None,
                 send_seq: None,
             }),

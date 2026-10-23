@@ -506,6 +506,20 @@ thread; Discord posts the parts one after another, and only the first answers th
 replied to. A message sent into a thread keeps every part in that thread. If a part fails, the
 unsent rest is retried into the same thread (`#263 post-split-per-provider`).
 
+**A refused message says why.** When the chat service refuses a message (an HTTP 4xx answer), its
+row in the outbox says **Not sent** and gives the reason in plain words, for example "Google Chat
+refused this message: it contains @Ada, which would notify someone." It is not sent again on its
+own, because the same words would be refused the same way: use **Edit** to change it, or
+**Dismiss**. The server log records each refusal at WARN with the service's reason and the
+message's size, never its words (`#444 send-refusal-reason`).
+
+**Names written with @ never notify anyone in Google Chat.** A bridge serving Google Chat refuses
+a message holding text Google Chat could turn into a mention, such as `@Ada` or `<users/123>`,
+which a quoted message or a reply that addresses someone often holds. So vibe-talk puts an invisible
+word joiner (U+2060) after the `@` or `<` before sending to a provider with
+`markup = "google-chat"`. The message reads the same and goes, and nobody is notified. An e-mail
+address is left alone (`#445 gchat-mention-defuse`).
+
 ## Installing the reader
 
 Serve vibe-talk over HTTPS, open it (the app is the page at `/`) in Chrome on Android, and choose
@@ -2396,7 +2410,7 @@ model provider or a real gateway.
 | Upstream read marks | `discord.upstream_read_marks` | — | **off by default**; enable only when `discord.api_base` is a compatible bridge implementing `POST /channels/{id}/read` |
 | Chat service name | `discord.provider_name` | — | `Discord`; set to the source service's name (for example, `Google Chat`) when using a compatible HTTP bridge |
 | Post size | `discord.max_post_chars` / `discord.max_post_bytes` | — | the most one message may hold, in characters and in UTF-8 bytes; a longer one is cut into parts. Discord itself: 2,000 characters, never more. A bridge: what you set, and 2,000 characters when you set neither, so an upgrade never sends a bridge a longer message than it has accepted before. A bridge with `markup = "google-chat"` is also held to Google Chat's 32,000 bytes and refuses a larger setting; set `max_post_bytes` to what the bridge itself accepts, up to that. Under `500` is refused. Also accepted on every `[[providers]]` entry; see "A long message stays one message where it can" under [What it does in v0](#what-it-does-in-v0) |
-| Message markup | `discord.markup` | — | how the service writes message text, for the page's renderer: `discord` (default), `google-chat` for a bridge serving Google Chat, where `*a*` is bold and a link may arrive as `<https://…\|label>`, or `slack` for a bridge passing Slack's text through. A Slack provider is always `slack` and refuses the key. See [How message text is drawn](#how-message-text-is-drawn) |
+| Message markup | `discord.markup` | — | how the service writes message text, for the page's renderer: `discord` (default), `google-chat` for a bridge serving Google Chat, where `*a*` is bold and a link may arrive as `<https://…\|label>`, and whose posts go with their mention syntax made inert (see "Names written with @ never notify anyone in Google Chat"), or `slack` for a bridge passing Slack's text through. A Slack provider is always `slack` and refuses the key. See [How message text is drawn](#how-message-text-is-drawn) |
 | Thread protocol | `discord.thread_api` | — | `native` (default) for Discord, `bridge` for the normalized endpoints below, or `off` to disable child-thread timelines; an added source that identifies one upstream conversation remains an ordinary channel-picker entry in every mode |
 | Bridge recent read | `discord.recent_view` / `discord.recent_view_shadow` | — | `thread_api = "bridge"` only, refused otherwise: which endpoint answers a read of a channel's most recent messages, `messages` (default) or `flat`, and whether `messages` reads are checked against Flat for diagnostics, one at a time once recent reads stop (default `false`; refused with `flat`) — see [A bridge's recent read through Flat](#a-bridges-recent-read-through-flat) |
 | Bridge range reads | `discord.range_reads` | — | `thread_api = "bridge"` only, refused otherwise; default `false`. On, `/page` through a span and `/count` since an instant ask the bridge for the window itself — see [A bridge's range reads](#a-bridges-range-reads) |

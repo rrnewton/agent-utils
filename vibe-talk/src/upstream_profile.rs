@@ -1804,6 +1804,10 @@ impl ChatClient for ProfiledClient {
         self.inner.post_limit(channel)
     }
 
+    fn defuses_mentions(&self, channel: &ChannelId) -> bool {
+        self.inner.defuses_mentions(channel)
+    }
+
     fn continuation_thread(&self, channel: &ChannelId, first: &Message) -> Option<String> {
         self.inner.continuation_thread(channel, first)
     }

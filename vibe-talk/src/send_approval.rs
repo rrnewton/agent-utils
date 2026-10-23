@@ -943,6 +943,7 @@ mod tests {
             resumable: true,
             thread_id: None,
             uncertain,
+            refusal: None,
             first: None,
         }
     }

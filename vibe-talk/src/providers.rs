@@ -842,6 +842,13 @@ impl ChatClient for ChatRouter {
         }
     }
 
+    /// The channel's own provider's say: a Google Chat channel's posts are defused and a Slack
+    /// channel's beside it are not. `#445 gchat-mention-defuse`.
+    fn defuses_mentions(&self, channel: &ChannelId) -> bool {
+        self.route(channel)
+            .is_ok_and(|entry| entry.client.defuses_mentions(channel))
+    }
+
     fn continuation_thread(&self, channel: &ChannelId, first: &Message) -> Option<String> {
         self.route(channel)
             .ok()?

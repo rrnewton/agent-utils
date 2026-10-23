@@ -1046,6 +1046,8 @@ pub struct HttpDiscordClient {
     owner_user_id: Option<String>,
     /// The most one post may carry; see [`DiscordConfig::post_limit`].
     post_limit: crate::chat::PostLimit,
+    /// Whether posts go with their mention syntax defused; see [`DiscordConfig::defuses_mentions`].
+    defuses_mentions: bool,
     /// Which bridge endpoint answers a read of the newest messages. `#208 persistent-cache`.
     recent: crate::config::RecentReads,
     /// Whether the bridge reads a span of time itself; see [`range_request`]. remote-ops-audit
@@ -1134,6 +1136,7 @@ impl HttpDiscordClient {
             upstream_read_marks: config.upstream_read_marks,
             owner_user_id: config.owner_user_id.clone(),
             post_limit: config.post_limit(),
+            defuses_mentions: config.defuses_mentions(),
             recent: config.recent,
             range_reads: config.range_reads,
             id_reads: config.id_reads,
@@ -1315,6 +1318,10 @@ impl ChatClient for HttpDiscordClient {
 
     fn post_limit(&self, _channel: &ChannelId) -> crate::chat::PostLimit {
         self.post_limit
+    }
+
+    fn defuses_mentions(&self, _channel: &ChannelId) -> bool {
+        self.defuses_mentions
     }
 
     /// A bridge's own thread for the first part, as its answer reported it. `#263
@@ -2232,6 +2239,7 @@ mod tests {
             upstream_read_marks: true,
             owner_user_id: None,
             post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
+            defuses_mentions: false,
             recent: crate::config::RecentReads::default(),
             range_reads: false,
             id_reads: false,
@@ -2264,6 +2272,7 @@ mod tests {
             upstream_read_marks,
             owner_user_id: None,
             post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
+            defuses_mentions: false,
             recent: crate::config::RecentReads::default(),
             range_reads: false,
             id_reads: false,
@@ -2507,6 +2516,7 @@ mod tests {
             upstream_read_marks: false,
             owner_user_id: None,
             post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
+            defuses_mentions: false,
             recent: crate::config::RecentReads::default(),
             range_reads: false,
             id_reads: false,
@@ -2578,6 +2588,7 @@ mod tests {
             upstream_read_marks: false,
             owner_user_id: None,
             post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
+            defuses_mentions: false,
             recent: crate::config::RecentReads::default(),
             range_reads: false,
             id_reads: false,
@@ -2638,6 +2649,7 @@ mod tests {
             upstream_read_marks: false,
             owner_user_id: None,
             post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
+            defuses_mentions: false,
             recent: crate::config::RecentReads::default(),
             range_reads: false,
             id_reads: false,
@@ -2702,6 +2714,7 @@ mod tests {
                 upstream_read_marks: false,
                 owner_user_id: None,
                 post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
+                defuses_mentions: false,
                 recent: crate::config::RecentReads::default(),
                 range_reads: false,
                 id_reads: false,
@@ -2759,6 +2772,7 @@ mod tests {
             upstream_read_marks: false,
             owner_user_id: None,
             post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
+            defuses_mentions: false,
             recent: crate::config::RecentReads::default(),
             range_reads: false,
             id_reads: false,
@@ -2842,6 +2856,7 @@ mod tests {
             upstream_read_marks: false,
             owner_user_id: None,
             post_limit: crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
+            defuses_mentions: false,
             recent: crate::config::RecentReads::default(),
             range_reads: false,
             id_reads: false,

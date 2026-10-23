@@ -42353,6 +42353,48 @@ test("a refusal is never sent again on its own, keyed or not", async () => {
   assert.equal(page.repliesPosted.length, 2, "a refusal was asked again");
 });
 
+// `#444 send-refusal-reason`. The owner, replying in a thread: "the message won't send after multiple
+// retries." Each was the chat service's 400, which the server answered as a 207 that said nothing
+// was posted, certainly (`uncertain` false), and why; the row called it "Delivery unconfirmed.
+// Retrying cannot post it twice." and sent him back to Retry.
+test("a refusal the server is sure of is Not sent, says why in plain words, and is never sent again on its own", async () => {
+  const page = await keyedChannel();
+  page.replyResponse = async () => json(207, {
+    error: "partially_posted", posted: 0, unsent: "@Ada can you look", retryable: false, resumable: true,
+    uncertain: false,
+    detail: 'Example Chat returned HTTP 400: {"message":"content contains mention syntax that Google Chat would expand"}',
+    refusal: {
+      status: 400, reason: "content contains mention syntax that Google Chat would expand",
+      explanation: "it contains @Ada, which would notify someone",
+    },
+  });
+  await sendChannel(page, "@Ada can you look");
+  const row = outgoingRows(page)[0];
+  assert.equal(row.getAttribute("data-send-state"), "failed");
+  assert.match(row.text(),
+    /Not sent\. Example Chat refused this message: it contains @Ada, which would notify someone\./);
+  assert.doesNotMatch(row.text(), /unconfirmed|cannot post it twice|Retrying in|\{/);
+  // Nothing of it can be in the channel, so Edit takes it back to the box to be changed.
+  assert.ok(outgoingEdit(row), "a refused send offered no Edit");
+  for (const wait of [0, 1, 2, 3, 4, 5].map(retryWait)) page.expireTimers(wait);
+  await settleSend(page);
+  assert.equal(page.repliesPosted.length, 1, "a refusal was sent again on its own");
+
+  // Refused after a part went: that part is confirmed, the rest is not sent, and Edit stays away from
+  // a send part of which is in the channel.
+  await outgoingDismiss(row).click();
+  page.replyResponse = async () => json(207, {
+    error: "partially_posted", posted: 1, unsent: "the second part", retryable: false, resumable: true,
+    uncertain: false, detail: 'Example Chat returned HTTP 400: {"message":"no"}',
+    refusal: { status: 400, reason: "no", explanation: "no" },
+  });
+  await sendChannel(page, "the first part");
+  const partial = outgoingRows(page)[0];
+  assert.equal(partial.getAttribute("data-send-state"), "failed");
+  assert.match(partial.text(), /1 part confirmed\. Not sent\. Example Chat refused this message: no\./);
+  assert.equal(outgoingEdit(partial), undefined, "Edit was offered for a send partly in the channel");
+});
+
 test("where no provider promises one post per key, a lost send waits for the reader and carries no key", async () => {
   const page = newPage();
   page.chatProviderName = "Example Chat";

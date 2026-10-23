@@ -13317,7 +13317,9 @@ async function commitShownProposal(proposal, confirmedBy) {
       // A failed first part is reported the same way, as a partial send of nothing — unless its
       // answer was lost, when it may be in the channel: that is not confirmed, never "refused".
       // `#270 voice-transcript-markers`.
-      const detail = redact(answer.detail || "the rest was not sent");
+      // `#444 send-refusal-reason`. A refusal in the reader's words, where the chat service refused it.
+      const refused = refusalWords(answer.refusal, chatServiceOf(String(proposal.channel_id)));
+      const detail = redact(refused ? refused.replace(/\.$/, "") : answer.detail || "the rest was not sent");
       const nothing = Number(answer.posted) === 0;
       const unconfirmed = nothing && answer.uncertain === true;
       if (!nothing || unconfirmed) drawSentCard(proposal, confirmedBy, unconfirmed ? "unconfirmed" : "partial", answer);
@@ -27043,12 +27045,18 @@ async function dispatchOutgoingMessage(entry, job) {
       // An adapter can lose an acknowledgement after delivery. Even a 207 is not proof that the
       // last attempted part failed to arrive; its unsent suffix is the ONLY safe retry candidate.
       entry.remaining = typeof payload.unsent === "string" ? payload.unsent : "";
-      entry.state = "unconfirmed";
-      entry.mayHavePosted = true;
+      // `#444 send-refusal-reason`. Unless the server says the part that failed was answered, not
+      // lost (`uncertain` false): then it is certainly not in the channel, and this is a send that
+      // was not sent. Calling it unconfirmed — "Retrying cannot post it twice" — sent the owner
+      // back to Retry four times over a refusal that the same words meet every time. An older
+      // server does not say, and its 207 stays unconfirmed.
+      const answered = payload.uncertain === false;
+      entry.state = answered ? "failed" : "unconfirmed";
+      if (!answered || entry.postedCount > 0) entry.mayHavePosted = true;
       outgoingObservations.delete(entry.id);
-      entry.detail = redact(payload.detail
+      entry.detail = redact(refusalWords(payload.refusal, chatServiceOf(entry.channel)) || (payload.detail
         ? readableCause(payload.detail, chatServiceOf(entry.channel))
-        : "The remaining delivery could not be confirmed.");
+        : "The remaining delivery could not be confirmed."));
       // Said by the server, which knows whether the provider answered or merely failed to; an
       // older server does not say, and its 207 is left to the reader.
       transient = payload.retryable === true && Boolean(entry.remaining);
@@ -27264,6 +27272,18 @@ function resumeOutgoingRetries() {
 // full window — some harnesses build one by hand — has no `window.addEventListener`.
 if (typeof window.addEventListener === "function") {
   window.addEventListener("online", () => resumeOutgoingRetries());
+}
+
+/**
+ * A 207's `refusal` — the chat service's 4xx answer to the part that failed — as a sentence for the
+ * reader: "Google Chat refused this message: it contains @Ada, which would notify someone." The
+ * server puts the reason in the reader's words (`explanation`); "" where there is no refusal, from
+ * a failure that is not one or a server too old to say. `#444 send-refusal-reason`.
+ */
+function refusalWords(refusal, service) {
+  const why = refusal && typeof refusal.explanation === "string" ? refusal.explanation.trim() : "";
+  if (!why) return "";
+  return `${sentenceStart(service)} refused this message: ${why.replace(/[.!?…]+$/, "")}.`;
 }
 
 /**

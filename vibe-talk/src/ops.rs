@@ -98,6 +98,10 @@ pub enum OpError {
         /// voice-send-approval`: what lets a voice agent say "not confirmed" rather than "not
         /// sent" about a post whose answer was lost.
         uncertain: bool,
+        /// The provider's refusal of the part that failed, when it refused it: its status, its
+        /// reason, and that reason in the reader's words. `#444 send-refusal-reason`. `None` for
+        /// a failure that is not a refusal, which [`ChatError::is_transient`] may call a moment.
+        refusal: Option<Box<crate::send_refusal::SendRefusal>>,
         /// The first part as the provider accepted it, when any part was. `#270
         /// voice-transcript-markers`: what lets a card for a partial send open the message.
         first: Option<Box<Message>>,
@@ -3505,6 +3509,15 @@ async fn ready_to_post(
     // not Discord's: cut at Discord's 2000 characters, a long message to Google Chat, which takes
     // sixteen times that, arrived as three. `#263 post-split-per-provider`.
     let limit = state.chat.post_limit(&info.id);
+    // `#445 gchat-mention-defuse`. Mention syntax the provider would refuse is made inert first,
+    // before the cut, so what it adds counts toward the limit — and the text a 207 hands back is
+    // the defused text, which defusing again leaves as it is, so a retry is cut and keyed alike.
+    let defused = if state.chat.defuses_mentions(&info.id) {
+        crate::mention_defuse::defuse(text)
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    };
+    let text: &str = &defused;
     let parts = crate::discord::split::split_within(text, &limit);
     if parts.is_empty() {
         return Err(OpError::Chat(ChatError::Refused(
@@ -3646,6 +3659,18 @@ async fn post_each(
                 // of a continued post is that part's thread rather than the conversation.
                 let replying = reply_to.is_some() && continuation.is_none();
                 let (unsent, resumable) = unsent_remainder(&text, &parts, index, replying, &limit);
+                // `#444 send-refusal-reason`. Why, in the log and to the caller: a provider's
+                // refusal said why, and the same text sent again is refused the same way.
+                let refusal = crate::send_refusal::SendRefusal::of(&cause, part);
+                crate::send_refusal::log_failed_part(
+                    &info,
+                    into,
+                    index,
+                    parts.len(),
+                    part,
+                    &cause,
+                    refusal.as_ref(),
+                );
                 return Err(OpError::PartiallyPosted {
                     posted: posted.len(),
                     unsent,
@@ -3654,6 +3679,7 @@ async fn post_each(
                     thread_id: into.map(str::to_owned),
                     uncertain: cause.may_have_delivered(),
                     cause: cause.to_string(),
+                    refusal: refusal.map(Box::new),
                     first: posted.first().cloned().map(Box::new),
                 });
             }

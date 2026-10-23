@@ -1306,6 +1306,10 @@ impl crate::chat::ChatClient for CountingChat {
         self.inner.post_limit(channel)
     }
 
+    fn defuses_mentions(&self, channel: &crate::model::ChannelId) -> bool {
+        self.inner.defuses_mentions(channel)
+    }
+
     fn continuation_thread(
         &self,
         channel: &crate::model::ChannelId,
