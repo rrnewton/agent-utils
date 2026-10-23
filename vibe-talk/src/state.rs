@@ -217,11 +217,19 @@ impl AppState {
             .store
             .kept_post_keys(now - crate::store::POST_KEY_KEEP_MS)
             .await?;
+        let total = rows.len();
         let kept: Vec<crate::post_keys::Kept> = rows
             .into_iter()
             .filter_map(|(record, _)| serde_json::from_str(&record).ok())
             .collect();
         let count = kept.len();
+        if count < total {
+            // A record an older or newer build filed in another shape: its repeat may post again.
+            tracing::warn!(
+                skipped = total - count,
+                "send log records in the store did not parse and were not restored"
+            );
+        }
         self.post_keys.restore(kept, now);
         Ok(count)
     }

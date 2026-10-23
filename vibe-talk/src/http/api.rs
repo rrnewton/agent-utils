@@ -3785,6 +3785,9 @@ pub async fn purge_storage(
 ) -> Result<Response, ApiError> {
     let clearing = state.live.upstream_clear();
     let changing = clearing.changing().await;
+    // The send log's memory first, so a post settling during the purge is not filed after it.
+    // `#471 replication-c5-post-keys`.
+    state.post_keys.forget_settled();
     state.store.purge_everything().await?;
     let forgotten = clearing.forget_all();
     drop(changing);

@@ -174,6 +174,39 @@ async fn a_repeat_after_a_restart_is_answered_from_the_store_and_posts_nothing()
 }
 
 #[tokio::test]
+async fn the_purge_forgets_the_send_log_in_memory_and_in_the_store() {
+    let fake = Fake::start(fixture(vec![]), 50).await;
+    let state = slack(&fake).await;
+    let words = json!({ "text": "deploying now", "idempotency_key": KEY });
+    let (status, _) = call(&state, &reply(), words.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    let request = Request::builder()
+        .method("DELETE")
+        .uri("/api/v1/storage")
+        .header("authorization", format!("Bearer {WRITE_TOKEN}"))
+        .body(Body::empty())
+        .expect("request");
+    let response = vibe_talk::http::router(state.clone())
+        .oneshot(request)
+        .await
+        .expect("router responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        state
+            .store
+            .kept_post_keys(0)
+            .await
+            .expect("read")
+            .is_empty(),
+        "the purge left the owner's words in the store"
+    );
+    // Erased means forgotten: the same send is a new post now, as it would be with a new key.
+    let (status, _) = call(&state, &reply(), words).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(fake.calls("chat.postMessage"), 2);
+}
+
+#[tokio::test]
 async fn a_lost_answer_whose_post_cannot_be_seen_stays_uncertain() {
     // The transport drops metadata, and the fake's dates are older than the request, so neither
     // the key nor the words can find it: the answer stays what it was.
@@ -228,60 +261,61 @@ fn message(id: &str, author: &str, text: &str, at_ms: i64, op_key: Option<&str>)
 fn the_words_match_only_one_new_message_by_this_account_with_no_other_key() {
     let began = 1_790_000_000_000;
     let mine = |id: &str, text: &str, at: i64| message(id, "me", text, at, None);
+    let none_ours = |_: &MessageId| false;
+    let find = |read: &[Message], part: &str, key: Option<&str>, readable: bool| {
+        match_uncertain_part(read, part, key, readable, Some("me"), began, none_ours)
+    };
     // Found: the one new message by this account with the part's words, whitespace aside.
     let read = [
         mine("a", "yes,  it is\ngreen", began + 900),
         message("b", "ada", "is the build green?", began - 60_000, None),
     ];
-    let found = match_uncertain_part(
-        &read,
-        "yes, it is green",
-        Some(KEY),
-        false,
-        Some("me"),
-        began,
-    )
-    .expect("found");
+    let found = find(&read, "yes, it is green", Some(KEY), false).expect("found");
     assert_eq!(found.id.0, "a");
-    // Not: an older post with the same words, the owner's earlier one.
+    // Not: an older post with the same words.
     let older = [mine(
         "a",
         "yes, it is green",
         began - UNCERTAIN_PART_SKEW_MS - 1,
     )];
+    assert!(find(&older, "yes, it is green", None, false).is_none());
+    // Not: the same words this server already saw land as its own post a moment before, whose
+    // answer came back: the owner sending "ok" twice, the second never posted.
+    let earlier = [mine("a", "ok", began + 1)];
     assert!(
-        match_uncertain_part(&older, "yes, it is green", None, false, Some("me"), began).is_none()
+        match_uncertain_part(&earlier, "ok", None, false, Some("me"), began, |id| id.0
+            == "a")
+        .is_none(),
+        "an earlier send of the same words was taken for this one"
     );
     // Not: someone else's words.
     let theirs = [message("a", "ada", "yes, it is green", began + 10, None)];
-    assert!(
-        match_uncertain_part(&theirs, "yes, it is green", None, false, Some("me"), began).is_none()
-    );
+    assert!(find(&theirs, "yes, it is green", None, false).is_none());
     // Not: two that match; which is ours cannot be told.
     let two = [mine("a", "ok", began + 1), mine("b", "ok", began + 2)];
-    assert!(match_uncertain_part(&two, "ok", None, false, Some("me"), began).is_none());
+    assert!(find(&two, "ok", None, false).is_none());
     // Not: a message carrying another key.
     let other = [message("a", "me", "ok", began + 1, Some("someone-else"))];
-    assert!(match_uncertain_part(&other, "ok", Some(KEY), false, Some("me"), began).is_none());
+    assert!(find(&other, "ok", Some(KEY), false).is_none());
     // Where reads return every key and this part carried one, no key means not posted.
     let unkeyed = [mine("a", "ok", began + 1)];
-    assert!(match_uncertain_part(&unkeyed, "ok", Some(KEY), true, Some("me"), began).is_none());
-    // By key, exactly, whatever its words or time.
+    assert!(find(&unkeyed, "ok", Some(KEY), true).is_none());
+    // Not by words at all where the provider does not say which account is this server's.
+    assert!(match_uncertain_part(&unkeyed, "ok", None, false, None, began, none_ours).is_none());
+    // By key, exactly, whatever its words, time or account.
     let keyed = [message(
         "z",
-        "me",
+        "ada",
         "edited since",
         began - 99_999,
         Some(KEY),
     )];
     assert_eq!(
-        match_uncertain_part(&keyed, "ok", Some(KEY), true, Some("me"), began)
+        match_uncertain_part(&keyed, "ok", Some(KEY), true, None, began, none_ours)
             .expect("found")
             .id
             .0,
         "z"
     );
-    // An unknown own account matches on the words and time alone.
-    assert!(match_uncertain_part(&unkeyed, "ok", None, false, None, began).is_some());
     let _ = ChannelId("C1".to_owned());
 }

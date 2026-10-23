@@ -515,6 +515,14 @@ impl ChatRouter {
         (groups, unrouted)
     }
 
+    /// The account the channel's own provider posts as, when it says. `#465
+    /// replication-c6-op-key-marker`: [`ChatClient::self_author_id`] answers for the default
+    /// provider only, which is another provider's account for a channel routed elsewhere.
+    #[must_use]
+    pub fn self_author_for(&self, channel: &ChannelId) -> Option<String> {
+        self.route(channel).ok()?.client.self_author_id()
+    }
+
     fn route(&self, channel: &ChannelId) -> Result<&ProviderEntry, ChatError> {
         self.index_for(channel)
             .map(|index| &self.entries[index])

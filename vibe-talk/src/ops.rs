@@ -3850,11 +3850,15 @@ async fn post_parts(
         let remembered = to_remember(&result);
         // `#471 replication-c5-post-keys`: what it landed as is filed in the store too, so a
         // repeat after a restart is answered with it rather than posted again.
-        let kept = remembered.clone().map(|outcome| crate::post_keys::Kept {
-            fingerprint: claim.fingerprint().clone(),
-            outcome,
-            at_ms: crate::store::now_ms(),
-        });
+        // Not after a purge emptied the send log while this post was in flight.
+        let kept = remembered
+            .clone()
+            .filter(|_| claim.fileable())
+            .map(|outcome| crate::post_keys::Kept {
+                fingerprint: claim.fingerprint().clone(),
+                outcome,
+                at_ms: crate::store::now_ms(),
+            });
         claim.settle(remembered);
         if let Some(kept) = kept {
             keep_post_key(&state, &kept).await;
@@ -3930,7 +3934,7 @@ async fn post_each(
         // landed, and the post goes on as if the answer had come back.
         let sent = match sent {
             Err(cause) if cause.may_have_delivered() => {
-                match find_uncertain_part(state, &info, into, part, key, began_ms).await {
+                match find_uncertain_part(state, &info, into, parent, part, key, began_ms).await {
                     Some(found) => Ok(found),
                     None => Err(cause),
                 }
@@ -4008,58 +4012,61 @@ async fn post_each(
 }
 
 /// How much earlier than the request for it, in milliseconds, a message found upstream for an
-/// uncertain part may say it was created and still be taken for it: the provider's clock and this
-/// server's, a little apart. Small, because an older message with the same words is the owner's
-/// earlier post, not this one. `#465 replication-c6-op-key-marker`.
-pub const UNCERTAIN_PART_SKEW_MS: i64 = 10_000;
+/// uncertain part may say it was created and still be taken for it by its words: the provider's
+/// clock and this server's, a little apart. Small, because an older message with the same words is
+/// an earlier post, not this one. `#465 replication-c6-op-key-marker`.
+pub const UNCERTAIN_PART_SKEW_MS: i64 = 2_000;
 
-/// The message an uncertain part became, found by reading its destination: the newest page of the
-/// thread it went into, or of the channel's flat view (its own page where it has none). `#465
+/// The message an uncertain part became, found by reading its destination. `#465
 /// replication-c6-op-key-marker`, part 2.
 ///
-/// - **By its key**, where the provider carried it ([`crate::chat::OpKeyCarrier`]) and a read
-///   returned it: exact.
-/// - **By its words** otherwise: the one message created no earlier than the request
-///   ([`UNCERTAIN_PART_SKEW_MS`]), by this server's own account where the provider says which that
-///   is, whose text is the part's, carrying no other key. Not where the provider's reads return
-///   every key and this part carried one: there no key means not posted.
+/// One cheap read, while the destination's turn is held: the newest page of the thread the part
+/// went into, or of the channel itself for a post to the channel. A reply on a provider that puts
+/// it in the answered message's thread (Slack) names no thread here, so it is not looked for.
 ///
-/// `None` when nothing matches or the read fails, which leaves the part uncertain, as before. Not
-/// asked at all where the provider itself makes a repeat of the key the first post: there sending
-/// it again is already safe.
+/// Not asked at all where the provider itself recognises a repeat of a key (a registration
+/// bridge always, Discord within its window): a keyed post is safe to send again there, and for
+/// any post a read could only add a request and a chance of taking another message for it.
+///
+/// `None` when nothing matches or the read fails, which leaves the part uncertain, as before.
 async fn find_uncertain_part(
     state: &AppState,
     info: &ChannelInfo,
     into: Option<&str>,
+    parent: Option<&MessageId>,
     part: &str,
     key: Option<&str>,
     began_ms: i64,
 ) -> Option<Message> {
     let carrier = state.chat.op_key_carrier(&info.id);
-    if key.is_some() && carrier.dedupes == crate::chat::OpKeyDedupe::Always {
+    if carrier.dedupes != crate::chat::OpKeyDedupe::Never {
         return None;
     }
-    let request = crate::threads::TimelineRequest {
-        view: if into.is_some() {
-            crate::threads::TimelineView::Thread
-        } else {
-            crate::threads::TimelineView::Flat
-        },
-        thread_id: into.map(str::to_owned),
-        ..crate::threads::TimelineRequest::default()
-    };
-    let read = match state.chat.fetch_timeline(&info.id, &request).await {
-        Ok(page) => page.messages,
-        Err(_) if into.is_none() => state.chat.fetch_page(&info.id, 50, None, None).await.ok()?,
-        Err(_) => return None,
+    let read = match into {
+        Some(thread) => {
+            let request = crate::threads::TimelineRequest {
+                view: crate::threads::TimelineView::Thread,
+                thread_id: Some(thread.to_owned()),
+                ..crate::threads::TimelineRequest::default()
+            };
+            state
+                .chat
+                .fetch_timeline(&info.id, &request)
+                .await
+                .ok()?
+                .messages
+        }
+        None if parent.is_some() && state.chat.replies_in_thread() => return None,
+        None => state.chat.fetch_page(&info.id, 50, None, None).await.ok()?,
     };
     let found = match_uncertain_part(
         &read,
         part,
         key,
         carrier.readable,
-        state.chat.self_author_id().as_deref(),
+        state.providers.self_author_for(&info.id).as_deref(),
         began_ms,
+        |id| state.live.is_self_posted(id),
     );
     tracing::info!(
         channel = %info.id,
@@ -4071,6 +4078,15 @@ async fn find_uncertain_part(
 }
 
 /// [`find_uncertain_part`]'s decision over the messages a read returned.
+///
+/// - **By its key**: the message carrying it, wherever a read returned it. A key that comes back
+///   is the provider's own word that this post is there.
+/// - **By its words** otherwise, and only where the provider names this server's own account
+///   (`self_author`): the one message by that account, created no earlier than the request
+///   ([`UNCERTAIN_PART_SKEW_MS`]), that this server has not already seen land as one of its own
+///   posts (`already_ours`, so an earlier send of the same words is never taken for this one),
+///   carrying no other key, whose text is the part's, whitespace aside. Not where the provider's
+///   reads return every key and this part carried one: there no key means not posted.
 #[must_use]
 pub fn match_uncertain_part(
     read: &[Message],
@@ -4079,6 +4095,7 @@ pub fn match_uncertain_part(
     readable: bool,
     self_author: Option<&str>,
     began_ms: i64,
+    already_ours: impl Fn(&MessageId) -> bool,
 ) -> Option<Message> {
     if let Some(key) = key {
         if let Some(found) = read.iter().find(|m| m.op_key.as_deref() == Some(key)) {
@@ -4088,11 +4105,13 @@ pub fn match_uncertain_part(
             return None;
         }
     }
+    let me = self_author?;
     let words = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
     let wanted = words(part);
     let mut matches = read.iter().filter(|m| {
         m.op_key.is_none()
-            && self_author.is_none_or(|me| m.author_id.as_str() == me)
+            && m.author_id.as_str() == me
+            && !already_ours(&m.id)
             && message_ms(m).is_some_and(|at| at >= began_ms - UNCERTAIN_PART_SKEW_MS)
             && words(&m.content) == wanted
     });

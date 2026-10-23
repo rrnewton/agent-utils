@@ -205,6 +205,9 @@ impl Fingerprint {
 pub struct PostKeys {
     slots: Mutex<HashMap<String, Slot>>,
     keep: Duration,
+    /// Moved by every [`PostKeys::forget_settled`]: a claim made before it settles into memory,
+    /// but is not filed in the store. `#471 replication-c5-post-keys`.
+    generation: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for PostKeys {
@@ -282,6 +285,8 @@ pub struct Pending {
     /// What the key named before this claim — the post whose unsent rest this is — put back if
     /// this one is forgotten, so the key still answers for the part that landed.
     before: Option<Box<Slot>>,
+    /// [`PostKeys::generation`] when the claim was made.
+    generation: u64,
 }
 
 impl Pending {
@@ -289,6 +294,13 @@ impl Pending {
     #[must_use]
     pub fn fingerprint(&self) -> &Fingerprint {
         &self.fingerprint
+    }
+
+    /// Whether the store may file what this claim settles as: no purge has emptied the send log
+    /// since it was made. `#471 replication-c5-post-keys`.
+    #[must_use]
+    pub fn fileable(&self) -> bool {
+        self.keys.generation() == self.generation
     }
 
     /// How far the post has got, for [`PostKeys::lookup`] to report.
@@ -356,6 +368,7 @@ impl PostKeys {
         Self {
             slots: Mutex::new(HashMap::new()),
             keep,
+            generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -408,6 +421,7 @@ impl PostKeys {
             settle: Some(sender),
             progress,
             before,
+            generation: self.generation(),
         })
     }
 
@@ -442,9 +456,9 @@ impl PostKeys {
             if age >= self.keep {
                 continue;
             }
-            let Some(at) = now.checked_sub(age) else {
-                continue;
-            };
+            // Soon after the host started, the monotonic clock may not reach back that far: the
+            // record is then taken as settled now, which keeps it a little longer, never shorter.
+            let at = now.checked_sub(age).unwrap_or(now);
             restored.insert(
                 record.fingerprint.key.clone(),
                 Slot {
@@ -460,6 +474,23 @@ impl PostKeys {
             slots.entry(key).or_insert(slot);
         }
         self.prune(&mut slots);
+    }
+
+    /// Forget every post that landed, as the operator's purge does to the store, and move the
+    /// generation so a post in flight now is remembered here when it settles but never filed in
+    /// the store ([`Pending::fileable`]). Posts in flight stay, so a repeat still waits for them.
+    /// `#471 replication-c5-post-keys`.
+    pub fn forget_settled(&self) {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.lock()
+            .retain(|_, slot| matches!(slot.state, State::InFlight { .. }));
+    }
+
+    /// The generation [`PostKeys::forget_settled`] moves.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// How many posts are remembered or in flight.
@@ -564,6 +595,37 @@ mod tests {
         let record = serde_json::to_string(&kept("k", "hello", 1, now)).expect("JSON");
         let back: Kept = serde_json::from_str(&record).expect("parses");
         assert_eq!(back.key(), "k");
+    }
+
+    #[test]
+    fn the_purge_forgets_what_landed_and_a_claim_made_before_it_is_not_filed() {
+        // `#471 replication-c5-post-keys`.
+        let keys = Arc::new(PostKeys::new());
+        let Claim::Mine(done) = keys.claim(fingerprint("done", "landed")) else {
+            panic!("a fresh post was not the caller's");
+        };
+        done.settle(Some(partial(1)));
+        let Claim::Mine(flying) = keys.claim(fingerprint("flying", "now")) else {
+            panic!("a fresh post was not the caller's");
+        };
+        assert!(flying.fileable());
+        keys.forget_settled();
+        assert!(
+            !flying.fileable(),
+            "a post in flight at the purge would be filed after it"
+        );
+        assert!(matches!(
+            keys.claim(fingerprint("done", "landed")),
+            Claim::Mine(_)
+        ));
+        assert!(
+            matches!(keys.claim(fingerprint("flying", "now")), Claim::Wait(_)),
+            "a post in flight is still waited for"
+        );
+        let Claim::Mine(after) = keys.claim(fingerprint("after", "later")) else {
+            panic!("a fresh post was not the caller's");
+        };
+        assert!(after.fileable());
     }
 
     #[tokio::test]

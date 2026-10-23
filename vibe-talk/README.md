@@ -3416,14 +3416,18 @@ because a later copy lacks it. Metadata filed under any other `event_type` is ne
 
 **A post whose answer was lost is looked for before it is called uncertain** (`#465
 replication-c6-op-key-marker`). When a part's answer may have been lost after the provider took it
-(a timeout, a gateway's 5xx), the server reads the part's destination, the thread it went into or
-the channel's flat view, before it answers. It takes the message carrying the part's key where a
-read returned one; otherwise the one message by this server's account, created no earlier than the
-request (`UNCERTAIN_PART_SKEW_MS`, ten seconds of clock difference), with the part's words and no
-other key. Found, the part landed and the send is answered as posted, so Retry cannot post it
-twice; not found, or where the read fails, it stays uncertain as before. Where reads return every
-key and the part carried one, a message without it is not taken. A provider that itself makes a
-repeat of the key the first post (a registration bridge) is not read: sending again is safe there. The cache keeps a message's key with it, and a later copy without one
+(a timeout, a gateway's 5xx), the server reads the newest page of the part's destination, the
+thread it went into or the channel itself, once, before it answers. It takes the message carrying
+the part's key where a read returned one. Otherwise, only where the channel's provider names this
+server's own account, it takes the one message by that account, created no earlier than the request
+(`UNCERTAIN_PART_SKEW_MS`, two seconds of clock difference), that the server has not already seen
+land as one of its own posts, with the part's words and no other key. Found, the part landed and
+the send is answered as posted, so Retry cannot post it twice; not found, or where the read fails,
+it stays uncertain as before. Where reads return every key and the part carried one, a message
+without it is not taken. Not looked for: a reply on a provider that puts it in the answered
+message's thread (Slack), whose thread is not known there; and any post to a provider that
+itself recognises a repeat of a key (a registration bridge, or Discord within its window), where a
+keyed post is safe to send again. The cache keeps a message's key with it, and a later copy without one
 never takes it away.
 
 A registration-capable bridge may also list the channels its account can see, which lets
