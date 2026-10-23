@@ -164,6 +164,15 @@ HEADER_JS = """(root) => {
 # machine, opens the thread later than a fixed window starting now would allow for. `ms` only bounds a
 # thread that never opens.
 REST_FRAMES = 20
+
+# `#472 gate-flake-hardening`. The card's move, ten times as long as the page's own 220 ms, through the
+# stylesheet variable the page reads its length from (`--card-flight`, web/voice.js `cardFlightMs`), so
+# its fallback timer stretches with it. At 220 ms a renderer starved for a frame or two on a loaded host
+# drew the move in two or three frames, and "only upward through at least three places between" failed
+# on a move that was really there ("through only [276]"). Slowed, a stall of 200 ms still leaves most of
+# the move to be drawn, while a card that jumps -- no move at all -- is drawn at its place from the first
+# frame whatever the length. Not under reduced motion, where the length is 0 and nothing must move.
+SLOW_FLIGHT_CSS = "@media (prefers-reduced-motion: no-preference) { #screen-main { --card-flight: 2200ms; } }"
 WATCH_JS = """({card, area, list, pane, ms, rest}) => {
     const node = document.getElementById(card), scroller = document.getElementById(area);
     const fading = document.getElementById(pane);
@@ -314,6 +323,12 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 # The channel re-reads itself every 45 s; the walk brings that forward on this clock.
                 page.clock.install()
             page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
+            # The page's own length first, so the slowed one cannot stand in for a move the page lost.
+            flight = page.evaluate("() => getComputedStyle(document.getElementById('screen-main'))"
+                                   ".getPropertyValue('--card-flight').trim()")
+            check(flight == ("0ms" if kind == "reduced" else "220ms"),
+                  f"{label}: the page says its card moves for {flight!r}")
+            page.add_style_tag(content=SLOW_FLIGHT_CSS)
             if kind == "redraw":
                 redraw_walk(desk, api)
             elif kind == "desk":
