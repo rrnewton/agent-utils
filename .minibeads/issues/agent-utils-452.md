@@ -1,6 +1,6 @@
 ---
 title: 'slack-live-ingest: ingest the Slack tail''s message text directly instead of re-reading it'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
@@ -9,7 +9,8 @@ labels:
 - live
 - cache
 created_at: 2026-10-23T13:16:00.422275527+00:00
-updated_at: 2026-10-23T13:16:00.422275527+00:00
+updated_at: 2026-10-23T14:12:53.127886333+00:00
+closed_at: 2026-10-23T14:12:53.127886164+00:00
 ---
 
 # Description
@@ -19,3 +20,7 @@ updated_at: 2026-10-23T13:16:00.422275527+00:00
 # Acceptance Criteria
 
 Pushed message.created records reach the live stream and the message cache without a provider read; a later read of the same message merges as the same message and never republishes it as new; GAP forces a re-read; the relist publishes edits and deletions; adapter self-test and server tests cover each part; send-to-visible latency measured before/after on the fake.
+
+# Notes
+
+[opus 5.5] Delivered: POST and GET /api/v1/live/tail (content-carrying, strictly validated, the same normalization as a read), created-memory deduplication with the poller, history rules, GAP and reaction handling, the relist ([ingest] relist_seconds), live-hint-adapter.py --records (every conversation, persisted cursor, overflow and unreadable lines reported as gaps), tests, and fake-Slack latency figures (README, "Stream records"). Unverified: the real tail's reaction record payload is not interpreted (a reaction only wakes the poller), and nothing has run against the live stream; deployment and switching the adapter to --records are the coordinator's.
