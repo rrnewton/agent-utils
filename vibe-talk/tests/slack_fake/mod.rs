@@ -105,6 +105,9 @@ pub struct FakeState {
     pub auth_user: Option<String>,
     /// The `team_id` `auth.test` reports instead of [`TEAM`]; an empty one reports none at all.
     pub team: Option<String>,
+    /// How long every answer is held before it is sent: a bridge's own read latency, for a test
+    /// that measures what an extra provider read costs. `#452 slack-live-ingest`.
+    pub delay: Option<std::time::Duration>,
 }
 
 /// A `conversations.replies` request answered late, so a test can act while a read is in flight.
@@ -160,6 +163,10 @@ impl Fake {
             let shared = Arc::clone(&shared);
             async move {
                 let hold = take_hold(&shared, &uri, &body);
+                let delay = shared.lock().expect("state").delay;
+                if let Some(delay) = delay {
+                    tokio::time::sleep(delay).await;
+                }
                 let response = handle(&shared, &uri, &headers, &body);
                 if let Some(hold) = hold {
                     hold.arrived.notify_one();

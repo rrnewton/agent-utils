@@ -43,7 +43,7 @@ pub async fn require_bearer(
 
 /// Whether a request must carry one of the two browser tokens before it is routed.
 ///
-/// Everything under `/api/` does, except the five requests whose route carries a different
+/// Everything under `/api/` does, except the seven requests whose route carries a different
 /// credential and checks it before reading anything else: the adapter's ingest token, the
 /// read-aloud ticket in the path that stands in for the header an `<audio src>` cannot send, and
 /// the pairing code in the body of a redemption, which is how a device with no token yet gets one
@@ -62,6 +62,11 @@ fn needs_bearer(method: &Method, path: &str) -> bool {
     ];
     let own_credential = match segments {
         [Some("v1"), Some("live"), Some("events" | "hints"), None, _] => method == Method::POST,
+        // `#452 slack-live-ingest`: an adapter posts stream records and asks what to tail, both
+        // under the ingest credential.
+        [Some("v1"), Some("live"), Some("tail"), None, _] => {
+            method == Method::POST || method == Method::GET
+        }
         [Some("v1"), Some("pair"), Some("redeem"), None, _] => method == Method::POST,
         // `HEAD` because axum answers it wherever it answers `GET`, and a media element may use it.
         // An empty ticket is never a live one, so it earns no exemption and routing never answers it.
@@ -101,6 +106,9 @@ mod tests {
         assert!(needs_bearer(&Method::GET, "/api/v1/live/events"));
         assert!(!needs_bearer(&Method::POST, "/api/v1/live/hints"));
         assert!(needs_bearer(&Method::GET, "/api/v1/live/hints"));
+        assert!(!needs_bearer(&Method::POST, "/api/v1/live/tail"));
+        assert!(!needs_bearer(&Method::GET, "/api/v1/live/tail"));
+        assert!(needs_bearer(&Method::DELETE, "/api/v1/live/tail"));
         assert!(!needs_bearer(&Method::POST, "/api/v1/pair/redeem"));
         assert!(needs_bearer(&Method::GET, "/api/v1/pair/redeem"));
         assert!(needs_bearer(&Method::POST, "/api/v1/pair"));

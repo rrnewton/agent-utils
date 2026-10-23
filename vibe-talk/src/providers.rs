@@ -1140,6 +1140,24 @@ impl ChatClient for ChatRouter {
             .is_ok_and(|entry| entry.client.polls_thread_replies(channel))
     }
 
+    /// `#452 slack-live-ingest`. Forwarded: the channel's own provider normalizes what its
+    /// stream pushed.
+    fn takes_pushed_messages(&self, channel: &ChannelId) -> bool {
+        self.route(channel)
+            .is_ok_and(|entry| entry.client.takes_pushed_messages(channel))
+    }
+
+    async fn pushed_message(
+        &self,
+        channel: &ChannelId,
+        raw: serde_json::Value,
+    ) -> Result<Option<Message>, ChatError> {
+        self.route(channel)?
+            .client
+            .pushed_message(channel, raw)
+            .await
+    }
+
     /// `#307 slack-reply-live`. Forwarded, so the provider keeps its own place in each thread.
     async fn fetch_live(
         &self,

@@ -1052,6 +1052,37 @@ pub trait ChatClient: Send + Sync {
         })
     }
 
+    /// Whether this provider can turn a message its own event stream delivered, content and all,
+    /// into a [`Message`] for `channel` ([`ChatClient::pushed_message`]). `#452 slack-live-ingest`.
+    ///
+    /// False by default: such a provider's adapter can only send content-free hints, and the
+    /// poller reads what changed.
+    fn takes_pushed_messages(&self, _channel: &ChannelId) -> bool {
+        false
+    }
+
+    /// Normalize one message object the provider's event stream delivered for `channel`, in the
+    /// provider's own wire shape, exactly as a read of the same message would: the same id, the
+    /// same author mapping and the same thread, so that a later read's copy is the same message.
+    /// `#452 slack-live-ingest`.
+    ///
+    /// `Ok(None)` for an object a read would also leave out: a system event, or one with no
+    /// author. The text is untrusted third-party content, as a read's is.
+    ///
+    /// # Errors
+    ///
+    /// [`ChatError::Refused`] from a provider that does not take pushed messages (the default),
+    /// and [`ChatError::Shape`] for an object that is not one of its messages.
+    async fn pushed_message(
+        &self,
+        _channel: &ChannelId,
+        _raw: serde_json::Value,
+    ) -> Result<Option<Message>, ChatError> {
+        Err(ChatError::Refused(
+            "this provider does not take messages from its event stream".to_owned(),
+        ))
+    }
+
     /// Which bulk reads this provider answers natively for `channel`. remote-ops-audit W10
     /// `#287 bulk-reads`.
     ///

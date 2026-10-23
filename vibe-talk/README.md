@@ -2073,8 +2073,10 @@ message cache can be worked out from real messages rather than guessed (`#208 pe
   "Older threads…" when no cursor is known yet) and `side` (the right column's thread or list of
   threads, read beside Main). The server names its own: `naming` (a thread read to name it), `recent` (a
   voice catch-up's window), `probe`, `summary-window`, `speech`, `shadow` (the recent-view check),
-  `tool` (an MCP tool call) and `reply-mark` (whether a reply's provider read mark would clear more
-  than the channel). A bulk read (see
+  `tool` (an MCP tool call), `reply-mark` (whether a reply's provider read mark would clear more
+  than the channel), `relist` (a channel's newest page and active threads read again for edits and
+  deletions a provider's event stream never carries) and `backfill` (older history walked to fill
+  the message cache). A bulk read (see
   [Bulk and time-range reads](#bulk-and-time-range-reads)) carries the reason of the reads it
   stands in for, native or emulated: a catch-up's head read and its read of several channels are
   `recent`, the head read checked beside the probe is `probe`, and speech preparation's lookup by
@@ -2405,7 +2407,9 @@ model provider or a real gateway.
 | Count ceiling | `chat.max_count_scan` | — | how many messages a count may walk, default `500`; also accepted as `discord.max_count_scan` |
 | Provider request timeout | `discord.request_timeout_seconds` | — | seconds for one ordinary provider HTTP request, default `20`, range `1`–`120`; compatible bridges may need longer |
 | Live poll interval | `discord.live_poll_seconds` | `VIBE_TALK_LIVE_POLL_SECONDS` | seconds between inbound reads per channel; **`0` (default) is OFF**, and under `5` is refused |
-| Live adapter token | `ingest.token` | `VIBE_TALK_INGEST_TOKEN` | **secret**, optional, ≥ 24 chars and distinct from both API tokens; authenticates normalized event push and content-free change hints. Full events for a polled provider are refused with `409 channel_is_polled`; hints may safely coexist because they wake the poller's own cursor |
+| Live adapter token | `ingest.token` | `VIBE_TALK_INGEST_TOKEN` | **secret**, optional, ≥ 24 chars and distinct from both API tokens; authenticates normalized event push, content-free change hints, and a provider's own stream records at `/api/v1/live/tail` ([Stream records](#stream-records)). Full events for a polled provider are refused with `409 channel_is_polled`; hints and stream records may safely coexist with polling, because a hint wakes the poller's own cursor and a record's message is published once between the record and the poller |
+| Relist interval | `ingest.relist_seconds` | — | optional; `0` (the default) or 30 to 86400 seconds. Each channel of a provider that takes stream records has its newest page and its recently active threads read again on this interval, and the edits and deletions found go out as live updates ([Stream records](#stream-records)) |
+| Relist threads | `ingest.relist_threads` | — | optional; default `4`, 0 to 16: the recently active threads of one channel each relist reads |
 | Channel registration | `discord.channel_registration` | — | **off by default**; enable only when `discord.api_base` is a compatible bridge implementing `POST /channels` and `DELETE /channels/{id}` |
 | Upstream read marks | `discord.upstream_read_marks` | — | **off by default**; enable only when `discord.api_base` is a compatible bridge implementing `POST /channels/{id}/read` |
 | Chat service name | `discord.provider_name` | — | `Discord`; set to the source service's name (for example, `Google Chat`) when using a compatible HTTP bridge |
@@ -2457,7 +2461,7 @@ model provider or a real gateway.
 | Replay transport | `replay.transport` | `VIBE_TALK_REPLAY_TRANSPORT` | `contextual_update` (default) or `client_data` |
 | Config file path | — | `VIBE_TALK_CONFIG` | or `--config` |
 | Config overlays | — | `VIBE_TALK_CONFIG_OVERLAY` | or `--config-overlay`, repeatable; TOML laid over the config file table by table, see [One config file, two hosts](#one-config-file-two-hosts) |
-| Message cache | `[message_cache]` | — | **filled from what write-scope and server-owned reads see; reads are answered from it only with `serve = true`** (`#208 persistent-cache`, `#384 cache-serve`). At startup, `enabled = true` registers the file in the sidecar `<storage path>.message-cache.json` and then opens it; `enabled = false`, or the owner's off recorded in that sidecar, erases every cache file this server made; an absent table opens nothing, warns at every start while a file from an earlier configuration is present, and erases it once the table has been absent for seven days. Keys: `enabled` (default `false`), `serve` (default `false`: answer a newest timeline page and a fresh newest window from the cache at once, refreshing from the provider in the background; needs `enabled = true`), `path` (absolute; default beside `[storage] path`, never equal to it), `max_days` (default `90`, 1 to 365), `max_megabytes` (default `256`, 16 to 4096, counting the `-wal` and `-shm` files), `backfill` (`adaptive`, the default, or `off`; no effect yet), `timeline_fallback_ms` (default `10000`, 1000 to 60000; no effect yet), and `[[message_cache.channel]]` entries of `id` and `max_days` for a channel kept for a different time. `0` is refused, not read as unlimited; an unknown key is refused; `enabled = true` needs `[storage] path`, where the cache's off switch is kept. An absent table is not the same as `enabled = false`. Turning it on, the preflight, rollback and what erases it: see [The message cache](#the-message-cache) |
+| Message cache | `[message_cache]` | — | **filled from what write-scope and server-owned reads see; reads are answered from it only with `serve = true`** (`#208 persistent-cache`, `#384 cache-serve`). At startup, `enabled = true` registers the file in the sidecar `<storage path>.message-cache.json` and then opens it; `enabled = false`, or the owner's off recorded in that sidecar, erases every cache file this server made; an absent table opens nothing, warns at every start while a file from an earlier configuration is present, and erases it once the table has been absent for seven days. Keys: `enabled` (default `false`), `serve` (default `false`: answer a newest timeline page and a fresh newest window from the cache at once, refreshing from the provider in the background; needs `enabled = true`), `path` (absolute; default beside `[storage] path`, never equal to it), `max_days` (default `90`, 1 to 365), `max_megabytes` (default `256`, 16 to 4096, counting the `-wal` and `-shm` files), `backfill` (`adaptive`, the default: walk each cached channel's newest pages back into the cache while its provider is otherwise idle, see [The backfill](#the-backfill); or `off`), `timeline_fallback_ms` (default `10000`, 1000 to 60000; no effect yet), and `[[message_cache.channel]]` entries of `id` and `max_days` for a channel kept for a different time. `0` is refused, not read as unlimited; an unknown key is refused; `enabled = true` needs `[storage] path`, where the cache's off switch is kept. An absent table is not the same as `enabled = false`. Turning it on, the preflight, rollback and what erases it: see [The message cache](#the-message-cache) |
 
 Environment wins over file. An empty environment variable is treated as unset, so a runtime that
 renders unset variables as `""` cannot blank out a configured value. An unknown key in the file is
@@ -4298,9 +4302,28 @@ stretch both answers cover count as missing rows. This build does not serve Slac
 all, as #297 cache-coverage-races requires of a serving build until it answers them from the
 threads too; a Slack Main timeline page is the conversation's own history and may be served.
 
-`backfill` and `timeline_fallback_ms` are read and checked, and do nothing in this build. There
-is no backfill yet; with `serve = true` a slow timeline read is not waited out at all, it is
-the refresh behind an answered page.
+`timeline_fallback_ms` is read and checked, and does nothing in this build: with `serve = true`
+a slow timeline read is not waited out at all, it is the refresh behind an answered page.
+
+### The backfill
+
+`#453 cache-backfill`. With `backfill = "adaptive"` (the default) and a cache open, the server
+walks each cached channel's own timeline from its newest page back through older ones, offering
+each page to the cache under the backfill's own grant, until the provider says nothing is older,
+the pages reach `max_days`, or 20 pages have been read. It walks again every six hours, which also
+keeps what it holds revalidated. It reads one page at a time, at least a second apart, and only
+while the provider has had nothing else running for two seconds: a page, the poller and a voice
+call always go first. Its reads are counted under the read reason `backfill`. `backfill = "off"`
+makes none.
+
+What it does and does not buy, measured on the loopback Slack fake
+(`tests/slack_ingest_measure.rs`, ten rounds of "a message arrives through the stream, then a
+reader asks for the newest Main page"): the shadow counted the newest page servable 0 of 10 times
+filled only by reads and pushes, 0 of 10 with the backfill alone, and 10 of 10, all agreeing with
+upstream, once the relist ([Stream records](#stream-records)) read the newest page after each
+arrival. Every fill-only miss was a `gap`: the pushed row sat above the head the last read listed,
+held only as the push brought it. The newest page needs the relist; the backfill gives the older
+history depth a step back into the past, a count, or a summary reads.
 
 ### Diagnostics and logs
 
@@ -4917,6 +4940,9 @@ There are two mutually exclusive ways to PRODUCE messages in the same channel-ke
 
 A polled provider may additionally receive content-free change hints at `POST /api/v1/live/hints`.
 That is not a third producer: the hint wakes the poller's own provider client and its one cursor.
+A Slack provider may receive its own stream's records, text included, at `POST
+/api/v1/live/tail` ([Stream records](#stream-records)): published at once, and once between them
+and the poller.
 
 The browser learns `live_delivery: "off" | "poll" | "push"` from `/api/v1/client-config`, so a
 push-only deployment with a zero poll interval still attaches its SSE stream. In push mode the
@@ -4991,6 +5017,71 @@ those two directives unset and allows 2 GiB and 2,048 tasks. The Python adapter 
 that footprint. If the command after `--` is a different event source, measure that command and
 restore the strongest sandbox and smallest limits it supports rather than copying the managed
 runtime's exceptions without evidence.
+
+### Stream records
+
+`#452 slack-live-ingest`. A content-free hint throws away the text the provider's event stream
+already carried and reads the channel again through the provider: one more round trip per
+arrival, and, while hints keep coming, at least five seconds between reads. For a Slack provider
+the adapter can instead post each record of `slack.conversation tail --output=json
+--include-iris-seq-id` as it stands to `POST /api/v1/live/tail`, under the ingest token.
+
+The server checks every field before it uses any (a conversation, `ts`, user, bot, app, team and
+subtype id each of its Slack shape, the conversation named consistently, the text at most 40,000
+characters, the record at most 168,192 bytes) and names only the field when it refuses one. A message
+record becomes the `conversations.history` object a read would have returned and goes through the
+same normalization, author lookup, mention names and thread mapping included, so a later read of
+it is the same message; its text is untrusted third-party text, as a read's is. It is published to
+every configured channel of its conversation at once, a thread reply as a reply, and offered to
+the message cache as a push, whose text a later read proves whole. What the stream does not
+carry (files, reactions, an edit mark) arrives with the poller's next read of the message, as a
+live update when it says more than the record did; a read of a message already pushed publishes
+nothing new, and a record for a message already read is acknowledged as `known`.
+
+A record at or behind where the poller seeded the channel, or, before it has, more than two
+minutes old, is history a page has read: acknowledged as `history`, published to nobody, and never
+looked up. A `GAP` record reads every fed channel forward at once and relists it; a
+`reaction.created` or `reaction.deleted` record wakes the poller, whose read reports the reaction
+set as it stands (`#378 live-reactions`); heartbeats and other kinds are `ignored`; a conversation
+that is not on the list is `unlisted`. Answers: `202` for a record that did something, `200` for
+one that did not, `400` for a malformed one, which must not be retried as it is. `GET
+/api/v1/live/tail`, under the same token, answers `{"conversations": [...]}`: what to tail.
+
+**The relist** (`ingest.relist_seconds`, off by default). The stream carries no edits, no
+deletions and no other bots' posts. The poller's walk forward publishes the other bots' posts; the
+relist reads each fed channel's newest page, and each thread a reply was pushed in recently (at
+most `relist_threads`), on its interval, offers each read to the cache, and compares it with what
+readers were given: a message the read holds differently goes out as a live update, and one gone
+from inside the read's span as a live deletion. A message created in the 30 seconds before the
+read is never taken for a deleted one, since a provider may not list it yet. Its reads are counted
+under the read reason `relist`.
+
+How long a message takes from its record reaching the server to the live hub, measured on the
+loopback Slack fake with a modelled bridge read latency (`tests/slack_ingest_measure.rs`, four
+messages each):
+
+| Bridge read | Arrivals | Hint, median (max) | Record, median (max) |
+|---|---|---|---|
+| 0 ms | 6 s apart | 106 ms (107) | 3 ms (4) |
+| 0 ms | 1 s apart | 4,003 ms (4,003) | 3 ms (4) |
+| 300 ms | 6 s apart | 407 ms (408) | 3 ms (305) |
+| 300 ms | 1 s apart | 4,304 ms (4,304) | 2 ms (304) |
+| 1,500 ms | 6 s apart | 1,608 ms (1,608) | 3 ms (1,505) |
+| 1,500 ms | 1 s apart | 5,503 ms (5,504) | 3 ms (1,505) |
+
+A hint costs its 100 ms burst window and one bridge read, and arrivals closer together than five
+seconds wait for the hint floor. A record costs a few milliseconds, plus one author lookup the
+first time an author is seen (the maximum above). The time from a message being sent to its
+record reaching the server is the stream's own and is the same either way.
+
+`scripts/live-hint-adapter.py --records` runs the tail and posts its records; see its `--help`
+and [`systemd/vibe-talk-live-tail.service.example`](systemd/vibe-talk-live-tail.service.example).
+It keeps the stream position of the last acknowledged record in `--state-file` and resumes from it
+(`{catchup}` in the command), tails every conversation `GET /api/v1/live/tail` names unless
+`--channel` fixes the list (`{channels}`), asks again every five minutes and restarts the stream
+when the answer changes, skips a record the server refuses as malformed, and reports a stream that
+cannot resume from its saved position as a gap before it exits. Contentless hints stay available
+as the adapter's default mode.
 
 ### Provider-adapter push
 

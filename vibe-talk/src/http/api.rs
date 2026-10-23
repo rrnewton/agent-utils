@@ -513,20 +513,7 @@ pub async fn ingest_event(
     // each page by `live::judge`; no subscriber of the hub ever sees what an adapter put there.
     // The heading goes with it: it names the words of `content_html` the page hides (`#242
     // rich-headers`).
-    message.content_html = String::new();
-    message.heading = None;
-    if kind == crate::live::LiveKind::Delete {
-        message.spoken_time = String::new();
-        message.spoken_content = String::new();
-    } else {
-        message.spoken_time = crate::clock::spoken(&message.timestamp, &state.config.timezone);
-        message.spoken_content = ops::prepared_body(
-            &state,
-            &message.content,
-            &message.mentions,
-            jiff::Timestamp::now().as_millisecond(),
-        );
-    }
+    //
     // `#427 server-thread-hues`. Nor is the thread's colour an adapter's to supply: ingestion is
     // one of the ways this server first learns of a thread, so a live arrival colours the thread
     // here — at write scope, the server's own act under the adapter credential, which already
@@ -534,19 +521,20 @@ pub async fn ingest_event(
     // tail to every subscriber. A HISTORICAL delivery only carries a colour already assigned,
     // for the poller's seeding reason (`live::poll_once`): catch-up history is what a browser's
     // one seeding offer must still be able to win for. A delete's tombstone has no thread and
-    // colours nothing.
-    if kind != crate::live::LiveKind::Delete {
-        ops::attach_message_hues(
-            &state,
-            if historical {
-                crate::auth::Scope::Read
-            } else {
-                crate::auth::Scope::Write
-            },
-            &channel_id,
-            std::slice::from_mut(&mut message),
-        )
-        .await;
+    // colours nothing. All of it is `ops::prepare_arrival`, which a provider's pushed stream
+    // record goes through too (`#452 slack-live-ingest`).
+    if kind == crate::live::LiveKind::Delete {
+        message.content_html = String::new();
+        message.heading = None;
+        message.spoken_time = String::new();
+        message.spoken_content = String::new();
+    } else {
+        let scope = if historical {
+            crate::auth::Scope::Read
+        } else {
+            crate::auth::Scope::Write
+        };
+        ops::prepare_arrival(&state, scope, &channel_id, &mut message).await;
     }
     // `#191 read-aloud-first-lag`: a recently fetched copy no longer says what the message says.
     if kind != crate::live::LiveKind::Create {
@@ -643,6 +631,123 @@ pub async fn ingest_hint(
         Json(IngestEventResponse {
             accepted,
             duplicate: !accepted,
+        }),
+    )
+        .into_response())
+}
+
+/// What `POST /api/v1/live/tail` did with one stream record. `#452 slack-live-ingest`.
+#[derive(Debug, Serialize)]
+pub struct TailIngestResponse {
+    /// True only when the record put a new message out to the live hub, or acted on a gap or a
+    /// reaction.
+    pub accepted: bool,
+    /// True when every channel the message belongs to already had it.
+    pub duplicate: bool,
+    /// `published`, `known`, `history`, `ignored`, `unlisted`, `gap` or `hinted`.
+    pub outcome: &'static str,
+}
+
+/// The conversations an adapter should tail. `#452 slack-live-ingest`.
+#[derive(Debug, Serialize)]
+pub struct TailChannelsResponse {
+    /// Provider conversation ids, sorted: every configured channel of a provider that takes
+    /// pushed messages, a channel narrowed to one thread named by its conversation.
+    pub conversations: Vec<String>,
+}
+
+/// `GET /api/v1/live/tail` — which conversations to tail, under the ingest credential. `#452
+/// slack-live-ingest`.
+///
+/// An adapter asks again from time to time and restarts its stream when the answer changes, so a
+/// channel added in the app is tailed without anybody editing the adapter's command.
+pub async fn tail_channels(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<TailChannelsResponse>, ApiError> {
+    require_ingest(&headers, &state)?;
+    Ok(Json(TailChannelsResponse {
+        conversations: crate::live_tail::conversations(&state),
+    }))
+}
+
+/// `POST /api/v1/live/tail` — one record of a provider's own event stream, content and all.
+/// `#452 slack-live-ingest`; see [`crate::live_tail`].
+///
+/// The body is the record exactly as the provider's stream client wrote it, one line of
+/// `slack.conversation tail --output=json --include-iris-seq-id`. It is authenticated before it
+/// is read, bounded before it is parsed, and checked field by field ([`crate::slack::tail`])
+/// before anything of it is used. A message for a configured channel is published at once; one
+/// already published, or history, is acknowledged without publishing it again, so an adapter
+/// replaying its stream after a restart, or retrying an uncertain delivery, does no harm. Unlike
+/// `/api/v1/live/events`, this is accepted for a channel whose provider is polled: the poller
+/// and this route publish each message once between them.
+///
+/// Answers 202 for a record that did something, 200 for one that did not, and 4xx for a record
+/// that must not be retried as it is.
+pub async fn ingest_tail(
+    State(state): State<AppState>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    require_ingest(request.headers(), &state)?;
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    if !content_type.is_some_and(|value| value.eq_ignore_ascii_case("application/json")) {
+        return Err(ApiError::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+            "stream records require Content-Type: application/json",
+        ));
+    }
+    let body = axum::body::to_bytes(request.into_body(), crate::slack::tail::MAX_RECORD_BYTES)
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                format!(
+                    "a stream record may be at most {} bytes",
+                    crate::slack::tail::MAX_RECORD_BYTES
+                ),
+            )
+        })?;
+    let value: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::bad_request("the stream record is not valid JSON"))?;
+    let record = crate::slack::tail::parse(&value)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let outcome = crate::live_tail::ingest(&state, record, jiff::Timestamp::now().as_millisecond())
+        .await
+        .map_err(|error| match error {
+            ChatError::Shape(_) => {
+                ApiError::bad_request("the stream record is not a message this provider reads")
+            }
+            other => ApiError::from(OpError::Chat(other)),
+        })?;
+    use crate::live_tail::TailOutcome;
+    let (accepted, duplicate, name) = match outcome {
+        TailOutcome::Published => (true, false, "published"),
+        TailOutcome::Known => (false, true, "known"),
+        TailOutcome::History => (false, false, "history"),
+        TailOutcome::Ignored => (false, false, "ignored"),
+        TailOutcome::Unlisted => (false, false, "unlisted"),
+        TailOutcome::Gap(_) => (true, false, "gap"),
+        TailOutcome::Hinted(_) => (true, false, "hinted"),
+    };
+    let status = if accepted {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    Ok((
+        status,
+        Json(TailIngestResponse {
+            accepted,
+            duplicate,
+            outcome: name,
         }),
     )
         .into_response())

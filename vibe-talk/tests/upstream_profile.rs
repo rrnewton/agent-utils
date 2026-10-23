@@ -451,6 +451,18 @@ impl ChatClient for Recorder {
         self.note("polls_thread_replies");
         true
     }
+    fn takes_pushed_messages(&self, _channel: &ChannelId) -> bool {
+        self.note("takes_pushed_messages");
+        true
+    }
+    async fn pushed_message(
+        &self,
+        _channel: &ChannelId,
+        _raw: Value,
+    ) -> Result<Option<Message>, ChatError> {
+        self.note("pushed_message");
+        Ok(Some(self.message.clone()))
+    }
     async fn fetch_live(
         &self,
         _channel: &ChannelId,
@@ -757,6 +769,14 @@ async fn every_method_reaches_the_wrapped_clients_own_override_and_each_upstream
     ran("fetch_recent_dated");
     assert!(client.polls_thread_replies(&channel));
     ran("polls_thread_replies");
+    assert!(client.takes_pushed_messages(&channel));
+    ran("takes_pushed_messages");
+    let pushed = client
+        .pushed_message(&channel, serde_json::json!({"ts": "1.0"}))
+        .await
+        .expect("pushed");
+    assert!(pushed.is_some());
+    ran("pushed_message");
     let live = client
         .fetch_live(&channel, 5, Some(&id))
         .await
@@ -957,12 +977,17 @@ async fn every_method_reaches_the_wrapped_clients_own_override_and_each_upstream
         Some(2),
         "one message from each of two threads"
     );
-    // Ten reads each return the one message (a lookup's absent id is no message, a live read's
-    // reply is one), and the reads of two channels and of two threads return it twice each; posts
-    // return ours and are not counted.
+    assert_eq!(
+        rows("pushed_message"),
+        Some(1),
+        "a normalized push is a row"
+    );
+    // Eleven reads each return the one message (a lookup's absent id is no message, a live read's
+    // reply is one, a normalized push is one), and the reads of two channels and of two threads
+    // return it twice each; posts return ours and are not counted.
     let bytes = recorder.message.content.len() as u64;
-    assert_eq!(rec.content_bytes.messages, 14, "{:?}", rec.content_bytes);
-    assert_eq!(rec.content_bytes.total, 14 * bytes);
+    assert_eq!(rec.content_bytes.messages, 15, "{:?}", rec.content_bytes);
+    assert_eq!(rec.content_bytes.total, 15 * bytes);
     assert_eq!(rec.content_bytes.max, bytes);
     assert!(
         rec.shim_calls.is_empty(),

@@ -1158,6 +1158,28 @@ impl ChatClient for HttpSlackClient {
             .map_err(|error| error.with_provider(&self.provider_name))
     }
 
+    /// Slack's own event stream delivers each new message with its text, so it is normalized
+    /// here as a read would normalize it. `#452 slack-live-ingest`; see `super::tail`.
+    fn takes_pushed_messages(&self, channel: &ChannelId) -> bool {
+        Self::channel_ref(channel).is_ok()
+    }
+
+    /// One `conversations.history`-shaped object, built by `super::tail` from a stream record,
+    /// through the same [`HttpSlackClient::messages`] every read passes through: the same author
+    /// lookup, mentions and thread mapping, so a later read of it is the same message.
+    async fn pushed_message(
+        &self,
+        channel: &ChannelId,
+        raw: Value,
+    ) -> Result<Option<Message>, ChatError> {
+        Self::channel_ref(channel)?;
+        let raw = Raw::parse(raw)?;
+        if !raw.is_real() {
+            return Ok(None);
+        }
+        Ok(self.messages(channel, &[raw]).await.into_iter().next())
+    }
+
     /// Slack reads by time itself: `conversations.history` and `conversations.replies` take
     /// `oldest`, `latest` and a cursor. remote-ops-audit W10 `#287 bulk-reads`; see `super::range`.
     /// The same bounds look several messages up a run of timestamps a call (W11, see
