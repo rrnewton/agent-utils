@@ -66167,7 +66167,7 @@ test("`#277 reply-in-column`: a reply sent from a column that does not go says s
 
   // THE CONTROL: nothing told. The walk above sees the status line and the chip only through it.
   const { page: control } = await tallReplyColumnsPage(brokenScript(
-    "if (columnReplies.has(entry.id) && !job.stopped) reportColumnReply(entry);", ""));
+    "if (columnReplies.has(entry.id) && !job.stopped && !unchanged) reportColumnReply(entry);", ""));
   const area = control.el("scroll-area");
   area.scrollTop = 0;
   await area.dispatch("scroll");
@@ -79979,4 +79979,56 @@ test("`#448 send-dedupe`: an ask that never answers ends, and the send is left u
   const row = outgoingRows(page)[0];
   assert.equal(row.getAttribute("data-send-state"), "unconfirmed", "the send stayed on an ask that never answered");
   assert.equal(page.repliesPosted.length, 1);
+});
+
+test("`#468 send-dedupe`: the stream's copy of a post made under a send's key settles it, unconfirmed, without posting", async () => {
+  const page = await unkeyedChannel();
+  const parts = threeParts(["landed after all"]).slice(0, 1);
+  page.replyResponse = gatewayLost;
+  await sendChannel(page, "landed after all");
+  const row = outgoingRows(page)[0];
+  assert.equal(row.getAttribute("data-send-state"), "unconfirmed", "the premise is a send nobody could vouch for");
+  const key = posted(page)[0].idempotency_key;
+  // Somebody else's key, or no key, settles nothing and asks nothing.
+  await deliver(page, page.stream(), sseMessage(message({ id: "9448000000000000099", content: "other" }),
+    { self_posted: true, client_key: "outgoing-not-this-page" }));
+  await page.settle();
+  assert.equal(page.outcomeAsks.length, 1, "a key this page does not hold was asked about");
+  page.outcomeResponse = async () => json(200, { posted: parts[0], parts });
+  await deliver(page, page.stream(), sseMessage(parts[0], { self_posted: true, client_key: key }));
+  await settleSend(page);
+  assert.equal(page.outcomeAsks.length, 2, "the echo did not ask what became of the send");
+  assert.equal(page.outcomeAsks[1].body.idempotency_key, key);
+  assert.equal(page.repliesPosted.length, 1, "settling it posted it again");
+  assert.equal(outgoingRows(page).length, 0, `the send stayed: ${outgoingRows(page)[0]?.text()}`);
+});
+
+test("`#468 send-dedupe`: a send left unconfirmed by a closed page is asked about once when the page loads again", async () => {
+  const page = await unkeyedChannel();
+  page.replyResponse = gatewayLost;
+  await sendChannel(page, "sent before the reload");
+  const first = posted(page)[0];
+  assert.equal(savedOutgoing(page)[0].state, "unconfirmed");
+  const parts = threeParts(["sent before the reload"]).slice(0, 1);
+  // The server has it: settled on load, and nothing posted.
+  const found = reloadWith(new Map(page.storage), []);
+  found.chatProviderName = "Other Chat";
+  found.outcomeResponse = async () => json(200, { posted: parts[0], parts });
+  await signIn(found);
+  await settleSend(found);
+  assert.equal(found.outcomeAsks.length, 1, "the reloaded page did not ask about its unconfirmed send");
+  assert.deepEqual(found.outcomeAsks[0].body, first, "the ask did not name the post that was sent");
+  assert.equal(found.repliesPosted.length, 0, "the reloaded page posted it");
+  assert.equal(savedOutgoing(found)[0]?.state ?? "sent", "sent");
+  // The server does not have it: left as it was, said as it was, for the reader.
+  const unknown = reloadWith(new Map(page.storage), []);
+  unknown.chatProviderName = "Other Chat";
+  await signIn(unknown);
+  await settleSend(unknown);
+  assert.equal(unknown.outcomeAsks.length, 1);
+  assert.equal(unknown.repliesPosted.length, 0);
+  const saved = savedOutgoing(unknown)[0];
+  assert.equal(saved.state, "unconfirmed");
+  assert.ok(saved.detail, "the unconfirmed send lost what was said of it");
+  assert.equal(saved.detail, savedOutgoing(page)[0].detail, "asking changed what is said of the send");
 });

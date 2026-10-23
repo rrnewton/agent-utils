@@ -474,6 +474,7 @@
       "untrusted_content_notice": "third-party text"
     },
     {
+      "client_key": "outgoing-key_468",
       "from_tail": true,
       "message": {
         "author": "someone",

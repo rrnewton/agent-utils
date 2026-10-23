@@ -730,6 +730,7 @@ fn an_adapters_pushed_edit_without_an_edit_time_is_never_thrown_away() {
                 historical: false,
                 message: edited,
                 self_posted: false,
+                client_key: None,
             };
             fx.offer(&fx.chan, observe::pushed(shape, &live, by, at));
             let content = held_by_id(&fx, &id, shape);

@@ -1013,6 +1013,11 @@ pub struct LiveMessageEvent<'a> {
     pub from_tail: bool,
     /// Whether THIS SERVER posted it; the page must not relay these into a live conversation.
     pub self_posted: bool,
+    /// The idempotency key of the request this server posted it for, when it had one: the page
+    /// that sent it settles its outbox entry by it when the post's own answer was lost. `#468
+    /// send-dedupe`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_key: Option<&'a str>,
     /// Standing reminder that the content is third-party text.
     pub untrusted_content_notice: &'static str,
 }

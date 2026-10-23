@@ -5273,8 +5273,12 @@ allowlist gets `404 unknown_channel`, never a `200` that streams nothing — on 
 are indistinguishable forever.
 
 * Every event carries `id: <message id>` and `event: message`, and a payload of
-  `{message, self_posted, replayed, from_tail, untrusted_content_notice}`. The notice is the same
-  one `/messages` carries: a pushed message is third-party text exactly as a fetched one is.
+  `{message, self_posted, client_key?, replayed, from_tail, untrusted_content_notice}`. The notice is
+  the same one `/messages` carries: a pushed message is third-party text exactly as a fetched one is.
+  `client_key` is present only on a message this server posted for a request that carried an
+  `idempotency_key`, and is that key: the page that sent it settles a send whose answer it lost by
+  asking `POST .../reply/outcome`, which posts nothing, and it asks the same once per load for every
+  send it left unconfirmed (`#468 send-dedupe`).
 * **`replayed` says whether the event came out of the tail or off the wire just now**, because on
   the wire those are otherwise identical. Every attach that carries no `Last-Event-ID` — a fresh
   sign-in, a channel change, the reconnect after an `event: reset` — is handed the whole tail, and

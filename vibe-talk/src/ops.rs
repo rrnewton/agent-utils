@@ -3595,6 +3595,7 @@ async fn ready_to_post(state: &AppState, post: Post<'_>) -> Result<Ready, OpErro
         limit,
         defuse,
         claim,
+        key: idempotency_key.map(str::to_owned),
     };
     Ok(Ready::Post(Box::new(posting), turn))
 }
@@ -3805,6 +3806,9 @@ struct Posting {
     defuse: bool,
     /// Its claim under its key, settled once it has an answer. `#448 send-dedupe`.
     claim: Option<crate::post_keys::Pending>,
+    /// The caller's idempotency key, which the live stream names on each part it posted. `#468
+    /// send-dedupe`.
+    key: Option<String>,
 }
 
 /// Post every part of `posting` in order, holding the destination's `turn` until the provider has
@@ -3846,6 +3850,7 @@ async fn post_each(
         limit,
         defuse,
         claim: _,
+        key: key_of_post,
     } = posting;
     if let Some(progress) = progress {
         progress.begin(parts.len());
@@ -3892,7 +3897,7 @@ async fn post_each(
                 // Remember that WE posted this, before anything can observe it. `#44 live-push`:
                 // the poller will see it in a few seconds, and relaying it into the live
                 // conversation would make the agent hear its own reply as new information.
-                state.live.note_self_posted(&one.id);
+                state.live.note_self_posted(&one.id, key_of_post.as_deref());
                 if index == 0 && thread_id.is_none() && parts.len() > 1 {
                     continuation = state.chat.continuation_thread(&info.id, &one);
                     if let (Some(thread), None) = (&continuation, &one.thread) {

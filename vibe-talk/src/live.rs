@@ -271,7 +271,15 @@ pub struct LiveMessage {
     ///
     /// The page must not relay these into a live conversation; see the module documentation.
     pub self_posted: bool,
+    /// The idempotency key of the request this server posted it for, when it had one. `#468
+    /// send-dedupe`: the page that sent it settles its outbox entry by it, as from the post's own
+    /// answer, when that answer was lost.
+    pub client_key: Option<String>,
 }
+
+/// The messages this server posted, in the order it posted them, each with the key of the request
+/// it posted it for, when that had one (`#468 send-dedupe`).
+type SelfPosted = (VecDeque<MessageId>, BTreeMap<MessageId, Option<String>>);
 
 /// One channel's remembered reaction sets: the order they were first noted in, and the set each
 /// message was last seen with (`None` for a known message no copy has reported one for).
@@ -423,7 +431,7 @@ pub struct LiveHub {
     /// This process's name in the cursors of [`LiveHub::subscribe_all`], so a cursor handed out
     /// before a restart is told apart from one of this process's and answered with a reset.
     epoch: String,
-    self_posted: Mutex<(VecDeque<MessageId>, BTreeSet<MessageId>)>,
+    self_posted: Mutex<SelfPosted>,
     hinted: Mutex<BTreeMap<Option<String>, BTreeSet<ChannelId>>>,
     hint_generation: watch::Sender<u64>,
     /// The newest created message per channel the owner set to clear unread at its provider.
@@ -497,7 +505,7 @@ impl LiveHub {
                 published: 0,
             }),
             epoch: epoch.iter().map(|byte| format!("{byte:02x}")).collect(),
-            self_posted: Mutex::new((VecDeque::new(), BTreeSet::new())),
+            self_posted: Mutex::new((VecDeque::new(), BTreeMap::new())),
             hinted: Mutex::new(BTreeMap::new()),
             hint_generation,
             upstream_clear: std::sync::Arc::new(crate::upstream_clear::Candidates::new()),
@@ -603,19 +611,20 @@ impl LiveHub {
             .unwrap_or_default()
     }
 
-    /// Remember that this server posted `id`, so the poll that reads it back can say so.
+    /// Remember that this server posted `id`, for a request keyed `key` or none, so the poll that
+    /// reads it back can say so, and name the key (`#468 send-dedupe`).
     ///
     /// Bounded to [`SELF_POSTED_MEMORY`] ids, oldest evicted first.
-    pub fn note_self_posted(&self, id: &MessageId) {
+    pub fn note_self_posted(&self, id: &MessageId, key: Option<&str>) {
         let mut guard = lock(&self.self_posted);
-        let (order, set) = &mut *guard;
-        if !set.insert(id.clone()) {
+        let (order, held) = &mut *guard;
+        if held.insert(id.clone(), key.map(str::to_owned)).is_some() {
             return;
         }
         order.push_back(id.clone());
         while order.len() > SELF_POSTED_MEMORY {
             if let Some(evicted) = order.pop_front() {
-                set.remove(&evicted);
+                held.remove(&evicted);
             }
         }
     }
@@ -623,7 +632,15 @@ impl LiveHub {
     /// Whether `id` is one this server posted.
     #[must_use]
     pub fn is_self_posted(&self, id: &MessageId) -> bool {
-        lock(&self.self_posted).1.contains(id)
+        lock(&self.self_posted).1.contains_key(id)
+    }
+
+    /// Whether `id` is one this server posted, and the key of the request it was posted for.
+    fn self_posted_of(&self, id: &MessageId) -> (bool, Option<String>) {
+        match lock(&self.self_posted).1.get(id) {
+            Some(key) => (true, key.clone()),
+            None => (false, None),
+        }
     }
 
     /// Whether anybody is listening for `channel` right now: a subscriber to its own stream, or
@@ -767,6 +784,7 @@ impl LiveHub {
             historical: false,
             message,
             self_posted: false,
+            client_key: None,
         };
         self.publish_to_feed(channel, live, false, read);
     }
@@ -793,13 +811,14 @@ impl LiveHub {
         message: Message,
         read: Option<crate::cache::ReadStart>,
     ) -> Published {
-        let self_posted = self.is_self_posted(&message.id);
+        let (self_posted, client_key) = self.self_posted_of(&message.id);
         let live = LiveMessage {
             event_id: message.id.as_str().to_owned(),
             kind: LiveKind::Create,
             historical: false,
             message,
             self_posted,
+            client_key,
         };
         self.publish_inner(channel, live, false, read, CreatedCheck::Read)
     }
@@ -826,13 +845,14 @@ impl LiveHub {
         message: Message,
         read: Option<crate::cache::ReadStart>,
     ) -> Published {
-        let self_posted = self.is_self_posted(&message.id);
+        let (self_posted, client_key) = self.self_posted_of(&message.id);
         let live = LiveMessage {
             event_id: message.id.as_str().to_owned(),
             kind: LiveKind::Create,
             historical: false,
             message,
             self_posted,
+            client_key,
         };
         self.publish_checked(channel, live, false, read, CreatedCheck::Read)
     }
@@ -868,13 +888,14 @@ impl LiveHub {
                 self.note_thread_activity(channel, &thread.id, now_ms);
             }
         }
-        let self_posted = self.is_self_posted(&message.id);
+        let (self_posted, client_key) = self.self_posted_of(&message.id);
         let live = LiveMessage {
             event_id: message.id.as_str().to_owned(),
             kind: LiveKind::Create,
             historical: false,
             message,
             self_posted,
+            client_key,
         };
         if reply {
             self.publish_checked(channel, live, true, None, CreatedCheck::Pushed)
@@ -981,7 +1002,11 @@ impl LiveHub {
         }
         let (mut updates, mut deletes) = (0, 0);
         for (kind, message, held) in changes {
-            let self_posted = kind != LiveKind::Delete && self.is_self_posted(&message.id);
+            let (self_posted, client_key) = if kind == LiveKind::Delete {
+                (false, None)
+            } else {
+                self.self_posted_of(&message.id)
+            };
             let at = self
                 .updates
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -992,6 +1017,7 @@ impl LiveHub {
                 historical: false,
                 message,
                 self_posted,
+                client_key,
             };
             let offer = kind == LiveKind::Delete;
             let published = self.publish_to_feed_offering(
@@ -1117,13 +1143,18 @@ impl LiveHub {
         channel: &ChannelId,
         message: Message,
     ) -> bool {
-        let self_posted = kind != LiveKind::Delete && self.is_self_posted(&message.id);
+        let (self_posted, client_key) = if kind == LiveKind::Delete {
+            (false, None)
+        } else {
+            self.self_posted_of(&message.id)
+        };
         let live = LiveMessage {
             event_id: format!("{INGEST_EVENT_PREFIX}{event_id}"),
             kind,
             historical,
             message,
             self_posted,
+            client_key,
         };
         self.publish_inner(channel, live, true, None, CreatedCheck::Unchecked) == Published::New
     }
@@ -1171,7 +1202,11 @@ impl LiveHub {
         message: Message,
         served_as: &Message,
     ) {
-        let self_posted = kind != LiveKind::Delete && self.is_self_posted(&message.id);
+        let (self_posted, client_key) = if kind == LiveKind::Delete {
+            (false, None)
+        } else {
+            self.self_posted_of(&message.id)
+        };
         let at = self
             .updates
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -1186,6 +1221,7 @@ impl LiveHub {
             historical: false,
             message,
             self_posted,
+            client_key,
         };
         self.publish_to_feed_offering(
             channel,
@@ -1818,6 +1854,7 @@ fn message_event_as(live: &LiveMessage, from_tail: bool, id: &str) -> axum::resp
         LiveKind::Create | LiveKind::Update => event.json_data(LiveMessageEvent {
             message: &live.message,
             self_posted: live.self_posted,
+            client_key: live.client_key.as_deref(),
             replayed,
             from_tail,
             untrusted_content_notice: crate::untrusted::NOTICE,
@@ -3584,7 +3621,7 @@ mod tests {
     fn a_message_this_server_posted_is_published_marked_as_such() {
         let channel = ChannelId("1111".to_owned());
         let hub = hub_for(&channel);
-        hub.note_self_posted(&MessageId("10".to_owned()));
+        hub.note_self_posted(&MessageId("10".to_owned()), None);
         hub.publish(&channel, message(&channel, 10, "our own reply"));
         hub.publish(&channel, message(&channel, 11, "somebody else"));
         let subscription = hub.subscribe(&channel, None);
@@ -3603,7 +3640,7 @@ mod tests {
     fn the_self_posted_memory_is_bounded_and_forgets_the_oldest_first() {
         let hub = LiveHub::new();
         for n in 0..(SELF_POSTED_MEMORY + 5) {
-            hub.note_self_posted(&MessageId(n.to_string()));
+            hub.note_self_posted(&MessageId(n.to_string()), None);
         }
         assert!(!hub.is_self_posted(&MessageId("0".to_owned())));
         assert!(hub.is_self_posted(&MessageId((SELF_POSTED_MEMORY + 4).to_string())));

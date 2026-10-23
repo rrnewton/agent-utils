@@ -2343,6 +2343,7 @@ mod tests {
             historical: false,
             message: message.clone(),
             self_posted: false,
+            client_key: None,
         };
         // Each kind of read, offering one message it saw. A page with more behind it, so no read
         // here claims the channel's start and none takes away what an earlier one wrote.

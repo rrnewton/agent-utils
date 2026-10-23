@@ -569,6 +569,13 @@
     "LiveMessageEvent": {
       "description": "The data of a live stream `message` or `message_update` event.",
       "properties": {
+        "client_key": {
+          "description": "The idempotency key of the request this server posted it for, when it had one: the page\nthat sent it settles its outbox entry by it when the post's own answer was lost. `#468\nsend-dedupe`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "from_tail": {
           "description": "Whether it was published before this stream attached and is re-sent from the replay tail.\nAny channel read begun after the stream's response arrived has already seen it. An\nadapter's catch-up arriving after the attach is `replayed` but not from the tail: it may be\nnewer than every read the page has made.",
           "type": "boolean"

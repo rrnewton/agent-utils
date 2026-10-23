@@ -550,6 +550,12 @@ declare namespace VibeTalk {
    */
   interface LiveMessageEvent {
     /**
+     * The idempotency key of the request this server posted it for, when it had one: the page
+     * that sent it settles its outbox entry by it when the post's own answer was lost. `#468
+     * send-dedupe`.
+     */
+    client_key?: string | null;
+    /**
      * Whether it was published before this stream attached and is re-sent from the replay tail.
      * Any channel read begun after the stream's response arrived has already seen it. An
      * adapter's catch-up arriving after the attach is `replayed` but not from the tail: it may be

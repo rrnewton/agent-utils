@@ -724,6 +724,7 @@ fn samples() -> Value {
                 replayed: false,
                 from_tail: false,
                 self_posted: false,
+                client_key: None,
                 untrusted_content_notice: "third-party text",
             }),
             to(&LiveMessageEvent {
@@ -731,6 +732,7 @@ fn samples() -> Value {
                 replayed: true,
                 from_tail: true,
                 self_posted: true,
+                client_key: Some("outgoing-key_468"),
                 untrusted_content_notice: "third-party text",
             }),
         ],

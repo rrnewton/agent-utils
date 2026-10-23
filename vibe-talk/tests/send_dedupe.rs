@@ -416,3 +416,34 @@ async fn a_short_post_does_not_excuse_a_later_reply_into_its_thread_from_the_rea
     .await;
     assert_eq!(fake.calls("conversations.replies"), 1);
 }
+
+#[tokio::test]
+async fn the_live_copy_of_a_keyed_post_names_its_key() {
+    // `#468 send-dedupe`. A page whose answer was lost settles its outbox entry by the stream's
+    // copy of what this server posted for it.
+    let fake = Fake::start(fixture(), 20).await;
+    let state = slack(&fake, 600).await;
+    let (status, answer) = call(
+        &state,
+        &reply(),
+        json!({ "text": "keyed", "idempotency_key": KEY }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let (status, plain) = call(&state, &reply(), json!({ "text": "unkeyed" })).await;
+    assert_eq!(status, StatusCode::OK, "{plain}");
+    let channel = vibe_talk::model::ChannelId(TEAM.to_owned());
+    for posted in [&answer, &plain] {
+        let message: vibe_talk::model::Message =
+            serde_json::from_value(posted["posted"].clone()).expect("a message");
+        state.live.publish(&channel, message);
+    }
+    let replay = state.live.subscribe(&channel, None).replay;
+    assert_eq!(replay.len(), 2);
+    assert!(replay.iter().all(|live| live.self_posted));
+    assert_eq!(replay[0].client_key.as_deref(), Some(KEY));
+    assert_eq!(
+        replay[1].client_key, None,
+        "an unkeyed post was given a key"
+    );
+}

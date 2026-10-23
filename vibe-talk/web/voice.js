@@ -27324,6 +27324,57 @@ async function placeOutgoingMessage(entry, job) {
   }
 }
 
+/**
+ * The POST of `body` for `entry`'s attempt `job`, bounded by OUTGOING_TIMEOUT_MS and stopped by
+ * `job.cancel`: its answer, or, after a lost answer, the post's own answer found without posting
+ * (`askOutgoingOutcome`, `#448 send-dedupe`). Null when the attempt was stopped. Throws what the
+ * POST threw otherwise. `armed` is handed the timeout's handle, for the caller to clear.
+ *
+ * @param {any} entry
+ * @param {any} job
+ * @param {any} body
+ * @param {AbortController | null} controller
+ * @param {(handle: ReturnType<typeof setTimeout> | null) => void} armed
+ */
+async function postOutgoing(entry, job, body, controller, armed) {
+  if (body.idempotency_key) watchOutgoingProgress(entry, job, body);
+  let timer = null;
+  const interruption = new Promise((_resolve, reject) => {
+    job.cancel = () => {
+      if (controller) controller.abort();
+      reject(new Error("The send was interrupted before delivery was confirmed."));
+    };
+    timer = setTimeout(() => {
+      if (controller) controller.abort();
+      const late = /** @type {ApiRequestError} */ (new Error("The send timed out before delivery was confirmed."));
+      late.timedOut = true;
+      reject(late);
+    }, OUTGOING_TIMEOUT_MS);
+  });
+  armed(timer);
+  try {
+    const payload = await Promise.race([
+      api(`/api/v1/channels/${encodeURIComponent(entry.channel)}/reply`, {
+        method: "POST", body, ...(controller ? { signal: controller.signal } : {}),
+      }),
+      interruption,
+    ]);
+    return job.stopped ? null : payload;
+  } catch (error) {
+    clearTimeout(timer);
+    armed(null);
+    if (job.stopped) return null;
+    // `#448 send-dedupe`. The answer was lost — the page stopped waiting, the connection dropped,
+    // or something in front of the server answered for it — while the post may still be landing.
+    // The owner saw a long message "fail", pressed Retry, and it arrived twice. So the server is
+    // asked what became of it before anything is decided, posting nothing.
+    const found = body.idempotency_key && answerLost(error) ? await askOutgoingOutcome(entry, job, body) : null;
+    if (job.stopped) return null;
+    if (!found) throw error;
+    return found;
+  }
+}
+
 /** Post one outbox entry whose turn it is. */
 async function dispatchOutgoingMessage(entry, job) {
   if (job.stopped) return;
@@ -27334,6 +27385,10 @@ async function dispatchOutgoingMessage(entry, job) {
   let transient = false;
   // When this attempt started: the next one's wait counts from here (`planOutgoingRetry`).
   const startedAt = Date.now();
+  // The post's answer when it was found without posting (`settleFromServer`), and whether such an
+  // ask found nothing, which leaves the entry, and what was said of it, as they were.
+  let payloadFound = null;
+  let unchanged = false;
   try {
     if (outgoingCannotGo(entry, job)) return;
     entry.phase = "posting";
@@ -27366,39 +27421,21 @@ async function dispatchOutgoingMessage(entry, job) {
     if (IDEMPOTENCY_KEY.test(entry.id)) body.idempotency_key = entry.id;
     if (!channelPostsOnce(entry.channel) || !body.idempotency_key) entry.keyedOnly = false;
     entry.progress = null;
-    if (body.idempotency_key) watchOutgoingProgress(entry, job, body);
-    const interruption = new Promise((_resolve, reject) => {
-      job.cancel = () => {
-        if (controller) controller.abort();
-        reject(new Error("The send was interrupted before delivery was confirmed."));
-      };
-      timer = setTimeout(() => {
-        if (controller) controller.abort();
-        const late = /** @type {ApiRequestError} */ (new Error("The send timed out before delivery was confirmed."));
-        late.timedOut = true;
-        reject(late);
-      }, OUTGOING_TIMEOUT_MS);
-    });
-    let payload;
-    try {
-      payload = await Promise.race([
-        api(`/api/v1/channels/${encodeURIComponent(entry.channel)}/reply`, {
-          method: "POST", body, ...(controller ? { signal: controller.signal } : {}),
-        }),
-        interruption,
-      ]);
-    } catch (error) {
-      if (timer !== null) clearTimeout(timer);
-      timer = null;
-      // `#448 send-dedupe`. The answer was lost — the page stopped waiting, the connection dropped,
-      // or something in front of the server answered for it — while the post may still be landing.
-      // The owner saw a long message "fail", pressed Retry, and it arrived twice. So the server is
-      // asked what became of it before anything is decided, posting nothing.
-      const found = !job.stopped && body.idempotency_key && answerLost(error)
-        ? await askOutgoingOutcome(entry, job, body) : null;
-      if (!found) throw error;
-      payload = found;
+    // `#468 send-dedupe`. Only asking what became of an earlier attempt (`settleFromServer`):
+    // nothing is posted, and with no record the entry is left as it was.
+    if (entry.resolveOnly) {
+      const found = body.idempotency_key ? await askOutgoingOutcome(entry, job, body) : null;
+      if (job.stopped) return;
+      if (!found) {
+        Object.assign(entry, { state: "unconfirmed", detail: entry.resolveOnly.detail });
+        unchanged = true;
+        return;
+      }
+      entry.resolveOnly = null;
+      payloadFound = found;
     }
+    let payload = payloadFound;
+    if (!payload) payload = await postOutgoing(entry, job, body, controller, (handle) => { timer = handle; });
     if (job.stopped) return;
     if (payload && payload.error === "partially_posted") {
       entry.postedCount += Math.max(0, Number(payload.posted) || 0);
@@ -27498,12 +27535,13 @@ async function dispatchOutgoingMessage(entry, job) {
     entry.phase = "";
     entry.progress = null;
     entry.confirming = false;
+    entry.resolveOnly = null;
     if (transient && !job.stopped) planOutgoingRetry(entry, startedAt);
     persistOutgoingMessages();
     eachColumn(renderChannelRows);
     // `#277 reply-in-column`. After the rows, the outbox's among them: what is said points at one. Not
     // for a send that signing out stopped, which is the sign-in screen's to explain.
-    if (columnReplies.has(entry.id) && !job.stopped) reportColumnReply(entry);
+    if (columnReplies.has(entry.id) && !job.stopped && !unchanged) reportColumnReply(entry);
   }
 }
 
@@ -27581,6 +27619,31 @@ async function askOutgoingOutcome(entry, job, body) {
   } finally {
     entry.confirming = false;
   }
+}
+
+/**
+ * `#468 send-dedupe`. Ask the server what became of entry `id`, unconfirmed, without posting: the
+ * stream has shown this server's copy of a post made under its key, or the page has just loaded with
+ * it unconfirmed. Found, it is settled as the post's own answer would have settled it; not found, it
+ * is left as it was, for the reader. Goes in the outbox's order like any attempt, under the sign-in it
+ * was queued under, and never while it waits to go again on its own (which carries its key anyway).
+ */
+function settleFromServer(id) {
+  const entry = outgoingMessages.get(id);
+  if (!entry || entry.state !== "unconfirmed" || !IDEMPOTENCY_KEY.test(entry.id) || outgoingRetries.has(id) ||
+      !currentCredential()) return;
+  entry.resolveOnly = { detail: entry.detail };
+  entry.state = "sending";
+  entry.phase = "queued";
+  scheduleOutgoingMessage(entry);
+}
+
+/** Every unconfirmed send in the outbox, asked of the server once per load (`settleFromServer`). */
+let unconfirmedSettled = false;
+function settleUnconfirmedSends() {
+  if (unconfirmedSettled) return;
+  unconfirmedSettled = true;
+  for (const id of [...outgoingMessages.keys()]) settleFromServer(id);
 }
 
 /** Take a `202` posting answer's count of parts onto `entry`'s row. */
@@ -47606,6 +47669,8 @@ function onStreamFrame(frame) {
     return;
   }
   receiveLiveMessage(payload.message, payload.self_posted, payload.replayed, payload.from_tail);
+  // `#468 send-dedupe`. This server's copy of a post it made for one of this page's keys.
+  if (payload.self_posted && typeof payload.client_key === "string") settleFromServer(payload.client_key);
 }
 
 let liveMutationRefreshRunning = false;
@@ -48629,6 +48694,7 @@ function onWatchAllFrame(frame) {
   }
   if (!VibeTalkContract.is("LiveMessageEvent", payload)) return undefined;
   if (payload.self_posted) noteSelfAuthor(payload.message.author_id);
+  if (payload.self_posted && typeof payload.client_key === "string") settleFromServer(payload.client_key);
   relayToAgent(payload.message, payload.self_posted, payload.replayed, {
     fromTail: payload.from_tail === true,
     resumed: watchAllResumed,
@@ -50732,6 +50798,8 @@ async function signIn() {
   // `#457 settings-server-side`. The token is proven, so the settings sync may read with it:
   // it could not start at load, where a saved token is only a claim `/client-config` tests.
   startSettingsSync();
+  // `#468 send-dedupe`. What this page left unconfirmed, asked of the server once per load.
+  settleUnconfirmedSends();
   return true;
 }
 

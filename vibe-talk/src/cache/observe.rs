@@ -1194,6 +1194,7 @@ mod tests {
             historical: false,
             message,
             self_posted: false,
+            client_key: None,
         }
     }
 
