@@ -1736,6 +1736,7 @@ async function applyDeepLink() {
   if (currentView !== "discord") showView("discord");
   const channel = String(el("discord-channel").value);
   const startPlace = channelPlace();
+  const startVisit = { at: visitedAt, length: visited.length };
   // The channel's own first read decides its opening view as it lands; a place put on before
   // it would be decided over. Wait for that read, then put the link's place on — unless the
   // reader has navigated for themselves meanwhile: a link opened the page, it does not chase
@@ -1757,10 +1758,13 @@ async function applyDeepLink() {
   } else if (wanted.view === "main") {
     place = { screen: "main", channel, layout: "one", view: "main", thread: null, origin: null, side: null };
   }
-  // The reader moved while the read was coming: the link loses, quietly.
+  // The reader moved while the read was coming: the link loses, quietly. Moved is read from
+  // the places history, not only the standing place — a reader who went elsewhere and came
+  // back has still chosen since the link opened.
   const stood = channelPlace();
-  if (startPlace && stood && visitKey(stood) !== visitKey(startPlace) &&
-      !(place && visitKey(stood) === visitKey(place))) return;
+  const moved = visitedAt !== startVisit.at || visited.length !== startVisit.length ||
+    (startPlace && stood && visitKey(stood) !== visitKey(startPlace));
+  if (moved && !(place && stood && visitKey(stood) === visitKey(place))) return;
   if (place && channelPlaceShowable(place)) {
     showChannelPlace(place);
   } else if (place && place.view === "thread" && place.thread) {
