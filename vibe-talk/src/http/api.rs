@@ -979,6 +979,7 @@ pub async fn client_config(
         voice_prompt: Some(crate::voice_prompt::view(&state).await),
         voice_post_prefix: Some(crate::post_prefix::view(&state).await),
         message_cache,
+        client_settings_supported: true,
     }))
 }
 

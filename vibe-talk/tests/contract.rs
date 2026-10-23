@@ -289,6 +289,8 @@ fn client_config(
         // `#208 persistent-cache`. Present only in the full sample, as the server sends it only to
         // a write-scope caller of a server with a `[message_cache]` table.
         message_cache: full.then(|| message_cache_status(true)),
+        // `#457 settings-server-side`. Sent only when true, like its neighbours.
+        client_settings_supported: full,
     }
 }
 

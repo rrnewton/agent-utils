@@ -244,6 +244,14 @@ pub struct ClientConfigResponse {
     /// a path. Absent from an older server; the page then hides the group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_cache: Option<MessageCacheStatus>,
+    /// Whether this server keeps the owner's synced settings at `/api/v1/client-settings`.
+    /// `#457 settings-server-side`.
+    ///
+    /// The page asks for them only when this is true, as it asks for nothing a token or a
+    /// server cannot give (`#38`): an older server is never probed for a route it has not
+    /// got. Sent only when true: absent means false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub client_settings_supported: bool,
 }
 
 /// The tag this server puts before every message the voice agent posts. `#303 voice-post-prefix`.

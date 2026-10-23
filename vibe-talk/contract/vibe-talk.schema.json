@@ -206,6 +206,10 @@
           "description": "Source chat service's human-readable name, supplied by the selected backend.",
           "type": "string"
         },
+        "client_settings_supported": {
+          "description": "Whether this server keeps the owner's synced settings at `/api/v1/client-settings`.\n`#457 settings-server-side`.\n\nThe page asks for them only when this is true, as it asks for nothing a token or a\nserver cannot give (`#38`): an older server is never probed for a route it has not\ngot. Sent only when true: absent means false.",
+          "type": "boolean"
+        },
         "coding_agent_ids": {
           "description": "The accounts the configuration names as the coding agents, `coding_agent_user_ids`.\n`#323 slack-system-bots`.\n\nThe page draws each as the coding agent. Sent only when there are some; with several\nproviders, each provider's own are in its [`ProviderDescription`] instead.",
           "items": {

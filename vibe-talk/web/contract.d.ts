@@ -193,6 +193,15 @@ declare namespace VibeTalk {
      */
     chat_provider_name: string;
     /**
+     * Whether this server keeps the owner's synced settings at `/api/v1/client-settings`.
+     * `#457 settings-server-side`.
+     *
+     * The page asks for them only when this is true, as it asks for nothing a token or a
+     * server cannot give (`#38`): an older server is never probed for a route it has not
+     * got. Sent only when true: absent means false.
+     */
+    client_settings_supported?: boolean;
+    /**
      * The accounts the configuration names as the coding agents, `coding_agent_user_ids`.
      * `#323 slack-system-bots`.
      *

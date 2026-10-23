@@ -50589,6 +50589,9 @@ function applyClientConfig(config) {
   // where one channel can take Clear unread (`#351 settings-polish`). So both before the pickers.
   deploymentCapabilities.upstreamClear = config.upstream_clear_supported === true;
   tokenScope = ["read", "write"].includes(config.token_scope) ? config.token_scope : null;
+  // `#457 settings-server-side`. Only a server that says it keeps settings is asked for
+  // them: an older one is never probed for a route it has not got.
+  settingsSyncSupported = config.client_settings_supported === true;
   fillChannelSelect("discord-channel");
   // `#355 provider-grouped-channels`. The Service picker before Settings' channel picker, which lists
   // that service's channels; the hidden list and the add form are that service's too.
@@ -50900,7 +50903,7 @@ function forgetToken() {
   // and the archive was agreed under this one: both go, and the settings read fresh.
   settingsSyncProven = false;
   settingsSyncReady = false;
-  settingsSyncSupported = true;
+  settingsSyncSupported = false;
   syncedArchive.clear();
   settingsAtStart.clear();
   clearError();
@@ -50992,7 +50995,7 @@ let settingsSyncBusy = false;
 
 /** False once the server has said it has no such route or no store: settings stay local, unsynced
  * and unretried, rather than asking a question with a permanent answer every second and a half. */
-let settingsSyncSupported = true;
+let settingsSyncSupported = false;
 
 /** Whether the sync's timer is armed: armed once, by the first proven sign-in. */
 let settingsSyncStarted = false;
@@ -51222,7 +51225,9 @@ async function syncSettingsOnce() {
           seed.push({ key, value: local, updated_ms: 0 });
         }
       }
-      if (seed.length > 0) {
+      // A read-scope token reads the document and applies it, and writes nothing:
+      // asking would only be refused, on every pass, beside work it may do.
+      if (seed.length > 0 && tokenScope !== "read") {
         const answer = await apiDecoded("ClientSettings", "/api/v1/client-settings", {
           method: "PUT",
           body: { set: [], seed },
@@ -51248,6 +51253,12 @@ async function syncSettingsOnce() {
         }
         set.push({ key, value: local, updated_ms: 0 });
       }
+    }
+    if (tokenScope === "read") {
+      if (set.length > 0) {
+        renderSettingsSyncState("This token may only read, so settings stay on this device.");
+      }
+      return;
     }
     if (set.length === 0) {
       settingsPassesSinceRead += 1;

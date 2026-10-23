@@ -96,6 +96,7 @@
         }
       ],
       "chat_provider_name": "Chat",
+      "client_settings_supported": true,
       "coding_agent_ids": [
         "1000000000000000001"
       ],

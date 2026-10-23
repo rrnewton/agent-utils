@@ -74,6 +74,7 @@ class FakeApi:
             "read_aloud": {"backend": "browser", "label": "Browser voice", "playback": "browser",
                            "local_only": True},
             "token_scope": "write",
+            "client_settings_supported": True,
             "conversational_voice": {"name": "Test voice provider"},
             "replay_enabled": False,
             "self_author_id": None,
