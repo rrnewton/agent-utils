@@ -256,7 +256,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
         return {color: s.color, markBorder: getComputedStyle(m).borderTopWidth,
                 markBackground: getComputedStyle(m).backgroundColor,
                 tri: getComputedStyle(m, '::before').borderBottomColor}; }""", RUNNER)
-    desk.check(tri["color"] == card_edge or tri["tri"] == card_edge,
+    desk.check(tri["color"] == card_edge and tri["tri"] == card_edge,
                f"the pack triangle {tri} is not its card edge {card_edge}")
     desk.check(tri["markBorder"] == "0px" and tri["markBackground"] in ("rgba(0, 0, 0, 0)", "transparent"),
                f"the pack triangle still stands in a disc: {tri}")

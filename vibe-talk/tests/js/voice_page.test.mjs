@@ -11823,7 +11823,11 @@ test("`#451 read-strip-followups`: a read started with s outside reading mode ha
   page.enableStreamedAudio();
   page.enableAbort();
   await signIn(page);
-  await showDiscord(page, [message({ id: "1000000000000000001", content: "one block" })]);
+  await showDiscord(page, [
+    message({ id: "1000000000000000001", content: "one block" }),
+    message({ id: "1000000000000000002", author_id: "1000000000000000012", content: "another block",
+      timestamp: "2026-08-19T05:31:00.000Z" }),
+  ]);
   assert.equal(page.el("read-aloud-label").text(), "Read", "the premise: reading mode is off");
   assert.equal(page.el("read-aloud").getAttribute("data-active"), "false", "the premise: reading mode is off");
   assert.equal(page.el("read-aloud-stop").hidden, true, "the premise: no Stop before anything plays");
@@ -11844,6 +11848,27 @@ test("`#451 read-strip-followups`: a read started with s outside reading mode ha
   await page.el("read-aloud-stop").click();
   await page.settle();
   assertReadingModeLeft(page, "the bar's Stop on a read started with s");
+
+  // Still being fetched, it cannot be paused, so Read itself is the Stop that cancels it — and
+  // pressing it there does not enter the mode over the fetch. The preparation is held open, so
+  // the read stays in that window until it is let go, by which time nobody wants it.
+  let releasePrepare = () => {};
+  const prepareHeld = new Promise((resolve) => { releasePrepare = resolve; });
+  page.prepareHold = () => prepareHeld;
+  // The second message: the first's preparation survived its read, so asking for it again would
+  // play at once and never stand in the window this half is about.
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  await press(page, page.el("scroll-area"), "s");
+  assert.equal(page.el("read-aloud-label").text(), "Stop", "a read still being fetched is not offered its Stop");
+  assert.equal(page.el("read-aloud").getAttribute("data-active"), "true", "the fetched read lights no way out");
+  assert.equal(page.el("read-aloud").getAttribute("aria-pressed"), "false", "the fetched read entered reading mode");
+  await page.el("read-aloud").click();
+  await page.settle();
+  assertReadingModeLeft(page, "Read as Stop on a read still being fetched");
+  releasePrepare();
+  await page.settle();
+  assert.equal(page.el("read-aloud-label").text(), "Read", "the cancelled fetch still started a read");
+  assertReadingModeLeft(page, "the cancelled fetch let go");
 });
 
 test("`#451 read-strip-followups`: a held read's Play is told from its Stop at a glance", () => {
@@ -11897,6 +11922,15 @@ test("`#451 read-strip-followups`: a moved strip is held in the window again whe
   await page.settle();
   assert.deepEqual(stripOffset(page), ["-450px", "-560px"],
     "the chips grew and left the moved strip 60px out of the window's top");
+  // And the held place is where the next grip key starts from, not the offset the growth overtook.
+  await grip.dispatch("keydown", { key: "ArrowDown" });
+  assert.deepEqual(stripOffset(page), ["-450px", "-548px"],
+    "a grip key after the growth started from the place the window no longer allows");
+  // The composer's growth holds it by the same call, where the box's top edge is written: the
+  // fixture lays no box out, so this half is read where it is written, as its neighbours are.
+  const composerTop = SCRIPT_CODE.indexOf('"--composer-top"');
+  assert.ok(composerTop >= 0 && SCRIPT_CODE.slice(composerTop, composerTop + 400).includes("placeReadSteer()"),
+    "the composer moving the strip's band holds no moved strip in the window");
 });
 
 test("`#451 read-strip-followups`: the list of keys names the reading strip grip's keys", async () => {
@@ -78869,7 +78903,21 @@ test("`#440 thread-card-pack-toggle`: the triangle in the first unpacked row's g
   assert.ok(String(pack.getAttribute("title")).includes("Pack"), "the triangle has no tooltip");
   assert.equal(unpackRows(page, RAW).slice(1).some((row) => row.children.some((node) => String(node.className).includes("unpack-pack"))),
     false, "a later row holds a triangle too");
-  assert.match(cssBlock("#side-cards .unpack-pack-mark::before"), /border-bottom:\s*0\.42rem solid currentColor/, "the mark is not an up triangle");
+  // `#450 pack-triangle-hue`: plain, larger, and in the thread's own colour, grey where its card's
+  // edge is. (Chromium measures it drawn: tests/threads_polish_browser.py, tests/threads_unpack_browser.py.)
+  assert.match(cssBlock("#side-cards .unpack-pack-mark::before"), /border-bottom:\s*0\.85rem solid currentColor/, "the mark is not the larger up triangle");
+  assert.match(cssBlock("#side-cards .unpack-pack-mark::before"), /border-inline:\s*0\.6rem solid transparent/, "the triangle is no wider than the one the disc held");
+  const markRule = cssBlock("#side-cards .unpack-pack-mark");
+  assert.match(markRule, /border:\s*none;/, "the disc's ring is still drawn behind the triangle");
+  assert.match(markRule, /background:\s*none;/, "the disc is still filled behind the triangle");
+  assert.match(cssBlock("#side-cards .reply-ungather.unpack-pack"), /color:\s*hsl\(var\(--thread-hue, 210\) 55% 50%\);/,
+    "the triangle is not in its thread's colour");
+  assert.match(cssBlock('#side-cards[data-unpack="unread"] > .side-card-row[data-thread-read] + li[data-unpack-thread] .unpack-pack'),
+    /color:\s*var\(--thread-grey\);/, "under Unpack unread a read thread's triangle does not follow its grey edge");
+  assert.match(cssRules(CSS_CODE, "#side-cards .reply-ungather.unpack-pack:focus-visible").join("\n"), /outline:\s*2px solid currentColor;/,
+    "the triangle's keyboard ring is not its own colour");
+  assert.match(CSS_CODE, /@media \(hover: hover\) and \(pointer: fine\) \{[\s\S]*?:root:not\(\[data-input="keys"\]\) #side-cards \.reply-ungather\.unpack-pack:hover \{\s*background: color-mix\(in srgb, currentColor 18%, transparent\);/,
+    "the triangle's hover wash is not gated with the other row controls', in its own colour");
   const area = page.el("side-scroll");
   area.scrollTop = 40;
   await area.dispatch("scroll");

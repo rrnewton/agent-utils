@@ -704,6 +704,27 @@ def pack_walk(desk: Desk) -> None:
     desk.check(drawn["color"] == drawn["edge"] and drawn["triColor"] == drawn["edge"],
                f"the triangle is {drawn['triColor']}, the replica's edge {drawn['edge']}")
     desk.check("Pack" in str(drawn["title"]) and "^" in str(drawn["title"]), f"the triangle's tooltip: {drawn['title']!r}")
+    # Its hover wash and keyboard ring are that same colour, where a pointer can hover (a desk).
+    if page.evaluate("() => matchMedia('(hover: hover) and (pointer: fine)').matches"):
+        tri_sel = f"#side-cards > li[data-unpack-thread='{REPLICA}'] .unpack-pack"
+        page.locator(tri_sel).hover()
+        desk.settled()
+        hovered = page.evaluate(
+            "() => { const b = document.querySelector('#side-cards .unpack-pack:hover');"
+            " return b ? getComputedStyle(b).backgroundColor : null; }")
+        desk.check(hovered not in (None, "rgba(0, 0, 0, 0)", "transparent"),
+                   f"a resting mouse lights no wash on the triangle: {hovered}")
+        page.keyboard.press("Tab")
+        page.locator(tri_sel).focus()
+        desk.settled()
+        ring = page.evaluate(
+            f"() => {{ const s = getComputedStyle(document.querySelector(\"{tri_sel}\"));"
+            " return {style: s.outlineStyle, color: s.outlineColor}; }")
+        desk.check(ring["style"] != "none" and ring["color"] == drawn["edge"],
+                   f"the triangle's keyboard ring is {ring}, its edge {drawn['edge']}")
+        page.locator(tri_sel).evaluate("(b) => b.blur()")
+        page.mouse.move(0, 0)
+        desk.settled()
     desk.notes.append(f"the pack triangle {float(str(drawn['triWidth'])):.0f}px by {float(str(drawn['triHeight'])):.0f}px on a "
                       f"{float(str(drawn['width'])):.0f}px target, in its card edge's colour {drawn['edge']}, grey {grey} under Unpack unread")
     page.evaluate(f"() => document.querySelector(\"#side-cards > li[data-card][data-id='{REPLICA}']\").scrollIntoView({{block: 'start'}})")

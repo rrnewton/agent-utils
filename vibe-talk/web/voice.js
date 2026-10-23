@@ -19515,7 +19515,7 @@ function renderControls() {
   // `#451 read-strip-followups`: active for a read in progress as for the mode, so a read started
   // with s keeps the way-out colour and the keyboard-up slim row's Pause (`#429`), which both key
   // off this. `renderReadTransport` keeps it as a read starts, holds and ends between these draws.
-  el("read-aloud").setAttribute("data-active", readingMode || readInProgress() ? "true" : "false");
+  el("read-aloud").setAttribute("data-active", readingMode || readInProgress() || pendingRead !== null ? "true" : "false");
   // The state the READER cares about, on the control they pressed. Reset to a plain ready when the
   // mode is off, so a failure from the last session does not greet them on the next one.
   el("read-aloud").setAttribute("data-read-state", readingMode ? readState : "idle");
@@ -32316,6 +32316,10 @@ function stopReading() {
     if (wasPending) {
       if (readingMode) {
         setReadState("ready");
+      } else {
+        // `#451 read-strip-followups`: out of the mode nothing else redraws the transport, whose
+        // Read said Stop for the fetch just cancelled.
+        renderReadTransport();
       }
       eachColumn(renderChannelRows);
     }
@@ -33174,6 +33178,10 @@ function placeReadSteer() {
   const hold = (value, low, high) => Math.round(Math.min(Math.max(value, low), Math.max(low, high)));
   const x = hold(readSteerOffset.x, -left, root.clientWidth - box.width - left);
   const y = hold(readSteerOffset.y, -top, root.clientHeight - box.height - top);
+  // The held place is the place from here: a drag or a grip key after a layout growth starts from
+  // where the strip stands, not from an offset the window no longer allows (`#451`). Storage still
+  // changes only where a move ends (`moveReadSteer`), as for a window resize.
+  readSteerOffset = { x, y };
   strip.style.setProperty("--read-steer-dx", `${x}px`);
   strip.style.setProperty("--read-steer-dy", `${y}px`);
   strip.setAttribute("data-moved", "true");
@@ -33347,17 +33355,19 @@ function renderReadTransport() {
     button.setAttribute("data-paused", paused ? "true" : "false");
     // As `renderControls` states it, kept here for the starts, holds and stops between its draws
     // (`#451 read-strip-followups`).
-    button.setAttribute("data-active", readingMode || readInProgress() ? "true" : "false");
+    button.setAttribute("data-active", readingMode || readInProgress() || pendingRead !== null ? "true" : "false");
   }
   if (nowPlaying !== null || (pendingRead === null && !readJumping)) readJumpPending = false;
   const label = el("read-aloud-label");
   if (label) {
     // `#451 read-strip-followups`. A read in progress is what makes Read its Pause, in the mode or
     // out of it: s reads one message without entering the mode (`readFromKeyboard`), and that read
-    // is paused, resumed and stopped from the bar like any other. The mode's own Stop — Read with
-    // nothing playing — is still only the mode's.
+    // is paused, resumed and stopped from the bar like any other. A read still being fetched
+    // (`pendingRead`) cannot be paused — there is no clock to hold — so there Read is the Stop that
+    // cancels it, as it already was in the mode with nothing playing; out of the mode it used to
+    // say Read and enter the mode over the fetch.
     label.textContent = readInProgress() ? (paused ? "Resume" : "Pause")
-      : readingMode ? "Stop"
+      : readingMode || pendingRead !== null ? "Stop"
       : "Read";
   }
   // `#442 read-strip-order`. While Read is the read's Pause or Resume, the way out stands beside
@@ -50669,6 +50679,12 @@ el("read-aloud").addEventListener("click", () => {
   // mode pauses here too, where it used to enter the mode over a read still playing.
   if (readInProgress()) {
     toggleReadingPaused();
+    return;
+  }
+  // A read still being fetched: this button says Stop there, and stops it — leaving the mode with
+  // it where the mode is on, as its Stop always has (`leaveReadingMode`).
+  if (pendingRead !== null) {
+    leaveReadingMode();
     return;
   }
   setReadingMode(!readingMode);

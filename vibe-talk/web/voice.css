@@ -2958,12 +2958,12 @@ a.search-hit-link {
   content: none;
 }
 
-/* Where its card's edge goes grey, the triangle goes with it, by the two rules that grey the edge
-   (`#277 thread-card-focus`, `#440 thread-card-pack-toggle`, at the cards below): a read card under
-   Unpack unread, and every card but a highlighted one. The block's first row stands straight after
-   its card, so each rule reaches the triangle through that card. */
-#side-cards[data-unpack="unread"] > .side-card-row[data-thread-read] + li[data-unpack-thread] .unpack-pack,
-#side-cards:has(> .side-card-row[data-highlighted]:not([hidden]):not(.search-hidden)) > .side-card-row:not([data-highlighted]) + li[data-unpack-thread] .unpack-pack {
+/* Where its card's edge goes grey, the triangle goes with it: a read card under Unpack unread, by
+   the rule at the cards below (`#440 thread-card-pack-toggle`). The block's first row stands
+   straight after its card, so the rule reaches the triangle through that card. (The highlighted
+   card's greying never meets a triangle: a card is highlighted only where cards do not cycle to
+   unpacked, and unpacked only where nothing is highlighted.) */
+#side-cards[data-unpack="unread"] > .side-card-row[data-thread-read] + li[data-unpack-thread] .unpack-pack {
   color: var(--thread-grey);
 }
 
@@ -2984,9 +2984,9 @@ a.search-hit-link {
 }
 
 /* `#450 pack-triangle-hue`. The pack triangle's own states, from its own colour rather than the
-   accent above: a wash of the thread's colour under a resting mouse, a press and the keyboard's
-   ring — and grey where the triangle is grey, `currentColor` carrying either. */
-#side-cards .reply-ungather.unpack-pack:hover,
+   accent above: a wash of the thread's colour on a press and under the keyboard's ring — and grey
+   where the triangle is grey, `currentColor` carrying either. Its hover wash is with the other
+   row controls', gated where a pointer can hover and the keys are not in use (below). */
 #side-cards .reply-ungather.unpack-pack:active,
 #side-cards .reply-ungather.unpack-pack:focus-visible {
   background: color-mix(in srgb, currentColor 18%, transparent);
@@ -5894,6 +5894,11 @@ a.search-hit-link {
   :root:not([data-input="keys"]) #side-log .reply-ungather:hover,
   :root:not([data-input="keys"]) #discord-log .reply-ungather:hover {
     background: color-mix(in srgb, var(--accent) 18%, transparent);
+  }
+
+  /* `#450 pack-triangle-hue`: the pack triangle's hover wash, in its own colour as its press is. */
+  :root:not([data-input="keys"]) #side-cards .reply-ungather.unpack-pack:hover {
+    background: color-mix(in srgb, currentColor 18%, transparent);
   }
 
   :root:not([data-input="keys"]) #side-log .reply-marker:hover::before,
