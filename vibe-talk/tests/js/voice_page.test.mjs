@@ -13851,7 +13851,8 @@ async function scatteredPage(count = 2) {
 test("a long post's first part, a root by then, is one row with its continuation in its thread (#463)", async () => {
   // Slack posts a long message as its first part in the channel and the rest as replies in that
   // part's thread, about three seconds apart. The root used to stand alone, so the post read as
-  // separate messages; a root still never joins the row above it, nor a reply in another thread.
+  // separate messages. A root still never joins the row above it (705 after 704, two seconds
+  // apart), nor does a reply in another thread (707), nor another author's reply (706).
   const at = (seconds) => new Date(MESSAGE_DAY.getTime() + seconds * 1000).toISOString();
   const post = { id: "1792765680.753759", root_message_id: "701", is_root: true, reply_count: 3,
     reply_count_exact: true };
@@ -13862,7 +13863,10 @@ test("a long post's first part, a root by then, is one row with its continuation
     message({ id: "702", content: "part two", thread: { ...post, is_root: false }, timestamp: at(3), ...OWNER }),
     message({ id: "703", content: "part three", thread: { ...post, is_root: false }, timestamp: at(6), ...OWNER }),
     message({ id: "704", content: "a new thread", thread: other, timestamp: at(8), ...OWNER }),
-    message({ id: "705", content: "in the channel", timestamp: at(9), ...OWNER }),
+    // Slack names every message on the channel's own timeline the root of its own thread.
+    message({ id: "705", content: "in the channel", timestamp: at(9), ...OWNER,
+      thread: { id: "1792765691.000100", root_message_id: "705", is_root: true, reply_count: 0,
+        reply_count_exact: true } }),
     message({ id: "706", content: "an answer", thread: { ...post, is_root: false }, timestamp: at(10), ...ALICE }),
     message({ id: "707", content: "the other thread", thread: { ...other, is_root: false }, timestamp: at(11),
       ...OWNER }),
@@ -13883,6 +13887,44 @@ test("a long post's first part, a root by then, is one row with its continuation
   const first = page.el("discord-log").children[0];
   assert.match(bodyOf(first).text(), /state replication model\s*part two\s*part three/,
     "the combined row does not show the whole post in order");
+});
+
+test("a root's summary on Main is not the summary of the long post it heads in All (#463)", async () => {
+  // The same root heads two different rows: itself on Main, and the whole post with its parts in
+  // All. Each row is summarised for the text it draws, so neither view's answer is shown in the
+  // other, whichever view asked first.
+  const at = (seconds) => new Date(MESSAGE_DAY.getTime() + seconds * 1000).toISOString();
+  const post = { id: "1792765680.753759", root_message_id: "801", is_root: true, reply_count: 2,
+    reply_count_exact: true };
+  const messages = [
+    message({ id: "801", content: longMessage("part one"), thread: post, timestamp: at(0), ...OWNER }),
+    message({ id: "802", content: longMessage("part two"), thread: { ...post, is_root: false }, timestamp: at(3),
+      ...OWNER }),
+    message({ id: "803", content: longMessage("part three"), thread: { ...post, is_root: false },
+      timestamp: at(6), ...OWNER }),
+  ];
+  const page = newPage();
+  page.threadingSupported = true;
+  page.threads = [{ id: post.id, root: messages[0], title: "Long post", reply_count: 2, reply_count_exact: true,
+    updated_at: messages[2].timestamp }];
+  await signIn(page);
+  await showDiscord(page, messages);
+  assert.deepStrictEqual(page.el("discord-log").children.map((li) => li.getAttribute("data-ids")),
+    ["801 802 803"], "the fixture's post is not one row in All");
+  await turnSummariesOn(page);
+  assert.deepStrictEqual(page.summaryAsks.map((ask) => [ask.message, ask.with]), [["801", ["802", "803"]]],
+    "All did not ask about the whole post");
+  const picker = page.el("thread-select");
+  picker.value = "main";
+  await picker.dispatch("change");
+  await page.settle();
+  assert.deepStrictEqual(page.el("discord-log").children.map((li) => li.getAttribute("data-ids")), ["801"],
+    "Main does not draw the root alone");
+  // A scroll asks about what is on screen, as it does for any row (`requestVisibleSummaries`).
+  await page.el("scroll-area").dispatch("scroll");
+  await page.settle();
+  assert.deepStrictEqual(page.summaryAsks.map((ask) => [ask.message, ask.with]),
+    [["801", ["802", "803"]], ["801", []]], "Main reused the whole post's summary for its root alone");
 });
 
 /** The N replies chip on a row. */

@@ -3483,8 +3483,16 @@ let summaryMode = false;
  */
 const summaries = new Map();
 
-/** Every message id a request has gone out for. Consulted before asking, so one row is one ask. */
+/** Every row a request has gone out for, by `summaryKey`. Consulted before asking, so one row is one ask. */
 const summariesAsked = new Set();
+
+/**
+ * The key a row's summary is held under: every id the row stands for, in order. Not its first id
+ * alone, because the same first message heads different rows in different views — a thread's root
+ * is a row of its own on Main and the head of its long post's parts in the thread (`#463
+ * slack-text-fidelity`) — and each row's summary is of the text that row draws.
+ */
+const summaryKey = (entry) => [entry.id, ...(entry.also || [])].join(" ");
 
 /**
  * What the server says produced the summaries, quoted from its own answer.
@@ -3547,7 +3555,7 @@ function applySummaryState(entry) {
   if (!entry.note) {
     return;
   }
-  const held = summaries.get(entry.id);
+  const held = summaries.get(summaryKey(entry));
   const failed = held !== undefined && held.failed === true;
   if (held === undefined) {
     // Nothing has come back yet. The text is staged so the row is ready the instant it does, but
@@ -3698,15 +3706,16 @@ function requestVisibleSummaries(limit = Infinity) {
     if (issued >= limit) {
       return;
     }
-    if (summariesAsked.has(entry.id)) {
+    const key = summaryKey(entry);
+    if (summariesAsked.has(key)) {
       continue;
     }
     // Marked BEFORE the await, not in the handler: the scroll listener fires again long before a
     // response lands, and a record written on completion would let one row issue a request per
     // scroll event — the exact thing the issue names.
-    summariesAsked.add(entry.id);
+    summariesAsked.add(key);
     issued += 1;
-    fetchSummary(entry.id, entry.also);
+    fetchSummary(entry.id, entry.also, key);
   }
 }
 
@@ -3729,7 +3738,7 @@ function summaryRecheckAnswered() {
   requestVisibleSummaries();
 }
 
-async function fetchSummary(id, alsoIds = []) {
+async function fetchSummary(id, alsoIds = [], key = summaryKey({ id, also: alsoIds })) {
   const channel = el("discord-channel").value;
   if (!channel) {
     return;
@@ -3748,7 +3757,7 @@ async function fetchSummary(id, alsoIds = []) {
     // The CODE, not the sentence. `summarizer_not_configured` is a fact about the deployment and
     // `summarizer_error` is a fact about this attempt; the two are told apart on the machine
     // string the server sends for exactly that purpose, never on the prose beside it.
-    summaryFailed(id, error.message, error.code, error.detail);
+    summaryFailed(key, error.message, error.code, error.detail);
     return;
   }
   summaryRecheckAnswered();
@@ -3765,7 +3774,7 @@ async function fetchSummary(id, alsoIds = []) {
   // that work was done. It is SETTLED — the row keeps its own opening lines and is never asked
   // about again — which is the whole reason the STATE decides rather than the presence of text.
   if (payload && payload.state === "below_threshold") {
-    summaries.set(id, { text: null });
+    summaries.set(key, { text: null });
     renderSummaries();
     return;
   }
@@ -3774,10 +3783,10 @@ async function fetchSummary(id, alsoIds = []) {
   // "below threshold" would quietly file every malformed answer as a decision nobody made.
   const said = payload ? payload.summary : null;
   if (typeof said !== "string" || !said) {
-    summaryFailed(id, "the server answered without a summary");
+    summaryFailed(key, "the server answered without a summary");
     return;
   }
-  summaries.set(id, { text: said });
+  summaries.set(key, { text: said });
   renderSummaries();
 }
 
@@ -3809,8 +3818,8 @@ let summaryFailureTimer = null;
  *
  * `failed` also marks the entry as retryable — see `setSummaryMode`.
  */
-function summaryFailed(id, why, code, detail) {
-  summaries.set(id, { text: null, failed: true, why, code });
+function summaryFailed(key, why, code, detail) {
+  summaries.set(key, { text: null, failed: true, why, code });
   // A DEPLOYMENT-LEVEL refusal, not a row-level one: this server has no summariser configured, so
   // every other row would buy the same answer. The rows already asked about still go red — a
   // summary really was attempted for them and really did not arrive — but nothing further is
@@ -3822,7 +3831,7 @@ function summaryFailed(id, why, code, detail) {
   if (code === "summarizer_not_configured") {
     summariesUnavailable = detail || why || "this server has no summariser configured.";
   }
-  pendingSummaryFailures.add(id);
+  pendingSummaryFailures.add(key);
   if (summaryFailureTimer === null) {
     summaryFailureTimer = setTimeout(reportSummaryFailures, 0);
   }
