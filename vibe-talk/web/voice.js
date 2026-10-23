@@ -1833,11 +1833,11 @@ async function applyDeepLink() {
   const standing = Boolean(place && stood && visitKey(stood) === visitKey(place));
   if (!standing && place && channelPlaceShowable(place)) {
     showChannelPlace(place);
-  } else if (place && place.view === "thread" && place.thread) {
+  } else if (!standing && place && place.view === "thread" && place.thread) {
     // Not yet known is not gone: a thread named before its channel was read opens by id, and
     // the read that follows names it, as a reopened thread without its summary does.
     chooseOneColumn({ view: "thread", thread: place.thread, summary: null, origin: "main" });
-  } else if (place) {
+  } else if (!standing && place) {
     setStatus("That link's view cannot be shown here; showing the channel instead.");
   }
   syncDeepLinkAddress();
@@ -22312,8 +22312,14 @@ function openingChannelView() {
       if (wanted.view === "main") return { view: "main", thread: null, summary: null, origin: "main" };
       if (wanted.view === "all") return { view: "flat", thread: null, summary: null, origin: "main" };
       if ((wanted.view === "thread" || (!wanted.view && thread)) && thread && threadingSupported) {
-        const summary = channelCanon.threads.find((held) => String(held.id) === thread) || null;
-        return { view: "thread", thread, summary: summary || null, origin: "main" };
+        // The very thread this channel already opens in — a reload standing on its own
+        // address: the kept choice below says where its Back goes (the thread list it was
+        // opened from, say), and a link naming the same thread must not rewrite that.
+        const kept = chosenView(channel);
+        if (!(kept && kept.channelView === "thread" && kept.thread && String(kept.thread.id) === thread)) {
+          const summary = channelCanon.threads.find((held) => String(held.id) === thread) || null;
+          return { view: "thread", thread, summary: summary || null, origin: "main" };
+        }
       }
     }
   }
