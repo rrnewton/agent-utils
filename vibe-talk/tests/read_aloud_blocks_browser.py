@@ -18,6 +18,12 @@ grip that moves it comes first). While a read plays the bar's Read is its Pause 
 also in the keyboard-up slim row (`#429`). Stop, on the strip or the bar, ends the read and leaves
 reading mode. On a desk the strip is dragged by its grip and a double-click on the grip docks it.
 
+`#451 read-strip-followups`: held at 393x852, the strip's Play is drawn hollow where Stop keeps its
+solid fill (computed, and in the paused screenshot); and on a desk a one-block read started with s
+outside reading mode — which draws no strip — is paused and stopped from the bar, the mode never
+entered. (The moved strip held in the window as the chips row grows, and the grip's keys in Help's
+list, are pinned in the fake-DOM suite, which can grow a row and read the list.)
+
 It serves the checked-out assets and a small fake API from one loopback origin. The fake voice
 behaves like the deployed one in the two ways the boundaries depend on: ONE session, so a block's
 audio cannot begin until the block before it has been generated, and audio at SPEAKING PACE, so
@@ -524,12 +530,14 @@ def main() -> int:
     try:
         with sync_playwright() as playwright:
 
-            def open_page(profile: str, width: int, height: int, mobile: bool) -> tuple[BrowserContext, Page]:
+            def open_page(profile: str, width: int, height: int, mobile: bool,
+                          scheme: str = "light") -> tuple[BrowserContext, Page]:
                 context = playwright.chromium.launch_persistent_context(
                     profile,
                     headless=True,
                     executable_path=args.browser_executable,
                     viewport={"width": width, "height": height},
+                    color_scheme=scheme,  # type: ignore[arg-type]
                     is_mobile=mobile,
                     has_touch=mobile,
                 )
@@ -858,6 +866,19 @@ def main() -> int:
                 check(page.text_content("#read-pause") == "Play", "the held strip does not offer Play")
                 check(page.text_content("#read-aloud-label") == "Resume",
                       "the strip's pause left the Read button saying Pause")
+                # `#451`: held, Play and Stop no longer share the solid fill. Play is hollow
+                # (the panel through it, its word in the warn colour), Stop keeps the fill.
+                fills = page.evaluate(
+                    "() => { const bg = (id) => getComputedStyle(document.getElementById(id)).backgroundColor;"
+                    " const ink = (id) => getComputedStyle(document.getElementById(id)).color;"
+                    " return {play: bg('read-pause'), stop: bg('read-stop'), playInk: ink('read-pause'),"
+                    " panel: getComputedStyle(document.getElementById('read-steer')).backgroundColor}; }")
+                check(fills["play"] != fills["stop"],
+                      f"the held Play is filled as Stop is: Play {fills['play']}, Stop {fills['stop']}")
+                check(fills["play"] == fills["panel"],
+                      f"the held Play is filled {fills['play']}, not hollow against its strip {fills['panel']}")
+                check(fills["playInk"] == fills["stop"],
+                      f"the held Play's word is {fills['playInk']}, not the fill's colour {fills['stop']}")
                 # The status pill stacks over the strip rather than under its top edge (`#433`).
                 page.evaluate("() => setStatus('held at the second block')")
                 pill_gap = float(page.evaluate(
@@ -914,6 +935,59 @@ def main() -> int:
                 check_mode_left(page, "375x812's strip")
                 context.close()
 
+            # 11. `#451`: on a desk, a one-block read started with s outside reading mode. It draws
+            # no strip, so the bar is its only transport: Read pauses it and the Stop beside Read
+            # ends it, with the mode never entered (aria-pressed, the mode's own say, stays off).
+            with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
+                context, page = open_page(profile, 1280, 800, False)
+                press(page, "#read-aloud", False)
+                wait_for(lambda: page.text_content("#read-aloud-label") == "Read", 3,
+                         "the premise: leaving the mode the walk opened in")
+                check(page.get_attribute("#read-aloud", "aria-pressed") == "false",
+                      "the premise: reading mode is on")
+                check(page.is_hidden("#read-aloud-stop"), "the premise: a Stop stands before anything plays")
+                short_row = f'#discord-log > li[data-id="{SHORT}"]'
+                page.locator(short_row).hover()
+                page.wait_for_selector(f"{short_row}[data-selected='true']", timeout=5_000)
+                page.keyboard.press("s")
+                wait_for(lambda: page.text_content("#read-aloud-label") == "Pause" and page.is_visible("#read-aloud-stop"),
+                         5, "the read started with s has no Pause and Stop in the bar")
+                check(position(page) == "", "the premise: a one-block read drew a strip")
+                check(page.get_attribute("#read-aloud", "aria-pressed") == "false",
+                      "the read started with s entered reading mode")
+                press(page, "#read-aloud", False)
+                wait_for(lambda: page.evaluate("() => readAloudContext.state") == "suspended", 2,
+                         "Read did not hold the read started with s")
+                check(page.text_content("#read-aloud-label") == "Resume",
+                      "the held one-off read does not offer Resume")
+                check(page.is_visible("#read-aloud-stop"), "the held one-off read lost the bar's Stop")
+                if args.screenshots:
+                    page.screenshot(path=str(args.screenshots / "11-desk-s-held.png"))
+                press(page, "#read-aloud-stop", False)
+                check_mode_left(page, "the desk's bar on a read started with s")
+                check(page.get_attribute("#read-aloud", "aria-pressed") == "false",
+                      "stopping the one-off read left reading mode on")
+                context.close()
+
+            # 11b. The same held strip in the dark, on a desk: Play hollow, Stop filled, there too.
+            with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
+                context, page = open_page(profile, 1280, 800, False, scheme="dark")
+                press(page, f"{row} .body", False)
+                wait_position(page, "1 of 7")
+                press(page, "#read-pause", False)
+                wait_for(lambda: page.text_content("#read-pause") == "Play", 3,
+                         "the dark held strip does not offer Play")
+                dark_fills = page.evaluate(
+                    "() => { const bg = (id) => getComputedStyle(document.getElementById(id)).backgroundColor;"
+                    " return {play: bg('read-pause'), stop: bg('read-stop')}; }")
+                check(dark_fills["play"] != dark_fills["stop"],
+                      f"in the dark the held Play is filled as Stop is: Play {dark_fills['play']}, Stop {dark_fills['stop']}")
+                if args.screenshots:
+                    page.screenshot(path=str(args.screenshots / "11-desk-dark-paused.png"))
+                press(page, "#read-stop", False)
+                check_mode_left(page, "the dark desk's strip")
+                context.close()
+
         print(f"{browser_version}: 7 blocks walked at 412x915, 393x852, 375x812 and on a desk. Block boundaries, voice"
               f" first audio {round(FIRST_AUDIO_SECONDS * 1000)} ms: at speaking pace {pace_boundaries} ms"
               f" (worst {worst}); generating {AHEAD_PACE:g}x faster than it speaks, worst {ahead_worst} ms;"
@@ -924,7 +998,8 @@ def main() -> int:
               f" {bar375['stopWidth']:.0f}px wide at 375 ({slim['readWidth']:.0f}/{slim['stopWidth']:.0f}px in the"
               f" keyboard-up row), {bar393['readWidth']:.0f}/{bar393['stopWidth']:.0f}px at 393,"
               f" {bar_desk['readWidth']:.0f}/{bar_desk['stopWidth']:.0f}px on a desk; dragged 300,250px and docked"
-              " again on a desk. The first block's three sentences were lit in turn; highlight,"
+              " again on a desk; a held Play hollow against Stop's fill, and a one-block read started"
+              " with s paused and stopped from a desk's bar. The first block's three sentences were lit in turn; highlight,"
               " k of n, tap-to-jump, the timeline, Previous/Next, the media keys and Pause/Play by the"
               " strip, the Read button and the media keys all move or hold the one read.")
         return 0

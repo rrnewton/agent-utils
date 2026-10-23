@@ -11816,6 +11816,104 @@ test("`#442 read-strip-order`: a phone keeps the strip docked whatever a desk re
   assert.match(cssBlockIn(DESKTOP_QUERY, "#read-steer-grip"), /display:\s*inline-flex/);
 });
 
+test("`#451 read-strip-followups`: a read started with s outside reading mode has the bar's Stop, and Read pauses it", async () => {
+  // From `#442`'s handoff: s reads one message without entering the mode, and that read had no
+  // bar Stop — Read, pressed to stop it, entered reading mode instead and left it playing.
+  const page = newPage();
+  page.enableStreamedAudio();
+  page.enableAbort();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1000000000000000001", content: "one block" })]);
+  assert.equal(page.el("read-aloud-label").text(), "Read", "the premise: reading mode is off");
+  assert.equal(page.el("read-aloud").getAttribute("data-active"), "false", "the premise: reading mode is off");
+  assert.equal(page.el("read-aloud-stop").hidden, true, "the premise: no Stop before anything plays");
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  await press(page, page.el("scroll-area"), "s");
+  await page.settle();
+  assert.equal(page.el("read-steer").hidden, true, "the premise: a one-block read has no strip");
+  assert.equal(page.el("read-aloud-stop").hidden, false, "a read started with s has no Stop in the bar");
+  assert.equal(page.el("read-aloud-label").text(), "Pause", "Read does not pause a read started with s");
+  assert.equal(page.el("read-aloud").getAttribute("aria-pressed"), "false", "starting the read entered reading mode");
+  assert.equal(page.el("read-aloud").getAttribute("data-active"), "true", "the one-off read does not light its Pause as a session's does");
+  await page.el("read-aloud").click();
+  await page.settle();
+  assert.equal(page.el("read-aloud-label").text(), "Resume", "Read did not hold the read started with s");
+  assert.equal(page.audio.state, "suspended", "the held read's clock is still running");
+  assert.equal(page.el("read-aloud").getAttribute("aria-pressed"), "false", "pausing it entered reading mode");
+  assert.equal(page.el("read-aloud-stop").hidden, false, "a held read started with s lost the bar's Stop");
+  await page.el("read-aloud-stop").click();
+  await page.settle();
+  assertReadingModeLeft(page, "the bar's Stop on a read started with s");
+});
+
+test("`#451 read-strip-followups`: a held read's Play is told from its Stop at a glance", () => {
+  // Held, Play and Stop were both filled with the warn colour, told apart only by the word on one
+  // and the square on the other. Stop keeps the fill; a held Play is hollow, ringed in the same
+  // colour, so fill itself says which one ends the read.
+  const held = cssBlock('#read-pause[aria-pressed="true"]');
+  const stop = cssBlock("#read-stop");
+  const fill = (rule) => /background:\s*([^;]+);/.exec(rule)[1].trim();
+  assert.match(stop, /background:\s*var\(--warn\);/, "Stop lost the way-out fill");
+  assert.notEqual(fill(held), fill(stop), "a held Play is filled as Stop is");
+  assert.match(held, /box-shadow:\s*inset 0 0 0 1px var\(--warn\)/, "a held Play is not ringed against Stop's fill");
+  assert.match(held, /color:\s*var\(--warn\)/, "a held Play does not say itself in the read's colour");
+});
+
+test("`#451 read-strip-followups`: a moved strip is held in the window again when the chips row grows", async () => {
+  // The strip's place is an offset from where it docks on the chips row. The row growing — a chip
+  // arriving, the row wrapping — lifts that docked place, and an offset clamped against the old
+  // place can stand the strip partly out of the window with no resize to pull it back.
+  const page = newPage(new Map(), SCRIPT, (p) => p.enableResizeObserver());
+  page.enableStreamedAudio();
+  page.enableAbort();
+  page.speechBlocks[BLOCKED_ID] = BLOCKED_KINDS;
+  await signIn(page);
+  const rows = await inReadingMode(page, [
+    message({ id: BLOCKED_ID, content: "The run finished.\n\n- the budget landed\n- the rewrite is a draft",
+      content_html: BLOCKED_HTML }),
+  ]);
+  const base = { left: 450, top: 620 };
+  const strip = page.el("read-steer");
+  page.el("read-steer-grip").getClientRects = () => [{}];
+  strip.getBoundingClientRect = () => {
+    const dx = parseFloat(strip.style.getPropertyValue("--read-steer-dx")) || 0;
+    const dy = parseFloat(strip.style.getPropertyValue("--read-steer-dy")) || 0;
+    return { left: base.left + dx, top: base.top + dy, right: base.left + dx + 380,
+      bottom: base.top + dy + 60, width: 380, height: 60 };
+  };
+  page.documentElement.clientWidth = 1280;
+  page.documentElement.clientHeight = 800;
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  const grip = page.el("read-steer-grip");
+  await grip.dispatch("pointerdown", { button: 0, pointerId: 1, clientX: 460, clientY: 640 });
+  await grip.dispatch("pointermove", { pointerId: 1, clientX: -2000, clientY: -2000 });
+  await grip.dispatch("pointerup", { pointerId: 1 });
+  assert.deepEqual(stripOffset(page), ["-450px", "-620px"], "the premise: the strip is not held at the window's corner");
+  // The chips row grows by 60px, so the docked place stands 60px higher; the window does not change.
+  base.top = 560;
+  page.el("scroll-tools").textContent = "Expand all";
+  page.resized(page.el("scroll-tools"));
+  await page.settle();
+  assert.deepEqual(stripOffset(page), ["-450px", "-560px"],
+    "the chips grew and left the moved strip 60px out of the window's top");
+});
+
+test("`#451 read-strip-followups`: the list of keys names the reading strip grip's keys", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1000000000000000001", content: "one block" })]);
+  const listed = page.el("keyboard-keys").descendants().filter((node) => node.tagName === "kbd").map((node) => node.textContent);
+  const said = page.el("keyboard-keys").text();
+  assert.ok(listed.some((keys) => keys.includes("Shift+") && keys.includes("←")),
+    `the grip's Shift+arrows are not in the list of keys: ${listed.join(", ")}`);
+  assert.match(said, /reading controls' grip/, "the list does not say whose arrows those are");
+  assert.match(said, /Home docks|docks it on the chips row/, "the list does not say Home docks the strip");
+  const shortcuts = page.el("read-steer-grip").getAttribute("aria-keyshortcuts") || "";
+  assert.match(shortcuts, /ArrowLeft/, "the grip does not say its arrows to a screen reader");
+  assert.match(shortcuts, /Home/, "the grip does not say Home to a screen reader");
+});
+
 test("a read in blocks on a ticket with under five minutes left prepares the row again first", async () => {
   // Its last block is asked for minutes after the tap; a ticket that ends part-way through is a
   // read that stops with "could not be played".

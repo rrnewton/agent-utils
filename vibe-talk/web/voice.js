@@ -344,6 +344,12 @@ if (typeof window.ResizeObserver === "function") {
     if (pinned) area.scrollTop = area.scrollHeight;
     // The room the channel's box keeps for them is above it, so it moved with them.
     placeChipsOverComposer();
+    // `#451 read-strip-followups`: and the strip docked on this row moved with it, so a place a
+    // desk reader dragged it to is held inside the window against the row as it now stands — a
+    // chip arriving or the row wrapping is no window resize to do it by that path. (Called after
+    // `placeChipsOverComposer`, which this measure also moves; that one holds the strip again for
+    // the box's own growth, and holding twice in one report holds it once.)
+    placeReadSteer();
   }).observe(el("scroll-tools"));
 }
 
@@ -424,6 +430,9 @@ function placeChipsOverComposer() {
   if (top === composerTop) return;
   composerTop = top;
   leftEl("frame-body").style.setProperty("--composer-top", `${top}px`);
+  // `#451 read-strip-followups`: the band the strip floats in just moved with the box, so a strip
+  // put somewhere on a desk is held inside the window against where it now docks.
+  placeReadSteer();
 }
 
 const setStatus = (text) => {
@@ -11275,8 +11284,9 @@ function macFieldEditKey(event, target) {
  * @property {KeyChord[]} chords
  * @property {string | (() => string)} does What it does, as the list of keys says it: asked each time
  *   the list is drawn where it names a chord, so that the chord is in the words on the reader's keyboard.
- * @property {"browser" | "box"} [by] Answered by the browser's own scrolling, or by the own handler
- *   of a message box (`onComposerKey`), rather than by `run`: listed so the list is whole.
+ * @property {"browser" | "box" | "grip"} [by] Answered by the browser's own scrolling, by the own handler
+ *   of a message box (`onComposerKey`), or by the reading strip grip's own handler (`onReadGripKey`),
+ *   rather than by `run`: listed so the list is whole.
  * @property {boolean} [repeats] A held key repeats it. Only the keys that move, and a chord whose `run`
  *   keeps the default of the browser shut on every repeat of a held key (Ctrl+S, the Save page).
  * @property {boolean} [inField] Fires in a text field too, where `run` decides for itself.
@@ -11534,6 +11544,23 @@ const KEYMAP = [
     group: KEYS_MESSAGE, chords: [{ key: "s" }],
     does: "Read it aloud, or stop",
     run: (event, target) => readFromKeyboard(target),
+  },
+  {
+    // `#451 read-strip-followups`. The grip's own handler (`onReadGripKey`), listed so the list is
+    // whole: focused on the grip, its keys never reach this table (it refuses their default, which
+    // `onPageKey` leaves alone), and off the grip the arrows are the list's, above.
+    group: KEYS_MESSAGE, by: "grip",
+    chords: [{ key: "ArrowLeft" }, { key: "ArrowRight" }, { key: "ArrowUp" }, { key: "ArrowDown" },
+      { key: "ArrowLeft", shift: true }, { key: "ArrowRight", shift: true },
+      { key: "ArrowUp", shift: true }, { key: "ArrowDown", shift: true }],
+    does: "On the reading controls' grip, on a desk: move the reading controls; with Shift, by more. " +
+      "The place is remembered on this device",
+    controls: ["read-steer-grip"],
+  },
+  {
+    group: KEYS_MESSAGE, by: "grip", chords: [{ key: "Home" }],
+    does: "On the reading controls' grip: Home docks it on the chips row again, as a double-click does",
+    controls: ["read-steer-grip"],
   },
   {
     group: KEYS_MESSAGE, chords: [{ key: "." }],
@@ -19485,7 +19512,10 @@ function renderControls() {
   // held it is Resume — the strip's Pause/Play and the media keys say the same, from the one
   // state (`renderReadTransport`). With nothing playing it is "Stop" again, the way out above.
   renderReadTransport();
-  el("read-aloud").setAttribute("data-active", readingMode ? "true" : "false");
+  // `#451 read-strip-followups`: active for a read in progress as for the mode, so a read started
+  // with s keeps the way-out colour and the keyboard-up slim row's Pause (`#429`), which both key
+  // off this. `renderReadTransport` keeps it as a read starts, holds and ends between these draws.
+  el("read-aloud").setAttribute("data-active", readingMode || readInProgress() ? "true" : "false");
   // The state the READER cares about, on the control they pressed. Reset to a plain ready when the
   // mode is off, so a failure from the last session does not greet them on the next one.
   el("read-aloud").setAttribute("data-read-state", readingMode ? readState : "idle");
@@ -33313,18 +33343,29 @@ function renderReadTransport() {
   const strip = el("read-steer");
   if (strip) strip.setAttribute("data-paused", paused ? "true" : "false");
   const button = el("read-aloud");
-  if (button) button.setAttribute("data-paused", paused ? "true" : "false");
+  if (button) {
+    button.setAttribute("data-paused", paused ? "true" : "false");
+    // As `renderControls` states it, kept here for the starts, holds and stops between its draws
+    // (`#451 read-strip-followups`).
+    button.setAttribute("data-active", readingMode || readInProgress() ? "true" : "false");
+  }
   if (nowPlaying !== null || (pendingRead === null && !readJumping)) readJumpPending = false;
   const label = el("read-aloud-label");
   if (label) {
-    label.textContent = !readingMode ? "Read"
-      : readInProgress() ? (paused ? "Resume" : "Pause")
-      : "Stop";
+    // `#451 read-strip-followups`. A read in progress is what makes Read its Pause, in the mode or
+    // out of it: s reads one message without entering the mode (`readFromKeyboard`), and that read
+    // is paused, resumed and stopped from the bar like any other. The mode's own Stop — Read with
+    // nothing playing — is still only the mode's.
+    label.textContent = readInProgress() ? (paused ? "Resume" : "Pause")
+      : readingMode ? "Stop"
+      : "Read";
   }
   // `#442 read-strip-order`. While Read is the read's Pause or Resume, the way out stands beside
   // it; with nothing playing, Read is that way out itself and the second button would repeat it.
+  // `#451 read-strip-followups`: beside it for a read started with s too, whose one block draws no
+  // strip to stop it from.
   const stop = el("read-aloud-stop");
-  if (stop && button) stop.hidden = button.hidden || !readingMode || !readInProgress();
+  if (stop && button) stop.hidden = button.hidden || !readInProgress();
 }
 
 /** A read is playing or held, or moving to another of its blocks (`readJumpPending`). */
@@ -50624,8 +50665,9 @@ el("read-aloud").addEventListener("click", () => {
   // `#434 read-aloud-pause`: while a read is playing or held, this button is its Pause/Resume —
   // the strip's button and the media keys by another reach. Leaving the mode is what this button
   // does with nothing playing, and what Stop beside it and on the strip do while a read plays
-  // (`#442 read-strip-order`).
-  if (readingMode && readInProgress()) {
+  // (`#442 read-strip-order`). `#451 read-strip-followups`: a read started with s outside the
+  // mode pauses here too, where it used to enter the mode over a read still playing.
+  if (readInProgress()) {
     toggleReadingPaused();
     return;
   }
