@@ -767,7 +767,8 @@ function refusalSentence(error) {
 //
 // THE HISTORY MIRRORS WHAT IS OPEN. `backLevels` reads from the page's own state what a Back would
 // close, the first-opened first, and the page keeps one history entry above its own for each: at the
-// page's own URL, `/`, so the address never changes and a reload and the browser's Back on a desk
+// page's own URL, `/`, its query saying where the reader is (`#462 webapp-deep-links`, replaced
+// in step without touching any entry's state), so a reload and the browser's Back on a desk
 // are as they were; each tagged with what it stands for, how deep it is, and this page load's own
 // name (`BACK_SESSION`). `syncBackStack` puts the history in step after
 // anything opens or closes: an entry pushed for each thing opened, the top entry replaced where one
@@ -1080,6 +1081,14 @@ function scheduleBackSync() {
       // A browser that refuses a history call leaves the page as it was, with no entry to go back to.
       backSyncDue = false;
     }
+    // `#462 webapp-deep-links`. The address in step with the place just noted; and the place a
+    // link named, applied once there is a channel to apply it to (a no-op from then on).
+    try {
+      syncDeepLinkAddress();
+    } catch (_error) {
+      // An address that cannot be written leaves the last one standing.
+    }
+    guardQuietly(applyDeepLink)();
   });
 }
 
@@ -1493,6 +1502,295 @@ function placeFromKeyboard(step) {
   }
   setStatus(step < 0 ? "Nothing to go back to." : "Nothing to go forward to.");
   return true;
+}
+
+// --- deep links: the address names the view, and can name a message (#462 webapp-deep-links) ----
+//
+// The owner: "shouldn't there be some argument to the single page that selects the view and
+// makes things linkable? … shouldn't we have a link that jumps to a specific message in
+// vibe-talk?" So the page's address carries where the reader is, as a QUERY on `/` (`/voice`
+// already forwards there keeping it, `#302 root-is-the-app`) — never the FRAGMENT, which holds
+// a pairing code and is stripped before any request (`#369`):
+//
+//   /?c=<channel>&v=<main|all|threads|thread|columns>&t=<thread>
+//   /?m=<provider>:<channel>:<message>[:<thread>]        (+ c/v/t for where it opens)
+//
+// Each `m` part is percent-encoded before joining, so a `:` inside an id is data, never a
+// separator. The parts are DURABLE identity: the service's name, then the upstream's own ids
+// as this server canonically derives them — Discord snowflakes verbatim, a Slack conversation
+// verbatim and its `ts` losslessly encoded (`slack/ids.rs`), a bridged service's resource
+// names. No server-local row id, store or session is named, so any server on the same upstream
+// resolves the same link and a reboot changes nothing. A link carries ids only, never text.
+//
+// THE ADDRESS FOLLOWS, IT NEVER LEADS NAVIGATION. Where the reader goes is still decided by the
+// places above (`#423`) and the Back entries (`#304`): the query is rewritten in step with them
+// (`syncDeepLinkAddress`, heard where the history is kept in step), by `replaceState` carrying
+// the entry's own state untouched, so no entry is added or taken and Back keeps its meaning.
+// The one time the address leads is the OPEN: a link read at load wins over the device's
+// restored state (`#189`) — its channel and view are shown, its message fetched around and
+// landed on by the reply arrow's own walk. `v=voice` is read and refused politely: a link
+// never starts a call. Unknown values are ignored one by one; a link cannot break the open.
+
+/** The views a link may name (`voice` read only to refuse it: a link starts no call). */
+const DEEP_LINK_VIEWS = ["main", "all", "threads", "thread", "columns", "voice"];
+/** The longest query value read from a link: an id padded past this is not an id. */
+const DEEP_LINK_PART_MAX = 512;
+/** How long opening from a link waits for sign-in and a first read, in `PULL_WAIT_MS` waits. */
+const DEEP_LINK_WAITS = 600;
+
+/**
+ * @typedef {{provider: string, channel: string, message: string, thread: string | null}} DeepLinkRef
+ * @typedef {{channel: string | null, view: string | null, thread: string | null,
+ *   message: DeepLinkRef | null}} DeepLinkWanted
+ */
+
+/** The link the page opened by, once read; `undefined` until first read. */
+/** @type {DeepLinkWanted | null | undefined} */
+let deepLinkWanted = undefined;
+/** The message a link focused, kept in the address while its place stands. */
+/** @type {DeepLinkRef | null} */
+let deepLinkFocus = null;
+/** The query last written, so an address already saying this is not written again. */
+let deepLinkWritten = null;
+/** Opening from a link, done at most once a load; and one attempt of it at a time. */
+let deepLinkApplied = false;
+let deepLinkApplying = false;
+
+/**
+ * The address's query as a name-to-value map, read without `URLSearchParams`: the page runs in
+ * hosts without it (its own test fixture is one), and a query this small wants no parser but
+ * splitting on its two separators. A value that will not unescape is left out whole.
+ */
+function deepLinkParams(search) {
+  const params = new Map();
+  for (const pair of String(search || "").replace(/^\?/, "").split("&")) {
+    if (!pair) continue;
+    const at = pair.indexOf("=");
+    const key = at < 0 ? pair : pair.slice(0, at);
+    try {
+      params.set(decodeURIComponent(key), decodeURIComponent((at < 0 ? "" : pair.slice(at + 1)).replace(/\+/g, " ")));
+    } catch (_error) {
+      // A malformed escape: that pair says nothing.
+    }
+  }
+  return params;
+}
+
+/** One query value from the address, bounded as an id is; null for an absent or absurd one. */
+function deepLinkPart(params, key) {
+  const value = params.get(key);
+  return typeof value === "string" && value !== "" && value.length <= DEEP_LINK_PART_MAX ? value : null;
+}
+
+/** The message a link's `m` names, its parts unescaped; null for a shape no link of ours makes. */
+function deepLinkRefFrom(text) {
+  const parts = String(text || "").split(":");
+  if (parts.length < 3 || parts.length > 4) return null;
+  try {
+    const decoded = parts.map((part) => decodeURIComponent(part));
+    if (decoded.some((part) => !part || part.length > DEEP_LINK_PART_MAX)) return null;
+    return { provider: decoded[0].toLowerCase(), channel: decoded[1], message: decoded[2], thread: decoded[3] || null };
+  } catch (_error) {
+    return null;
+  }
+}
+
+/** A message's durable identity as a link names it: its service, channel, id, and thread. */
+function deepLinkRefOf(message) {
+  const channel = String((message && message.channel_id) || el("discord-channel").value || "");
+  const described = providerOfChannel(channel);
+  const name = described && typeof described.name === "string" && described.name.trim()
+    ? described.name.trim() : chatProviderName;
+  const thread = threadOf(message);
+  const record = message && message.thread;
+  const root = !record || record.is_root === true || String(record.root_message_id || "") === String(message.id);
+  return {
+    provider: String(name || "").toLowerCase(), channel, message: String(message.id),
+    thread: thread && !root ? thread : null,
+  };
+}
+
+/** A ref as the `m` value carries it: each part escaped, then joined. */
+function deepLinkRefText(ref) {
+  const parts = [ref.provider, ref.channel, ref.message, ...(ref.thread ? [ref.thread] : [])];
+  return parts.map((part) => encodeURIComponent(part)).join(":");
+}
+
+/** The link the page opened by, read from the query once; null for a plain open. */
+function deepLinkFromAddress() {
+  if (deepLinkWanted !== undefined) return deepLinkWanted;
+  deepLinkWanted = null;
+  try {
+    const params = deepLinkParams(window.location.search || "");
+    const channel = deepLinkPart(params, "c");
+    const saidView = deepLinkPart(params, "v");
+    const view = saidView && DEEP_LINK_VIEWS.includes(saidView.toLowerCase()) ? saidView.toLowerCase() : null;
+    const thread = deepLinkPart(params, "t");
+    const messageText = deepLinkPart(params, "m");
+    const message = messageText ? deepLinkRefFrom(messageText) : null;
+    if (channel || view || thread || message) deepLinkWanted = { channel, view, thread, message };
+  } catch (_error) {
+    // An address that cannot be read opens the page as any plain open does.
+  }
+  return deepLinkWanted;
+}
+
+/** The query for channel place `place` (and a focused message in it), each value escaped. */
+function deepLinkQuery(place, ref) {
+  const pairs = [["c", place.channel]];
+  if (place.layout === "list") pairs.push(["v", "threads"]);
+  else if (place.layout === "two") {
+    pairs.push(["v", "columns"]);
+    if (place.side) pairs.push(["t", place.side]);
+  } else if (place.view === "thread" && place.thread) {
+    pairs.push(["v", "thread"], ["t", place.thread]);
+  } else if (place.view === "flat") pairs.push(["v", "all"]);
+  else pairs.push(["v", "main"]);
+  if (ref && ref.channel === place.channel) pairs.push(["m", deepLinkRefText(ref)]);
+  return pairs.map(([key, value]) => `${key}=${encodeURIComponent(value)}`).join("&");
+}
+
+/** A whole link to `ref`'s message, opening where it stands: its thread, or Main for a root. */
+function deepLinkFor(ref) {
+  const place = {
+    screen: "main", channel: ref.channel, layout: "one",
+    view: ref.thread ? "thread" : "main", thread: ref.thread, origin: null, side: null,
+  };
+  const origin = typeof window === "object" && window.location && window.location.origin ? String(window.location.origin) : "";
+  return `${origin}/?${deepLinkQuery(place, ref)}`;
+}
+
+/**
+ * Keep the address saying where the reader is: the channel place's query, replaced into the
+ * current entry with its state untouched. Only a channel place is written — Settings, Help and
+ * the call keep the channel's address under them, as a link copied there should still name it.
+ */
+function syncDeepLinkAddress() {
+  const history = backHistory();
+  if (!history || typeof window !== "object" || !window.location) return;
+  const place = currentScreen === "main" ? channelPlace() : null;
+  if (!place) return;
+  const focus = deepLinkFocus && deepLinkFocus.channel === place.channel &&
+    (!deepLinkFocus.thread || place.thread === deepLinkFocus.thread || place.side === deepLinkFocus.thread ||
+      place.view === "flat") ? deepLinkFocus : null;
+  const query = deepLinkQuery(place, focus);
+  const address = `${window.location.pathname || "/"}?${query}`;
+  const standing = `${window.location.pathname || "/"}${window.location.search || ""}`;
+  if (address === standing || address === deepLinkWritten) return;
+  try {
+    history.replaceState(history.state, "", address);
+    deepLinkWritten = address;
+  } catch (_error) {
+    // A host that refuses the address keeps the page; only its link is stale.
+  }
+}
+
+/** Land on the linked message where a row holds it, as the reply arrow lands on its answer. */
+function landOnDeepLink(id) {
+  const row = rowHolding(id);
+  if (!row) return false;
+  if (String(row.className).split(/\s+/).includes("search-hidden")) setSearchOpen(false);
+  openReadRun(row);
+  revealRow(row);
+  renderScrollTools();
+  setStatus("Here is the linked message.");
+  return true;
+}
+
+/** Wait `waits` short waits for `ready`, as the seek walk waits for a read in flight. */
+async function waitForDeepLink(ready) {
+  for (let waited = 0; waited < DEEP_LINK_WAITS && !ready(); waited += 1) {
+    await new Promise((resolve) => setTimeout(resolve, PULL_WAIT_MS));
+  }
+  return ready();
+}
+
+/**
+ * Open where the link says, once: its channel over the restored one, its view over the
+ * channel's chosen one, its message landed on by the reply arrow's walk. Best-effort in every
+ * part, said in the status line where it cannot be done: an unreadable part never breaks the open.
+ */
+async function applyDeepLink() {
+  const wanted = deepLinkFromAddress();
+  if (!wanted || deepLinkApplied || deepLinkApplying) return;
+  deepLinkApplying = true;
+  try {
+  // Until the channel itself is on screen: applied over sign-in or the call view, the page's
+  // own open would simply overwrite it. Giving up here is not final — the next place noted
+  // kicks this again (`scheduleBackSync`); applied is only ever set past this wait.
+  if (!await waitForDeepLink(() => Boolean(token()) && knownChannels.length > 0 &&
+      Boolean(el("discord-channel").value) && currentScreen === "main" && currentView === "discord")) return;
+  deepLinkApplied = true;
+  const wantedChannel = (wanted.message && wanted.message.channel) || wanted.channel;
+  if (wantedChannel) {
+    if (!knownChannels.some((channel) => String(channel.id) === wantedChannel)) {
+      setStatus("That link names a channel this server does not read.");
+      syncDeepLinkAddress();
+      return;
+    }
+    if (String(el("discord-channel").value) !== wantedChannel) {
+      el("discord-channel").value = wantedChannel;
+      changeSelectedChannel();
+    }
+  }
+  if (currentView !== "discord") showView("discord");
+  const channel = String(el("discord-channel").value);
+  // The channel's own first read decides its opening view as it lands; a place put on before
+  // it would be decided over. Wait for a read to have landed, then put the link's place on.
+  await waitForDeepLink(() => String(el("discord-channel").value) !== channel ||
+    (timelineReadsStarted > 0 && !discordFetchInFlight));
+  if (String(el("discord-channel").value) !== channel) return;
+  const thread = wanted.thread || (wanted.message && wanted.message.thread) || null;
+  /** @type {ChannelPlace | null} */
+  let place = null;
+  if (wanted.view === "threads") {
+    place = { screen: "main", channel, layout: "list", view: null, thread: null, origin: null, side: null };
+  } else if (wanted.view === "columns") {
+    place = { screen: "main", channel, layout: "two", view: null, thread: null, origin: null, side: thread };
+  } else if (wanted.view === "thread" || (!wanted.view && thread)) {
+    if (thread) place = { screen: "main", channel, layout: "one", view: "thread", thread, origin: "main", side: null };
+  } else if (wanted.view === "all") {
+    place = { screen: "main", channel, layout: "one", view: "flat", thread: null, origin: null, side: null };
+  } else if (wanted.view === "main") {
+    place = { screen: "main", channel, layout: "one", view: "main", thread: null, origin: null, side: null };
+  }
+  if (place && channelPlaceShowable(place)) {
+    showChannelPlace(place);
+  } else if (place && place.view === "thread" && place.thread) {
+    // Not yet known is not gone: a thread named before its channel was read opens by id, and
+    // the read that follows names it, as a reopened thread without its summary does.
+    chooseOneColumn({ view: "thread", thread: place.thread, summary: null, origin: "main" });
+  } else if (place) {
+    setStatus("That link's view cannot be shown here; showing the channel instead.");
+  }
+  syncDeepLinkAddress();
+  if (wanted.view === "voice") {
+    setStatus("Links never start a call.");
+  }
+  if (!wanted.message) return;
+  deepLinkFocus = wanted.message;
+  syncDeepLinkAddress();
+  // The first read of the view now open, waited for as a seek waits for All to land.
+  await waitForDeepLink(() => String(el("discord-channel").value) !== channel ||
+    (channelCanon.views.has(viewKey()) && !discordFetchInFlight));
+  if (String(el("discord-channel").value) !== channel) return;
+  const target = wanted.message.message;
+  await seekMessage(target, () => landOnDeepLink(target),
+    () => threadingSupported && channelView !== "flat" && answeredElsewhere(target));
+  if (!rowHolding(target)) {
+    deepLinkFocus = null;
+    syncDeepLinkAddress();
+  }
+  } finally {
+    deepLinkApplying = false;
+  }
+}
+
+/** Copy this message's vibe-talk link, and say whether it went. The ⋯ menu's third copy. */
+async function copyDeepLink(message) {
+  const copied = await writeClipboardText(deepLinkFor(deepLinkRefOf(message)));
+  setStatus(copied ? "Copied the vibe-talk link." : COPY_REFUSED);
+  return copied;
 }
 
 // --- screens ----------------------------------------------------------------------------------
@@ -35958,10 +36256,22 @@ function discordNode(messages) {
   readCaption.setAttribute("aria-hidden", "true");
   readCaption.textContent = "Mark read";
   readGroup.append(readCaption, readThrough, upstreamRead);
+  // `#462 webapp-deep-links`. This app's own address for the message, beside its service's:
+  // it opens the app on the message, highlighted, on any server reading the same upstream.
+  // Always offered — it needs no upstream address to have come back.
+  const deepCopy = document.createElement("button");
+  deepCopy.className = "row-copy-deep-link-button";
+  deepCopy.setAttribute("type", "button");
+  deepCopy.setAttribute("title", "Copy a link that opens this app on this message");
+  deepCopy.textContent = "Copy vibe-talk link";
+  deepCopy.addEventListener("click", inThisColumn(() => {
+    setMenu(false);
+    guardQuietly(() => copyDeepLink(message))();
+  }));
   // Copy text first, then the ways to the message in its service where it has one — open it,
-  // copy its address — then Pin: the copies and the link together, ahead of the acts that
-  // change anything.
-  menu.append(copy, ...(openLink ? [openLink] : []), ...(copyLink ? [copyLink] : []), pinItem, bookmarkItem, readGroup);
+  // copy its address — then its address here, then Pin: the copies and the links together,
+  // ahead of the acts that change anything.
+  menu.append(copy, ...(openLink ? [openLink] : []), ...(copyLink ? [copyLink] : []), deepCopy, pinItem, bookmarkItem, readGroup);
   more.append(moreButton, menu);
   acts.append(more);
   // `#50 todo-view`. The non-gestural way to say "dealt with", and the one a keyboard can reach.
@@ -53448,3 +53758,5 @@ if (pairingCode !== null) {
 // what is open, from the screen the page opened on.
 startBackStack();
 
+// `#462 webapp-deep-links`. Open where a link says, once sign-in gives it a channel to open.
+guardQuietly(applyDeepLink)();

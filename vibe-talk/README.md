@@ -561,6 +561,29 @@ matches an installed app to its manifest by `id`, so the next manifest update mo
 `start_url` to `/`. Until then it launches `/voice`, is forwarded, and stays in its window, because
 both addresses are inside the manifest's `scope`, `/`.
 
+**Links into the app.** `#462 webapp-deep-links`: the page at `/` takes query arguments that
+say where to open, and its address keeps saying where the reader is as they move (replaced in
+step, so the Back stack is unchanged):
+
+```
+/?c=<channel>&v=<view>&t=<thread>&m=<provider>:<channel>:<message>[:<thread>]
+```
+
+`v` is `main`, `all`, `threads` (the thread list), `thread` (with `t`) or `columns` (with `t`
+on the right). `v=voice` is read and refused politely: a link never starts a call. `m` names
+one message to open on, highlighted: its service's name, then the upstream's own channel and
+message ids as vibe-talk canonically derives them (Discord snowflakes verbatim; a Slack `ts`
+losslessly encoded), each part percent-encoded. A message not yet loaded is fetched around,
+walking back page by page as a jump to a replied-to message does. A link read at load wins
+over the device's restored view; unknown values are ignored one by one.
+
+The ⋯ menu's **Copy vibe-talk link** copies such an address for its message (its thread for a
+reply, Main otherwise), beside **Open in \<service\>** and **Copy \<service\> link**, which name the
+message in the service it came from. Durability: a link names no server-local row and no
+session, so any vibe-talk server connected to the same upstream resolves the same link, and a
+reboot does not break it; the provider part only says which service's ids follow. A link
+carries ids only, never message text, and still needs the deployment's token to read anything.
+
 The manifest asks browsers that support `display_override` (including Chrome Android) for
 `standalone`, while retaining `display: browser` as the standards-defined fallback. Safari on iOS
 currently ignores `display_override`, and this page deliberately does not opt into Apple's

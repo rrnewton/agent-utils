@@ -134,6 +134,7 @@ def main() -> int:
     with sync_playwright() as playwright:
         for label, width, height, phone in SIZES:
             report.append(walk(playwright.chromium, args, label, width, height, phone))
+            report.append(deep_walk(playwright.chromium, args, label, width, height, phone))
     for line in report:
         print(line)
     return 0
@@ -173,6 +174,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
             reader = Reader(Desk(page, args.screenshots, label, width, height), context.new_cdp_session(page))
+            reader.origin = origin
             page.goto(f"{origin}/", wait_until="load")
             page.fill("#api-token", TOKEN)
             page.click("#save-token")
@@ -198,6 +200,7 @@ class Reader:
     def __init__(self, desk: Desk, cdp: CDPSession) -> None:
         self.desk = desk
         self.cdp = cdp
+        self.origin = ""
 
     @property
     def page(self) -> Page:
@@ -288,10 +291,12 @@ class Reader:
         items = opened["items"]
         assert isinstance(items, list)
         self.check(bool(opened["open"]), f"the ⋯ menu did not open: {opened}")
-        self.check([item["className"] for item in items[:3]] == ["row-copy-button", "row-open-link-button", "row-copy-link-button"],
-                   f"the link and its Copy are not under Copy text: {items}")
+        self.check([item["className"] for item in items[:4]] == ["row-copy-button", "row-open-link-button", "row-copy-link-button", "row-copy-deep-link-button"],
+                   f"the link and its copies are not under Copy text: {items}")
         self.check(items[2]["text"] == "Copy Slack link" and items[2]["tag"] == "BUTTON",
                    f"the Copy item is not named for its service: {items}")
+        self.check(items[3]["text"] == "Copy vibe-talk link",
+                   f"the app's own copy is not offered: {items}")
         link = items[1]
         self.check(link["text"] == "Open in Slack", f"the item is not named for its service: {items}")
         self.check(link["tag"] == "A" and link["href"] == ADDRESS and link["target"] == "_blank"
@@ -333,6 +338,18 @@ class Reader:
         self.desk.settled()
         self.desk.notes.append("the Copy item copied the same address")
 
+        # `#462`: this app's own link for the same message, from the reopened menu.
+        page.evaluate("(text) => navigator.clipboard.writeText(text)", SENTINEL)
+        page.locator(f"#discord-log > li[data-id='{QUESTION_ID}'] .row-copy-deep-link-button").click()
+        self.desk.settled()
+        deep = self.clipboard()
+        self.check(deep.startswith(self.origin + "/?") and "v=main" in deep and "%3A209" in deep
+                   and "migration" not in deep,
+                   f"Copy vibe-talk link copied no durable link: {deep}")
+        page.locator(menu_button).click()
+        self.desk.settled()
+        self.desk.notes.append("Copy vibe-talk link copied this app's durable address for it")
+
         # Following it opens the address in a new page, copies nothing, and shuts the menu.
         page.evaluate("(text) => navigator.clipboard.writeText(text)", SENTINEL)
         self.opened_at_the_address("item").close()
@@ -361,6 +378,8 @@ class Reader:
         assert isinstance(plain_items, list)
         self.check(all(item["className"] not in ("row-open-link-button", "row-copy-link-button") for item in plain_items),
                    f"a message with no address was offered one: {plain_items}")
+        self.check(any(item["className"] == "row-copy-deep-link-button" for item in plain_items),
+                   f"a message with no upstream address was not offered its vibe-talk link: {plain_items}")
         self.key("Escape")
         self.highlight(PLAIN_ID)
         self.check(self.copied_after("l") == SENTINEL, "l on a message with no address changed the clipboard")
@@ -370,9 +389,120 @@ class Reader:
         self.check(len(page.context.pages) == pages_before, "Shift+O on a message with no address opened a page")
         self.check(float(str(self.menu(PLAIN_ID)["overflow"])) <= 0, "the page scrolls sideways")
         self.desk.shot("2-no-link")
-        self.desk.notes.append("a message with no address offered no item, l on it copied nothing and "
-                               "Shift+O opened nothing")
+        self.desk.notes.append("a message with no address offered no upstream item (its vibe-talk link "
+                               "still stood), l on it copied nothing and Shift+O opened nothing")
 
+
+
+# A thread reply the deep-link walk lands on: REPLICA's second answer (its root is the long question).
+DEEP_REPLY_ID = "212"
+DEEP_THREAD = "spaces/A/threads/replica"
+DEEP_QUERY = ("c=1110000000000000001&v=thread&t=spaces%2FA%2Fthreads%2Freplica"
+              "&m=slack%3A1110000000000000001%3A212%3Aspaces%252FA%252Fthreads%252Freplica")
+
+
+def deep_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int,
+              phone: bool) -> str:
+    """`#462 webapp-deep-links` at one size: links in, addresses out, and a second server.
+
+    A fresh profile opens a link naming a thread reply: the thread opens over the restored
+    state and the reply is landed on. The views round-trip through the address (open `v=main`,
+    walk to All by the picker, the address follows; reload-standing query reopens the same
+    place). Then the SAME query is opened against a second, fresh server instance on the same
+    fake upstream — a reboot by another name — and lands on the same message.
+    """
+    servers: list[tuple[ThreadingHTTPServer, threading.Thread]] = []
+
+    def serve() -> str:
+        api = LinkedApi()
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api))
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        servers.append((server, thread))
+        return f"http://127.0.0.1:{server.server_port}"
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-deep-") as profile:
+            if phone:
+                context = chromium.launch_persistent_context(
+                    profile, headless=True, executable_path=args.browser_executable,
+                    viewport={"width": width, "height": height}, color_scheme="dark",
+                    device_scale_factor=2.625, is_mobile=True, has_touch=True,
+                )
+            else:
+                context = chromium.launch_persistent_context(
+                    profile, headless=True, executable_path=args.browser_executable,
+                    viewport={"width": width, "height": height}, color_scheme="dark",
+                )
+            version = context.browser.version if context.browser else "Chromium"
+            page = context.pages[0]
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            desk = Desk(page, args.screenshots, f"{label}-deep", width, height)
+
+            def open_at(origin: str, query: str) -> None:
+                page.goto(f"{origin}/?{query}", wait_until="load")
+                if page.locator("#api-token").is_visible():
+                    page.fill("#api-token", TOKEN)
+                    page.click("#save-token")
+                    page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
+                if page.evaluate("() => document.getElementById('pane-discord').hidden"):
+                    page.click("#view-switch")
+                desk.settled()
+
+            origin = serve()
+            open_at(origin, DEEP_QUERY)
+            desk.wait_for(f"() => {{ const row = document.querySelector('#discord-log > li[data-id=\"{DEEP_REPLY_ID}\"]');"
+                          " return row && row.getAttribute('data-landed') === 'true'; }",
+                          "the deep link did not land on its reply")
+            desk.check(page.evaluate("() => !document.getElementById('thread-heading').hidden"),
+                       "the deep link did not open its thread")
+            status = page.text_content("#status") or ""
+            desk.check("linked message" in status, f"the landing was not said: {status!r}")
+            desk.check("v=thread" in page.url and "m=slack%3A" in page.url,
+                       f"the address let go of the link's place: {page.url}")
+            desk.shot("3-deep-landed")
+            desk.notes.append("a deep link opened its thread and landed on its reply, the address still naming it")
+
+            # Views round-trip: in by link, out by address.
+            open_at(origin, "c=1110000000000000001&v=main")
+            desk.wait_for("() => document.getElementById('thread-select').value === 'main'",
+                          "v=main did not open Main")
+            page.select_option("#thread-select", "flat")
+            desk.wait_for("() => location.search.includes('v=all')", "the address did not follow into All")
+            page.reload(wait_until="load")
+            desk.settled()
+            if page.evaluate("() => document.getElementById('pane-discord').hidden"):
+                page.click("#view-switch")
+                desk.settled()
+            desk.wait_for("() => document.getElementById('thread-select').value === 'flat'",
+                          "a reload did not reopen the addressed view")
+            desk.notes.append("v=main opened Main, the address followed a move to All, a reload reopened All")
+
+            # Durability: the same query against a fresh server instance lands on the same reply.
+            other = serve()
+            page2 = context.new_page()
+            page2.on("pageerror", lambda error: errors.append(str(error)))
+            page2.goto(f"{other}/?{DEEP_QUERY}", wait_until="load")
+            if page2.locator("#api-token").is_visible():
+                page2.fill("#api-token", TOKEN)
+                page2.click("#save-token")
+                page2.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
+            if page2.evaluate("() => document.getElementById('pane-discord').hidden"):
+                page2.click("#view-switch")
+            page2.wait_for_function(
+                f"() => {{ const row = document.querySelector('#discord-log > li[data-id=\"{DEEP_REPLY_ID}\"]');"
+                " return row && row.getAttribute('data-landed') === 'true'; }", timeout=15_000)
+            desk.notes.append("the same query on a fresh server instance landed on the same reply")
+            check(not errors, f"{label} deep: the page threw: {errors}")
+            context.close()
+            return f"{version} deep at {width}x{height}: " + "; ".join(desk.notes)
+    finally:
+        for server, thread in servers:
+            server.shutdown()
+            server.server_close()
+            thread.join()
 
 if __name__ == "__main__":
     raise SystemExit(main())

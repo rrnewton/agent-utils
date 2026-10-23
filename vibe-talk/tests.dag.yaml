@@ -987,7 +987,7 @@ steps:
   # with no address offers no item and neither key does anything.
   - group: check
     job: open-upstream-link-browser
-    desc: Open in Slack in the ⋯ menu opens the message's own address in a new page with no opener, by the link and by Shift+O, l copies it, absent without one, in current Chromium at 1280x800 and 393x852
+    desc: Open in Slack in the ⋯ menu opens the message's own address in a new page with no opener, by the link and by Shift+O, l copies it, absent without one; Copy Slack link and Copy vibe-talk link beside it, a right-click reaching the anchor's own contextmenu, and deep links opening their view and message (the same query on a fresh server too), in current Chromium at 1280x800 and 393x852
     labels: [validation-vibe-talk]
     cmd: cd vibe-talk && python3 tests/open_upstream_link_browser.py
     jobs_flag: ""

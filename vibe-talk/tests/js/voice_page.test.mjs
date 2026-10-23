@@ -17305,9 +17305,9 @@ test("Open in the ⋯ menu links to the message's own address in its service, an
   ]);
   assert.equal(rows.length, 4, "the fixture did not produce four rows");
   const items = rowMoreMenu(rows[0]).children;
-  assert.deepStrictEqual(items.map((node) => node.className).slice(0, 3),
-    ["row-copy-button", "row-open-link-button", "row-copy-link-button"],
-    "the link and its Copy are not with Copy text at the menu's head");
+  assert.deepStrictEqual(items.map((node) => node.className).slice(0, 4),
+    ["row-copy-button", "row-open-link-button", "row-copy-link-button", "row-copy-deep-link-button"],
+    "the link and its copies are not with Copy text at the menu's head");
   const link = rows[0].descendants().find((node) => node.className === "row-open-link-button");
   assert.equal(String(link.tagName).toUpperCase(), "A", "the item is not a real link");
   assert.equal(link.textContent, "Open in Discord");
@@ -17400,6 +17400,152 @@ test("Open in the ⋯ menu links to the message's own address in its service, an
   assert.equal(page.expireTimers(HOLD_MS), 0, "a finger on the link armed the row's hold");
   assert.equal(rows[0].descendants().find((node) => node.className === "msg-details"), undefined,
     "a long press on the link opened the row's details");
+});
+
+/** Settle on a real clock until `done`, as an opening from a link lands: bounded, as its waits are. */
+async function untilDeepLink(page, done) {
+  for (let spins = 0; spins < 300 && !done(); spins += 1) {
+    await passTime(page, 60);
+    await page.settle();
+  }
+}
+
+test("`#462 webapp-deep-links`: Copy vibe-talk link copies durable upstream identity, beside the service's own", async () => {
+  const page = newPage(new Map(), SCRIPT, (p) => p.enableHistory());
+  page.threadingSupported = true;
+  const data = threadData();
+  page.threads = data.threads;
+  await signIn(page);
+  const rows = await showDiscord(page, data.messages);
+  // A reply's link opens its thread on it; a root's opens Main on it. Ids only — never text.
+  const replyRow = rowWithId(page, "202");
+  const copy = replyRow.descendants().find((node) => node.className === "row-copy-deep-link-button");
+  assert.ok(copy, "no Copy vibe-talk link in the menu");
+  assert.equal(copy.textContent, "Copy vibe-talk link");
+  const items = rowMoreMenu(replyRow).children.map((node) => node.className);
+  assert.ok(items.indexOf("row-copy-deep-link-button") > items.indexOf("row-copy-button"),
+    `the vibe-talk copy is not with the other copies: ${items}`);
+  await rowMoreButton(replyRow).click();
+  await copy.click();
+  await page.settle();
+  const link = page.clipboard;
+  assert.equal(typeof link, "string", "the Copy item copied nothing");
+  assert.ok(link.startsWith("https://vibe.example/?"), `the link is not this app's address: ${link}`);
+  const query = Object.fromEntries(link.split("?")[1].split("&").map((pair) => {
+    const at = pair.indexOf("=");
+    return [pair.slice(0, at), decodeURIComponent(pair.slice(at + 1))];
+  }));
+  assert.equal(query.c, CHANNEL.id, "the link names another channel");
+  assert.equal(query.v, "thread");
+  assert.equal(query.t, "spaces/A/threads/one & two", "the link does not name the reply's thread");
+  const ref = query.m.split(":").map((part) => decodeURIComponent(part));
+  assert.deepStrictEqual(ref, ["discord", CHANNEL.id, "202", "spaces/A/threads/one & two"],
+    "the link does not carry provider, channel, message and thread");
+  assert.ok(!link.includes("first thread answer"), "the link carries message text");
+  assert.equal(page.el("status").textContent, "Copied the vibe-talk link.");
+
+  // The pure round-trip: a ref out and back is itself, separators inside ids included.
+  const pure = page.pure(`JSON.stringify(deepLinkRefFrom(deepLinkRefText(
+    {provider: "google chat", channel: "spaces/A", message: "spaces/A/messages/x.y", thread: "spaces/A/threads/one & two"})))`);
+  assert.deepStrictEqual(JSON.parse(pure),
+    { provider: "google chat", channel: "spaces/A", message: "spaces/A/messages/x.y", thread: "spaces/A/threads/one & two" });
+  assert.equal(page.pure(`deepLinkRefFrom("garbage")`), null, "a malformed ref was taken for one");
+
+  // And the address follows the reader: opening that thread writes its place, state untouched.
+  await pickThread(page, "thread:spaces/A/threads/one & two");
+  await page.settle();
+  const last = page.history.addresses[page.history.addresses.length - 1] || "";
+  assert.match(last, /^\/?\?c=1110000000000000001&v=thread&t=spaces%2FA%2Fthreads%2Fone%20%26%20two$/,
+    `the address does not name the open thread: ${last}`);
+});
+
+test("`#462 webapp-deep-links`: a link opens its view and thread over the restored state, and lands on its message", async () => {
+  const data = threadData();
+  const page = newPage(new Map(), SCRIPT, (p) => {
+    p.enableHistory();
+    p.setAddress({ search: "?c=1110000000000000001&v=thread&t=spaces%2FA%2Fthreads%2Fanother" +
+      "&m=discord%3A1110000000000000001%3A204%3Aspaces%252FA%252Fthreads%252Fanother" });
+  });
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await untilDeepLink(page, () => !page.el("thread-heading").hidden && rowWithId(page, "204")?.getAttribute("data-landed") === "true");
+  assert.equal(page.el("thread-heading").hidden, false, "the link did not open its thread");
+  assert.equal(page.el("thread-select").value, "thread:spaces/A/threads/another");
+  const landed = rowWithId(page, "204");
+  assert.ok(landed, "the linked message is not drawn");
+  assert.equal(landed.getAttribute("data-landed"), "true", "the linked message was not landed on");
+  assert.match(statusText(page), /Here is the linked message/);
+  // The address still names it, so a reload or a copy of the address bar lands there again.
+  // Read as the page computes it: this fixture's location does not move when the page
+  // replaces the address, as a browser's does, so the written list lags the standing one.
+  assert.match(page.pure("deepLinkQuery(channelPlace(), deepLinkFocus)"), /&m=discord%3A/,
+    "the address let go of its message");
+  assert.ok(page.pure("deepLinkFocus !== null"), "the focus a link brought was dropped");
+});
+
+test("`#462 webapp-deep-links`: each view round-trips, voice is refused politely, garbage is ignored", async () => {
+  const cases = [
+    ["main", "main"], ["all", "flat"], ["threads", "threads"],
+  ];
+  for (const [said, picker] of cases) {
+    const data = threadData();
+    const page = newPage(new Map(), SCRIPT, (p) => {
+      p.enableHistory();
+      p.setAddress({ search: `?c=${CHANNEL.id}&v=${said}` });
+    });
+    page.threadingSupported = true;
+    page.threads = data.threads;
+    await signIn(page);
+    await showDiscord(page, data.messages);
+    await untilDeepLink(page, () => page.el("thread-select").value === picker);
+    assert.equal(page.el("thread-select").value, picker, `v=${said} opened ${page.el("thread-select").value}`);
+    assert.match(page.pure("deepLinkQuery(channelPlace(), deepLinkFocus)"),
+      new RegExp(`(^|&)v=${said}(&|$)`), `the address does not say ${said} back`);
+  }
+  // A list opens with its cards. (Round-trip back out of it is ↓'s walk in the back tests.)
+  // Voice: never a call from a link.
+  const voice = newPage(new Map(), SCRIPT, (p) => {
+    p.enableHistory();
+    p.setAddress({ search: `?c=${CHANNEL.id}&v=voice` });
+  });
+  voice.threadingSupported = true;
+  voice.threads = threadData().threads;
+  await signIn(voice);
+  await showDiscord(voice, threadData().messages);
+  await untilDeepLink(voice, () => /never start a call/.test(statusText(voice)));
+  assert.equal(voice.tab(), "discord", "a voice link left the channel view");
+  assert.match(statusText(voice), /never start a call/, "a voice link was refused in silence");
+  // Garbage: opened as a plain open, on the restored/default view (All, with threads).
+  const junk = newPage(new Map(), SCRIPT, (p) => {
+    p.enableHistory();
+    p.setAddress({ search: "?c=%&v=nope&m=garbage&t=" });
+  });
+  junk.threadingSupported = true;
+  junk.threads = threadData().threads;
+  await signIn(junk);
+  await showDiscord(junk, threadData().messages);
+  await junk.settle();
+  assert.equal(junk.tab(), "discord", "a garbage link broke the open");
+  assert.equal(junk.el("thread-select").value, "flat", "a garbage link chose a view");
+});
+
+test("`#462 webapp-deep-links`: a linked message further back than the loaded page is walked back to", async () => {
+  const page = newPage(new Map(), SCRIPT, (p) => {
+    p.enableHistory();
+    p.setAddress({ search: `?c=${CHANNEL.id}&m=discord%3A${CHANNEL.id}%3A5001` });
+  });
+  const all = pagedTimeline(page, { steps: 4, size: 4 });
+  await signIn(page);
+  await showDiscord(page, []);
+  await untilDeepLink(page, () => Boolean(rowWithId(page, all[1].id)));
+  const landed = rowWithId(page, all[1].id);
+  assert.ok(landed, "the linked message was never walked back to");
+  assert.equal(landed.getAttribute("data-landed"), "true", "the walk did not land on the linked message");
+  assert.match(statusText(page), /Here is the linked message/);
+  const older = timelineReads(page).filter((path) => /[?&]before=/.test(path));
+  assert.ok(older.length >= 3, `the walk read ${older.length} older pages for a message three pages back`);
 });
 
 test("mark read through here targets the newest part without archiving the row", async () => {
@@ -45794,20 +45940,22 @@ async function showPinned(page) {
   await page.settle();
 }
 
-test("the ⋯ menu is Copy text, then Pin, then the bookmark, then the two that mark read under one caption", async () => {
+test("the ⋯ menu is Copy text, its vibe-talk link, then Pin, then the bookmark, then the two that mark read under one caption", async () => {
   for (const upstream of [false, true]) {
     const page = newPage();
     page.upstreamReadMarkSupported = upstream;
     await signIn(page);
     const rows = await showDiscord(page, backlog(2));
     const items = rowMoreMenu(rows[0]).children;
+    // `#462 webapp-deep-links`: the app's own link with the copies, Pin after them.
     assert.deepStrictEqual(items.map((node) => node.className),
-      ["row-copy-button", "row-pin-button", "row-bookmark-button", "row-more-group"], `the menu's order (upstream ${upstream})`);
+      ["row-copy-button", "row-copy-deep-link-button", "row-pin-button", "row-bookmark-button", "row-more-group"], `the menu's order (upstream ${upstream})`);
     assert.equal(items[0].textContent, "Copy text", "Copy text is not first");
-    assert.equal(items[1].textContent, "Pin message");
+    assert.equal(items[1].textContent, "Copy vibe-talk link");
+    assert.equal(items[2].textContent, "Pin message");
     // `#240 reading-bookmark`.
-    assert.equal(items[2].textContent, "Bookmark above");
-    const group = items[3];
+    assert.equal(items[3].textContent, "Bookmark above");
+    const group = items[4];
     assert.equal(group.getAttribute("role"), "group", "the two that mark read are not a group");
     assert.equal(group.getAttribute("aria-label"), "Mark read");
     const [caption, through, provider] = group.children;
@@ -68052,7 +68200,14 @@ test("`#304 back-gesture-in-app`: a thread opened is one entry at the page's own
   assert.equal(opened.thread, true, "fixture: the picker did not open the thread");
   assert.equal(opened.grew, 1, "opening a thread did not push exactly one entry");
   assert.deepStrictEqual(opened.facts, { depth: 1, tag: "thread" });
-  assert.deepStrictEqual(page.history.addresses, [], "an entry changed the page's address");
+  // `#462 webapp-deep-links`: an entry no longer leaves the address alone — the query says
+  // where the reader is — but it is replaced into the same entry with its state untouched
+  // (the facts above), never pushed: the thread is still exactly one entry.
+  assert.ok(page.history.addresses.length > 0 &&
+    page.history.addresses.every((address) => address.startsWith("/?c=")),
+    `an entry wrote an address that is not the place's own query: ${page.history.addresses}`);
+  assert.ok(page.history.addresses.some((address) => /[?&]v=thread&/.test(address)),
+    "no address named the thread while it was open");
   // The gesture: the thread closes, back to the view it was opened from, and the app is still here.
   assert.equal(after.left, false, "the gesture in a thread left the app");
   assert.equal(after.thread, false, "the gesture in a thread did not close it");
