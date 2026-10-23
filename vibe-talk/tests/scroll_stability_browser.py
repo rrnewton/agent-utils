@@ -150,6 +150,23 @@ WATCH_JS = """(listId) => {
 }"""
 UNWATCH_JS = "() => { const watch = window.__scrollWatch; watch.on = false; return watch.samples; }"
 
+# `#472 gate-flake-hardening`. How many of the page's channel reads are on the wire: sent, and not yet
+# read to their last byte. On a phone the thread list's first open sends its first read of the threads,
+# whose answer puts the cards in the server's order and draws their summaries; on a calm host it lands
+# before the list is measured, and a loaded one landed it inside the hold ("row t28 ... became row t49").
+READS_JS = """(() => {
+    const send = window.fetch.bind(window);
+    window.__timelineReads = 0;
+    window.fetch = (input, init) => {
+        const url = String(input && input.url ? input.url : input);
+        if (!url.includes('/timeline?')) return send(input, init);
+        window.__timelineReads += 1;
+        const done = () => { window.__timelineReads -= 1; };
+        return send(input, init).then((response) => { response.clone().arrayBuffer().then(done, done); return response; },
+                                      (error) => { done(); throw error; });
+    };
+})()"""
+
 # The card of a thread: where the middle of what shows of it is, and how much of it shows.
 CARD_AT_JS = """(id) => {
     const card = document.querySelector(`#side-cards > li[data-id='${id}']`);
@@ -505,6 +522,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
             reader = Reader(page, api, args.screenshots, label, touch)
+            page.add_init_script(READS_JS)
             page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             open_main(reader)
             main_walk(reader)
@@ -955,7 +973,10 @@ def view_key(reader: Reader, digit: int, view: str, layout: str | None) -> None:
 
 def list_at_foot(reader: Reader, why: str) -> None:
     """The thread list on screen at its foot, where it opens, and held there and still for the glide's wait
-    and more."""
+    and more: from when the reads its opening sent have landed and been drawn (`READS_JS`)."""
+    reader.frames(2)
+    reader.wait_for("() => window.__timelineReads === 0", f"{why}: the thread list's read never came back")
+    reader.frames(2)
     gap = reader.gap("side-scroll")
     reader.check(gap <= 1, f"{why}: the thread list opened {gap:.0f}px above its foot")
     before = reader.first("side-cards")
