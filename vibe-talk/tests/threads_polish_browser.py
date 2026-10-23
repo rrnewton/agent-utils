@@ -48,8 +48,11 @@ threads), two of Main's messages (220 and 223) the owner's, from one loopback or
    cards, the runner's card (unread, newest) drawn; a tap on the line opens it; h -> Hide read: the two read
    cards gone, the runner's left; h -> Show read: all three;
 8. Unpack unread: the runner unpacked, the read replica and canary packed, their edges one grey and the
-   runner's its colour; Pack all: every edge its own colour; Unpack all, the triangle on the replica's first
-   unpacked row (aria-label Pack thread): pressed, the replica packed, its card within a pixel of where it
+   runner's its colour; the read replica unpacked by a click on its own card there: its triangle grey as
+   its edge (`#450 pack-triangle-hue`); Pack all: every edge its own colour; Unpack all, the triangle on
+   the replica's first unpacked row (aria-label Pack thread): no disc behind it, larger than the triangle
+   the disc held, a hit target of 32px at least, in the replica's own colour as its edge and bridge are;
+   pressed, the replica packed, its card within a pixel of where it
    was; a click on the replica's card goes whole, unpacked, collapsed.
 
 No page error and no sideways scroll at any step. Pass --screenshots DIR to keep a PNG of each state;
@@ -600,6 +603,31 @@ PACK_JS = """() => {
 }""".replace("RUNNER", RUNNER).replace("REPLICA", REPLICA).replace("CANARY", CANARY)
 
 
+# `#450 pack-triangle-hue`. A thread's pack triangle as drawn: the button's box and colour, the mark
+# behind the triangle (there is to be none), the triangle itself (the mark's ::before: its width is its
+# two transparent sides, its height its coloured base), and the card edge it is to match.
+TRIANGLE_JS = """(id) => {
+    const button = document.querySelector(`#side-cards > li[data-unpack-thread='${id}'] .unpack-pack`);
+    if (!button) return null;
+    const mark = button.querySelector('.unpack-pack-mark');
+    const tri = getComputedStyle(mark, '::before');
+    const card = document.querySelector(`#side-cards > li[data-card][data-id='${id}']`);
+    const r = button.getBoundingClientRect(); const s = getComputedStyle(button); const m = getComputedStyle(mark);
+    return {width: r.width, height: r.height, color: s.color, background: s.backgroundColor,
+            outline: s.outlineColor, title: button.getAttribute('title'),
+            markBorder: m.borderTopWidth, markBackground: m.backgroundColor, markRadius: m.borderTopLeftRadius,
+            triWidth: parseFloat(tri.borderLeftWidth) + parseFloat(tri.borderRightWidth),
+            triHeight: parseFloat(tri.borderBottomWidth), triColor: tri.borderBottomColor,
+            edge: getComputedStyle(card).borderLeftColor};
+}"""
+
+
+def triangle(desk: Desk, thread_id: str) -> dict[str, object]:
+    found = desk.page.evaluate(TRIANGLE_JS, thread_id)
+    assert isinstance(found, dict), f"no triangle on {thread_id}'s first unpacked row"
+    return found
+
+
 def packs(desk: Desk) -> dict[str, object]:
     found = desk.page.evaluate(PACK_JS)
     assert isinstance(found, dict)
@@ -631,6 +659,24 @@ def pack_walk(desk: Desk) -> None:
                f"the read cards' edges are not one grey beside the runner's colour: {replica['edge']}, {canary['edge']}, {runner['edge']}")
     desk.shot("8-unpack-unread")
     grey = replica["edge"]
+    # `#450 pack-triangle-hue`. The read replica unpacked by its own card under Unpack unread: its
+    # triangle follows its edge to grey, where the unpacked runner's keeps its thread's colour.
+    for want in ("expanded", "unpacked"):
+        page.click(f"#side-cards > li[data-card][data-id='{REPLICA}'] .side-card")
+        desk.wait_for(f"() => document.querySelector(\"#side-cards > li[data-card][data-id='{REPLICA}']\").getAttribute('data-card-state') === '{want}'",
+                      f"a click on the read replica's card did not go to {want} under Unpack unread")
+        desk.settled()
+    held = triangle(desk, REPLICA)
+    desk.check(held["color"] == grey and held["triColor"] == grey and held["edge"] == grey,
+               f"under Unpack unread the read replica's triangle is {held['triColor']}, its edge {grey}")
+    lively = triangle(desk, RUNNER)
+    desk.check(lively["triColor"] == lively["edge"] and lively["triColor"] != grey,
+               f"the unread runner's triangle is {lively['triColor']}, its edge {lively['edge']}")
+    desk.shot("8-triangle-grey")
+    page.click(f"#side-cards > li[data-unpack-thread='{REPLICA}'] .unpack-pack")
+    desk.wait_for(f"() => document.querySelectorAll(\"#side-cards > li[data-unpack-thread='{REPLICA}']\").length === 0",
+                  "the grey triangle did not pack the replica")
+    desk.settled()
     unpack_to(desk, "false")
     found = packs(desk)
     replica, canary = found["replica"], found["canary"]
@@ -644,6 +690,22 @@ def pack_walk(desk: Desk) -> None:
                   "the replica's first unpacked row holds no triangle")
     label = page.get_attribute(f"#side-cards > li[data-unpack-thread='{REPLICA}'] .unpack-pack", "aria-label")
     desk.check(label == "Pack thread", f"the triangle is named {label!r}")
+    # `#450 pack-triangle-hue`. Plain, larger, and in the thread's own colour. The triangle the disc
+    # held was 0.6rem wide and 0.42rem tall (9.6px by 6.7px at the page's root size); this one is at
+    # least half as wide again each way, with nothing drawn behind it, on a target a thumb can hit.
+    drawn = triangle(desk, REPLICA)
+    desk.check(drawn["markBorder"] == "0px" and drawn["markBackground"] in ("rgba(0, 0, 0, 0)", "transparent")
+               and drawn["markRadius"] == "0px",
+               f"the triangle still stands in a disc: border {drawn['markBorder']}, background {drawn['markBackground']}, radius {drawn['markRadius']}")
+    desk.check(float(str(drawn["triWidth"])) >= 15 and float(str(drawn["triHeight"])) >= 10,
+               f"the triangle is {drawn['triWidth']}px by {drawn['triHeight']}px, no bigger than the one in the disc")
+    desk.check(float(str(drawn["width"])) >= 32 and float(str(drawn["height"])) >= 32,
+               f"the triangle's hit target is {drawn['width']}px by {drawn['height']}px")
+    desk.check(drawn["color"] == drawn["edge"] and drawn["triColor"] == drawn["edge"],
+               f"the triangle is {drawn['triColor']}, the replica's edge {drawn['edge']}")
+    desk.check("Pack" in str(drawn["title"]) and "^" in str(drawn["title"]), f"the triangle's tooltip: {drawn['title']!r}")
+    desk.notes.append(f"the pack triangle {float(str(drawn['triWidth'])):.0f}px by {float(str(drawn['triHeight'])):.0f}px on a "
+                      f"{float(str(drawn['width'])):.0f}px target, in its card edge's colour {drawn['edge']}, grey {grey} under Unpack unread")
     page.evaluate(f"() => document.querySelector(\"#side-cards > li[data-card][data-id='{REPLICA}']\").scrollIntoView({{block: 'start'}})")
     desk.settled()
     before = packs(desk)["replica"]

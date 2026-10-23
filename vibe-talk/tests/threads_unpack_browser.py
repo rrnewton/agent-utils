@@ -248,6 +248,18 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
         f"() => getComputedStyle(document.querySelector('#side-cards > li[data-id=\"{RUNNER}\"]')).borderLeftColor")
     desk.check(runner[0]["bridge"]["spine"] == card_edge,
                f"the bridge {runner[0]['bridge']['spine']} is not the card edge {card_edge}")
+    # `#450 pack-triangle-hue`, at every size and in both schemes (this walk's four): the pack
+    # triangle in the first row's gutter is that same colour, with no disc drawn behind it.
+    tri = page.evaluate("""(id) => {
+        const b = document.querySelector(`#side-cards > li[data-unpack-thread="${id}"] .unpack-pack`);
+        const m = b.querySelector('.unpack-pack-mark'); const s = getComputedStyle(b);
+        return {color: s.color, markBorder: getComputedStyle(m).borderTopWidth,
+                markBackground: getComputedStyle(m).backgroundColor,
+                tri: getComputedStyle(m, '::before').borderBottomColor}; }""", RUNNER)
+    desk.check(tri["color"] == card_edge or tri["tri"] == card_edge,
+               f"the pack triangle {tri} is not its card edge {card_edge}")
+    desk.check(tri["markBorder"] == "0px" and tri["markBackground"] in ("rgba(0, 0, 0, 0)", "transparent"),
+               f"the pack triangle still stands in a disc: {tri}")
     spines = [row["bridge"]["left"] for row in runner]
     desk.check(max(spines) - min(spines) <= 2, f"the bridge spine wanders: {spines}")
     desk.check(all(row["bridge"]["left"] < row["box"]["left"] + 40 for row in runner),

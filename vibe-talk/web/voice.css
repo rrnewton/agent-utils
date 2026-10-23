@@ -2921,20 +2921,50 @@ a.search-hit-link {
   transform: translate(-50%, -50%) rotate(-45deg);
 }
 
-/* `#440 thread-card-pack-toggle`. The thread's Pack, in the first unpacked row's gutter: the X's own button
-   and disc (above), an up triangle drawn in it in place of the X. */
+/* `#440 thread-card-pack-toggle`, drawn plain by `#450 pack-triangle-hue`. The thread's Pack, in the
+   first unpacked row's gutter: the X's own button (above), but no disc under the mark — a plain up
+   triangle, larger than the one the disc held, in the thread's own colour as its card's left edge and
+   its bridge are (`--thread-hue`, `#427`), never the accent the button above rests in. The button is
+   still the gutter square, an invisible target of 44px at the page's root size and never under 32px;
+   only the triangle is ink. Centred where the disc's centre was (its 1.2rem box at the same left and
+   top arithmetic, this box 1.4rem), so the bridge and the rows do not move. */
+#side-cards .reply-ungather.unpack-pack {
+  color: hsl(var(--thread-hue, 210) 55% 50%);
+  min-width: 2rem;
+  min-height: 2rem;
+}
+
+#side-cards .unpack-pack-mark {
+  top: 0.55625rem;
+  left: calc(var(--reply-gutter) - 2.54375rem);
+  width: 1.4rem;
+  height: 1.4rem;
+  border: none;
+  border-radius: 0;
+  background: none;
+}
+
 #side-cards .unpack-pack-mark::before {
   width: 0;
   height: 0;
   border-radius: 0;
   background: none;
-  border-inline: 0.3rem solid transparent;
-  border-bottom: 0.42rem solid currentColor;
-  transform: translate(-50%, -62%);
+  border-inline: 0.6rem solid transparent;
+  border-bottom: 0.85rem solid currentColor;
+  transform: translate(-50%, -50%);
 }
 
 #side-cards .unpack-pack-mark::after {
   content: none;
+}
+
+/* Where its card's edge goes grey, the triangle goes with it, by the two rules that grey the edge
+   (`#277 thread-card-focus`, `#440 thread-card-pack-toggle`, at the cards below): a read card under
+   Unpack unread, and every card but a highlighted one. The block's first row stands straight after
+   its card, so each rule reaches the triangle through that card. */
+#side-cards[data-unpack="unread"] > .side-card-row[data-thread-read] + li[data-unpack-thread] .unpack-pack,
+#side-cards:has(> .side-card-row[data-highlighted]:not([hidden]):not(.search-hidden)) > .side-card-row:not([data-highlighted]) + li[data-unpack-thread] .unpack-pack {
+  color: var(--thread-grey);
 }
 
 #side-log .reply-ungather:active,
@@ -2950,6 +2980,20 @@ a.search-hit-link {
 #side-cards .reply-ungather:focus-visible,
 #discord-log .reply-ungather:focus-visible {
   outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* `#450 pack-triangle-hue`. The pack triangle's own states, from its own colour rather than the
+   accent above: a wash of the thread's colour under a resting mouse, a press and the keyboard's
+   ring — and grey where the triangle is grey, `currentColor` carrying either. */
+#side-cards .reply-ungather.unpack-pack:hover,
+#side-cards .reply-ungather.unpack-pack:active,
+#side-cards .reply-ungather.unpack-pack:focus-visible {
+  background: color-mix(in srgb, currentColor 18%, transparent);
+}
+
+#side-cards .reply-ungather.unpack-pack:focus-visible {
+  outline: 2px solid currentColor;
   outline-offset: -2px;
 }
 
