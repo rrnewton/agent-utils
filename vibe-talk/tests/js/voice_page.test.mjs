@@ -80135,3 +80135,95 @@ test("`#466 reply-promotes-thread`: a newest page answered from older state does
   await page.settle();
   assert.ok(!shownIds(page).includes(mine.id), "a reply removed upstream stayed drawn");
 });
+
+// --- `#466 reply-promotes-thread`: the thread a reply starts, drawn the moment it is sent ----------
+//
+// The owner: "I expected the main-channel message to be promoted to the root of a new thread, and that
+// didn't visually happen, not locally and not quickly ... It would be great if promoting a root message
+// to a thread and visually linking the sent message to it happened locally, without waiting for some
+// asynchronous server refresh." On Slack every message on the channel heads a thread of its own nobody
+// has answered (`#252 thread-button-state`), and a reply to it is posted in that thread. The page now
+// counts a send still in the outbox into the thread it goes to, and shows it there, deriving both from
+// the outbox at every pass and writing nothing into its copy of the message answered.
+
+/** A Slack-like page on `freshMessageData`, Main showing, a reply to 210 held on its way. */
+async function promotingPage() {
+  const { page, data } = await freshMessagePage((p) => { p.repliesInThread = true; });
+  await pickThread(page, "main");
+  const mine = message({ id: "9466000000000000002", content: "the first answer to 210",
+    thread: { id: data.lone.id, root_message_id: "210", is_root: false, reply_count: null, reply_count_exact: false } });
+  const finish = delayedReply(page);
+  await replyButton(rowOf(page, "210")).click();
+  await page.el("reply-text").setValue("the first answer to 210");
+  const sent = page.el("reply-send").click();
+  await page.settle();
+  return { page, data, mine, finish, sent };
+}
+
+const cardIdsOf = (page) => page.el("side-cards").children.map((card) => card.getAttribute("data-id"));
+
+test("`#466 reply-promotes-thread`: a reply on its way makes the message it answers a thread, in Main, the Threads view and the thread", async () => {
+  const { page, data, mine, finish, sent } = await promotingPage();
+  assert.equal(page.repliesPosted.length, 1, "the premise is a reply on its way");
+  // Main: the message answered is the root of a thread with one reply, in its thread's colour.
+  const tag = tagOf(rowOf(page, "210"));
+  assert.equal(tag.state, "open", `the message answered still offers to start a thread: ${JSON.stringify(tag)}`);
+  assert.equal(tag.text, "Thread(1)");
+  assert.notEqual(tag.hue, "", "the new thread has no colour");
+  // The Threads view lists the thread it starts.
+  await pickThread(page, "threads");
+  assert.ok(cardIdsOf(page).includes(data.lone.id), `the Threads view has no card for the new thread: ${cardIdsOf(page)}`);
+  // The thread itself shows the reply, still sending.
+  await pickThread(page, "main");
+  await threadBadge(rowOf(page, "210")).click();
+  await page.settle();
+  assert.equal(page.el("thread-select").value, `thread:${data.lone.id}`, "the tag did not open the new thread");
+  const rows = [...outgoingRows(page)];
+  assert.equal(rows.length, 1, "the thread does not show the reply on its way");
+  assert.equal(rows[0].getAttribute("data-send-state"), "sending");
+  assert.match(rows[0].text(), /the first answer to 210/);
+  // Sent: the reply itself in the thread, once, and the count unchanged on Main.
+  finish(json(200, { posted: mine, parts: [mine] }));
+  await sent;
+  await page.settle();
+  assert.equal(shownIds(page).filter((id) => id === mine.id).length, 1, "the reply is not drawn once in its thread");
+  assert.equal(outgoingRows(page).length, 0, "the reply is drawn twice, as itself and as its row in the outbox");
+  await pickThread(page, "main");
+  assert.equal(tagOf(rowOf(page, "210")).text, "Thread(1)", "the count changed as the reply landed");
+});
+
+test("`#466 reply-promotes-thread`: a reply that was not sent keeps its thread, with Retry, until it is dismissed", async () => {
+  const { page, data, finish, sent } = await promotingPage();
+  finish(json(403, { error: "refused", detail: "You cannot post to this channel." }));
+  await sent;
+  await page.settle();
+  assert.equal(tagOf(rowOf(page, "210")).text, "Thread(1)", "a reply not sent took its thread away at once");
+  await threadBadge(rowOf(page, "210")).click();
+  await page.settle();
+  const row = outgoingRows(page)[0];
+  assert.ok(row, "the reply not sent is not in its thread");
+  assert.equal(row.getAttribute("data-send-state"), "failed");
+  assert.ok(outgoingRetry(row), "the reply not sent offers no Retry in its thread");
+  await outgoingDismiss(row).click();
+  await page.settle();
+  await pickThread(page, "main");
+  assert.equal(tagOf(rowOf(page, "210")).state, "start", "dismissed, the reply still made the message a thread");
+  assert.ok(data);
+});
+
+test("`#466 reply-promotes-thread`: in two columns the thread a reply on its way starts is a card on the right, and shows the reply there", async () => {
+  const { page, data, mine, finish, sent } = await promotingPage();
+  await twoColumns(page);
+  assert.ok(cardIdsOf(page).includes(data.lone.id), `the right column has no card for the new thread: ${cardIdsOf(page)}`);
+  assert.equal(tagOf(rowOf(page, "210")).text, "Thread(1)");
+  await threadBadge(rowOf(page, "210")).click();
+  await page.settle();
+  const right = () => page.el("side-outgoing-log").children;
+  assert.equal(right().length, 1, "the thread on the right does not show the reply on its way");
+  assert.match(right()[0].text(), /the first answer to 210/);
+  finish(json(200, { posted: mine, parts: [mine] }));
+  await sent;
+  await page.settle();
+  assert.equal(right().length, 0, "the reply stayed in the outbox on the right once it was there");
+  assert.ok(sideIds(page).includes(mine.id), `the reply is not drawn in its thread on the right: ${sideIds(page)}`);
+});

@@ -23581,6 +23581,9 @@ function threadIndex() {
   /** @type {Map<string, ReturnType<typeof threadChoice>>} */
   const byId = new Map();
   if (!threadingSupported || channelCanon.channel !== String(el("discord-channel").value)) return byId;
+  // `#466 reply-promotes-thread`. The threads sends in the outbox are going into, and when the newest
+  // was written: a root a send answers is a thread to read, as new as that send.
+  const pending = pendingThreadTimes();
   for (const summary of channelCanon.threads) {
     const id = String(summary.id);
     if (id !== channelCanon.scope) byId.set(id, threadChoice(id, summary));
@@ -23595,12 +23598,16 @@ function threadIndex() {
       // A root nobody has answered is not offered as a thread to read, as the server's own thread
       // list leaves it out: on a provider that names a thread for every message, that would be
       // every recent message. Opened from its tag on All, it is still offered while it is open.
-      if (root && root.thread.reply_count !== 0) byId.set(id, threadChoice(id, null, root));
+      if (root && (root.thread.reply_count !== 0 || pending.has(id))) byId.set(id, threadChoice(id, null, root));
       continue;
     }
     if (Number.isFinite(at)) known.at = Number.isFinite(known.at) ? Math.max(known.at, at) : at;
     if (root && !known.root) known.root = root;
     if (root && !Number.isFinite(known.started)) known.started = at;
+  }
+  for (const [id, at] of pending) {
+    const known = byId.get(id);
+    if (known) known.at = Number.isFinite(known.at) ? Math.max(known.at, at) : at;
   }
   return byId;
 }
@@ -23949,7 +23956,8 @@ function olderThreadsFailure() {
 /** The Threads list's cards for `summaries`, their unread replies counted once for them all. */
 function threadCards(summaries) {
   const tally = replyTally();
-  return summaries.map((summary) => threadCard(summary, tally));
+  // `#466 reply-promotes-thread`: and the threads sends in the outbox are starting.
+  return withPendingThreads(summaries).map((summary) => threadCard(summary, tally));
 }
 
 /**
@@ -24486,10 +24494,12 @@ function drawThreadChips(row, tally, inMain, inAll = false) {
     const entry = tally.threads.get(own) || { held: 0, unread: 0 };
     const reported = threadReplyCount(own, message);
     const exact = exactReplyCount(own, message, tally);
-    const replies = Math.max(typeof reported === "number" ? reported : 0, entry.held, exact || 0);
+    // `#466 reply-promotes-thread`: with the sends in the outbox going into it.
+    const pending = pendingInto(own);
+    const replies = Math.max(typeof reported === "number" ? reported : 0, entry.held, exact || 0) + pending;
     // `#252 thread-button-state`. Grey while nobody has answered; the coloured Thread(N) from the
     // first reply on, which is this pass, the next time the rows are passed over after it arrives.
-    paintThreadBadge(badge, own, replies, unansweredRoot(message, reported, entry.held, exact));
+    paintThreadBadge(badge, own, replies, pending === 0 && unansweredRoot(message, reported, entry.held, exact));
     const gather = childByClass(row, "thread-replies");
     if (gather && message.thread.is_root) {
       const { count, exact } = gatherCount(own, message, entry.held);
@@ -26259,7 +26269,8 @@ function loadOutgoingMessages() {
 
 function outgoingInView(entry) {
   if (entry.channel !== el("discord-channel").value) return false;
-  if (channelView === "thread") return entry.threadId === selectedThreadId;
+  // `#466 reply-promotes-thread`: the thread it goes into, which a reply to a message on Slack is too.
+  if (channelView === "thread") return outgoingThreadOf(entry) === String(selectedThreadId);
   if (channelView === "flat") return true;
   // A reply opened from a root in the main view needs a visible receipt when Reply closes.
   return !entry.threadId || entry.originView === "main";
@@ -26502,7 +26513,124 @@ function renderOutgoingMessages() {
 
 /** The outbox's rows in every column showing messages: what the outbox did is no one column's. `#229`. */
 function renderOutgoingEverywhere() {
-  eachColumn(renderOutgoingMessages);
+  // `#466 reply-promotes-thread`. A send going into a thread, or gone from the outbox, changes that
+  // thread's count and whether the Threads view has a card for it: every row, and the cards, again.
+  const key = pendingThreadsKey();
+  if (key === drawnPendingThreads) {
+    eachColumn(renderOutgoingMessages);
+    return;
+  }
+  drawnPendingThreads = key;
+  eachColumn(() => {
+    renderChannelRows();
+    if (channelView === "threads") el("thread-list").replaceChildren(...threadCards(timelineThreads));
+  });
+  if (sideColumnUp() && columns.side.mode !== "thread") renderSideCards();
+}
+
+// --- the thread a send goes into, before it is there ------------------------------------------------
+//
+// `#466 reply-promotes-thread`. The owner, on Slack: "I expected the main-channel message to be promoted
+// to the root of a new thread, and that didn't visually happen, not locally and not quickly ... It would
+// be great if promoting a root message to a thread and visually linking the sent message to it happened
+// locally, without waiting for some asynchronous server refresh."
+//
+// A send still in the outbox — on its way, unconfirmed, or not sent and waiting for the reader — counts
+// in the thread it goes to, and is shown there: the message it answers reads as that thread's root, with
+// the count and colour of a thread (`drawThreadChips`); the Threads view has a card for it
+// (`threadCards`); and the thread itself shows the send's row (`outgoingInView`). All of it is derived
+// from the outbox at every pass, keyed by the thread's own id (on Slack the message's ts, from its thread
+// record, never its message id), and nothing is written into the store's copy of the message answered:
+// a read whose copy predates the reply cannot undo it, and a send dismissed takes it back with nothing to
+// undo. A send not sent keeps its thread, with Retry, until it is dismissed (replication model §5.2).
+// Once sent, the reply is an ordinary held reply, which the count already takes (`max(reported, held)`).
+//
+// The count adds the sends to what the provider reported and what is held, which overcounts by one a
+// send that landed though its answer was lost and that a later read already counts, until it is settled
+// (`settleFromServer`).
+
+/** `pendingThreadsKey` as it stood when the rows were last passed over for it. */
+let drawnPendingThreads = "";
+
+/**
+ * The thread `entry` posts into in the channel on screen: where the rest of a cut post continues, the
+ * thread it was written in, or — where a reply is a thread reply (`channelRepliesInThread`, Slack) —
+ * the thread of the message it answers, by that message's own thread record. Null for the main channel,
+ * or a message whose thread is not known.
+ */
+function outgoingThreadOf(entry) {
+  if (entry.continueIn) return String(entry.continueIn);
+  if (entry.threadId) return String(entry.threadId);
+  if (!entry.replyTo || entry.channel !== String(el("discord-channel").value) ||
+      !channelRepliesInThread(entry.channel)) return null;
+  const answered = heldMessage(entry.replyTo);
+  const record = answered ? heldThreadRecord(answered) : null;
+  return record ? String(record.id) : null;
+}
+
+/** The sends in the outbox for the channel on screen that count in thread `thread`, not yet sent. */
+function pendingInto(thread) {
+  const viewing = String(el("discord-channel").value);
+  let count = 0;
+  for (const entry of outgoingMessages.values()) {
+    if (entry.channel !== viewing || entry.state === "sent" || !entry.remaining) continue;
+    if (outgoingThreadOf(entry) === String(thread)) count += 1;
+  }
+  return count;
+}
+
+/** The threads of the channel on screen sends in the outbox go into, each with when its newest was written. */
+function pendingThreadTimes() {
+  const viewing = String(el("discord-channel").value);
+  /** @type {Map<string, number>} */
+  const times = new Map();
+  for (const entry of outgoingMessages.values()) {
+    if (entry.channel !== viewing || entry.state === "sent" || !entry.remaining) continue;
+    const thread = outgoingThreadOf(entry);
+    if (thread === null) continue;
+    const at = Number(entry.createdAt) || 0;
+    times.set(thread, Math.max(times.get(thread) || 0, at));
+  }
+  return times;
+}
+
+/** Which threads of the channel on screen have sends counting in them, and how many: for redraws. */
+function pendingThreadsKey() {
+  const viewing = String(el("discord-channel").value);
+  /** @type {Map<string, number>} */
+  const counts = new Map();
+  for (const entry of outgoingMessages.values()) {
+    if (entry.channel !== viewing || entry.state === "sent" || !entry.remaining) continue;
+    const thread = outgoingThreadOf(entry);
+    if (thread !== null) counts.set(thread, (counts.get(thread) || 0) + 1);
+  }
+  return [viewing, ...[...counts].sort().map(([thread, count]) => `${thread}=${count}`)].join(" ");
+}
+
+/**
+ * `summaries`, with a card for every thread a send in the outbox goes into that they lack, whose root
+ * the store holds: the newest first, before the rest, as a thread just answered is the newest.
+ *
+ * @param {any[]} summaries
+ */
+function withPendingThreads(summaries) {
+  const listed = new Set(summaries.map((summary) => String(summary.id)));
+  const viewing = String(el("discord-channel").value);
+  /** @type {Map<string, any>} */
+  const added = new Map();
+  for (const entry of [...outgoingMessages.values()].reverse()) {
+    if (entry.channel !== viewing || entry.state === "sent" || !entry.remaining) continue;
+    const thread = outgoingThreadOf(entry);
+    if (thread === null || listed.has(thread) || added.has(thread)) continue;
+    const root = channelCanon.messages.find((held) => threadOf(held) === thread && held.thread.is_root === true);
+    if (!root) continue;
+    added.set(thread, {
+      id: thread, title: "", root, display_name: null, summary: null, hue: root.thread.hue ?? null,
+      reply_count: null, reply_count_exact: false, complete: false,
+      updated_at: new Date(entry.createdAt || Date.now()).toISOString(),
+    });
+  }
+  return added.size ? [...added.values(), ...summaries] : summaries;
 }
 
 /**
@@ -43439,7 +43567,9 @@ function sideCardUnread(choice, tally) {
 function sideCardReplies(choice, tally) {
   const entry = tally.threads.get(choice.id);
   const reported = typeof choice.count === "number" ? choice.count : 0;
-  const count = Math.max(reported, entry ? entry.held : 0, exactReplyCount(choice.id, choice.root, tally) || 0);
+  // `#466 reply-promotes-thread`: with the sends in the outbox going into it, as its root's tag counts.
+  const count = Math.max(reported, entry ? entry.held : 0, exactReplyCount(choice.id, choice.root, tally) || 0) +
+    pendingInto(choice.id);
   return count > 0 ? threadCount(count, choice.summary ? choice.summary.reply_count_exact : true) : "";
 }
 
