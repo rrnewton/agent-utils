@@ -32,7 +32,11 @@ import threading
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, unquote, urlsplit
+
+if TYPE_CHECKING:
+    from playwright.sync_api import BrowserContext
 
 TOKEN = "write-token-browser-settings-sync-check"
 CHANNEL = {"id": "1110000000000000001", "label": "lead team", "writable": True, "alias": None,
@@ -93,6 +97,12 @@ class FakeApi:
                 for key, (value, stamp) in sorted(self.settings.items())
             ]}
 
+    def entries(self, body: Json, name: str) -> list[Json]:
+        held = body.get(name)
+        if not isinstance(held, list):
+            return []
+        return [entry for entry in held if isinstance(entry, dict)]
+
     def apply(self, body: Json) -> Json:
         """One page's write, the real server's rules: seed fills gaps only, set overwrites,
         this clock stamps, and what changed goes out on every open stream."""
@@ -101,14 +111,12 @@ class FakeApi:
             self.writes.append(body)
             self.clock += 1000
             stamp = self.clock
-            for entry in body.get("seed") or []:
-                assert isinstance(entry, dict)
+            for entry in self.entries(body, "seed"):
                 key, value = str(entry["key"]), entry.get("value")
                 if key not in self.settings and isinstance(value, str):
                     self.settings[key] = (value, stamp)
                     changed.append({"key": key, "value": value, "updated_ms": stamp})
-            for entry in body.get("set") or []:
-                assert isinstance(entry, dict)
+            for entry in self.entries(body, "set"):
                 key, value = str(entry["key"]), entry.get("value")
                 if value is None:
                     if key in self.settings:
@@ -117,7 +125,7 @@ class FakeApi:
                 elif self.settings.get(key, (None, 0))[0] != value:
                     self.settings[key] = (str(value), stamp)
                     changed.append({"key": key, "value": value, "updated_ms": stamp})
-            held = {"settings": [
+            held: Json = {"settings": [
                 {"key": key, "value": value, "updated_ms": held_stamp}
                 for key, (value, held_stamp) in sorted(self.settings.items())
             ]}
@@ -260,7 +268,7 @@ def main() -> int:
 
     try:
         with sync_playwright() as playwright:
-            def device(profile: str, preset: dict[str, str]) -> tuple[object, Page, list[str]]:
+            def device(profile: str, preset: dict[str, str]) -> tuple[BrowserContext, Page, list[str]]:
                 context = playwright.chromium.launch_persistent_context(
                     profile, headless=True, executable_path=args.browser_executable,
                     viewport={"width": 1280, "height": 800})
