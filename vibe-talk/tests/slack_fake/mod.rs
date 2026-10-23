@@ -114,6 +114,10 @@ pub struct FakeState {
     /// Drop `chat.postMessage`'s `metadata`, as a transport in front of Slack that does not pass
     /// it through would: the message is posted without it. `#465 replication-c6-op-key-marker`.
     pub drops_metadata: bool,
+    /// `chat.postMessage` calls, numbered from 1, that ARE posted and then answered with HTTP 502,
+    /// as a gateway that gave up after Slack took the post would. `#465
+    /// replication-c6-op-key-marker`.
+    pub lose_post_answers: Vec<usize>,
 }
 
 /// Take `metadata` off every message of a read answer that did not ask for it with
@@ -691,6 +695,12 @@ fn handle(shared: &Mutex<FakeState>, uri: &Uri, headers: &HeaderMap, body: &[u8]
                     .get_mut(&channel)
                     .expect("checked")
                     .push(message.clone()),
+            }
+            if state
+                .lose_post_answers
+                .contains(&state.calls["chat.postMessage"])
+            {
+                return (StatusCode::BAD_GATEWAY, "upstream send timed out").into_response();
             }
             ok(json!({"channel": channel, "ts": ts, "message": message}))
         }

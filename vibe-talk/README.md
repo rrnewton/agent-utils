@@ -3412,7 +3412,18 @@ A transport in front of Slack that drops `metadata` posts the message without it
 no key; nothing is invented. Where reads are not promised to return every key (a bridge in front of
 Slack, which may only echo the keys of posts it saw succeed), a read without a key proves nothing: a
 send whose answer was lost is matched by its words instead, and a key once seen is never cleared
-because a later copy lacks it. Metadata filed under any other `event_type` is never read as a key. The cache keeps a message's key with it, and a later copy without one
+because a later copy lacks it. Metadata filed under any other `event_type` is never read as a key.
+
+**A post whose answer was lost is looked for before it is called uncertain** (`#465
+replication-c6-op-key-marker`). When a part's answer may have been lost after the provider took it
+(a timeout, a gateway's 5xx), the server reads the part's destination, the thread it went into or
+the channel's flat view, before it answers. It takes the message carrying the part's key where a
+read returned one; otherwise the one message by this server's account, created no earlier than the
+request (`UNCERTAIN_PART_SKEW_MS`, ten seconds of clock difference), with the part's words and no
+other key. Found, the part landed and the send is answered as posted, so Retry cannot post it
+twice; not found, or where the read fails, it stays uncertain as before. Where reads return every
+key and the part carried one, a message without it is not taken. A provider that itself makes a
+repeat of the key the first post (a registration bridge) is not read: sending again is safe there. The cache keeps a message's key with it, and a later copy without one
 never takes it away.
 
 A registration-capable bridge may also list the channels its account can see, which lets
