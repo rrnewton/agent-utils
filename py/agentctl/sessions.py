@@ -265,7 +265,8 @@ class Sessions(ManagedAgents):
             return str(result.get("text", result.get("output", "")))
 
     def prompts(self, name: str, *, option: int | None = None,
-                text: str | None = None, answering: bool = False) -> dict[str, object]:
+                text: str | None = None, answering: bool = False,
+                replace_draft: bool = False) -> dict[str, object]:
         """Reveal for inspection or answer under the session and pane input locks."""
         from agentctl.harness_tui import harness_tui
         from agentctl.tui_prompts import answer, inspect_question
@@ -286,7 +287,7 @@ class Sessions(ManagedAgents):
                 terminal = guard._guarded()
                 if not answering:
                     return asdict(inspect_question(terminal, pane, adapter, verify=guard.verify_recipient))
-                return answer(terminal, pane, adapter, option=option, text=text,
+                return answer(terminal, pane, adapter, option=option, text=text, replace_draft=replace_draft,
                               verify=guard.verify_recipient)
             finally:
                 lock.close()

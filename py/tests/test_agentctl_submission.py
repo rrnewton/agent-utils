@@ -1194,6 +1194,48 @@ def test_async_question_refuses_stale_capture_and_existing_answer() -> None:
     assert not terminal.texts and not terminal.keys
 
 
+@pytest.mark.parametrize("fault", ["none", "dropped-clear", "changed-question", "changed-recipient", "folded-paste", "dropped-submit"])
+def test_explicit_free_text_draft_replacement(fault: str) -> None:
+    class DraftTerminal(FormTerminal):
+        def send_keys(self, pane: str, key: str) -> None:
+            super().send_keys(pane, key)
+            if key == "ctrl+u" and fault != "dropped-clear":
+                self.screen = self.screen.replace("[Pasted Content 1672 chars]", "Type your answer")
+                if fault == "changed-question":
+                    self.screen = self.screen.replace("Is there an admission map for these source fixtures?", "A different question?")
+        def send_text(self, pane: str, text: str) -> None:
+            super().send_text(pane, text)
+            if fault == "folded-paste":
+                self.screen = self.screen.replace("Short replacement", "[Pasted Content 17 chars]")
+    terminal = DraftTerminal("async-freeform", drop=fault == "dropped-submit")
+    terminal.screen = terminal.screen.replace("Type your answer", "[Pasted Content 1672 chars]")
+    def verify(pane: str) -> None:
+        if fault == "changed-recipient" and terminal.keys:
+            raise AgentDeliveryError("recipient replaced")
+    if fault == "none":
+        assert answer(terminal, "w1:p1", adapter(), text="Short replacement", replace_draft=True,
+                      verify=verify, sleep=terminal.sleep, monotonic=lambda: terminal.seconds)["answered"] is True
+        assert terminal.keys == ["ctrl+u", "Enter"]
+    else:
+        with pytest.raises(AgentPossiblySubmitted):
+            answer(terminal, "w1:p1", adapter(), text="Short replacement", replace_draft=True,
+                      verify=verify, sleep=terminal.sleep, monotonic=lambda: terminal.seconds)
+        assert terminal.keys == (["ctrl+u", "Enter"] if fault == "dropped-submit" else ["ctrl+u"])
+        if fault in ("dropped-clear", "changed-question", "changed-recipient"):
+            assert not terminal.texts
+
+
+@pytest.mark.parametrize("kind,text,option", [("options", "replacement", None),
+    ("multi_question_first", "replacement", None), ("async-freeform", "bad\ntext", None),
+    ("async-freeform", None, 1)])
+def test_draft_replacement_refuses_before_effect(kind: str, text: str | None, option: int | None) -> None:
+    terminal = FormTerminal(kind)
+    with pytest.raises(AgentDeliveryError):
+        answer(terminal, "w1:p1", adapter(), text=text, option=option, replace_draft=True,
+               verify=lambda p: None)
+    assert not terminal.keys and not terminal.texts
+
+
 def test_async_question_never_repeats_an_unacknowledged_submit() -> None:
     terminal = FormTerminal("async-freeform", drop=True)
     with pytest.raises(AgentPossiblySubmitted):
@@ -1243,6 +1285,7 @@ def test_question_cannot_be_confused_with_a_menu_or_quoted_transcript() -> None:
 
 def test_cli_selection_is_mutually_exclusive_and_required() -> None:
     assert cli.parser().parse_args(["prompts", "worker"]).command == "prompts"
+    assert cli.parser().parse_args(["answer", "worker", "--text", "x", "--replace-draft"]).replace_draft
     for args in (["answer", "worker"], ["answer", "worker", "--option", "1", "--text", "x"]):
         with pytest.raises(SystemExit):
             cli.parser().parse_args(args)

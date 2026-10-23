@@ -61,6 +61,7 @@ class HarnessTui(Protocol):
     working_followups: bool
     working_submit_key: str
     open_question_keys: tuple[str, ...]
+    free_text_clear_key: str | None
 
     def classify(self, screen: str) -> View:
         """Classify visible text and extract any safely recognizable question."""

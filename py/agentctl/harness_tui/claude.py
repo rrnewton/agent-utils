@@ -12,6 +12,7 @@ class ClaudeTui:
     working_followups = True
     working_submit_key = "Enter"
     open_question_keys: tuple[str, ...] = ()
+    free_text_clear_key: str | None = None
 
     def classify(self, screen: str) -> View:
         """Recognize a single selection form without treating approval menus as questions."""

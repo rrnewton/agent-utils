@@ -902,11 +902,17 @@ recognized single-question selection form supports `--option`; unknown free-text
 and multi-question forms require interactive attention. Pickers and permission
 dialogs are not answered by these commands. Hidden options, multiple questions,
 remapped submission hints, and unfamiliar layouts are refused. Existing drafts
-are never overwritten. For a Codex free-text form only, an explicit `--text`
+are preserved by default. For a Codex free-text form only, an explicit `--text`
 identical to the complete visible draft confirms that answer without retyping it.
 Wrapped text is joined at visible word boundaries and must still match exactly.
 Inspect the pane before explicitly confirming a staged answer; never automatically
-repeat an answer whose submission was uncertain. A different draft is refused.
+repeat an answer whose submission was uncertain. A different draft is refused
+unless you explicitly use `--text TEXT --replace-draft` after inspecting the draft.
+This opt-in replacement supports only a single Codex free-text form: it clears
+once, verifies the same question is empty, then pastes and verifies the exact
+replacement before submitting once. A folded paste marker never proves the
+answer's contents; use a short answer or a pointer to a file. Failed clears or
+changed questions stop without pasting or submitting.
 
 `--option N` uses the one-based number printed on screen; `--text TEXT` is literal,
 nonempty, single-line text without terminal controls. Exactly one is required.

@@ -12,6 +12,7 @@ class CodexTui:
     working_followups = True
     working_submit_key = "Enter"
     open_question_keys: tuple[str, ...] = ("shift+left",)
+    free_text_clear_key: str | None = "ctrl+u"
 
     def classify(self, screen: str) -> View:
         """Read default-keymap Codex forms, refusing missing or contradictory layout cues."""

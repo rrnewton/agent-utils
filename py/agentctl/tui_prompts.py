@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from collections.abc import Callable
 
 from agentctl.client import GuardedInput
@@ -53,13 +54,15 @@ def inspect_question(
 
 def answer(
     terminal: GuardedInput, pane: str, adapter: HarnessTui, *,
-    option: int | None = None, text: str | None = None,
+    option: int | None = None, text: str | None = None, replace_draft: bool = False,
     verify: Callable[[str], None], sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, object]:
     """Never repeat Enter: after an input attempt every uncertain result exits 76."""
     if (option is None) == (text is None):
         raise AgentDeliveryError("choose exactly one of --option or --text")
+    if replace_draft and text is None:
+        raise AgentDeliveryError("--replace-draft requires --text")
     attempted = False
 
     def observe() -> View:
@@ -107,6 +110,28 @@ def answer(
         q = view.question
         if q is None:
             raise AgentDeliveryError("question did not open into a supported form")
+        if replace_draft:
+            if (adapter.free_text_clear_key is None or q.options or q.total != 1
+                    or q.collapsed or q.notes):
+                raise AgentDeliveryError("draft replacement requires a supported single free-text form")
+            # Validate the replacement before clearing any caller-inspected draft.
+            adapter.answer_plan(replace(q, draft=""), option, text)
+            if q.draft:
+                same_question(q, selected=q.selected, notes=False)
+                key(adapter.free_text_clear_key)
+                deadline = monotonic() + 2
+                while True:
+                    cleared = observe()
+                    current = cleared.question
+                    if (cleared.state != State.QUESTION or current is None
+                            or replace(current, draft="") != replace(q, draft="")):
+                        raise AgentDeliveryError("question changed while clearing draft; no answer pasted or submitted")
+                    if not current.draft:
+                        q = current
+                        break
+                    if current.draft != q.draft or monotonic() >= deadline:
+                        raise AgentDeliveryError("empty draft was not verified; no answer pasted or submitted")
+                    sleep(0.1)
         plan = adapter.answer_plan(q, option, text)
         selected = q.selected
         for value in plan.keys:
