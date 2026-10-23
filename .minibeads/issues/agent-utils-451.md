@@ -1,13 +1,14 @@
 ---
 title: 'read-strip-followups: Stop for a one-off read, Play told from Stop, a strip held on screen, the grip''s keys in Help'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 - read-aloud
 created_at: 2026-10-23T13:06:41.436672368+00:00
-updated_at: 2026-10-23T13:06:41.436672368+00:00
+updated_at: 2026-10-23T14:41:34.769179984+00:00
+closed_at: 2026-10-23T14:41:34.769179914+00:00
 ---
 
 # Description

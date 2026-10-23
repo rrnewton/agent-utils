@@ -1,12 +1,13 @@
 ---
 title: 'pack-triangle-hue: a plain, larger pack triangle in its thread''s colour'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-23T13:06:33.030627982+00:00
-updated_at: 2026-10-23T13:06:33.030627982+00:00
+updated_at: 2026-10-23T14:41:34.769000483+00:00
+closed_at: 2026-10-23T14:41:34.769000123+00:00
 ---
 
 # Description
