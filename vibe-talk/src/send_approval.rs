@@ -479,21 +479,30 @@ pub fn send_report(
             first,
             ..
         }) if *posted > 0 || *uncertain => {
-            let limit = state
-                .chat
-                .post_limit(&ChannelId(binding.channel_id.clone()));
-            let split = crate::discord::split::split_within(&binding.text, &limit);
+            // Cut as the post was, defused where it was (`#445 gchat-mention-defuse`), so the
+            // parts counted are the parts sent; the words reported are the words as written.
+            let channel = ChannelId(binding.channel_id.clone());
+            let limit = state.chat.post_limit(&channel);
+            let defuse = state.chat.defuses_mentions(&channel);
+            let split = crate::ops::cut_post(&binding.text, &limit, defuse).1;
+            let written = |part: &str| {
+                if defuse {
+                    part.replace(crate::mention_defuse::WORD_JOINER, "")
+                } else {
+                    part.to_owned()
+                }
+            };
             let posted = (*posted).min(split.len());
             let unsent_from = (posted + usize::from(*uncertain)).min(split.len());
             let unsent_chars: usize = split[unsent_from..]
                 .iter()
-                .map(|part| part.chars().count())
+                .map(|part| written(part).chars().count())
                 .sum();
             let (message_id, thread_id, thread_name) = place(first.as_deref());
             let (outcome, text) = if posted == 0 {
                 (SendOutcome::Unconfirmed, binding.text.clone())
             } else {
-                (SendOutcome::Partial, split[..posted].concat())
+                (SendOutcome::Partial, written(&split[..posted].concat()))
             };
             Some(SendReport {
                 outcome,

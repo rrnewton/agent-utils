@@ -73,7 +73,12 @@ fn reason_in(body: &str) -> String {
             })
         })
         .unwrap_or_else(|| body.trim().to_owned());
-    let one_line: String = said
+    one_line_capped(&said)
+}
+
+/// `text` on one line, cut to [`REASON_MAX_CHARS`].
+fn one_line_capped(text: &str) -> String {
+    let one_line: String = text
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
@@ -144,7 +149,7 @@ pub fn log_failed_part(
             provider,
             channel = %info.id,
             place,
-            error = %error,
+            error = %failure_in_brief(error),
             transient = error.is_transient(),
             may_have_delivered = error.may_have_delivered(),
             content_bytes,
@@ -153,6 +158,15 @@ pub fn log_failed_part(
             parts,
             "a post failed"
         ),
+    }
+}
+
+/// A failure that is not a refusal, for the log: the status and the provider's reason, cut short,
+/// rather than the whole body — an intermediary's error page, or a body that repeats the post.
+fn failure_in_brief(error: &ChatError) -> String {
+    match error.cause() {
+        ChatError::Status { status, body } => format!("HTTP {status}: {}", reason_in(body)),
+        other => one_line_capped(&other.to_string()),
     }
 }
 
@@ -240,6 +254,25 @@ mod tests {
         );
         assert_eq!(refusal.reason.chars().count(), REASON_MAX_CHARS + 1);
         assert!(!refusal.reason.contains('\n'));
+    }
+
+    #[test]
+    fn a_failure_is_logged_in_brief() {
+        let page = status(502, &format!("<html>{}</html>", "x".repeat(2000)));
+        let brief = failure_in_brief(&page);
+        assert!(brief.starts_with("HTTP 502: <html>"), "{brief}");
+        assert_eq!(
+            brief.chars().count(),
+            "HTTP 502: ".len() + REASON_MAX_CHARS + 1
+        );
+        assert_eq!(
+            failure_in_brief(&status(503, r#"{"message": "upstream send timed out"}"#)),
+            "HTTP 503: upstream send timed out"
+        );
+        assert_eq!(
+            failure_in_brief(&ChatError::Transport("connection\nreset".to_owned())),
+            "chat request failed: connection reset"
+        );
     }
 
     #[test]

@@ -598,6 +598,10 @@ impl ChatClient for Recorder {
         self.note("post_limit");
         PostLimit::bytes(4321)
     }
+    fn defuses_mentions(&self, _channel: &ChannelId) -> bool {
+        self.note("defuses_mentions");
+        true
+    }
     fn continuation_thread(&self, _channel: &ChannelId, _first: &Message) -> Option<String> {
         self.note("continuation_thread");
         Some("t-continued".to_owned())
@@ -873,6 +877,8 @@ async fn every_method_reaches_the_wrapped_clients_own_override_and_each_upstream
     ran("post_in_thread_keyed");
     assert_eq!(client.post_limit(&channel), PostLimit::bytes(4321));
     ran("post_limit");
+    assert!(client.defuses_mentions(&channel));
+    ran("defuses_mentions");
     assert_eq!(
         client
             .continuation_thread(&channel, &recorder.message)
