@@ -19,6 +19,8 @@
 //! Cursors are opaque, bound to the channel, view and thread they were issued for, and carry a
 //! Slack `ts` (or, for the thread list, an activity instant and a root) as their boundary.
 
+use std::time::Instant;
+
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use futures_util::{stream, StreamExt as _, TryStreamExt as _};
@@ -47,6 +49,10 @@ pub const FLAT_MAX_REPLIES: usize = 50;
 pub const FLAT_RECONCILE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 /// Most threads whose Flat replies are remembered at once.
 const FLAT_REMEMBERED_MAX: usize = 256;
+/// How long the thread the first part of a long post went into or started is taken to be there
+/// without reading it first: long enough for the rest of that post, parts and a retry of the rest,
+/// short enough that a thread removed meanwhile is soon read again. `#448 send-dedupe`.
+pub const ROOTS_KEEP: std::time::Duration = std::time::Duration::from_secs(2 * 60);
 /// Characters of a root's first line used as its thread title.
 pub const THREAD_TITLE_CHARS: usize = 80;
 /// Pages of `users.conversations` one discovery request may read while filtering.
@@ -1281,9 +1287,38 @@ impl HttpSlackClient {
     ) -> Result<Message, ChatError> {
         let target = Self::channel_ref(channel)?;
         let thread = self.member_thread(&target, thread_id)?;
-        self.thread_root(&target.conversation, &thread).await?;
+        // `#448 send-dedupe`. The second and third parts of a long post went in only after a read
+        // of the thread their own first part had just started — a round trip each, one after
+        // another, on a post the owner was already waiting seconds for. That thread is proven
+        // there by the first part's own answer (`note_posted_root`); any other is read first, so
+        // a reply to a root removed meanwhile is still refused (`#315 removed-reply-target`).
+        if !self.posted_root_known(&target.conversation, &thread) {
+            self.thread_root(&target.conversation, &thread).await?;
+        }
         self.post_raw(channel, &target.conversation, content, Some(&thread))
             .await
+    }
+
+    /// Remember that `thread` in `conversation` is there: the thread the first part of a long post
+    /// just went into or started, where the rest of it goes next.
+    pub(super) fn note_posted_root(&self, conversation: &str, thread: &str) {
+        let mut roots = self
+            .posted_roots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        roots.retain(|_, at| now.duration_since(*at) < ROOTS_KEEP);
+        roots.insert((conversation.to_owned(), thread.to_owned()), now);
+    }
+
+    /// Whether this client posted into `thread` in `conversation`, or posted its root, within
+    /// [`ROOTS_KEEP`].
+    fn posted_root_known(&self, conversation: &str, thread: &str) -> bool {
+        self.posted_roots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(conversation.to_owned(), thread.to_owned()))
+            .is_some_and(|at| at.elapsed() < ROOTS_KEEP)
     }
 
     /// [`crate::chat::ChatClient::fetch_thread_message`], without the provider label.

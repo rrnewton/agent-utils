@@ -74,6 +74,7 @@ pub mod owner;
 pub mod pair_link;
 pub mod pairing;
 pub mod post_gate;
+pub mod post_keys;
 pub mod post_lanes;
 pub mod post_prefix;
 pub mod probe;

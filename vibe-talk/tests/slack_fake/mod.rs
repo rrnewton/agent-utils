@@ -108,6 +108,9 @@ pub struct FakeState {
     /// How long every answer is held before it is sent: a bridge's own read latency, for a test
     /// that measures what an extra provider read costs. `#452 slack-live-ingest`.
     pub delay: Option<std::time::Duration>,
+    /// How long every `chat.postMessage` takes before it is answered — and before it is posted —
+    /// as a slow bridge in front of Slack does. `#448 send-dedupe`.
+    pub post_delay: Option<std::time::Duration>,
 }
 
 /// A `conversations.replies` request answered late, so a test can act while a read is in flight.
@@ -165,6 +168,9 @@ impl Fake {
                 let hold = take_hold(&shared, &uri, &body);
                 let delay = shared.lock().expect("state").delay;
                 if let Some(delay) = delay {
+                    tokio::time::sleep(delay).await;
+                }
+                if let Some(delay) = post_delay(&shared, &uri) {
                     tokio::time::sleep(delay).await;
                 }
                 let response = handle(&shared, &uri, &headers, &body);
@@ -456,6 +462,14 @@ fn page(list: Vec<Value>, key: &str, params: &HashMap<String, String>, cap: usiz
     });
     answer[key] = Value::Array(slice);
     answer
+}
+
+/// How long a `chat.postMessage` request waits before it is handled: [`FakeState::post_delay`].
+fn post_delay(shared: &Mutex<FakeState>, uri: &Uri) -> Option<std::time::Duration> {
+    if uri.path().trim_start_matches("/api/") != "chat.postMessage" {
+        return None;
+    }
+    shared.lock().expect("state").post_delay
 }
 
 /// The [`Hold`] this request matches, taken so that it holds no later request.

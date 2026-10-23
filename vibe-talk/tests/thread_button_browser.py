@@ -386,6 +386,14 @@ class Walk:
         self.check(tag["problems"] == [], f"{where}: {row}'s tag: {tag['problems']}")
 
 
+def unkeyed(replies: list[Json]) -> list[Json]:
+    """The posted replies without their idempotency keys, which every send carries (`#448
+    send-dedupe`): a reply that went without one is left with it absent, so it compares unequal."""
+    return [{k: v for k, v in reply.items() if k != "idempotency_key"}
+            if str(reply.get("idempotency_key", "")).startswith("outgoing-") else {**reply, "keyless": True}
+            for reply in replies]
+
+
 def thread_button_walk(walk: Walk) -> None:
     page = walk.page
     page.fill("#api-token", TOKEN)
@@ -429,7 +437,7 @@ def thread_button_walk(walk: Walk) -> None:
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline and not walk.api.replies:
         page.wait_for_timeout(25)
-    walk.check(walk.api.replies == [{"text": "On it: deploying once the lane is green.", "thread_id": lone(FRESH)}],
+    walk.check(unkeyed(walk.api.replies) == [{"text": "On it: deploying once the lane is green.", "thread_id": lone(FRESH)}],
                f"the first send did not post into the message's thread: {walk.api.replies}")
     walk.wait_for("() => document.querySelectorAll('#discord-log > li[data-id]').length === 2",
                   "the first reply was not drawn in the thread")
@@ -472,7 +480,7 @@ def thread_button_walk(walk: Walk) -> None:
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline and len(walk.api.replies) < 2:
         page.wait_for_timeout(25)
-    walk.check(walk.api.replies[1:] == [{"text": "Will do.", "thread_id": lone(OTHER)}],
+    walk.check(unkeyed(walk.api.replies[1:]) == [{"text": "Will do.", "thread_id": lone(OTHER)}],
                f"the right column's first send did not post into the thread: {walk.api.replies}")
     walk.wait_for(f"() => {{ const li = document.querySelector('#discord-log > li[data-id=\"{OTHER}\"]');"
                   " return !!li && li.querySelector('.thread-badge').getAttribute('data-thread-state') === 'open'; }",

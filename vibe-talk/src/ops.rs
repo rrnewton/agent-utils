@@ -116,6 +116,12 @@ pub enum OpError {
     )]
     NotReadInTime,
 
+    /// An idempotency key already names another post — other words, or another channel — which
+    /// this request neither repeats nor continues. Nothing was posted. `#448 send-dedupe`: a new
+    /// message needs a new key.
+    #[error("that idempotency_key already names another post; send a new message under a new key")]
+    KeyReused,
+
     /// The configured chat provider failed, or refused the request before it was sent.
     #[error(transparent)]
     Chat(#[from] ChatError),
@@ -142,6 +148,7 @@ impl OpError {
             Self::CursorMismatch => "cursor_mismatch",
             Self::PartiallyPosted { .. } => "partially_posted",
             Self::NotReadInTime => "not_read_in_time",
+            Self::KeyReused => "key_reused",
             Self::Chat(error) if matches!(error.cause(), ChatError::Refused(_)) => "refused",
             Self::Chat(error) if matches!(error.cause(), ChatError::CursorExpired(_)) => {
                 "cursor_expired"
@@ -3486,7 +3493,10 @@ async fn post_settled(
 ) {
     let mut unposted = Unposted(settle);
     let (posting, turn) = match ready_to_post(state, post).await {
-        Ok(ready) => ready,
+        Ok(Ready::Post(posting, turn)) => (*posting, turn),
+        // `#448 send-dedupe`. This very post landed, or landed in part, under its key: its own
+        // answer, and nothing posted again.
+        Ok(Ready::Known(outcome)) => return (remembered_answer(&outcome), None),
         Err(refused) => return (Err(refused), None),
     };
     // Posting is not this request's own. axum drops a handler the moment its caller closes the
@@ -3504,12 +3514,16 @@ async fn post_settled(
     joined(tokio::spawn(post_parts(state.clone(), posting, turn, settle)).await)
 }
 
+/// What [`ready_to_post`] found: a post to make, with its destination's turn, or the answer of
+/// the same post made already under its key (`#448 send-dedupe`).
+enum Ready {
+    Post(Box<Posting>, crate::post_lanes::Turn),
+    Known(std::sync::Arc<crate::post_keys::Outcome>),
+}
+
 /// Everything [`post_settled`] checks before anything is sent — the allowlist, the write policy,
 /// the thread and the key, emptiness — and the post cut in parts, with its destination's turn.
-async fn ready_to_post(
-    state: &AppState,
-    post: Post<'_>,
-) -> Result<(Posting, crate::post_lanes::Turn), OpError> {
+async fn ready_to_post(state: &AppState, post: Post<'_>) -> Result<Ready, OpError> {
     let Post {
         channel_id,
         text,
@@ -3536,6 +3550,8 @@ async fn ready_to_post(
     // sixteen times that, arrived as three. `#263 post-split-per-provider`.
     let limit = state.chat.post_limit(&info.id);
     let defuse = state.chat.defuses_mentions(&info.id);
+    // The words as the caller sent them, which its key names. `#448 send-dedupe`.
+    let asked = text;
     let (defused, parts) = cut_post(text, &limit, defuse);
     let text: &str = &defused;
     if parts.is_empty() {
@@ -3545,6 +3561,25 @@ async fn ready_to_post(
     }
 
     let keys = idempotency_key.map(|key| part_keys(key, &parts));
+    // `#448 send-dedupe`. The same post under the same key, already made or being made, is not
+    // made again, whatever the provider. Claimed before the turn: a repeat that arrives while the
+    // first is posting waits for that post's answer rather than for the destination.
+    let claim = match idempotency_key {
+        Some(key) => {
+            let fingerprint = crate::post_keys::Fingerprint::new(
+                key,
+                info.id.as_str(),
+                thread_id,
+                reply_to.as_ref().map(|id| id.0.as_str()),
+                asked,
+            );
+            match claim_post(state, fingerprint).await? {
+                Ok(pending) => Some(pending),
+                Err(outcome) => return Ok(Ready::Known(outcome)),
+            }
+        }
+        None => None,
+    };
     // `#277 send-order`. This destination's turn, after every post to it that arrived first, held
     // from the first part to the last, so nothing lands between the parts of a long post. Waiting
     // for it is this request's own: a caller that goes away while it waits gives up its place, and
@@ -3559,8 +3594,168 @@ async fn ready_to_post(
         thread_id: thread_id.map(str::to_owned),
         limit,
         defuse,
+        claim,
     };
-    Ok((posting, turn))
+    Ok(Ready::Post(Box::new(posting), turn))
+}
+
+/// The claim on `fingerprint`, once nobody else is making it; or the answer it already has.
+async fn claim_post(
+    state: &AppState,
+    fingerprint: crate::post_keys::Fingerprint,
+) -> Result<Result<crate::post_keys::Pending, std::sync::Arc<crate::post_keys::Outcome>>, OpError> {
+    use crate::post_keys::Claim;
+    loop {
+        match state.post_keys.claim(fingerprint.clone()) {
+            Claim::Mine(pending) => return Ok(Ok(pending)),
+            Claim::Known(outcome) => return Ok(Err(outcome)),
+            Claim::Reused => return Err(OpError::KeyReused),
+            // Coalesced: once the post under this key settles, this one is answered by what the
+            // key then names — that post, the rest of it, or a refusal. Forgotten — it certainly
+            // posted nothing, or its first part's answer was lost — this caller may make it.
+            Claim::Wait(waiting) => {
+                waiting.settled().await;
+            }
+        }
+    }
+}
+
+/// A remembered post's answer, as [`reply_scoped`] gives it.
+fn remembered_answer(
+    outcome: &crate::post_keys::Outcome,
+) -> Result<(ChannelInfo, Message, Vec<Message>), OpError> {
+    match outcome {
+        crate::post_keys::Outcome::Posted {
+            channel,
+            first,
+            parts,
+        } => Ok((channel.clone(), first.clone(), parts.clone())),
+        crate::post_keys::Outcome::Partial(partial) => Err(OpError::PartiallyPosted {
+            posted: partial.posted,
+            unsent: partial.unsent.clone(),
+            cause: partial.cause.clone(),
+            retryable: partial.retryable,
+            resumable: partial.resumable,
+            thread_id: partial.thread_id.clone(),
+            uncertain: partial.uncertain,
+            refusal: partial.refusal.clone().map(Box::new),
+            first: partial.first.clone().map(Box::new),
+        }),
+    }
+}
+
+/// What of `result` to remember under its key: a post that landed, wholly or in part. Not one
+/// that posted nothing — refused, or its only part's answer lost — which sending again must try
+/// afresh. See [`crate::post_keys`].
+fn to_remember(
+    result: &Result<(ChannelInfo, Message, Vec<Message>), OpError>,
+) -> Option<crate::post_keys::Outcome> {
+    match result {
+        Ok((channel, first, parts)) => Some(crate::post_keys::Outcome::Posted {
+            channel: channel.clone(),
+            first: first.clone(),
+            parts: parts.clone(),
+        }),
+        Err(OpError::PartiallyPosted {
+            posted,
+            unsent,
+            cause,
+            retryable,
+            resumable,
+            thread_id,
+            uncertain,
+            refusal,
+            first,
+        }) if *posted > 0 => Some(crate::post_keys::Outcome::Partial(
+            crate::post_keys::Partial {
+                posted: *posted,
+                unsent: unsent.clone(),
+                cause: cause.clone(),
+                retryable: *retryable,
+                resumable: *resumable,
+                thread_id: thread_id.clone(),
+                uncertain: *uncertain,
+                refusal: refusal.as_deref().cloned(),
+                first: first.as_deref().cloned(),
+            },
+        )),
+        Err(_) => None,
+    }
+}
+
+/// What became of the post `idempotency_key` names, posting nothing: its answer, waiting up to
+/// `wait` for one in flight. `#448 send-dedupe`: what a caller that lost its answer asks before
+/// it decides anything, and what says which part a slow post is on.
+///
+/// # Errors
+///
+/// As [`reply_scoped`] for a post that landed in part; [`OpError::ChannelNotAllowed`] and the
+/// other refusals of a channel or key that could never have been posted.
+pub async fn post_outcome(
+    state: &AppState,
+    channel_id: &str,
+    text: &str,
+    reply_to: Option<&str>,
+    thread_id: Option<&str>,
+    idempotency_key: &str,
+    wait: std::time::Duration,
+) -> Result<PostOutcome, OpError> {
+    let info = allowed(state, channel_id).await?;
+    validate_idempotency_key(idempotency_key)?;
+    if let Some(thread) = thread_id {
+        validate_thread_id(thread)?;
+    }
+    // Fingerprinted as the post was: on the text as the caller sent it.
+    let fingerprint = crate::post_keys::Fingerprint::new(
+        idempotency_key,
+        info.id.as_str(),
+        thread_id,
+        reply_to,
+        text,
+    );
+    let waiting = match state.post_keys.lookup(&fingerprint) {
+        crate::post_keys::Lookup::Known(outcome) => {
+            return Ok(PostOutcome::Settled(Box::new(remembered_answer(&outcome))))
+        }
+        crate::post_keys::Lookup::Unknown => return Ok(PostOutcome::Unknown),
+        crate::post_keys::Lookup::InFlight(waiting) => waiting,
+    };
+    match tokio::time::timeout(wait, waiting.settled()).await {
+        Ok(Some(outcome)) => Ok(PostOutcome::Settled(Box::new(remembered_answer(&outcome)))),
+        // Forgotten as it settled: it posted nothing anyone can confirm.
+        Ok(None) => Ok(PostOutcome::Unknown),
+        Err(_) => {
+            // Read again: it may have moved on while this waited.
+            let (posted, parts) = match state.post_keys.lookup(&fingerprint) {
+                crate::post_keys::Lookup::InFlight(waiting) => waiting.progress(),
+                crate::post_keys::Lookup::Known(outcome) => {
+                    return Ok(PostOutcome::Settled(Box::new(remembered_answer(&outcome))))
+                }
+                crate::post_keys::Lookup::Unknown => return Ok(PostOutcome::Unknown),
+            };
+            Ok(PostOutcome::Posting { posted, parts })
+        }
+    }
+}
+
+/// What a post came to: its channel, first message and every part, or why not.
+pub type PostResult = Result<(ChannelInfo, Message, Vec<Message>), OpError>;
+
+/// What [`post_outcome`] found.
+#[derive(Debug)]
+pub enum PostOutcome {
+    /// The post's own answer, as [`reply_scoped`] gave it.
+    Settled(Box<PostResult>),
+    /// Still posting: `posted` parts of `parts` have landed (`parts` is 0 before it is cut).
+    Posting {
+        /// Parts landed so far.
+        posted: usize,
+        /// Parts in all.
+        parts: usize,
+    },
+    /// Not remembered: never asked for, certainly not posted, its one part's answer lost, or asked
+    /// for before this server restarted. Proves nothing either way.
+    Unknown,
 }
 
 /// The parts `text` is posted as through a provider whose limit is `limit`, and the text they were
@@ -3608,6 +3803,8 @@ struct Posting {
     limit: crate::chat::PostLimit,
     /// Whether the post was defused as it was cut; see [`cut_post`].
     defuse: bool,
+    /// Its claim under its key, settled once it has an answer. `#448 send-dedupe`.
+    claim: Option<crate::post_keys::Pending>,
 }
 
 /// Post every part of `posting` in order, holding the destination's `turn` until the provider has
@@ -3615,14 +3812,19 @@ struct Posting {
 /// Run as a task of its own; see [`post_settled`].
 async fn post_parts(
     state: AppState,
-    posting: Posting,
+    mut posting: Posting,
     turn: crate::post_lanes::Turn,
     settle: Option<Settle>,
 ) -> (
     Result<(ChannelInfo, Message, Vec<Message>), OpError>,
     Option<u64>,
 ) {
-    let result = post_each(&state, posting).await;
+    let claim = posting.claim.take();
+    let progress = claim.as_ref().map(crate::post_keys::Pending::progress);
+    let result = post_each(&state, posting, progress.as_deref()).await;
+    if let Some(claim) = claim {
+        claim.settle(to_remember(&result));
+    }
     let send_seq = settle.and_then(|settle| settle.file(&state, &result));
     drop(turn);
     (result, send_seq)
@@ -3632,6 +3834,7 @@ async fn post_parts(
 async fn post_each(
     state: &AppState,
     posting: Posting,
+    progress: Option<&crate::post_keys::Progress>,
 ) -> Result<(ChannelInfo, Message, Vec<Message>), OpError> {
     let Posting {
         info,
@@ -3642,7 +3845,11 @@ async fn post_each(
         thread_id,
         limit,
         defuse,
+        claim: _,
     } = posting;
+    if let Some(progress) = progress {
+        progress.begin(parts.len());
+    }
     let thread_id = thread_id.as_deref();
     let mut posted: Vec<Message> = Vec::new();
     // Where the parts after the first go, for a post to the conversation itself: the thread under
@@ -3705,6 +3912,9 @@ async fn post_each(
                     fill.offer_posted(&one, into.as_deref());
                 }
                 posted.push(one);
+                if let Some(progress) = progress {
+                    progress.landed();
+                }
             }
             Err(cause) => {
                 // PART OF IT IS ALREADY IN THE CHANNEL and cannot be unsent. Reporting a plain

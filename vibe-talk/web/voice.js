@@ -1923,6 +1923,12 @@ const CHANNEL_DRAFTS_KEY = "vibe-talk.channel-drafts";
 // Local send records never enter the provider message list or its read/archive/reply machinery.
 const OUTGOING_KEY = "vibe-talk.outgoing-messages";
 const OUTGOING_TIMEOUT_MS = 60000;
+// `#448 send-dedupe`. After a send whose answer never came back, how long the page keeps asking
+// the server what became of it (`askOutgoingOutcome`), each ask waiting up to OUTGOING_OUTCOME_WAIT_S
+// for a post still in flight; and how often a slow send asks how far it has got.
+const OUTGOING_OUTCOME_MS = 120000;
+const OUTGOING_OUTCOME_WAIT_S = 20;
+const OUTGOING_PROGRESS_MS = 2000;
 // `#195 send-resilience`. A send whose answer was lost goes out again on its own after the first
 // wait, then after each wait this many times the last, never more than the longest — 3 s, 6 s,
 // 12 s, 20 s, 20 s, 20 s — and then a person decides. Each wait counts from when the attempt that
@@ -25923,9 +25929,18 @@ function outgoingFromSaved(held) {
     mayHavePosted: held.mayHavePosted === true || held.state === "unconfirmed" || attempted,
     // `#263 post-split-per-provider`: where the rest of a post cut in parts goes.
     continueIn: typeof held.continueIn === "string" && held.continueIn ? held.continueIn : null,
+    // `#448 send-dedupe`: where its words went on the first attempt that sent them.
+    wire: savedWire(held.wire),
     detail: attempted ? "This page closed before delivery was confirmed."
       : interrupted ? "This page closed before this message was sent." : String(held.detail || ""),
   };
+}
+
+/** A saved entry's `wire` (`dispatchOutgoingMessage`), or null for anything that is not one. */
+function savedWire(wire) {
+  const place = (value) => (typeof value === "string" && value ? value : null);
+  return wire && typeof wire.text === "string"
+    ? { text: wire.text, replyTo: place(wire.replyTo), threadId: place(wire.threadId) } : null;
 }
 
 function loadOutgoingMessages() {
@@ -25974,7 +25989,14 @@ function outgoingStatus(entry) {
       const ahead = outgoingBlocker(entry);
       return ahead ? `Waiting to send… ${waitingBehind(ahead)}` : "Waiting to send…";
     }
-    return entry.phase === "placing" ? "Finding out which thread the message you answered is in…" : "Sending…";
+    if (entry.phase === "placing") return "Finding out which thread the message you answered is in…";
+    // `#448 send-dedupe`. A slow send says what it is doing, so it never looks stuck: which part is
+    // going, for a post cut in several, and after a lost answer, that it is finding out.
+    const progress = entry.progress;
+    if (progress && progress.parts > 1) {
+      return `Posting part ${Math.min(progress.posted + 1, progress.parts)} of ${progress.parts}…`;
+    }
+    return entry.confirming ? "Sending… The answer was lost; checking whether it went." : "Sending…";
   }
   if (entry.state === "sent") return "Sent.";
   const prefix = entry.postedCount > 0
@@ -26924,7 +26946,7 @@ function pumpOutgoing() {
 function startOutgoing(entry) {
   // Under the credential it was queued under: a send made by one person is not made by another.
   const credential = outgoingQueuedUnder.has(entry.id) ? outgoingQueuedUnder.get(entry.id) : currentCredential();
-  const job = { credential, stopped: false, cancel: null };
+  const job = { credential, stopped: false, cancel: null, attemptOver: false };
   outgoingJobs.set(entry.id, job);
   const placing = entry.placement === "unknown";
   const over = () => {
@@ -27045,16 +27067,29 @@ async function dispatchOutgoingMessage(entry, job) {
     // continues where the server said the parts after it went — the first part's thread, for a
     // provider that threads a long message under its first part — and without the reply target,
     // which only the first part carries.
-    if (entry.replyTo && !entry.continueIn) body.reply_to = entry.replyTo;
-    if (entry.continueIn || entry.threadId) body.thread_id = entry.continueIn || entry.threadId;
-    // The entry's id names this post on every attempt, across reloads, so the server can tell a
-    // retry from a second message. Sent only where it is honoured; one attempt without it and the
-    // entry can never again prove a retry safe.
-    if (channelPostsOnce(entry.channel) && IDEMPOTENCY_KEY.test(entry.id)) {
-      body.idempotency_key = entry.id;
+    let replyTo = entry.replyTo && !entry.continueIn ? entry.replyTo : null;
+    let threadId = entry.continueIn || entry.threadId || null;
+    // `#448 send-dedupe`. Where these words go is decided by the first attempt that sends them, and
+    // every later one says the same, across reloads: the server answers a repeat under the key with
+    // the post it made, and a page that has since drawn the reply into the thread it started must
+    // not ask for it somewhere else. Only the unsent rest of a 207 is new words, placed afresh.
+    if (entry.wire && entry.wire.text === entry.remaining) {
+      ({ replyTo, threadId } = entry.wire);
     } else {
-      entry.keyedOnly = false;
+      entry.wire = { text: entry.remaining, replyTo, threadId };
     }
+    if (replyTo) body.reply_to = replyTo;
+    if (threadId) body.thread_id = threadId;
+    // The entry's id names this post on every attempt, across reloads, so the server can tell a
+    // retry from a second message. `#448 send-dedupe`: sent to every provider, since the server
+    // itself answers a repeat of a post that landed, or is landing, with that post. Only a provider
+    // that honours it upstream (`channelPostsOnce`) also covers a part whose own answer was lost,
+    // which is what an automatic retry needs; one attempt anywhere else and the entry can never
+    // again prove a retry safe.
+    if (IDEMPOTENCY_KEY.test(entry.id)) body.idempotency_key = entry.id;
+    if (!channelPostsOnce(entry.channel) || !body.idempotency_key) entry.keyedOnly = false;
+    entry.progress = null;
+    if (body.idempotency_key) watchOutgoingProgress(entry, job, body);
     const interruption = new Promise((_resolve, reject) => {
       job.cancel = () => {
         if (controller) controller.abort();
@@ -27067,12 +27102,26 @@ async function dispatchOutgoingMessage(entry, job) {
         reject(late);
       }, OUTGOING_TIMEOUT_MS);
     });
-    const payload = await Promise.race([
-      api(`/api/v1/channels/${encodeURIComponent(entry.channel)}/reply`, {
-        method: "POST", body, ...(controller ? { signal: controller.signal } : {}),
-      }),
-      interruption,
-    ]);
+    let payload;
+    try {
+      payload = await Promise.race([
+        api(`/api/v1/channels/${encodeURIComponent(entry.channel)}/reply`, {
+          method: "POST", body, ...(controller ? { signal: controller.signal } : {}),
+        }),
+        interruption,
+      ]);
+    } catch (error) {
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+      // `#448 send-dedupe`. The answer was lost — the page stopped waiting, the connection dropped,
+      // or something in front of the server answered for it — while the post may still be landing.
+      // The owner saw a long message "fail", pressed Retry, and it arrived twice. So the server is
+      // asked what became of it before anything is decided, posting nothing.
+      const found = !job.stopped && body.idempotency_key && answerLost(error)
+        ? await askOutgoingOutcome(entry, job, body) : null;
+      if (!found) throw error;
+      payload = found;
+    }
     if (job.stopped) return;
     if (payload && payload.error === "partially_posted") {
       entry.postedCount += Math.max(0, Number(payload.posted) || 0);
@@ -27168,7 +27217,10 @@ async function dispatchOutgoingMessage(entry, job) {
   } finally {
     if (timer !== null) clearTimeout(timer);
     job.cancel = null;
+    job.attemptOver = true;
     entry.phase = "";
+    entry.progress = null;
+    entry.confirming = false;
     if (transient && !job.stopped) planOutgoingRetry(entry, startedAt);
     persistOutgoingMessages();
     eachColumn(renderChannelRows);
@@ -27176,6 +27228,107 @@ async function dispatchOutgoingMessage(entry, job) {
     // for a send that signing out stopped, which is the sign-in screen's to explain.
     if (columnReplies.has(entry.id) && !job.stopped) reportColumnReply(entry);
   }
+}
+
+// --- what became of a send whose answer was lost ---------------------------------------------------
+//
+// `#448 send-dedupe`. The owner sent a long message to a Slack channel, cut in three parts; it took
+// twelve seconds and the page showed it as failed: "that long message appeared to fail to send the
+// first time, and then on retry appeared to succeed, but apparently that caused message duplication."
+// The server had posted every part, under a key no Slack request carries. Now the server remembers
+// each keyed post itself (src/post_keys.rs), and:
+//
+//   * A send whose answer never came back — the page's own timeout, a dropped connection, a gateway's
+//     page in place of the server's answer — asks `POST .../reply/outcome`, which posts nothing and
+//     waits for a post still in flight. The post's own answer is then this attempt's answer: Sent, or
+//     the 207 of a post that landed in part. Only a post the server has no record of is left
+//     unconfirmed, as before, since that proves nothing either way.
+//   * Retry, by hand or on its own, carries the same key to every provider, and the server answers a
+//     repeat of a post that landed, or is landing, with that post.
+//   * While a send is slow, the row says which part is going ("Posting part 2 of 3…"), asked of the
+//     same route every OUTGOING_PROGRESS_MS, so a send that takes seconds never looks stuck.
+
+/** Whether `error` means the server's answer was lost rather than given. */
+function answerLost(error) {
+  // A gateway's 5xx is one whether its page is HTML (`gatewayStatus`) or JSON that is not this
+  // server's error body (`code` "error", see `api`).
+  return Boolean(error && (error.network || error.timedOut || error.gatewayStatus >= 500 ||
+    error.gatewayStatus === 408 || (error.status >= 500 && error.code === "error")));
+}
+
+/** One ask of the outcome route for `body`'s post: its answer, `202` posting, or a thrown error. */
+function outgoingOutcome(entry, body, wait, signal) {
+  return api(`/api/v1/channels/${encodeURIComponent(entry.channel)}/reply/outcome?wait=${wait}`, {
+    method: "POST", body, ...(signal ? { signal } : {}),
+  });
+}
+
+/**
+ * Ask what became of `entry`'s post until it has an answer, for at most OUTGOING_OUTCOME_MS: the
+ * post's own answer (a 200's or a 207's body), or null where the server has no record of it, cannot
+ * be reached, or the attempt was stopped.
+ */
+async function askOutgoingOutcome(entry, job, body) {
+  const until = Date.now() + OUTGOING_OUTCOME_MS;
+  entry.confirming = true;
+  renderOutgoingEverywhere();
+  try {
+    while (!job.stopped && Date.now() < until) {
+      const controller = typeof AbortController === "function" ? new AbortController() : null;
+      let timer = null;
+      // Each ask ends: a connection gone dead under it would otherwise hold this message, and every
+      // one written after it to the same place, until the reader signed out.
+      const stop = new Promise((_resolve, reject) => {
+        const end = () => {
+          if (controller) controller.abort();
+          reject(new Error("The ask went unanswered."));
+        };
+        job.cancel = end;
+        timer = setTimeout(end, (OUTGOING_OUTCOME_WAIT_S + 10) * 1000);
+      });
+      let answer;
+      try {
+        answer = await Promise.race([
+          outgoingOutcome(entry, body, OUTGOING_OUTCOME_WAIT_S, controller && controller.signal), stop,
+        ]);
+      } catch (_error) {
+        return null;
+      } finally {
+        clearTimeout(timer);
+      }
+      if (job.stopped) return null;
+      if (!answer || answer.state !== "posting") return answer;
+      noteOutgoingProgress(entry, answer);
+    }
+    return null;
+  } finally {
+    entry.confirming = false;
+  }
+}
+
+/** Take a `202` posting answer's count of parts onto `entry`'s row. */
+function noteOutgoingProgress(entry, answer) {
+  const posted = Math.max(0, Number(answer.posted) || 0);
+  const parts = Math.max(0, Number(answer.parts) || 0);
+  if (entry.progress && entry.progress.posted === posted && entry.progress.parts === parts) return;
+  entry.progress = { posted, parts };
+  renderOutgoingEverywhere();
+}
+
+/**
+ * While `job`'s POST of `body` is on the wire, ask every OUTGOING_PROGRESS_MS how far it has got, one
+ * ask at a time. Ends with the attempt. A failed ask changes nothing: it is only for the row's words.
+ */
+function watchOutgoingProgress(entry, job, body) {
+  const tick = () => {
+    if (job.stopped || job.attemptOver || entry.confirming) return;
+    outgoingOutcome(entry, body, 0, null).then((answer) => {
+      if (!job.stopped && !job.attemptOver && answer && answer.state === "posting") noteOutgoingProgress(entry, answer);
+    }, () => {}).finally(() => {
+      if (!job.stopped && !job.attemptOver) setTimeout(tick, OUTGOING_PROGRESS_MS);
+    });
+  };
+  setTimeout(tick, OUTGOING_PROGRESS_MS);
 }
 
 // --- sending again on its own ---------------------------------------------------------------------

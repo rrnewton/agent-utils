@@ -161,6 +161,11 @@ pub struct HttpSlackClient {
     /// The `users.conversations` pages the channel browser read, by cursor, so searches typed one
     /// after another walk the same listing without asking Slack again. `#371 channel-search-hash`.
     pub(super) directory_pages: crate::directory::Kept<String, Value>,
+    /// The threads the first parts of long posts just went into or started, by conversation and
+    /// root `ts`, and when: proven to be there by Slack's own answer to that part, so the rest of
+    /// the post goes in without reading the thread first. `#448 send-dedupe`; see
+    /// `super::timeline::ROOTS_KEEP`.
+    pub(super) posted_roots: Mutex<HashMap<(String, String), Instant>>,
 }
 
 impl HttpSlackClient {
@@ -226,6 +231,7 @@ impl HttpSlackClient {
             post_limit: config.post_limit(),
             shim_profile: None,
             directory_pages: crate::directory::Kept::default(),
+            posted_roots: Mutex::new(HashMap::new()),
         })
     }
 
@@ -930,12 +936,18 @@ impl ChatClient for HttpSlackClient {
     /// thread id. So the rest of a long post goes under the first part rather than after it, and a
     /// first part that answered a message — which Slack placed in that message's thread — is
     /// followed into the same thread rather than left there alone.
-    fn continuation_thread(&self, _channel: &ChannelId, first: &Message) -> Option<String> {
-        first
+    fn continuation_thread(&self, channel: &ChannelId, first: &Message) -> Option<String> {
+        let thread = first
             .thread
             .as_ref()
             .map(|thread| thread.id.clone())
-            .or_else(|| ids::ts_from_message_id(&first.id))
+            .or_else(|| ids::ts_from_message_id(&first.id))?;
+        // Slack's answer to the first part has just shown this thread is there, so the rest goes
+        // in without reading it first (`#448 send-dedupe`).
+        if let Some(target) = ids::ChannelRef::parse(channel.as_str()) {
+            self.note_posted_root(&target.conversation, &thread);
+        }
+        Some(thread)
     }
 
     async fn fetch_timeline(

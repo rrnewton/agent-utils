@@ -190,6 +190,13 @@ fn inventory() -> Vec<Route> {
             Write,
             Json(r#"{"text":"hi"}"#),
         ),
+        // `#448 send-dedupe`.
+        route(
+            "POST",
+            "/api/v1/channels/{channel_id}/reply/outcome",
+            Write,
+            Json(r#"{"text":"hi","idempotency_key":"k"}"#),
+        ),
         route(
             "POST",
             "/api/v1/channels/{channel_id}/ask",

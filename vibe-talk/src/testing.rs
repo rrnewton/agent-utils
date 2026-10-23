@@ -302,6 +302,7 @@ fn state_pieces_with(
             0,
         )),
         post_lanes: Arc::new(crate::post_lanes::PostLanes::new()),
+        post_keys: Arc::new(crate::post_keys::PostKeys::new()),
         reply_reads: Arc::new(crate::reply_read::ReplyReads::new()),
         spoken_names: Arc::new(crate::speakable::SharedNames::new()),
         live,

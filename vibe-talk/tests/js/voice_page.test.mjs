@@ -1445,6 +1445,16 @@ function sameRealm(value) {
 }
 
 /** A JSON response, shaped exactly as the page's `api()` unpacks one. */
+/**
+ * `#448 send-dedupe`. A posted reply's body without its idempotency key, which every send carries now,
+ * whatever the provider: the key is checked to be there, in the outbox id's shape, and taken off.
+ */
+function sentWithoutKey(body) {
+  const { idempotency_key: key, ...rest } = body || {};
+  assert.match(String(key), /^outgoing-[A-Za-z0-9_-]+$/, `a send went without its key: ${JSON.stringify(body)}`);
+  return rest;
+}
+
 const json = (status, body) => ({
   ok: status < 400,
   status,
@@ -2201,6 +2211,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     dateFormatsMade: 0,
     /** Every reply the page has POSTed, exactly as it went out. */
     repliesPosted: [],
+    /** `#448 send-dedupe`: every ask of the reply outcome route, as `{path, body}`. */
+    outcomeAsks: [],
     /** `#49 cached-summaries`: every summary the page has asked for, in order. */
     summaryAsks: [],
     summaryPaths: [],
@@ -3612,6 +3624,14 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       // `#51 reply-view`. Recorded rather than merely answered: the assertion that matters is what
       // the page really SENT — the channel it named and the message it referenced — and asserting
       // that against the interface's own claim of success would prove nothing.
+      // `#448 send-dedupe`. What became of a keyed post: by default, a post this server has no
+      // record of, which changes nothing the page decides.
+      if (/\/reply\/outcome(\?|$)/.test(String(path))) {
+        page.outcomeAsks.push({ path: String(path), body: JSON.parse((options && options.body) || "null") });
+        return page.outcomeResponse
+          ? page.outcomeResponse(path, options)
+          : json(404, { error: "post_unknown", detail: "this server has no record of that post" });
+      }
       if (/\/reply$/.test(String(path))) {
         page.repliesPosted.push({
           path: String(path),
@@ -4489,6 +4509,18 @@ const TUNING_BANDS = {
     "shows Loading thread at reading speed, farther reads threads nobody reaches"],
   OUTGOING_TIMEOUT_MS: [15000, 180000,
     "slow mobile sends need time to complete, but a lost response must not spin forever or block queued messages"],
+  OUTGOING_OUTCOME_MS: [30000, 300000,
+    "how long a send whose answer was lost keeps asking what became of it (#448 send-dedupe). Under " +
+    "half a minute a slow multi-part post is still landing when the page gives up and calls it " +
+    "unconfirmed, which is what sent the owner to Retry; past five minutes the row is stuck on a post " +
+    "the server has long finished or forgotten"],
+  OUTGOING_OUTCOME_WAIT_S: [5, 25,
+    "seconds one ask of the outcome route waits for a post in flight (#448 send-dedupe): the server " +
+    "caps it at 25, under the usual 30-second proxy idle timeout; under five the page asks again and " +
+    "again for one slow post"],
+  OUTGOING_PROGRESS_MS: [1000, 5000,
+    "how often a slow send asks which part is going (#448 send-dedupe). Faster spends a request a " +
+    "moment on words; slower and a three-part post is half done before the row says so"],
   OUTGOING_RETRY_FIRST_MS: [2000, 15000,
     "the wait before a lost send goes again on its own (#195 send-resilience). Under a couple of " +
     "seconds it lands on the same slow moment that lost it; past fifteen the reader has already " +
@@ -15047,7 +15079,7 @@ test("A REPLY THAT ONLY HALF POSTED KEEPS THE REST OF YOUR TEXT", async () => {
   });
   await outgoingRetry(held).click();
   await page.settle();
-  assert.deepEqual(page.repliesPosted[1].body, {
+  assert.deepEqual(sentWithoutKey(page.repliesPosted[1].body), {
     text: "second half.", reply_to: "1000000000000000001",
   }, "retry repeated the already accepted prefix");
 });
@@ -19396,7 +19428,7 @@ test("THE REPLY REALLY REFERENCES THE MESSAGE IT WAS OPENED ON", async () => {
 
   assert.equal(page.repliesPosted.length, 1, "the reply was not posted at all");
   const sent = page.repliesPosted[0];
-  assert.deepStrictEqual(sent.body, { text: "looking at it now", reply_to: "222" });
+  assert.deepStrictEqual(sentWithoutKey(sent.body), { text: "looking at it now", reply_to: "222" });
   assert.equal(sent.method, "POST");
   assert.equal(sent.contentType, "application/json", "a JSON body went out with no content type");
   assert.ok(
@@ -23207,7 +23239,7 @@ const ENTER_COMPOSERS = {
       page, field: "channel-compose-text",
       ready: (text) => page.el("channel-compose-text").setValue(text),
       sent: () => page.repliesPosted.length,
-      went: (text) => assert.deepEqual(page.repliesPosted.at(-1).body, { text }),
+      went: (text) => assert.deepEqual(sentWithoutKey(page.repliesPosted.at(-1).body), { text }),
     };
   },
   async thread(on) {
@@ -23225,7 +23257,7 @@ const ENTER_COMPOSERS = {
       ready: (text) => page.el("channel-compose-text").setValue(text),
       sent: () => page.repliesPosted.length,
       went: (text) =>
-        assert.deepEqual(page.repliesPosted.at(-1).body, { text, thread_id: page.threads[0].id }),
+        assert.deepEqual(sentWithoutKey(page.repliesPosted.at(-1).body), { text, thread_id: page.threads[0].id }),
     };
   },
   async reply(on) {
@@ -23241,7 +23273,7 @@ const ENTER_COMPOSERS = {
         await page.el("reply-text").setValue(text);
       },
       sent: () => page.repliesPosted.length,
-      went: (text) => assert.deepEqual(page.repliesPosted.at(-1).body, { text, reply_to: "111" }),
+      went: (text) => assert.deepEqual(sentWithoutKey(page.repliesPosted.at(-1).body), { text, reply_to: "111" }),
     };
   },
 };
@@ -23353,7 +23385,7 @@ test("the platform words the hint and decides nothing: Ctrl+Enter and Cmd+Enter 
       await page.el("channel-compose-text").setValue(text);
       await page.el("channel-compose-text").dispatch("keydown", enterKey(fields));
       await page.settle();
-      assert.deepEqual(page.repliesPosted.at(-1)?.body, { text }, `${text} did not send`);
+      assert.deepEqual(sentWithoutKey(page.repliesPosted.at(-1)?.body), { text }, `${text} did not send`);
     }
   }
 });
@@ -35036,7 +35068,7 @@ test("the normal composer lives after history and posts standalone messages with
   page.el("channel-compose-text").value = "a fresh main message";
   await page.el("channel-compose-text").dispatch("input");
   await page.el("channel-send").click();
-  assert.deepEqual(page.repliesPosted[0].body, { text: "a fresh main message" });
+  assert.deepEqual(sentWithoutKey(page.repliesPosted[0].body), { text: "a fresh main message" });
   assert.equal(page.el("channel-compose-text").value, "");
   assert.equal(page.sockets.length, 0, "posting to chat started a voice conversation");
 });
@@ -35095,7 +35127,7 @@ test("removing the selected channel cannot carry its thread or composer draft in
   assert.match(page.storage.get("vibe-talk.channel-drafts"), /belongs only in the original thread/);
   page.el("channel-compose-text").value = "a new message for the remaining channel";
   await page.el("channel-send").click();
-  assert.deepEqual(page.repliesPosted[0].body, { text: "a new message for the remaining channel" });
+  assert.deepEqual(sentWithoutKey(page.repliesPosted[0].body), { text: "a new message for the remaining channel" });
   assert.equal(page.repliesPosted[0].path, `/api/v1/channels/${other.id}/reply`);
   await page.el("remove-channel").click();
   await page.settle();
@@ -35113,7 +35145,7 @@ test("main drafts and a thread's unsent remainder survive navigation and reload 
   await page.el("channel-compose-text").dispatch("input");
   page.replyResponse = async () => json(207, { error: "partially_posted", posted: 1, unsent: "unsent tail", detail: "Google Chat returned HTTP 502" });
   await page.el("channel-send").click();
-  assert.deepEqual(page.repliesPosted[0].body, { text: "thread draft", thread_id: page.threads[0].id });
+  assert.deepEqual(sentWithoutKey(page.repliesPosted[0].body), { text: "thread draft", thread_id: page.threads[0].id });
   assert.equal(page.el("channel-compose-text").value, "");
   assert.match(outgoingRows(page)[0].text(), /unsent tail/);
   assert.match(outgoingRows(page)[0].text(), /Google Chat returned HTTP 502/);
@@ -35183,7 +35215,7 @@ test("thread replies retain thread context on the existing message Reply control
   await button.click();
   page.el("reply-text").value = "specific answer";
   await page.el("reply-send").click();
-  assert.deepEqual(page.repliesPosted[0].body, { text: "specific answer", reply_to: "202", thread_id: page.threads[0].id });
+  assert.deepEqual(sentWithoutKey(page.repliesPosted[0].body), { text: "specific answer", reply_to: "202", thread_id: page.threads[0].id });
 });
 
 test("live replies refresh only the active thread instead of leaking across contexts", async () => {
@@ -35503,7 +35535,7 @@ test("a rejected send stops spinning, keeps its text, and allows an explicit ret
   });
   await outgoingRetry(failed).click();
   await page.settle();
-  assert.deepEqual(page.repliesPosted.map((call) => call.body), [
+  assert.deepEqual(page.repliesPosted.map((call) => sentWithoutKey(call.body)), [
     { text: "retained after refusal" }, { text: "retained after refusal" },
   ]);
   assert.equal(outgoingRows(page).length, 0);
@@ -35601,7 +35633,7 @@ test("retry retains its original channel, thread and reply target after navigati
   await outgoingRetry(outgoingRows(again)[0]).click();
   await again.settle();
   assert.equal(again.repliesPosted[0].path, original.path);
-  assert.deepEqual(again.repliesPosted[0].body, {
+  assert.deepEqual(sentWithoutKey(again.repliesPosted[0].body), {
     text: "answer only inside this thread", thread_id: page.threads[0].id, reply_to: "202",
   });
 });
@@ -35772,7 +35804,7 @@ test("a reply from All to a thread reply that arrived live goes into that thread
   await page.el("reply-send").click();
   await page.settle();
   assert.equal(page.repliesPosted.length, 1);
-  assert.deepEqual(page.repliesPosted[0].body, {
+  assert.deepEqual(sentWithoutKey(page.repliesPosted[0].body), {
     text: "answering where the question was asked", reply_to: "206", thread_id: first.id,
   }, "the reply left its thread for the main channel");
 });
@@ -35807,7 +35839,7 @@ test("a reply whose message cannot be placed is not posted anywhere, and Retry p
   page.timeline = standard;
   await outgoingRetry(held).click();
   await page.settle();
-  assert.deepEqual(page.repliesPosted[0].body, {
+  assert.deepEqual(sentWithoutKey(page.repliesPosted[0].body), {
     text: "held until the page knows where", reply_to: "206", thread_id: first.id,
   });
 });
@@ -35826,7 +35858,7 @@ test("the live echo of a reply sent into a thread does not take the thread away 
   await page.el("reply-text").setValue("my answer in the first discussion");
   await page.el("reply-send").click();
   await page.settle();
-  assert.deepEqual(page.repliesPosted[0].body, {
+  assert.deepEqual(sentWithoutKey(page.repliesPosted[0].body), {
     text: "my answer in the first discussion", reply_to: "202", thread_id: first.id,
   });
   // The stream's copy of the same message, which says nothing about threads.
@@ -35846,7 +35878,7 @@ test("the live echo of a reply sent into a thread does not take the thread away 
   await page.el("reply-text").setValue("and a follow-up");
   await page.el("reply-send").click();
   await page.settle();
-  assert.deepEqual(page.repliesPosted[1].body, { text: "and a follow-up", reply_to: "9301", thread_id: first.id });
+  assert.deepEqual(sentWithoutKey(page.repliesPosted[1].body), { text: "and a follow-up", reply_to: "9301", thread_id: first.id });
 });
 
 test("a read that lands after a newer one was asked for still places the message a reply is opened on", async () => {
@@ -35877,7 +35909,7 @@ test("a read that lands after a newer one was asked for still places the message
   await page.el("reply-text").setValue("answering from the stale row");
   await page.el("reply-send").click();
   await page.settle();
-  assert.deepEqual(page.repliesPosted[0].body, {
+  assert.deepEqual(sentWithoutKey(page.repliesPosted[0].body), {
     text: "answering from the stale row", reply_to: "206", thread_id: first.id,
   }, "the reply trusted the row's copy over what the store had since read");
 });
@@ -35957,7 +35989,7 @@ test("Reply offers a new thread only on a main-channel message the chat service 
     await page.el("reply-text").setValue(text);
     await page.el("reply-send").click();
     await page.settle();
-    return page.repliesPosted.at(-1).body;
+    return sentWithoutKey(page.repliesPosted.at(-1).body);
   };
 
   // A main-channel message with an empty thread: offered, off, and off means a reply on Main.
@@ -36371,7 +36403,7 @@ test("two independent identical sends keep separate bubbles and POSTs, in submis
   responses[1](json(200, { posted: message({ id: "9172", content: "same words" }) }));
   await Promise.all([first, second]);
   await page.settle();
-  assert.deepEqual(page.repliesPosted.map((call) => call.body), [
+  assert.deepEqual(page.repliesPosted.map((call) => sentWithoutKey(call.body)), [
     { text: "same words" }, { text: "same words" },
   ]);
   assert.equal(shownIds(page).filter((id) => id === "9171").length, 1);
@@ -36731,7 +36763,7 @@ test("`#193 compose-draft-loss`: Edit on a failed reply opens Reply on the messa
   distinctReplies(page);
   await page.el("reply-send").click();
   await page.settle();
-  assert.deepEqual(page.repliesPosted.at(-1).body, { text: both, reply_to: "9310" });
+  assert.deepEqual(sentWithoutKey(page.repliesPosted.at(-1).body), { text: both, reply_to: "9310" });
 });
 
 test("`#193 compose-draft-loss`: a failed reply that started a new thread comes back to Reply with that choice ticked", async () => {
@@ -36760,7 +36792,7 @@ test("`#193 compose-draft-loss`: a failed reply that started a new thread comes 
   distinctReplies(page);
   await page.el("reply-send").click();
   await page.settle();
-  assert.deepEqual(page.repliesPosted.at(-1).body,
+  assert.deepEqual(sentWithoutKey(page.repliesPosted.at(-1).body),
     { text: "starting a thread on it", reply_to: "210", thread_id: lone.id });
 });
 
@@ -36861,7 +36893,7 @@ test("`#193 compose-draft-loss`: Undo puts back a send's wait to go again on its
   assert.match(outgoingRows(offline)[0].text(), /Offline\. Will send when online\./);
   await offline.setOnline(true);
   await settleSend(offline);
-  assert.deepEqual(posted(offline), [{ text: "written in a tunnel" }]);
+  assert.deepEqual(posted(offline).map(sentWithoutKey), [{ text: "written in a tunnel" }]);
   assert.equal(outgoingRows(offline).length, 0);
   // ...and one whose connection came back while it was dismissed goes at once, not on an `online`
   // that has already fired.
@@ -36874,7 +36906,7 @@ test("`#193 compose-draft-loss`: Undo puts back a send's wait to go again on its
   await offline.el("undo-send-dismiss").click();
   assert.equal(offline.expireTimers(0), 1, "the send taken back was left waiting for a connection it has");
   await settleSend(offline);
-  assert.deepEqual(posted(offline)[1], { text: "written in the next tunnel" });
+  assert.deepEqual(sentWithoutKey(posted(offline)[1]), { text: "written in the next tunnel" });
   assert.equal(outgoingRows(offline).length, 0);
 
   // Put back once the chip has gone is a decision of the reader's for later: Retry, not a wait.
@@ -42623,7 +42655,10 @@ test("a refusal the server is sure of is Not sent, says why in plain words, and 
   assert.equal(outgoingEdit(partial), undefined, "Edit was offered for a send partly in the channel");
 });
 
-test("where no provider promises one post per key, a lost send waits for the reader and carries no key", async () => {
+test("where no provider promises one post per key, a lost send waits for the reader, carrying its key for the server", async () => {
+  // `#448 send-dedupe`. The key goes to every provider now: the server itself answers a repeat of a
+  // post that landed, or is landing, with that post. It cannot vouch for a part whose own answer was
+  // lost, which only the provider could recognise, so nothing here goes again on its own.
   const page = newPage();
   page.chatProviderName = "Example Chat";
   await signIn(page);
@@ -42633,7 +42668,7 @@ test("where no provider promises one post per key, a lost send waits for the rea
     detail: "Example Chat request failed: connection reset by peer",
   });
   await sendChannel(page, "maybe delivered");
-  assert.deepEqual(posted(page), [{ text: "maybe delivered" }], "a key went to a server that ignores it");
+  assert.deepEqual(posted(page).map(sentWithoutKey), [{ text: "maybe delivered" }]);
   const row = outgoingRows(page)[0];
   assert.equal(row.getAttribute("data-send-state"), "unconfirmed");
   assert.match(row.text(), /Check history before retrying/);
@@ -42672,9 +42707,14 @@ test("where no provider promises one post per key, a lost send waits for the rea
   await multi.el("discord-channel").dispatch("change");
   await multi.settle();
   await sendChannel(multi, "to the space");
-  assert.equal("idempotency_key" in posted(multi)[0], false, "the other provider's guarantee was borrowed");
+  // Both carry their keys (`#448 send-dedupe`); only the promising provider's goes again on its own.
+  assert.ok(posted(multi)[0].idempotency_key, "the team's send carried no key");
   assert.ok(posted(multi)[1].idempotency_key, "the promising provider's channel sent no key");
   assert.match(outgoingRows(multi)[0].text(), retryingFirst());
+  multi.expireTimers(RETRY_FIRST_MS);
+  await settleSend(multi);
+  assert.deepEqual(posted(multi).map((body) => body.text), ["to the team", "to the space", "to the space"],
+    "the other provider's guarantee was borrowed");
 });
 
 test("a message written while the device is offline waits for the connection, then goes", async () => {
@@ -42691,7 +42731,7 @@ test("a message written while the device is offline waits for the connection, th
   assert.equal(savedOutgoing(page)[0].state, "failed", "a reload would claim it might have been sent");
   await page.setOnline(true);
   await settleSend(page);
-  assert.deepEqual(posted(page), [{ text: "written in a tunnel" }]);
+  assert.deepEqual(posted(page).map(sentWithoutKey), [{ text: "written in a tunnel" }]);
   assert.equal(outgoingRows(page).length, 0);
 });
 
@@ -58271,7 +58311,7 @@ test("`#252 thread-button-state`: the grey Thread opens the empty thread with no
   page.el("channel-compose-text").value = "the first reply, which starts the thread";
   await page.el("channel-send").click();
   await page.settle();
-  assert.deepStrictEqual(page.repliesPosted.map((call) => call.body),
+  assert.deepStrictEqual(page.repliesPosted.map((call) => sentWithoutKey(call.body)),
     [{ text: "the first reply, which starts the thread", thread_id: data.lone.id }],
     "the first send did not post into the message's thread");
   assert.deepStrictEqual(shownIds(page), ["210", "9400000000000000001"], "the first reply was not drawn in the thread");
@@ -58326,7 +58366,7 @@ test("`#252 thread-button-state`: a thread nobody has answered opens at once fro
   page.el("channel-compose-text").value = "first";
   await page.el("channel-send").click();
   await page.settle();
-  assert.deepStrictEqual(page.repliesPosted.at(-1).body, { text: "first", thread_id: data.lone.id });
+  assert.deepStrictEqual(sentWithoutKey(page.repliesPosted.at(-1).body), { text: "first", thread_id: data.lone.id });
 });
 
 test("`#252 thread-button-state`: the tag turns coloured live when somebody else answers — on the stream in All, by a read in Main", async () => {
@@ -58422,7 +58462,7 @@ test("`#252 thread-button-state`: per provider — Google Chat's and Slack's eve
     page.el("channel-compose-text").value = `${name}: the first reply`;
     await page.el("channel-send").click();
     await page.settle();
-    assert.deepStrictEqual(page.repliesPosted.at(-1).body, { text: `${name}: the first reply`, thread_id: start.thread.id },
+    assert.deepStrictEqual(sentWithoutKey(page.repliesPosted.at(-1).body), { text: `${name}: the first reply`, thread_id: start.thread.id },
       `${name}: the first reply did not go into the message's thread`);
   }
 });
@@ -58443,7 +58483,7 @@ test("`#252 thread-button-state`: on Slack, where a reply is a thread reply, Rep
     await page.el("reply-text").setValue(`${name}: a reply`);
     await page.el("reply-send").click();
     await page.settle();
-    assert.deepStrictEqual(page.repliesPosted.at(-1).body, { text: `${name}: a reply`, reply_to: "210" },
+    assert.deepStrictEqual(sentWithoutKey(page.repliesPosted.at(-1).body), { text: `${name}: a reply`, reply_to: "210" },
       `${name}: Reply no longer posts as it did`);
     // The grey Thread is the way to start the thread from vibe-talk, on both.
     await pickThread(page, "main");
@@ -58453,7 +58493,7 @@ test("`#252 thread-button-state`: on Slack, where a reply is a thread reply, Rep
     page.el("channel-compose-text").value = `${name}: into the thread`;
     await page.el("channel-send").click();
     await page.settle();
-    assert.deepStrictEqual(page.repliesPosted.at(-1).body, { text: `${name}: into the thread`, thread_id: data.lone.id });
+    assert.deepStrictEqual(sentWithoutKey(page.repliesPosted.at(-1).body), { text: `${name}: into the thread`, thread_id: data.lone.id });
   }
 
   // Several providers: each channel answers for its own, by its provider's description.
@@ -58523,7 +58563,7 @@ test("`#252 thread-button-state` x `#229 desktop-two-column`: the grey Thread op
   page.el("side-compose-text").value = "the first reply, from the right";
   await page.el("side-send").click();
   await page.settle();
-  assert.deepStrictEqual(page.repliesPosted.at(-1).body, { text: "the first reply, from the right", thread_id: data.lone.id });
+  assert.deepStrictEqual(sentWithoutKey(page.repliesPosted.at(-1).body), { text: "the first reply, from the right", thread_id: data.lone.id });
   assert.deepStrictEqual(sideIds(page), ["210", "9400000000000000001"], "the first reply was not drawn on the right");
   const tag = tagOf(rowWithId(page, "210"));
   assert.equal(tag.state, "open", "Main's tag stayed grey after the first reply");
@@ -58578,7 +58618,7 @@ test("`#252 thread-button-state`: → on a message nobody has answered opens its
     page.el(box).value = "typed straight after →";
     await page.el(two ? "side-send" : "channel-send").click();
     await page.settle();
-    assert.deepStrictEqual(page.repliesPosted.at(-1).body, { text: "typed straight after →", thread_id: data.lone.id });
+    assert.deepStrictEqual(sentWithoutKey(page.repliesPosted.at(-1).body), { text: "typed straight after →", thread_id: data.lone.id });
   }
 });
 
@@ -58611,7 +58651,7 @@ test("`#300 reply-marks-read`: the first reply written in a thread nobody has an
   await page.settle();
   assert.deepStrictEqual(shownIds(page), ["210"], "the premise is the empty thread, opened from its grey Thread");
   await writeInThread(page, "the first reply, which starts the thread");
-  assert.deepStrictEqual(page.repliesPosted.map((call) => call.body),
+  assert.deepStrictEqual(page.repliesPosted.map((call) => sentWithoutKey(call.body)),
     [{ text: "the first reply, which starts the thread", thread_id: data.lone.id }], "the reply went elsewhere");
   assert.deepStrictEqual(page.dismissCalls, [{ messages: ["210"] }], "the root of the thread it started is not Done");
   assert.deepStrictEqual(page.upstreamReadCalls, [{ message_id: "210", after_reply: true }],
@@ -58646,7 +58686,7 @@ test("`#300 reply-marks-read`: in two columns the first reply in the right colum
   await page.settle();
   assert.deepStrictEqual(sideIds(page), ["210"], "the premise is the empty thread on the right");
   await writeInThread(page, "the first reply, from the right", true);
-  assert.deepStrictEqual(page.repliesPosted.at(-1).body, { text: "the first reply, from the right", thread_id: data.lone.id });
+  assert.deepStrictEqual(sentWithoutKey(page.repliesPosted.at(-1).body), { text: "the first reply, from the right", thread_id: data.lone.id });
   assert.deepStrictEqual(page.dismissCalls, [{ messages: ["210"] }]);
   assert.deepStrictEqual(page.upstreamReadCalls, [{ message_id: "210", after_reply: true }]);
   assert.equal(rowWithId(page, "210").getAttribute("data-archived"), "true", "Main does not draw the root read");
@@ -58695,7 +58735,7 @@ test("`#300 reply-marks-read`: in a thread that has replies its box marks nothin
   assert.deepStrictEqual(page.dismissCalls, [], "a message in an answered thread's box marked something Done");
   assert.deepStrictEqual(page.upstreamReadCalls, [], "a message in an answered thread's box marked something at the provider");
   await replyAndSend(page, "202", "agreed, merging");
-  assert.deepStrictEqual(page.repliesPosted.at(-1).body,
+  assert.deepStrictEqual(sentWithoutKey(page.repliesPosted.at(-1).body),
     { text: "agreed, merging", reply_to: "202", thread_id: "spaces/A/threads/one & two" });
   assert.deepStrictEqual(page.dismissCalls, [{ messages: ["202"] }], "Reply in the thread did not mark what it answered");
   assert.deepStrictEqual(page.upstreamReadCalls, [{ message_id: "202", after_reply: true }]);
@@ -60659,7 +60699,7 @@ test("`#185 reply-new-thread`: a new thread started from Reply on Main goes into
   assert.equal(page.el("reply-destination").textContent, "Posts in a new thread on this message, as its first reply.");
   await page.el("reply-send").click();
   await page.settle();
-  assert.deepStrictEqual(page.repliesPosted.map((call) => call.body),
+  assert.deepStrictEqual(page.repliesPosted.map((call) => sentWithoutKey(call.body)),
     [{ text: "the first answer, in a thread of its own", reply_to: "210", thread_id: data.lone.id }]);
 
   // Back where Reply was pressed, as after every reply: Main, which shows no thread's replies, so the
@@ -60786,7 +60826,7 @@ test("`#185 reply-new-thread`: a reply arriving while Reply is open takes the ne
 
   await page.el("reply-send").click();
   await page.settle();
-  assert.deepStrictEqual(page.repliesPosted.map((call) => call.body),
+  assert.deepStrictEqual(page.repliesPosted.map((call) => sentWithoutKey(call.body)),
     [{ text: "my answer", reply_to: "210", thread_id: data.lone.id }]);
   // Sent, the binding went with the words: the next reply on it is an ordinary one, to Main.
   await replyButton(rowOf(page, "210")).click();
@@ -60809,7 +60849,7 @@ test("`#185 reply-new-thread`: a reply arriving while Reply is open, unticked, l
   assert.equal(page.el("reply-destination").hidden, true);
   await page.el("reply-send").click();
   await page.settle();
-  assert.deepStrictEqual(page.repliesPosted.map((call) => call.body), [{ text: "on the main channel", reply_to: "210" }]);
+  assert.deepStrictEqual(page.repliesPosted.map((call) => sentWithoutKey(call.body)), [{ text: "on the main channel", reply_to: "210" }]);
 });
 
 test("`#185 reply-new-thread`: Edit of a failed new-thread reply whose thread has been answered since puts it back into that thread", async () => {
@@ -60833,7 +60873,7 @@ test("`#185 reply-new-thread`: Edit of a failed new-thread reply whose thread ha
   page.replyResponse = posts;
   await page.el("reply-send").click();
   await page.settle();
-  assert.deepStrictEqual(page.repliesPosted.at(-1).body,
+  assert.deepStrictEqual(sentWithoutKey(page.repliesPosted.at(-1).body),
     { text: "starting a thread on it", reply_to: "210", thread_id: data.lone.id });
 });
 
@@ -60938,7 +60978,7 @@ test("`#267 quote-reply`: Quote reply opens the reply with the words quoted line
   await page.el("reply-text").setValue(`${quote}it is wedged on the cache`);
   await page.el("reply-send").click();
   await page.settle();
-  assert.deepStrictEqual(page.repliesPosted.at(-1).body,
+  assert.deepStrictEqual(sentWithoutKey(page.repliesPosted.at(-1).body),
     { text: `${quote}it is wedged on the cache`, reply_to: "1000000000000000001" },
     "the quote reply did not post as a reply to its message");
 
@@ -61022,7 +61062,7 @@ test("`#267 quote-reply`: on Slack Quote reply is offered too and posts where Re
     await page.el("reply-send").click();
     await page.settle();
     // What Reply posts on each (`#252 thread-button-state`): Slack's server threads it from there.
-    assert.deepStrictEqual(page.repliesPosted.at(-1).body, { text: "> nobody has answered\n\nI will", reply_to: "210" },
+    assert.deepStrictEqual(sentWithoutKey(page.repliesPosted.at(-1).body), { text: "> nobody has answered\n\nI will", reply_to: "210" },
       `${name}: Quote reply did not post as Reply does`);
   }
 });
@@ -65845,7 +65885,7 @@ test("`#277 reply-in-column`: Quote reply in either column quotes the words sele
   await page.el("reply-send").click();
   await page.settle();
   assert.deepStrictEqual(keyless(page.repliesPosted.at(-1).body),
-    { text: "> first thread answer\n\nyes, this", reply_to: "202", thread_id: "spaces/A/threads/one & two", keyed: false });
+    { text: "> first thread answer\n\nyes, this", reply_to: "202", thread_id: "spaces/A/threads/one & two", keyed: true });
 });
 
 test("`#277 reply-in-column`: Escape closes an empty box at once; with words, the first goes to the column's list and keeps the draft, and the next puts the reply down; c goes back to the box", async () => {
@@ -65895,7 +65935,7 @@ test("`#410 inline-reply-editor`: two columns going while a reply is open keep i
   await page.el("reply-send").click();
   await page.settle();
   assert.deepStrictEqual(keyless(page.repliesPosted.at(-1).body),
-    { text: "keep me", reply_to: "202", thread_id: "spaces/A/threads/one & two", keyed: false },
+    { text: "keep me", reply_to: "202", thread_id: "spaces/A/threads/one & two", keyed: true },
     "the reply opened again did not post where it was going");
   await page.setDesk(true);
   assert.ok(inTwoColumns(page));
@@ -66439,7 +66479,7 @@ test("`#419 threads-view-main-messages`: Thread or Reply on a main-channel messa
   await page.el("reply-send").click();
   await page.settle();
   assert.deepStrictEqual(keyless(page.repliesPosted.at(-1).body),
-    { text: "first answer", reply_to: "210", thread_id: data.lone.id, keyed: false }, "the reply did not start 210's thread");
+    { text: "first answer", reply_to: "210", thread_id: data.lone.id, keyed: true }, "the reply did not start 210's thread");
   assert.equal(page.el("channel-composer").hidden, false, "the box at the foot did not come back");
   assert.equal(page.el("channel-composer").parentNode, page.el("side-list"));
   // Reply on 200, which heads no thread here: under it, and Cancel gives the box back.
@@ -66453,7 +66493,7 @@ test("`#419 threads-view-main-messages`: Thread or Reply on a main-channel messa
   await page.el("channel-compose-text").setValue("to everyone");
   await page.el("channel-send").click();
   await page.settle();
-  assert.deepStrictEqual(keyless(page.repliesPosted.at(-1).body), { text: "to everyone", keyed: false },
+  assert.deepStrictEqual(keyless(page.repliesPosted.at(-1).body), { text: "to everyone", keyed: true },
     "the box at the foot did not post to the main channel");
 });
 
@@ -72099,7 +72139,7 @@ for (const reads of ["held", "failing"]) {
       await page.el("reply-text").setValue("an answer to a message that is gone");
       await page.el("reply-send").click();
       for (let i = 0; i < 3; i += 1) await page.settle();
-      const sent = { posted: page.repliesPosted.map((call) => call.body), placing: replyPlacingReads(page, from),
+      const sent = { posted: page.repliesPosted.map((call) => sentWithoutKey(call.body)), placing: replyPlacingReads(page, from),
         state: page.el("reply-state").textContent, open: replyInStream(page), text: page.el("reply-text").value,
         outbox: outgoingRows(page).length };
       return { page, opened, sent, release };
@@ -72165,7 +72205,7 @@ test("`#315 removed-reply-target`: a reply sent before its message was removed, 
     assert.ok(page.expireTimers(retryWait(0)) >= 1, "fixture: the reply was not to be placed again");
     for (let i = 0; i < 3; i += 1) await page.settle();
     const rows = outgoingRows(page);
-    return { page, from, posted: page.repliesPosted.map((call) => call.body), rows: rows.map((row) => row.text()),
+    return { page, from, posted: page.repliesPosted.map((call) => sentWithoutKey(call.body)), rows: rows.map((row) => row.text()),
       state: rows.length ? rows[0].getAttribute("data-send-state") : null };
   };
   const { page, from, posted, rows, state } = await run(SCRIPT);
@@ -72207,7 +72247,7 @@ test("`#315 removed-reply-target`: after a reload during the outage, a reply to 
     await again.el("reply-text").setValue("still answering it");
     await again.el("reply-send").click();
     for (let i = 0; i < 3; i += 1) await again.settle();
-    return { note, posted: again.repliesPosted.map((call) => call.body) };
+    return { note, posted: again.repliesPosted.map((call) => sentWithoutKey(call.body)) };
   };
   const { note, posted } = await run(SCRIPT);
   assert.match(note, /was removed from the channel/, `after a reload Reply did not say the message was removed: ${note}`);
@@ -79420,4 +79460,182 @@ test("`#407 unpack-row-parity`: n goes to the next unread message over unpacked 
   await mouseOnto(page, unpackedRow(page, "700"));
   await pressHere(page, "n");
   assert.equal(heldRow(page), "703", "n did not skip the read rows to the unread reply");
+});
+
+// --- one post per message, whatever the provider ------------------------------------------------
+//
+// `#448 send-dedupe`. The owner sent a long message to a Slack channel; it was cut in three parts and
+// took twelve seconds. "That long message appeared to fail to send the first time, and then on retry
+// appeared to succeed, but apparently that caused message duplication." The server now remembers each
+// keyed post itself, and the page asks it what became of a send whose answer was lost before deciding
+// anything. The provider name and every text here are invented.
+
+const OUTGOING_PROGRESS_MS = sourceConstant("OUTGOING_PROGRESS_MS");
+const OUTGOING_OUTCOME_WAIT_S = sourceConstant("OUTGOING_OUTCOME_WAIT_S");
+
+/** A signed-in channel on a provider that promises nothing per key, as Slack does. */
+async function unkeyedChannel() {
+  const page = newPage();
+  page.chatProviderName = "Other Chat";
+  await signIn(page);
+  await showDiscord(page, []);
+  return page;
+}
+
+const gatewayLost = async () => ({ ok: false, status: 504, text: async () => "<html>Gateway Timeout</html>" });
+const threeParts = (texts) => texts.map((content, at) => message({ id: `944800000000000000${at + 1}`, content }));
+
+test("`#448 send-dedupe`: a send whose answer a gateway lost is confirmed from the server and never posted again", async () => {
+  const page = await unkeyedChannel();
+  const parts = threeParts(["part one. ", "part two. ", "part three"]);
+  page.replyResponse = gatewayLost;
+  page.outcomeResponse = async () => json(200, { posted: parts[0], parts });
+  await sendChannel(page, "part one. part two. part three");
+  assert.equal(page.repliesPosted.length, 1, "the page posted the message again");
+  assert.equal(page.outcomeAsks.length, 1, "the page did not ask what became of the send");
+  const asked = page.outcomeAsks[0];
+  assert.match(asked.path, new RegExp(`/reply/outcome\\?wait=${OUTGOING_OUTCOME_WAIT_S}$`));
+  assert.deepEqual(asked.body, posted(page)[0], "the ask did not name the post that was sent");
+  assert.ok(asked.body.idempotency_key, "a send to a provider that promises nothing went without its key");
+  assert.equal(outgoingRows(page).length, 0, `the send was left as a row: ${outgoingRows(page)[0]?.text()}`);
+  assert.deepEqual(shownIds(page), parts.map((part) => part.id), "the parts the server posted are not drawn");
+  page.expireTimers(60000);
+  await settleSend(page);
+  assert.equal(page.repliesPosted.length, 1, "something sent it again later");
+});
+
+test("`#448 send-dedupe`: a lost answer for a post still landing says which part is going, then Sent", async () => {
+  const page = await unkeyedChannel();
+  const parts = threeParts(["part one. ", "part two. ", "part three"]);
+  page.replyResponse = gatewayLost;
+  let finish;
+  const answers = [
+    async () => json(202, { state: "posting", posted: 1, parts: 3 }),
+    () => new Promise((resolve) => { finish = resolve; }),
+  ];
+  page.outcomeResponse = () => answers.shift()();
+  page.el("channel-compose-text").setValue("part one. part two. part three");
+  const sent = page.el("channel-send").click();
+  await page.settle();
+  await page.settle();
+  const row = outgoingRows(page)[0];
+  assert.equal(row.getAttribute("data-send-state"), "sending");
+  assert.match(row.text(), /Posting part 2 of 3…/);
+  assert.equal(outgoingRetry(row), undefined, "a send still going offered Retry");
+  finish(json(200, { posted: parts[0], parts }));
+  await sent;
+  await page.settle();
+  assert.equal(page.repliesPosted.length, 1);
+  assert.equal(page.outcomeAsks.length, 2);
+  assert.equal(outgoingRows(page).length, 0);
+});
+
+test("`#448 send-dedupe`: a slow send says which part is being posted while its POST is on the wire", async () => {
+  const page = await unkeyedChannel();
+  const parts = threeParts(["part one. ", "part two. ", "part three"]);
+  const finish = delayedReply(page);
+  let progress = { state: "posting", posted: 0, parts: 3 };
+  page.outcomeResponse = async () => json(202, progress);
+  page.el("channel-compose-text").setValue("part one. part two. part three");
+  const sent = page.el("channel-send").click();
+  await page.settle();
+  assert.match(outgoingRows(page)[0].text(), /^You.*Sending…$/, "the row claimed progress before any was known");
+  assert.equal(page.expireTimers(OUTGOING_PROGRESS_MS), 1, "no ask of how far it has got was armed");
+  await page.settle();
+  assert.match(outgoingRows(page)[0].text(), /Posting part 1 of 3…/);
+  progress = { state: "posting", posted: 2, parts: 3 };
+  page.expireTimers(OUTGOING_PROGRESS_MS);
+  await page.settle();
+  assert.match(outgoingRows(page)[0].text(), /Posting part 3 of 3…/);
+  assert.match(page.outcomeAsks[0].path, /\/reply\/outcome\?wait=0$/);
+  assert.equal(page.outcomeAsks[0].body.idempotency_key, posted(page)[0].idempotency_key);
+  finish(json(200, { posted: parts[0], parts }));
+  await sent;
+  await page.settle();
+  const asks = page.outcomeAsks.length;
+  page.expireTimers(OUTGOING_PROGRESS_MS);
+  await page.settle();
+  assert.equal(page.outcomeAsks.length, asks, "the page kept asking after the send was over");
+  assert.equal(page.repliesPosted.length, 1);
+  assert.equal(outgoingRows(page).length, 0);
+});
+
+test("`#448 send-dedupe`: Retry of a send the server has no record of carries the same key; a new message a new one", async () => {
+  const page = await unkeyedChannel();
+  page.replyResponse = async () => ({ ok: false, status: 502, text: async () => "<html>Bad Gateway</html>" });
+  await sendChannel(page, "the same words");
+  const row = outgoingRows(page)[0];
+  assert.equal(row.getAttribute("data-send-state"), "unconfirmed");
+  assert.match(row.text(), /Check history before retrying/);
+  assert.equal(page.outcomeAsks.length, 1, "the page did not ask before leaving it to the reader");
+  page.expireTimers(60000);
+  await settleSend(page);
+  assert.equal(page.repliesPosted.length, 1, "a send nobody can vouch for went again on its own");
+  page.replyResponse = sentOk;
+  await outgoingRetry(row).click();
+  await settleSend(page);
+  assert.equal(page.repliesPosted.length, 2);
+  assert.deepEqual(posted(page)[1], posted(page)[0], "Retry was not the same request under the same key");
+  // The same words written again are another message: a new key, and the server posts it.
+  await sendChannel(page, "the same words");
+  assert.equal(page.repliesPosted.length, 3);
+  assert.equal(posted(page)[2].text, "the same words");
+  assert.notEqual(posted(page)[2].idempotency_key, posted(page)[0].idempotency_key);
+});
+
+test("`#448 send-dedupe`: where a send goes is frozen by its first attempt, so a retry after its reply was moved into a thread asks for the same post", async () => {
+  // A page that draws a reply into the thread it starts before the server's copy arrives (the
+  // reply-promotes-thread work) may rewrite the entry from "reply to X" to "thread X". The key names
+  // the post, and the retry must ask for the post the first attempt made, where it made it.
+  const page = newPage();
+  page.chatProviderName = "Other Chat";
+  page.messages = [message({ id: "210", content: "nobody has answered this" })];
+  await signIn(page);
+  await openReplyOn(page, page.messages);
+  page.replyResponse = async () => ({ ok: false, status: 502, text: async () => "<html>Bad Gateway</html>" });
+  await page.el("reply-text").setValue("an answer");
+  await page.el("reply-send").click();
+  await page.settle();
+  const first = posted(page)[0];
+  assert.equal(first.reply_to, "210");
+  assert.equal(savedOutgoing(page)[0].state, "unconfirmed");
+  // The promotion, as a later page would make it, written where a reload reads it.
+  const saved = savedOutgoing(page);
+  Object.assign(saved[0], { replyTo: null, threadId: "210" });
+  const store = new Map(page.storage);
+  store.set("vibe-talk.outgoing-messages", JSON.stringify(saved));
+  const again = reloadWith(store, page.messages);
+  await signIn(again);
+  await reopenedChannel(again);
+  again.replyResponse = sentOk;
+  await outgoingRetry(outgoingRows(again)[0]).click();
+  await settleSend(again);
+  assert.deepEqual(posted(again)[0], first, "the retry asked for the post somewhere else");
+});
+
+test("`#448 send-dedupe`: a gateway's JSON 5xx is a lost answer too, and the server is asked", async () => {
+  const page = await unkeyedChannel();
+  const parts = threeParts(["one. ", "two"]).slice(0, 2);
+  page.replyResponse = async () => json(504, { message: "upstream timed out" });
+  page.outcomeResponse = async () => json(200, { posted: parts[0], parts });
+  await sendChannel(page, "one. two");
+  assert.equal(page.outcomeAsks.length, 1, "a JSON gateway page was taken for the server's answer");
+  assert.equal(page.repliesPosted.length, 1);
+  assert.equal(outgoingRows(page).length, 0);
+});
+
+test("`#448 send-dedupe`: an ask that never answers ends, and the send is left unconfirmed rather than stuck", async () => {
+  const page = await unkeyedChannel();
+  page.replyResponse = gatewayLost;
+  page.outcomeResponse = () => new Promise(() => {});
+  page.el("channel-compose-text").setValue("down a dead connection");
+  const sent = page.el("channel-send").click();
+  await page.settle();
+  assert.match(outgoingRows(page)[0].text(), /checking whether it went/);
+  page.expireTimers((OUTGOING_OUTCOME_WAIT_S + 10) * 1000);
+  await sent;
+  await page.settle();
+  const row = outgoingRows(page)[0];
+  assert.equal(row.getAttribute("data-send-state"), "unconfirmed", "the send stayed on an ask that never answered");
+  assert.equal(page.repliesPosted.length, 1);
 });

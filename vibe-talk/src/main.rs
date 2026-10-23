@@ -720,6 +720,7 @@ async fn main() -> anyhow::Result<()> {
         message_cache,
         post_gate: Arc::new(vibe_talk::post_gate::PostGate::new()),
         post_lanes: Arc::new(vibe_talk::post_lanes::PostLanes::new()),
+        post_keys: Arc::new(vibe_talk::post_keys::PostKeys::new()),
         reply_reads: Arc::new(vibe_talk::reply_read::ReplyReads::new()),
         live: Arc::clone(&live),
         summarizer,

@@ -139,12 +139,13 @@ async fn a_reply_the_bridge_confirms_without_membership_is_sent_in_its_thread() 
     assert_eq!(answer["posted"]["thread"]["id"], "t_root", "{answer}");
 
     // Retry, as the page's Retry does: the same request under the same key. It is confirmed too,
-    // as the same message, and it asked the bridge for the same post rather than another.
+    // as the same message, and the server answered it from the post it made (`#448
+    // send-dedupe`) without asking the bridge again.
     let (status, again) = call(&state, reply_in_thread()).await;
     assert_eq!(status, StatusCode::OK, "{again}");
     assert_eq!(again["parts"][0]["id"], part["id"], "{again}");
     let requests = requests.lock().expect("requests");
-    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert_eq!(requests.len(), 1, "{requests:?}");
     assert!(
         requests
             .iter()
@@ -152,10 +153,6 @@ async fn a_reply_the_bridge_confirms_without_membership_is_sent_in_its_thread() 
         "{requests:?}"
     );
     assert!(requests[0].1.is_some(), "the post carried no nonce");
-    assert_eq!(
-        requests[0].1, requests[1].1,
-        "a retry must carry the same nonce"
-    );
     task.abort();
 }
 

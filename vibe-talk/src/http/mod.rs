@@ -240,6 +240,10 @@ fn routes(state: AppState) -> Router {
         .route("/api/v1/channels/{channel_id}/digest", get(api::digest))
         .route("/api/v1/channels/{channel_id}/resolve", post(api::resolve))
         .route("/api/v1/channels/{channel_id}/reply", post(api::reply))
+        .route(
+            "/api/v1/channels/{channel_id}/reply/outcome",
+            post(api::reply_outcome),
+        )
         .route("/api/v1/channels/{channel_id}/ask", post(api::ask))
         // `#34 voice-chat-write-confirm`. WRITE scope, all of them, and NO tool reaches the last
         // two: `post_reply` proposes through the first, and only the person the bot speaks for —

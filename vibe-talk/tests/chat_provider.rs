@@ -293,10 +293,18 @@ async fn a_keyed_reply_reaches_a_bridge_under_the_same_nonce_on_every_attempt() 
     let (status, second) = call("POST", reply.clone(), Some(keyed("the same words"))).await;
     assert_eq!(status, StatusCode::OK, "{second}");
 
-    let (status, _) = call("POST", reply.clone(), Some(keyed("other words"))).await;
+    // `#448 send-dedupe`. The key names the post that landed: other words under it are refused
+    // here, and never reach the bridge. A new message is a new key.
+    let (status, reused) = call("POST", reply.clone(), Some(keyed("other words"))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{reused}");
+    assert_eq!(reused["error"], "key_reused", "{reused}");
+    let other = serde_json::json!({"text": "other words", "idempotency_key": "outgoing-key_2"});
+    let (status, _) = call("POST", reply.clone(), Some(other)).await;
     assert_eq!(status, StatusCode::OK);
 
-    let (status, refused) = call("POST", reply.clone(), Some(keyed("refused words"))).await;
+    let refused_words =
+        serde_json::json!({"text": "refused words", "idempotency_key": "outgoing-key_3"});
+    let (status, refused) = call("POST", reply.clone(), Some(refused_words)).await;
     assert_eq!(status, StatusCode::MULTI_STATUS, "{refused}");
     assert_eq!(
         refused["retryable"], false,
@@ -328,10 +336,7 @@ async fn a_keyed_reply_reaches_a_bridge_under_the_same_nonce_on_every_attempt() 
         "a retry of the same text minted a different request id"
     );
     assert!(nonces[0].starts_with("outgoing-key_1."), "{nonces:?}");
-    assert_ne!(
-        nonces[0], nonces[2],
-        "one key named two different texts as the same post"
-    );
+    assert!(nonces[2].starts_with("outgoing-key_2."), "{nonces:?}");
     task.abort();
 }
 

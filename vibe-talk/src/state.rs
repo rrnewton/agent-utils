@@ -122,6 +122,10 @@ pub struct AppState {
     /// see [`crate::post_lanes`]. Every post goes through [`crate::ops::reply_scoped`], which takes
     /// its destination's turn here.
     pub post_lanes: Arc<crate::post_lanes::PostLanes>,
+    /// What became of each keyed post, for a while, whatever its provider. `#448 send-dedupe`; see
+    /// [`crate::post_keys`]. A repeat of a post that landed, or that is landing now, is answered
+    /// with that post's answer and posts nothing. In memory.
+    pub post_keys: Arc<crate::post_keys::PostKeys>,
     /// Per channel, the newest message whose provider read marker this server has moved through,
     /// so that a reply to it, or to anything before it, does not ask the provider again. `#300
     /// reply-marks-read`; see [`crate::reply_read`]. In memory, ids only.

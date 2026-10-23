@@ -186,14 +186,14 @@ async fn a_second_post_to_one_destination_waits_until_the_first_has_landed() {
 
     held.gate.add_permits(1);
     assert_eq!(first.await.expect("first").0, StatusCode::OK);
+    // `#448 send-dedupe`. The retry is the same post under the same key: answered with it, and
+    // never sent to the provider, so B is next.
+    assert_eq!(retry.await.expect("retry").0, StatusCode::OK);
     assert_eq!(
         reached(&held).await,
-        ["A", "A"],
-        "the retry did not go next"
+        ["A", "B"],
+        "the retry reached the provider, or B did not go next"
     );
-    held.gate.add_permits(1);
-    assert_eq!(retry.await.expect("retry").0, StatusCode::OK);
-    assert_eq!(reached(&held).await, ["A", "A", "B"]);
     held.gate.add_permits(1);
     assert_eq!(second.await.expect("second").0, StatusCode::OK);
     assert_eq!(

@@ -163,6 +163,7 @@ impl From<OpError> for ApiError {
             | OpError::HoursWithSpan
             | OpError::CursorMismatch => StatusCode::BAD_REQUEST,
             OpError::ChannelNotWritable => StatusCode::FORBIDDEN,
+            OpError::KeyReused => StatusCode::CONFLICT,
             // A fallback only: the reply route handles this itself, because an `ApiError` body
             // carries a code and prose and this case has to carry the UNSENT TEXT. Reaching here
             // would mean some other caller grew a split path without deciding what to do with the
@@ -2366,7 +2367,7 @@ pub async fn reply(
     Path(channel_id): Path<String>,
     Json(request): Json<ReplyRequest>,
 ) -> Result<Response, ApiError> {
-    match ops::reply_scoped(
+    let result = ops::reply_scoped(
         &state,
         &channel_id,
         &request.text,
@@ -2374,8 +2375,17 @@ pub async fn reply(
         request.thread_id.as_deref(),
         request.idempotency_key.as_deref(),
     )
-    .await
-    {
+    .await;
+    reply_answer(&state, result)
+}
+
+/// A post's answer as the reply route gives it: `200` with every part, or `207` for a post that
+/// landed in part.
+fn reply_answer(
+    state: &AppState,
+    result: Result<(ChannelInfo, Message, Vec<Message>), ops::OpError>,
+) -> Result<Response, ApiError> {
+    match result {
         Ok((channel, mut posted, mut parts)) => {
             // The page draws the acknowledged parts before any read brings them back.
             crate::render::fill(
@@ -2394,6 +2404,82 @@ pub async fn reply(
             Ok(partial) => Ok((StatusCode::MULTI_STATUS, Json(partial)).into_response()),
             Err(other) => Err(other.into()),
         },
+    }
+}
+
+/// The longest `POST .../reply/outcome` waits for a post in flight, in seconds. Under the usual
+/// 30-second proxy idle timeout, as [`PROPOSAL_WAIT_MAX_SECONDS`] is.
+pub const OUTCOME_WAIT_MAX_SECONDS: u64 = 25;
+
+/// Query of the outcome route.
+#[derive(Debug, Deserialize)]
+pub struct OutcomeQuery {
+    /// Seconds to wait for a post still in flight to settle, at most
+    /// [`OUTCOME_WAIT_MAX_SECONDS`]. Absent answers at once.
+    pub wait: Option<u64>,
+}
+
+/// What the outcome route answers for a post still in flight: `202`.
+#[derive(Debug, Serialize)]
+pub struct PostingResponse {
+    /// Always `"posting"`.
+    pub state: &'static str,
+    /// Parts that have landed so far.
+    pub posted: usize,
+    /// Parts in all; 0 before the post is cut.
+    pub parts: usize,
+}
+
+/// `POST /api/v1/channels/{channel_id}/reply/outcome` — what became of a keyed post, posting
+/// nothing. `#448 send-dedupe`.
+///
+/// The body is the reply's own, `idempotency_key` required. A post that landed answers as the
+/// reply did — `200`, or `207` for one that landed in part; one still being posted waits up to
+/// `?wait=` seconds and then answers `202` with how many parts have landed; one this server does
+/// not remember answers `404 post_unknown`, which proves nothing either way.
+pub async fn reply_outcome(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path(channel_id): Path<String>,
+    Query(query): Query<OutcomeQuery>,
+    Json(request): Json<ReplyRequest>,
+) -> Result<Response, ApiError> {
+    let Some(key) = request.idempotency_key.as_deref() else {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "idempotency_key is required: it names the post to look up",
+        ));
+    };
+    let wait =
+        std::time::Duration::from_secs(query.wait.unwrap_or(0).min(OUTCOME_WAIT_MAX_SECONDS));
+    let outcome = ops::post_outcome(
+        &state,
+        &channel_id,
+        &request.text,
+        request.reply_to.as_deref(),
+        request.thread_id.as_deref(),
+        key,
+        wait,
+    )
+    .await?;
+    match outcome {
+        ops::PostOutcome::Settled(result) => reply_answer(&state, *result),
+        ops::PostOutcome::Posting { posted, parts } => Ok((
+            StatusCode::ACCEPTED,
+            Json(PostingResponse {
+                state: "posting",
+                posted,
+                parts,
+            }),
+        )
+            .into_response()),
+        ops::PostOutcome::Unknown => Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "post_unknown",
+            "this server has no record of that post: it was never received, it certainly posted \
+             nothing, or it was sent before a restart",
+        )),
     }
 }
 
