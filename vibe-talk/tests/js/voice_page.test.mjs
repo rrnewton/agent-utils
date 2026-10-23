@@ -17515,6 +17515,26 @@ test("`#462 webapp-deep-links`: a reader who chooses a view while the link is st
   assert.equal(page.el("thread-heading").hidden, true, "the link opened its thread over the reader");
 });
 
+test("`#462 webapp-deep-links`: a reader who chooses another channel while the link is landing keeps it", async () => {
+  const data = threadData();
+  const second = { id: "1110000000000000002", label: "second", writable: true };
+  const page = newPage(new Map(), SCRIPT, (p) => {
+    p.enableHistory();
+    p.setAddress({ search: "?c=1110000000000000001&v=thread&t=spaces%2FA%2Fthreads%2Fanother" });
+  });
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  page.channels = [{ ...CHANNEL }, second];
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  page.el("discord-channel").value = second.id;
+  await page.el("discord-channel").dispatch("change");
+  await untilDeepLink(page, () => page.pure("deepLinkApplied") === true);
+  assert.equal(page.el("discord-channel").value, second.id,
+    "the link moved the reader back to its own channel");
+  assert.equal(page.el("thread-heading").hidden, true, "the link opened its thread over the reader");
+});
+
 test("`#462 webapp-deep-links`: each view round-trips, voice is refused politely, garbage is ignored", async () => {
   const cases = [
     ["main", "main"], ["all", "flat"], ["threads", "threads"],
