@@ -1940,7 +1940,9 @@ impl Writer<'_> {
                     extra,
                 ])?;
                 Stats::add(&self.shared.stats.rows_written, 1);
-                (self.conn.last_insert_rowid(), created)
+                let row_id = self.conn.last_insert_rowid();
+                self.count_reply_on_root(chan_id, message)?;
+                (row_id, created)
             }
             Some(row) => {
                 let (row_id, created) = (row.row_id, row.created_ms);
@@ -2000,6 +2002,7 @@ impl Writer<'_> {
             observed_ms,
             edited_ms: incoming.edited_ms,
             reports_edits: incoming.reports_edits,
+            polled: incoming.polled,
             arrival,
             partial: offered_partial,
         };
@@ -2099,9 +2102,14 @@ impl Writer<'_> {
             }
             next.is_root = message.thread.as_ref().map_or(held.is_root, |t| t.is_root);
             next.numeric_id = rows::numeric_id(message).or(held.numeric_id);
+            let thread = self.root_count_floor(
+                held.row_id,
+                message.thread.clone(),
+                held_extra.thread.as_ref(),
+            )?;
             next.extra = serde_json::to_string(&Extra {
                 timestamp: message.timestamp.clone(),
-                thread: message.thread.clone().or(held_extra.thread),
+                thread: thread.or(held_extra.thread),
                 // A copy that could not see reactions never erases ones a read brought.
                 reactions: message.reactions.clone().or(held_extra.reactions),
                 // Nor does a copy that named no mention erase the names a read found: a name is
@@ -2176,6 +2184,92 @@ impl Writer<'_> {
     fn search_text(&self, provider_key: &str, message: &crate::model::Message) -> String {
         let rendered = self.shared.search_text.rendered(provider_key, message);
         super::search_text::build(&message.author, &message.content, &rendered)
+    }
+
+    /// A reply the file did not hold proves its root has at least one reply. `#470 replication-c8-root-count`.
+    ///
+    /// Where the held root's own thread record still says none — its copy predates the reply: a
+    /// reply this server just posted, or one a read of the thread brought before the root was read
+    /// again — it is raised to one, marked not exact, so a root served from the file is not drawn
+    /// unanswered beside its own reply. Only ever up from none, never a count: the provider's own
+    /// count comes with the next copy of the root, which replaces this as any newer copy does.
+    fn count_reply_on_root(
+        &mut self,
+        chan_id: i64,
+        message: &crate::model::Message,
+    ) -> rusqlite::Result<()> {
+        let Some(thread) = message.thread.as_ref().filter(|thread| !thread.is_root) else {
+            return Ok(());
+        };
+        let Some(root_id) = thread.root_message_id.as_ref() else {
+            return Ok(());
+        };
+        let Some(root) = self
+            .hot
+            .row_select
+            .query_row(params![chan_id, root_id.0], Row::from_sql)
+            .optional()?
+        else {
+            return Ok(());
+        };
+        let mut extra: Extra = serde_json::from_str(&root.extra).unwrap_or_default();
+        let Some(record) = extra
+            .thread
+            .as_mut()
+            .filter(|record| record.is_root && record.id == thread.id)
+        else {
+            return Ok(());
+        };
+        if record.reply_count.unwrap_or(0) > 0 {
+            return Ok(());
+        }
+        record.reply_count = Some(1);
+        record.reply_count_exact = false;
+        let Ok(extra) = serde_json::to_string(&extra) else {
+            return Ok(());
+        };
+        self.conn.execute(
+            "UPDATE message SET extra = ?1, thread_id = ?2 WHERE row_id = ?3",
+            params![extra, thread.id, root.row_id],
+        )?;
+        Ok(())
+    }
+
+    /// The thread record a newer copy of a root brings, kept at no fewer replies than the file
+    /// holds for it when it says none and the held record said some. `#470
+    /// replication-c8-root-count`.
+    ///
+    /// A read that began before a reply was posted (the server's own, say) can land after the
+    /// reply's row, observed later than the root's held copy, with the root's count of none: it
+    /// would draw the root unanswered beside its own reply again. While the file holds a reply,
+    /// the root has at least that many, marked not exact; once the reply is gone (a listing of the
+    /// thread, a deletion) the provider's own count stands again.
+    fn root_count_floor(
+        &mut self,
+        root_row: i64,
+        offered: Option<crate::threads::MessageThread>,
+        held: Option<&crate::threads::MessageThread>,
+    ) -> rusqlite::Result<Option<crate::threads::MessageThread>> {
+        let Some(mut record) = offered else {
+            return Ok(None);
+        };
+        let offered_none = record.is_root && record.reply_count.unwrap_or(0) == 0;
+        let held_some = held.is_some_and(|held| held.is_root && held.reply_count.unwrap_or(0) > 0);
+        if !(offered_none && held_some) {
+            return Ok(Some(record));
+        }
+        let replies: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM message AS reply, message AS root
+             WHERE root.row_id = ?1 AND reply.chan = root.chan AND reply.thread_id = ?2
+               AND reply.is_root = 0 AND reply.row_id != root.row_id",
+            params![root_row, record.id],
+            |row| row.get(0),
+        )?;
+        if replies > 0 {
+            record.reply_count = Some(u64::try_from(replies).unwrap_or(0));
+            record.reply_count_exact = false;
+        }
+        Ok(Some(record))
     }
 
     /// Thread records from a message: a root that has replies, or a reply.

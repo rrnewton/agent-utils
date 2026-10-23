@@ -449,10 +449,11 @@ pub fn single(
 pub fn pushed(shape: Shape, live: &LiveMessage, by: PushedBy, observed_ms: i64) -> Observation {
     let push = match live.kind {
         LiveKind::Create | LiveKind::Update => Push::Upsert {
-            message: Box::new(
-                Incoming::new(live.message.clone(), home(shape, &live.message, None))
-                    .reporting_edits(by == PushedBy::Poller && shape.reports_edits()),
-            ),
+            message: Box::new(Incoming {
+                polled: by == PushedBy::Poller,
+                ..Incoming::new(live.message.clone(), home(shape, &live.message, None))
+                    .reporting_edits(by == PushedBy::Poller && shape.reports_edits())
+            }),
             update: live.kind == LiveKind::Update,
             partial: false,
         },

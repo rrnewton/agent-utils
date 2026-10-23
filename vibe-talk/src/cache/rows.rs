@@ -99,6 +99,11 @@ pub struct Incoming {
     /// with no edit time is of a message not edited when it was read ([`super::merge`], rule 2).
     /// Set by [`super::observe`] for the providers that do.
     pub reports_edits: bool,
+    /// Whether this copy is the live poller's own read, published on the feed, rather than a
+    /// change the feed carried: it is the message as the poller's read found it, never one held
+    /// back behind a later edit. Set by [`super::observe::pushed`]. `#469
+    /// replication-model-tests`.
+    pub polled: bool,
 }
 
 impl Incoming {
@@ -124,6 +129,7 @@ impl Incoming {
             home,
             edited_ms,
             reports_edits: false,
+            polled: false,
         }
     }
 

@@ -13,7 +13,9 @@
 //!    never replaces it, however late it was observed; and where every copy a provider gives
 //!    reports the message's edits ([`Offered::reports_edits`]), a copy that reports none is of a
 //!    version older than a held copy that reports one, and one that reports an edit is newer than
-//!    a held copy that reports none. That is what keeps a copy a provider served from memory (a
+//!    a held copy that reports none. A creation the feed carried is the message as first written,
+//!    so it is older than a held copy that reports an edit, however late it is delivered; the live
+//!    poller's own reads, which it publishes as creations, are not such a creation. That is what keeps a copy a provider served from memory (a
 //!    Slack reply Flat last read in full up to a quarter of an hour before, offered as seen at the
 //!    window's start) from putting back text a later read had already replaced. But a copy with no
 //!    edit time, from a path that cannot say, may bring a later version than the held time is of,
@@ -105,6 +107,9 @@ pub struct Offered<'a> {
     /// may a change an adapter pushes for any provider, so theirs are compared by edit time only
     /// where both copies carry one.
     pub reports_edits: bool,
+    /// Whether it is the live poller's own read published on the feed, not a change the feed
+    /// carried ([`super::Incoming::polled`]).
+    pub polled: bool,
     /// How it arrived.
     pub arrival: Arrival,
     /// Whether the sender marked it as possibly a snippet.
@@ -129,6 +134,18 @@ pub enum Verdict {
 /// that can be told: `Less` when the offered copy is the earlier. See rule 2.
 #[must_use]
 pub fn edit_order(held: &Held<'_>, offered: &Offered<'_>) -> Option<std::cmp::Ordering> {
+    // A creation the feed carried is the message as first written, so it is older than any held
+    // copy that reports an edit, however late the feed delivers it: an event retried, or one
+    // queued behind reads that have since seen the edit. Not the live poller's own reads, which
+    // it publishes as creations and which are the message as its read found it.
+    // `#469 replication-model-tests`.
+    if offered.arrival == Arrival::PushCreate
+        && !offered.polled
+        && offered.edited_ms.is_none()
+        && held.edited_ms.is_some()
+    {
+        return Some(std::cmp::Ordering::Less);
+    }
     match (offered.edited_ms, held.edited_ms) {
         (Some(offered_ms), Some(held_ms)) => Some(offered_ms.cmp(&held_ms)),
         (Some(_), None) if offered.reports_edits => Some(std::cmp::Ordering::Greater),
@@ -269,10 +286,54 @@ mod tests {
                 observed_ms,
                 edited_ms: None,
                 reports_edits: false,
+                polled: false,
                 arrival,
                 partial: false,
             },
         )
+    }
+
+    #[test]
+    fn a_late_pushed_creation_never_replaces_an_edited_copy() {
+        // `#469 replication-model-tests`: the creation event, retried or queued behind reads that
+        // have since seen an edit, arrives with no edit time and the latest observation.
+        let held_hash = crate::cache::rows::content_hash("edited");
+        let offered_hash = crate::cache::rows::content_hash("first");
+        let held = Held {
+            content: "edited",
+            content_hash: &held_hash,
+            observed_ms: 20,
+            edited_ms: Some(15),
+            partial: false,
+        };
+        let creation = Offered {
+            content: "first",
+            content_hash: &offered_hash,
+            observed_ms: 30,
+            edited_ms: None,
+            reports_edits: false,
+            polled: false,
+            arrival: Arrival::PushCreate,
+            partial: false,
+        };
+        assert_eq!(edit_order(&held, &creation), Some(std::cmp::Ordering::Less));
+        assert_eq!(content_verdict(&held, &creation), Verdict::Keep);
+        // A pushed edit with no edit time is still taken as rule 2 says: it may be the later one.
+        let edit = Offered {
+            arrival: Arrival::PushUpdate,
+            ..creation
+        };
+        assert_eq!(
+            content_verdict(&held, &edit),
+            Verdict::Replace { partial: true }
+        );
+        // The live poller's own read, published as a creation, is the message as read: not
+        // ranked older, so a bridge's newer read copy with no edit time is taken as before.
+        let polled = Offered {
+            polled: true,
+            ..creation
+        };
+        assert_eq!(edit_order(&held, &polled), None);
     }
 
     #[test]
@@ -304,6 +365,7 @@ mod tests {
             observed_ms: 40,
             edited_ms: Some(200),
             reports_edits: false,
+            polled: false,
             arrival: Arrival::Listing,
             partial: false,
         };
@@ -334,6 +396,7 @@ mod tests {
             observed_ms: 90,
             edited_ms,
             reports_edits,
+            polled: false,
             arrival,
             partial: false,
         };
@@ -446,6 +509,7 @@ mod tests {
                         observed_ms: at,
                         edited_ms: Some(200),
                         reports_edits,
+                        polled: false,
                         arrival,
                         partial: false,
                     };

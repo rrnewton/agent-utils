@@ -2469,6 +2469,8 @@ mod coverage_race_tests;
 #[cfg(test)]
 pub(crate) mod fixtures;
 #[cfg(test)]
+mod model_tests;
+#[cfg(test)]
 mod privacy_tests;
 #[cfg(test)]
 mod race_tests;
