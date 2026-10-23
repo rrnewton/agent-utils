@@ -3702,6 +3702,7 @@ pub const PURGED: &[&str] = &[
     "voice_settings",
     "voice_prompt",
     "voice_post_prefix",
+    "client_settings",
     "message_cache",
 ];
 

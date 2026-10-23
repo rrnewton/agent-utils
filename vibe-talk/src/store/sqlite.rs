@@ -6663,11 +6663,13 @@ mod tests {
         // The bundled SQLite is new enough for `DROP COLUMN`, as the README requires.
         let connection = Connection::open(&file).expect("open for the rollback");
         // Newest first, as the README has it: a file at this build is past the detail step, and
-        // each later step is undone by its own note before this one is reached. The one later
-        // step there is adds a table, dropped here as its note says.
+        // each later step is undone by its own note before this one is reached. The later
+        // steps there are add a table each, dropped here as their notes say.
         connection
-            .execute_batch("DROP TABLE IF EXISTS thread_hues;")
-            .expect("undo the thread-hues step");
+            .execute_batch(
+                "DROP TABLE IF EXISTS client_settings; DROP TABLE IF EXISTS thread_hues;",
+            )
+            .expect("undo the later steps");
         let pasted: String = statements.iter().map(|line| format!("{line}\n")).collect();
         connection
             .execute_batch(&pasted)
