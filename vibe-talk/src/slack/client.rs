@@ -166,6 +166,10 @@ pub struct HttpSlackClient {
     /// the post goes in without reading the thread first. `#448 send-dedupe`; see
     /// `super::timeline::ROOTS_KEEP`.
     pub(super) posted_roots: Mutex<HashMap<(String, String), Instant>>,
+    /// Whether Slack, as this client reaches it, has handed back an operation key on a message:
+    /// the proof that the transport passes `metadata` through both ways. Until then reads are not
+    /// promised to return one. `#465 replication-c6-op-key-marker`.
+    op_keys_returned: std::sync::atomic::AtomicBool,
 }
 
 impl HttpSlackClient {
@@ -232,6 +236,7 @@ impl HttpSlackClient {
             shim_profile: None,
             directory_pages: crate::directory::Kept::default(),
             posted_roots: Mutex::new(HashMap::new()),
+            op_keys_returned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -624,7 +629,8 @@ impl HttpSlackClient {
             .filter_map(|(id, found)| found.map(|found| ((*id).to_owned(), found)))
             .collect();
         let channels = self.mentioned_channels(raws).await;
-        raws.iter()
+        let messages: Vec<Message> = raws
+            .iter()
             .filter_map(|raw| {
                 let message =
                     raw.to_message(channel, &resolved, &channels, self.owner_user_id.as_deref());
@@ -633,7 +639,12 @@ impl HttpSlackClient {
                 }
                 message
             })
-            .collect()
+            .collect();
+        if messages.iter().any(|message| message.op_key.is_some()) {
+            self.op_keys_returned
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        messages
     }
 
     /// Resolve a vibe-talk channel id into its Slack conversation and optional thread.
@@ -842,6 +853,8 @@ impl Raw {
             // Formed when the message is served (`ops::stamp` asks this client's
             // `upstream_url`), never at read: the workspace address may not be learned yet.
             upstream_url: None,
+            // The operation key a keyed post filed in its metadata. `#465 replication-c6-op-key-marker`.
+            op_key: op_key_of(&self.value),
         })
     }
 }
@@ -967,9 +980,41 @@ impl ChatClient for HttpSlackClient {
         content: &str,
         reply_to: Option<&MessageId>,
     ) -> Result<Message, ChatError> {
-        self.thread_post(channel, thread_id, content, reply_to)
+        self.thread_post(channel, thread_id, content, reply_to, None)
             .await
             .map_err(|error| error.with_provider(&self.provider_name))
+    }
+
+    async fn post_in_thread_keyed(
+        &self,
+        channel: &ChannelId,
+        thread_id: &str,
+        content: &str,
+        reply_to: Option<&MessageId>,
+        key: Option<&str>,
+    ) -> Result<Message, ChatError> {
+        self.thread_post(channel, thread_id, content, reply_to, key)
+            .await
+            .map_err(|error| error.with_provider(&self.provider_name))
+    }
+
+    /// Slack keeps message metadata, invisible in its clients and returned by
+    /// `conversations.history` and `conversations.replies` when asked for; Slack does not
+    /// deduplicate by it. Every keyed post carries its key. `#465 replication-c6-op-key-marker`.
+    ///
+    /// Readable only from Slack's own Web API, and only once it has returned a key. A bridge in
+    /// front of Slack is never readable, whatever it echoes: one whose client cannot read message
+    /// metadata can only hand back the keys of posts it saw succeed, from memory, so a post whose
+    /// answer was lost never shows its key, and a read without one proves nothing.
+    fn op_key_carrier(&self, _channel: &ChannelId) -> crate::chat::OpKeyCarrier {
+        crate::chat::OpKeyCarrier {
+            carried: true,
+            dedupes: crate::chat::OpKeyDedupe::Never,
+            readable: super::is_official_slack_api_base(&self.api_base)
+                && self
+                    .op_keys_returned
+                    .load(std::sync::atomic::Ordering::Relaxed),
+        }
     }
 
     async fn fetch_thread_message(
@@ -1274,10 +1319,52 @@ impl ChatClient for HttpSlackClient {
         content: &str,
         reply_to: Option<&MessageId>,
     ) -> Result<Message, ChatError> {
-        self.post(channel, content, reply_to)
+        self.post(channel, content, reply_to, None)
             .await
             .map_err(|error| error.with_provider(&self.provider_name))
     }
+
+    async fn post_message_keyed(
+        &self,
+        channel: &ChannelId,
+        content: &str,
+        reply_to: Option<&MessageId>,
+        key: Option<&str>,
+    ) -> Result<Message, ChatError> {
+        self.post(channel, content, reply_to, key)
+            .await
+            .map_err(|error| error.with_provider(&self.provider_name))
+    }
+}
+
+/// The `event_type` vibe-talk's operation-key metadata is filed under. `#465
+/// replication-c6-op-key-marker`. Its own name, so metadata a transport files for its own purposes
+/// under another type is never read as a key.
+pub const OP_KEY_EVENT_TYPE: &str = "vibe_talk_op_key";
+
+/// The `metadata` parameter of a `chat.postMessage` carrying `key`: Slack's documented shape,
+/// `{event_type, event_payload}`.
+pub(super) fn op_key_metadata(key: &str) -> String {
+    serde_json::json!({
+        "event_type": OP_KEY_EVENT_TYPE,
+        "event_payload": { "op_key": key },
+    })
+    .to_string()
+}
+
+/// The operation key a message object carries in vibe-talk's metadata, if any. Metadata another
+/// app filed under another `event_type` is not ours and is ignored.
+pub(super) fn op_key_of(value: &Value) -> Option<String> {
+    let metadata = value.get("metadata")?;
+    if metadata.get("event_type").and_then(Value::as_str) != Some(OP_KEY_EVENT_TYPE) {
+        return None;
+    }
+    metadata
+        .get("event_payload")
+        .and_then(|payload| payload.get("op_key"))
+        .and_then(Value::as_str)
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -1300,6 +1387,59 @@ mod tests {
             workspace_url: None,
         })
         .expect("client")
+    }
+
+    fn client_at(api_base: &str) -> HttpSlackClient {
+        HttpSlackClient::new(&SlackConfig {
+            provider_name: "Slack".to_owned(),
+            api_base: api_base.to_owned(),
+            token: Secret::new("xoxp-not-a-real-token"),
+            owner_user_id: None,
+            request_timeout_seconds: 5,
+            channel_registration: false,
+            registered_channels_writable: false,
+            channel_discovery: false,
+            upstream_clear: false,
+            max_post_chars: None,
+            max_post_bytes: None,
+            workspace_url: None,
+        })
+        .expect("client")
+    }
+
+    #[tokio::test]
+    async fn only_slack_itself_is_readable_and_only_once_a_key_came_back() {
+        // `#465 replication-c6-op-key-marker`. A message as a read returns it with our metadata,
+        // and one with another party's.
+        let ours = Raw::parse(serde_json::json!({
+            "ts": "1700000000.000100", "user": "U0ADA", "text": "on it",
+            "user_profile": {"display_name": "Ada"},
+            "metadata": {"event_type": OP_KEY_EVENT_TYPE, "event_payload": {"op_key": "k.1"}},
+        }))
+        .expect("raw");
+        let channel = ChannelId("C0123ABCDE".to_owned());
+        for (base, readable_after) in [
+            ("https://slack.com/api", true),
+            ("https://slack.example/api", false),
+        ] {
+            let client = client_at(base);
+            let before = client.op_key_carrier(&channel);
+            assert!(before.carried && !before.readable, "{base}: {before:?}");
+            let read = client.messages(&channel, std::slice::from_ref(&ours)).await;
+            assert_eq!(read[0].op_key.as_deref(), Some("k.1"));
+            assert_eq!(
+                client.op_key_carrier(&channel).readable,
+                readable_after,
+                "{base}: a bridge that echoes some keys is still not readable"
+            );
+        }
+        assert_eq!(
+            op_key_of(
+                &serde_json::json!({"metadata": {"event_type": "vibe_talk_post",
+            "event_payload": {"op_key": "theirs"}}})
+            ),
+            None
+        );
     }
 
     #[test]

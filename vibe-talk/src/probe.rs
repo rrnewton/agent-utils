@@ -1047,6 +1047,7 @@ mod tests {
                     heading: None,
                     mentions: Vec::new(),
                     upstream_url: None,
+                    op_key: None,
                 }])
             }
             async fn post_message(

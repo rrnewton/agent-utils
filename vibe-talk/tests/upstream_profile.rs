@@ -585,6 +585,14 @@ impl ChatClient for Recorder {
         self.note("supports_idempotent_posts");
         true
     }
+    fn op_key_carrier(&self, _channel: &ChannelId) -> vibe_talk::chat::OpKeyCarrier {
+        self.note("op_key_carrier");
+        vibe_talk::chat::OpKeyCarrier {
+            carried: true,
+            dedupes: vibe_talk::chat::OpKeyDedupe::Always,
+            readable: true,
+        }
+    }
     async fn post_message_keyed(
         &self,
         _channel: &ChannelId,
@@ -885,6 +893,8 @@ async fn every_method_reaches_the_wrapped_clients_own_override_and_each_upstream
     ran("post_message");
     assert!(client.supports_idempotent_posts());
     ran("supports_idempotent_posts");
+    assert!(client.op_key_carrier(&channel).readable);
+    ran("op_key_carrier");
     client
         .post_message_keyed(&channel, "hi", None, Some("k"))
         .await

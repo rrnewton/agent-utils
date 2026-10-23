@@ -171,6 +171,9 @@ pub(crate) struct Extra {
     /// `#320 slack-edited-mark`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) edited_timestamp: Option<String>,
+    /// The operation key the provider carried on the message, as [`Message::op_key`]. `#465 replication-c6-op-key-marker`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) op_key: Option<String>,
 }
 
 /// Provider creation time, derived as `ops::message_ms` derives it: the id's own time first (a
@@ -238,6 +241,7 @@ pub(crate) fn reconstruct(
         heading: None,
         mentions: extra.mentions,
         upstream_url: None,
+        op_key: extra.op_key,
     }
 }
 

@@ -137,6 +137,8 @@ impl HttpSlackClient {
         if inclusive {
             params.push(("inclusive", "true".to_owned()));
         }
+        // So a message posted with an operation key comes back with it. `#465 replication-c6-op-key-marker`.
+        params.push(("include_all_metadata", "true".to_owned()));
         let value = self.call(method, &params).await?;
         let raws = value
             .get("messages")

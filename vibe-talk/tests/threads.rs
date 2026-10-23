@@ -43,6 +43,7 @@ fn message(id: &str, content: &str, thread: bool) -> Message {
         heading: None,
         mentions: Vec::new(),
         upstream_url: None,
+        op_key: None,
     }
 }
 

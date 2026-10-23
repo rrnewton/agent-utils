@@ -679,6 +679,13 @@
           "description": "Whether the owner's noise rules call this message read already. `#196 auto-read-noise`.\n\nDECIDED BY THIS SERVER EVERY TIME the message is served, from its current text, by\n[`crate::noise::NoiseFilter::mark`]; it is never stored and never trusted from whoever\nsent the message. That is what lets an edited placeholder come back as unread, and a\nremoved rule un-hide everything it caught, without a single record having to change.\n\nThe page reads this flag rather than matching the text itself, so there is one predicate\nand it is the server's. Absent means `false`, which is also what an older server meant.",
           "type": "boolean"
         },
+        "op_key": {
+          "description": "The operation key this message was posted with, where its provider carries one invisibly\nand returned it on this copy: exactly the key handed to the post\n([`crate::chat::ChatClient::post_message_keyed`]). `#465 replication-c6-op-key-marker`. Provider-neutral,\nso nothing that reads it needs to know where it came from\n([`crate::chat::ChatClient::op_key_carrier`] says whether a provider returns it at all).\nABSENT IS \"NONE CARRIED\": a message nobody keyed, or one from a provider or path that cannot\nsay, and a copy without it never takes away one another copy brought.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "reactions": {
           "description": "The emoji people reacted to this message with, and how many of each. `#219\nemoji-reactions`.\n\nABSENT AND EMPTY ARE DIFFERENT ANSWERS. Absent (`None`) means this copy came by a path that\ncannot see reactions: a provider that does not report them, or a live echo of a message,\nwhich carries none. Empty means the source looked and there are none. So a live copy\nwithout reactions never overwrites a held copy that has them — the echo of a message\narrives after the read that brought its acknowledgements — while a read replaces them, as\nit replaces the rest of the message. Discord omits the array when there are none, so on\nthat provider absent from a read means none. Slack omits it too, and so does a Slack bridge\nthat cannot supply reactions, so there it stays \"not reported\" (`#312 slack-reactions`).\n\nCounts, and whether the owner is among those who reacted, never who else did: that is a\nseparate question for each emoji, and asking it would hand this server identities it has\nno use for. UNTRUSTED: a custom emoji's name is written by whoever made it.",
           "items": {

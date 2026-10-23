@@ -693,6 +693,16 @@ declare namespace VibeTalk {
      */
     noise?: boolean;
     /**
+     * The operation key this message was posted with, where its provider carries one invisibly
+     * and returned it on this copy: exactly the key handed to the post
+     * ([`crate::chat::ChatClient::post_message_keyed`]). `#465 replication-c6-op-key-marker`. Provider-neutral,
+     * so nothing that reads it needs to know where it came from
+     * ([`crate::chat::ChatClient::op_key_carrier`] says whether a provider returns it at all).
+     * ABSENT IS "NONE CARRIED": a message nobody keyed, or one from a provider or path that cannot
+     * say, and a copy without it never takes away one another copy brought.
+     */
+    op_key?: string | null;
+    /**
      * The emoji people reacted to this message with, and how many of each. `#219
      * emoji-reactions`.
      *

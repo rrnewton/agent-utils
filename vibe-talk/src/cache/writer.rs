@@ -1915,6 +1915,7 @@ impl Writer<'_> {
                     reactions: message.reactions.clone(),
                     mentions: message.mentions.clone(),
                     edited_timestamp: message.edited_timestamp.clone(),
+                    op_key: message.op_key.clone(),
                 })
                 .unwrap_or_else(|_| "{}".to_owned());
                 let search_text = self.search_text(&chan.provider_key, message);
@@ -2115,6 +2116,9 @@ impl Writer<'_> {
                     message.edited_timestamp.clone(),
                     held_extra.edited_timestamp,
                 ),
+                // A message is posted with one key or none, so a copy that cannot see it never
+                // takes it away. `#465 replication-c6-op-key-marker`.
+                op_key: message.op_key.clone().or(held_extra.op_key),
             })
             .unwrap_or(held.extra.clone());
         }

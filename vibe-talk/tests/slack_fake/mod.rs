@@ -111,6 +111,24 @@ pub struct FakeState {
     /// How long every `chat.postMessage` takes before it is answered — and before it is posted —
     /// as a slow bridge in front of Slack does. `#448 send-dedupe`.
     pub post_delay: Option<std::time::Duration>,
+    /// Drop `chat.postMessage`'s `metadata`, as a transport in front of Slack that does not pass
+    /// it through would: the message is posted without it. `#465 replication-c6-op-key-marker`.
+    pub drops_metadata: bool,
+}
+
+/// Take `metadata` off every message of a read answer that did not ask for it with
+/// `include_all_metadata`, as Slack does.
+fn strip_metadata(answer: &mut Value, params: &HashMap<String, String>) {
+    if params.get("include_all_metadata").map(String::as_str) == Some("true") {
+        return;
+    }
+    if let Some(messages) = answer.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages {
+            if let Some(fields) = message.as_object_mut() {
+                fields.remove("metadata");
+            }
+        }
+    }
 }
 
 /// A `conversations.replies` request answered late, so a test can act while a read is in flight.
@@ -590,7 +608,11 @@ fn handle(shared: &Mutex<FakeState>, uri: &Uri, headers: &HeaderMap, body: &[u8]
             ok(json!({}))
         }
         "conversations.history" => match state.history.get(&channel) {
-            Some(list) => ok(window(list.clone(), &params, cap, true)),
+            Some(list) => {
+                let mut answer = window(list.clone(), &params, cap, true);
+                strip_metadata(&mut answer, &params);
+                ok(answer)
+            }
             None => err("channel_not_found"),
         },
         "conversations.replies" => {
@@ -631,6 +653,7 @@ fn handle(shared: &Mutex<FakeState>, uri: &Uri, headers: &HeaderMap, body: &[u8]
                     messages.insert(0, root);
                 }
             }
+            strip_metadata(&mut answer, &params);
             ok(answer)
         }
         "chat.postMessage" => {
@@ -651,6 +674,9 @@ fn handle(shared: &Mutex<FakeState>, uri: &Uri, headers: &HeaderMap, body: &[u8]
             let mut message = json!({"type": "message", "ts": ts, "user": SELF_USER,
                 "bot_id": "BBOTSELF1", "text": params.get("text").cloned().unwrap_or_default(),
                 "bot_profile": {"name": "vibe-bot"}});
+            if let Some(metadata) = params.get("metadata").filter(|_| !state.drops_metadata) {
+                message["metadata"] = serde_json::from_str(metadata).expect("metadata is JSON");
+            }
             match params.get("thread_ts") {
                 Some(thread) => {
                     message["thread_ts"] = json!(thread);

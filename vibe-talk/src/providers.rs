@@ -1191,6 +1191,16 @@ impl ChatClient for ChatRouter {
             .any(|entry| entry.client.supports_idempotent_posts())
     }
 
+    /// The channel's own provider's carrier: a Slack channel's key is metadata, a bridge
+    /// channel's beside it a provider request id. A channel no provider holds carries nothing.
+    /// `#465 replication-c6-op-key-marker`.
+    fn op_key_carrier(&self, channel: &ChannelId) -> crate::chat::OpKeyCarrier {
+        self.route(channel)
+            .map_or(crate::chat::OpKeyCarrier::NONE, |entry| {
+                entry.client.op_key_carrier(channel)
+            })
+    }
+
     async fn post_message_keyed(
         &self,
         channel: &ChannelId,

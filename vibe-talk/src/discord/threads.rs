@@ -1544,16 +1544,22 @@ impl HttpDiscordClient {
                 if let Some(message) = reply_to {
                     self.thread_message(channel, id, message).await?;
                 }
-                let value = self
-                    .send(post_request_with_nonce(
-                        &self.api_base,
-                        &ChannelId(id.to_owned()),
-                        content,
-                        reply_to,
-                        None,
-                        &self.post_limit,
-                    )?)
-                    .await?;
+                // Discord's own `nonce` for a keyed post, where this is Discord itself. `#465 replication-c6-op-key-marker`.
+                let nonce = key
+                    .filter(|_| !self.channel_registration && self.is_discord_itself())
+                    .map(super::discord_op_nonce);
+                let mut request = post_request_with_nonce(
+                    &self.api_base,
+                    &ChannelId(id.to_owned()),
+                    content,
+                    reply_to,
+                    nonce.as_deref(),
+                    &self.post_limit,
+                )?;
+                if nonce.is_some() {
+                    super::enforce_nonce(&mut request);
+                }
+                let value = self.send(request).await?;
                 let mut message = parse_message(&value)?;
                 if message.channel_id.as_str() != id {
                     return Err(shape("thread post returned a different channel"));

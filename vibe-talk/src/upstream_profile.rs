@@ -1850,6 +1850,10 @@ impl ChatClient for ProfiledClient {
         self.inner.supports_idempotent_posts()
     }
 
+    fn op_key_carrier(&self, channel: &crate::model::ChannelId) -> crate::chat::OpKeyCarrier {
+        self.inner.op_key_carrier(channel)
+    }
+
     async fn post_message_keyed(
         &self,
         channel: &ChannelId,

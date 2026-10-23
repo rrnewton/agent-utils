@@ -3385,7 +3385,10 @@ once per logical post and kept unchanged across internal HTTP retries; bridges m
 through as their provider request id. When the caller of the reply route sends an `idempotency_key`,
 each part's nonce is derived from that key and the part's own text instead, so the caller's retry of
 the same text reuses the same request id (`#195 send-resilience`); a `207` says whether its unsent
-remainder keeps that property (`resumable`). Direct Discord posts do not carry this bridge-only field. The bridge must
+remainder keeps that property (`resumable`). Direct Discord posts do not carry this bridge-only field;
+a keyed post to Discord itself carries Discord's own `nonce` (a 25-character fold of the part's key)
+with `enforce_nonce`, which Discord honours for a few minutes (`#465 replication-c6-op-key-marker`;
+see "The operation key on a post" below). The bridge must
 implement idempotent `DELETE /channels/{id}`: deleting an already-absent registration still succeeds
 with `204 No Content`. Opt in with `discord.channel_registration = true`. Settings then accepts a
 channel link or provider reference, lets the bridge resolve it to the stable id used by vibe-talk,
@@ -3393,6 +3396,24 @@ checks that id is readable, and hides the writable checkbox. Only rows originall
 this managed flow are unregistered upstream on removal; direct and pre-migration rows remain local-only.
 Direct Discord deployments keep the existing id, label, default-off explicit writable switch, and must
 leave this setting off.
+
+**The operation key on a post** (`#465 replication-c6-op-key-marker`). A post sent with an
+`idempotency_key` hands each part's key to the provider's own invisible carrier, where it has one, and every read hands back a
+key it finds there as the message's `op_key`, so nothing above the provider asks which one it is:
+
+| Provider | Carrier | A repeat of the key | Reads return it |
+|---|---|---|---|
+| Slack | message `metadata`, `event_type` `vibe_talk_op_key`, `event_payload.op_key`; reads ask for it with `include_all_metadata` | posts again | from Slack's own Web API, once it has handed one back; through a bridge, never promised (it may echo only the keys of posts it saw succeed) |
+| A registration bridge (Google Chat) | the `nonce`, the provider request id | answered with the first post | no |
+| Discord itself | `nonce` and `enforce_nonce` | answered with the first post, for about two minutes | no |
+| Anything else | none | posts again | no |
+
+A transport in front of Slack that drops `metadata` posts the message without it, and reads then find
+no key; nothing is invented. Where reads are not promised to return every key (a bridge in front of
+Slack, which may only echo the keys of posts it saw succeed), a read without a key proves nothing: a
+send whose answer was lost is matched by its words instead, and a key once seen is never cleared
+because a later copy lacks it. Metadata filed under any other `event_type` is never read as a key. The cache keeps a message's key with it, and a later copy without one
+never takes it away.
 
 A registration-capable bridge may also list the channels its account can see, which lets
 Settings offer **Browse channels** (`#19 channel-browser`): a searchable list with one-tap Add and

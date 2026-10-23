@@ -122,6 +122,10 @@ struct State {
     /// Whether posts go with their mention syntax defused, as a Google Chat bridge's do. `#445
     /// gchat-mention-defuse`.
     defuses_mentions: bool,
+    /// How this fake carries a post's operation key ([`FakeDiscord::carry_op_keys`]), and the
+    /// message each key it carried posted, in order. `#465 replication-c6-op-key-marker`.
+    op_key_carrier: crate::chat::OpKeyCarrier,
+    keyed_posts: Vec<(String, MessageId)>,
     next_id: u64,
     /// Author display name -> snowflake, so one author keeps one id and two authors never share
     /// one. A fake that handed every author the same id would let a test pass while the server
@@ -422,6 +426,7 @@ impl FakeDiscord {
             heading: None,
             mentions: Vec::new(),
             upstream_url: None,
+            op_key: None,
         });
         id
     }
@@ -654,8 +659,82 @@ impl FakeDiscord {
     }
 }
 
+impl FakeDiscord {
+    /// Carry operation keys as `carrier` says: a provider that deduplicates answers a repeated key
+    /// with the first post, and one whose reads return the key puts it on the stored message.
+    /// Off by default, as a provider with no such field is. `#465 replication-c6-op-key-marker`.
+    pub fn carry_op_keys(&self, carrier: crate::chat::OpKeyCarrier) {
+        self.lock().op_key_carrier = carrier;
+    }
+
+    /// Every key this fake carried, with the message it posted, in order.
+    #[must_use]
+    pub fn keyed_posts(&self) -> Vec<(String, MessageId)> {
+        self.lock().keyed_posts.clone()
+    }
+}
+
 #[async_trait]
 impl ChatClient for FakeDiscord {
+    fn op_key_carrier(&self, _channel: &ChannelId) -> crate::chat::OpKeyCarrier {
+        self.lock().op_key_carrier
+    }
+
+    fn supports_idempotent_posts(&self) -> bool {
+        self.lock().op_key_carrier.dedupes == crate::chat::OpKeyDedupe::Always
+    }
+
+    /// The carrier this fake was given ([`FakeDiscord::carry_op_keys`]): a repeat it deduplicates
+    /// posts nothing and answers the first message, and a post that landed is recorded under its
+    /// key even when its answer was lost, as a provider that applied it would.
+    async fn post_message_keyed(
+        &self,
+        channel: &ChannelId,
+        content: &str,
+        reply_to: Option<&MessageId>,
+        key: Option<&str>,
+    ) -> Result<Message, ChatError> {
+        let carrier = self.lock().op_key_carrier;
+        let Some(key) = key.filter(|_| carrier.carries()) else {
+            return self.post_message(channel, content, reply_to).await;
+        };
+        if carrier.dedupes != crate::chat::OpKeyDedupe::Never {
+            let state = self.lock();
+            let first = state
+                .keyed_posts
+                .iter()
+                .find(|(held, _)| held == key)
+                .and_then(|(_, id)| state.messages.iter().find(|m| &m.id == id).cloned());
+            if let Some(first) = first {
+                return Ok(first);
+            }
+        }
+        let before = self.lock().posted.len();
+        let result = self.post_message(channel, content, reply_to).await;
+        let mut state = self.lock();
+        if state.posted.len() > before {
+            let landed = state
+                .messages
+                .iter_mut()
+                .rev()
+                .find(|m| &m.channel_id == channel && m.content == content);
+            if let Some(landed) = landed {
+                if carrier.readable {
+                    landed.op_key = Some(key.to_owned());
+                }
+                let id = landed.id.clone();
+                state.keyed_posts.push((key.to_owned(), id));
+            }
+        }
+        drop(state);
+        result.map(|mut message| {
+            if carrier.readable {
+                message.op_key = Some(key.to_owned());
+            }
+            message
+        })
+    }
+
     fn provider_name(&self) -> &str {
         "Discord"
     }

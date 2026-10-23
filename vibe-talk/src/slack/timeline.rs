@@ -1191,6 +1191,7 @@ impl HttpSlackClient {
         channel: &ChannelId,
         content: &str,
         reply_to: Option<&MessageId>,
+        key: Option<&str>,
     ) -> Result<Message, ChatError> {
         let target = Self::channel_ref(channel)?;
         let conversation = target.conversation.as_str();
@@ -1199,7 +1200,7 @@ impl HttpSlackClient {
             (None, Some(id)) => Some(self.reply_thread(conversation, id).await?),
             (None, None) => None,
         };
-        self.post_raw(channel, conversation, content, thread.as_deref())
+        self.post_raw(channel, conversation, content, thread.as_deref(), key)
             .await
     }
 
@@ -1235,6 +1236,7 @@ impl HttpSlackClient {
         conversation: &str,
         content: &str,
         thread: Option<&str>,
+        key: Option<&str>,
     ) -> Result<Message, ChatError> {
         if content.trim().is_empty() {
             return Err(refused("message content is empty"));
@@ -1251,6 +1253,11 @@ impl HttpSlackClient {
         ];
         if let Some(thread) = thread {
             params.push(("thread_ts", thread.to_owned()));
+        }
+        // The operation key, where the caller gave one, as message metadata: invisible in every
+        // Slack client, and returned to reads that ask for it. `#465 replication-c6-op-key-marker`.
+        if let Some(key) = key {
+            params.push(("metadata", super::client::op_key_metadata(key)));
         }
         let value = self.call("chat.postMessage", &params).await?;
         if value.get("channel").and_then(Value::as_str) != Some(conversation) {
@@ -1284,6 +1291,7 @@ impl HttpSlackClient {
         thread_id: &str,
         content: &str,
         _reply_to: Option<&MessageId>,
+        key: Option<&str>,
     ) -> Result<Message, ChatError> {
         let target = Self::channel_ref(channel)?;
         let thread = self.member_thread(&target, thread_id)?;
@@ -1295,7 +1303,7 @@ impl HttpSlackClient {
         if !self.posted_root_known(&target.conversation, &thread) {
             self.thread_root(&target.conversation, &thread).await?;
         }
-        self.post_raw(channel, &target.conversation, content, Some(&thread))
+        self.post_raw(channel, &target.conversation, content, Some(&thread), key)
             .await
     }
 

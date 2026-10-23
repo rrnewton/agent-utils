@@ -311,6 +311,15 @@ pub struct Message {
     /// deployment's configuration, which a stored copy would outlive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_url: Option<String>,
+    /// The operation key this message was posted with, where its provider carries one invisibly
+    /// and returned it on this copy: exactly the key handed to the post
+    /// ([`crate::chat::ChatClient::post_message_keyed`]). `#465 replication-c6-op-key-marker`. Provider-neutral,
+    /// so nothing that reads it needs to know where it came from
+    /// ([`crate::chat::ChatClient::op_key_carrier`] says whether a provider returns it at all).
+    /// ABSENT IS "NONE CARRIED": a message nobody keyed, or one from a provider or path that cannot
+    /// say, and a copy without it never takes away one another copy brought.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op_key: Option<String>,
 }
 
 /// Who one user mention names. `#318 slack-mention-names`; see [`Message::mentions`].
@@ -602,6 +611,7 @@ mod tests {
             heading: None,
             mentions: Vec::new(),
             upstream_url: None,
+            op_key: None,
         }
     }
 

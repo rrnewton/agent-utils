@@ -289,6 +289,7 @@ async fn a_gap_a_suspect_channel_and_a_blocked_one_each_miss() {
         edited_timestamp: None,
         mentions: Vec::new(),
         upstream_url: None,
+        op_key: None,
         thread: None,
         id: MessageId::at_time_ms(T0 + 30 * SECOND),
         channel_id: ChannelId(READ_CHANNEL.to_owned()),

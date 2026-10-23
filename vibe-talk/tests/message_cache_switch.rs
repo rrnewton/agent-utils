@@ -256,6 +256,7 @@ fn message(at_ms: i64, text: &str) -> Message {
         edited_timestamp: None,
         mentions: Vec::new(),
         upstream_url: None,
+        op_key: None,
         thread: None,
         id: MessageId::at_time_ms(at_ms),
         channel_id: ChannelId(READ_CHANNEL.to_owned()),

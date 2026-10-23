@@ -910,6 +910,7 @@ pub fn parse_message(value: &serde_json::Value) -> Result<Message, ChatError> {
         heading: None,
         mentions: Vec::new(),
         upstream_url: None,
+        op_key: None,
     })
 }
 
@@ -1014,6 +1015,34 @@ fn rate_limit_headers(headers: &reqwest::header::HeaderMap) -> Headers {
     out
 }
 
+/// Discord's own `nonce` for an operation key. `#465 replication-c6-op-key-marker`.
+///
+/// Discord takes a nonce of at most 25 characters and, with `enforce_nonce`, answers a repeat
+/// from the same author within a few minutes with the first message instead of posting again.
+/// A key (a part's key especially, [`crate::ops::part_key`]) is longer than that, so it is folded
+/// to `vt` and the 16 hex digits of its 64-bit FNV-1a hash: the same key gives the same nonce on
+/// every attempt, and two keys of one author's posts in one window do not meet by chance.
+#[must_use]
+pub fn discord_op_nonce(key: &str) -> String {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let hash = key.bytes().fold(OFFSET, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(PRIME)
+    });
+    format!("vt{hash:016x}")
+}
+
+/// How long Discord recognises a repeated `nonce` under `enforce_nonce`: "the past few minutes",
+/// read as two. `#465 replication-c6-op-key-marker`.
+pub const DISCORD_NONCE_WINDOW_SECONDS: u64 = 120;
+
+/// Ask Discord itself to post at most once per `nonce` within its window. `#465 replication-c6-op-key-marker`.
+fn enforce_nonce(request: &mut PreparedRequest) {
+    if let Some(body) = request.body.as_mut() {
+        body["enforce_nonce"] = json!(true);
+    }
+}
+
 fn fresh_post_nonce() -> String {
     use base64::Engine as _;
 
@@ -1089,6 +1118,13 @@ pub struct HttpDiscordClient {
 type DirectoryKey = (Option<String>, Option<String>, u16);
 
 impl HttpDiscordClient {
+    /// Whether this client talks to Discord's own API rather than a compatible bridge: only then
+    /// does a post carry Discord's `nonce` and `enforce_nonce`, fields a bridge's contract does not
+    /// name. `#465 replication-c6-op-key-marker`.
+    pub(super) fn is_discord_itself(&self) -> bool {
+        self.api_base.trim_end_matches('/') == crate::config::DEFAULT_DISCORD_API_BASE
+    }
+
     /// Build a client from the Discord section of the configuration.
     ///
     /// # Errors
@@ -1365,6 +1401,28 @@ impl ChatClient for HttpDiscordClient {
     /// thread post goes to Discord itself, which honours no such field, so it is excluded.
     fn supports_idempotent_posts(&self) -> bool {
         self.channel_registration && self.thread_api != crate::threads::ThreadApi::Native
+    }
+
+    /// `#465 replication-c6-op-key-marker`. A registration bridge makes the key its provider request id — a client-assigned
+    /// message id on Google Chat — so a repeat can never post twice ([`Self::supports_idempotent_posts`]).
+    /// Discord itself recognises a repeated `nonce` for a few minutes. Neither returns the key on
+    /// a later read. Anything else (a bridge without registration, or one whose thread posts go
+    /// to Discord's own threads) carries nothing it can promise.
+    fn op_key_carrier(&self, _channel: &ChannelId) -> crate::chat::OpKeyCarrier {
+        let dedupes = if self.supports_idempotent_posts() {
+            crate::chat::OpKeyDedupe::Always
+        } else if !self.channel_registration && self.is_discord_itself() {
+            crate::chat::OpKeyDedupe::Within {
+                seconds: DISCORD_NONCE_WINDOW_SECONDS,
+            }
+        } else {
+            crate::chat::OpKeyDedupe::Never
+        };
+        crate::chat::OpKeyCarrier {
+            carried: dedupes != crate::chat::OpKeyDedupe::Never,
+            dedupes,
+            readable: false,
+        }
     }
 
     async fn post_in_thread_keyed(
@@ -1758,10 +1816,15 @@ impl ChatClient for HttpDiscordClient {
             self.validate_main_post(channel)?;
             // The caller's key when it has one, so the page's next attempt at the same post reuses
             // it; otherwise one minted here, kept across this call's own retries as before.
-            let nonce = self
-                .channel_registration
-                .then(|| key.map_or_else(fresh_post_nonce, str::to_owned));
-            let request = post_request_with_nonce(
+            let nonce = if self.channel_registration {
+                Some(key.map_or_else(fresh_post_nonce, str::to_owned))
+            } else if self.is_discord_itself() {
+                // Discord's own `nonce` and `enforce_nonce`, only for a keyed post. `#465 replication-c6-op-key-marker`.
+                key.map(discord_op_nonce)
+            } else {
+                None
+            };
+            let mut request = post_request_with_nonce(
                 &self.api_base,
                 channel,
                 content,
@@ -1769,6 +1832,9 @@ impl ChatClient for HttpDiscordClient {
                 nonce.as_deref(),
                 &self.post_limit,
             )?;
+            if !self.channel_registration && nonce.is_some() {
+                enforce_nonce(&mut request);
+            }
             let value = self.send(request).await?;
             parse_message(&value)
         }
@@ -1853,6 +1919,70 @@ mod tests {
 
     fn channel() -> ChannelId {
         ChannelId("123".to_owned())
+    }
+
+    #[test]
+    fn each_discord_shape_says_what_its_op_key_carrier_gives() {
+        // `#465 replication-c6-op-key-marker`.
+        use crate::chat::{OpKeyCarrier, OpKeyDedupe};
+        let discord = HttpDiscordClient::new(&client_config(BASE, false)).expect("client");
+        assert!(discord.is_discord_itself());
+        assert_eq!(
+            discord.op_key_carrier(&channel()),
+            OpKeyCarrier {
+                carried: true,
+                dedupes: OpKeyDedupe::Within {
+                    seconds: DISCORD_NONCE_WINDOW_SECONDS
+                },
+                readable: false,
+            }
+        );
+        let mut config = client_config("https://bridge.example/v1", true);
+        config.thread_api = crate::threads::ThreadApi::Bridge;
+        let bridge = HttpDiscordClient::new(&config).expect("client");
+        assert!(bridge.supports_idempotent_posts());
+        assert_eq!(
+            bridge.op_key_carrier(&channel()).dedupes,
+            OpKeyDedupe::Always,
+            "a registration bridge makes the key its provider request id"
+        );
+        config.thread_api = crate::threads::ThreadApi::Native;
+        let native_threads = HttpDiscordClient::new(&config).expect("client");
+        assert_eq!(
+            native_threads.op_key_carrier(&channel()),
+            OpKeyCarrier::NONE
+        );
+        let unregistered =
+            HttpDiscordClient::new(&client_config("https://bridge.example/v1", false))
+                .expect("client");
+        assert!(!unregistered.is_discord_itself());
+        assert_eq!(unregistered.op_key_carrier(&channel()), OpKeyCarrier::NONE);
+    }
+
+    #[test]
+    fn discords_own_nonce_fits_and_names_one_key() {
+        // `#465 replication-c6-op-key-marker`.
+        let key = "out-1700000000000-abcdef.00000000deadbeef.0";
+        let nonce = discord_op_nonce(key);
+        assert!(nonce.len() <= 25, "{nonce}");
+        assert_eq!(nonce, discord_op_nonce(key), "the same key, the same nonce");
+        assert_ne!(
+            nonce,
+            discord_op_nonce("out-1700000000000-abcdef.00000000deadbeef.1")
+        );
+        let mut request = post_request_with_nonce(
+            BASE,
+            &channel(),
+            "hello",
+            None,
+            Some(&nonce),
+            &crate::chat::PostLimit::chars(DISCORD_MAX_CONTENT_LEN),
+        )
+        .expect("a valid post");
+        enforce_nonce(&mut request);
+        let body = request.body.expect("a body");
+        assert_eq!(body["nonce"], nonce);
+        assert_eq!(body["enforce_nonce"], true);
     }
 
     fn client_config(api_base: &str, channel_registration: bool) -> DiscordConfig {

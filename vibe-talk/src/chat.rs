@@ -264,6 +264,59 @@ pub enum UpstreamReadScope {
     Unknown,
 }
 
+/// Whether a provider refuses to post a second message under a key it has already posted.
+/// `#465 replication-c6-op-key-marker`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum OpKeyDedupe {
+    /// It does not: a repeat of the key posts again.
+    #[default]
+    Never,
+    /// Only for a repeat within `seconds` of the first: Discord's `enforce_nonce`.
+    Within {
+        /// How long after the first post a repeat is still recognised, as far as the provider
+        /// documents it, read conservatively.
+        seconds: u64,
+    },
+    /// However late the repeat comes: a bridge whose provider request id names the post.
+    Always,
+}
+
+/// What a provider's invisible operation-key carrier gives back. `#465 replication-c6-op-key-marker`.
+///
+/// The owner, 2026-10-23: every post carries its operation key where the provider can hold one
+/// invisibly, through the provider trait, so nothing above it switches on the backend.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct OpKeyCarrier {
+    /// Whether a keyed post hands its key to the provider at all: written, whatever comes back.
+    pub carried: bool,
+    /// Whether the provider itself turns a repeat of the key into the first post.
+    pub dedupes: OpKeyDedupe,
+    /// Whether reads return the key on EVERY message it was posted with
+    /// ([`crate::model::Message::op_key`]), so a post whose answer was lost can be found by its
+    /// key rather than by its words, and a read that finds no key is evidence the post is not
+    /// there. False wherever a read may return the key for some posts and not others — a bridge
+    /// in front of Slack that can only echo the keys of posts it saw succeed — and there a key a
+    /// read lacks proves nothing: a caller falls back to the words, and never clears a key it
+    /// holds because a later copy lacks it.
+    pub readable: bool,
+}
+
+impl OpKeyCarrier {
+    /// Carries nothing: no deduplication, nothing on reads.
+    pub const NONE: Self = Self {
+        carried: false,
+        dedupes: OpKeyDedupe::Never,
+        readable: false,
+    };
+
+    /// Whether the key reaches the provider at all.
+    #[must_use]
+    pub fn carries(&self) -> bool {
+        self.carried
+    }
+}
+
 /// How much text one post may carry at a provider, counted the way that provider counts it.
 /// `#263 post-split-per-provider`.
 ///
@@ -1277,6 +1330,19 @@ pub trait ChatClient: Send + Sync {
     ) -> Result<Message, ChatError> {
         self.post_in_thread(channel, thread_id, content, reply_to)
             .await
+    }
+
+    /// How this provider carries a post's operation key, invisibly to anyone reading the channel.
+    /// `#465 replication-c6-op-key-marker`.
+    ///
+    /// A keyed post ([`ChatClient::post_message_keyed`], [`ChatClient::post_in_thread_keyed`])
+    /// hands its key to the provider's own invisible carrier where it has one: Slack message
+    /// metadata, a bridge's provider request id, Discord's `nonce`. This says what that carrier
+    /// gives back, so a caller asks it rather than which provider it is talking to, and finds a
+    /// carried key on a read copy in the neutral [`crate::model::Message::op_key`]. The default
+    /// carries nothing, which is what a provider without such a field honestly says.
+    fn op_key_carrier(&self, _channel: &ChannelId) -> OpKeyCarrier {
+        OpKeyCarrier::NONE
     }
 
     /// The most text one post to `channel` may carry. `#263 post-split-per-provider`.
@@ -2367,6 +2433,7 @@ mod lookup_tests {
             heading: None,
             mentions: Vec::new(),
             upstream_url: None,
+            op_key: None,
         }
     }
 
@@ -2702,6 +2769,7 @@ mod threads_tests {
             heading: None,
             mentions: Vec::new(),
             upstream_url: None,
+            op_key: None,
         }
     }
 
