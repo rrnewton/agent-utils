@@ -7,7 +7,7 @@ move up to the top of the screen and KEEP its connector linkage over to the main
 left column. So it just moves up and disgorges its internal messages underneath while keeping the visual
 object of the thread card. We can still sneak in an X button somewhere for a mouse-only exit back to
 all-threads view." The fake-DOM suite (tests/js/voice_page.test.mjs) pins what the page does; it lays
-nothing out and draws nothing, so it cannot say where the card stands, how tall it is whatever it says,
+nothing out and draws nothing, so it cannot say where the card stands, how tall its words make it,
 what colour its edge is, or whether opening it moves the list. This does.
 
 It serves the checked-out page and the fake API of tests/two_column_browser.py — a channel taller than
@@ -24,8 +24,8 @@ loopback origin, at a 1280x800 desk with a mouse, in the dark scheme and the lig
   Main scrolled to its foot, the root above it: the line clipped at Main's top, pointing up -> the mouse
   crossing the card to the dock: nothing moves for 2.5 s -> the mouse resting on the card: after 1.5 s
   Main glides, through several scroll positions, until the root is on screen and the line whole -> the X:
-  the cards -> the long question's card's replies button: its text cut to three lines, the card exactly
-  as tall as the summarised one's -> Esc: the cards. (A press on the card folds it to a bar since
+  the cards -> the long question's card's replies button: its text cut to three lines, the card taller
+  than the shorter summarised one's by its lines (`#482 thread-card-fit`) -> Esc: the cards. (A press on the card folds it to a bar since
   `#388 thread-header-collapse`, which tests/thread_header_collapse_browser.py walks.)
 
 The card moves up (part 2 of #298): "I would like to see the SAME colorful card move up to the top of the
@@ -39,7 +39,7 @@ And the same card across the window, the owner: "When we go to single column thr
 drill in I'd like the same thing. One unified thread list view and one unified intra-thread view."
 At the desk, after the walk above: real Ctrl+3, the thread list across the window -> the summarised
 thread's replies button: its card moves up from the list to the top of the window, across layouts,
-and heads the thread there, saying what the card said, three lines, its X on it, no line drawn ->
+and heads the thread there, saying what the card said in its fitted lines, its X on it, no line drawn ->
 the thread scrolled: the card does not move (the owner: "the card should NOT scroll away when I
 scroll down, but should be the fixed header object") -> the X, Esc and <- each go back to the list.
 
@@ -56,15 +56,15 @@ focus, its age (which folds the card, `#388`): the focus on the body -> the re-r
 not given to Main -> real Esc: the right column's thread closes.
 
 On a 412x915 phone by touch, in the dark scheme and the light: the thread list from the view picker
--> a card's replies button: the card moves up to the top of the screen and heads the thread, two
-lines of it, its X a thumb's size -> the thread scrolled: the card does not move -> the X: the list.
+-> a card's replies button: the card moves up to the top of the screen and heads the thread, at
+most two lines of it and fitted below that, its X a thumb's size -> the thread scrolled: the card does not move -> the X: the list.
 
 With the larger type a phone reader's own settings give, stood in for by the root font as
 tests/offline_cache_browser.py does (130% and 150% on a 360x800 phone, 150% on 412x915): the card
 heading the thread, saying what it says and then what a busier thread would ("3d3h", "123 replies ·
 99+ unread") -> its age whole and ending before the count starts, the count before the X, the X a
-thumb's size inside the card and the screen, the page no wider than the screen, the card the same
-height whatever it says -> the X: the list.
+thumb's size inside the card and the screen, the page no wider than the screen, the card no taller
+for the busier count -> the X: the list.
 
 No horizontal overflow and no page error at any step. Pass --screenshots DIR to keep a PNG of each state
 for review; --web-root DIR to run the same walk against another copy of the page.
@@ -603,20 +603,22 @@ def desk_walk(desk: Desk) -> None:
                       f"nothing for 2.5 s, and resting on it glided Main through {len(distinct)} places in "
                       f"{time.monotonic() - started:.1f}s until the line was whole")
 
-    # The X: the cards. The long question's card: three lines, and the card at the top as tall as the other.
+    # The X: the cards. The long question's card: three lines, and taller than the shorter one's
+    # card by the lines it has over it (`#482 thread-card-fit`: fitted, no longer one fixed height).
     page.click("#side-close")
     desk.wait_for("() => !document.getElementById('side-list').hidden && document.getElementById('side-pane').hidden"
                   " && document.getElementById('side-thread-card').hidden", "the X did not go back to the cards")
     long = open_card(desk, REPLICA)
     long_box = part(long, "box")
     desk.check(bool(long["clamped"]) and number(long, "lines") == 3, f"the long question is not cut to three lines: {long['lines']}")
-    desk.check(abs(number(long_box, "height") - number(box, "height")) <= 0.5,
-               f"the card at the top is {long_box['height']}px over the long question and {box['height']}px over the other")
+    desk.check(number(found, "lines") < 3 and number(long_box, "height") > number(box, "height") + 10,
+               f"the card at the top is {long_box['height']}px over the long question and {box['height']}px "
+               f"over the {found['lines']}-line one: fitted cards should differ by their lines")
     desk.shot("4-long")
 
     page.keyboard.press("Escape")
     desk.wait_for("() => !document.getElementById('side-list').hidden", "Esc did not close the thread")
-    desk.notes.append("the long question's card was three lines and the same height; Esc closed the thread")
+    desk.notes.append("the long question's card was three lines and taller than the shorter one's by its lines; Esc closed the thread")
 
     # Thread(N) on the root in Main, the thread's card on screen on the right: the card moves up from
     # there too, as it does from its replies button.
@@ -695,12 +697,13 @@ def back_in_list(desk: Desk, how: str) -> None:
 
 
 def check_wide(desk: Desk, found: Json, said: str, lines: int, where: str) -> None:
-    """The card heading a thread across the window: the list card's words, `lines` of them, its X on it,
-    above the thread and not in it, in the thread's colour, no line drawn, and the page no wider."""
+    """The card heading a thread across the window: the list card's words in at most `lines` of them
+    (fitted below that most, `#482 thread-card-fit`), its X on it, above the thread and not in it,
+    in the thread's colour, no line drawn, and the page no wider."""
     box, back, listed = part(found, "box"), part(found, "back"), part(found, "list")
     desk.check(bool(found["shown"]), f"{where}: no card heads the thread")
     desk.check(found["text"] == said, f"{where}: the card at the top says {found['text']!r}, its card said {said!r}")
-    desk.check(number(found, "lines") == lines, f"{where}: the card at the top is {found['lines']} lines, not {lines}")
+    desk.check(1 <= number(found, "lines") <= lines, f"{where}: the card at the top is {found['lines']} lines, not within {lines}")
     desk.check(bool(back["shown"]) and number(back, "left") >= number(box, "left") and number(back, "right") <= number(box, "right")
                and number(back, "top") >= number(box, "top") and number(back, "bottom") <= number(box, "bottom"),
                f"{where}: the X is not on the card: {back} in {box}")
@@ -765,7 +768,7 @@ def list_walk(desk: Desk) -> None:
     page.keyboard.press("ArrowLeft")
     back_in_list(desk, "<-")
     desk.notes.append(f"Ctrl+3 then a replies button: the thread across the window under its card, {number(box, 'height'):.0f}px "
-                      "and three lines, fixed while the thread scrolled; the X, Esc and <- each went back to the list")
+                      f"and {number(found, 'lines'):.0f} fitted lines, fixed while the thread scrolled; the X, Esc and <- each went back to the list")
 
 
 # --- Esc after two columns went, the card at the top left open ----------------------------------------------
@@ -894,7 +897,7 @@ def phone_walk(desk: Desk) -> None:
     page.touchscreen.tap(number(back, "left") + number(back, "width") / 2, number(back, "top") + number(back, "height") / 2)
     back_in_list(desk, "the X")
     desk.notes.append(f"a tap on a replies button in the thread list moved its card up {card['y'] - number(box, 'top'):.0f}px "
-                      f"to head the thread, two lines and {number(box, 'height'):.0f}px, its X {number(back, 'width'):.0f}px, "
+                      f"to head the thread, {number(found, 'lines'):.0f} fitted lines and {number(box, 'height'):.0f}px, its X {number(back, 'width'):.0f}px, "
                       "fixed while the thread scrolled; the X went back to the list")
 
 
@@ -937,7 +940,7 @@ def check_facts(desk: Desk, found: Json, where: str) -> None:
 def type_walk(desk: Desk, root_percent: int) -> None:
     """`#298 thread-card-header` with larger type: the card heading a thread across the window, from the
     thread list, saying what it says and then what a busier thread would, each legible and the card
-    the same height; then its X, by touch, back to the list."""
+    no taller for the busier count; then its X, by touch, back to the list."""
     phone_thread_list(desk)
     into_list_thread(desk, RUNNER, tap=True)
     at_rest(desk, "thread-card", "pane-discord")
