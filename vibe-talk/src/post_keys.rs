@@ -89,7 +89,7 @@ impl Fingerprint {
 }
 
 /// What a remembered post came to.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub enum Outcome {
     /// Every part landed.
     Posted {
@@ -102,6 +102,63 @@ pub enum Outcome {
     },
     /// Some parts landed and then one failed: the 207 the post was answered with.
     Partial(Partial),
+}
+
+/// How an [`Outcome`] is filed in the store: `Posted` without `first`, which is always
+/// `parts[0]`. That copy was two fifths of every record. `#490 storage-io-audit`.
+#[derive(serde::Serialize)]
+enum FiledRef<'a> {
+    Posted {
+        channel: &'a ChannelInfo,
+        parts: &'a [Message],
+    },
+    Partial(&'a Partial),
+}
+
+/// A filed [`Outcome`] as it is read back. A record filed before `#490 storage-io-audit` still
+/// carries `first`, and is read as it was written.
+#[derive(serde::Deserialize)]
+enum Filed {
+    Posted {
+        channel: ChannelInfo,
+        #[serde(default)]
+        first: Option<Message>,
+        parts: Vec<Message>,
+    },
+    Partial(Partial),
+}
+
+impl serde::Serialize for Outcome {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Posted { channel, parts, .. } => FiledRef::Posted { channel, parts },
+            Self::Partial(partial) => FiledRef::Partial(partial),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Outcome {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(match Filed::deserialize(deserializer)? {
+            Filed::Posted {
+                channel,
+                first,
+                parts,
+            } => {
+                let first = match first.or_else(|| parts.first().cloned()) {
+                    Some(first) => first,
+                    None => return Err(serde::de::Error::custom("a posted record has no part")),
+                };
+                Self::Posted {
+                    channel,
+                    first,
+                    parts,
+                }
+            }
+            Filed::Partial(partial) => Self::Partial(partial),
+        })
+    }
 }
 
 /// The facts of a post that landed in part; see [`crate::ops::OpError::PartiallyPosted`].
@@ -595,6 +652,74 @@ mod tests {
         let record = serde_json::to_string(&kept("k", "hello", 1, now)).expect("JSON");
         let back: Kept = serde_json::from_str(&record).expect("parses");
         assert_eq!(back.key(), "k");
+    }
+
+    #[test]
+    fn a_posted_record_is_filed_without_its_first_part_twice_and_an_older_one_still_reads() {
+        // `#490 storage-io-audit`. A record as `#471 replication-c5-post-keys` filed it, with
+        // `first` beside `parts`.
+        let part = |id: &str, text: &str| {
+            serde_json::json!({
+                "id": id, "channel_id": "C1", "author": "owner", "author_id": "U1",
+                "author_is_bot": false, "timestamp": "2026-09-15T12:00:00Z", "content": text,
+            })
+        };
+        let older = serde_json::json!({
+            "fingerprint": {"key": "k", "channel": "C1", "thread": null, "reply_to": null,
+                            "text": "one two"},
+            "outcome": {"Posted": {
+                "channel": {"id": "C1", "label": "lead team", "writable": true},
+                "first": part("1", "one"),
+                "parts": [part("1", "one"), part("2", "two")],
+            }},
+            "at_ms": 1_790_000_000_000_i64,
+        })
+        .to_string();
+        let kept: Kept = serde_json::from_str(&older).expect("an older record reads");
+        let Outcome::Posted { first, parts, .. } = &kept.outcome else {
+            panic!("not a posted record");
+        };
+        assert_eq!((first.id.0.as_str(), parts.len()), ("1", 2));
+
+        let filed = serde_json::to_string(&kept).expect("JSON");
+        assert!(!filed.contains("\"first\""), "{filed}");
+        assert!(filed.len() < older.len());
+        let back: Kept = serde_json::from_str(&filed).expect("parses");
+        let Outcome::Posted { first, parts, .. } = &back.outcome else {
+            panic!("not a posted record");
+        };
+        assert_eq!(first, &parts[0], "the first part is the first of the parts");
+        assert_eq!(parts.len(), 2);
+
+        let empty = filed.replace(&serde_json::to_string(parts).expect("JSON"), "[]");
+        assert!(
+            serde_json::from_str::<Kept>(&empty).is_err(),
+            "a posted record with no part at all is refused, not given an invented one"
+        );
+        let null = older.replacen(
+            &serde_json::to_string(&part("1", "one")).expect("JSON"),
+            "null",
+            1,
+        );
+        assert!(null.contains("\"first\":null"), "{null}");
+        let back: Kept = serde_json::from_str(&null).expect("a null first reads");
+        assert!(matches!(&back.outcome, Outcome::Posted { first, .. } if first.id.0 == "1"));
+
+        // A partial post is filed as it always was.
+        let partial = Kept {
+            fingerprint: fingerprint("p", "rest"),
+            outcome: partial(1),
+            at_ms: 1_790_000_000_000,
+        };
+        let filed = serde_json::to_string(&partial).expect("JSON");
+        assert!(
+            filed.contains("\"outcome\":{\"Partial\":{\"posted\":1,"),
+            "{filed}"
+        );
+        let back: Kept = serde_json::from_str(&filed).expect("parses");
+        assert!(
+            matches!(&back.outcome, Outcome::Partial(p) if p.posted == 1 && p.unsent == "rest")
+        );
     }
 
     #[test]
