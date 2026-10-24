@@ -1,13 +1,14 @@
 ---
 title: 'test-time-agent-utils: profile and shorten the gate''s test suites outside vibe-talk'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
 - validation
 - performance
 created_at: 2026-10-24T12:07:05.365267200+00:00
-updated_at: 2026-10-24T12:07:05.365267200+00:00
+updated_at: 2026-10-24T12:55:25.945984993+00:00
+closed_at: 2026-10-24T12:55:25.945984852+00:00
 ---
 
 # Description

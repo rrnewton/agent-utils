@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-494-cc25c23ceec",
+    "issue_id": "agent-utils-494",
+    "author": "cl-topt-au",
+    "body": "[opus 5.5] Landed ae95b59a..40aa2f49: d23010b8 lifecycle-io 5 -> 11, so all eleven wrkslots Python steps run at once (one 65-case sub-shard: 53.2 s alone, 56.8-58.1 s with 11 copies at once); 086e4122 RUST_TEST_THREADS=4 for agentctl, wrkslotsd and gh-paced, plus an agentctl test that had passed only because nothing lived at a guessed PID (dagrun stays serial: a delegated-cgroup test saw a CPU budget of 1 instead of 2 in a gate); 40aa2f49 findings in ai_docs/transient/2026-10-24-test-time-agent-utils.md. Whole gate 830.3 s / 11 978 CPU-s -> 612.0 s / 8 090 CPU-s, together with the test-time-vibe-talk lane. Per step: rust.agentctl.test 443 -> 145 s, rust.wrkslots.test 279 -> 109 s, rust.gh-paced.test 227 -> 56 s; the lifecycle pool went from about 760 s of the gate to its longest step, 480 s. Gate: rc 0, 179 passed, 0 failed; PARTIAL only for the 7 standing delegated-live-scope dagrun cross skips, which are UNVERIFIED. Nothing pruned. Left for the owner (doc section 5): cross.agentctl.differential (571 s) is now the critical path, and its groups cannot run at once while both editions lock one host-wide file per pane; the debatable prune candidates; #495 revive-stat-parse-flake.",
+    "created_at": "2026-10-24T12:55:25.943706924Z",
+    "updated_at": "2026-10-24T12:55:25.943706924Z"
+  }
+]
