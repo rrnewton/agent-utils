@@ -333,7 +333,10 @@ mod summary_schedule_tests {
         // `#484 summary-card-threshold`: nothing at 1 or 2 messages; the first summary is at 3,
         // and the old powers-of-two backoff runs from there (4, 8, then every 10).
         assert_eq!(schedule(40), [3, 4, 8, 18, 28, 38]);
-        assert!(!thread_summary_due(1, None), "a lone root is not summarised");
+        assert!(
+            !thread_summary_due(1, None),
+            "a lone root is not summarised"
+        );
         assert!(
             !thread_summary_due(2, None),
             "one question and one response is not summarised"
