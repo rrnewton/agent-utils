@@ -1,13 +1,14 @@
 ---
 title: 'replication-c5-post-keys: persist the send log so a repeat after a restart posts nothing'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
 - vibe-talk
 - replication
 created_at: 2026-10-23T19:07:44.704677730+00:00
-updated_at: 2026-10-23T19:07:44.704677730+00:00
+updated_at: 2026-10-24T00:55:29.205933435+00:00
+closed_at: 2026-10-24T00:55:29.205933255+00:00
 ---
 
 # Description
