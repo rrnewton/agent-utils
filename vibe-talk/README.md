@@ -584,6 +584,17 @@ session, so any vibe-talk server connected to the same upstream resolves the sam
 reboot does not break it; the provider part only says which service's ids follow. A link
 carries ids only, never message text, and still needs the deployment's token to read anything.
 
+For Slack, **Settings → Screen and keys → Opening links** chooses where **Open in Slack**
+opens on this device: in the browser (the default — a new tab at the permalink) or in Slack's
+own application by its `slack://` address, which leaves no tab standing behind from the
+browser's handoff to the application. The choice is kept on the device only, along with the
+rest of that section: a page cannot tell whether the application is installed without asking
+it to open, so choosing the application is the owner's word that it is there. A copied link
+is the web address either way, the one that opens for anybody; where the application ignores
+the message part of its address it still opens the message's channel, and where no team has
+been learned yet the web address opens as it always did. Other services have no such scheme
+and are unchanged (`#481 slack-app-deep-link`).
+
 The manifest asks browsers that support `display_override` (including Chrome Android) for
 `standalone`, while retaining `display: browser` as the standards-defined fallback. Safari on iOS
 currently ignores `display_override`, and this page deliberately does not opt into Apple's

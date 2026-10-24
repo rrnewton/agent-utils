@@ -157,7 +157,7 @@ pub fn is_user_id(id: &str) -> bool {
 }
 
 /// Whether `id` has the shape of a Slack workspace or enterprise id: `T` or `E` and alphanumerics.
-fn is_team_id(id: &str) -> bool {
+pub(crate) fn is_team_id(id: &str) -> bool {
     id.len() >= 2
         && id.len() <= 32
         && matches!(id.as_bytes()[0], b'T' | b'E')

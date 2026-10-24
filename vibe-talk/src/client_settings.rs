@@ -12,9 +12,11 @@
 //!
 //! * **Screen and keys stays on the device** — text size (`msg-scale`), reading width
 //!   (`width`), control-bar placement (`bar-placement`), Enter sends (`enter-sends`),
-//!   single keys (`single-keys`), and the composer-grow box beside the composer
-//!   (`composer-grow`, a screen-layout choice with no Settings row of its own). None of
-//!   those keys appears below, and the section's heading says "(client side)".
+//!   single keys (`single-keys`), where Slack links open (`slack-open`: whether that app
+//!   is installed is this device's own business, `#481 slack-app-deep-link`), and the
+//!   composer-grow box beside the composer (`composer-grow`, a screen-layout choice with
+//!   no Settings row of its own). None of those keys appears below, and the section's
+//!   heading says "(client side)".
 //! * **Everything else is here** — one document for the owner (this server has one), a row
 //!   per key, **per-key last-writer-wins on the server's clock**. That is the two-party
 //!   shape `ai_docs/transient/2026-10-23-replication-model.md` §4 gives small owner

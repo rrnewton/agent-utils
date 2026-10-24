@@ -2015,6 +2015,29 @@
 
                   <section class="settings-group">
                     <div class="group-head">
+                      <h3 title="Whether Open in Slack opens Slack's own app on this device, or the message in the browser."><button class="fold-toggle" id="fold-opening-links" type="button" aria-expanded="false" aria-controls="fold-opening-links-body">Opening links</button></h3>
+                    </div>
+                    <div class="fold-body" id="fold-opening-links-body" hidden="until-found">
+                      <!--
+                        `#481 slack-app-deep-link`. A Slack permalink opened in a browser hands over
+                        to the Slack app where there is one and leaves its tab standing behind. The
+                        app choice opens the same message by its slack:// address instead, with no
+                        tab at all; a copied link is the web address either way. Which app is
+                        installed is this device's own business, so the choice is kept here and
+                        never synced: the browser is the shipped default, since no page can tell
+                        whether the app is there until it asks it to open.
+                      -->
+                      <label for="slack-open-in">Open Slack links in</label>
+                      <select id="slack-open-in" aria-describedby="slack-open-state">
+                        <option value="browser">Browser — a new tab at the message</option>
+                        <option value="app">Slack app — no tab left behind</option>
+                      </select>
+                      <p id="slack-open-state" class="hint" aria-live="polite"></p>
+                    </div>
+                  </section>
+
+                  <section class="settings-group">
+                    <div class="group-head">
                       <h3><button class="fold-toggle" id="fold-typing" type="button" aria-expanded="false" aria-controls="fold-typing-body">Typing</button></h3>
                     </div>
                     <div class="fold-body" id="fold-typing-body" hidden="until-found">

@@ -311,6 +311,14 @@ pub struct Message {
     /// deployment's configuration, which a stored copy would outlive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_url: Option<String>,
+    /// The same message's address in its service's own app, where the service has one
+    /// (`#481 slack-app-deep-link`): a `slack://` address for Slack, formed beside
+    /// `upstream_url` by the same stamp from the workspace's team id the provider has
+    /// learned. The page opens it in place of the web address when the reader has chosen
+    /// the app; copies always take the web address. Absent (and omitted) wherever no app
+    /// address can be formed, which is every other provider today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_app_url: Option<String>,
     /// The operation key this message was posted with, where its provider carries one invisibly
     /// and returned it on this copy: exactly the key handed to the post
     /// ([`crate::chat::ChatClient::post_message_keyed`]). `#465 replication-c6-op-key-marker`. Provider-neutral,
@@ -621,6 +629,7 @@ mod tests {
             heading: None,
             mentions: Vec::new(),
             upstream_url: None,
+            upstream_app_url: None,
             op_key: None,
             observed_ms: None,
         }

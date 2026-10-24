@@ -128,6 +128,9 @@ pub struct HttpSlackClient {
     /// The workspace's own origin (`https://acme.slack.com`), as configured or as `auth.test`
     /// reported it, where a message's permalink lives. `#408 copy-upstream-link`.
     workspace_url: Mutex<Option<String>>,
+    /// The workspace's team id as `auth.test` reported it, where a message's address in
+    /// Slack's own app names it. `#481 slack-app-deep-link`.
+    team_id: Mutex<Option<String>>,
     users: Mutex<HashMap<String, CachedUser>>,
     /// Each group DM's member ids, or `None` where Slack would not list them, and when that was
     /// learned, so the channel browser names it by its members without asking again. `#317
@@ -224,6 +227,7 @@ impl HttpSlackClient {
                     .as_deref()
                     .and_then(crate::upstream_url::workspace_origin),
             ),
+            team_id: Mutex::new(None),
             users: Mutex::new(HashMap::new()),
             group_members: GroupMembers::default(),
             channel_names: super::mentions::ChannelNames::default(),
@@ -853,6 +857,7 @@ impl Raw {
             // Formed when the message is served (`ops::stamp` asks this client's
             // `upstream_url`), never at read: the workspace address may not be learned yet.
             upstream_url: None,
+            upstream_app_url: None,
             // The operation key a keyed post filed in its metadata. `#465 replication-c6-op-key-marker`.
             op_key: op_key_of(&self.value),
             observed_ms: None,
@@ -928,6 +933,31 @@ impl ChatClient for HttpSlackClient {
             .map(|thread| thread.id.as_str())
             .or(reference.thread_ts.as_deref().filter(|root| *root != ts));
         crate::upstream_url::slack_permalink(&workspace, &reference.conversation, &ts, root)
+    }
+
+    /// The message's address in Slack's own app. `#481 slack-app-deep-link`.
+    ///
+    /// The same parts read the same way as the permalink, on the workspace's team: the team
+    /// `auth.test` reported, held as the workspace's origin is. No team learned yet, no app
+    /// address — the page then opens the permalink, as it always did.
+    fn upstream_app_url(
+        &self,
+        channel: &ChannelId,
+        id: &MessageId,
+        thread: Option<&crate::threads::MessageThread>,
+    ) -> Option<String> {
+        let team = self
+            .team_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()?;
+        let reference = ids::ChannelRef::parse(channel.as_str())?;
+        let ts = ids::ts_from_message_id(id)?;
+        let root = thread
+            .filter(|thread| !thread.is_root)
+            .map(|thread| thread.id.as_str())
+            .or(reference.thread_ts.as_deref().filter(|root| *root != ts));
+        crate::upstream_url::slack_app_url(&team, &reference.conversation, &ts, root)
     }
 
     fn supports_threading(&self) -> bool {
@@ -1133,6 +1163,22 @@ impl ChatClient for HttpSlackClient {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if slot.is_none() {
                     *slot = Some(reported);
+                }
+            }
+            // The team id a message's address in Slack's app names (`#481
+            // slack-app-deep-link`), held as the workspace's origin is: learned once, only
+            // ever read back to form an address, and only in Slack's own shape.
+            if let Some(team) = value
+                .get("team_id")
+                .and_then(Value::as_str)
+                .filter(|team| ids::is_team_id(team))
+            {
+                let mut slot = self
+                    .team_id
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if slot.is_none() {
+                    *slot = Some(team.to_owned());
                 }
             }
             let handle = value
@@ -1406,6 +1452,42 @@ mod tests {
             workspace_url: None,
         })
         .expect("client")
+    }
+
+    #[test]
+    fn an_app_address_waits_for_a_learned_team_and_names_the_message_and_its_thread() {
+        // `#481 slack-app-deep-link`: no team learned yet, no app address; once `auth.test`
+        // has reported one (held in the slot as it learns it), a message's address names its
+        // conversation and ts, a reply's its thread root too — by the same reads as the
+        // permalink beside it, so the two cannot name different messages.
+        let client = client();
+        let channel = ChannelId("C0123ABCD".to_owned());
+        let root_id = ids::message_id_from_ts("1700000000.000100").expect("root id");
+        let reply_id = ids::message_id_from_ts("1700000060.000200").expect("reply id");
+        assert_eq!(client.upstream_app_url(&channel, &reply_id, None), None);
+        *client.team_id.lock().expect("team slot") = Some("T0123ABCD".to_owned());
+        assert_eq!(
+            client.upstream_app_url(&channel, &root_id, None),
+            Some(
+                "slack://channel?team=T0123ABCD&id=C0123ABCD&message=1700000000.000100".to_owned()
+            )
+        );
+        let thread = MessageThread {
+            hue: None,
+            root_message_id: Some(root_id.clone()),
+            id: "1700000000.000100".to_owned(),
+            is_root: false,
+            reply_count: None,
+            reply_count_exact: false,
+        };
+        assert_eq!(
+            client.upstream_app_url(&channel, &reply_id, Some(&thread)),
+            Some(
+                "slack://channel?team=T0123ABCD&id=C0123ABCD&message=1700000060.000200\
+                 &thread_ts=1700000000.000100"
+                    .to_owned()
+            )
+        );
     }
 
     #[tokio::test]

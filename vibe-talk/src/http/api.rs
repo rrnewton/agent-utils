@@ -473,6 +473,7 @@ pub async fn ingest_event(
                 heading: None,
                 mentions: Vec::new(),
                 upstream_url: None,
+                upstream_app_url: None,
                 op_key: None,
                 observed_ms: None,
             };
@@ -4504,6 +4505,8 @@ fn fill_pin_links<'p>(
             });
         pin.upstream_url =
             client.upstream_url(&channel.id, &pin.snapshot.message_id, thread.as_ref());
+        pin.upstream_app_url =
+            client.upstream_app_url(&channel.id, &pin.snapshot.message_id, thread.as_ref());
     }
 }
 

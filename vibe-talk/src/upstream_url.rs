@@ -11,7 +11,11 @@
 //!   dot}`, a thread reply's carrying `?thread_ts={root}&cid={conversation}` so it opens the
 //!   thread at the reply — the same shapes [`crate::slack::ids::parse_source`] accepts back. The
 //!   workspace is one origin (`https://acme.slack.com`), configured or reported by the provider;
-//!   see [`crate::slack::HttpSlackClient::upstream_url`].
+//!   see [`crate::slack::HttpSlackClient::upstream_url`]. Beside it, the address in Slack's own
+//!   app (`#481 slack-app-deep-link`): the documented `slack://channel?team={team}&id={conversation}`
+//!   (Slack's deep-linking docs), carrying the message's `ts` and a reply's `thread_ts` as the
+//!   permalink names them, so an app that honors them opens at the message and one that does not
+//!   still opens its channel — never a browser tab left behind by the handoff.
 //! * **Discord**: `https://discord.com/channels/{guild}/{channel}/{message}`, only where the
 //!   guild (server) is known.
 //! * **Google Chat**, read through a Discord-protocol bridge, whose ids are Chat resource names:
@@ -80,6 +84,38 @@ pub fn slack_permalink(
             return None;
         }
         url.push_str(&format!("?thread_ts={root}&cid={conversation}"));
+    }
+    (url.len() <= MAX_URL_BYTES).then_some(url)
+}
+
+/// A Slack message's address in Slack's own app: the documented
+/// `slack://channel?team={team}&id={conversation}`, with the message named by its `ts` (and a
+/// reply's thread by its root's) as a permalink names them. Slack's docs name only the channel
+/// form; the message parts ride along the same way and degrade to the channel where an app
+/// ignores them. `None` when any part cannot be read — no team learned yet, no app address,
+/// and the page falls back to the permalink. `#481 slack-app-deep-link`.
+#[must_use]
+pub fn slack_app_url(
+    team: &str,
+    conversation: &str,
+    ts: &str,
+    thread_root_ts: Option<&str>,
+) -> Option<String> {
+    if !crate::slack::ids::is_team_id(team) || !crate::slack::ids::is_conversation_id(conversation)
+    {
+        return None;
+    }
+    let ts = crate::slack::ids::canonical_ts(ts)?;
+    if ts.replace('.', "").len() != 16 {
+        return None;
+    }
+    let mut url = format!("slack://channel?team={team}&id={conversation}&message={ts}");
+    if let Some(root) = thread_root_ts {
+        let root = crate::slack::ids::canonical_ts(root)?;
+        if root == ts || root.replace('.', "").len() != 16 {
+            return None;
+        }
+        url.push_str(&format!("&thread_ts={root}"));
     }
     (url.len() <= MAX_URL_BYTES).then_some(url)
 }
@@ -261,6 +297,48 @@ mod tests {
                  ?thread_ts=1700000000.000100&cid=C0123ABCD"
                     .to_owned()
             )
+        );
+    }
+
+    #[test]
+    fn a_slack_app_link_names_the_team_channel_and_message() {
+        assert_eq!(
+            slack_app_url("T0123ABCD", "C0123ABCD", "1700000060.000200", None),
+            Some(
+                "slack://channel?team=T0123ABCD&id=C0123ABCD&message=1700000060.000200".to_owned()
+            )
+        );
+        assert_eq!(
+            slack_app_url(
+                "T0123ABCD",
+                "C0123ABCD",
+                "1700000060.000200",
+                Some("1700000000.000100")
+            ),
+            Some(
+                "slack://channel?team=T0123ABCD&id=C0123ABCD&message=1700000060.000200\
+                 &thread_ts=1700000000.000100"
+                    .to_owned()
+            )
+        );
+        // No team of Slack's shape, no conversation, no readable ts: no app address.
+        assert_eq!(
+            slack_app_url("acme", "C0123ABCD", "1700000060.000200", None),
+            None
+        );
+        assert_eq!(
+            slack_app_url("T0123ABCD", "general", "1700000060.000200", None),
+            None
+        );
+        assert_eq!(slack_app_url("T0123ABCD", "C0123ABCD", "soon", None), None);
+        assert_eq!(
+            slack_app_url(
+                "T0123ABCD",
+                "C0123ABCD",
+                "1700000060.000200",
+                Some("1700000060.000200")
+            ),
+            None
         );
     }
 

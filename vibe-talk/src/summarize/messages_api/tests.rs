@@ -185,6 +185,7 @@ fn message(content: &str) -> Message {
         heading: None,
         mentions: Vec::new(),
         upstream_url: None,
+        upstream_app_url: None,
         op_key: None,
         observed_ms: None,
     }

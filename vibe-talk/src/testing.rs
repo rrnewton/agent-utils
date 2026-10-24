@@ -904,6 +904,15 @@ impl crate::chat::ChatClient for CountingChat {
         self.inner.upstream_url(channel, id, thread)
     }
 
+    fn upstream_app_url(
+        &self,
+        channel: &crate::model::ChannelId,
+        id: &crate::model::MessageId,
+        thread: Option<&crate::threads::MessageThread>,
+    ) -> Option<String> {
+        self.inner.upstream_app_url(channel, id, thread)
+    }
+
     fn supports_threading(&self) -> bool {
         self.inner.supports_threading()
     }

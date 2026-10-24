@@ -812,6 +812,15 @@ declare namespace VibeTalk {
      */
     timestamp: string;
     /**
+     * The same message's address in its service's own app, where the service has one
+     * (`#481 slack-app-deep-link`): a `slack://` address for Slack, formed beside
+     * `upstream_url` by the same stamp from the workspace's team id the provider has
+     * learned. The page opens it in place of the web address when the reader has chosen
+     * the app; copies always take the web address. Absent (and omitted) wherever no app
+     * address can be formed, which is every other provider today.
+     */
+    upstream_app_url?: string | null;
+    /**
      * The message's own address in the service it came from, for the page's "Open in
      * \<service\>" link. `#408 copy-upstream-link`, `#409 open-upstream-link`; see
      * [`crate::upstream_url`].
@@ -1172,6 +1181,11 @@ declare namespace VibeTalk {
      * Whether `content` was cut to fit.
      */
     truncated: boolean;
+    /**
+     * The same message's address in its service's own app, by
+     * [`crate::model::Message::upstream_app_url`]'s rules. `#481 slack-app-deep-link`.
+     */
+    upstream_app_url?: string | null;
     /**
      * The pinned message's own address in its service, formed when the pin is SERVED and never
      * stored, by [`crate::model::Message::upstream_url`]'s rules — so a row drawn from a pin

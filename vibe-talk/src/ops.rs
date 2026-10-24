@@ -351,6 +351,11 @@ fn stamp(state: &AppState, messages: &mut [Message]) {
             state
                 .chat
                 .upstream_url(&message.channel_id, &message.id, message.thread.as_ref());
+        // `#481 slack-app-deep-link`: beside it, its address in the service's own app.
+        message.upstream_app_url =
+            state
+                .chat
+                .upstream_app_url(&message.channel_id, &message.id, message.thread.as_ref());
     }
 }
 

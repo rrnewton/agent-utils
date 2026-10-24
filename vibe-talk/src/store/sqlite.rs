@@ -2246,6 +2246,7 @@ impl StateStore for SqliteStore {
                         content_html: String::new(),
                         heading: None,
                         upstream_url: None,
+                        upstream_app_url: None,
                     })
                 })
                 .map_err(backend)?;
@@ -2368,6 +2369,7 @@ impl StateStore for SqliteStore {
                     content_html: String::new(),
                     heading: None,
                     upstream_url: None,
+                    upstream_app_url: None,
                 }),
                 unpinned,
                 revision,

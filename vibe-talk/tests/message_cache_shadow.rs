@@ -289,6 +289,7 @@ async fn a_gap_a_suspect_channel_and_a_blocked_one_each_miss() {
         edited_timestamp: None,
         mentions: Vec::new(),
         upstream_url: None,
+        upstream_app_url: None,
         op_key: None,
         observed_ms: None,
         thread: None,

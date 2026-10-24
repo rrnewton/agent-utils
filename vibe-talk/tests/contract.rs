@@ -85,6 +85,7 @@ fn message(id: &str) -> Message {
         heading: None,
         mentions: Vec::new(),
         upstream_url: None,
+        upstream_app_url: None,
         op_key: None,
         observed_ms: None,
     }
@@ -409,6 +410,10 @@ fn pin(id: &str, threaded: bool) -> Pin {
         // `#408 copy-upstream-link`: present on the threaded sample and absent on the other.
         upstream_url: threaded
             .then(|| "https://acme.slack.com/archives/C0123ABCD/p1700000000000100".into()),
+        // `#481 slack-app-deep-link`: beside it on the same sample, the app address.
+        upstream_app_url: threaded.then(|| {
+            "slack://channel?team=T0123ABCD&id=C0123ABCD&message=1700000000.000100".into()
+        }),
     }
 }
 

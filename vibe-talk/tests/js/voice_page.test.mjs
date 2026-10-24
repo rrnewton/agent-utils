@@ -17415,6 +17415,99 @@ test("Open in the ⋯ menu links to the message's own address in its service, an
     "a long press on the link opened the row's details");
 });
 
+test("`#481 slack-app-deep-link`: with the app chosen, Open takes the slack:// address and no tab; copies still copy the web address", async () => {
+  // The app address is the server's, carried beside the web one; the choice is this device's,
+  // kept in its own storage. Only the one shape is offered from it: anything else a message
+  // carries there, the ordinary web address is opened instead — as it is by default, with
+  // nothing chosen, and with a stored word that is neither choice.
+  const address = "https://acme.slack.com/archives/C0123ABCD/p1700000060000200";
+  const inApp = "slack://channel?team=T0123ABCD&id=C0123ABCD&message=1700000060.000200";
+  const withLinks = (appUrl, n, minute) => message({
+    id: `80000000000000004${n}0`, content: `with links ${n}`, upstream_url: address,
+    ...(appUrl === undefined ? {} : { upstream_app_url: appUrl }),
+    timestamp: `2026-08-19T04:${minute}:00.000Z`,
+  });
+  const openLinkOf = (row) => row.descendants().find((node) => node.className === "row-open-link-button");
+
+  const page = newPage(new Map([["vibe-talk.voice.slack-open", "app"]]));
+  await signIn(page);
+  assert.equal(page.el("slack-open-in").value, "app", "the setting does not show the stored choice");
+  const rows = await showDiscord(page, [
+    withLinks(inApp, 0, "31"),
+    withLinks("javascript:alert(1)", 1, "36"),
+    withLinks("slack://channel?team=t0123abcd&id=C0123ABCD&message=1700000060.000200", 2, "41"),
+    withLinks("https://acme.slack.com/archives/C0123ABCD/p1700000060000200", 3, "46"),
+    withLinks(undefined, 4, "51"),
+  ]);
+  assert.equal(rows.length, 5, "the fixture did not produce five rows");
+  const link = openLinkOf(rows[0]);
+  assert.equal(link.getAttribute("href"), inApp, "the app was chosen and the link still opens the web address");
+  assert.equal(link.getAttribute("target"), null, "the app address would open the blank tab it exists to avoid");
+  assert.equal(link.getAttribute("rel"), null, "the app address carries a new-tab rel it does not open with");
+  assert.equal(link.getAttribute("title"), `Open this message in Discord: ${inApp}`);
+  for (const row of rows.slice(1)) {
+    const web = openLinkOf(row);
+    assert.equal(web.getAttribute("href"), address,
+      "an app address of no formable shape (or none) was opened instead of the web address");
+    assert.equal(web.getAttribute("target"), "_blank");
+    assert.equal(web.getAttribute("rel"), "noopener noreferrer");
+  }
+  // Copying is for sending to anybody, app or no app: the web address, as l copies it.
+  const copyLink = rows[0].descendants().find((node) => node.className === "row-copy-link-button");
+  await rowMoreButton(rows[0]).click();
+  await copyLink.click();
+  await page.settle();
+  assert.equal(page.clipboard, address, "the Copy item copied the app address nobody else can open");
+
+  for (const stored of [undefined, "browser", "banana"]) {
+    const store = stored === undefined ? new Map() : new Map([["vibe-talk.voice.slack-open", stored]]);
+    const webPage = newPage(store);
+    await signIn(webPage);
+    assert.equal(webPage.el("slack-open-in").value, "browser",
+      `a stored choice of ${JSON.stringify(stored)} is not shown as the browser`);
+    const webRows = await showDiscord(webPage, [withLinks(inApp, 5, "31")]);
+    const webLink = openLinkOf(webRows[0]);
+    assert.equal(webLink.getAttribute("href"), address,
+      `the app address was opened with ${JSON.stringify(stored)} stored, not the app chosen`);
+    assert.equal(webLink.getAttribute("target"), "_blank");
+    assert.equal(webLink.getAttribute("rel"), "noopener noreferrer");
+  }
+});
+
+test("`#481 slack-app-deep-link`: CHOOSING THE APP SAVES THE CHOICE, AND IT SURVIVES A RELOAD", async () => {
+  const page = newPage();
+  await signIn(page);
+  assert.equal(page.el("slack-open-in").value, "browser", "the setting does not start at the browser");
+  page.el("slack-open-in").value = "app";
+  await page.el("slack-open-in").dispatch("change");
+  assert.match(page.el("slack-open-state").textContent, /Saved/);
+  assert.match(page.el("slack-open-state").textContent, /goes to the app/);
+  // Rows drawn from now on open in the app, and so do a reload's: same storage, new page.
+  const address = "https://acme.slack.com/archives/C0123ABCD/p1700000060000200";
+  const inApp = "slack://channel?team=T0123ABCD&id=C0123ABCD&message=1700000060.000200";
+  const carried = () => message({ id: "8000000000000000500", content: "in the app",
+    upstream_url: address, upstream_app_url: inApp, timestamp: "2026-08-19T04:31:00.000Z" });
+  const rows = await showDiscord(page, [carried()]);
+  assert.equal(rows[0].descendants().find((node) => node.className === "row-open-link-button").getAttribute("href"), inApp,
+    "a row drawn after the choice still opens the web address");
+  const again = reloadWith(page.storage, [carried()]);
+  await signIn(again);
+  assert.equal(again.el("slack-open-in").value, "app", "the choice was lost");
+  const reloaded = await reopenedChannel(again);
+  assert.equal(reloaded[0].descendants().find((node) => node.className === "row-open-link-button").getAttribute("href"), inApp,
+    "a reload opens the web address again");
+});
+
+test("`#481 slack-app-deep-link`: a browser that refuses to store where links open says so", async () => {
+  const page = newPage();
+  await signIn(page);
+  page.storage.set = () => page.storage;
+  page.el("slack-open-in").value = "app";
+  await page.el("slack-open-in").dispatch("change");
+  assert.doesNotMatch(page.el("slack-open-state").textContent, /Saved/, "it claimed success");
+  assert.match(page.el("slack-open-state").textContent, /refused to store/);
+});
+
 /** Settle on a real clock until `done`, as an opening from a link lands: bounded, as its waits are. */
 async function untilDeepLink(page, done) {
   for (let spins = 0; spins < 300 && !done(); spins += 1) {
@@ -63141,7 +63234,11 @@ test("`#271 settings-groups`: the Messages section holds the message options, an
     "Reading full messages in channel view"]) {
     assert.ok(!messages.includes(agentGroup), `"${agentGroup}" is in Messages`);
   }
-  assert.deepStrictEqual(groupsIn("Screen and keys"), ["Text size", "Reading width", "Control bar", "Typing", "Keyboard"]);
+  // `#481 slack-app-deep-link` put Opening links here, beside the bar that offers the links:
+  // whether the Slack app is on this device is the device's own business, so it is one of the
+  // per-device choices and is never synced.
+  assert.deepStrictEqual(groupsIn("Screen and keys"),
+    ["Text size", "Reading width", "Control bar", "Opening links", "Typing", "Keyboard"]);
   // `#457 settings-server-side`: the one per-device section says so beside its title.
   assert.match(HTML, /<h2 id="settings-screen-title"><button class="fold-toggle" id="fold-settings-screen"[^>]*>Screen and keys<\/button><span class="settings-scope-note">\(client side\)<\/span><\/h2>/,
     "Screen and keys does not say (client side) beside its title");
@@ -64456,7 +64553,8 @@ function foldProblems(html, css, script) {
 
 test("`#346 settings-collapsible`: every section but Server and every group in them folds, hidden until found", () => {
   assert.deepStrictEqual(foldProblems(HTML, CSS_CODE, SCRIPT_CODE), []);
-  assert.equal(scriptFolds(SCRIPT_CODE).length, 30, "a fold went missing from the list, or one was added unchecked");
+  // 31 since `#481 slack-app-deep-link` added Opening links, counted and checked above.
+  assert.equal(scriptFolds(SCRIPT_CODE).length, 31, "a fold went missing from the list, or one was added unchecked");
 });
 
 test("`#346 settings-collapsible`: the check refuses a fold out of find's reach, an unfolding group, and a list that disagrees (negative controls)", () => {

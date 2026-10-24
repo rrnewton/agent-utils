@@ -175,7 +175,7 @@ const ALL_CHANNELS = "*";
 /**
  * @overload
  * @param {"bar-placement" | "discord-channel" | "relay-to-agent" | "settings-audio-source"
- *   | "settings-channel" | "settings-service" | "thread-select" | "upstream-clear-mode"} id
+ *   | "settings-channel" | "settings-service" | "slack-open-in" | "thread-select" | "upstream-clear-mode"} id
  * @returns {HTMLSelectElement}
  */
 /**
@@ -186,7 +186,7 @@ const ALL_CHANNELS = "*";
  *   | "channel-view-flat" | "channel-view-main" | "channel-view-threads" | "clear-alias"
  *   | "clear-backlog" | "clear-view" | "close-browse-channels" | "close-help"
  *   | "close-settings" | "collapse-all" | "column-toggle" | "dismiss-banner"
- *   | "dismiss-error" | "dismiss-status" | "expand-all" | "fold-help" | "fold-auto-read" | "fold-canned-prompts" | "fold-collapsed-lines" | "fold-combining" | "fold-connection" | "fold-control-bar" | "fold-dismissed" | "fold-empty-messages" | "fold-hidden-channels" | "fold-instructions" | "fold-keyboard" | "fold-mark-own" | "fold-message-cache" | "fold-microphone" | "fold-provider" | "fold-reading-full" | "fold-reading-width" | "fold-relay" | "fold-resuming" | "fold-rich-headers" | "fold-sending" | "fold-settings-all" | "fold-settings-channels" | "fold-settings-messages" | "fold-settings-screen" | "fold-settings-storage" | "fold-settings-voice-agent" | "fold-storage" | "fold-text-size" | "fold-token" | "fold-typing" | "forget-conversations"
+ *   | "dismiss-error" | "dismiss-status" | "expand-all" | "fold-help" | "fold-auto-read" | "fold-canned-prompts" | "fold-collapsed-lines" | "fold-combining" | "fold-connection" | "fold-control-bar" | "fold-dismissed" | "fold-opening-links" | "fold-empty-messages" | "fold-hidden-channels" | "fold-instructions" | "fold-keyboard" | "fold-mark-own" | "fold-message-cache" | "fold-microphone" | "fold-provider" | "fold-reading-full" | "fold-reading-width" | "fold-relay" | "fold-resuming" | "fold-rich-headers" | "fold-sending" | "fold-settings-all" | "fold-settings-channels" | "fold-settings-messages" | "fold-settings-screen" | "fold-settings-storage" | "fold-settings-voice-agent" | "fold-storage" | "fold-text-size" | "fold-token" | "fold-typing" | "forget-conversations"
  *   | "forget-dismissed-sends" | "forget-token"
  *   | "dismissed-send-close" | "dismissed-send-copy" | "dismissed-send-restore"
  *   | "retry-start"
@@ -2066,6 +2066,7 @@ const SETTINGS_FOLDS = [
   "reading-width",
   "collapsed-lines",
   "control-bar",
+  "opening-links",
   "typing",
   "keyboard",
   "settings-storage",
@@ -36411,12 +36412,21 @@ function discordNode(messages) {
   let copyLink = null;
   if (upstreamUrl !== null) {
     const linkService = upstreamServiceName(message);
+    // `#481 slack-app-deep-link`: where this device opens Slack links in the app and the
+    // message carries an app address, the link goes there instead — by its slack:// address,
+    // with no target for a browser to leave a blank tab in. Copies below still take the web
+    // address, the one that can be sent to anybody.
+    const appUrl = upstreamAppUrlOf(message);
+    const opensInApp = appUrl !== null && storedSlackOpen() === "app";
+    const opensAt = opensInApp ? appUrl : upstreamUrl;
     openLink = document.createElement("a");
     openLink.className = "row-open-link-button";
-    openLink.setAttribute("href", upstreamUrl);
-    openLink.setAttribute("target", "_blank");
-    openLink.setAttribute("rel", "noopener noreferrer");
-    openLink.setAttribute("title", `Open this message in ${linkService}: ${upstreamUrl}`);
+    openLink.setAttribute("href", opensAt);
+    if (!opensInApp) {
+      openLink.setAttribute("target", "_blank");
+      openLink.setAttribute("rel", "noopener noreferrer");
+    }
+    openLink.setAttribute("title", `Open this message in ${linkService}: ${opensAt}`);
     openLink.textContent = `Open in ${linkService}`;
     sayRowShortcut(openLink, "row-open-link-button");
     openLink.addEventListener("click", inThisColumn(() => setMenu(false)));
@@ -36713,6 +36723,54 @@ async function markReadThroughHere(row, upstreamId) {
 function upstreamUrlOf(message) {
   const url = message && typeof message.upstream_url === "string" ? message.upstream_url : "";
   return /^https:\/\//i.test(url) && !/\s/.test(url) && HTTP_ADDRESS.test(url) ? url : null;
+}
+
+const SLACK_OPEN_KEY = "vibe-talk.voice.slack-open";
+
+/**
+ * Where this device opens Slack links: in Slack's app or in the browser (`#481
+ * slack-app-deep-link`). Kept on the device and never synced, as Screen and keys' choices are:
+ * whether the app is installed is this device's own business, and no page can tell without
+ * asking it to open — so the browser is the shipped default, and choosing the app is the
+ * owner's word that it is there. Anything stored that is neither word is the browser.
+ */
+function storedSlackOpen() {
+  let stored = null;
+  try {
+    stored = localStorage.getItem(SLACK_OPEN_KEY);
+  } catch (_error) {
+    stored = null;
+  }
+  return stored === "app" ? "app" : "browser";
+}
+
+function slackOpenChanged() {
+  const chosen = el("slack-open-in").value === "app" ? "app" : "browser";
+  let saved = false;
+  try {
+    localStorage.setItem(SLACK_OPEN_KEY, chosen);
+    saved = localStorage.getItem(SLACK_OPEN_KEY) === chosen;
+  } catch (_error) {
+    saved = false;
+  }
+  el("slack-open-state").textContent = saved
+    ? chosen === "app"
+      ? "Saved. Open in Slack goes to the app from here; copied links are web addresses either way."
+      : "Saved. Open in Slack opens the message in a browser tab."
+    : "This browser refused to store the setting, so links will open in the browser after a reload.";
+}
+
+/**
+ * A message's address in its service's own app, as the server formed it (`slack://` for Slack;
+ * `#481 slack-app-deep-link`), or null. The counterpart of `upstreamUrlOf` with that sink's own
+ * shape: only the one scheme and the parts a Slack app address is made of pass, so nothing a
+ * message carries can put another scheme in the href.
+ *
+ * @param {any} message
+ */
+function upstreamAppUrlOf(message) {
+  const url = message && typeof message.upstream_app_url === "string" ? message.upstream_app_url : "";
+  return /^slack:\/\/channel\?team=T[A-Z0-9]+&id=[A-Z0-9]+(&message=[0-9.]+)?(&thread_ts=[0-9.]+)?$/.test(url) ? url : null;
 }
 
 /**
@@ -52637,6 +52695,10 @@ for (const [id, key] of MIC_TOGGLES) {
 // — the select carries the live truth, exactly as the microphone checkboxes do.
 el("bar-placement").value = storedPlacement();
 el("bar-placement").addEventListener("change", placementChanged);
+
+// `#481 slack-app-deep-link`. Where this device opens Slack links, as the bar's placement is.
+el("slack-open-in").value = storedSlackOpen();
+el("slack-open-in").addEventListener("change", slackOpenChanged);
 
 // `#44 live-push`, extended by `#126 read-new-selector`. TWO controls over one value: the button
 // on the bar, where the reader is when a message arrives, and the select in Settings, where there

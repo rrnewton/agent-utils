@@ -1290,6 +1290,10 @@ pub struct Pin {
     /// alone offers its link like a loaded message does. `#408 copy-upstream-link`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_url: Option<String>,
+    /// The same message's address in its service's own app, by
+    /// [`crate::model::Message::upstream_app_url`]'s rules. `#481 slack-app-deep-link`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_app_url: Option<String>,
 }
 
 /// A channel's pins, and the revision they are at.

@@ -1833,6 +1833,9 @@ fn judge(
         message.upstream_url = app.providers.client_for(channel).and_then(|client| {
             client.upstream_url(&message.channel_id, &message.id, message.thread.as_ref())
         });
+        message.upstream_app_url = app.providers.client_for(channel).and_then(|client| {
+            client.upstream_app_url(&message.channel_id, &message.id, message.thread.as_ref())
+        });
     }
 }
 
@@ -3883,6 +3886,7 @@ mod tests {
             heading: None,
             mentions: Vec::new(),
             upstream_url: None,
+            upstream_app_url: None,
             op_key: None,
             observed_ms: None,
         }

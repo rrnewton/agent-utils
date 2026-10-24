@@ -3702,7 +3702,7 @@ return errors === 0;
 }
 validate42.evaluated = {"props":{"complete":true,"deleted":true,"more":true,"removed_threads":true},"dynamicProps":false,"dynamicItems":false};
 
-const schema62 = {"properties":{"author":{"type":"string"},"author_id":{"$ref":"#/$defs/UserId"},"author_is_bot":{"type":"boolean"},"channel_id":{"$ref":"#/$defs/ChannelId"},"content":{"type":"string"},"content_html":{"type":"string"},"edited_timestamp":{"type":["string","null"]},"heading":{"anyOf":[{"$ref":"#/$defs/Heading"},{"type":"null"}]},"id":{"$ref":"#/$defs/MessageId"},"noise":{"type":"boolean"},"observed_ms":{"format":"int64","type":["integer","null"]},"op_key":{"type":["string","null"]},"reactions":{"items":{"$ref":"#/$defs/Reaction"},"type":["array","null"]},"reply_to":{"anyOf":[{"$ref":"#/$defs/MessageId"},{"type":"null"}],"default":null},"spoken_content":{"type":"string"},"spoken_time":{"default":"","type":"string"},"thread":{"anyOf":[{"$ref":"#/$defs/MessageThread"},{"type":"null"}]},"timestamp":{"type":"string"},"upstream_url":{"type":["string","null"]}},"required":["id","channel_id","author","author_id","author_is_bot","timestamp","spoken_time","reply_to","content"],"type":"object"};
+const schema62 = {"properties":{"author":{"type":"string"},"author_id":{"$ref":"#/$defs/UserId"},"author_is_bot":{"type":"boolean"},"channel_id":{"$ref":"#/$defs/ChannelId"},"content":{"type":"string"},"content_html":{"type":"string"},"edited_timestamp":{"type":["string","null"]},"heading":{"anyOf":[{"$ref":"#/$defs/Heading"},{"type":"null"}]},"id":{"$ref":"#/$defs/MessageId"},"noise":{"type":"boolean"},"observed_ms":{"format":"int64","type":["integer","null"]},"op_key":{"type":["string","null"]},"reactions":{"items":{"$ref":"#/$defs/Reaction"},"type":["array","null"]},"reply_to":{"anyOf":[{"$ref":"#/$defs/MessageId"},{"type":"null"}],"default":null},"spoken_content":{"type":"string"},"spoken_time":{"default":"","type":"string"},"thread":{"anyOf":[{"$ref":"#/$defs/MessageThread"},{"type":"null"}]},"timestamp":{"type":"string"},"upstream_app_url":{"type":["string","null"]},"upstream_url":{"type":["string","null"]}},"required":["id","channel_id","author","author_id","author_is_bot","timestamp","spoken_time","reply_to","content"],"type":"object"};
 const schema63 = {"type":"string"};
 const schema65 = {"properties":{"cut":{"format":"uint32","minimum":0,"type":"integer"},"tag":{"type":["string","null"]},"time":{"type":["string","null"]},"title":{"type":["string","null"]}},"required":["cut"],"type":"object"};
 const schema67 = {"properties":{"count":{"format":"uint32","minimum":0,"type":"integer"},"custom":{"type":"boolean"},"custom_id":{"type":["string","null"]},"emoji":{"type":"string"},"owner_reacted":{"type":"boolean"}},"required":["emoji","count"],"type":"object"};
@@ -4492,17 +4492,31 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.upstream_url !== undefined){
-let data28 = data.upstream_url;
+if(data.upstream_app_url !== undefined){
+let data28 = data.upstream_app_url;
 const _errs74 = errors;
 if((typeof data28 !== "string") && (data28 !== null)){
-validate44.errors = [{instancePath:instancePath+"/upstream_url",schemaPath:"#/properties/upstream_url/type",keyword:"type",params:{type: schema62.properties.upstream_url.type},message:"must be string,null"}];
+validate44.errors = [{instancePath:instancePath+"/upstream_app_url",schemaPath:"#/properties/upstream_app_url/type",keyword:"type",params:{type: schema62.properties.upstream_app_url.type},message:"must be string,null"}];
 return false;
 }
 var valid0 = _errs74 === errors;
 }
 else {
 var valid0 = true;
+}
+if(valid0){
+if(data.upstream_url !== undefined){
+let data29 = data.upstream_url;
+const _errs76 = errors;
+if((typeof data29 !== "string") && (data29 !== null)){
+validate44.errors = [{instancePath:instancePath+"/upstream_url",schemaPath:"#/properties/upstream_url/type",keyword:"type",params:{type: schema62.properties.upstream_url.type},message:"must be string,null"}];
+return false;
+}
+var valid0 = _errs76 === errors;
+}
+else {
+var valid0 = true;
+}
 }
 }
 }
@@ -4532,7 +4546,7 @@ return false;
 validate44.errors = vErrors;
 return errors === 0;
 }
-validate44.evaluated = {"props":{"author":true,"author_id":true,"author_is_bot":true,"channel_id":true,"content":true,"content_html":true,"edited_timestamp":true,"heading":true,"id":true,"noise":true,"observed_ms":true,"op_key":true,"reactions":true,"reply_to":true,"spoken_content":true,"spoken_time":true,"thread":true,"timestamp":true,"upstream_url":true},"dynamicProps":false,"dynamicItems":false};
+validate44.evaluated = {"props":{"author":true,"author_id":true,"author_is_bot":true,"channel_id":true,"content":true,"content_html":true,"edited_timestamp":true,"heading":true,"id":true,"noise":true,"observed_ms":true,"op_key":true,"reactions":true,"reply_to":true,"spoken_content":true,"spoken_time":true,"thread":true,"timestamp":true,"upstream_app_url":true,"upstream_url":true},"dynamicProps":false,"dynamicItems":false};
 
 const schema71 = {"properties":{"from":{"$ref":"#/$defs/MessageId"},"messages":{"items":{"$ref":"#/$defs/MessageId"},"type":"array"}},"required":["from","messages"],"type":"object"};
 
@@ -4745,6 +4759,7 @@ props0.spoken_content = true;
 props0.spoken_time = true;
 props0.thread = true;
 props0.timestamp = true;
+props0.upstream_app_url = true;
 props0.upstream_url = true;
 }
 const _errs14 = errors;
@@ -9195,17 +9210,31 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.upstream_url !== undefined){
-let data28 = data.upstream_url;
+if(data.upstream_app_url !== undefined){
+let data28 = data.upstream_app_url;
 const _errs74 = errors;
 if((typeof data28 !== "string") && (data28 !== null)){
-validate142.errors = [{instancePath:instancePath+"/upstream_url",schemaPath:"#/properties/upstream_url/type",keyword:"type",params:{type: schema62.properties.upstream_url.type},message:"must be string,null"}];
+validate142.errors = [{instancePath:instancePath+"/upstream_app_url",schemaPath:"#/properties/upstream_app_url/type",keyword:"type",params:{type: schema62.properties.upstream_app_url.type},message:"must be string,null"}];
 return false;
 }
 var valid0 = _errs74 === errors;
 }
 else {
 var valid0 = true;
+}
+if(valid0){
+if(data.upstream_url !== undefined){
+let data29 = data.upstream_url;
+const _errs76 = errors;
+if((typeof data29 !== "string") && (data29 !== null)){
+validate142.errors = [{instancePath:instancePath+"/upstream_url",schemaPath:"#/properties/upstream_url/type",keyword:"type",params:{type: schema62.properties.upstream_url.type},message:"must be string,null"}];
+return false;
+}
+var valid0 = _errs76 === errors;
+}
+else {
+var valid0 = true;
+}
 }
 }
 }
@@ -9235,7 +9264,7 @@ return false;
 validate142.errors = vErrors;
 return errors === 0;
 }
-validate142.evaluated = {"props":{"author":true,"author_id":true,"author_is_bot":true,"channel_id":true,"content":true,"content_html":true,"edited_timestamp":true,"heading":true,"id":true,"noise":true,"observed_ms":true,"op_key":true,"reactions":true,"reply_to":true,"spoken_content":true,"spoken_time":true,"thread":true,"timestamp":true,"upstream_url":true},"dynamicProps":false,"dynamicItems":false};
+validate142.evaluated = {"props":{"author":true,"author_id":true,"author_is_bot":true,"channel_id":true,"content":true,"content_html":true,"edited_timestamp":true,"heading":true,"id":true,"noise":true,"observed_ms":true,"op_key":true,"reactions":true,"reply_to":true,"spoken_content":true,"spoken_time":true,"thread":true,"timestamp":true,"upstream_app_url":true,"upstream_url":true},"dynamicProps":false,"dynamicItems":false};
 
 exports.ThreadSummary = validate144;
 
@@ -9374,6 +9403,7 @@ props0.spoken_content = true;
 props0.spoken_time = true;
 props0.thread = true;
 props0.timestamp = true;
+props0.upstream_app_url = true;
 props0.upstream_url = true;
 }
 const _errs14 = errors;
@@ -9476,7 +9506,7 @@ validate144.evaluated = {"props":{"display_name":true,"hue":true,"id":true,"repl
 
 exports.PinsResponse = validate146;
 const schema96 = {"properties":{"channel":{"$ref":"#/$defs/ChannelInfo"},"limit":{"format":"uint","minimum":0,"type":"integer"},"pins":{"items":{"$ref":"#/$defs/Pin"},"type":"array"},"pins_notice":{"type":"string"},"revision":{"format":"int64","type":"integer"},"untrusted_content_notice":{"type":"string"}},"required":["channel","pins","revision","limit","pins_notice","untrusted_content_notice"],"type":"object"};
-const schema97 = {"properties":{"author":{"type":"string"},"author_id":{"$ref":"#/$defs/UserId"},"author_is_bot":{"type":"boolean"},"content":{"type":"string"},"content_html":{"type":"string"},"heading":{"anyOf":[{"$ref":"#/$defs/Heading"},{"type":"null"}]},"message_id":{"$ref":"#/$defs/MessageId"},"pinned_at_ms":{"format":"int64","type":"integer"},"thread_id":{"type":["string","null"]},"thread_root":{"type":"boolean"},"timestamp":{"type":"string"},"truncated":{"type":"boolean"},"upstream_url":{"type":["string","null"]}},"required":["message_id","author","author_id","author_is_bot","content","truncated","timestamp","thread_id","thread_root","pinned_at_ms"],"type":"object"};
+const schema97 = {"properties":{"author":{"type":"string"},"author_id":{"$ref":"#/$defs/UserId"},"author_is_bot":{"type":"boolean"},"content":{"type":"string"},"content_html":{"type":"string"},"heading":{"anyOf":[{"$ref":"#/$defs/Heading"},{"type":"null"}]},"message_id":{"$ref":"#/$defs/MessageId"},"pinned_at_ms":{"format":"int64","type":"integer"},"thread_id":{"type":["string","null"]},"thread_root":{"type":"boolean"},"timestamp":{"type":"string"},"truncated":{"type":"boolean"},"upstream_app_url":{"type":["string","null"]},"upstream_url":{"type":["string","null"]}},"required":["message_id","author","author_id","author_is_bot","content","truncated","timestamp","thread_id","thread_root","pinned_at_ms"],"type":"object"};
 
 function validate80(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
 let vErrors = null;
@@ -9807,17 +9837,31 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.upstream_url !== undefined){
-let data16 = data.upstream_url;
+if(data.upstream_app_url !== undefined){
+let data16 = data.upstream_app_url;
 const _errs40 = errors;
 if((typeof data16 !== "string") && (data16 !== null)){
-validate80.errors = [{instancePath:instancePath+"/upstream_url",schemaPath:"#/properties/upstream_url/type",keyword:"type",params:{type: schema97.properties.upstream_url.type},message:"must be string,null"}];
+validate80.errors = [{instancePath:instancePath+"/upstream_app_url",schemaPath:"#/properties/upstream_app_url/type",keyword:"type",params:{type: schema97.properties.upstream_app_url.type},message:"must be string,null"}];
 return false;
 }
 var valid0 = _errs40 === errors;
 }
 else {
 var valid0 = true;
+}
+if(valid0){
+if(data.upstream_url !== undefined){
+let data17 = data.upstream_url;
+const _errs42 = errors;
+if((typeof data17 !== "string") && (data17 !== null)){
+validate80.errors = [{instancePath:instancePath+"/upstream_url",schemaPath:"#/properties/upstream_url/type",keyword:"type",params:{type: schema97.properties.upstream_url.type},message:"must be string,null"}];
+return false;
+}
+var valid0 = _errs42 === errors;
+}
+else {
+var valid0 = true;
+}
 }
 }
 }
@@ -9841,7 +9885,7 @@ return false;
 validate80.errors = vErrors;
 return errors === 0;
 }
-validate80.evaluated = {"props":{"author":true,"author_id":true,"author_is_bot":true,"content":true,"content_html":true,"heading":true,"message_id":true,"pinned_at_ms":true,"thread_id":true,"thread_root":true,"timestamp":true,"truncated":true,"upstream_url":true},"dynamicProps":false,"dynamicItems":false};
+validate80.evaluated = {"props":{"author":true,"author_id":true,"author_is_bot":true,"content":true,"content_html":true,"heading":true,"message_id":true,"pinned_at_ms":true,"thread_id":true,"thread_root":true,"timestamp":true,"truncated":true,"upstream_app_url":true,"upstream_url":true},"dynamicProps":false,"dynamicItems":false};
 
 
 function validate146(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
@@ -10061,6 +10105,7 @@ props0.thread_id = true;
 props0.thread_root = true;
 props0.timestamp = true;
 props0.truncated = true;
+props0.upstream_app_url = true;
 props0.upstream_url = true;
 }
 const _errs10 = errors;

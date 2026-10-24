@@ -256,6 +256,7 @@ fn message(at_ms: i64, text: &str) -> Message {
         edited_timestamp: None,
         mentions: Vec::new(),
         upstream_url: None,
+        upstream_app_url: None,
         op_key: None,
         observed_ms: None,
         thread: None,

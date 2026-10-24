@@ -832,6 +832,19 @@ pub trait ChatClient: Send + Sync {
         None
     }
 
+    /// The same message's address in the provider's own app, where the service has one with
+    /// an address of its own (`#481 slack-app-deep-link`): opened instead of the web address
+    /// when the reader has chosen the app, so no browser tab is left behind by the handoff.
+    /// Same discipline as [`ChatClient::upstream_url`]: formed only from what is already held.
+    fn upstream_app_url(
+        &self,
+        _channel: &ChannelId,
+        _id: &MessageId,
+        _thread: Option<&crate::threads::MessageThread>,
+    ) -> Option<String> {
+        None
+    }
+
     /// Whether this backend supports channel and thread timeline views.
     fn supports_threading(&self) -> bool {
         false
@@ -2436,6 +2449,7 @@ mod lookup_tests {
             heading: None,
             mentions: Vec::new(),
             upstream_url: None,
+            upstream_app_url: None,
             op_key: None,
             observed_ms: None,
         }
@@ -2773,6 +2787,7 @@ mod threads_tests {
             heading: None,
             mentions: Vec::new(),
             upstream_url: None,
+            upstream_app_url: None,
             op_key: None,
             observed_ms: None,
         }

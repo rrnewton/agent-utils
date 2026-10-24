@@ -772,6 +772,25 @@ impl ChatClient for ChatRouter {
         self.entries[index].client.upstream_url(channel, id, thread)
     }
 
+    /// The owning provider's app address for the message, routed as `upstream_url` is.
+    /// `#481 slack-app-deep-link`.
+    fn upstream_app_url(
+        &self,
+        channel: &ChannelId,
+        id: &MessageId,
+        thread: Option<&crate::threads::MessageThread>,
+    ) -> Option<String> {
+        let index = self.index_for(channel).or_else(|| {
+            channel
+                .as_str()
+                .split_once(crate::slack::ids::THREAD_SEPARATOR)
+                .and_then(|(base, _)| self.index_for(&ChannelId(base.to_owned())))
+        })?;
+        self.entries[index]
+            .client
+            .upstream_app_url(channel, id, thread)
+    }
+
     fn supports_threading(&self) -> bool {
         self.entries
             .iter()
