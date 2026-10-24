@@ -79602,6 +79602,23 @@ test("`#483 thread-card-read-style`: a fully read thread's card recedes by the r
     "a read run's line over the cards recedes with its card");
 });
 
+test("`#483 thread-card-read-style`: a Threads list card says its thread is read, as the Threads view's cards do", async () => {
+  const page = newPage();
+  const data = threadData();
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  for (const id of ["201", "202"]) page.dealtWith.add(id);
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await page.el("channel-view-threads").click();
+  await page.settle();
+  const byThread = new Map(page.el("thread-list").children.map((card) => [card.getAttribute("data-context-id"), card]));
+  assert.equal(byThread.get(data.threads[0].id)?.hasAttribute("data-thread-read"), true,
+    "the read thread's Threads list card does not say so, so it is not drawn read");
+  assert.equal(byThread.get(data.threads[1].id)?.hasAttribute("data-thread-read"), false,
+    "the unread thread's Threads list card says it is read");
+});
+
 test("`#440 thread-card-pack-toggle`: a thread's own choice outranks Unpack until Unpack is pressed again; choices and Unpack are kept on the device, and an old on means Unpack all", async () => {
   const storage = new Map([[UNPACK_STORAGE, "on"]]);
   const { page } = await unpackPage(storage);

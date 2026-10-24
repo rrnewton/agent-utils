@@ -178,11 +178,13 @@ pub const THREAD_SUMMARY_MIN_MESSAGES: u64 = 3;
 
 /// Whether a thread's filed name and sentence may be shown on a page, by its reported size:
 /// `reply_count` replies, the root counted on top. Below [`THREAD_SUMMARY_MIN_MESSAGES`] the
-/// card says the thread's real words instead. An unreported count proves nothing about the
-/// thread's size, so what is filed still shows.
+/// card says the thread's real words instead. An unreported or inexact count proves nothing
+/// about the thread's size, so what is filed still shows.
 #[must_use]
-pub fn thread_summary_shown(reply_count: Option<u64>) -> bool {
-    reply_count.is_none_or(|replies| replies.saturating_add(1) >= THREAD_SUMMARY_MIN_MESSAGES)
+pub fn thread_summary_shown(reply_count: Option<u64>, reply_count_exact: bool) -> bool {
+    !reply_count_exact
+        || reply_count
+            .is_none_or(|replies| replies.saturating_add(1) >= THREAD_SUMMARY_MIN_MESSAGES)
 }
 
 /// Whether a thread with `messages` messages, last summarised at `last` messages, is due again.

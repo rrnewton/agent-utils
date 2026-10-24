@@ -8783,7 +8783,7 @@ li.discord-message[data-root-child] > .reply-bridge {
   pointer-events: none;
 }
 
-/* The threads, one card each, every card the same height: the reader's collapsed lines of what the
+/* The threads, one card each, fitted to at most the reader's collapsed lines of what the
    thread is about (`--collapsed-lines`, three until they say otherwise, never under one on a card),
    clamped with an ellipsis, then how long since it moved beside the button into it — save the
    card highlighted, which shows all of it (below). Edged in the thread's own colour, as its tag. */
@@ -8893,8 +8893,10 @@ li.discord-message[data-root-child] > .reply-bridge {
    `threadIsRead`) recedes as a read message row does: the archived rows' own amounts, above
    (`li.discord-message[data-archived="true"]`), in every read mode — Fold read folds such
    cards into runs and Hide read leaves them out before this is seen; under Show read this is
-   what says the thread wants nothing. The grey edge above stays Unpack unread's alone.
-   The card heading an open thread is never marked read, so it never recedes. */
+   what says the thread wants nothing. The desaturation drains the edge's colour with the rest
+   of the card, as it drains a read row's speaker tint; the grey-edge RULE above, which recolours
+   the edge itself, stays Unpack unread's alone. The card heading an open thread is never
+   marked read, so it never recedes. */
 .side-card-row[data-thread-read] {
   --row-opacity: 0.42;
   --row-filter: grayscale(1);

@@ -704,6 +704,7 @@ def check_wide(desk: Desk, found: Json, said: str, lines: int, where: str) -> No
     desk.check(bool(found["shown"]), f"{where}: no card heads the thread")
     desk.check(found["text"] == said, f"{where}: the card at the top says {found['text']!r}, its card said {said!r}")
     desk.check(1 <= number(found, "lines") <= lines, f"{where}: the card at the top is {found['lines']} lines, not within {lines}")
+    desk.check(not found["clamped"], f"{where}: the summarised card at the top is cut, not fitted whole")
     desk.check(bool(back["shown"]) and number(back, "left") >= number(box, "left") and number(back, "right") <= number(box, "right")
                and number(back, "top") >= number(box, "top") and number(back, "bottom") <= number(box, "bottom"),
                f"{where}: the X is not on the card: {back} in {box}")
