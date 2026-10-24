@@ -1,12 +1,13 @@
 ---
 title: 'thread-card-read-style: a fully read thread card looks read'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
 - vibe-talk
 created_at: 2026-10-24T10:13:17.177379786+00:00
-updated_at: 2026-10-24T10:13:17.177379786+00:00
+updated_at: 2026-10-24T11:45:45.996039185+00:00
+closed_at: 2026-10-24T11:45:45.996039125+00:00
 ---
 
 # Description
