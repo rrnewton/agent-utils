@@ -21,17 +21,20 @@ Three real problems, and some friction:
 
 1. **agentctl is four products in one crate.** The Rust `agentctl` crate holds agent management
    (the registry, queue, drainer, Herdr adapter, harness TUIs and agentcloud), the chat bridge
-   host (about 45% of the crate's source lines), the coordinator inbox and the agent watcher.
+   host (about 46% of the crate's Rust lines), the coordinator inbox and the agent watcher.
    Team messaging is designed to join them. The coupling between chat and agent management is
-   real but narrow, and it runs one way (section 2.2).
-2. **The Rust chat bridge has no provider that a public user can run.** The bundled Slack
-   provider reaches Slack only through a separately installed Slack command-line client; its Web
+   real and mostly one way, but it is wider than one interface: chat also uses the composer
+   layer, the target lock, credentials and inbox helpers, and the core carries three chat-born
+   pieces of its own (section 2.2).
+2. **The Rust chat bridge has no provider that a public user can run.** The repository's
+   Slack provider (an unpublished crate built separately) reaches Slack only through a separately installed Slack command-line client; its Web
    API transport is a placeholder that refuses every call. The public Google Chat transport
    exists only in the Python edition. So "chat bridging only", on the Rust edition, means
    writing a plugin (section 3.1).
 3. **Herdr is a hard dependency of every agentctl feature that types into an agent**, including
-   chat and the planned team messaging. That is a design choice, not an accident: the
-   single-typist rule needs one owner of the pane. But it means that "team messaging without
+   chat and the planned team messaging. That is a design choice, not an accident: delivery
+   means typing into a terminal pane that agentctl drives, and the single-typist lock lives on
+   that pane. But it means that "team messaging without
    subagents" still means "agentctl and Herdr" (section 3.2).
 4. **Friction, not hard dependencies:** `wrkslots init` defaults new projects to disk-image
    slots, so the first `create` on a machine without passwordless `sudo` or `fuse2fs` refuses
@@ -39,18 +42,20 @@ Three real problems, and some friction:
    setup skill only builds the full coordinator harness. The README said that no chat provider
    ships for the Rust bridge; this change corrects it (sections 3.1, 3.3, 3.8).
 
-**Recommendation for agentctl:** keep one `agentctl` command. Split the crate along the seam
-that already exists: an `agentctl-core` library (registry, queue, drainer, Herdr adapter,
-harness TUIs, subagents), an `agentctl-chat` library (the bridge host), and later an
-`agentctl-teams` library. The binary enables chat and teams through default-on Cargo features.
+**Recommendation for agentctl:** keep one `agentctl` command. Split the crate into an
+`agentctl-core` library (registry, queue, drainer, target lock, Herdr adapter, composer layer,
+harness TUIs, subagents, credentials, inbox), an `agentctl-chat` library (the bridge host), and
+later an `agentctl-teams` library. This is a refactor of weeks, not days: section 2.2 lists what
+must first become a public core API and what must move out of core. The binary enables chat and teams through default-on Cargo features.
 Add a CI build of the core with neither feature, plus a dependency check that core never
 depends on chat and teams never depend on chat. Version the on-disk registry and queue format
 explicitly, because that format, not the binary, is the contract between the CLI and the
 long-running services that pin older builds. A separately shipped bridge binary stays a cheap
 later step (section 2.4).
 
-**Periodic check:** `scripts/check_standalone.py` (section 4) installs a subset into an empty
-directory and gives it a fresh `HOME` and a `PATH` with every suite command and Herdr removed.
+**Periodic check:** `scripts/check_standalone.py` (section 4) installs a subset into a bare
+virtual environment and gives it a fresh `HOME` and a `PATH` with every suite command, Herdr,
+and the system commands the subset claims not to need removed.
 It proves that no other suite command or sibling package is reachable, then runs the subset's
 quickstart and a scenario. It runs as `packages.standalone.tick-hub` and
 `packages.standalone.wrkslots` in `validation.dag.yaml`. Section 4.3 proposes the next subsets,
@@ -73,7 +78,7 @@ the tool cannot do its main job without it. "Optional" means a flag or configura
 | Slack provider | Rust crate `chat-subscription-slack` (`publish = false`): `agentctl-slack-plugin`, `agentctl-slack-outbound` | Crates `chat-subscription`, `chat-subscription-plugin`; `agentctl` only as a dev-dependency for tests (`rs/chat-subscription-slack/Cargo.toml:13-20`) | A Slack command-line client at an operator-configured absolute path. The Web API transport refuses: "not implemented in this release; configure the cli transport" (`rs/chat-subscription-slack/src/transport.rs:438-456`) | Runs as a child of `agentctl chat run` |
 | `agentctl chat` (Python) | Part of the Python `agentctl` distribution (`chat.py`, `chat_*.py`) | As above | Google Chat's public REST API with an operator-provided OAuth token command (`py/agentctl/chat.py:1472-1484`), or an operator transport command or socket; Herdr | **Hard:** agentctl's queue and drainer |
 | `agentctl inbox`, `agentctl watch-agents` | Part of the Rust crate | As above | Herdr (the watcher reads panes); `agentcloud-notify` delivery needs agentcloud | Read agentctl's registry |
-| `wrkslots` | Python `wrkslots`; Rust `wrkslotsd` is an unpublished read-only replay of its event log | Python 3.10, no dependencies | Git and Linux `/proc`. Disk-image slots: `mkfs.ext4` and passwordless `sudo` or `fuse2fs` with `/dev/fuse`. `run`, `box` and `shell-command`: a systemd user manager (`systemd-run`, `busctl`) and user namespaces or `sudo` (`common/docs/wrkslots/README.md`, "Install") | **Glue:** the required `liveness_command` (`py/wrkslots/cli.py`, `REQUIRED_CONFIG_KEYS`) is project-owned. The package ships a generic fixture probe and an agentctl probe (`py/wrkslots/examples/`); this harness uses the agentctl one. Agent names follow agentctl's naming rule, by documented convention (`py/wrkslots/cli.py:594-600`) |
+| `wrkslots` | Python `wrkslots`; Rust `wrkslotsd` is an unpublished read-only replay of its event log | Python 3.10, no dependencies | Git and Linux `/proc`. Disk-image slots: `mkfs.ext4` and passwordless `sudo` or `fuse2fs` with `/dev/fuse`. `run`, `box` and `shell-command`: a systemd user manager (`systemd-run`, `busctl`) and user namespaces or `sudo` (`common/docs/wrkslots/README.md`, "Install") | **Glue:** the required `liveness_command` (`py/wrkslots/cli.py`, `REQUIRED_CONFIG_KEYS`) is project-owned. The package ships a generic fixture probe and an agentctl probe (`py/wrkslots/examples/`); this harness uses the agentctl one. Agent names must follow agentctl's naming rule: `create`, `adopt` and `transfer-owner` refuse others (`py/wrkslots/cli.py:594-600`) |
 | `dagrun`, `cpuset-alloc` | Python `dagrun` (both commands); Rust crate `dagrun` (both binaries) | Python: PyYAML. Rust: ordinary crates | cgroup v2 through a systemd user manager, required by default; `--allow-cgroup-failure` accepts running without it (`py/dagrun/README.md`) | **Optional:** `gh-paced` for GitHub calls (below) |
 | `parallel-experiment-runner` | Python only | `dagrun>=0.13.1` (`py/parallel_experiment_runner/pyproject.toml`) | systemd user manager (through dagrun) | **Hard, declared:** `dagrun` |
 | `herdr-run` | Python `herdr-run`; Rust crate `herdr-run` | None (its own YAML-subset parser in Rust) | Herdr at a fixed path and a systemd user manager (`py/herdr_run/README.md:92-95`) | None |
@@ -127,14 +132,14 @@ needing Herdr) until the standalone check in section 4.
 
 ### 2.1 What is in the binary
 
-The Rust `agentctl` binary has 35 top-level subcommands (`rs/agentctl/src/cli.rs:67-547`). They
-fall into four groups:
+The Rust `agentctl` binary has 35 top-level subcommands (the `Commands` enum,
+`rs/agentctl/src/cli.rs:67-202`). They fall into four groups:
 
-| Group | Subcommands | Source (lines, including tests and embedded guides) |
+| Group | Subcommands | Rust source lines, tests included (embedded guides excluded) |
 |---|---|---|
-| Agent management | `capabilities start profiles skill adopt move rename anchor promote restore install-units watch doctor stop revive list status send drain prompts answer read wait goal bind-session codex-goal attach attach-self pause resume` | `agent.rs`, `client.rs`, `submission.rs`, `subagents.rs` and `subagents/`, `harness_tui/`, `profiles.rs`, `restore.rs`, `units.rs`, `tui_prompts.rs`, `codex_goal*`, `skill_install.rs`, `credentials.rs`, and `cli.rs`: about 68,700 (the remainder) |
-| Chat bridge host | `chat` (20 subcommands: `init status grant grants revoke grant-limit ... run reply close`) | `chat_runtime.rs` and `chat_runtime/`, `chat_service.rs` and `chat_service/`, `chat_events.rs`, `stale_composer.rs`, chat guides: about 62,700 |
-| Supervision | `inbox`, `watch-agents` | `inbox.rs` and `inbox/`, `agent_watch.rs`, inbox guides: about 6,700 |
+| Agent management | `capabilities start profiles skill adopt move rename anchor promote restore install-units watch doctor stop revive list status send drain prompts answer read wait goal bind-session codex-goal attach attach-self pause resume` | `agent.rs`, `client.rs`, `submission.rs`, `subagents.rs` and `subagents/`, `harness_tui/`, `profiles.rs`, `restore.rs`, `units.rs`, `tui_prompts.rs`, `codex_goal*`, `skill_install.rs`, `credentials.rs`, `cli.rs`, and the chat-born `plugins.rs` (1,756) and `prompt_time.rs` (633): about 65,300 (the remainder) |
+| Chat bridge host | `chat` (20 subcommands: `init status grant grants revoke grant-limit ... run reply close`) | `chat_runtime.rs` and `chat_runtime/`, `chat_service.rs` and `chat_service/`, `chat_events.rs`, `stale_composer.rs`: about 60,000 |
+| Supervision | `inbox`, `watch-agents` | `inbox.rs` and `inbox/`, `agent_watch.rs`: about 6,400 |
 | Planned: team messaging | `teams ...`, `team ...` (#496 section 11) | not written |
 
 Chat providers are already outside the crate. `chat-subscription` (2,900 lines) and
@@ -144,10 +149,10 @@ already a plugin architecture. The open question is only about the bridge host.
 
 ### 2.2 Where the coupling is real
 
-**Chat depends on agent management, through a narrow seam.** The chat modules import
+**Chat depends on agent management, through more than one interface.** The chat modules import
 `agent::{DrainOptions, QueueMessageState}` and `subagents::{ManagedAgents, ManagedApi}`
 (`chat_runtime.rs:34-35`), plus `AgentRuntime`, `HerdrClient` and `StaleComposer`
-(`chat_service.rs:29-40`). What they actually use is small:
+(`chat_service.rs:29-40`). Outside tests, chat uses:
 
 - prompt delivery through the internal trait `CoordinatorDelivery`: `submit`, `drain`,
   `message_state` and their reporting variants (`chat_runtime.rs:4544-4600`). The
@@ -156,31 +161,58 @@ already a plugin architecture. The open question is only about the bridge host.
 - pane observation: `pane_info`, `read_capture`, `peek_capture` (with and without a runtime),
   and `pause`, which is all `chat_service.rs` calls on the manager;
 - Herdr's event socket, for wakeups on pane output (`client.event_socket`,
-  `client.event_socket_with_cancellation`).
+  `client.event_socket_with_cancellation`);
+- the harness composer layer: `submission::composer_view`, `composer_is_empty`, `running_turn`
+  and `clear_composer` (`stale_composer.rs:112-113, 214, 355`; `running_turn` also in
+  `chat_service.rs`). The bridge clears a stale composer itself, so it types into the pane
+  directly as well as through the queue;
+- the host-wide target lock, `agent::lock_target_within` (`stale_composer.rs:540`), the same
+  lock the drainer takes;
+- credential inspection, `credentials::{problems, inspect, failure_explanation,
+  CREDENTIAL_EXPIRY_WARNING}` (`chat_runtime.rs:6837-6838` and nearby, `chat_service.rs`);
+- inbox helpers for reply reminders, `inbox::{environment_value, claude_sessions_by_pane,
+  transcript_of_session}` (`chat_service/reply_reminders.rs:205, 329, 374`);
+- many private-file helpers from `agent` (`open_private_lock`, `atomic_json`, `sync_directory`,
+  `validate_private_directory`, and others).
 
-This coupling is essential, not incidental. The bridge types owner messages into the same queue
-that `agentctl send` uses, and under the same single-typist drain lock, so a chat message and a
-CLI message can never be pasted into one composer at once. It reads replies from the same pane
-that `agentctl read` reads. Any factoring must keep exactly one implementation of the queue and
-the drainer. A bridge with its own typist would bring back the race that the shared queue exists
-to prevent.
+The first two items are the essential coupling. The bridge types owner messages into the same
+queue that `agentctl send` uses, and the drainer takes the host-wide target lock before it types,
+so a chat message and a CLI message can never be pasted into one composer at once. The bridge
+reads replies from the same pane that `agentctl read` reads. Any factoring must keep exactly one
+implementation of the queue, the drainer and the lock. Herdr is required for a separate reason:
+delivery means typing into a terminal pane, and Herdr is the pane host agentctl drives. The other
+items are ordinary shared code that a core library can export.
 
-**Agent management barely depends on chat.** Outside `cli.rs`, the only references from the
-agent layer into chat code are `prompt_time.rs:100`, which borrows `chat_runtime::unix_millis()`
-(a clock helper), and `subagents::chat_capture_source` (`subagents.rs:73-79`), a chat helper
-defined in the wrong module. Both are incidental and take minutes to move. The dependency points
-one way: chat → core.
+**Agent management depends on chat in three places.** Outside `cli.rs`:
+
+- `prompt_time.rs` is a chat feature: "The time stamp that opens every chat request prompt". Core
+  carries it because a queued prompt stores its deferred opening and create time (`sent_at`,
+  `opening`), written by `agent::enqueue` (`agent.rs:838-845`) and retimed by the drainer
+  (`agent.rs:2927-2935`). Those fields are part of the queue format, so this piece belongs in
+  core with the queue, not in chat.
+- The Herdr client runs every `herdr` command through
+  `chat_subscription_plugin::process::ProcessPluginChild` (`client.rs:6, 1099`), a process
+  supervision primitive from the chat plugin library. A core-only build would still link
+  `chat-subscription-plugin` unless that primitive moves to a neutral crate.
+- `plugins.rs` (chat-provider plugin discovery) is reached from the core command
+  `capabilities` (`cli.rs:1367, 2148-2150`). `capabilities` needs a way to report chat
+  plugins only when the chat feature is built.
+
+There are two small leftovers: `prompt_time.rs:100` borrows `chat_runtime::unix_millis()`, and
+the chat helper `subagents::chat_capture_source` (`subagents.rs:73-79`) lives in the wrong
+module.
 
 **The shared state is the real contract.** The bridge, the agent watcher and the CLI all read
 and write the same registry and queue directories. In practice they already run different
-builds: the owner's deployment pins one agentctl binary for the chat bridge and another for the
-watcher, while the coordinator runs the CLI from the current source tree. The team-messaging
+builds: a deployment that runs the bridge and the watcher as long-lived services naturally pins
+a copy of the binary for each, while the coordinator runs whatever CLI is current. The team-messaging
 design names "which binary drives that registry" among the facts an operator has to know by hand
 and that go stale (#496 section 0). Splitting binaries would not create version skew. The skew exists today; what
 is missing is an explicit, versioned format that tells a reader its writer was newer.
 
 **Supervision** (`inbox`, `watch-agents`) reads the registry and panes and posts notices. It
-depends on the core in the same way chat does, and on nothing in chat.
+depends on the core in the same way chat does, and on nothing in chat. Chat depends on it,
+through the inbox helpers above.
 
 ### 2.3 Options
 
@@ -191,7 +223,7 @@ depends on the core in the same way chat does, and on nothing in chat.
 | Packaging | Unchanged for users. `cargo install agentctl --no-default-features` gives a lean core | Two artifacts. A chat user installs both, because adopt and status live in core | As B, plus discovery rules | Unchanged |
 | Versioning | One version | Two versions that must agree on the on-disk format, which needs explicit versioning either way | As B | One version, but pinned services skew anyway |
 | Pinned deployments | Unchanged: services keep pinning a copy of `agentctl` | Simplifies them: the bridge unit pins `agentctl-chat` and the CLI upgrades freely | As B | Unchanged |
-| Cost to build | Crate boundaries: the `pub(crate)` items chat uses become a public core API; `cli.rs` dispatch moves behind features | A, plus a second binary target and packaging checks | A, plus a dispatcher. A dynamic library is ruled out: Rust has no stable ABI | None |
+| Cost to build | Weeks: the `pub(crate)` items chat uses (section 2.2) become a public core API, `ProcessPluginChild` moves to a neutral crate, `cli.rs` dispatch and `capabilities` move behind features | A, plus a second binary target and packaging checks | A, plus a dispatcher. A dynamic library is ruled out: Rust has no stable ABI | None |
 | What it buys | Enforced layering: core cannot grow chat dependencies. Team messaging lands on core without touching chat. A core-only build for people who never bridge chat | A's benefits, plus independent upgrades of the long-running bridge | Like B, discovered at run time | Nothing |
 
 **Python edition.** The modules are already grouped (`chat*.py`, `mcp.py`, `foreign/`), and the
@@ -203,22 +235,29 @@ question (section 6, question 2).
 
 Choose **A**, and treat B as a later packaging decision rather than an architecture change:
 
-1. Extract `agentctl-core` (registry, queue, drainer, Herdr client, harness TUIs, subagents,
-   profiles, restore). Move `unix_millis` and `chat_capture_source` to where they belong. Make
-   the `CoordinatorDelivery` and pane-observation methods chat uses the core's public API.
-2. Move the bridge host into `agentctl-chat`, which depends on core, `chat-subscription` and
-   `chat-subscription-plugin`. Move `inbox` and `watch-agents` into `agentctl-supervise` or keep
-   them in core; they are small and need nothing from chat.
-3. Build team messaging as `agentctl-teams` on core. Its "bridges beside a contact" checks
+1. Extract `agentctl-core`: registry, queue (including `prompt_time`'s deferred openings, which
+   are part of its format), drainer, target lock, Herdr client, composer layer (`submission`),
+   harness TUIs, subagents, profiles, restore, credentials, the private-file helpers, and
+   `inbox` and `watch-agents` (chat uses the inbox helpers, and they are small). Make the
+   `CoordinatorDelivery`, pane-observation, composer and lock functions chat uses the core's
+   public API. Move `unix_millis` and `chat_capture_source`.
+2. Move `ProcessPluginChild` (and whatever it needs) from `chat-subscription-plugin` into a
+   small neutral crate that both the Herdr client and the plugin protocol depend on, so core
+   stops linking the chat plugin library.
+3. Move the bridge host and `plugins.rs` into `agentctl-chat`, which depends on core,
+   `chat-subscription` and `chat-subscription-plugin`. `capabilities` asks the chat feature for
+   its plugin inventory when it is built.
+4. Build team messaging as `agentctl-teams` on core. Its "bridges beside a contact" checks
    (#496 section 9) read bridge state files; they must not link chat code, and they must treat
    "no bridge configured" as normal.
-4. In the `agentctl` binary, gate `chat` and `team`/`teams` behind default-on features. `agentctl
+5. In the `agentctl` binary, gate `chat` and `team`/`teams` behind default-on features. `agentctl
    capabilities` already reports services and plugins; it should report which features this
    build has, so `team` in a build without it fails with exit 2 as #496 section 11 already
    specifies for an edition that lacks it.
-5. Enforce the layering in validation: build `-p agentctl --no-default-features`, and fail if
-   `cargo tree -p agentctl-core` or `-p agentctl-teams` reaches `agentctl-chat`.
-6. Give the registry and queue a format version that readers check, with a clear refusal when a
+6. Enforce the layering in validation: build `-p agentctl --no-default-features`, and fail if
+   `cargo tree -p agentctl-core` or `-p agentctl-teams` reaches `agentctl-chat` or
+   `chat-subscription-plugin`.
+7. Give the registry and queue a format version that readers check, with a clear refusal when a
    writer was newer. This is the contract between pinned services and the CLI under any option.
 
 If the owner later wants the bridge to be its own artifact (B), add an `agentctl-chat` binary
@@ -279,7 +318,8 @@ Per the #496 design, which is not implemented yet.
 - **Install:** `python3 -m pip install wrkslots`. Git.
 - **Configure:** `wrkslots init . --worktrees-dir worktrees/slots --liveness-command PATH` with a
   project-written liveness command.
-- **Proven:** with no agentctl, Herdr, systemd unit or `sudo`, an agent creates its own slot,
+- **Proven:** with no agentctl or Herdr, and with `sudo`, `systemd-run`, `systemctl`, `busctl`,
+  `mount` and the image tools withheld from `PATH`, an agent creates its own slot,
   commits, writes a handoff and releases. The coordinator reads the handoff and removes the slot,
   and the agent's branch keeps its commit (`scripts/check_standalone.py`, `wrkslots_scenario`).
 - **Accidental friction:**
@@ -367,25 +407,36 @@ No tool was found that needs another suite tool's binary or configuration just t
 
 `scripts/check_standalone.py` keeps a table of subsets. For each one it:
 
-1. copies each of the subset's `py/` projects to a temporary directory and installs it with
-   `pip install --no-deps --no-index --no-build-isolation --target` (the source tree gains no
-   build output);
+1. builds each of the subset's `py/` projects as a wheel from a temporary copy (`pip wheel
+   --no-deps --no-index --no-build-isolation`; the source tree gains no build output) and
+   installs it into a fresh virtual environment created without pip and without the
+   interpreter's own site-packages, so its console scripts start that environment's
+   interpreter and see nothing installed on the host;
 2. copies each declared third-party dependency's installed files (PyYAML for tick-hub) from the
-   validating interpreter, and nothing else;
+   validating interpreter into that environment, and fails if a declared dependency names no
+   files to copy;
 3. builds a directory of links to every ordinary system command from the standard system
-   directories, except every command the suite installs and Herdr. The suite's command list is
-   read from the tree (`py/bin/*` and every `[[bin]]` in the Cargo manifests), so a new tool is
-   excluded automatically;
+   directories, except every command the suite installs, Herdr, and the system commands the
+   subset says it does not need (for wrkslots: `sudo`, `systemd-run`, `systemctl`, `busctl`,
+   `fuse2fs`, `mkfs.ext4`, `mount`, `umount`). The suite's command and package lists are read
+   from the tree (`py/bin/*`, every `[[bin]]` in the Cargo manifests, every `py/*` project), so
+   a new tool is excluded automatically;
 4. runs every command with an empty environment: a fresh `HOME`, `TMPDIR` and XDG directories,
-   `PATH` set to the subset's own commands plus that directory, `PYTHONNOUSERSITE=1`;
-5. proves isolation before the scenario: the subset's own commands resolve into its install,
-   no other suite command resolves at all, and no other suite package imports;
+   `PATH` set to the environment's `bin` plus that directory, `PYTHONNOUSERSITE=1`. Each command
+   leads its own process group, and a timeout kills the whole group;
+5. proves isolation before the scenario: the subset's own commands resolve into its environment
+   and start its interpreter, no other suite command or withheld system command resolves, and
+   no other suite package imports from inside the environment;
 6. runs `COMMAND quickstart`, then the subset's scenario.
 
 A scenario that tries a foreign command fails with "not installed in this subset's
-environment". Three negative probes were run by hand while writing it: calling `agentctl`,
-importing `wrkslots` from the tick-hub subset, and `command -v herdr`. All three failed as they
-should.
+environment". Five negative probes were run by hand against the tick-hub subset: dropping its
+PyYAML declaration, calling `agentctl`, importing `dagrun`, calling a withheld `sudo`, and a
+command that outlives its timeout with a background child. All five failed as they should, and
+the timed-out process group left nothing running. An earlier version ran commands through the
+validating interpreter with `PYTHONPATH`; the adversarial review showed that this left the
+interpreter's own site-packages visible, which is why the environment is now a bare virtual
+environment.
 
 Wiring: two steps in `validation/packages.dag.yaml`, group `standalone`, labelled
 `validation-packages`, `validation-python-packages` and the tool's component label. A change to
@@ -395,8 +446,8 @@ them. Cost measured on the development host, a busy shared workstation:
 
 | Step | Wall | CPU | Where the time goes |
 |---|---|---|---|
-| `packages.standalone.tick-hub` | 1.3-1.4 s | about 1.3 s | install and three ticks |
-| `packages.standalone.wrkslots` | 41 s | about 18 s user, 23 s system | almost all in `wrkslots remove`, whose process census scales with the host's process count. A runner with few processes should take a few seconds |
+| `packages.standalone.tick-hub` | 1.6-1.7 s | about 1.7 s | wheel build, install and three ticks |
+| `packages.standalone.wrkslots` | 42 s | about 18 s user, 23 s system | almost all in `wrkslots remove`, whose process census scales with the host's process count. A runner with few processes should take a few seconds |
 
 The wrkslots step declares `cpu_timeout: 300` and `timeout: 900` for that reason.
 
