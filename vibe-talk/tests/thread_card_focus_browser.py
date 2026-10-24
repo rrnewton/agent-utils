@@ -16,7 +16,7 @@ the window with three threads, one opened by a long question — from one loopba
 At 1280x800, with a mouse and the keys, in two columns over the cards:
 
   Main scrolled until the long question's root and another root are on screen, both linked to their
-  cards -> every card three lines and one height, every card's edge and every link in its thread's
+  cards -> every card at most three lines, its height following its lines, every card's edge and every link in its thread's
   colour, by the computed colour and by the pixels drawn -> the mouse over the long card: selected,
   still three lines, no card a pixel taller -> a click on it: highlighted and shown whole, its thread
   not entered, every other card its old height; every other card's edge the page's grey, by its
@@ -39,7 +39,7 @@ At 412x915, with a finger, in one column over the Threads list:
 `#281 view-keys`. Then, on the same phone, the thread list the view picker chooses (Ctrl+3 on a desk):
 the right column's cards, across the window. The card highlighted on the Threads list is highlighted
 here too, one per channel, and every other card's edge is the grey, by computed colour and pixels;
-every card but it three lines; each card's replies button a thumb's height -> a tap on the long
+every card but it at most three lines; each card's replies button a thumb's height -> a tap on the long
 question's card: it takes the highlight and shows all of itself, the list still on screen, the card
 that had it now grey -> a tap on its replies button: its thread across the window -> Back: the thread
 list, the card still highlighted.
@@ -411,8 +411,12 @@ def desk_walk(desk: Desk) -> None:
     desk.settled()
     before = state(desk, "side-cards")
     cards = by_id(before)
-    heights = {round(number(card, "height")) for card in cards.values()}
-    desk.check(len(heights) == 1, f"the cards are not one height: {heights}")
+    # Fitted (`#482 thread-card-fit`): every card at most three lines, its height following its lines.
+    by_lines = sorted(cards.values(), key=lambda card: number(card, "lines"))
+    desk.check(all(number(card, "lines") <= 3 for card in by_lines),
+               f"a card is past three lines: {[(number(c, 'lines'), round(number(c, 'height'))) for c in by_lines]}")
+    desk.check(all(round(number(a, "height")) <= round(number(b, "height")) for a, b in zip(by_lines, by_lines[1:])),
+               f"a card's height does not follow its lines: {[(number(c, 'lines'), round(number(c, 'height'))) for c in by_lines]}")
     desk.check(bool(cards[REPLICA]["clamped"]) and number(cards[REPLICA], "lines") == 3, "the long card is not three lines")
     check_coloured(desk, before, "before a highlight")
     no_overflow(desk, before, "before a highlight")
@@ -587,13 +591,13 @@ def phone_list_walk(desk: Desk) -> None:
     shown = by_id(before)
     drawn = edge_pixels(desk, before)
     # `#440 thread-card-pack-toggle`. The thread list highlights no card and greys none, whatever the
-    # Threads list had lit: every card three lines, its edge in its thread's colour.
+    # Threads list had lit: every card at most three lines (fitted, `#482`), its edge in its thread's colour.
     for card_id, card in shown.items():
         desk.check(not card["lit"], f"the thread list drew {card_id} highlighted")
         edge = colour(card, "edge")
         desk.check(chroma(edge) >= COLOURED and chroma(drawn[card_id]) >= COLOURED_PIXEL,
                    f"the edge of {card_id} is {edge}, drawn {drawn[card_id]}, not its colour")
-        desk.check(number(card, "lines") == 3, f"{card_id} is not three lines: {card['lines']}")
+        desk.check(1 <= number(card, "lines") <= 3, f"{card_id} is past three lines: {card['lines']}")
     # A finger's target: the way into each thread is a thumb high, where the desk's chip is the facts' height.
     tall = page.evaluate("() => [...document.querySelectorAll('#side-cards .side-card-open')]"
                          ".map((button) => button.getBoundingClientRect().height)")
