@@ -27049,7 +27049,15 @@ function observeOutgoingMessages(messages) {
 function renderOutgoingMessages() {
   const host = el("outgoing-log");
   const channel = el("discord-channel").value;
-  const visibleIds = new Set([...el("discord-log").children].flatMap(rowMessages)
+  // `#491 threads-view-sent-receipt`. And the rows among the Threads view's cards, where that view
+  // draws a reply sent from it: the owner, 2026-10-23, "After it sent there was still a card on the
+  // bottom AND it rendered as a card under the thread. The same message is on the screen twice."
+  const drawnRows = [...el("discord-log").children];
+  if (sideCardsShown()) {
+    drawnRows.push(.../** @type {HTMLElement[]} */ ([...leftEl("side-cards").children])
+      .filter((li) => li.hasAttribute("data-unpack-thread") || li.hasAttribute("data-main-row")));
+  }
+  const visibleIds = new Set(drawnRows.flatMap(rowMessages)
     .filter((message) => String(message.channel_id) === channel).map((message) => String(message.id)));
   let retired = false;
   const rows = [];

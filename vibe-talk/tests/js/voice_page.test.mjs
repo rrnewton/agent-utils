@@ -80610,6 +80610,35 @@ test("`#407 unpack-row-parity`: Reply from an unpacked row opens under it among 
   assert.ok(page.el("side-cards").children.some((li) => li.hasAttribute("data-unpack-thread")), "the cards came back packed");
 });
 
+test("`#491 threads-view-sent-receipt`: a reply sent from among the cards, once drawn there, leaves no Sent row at the foot", async () => {
+  // The owner, 2026-10-23: "After it sent there was still a card on the bottom AND it rendered as a card
+  // under the thread. The same message is on the screen twice."
+  const { page, data } = await parityPage({ long: false });
+  const answered = data.messages.find((m) => m.id === "703");
+  const mine = message({ id: "7990", content: "Answered from the cards.", reply_to: "703",
+    thread: { ...answered.thread, is_root: false, reply_count: null, reply_count_exact: false } });
+  page.replyResponse = async () => {
+    page.messages.push(mine);
+    return json(200, { posted: mine });
+  };
+  const area = page.el("side-scroll");
+  area.focus();
+  await mouseOnto(page, unpackedRow(page, "703"));
+  await pressHere(page, "r");
+  assert.ok(replyInStream(page), "r did not open the reply");
+  await page.el("reply-text").setValue("Answered from the cards.");
+  await page.el("reply-send").click();
+  await page.settle();
+  await deliver(page, page.stream(), sseMessage(mine, { self_posted: true }));
+  await page.settle();
+  const drawn = () => page.el("side-cards").children.filter((li) => li.hasAttribute("data-unpack-thread") &&
+    li.text().includes("Answered from the cards."));
+  const receipts = () => page.el("outgoing-log").children.filter((li) => li.text().includes("Answered from the cards."));
+  assert.equal(drawn().length, 1, "the premise: the reply is not drawn among the cards");
+  assert.deepEqual(receipts().map((li) => li.getAttribute("data-send-state")), [],
+    "the reply is drawn among the cards and again as a receipt at the foot");
+});
+
 test("`#407 unpack-row-parity`: n goes to the next unread message over unpacked cards, a card standing for its unread replies", async () => {
   const { page } = await parityPage({ long: false });
   const area = page.el("side-scroll");
