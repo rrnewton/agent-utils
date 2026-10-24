@@ -1,13 +1,14 @@
 ---
 title: 'browser-lane-critical-path: the serialized browser lane is the whole gate''s wall time'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
 - validation
 - vibe-talk
 created_at: 2026-10-23T23:26:13.489587599+00:00
-updated_at: 2026-10-23T23:26:13.489587599+00:00
+updated_at: 2026-10-24T01:33:18.406083525+00:00
+closed_at: 2026-10-24T01:33:18.406083395+00:00
 ---
 
 # Description
