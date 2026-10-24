@@ -6,8 +6,9 @@
 description: Tool-owned Python regression suites
 
 resource_caps:
-  # Shared with the lifecycle fragment when both are included in the repository graph.
-  lifecycle-io: 5
+  # Shared with the lifecycle fragment when both are included in the repository graph; see the
+  # measurements there.
+  lifecycle-io: 11
 
 steps:
   - group: agentctl
