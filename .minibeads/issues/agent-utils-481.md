@@ -1,12 +1,13 @@
 ---
 title: 'slack-app-deep-link: open Slack messages in the app via slack://, no blank tab, as a Settings choice'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
 - vibe-talk
 created_at: 2026-10-24T04:51:51.783630644+00:00
-updated_at: 2026-10-24T04:51:51.783630644+00:00
+updated_at: 2026-10-24T06:53:06.917369565+00:00
+closed_at: 2026-10-24T06:53:06.917369315+00:00
 ---
 
 # Description

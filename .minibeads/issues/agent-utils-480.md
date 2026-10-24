@@ -1,12 +1,13 @@
 ---
 title: 'fold-one-message-key: Shift+O folds the selected message into a read-run line; open-upstream moves to Cmd+O'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
 - vibe-talk
 created_at: 2026-10-24T04:51:51.781163432+00:00
-updated_at: 2026-10-24T04:51:51.781163432+00:00
+updated_at: 2026-10-24T06:53:06.914373624+00:00
+closed_at: 2026-10-24T06:53:06.914373243+00:00
 ---
 
 # Description
