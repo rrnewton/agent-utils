@@ -8,6 +8,7 @@
 //! | post | `slack.message send --channel-id=C… --markdown=file://- [--thread-ts=…] [--as=A…] --output=json` |
 //! | reaction | `slack.reaction add --channel-id=C… --message-ts=… --name=… [--as=A…] --output=json` |
 //! | listing | `slack.message list --channel-id=C… [--thread-ts=…] --oldest=… [--as=A…] --output=json` |
+//! | rescan listing | `slack.message list --channel-id=C… [--thread-ts=…] --oldest=… [--page-token=…] --limit=20 --columns=… --content-format=mrkdwn --output=json` |
 //! | sender lookup | `slack.user describe --user=<unixname\|email\|ID> --columns=user_id [--as=A…] --output=json` |
 //! | human-author check | `slack.user describe --user=U… --columns=user_id,is_bot [--as=A…] --output=json` |
 //! | current members | `slack.conversation members --channel-id=C… --limit=20 --columns=user_id [--page-token=…] [--as=A…] --output=json` |
@@ -26,7 +27,7 @@
 //!
 //! Each tail stdout line is one JSON object: `{"type": "message.created", "iris_seq_id": N,
 //! "payload": {"container_id": "C…", "slack_message": {"channel_id", "message_ts", "thread_ts",
-//! "slack_user_id", "bot_id", "app_id", "subtype", "text", "team_id"}}}`, plus
+//! "slack_user_id", "bot_id", "app_id", "subtype", "text", "team_id", "file_ids"}}}`, plus
 //! `{"type": "HEARTBEAT"}` and `{"type": "GAP", ...}` records.
 
 use std::collections::BTreeSet;
@@ -42,8 +43,9 @@ use serde_json::Value;
 
 use crate::ids::{self, AppId};
 use crate::transport::{
-    Catchup, EventStream, ListQuery, ListedMessage, PostMessage, SlackMessage, SlackTransport,
-    StreamCancel, StreamRecord, StreamWait, SubscribeSpec, TextFormat, TransportError,
+    Catchup, EventStream, ListQuery, ListedMessage, PostMessage, ScanPage, ScanQuery,
+    ScannedMessage, SlackMessage, SlackTransport, StreamCancel, StreamRecord, StreamWait,
+    SubscribeSpec, TextFormat, TransportError,
 };
 
 /// Largest accepted stream line; longer lines are dropped with a notice.
@@ -195,6 +197,31 @@ fn text_field(value: &Value, key: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The valid Slack file IDs in a row's `file_ids`, which the client reports either as a list or
+/// as one comma-separated string. At most [`MAX_FILE_IDS`] are kept, in order, without repeats.
+#[must_use]
+pub fn file_ids_field(value: &Value) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut push = |candidate: &str| {
+        let candidate = candidate.trim();
+        if ids::valid_file_id(candidate)
+            && ids.len() < MAX_FILE_IDS
+            && !ids.iter().any(|id| id == candidate)
+        {
+            ids.push(candidate.to_owned());
+        }
+    };
+    match value.get("file_ids") {
+        Some(Value::String(joined)) => joined.split([',', ' ']).for_each(&mut push),
+        Some(Value::Array(values)) => values.iter().filter_map(Value::as_str).for_each(push),
+        _ => {}
+    }
+    ids
+}
+
+/// Most file IDs kept from one message.
+pub const MAX_FILE_IDS: usize = 20;
+
 /// Classify one stdout line of the tail.
 #[must_use]
 pub fn parse_tail_line(line: &str) -> StreamRecord {
@@ -260,6 +287,7 @@ pub fn parse_tail_line(line: &str) -> StreamRecord {
                     .unwrap_or_default()
                     .to_owned(),
                 team_id: text_field(slack, "team_id"),
+                file_ids: file_ids_field(slack),
             }))
         });
     StreamRecord::Event {
@@ -1058,6 +1086,97 @@ fn member_page(document: &Value) -> Result<(Vec<String>, Option<String>), Transp
     Ok((members, token))
 }
 
+/// The client arguments of one rescan listing page. It runs as the configured member, like the
+/// tail, so it takes no `--as`; `mrkdwn` is the stored text an event carries.
+#[must_use]
+pub fn scan_arguments(query: &ScanQuery<'_>) -> Vec<String> {
+    let mut arguments = vec![
+        "slack.message".to_owned(),
+        "list".to_owned(),
+        format!("--channel-id={}", query.channel_id),
+    ];
+    if let Some(thread_ts) = query.thread_ts {
+        arguments.push(format!("--thread-ts={thread_ts}"));
+    }
+    arguments.push(format!("--oldest={}", query.oldest));
+    if let Some(token) = query.page_token {
+        arguments.push(format!("--page-token={token}"));
+    }
+    arguments.extend([
+        "--limit=20".to_owned(),
+        "--columns=message_ts,thread_ts,author_user_id,subtype,content,file_ids,reply_count,latest_reply"
+            .to_owned(),
+        "--content-format=mrkdwn".to_owned(),
+        "--output=json".to_owned(),
+    ]);
+    arguments
+}
+
+/// Decode one rescan listing page. Rows without a valid `message_ts` are skipped; a page whose
+/// pagination says another page exists without a usable token is refused.
+///
+/// # Errors
+///
+/// Returns `listing_unreadable` for a document without rows or with inconsistent pagination.
+pub fn scan_page(document: &Value, channel_id: &str) -> Result<ScanPage, TransportError> {
+    let unreadable =
+        |detail: &str| TransportError::not_applied("listing_unreadable", detail.to_owned(), true);
+    let rows = document
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| unreadable("the client listing had no data array"))?;
+    let messages = rows
+        .iter()
+        .filter_map(|row| {
+            let message_ts = text_field(row, "message_ts").filter(|ts| ids::valid_ts(ts))?;
+            Some(ScannedMessage {
+                message: SlackMessage {
+                    channel_id: channel_id.to_owned(),
+                    message_ts,
+                    thread_ts: text_field(row, "thread_ts").filter(|ts| ids::valid_ts(ts)),
+                    user_id: text_field(row, "author_user_id"),
+                    subtype: text_field(row, "subtype"),
+                    text: row
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    file_ids: file_ids_field(row),
+                    ..SlackMessage::default()
+                },
+                reply_count: row.get("reply_count").and_then(Value::as_u64).unwrap_or(0),
+                latest_reply: text_field(row, "latest_reply").filter(|ts| ids::valid_ts(ts)),
+            })
+        })
+        .collect();
+    let pagination = document.get("pagination").unwrap_or(&Value::Null);
+    let has_next = pagination
+        .get("has_next_page")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let token = match pagination.get("next_page_token") {
+        Some(Value::String(token))
+            if !token.is_empty()
+                && token.len() <= 4_096
+                && !token.chars().any(char::is_control) =>
+        {
+            Some(token.clone())
+        }
+        Some(Value::String(token)) if token.is_empty() => None,
+        Some(Value::Null) | None => None,
+        _ => return Err(unreadable("the client listing had an invalid page token")),
+    };
+    if has_next && token.is_none() {
+        return Err(unreadable(
+            "the client listing said another page exists but gave no page token",
+        ));
+    }
+    Ok(ScanPage {
+        messages,
+        next_page_token: token.filter(|_| has_next),
+    })
+}
+
 /// The client arguments of one post, whose body the client reads from standard input. `app`
 /// is the `--as` argument, if the client takes one: see [`ClientIdentity::app_argument`].
 #[must_use]
@@ -1281,6 +1400,23 @@ impl SlackTransport for CliTransport {
             .collect())
     }
 
+    fn scan_messages(&mut self, query: &ScanQuery<'_>) -> Result<ScanPage, TransportError> {
+        let completed = self
+            .run(&scan_arguments(query), None)
+            .map_err(|failure| run_failure(failure, false))?;
+        if !completed.status.success() {
+            return Err(exit_failure(&completed, false));
+        }
+        let parsed = first_json_value(&completed.stdout).ok_or_else(|| {
+            TransportError::not_applied(
+                "listing_unreadable",
+                "the client listing was not JSON",
+                true,
+            )
+        })?;
+        scan_page(&parsed, query.channel_id)
+    }
+
     fn resolve_sender(&mut self, app_id: &AppId, query: &str) -> Result<String, TransportError> {
         let mut arguments = vec![
             "slack.user".to_owned(),
@@ -1427,6 +1563,86 @@ mod tests {
         assert_eq!(message.thread_ts.as_deref(), Some("1690000000.000001"));
         assert_eq!(message.user_id.as_deref(), Some("U012ABCDEF"));
         assert_eq!(message.text, "hi &amp; bye");
+    }
+
+    #[test]
+    fn a_message_event_carries_its_file_ids_in_either_form() {
+        for files in [
+            r#""F0AAAAAAAA1,F0AAAAAAAA2""#,
+            r#"["F0AAAAAAAA1","F0AAAAAAAA2","not-a-file"]"#,
+        ] {
+            let line = format!(
+                r#"{{"type":"message.created","iris_seq_id":7,"payload":{{"event_type":"message.created",
+                "slack_message":{{"channel_id":"C0C91RW5FAR","message_ts":"1700000000.000100",
+                "slack_user_id":"U012ABCDEF","text":"","file_ids":{files}}}}}}}"#
+            )
+            .replace('\n', "");
+            let StreamRecord::Event { message, .. } = parse_tail_line(&line) else {
+                panic!("not an event");
+            };
+            assert_eq!(message.unwrap().file_ids, ["F0AAAAAAAA1", "F0AAAAAAAA2"]);
+        }
+    }
+
+    #[test]
+    fn rescan_listings_decode_the_clients_rows_and_pagination() {
+        let query = ScanQuery {
+            channel_id: "C0C91RW5FAR",
+            thread_ts: Some("1792836353.598709"),
+            oldest: "1792836400.000000",
+            page_token: Some("bmV4dA"),
+        };
+        assert_eq!(
+            scan_arguments(&query),
+            [
+                "slack.message",
+                "list",
+                "--channel-id=C0C91RW5FAR",
+                "--thread-ts=1792836353.598709",
+                "--oldest=1792836400.000000",
+                "--page-token=bmV4dA",
+                "--limit=20",
+                "--columns=message_ts,thread_ts,author_user_id,subtype,content,file_ids,reply_count,latest_reply",
+                "--content-format=mrkdwn",
+                "--output=json",
+            ]
+        );
+        // The shape the client printed on 2026-10-24, content shortened.
+        let document: Value = serde_json::from_str(
+            r#"{"pagination":{"next_page_token":"bmV4dF90cw","has_next_page":true,"page_size":3},
+            "completeness":{"source_complete":true},"dropped_row_count":0,"data":[
+            {"message_ts":"1792837627.459099","thread_ts":null,"author_user_id":"U0C23P5291P","subtype":null,"content":"a &amp; b","reply_count":null,"file_ids":"","latest_reply":null},
+            {"message_ts":"1792836353.598709","thread_ts":"1792836353.598709","author_user_id":"U0C23P5291P","subtype":null,"content":"root","reply_count":6,"file_ids":"","latest_reply":"1792837507.949079"},
+            {"message_ts":"1792836302.768889","thread_ts":null,"author_user_id":"U0C23P5291P","subtype":null,"content":"","reply_count":null,"file_ids":"F0CBYK33RNY","latest_reply":null},
+            {"message_ts":"not a ts"}]}"#,
+        )
+        .unwrap();
+        let page = scan_page(&document, "C0C91RW5FAR").unwrap();
+        assert_eq!(page.next_page_token.as_deref(), Some("bmV4dF90cw"));
+        assert_eq!(page.messages.len(), 3);
+        assert_eq!(page.messages[0].message.text, "a &amp; b");
+        assert_eq!(page.messages[0].message.thread_ts, None);
+        assert_eq!(page.messages[1].reply_count, 6);
+        assert_eq!(
+            page.messages[1].latest_reply.as_deref(),
+            Some("1792837507.949079")
+        );
+        assert_eq!(page.messages[2].message.file_ids, ["F0CBYK33RNY"]);
+        assert_eq!(page.messages[2].message.channel_id, "C0C91RW5FAR");
+        let last: Value = serde_json::from_str(
+            r#"{"pagination":{"next_page_token":null,"has_next_page":false},"data":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            scan_page(&last, "C0C91RW5FAR").unwrap(),
+            ScanPage::default()
+        );
+        let inconsistent: Value =
+            serde_json::from_str(r#"{"pagination":{"has_next_page":true},"data":[]}"#).unwrap();
+        assert_eq!(
+            scan_page(&inconsistent, "C0C91RW5FAR").unwrap_err().code,
+            "listing_unreadable"
+        );
     }
 
     #[test]

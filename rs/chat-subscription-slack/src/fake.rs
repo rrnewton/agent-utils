@@ -16,8 +16,9 @@ use std::time::Duration;
 use crate::cli::{classify_tail_stderr, parse_tail_line, PositionProof};
 use crate::ids::AppId;
 use crate::transport::{
-    EventStream, ListQuery, ListedMessage, PostMessage, SlackTransport, StreamCancel, StreamRecord,
-    StreamWait, SubscribeSpec, TextFormat, TransportError,
+    EventStream, ListQuery, ListedMessage, PostMessage, ScanPage, ScanQuery, ScannedMessage,
+    SlackMessage, SlackTransport, StreamCancel, StreamRecord, StreamWait, SubscribeSpec,
+    TextFormat, TransportError,
 };
 
 /// One scripted stream step.
@@ -100,6 +101,14 @@ pub struct FakeState {
     pub list_calls: usize,
     /// Next assigned message ts (seconds part).
     pub next_ts_seconds: u64,
+    /// The conversations' messages as a rescan listing sees them, in any order.
+    pub history: Vec<SlackMessage>,
+    /// Rows per rescan listing page; 0 means 20.
+    pub scan_page_size: usize,
+    /// Every rescan listing call, as `(channel_id, thread_ts, oldest, page_token)`.
+    pub scans: Vec<(String, Option<String>, String, Option<String>)>,
+    /// Injected errors for the next rescan listing calls.
+    pub scan_failures: VecDeque<TransportError>,
 }
 
 /// Shared handle on a [`FakeState`].
@@ -142,6 +151,81 @@ impl FakeTransport {
     pub fn push_post_failure(&self, failure: FakePostFailure) {
         self.state().post_failures.push_back(failure);
     }
+
+    /// Add a message the rescan listing will see.
+    pub fn push_history(&self, message: SlackMessage) {
+        self.state().history.push(message);
+    }
+}
+
+fn is_reply(message: &SlackMessage) -> bool {
+    message
+        .thread_ts
+        .as_deref()
+        .is_some_and(|root| root != message.message_ts)
+}
+
+/// A rescan listing over `history`, shaped like the client's: history holds top-level messages
+/// and thread broadcasts newest first; a thread holds its root and then its replies oldest first;
+/// a root carries its reply count and newest reply.
+fn scan_listing(history: &[SlackMessage], query: &ScanQuery<'_>) -> Vec<ScannedMessage> {
+    let micros = |ts: &str| crate::ids::ts_micros(ts).unwrap_or(0);
+    let oldest = micros(query.oldest);
+    let in_channel = history
+        .iter()
+        .filter(|message| message.channel_id == query.channel_id);
+    let row = |message: &SlackMessage| {
+        let replies: Vec<&SlackMessage> = in_channel
+            .clone()
+            .filter(|reply| {
+                is_reply(reply) && reply.thread_ts.as_deref() == Some(&message.message_ts)
+            })
+            .collect();
+        ScannedMessage {
+            message: SlackMessage {
+                thread_ts: message
+                    .thread_ts
+                    .clone()
+                    .or_else(|| (!replies.is_empty()).then(|| message.message_ts.clone())),
+                ..message.clone()
+            },
+            reply_count: replies.len() as u64,
+            latest_reply: replies
+                .iter()
+                .map(|reply| reply.message_ts.clone())
+                .max_by_key(|ts| micros(ts)),
+        }
+    };
+    let mut rows: Vec<ScannedMessage> = match query.thread_ts {
+        None => in_channel
+            .clone()
+            .filter(|message| {
+                (!is_reply(message) || message.subtype.as_deref() == Some("thread_broadcast"))
+                    && micros(&message.message_ts) > oldest
+            })
+            .map(row)
+            .collect(),
+        Some(root) => in_channel
+            .clone()
+            .filter(|message| {
+                message.message_ts == root
+                    || (message.thread_ts.as_deref() == Some(root)
+                        && is_reply(message)
+                        && micros(&message.message_ts) > oldest)
+            })
+            .map(row)
+            .collect(),
+    };
+    match query.thread_ts {
+        None => rows.sort_by_key(|row| std::cmp::Reverse(micros(&row.message.message_ts))),
+        Some(root) => rows.sort_by_key(|row| {
+            (
+                row.message.message_ts != root,
+                micros(&row.message.message_ts),
+            )
+        }),
+    }
+    rows
 }
 
 struct FakeCancel {
@@ -303,6 +387,36 @@ impl SlackTransport for FakeTransport {
         }
         state.reactions.push(reaction);
         Ok(false)
+    }
+
+    fn scan_messages(&mut self, query: &ScanQuery<'_>) -> Result<ScanPage, TransportError> {
+        let mut state = self.state();
+        state.scans.push((
+            query.channel_id.to_owned(),
+            query.thread_ts.map(str::to_owned),
+            query.oldest.to_owned(),
+            query.page_token.map(str::to_owned),
+        ));
+        if let Some(error) = state.scan_failures.pop_front() {
+            return Err(error);
+        }
+        let size = if state.scan_page_size == 0 {
+            20
+        } else {
+            state.scan_page_size
+        };
+        let rows = scan_listing(&state.history, query);
+        let start = query
+            .page_token
+            .and_then(|token| token.strip_prefix("page-"))
+            .and_then(|offset| offset.parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(rows.len());
+        let end = (start + size).min(rows.len());
+        Ok(ScanPage {
+            messages: rows[start..end].to_vec(),
+            next_page_token: (end < rows.len()).then(|| format!("page-{end}")),
+        })
     }
 
     fn list_messages(

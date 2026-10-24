@@ -4,7 +4,8 @@
 //!
 //! * `agentctl-slack-plugin` speaks the `agentctl-chat-subscription` v1 process protocol. It
 //!   turns `message.created` events from one Slack channel into ordered inbound requests
-//!   ([`plugin`]).
+//!   ([`plugin`]), and periodically rescans the channel's history for messages the event stream
+//!   never carries, such as ones with files ([`rescan`]).
 //! * `agentctl-slack-outbound` is the bridge's one-shot `outbound_command`. Each run reads one
 //!   JSON request line, posts a reply into the request's Slack thread or adds the
 //!   acknowledgement reaction, and writes one JSON response line ([`outbound`]). Run with
@@ -29,6 +30,7 @@ pub mod ids;
 pub mod outbound;
 pub mod plugin;
 pub mod refusals;
+pub mod rescan;
 pub mod transport;
 pub mod warm;
 
