@@ -165,6 +165,23 @@ steps:
       classification: light
       rss_baseline_bytes: 268435456
 
+  # The screenshot harness's own controls: the capture judge and its PNG decoder against frames it
+  # builds itself, a blank frame refused on the walk's path, and the scene table. Offline, with no
+  # browser and no server, where `shots.screenshots` needs both; it was in no step until
+  # `test-time-vibe-talk`, which found it broken by a test double the walk's driver had outgrown.
+  - group: check
+    job: screenshots-self-test
+    desc: offline controls for the screenshot harness's capture judge, PNG decoder and scene table
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 scripts/screenshots.py --self-test
+    jobs_flag: ""
+    timeout: 60
+    cpu_timeout: 30
+    hint:
+      est_duration_s: 2
+      classification: light
+      rss_baseline_bytes: 268435456
+
   - group: check
     job: live-hint-adapter-self-test
     desc: offline framing, retry, privacy, and child-cleanup controls for live change hints
@@ -1915,7 +1932,12 @@ steps:
       # Re-measured on 2026-10-18 at 494s wall on a loaded host, after the owner's Settings batch
       # (`#345 settings-multi-column` to `#349 channel-settings-all`) added scenes 63 to 71, most at
       # three sizes, so the estimate is 500. The 900s timeout above still leaves room.
-      est_duration_s: 500
+      #
+      # Re-measured on 2026-10-24 (`test-time-vibe-talk`): 508s wall for 222 captures, 221s of it the
+      # walk waiting while each capture's PNG was decoded and judged, a second or so of pure Python
+      # apiece. With the decoder doing a row at a time and the judging done in two processes beside
+      # the walk, 311s wall and 235s of CPU (280s wall in a gate), so the estimate is 330.
+      est_duration_s: 330
       # latency-bound, not cpu-bound: most of its wall time is waiting for a page to settle, and
       # telling the scheduler otherwise makes it reserve cores it will not use. Confirmed by the
       # same run -- 0.60 effective cores over 284 seconds.

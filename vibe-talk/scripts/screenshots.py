@@ -101,6 +101,7 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import multiprocessing
 import os
 import pathlib
 import struct
@@ -108,9 +109,11 @@ import sys
 import time
 import zlib
 from collections import Counter
+from concurrent.futures import Executor, Future, ProcessPoolExecutor
+from itertools import accumulate
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterable, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Callable, Iterable, Iterator, Literal, TypedDict, cast
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -138,9 +141,13 @@ BROWSER_INSTALL_HINT = "python3 -m playwright install chromium"
 # open, so the saved file is the thing that gets judged -- not a smaller copy taken alongside it,
 # which is how a harness ends up certifying an image nobody has.
 #
-# Decoding is done here, in the standard library, rather than through Pillow or numpy. Measured on
-# a 1179x1977 phone capture the pure-Python path takes about 1.8 seconds, which is a fine price for
-# not making this script's one hard dependency into two. `--self-test` builds its own PNGs with
+# Decoding is done here, in the standard library, rather than through Pillow or numpy. A byte at a
+# time in Python that took about 1.8 seconds a phone capture, and the walk judges well over a hundred
+# captures one after another, so the common cases are done a whole row at a time instead
+# (`test-time-vibe-talk`): `Up`, which is most of the rows a browser writes, as one wide integer
+# addition that keeps each byte's carry to itself, `Sub` as a running sum per channel, and the
+# pixels cut out of a row by slicing. A 1179x2556 phone capture now decodes in under a second, and
+# the walk does not wait for it (`start_capture`). `--self-test` builds its own PNGs with
 # `encode_png` below and deliberately varies the row filter, so the decoder's five filter cases are
 # each exercised offline.
 # =================================================================================================
@@ -185,8 +192,32 @@ def _png_chunks(data: bytes) -> tuple[bytes, bytes]:
     return header, bytes(idat)
 
 
-def decode_png(data: bytes) -> Image:
-    """Decode an 8-bit non-interlaced PNG. That is what every browser writes."""
+_ROW_MASKS: dict[int, tuple[int, int]] = {}
+
+
+def _add_rows(line: bytes | bytearray, previous: bytes | bytearray) -> bytearray:
+    """Each byte of `line` plus the byte above it, modulo 256: the `Up` filter, a row at a time.
+
+    Both rows as one integer each. The low seven bits of every byte are added together, which can
+    carry into that byte's top bit but never out of it, and the top bit is then the exclusive or of
+    the two top bits and that carry; a carry out of the top bit, which modulo 256 drops, is never
+    made.
+    """
+    size = len(line)
+    masks = _ROW_MASKS.get(size)
+    if masks is None:
+        masks = _ROW_MASKS.setdefault(
+            size, (int.from_bytes(b"\x7f" * size, "little"), int.from_bytes(b"\x80" * size, "little"))
+        )
+    low, high = masks
+    a = int.from_bytes(line, "little")
+    b = int.from_bytes(previous, "little")
+    return bytearray((((a & low) + (b & low)) ^ ((a ^ b) & high)).to_bytes(size, "little"))
+
+
+def _png_rows(data: bytes) -> tuple[int, int, int, Iterator[bytearray]]:
+    """Width, height, channels, and the rows of an 8-bit non-interlaced PNG, each reconstructed as
+    it is asked for. That is what every browser writes."""
     header, idat = _png_chunks(data)
     width, height, depth, colour_type, _compression, _filter, interlace = struct.unpack(
         ">IIBBBBB", header[:13]
@@ -203,8 +234,11 @@ def decode_png(data: bytes) -> Image:
     expected = height * (stride + 1)
     if len(raw) < expected:
         raise BadPng(f"image data is short: {len(raw)} bytes, expected {expected}")
+    return width, height, channels, _unfiltered(raw, height, stride, channels)
 
-    pixels: list[tuple[int, ...]] = []
+
+def _unfiltered(raw: bytes, height: int, stride: int, channels: int) -> Iterator[bytearray]:
+    """Each row of `raw` with its row filter undone, in order."""
     previous = bytearray(stride)
     at = 0
     for row in range(height):
@@ -215,26 +249,37 @@ def decode_png(data: bytes) -> Image:
         if kind == 0:
             pass
         elif kind == 1:
-            for x in range(channels, stride):
-                line[x] = (line[x] + line[x - channels]) & 0xFF
-        elif kind == 2:
-            for x in range(stride):
-                line[x] = (line[x] + previous[x]) & 0xFF
-        elif kind == 3:
-            for x in range(stride):
-                left = line[x - channels] if x >= channels else 0
-                line[x] = (line[x] + ((left + previous[x]) >> 1)) & 0xFF
-        elif kind == 4:
-            for x in range(stride):
-                left = line[x - channels] if x >= channels else 0
-                up = previous[x]
-                up_left = previous[x - channels] if x >= channels else 0
-                estimate = left + up - up_left
-                da, db, dc = (
-                    abs(estimate - left),
-                    abs(estimate - up),
-                    abs(estimate - up_left),
+            for channel in range(channels):
+                line[channel::channels] = bytes(
+                    map((0xFF).__and__, accumulate(line[channel::channels]))
                 )
+        elif kind == 2:
+            line = _add_rows(line, previous)
+        elif kind == 3:
+            # The first pixel has nothing to its left, which counts as zero.
+            for x in range(min(channels, stride)):
+                line[x] = (line[x] + (previous[x] >> 1)) & 0xFF
+            for x in range(channels, stride):
+                line[x] = (line[x] + ((line[x - channels] + previous[x]) >> 1)) & 0xFF
+        elif kind == 4:
+            # The first pixel has nothing to its left or above-left, so the nearest is the byte above.
+            for x in range(min(channels, stride)):
+                line[x] = (line[x] + previous[x]) & 0xFF
+            for x in range(channels, stride):
+                left = line[x - channels]
+                up = previous[x]
+                up_left = previous[x - channels]
+                # The distances of the estimate `left + up - up_left` from each of the three,
+                # written out without a call to abs(), which this loop makes millions of times.
+                da = up - up_left
+                db = left - up_left
+                dc = da + db
+                if da < 0:
+                    da = -da
+                if db < 0:
+                    db = -db
+                if dc < 0:
+                    dc = -dc
                 if da <= db and da <= dc:
                     nearest = left
                 elif db <= dc:
@@ -244,9 +289,21 @@ def decode_png(data: bytes) -> Image:
                 line[x] = (line[x] + nearest) & 0xFF
         else:
             raise BadPng(f"unknown row filter {kind} on row {row}")
-        for x in range(0, stride, channels):
-            pixels.append(tuple(line[x : x + channels]))
+        yield line
         previous = line
+
+
+def _row_pixels(line: bytearray, channels: int) -> Iterator[tuple[int, ...]]:
+    """The pixels of one reconstructed row, as tuples of their samples."""
+    return zip(*(line[channel::channels] for channel in range(channels)))
+
+
+def decode_png(data: bytes) -> Image:
+    """Decode an 8-bit non-interlaced PNG. That is what every browser writes."""
+    width, height, channels, rows = _png_rows(data)
+    pixels: list[tuple[int, ...]] = []
+    for line in rows:
+        pixels.extend(_row_pixels(line, channels))
     return Image(width=width, height=height, pixels=pixels)
 
 
@@ -352,28 +409,32 @@ def judge_capture(data: bytes) -> Verdict:
             False,
             f"the file is {len(data)} bytes, under the {MIN_BYTES}-byte floor — nothing rendered",
         )
+    # Counted a row at a time rather than through `decode_png`'s list of every pixel, which for a
+    # phone capture is millions of tuples held at once in each judging process.
+    counts: Counter[tuple[int, ...]] = Counter()
     try:
-        image = decode_png(data)
+        width, height, channels, rows = _png_rows(data)
+        for line in rows:
+            counts.update(_row_pixels(line, channels))
     except BadPng as error:
         return Verdict(False, f"the file is not a readable PNG: {error}")
-    if image.width < MIN_EDGE or image.height < MIN_EDGE:
+    if width < MIN_EDGE or height < MIN_EDGE:
         return Verdict(
             False,
-            f"the frame is {image.width}x{image.height}; both edges must be at least {MIN_EDGE}px",
-            width=image.width,
-            height=image.height,
+            f"the frame is {width}x{height}; both edges must be at least {MIN_EDGE}px",
+            width=width,
+            height=height,
         )
-    counts = Counter(image.pixels)
     distinct = len(counts)
-    total = len(image.pixels)
+    total = width * height
     dominant = counts.most_common(1)[0][1] / total if total else 1.0
     if distinct < MIN_DISTINCT_COLOURS:
         return Verdict(
             False,
             f"the frame has only {distinct} distinct colour(s) — it is blank or a flat fill, "
             f"not a rendered page",
-            width=image.width,
-            height=image.height,
+            width=width,
+            height=height,
             distinct=distinct,
             dominant_share=dominant,
         )
@@ -382,16 +443,16 @@ def judge_capture(data: bytes) -> Verdict:
             False,
             f"one colour covers {dominant:.2%} of the frame — the page is effectively blank "
             f"even though {distinct} colours are present",
-            width=image.width,
-            height=image.height,
+            width=width,
+            height=height,
             distinct=distinct,
             dominant_share=dominant,
         )
     return Verdict(
         True,
         "shows a rendered page",
-        width=image.width,
-        height=image.height,
+        width=width,
+        height=height,
         distinct=distinct,
         dominant_share=dominant,
     )
@@ -409,18 +470,66 @@ class TrivialCapture(Exception):
         self.verdict = verdict
 
 
-def record_capture(path: Path, data: bytes, label: str) -> Verdict:
-    """Write a capture and judge it. The write happens first, so a rejected frame can be looked at.
+def _judge_fields(data: bytes) -> tuple[bool, str, int, int, int, float]:
+    """`judge_capture` as plain values, which is what crosses back from a judging process."""
+    verdict = judge_capture(data)
+    return (
+        verdict.ok,
+        verdict.reason,
+        verdict.width,
+        verdict.height,
+        verdict.distinct,
+        verdict.dominant_share,
+    )
+
+
+class PendingCapture:
+    """A capture already on disk, whose judgement may still be running in another process."""
+
+    def __init__(
+        self, label: str, judged: Future[tuple[bool, str, int, int, int, float]]
+    ) -> None:
+        self.label = label
+        self._judged = judged
+
+    def done(self) -> bool:
+        return self._judged.done()
+
+    def verdict(self) -> Verdict:
+        """The judgement, waited for if need be. A frame that shows nothing raises, by name."""
+        verdict = Verdict(*self._judged.result())
+        if not verdict.ok:
+            raise TrivialCapture(self.label, verdict)
+        return verdict
+
+
+def start_capture(
+    path: Path, data: bytes, label: str, judges: Executor | None = None
+) -> PendingCapture:
+    """Write a capture and start judging it. The write comes first, so a rejected frame can be
+    looked at.
 
     This is the only function that puts a screenshot on disk, which is what makes the blank check
-    impossible to route around: there is no second path that writes an unjudged file.
+    impossible to route around: there is no second path that writes an unjudged file. With
+    `judges`, the judgement runs there while the walk goes on to the next state -- decoding a
+    capture is about a second of pure Python, and the walk is mostly waiting on the page, so done
+    in line it was over a third of the walk (`test-time-vibe-talk`). The walk collects every
+    verdict before it calls a profile done, so a blank frame still fails the run by name.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
-    verdict = judge_capture(data)
-    if not verdict.ok:
-        raise TrivialCapture(label, verdict)
-    return verdict
+    judged: Future[tuple[bool, str, int, int, int, float]]
+    if judges is None:
+        judged = Future()
+        judged.set_result(_judge_fields(data))
+    else:
+        judged = judges.submit(_judge_fields, data)
+    return PendingCapture(label, judged)
+
+
+def record_capture(path: Path, data: bytes, label: str) -> Verdict:
+    """Write a capture and judge it before returning: `start_capture`, waited for."""
+    return start_capture(path, data, label).verdict()
 
 
 # =================================================================================================
@@ -975,6 +1084,7 @@ class Driver:
         profile: Profile,
         theme: Theme,
         mock_control: str = "",
+        judges: Executor | None = None,
     ) -> None:
         self.theme = theme
         self.page = page
@@ -995,6 +1105,9 @@ class Driver:
         self.token = token
         self.out_dir = out_dir
         self.profile = profile
+        # Where captures are judged (`start_capture`); None judges each before the walk goes on.
+        self.judges = judges
+        self.pending: list[tuple[str, Path, PendingCapture]] = []
         self.results: list[tuple[str, Path, Verdict]] = []
 
     # -- page-level helpers ----------------------------------------------------------------------
@@ -1122,8 +1235,22 @@ class Driver:
 
         path = self.out_dir / f"{self.theme}--{self.profile.name}--{scene.name}.png"
         data = self.page.screenshot(animations=animations)
-        verdict = record_capture(path, data, f"{self.theme}/{self.profile.name}/{scene.name}")
-        self.results.append((scene.name, path, verdict))
+        label = f"{self.theme}/{self.profile.name}/{scene.name}"
+        self.pending.append((scene.name, path, start_capture(path, data, label, self.judges)))
+
+    def judged(self, wait: bool) -> list[tuple[str, Path, Verdict]]:
+        """The captures judged since the last call, in the order they were taken.
+
+        Without `wait`, only those whose judgement has finished, stopping at the first that has
+        not, so the order holds; with it, every one. A frame that shows nothing raises
+        `TrivialCapture` here, naming it.
+        """
+        settled: list[tuple[str, Path, Verdict]] = []
+        while self.pending and (wait or self.pending[0][2].done()):
+            name, path, pending = self.pending.pop(0)
+            settled.append((name, path, pending.verdict()))
+        self.results.extend(settled)
+        return settled
 
 
 # -- the scenes ------------------------------------------------------------------------------------
@@ -6972,61 +7099,83 @@ def run_captures(
             ) from error
 
     everything: list[tuple[str, Path, Verdict]] = []
-    with sync_playwright() as playwright:
-        browser = open_browser(playwright)
-        try:
-            for theme in themes:
-                for profile in PROFILES:
-                    context = browser.new_context(**profile.context_options(theme))
-                    context.grant_permissions(["microphone"], origin=url)
-                    # The vendor boundary, and the ONLY request that is faked. Everything else --
-                    # /api/v1/client-config, the channel read -- goes to the real server.
-                    context.route(
-                        "**/api/v1/signed-url",
-                        lambda route: route.fulfill(
-                            status=200,
-                            content_type="application/json",
-                            body=json.dumps(signed),
-                        ),
-                    )
-                    page = context.new_page()
-                    driver = Driver(page, url, token, out_dir, profile, theme, mock_control)
-                    print(f"==> {theme} · {profile.name}: {profile.what}")
-                    purge_stored_conversations()
-                    for scene in scenes:
-                        # A state that does not exist on this device is SKIPPED by name rather
-                        # than attempted: the desktop reading column has nothing to photograph on
-                        # a phone, and a scene that quietly succeeded there would be filed as
-                        # evidence of a layout the phone does not have.
-                        if (scene.profiles and profile.name not in scene.profiles) or (
-                            profile.opt_in and not scene.profiles
-                        ):
-                            print(f"  skip  {scene.name:<30} not a state this profile has")
-                            continue
-                        # A timeout inside the walk is an UNREACHABLE STATE and must read as one.
-                        # Left to itself Playwright raises a TimeoutError whose traceback names a
-                        # line number in this file and not the state, which is exactly the report
-                        # that sends the next reader to debug the harness when the page has moved.
+    # Two processes judge the captures while the walk goes on; see `start_capture`. Spawned rather
+    # than forked: this process is about to hold a browser driver's threads and pipes.
+    judges = ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context("spawn"))
+    try:
+        with sync_playwright() as playwright:
+            browser = open_browser(playwright)
+            try:
+                for theme in themes:
+                    for profile in PROFILES:
+                        context = browser.new_context(**profile.context_options(theme))
+                        context.grant_permissions(["microphone"], origin=url)
+                        # The vendor boundary, and the ONLY request that is faked. Everything else
+                        # -- /api/v1/client-config, the channel read -- goes to the real server.
+                        context.route(
+                            "**/api/v1/signed-url",
+                            lambda route: route.fulfill(
+                                status=200,
+                                content_type="application/json",
+                                body=json.dumps(signed),
+                            ),
+                        )
+                        page = context.new_page()
+                        driver = Driver(
+                            page, url, token, out_dir, profile, theme, mock_control, judges
+                        )
+                        print(f"==> {theme} · {profile.name}: {profile.what}")
+                        purge_stored_conversations()
                         try:
-                            scene.act(driver)
-                        except Exception as error:
-                            if isinstance(error, (Unreachable, TrivialCapture)):
-                                raise
-                            raise Unreachable(
-                                scene.name,
-                                f"the walk into it did not complete ({type(error).__name__})",
-                                str(error).strip().splitlines()[0] if str(error).strip() else "",
-                            ) from error
-                        driver.capture(scene)
-                        if scene.after is not None:
-                            scene.after(driver)
-                        name, path, verdict = driver.results[-1]
-                        print(f"  ok    {name:<30} {verdict.describe()}")
-                    everything.extend(driver.results)
-                    context.close()
-        finally:
-            browser.close()
+                            walk_profile(driver, profile, scenes)
+                        except Exception:
+                            # A frame taken before the walk failed, and judged blank since, is the
+                            # walk's first failure and is reported as one; the frames that passed
+                            # are reported as they were before.
+                            for name, _path, verdict in driver.judged(wait=True):
+                                print(f"  ok    {name:<30} {verdict.describe()}")
+                            raise
+                        for name, _path, verdict in driver.judged(wait=True):
+                            print(f"  ok    {name:<30} {verdict.describe()}")
+                        everything.extend(driver.results)
+                        context.close()
+            finally:
+                browser.close()
+    finally:
+        judges.shutdown(wait=True, cancel_futures=True)
     return everything
+
+
+def walk_profile(driver: Driver, profile: Profile, scenes: list[Scene]) -> None:
+    """Walk one profile through every scene it has, capturing each; see `run_captures`."""
+    for scene in scenes:
+        # A state that does not exist on this device is SKIPPED by name rather than attempted: the
+        # desktop reading column has nothing to photograph on a phone, and a scene that quietly
+        # succeeded there would be filed as evidence of a layout the phone does not have.
+        if (scene.profiles and profile.name not in scene.profiles) or (
+            profile.opt_in and not scene.profiles
+        ):
+            print(f"  skip  {scene.name:<30} not a state this profile has")
+            continue
+        # A timeout inside the walk is an UNREACHABLE STATE and must read as one. Left to itself
+        # Playwright raises a TimeoutError whose traceback names a line number in this file and not
+        # the state, which is exactly the report that sends the next reader to debug the harness
+        # when the page has moved.
+        try:
+            scene.act(driver)
+        except Exception as error:
+            if isinstance(error, (Unreachable, TrivialCapture)):
+                raise
+            raise Unreachable(
+                scene.name,
+                f"the walk into it did not complete ({type(error).__name__})",
+                str(error).strip().splitlines()[0] if str(error).strip() else "",
+            ) from error
+        driver.capture(scene)
+        if scene.after is not None:
+            scene.after(driver)
+        for name, _path, verdict in driver.judged(wait=False):
+            print(f"  ok    {name:<30} {verdict.describe()}")
 
 
 # =================================================================================================
@@ -7606,6 +7755,10 @@ def check_scene_storage_isolation_controls() -> list[str]:
         def on(self, _event: str, _handler: object) -> None:
             pass
 
+        # `Driver` stretches this one's deadlines (`_patient_waits`); the probe never waits.
+        def wait_for_function(self, _expression: str, **_options: object) -> None:
+            pass
+
         def add_init_script(self, script: str) -> None:
             self.init_scripts.append(script)
 
@@ -7769,6 +7922,30 @@ def check_blank_gate_controls(tmp: Path) -> list[str]:
     else:
         if not good.exists() or not verdict.ok:
             problems.append("positive control: a good capture was not written.")
+
+    # The walk's own path: judged in another process, as `run_captures` does, the verdict waited for.
+    with ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn")) as judges:
+        later_blank = start_capture(
+            tmp / "later-blank.png", _flat_png(400, 400, (0, 0, 0)), "control/later-blank", judges
+        )
+        later_good = start_capture(
+            tmp / "later-good.png", _busy_png(300, 300), "control/later-good", judges
+        )
+        try:
+            later_blank.verdict()
+        except TrivialCapture as error:
+            if "control/later-blank" not in str(error):
+                problems.append("a capture rejected in a judging process is not named.")
+        else:
+            problems.append(
+                "negative control: a blank frame judged in another process was accepted, so the "
+                "walk's own captures are not held to the blank check."
+            )
+        try:
+            if not later_good.verdict().ok:
+                problems.append("positive control: a good capture judged in another process failed.")
+        except TrivialCapture as error:
+            problems.append(f"positive control: a judging process rejected a rendered frame ({error}).")
     return problems
 
 
