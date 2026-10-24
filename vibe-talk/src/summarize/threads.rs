@@ -928,6 +928,11 @@ impl ThreadNames {
         may_write: bool,
     ) {
         if !deps.summarizer.names_threads() {
+            // Nothing to attach or queue, but a bridge's own name and sentence for a thread
+            // known to be under the threshold still do not reach a card (`#484`).
+            for summary in page.threads.iter_mut().chain(page.thread.iter_mut()) {
+                hide_under_threshold(summary);
+            }
             return;
         }
         // Every thread this answer queues is queued at the same moment, so an overdue queue still
@@ -938,12 +943,8 @@ impl ThreadNames {
             answered.insert(summary.id.clone());
             match self.lookup(deps, channel, &summary.id).await {
                 Lookup::Known(record) => {
-                    // `#484 summary-card-threshold`: while a thread is known to be under the
-                    // threshold its page is served neither half, whoever filed them; the record
-                    // itself is kept and shows again from the third message.
-                    if !thread_summary_shown(summary.reply_count) {
-                        summary.display_name = None;
-                        summary.summary = None;
+                    if !thread_summary_shown(summary.reply_count, summary.reply_count_exact) {
+                        hide_under_threshold(summary);
                     } else if let Some(record) = &record {
                         summary.display_name = Some(record.name.clone());
                         summary.summary = record.sentence.as_ref().map(|sentence| {
@@ -964,18 +965,22 @@ impl ThreadNames {
                 }
                 Lookup::Unknown(name) => {
                     // The same threshold as the known record above (`#484 summary-card-threshold`).
-                    if thread_summary_shown(summary.reply_count) {
+                    if thread_summary_shown(summary.reply_count, summary.reply_count_exact) {
                         summary.display_name = name;
                     } else {
-                        summary.display_name = None;
-                        summary.summary = None;
+                        hide_under_threshold(summary);
                     }
                     self.refresh_copies(channel, summary);
                 }
             }
         }
         if request.view == TimelineView::Threads && request.after.is_some() {
-            let renamed = self.recently_renamed(channel, &answered);
+            // A thread renamed since the page was read may have shrunk under the threshold
+            // while it was being named: its delta copy is served by the same rule (`#484`).
+            let mut renamed = self.recently_renamed(channel, &answered);
+            for summary in &mut renamed {
+                hide_under_threshold(summary);
+            }
             if !renamed.is_empty() {
                 page.threads.extend(renamed);
                 // Still oldest activity first, as every thread list is.
@@ -1292,7 +1297,8 @@ impl ThreadNames {
                 state.known.insert(key, Some(record));
                 return;
             }
-            // The channel was taken off the list while the thread was being named.
+            // The channel was taken off the list while the thread was being named, or the
+            // thread is under the summary threshold and its pause is already recorded.
             Ok(None) => return,
             Err(failure) => failure,
         };
@@ -1333,7 +1339,8 @@ impl ThreadNames {
     }
 
     /// Read one thread, ask for its name and sentence, and file them: `Ok(None)` when the channel
-    /// was taken off the list before anything was filed.
+    /// was taken off the list before anything was filed, or the thread is under the summary
+    /// threshold and nothing was asked.
     ///
     /// The thread is read HERE, at its turn, and the prompt holds exactly what that read returned:
     /// no copy held from the page that queued it, which may be many minutes old by now.
@@ -1428,55 +1435,25 @@ impl ThreadNames {
                 "the thread has no text to name it by".to_owned(),
             )));
         }
-        // `#484 summary-card-threshold`: no model call while every count in hand — what this read
-        // brought back, what it reported, and the most replies a page showed while the thread
-        // waited — is under the threshold. (Going by the read's messages alone would unname a
-        // thread whose list has reached the threshold while its thread view lags a reply behind.)
-        // Too few is no failure: nothing is asked or filed, and the thread falls due as it grows.
-        let known = [
-            read_copy.as_ref().and_then(|thread| thread.reply_count),
-            waiting.most_replies,
-        ]
-        .into_iter()
-        .flatten()
-        .map(|replies| replies.saturating_add(1))
-        .chain(std::iter::once(messages.len() as u64))
-        .max()
-        .unwrap_or(0);
-        if known < THREAD_SUMMARY_MIN_MESSAGES {
-            tracing::info!(
-                messages = known,
-                "a thread under the summary threshold was not named; no model call was spent"
-            );
-            return Ok(None);
-        }
-        let request = ThreadRequest::new(&messages, deps.sentence_chars);
-        let began = std::time::Instant::now();
-        let naming = deps
-            .summarizer
-            .name_thread(&request)
-            .await
-            .map_err(TurnFailure::Other)?;
-        let renamed = kept.is_none();
-        let cut_at = naming.cut_at;
-        // How many messages the sentence is filed at. Never fewer than the most replies a page
-        // showed while the thread waited, before the read began: a write-scope page that shows
-        // that count again would find the thread due and queue it, and a read that is behind (a
-        // bridge's `as_of`, or a thread view that counts fewer replies than the list) answers the
-        // same at every turn, so the thread would be read and named again at every interval, for
-        // as long as it stays behind. The most, not the newest copy's: two copies whose order by
-        // activity and by replies cross — a list a bridge answers from its cache now and then,
-        // or a deletion that moved the thread's activity forward — would otherwise leave the one
-        // with more replies due at every turn. No reply that came after the read began is
-        // counted: every page counted here landed before it began.
+        // How many messages the sentence would be filed at, worked out before the model is
+        // asked because the summary threshold below turns on it. Never fewer than the most
+        // replies a page showed while the thread waited, before the read began: a write-scope
+        // page that shows that count again would find the thread due and queue it, and a read
+        // that is behind (a bridge's `as_of`, or a thread view that counts fewer replies than
+        // the list) answers the same at every turn, so the thread would be read and named again
+        // at every interval, for as long as it stays behind. The most, not the newest copy's:
+        // two copies whose order by activity and by replies cross — a list a bridge answers
+        // from its cache now and then, or a deletion that moved the thread's activity forward —
+        // would otherwise leave the one with more replies due at every turn. No reply that came
+        // after the read began is counted: every page counted here landed before it began.
         //
         // A read that says it is behind is filed at exactly what those pages counted (or at how
         // many messages the read held, when none gave a count), as before W5: nothing it counted
-        // is trusted, as nothing it returned is carried on a delta. A copy from before a reply was
-        // deleted still counts the deleted reply, so filed at its count the sentence would keep
-        // the deleted reply's text and the next reply would not make the thread due. Otherwise it
-        // is the most of what the read counted, what those pages counted, and how many messages
-        // the read held.
+        // is trusted, as nothing it returned is carried on a delta. A copy from before a reply
+        // was deleted still counts the deleted reply, so filed at its count the sentence would
+        // keep the deleted reply's text and the next reply would not make the thread due.
+        // Otherwise it is the most of what the read counted, what those pages counted, and how
+        // many messages the read held.
         let at = if behind {
             waiting
                 .most_replies
@@ -1493,6 +1470,37 @@ impl ThreadNames {
             .max()
             .unwrap_or(0)
         };
+        // `#484 summary-card-threshold`: no model call for a sentence that would be filed under
+        // the threshold. Going by the filed-at count rather than this read's messages alone
+        // keeps a thread whose list has reached the threshold while its thread view lags a
+        // reply behind, and on a behind read it is the pages' count — a deleted reply the read
+        // still holds never names a thread the list shows under the threshold. Too few is no
+        // failure, but the thread is left unqueued for the failure pause rather than re-read
+        // at every page until it grows: nothing is filed, and it falls due as it grows.
+        if at < THREAD_SUMMARY_MIN_MESSAGES {
+            tracing::info!(
+                messages = at,
+                "a thread under the summary threshold was not named; no model call was spent"
+            );
+            let mut state = self.lock();
+            state
+                .failed
+                .retain(|_, failed_at| failed_at.elapsed() < RETRY_AFTER_FAILURE);
+            state
+                .failed
+                .insert((channel.clone(), snapshot.id.clone()), Instant::now());
+            return Ok(None);
+        }
+        let request = ThreadRequest::new(&messages, deps.sentence_chars);
+        let began = std::time::Instant::now();
+        let naming = deps
+            .summarizer
+            .name_thread(&request)
+            .await
+            .map_err(TurnFailure::Other)?;
+        let renamed = kept.is_none();
+        let cut_at = naming.cut_at;
+        // Filed at `at`, worked out above before the model was asked.
         let record = ThreadRecord {
             // A thread that already has a name keeps it, whatever the model offered this time.
             name: kept.unwrap_or(naming.slug),
@@ -1564,14 +1572,26 @@ fn not_older(arriving: &ThreadSummary, held: &ThreadSummary) -> bool {
     (activity_of(arriving), arriving.reply_count) >= (activity_of(held), held.reply_count)
 }
 
+/// Serve neither half of a thread known to be under the summary threshold, whoever filed
+/// them (`#484 summary-card-threshold`, [`crate::threads::thread_summary_shown`]). The record
+/// itself is kept and shows again from the third message.
+fn hide_under_threshold(summary: &mut ThreadSummary) {
+    if !thread_summary_shown(summary.reply_count, summary.reply_count_exact) {
+        summary.display_name = None;
+        summary.summary = None;
+    }
+}
+
 /// Whether a thread needs a name, or a fresh sentence.
 fn due(summary: &ThreadSummary, record: Option<&ThreadRecord>) -> bool {
     let messages = summary.reply_count.map(|replies| replies.saturating_add(1));
     // `#484 summary-card-threshold`: a thread known to hold fewer than
-    // `THREAD_SUMMARY_MIN_MESSAGES` is never due, named or not. With no count reported the
-    // thread is still queued, and the worker counts the messages its own read brings back
+    // `THREAD_SUMMARY_MIN_MESSAGES` is never due, named or not. With no count reported, or an
+    // inexact one, the thread is still queued, and the worker counts what its own read holds
     // before any model call (`name_turn`).
-    if matches!(messages, Some(count) if count < THREAD_SUMMARY_MIN_MESSAGES) {
+    if summary.reply_count_exact
+        && matches!(messages, Some(count) if count < THREAD_SUMMARY_MIN_MESSAGES)
+    {
         return false;
     }
     let Some(record) = record else {

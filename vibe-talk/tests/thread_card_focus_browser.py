@@ -598,6 +598,7 @@ def phone_list_walk(desk: Desk) -> None:
         desk.check(chroma(edge) >= COLOURED and chroma(drawn[card_id]) >= COLOURED_PIXEL,
                    f"the edge of {card_id} is {edge}, drawn {drawn[card_id]}, not its colour")
         desk.check(1 <= number(card, "lines") <= 3, f"{card_id} is past three lines: {card['lines']}")
+    desk.check(number(shown[REPLICA], "lines") == 3, f"the long card does not reach its clamp: {shown[REPLICA]['lines']}")
     # A finger's target: the way into each thread is a thumb high, where the desk's chip is the facts' height.
     tall = page.evaluate("() => [...document.querySelectorAll('#side-cards .side-card-open')]"
                          ".map((button) => button.getBoundingClientRect().height)")

@@ -628,6 +628,68 @@ async fn a_thread_is_not_named_or_shown_named_before_its_third_message() {
 }
 
 #[tokio::test]
+async fn a_name_filed_before_the_threshold_is_kept_but_not_shown_until_the_third_message() {
+    // `#484 summary-card-threshold`: a name and sentence on file (filed when one-message threads
+    // were named, or before a reply was deleted) are kept, and served again from the third
+    // message, but a page that knows the thread holds two is served neither half.
+    let h = harness();
+    let now = jiff::Timestamp::now().as_second();
+    for thread in THREADS {
+        h.store
+            .cache_summary(
+                &name_key(&channel(), thread),
+                &serde_json::to_string(&FiledName {
+                    name: "kept-name".to_owned(),
+                    touched: now,
+                })
+                .unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        h.store
+            .cache_summary(
+                &sentence_key(&h.state.summary_version, &channel(), thread),
+                &serde_json::to_string(&FiledSentence {
+                    summary: "It is stuck.".to_owned(),
+                    at: 3,
+                })
+                .unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    h.threads.grow(0, 1);
+    h.threads.grow(1, 1);
+    let (_, small) = call(&h.app, THREAD_LIST, READ_TOKEN).await;
+    for (id, name, sentence) in names_of(&small) {
+        assert_eq!(
+            (name, sentence),
+            (None, None),
+            "{id} was served its filed name under the threshold: {small}"
+        );
+    }
+
+    h.threads.grow(0, 2);
+    let (_, grown) = call(&h.app, THREAD_LIST, READ_TOKEN).await;
+    let shown: Vec<_> = names_of(&grown)
+        .into_iter()
+        .filter(|(_, name, _)| name.is_some())
+        .map(|(id, name, sentence)| (id, name.unwrap(), sentence))
+        .collect();
+    assert_eq!(
+        shown,
+        [(
+            THREADS[0].to_owned(),
+            "kept-name".to_owned(),
+            Some("It is stuck.".to_owned())
+        )],
+        "the kept name did not show again at three messages: {grown}"
+    );
+}
+
+#[tokio::test]
 async fn a_read_token_is_shown_names_but_never_spends_the_model() {
     let h = harness();
     let (status, body) = call(&h.app, THREAD_LIST, READ_TOKEN).await;
