@@ -12311,6 +12311,29 @@ test("a stall in the middle of a block holds the sentence light through the sile
   assert.equal(await look(4.5), "Seven eight?", "2.2 s of 2.72 s said is the third sentence");
 });
 
+// --- `#489 card-root-lines`: a card showing its first message keeps its lines ----------------------
+
+test("A CARD WITH NO SUMMARY shows its first message line by line, as the message is drawn", async () => {
+  // The owner, 2026-10-22: his "header / ----- / body" was squashed onto one line on its card.
+  const page = newPage();
+  await signIn(page);
+  const sideCardText = page.pure("sideCardText");
+  const root = message({ id: "500", content: "TODO: thread view send message?\n-----\nIn the   thread list view.\n\nSecond paragraph.",
+    content_html: "<h2>TODO: thread view send message?</h2>\n<p>In the   thread list view.</p>\n<p>Second paragraph.</p>\n" });
+  assert.equal(sideCardText({ id: "500", root, summary: null }),
+    "TODO: thread view send message?\nIn the thread list view.\nSecond paragraph.");
+  // Plain text keeps its own lines, its blank ones dropped.
+  const plain = message({ id: "501", content: "header\n-----\nbody\n\n\nmore" });
+  assert.equal(sideCardText({ id: "501", root: plain, summary: null }), "header\n-----\nbody\nmore");
+  // A summary is drawn as it always was.
+  assert.equal(sideCardText({ id: "500", root, summary: { display_name: "send-box", summary: "Where to send." } }),
+    "send-box: Where to send.");
+  // And the stylesheet keeps the line ends, on both lists' cards.
+  for (const selector of [".side-card-text", ".thread-card-text"]) {
+    assert.match(cssBlock(selector), /white-space:\s*pre-line/, `${selector} does not keep a card's line ends`);
+  }
+});
+
 // --- `#486 read-aloud-pieces`: a block read in pieces --------------------------------------------
 
 /** The cases src/render.rs `read_pieces` is held to: the page cuts each the same way. */
@@ -53091,7 +53114,8 @@ test("`#229 desktop-two-column`: with no thread selected, a card per thread, new
   await page.settle();
   await page.settle();
   const said = cardPart(page, "spaces/A/threads/long", "side-card-text");
-  assert.ok(said && said.startsWith("a long first message that runs over several lines and on"), `the long card says ${said}`);
+  // `#489 card-root-lines`: line by line, as the message is drawn.
+  assert.ok(said && said.startsWith("a long first message\nthat runs over several lines and on"), `the long card says ${said}`);
 });
 
 test("`#229 desktop-two-column`: every way into a thread selects it on the right — its tag, its N replies, a card — and a plain tap does not", async () => {

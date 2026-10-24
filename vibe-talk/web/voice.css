@@ -8938,6 +8938,13 @@ li.discord-message[data-root-child] > .reply-bridge {
   overflow-wrap: anywhere;
 }
 
+/* `#489 card-root-lines`. A card that shows its thread's first message, for want of a summary, shows
+   it line by line as the message is drawn (`cardLines` in web/voice.js), clamped as before. */
+.side-card-text,
+.thread-card-text {
+  white-space: pre-line;
+}
+
 /* `#257 summary-truncation`, made `#277 thread-card-focus`. An even number of lines keeps the list
    even, but a name and a summary longer than those lines of this column were cut by the clamp with
    no way to read the rest short of opening the thread, whose heading gives only the name. The card
