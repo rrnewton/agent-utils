@@ -1,12 +1,13 @@
 ---
 title: 'threads-row-widths: a thread unpacked in the Threads view reaches its card''s right edge, the owner''s rows the narrower, and its reply box as wide as its rows'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-24T11:45:20.672374669+00:00
-updated_at: 2026-10-24T11:45:20.672374669+00:00
+updated_at: 2026-10-24T13:02:35.820666288+00:00
+closed_at: 2026-10-24T13:02:35.820666157+00:00
 ---
 
 # Description

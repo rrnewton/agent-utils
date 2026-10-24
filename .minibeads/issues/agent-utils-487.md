@@ -1,12 +1,13 @@
 ---
 title: 'read-aloud-recovery: a read whose ticket was lost prepares again and goes on, and a later tap works'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-24T10:44:31.012337187+00:00
-updated_at: 2026-10-24T10:44:31.012337187+00:00
+updated_at: 2026-10-24T13:02:35.803134235+00:00
+closed_at: 2026-10-24T13:02:35.803134135+00:00
 ---
 
 # Description

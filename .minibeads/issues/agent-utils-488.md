@@ -1,12 +1,13 @@
 ---
 title: 'slack-app-agents: a Slack app''s posts can be named the coding agent, and who-is-who choices follow the owner to every device'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-24T10:44:32.700578398+00:00
-updated_at: 2026-10-24T10:44:32.700578398+00:00
+updated_at: 2026-10-24T13:02:35.807075170+00:00
+closed_at: 2026-10-24T13:02:35.807075040+00:00
 ---
 
 # Description

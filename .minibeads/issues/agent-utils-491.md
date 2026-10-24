@@ -1,12 +1,13 @@
 ---
 title: 'threads-view-sent-receipt: a reply sent from the Threads view is drawn once, not also as a Sent receipt at the foot'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-24T11:39:43.215581801+00:00
-updated_at: 2026-10-24T11:39:43.215581801+00:00
+updated_at: 2026-10-24T13:02:35.816779354+00:00
+closed_at: 2026-10-24T13:02:35.816779214+00:00
 ---
 
 # Description

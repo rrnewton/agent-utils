@@ -1,12 +1,13 @@
 ---
 title: 'card-root-lines: a thread card that shows its first message keeps that message''s lines'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-24T10:44:34.390624343+00:00
-updated_at: 2026-10-24T10:44:34.390624343+00:00
+updated_at: 2026-10-24T13:02:35.812278022+00:00
+closed_at: 2026-10-24T13:02:35.812277872+00:00
 ---
 
 # Description
