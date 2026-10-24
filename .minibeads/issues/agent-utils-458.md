@@ -1,13 +1,14 @@
 ---
 title: 'replication-c9-lattice-fixes: hue eviction keeps tombstones; read marks become (epoch, max)'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
 - vibe-talk
 - replication
 created_at: 2026-10-23T14:41:08.716532114+00:00
-updated_at: 2026-10-23T14:41:08.716532114+00:00
+updated_at: 2026-10-24T00:55:29.195744416+00:00
+closed_at: 2026-10-24T00:55:29.195744255+00:00
 ---
 
 # Description

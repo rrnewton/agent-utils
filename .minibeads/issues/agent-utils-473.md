@@ -1,13 +1,14 @@
 ---
 title: 'replication-c7-server-versions: send the server''s versions to the page and retire read-send order'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
 - vibe-talk
 - replication
 created_at: 2026-10-23T22:49:27.255595376+00:00
-updated_at: 2026-10-23T22:49:27.255595376+00:00
+updated_at: 2026-10-24T00:55:29.209470123+00:00
+closed_at: 2026-10-24T00:55:29.209469993+00:00
 ---
 
 # Description

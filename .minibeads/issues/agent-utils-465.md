@@ -1,13 +1,14 @@
 ---
 title: 'replication-c6-op-key-marker: every post carries its operation key invisibly, through the provider trait'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
 - vibe-talk
 - replication
 created_at: 2026-10-23T17:02:32.338013293+00:00
-updated_at: 2026-10-23T17:02:32.338013293+00:00
+updated_at: 2026-10-24T00:55:29.198939779+00:00
+closed_at: 2026-10-24T00:55:29.198939659+00:00
 ---
 
 # Description
