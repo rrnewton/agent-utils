@@ -2325,6 +2325,11 @@ const OUTGOING_PROGRESS_MS = 2000;
 // channel does not carry it (`ownPostStands`): a chat service answering from older state catches up
 // within seconds, and a reply deleted upstream meanwhile still goes by the removal the page is told of.
 const OWN_POST_GRACE_MS = 600000;
+// `#500 sent-receipts-pile-up`. How long a confirmed send's "Sent." receipt is shown where the message
+// itself is not drawn — a reply into a thread, sent from Main or the Threads view's cards — before it
+// goes once the page holds the message (`sentReceiptRetires`); and it goes by OWN_POST_GRACE_MS after
+// confirmation whatever the page holds.
+const SENT_RECEIPT_MS = 15000;
 // `#195 send-resilience`. A send whose answer was lost goes out again on its own after the first
 // wait, then after each wait this many times the last, never more than the longest — 3 s, 6 s,
 // 12 s, 20 s, 20 s, 20 s — and then a person decides. Each wait counts from when the attempt that
@@ -26827,7 +26832,12 @@ function persistOutgoingMessages() {
   // `#466 reply-promotes-thread`: what `pendingByThread` worked out is stale.
   outboxVersion += 1;
   try {
-    const encoded = JSON.stringify([...outgoingMessages.values()]);
+    // `#500 sent-receipts-pile-up`. Never a confirmed send where the store keeps the page's own posts
+    // (`sentReceiptRetires`): its receipt is a display aid for this page, and a reload keeps the post
+    // itself against a read from older state as this page does (`saveOwnPosts`). Saved, a receipt no
+    // read of this page ever retired came back on every reload.
+    const encoded = JSON.stringify([...outgoingMessages.values()]
+      .filter((entry) => entry.state !== "sent" || !storeKeepsOwnPosts(entry.channel)));
     outgoingStorageOkay = storedExactly(OUTGOING_KEY, encoded);
     if (!outgoingStorageOkay) {
       // A full quota is not a reason to lose an unsent message: saved channel rows can be read
@@ -26881,6 +26891,8 @@ function outgoingFromSaved(held) {
     continueIn: typeof held.continueIn === "string" && held.continueIn ? held.continueIn : null,
     // `#448 send-dedupe`: where its words went on the first attempt that sent them.
     wire: savedWire(held.wire),
+    // `#500 sent-receipts-pile-up`: when the server confirmed it, for a send that is sent.
+    sentAt: Number(held.sentAt) || 0,
     detail: attempted ? "This page closed before delivery was confirmed."
       : interrupted ? "This page closed before this message was sent." : String(held.detail || ""),
   };
@@ -26898,10 +26910,19 @@ function loadOutgoingMessages() {
     const saved = JSON.parse(localStorage.getItem(OUTGOING_KEY) || "[]");
     if (!Array.isArray(saved)) return;
     const queued = [];
+    let confirmed = false;
     for (const held of saved) {
       const entry = outgoingFromSaved(held);
       if (!entry) continue;
+      // `#500 sent-receipts-pile-up`. Nor a confirmed send saved by an earlier build, which did not say
+      // when it was confirmed, or past the grace (`sentReceiptRetires`): the owner's pile of "Sent."
+      // receipts, all of them posted long before, goes on the first load.
+      if (entry.state === "sent" && !(Date.now() - entry.sentAt < OWN_POST_GRACE_MS)) {
+        confirmed = true;
+        continue;
+      }
       outgoingMessages.set(entry.id, entry);
+      if (entry.state === "sent") armSentReceipt(entry, OWN_POST_GRACE_MS);
       if (held.state === "sending" && held.phase === "queued") queued.push(entry);
     }
     // `#277 send-order`. A message that was waiting behind an earlier one to the same place still
@@ -26919,7 +26940,7 @@ function loadOutgoingMessages() {
       }
     }
     // In particular, never replay a POST merely because Android reopened this page.
-    if (outgoingMessages.size) persistOutgoingMessages();
+    if (outgoingMessages.size || confirmed) persistOutgoingMessages();
   } catch (_error) {
     outgoingStorageOkay = false;
   }
@@ -26995,6 +27016,50 @@ const sentFromThisPage = (message) => sentFromHere.has(String(message.id));
 const sentFromHereAt = new Map();
 
 /**
+ * `#500 sent-receipts-pile-up`. `sentFromHereAt` on the device, for OWN_POST_GRACE_MS: a confirmed send's
+ * receipt is no longer saved, and a reload in the grace keeps the page's own post against a read from
+ * older state as the page that sent it did. Every window of the origin writes it, each adding its own.
+ */
+const OWN_POSTS_KEY = "vibe-talk.own-posts";
+
+/** The saved `sentFromHereAt` still in its grace, by id. */
+function savedOwnPosts() {
+  /** @type {Map<string, number>} */
+  const kept = new Map();
+  try {
+    const saved = JSON.parse(localStorage.getItem(OWN_POSTS_KEY) || "{}");
+    for (const [id, at] of Object.entries(saved && typeof saved === "object" ? saved : {})) {
+      if (typeof at === "number" && Date.now() - at < OWN_POST_GRACE_MS) kept.set(id, at);
+    }
+  } catch (_error) {
+    // Unreadable: nothing kept, as on a device that never sent.
+  }
+  return kept;
+}
+
+/**
+ * Save `sentFromHereAt`, with what other windows saved, within the grace, and without `removed`.
+ *
+ * @param {string | null} [removed] a post removed upstream (`noteLiveRemoval`)
+ */
+function saveOwnPosts(removed = null) {
+  const all = savedOwnPosts();
+  for (const [id, at] of sentFromHereAt) if (Date.now() - at < OWN_POST_GRACE_MS) all.set(id, at);
+  if (removed !== null) all.delete(removed);
+  try {
+    if (all.size) localStorage.setItem(OWN_POSTS_KEY, JSON.stringify(Object.fromEntries(all)));
+    else localStorage.removeItem(OWN_POSTS_KEY);
+  } catch (_error) {
+    // A full quota: the page keeps them for itself, as before this was saved.
+  }
+}
+
+/** Take back what earlier pages of the device sent in the grace (`saveOwnPosts`). */
+function loadOwnPosts() {
+  for (const [id, at] of savedOwnPosts()) if (!sentFromHereAt.has(id)) sentFromHereAt.set(id, at);
+}
+
+/**
  * Whether message `id` is one this page posted within OWN_POST_GRACE_MS: a page that does not carry
  * it is not evidence that it is gone.
  *
@@ -27011,9 +27076,12 @@ const sentFromHereAt = new Map();
  * each copy is (C7), this page's own fresh post is taken out only once it is told of its removal
  * (`noteRemoved`), never by its absence from a page alone.
  *
- * INTERIM, for R9 only. Once the page orders copies by the server's `observed_ms` and a newest page's
- * `settled_below_ms` (C7's page part), no stale page can drop a copy observed after it began, and this
- * and the receipt rule in `receiveLiveMessage` can go back to being display aids.
+ * For copies without the server's versions only. Where a page says its `observed_ms` and a newest
+ * page's `settled_below_ms` and the store's copy says its own `observed_ms` (`#473
+ * replication-c7-server-versions`; the answer to a post carries it), no stale page can drop a copy
+ * observed after it began, and `pageFold` decides by those before this is asked. Either way the
+ * page's own post is kept, so its receipt is a display aid (`sentReceiptRetires`, `#500
+ * sent-receipts-pile-up`).
  */
 function ownPostStands(id) {
   const at = sentFromHereAt.get(String(id));
@@ -27021,6 +27089,68 @@ function ownPostStands(id) {
   if (Date.now() - at < OWN_POST_GRACE_MS) return true;
   sentFromHereAt.delete(String(id));
   return false;
+}
+
+/**
+ * Whether the page's store keeps its own posts in channel `channel` against a page from older state
+ * (`ownPostStands`, and the server's versions where said, `pageFold`): a channel with threads. Without
+ * them a read replaces the rows, and the receipt is what draws a confirmed post a stale read left out.
+ *
+ * @param {string} channel
+ */
+function storeKeepsOwnPosts(channel) {
+  const provider = providerOfChannel(channel);
+  return provider ? provider.threading_supported === true
+    : threadingSupported && channel === String(el("discord-channel").value);
+}
+
+/**
+ * Whether the receipt of `entry`, a send, retires now. The owner, 2026-10-24: "messages I sent stack up
+ * in the 'Sent.' cards at the bottom of the screen, and they survive even the page restart." From
+ * `#466 reply-promotes-thread` a receipt went only once a READ carried every part, and was saved until
+ * then: a reply into a thread the page never reads — sent from Main, or from the Threads view's cards —
+ * kept its receipt for good, and every reload put it back.
+ *
+ * Where the store keeps the page's own posts (`storeKeepsOwnPosts`), a receipt is a display aid: taking
+ * it away cannot take the message with it. It goes:
+ *   - at once when reads have carried every part, as ever;
+ *   - there, once it has been shown SENT_RECEIPT_MS and the selected channel's store holds every part
+ *     — the post's answer, the stream's copy or a read's — or a row draws it. Not a send to another
+ *     channel: its store is not loaded, and the stream's copy of it is put in none;
+ *   - OWN_POST_GRACE_MS after the server confirmed it, whatever the page holds — as long as the page
+ *     keeps its own post against a page that does not carry it.
+ * Nor is it saved there (`persistOutgoingMessages`), and a confirmed send saved past the grace, or by an
+ * earlier build, is not loaded (`loadOutgoingMessages`). Not sent, unconfirmed or on its way, an entry
+ * stays for the reader, as before.
+ *
+ * @param {any} entry
+ * @param {Set<string>} drawn the ids of the selected channel's messages drawn in this column
+ */
+function sentReceiptRetires(entry, drawn) {
+  if (entry.state !== "sent" || !entry.parts.length) return false;
+  if (entry.parts.every((part) => entry.observedParts.includes(part.id))) return true;
+  const shown = Date.now() - (Number(entry.sentAt) || 0);
+  if (shown >= OWN_POST_GRACE_MS) return true;
+  if (shown < SENT_RECEIPT_MS || !storeKeepsOwnPosts(entry.channel)) return false;
+  const here = entry.channel === String(el("discord-channel").value);
+  const stored = here && channelCanon.channel === entry.channel
+    ? new Set(channelCanon.messages.map((held) => String(held.id))) : null;
+  return here && entry.parts.every((part) => drawn.has(part.id) || Boolean(stored && stored.has(part.id)));
+}
+
+/**
+ * `#500 sent-receipts-pile-up`. Draw the outbox again when `entry`'s receipt, just confirmed, comes due
+ * to retire (`sentReceiptRetires`): after its showing, and if that leaves it, at the end of the grace.
+ *
+ * @param {any} entry
+ * @param {number} [due] how long after confirmation to draw again
+ */
+function armSentReceipt(entry, due = SENT_RECEIPT_MS) {
+  setTimeout(() => {
+    if (outgoingMessages.get(entry.id) !== entry || entry.state !== "sent") return;
+    renderOutgoingEverywhere();
+    if (outgoingMessages.get(entry.id) === entry && due < OWN_POST_GRACE_MS) armSentReceipt(entry, OWN_POST_GRACE_MS);
+  }, Math.max(0, due - (Date.now() - entry.sentAt)));
 }
 
 /** Only provider history/stream observations retire receipts; appending an ACK is not a read. */
@@ -27062,12 +27192,11 @@ function renderOutgoingMessages() {
   let retired = false;
   const rows = [];
   for (const entry of outgoingMessages.values()) {
-    // An ACK can render as an ordinary, actionable provider row immediately. Keep its receipt
-    // until history/stream has independently caught up, so a stale read cannot erase the send.
+    // An ACK can render as an ordinary, actionable provider row immediately; its receipt, drawn
+    // only where the message is not, goes by `sentReceiptRetires` (`#500 sent-receipts-pile-up`).
     const unseen = entry.channel === channel
       ? entry.parts.filter((part) => !visibleIds.has(part.id)) : entry.parts;
-    if (entry.state === "sent" && entry.parts.length &&
-        entry.parts.every((part) => entry.observedParts.includes(part.id))) {
+    if (sentReceiptRetires(entry, visibleIds)) {
       outgoingMessages.delete(entry.id);
       outgoingObservations.delete(entry.id);
       retired = true;
@@ -27246,7 +27375,10 @@ function placeOutgoingInPlace(rows) {
     outgoingInPlaceDrawn.set(activeColumn, { anchors: [], groups: [] });
     return rows;
   }
-  const lists = [el("discord-log")];
+  // `#500 sent-receipts-pile-up`. Or the Threads view's cards, over the left column's list: a reply sent
+  // from the box under an unpacked row (`#407 unpack-row-parity`) stays under that row, not at the foot
+  // of the cards, until it is drawn there or its receipt goes; never under the same message in Main.
+  const cards = activeColumn === columns.main && sideCardsShown() ? [leftEl("side-cards")] : [];
   /** @type {Map<HTMLElement, {list: HTMLElement, rows: HTMLElement[]}>} */
   const under = new Map();
   /** @type {HTMLElement[]} */
@@ -27255,7 +27387,7 @@ function placeOutgoingInPlace(rows) {
     const entry = /** @type {any} */ (row).outgoingEntry;
     let found = null;
     if (entry && entry.inPlace) {
-      for (const list of lists) {
+      for (const list of entry.inCards ? cards : [el("discord-log")]) {
         const anchor = shownNode(list) ? anchorUnder(list, String(entry.inPlace)) : null;
         if (anchor) {
           found = { list, anchor };
@@ -28511,6 +28643,7 @@ async function dispatchOutgoingMessage(entry, job) {
       sentFromHere.add(part.id);
       sentFromHereAt.set(part.id, Date.now());
     }
+    saveOwnPosts();
     // `#263 post-split-per-provider`. The rest of a long post may have continued in its first
     // part's thread, where it is drawn rather than here; the receipt for it says which thread.
     if (!entry.threadId) entry.continueIn = entry.parts.slice(1).map(threadOf).find(Boolean) || entry.continueIn;
@@ -28519,6 +28652,9 @@ async function dispatchOutgoingMessage(entry, job) {
     outgoingObservations.set(entry.id, new Set(entry.observedParts));
     entry.state = "sent";
     entry.detail = "";
+    // `#500 sent-receipts-pile-up`. From now its receipt is shown for a while, then goes.
+    entry.sentAt = Date.now();
+    armSentReceipt(entry);
     // Whether the reader follows is decided BEFORE anything this answer changes is drawn. The first
     // message sent can tell the page who "me" is, and then every row of mine is drawn again as mine
     // (`noteSelfAuthor`), narrower, where a line may wrap onto one more: a reader on the newest line
@@ -42714,6 +42850,9 @@ async function sendReply() {
     // `#467 inline-send-in-place`. Sent from the box in the stream: its row is drawn where that box was,
     // under the message it answers, until the reply itself is drawn (`placeOutgoingInPlace`).
     ...(replyDocked ? { inPlace: String(target.id) } : {}),
+    // `#500 sent-receipts-pile-up`. And in which list: the Threads view's cards, where Main may draw the
+    // same message on the left.
+    ...(replyDocked && replyList === leftEl("side-cards") ? { inCards: true } : {}),
     // `#300 reply-marks-read`. A targeted reply marks the message it answers, wherever it goes.
     marksRead: String(target.id),
     // Not where to post yet: the send reads the channel first. See `placeReplyTarget`.
@@ -45001,7 +45140,9 @@ function renderSideCards() {
   if (button.disabled !== loading) button.disabled = loading;
   // `#491 threads-view-sent-receipt`. A sent reply these cards now draw takes its receipt away: the
   // outbox was drawn before them on a pass over the rows, and an unpack read draws them on its own.
-  if (sideCardsShown() && [...outgoingMessages.values()].some((entry) => entry.state === "sent")) {
+  // `#500 sent-receipts-pile-up`: and a reply's row drawn under the row it answers here is placed
+  // again under that row as now drawn.
+  if (sideCardsShown() && [...outgoingMessages.values()].some((entry) => entry.state === "sent" || entry.inPlace)) {
     eachColumn(renderOutgoingMessages);
   }
   // `#410 inline-reply-editor`. A reply open under a row unpacked here, under it as the rows now stand;
@@ -49241,10 +49382,10 @@ function refreshAfterLiveMutation() {
 function receiveLiveMessage(message, selfPosted, replayed, fromTail) {
   // `#337 voice-relay-silent`. How it came, for whether a call that may have missed it hears it.
   const arrival = { fromTail: fromTail === true, resumed: liveAttachResumed };
-  // `#466 reply-promotes-thread`. Not observed from here: a sent receipt stays until a READ carries
-  // its parts. The stream's copy is newer than any read on the wire only in having arrived, and the
-  // read it asks for may be answered from older state without them (`ownPostStands`). INTERIM, for
-  // the replication model's R9, until C7's page part orders copies by the server's versions.
+  // `#466 reply-promotes-thread`. Not a read's observation, which retires a sent receipt at once: the
+  // read the stream's copy asks for may be answered from older state. The copy goes into the store,
+  // which keeps the page's own post against such a read (`ownPostStands`), and the receipt goes after
+  // its showing (`sentReceiptRetires`, `#500 sent-receipts-pile-up`).
   // The other free way to learn which account is ours: the server marks what IT posted, so the
   // author of a self-posted message is this bridge by construction. Done before the channel guard
   // below, because the fact is true regardless of which channel the reader happens to be looking
@@ -49457,7 +49598,8 @@ function noteLiveRemoval(channel, id, observedMs = null) {
   liveRemovalsSeen.set(String(channel), (liveRemovalsSeen.get(String(channel)) || 0) + 1);
   // `#466 reply-promotes-thread`. Heard of in any channel: a post of this page's removed upstream is no
   // longer kept against reads that do not carry it (`ownPostStands`).
-  sentFromHereAt.delete(String(id));
+  // `#500 sent-receipts-pile-up`: nor on the device, whichever of its windows sent it.
+  if (sentFromHereAt.delete(String(id)) || savedOwnPosts().has(String(id))) saveOwnPosts(String(id));
   if (channelCanon.channel !== String(channel)) return;
   noteRemoved(channelCanon, String(id), observedMs);
   // `#315 removed-reply-target`. A reply open on it says so now, not when the read behind this lands,
@@ -53475,6 +53617,8 @@ for (const topic of HELP_TOPICS) {
 // `#51 reply-view`. Every way out of a reply goes through `closeReply`, so none can be the one that
 // forgets to put the reader back where they were reading.
 loadDrafts();
+// `#500 sent-receipts-pile-up`. Before the outbox, whose confirmed sends are no longer saved.
+loadOwnPosts();
 loadOutgoingMessages();
 // `#193 compose-draft-loss`. What was dismissed from the outbox in the last days, for Settings.
 loadDismissedSends();

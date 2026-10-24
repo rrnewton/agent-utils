@@ -4645,6 +4645,11 @@ const TUNING_BANDS = {
     "reply-promotes-thread). Under a minute a lagging chat service still takes the owner's reply away " +
     "as they look for it; past half an hour a reply deleted in another app without a removal the page " +
     "hears of stays drawn that long"],
+  SENT_RECEIPT_MS: [3000, 60000,
+    "how long a confirmed send's Sent. receipt is shown where the message itself is not drawn, before " +
+    "it goes once the page holds the message (#500 sent-receipts-pile-up). Under a few seconds a reply " +
+    "into a thread leaves nothing the reader can see said; past a minute receipts of replies pile up " +
+    "at the foot as the owner's did"],
   OUTGOING_RETRY_FIRST_MS: [2000, 15000,
     "the wait before a lost send goes again on its own (#195 send-resilience). Under a couple of " +
     "seconds it lands on the same slow moment that lost it; past fifteen the reader has already " +
@@ -80692,6 +80697,179 @@ test("`#491 threads-view-sent-receipt`: a reply sent from among the cards, once 
   assert.equal(drawn().length, 1, "the premise: the reply is not drawn among the cards");
   assert.deepEqual(receipts().map((li) => li.getAttribute("data-send-state")), [],
     "the reply is drawn among the cards and again as a receipt at the foot");
+});
+
+// --- a confirmed send's receipt goes (#500 sent-receipts-pile-up) ---------------------------------------
+//
+// The owner, 2026-10-24, on Slack in the Threads view on a desk: "Some weird bug where messages I sent stack
+// up in the 'Sent.' cards at the bottom of the screen, and they survive even the page restart." Five
+// "You · Reply … Sent." receipts of thread replies, each with its Thread chip, at the foot of the cards over
+// the main channel's box, long after they posted. A receipt went only once a READ carried its reply
+// (`#466 reply-promotes-thread`), and none of this view's reads carries a thread's replies; and it was
+// saved, so every reload drew it again.
+
+const SENT_RECEIPT_MS = sourceConstant("SENT_RECEIPT_MS");
+
+/** The Threads view as the owner had it: Main channel among the cards, threads with unread replies unpacked. */
+async function ownersCards(storage = new Map()) {
+  const data = parityData({ long: false });
+  const page = newPage(new Map([[UNPACK_STORAGE, "unread"], [THREADS_MAIN_STORAGE, "on"], ...storage]));
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  page.messages = data.messages;
+  const server = forwardTimeline(page);
+  for (const id of ["700", "701", "702", "704", "705", "706"]) page.dealtWith.add(id);
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await pickThread(page, "threads");
+  await page.settle();
+  return { page, data, server };
+}
+
+/** Reply `text` on message `id` from the box under its unpacked row; the server posts it in that thread. */
+async function replyFromCards(page, server, data, id, text, postedId) {
+  const answered = data.messages.find((m) => m.id === id);
+  const mine = message({ id: postedId, content: text, reply_to: id,
+    thread: { ...answered.thread, is_root: false, reply_count: null, reply_count_exact: false } });
+  page.replyResponse = async () => json(200, { posted: server.post(mine) });
+  await replyButton(unpackedRow(page, id)).click();
+  await page.settle();
+  assert.ok(replyInStream(page), `Reply on ${id} did not open among the cards`);
+  await page.el("reply-text").setValue(text);
+  await page.el("reply-send").click();
+  await page.settle();
+  await deliver(page, page.stream(), sseMessage(mine, { self_posted: true }));
+  await page.settle();
+  return mine;
+}
+
+/** The receipts drawn anywhere — at the foot, or in place under a row — that say `text`, by their state. */
+const receiptsSaying = (page, text) => [...outgoingRows(page), ...inPlaceRows(page, "side-list")]
+  .filter((li) => li.text().includes(text)).map((li) => li.getAttribute("data-send-state"));
+
+test("`#500 sent-receipts-pile-up`: thread replies sent from the cards say Sent for a while, then go; none is saved, and a reload draws none while the replies stay", async () => {
+  const { page, data, server } = await ownersCards();
+  // The first reply: its thread is read now, and packs, so the reply is drawn nowhere in the view.
+  const first = await replyFromCards(page, server, data, "703", "first answer from the cards", "7990");
+  // The second, from a thread unpacked again for it, which packs again after.
+  await page.el("side-unpack").click(); // Unpack unread -> Unpack all
+  await page.settle();
+  const second = await replyFromCards(page, server, data, "707", "second answer from the cards", "7991");
+  await page.el("side-unpack").click(); // Unpack all -> Pack all
+  await page.el("side-unpack").click(); // Pack all -> Unpack unread
+  await page.settle();
+  // Said, for the reader, with the thread it went into: the owner's cards, as they first stood.
+  assert.deepEqual(receiptsSaying(page, first.content), ["sent"], "the first reply said nothing of being sent");
+  assert.deepEqual(receiptsSaying(page, second.content), ["sent"], "the second reply said nothing of being sent");
+  const shown = outgoingRows(page).find((li) => li.text().includes(first.content));
+  assert.equal(threadBadge(shown)?.textContent, "Thread", "the receipt does not lead to the thread its reply is in");
+  assert.deepEqual(savedOutgoing(page), [], "a confirmed send was saved, for a reload to draw again");
+  // No read of this view carries either reply. Before the fix the receipts stayed for good.
+  await passTime(page, SENT_RECEIPT_MS);
+  assert.deepEqual(receiptsSaying(page, first.content), [], "the first reply's receipt outlived its showing");
+  assert.deepEqual(receiptsSaying(page, second.content), [], "the second reply's receipt outlived its showing");
+  assert.deepEqual(savedOutgoing(page), []);
+  // The replies themselves are held, and drawn in their threads.
+  await pickThread(page, `thread:${data.threads[0].id}`);
+  await page.settle();
+  assert.ok(shownIds(page).includes(first.id), "the first reply went with its receipt");
+  await pickThread(page, "threads");
+  await page.settle();
+  // A reload: nothing to draw again, and the replies still in their threads.
+  const again = reloadWith(new Map(page.storage), page.messages, (p) => {
+    p.threadingSupported = true;
+    p.threads = page.threads;
+    forwardTimeline(p);
+  });
+  await signIn(again);
+  await reopenedChannel(again);
+  assert.equal(again.el("thread-select").value, "threads", "the reload did not come back to the Threads view");
+  assert.deepEqual([...receiptsSaying(again, first.content), ...receiptsSaying(again, second.content)], [],
+    "a reload drew a receipt again");
+  await pickThread(again, `thread:${data.threads[1].id}`);
+  await again.settle();
+  assert.ok(shownIds(again).includes(second.id), "the second reply is not in its thread after the reload");
+});
+
+test("`#500 sent-receipts-pile-up`: the receipts an earlier build saved for sends long confirmed are dropped on load, and an unsent one is kept", async () => {
+  // As the owner's device holds them: thread replies, each "sent", with its server parts, and nothing
+  // saying when it was confirmed.
+  const data = parityData({ long: false });
+  const pile = ["703", "707", "703"].map((answers, at) => {
+    const answered = data.messages.find((m) => m.id === answers);
+    const part = message({ id: `7980${at}`, content: `an old answer ${at}`, reply_to: answers,
+      thread: { ...answered.thread, is_root: false } });
+    return { id: `outgoing-old-${at}`, channel: CHANNEL.id, text: part.content, remaining: part.content,
+      state: "sent", threadId: answered.thread.id, replyTo: answers, originView: "main", createdAt: 1,
+      postedCount: 0, parts: [part], observedParts: [], detail: "" };
+  });
+  const unsent = { id: "outgoing-not-sent", channel: CHANNEL.id, text: "still to go", remaining: "still to go",
+    state: "failed", threadId: null, replyTo: null, createdAt: 1, postedCount: 0, parts: [], observedParts: [],
+    detail: "refused" };
+  const { page } = await ownersCards(new Map([["vibe-talk.outgoing-messages", JSON.stringify([...pile, unsent])]]));
+  for (const entry of pile) {
+    assert.deepEqual(receiptsSaying(page, entry.text), [], `the old receipt "${entry.text}" was drawn again`);
+  }
+  assert.deepEqual(savedOutgoing(page).map((entry) => entry.id), ["outgoing-not-sent"],
+    "the saved outbox still holds the confirmed sends, or lost the one not sent");
+  assert.deepEqual(receiptsSaying(page, "still to go"), ["failed"], "the send not sent is not offered again");
+});
+
+test("`#500 sent-receipts-pile-up`: a reply sent from the box under an unpacked row is drawn there while it goes, not at the foot of the cards", async () => {
+  const { page, data, server } = await ownersCards(new Map([[UNPACK_STORAGE, "on"]]));
+  const finish = delayedReply(page);
+  const answered = data.messages.find((m) => m.id === "707");
+  await replyButton(unpackedRow(page, "707")).click();
+  await page.settle();
+  await page.el("reply-text").setValue("on its way from the cards");
+  const sent = page.el("reply-send").click();
+  await page.settle();
+  const placed = inPlaceRows(page, "side-list").filter((li) => li.text().includes("on its way from the cards"));
+  assert.deepEqual(placed.map((li) => li.getAttribute("data-send-state")), ["sending"],
+    "the reply going is not drawn under the row it answers");
+  assert.deepEqual(page.el("outgoing-log").children.filter((li) => li.text().includes("on its way from the cards")), [],
+    "the reply going is drawn at the foot of the cards as well");
+  assert.ok(unpackedRow(page, "707").hasAttribute("data-outgoing-anchor"), "the row answered keeps no room under it");
+  const mine = message({ id: "7992", content: "on its way from the cards", reply_to: "707",
+    thread: { ...answered.thread, is_root: false, reply_count: null, reply_count_exact: false } });
+  finish(json(200, { posted: server.post(mine) }));
+  await sent;
+  await page.settle();
+  // Drawn among the cards now, in its thread: nothing more to stand in for (`#491`).
+  assert.deepEqual(receiptsSaying(page, "on its way from the cards"), [], "the reply is drawn twice once sent");
+});
+
+test("`#500 sent-receipts-pile-up`: a reload in the grace keeps a reply the server does not list yet, its receipt no longer saved to draw it", async () => {
+  // From review: the saved receipt was what drew the page's own post after a reload whose first read
+  // came from older state. The post is kept now as the page that sent it kept it (`ownPostStands`).
+  const run = async (forget) => {
+    const { page, data } = await freshMessagePage((p) => { p.repliesInThread = true; });
+    const mine = message({ id: "9500000000000000001", content: "said just before a reload",
+      thread: { id: data.lone.id, root_message_id: "210", is_root: false, reply_count: null, reply_count_exact: false } });
+    // Posted, but the service's reads do not show it yet, before the reload or after it.
+    page.replyResponse = async () => json(200, { posted: mine, parts: [mine] });
+    await replyButton(rowOf(page, "210")).click();
+    await page.el("reply-text").setValue("said just before a reload");
+    await page.el("reply-send").click();
+    await page.settle();
+    assert.ok(shownIds(page).includes(mine.id), "the premise: the reply is drawn as it is sent");
+    assert.deepEqual(savedOutgoing(page), [], "a confirmed send was saved");
+    const store = new Map(page.storage);
+    if (forget) store.delete("vibe-talk.own-posts");
+    const again = reloadWith(store, page.messages, (p) => {
+      p.threadingSupported = true;
+      p.threads = data.threads;
+      p.repliesInThread = true;
+      threadedService(p);
+    });
+    await signIn(again);
+    await reopenedChannel(again);
+    await reReadChannel(again);
+    return shownIds(again).includes(mine.id);
+  };
+  assert.equal(await run(false), true, "a read from older state took the reply out after a reload");
+  // Negative control: without what the page saved of its own posts, the same read takes it out.
+  assert.equal(await run(true), false, "the premise: the reload's reads would take the reply out");
 });
 
 test("`#492 threads-row-widths`: an unpacked thread's rows reach the card's right edge, the owner's half an inset narrower, the reply as wide", () => {

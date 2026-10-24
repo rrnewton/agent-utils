@@ -1446,6 +1446,26 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#500 sent-receipts-pile-up` in the browser engine, at 1280x800 with a mouse: receipts an earlier build
+  # saved for replies long confirmed are not drawn on load, nor kept; a reply sent from under an unpacked
+  # row of the Threads view is drawn directly under it while its post is held; three replies' Sent receipts
+  # at the foot of the packed cards go once shown (SENT_RECEIPT_MS, waited out for real), none saved, and a
+  # reload draws none while each reply is in its thread. Measured on 2026-10-24: about 19s wall, most of it
+  # the receipts' showing.
+  - group: check
+    job: sent-receipts-browser
+    desc: the Sent receipts of thread replies sent from the Threads view go once shown, are never saved, and a reload draws none, in current Chromium at 1280x800
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/sent_receipts_browser.py
+    jobs_flag: ""
+    timeout: 120
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 20
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#421 chip-states`, `#422 composer-key-stay`, `#424 threads-main-own-center` and `#423
   # back-key-consistency` in the browser engine, at 1280x800 with a mouse and 393x852 by touch: the
   # Threads view's three chips alike at rest and alike pressed, unlike each other way; Cmd+S with Main
