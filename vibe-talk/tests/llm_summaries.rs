@@ -536,7 +536,10 @@ async fn a_thread_list_read_by_the_owner_names_its_threads_in_the_background() {
         .expect("readable")
         .expect("filed");
     let sentence: FiledSentence = serde_json::from_str(&sentence.text).expect("a sentence row");
-    assert_eq!(sentence.at, 3, "named at three messages: the root and two replies");
+    assert_eq!(
+        sentence.at, 3,
+        "named at three messages: the root and two replies"
+    );
 
     // A read with nothing due asks nothing.
     let (_, _) = call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
@@ -587,11 +590,25 @@ async fn a_thread_is_not_named_or_shown_named_before_its_third_message() {
     let (status, first) = call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
     assert_eq!(status, StatusCode::OK, "{first}");
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(h.names.pending() + h.names.named(), 0, "a small thread was queued");
-    assert!(h.threads.thread_reads.lock().unwrap().is_empty(), "a small thread was read");
-    assert!(h.summarizer.thread_prompts().is_empty(), "the model was asked");
+    assert_eq!(
+        h.names.pending() + h.names.named(),
+        0,
+        "a small thread was queued"
+    );
+    assert!(
+        h.threads.thread_reads.lock().unwrap().is_empty(),
+        "a small thread was read"
+    );
+    assert!(
+        h.summarizer.thread_prompts().is_empty(),
+        "the model was asked"
+    );
     for (_, name, sentence) in names_of(&first) {
-        assert_eq!((name, sentence), (None, None), "a small thread was served named: {first}");
+        assert_eq!(
+            (name, sentence),
+            (None, None),
+            "a small thread was served named: {first}"
+        );
     }
 
     h.threads.grow(0, 2);
@@ -603,7 +620,11 @@ async fn a_thread_is_not_named_or_shown_named_before_its_third_message() {
         .filter(|(_, name, _)| name.is_some())
         .map(|(id, _, _)| id)
         .collect();
-    assert_eq!(named, [THREADS[0]], "only the grown thread is named: {second}");
+    assert_eq!(
+        named,
+        [THREADS[0]],
+        "only the grown thread is named: {second}"
+    );
 }
 
 #[tokio::test]
