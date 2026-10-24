@@ -1,12 +1,13 @@
 ---
 title: 'webapp-deep-links: the page''s URL selects the view, and a link can name one message'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-23T14:54:33.612862611+00:00
-updated_at: 2026-10-23T14:54:33.612862611+00:00
+updated_at: 2026-10-24T02:21:08.294404924+00:00
+closed_at: 2026-10-24T02:21:08.294404754+00:00
 ---
 
 # Description
