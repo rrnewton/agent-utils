@@ -7299,7 +7299,7 @@ return errors === 0;
 validate132.evaluated = {"props":{"client_key":true,"from_tail":true,"message":true,"replayed":true,"self_posted":true,"untrusted_content_notice":true},"dynamicProps":false,"dynamicItems":false};
 
 exports.LiveDeleteEvent = validate134;
-const schema89 = {"properties":{"channel_id":{"$ref":"#/$defs/ChannelId"},"from_tail":{"type":"boolean"},"message_id":{"$ref":"#/$defs/MessageId"},"replayed":{"type":"boolean"}},"required":["channel_id","message_id","replayed","from_tail"],"type":"object"};
+const schema89 = {"properties":{"channel_id":{"$ref":"#/$defs/ChannelId"},"from_tail":{"type":"boolean"},"message_id":{"$ref":"#/$defs/MessageId"},"observed_ms":{"format":"int64","type":["integer","null"]},"replayed":{"type":"boolean"}},"required":["channel_id","message_id","replayed","from_tail"],"type":"object"};
 
 function validate134(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
 let vErrors = null;
@@ -7355,16 +7355,30 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.replayed !== undefined){
+if(data.observed_ms !== undefined){
+let data3 = data.observed_ms;
 const _errs9 = errors;
-if(typeof data.replayed !== "boolean"){
-validate134.errors = [{instancePath:instancePath+"/replayed",schemaPath:"#/properties/replayed/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+if((!(((typeof data3 == "number") && (!(data3 % 1) && !isNaN(data3))) && (isFinite(data3)))) && (data3 !== null)){
+validate134.errors = [{instancePath:instancePath+"/observed_ms",schemaPath:"#/properties/observed_ms/type",keyword:"type",params:{type: schema89.properties.observed_ms.type},message:"must be integer,null"}];
 return false;
 }
 var valid0 = _errs9 === errors;
 }
 else {
 var valid0 = true;
+}
+if(valid0){
+if(data.replayed !== undefined){
+const _errs11 = errors;
+if(typeof data.replayed !== "boolean"){
+validate134.errors = [{instancePath:instancePath+"/replayed",schemaPath:"#/properties/replayed/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+return false;
+}
+var valid0 = _errs11 === errors;
+}
+else {
+var valid0 = true;
+}
 }
 }
 }
@@ -7379,7 +7393,7 @@ return false;
 validate134.errors = vErrors;
 return errors === 0;
 }
-validate134.evaluated = {"props":{"channel_id":true,"from_tail":true,"message_id":true,"replayed":true},"dynamicProps":false,"dynamicItems":false};
+validate134.evaluated = {"props":{"channel_id":true,"from_tail":true,"message_id":true,"observed_ms":true,"replayed":true},"dynamicProps":false,"dynamicItems":false};
 
 exports.LiveResetEvent = validate135;
 const schema92 = {"properties":{"detail":{"type":"string"},"missed":{"format":"uint64","minimum":0,"type":"integer"}},"required":["missed","detail"],"type":"object"};

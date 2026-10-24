@@ -1033,6 +1033,11 @@ pub struct LiveDeleteEvent {
     pub replayed: bool,
     /// Whether it was published before this stream attached; see [`LiveMessageEvent::from_tail`].
     pub from_tail: bool,
+    /// When this server observed the removal, on its clock, in Unix milliseconds: a page read that
+    /// began before it never brings the message back. `#473 replication-c7-server-versions`, the
+    /// replication model's rule 3.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_ms: Option<i64>,
 }
 
 /// The data of a live stream `reset` event: the subscriber fell behind the replay tail.

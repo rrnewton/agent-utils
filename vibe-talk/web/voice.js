@@ -20640,6 +20640,19 @@ function foldTimelinePage(payload, older, view = channelView, thread = selectedT
 function pageFold(canon, payload, held) {
   const number = sentNumberOf(payload);
   const holds = held ? heldNow(canon) : null;
+  const versions = serverVersions(payload);
+  /** @type {Map<string, any> | null} the store's copies by id, for the server's versions: built once */
+  let stored = null;
+  const storedNow = () => {
+    if (!stored) stored = holds || new Map(canon.messages.map((copy) => [String(copy.id), copy]));
+    return stored;
+  };
+  /** @type {Set<string> | null} the ids the page carries, for the server's versions: built once */
+  let carriedIds = null;
+  const carried = () => {
+    if (!carriedIds) carriedIds = new Set((payload.messages || []).map((copy) => String(copy.id)));
+    return carriedIds;
+  };
   /**
    * @param {string} id whether the store holds a copy of message `id` older than this page
    * @param {boolean} [says] older in what it says (`copyOlderThan`)
@@ -20652,7 +20665,14 @@ function pageFold(canon, payload, held) {
     /** @param {any} message */
     takes: (message) => {
       const id = String(message.id);
-      if (removedSince(canon, id, number)) return false;
+      if (removedSince(canon, id, number) || removedAfterRead(canon, id, versions)) return false;
+      // `#473 replication-c7-server-versions`: where the server says how new both copies are, that
+      // decides, whatever order the reads were sent in.
+      const kept = versions ? storedNow().get(id) : undefined;
+      // A copy that says the message as it was posted (the stream's, the reader's own send) is older
+      // in what it says than any read that carries the message, however late it arrived.
+      const byServer = kept && postedCopies.has(kept) ? true : versions ? pageCopyNewer(kept, message, versions) : null;
+      if (byServer !== null) return byServer;
       if (!held || !holds) return true;
       if (holds.has(id)) return older(id, true);
       // Taken out since it was sent.
@@ -20660,9 +20680,78 @@ function pageFold(canon, payload, held) {
       return !newerPageSpeaksFor(canon, message, number);
     },
     /** @param {any} message */
-    answers: (message) => removedSince(canon, String(message.id), number) ||
-      ((!held || older(String(message.id))) && (canon.removed.has(String(message.id)) || !ownPostStands(message.id))),
+    answers: (message) => {
+      const id = String(message.id);
+      if (removedSince(canon, id, number) || removedAfterRead(canon, id, versions)) return true;
+      // `#473 replication-c7-server-versions`: the replication model's rule 4, as the server applies
+      // it. A held copy is gone by its absence only where the server says it observed that copy
+      // before this page's read began and it was created below the stretch the page proves.
+      // A message the page carries is there, whichever copy of it the store keeps.
+      const byServer = versions ? (carried().has(id) ? false : goneByAbsence(message, versions)) : null;
+      if (byServer !== null) return byServer;
+      return (!held || older(id)) && (canon.removed.has(id) || !ownPostStands(message.id));
+    },
   };
+}
+
+/**
+ * `#473 replication-c7-server-versions`. How new a page of the server's is, on the server's clock: when
+ * its read began (`observed_ms`), and on a newest page the provider time below which its absence of a
+ * message proves the message gone (`settled_below_ms`). Null from an older server, which says neither:
+ * the page then orders copies by when it sent its reads (`copyOrder`), as before.
+ *
+ * @param {any} payload
+ * @returns {{observed: number, settledBelow: number | null} | null}
+ */
+function serverVersions(payload) {
+  if (!payload || typeof payload.observed_ms !== "number") return null;
+  return {
+    observed: payload.observed_ms,
+    settledBelow: typeof payload.settled_below_ms === "number" ? payload.settled_below_ms : null,
+  };
+}
+
+/**
+ * `#473`. Whether a page whose versions are `versions` takes its copy of a message, `offered`, over the
+ * store's, `held`: true when the store holds none; by edit time where both say one (an earlier edit
+ * never replaces a later one, however late it was seen); otherwise by the server's observation of each,
+ * the page's being when its read began. Null where the store's copy does not say how new it is (saved
+ * by an older build, or put together by one): the caller decides as before.
+ *
+ * @param {any} held
+ * @param {any} offered
+ * @param {{observed: number}} versions
+ * @returns {boolean | null}
+ */
+function pageCopyNewer(held, offered, versions) {
+  if (!held) return null;
+  if (typeof held.observed_ms !== "number") return null;
+  const heldEdit = held.edited_timestamp ? Date.parse(held.edited_timestamp) : NaN;
+  const offeredEdit = offered.edited_timestamp ? Date.parse(offered.edited_timestamp) : NaN;
+  if (Number.isFinite(heldEdit) && Number.isFinite(offeredEdit) && heldEdit !== offeredEdit) {
+    return offeredEdit > heldEdit;
+  }
+  const seen = typeof offered.observed_ms === "number" ? offered.observed_ms : versions.observed;
+  return seen >= held.observed_ms;
+}
+
+/**
+ * `#473`. Whether a page whose versions are `versions`, which does not carry the store's copy `held` of a
+ * message, says the message is gone: only a newest page (one that says where its proven stretch ends),
+ * only for a copy the server observed before the page's read began, and only for a message created
+ * below that stretch. A copy observed after the read began — the reply just sent, a message the stream
+ * delivered — is newer than the page; one created in the unsettled band may simply not be listed yet.
+ * Null where the store's copy does not say how new it is: the caller decides as before.
+ *
+ * @param {any} held
+ * @param {{observed: number, settledBelow: number | null}} versions
+ * @returns {boolean | null}
+ */
+function goneByAbsence(held, versions) {
+  if (typeof held.observed_ms !== "number") return null;
+  if (versions.settledBelow === null) return false;
+  const created = timeOf(held, "timestamp");
+  return held.observed_ms < versions.observed && Number.isFinite(created) && created < versions.settledBelow;
 }
 
 /**
@@ -20779,7 +20868,7 @@ function foldTimelineDelta(payload, sent, view = channelView, thread = selectedT
     channelCanon.messages = channelCanon.messages.filter((message) => !gone.has(String(message.id)));
     for (const id of gone) {
       channelCanon.dismissed.delete(id);
-      noteRemoved(channelCanon, id);
+      noteRemoved(channelCanon, id, typeof payload.observed_ms === "number" ? payload.observed_ms : null);
       archivedIds.delete(id);
     }
   }
@@ -26967,10 +27056,43 @@ function forgetUnplaced(canon, id) {
  *
  * @param {any} canon
  * @param {string} id
+ * @param {number | null} [observedMs] when the server observed the removal (`removalsObserved`)
  */
-function noteRemoved(canon, id) {
+function noteRemoved(canon, id, observedMs = null) {
   forgetUnplaced(canon, id);
   canon.removed.set(id, timelineAnswersAsked);
+  if (typeof observedMs === "number") removalObserved(canon.channel).set(String(id), observedMs);
+}
+
+/**
+ * `#473 replication-c7-server-versions`. By channel, then message id, when the server observed each
+ * removal the page was told of, on the server's clock: a page whose read began before it never brings
+ * the message back, however late it was sent (the replication model's rule 3). Kept beside `removed`,
+ * which orders removals by when reads were sent, for a server that says neither.
+ *
+ * @type {Map<string, Map<string, number>>}
+ */
+const removalsObserved = new Map();
+
+/** The removals of `channel` the server said when it observed (`removalsObserved`). */
+function removalObserved(channel) {
+  const key = String(channel);
+  let held = removalsObserved.get(key);
+  if (!held) {
+    held = new Map();
+    removalsObserved.set(key, held);
+  }
+  return held;
+}
+
+/**
+ * Whether a page whose versions are `versions` (`serverVersions`) began before the server observed the
+ * removal of message `id` of `canon`: it is older than that removal, and never brings the message back.
+ */
+function removedAfterRead(canon, id, versions) {
+  if (!versions) return false;
+  const at = removalObserved(canon.channel).get(String(id));
+  return at !== undefined && versions.observed <= at;
 }
 
 /**
@@ -26984,9 +27106,15 @@ function noteRemoved(canon, id) {
 function believeCarried(canon, payload) {
   if (canon.removed.size === 0) return;
   const number = sentNumberOf(payload);
+  const versions = serverVersions(payload);
   for (const message of payload.messages || []) {
     const at = canon.removed.get(String(message.id));
-    if (at !== undefined && number > at) canon.removed.delete(String(message.id));
+    // `#473`: not a page whose read began before the server observed the removal.
+    if (removedAfterRead(canon, String(message.id), versions)) continue;
+    if (at !== undefined && number > at) {
+      canon.removed.delete(String(message.id));
+      removalObserved(canon.channel).delete(String(message.id));
+    }
   }
 }
 
@@ -48039,7 +48167,8 @@ function onStreamFrame(frame) {
     // ...and a removal says the message is gone upstream, whatever the read below brings: no answer
     // sent before it may put the message back.
     if (threadingSupported && frame.event === "message_delete" && VibeTalkContract.is("LiveDeleteEvent", payload)) {
-      noteLiveRemoval(payload.channel_id, payload.message_id);
+      noteLiveRemoval(payload.channel_id, payload.message_id,
+        typeof payload.observed_ms === "number" ? payload.observed_ms : null);
     }
     // An edit or removal out of the replay tail is on every page read begun after the attach, so
     // it waits for such a read rather than making its own. The page's copy of the message says
@@ -48333,14 +48462,15 @@ function takeThreadRecord(message) {
  *
  * @param {string} channel
  * @param {string} id
+ * @param {number | null} [observedMs] when the server observed the removal (`removalsObserved`)
  */
-function noteLiveRemoval(channel, id) {
+function noteLiveRemoval(channel, id, observedMs = null) {
   liveRemovalsSeen.set(String(channel), (liveRemovalsSeen.get(String(channel)) || 0) + 1);
   // `#466 reply-promotes-thread`. Heard of in any channel: a post of this page's removed upstream is no
   // longer kept against reads that do not carry it (`ownPostStands`).
   sentFromHereAt.delete(String(id));
   if (channelCanon.channel !== String(channel)) return;
-  noteRemoved(channelCanon, String(id));
+  noteRemoved(channelCanon, String(id), observedMs);
   // `#315 removed-reply-target`. A reply open on it says so now, not when the read behind this lands,
   // and so does one after a reload before that read has landed.
   followReplyStore();

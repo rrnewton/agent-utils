@@ -535,6 +535,12 @@ declare namespace VibeTalk {
      */
     message_id: MessageId;
     /**
+     * When this server observed the removal, on its clock, in Unix milliseconds: a page read that
+     * began before it never brings the message back. `#473 replication-c7-server-versions`, the
+     * replication model's rule 3.
+     */
+    observed_ms?: number | null;
+    /**
      * Whether it was classified as history rather than news.
      */
     replayed: boolean;
