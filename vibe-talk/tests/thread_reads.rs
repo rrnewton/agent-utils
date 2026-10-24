@@ -354,12 +354,14 @@ async fn record() -> Value {
         channel("D0000000004"),
         channel("E0000000005"),
     );
-    let replies: Vec<u64> = (0..20).map(|n| n % 4).collect();
+    // Every thread at the summary threshold or past it (`#484 summary-card-threshold`): due when
+    // unnamed, as this record's cases say.
+    let replies: Vec<u64> = (0..20).map(|n| 2 + n % 4).collect();
     plain.seed(&a, "a", &replies);
-    plain.seed(&b, "b", &[1, 0, 2]);
-    plain.seed(&c, "c", &[3, 1]);
-    plain.seed(&d, "d", &[1, 2, 0]);
-    plain.seed(&e, "e", &[0, 1]);
+    plain.seed(&b, "b", &[3, 2, 4]);
+    plain.seed(&c, "c", &[5, 3]);
+    plain.seed(&d, "d", &[3, 4, 2]);
+    plain.seed(&e, "e", &[2, 3]);
     plain.fail("d01");
 
     let mut cases = Vec::new();
@@ -406,9 +408,10 @@ async fn record() -> Value {
         json!([shown(&shown_b), shown(&shown_c)]),
     );
 
-    // At 1 message a thread is due again at 2; at 3, at 4; at 4, at 8.
-    plain.grow("a00", 1);
-    plain.grow("a02", 3);
+    // Filed at 3 messages a thread is due again at 4; filed at 5 or 6, at 8 (3, 4, 8, then
+    // every 10): a00 was filed at 3, a02 at 5, a03 at 6.
+    plain.grow("a00", 3);
+    plain.grow("a02", 7);
     plain.grow("a03", 7);
     list(&names, &deps, &plain, &a, true).await;
     settle(&names, 28).await;
