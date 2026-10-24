@@ -1616,6 +1616,27 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#482 thread-card-fit`, `#483 thread-card-read-style` in the browser engine, at 1280x800 and at
+  # 393x852 by touch: a one-line thread card is one line tall with no reserved room under its words
+  # while a long one still clamps at three, a short summary is whole at its own height, a fully
+  # read card is drawn at a read message row's opacity and desaturation (back at full strength
+  # under focus), Unpack unread greys its edge, Fold read folds the read run behind one
+  # full-strength line and Hide read leaves the read cards out, and the card heading the open
+  # thread is one fitted line. Served through Playwright's request routing, so it opens no port.
+  - group: check
+    job: thread-card-fit-browser
+    desc: thread cards fitted to their words and fully read cards drawn read, packed, unpacked and under every read mode, in current Chromium at 1280x800 and 393x852
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/thread_card_fit_browser.py
+    jobs_flag: ""
+    timeout: 180
+    cpu_timeout: 90
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 30
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#245 done-feedback` in the browser engine: on a threaded channel at 1280x800, in the dark scheme and
   # the light one, a selected unread message is ringed solid in the accent and a selected read one
   # dashed in grey on the same lit surface, each at 3:1 or more against it, by computed style; e draws

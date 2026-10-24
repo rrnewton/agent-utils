@@ -24638,7 +24638,10 @@ function threadCard(summary, tally) {
   about.textContent = said || (first === title.textContent ? "" : first);
   button.append(title, about);
   button.addEventListener("click", () => toggleLitCard(id, row));
-  const open = cardOpener("thread-card", sideCardReplies(choice, tally), sideCardUnread(choice, tally),
+  const unread = sideCardUnread(choice, tally);
+  // `#483 thread-card-read-style`: read whole, this card recedes as the Threads view's cards do.
+  if (threadIsRead(choice, unread)) row.setAttribute("data-thread-read", "");
+  const open = cardOpener("thread-card", sideCardReplies(choice, tally), unread,
     inThisColumn(() => guardQuietly(() => enterCard(id, summary, row))()));
   row.append(button, open);
   // `#439 search-unmatched-separators`. What a gap among these cards counts for this whole thread.
