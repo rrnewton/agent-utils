@@ -533,6 +533,14 @@
           "$ref": "#/$defs/MessageId",
           "description": "The message that was removed."
         },
+        "observed_ms": {
+          "description": "When this server observed the removal, on its clock, in Unix milliseconds: a page read that\nbegan before it never brings the message back. `#473 replication-c7-server-versions`, the\nreplication model's rule 3.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "replayed": {
           "description": "Whether it was classified as history rather than news.",
           "type": "boolean"

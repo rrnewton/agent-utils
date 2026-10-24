@@ -743,6 +743,7 @@ fn samples() -> Value {
             message_id: MessageId("300".into()),
             replayed: true,
             from_tail: false,
+            observed_ms: Some(1_790_000_000_000),
         })],
         "LiveResetEvent": [to(&LiveResetEvent { missed: 12, detail: "re-read" })],
         "VibeTalkV1ServerFrame": [

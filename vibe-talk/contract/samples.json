@@ -452,6 +452,7 @@
       "channel_id": "100",
       "from_tail": false,
       "message_id": "300",
+      "observed_ms": 1790000000000,
       "replayed": true
     }
   ],

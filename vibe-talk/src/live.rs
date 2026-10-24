@@ -1871,6 +1871,7 @@ fn message_event_as(live: &LiveMessage, from_tail: bool, id: &str) -> axum::resp
             message_id: live.message.id.clone(),
             replayed,
             from_tail,
+            observed_ms: live.message.observed_ms,
         }),
     };
     // A `Message` is plain data and cannot fail to serialize. If that ever stops being true,

@@ -69985,7 +69985,7 @@ for (const placing of ["newest", "delta"]) {
         const kept = savedMessage(control.page, "300");
         return Boolean(kept && kept.thread && kept.thread.id === control.first.id);
       };
-      const unplaced = await run(brokenScript("  if (channelCanon.channel !== String(channel)) return;\n  noteRemoved(channelCanon, String(id));\n",
+      const unplaced = await run(brokenScript("  if (channelCanon.channel !== String(channel)) return;\n  noteRemoved(channelCanon, String(id), observedMs);\n",
         "  if (channelCanon.channel !== String(channel)) return;\n"));
       assert.ok(inThread(unplaced), "the reply stayed gone anyway, so this test cannot see it");
       if (placing === "delta") {
@@ -72666,9 +72666,8 @@ test("`#316 late-counts-resurrect`: a read of All for Main's counts does not bri
 // never reported it, and the message stayed on Main, and saved, until the next newest page fifteen
 // minutes on. A removal replayed from the stream's tail asks for no read at all.
 const REMOVED_LEFT_TO_ITS_READ = [
-  "    answers: (message) => removedSince(canon, String(message.id), number) ||\n" +
-  "      ((!held || older(String(message.id))) && (canon.removed.has(String(message.id)) || !ownPostStands(message.id))),\n",
-  "    answers: (message) => !removedSince(canon, String(message.id), number) && (!held || older(String(message.id))),\n"];
+  "      if (removedSince(canon, id, number) || removedAfterRead(canon, id, versions)) return true;\n",
+  "      if (removedSince(canon, id, number) || removedAfterRead(canon, id, versions)) return false;\n"];
 
 for (const removal of ["after", "before", "tail"]) {
   const named = { after: "answered after the removal", before: "answered before the removal",
@@ -80339,4 +80338,264 @@ test("`#467 inline-send-in-place`: the row is drawn straight after the list, and
   await page.el("pinned-filter").click();
   await page.settle();
   assert.equal(inPlaceRows(page).length, 1, "the reply's row did not come back with the list");
+});
+
+// --- `#473 replication-c7-server-versions`: the page orders copies by the server's versions --------
+//
+// The replication model's C7. The server says how new each copy it serves is (`observed_ms`) and, on a
+// newest page, the stretch whose absence proves a message gone (`settled_below_ms`). The page decides by
+// those where both sides carry them, instead of by when it sent the reads: so a page answered from older
+// state takes away nothing observed after its read began, with or without `#466`'s interim grace.
+
+/** Every timeline answer of `page` stamped as the server stamps it, its read begun at `clock.at()`. */
+function serverVersioned(page, clock) {
+  const serve = page.timeline;
+  page.timeline = async (path, options) => {
+    const answer = await serve(path, options);
+    if (!answer || !answer.ok) return answer;
+    const body = JSON.parse(await answer.text());
+    const url = new URL(path, "http://fixture.test");
+    const newest = !url.searchParams.get("before") && !url.searchParams.get("after");
+    const observed = clock.at();
+    body.observed_ms = observed;
+    if (newest) body.settled_below_ms = observed - 120000;
+    for (const held of body.messages || []) {
+      if (typeof held.observed_ms !== "number") held.observed_ms = observed;
+    }
+    return json(answer.status, body);
+  };
+}
+
+/** The text of message `id` as the page keeps it for this channel. */
+const storedText = (page, id) => {
+  const kept = savedScopes(page)[scopeKey(CHANNEL.id)];
+  const copy = kept && kept.messages.find((m) => m.id === id);
+  return copy ? copy.content : undefined;
+};
+
+/** `#473`: the page deciding by read-send order alone, as before C7. */
+const SERVER_VERSIONS_IGNORED = ["function serverVersions(payload) {\n", "function serverVersions(payload) {\n  return null;\n"];
+
+test("`#473 replication-c7-server-versions`: a newest page answered from older state cannot take away a reply observed after its read began, without the interim grace", async () => {
+  const run = async (script) => {
+    const clock = { now: Date.parse("2026-10-23T12:00:00Z"), at() { return this.now; } };
+    const { page, data } = await freshMessagePage((p) => {
+      p.repliesInThread = true;
+      serverVersioned(p, clock);
+    }, script);
+    const posted = clock.now + 5000;
+    const mine = message({ id: "9473000000000000001", content: "my answer to the fresh message", observed_ms: posted,
+      thread: { id: data.lone.id, root_message_id: "210", is_root: false, reply_count: null, reply_count_exact: false } });
+    page.replyResponse = async () => json(200, { posted: mine, parts: [mine] });
+    await replyButton(rowOf(page, "210")).click();
+    await page.el("reply-text").setValue("my answer to the fresh message");
+    await page.el("reply-send").click();
+    await page.settle();
+    // The service answers from a memory a minute old, which says so: its reads began before the post.
+    clock.now = posted - 60000;
+    await deliver(page, page.stream(), sseMessage(mine, { self_posted: true }));
+    await page.settle();
+    const afterEcho = shownIds(page).includes(mine.id);
+    await reReadChannel(page);
+    const afterReread = shownIds(page).includes(mine.id);
+    return { page, mine, clock, afterEcho, afterReread };
+  };
+  const noGrace = brokenAlso(SCRIPT, OWN_POST_FORGOTTEN);
+  const { page, mine, clock, afterEcho, afterReread } = await run(noGrace);
+  assert.ok(afterEcho, "a page whose read began before the post took the reply away");
+  assert.ok(afterReread, "the next stale page took it away");
+  await pickThread(page, "main");
+  assert.equal(tagOf(rowOf(page, "210")).text, "Thread(1)", "the message answered went back to starting a thread");
+  // A newest page begun after the reply was observed, that still lacks it, says it is gone.
+  await pickThread(page, "flat");
+  clock.now = mine.observed_ms + 60000;
+  await reReadChannel(page);
+  assert.ok(!shownIds(page).includes(mine.id), "a page begun after the reply that lacks it did not take it away");
+
+  // THE CONTROL: deciding by read-send order, with the interim grace gone too, the stale page takes it away.
+  const control = await run(brokenAlso(noGrace, SERVER_VERSIONS_IGNORED));
+  assert.ok(!(control.afterEcho && control.afterReread),
+    "without the server's versions the reply still survived, so this test cannot see them");
+});
+
+test("`#473 replication-c7-server-versions`: an edit the server observed is not replaced by an earlier one, nor a message in the unsettled band dropped", async () => {
+  const clock = { now: Date.parse("2026-10-23T12:00:00Z"), at() { return this.now; } };
+  const { page, data } = await freshMessagePage((p) => serverVersioned(p, clock));
+  const target = page.messages.find((held) => held.id === "210");
+  // A read sees the edit; a later page answered from a memory older than the edit carries the old text
+  // with an older edit time.
+  page.messages = page.messages.map((held) => (held === target
+    ? { ...held, content: "edited text", edited_timestamp: "2026-10-23T11:59:00Z" } : held));
+  await pollOnce(page);
+  assert.equal(storedText(page, "210"), "edited text", "the premise is the edit in the store");
+  page.messages = page.messages.map((held) => (held.id === "210"
+    ? { ...held, content: "older text", edited_timestamp: "2026-10-23T11:58:00Z" } : held));
+  clock.now += 60000;
+  await pollOnce(page);
+  assert.equal(storedText(page, "210"), "edited text", "an earlier edit replaced a later one");
+  // A message posted a moment ago, which a newest page does not list yet: in the band, not gone.
+  const fresh = message({ id: "9473000000000000002", content: "just now", timestamp: new Date(clock.now - 1000).toISOString(),
+    observed_ms: clock.now - 5000 });
+  await deliver(page, page.stream(), sseMessage(fresh));
+  await page.settle();
+  assert.ok(shownIds(page).includes(fresh.id), "the premise is the streamed message drawn");
+  clock.now += 10000;
+  await pollOnce(page);
+  assert.ok(shownIds(page).includes(fresh.id), "a message in the unsettled band was dropped by its absence");
+  void data;
+});
+
+// --- `#469 replication-model-tests`: the page against random interleavings --------------------------
+//
+// The replication model's §8 on the page, with the server's versions (`#473`). A seeded xorshift picks
+// events: the service creates, edits and deletes messages; the stream delivers a deletion at once, late
+// or never; and newest reads land fresh, or answered from a memory up to ten minutes old that says so
+// (`observed_ms` earlier). After every step: no message's text goes back to an earlier version, none comes
+// back once the page was told it was removed, and nothing is invented. At quiescence (a fresh read begun
+// well past every change) the page holds exactly what the service holds. A failure names its seed and its
+// steps, which replay exactly.
+
+/** xorshift64*, as the server's model tests use, in BigInt. */
+function xorshift(seed) {
+  let state = BigInt(seed) * 0x9e3779b97f4a7c15n | 1n;
+  const mask = (1n << 64n) - 1n;
+  return (n) => {
+    state ^= state >> 12n;
+    state = (state ^ (state << 25n)) & mask;
+    state ^= state >> 27n;
+    return Number(((state * 0x2545f4914f6cdd1dn) & mask) % BigInt(Math.max(1, n)));
+  };
+}
+
+/**
+ * One seeded run of the page against the service model, with `script` as web/voice.js. Answers the
+ * first property broken, with its seed and steps, or null.
+ */
+async function pageModelRun(seed, script) {
+  {
+    const pick = xorshift(seed);
+    const log = [];
+    const fail = (what) => { throw new Error(`seed ${seed}: ${what}\nsteps:\n  ${log.join("\n  ")}`); };
+    const clock = { now: Date.parse("2026-10-23T12:00:00Z"), at() { return this.now; } };
+    /** The service's history: every state, with when it began, for reads answered from older state. */
+    const history = [];
+    let readAsOf = null;
+    const { page } = await freshMessagePage((p) => {
+      const serve = p.timeline;
+      p.timeline = async (path, options) => {
+        const asOf = readAsOf === null ? clock.now : readAsOf;
+        const state = [...history].reverse().find((entry) => entry.at <= asOf) || history[0];
+        const live = p.messages;
+        p.messages = state.messages;
+        try {
+          const answer = await serve(path, options);
+          if (!answer || !answer.ok) return answer;
+          const body = JSON.parse(await answer.text());
+          const url = new URL(path, "http://fixture.test");
+          body.observed_ms = asOf;
+          if (!url.searchParams.get("before") && !url.searchParams.get("after")) body.settled_below_ms = asOf - 120000;
+          for (const held of body.messages || []) held.observed_ms = asOf;
+          return json(answer.status, body);
+        } finally {
+          p.messages = live;
+        }
+      };
+    }, script);
+    const record = () => history.push({ at: clock.now, messages: page.messages });
+    record();
+    /** By id, the versions the service gave it, and whether the page was told it was removed. */
+    const versions = new Map();
+    const removed = new Set();
+    let next = 0;
+    const versionOf = (text) => {
+      const found = /^m(\d+) v(\d+)$/.exec(String(text));
+      return found ? Number(found[2]) : null;
+    };
+    const ownedIds = () => [...versions.keys()];
+    const highest = new Map();
+    const check = () => {
+      const kept = savedScopes(page)[scopeKey(CHANNEL.id)];
+      for (const copy of (kept ? kept.messages : [])) {
+        const id = String(copy.id);
+        if (!versions.has(id)) continue;
+        if (removed.has(id)) fail(`${id} came back after the page was told it was removed`);
+        const version = versionOf(copy.content);
+        if (version === null || !versions.get(id).includes(copy.content)) fail(`${id} holds text the service never gave it: ${copy.content}`);
+        if (version < (highest.get(id) ?? -1)) fail(`${id} went back from v${highest.get(id)} to v${version}`);
+        highest.set(id, Math.max(version, highest.get(id) ?? -1));
+      }
+    };
+    for (let step = 0; step < 24; step += 1) {
+      clock.now += 1000 + pick(20) * 1000;
+      const live = ownedIds().filter((id) => page.messages.some((m) => m.id === id));
+      const choice = pick(100);
+      if (choice < 25 || live.length === 0) {
+        next += 1;
+        const id = `98000000000000${String(next).padStart(5, "0")}`;
+        const text = `m${next} v0`;
+        versions.set(id, [text]);
+        page.messages = [...page.messages, message({ id, content: text, timestamp: new Date(clock.now).toISOString() })];
+        record();
+        log.push(`${clock.now} create ${id}`);
+      } else if (choice < 50) {
+        const id = live[pick(live.length)];
+        const texts = versions.get(id);
+        const text = `m${Number(id.slice(-5))} v${texts.length}`;
+        texts.push(text);
+        page.messages = page.messages.map((m) => (m.id === id
+          ? { ...m, content: text, edited_timestamp: new Date(clock.now).toISOString() } : m));
+        record();
+        log.push(`${clock.now} edit ${id} to ${text}`);
+      } else if (choice < 65) {
+        const id = live[pick(live.length)];
+        page.messages = page.messages.filter((m) => m.id !== id);
+        record();
+        log.push(`${clock.now} delete ${id}`);
+        if (pick(2) === 0) {
+          await deliver(page, page.stream(), sseDelete(`del-${id}-${step}`, CHANNEL.id, id, { observed_ms: clock.now }));
+          await page.settle();
+          removed.add(id);
+          log.push(`${clock.now} stream delivers the deletion of ${id}`);
+        }
+      } else {
+        const stale = pick(3) === 0 ? pick(10) * 60000 : 0;
+        readAsOf = clock.now - stale;
+        await reReadChannel(page);
+        readAsOf = null;
+        log.push(`${clock.now} read as of ${clock.now - stale}`);
+      }
+      check();
+    }
+    // Quiescence: a fresh read begun past every change and the band.
+    clock.now += 600000;
+    record();
+    await reReadChannel(page);
+    check();
+    const kept = savedScopes(page)[scopeKey(CHANNEL.id)];
+    const held = new Map((kept ? kept.messages : []).filter((m) => versions.has(String(m.id))).map((m) => [String(m.id), m.content]));
+    const service = new Map(page.messages.filter((m) => versions.has(m.id)).map((m) => [m.id, m.content]));
+    if (JSON.stringify([...held].sort()) !== JSON.stringify([...service].sort())) {
+      fail(`did not converge:\n  page    ${JSON.stringify([...held].sort())}\n  service ${JSON.stringify([...service].sort())}`);
+    }
+  }
+}
+
+test("`#469 replication-model-tests`: the page agrees with the service under random interleavings of edits, deletions, stream removals and stale reads", async () => {
+  for (let seed = 1; seed <= 12; seed += 1) {
+    try {
+      await pageModelRun(seed, SCRIPT);
+    } catch (error) {
+      assert.fail(error.message);
+    }
+  }
+  // THE CONTROL: ordering copies by read-send order alone, some seed breaks a property.
+  let caught = null;
+  for (let seed = 1; seed <= 12 && caught === null; seed += 1) {
+    try {
+      await pageModelRun(seed, brokenAlso(SCRIPT, SERVER_VERSIONS_IGNORED));
+    } catch (error) {
+      caught = error.message;
+    }
+  }
+  assert.ok(caught !== null, "without the server's versions no seed broke a property, so this test cannot see them");
 });
