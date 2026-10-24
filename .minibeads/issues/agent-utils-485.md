@@ -1,13 +1,14 @@
 ---
 title: 'chat-file-messages: rescue Slack messages with files that the event stream never carries'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - agentctl
 - chat
 created_at: 2026-10-24T10:42:01.750598649+00:00
-updated_at: 2026-10-24T10:42:01.750598649+00:00
+updated_at: 2026-10-24T11:14:52.070453750+00:00
+closed_at: 2026-10-24T11:14:52.070453400+00:00
 ---
 
 # Description
