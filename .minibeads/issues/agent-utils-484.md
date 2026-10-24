@@ -1,12 +1,13 @@
 ---
 title: 'summary-card-threshold: no summary card before a thread''s third message'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
 - vibe-talk
 created_at: 2026-10-24T10:13:27.591543459+00:00
-updated_at: 2026-10-24T10:13:27.591543459+00:00
+updated_at: 2026-10-24T11:45:45.996123342+00:00
+closed_at: 2026-10-24T11:45:45.996123282+00:00
 ---
 
 # Description

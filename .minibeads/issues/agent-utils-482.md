@@ -1,12 +1,13 @@
 ---
 title: 'thread-card-fit: thread cards shrink to fit their content'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
 - vibe-talk
 created_at: 2026-10-24T10:13:07.277929443+00:00
-updated_at: 2026-10-24T10:13:07.277929443+00:00
+updated_at: 2026-10-24T11:45:45.995873775+00:00
+closed_at: 2026-10-24T11:45:45.995873595+00:00
 ---
 
 # Description
