@@ -1,13 +1,14 @@
 ---
 title: 'cache-shadow-missing-row: explain and fix the shadow''s one missing row per window'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 - message-cache
 created_at: 2026-10-24T13:27:10.383524164+00:00
-updated_at: 2026-10-24T13:27:10.383524164+00:00
+updated_at: 2026-10-24T14:02:25.985723123+00:00
+closed_at: 2026-10-24T14:02:25.985722923+00:00
 ---
 
 # Description
