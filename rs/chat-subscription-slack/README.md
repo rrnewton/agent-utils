@@ -5,7 +5,13 @@ This crate holds two executables for an `agentctl chat` bridge:
 * `agentctl-slack-plugin`, the chat-subscription plugin `slack`
   (capability `chat-subscription.slack`). It speaks
   `agentctl-chat-subscription` v1 on stdin/stdout and turns `message.created`
-  events from one Slack channel into ordered, durably cursored requests.
+  events from one Slack channel into ordered, durably cursored requests. The
+  event stream never carries a message with an attached file, so a periodic
+  rescan of the channel's history (`slack.message list`, every
+  `rescan_interval_seconds`, 90 by default) delivers the messages the stream
+  missed, once, with each file's ID and download command in the request text.
+  Its ledger, `slack-rescan-ledger.json`, lives beside the plugin's
+  `diagnostics_log`; see `src/rescan.rs` and the userguide.
 * `agentctl-slack-outbound`, the bridge's one-shot `outbound_command`. It posts
   replies into the request's Slack thread and adds the acknowledgement
   reactions, verifies human authors before rejection reactions, and supports

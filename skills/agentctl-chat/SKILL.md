@@ -128,6 +128,25 @@ owner or the deployment's notes give.
   together after an outage or a long turn; answer them knowing how old they
   are.
 
+## Messages with files, and messages that come late
+
+The Slack event stream does not carry a message with an attached file, such as
+a screenshot. The Slack provider's periodic rescan delivers it instead, within
+one rescan interval (90 seconds by default, `rescan_interval_seconds`) and
+after messages the stream carried meanwhile, so check its send time. Such a
+request's text ends with a line saying it came through the rescan. When a
+message has files, a further note names each file ID with the exact command to
+download it, for example:
+
+```text
+[agentctl] This message has 1 attached file: F0123456789. To view it, download to a temporary path with:
+/path/to/slack-client slack.file download --file-id=F0123456789 --channel-id=C0123456789 --output-path=/tmp/agentctl-slack-files/
+```
+
+Run the command as printed and look at the file it reports saving, typically
+an image you can read, before you answer. If the download fails, say so in your
+reply rather than guessing what the file showed.
+
 ## Do not
 
 - Do not use another chat tool or the provider's API to answer a bridged

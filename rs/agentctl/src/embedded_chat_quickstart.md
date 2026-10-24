@@ -54,6 +54,13 @@ directory.
    variable names to `subscription_environment`; every named value must exist
    when the service starts, while its value is never saved in bridge state.
 
+   With the Slack provider, messages the event stream never carries, such as
+   ones with attached files, arrive through the plugin's periodic rescan within
+   `rescan_interval_seconds` (90 by default) instead, with each file's ID and the
+   command to download it in the request text. The rescan keeps its ledger
+   beside the plugin's `diagnostics_log` and stays off without one; the
+   userguide's "Messages the event stream never carries" has the details.
+
 3. Initialize once, then run the foreground service:
 
    ```sh

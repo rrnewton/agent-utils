@@ -1996,7 +1996,9 @@ emoji the configuration chooses instead).
 * `agentctl-slack-plugin` is the subscription plugin (manifest name `slack`,
   capability `chat-subscription.slack`). It runs the installed Slack
   command-line client's `slack.conversation tail` for the configured channel and
-  turns each `message.created` event into one batch.
+  turns each `message.created` event into one batch. A periodic rescan of the
+  channel's history delivers the messages the tail never carries, such as ones
+  with files (see "Messages the event stream never carries").
 * `agentctl-slack-outbound` is the `outbound_command`. It posts replies with
   `slack.message send` and adds reactions with `slack.reaction add`, as the
   registered Slack app's bot identity: with `--as=<APP_ID>` when the client
@@ -2031,16 +2033,61 @@ feedback. The cursor advances in every case. Slack's `&amp;`, `&lt;` and `&gt;`
 escapes are undone.
 
 Messages the event stream never carries. The stream does not publish every
-message. On 2026-10-21 a message with an attached file never reached the owner's
-subscription: his queue held no event of any type for it, while his plain reply
-in its thread arrived as usual. Such a message never becomes a request, whatever
-its subtype, and the reply reaches the agent without it. When a reply arrives in
-a thread whose root the stream has not carried, although the root is newer than
+message. A message with an attached file never reaches the member's
+subscription at all: on 2026-10-21 the owner's queue held no event of any type
+for one, while his plain reply in its thread arrived as usual, and over the four
+days before 2026-10-24 nine of his messages with screenshots were dropped
+outright, text included (#485 chat-file-messages). When a reply arrives in a
+thread whose root the stream has not carried, although the root is newer than
 the lineage start and than the first message this subscription carried, the
 plugin's diagnostics log names the root once, with the reply that revealed it.
-Nothing else changes: the reply is delivered as before, and no alarm is raised,
-since a root that is only late, or one posted by a bot (the client documents
-that it emits no posts by other bots), looks the same.
+
+The rescan, separate from the tail, delivers them. Every
+`rescan_interval_seconds` (90 by default), while the tail is idle, the plugin
+lists the channel's top-level history from the last `rescan_window_seconds` (a
+day by default) with `slack.message list --content-format=mrkdwn`, as the same
+member the tail runs as, and lists the replies of each thread in it whose newest
+reply it has not yet listed. A message at least 15 seconds old (younger ones
+are left to the stream) that the stream did not carry and the rescan has not
+already delivered goes through the same filtering as a stream message (allowed
+senders and grants, subtypes, ignored prefixes, the lineage start) and becomes
+its own batch. So a file message reaches the agent within about one interval,
+two at most. The request's text is the message's text followed by a line saying
+it came by the rescan; when the message has files, from either path, a further
+note names their IDs with the exact command to download each, for example:
+
+```text
+[agentctl] This message has 1 attached file: F0123456789. To view it, download to a temporary path with:
+/path/to/slack-client slack.file download --file-id=F0123456789 --channel-id=C0123456789 --output-path=/tmp/agentctl-slack-files/
+Each saves /tmp/agentctl-slack-files/<file id>-<file name> and prints that path.
+```
+
+The command is the plugin's own `cli_path` (with `cli_environment`), which runs
+as the channel member and can read the channel's files. The provider payload
+also carries `file_ids` and, for a rescued message, `delivered_by: "rescan"`.
+
+A message is delivered once whichever way it comes. The plugin keeps
+`slack-rescan-ledger.json` beside `diagnostics_log`: the messages the stream
+carried, the messages the rescan delivered, and the one rescued batch offered
+and not yet acknowledged. The rescan skips a message the stream carried (even
+if it has been edited since, so an edit is never a new request), a stream event
+for a message the rescan already delivered commits as a checkpoint, and a
+restart offers an unacknowledged rescued batch again, identically, before
+anything else, as the host requires after a rollback. The rescan never rescues a
+message created before the ledger began. A rescued batch's cursor is the
+cursor before it plus `;rescued:<channel>/<ts>`, and a restart from it resumes
+the tail where that earlier cursor does. Without `diagnostics_log` there is no
+place for the ledger, so the rescan stays off; `rescan_interval_seconds: 0`
+turns it off too.
+
+A pass reads at most 5 history pages of 20 messages, 8 threads of 2 pages each,
+and queues at most 32 messages; what it leaves is found by the next pass. It
+starts no listing after 60 seconds, and while a listing runs the plugin does not
+read the tail (events wait in the pipe). After a failed listing the next pass
+waits twice as long, up to 30 minutes, and a success resets that; a transport
+that cannot list stops the rescan for the subscription. The diagnostics log
+records each rescued message and each failure. A reply in a thread whose root is
+older than the window is not found.
 
 Cursor and recovery. The cursor is `slack1:seq:<n>`, the event stream's
 sequence number, or `slack1:since:<unix ms>` before the first event. A restart
@@ -2168,7 +2215,9 @@ Unknown keys are refused.
 | `cursor_refresh_seconds` | 7200 | Reopen the tail when the sequence cursor has not moved for this long, so a quiet channel's cursor stays inside the stream's retention (see "Cursor and recovery"). 600–21600, or 0 to never reopen. |
 | `initial_backfill_seconds` | 0 | A new state directory also delivers messages this many seconds old. |
 | `ignore_text_prefixes` | `[]` | Messages starting with one of these are never delivered. |
-| `diagnostics_log` | stderr | Private diagnostics file (identifiers and codes only, never message text). |
+| `diagnostics_log` | stderr | Private diagnostics file (identifiers and codes only, never message text). The rescan keeps its ledger beside it. |
+| `rescan_interval_seconds` | 90 | How often, while the tail is idle, to list recent history for messages the stream did not carry (see "Messages the event stream never carries"). 30–3600, or 0 to never rescan. |
+| `rescan_window_seconds` | 86400 | How far back a rescan lists, 600–604800. |
 
 The host clears the plugin environment except `HOME`, `USER`, `LOGNAME`, `PATH`,
 `LANG`, `LC_ALL`, `TMPDIR` and `XDG_RUNTIME_DIR`. If the client needs another

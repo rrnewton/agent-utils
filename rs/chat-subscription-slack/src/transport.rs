@@ -56,6 +56,8 @@ pub struct SlackMessage {
     pub text: String,
     /// Workspace ID, when reported.
     pub team_id: Option<String>,
+    /// IDs of the files attached to the message, in Slack's order.
+    pub file_ids: Vec<String>,
 }
 
 /// One classified record from an event stream.
@@ -165,6 +167,40 @@ pub struct ListQuery<'a> {
     pub thread_ts: Option<&'a str>,
     /// Only messages after this Slack timestamp.
     pub oldest: &'a str,
+}
+
+/// One page of a read-only listing the plugin's rescan makes as the configured member.
+#[derive(Clone, Copy, Debug)]
+pub struct ScanQuery<'a> {
+    /// Conversation ID.
+    pub channel_id: &'a str,
+    /// Thread root to list; `None` lists the conversation's top-level history.
+    pub thread_ts: Option<&'a str>,
+    /// Only messages after this Slack timestamp.
+    pub oldest: &'a str,
+    /// The previous page's continuation token.
+    pub page_token: Option<&'a str>,
+}
+
+/// One message from a rescan listing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScannedMessage {
+    /// The message, with its stored (`mrkdwn`) text, as an event would carry it.
+    pub message: SlackMessage,
+    /// Number of replies, for a thread root.
+    pub reply_count: u64,
+    /// The newest reply's `ts`, for a thread root.
+    pub latest_reply: Option<String>,
+}
+
+/// One page of a rescan listing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScanPage {
+    /// Messages in the provider's order: newest first for history; for a thread, the root
+    /// first and then replies oldest first.
+    pub messages: Vec<ScannedMessage>,
+    /// Token for the next page, when there is one.
+    pub next_page_token: Option<String>,
 }
 
 /// Whether a failed write is proven not to have happened.
@@ -298,6 +334,20 @@ pub trait SlackTransport: Send {
         &mut self,
         query: &ListQuery<'_>,
     ) -> Result<Vec<ListedMessage>, TransportError>;
+
+    /// List one page of a conversation's history or one thread's replies, as the identity the
+    /// event stream runs as, for the plugin's rescan.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError`]. Transports without listings refuse, and the rescan stays off.
+    fn scan_messages(&mut self, _query: &ScanQuery<'_>) -> Result<ScanPage, TransportError> {
+        Err(TransportError::not_applied(
+            "scan_unsupported",
+            "this transport cannot list conversation history for the rescan",
+            false,
+        ))
+    }
 
     /// Resolve one unixname, email address or Slack user ID to its provider user ID.
     ///

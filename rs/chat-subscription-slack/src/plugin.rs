@@ -58,13 +58,36 @@
 //! `--cli` may run as the Crewmate. The diagnostics log warns once when the client's standard
 //! error names a Crewmate, and notes once when a stream stays subscribed for
 //! [`QUIET_NOTICE_MILLIS`] with no event at all, which in a busy channel points the same way.
+//!
+//! # Rescan: messages the stream never carries
+//!
+//! The stream does not carry every message. A message with an attached file never arrives at all
+//! (#415 slack-file-share-delivery; #485 chat-file-messages: nine of the owner's screenshots in four
+//! days), so neither its text nor its file reached the agent. So every `rescan_interval_seconds`
+//! (90 by default; 0 turns it off), when the stream is idle, the driver lists each configured
+//! channel's history from the last `rescan_window_seconds` (a day by default) and the threads in it
+//! with replies it has not listed, through [`SlackTransport::scan_messages`] as the same member the
+//! tail runs as. A message at least [`rescan::GRACE_MILLIS`] old that the stream did not carry and
+//! the rescan has not delivered goes through the same admission as a stream message, and an
+//! admitted one becomes its own batch. Its text ends with a note that it came by the rescan
+//! and, when it has files, their IDs and the exact command to download each to a temporary path;
+//! a stream message with files gets the same file note.
+//!
+//! A rescued batch's cursor is the cursor before it with `;rescued:<channel>/<ts>` appended, so a
+//! subscription resumed from it resumes the stream where the cursor before it did. Which messages
+//! the stream carried and the rescan delivered, and the one rescued batch not yet acknowledged,
+//! are kept durably in [`rescan::Ledger`] beside the diagnostics log; without a diagnostics log the
+//! rescan stays off. The ledger is what lets the bridge admit a message seen both ways once, never
+//! offer an edited message again as new, and receive an identical rescued batch again after a
+//! restart (see the [`rescan`] module). A pass is bounded in pages, threads, messages and time,
+//! backs off exponentially after a failed listing, and logs what it rescued.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroU16;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chat_subscription::{
     BackendCapabilities, BackendFailure, CancellationError, ChannelId, ChatSubscriptionBackend,
@@ -78,9 +101,10 @@ use serde_json::{Map, Value};
 use crate::cli::{CliOptions, CliTransport, TailOptions};
 use crate::diag::{unix_millis, Diagnostics};
 use crate::ids;
+use crate::rescan::{self, message_key, Ledger, PendingRescue};
 use crate::transport::{
-    Catchup, EventStream, SlackMessage, SlackTransport, StreamCancel, StreamRecord, StreamWait,
-    SubscribeSpec, WebApiTransport,
+    Catchup, EventStream, ScanQuery, SlackMessage, SlackTransport, StreamCancel, StreamRecord,
+    StreamWait, SubscribeSpec, TransportError, WebApiTransport,
 };
 
 /// Schema of `backend_configuration` for this plugin.
@@ -134,6 +158,10 @@ pub struct PluginConfig {
     pub ignore_text_prefixes: Vec<String>,
     /// Diagnostics file.
     pub diagnostics_log: Option<PathBuf>,
+    /// How often to rescan for messages the stream did not carry; `None` never does.
+    pub rescan_interval: Option<Duration>,
+    /// How far back a rescan looks.
+    pub rescan_window: Duration,
 }
 
 fn failure(code: &str, detail: impl Into<String>, retryable: bool) -> BackendFailure {
@@ -215,6 +243,8 @@ impl PluginConfig {
             "initial_backfill_seconds",
             "ignore_text_prefixes",
             "diagnostics_log",
+            "rescan_interval_seconds",
+            "rescan_window_seconds",
         ];
         if let Some(unknown) = data.keys().find(|key| !KNOWN.contains(&key.as_str())) {
             return Err(invalid(format!(
@@ -319,6 +349,18 @@ impl PluginConfig {
             }
             Some(seconds) => Some(Duration::from_secs(seconds)),
         };
+        let rescan_interval = match optional_seconds(data, "rescan_interval_seconds", 0..=3_600)? {
+            None => Some(rescan::DEFAULT_INTERVAL),
+            Some(0) => None,
+            Some(seconds) if seconds < 30 => {
+                return Err(invalid(
+                    "rescan_interval_seconds must be 0 (never) or from 30 to 3600",
+                ))
+            }
+            Some(seconds) => Some(Duration::from_secs(seconds)),
+        };
+        let rescan_window = optional_seconds(data, "rescan_window_seconds", 600..=604_800)?
+            .map_or(rescan::DEFAULT_WINDOW, Duration::from_secs);
         Ok(Self {
             transport,
             cli,
@@ -334,6 +376,8 @@ impl PluginConfig {
             .unwrap_or(0),
             ignore_text_prefixes,
             diagnostics_log: optional_string(data, "diagnostics_log")?.map(PathBuf::from),
+            rescan_interval,
+            rescan_window,
         })
     }
 }
@@ -377,10 +421,11 @@ impl Cursor {
         }
     }
 
-    /// Decode a cursor produced by [`Self::encode`].
+    /// Decode a cursor produced by [`Self::encode`], or a rescued batch's cursor built on one
+    /// ([`rescan::rescue_cursor`]), which resumes where its base does.
     #[must_use]
     pub fn decode(value: &str) -> Option<Self> {
-        let rest = value.strip_prefix(CURSOR_PREFIX)?;
+        let rest = rescan::strip_rescue(value).strip_prefix(CURSOR_PREFIX)?;
         if let Some(sequence) = rest.strip_prefix("seq:") {
             return sequence.parse().ok().map(Self::Sequence);
         }
@@ -577,6 +622,25 @@ impl ChatSubscriptionBackend for SlackBackend {
                  a stream position",
             );
         }
+        let rescan = open_rescan(&config, &diagnostics, resume.as_deref(), now);
+        let download_command = config.cli.as_ref().map(|cli| {
+            let mut words: Vec<String> = Vec::new();
+            if !cli.environment.is_empty() {
+                words.push("env".to_owned());
+                words.extend(
+                    cli.environment
+                        .iter()
+                        .map(|(name, value)| rescan::shell_word(&format!("{name}={value}"))),
+                );
+            }
+            words.push(rescan::shell_word(&cli.program.to_string_lossy()));
+            words.extend(
+                cli.prefix_arguments
+                    .iter()
+                    .map(|word| rescan::shell_word(word)),
+            );
+            words.join(" ")
+        });
         let mut transport = (self.factory)(&config)?;
         let spec = SubscribeSpec {
             channel_ids: channels.iter().cloned().collect(),
@@ -625,9 +689,114 @@ impl ChatSubscriptionBackend for SlackBackend {
             carried: BTreeSet::new(),
             carried_since_micros: None,
             uncarried_noted: BTreeSet::new(),
+            rescan,
+            download_command,
             transport,
         }))
     }
+}
+
+/// The rescan state for a new subscription, settling a rescued batch the previous one left
+/// unacknowledged: one the bridge committed (it resumes from that batch's cursor) is recorded
+/// rescued; one it may have rolled back (it resumes from the cursor before) is offered again
+/// first, identical; any other is recorded rescued too, so it is never offered with a possibly
+/// different text, and logged.
+fn open_rescan(
+    config: &PluginConfig,
+    diagnostics: &Diagnostics,
+    resume: Option<&str>,
+    now_millis: u64,
+) -> Option<Rescan> {
+    let interval = config.rescan_interval?;
+    let Some(path) = Ledger::path_beside(config.diagnostics_log.as_deref()) else {
+        diagnostics.log(
+            "rescan is off: it keeps its ledger beside diagnostics_log, which is not configured, \
+             so messages the event stream does not carry (such as ones with files) are not rescued",
+        );
+        return None;
+    };
+    let (mut ledger, note) = Ledger::load(path, u128::from(now_millis) * 1_000);
+    if let Some(note) = note {
+        diagnostics.log(&format!("rescan: {note}"));
+    }
+    let mut replay = None;
+    if let Some(pending) = ledger.pending.clone() {
+        if resume == Some(pending.cursor.as_str()) {
+            diagnostics.log(&format!(
+                "rescan: the bridge committed the rescued message {} before this subscription",
+                pending.key
+            ));
+            ledger.mark_rescued(&pending.key);
+            ledger.pending = None;
+        } else if resume == pending.prior_cursor.as_deref() {
+            diagnostics.log(&format!(
+                "rescan: offering the unacknowledged rescued message {} again first",
+                pending.key
+            ));
+            replay = Some(pending);
+        } else {
+            diagnostics.log(&format!(
+                "rescan: the unacknowledged rescued message {} belongs to another cursor than \
+                 this subscription's; it is recorded delivered and not offered again",
+                pending.key
+            ));
+            ledger.mark_rescued(&pending.key);
+            ledger.pending = None;
+        }
+        if let Err(error) = ledger.save() {
+            diagnostics.log(&format!("rescan: the ledger could not be saved: {error}"));
+        }
+    }
+    diagnostics.log(&format!(
+        "rescan: every {} s over the last {} s; ledger {}",
+        interval.as_secs(),
+        config.rescan_window.as_secs(),
+        ledger.path().display()
+    ));
+    Some(Rescan {
+        interval,
+        window: config.rescan_window,
+        ledger,
+        threads: BTreeMap::new(),
+        queue: VecDeque::new(),
+        next_due_millis: now_millis,
+        failures: 0,
+        stopped: false,
+        delivering: None,
+        replay,
+        noted: BTreeSet::new(),
+        truncation_noted: false,
+    })
+}
+
+/// The rescan's state within one subscription.
+struct Rescan {
+    interval: Duration,
+    window: Duration,
+    ledger: Ledger,
+    // The newest reply each thread was listed through, by `C…/<root ts>`.
+    threads: BTreeMap<String, u128>,
+    // Messages found by the last pass and not yet offered, oldest first.
+    queue: VecDeque<SlackMessage>,
+    next_due_millis: u64,
+    // Consecutive failed passes.
+    failures: u32,
+    // The transport cannot list; the ledger still guards the stream.
+    stopped: bool,
+    // The rescued batch awaiting acknowledgement, by ledger key.
+    delivering: Option<String>,
+    // An unacknowledged rescued batch to offer again before anything else.
+    replay: Option<PendingRescue>,
+    // Allowed senders' messages a pass did not admit, logged once each.
+    noted: BTreeSet<String>,
+    truncation_noted: bool,
+}
+
+const MAX_NOTED: usize = 1_024;
+const MAX_TRACKED_THREADS: usize = 1_024;
+
+fn micros_ts(micros: u128) -> String {
+    format!("{}.{:06}", micros / 1_000_000, micros % 1_000_000)
 }
 
 enum Initial {
@@ -672,6 +841,9 @@ struct SlackDriver {
     carried_since_micros: Option<u128>,
     // Thread roots already noted as never carried, so each is noted once.
     uncarried_noted: BTreeSet<u128>,
+    rescan: Option<Rescan>,
+    // The shell-quoted client command a file note tells the agent to run.
+    download_command: Option<String>,
     transport: Box<dyn SlackTransport>,
 }
 
@@ -744,8 +916,8 @@ impl SlackDriver {
     /// The event stream does not publish every message: on 2026-10-21 the owner's thread root
     /// with an attached file never reached his subscription, while his plain reply in that thread
     /// did; his queue held no event of any type for the root (#415 slack-file-share-delivery).
-    /// Such a message cannot be delivered from the stream, and the reply alone reaches the agent
-    /// without it, so the log names the root for an operator to find. Only the log: a batch is
+    /// Such a message cannot be delivered from the stream (the rescan delivers it instead; see the
+    /// module documentation), so the log also names the root for an operator to find. Only the log: a batch is
     /// built from its event alone, so a replay stays identical; a root may also merely be late,
     /// and the client documents that it emits no posts by other bots, so a bot's root looks the
     /// same and is no message from a person to alarm about.
@@ -776,7 +948,7 @@ impl SlackDriver {
                     "event {sequence}: thread reply {} (user {}) is in thread {root}, whose root \
                      this stream has not carried although it carried an earlier message; the event \
                      stream does not publish some messages, such as one with a file, so unless it \
-                     is only late, that root will not be delivered as a request",
+                     is only late, that root reaches the agent only through the rescan
                     message.message_ts,
                     message.user_id.as_deref().unwrap_or("none")
                 ));
@@ -821,8 +993,9 @@ impl SlackDriver {
         self.batch(cursor, CommittableEvent::Gap(gap))
     }
 
-    /// The inbound message for an admitted Slack message, or why it is not a request.
-    fn admit(&self, message: &SlackMessage) -> Result<InboundMessage, &'static str> {
+    /// The inbound message for an admitted Slack message, or why it is not a request. Stream and
+    /// rescan share it; `rescued` marks a message the rescan found.
+    fn admit(&self, message: &SlackMessage, rescued: bool) -> Result<InboundMessage, &'static str> {
         if !self.channels.contains(&message.channel_id) {
             return Err("other channel");
         }
@@ -866,14 +1039,22 @@ impl SlackDriver {
         {
             return Err("ignored prefix");
         }
-        if text.len() > chat_subscription::MAX_MESSAGE_TEXT_BYTES {
-            let mut boundary = chat_subscription::MAX_MESSAGE_TEXT_BYTES - TRUNCATION_MARKER.len();
+        let note = rescan::delivery_note(
+            self.download_command.as_deref(),
+            &message.channel_id,
+            &message.file_ids,
+            rescued,
+        );
+        let limit = chat_subscription::MAX_MESSAGE_TEXT_BYTES - note.len();
+        if text.len() > limit {
+            let mut boundary = limit - TRUNCATION_MARKER.len();
             while !text.is_char_boundary(boundary) {
                 boundary -= 1;
             }
             text.truncate(boundary);
             text.push_str(TRUNCATION_MARKER);
         }
+        text.push_str(&note);
         let root = message
             .thread_ts
             .as_deref()
@@ -895,6 +1076,7 @@ impl SlackDriver {
         if let Some(team) = &message.team_id {
             payload.insert("team_id".to_owned(), Value::String(team.clone()));
         }
+        rescan::annotate_payload(&mut payload, &message.file_ids, rescued);
         let provider_payload =
             ProviderPayload::new(PAYLOAD_SCHEMA, payload).map_err(|_| "payload too large")?;
         InboundMessage::new(
@@ -913,6 +1095,350 @@ impl SlackDriver {
         )
         .map(|inbound| inbound.with_provider_payload(provider_payload))
         .map_err(|_| "invalid message")
+    }
+
+    /// For a stream event's message in a configured channel: a checkpoint in its place when the
+    /// rescan already delivered it, and otherwise a durable record that the stream carried it, so
+    /// the rescan never offers it.
+    fn rescan_guard(&mut self, sequence: u64, message: &SlackMessage) -> Option<CommittableEvent> {
+        let rescan = self.rescan.as_mut()?;
+        if !self.channels.contains(&message.channel_id) || !ids::valid_ts(&message.message_ts) {
+            return None;
+        }
+        let key = message_key(&message.channel_id, &message.message_ts);
+        if rescan.ledger.rescued(&key) {
+            self.diagnostics.log(&format!(
+                "event {sequence}: checkpoint ({key} was already delivered by the rescan)"
+            ));
+            return Some(CommittableEvent::Checkpoint);
+        }
+        if rescan.ledger.mark_carried(&key) {
+            rescan
+                .ledger
+                .prune(u128::from((self.now_millis)()) * 1_000, rescan.window);
+            if let Err(error) = rescan.ledger.save() {
+                self.diagnostics.log(&format!(
+                    "event {sequence}: the rescan ledger could not record {key} carried: {error}"
+                ));
+            }
+        }
+        None
+    }
+
+    /// The next rescued batch: an unacknowledged one to offer again, else the oldest message the
+    /// last pass found that the stream has not carried since. Its pending record is saved before
+    /// it is offered; if that fails nothing is offered, and the next pass finds the message again.
+    fn next_rescued(&mut self) -> Result<Option<SubscriptionItem>, BackendFailure> {
+        let Some(mut rescan) = self.rescan.take() else {
+            return Ok(None);
+        };
+        let item = self.next_rescued_from(&mut rescan);
+        self.rescan = Some(rescan);
+        item
+    }
+
+    fn next_rescued_from(
+        &mut self,
+        rescan: &mut Rescan,
+    ) -> Result<Option<SubscriptionItem>, BackendFailure> {
+        if let Some(pending) = rescan.replay.take() {
+            rescan.delivering = Some(pending.key.clone());
+            self.diagnostics.log(&format!(
+                "rescan: request {} again at {}",
+                pending.message.message_id().as_str(),
+                pending.cursor
+            ));
+            return self
+                .batch(
+                    pending.cursor,
+                    CommittableEvent::message_created(pending.message),
+                )
+                .map(Some);
+        }
+        while let Some(message) = rescan.queue.pop_front() {
+            let key = message_key(&message.channel_id, &message.message_ts);
+            if rescan.ledger.carried(&key) || rescan.ledger.rescued(&key) {
+                continue;
+            }
+            let Ok(inbound) = self.admit(&message, true) else {
+                continue;
+            };
+            let base = self
+                .last_cursor
+                .clone()
+                .unwrap_or_else(|| Cursor::Since(self.created_floor_millis()).encode());
+            let cursor = rescan::rescue_cursor(&base, &key);
+            rescan.ledger.pending = Some(PendingRescue {
+                prior_cursor: self.last_cursor.clone(),
+                cursor: cursor.clone(),
+                key: key.clone(),
+                message: inbound.clone(),
+            });
+            if let Err(error) = rescan.ledger.save() {
+                rescan.ledger.pending = None;
+                rescan.queue.clear();
+                self.diagnostics.log(&format!(
+                    "rescan: {key} was not offered because the ledger could not be saved \
+                     ({error}); the next pass finds it again"
+                ));
+                return Ok(None);
+            }
+            rescan.delivering = Some(key);
+            self.diagnostics.log(&format!(
+                "rescan: request {} ({} file{}) at {cursor}",
+                inbound.message_id().as_str(),
+                message.file_ids.len(),
+                if message.file_ids.len() == 1 { "" } else { "s" }
+            ));
+            return self
+                .batch(cursor, CommittableEvent::message_created(inbound))
+                .map(Some);
+        }
+        Ok(None)
+    }
+
+    fn created_floor_millis(&self) -> u64 {
+        u64::try_from(self.created_floor_micros / 1_000).unwrap_or(u64::MAX)
+    }
+
+    /// Run a rescan pass when one is due, and offer the first message it found.
+    fn rescan_if_due(&mut self) -> Result<Option<SubscriptionItem>, BackendFailure> {
+        let now = (self.now_millis)();
+        let Some(mut rescan) = self.rescan.take() else {
+            return Ok(None);
+        };
+        if !rescan.stopped && now >= rescan.next_due_millis {
+            self.rescan_pass(&mut rescan, now);
+        }
+        let item = self.next_rescued_from(&mut rescan);
+        self.rescan = Some(rescan);
+        item
+    }
+
+    /// One bounded pass over every configured channel's history and the threads in it with
+    /// replies not yet listed; see the module documentation.
+    fn rescan_pass(&mut self, rescan: &mut Rescan, now: u64) {
+        let now_micros = u128::from(now) * 1_000;
+        let floor = self
+            .created_floor_micros
+            .max(rescan.ledger.tracking_since_micros)
+            .max(now_micros.saturating_sub(rescan.window.as_micros()));
+        let ripe = now_micros.saturating_sub(u128::from(rescan::GRACE_MILLIS) * 1_000);
+        let started = Instant::now();
+        let mut listings = 0_usize;
+        let mut found = Vec::new();
+        let mut failure: Option<TransportError> = None;
+        let channels: Vec<String> = self.channels.iter().cloned().collect();
+        let stop = |driver: &Self| {
+            driver.cancel.cancelled.load(Ordering::SeqCst)
+                || started.elapsed() >= rescan::PASS_BUDGET
+        };
+        'pass: for channel in &channels {
+            let mut due_threads: Vec<(u128, String)> = Vec::new();
+            let mut token: Option<String> = None;
+            for page in 0..rescan::MAX_HISTORY_PAGES {
+                if stop(self) {
+                    break 'pass;
+                }
+                let oldest = micros_ts(floor);
+                let query = ScanQuery {
+                    channel_id: channel,
+                    thread_ts: None,
+                    oldest: &oldest,
+                    page_token: token.as_deref(),
+                };
+                let listed = match self.transport.scan_messages(&query) {
+                    Ok(listed) => listed,
+                    Err(error) => {
+                        failure = Some(error);
+                        break 'pass;
+                    }
+                };
+                listings += 1;
+                for row in &listed.messages {
+                    self.consider(rescan, &row.message, floor, ripe, &mut found);
+                    let root = &row.message.message_ts;
+                    if let Some(latest) = row
+                        .latest_reply
+                        .as_deref()
+                        .and_then(ids::ts_micros)
+                        .filter(|_| row.reply_count > 0)
+                    {
+                        let through = rescan
+                            .threads
+                            .get(&message_key(channel, root))
+                            .copied()
+                            .unwrap_or(0);
+                        if latest >= floor && latest > through {
+                            due_threads.push((latest, root.clone()));
+                        }
+                    }
+                }
+                token = listed.next_page_token;
+                if token.is_none() {
+                    break;
+                }
+                if page + 1 == rescan::MAX_HISTORY_PAGES && !rescan.truncation_noted {
+                    rescan.truncation_noted = true;
+                    self.diagnostics.log(&format!(
+                        "rescan: {channel} has more than {} top-level messages in the window; a \
+                         pass reads only the newest",
+                        rescan::MAX_HISTORY_PAGES * 20
+                    ));
+                }
+            }
+            due_threads.sort_by(|a, b| b.cmp(a));
+            due_threads.dedup_by(|a, b| a.1 == b.1);
+            due_threads.truncate(rescan::MAX_THREADS_PER_PASS);
+            for (latest, root) in due_threads {
+                let key = message_key(channel, &root);
+                let through = rescan.threads.get(&key).copied().unwrap_or(0);
+                let oldest = micros_ts(floor.max(through));
+                let mut listed_through = through;
+                let mut token: Option<String> = None;
+                let mut complete = false;
+                for _ in 0..rescan::MAX_THREAD_PAGES {
+                    if stop(self) {
+                        break 'pass;
+                    }
+                    let query = ScanQuery {
+                        channel_id: channel,
+                        thread_ts: Some(&root),
+                        oldest: &oldest,
+                        page_token: token.as_deref(),
+                    };
+                    let listed = match self.transport.scan_messages(&query) {
+                        Ok(listed) => listed,
+                        Err(error) => {
+                            failure = Some(error);
+                            break 'pass;
+                        }
+                    };
+                    listings += 1;
+                    for row in &listed.messages {
+                        if row.message.message_ts == root {
+                            continue;
+                        }
+                        self.consider(rescan, &row.message, floor, ripe, &mut found);
+                        if let Some(at) = ids::ts_micros(&row.message.message_ts) {
+                            if at <= ripe {
+                                listed_through = listed_through.max(at);
+                            }
+                        }
+                    }
+                    token = listed.next_page_token;
+                    if token.is_none() {
+                        complete = true;
+                        break;
+                    }
+                }
+                if complete && latest <= ripe {
+                    listed_through = listed_through.max(latest);
+                }
+                rescan.threads.insert(key, listed_through);
+            }
+        }
+        rescan.threads.retain(|_, through| *through >= floor);
+        while rescan.threads.len() > MAX_TRACKED_THREADS {
+            rescan.threads.pop_first();
+        }
+        rescan
+            .queue
+            .make_contiguous()
+            .sort_by_key(|message| ids::ts_micros(&message.message_ts).unwrap_or(0));
+        match failure {
+            Some(error)
+                if matches!(
+                    error.code.as_str(),
+                    "scan_unsupported" | "transport_unimplemented"
+                ) =>
+            {
+                rescan.stopped = true;
+                self.diagnostics.log(&format!(
+                    "rescan stopped: the transport cannot list history ({}: {})",
+                    error.code, error.detail
+                ));
+            }
+            Some(error) => {
+                rescan.failures = rescan.failures.saturating_add(1);
+                let delay = rescan
+                    .interval
+                    .saturating_mul(1_u32 << rescan.failures.min(16))
+                    .min(rescan::MAX_BACKOFF);
+                rescan.next_due_millis =
+                    now.saturating_add(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
+                self.diagnostics.log(&format!(
+                    "rescan: a listing failed after {listings} succeeded ({}: {}); next pass in \
+                     {} s (failure {} in a row)",
+                    error.code,
+                    error.detail,
+                    delay.as_secs(),
+                    rescan.failures
+                ));
+            }
+            None => {
+                rescan.failures = 0;
+                rescan.next_due_millis = now
+                    .saturating_add(u64::try_from(rescan.interval.as_millis()).unwrap_or(u64::MAX));
+            }
+        }
+        if !found.is_empty() {
+            self.diagnostics.log(&format!(
+                "rescan: {listings} listings found {} message{} the stream did not carry: {}",
+                found.len(),
+                if found.len() == 1 { "" } else { "s" },
+                found.join(", ")
+            ));
+        }
+    }
+
+    /// Queue one listed message for delivery when it is inside the pass's window, neither
+    /// carried by the stream nor already rescued or queued, and admitted.
+    fn consider(
+        &self,
+        rescan: &mut Rescan,
+        message: &SlackMessage,
+        floor: u128,
+        ripe: u128,
+        found: &mut Vec<String>,
+    ) {
+        let Some(created) = ids::ts_micros(&message.message_ts) else {
+            return;
+        };
+        if created < floor || created > ripe || rescan.queue.len() >= rescan::MAX_RESCUES_PER_PASS {
+            return;
+        }
+        let key = message_key(&message.channel_id, &message.message_ts);
+        if rescan.ledger.carried(&key)
+            || rescan.ledger.rescued(&key)
+            || rescan.queue.iter().any(|queued| {
+                queued.channel_id == message.channel_id && queued.message_ts == message.message_ts
+            })
+        {
+            return;
+        }
+        match self.admit(message, true) {
+            Ok(_) => {
+                let files = message.file_ids.len();
+                found.push(if files == 0 {
+                    key
+                } else {
+                    format!("{key} ({files} file{})", if files == 1 { "" } else { "s" })
+                });
+                rescan.queue.push_back(message.clone());
+            }
+            Err(reason) => {
+                let allowed = message
+                    .user_id
+                    .as_deref()
+                    .is_some_and(|user| self.senders.contains(user));
+                if allowed && rescan.noted.len() < MAX_NOTED && rescan.noted.insert(key.clone()) {
+                    self.diagnostics.log(&format!(
+                        "rescan: {key} from an allowed sender is not a request ({reason})"
+                    ));
+                }
+            }
+        }
     }
 
     /// Metadata for a rejected new message; never text, thread routing or an admitted request.
@@ -980,6 +1506,9 @@ impl ChatSubscriptionDriver for SlackDriver {
             Some(Initial::Gap(cursor, reason)) => return self.gap(cursor, &reason).map(Some),
             None => {}
         }
+        if let Some(item) = self.next_rescued()? {
+            return Ok(Some(item));
+        }
         loop {
             if self.cancel.cancelled.load(Ordering::SeqCst) {
                 return Err(failure("cancelled", "the subscription was cancelled", true));
@@ -1001,6 +1530,9 @@ impl ChatSubscriptionDriver for SlackDriver {
                         ));
                     }
                     self.refresh_cursor()?;
+                    if let Some(item) = self.rescan_if_due()? {
+                        return Ok(Some(item));
+                    }
                     let sequence = self.take_sequence()?;
                     return Ok(Some(SubscriptionItem::Heartbeat(Heartbeat::new(sequence))));
                 }
@@ -1091,7 +1623,13 @@ impl ChatSubscriptionDriver for SlackDriver {
                         self.note_carried(sequence, message);
                     }
                     let cursor = Cursor::Sequence(sequence).encode();
-                    let event = match message.as_ref().map(|message| self.admit(message)) {
+                    if let Some(suppressed) = message
+                        .as_deref()
+                        .and_then(|message| self.rescan_guard(sequence, message))
+                    {
+                        return self.batch(cursor, suppressed).map(Some);
+                    }
+                    let event = match message.as_ref().map(|message| self.admit(message, false)) {
                         Some(Ok(inbound)) => {
                             self.diagnostics.log(&format!(
                                 "event {sequence}: request {}",
@@ -1163,6 +1701,19 @@ impl ChatSubscriptionDriver for SlackDriver {
         match &self.pending {
             Some(pending) if pending == delivery_id => {
                 self.pending = None;
+                let now_micros = u128::from((self.now_millis)()) * 1_000;
+                if let Some(rescan) = self.rescan.as_mut() {
+                    if let Some(key) = rescan.delivering.take() {
+                        rescan.ledger.mark_rescued(&key);
+                        rescan.ledger.pending = None;
+                        rescan.ledger.prune(now_micros, rescan.window);
+                        if let Err(error) = rescan.ledger.save() {
+                            self.diagnostics.log(&format!(
+                                "rescan: the ledger could not record {key} delivered: {error}"
+                            ));
+                        }
+                    }
+                }
                 Ok(())
             }
             Some(_) => Err(failure(

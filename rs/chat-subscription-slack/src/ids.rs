@@ -26,6 +26,12 @@ pub fn valid_user_id(value: &str) -> bool {
     slack_id(value, b"UW")
 }
 
+/// A Slack file ID: `F` followed by uppercase letters and digits.
+#[must_use]
+pub fn valid_file_id(value: &str) -> bool {
+    slack_id(value, b"F")
+}
+
 /// A bot or user ID used to recognise this app's own posts: `U`, `W` or `B` prefixed.
 #[must_use]
 pub fn valid_author_id(value: &str) -> bool {
