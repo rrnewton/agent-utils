@@ -1,42 +1,55 @@
-# agentctl-team-messaging: messaging another team's coordinator, across hosts, with stale state in mind
+# agentctl-team-messaging: messaging another team's coordinator, across hosts, exactly once
 
 Working design, 2026-10-24. Not user documentation, and nothing here is implemented.
-`#496 agentctl-team-messaging`. Revised the same day after one adversarial review; section 15
-lists what the review changed.
+`#496 agentctl-team-messaging`.
 
-Code references are to `main` at `8efb7191`.
+**Revision 2** (same day) follows the owner's feedback on revision 1: the data files are JSON;
+only coordinators (and registered services) send to other teams; routes are a pluggable layer
+described in data (local, ssh with an optional managed link, a generic command transport for
+company-internal channels, and an opportunistic chat relay); exactly-once delivery is a
+first-class section; only the receiving host's own agentctl touches its panes; and team
+messaging is factored as its own tool. Section 20 records what each revision changed.
+
+Code references are to `main` at `8efb7191` unless marked with `2a9d8012`.
 
 ## 0. Summary
 
 A **team** is a coordinator plus the workers it manages: one harness directory, one agentctl
-registry, one Herdr workspace, on one host. The owner runs several teams on several hosts. Today
-a team's coordinator can be reached from outside its harness only by someone who knows, by hand,
-which host it is on, which registry names it, which binary drives that registry, and whether the
-chat bridge that shares its queue is still the one running. That knowledge goes stale, and every
-incident in section 1 is a delivery made on stale knowledge.
+registry (if it uses agentctl), one Herdr workspace, on one host. The owner runs several teams
+on several hosts. Today a team's coordinator can be reached from outside its harness only by
+someone who knows, by hand, which host it is on, which registry names it, which binary drives
+that registry, and whether the chat bridge that shares its queue is still the one running. That
+knowledge goes stale, and every incident in section 1 is a delivery made on stale knowledge or a
+retry that delivered twice.
 
-The proposal has four parts:
+The proposal, in seven parts:
 
-1. **A sparse teams registry**, one owner-level file (`teams.yaml`), saying which teams exist, the
-   hosts they run on, where each coordinator entry point lives, an ordered list of contacts, and
-   how to reach each host. It is a routing hint, not a mirror of Herdr: it is edited by people
-   and by `agentctl teams discover --apply`, never by a send.
-2. **Host-local resolution at delivery time.** The sender's file only has to get the message to
-   the right host. On that host, `agentctl team accept` resolves the team from a small
-   declaration the harness itself keeps current (`REGISTRY/team.json`), re-verifies the
-   coordinator (live record, pinned harness process, current boot, bridge), applies the
-   receiving team's own policy, records the message in a per-team ledger, and **enqueues** it
-   into agentctl's durable queue. `team accept` never types; agentctl's existing drainers do,
-   under the single-typist rule.
-3. **Messages that know when they are stale.** Every team message carries an expiry, an optional
-   topic ordered by the sender's clock, and optional `supersedes` keys. Cancellation is a
-   tombstone that needs no lock, and the drain checks tombstones and expiry immediately before
-   it pastes, so a "hold" queued for an agent that only takes input when idle is discarded, with
-   a receipt to the sender, instead of arriving hours late.
-4. **Attribution that is proved where it can be and labelled where it cannot.** Senders are
-   derived from process ancestry or a registered service unit, never claimed by a flag, and
-   nothing is ever sent as the owner. Receipts and replies come back by pull, which also works
-   where only one host can reach the other.
+1. **A separate, à la carte tool** (working name `agent-teams`), not more subcommands of
+   agentctl. It shares one small library with agentctl (queue format, ledger primitives,
+   harness identity) and integrates with agentctl, chat bridges and transports through data and
+   commands, so each piece works alone (section 4).
+2. **A sparse teams file** (`teams.json`), one owner-level routing hint: which teams exist, on
+   which hosts, their contacts, and the ordered routes to each host. Private route definitions
+   live in separate data files (`routes.d/*.json`) so the public code carries no
+   company-specific knowledge (sections 6, 10).
+3. **The receiving host's agentctl does the work.** No route types into, reads, or drives a
+   remote host's Herdr panes. Every route ends at the receiving host's own `agent-teams accept`,
+   which verifies the coordinator there, applies that team's policy, records the message in the
+   team's ledger and enqueues it; that host's local drainer types it (section 3).
+4. **Coordinators only.** A message is sent by a team's coordinator (proved by process
+   ancestry) or by a registered service, and is addressed to a team's coordinator. Workers
+   neither send nor receive team messages (section 8.2).
+5. **Exactly once.** One message ID, fixed at send and carried on every route; a durable
+   per-team seen-set at the receiver, claimed atomically before enqueue; a second route or
+   contact is tried only after the first is proved not to have delivered; ambiguity is resolved
+   by asking the receiver, never by resending blind; and the drain never pastes one ID twice
+   (section 9).
+6. **Messages that know when they are stale.** Expiry, topics ordered by the sender's clock,
+   supersede and retract, as lock-free tombstones re-checked just before the paste (section 12).
+7. **Routes as data.** Each route names a driver built into the code (`local`, `ssh`,
+   `command`) and is otherwise described in data: targets, keys, command templates, capability
+   flags, idempotency semantics, attribution. A chat relay is opportunistic and never required
+   (sections 10, 11).
 
 ## 1. Incidents this design must prevent
 
@@ -47,27 +60,34 @@ host or project names.
   and found it only by reading Herdr tab labels by hand: it was an agentcloud session viewed
   through `agentterm` in a Herdr tab, in no agentctl registry, and nothing on the host recorded
   that it was the coordinator.
-- **I2. Two chat bridges watching one pane.** Two bridge states, each with its own channel,
-  routed to the same coordinator pane. One bridge saw a reply block that belonged to the other,
-  reported it to the agent as "not sent"; the agent sent it again, and the channel got
-  duplicates. Two bridges on one pane are a supported arrangement (one per chat provider), but
-  only when each has its own non-overlapping `reply_alias_range`
+- **I2. Two chat bridges watching one pane: duplicate replies.** Two bridge states, each with
+  its own channel, routed to the same coordinator pane. One bridge saw a reply block that
+  belonged to the other and reported it to the agent as "not sent"; the agent sent it again,
+  and the channel got duplicates. Two bridges on one pane are a supported arrangement (one per
+  chat provider), but only when each has its own non-overlapping `reply_alias_range`
   (`rs/agentctl/src/embedded_chat_userguide.md:831-849`); that key was added after this
   incident, and nothing checks that a second bridge on a pane has one.
 - **I3. Stale holds delivered late.** Several messages were queued for a Muse agent. agentctl
   types into a Muse pane only when its composer is idle and bare
   (`embedded_userguide.md:410-420`), and the agent stayed busy for hours. When it went idle the
-  backlog drained in order, including a "hold" that a later message had already lifted. Nothing
-  in the queue knew the hold had expired or been superseded.
+  backlog drained in order, including a "hold" that a later message had already lifted.
 - **I4. A contact naming a disabled bridge unit.** A per-host coordinators file named a bridge
   unit whose queue the coordinator shared. The unit had since been disabled. The delivering
-  helper noticed only that the unit was "not running" and fell back to the file's own registry
-  and binary paths, with a note, not a failure, so the configuration's claim that a bridge
-  serves that queue stayed wrong and unflagged.
+  helper noticed only that the unit was "not running" and fell back to the file's own paths,
+  with a note, not a failure, so the configuration's claim stayed wrong and unflagged.
+- **I5. A retry posted a message three times** (`#448 send-dedupe`). A long message, cut into
+  three parts, took 7.5-12 s per attempt to post. The sending page showed the first attempt as
+  failed while the server was still posting; the owner pressed Retry, and the whole message
+  reached the channel three times (three requests, each answered 200; a two-times repeat the day
+  before). The provider takes no idempotency key and the page sent none, so nothing could
+  recognise the retry. The fix gave every composed message one key, carried on every attempt,
+  and an outcome query to ask after a lost answer before calling a send failed.
 
-Two general lessons follow. First, every fact about another team is stale until re-checked on
-that team's host, at delivery time. Second, a message's meaning can expire before it is
-delivered, and only the delivering side knows when delivery happens.
+Three lessons follow. Every fact about another team is stale until re-checked on that team's
+host, at delivery time. A message's meaning can expire before it is delivered, and only the
+delivering side knows when delivery happens. And a retry after an unclear outcome is a second
+message unless the receiver can recognise it: I2 and I5 are both an unclear "did it go?"
+answered by sending again.
 
 ## 2. What exists today (verified)
 
@@ -77,825 +97,1530 @@ delivered, and only the delivering side knows when delivery happens.
   `embedded_userguide.md:221`). One `REGISTRY/<agent>/agent.json` per agent, with Herdr
   `workspace_id`, `tab_id`, `pane_id`, `terminal_id`, `harness`, `lifecycle`, `slot`, a
   `token` (record generation) and, once pinned, `harness_identity` = `{boot_id, pid,
-  starttime_ticks, executable_device, executable_inode}`. Read on this harness: the coordinator
-  record is an adopted (`herdr-foreign`) Claude pane with both a foreign-shell and a harness
-  identity. `profiles.json` sits beside the records. `REGISTRY/restore.json`, when present,
-  names the coordinator, the `units` to start and `also_registered` (other registries naming
-  the same pane; `embedded_userguide.md:578-582`). It is optional, and absent on this harness.
-  `stop` moves a record and its queue under `REGISTRY/archive/`, so a name reused later starts
-  with an empty queue.
-- **Pane IDs are per Herdr server** (`w16:pD`). They are not a cross-host identity, and they
-  change after a Herdr restart. The harness identity includes the boot ID, so a record from a
-  previous boot is detectably stale.
+  starttime_ticks, executable_device, executable_inode}`. `profiles.json` (owner-edited launch
+  profiles) sits beside the records; `REGISTRY/restore.json`, when present, names the
+  coordinator, the `units` to start and `also_registered` (`embedded_userguide.md:578-582`).
+  A chat bridge is configured by an owner-edited `chat.json` and keeps `bridge.json` in its
+  state. **Every piece of agentctl state, owner-edited or machine-written, is JSON.**
+  `stop` moves a record and its queue under `REGISTRY/archive/`.
+- **Pane IDs are per Herdr server** (`w16:pD`): not a cross-host identity, and they change after
+  a Herdr restart. The harness identity includes the boot ID, so a record from a previous boot
+  is detectably stale.
 - **Queue.** `REGISTRY/<agent>/queue/` has `target.json` (bound to a pane ID, never to a name)
-  and four durable directories: `inbox/` (pending, not yet past the submission barrier),
-  `inflight/`, `failed/` (quarantined, including `possibly_submitted`), `processed/` (working
-  transition confirmed) (`embedded_userguide.md:951-968`). `send --message-id ID` refuses an ID
-  whose file exists in any phase (`cli.rs:645`); `withdraw` deletes an untyped item's file so
-  its ID can be queued again (`agent.rs:1473-1480`), so the queue is not a permanent dedupe
-  record. Uncertain delivery is never replayed. `processed/` is never pruned (201 items in the
-  coordinator's queue here: 125 `chat-*`, 10 `agent-watch-*`, 2 `chat-reminder-*`).
-- **Locks.** A drain takes the queue's `.delivery.lock` before its loop and holds it across
-  every item, readiness waits included (`agent.rs:913-940`), and takes the host-wide target
-  lock, keyed by the pane ID, before typing (`agent::lock_target`, `agent.rs:2476`; reached from
-  `subagents.rs:4275`). Enqueue and `withdraw` need the same delivery lock. So while a drain
-  waits up to `--ready-timeout` (900 s) for a busy pane, nothing can be added to or taken out of
-  that queue. agentctl instances using different registries for the same pane serialize at the
-  typing step. A bounded variant exists internally (`lock_target_within`, `agent.rs:2453`), but
-  the CLI has no deadline, lock timeout or item limit on `send`/`drain`.
+  and four durable directories: `inbox/`, `inflight/`, `failed/` (quarantined, including
+  `possibly_submitted`), `processed/` (`embedded_userguide.md:951-968`). `send --message-id ID`
+  refuses an ID whose file exists in any phase (`cli.rs:645`); `withdraw` deletes an untyped
+  item's file so its ID can be queued again (`agent.rs:1473-1480`), so the queue is not a
+  permanent dedupe record. Uncertain delivery is never replayed. `processed/` is never pruned
+  (201 items in this harness coordinator's queue on 2026-10-24).
+- **Locks.** A drain holds the queue's `.delivery.lock` across every item, readiness waits
+  included (`agent.rs:913-940`), and takes the host-wide target lock, keyed by pane ID, before
+  typing (`agent.rs:2476`). Enqueue and `withdraw` need the same delivery lock, so while a drain
+  waits up to `--ready-timeout` (900 s) for a busy pane, nothing can be added or removed. The
+  CLI has no deadline, lock timeout or item limit on `send`/`drain`.
 - **Readiness.** By default a send waits for an idle or done pane; `--deliver-while-working`
-  lets Claude Code queue the prompt behind its turn, and Codex ordinary follow-ups are entered
-  while working by default (`cli.rs:404`). Muse is idle-only. There is **no** expiry, topic or
-  supersede field on a queue item.
-- **Other queue writers.** The chat bridge queues `chat-*` prompts and reminders; `watch-agents`
-  queues `agent-watch-*` notices into the coordinator's queue; a human or coordinator runs
-  `agentctl send`. Every one of them drains the queue as it sends, oldest first, with whatever
-  binary it was started with. On this harness the bridge and the watcher run two different
-  pinned binaries. A `send_once` reminder refuses to queue when untyped prompts are already
-  waiting (`subagents.rs:7880-7895`).
-- **`agentctl inbox`** (`embedded_inbox_quickstart.md`) already has the superseding idea for
-  worker notices: "A worker keeps one live state notice; a newer one replaces it", and
-  priority-3 notices expire after `--stale-after` (default 86400 s, `inbox.rs:47`). Its
-  `deliver --via agentcloud-notify` uses `agentcloudctl notify --mode cli-script` and never
-  re-sends a claimed batch "to a different adapter or session" (`inbox.rs:248-250`). It is a
-  notice batcher for one coordinator on one host, not a transport.
-- **agentcloud agents.** `agentctl send` to an agentcloud agent journals through
-  `agentcloudctl send --end-of-turn`; when the caller is a different agentcloud session it uses
-  an attributed `agentcloudctl send-message` instead, and an explicit human send from inside a
-  different session is refused, "never disguised" (`cli.rs:139`).
-- **No caller identity.** agentctl sets no environment variable naming the agent a process
-  belongs to; a sender's identity has to be proved some other way (section 6.2).
+  lets Claude Code queue the prompt behind its turn (`cli.rs:404`). Muse is idle-only. There is
+  **no** expiry, topic or supersede field on a queue item.
+- **Other queue writers.** The chat bridge (`chat-*` prompts and reminders), `watch-agents`
+  (`agent-watch-*`), and humans or coordinators (`agentctl send`). Each drains as it sends,
+  oldest first, with whatever binary it was started with; here the bridge and the watcher run
+  two different pinned binaries. A `send_once` reminder refuses to queue when untyped prompts
+  are waiting (`subagents.rs:7880-7895`).
+- **`agentctl inbox`** supersedes worker notices ("a newer one replaces it") and expires
+  priority-3 notices after `--stale-after` (`inbox.rs:47`). Its `deliver --via
+  agentcloud-notify` never re-sends a claimed batch "to a different adapter or session"
+  (`inbox.rs:248-250`). It is a notice batcher for one coordinator on one host, not a
+  transport.
+- **agentcloud agents.** `agentctl send` to an agentcloud agent journals through `agentcloudctl
+  send --end-of-turn`, or an attributed `send-message` when the caller is another session; a
+  disguised human send from inside a session is refused (`cli.rs:139`). `attach-self` registers
+  the caller's own session in a registry (`embedded_userguide.md:1175-1190`).
+- **No caller identity variable.** agentctl sets no environment variable naming the agent a
+  process belongs to; identity has to be proved (section 8.2).
+- **No ssh.** agentctl itself never runs ssh today.
 
 ### 2.2 wrkslots
 
 `.wrkslots.yml` per harness describes the slot pool; slot ownership is per coordinator process.
-Slot boxes (cgroup, user-namespace or root isolation) limit what a worker can write, which
-matters for where a sender's outbox can live (6.2). `discover` can read it to say which harness
-directory a slot (and so a worker) belongs to.
+Slot boxes (cgroup, user-namespace or root isolation) limit what a worker can write, and its
+process ancestry may stop at the box's relay.
 
 ### 2.3 A consuming project's per-host coordinators file
 
 One consuming project keeps a file (schema `<project>/coordinators/v1`) that answers "where do
-operational alerts go?" per host. Per host: a full name and optional ssh target, an optional
-Herdr binary, and a `coordinator` with a `name`, `harness`, and ordered `contacts`:
-
-- `agentcloud`: `session` UUID (and an informational URL); delivered with `agentcloudctl
-  notify` in its default mode, so alerts arrive as `[operator]` system reminders, which the file
-  calls safe mid-turn.
-- `agentctl`: `agent`, `registry`, `bin`, `herdr_bin`, optional `bridge_unit`, informational
-  `workspace`/`tab`. Delivered with `agentctl send NAME --message-id ID`. When `bridge_unit` is
-  running, the binary, registry and Herdr binary on its command line win and any difference is
-  reported as config drift (local delivery only).
-- `herdr`: refused since early October; typing into a pane is not done.
-
-One helper delivers through it (about 3100 lines of Python). Beyond the contact walk it
-carries hard-won rules worth keeping:
+operational alerts go?" per host: a name and optional ssh target, an optional Herdr binary, and
+a `coordinator` with ordered `contacts`: `agentcloud` (a session, delivered with `agentcloudctl
+notify` in its default mode, so alerts arrive as `[operator]` system reminders), `agentctl`
+(`agent`, `registry`, `bin`, `herdr_bin`, optional `bridge_unit`), and `herdr` (refused since
+early October). One helper (about 3100 lines of Python) delivers through it, with rules worth
+keeping:
 
 - an attempt ID stored before agentctl runs and reused on every retry;
 - outcome decided by where the item sits in the queue plus per-item delivery evidence, not by
   exit status; an item found in no phase is `lost`, never resent;
-- `possibly_submitted` never retried and never resent under a new ID until a human resolves
-  it, and "a change of the bridge's registry does not reopen it";
-- **it defers instead of running agentctl whenever the target queue holds a chat prompt**,
-  because `agentctl send`/`drain` would type that prompt without the bridge's
-  read-before-typing check;
-- a bounded run (40 + 10 s) that never kills agentctl, with a TODO asking agentctl for a
-  deadline, a lock timeout and an item limit;
+- `possibly_submitted` never retried or resent under a new ID until a human resolves it, and "a
+  change of the bridge's registry does not reopen it";
+- it defers instead of running agentctl whenever the target queue holds a chat prompt, because
+  `send`/`drain` would type that prompt without the bridge's read-before-typing check;
+- a bounded run (40 + 10 s) that never kills agentctl;
 - dedupe by key with `--repeat-after`, and a JSONL log of every attempt.
 
-Cross-host delivery is ssh only, with absolute or `~/` remote paths, and the bridge unit is not
-consulted remotely. When the named bridge unit is not running, it notes that and uses the
-file's paths (incident I4).
+Cross-host delivery is ssh only, using whatever keys the account has, and the bridge unit is not
+consulted remotely (I4).
 
 ### 2.4 agentcloud and host reach
 
-- `agentcloudctl notify --session S --text T [--mode M] --idempotency-key K`: owner-only, into a
-  session you own. Default `--mode system-notification` arrives as an **`[operator]`-labelled
-  directive**; `--mode cli-script` arrives as a peer-level session message from "cli-script".
-  Into a halted session it is receipted but never run, even after resume; `inspect` reports
-  `halted: true`. A keyless retry after a transport failure may deliver twice.
+- `agentcloudctl notify --session S --text T [--mode M] --idempotency-key K`: owner-only. The
+  default `system-notification` mode arrives as an **`[operator]`-labelled directive**;
+  `--mode cli-script` arrives as a peer-level message. Into a halted session it is receipted but
+  never run. A keyless retry after a transport failure may deliver twice; the same key with a
+  different text silently keeps the first.
 - `agentcloudctl send-message --session SENDER --to TARGET --body B --idempotency-key K`:
-  point-to-point from one session to another, same owner, arrives as ordinary input; agentcloud
-  itself attributes it to SENDER.
-- `agentcloudctl inspect --session S`: folded state, including halted.
-- A coordinator can be an agentcloud session viewed in a Herdr tab, registered in no agentctl
-  registry (I1) unless someone ran `agentctl attach-self` or `adopt`.
+  session to session, same owner; agentcloud attributes it to SENDER.
+- `agentcloudctl inspect --session S`: folded state, including `halted`.
 - Hosts are reached by ssh, or, where ssh is refused, by a managed runtime's node-exec command
-  that runs an argv on a named node.
+  that runs an argv on a named node. Whether that command passes stdin is unverified.
 
 ### 2.5 Chat bridges
 
-`agentctl chat run` routes every thread of its channels to one agent in one registry and holds
-an exclusive lease on its own state (`embedded_chat_userguide.md:270-290`). Two bridges cannot
-split one channel. Two bridge states may target the same agent pane (one per provider) if
-their `reply_alias_range`s do not overlap, but nothing checks that they do (I2). The running
-units here are `/bin/sh -c 'exec agentctl --registry R chat run --bridge-state S ...'`: after
-the `exec`, the unit's main process is agentctl itself, its command line carries the registry
-and bridge state but not the agent, which is in the bridge state's own configuration. Inbound
-admission is by `allowed_senders` and temporary grants. The bundled Slack provider **ignores
-bot-message subtypes** (`embedded_chat_userguide.md:183`), so a message posted to a team's
-channel by an app identity never reaches the agent through that bridge. A bridge reads reply
-markers on the agent's output rows, and in a read of an idle Claude Code pane longer than its
-screen it can also count markers inside a received prompt (`embedded_chat_userguide.md:674-680`).
+- `agentctl chat run` routes every thread of its channels to one agent in one registry and holds
+  an exclusive lease on its state. "Two bridges cannot split one shared channel by thread"
+  (`embedded_chat_userguide.md:270-276`).
+- **What the Slack provider admits** (`rs/chat-subscription-slack/src/plugin.rs:122-124,
+  1043-1066`, at `2a9d8012`): a message is refused as a "non-message subtype" unless it has no
+  subtype or one of `thread_broadcast`, `file_share`, `me_message`, so `bot_message` posts are
+  dropped; and it is refused as "sender not allowed" unless its user ID is in the allowlist.
+  `app_id` and `bot_id` never decide authorship. "The bridge's own posts are written as its app's
+  bot user, a different user ID, which is never an allowed sender, so they cannot come back as
+  requests." The tail must run as a human member, because Slack does not deliver channel events
+  to an app's identity (`embedded_chat_userguide.md:2162-2170`). **So today one team's bridge
+  cannot hear another team's bridge at all**, and adding the peer to `allowed_senders` would
+  give it the owner's authority.
+- **Outbound idempotency.** Slack takes no idempotency key. The outbound helper keeps a ledger
+  per operation UUID and, after an uncertain outcome, lists the thread for a matching post from
+  the app; if none is found it **posts again** after `--uncertain-repost-after-seconds` (default
+  120) (`embedded_chat_userguide.md:2144-2153`). Chunks above 11,000 bytes become consecutive
+  posts. A provider-level resend is therefore possible by design.
+- A bridge reads reply markers on the agent's output rows, and in a long idle Claude Code pane
+  it can also count markers inside a received prompt (`embedded_chat_userguide.md:674-680`).
 
-## 3. Model
+## 3. Principles
+
+1. **The local agentctl does the TUI work; nothing drives Herdr from afar.** The owner's
+   words: "the local agentctl should do the actual TUI manipulation and we shouldn't directly
+   start messing with Herdr from afar." No route types into, reads, or drives a remote host's
+   Herdr panes, and no route reaches a remote Herdr socket. Every remote route ends at the
+   receiving host's own `agent-teams accept`, which enqueues; that host's own drainer
+   (agentctl's drain, a bridge, or another local deliverer, section 4.4) does the typing, under
+   the single-typist rule. Verification of the coordinator (live record, pinned harness
+   process, current boot, real bridges) is done by the receiving host, never inferred by the
+   sender from remote reads. Where the coordinator is an agent-runtime session (agentcloud),
+   the runtime's own message API is the "local" owner of that session's input, and its own
+   `inspect` is the verification (section 10.5).
+2. **Exactly once, by construction.** Delivery is made idempotent at the one place every route
+   converges, the receiving team's ledger, and every retry rule is written so that a route
+   failure can delay a message or strand it for a human, but never deliver it twice (section 9).
+3. **Components work alone.** Team messaging must not require agentctl subagent management, a
+   chat bridge, ssh, or any company-internal channel; and none of those may require team
+   messaging. A route that is not configured, or whose peer does not advertise support, is
+   simply not tried (section 4).
+4. **No company-specific knowledge in code.** Drivers are generic; everything about a
+   particular runtime, node-exec command or chat workspace is in a data file the owner keeps
+   (section 10.4).
+5. **Coordinators talk to coordinators.** A team's outward voice is its coordinator (or a
+   registered service); workers ask their coordinator (section 8.2).
+6. **Stale until re-checked.** Owner-level data is a routing hint; authority is on the target
+   host, read at delivery time.
+
+## 4. Where team messaging lives: composability
+
+The owner: "Another big requirement of our whole setup is that our tools be à la carte, unlike
+Gastown." agentctl already combines Herdr agent management and the chat bridge in one binary;
+adding team messaging to it as revision 1 proposed (`agentctl team ...`, `agentctl teams ...`)
+makes a fat multi-purpose binary. This section looks only at team messaging; the whole-suite
+factoring, including whether the chat bridge leaves agentctl, is a separate lane's audit, and
+the interfaces below are written to work whichever way that goes.
+
+### 4.1 What team messaging actually needs from agentctl
+
+Reading revision 1 for every agentctl dependency gives a short list:
+
+| Needed | Is it agent management? | Where it belongs |
+|---|---|---|
+| The queue directory format, enqueue with duplicate check, the new lane, tombstones and `not_after` | no: it is the delivery queue | a shared library |
+| The pre-paste re-check of tombstones and expiry | no, but it runs inside the drain | the drain (agentctl), via the library |
+| Harness identity: `(boot_id, pid, starttime_ticks)`, ancestry walk, pinning | no: it is process identity | the shared library |
+| "Who is this registry's coordinator?" | yes, a fact agentctl owns | agentctl writes it; teams read it |
+| Record liveness (lifecycle, pane resolves) | yes | agentctl, as `agentctl status --json` |
+| Typing into a pane | yes | agentctl only (principle 1) |
+
+Team messaging needs agentctl only at the final hop, and only when the coordinator is an
+agentctl agent. Everything else (teams file, routes, outbox, ledger, policy, receipts) has
+nothing to do with Herdr or subagents.
+
+### 4.2 Options
+
+- **A. Subcommands of agentctl** (revision 1). One binary to install. But a team-messaging-only
+  user installs the whole Herdr agent manager, its help grows another two command families, and
+  ssh links, route drivers and private route files land in the tool that types into panes.
+- **B. A separate tool, `agent-teams`, sharing a small library with agentctl.** The library
+  (working name `agent-queue`, a crate in the Rust workspace) holds the queue format, ledger
+  primitives (atomic claim, seen-set) and harness identity. agentctl depends on it for enqueue
+  and drain; `agent-teams` depends on it for enqueue (when it delivers into an agentctl queue)
+  and for sender proof. Neither binary depends on the other.
+- **C. A separate tool that shells out to `agentctl send`.** No shared code, but `agentctl send`
+  drains as it sends and so may type (the hazard the helper in 2.3 defers on), and it cannot
+  write the new lane or tombstones. It would also need an agentctl binary on every receiving
+  host, even one with no agentctl.
+
+Name: `agent-teams` (descriptive, matches `agent-usage`); `teamctl` is shorter but reads as
+another controller of agents. The owner decides (question 13).
+
+### 4.3 Dependency graph (option B)
 
 ```
-owner-level teams.yaml (sparse, maybe stale)        on the target host (authoritative, fresh)
-------------------------------------------         -------------------------------------------
-team "tools"                                       $XDG_STATE_HOME/agentctl/teams.d/tools/
-  entry on host-a  --reach: local----------------->   registry -> /home/u/work/dev-tools/.agentctl
-    contacts: agentctl coordinator                    ledger/   (every message ever accepted)
-              agentcloud session ...                REGISTRY/team.json  (declaration: team,
-              chat (visibility only)                  coordinator, contacts, accepts_from)
-team "sim"                                          REGISTRY/coordinator/agent.json (live identity)
-  entry on host-b  --reach: ssh------------------->   bridge state and unit, if any
-  entry on host-c  --reach: exec (template)------->   ...
+                 +-------------------+
+                 |  agent-queue lib  |   queue format, lanes, tombstones, not_after,
+                 |  (Rust crate)     |   ledger claim, harness identity and ancestry
+                 +---------+---------+
+                    ^             ^
+          links     |             |    links
+        +-----------+---+     +---+-----------------+
+        |   agentctl    |     |    agent-teams      |  teams.json, routes.d, outbox,
+        | agent mgmt +  |     | ledger, accept,     |  receipts, policy, route drivers
+        | drain (types) |     | deliverers          |
+        +-------+-------+     +----+-----------+----+
+                ^                  |           |
+   reads queue  |   enqueues into  |           | runs commands described in data
+   (drains)     +------------------+           v
+                     (agentctl deliverer)   ssh | node-exec | chat helper | ...
+        +---------------+
+        |  chat bridge  |  (today inside agentctl; may move)  -- optional team channel:
+        +---------------+     runs `agent-teams accept --via chat` on a peer envelope
 ```
 
-- **Team.** A name (`^[a-z0-9-]{1,32}$`, like agent names). A team may have **entries** on
-  several hosts (the consuming project in 2.3 runs one coordinator per host); `team@host` picks
-  one.
-- **Entry point.** The coordinator of one team on one host. Its contacts are tried in order.
-- **Contact kinds.** `agentctl` (an agent in a registry on that host, optionally noting the chat
-  bridge that shares its queue), `agentcloud` (a session), `chat` (a team channel; visibility
-  only today, section 9). No `herdr` kind: nothing types into a pane except agentctl's drain.
-- **Reach.** How the sender runs a command on the entry's host: `local`, `ssh` (target), or
-  `exec` (an argv template, for a node-exec command), plus the absolute agentctl binary there.
-- **Declaration.** `REGISTRY/team.json`, written by `agentctl team init` and kept current by
-  the commands that change who the coordinator is (`rename`, `restore`, `adopt` of a
-  coordinator). (Not called an "anchor": agentctl already uses that word for pinning a pane's
-  harness process.) A host-local directory `$XDG_STATE_HOME/agentctl/teams.d/<team>/` holds a
-  pointer to the declaring registry and the team's ledger, so `team accept --team tools` needs
-  no paths from the sender, and the ledger survives the coordinator being stopped, renamed or
-  replaced. Exactly one registry per host may declare a team: `team init` refuses when
-  `teams.d/<team>` points at another registry whose declaration still names the team, and
-  `team accept` refuses when it finds two.
+- agentctl knows nothing about teams. It gains only generic queue features (the `inbox.v2/`
+  lane, `not_after`, `cancel/` tombstones, `cancelled/`), useful to local sends too, and a
+  generic "coordinator designation" it already half has (`restore.json`'s `coordinator`).
+- The chat bridge knows nothing about teams. It gains one optional, generic feature: a channel
+  marked as a relay channel, whose admitted peer posts are piped to a configured command instead
+  of being typed (section 10.6).
+- Transports are external programs (OpenSSH, a node-exec command, a chat outbound helper),
+  invoked from data.
+- Version skew between the two binaries is handled where it already must be: the queue lane
+  older drainers never list, and `agentctl capabilities` (section 12.4).
 
-Why two levels: the owner's file changes when a team is created, moved to another host, or
-retired: rarely, and by people. The declaration changes whenever a coordinator is revived,
-renamed or re-adopted: often, and by agentctl itself, on the host where the change happens.
-Routing on the first and resolving on the second means a stale owner file costs a warning, not
-a misdelivery. Registry paths in `teams.yaml` remain as hints for hosts with no declaration yet
-(section 6.3, "undeclared").
+### 4.4 Deliverers: what types into the coordinator
 
-## 4. The teams registry file
+`agent-teams accept` never types. After it claims and records a message it hands it to the
+team's **deliverer**, chosen in the team's declaration:
 
-Default `${XDG_CONFIG_HOME:-~/.config}/agentctl/teams.yaml`; overridden by `--teams FILE` or
-`AGENTCTL_TEAMS`. It holds no secrets but routes messages, so it is refused if writable by
-others. YAML because people edit it; `teams show --json` prints the parsed form.
+| Deliverer | What it does | Wakes an idle agent? | Needs |
+|---|---|---|---|
+| `agentctl-queue` | enqueues into the coordinator's agentctl queue (`inbox.v2/`); agentctl's drainers type it | yes | agentctl and Herdr on that host |
+| `hook-inbox` | writes to a per-team inbox directory; a harness hook (`agent-teams hook`, for example a Claude Code `UserPromptSubmit` or `Stop` hook) claims items by atomic rename and prints them into the agent's context at the next turn boundary | **no**: delivered at the next turn boundary | only the harness's hook support |
+| `command` | runs an owner-supplied argv with the rendered message on stdin (their own harness API, a notifier) | depends on the command | the owner's command; its typing is outside this design's guarantees |
+| `session` | an agent-runtime session through a data-described command route (10.5) | runtime-dependent | the runtime's CLI |
 
-```yaml
-schema: agentctl-teams/v1
+`hook-inbox` is the pattern Gas Town's `gt nudge` falls back to (a file queue a Claude hook
+drains at the next turn boundary; `common/docs/agentctl/RELATED_WORK.md:123-130`). It needs no
+terminal server and never types, but a message to an agent idle at its prompt waits for the
+next human turn; the receipt says `delivered-at-next-turn` is pending, and the sender sees the
+target is hook-only.
 
-hosts:
-  host-a:
-    reach: local
-  host-b:
-    reach: ssh
-    ssh: host-b.example.net             # ssh target; default: the host key
-    agentctl: ~/.local/bin/agentctl     # required for remote reach: absolute or ~/ on THAT host
-    herdr: ~/bin/herdr                  # passed as --herdr-bin when set
-    services:                           # services that may send from this host (6.2)
-      tick-hub: {unit: tick-hub.service}
-  host-c:
-    reach: exec                         # argv template; {host} and {command} are substituted
-    argv: [node-exec, --node, "{host}.example.net", --, sh, -c, "{command}"]
-    agentctl: ~/.local/bin/agentctl
-    stdin: false                        # this transport does not pass stdin (probed, 5)
+### 4.5 A team-messaging-only user
 
-teams:
-  tools:
-    description: develops the shared tooling
-    primary: host-a
-    entries:
-      - host: host-a
-        coordinator: coordinator        # informational; the declaration is authoritative
-        harness: ~/work/dev-tools       # hint: registry = <harness>/.agentctl unless set
-        contacts:                       # tried in order (section 6.4)
-          - kind: agentctl
-            agent: coordinator
-            registry: ~/work/dev-tools/.agentctl
-            bridges:                    # chat bridges that share this queue, if any
-              - unit: agentctl-slack-dev-tools
-                state: ~/.local/state/agentctl-slack-dev-tools/bridge
-          - kind: chat                  # visibility / last resort; never delivers to the agent today
-            provider: slack
-            channel: C00000000
-    policy:                             # advisory here; the receiver's declaration is authoritative
-      accepts_from: [sim, service:tick-hub]
-    defaults:
-      ttl: 2h                           # default expiry of messages TO this team
-    reviewed: {at: 2026-10-24T12:00:00Z, by: "teams discover --apply"}
+Someone who clones agent-utils, wants their two coordinators on two machines to message each
+other, and never wants agentctl subagents:
 
-  sim:
-    primary: host-b
-    entries:
-      - host: host-b
-        coordinator: sim-coordinator
-        harness: ~/work/dev-sim
-        contacts:
-          - kind: agentcloud
-            session: 00000000-0000-0000-0000-000000000000
-            expect_title: sim-coordinator   # identity check (section 6.3)
-          - kind: agentctl
-            agent: sim-coordinator
-            registry: ~/.local/state/sim-chat/registry
-      - host: host-c
-        coordinator: coordinator
-        harness: ~/work/dev-sim
-        contacts:
-          - kind: agentctl
-            agent: coordinator
-    workers_on: [host-b, host-c]        # informational: where its slots run
+1. Installs `agent-teams` (one binary; no Herdr, no agentctl, no chat bridge).
+2. Writes `~/.config/agent-teams/teams.json` with two teams and one route each (an `ssh` route
+   with a dedicated key, section 10.3), and runs `agent-teams ssh enroll` to print the
+   restricted `authorized_keys` line for each side.
+3. On each host, from inside the coordinator session: `agent-teams init TEAM --coordinator-self
+   --deliver hook-inbox`, which pins the session's harness process as the team's coordinator
+   (as `agentctl attach-self` pins one) and prints the hook to add to the harness settings.
+4. Sends with `agent-teams send other-team --file msg.md` from inside the coordinator; the
+   other coordinator sees it at its next turn boundary with its ID and a reply command.
+
+Nothing in that path touches Herdr. If they later adopt agentctl, they change the deliverer to
+`agentctl-queue` and messages start waking idle agents; nothing else changes.
+
+### 4.6 Recommendation
+
+Option B: a separate `agent-teams` tool, with the queue format, ledger claim and harness
+identity extracted into a shared crate that agentctl also uses; agentctl gains only generic queue
+features and no team commands; the chat bridge gains only a generic relay-channel hook;
+integration is by data and commands. The rest of this document uses `agent-teams`; if the owner
+prefers subcommands, `agent-teams X` maps one-to-one to `agentctl team X` and nothing else in
+the design changes. The extraction is the first implementation step (17), and it also gives the
+Python edition one documented queue format to follow.
+
+## 5. Model
+
+```
+sender host                                         receiving host (authoritative, fresh)
+-----------                                         -------------------------------------
+teams.json (sparse hint)                            $XDG_STATE_HOME/agent-teams/teams.d/tools/
+  team "tools" entry on host-a                        declaration.json  (team, policy, deliverer,
+    contacts: [agentctl-queue coordinator,                               coordinator designation)
+               session 0000...]                       ledger/           (seen-set: every ID ever
+  host-a routes: [link-a, ssh-a, relay-coord]                            claimed, with its state)
+routes.d/*.json (route definitions, may be private)
+outbox/<id>.json (envelope, proof, attempts)        agent-teams accept -> claim in ledger ->
+     |                                                 deliverer (agentctl queue inbox.v2/,
+     +-- route: local | ssh | command | chat relay -->   hook inbox, command)
+                (every host route ends at accept)    local drainer types it (agentctl drain)
 ```
 
-**Freshness** is split from configuration on purpose:
+- **Team.** A name (`^[a-z0-9-]{1,32}$`). A team may have **entries** on several hosts (the
+  consuming project in 2.3 runs one coordinator per host); `team@host` picks one.
+- **Entry.** The coordinator of one team on one host, with ordered **contacts**.
+- **Contact.** A destination with its own dedupe authority: `host` (the entry host's
+  `agent-teams accept`, whatever its deliverer) or `session` (an agent-runtime session reached
+  through a session-mode command route, for coordinators that no host-side agent-teams serves).
+  There is no `herdr` and no `chat` destination: nothing reaches a pane except the local
+  drainer, and a chat channel is a route to `accept`, not a destination (10.6).
+- **Route.** How the sender reaches a contact's host: a name defined in `routes.d`, with a
+  built-in driver. Several routes may lead to one host contact; they are interchangeable for
+  retries because they converge on one ledger (9.3).
+- **Declaration.** `teams.d/<team>/declaration.json` on the receiving host, written by
+  `agent-teams init` and owned by agent-teams. It says which deliverer serves the team and how
+  the coordinator is designated: by an agentctl registry (the registry's own coordinator
+  designation, kept current by agentctl's `rename`, `restore` and `adopt`), or by a pinned
+  harness identity (`--coordinator-self`, for hook and command deliverers). Exactly one
+  declaration per team per host.
 
-- In the file: `reviewed` per team (when a person or `discover --apply` last confirmed it). The
-  file is never rewritten by a send; a send that finds it wrong *proposes* an edit (prints the
-  diff and `teams discover --host H --apply` to accept it).
-- In state (`$XDG_STATE_HOME/agentctl/teams/observations.json`, machine-written): per contact,
-  the last time it verified, the last delivery that confirmed, and the fingerprint seen then
-  (`boot_id`, harness `pid`/`starttime_ticks`, `terminal_id`, record `token`, agentcloud session
-  state). A changed fingerprint is reported ("coordinator re-launched since 3 h ago: new pid"),
-  not refused: identity rests on the declaration and the live record, not on a process ID.
-- `teams show` prints each entry's age: reviewed N days ago, last verified N minutes ago, last
-  confirmed delivery N hours ago. Anything unverified for longer than a threshold (default 7
-  days) is marked `stale?` so a reader knows to run `teams check`.
+Why two levels: the owner's file changes when a team is created, moved or retired; the
+coordinator's identity changes whenever it is revived, renamed or re-adopted, on the host where
+that happens. Routing on the first and resolving on the second means a stale owner file costs a
+warning, not a misdelivery.
 
-### 4.1 The declaration, `REGISTRY/team.json`
+## 6. Data files
+
+### 6.1 Format: JSON, versioned, with explicit comment fields
+
+The owner: "If we use JSON for the other machine-readable agentctl state, we can continue with
+JSON here. The main reason to use YAML would be if we want to add some extra metadata in the
+comments, but we could always have an explicit comment field in the JSON." agentctl's state is
+all JSON (2.1), including the owner-edited `profiles.json` and `chat.json`, so every file here
+is JSON:
+
+- **Schema.** Each file starts with `"schema": "agent-teams-<kind>/v<major>"`
+  (`agent-teams-teams/v1`, `agent-teams-routes/v1`, `agent-teams-declaration/v1`,
+  `agent-teams-message/v1`). A reader refuses an unknown major. Within a major, changes are
+  additive optional keys; an unknown key is a warning (`teams check` prints it), and an error
+  under `teams check --strict`, which a dotfiles repository's own CI can run to catch typos.
+- **Comments.** Any object may carry `"comment"` (a string or an array of strings, for people)
+  and `"notes"` (an object, free-form, for people or other tools); both are ignored by the
+  reader and **preserved** by every machine rewrite. That is an advantage over YAML comments,
+  which a machine rewrite such as `teams discover --apply` would lose.
+- **Writes.** Machine writes keep key order, indent by two spaces, end with a newline, are
+  atomic (write and rename), and keep the previous file as `<name>.<timestamp>`, so diffs stay
+  reviewable.
+- **Permissions.** No file holds secrets (keys are referenced by path), but they route messages,
+  so each is refused when writable by group or others.
+
+### 6.2 `teams.json`
+
+Default `${XDG_CONFIG_HOME:-~/.config}/agent-teams/teams.json`; `--teams FILE` or
+`AGENT_TEAMS_FILE` overrides.
 
 ```json
 {
-  "schema": "agentctl-team/v1",
-  "team": "tools",
-  "coordinator": "coordinator",
-  "contacts": [
-    {"kind": "agentctl", "agent": "coordinator"},
-    {"kind": "agentcloud", "session": "00000000-0000-0000-0000-000000000000"}
-  ],
-  "accepts_from": [
-    {"sender": "sim/coordinator", "kinds": ["info", "request", "hold", "resume", "reply"]},
-    {"sender": "service:tick-hub", "kinds": ["info"]}
-  ],
-  "may_send_to": ["sim"],
-  "limits": {"max_bytes": 8192, "per_sender_per_hour": 30},
-  "default_ttl_seconds": 7200,
-  "updated_at": "2026-10-24T12:00:00Z",
-  "updated_by": "agentctl rename"
+  "schema": "agent-teams-teams/v1",
+  "comment": "Owner-level routing hints. Edited by people and by `agent-teams discover --apply`.",
+  "hosts": {
+    "host-a": {
+      "routes": ["local"]
+    },
+    "host-b": {
+      "comment": "host-a may ssh here with the agent-teams key; host-b cannot reach host-a.",
+      "agent_teams": "~/.local/bin/agent-teams",
+      "routes": ["link-b", "relay-coord"],
+      "services": {
+        "tick-hub": {"unit": "tick-hub.service", "comment": "operational alerts"}
+      }
+    },
+    "host-c": {
+      "comment": "ssh is refused here; reached through a private command route from routes.d.",
+      "agent_teams": "~/.local/bin/agent-teams",
+      "routes": ["node-exec-c"]
+    }
+  },
+  "teams": {
+    "tools": {
+      "description": "develops the shared tooling",
+      "primary": "host-a",
+      "entries": [
+        {
+          "host": "host-a",
+          "coordinator": "coordinator",
+          "comment": "informational; the host's declaration is authoritative",
+          "contacts": [{"kind": "host"}]
+        }
+      ],
+      "policy_hint": {"accepts_from": ["sim", "service:tick-hub"]},
+      "reviewed": {"at": "2026-10-24T12:00:00Z", "by": "teams discover --apply"}
+    },
+    "sim": {
+      "primary": "host-b",
+      "entries": [
+        {
+          "host": "host-b",
+          "coordinator": "sim-coordinator",
+          "contacts": [
+            {"kind": "host"},
+            {"kind": "session", "route": "cloud-session", "session": "00000000-0000-0000-0000-000000000000",
+             "comment": "fallback for when host-b's agent-teams cannot be reached"}
+          ]
+        },
+        {"host": "host-c", "coordinator": "coordinator", "contacts": [{"kind": "host"}]}
+      ]
+    }
+  }
 }
 ```
 
-When `coordinator` is absent, `restore.json`'s `coordinator` is used; with neither, `team init`
-requires `--coordinator`. Bridges are not listed here: the receiver finds them from
-`restore.json`'s `units` and from running `chat run` processes (5), so there is no third copy
-of bridge unit names to go stale. `rename` rewrites the coordinator name in the same
-transaction as the record; `restore` and `adopt` refresh `updated_at`.
+- `hosts.<h>.routes` is the ordered list of route names to try for `host` contacts on that host
+  (section 11). `local` is built in; other names come from `routes.d`.
+- `agent_teams` is the absolute or `~/` path of the binary on that host, required for any
+  remote route.
+- A `session` contact names its own route (a session-mode command route).
+- `policy_hint` is advisory; the receiver's declaration decides.
+- Freshness: `reviewed` per team is the last human or `discover --apply` confirmation; machine
+  observations (last verified, last confirmed delivery, fingerprint seen) live in
+  `$XDG_STATE_HOME/agent-teams/observations.json`, never in this file; `teams show` prints ages
+  and marks anything unverified for 7 days `stale?`.
 
-## 5. Discovery and checking
+### 6.3 `routes.d/*.json`
 
-`teams.yaml` is maintained by `discover`, which proposes, and by people, who accept.
+`${XDG_CONFIG_HOME:-~/.config}/agent-teams/routes.d/`, every `*.json` file read in name order;
+a route name defined twice is an error. Splitting routes out of `teams.json` lets a private
+file (for a company-internal channel) live in a private dotfiles repository while `teams.json`
+and the public code stay generic. The formats are in section 10.
 
-```
-agentctl teams discover [--host H]... [--apply] [--json]
-agentctl teams check [TEAM[@HOST]]... [--json]
-agentctl teams show [TEAM] [--json]
-```
-
-`discover` runs on each host named (local, or through its reach) a read-only probe,
-`agentctl teams probe --json`, which reports:
-
-1. **Registries.** From `teams.d/`, registries named in `teams.yaml` for that host, the
-   `--registry` argument of every running `agentctl` process (bridges, watchers), and the
-   commands of user units that run agentctl. For each: `team.json`, `restore.json`'s
-   coordinator and units, every record's lifecycle, pane, harness identity, and whether its boot
-   ID is the host's current one.
-2. **Herdr.** Workspaces, tabs and the agent or foreground program of each pane, marked with the
-   registry (if any) that names the pane. A pane running a harness or `agentterm` that no
-   registry names is reported as **unregistered** with the `agentctl adopt` or `attach-self`
-   command that would register it (I1).
-3. **agentcloud.** For each `agentterm -s SESSION` pane, the session ID and its `inspect` state
-   (running, halted, archived).
-4. **Chat bridges.** Every running `chat run`, found by process, read from
-   `/proc/<pid>/cmdline` (registry, bridge state, binary) and its bridge state's configuration
-   (agent, channels, `reply_alias_range`), and the pane that agent resolves to; plus, for each
-   unit in `restore.json` or `teams.yaml`, `LoadState`, `UnitFileState` (`enabled`, `disabled`,
-   `transient`, `not-found`), `ActiveState` and `MainPID`. Two running bridges resolving to one
-   pane whose ranges overlap, or where either has none, is a **shared-pane-bridge** finding
-   (I2). A unit that is not found, disabled and inactive, or whose main process names a
-   different registry or agent, is a **stale-bridge** finding (I4).
-5. **Transport.** The agentctl binary's path and capabilities (`agentctl capabilities`), and,
-   for `exec` reach, whether stdin reached the probe (it sends a short known string).
-
-`discover` merges the probes into a proposed `teams.yaml` and prints a unified diff plus the
-findings. `--apply` writes it atomically (keeping the old file as `teams.yaml.<timestamp>`), and
-stamps `reviewed`. It never runs `adopt`, `team init`, or any `systemctl` verb; it prints them.
-
-`check` is `discover` without the proposal: for each entry, the pre-delivery verification of
-section 6.3 for every contact, as a table of contact, check, result and age. Exit 0 when every
-entry has at least one verified contact, 1 otherwise. It is cheap enough for a timer.
-
-## 6. Messaging
-
-### 6.1 Command and envelope
-
-```
-agentctl team send TEAM[@HOST] (--file FILE | --text TEXT)
-    [--key KEY] [--topic SLUG] [--supersedes KEY]... [--ttl DURATION | --expires TIME]
-    [--kind info|request|hold|resume] [--from-service NAME] [--wait SECONDS] [--json]
-```
-
-`team send` builds an envelope, proves the sender (6.2), writes the envelope to the outbox, and
-then runs the transport (6.4). The envelope:
+### 6.4 `declaration.json` (receiving host)
 
 ```json
 {
-  "schema": "agentctl-team-message/v1",
+  "schema": "agent-teams-declaration/v1",
+  "team": "tools",
+  "deliverer": {"kind": "agentctl-queue", "registry": "/home/u/work/dev-tools/.agentctl"},
+  "coordinator": {"designation": "registry",
+                  "comment": "the registry's own coordinator designation; agentctl keeps it current"},
+  "accepts_from": [
+    {"sender": "sim", "kinds": ["info", "request", "hold", "resume", "reply"]},
+    {"sender": "service:tick-hub", "kinds": ["info"], "authority": "peer"}
+  ],
+  "may_send_to": ["sim"],
+  "limits": {"max_bytes": 8192, "per_sender_per_hour": 30, "max_ttl_seconds": 604800},
+  "default_ttl_seconds": 7200,
+  "relay_channels": [{"route": "relay-coord", "comment": "accept envelopes relayed by this host's bridge"}],
+  "updated_at": "2026-10-24T12:00:00Z",
+  "updated_by": "agent-teams init"
+}
+```
+
+For a hook or command deliverer, `coordinator` is `{"designation": "pinned", "harness_identity":
+{...}}`, refreshed by re-running `init --coordinator-self` from the new session. A sender in
+`accepts_from` is a team name (meaning that team's coordinator) or `service:NAME`; there is no
+`team/agent` form, because only coordinators send (8.2).
+
+## 7. Discovery and checking
+
+```
+agent-teams discover [--host H]... [--apply] [--json]
+agent-teams check [TEAM[@HOST]]... [--strict] [--json]
+agent-teams show [TEAM] [--json]
+```
+
+`discover` runs, on each host named and through that host's routes, the read-only `agent-teams
+probe --json`. The probe runs locally on the target and reports what that host's own tools say;
+it does not read panes from afar (principle 1):
+
+1. **Declarations** in `teams.d/`, and for agentctl deliverers the registry's coordinator
+   designation, record lifecycle and harness identity (from `agentctl status --json`), and
+   whether the record's boot ID is the host's current one.
+2. **Unregistered coordinators.** `agentctl probe`'s own list of Herdr panes running a harness
+   or `agentterm` that no registry names, with the `agentctl adopt` or `attach-self` command
+   that would register them (I1). Absent when agentctl is not installed.
+3. **Sessions.** For each session the host can see, its runtime `inspect` state.
+4. **Chat bridges.** Every running bridge (from its main process's command line and its state's
+   configuration: agent, channels, `reply_alias_range`, relay channels), and each expected unit's
+   load, enable and active state. Two running bridges on one pane without disjoint reply ranges
+   is a **shared-pane-bridge** finding (I2); an expected unit that is missing, disabled and
+   inactive, or whose process names another registry or agent, is a **stale-bridge** finding
+   (I4).
+5. **Routes, from the sender's side.** For each route: whether it reached the probe, the link
+   state if it has one (10.3), whether stdin arrived (the probe echoes a short known string),
+   and the peer's protocol version.
+
+`discover` merges the probes into a proposed `teams.json`, prints a unified diff and the
+findings; `--apply` writes it (6.1) and stamps `reviewed`. It never runs `adopt`, `init`,
+`ssh enroll` or any `systemctl` verb; it prints them. `check` is `discover` without the
+proposal: every contact and route verified, as a table; exit 0 when every entry has at least one
+verified contact with at least one working route, 1 otherwise. It is cheap enough for a timer.
+
+## 8. Messaging
+
+### 8.1 Command and envelope
+
+```
+agent-teams send TEAM[@HOST] (--file FILE | --text TEXT)
+    [--key KEY] [--topic SLUG] [--supersedes KEY]... [--ttl DURATION | --expires TIME]
+    [--kind info|request|hold|resume] [--private] [--from-service NAME] [--wait SECONDS] [--json]
+```
+
+`send` builds an envelope, proves the sender (8.2), writes the envelope to the outbox, and then
+runs the route walk (11). The envelope:
+
+```json
+{
+  "schema": "agent-teams-message/v1",
   "id": "tm-sim-6f1d0c2a9b7e4d31",
   "key": "ci-hold-2026-10-24",
   "body_sha256": "…",
-  "from": {"team": "sim", "agent": "coordinator", "host": "host-b", "seq": 412,
+  "from": {"team": "sim", "role": "coordinator", "host": "host-b", "seq": 412,
            "proof": "harness-ancestry"},
   "to": {"team": "tools", "host": "host-a"},
   "kind": "hold",
   "topic": "ci-hold",
   "supersedes": [],
+  "private": false,
   "created_at": "2026-10-24T13:00:00.250Z",
   "not_after": "2026-10-24T15:00:00Z",
-  "reply_to": {"team": "sim", "host": "host-b", "agent": "coordinator", "in_reply_to": null},
+  "reply_to": {"team": "sim", "host": "host-b", "in_reply_to": null},
   "body": "Please hold landing to main until the mirror is repaired."
 }
 ```
 
-- **Key and ID.** The ID is `tm-<sender team>-` and 16 hex digits of SHA-256 over (sender
-  team, key). Keys are scoped to the sending team, deliberately: the same key from two of the
-  team's hosts names the same message, so the same body is deduplicated and a different body
-  is a visible conflict. Without `--key`, the key is derived from (target team, kind, topic,
-  body) and printed, so re-running an identical command is a retry, not a second message;
-  sending the same text again on purpose needs a new `--key`. `from.seq` is a per-host counter
-  kept in the sender's state, used only for topic order (7).
-- **Same key, same body** returns the existing message's current state from the receiver's
-  ledger (6.5), never "refused". **Same key, different body** is refused as a conflict
-  (stricter than `agentcloudctl notify`, where the same key silently keeps the first text); to
-  change a message, send a new key that supersedes the old one.
-- **What is typed.** `team accept` renders the envelope on the receiving host:
+- **ID.** `tm-<sender team>-` and 16 hex digits of SHA-256 over (sender team, key), fixed when
+  the outbox entry is written and never changed by any retry, route or contact (9.1). Without
+  `--key` the key is derived from (target team, kind, topic, body) and printed, so re-running an
+  identical command is a retry; sending the same text again on purpose needs a new `--key`.
+  `from.seq` is a per-host counter, used only for topic order (12.1).
+- **Same key, same body** returns the existing message's state from the receiver's ledger.
+  **Same key, different body** is refused as a conflict; to change a message, send a new key
+  that supersedes the old one.
+- **`--private`** keeps the body off routes that expose it to third parties (a chat channel;
+  10.6).
+- **What is typed.** The receiver renders the envelope on its own host:
 
   ```
-  [team message tm-sim-6f1d0c2a9b7e4d31 from sim/coordinator@host-b (agent, proved on host-b) to tools; kind hold; topic ci-hold; expires 15:00Z]
+  [team message tm-sim-6f1d0c2a9b7e4d31 from sim (coordinator, proved on host-b, via link-b) to tools; kind hold; topic ci-hold; expires 15:00Z]
   Please hold landing to main until the mirror is repaired.
-  [reply: agentctl team reply tm-sim-6f1d0c2a9b7e4d31 --file FILE]
+  [reply: agent-teams reply tm-sim-6f1d0c2a9b7e4d31 --file FILE]
   ```
 
   The header is generated by the receiver from the verified envelope, including how the sender
-  was proved (6.2). Body lines that begin with `[team message` or `[reply:`, and lines that
-  look like a chat bridge's reply markers, are indented by two spaces, so a body can neither
-  forge a header nor be posted by a bridge that reads a long idle pane (2.5). The typed text
-  never starts with `/`, so a body cannot become a harness slash command.
+  was proved and which route carried it. Body lines that begin with `[team message` or `[reply:`,
+  and lines that look like a chat bridge's reply markers, are indented by two spaces, so a body
+  can neither forge a header nor be posted by a bridge reading a long idle pane (2.5). The typed
+  text never starts with `/`.
 
-### 6.2 Who is sending
+### 8.2 Who may send: coordinators and registered services only
 
-The sender is derived, then proved; a flag can only narrow it.
+The owner: "I don't think workers should message other teams. Only coordinators." This resolves
+revision 1's question 8.
 
-- **Agent in a registry** (`proof: harness-ancestry`): agentctl walks its own process ancestry
-  and looks for a PID whose `(boot_id, pid, starttime_ticks)` equals some record's
-  `harness_identity` in a registry on this host that has a declaration. That proves the caller
-  runs inside that agent's harness. The team comes from that declaration.
-- **agentcloud session** (`proof: agentcloud-session`): `$AGENTCLOUD_SESSION_ID` is only an
-  environment variable, so on its own it proves nothing. It counts as proof only for delivery
-  to an agentcloud contact through `send-message --session <self>`, which agentcloud attributes
-  itself. For any other contact it is labelled `asserted: agentcloud-session`.
-- **Service** (`proof: service-unit`): `--from-service NAME` is accepted only when NAME is
-  registered for this host in `teams.yaml` with a systemd unit, and `/proc/self/cgroup` shows
-  the caller running inside that unit. It is refused outright when the ancestry walk finds an
-  agent harness, so an agent refused under its own name cannot retry as a service.
-- **Owner: never.** There is no `--from owner`; a process that cannot be proved to belong to an
-  agent or a registered service is refused, as `agentctl send` refuses a disguised human send
-  today. For agentcloud targets this means team messages never use `notify`'s default
-  `system-notification` mode, which renders as an `[operator]` directive; when the sender is
-  not itself a session, `notify --mode cli-script` (peer-level, as `inbox deliver` already uses)
-  is used and the body carries the header.
+- **Coordinator** (`proof: harness-ancestry`). agent-teams walks its own process ancestry for a
+  PID whose `(boot_id, pid, starttime_ticks)` equals the harness identity of **the team's
+  designated coordinator** on this host: the registry's coordinator record for an agentctl
+  deliverer, or the pinned identity in the declaration. Matching any other record in the
+  registry is not enough; a worker of the same team is refused with `refused:
+  sender-not-coordinator` and the hint "ask your coordinator". In-process helpers of the
+  coordinator (its own sub-agents, background jobs it started) share its ancestry and count as
+  the coordinator, which is answerable for them. Processes it starts in other panes (for example
+  through `herdr-run`) do not; that is why proof is taken at outbox write (below).
+- **Registered service** (`proof: service-unit`). Kept, explicitly, because operational alerts
+  (2.3) are the first user. `--from-service NAME` is accepted only when NAME is registered for
+  this host in `teams.json` with a systemd unit and `/proc/self/cgroup` shows the caller inside
+  that unit. It is refused outright when the ancestry walk finds any agent harness, so a worker
+  refused as itself cannot retry as a service. A service sends as `service:NAME`, never as a
+  team, and is labelled as a service.
+- **Workers: never.** Not as themselves, not as their team. A worker that needs another team asks
+  its coordinator. Workers are also never recipients: a team message is addressed to a team and
+  delivered to its coordinator; `reply_to` names a team, not an agent.
+- **agentcloud sessions.** A session coordinator is proved by its runtime (`send-message
+  --session <self>` is attributed by the runtime itself) only on a session-mode route that
+  declares `attribution: transport` (10.5); `$AGENTCLOUD_SESSION_ID` alone is an assertion. A
+  session coordinator that wants host routes registers itself with `agentctl attach-self` or
+  `agent-teams init --coordinator-self`.
+- **The owner: never.** A process that cannot be proved to be a coordinator or a registered
+  service is refused, and team messages never use a runtime's operator mode unless the
+  receiving team opts a specific service into it (question 6).
 
-**Proof is taken once, at outbox write, in the sender's own process tree.** Transport may run
-elsewhere, for example in a Herdr command pane through `herdr-run` (required for network
-commands on some hosts), where the ancestry ends at the Herdr server and proves nothing. So
-`team send` records the proof in the outbox entry and `team pump` (any process, including a
-`herdr-run` pane or a timer) carries it. For local reach, `team accept` re-derives the proof
-itself from the outbox entry's recorded caller and refuses a mismatch. For remote reach the
-receiver cannot re-derive anything; it records the transport (`ssh from host-b`, `exec`) and
-renders the proof as "proved on host-b", which is an assertion by that host's agentctl. Section
-8 says why that is acceptable.
+**Proof is taken once, at outbox write, in the sender's own process tree**, and carried by
+whatever process runs the route (`agent-teams pump` in a `herdr-run` pane, a timer). For the
+`local` route the receiver re-derives the proof from the outbox entry's recorded caller and
+refuses a mismatch. For remote routes it records what the route itself authenticates (10.2) and
+renders the proof as "proved on host-b", an assertion by that host's agent-teams.
 
-**Isolation.** The outbox lives at `REGISTRY/team-outbox/` of the sender's own registry, which
-is writable to an unboxed coordinator and to one in a wrkslots coordinator box. A worker in a
-slot box (cgroup, user-namespace or root isolation) generally cannot write its coordinator's
-registry, and its ancestry may stop at the box's relay; phase 3 does not support workers as
-senders. They ask their coordinator, which is also the default policy (owner question 8). Each
-supported mode gets a test that proves the sender from inside it.
+**Isolation.** The outbox is `$XDG_STATE_HOME/agent-teams/outbox/`, writable to an unboxed
+coordinator and one in a wrkslots coordinator box. Since workers cannot send, slot boxes need
+no outbox access. Each supported coordinator mode gets a test proving the sender from inside it.
 
-### 6.3 Verification before and after delivery
+### 8.3 Verification on the receiving host, at delivery time
 
-Every send re-checks, on the target host, that the contact is live and is who the file says.
-Checks run inside `team accept` where the state is, except reach, which only the sender can
-test.
+Every route ends at `agent-teams accept --protocol 1` on the target host, so verification is the
+same whichever route carried the envelope; only the receiver's agentctl and the receiver's own
+reads take part:
 
-| Check | agentctl contact | agentcloud contact | chat contact |
-|---|---|---|---|
-| Host reachable, agentctl present and new enough | `team accept --protocol 1` runs; an older binary is a definite `remote-too-old` refusal | sender side | n/a |
-| Team is who we think | `teams.d/<team>` points at a registry whose `team.json` says `team: <team>`, and no second registry claims it | `inspect`: session exists, owned, title matches `expect_title`, or the session has an `attach-self` record with a declaration | channel matches the team's configured channel |
-| Record is live | `agent.json` exists, `lifecycle: running`, not paused; record `boot_id` equals the host's current boot ID; the pinned harness process is alive with the same start ticks; pane resolves (agentctl's existing probe, as `agentctl status`) | not `halted`, not archived, before and after the send (6.5) | n/a |
-| Drainer exists | a running bridge on this registry and agent, or the host's `team drain` timer (7.3); otherwise the receipt says `queued-no-drainer` | n/a | n/a |
-| Bridge sanity | each running bridge's main process names this registry and its bridge state names this agent; each unit in `restore.json`/`teams.yaml` is loaded, enabled or transient, and active. A mismatch, or a disabled or missing unit, is a **stale-bridge** finding: the contact is still used if the record verifies, but the receipt carries the finding and the sender prints the proposed edit (I4: never a silent fallback). Two bridges on one pane without disjoint reply ranges: **shared-pane-bridge** finding (I2) | n/a | n/a |
-| Policy | sender and kind in `accepts_from`, size and rate limits, sender's `may_send_to` | same, from a declaration if the session has one; otherwise sender-side only, and the receipt says so | same |
+| Check | `host` contact |
+|---|---|
+| Protocol | `accept --protocol 1` runs; an older binary is a definite `remote-too-old` refusal |
+| Team | exactly one declaration for the team on this host |
+| Coordinator is live | agentctl deliverer: the designated record is `running`, its boot ID is the current one, the pinned harness process is alive with the same start ticks, the pane resolves (all from `agentctl status --json`, run locally). Pinned designation: the harness process is alive with the same identity |
+| Drainer exists | agentctl deliverer: a running bridge or watcher on this queue whose binary understands the lane, or the host's `agent-teams drain` timer; otherwise the receipt says `queued-no-drainer`. Hook deliverer: `hook-only` |
+| Bridge sanity | stale-bridge and shared-pane-bridge findings (7) travel in the receipt; the contact is still used if the coordinator verifies (I4: never a silent fallback) |
+| Policy | sender and kind in `accepts_from`, sender in its own `may_send_to` (checked by both sides), size and rate limits, `not_after` within `max_ttl_seconds` |
+| Freshness | `not_after` not passed; `created_at` not older than the ledger's retention horizon (9.2) |
 
-**Undeclared targets.** Until a host has `team init`, an `agentctl` contact with an explicit
-registry can still be used, but the "team is who we think" row cannot pass. Such a delivery is
-accepted only with `--allow-undeclared` (the migration wrapper in section 10 passes it), the
-receipt and both logs carry `unverified-team`, and the option is removed one release after
-phase 5.
+Verification for `session` contacts is the runtime's own `inspect`, run by the sender through
+the session route before and after delivery (10.5). Section 11.4 tabulates what each route adds.
 
-After the hand-off, the receipt says where the item is; the sender then re-reads it (at once
-and, with `--wait`, until it settles or the wait ends) through `team receipt ID` on the target.
-agentctl's own around-the-effect checks (pinned process re-verified before Enter, prompt seen
-leaving the composer) are what confirm delivery; `team send` reports them, it does not repeat
-them.
+### 8.4 Outbox, ledger, receipts and states
 
-### 6.4 Trying contacts in order
+- **Sender:** `outbox/<id>.json` (envelope, proof, and every attempt: route, contact, phase,
+  classification, timestamps), `team-log.jsonl`, and observations.
+- **Receiver:** `teams.d/<team>/ledger/<id>.json`: body SHA-256, sender, route, deliverer
+  target, state, timestamps, and the newest `(created_at, host, seq)` seen per sender and topic.
+  The ledger is the dedupe record (9.2).
 
-The outbox entry records every attempt per contact. Two rules keep a message from arriving
-twice by two routes, which is I2 by another path:
-
-- **Advance only on a definite answer.** The walk moves to the next contact only after the
-  previous one refused (a failed check, `remote-too-old`, policy), or after a later query of
-  that contact's ledger (`team receipt ID`) shows the ID unknown there. A transport failure
-  after the envelope may have been handed over (an ssh session that drops mid-command) is not a
-  definite answer, and neither is an unreadable receipt.
-- **Pin once handed over.** Once any contact has answered `accepted` or anything uncertain,
-  the message is pinned to that contact; no later run, `team pump` included, tries another.
-  This is the rule `inbox deliver` already has.
-
-Connect failures that provably precede any remote command (name resolution, connection refused,
-authentication refused before the session starts) are definite and recorded as such. The sender
-prints which contacts were tried, why each was skipped, and what to inspect.
-
-**How the envelope travels.** On stdin where the reach passes it (local, ssh, and an `exec`
-template the probe confirmed), otherwise as one base64 argument, which the size limit keeps
-small (8 KiB of body is about 11 KiB of argument).
-
-### 6.5 Ledger, outbox, receipts and states
-
-- **Sender:** `REGISTRY/team-outbox/<id>.json` (envelope, proof, attempts per contact, last
-  receipt), `REGISTRY/team-log.jsonl`, and machine observations (4).
-- **Receiver:** the team ledger, `$XDG_STATE_HOME/agentctl/teams.d/<team>/ledger/<id>.json`:
-  body SHA-256, sender, registry and agent it was queued for, state, timestamps, and the newest
-  `(created_at, host, seq)` seen per sender and topic. `team accept` writes the ledger entry
-  before it enqueues and updates it after, so a crash between the two is recognised at the next
-  accept or receipt. The ledger, not the queue, is the dedupe record: it outlives `withdraw`,
-  `stop`, archive, `rename`, and a change of declaring registry, which keeps the helper's rule
-  that a change of registry does not reopen a message.
-
-| State | Where the item is | Retried? |
+| State | Meaning | Retried? |
 |---|---|---|
-| `accepted` | in the target's queue, not yet typed | the target's drainer types it |
-| `delivered` | `processed/` with confirmed delivery evidence (the per-item rule the helper in 2.3 uses) | no |
-| `expired` | `not_after` passed before it could be typed | no; sender told |
-| `superseded` | a newer message on its topic, or one naming its key, cancelled it before it was typed | no; sender told which |
-| `retracted` | `team retract` cancelled it before it was typed | no |
+| `claimed` | the ledger entry exists; the deliverer has not confirmed the hand-over yet (recovered at the next accept or receipt, 9.2) | no new claim; recovery finishes it |
+| `accepted` | handed to the deliverer (in the agentctl queue, or the hook inbox), not yet typed or read | the deliverer delivers it |
+| `delivered` | agentctl: in `processed/` with delivery evidence; hook: printed by the hook | no |
+| `expired` | `not_after` passed before delivery | no; sender told |
+| `superseded` | a newer message on its topic, or one naming its key, cancelled it first | no; sender told which |
+| `retracted` | `agent-teams retract` cancelled it first | no |
+| `fenced` | the sender asked the receiver to bar this ID before it arrived (9.4) | never accepted here |
 | `possibly_submitted` | stranded in `inflight/` or uncertain in `failed/` | **never**; a human resolves it |
 | `lost` | in the ledger as accepted but in no queue phase | **never**; reported until resolved |
-| `refused` | not enqueued: policy, verification, conflict | sender may fix and resend under a new key |
-| `deferred` | only in the sender's outbox (no contact gave a definite answer yet, or none was reachable) | `team pump` retries the pinned or next contact until `not_after` |
-| `journaled` / `journaled-halted` | agentcloud contact: in the session's journal; `-halted` when `inspect` after the send shows the session halted, so it will not be run | no; `-halted` is reported as undelivered |
+| `refused` | not handed over: policy, verification, conflict | under a new key only |
+| `deferred` | sender-side only: no contact has given a definite answer yet | `pump` resolves, then retries (11) |
+| `ambiguous` | sender-side only: a hand-over may have happened; awaiting a receipt | never resent blind (9.3) |
+| `journaled` / `journaled-halted` | session contact: in the session's journal; `-halted` when the runtime shows it will not run | no |
 
-Receipts read the ledger and list queue directories without taking the delivery or lifecycle
-lock, so `team receipt` answers at once even while a drainer waits on a busy pane.
-`agentctl team outbox` lists open messages; `team status ID` refreshes one; `team pump` (for a
-timer) refreshes every open receipt and retries `deferred` ones. Receipts are **pulled**: the
-sender runs `team receipt` on the target through its reach. Nothing on the target has to reach
-back, so a host that refuses inbound ssh can still send and learn the outcome.
+Receipts read the ledger and list queue directories without taking the delivery lock, so
+`agent-teams receipt ID` answers at once while a drainer waits on a busy pane. Receipts are
+**pulled** by the sender through a route; nothing on the target has to reach back, except where
+the only route is the receiver pulling (10.3), in which case the receiver pushes receipts with
+its acknowledgement.
 
-**Retention.** Outbox entries and ledger entries in a terminal state are kept 30 days, then
-pruned by `team pump`; `possibly_submitted` and `lost` are kept until resolved. The queue's own
-`processed/` is outside this design (owner question 9).
+**Retention.** Terminal ledger and outbox entries are kept 30 days (and at least as long as 9.2
+requires); `possibly_submitted` and `lost` until resolved. The queue's `processed/` is outside
+this design (question 9).
 
-### 6.6 Replies
+### 8.5 Replies
 
-`agentctl team reply ID --file FILE`, run inside the receiving team, builds an envelope to the
-original `reply_to` with `in_reply_to: ID`, proved and policy-checked like any send. Its key
-defaults to `reply:<ID>`, so re-running the same reply is a retry; a second, different reply to
-the same message needs `--key`. If the replying host can reach the sender's host (its own
-`teams.yaml`, or the reach in `reply_to` when that host is listed there), it is delivered
-directly. Otherwise it stays in the replying team's outbox with state `awaiting-pull`, and the
-original sender's `team pump` collects replies addressed to its team (`team pull --for sim`)
-over the reach it already uses. A reply is delivered to the sender team's coordinator entry,
-or to `reply_to.agent` when that agent is still live and named in the sender's declaration.
+`agent-teams reply ID --file FILE`, run by the receiving team's coordinator (proved as in 8.2),
+builds an envelope to `reply_to` with `in_reply_to: ID`. Its key defaults to `reply:<ID>`, so
+re-running the same reply is a retry and a reply to a duplicate sighting of the same message is
+the same reply (9.6). A second, different reply needs `--key`. It travels over the replying
+host's routes to the sender's team; where the replying host has none, it waits in the outbox as
+`awaiting-pull` and the original sender's `pump` collects it (`agent-teams pull --for sim`). A
+reply is delivered to the sender team's coordinator, never to a worker.
 
-## 7. Agents that only take input when idle
+## 9. Exactly-once delivery
 
-I3 is not a transport failure; the message was delivered exactly as designed, hours after it
-meant anything. The fix belongs in agentctl's queue, and it helps local sends too.
+The owner: "One of the most important things is that these messages don't get duplicated,
+especially if there are multiple routes to attempt delivery or to retry." Two of the incidents
+are duplicates: I5 (a retry after a slow, unclear send posted a message three times) and I2 (a
+bridge reported a reply as unsent, so the agent sent it again). Both are the same mistake: an
+unclear outcome answered by sending again, to a receiver that could not recognise the second
+copy. Multiple routes multiply the chances of making it.
 
-### 7.1 Expiry, topics, supersede, retract
+### 9.1 What "exactly once" means here
 
-- **Expiry.** A team queue item carries `not_after` (Unix ms). Every team message has one:
-  `--ttl`/`--expires`, else the receiving team's `default_ttl_seconds`, else 2 h. `--ttl none`
-  is allowed only for `--kind info` to a team whose declaration permits it.
-- **Topics, by the sender's order.** `--topic SLUG` makes the newest message in a topic from
-  one sender team supersede older ones from that team that have not been typed yet. "Newest" is
-  the sender's `(created_at, host, seq)`, not arrival order: `team pump` can deliver a deferred
-  message late, and a team with entries on two hosts can send from both. On arrival, a message
-  older than the newest message the ledger has seen on its topic, **in any state, delivered
-  included**, starts as `superseded` and is never queued. So a `hold` deferred at 13:00 and
-  delivered at 13:10, after a `resume` created at 13:05 was typed, is dropped, not typed last.
-  Within one sending host `seq` orders strictly; across hosts, `created_at` decides, and two
-  messages within the skew tolerance (default 2 s) of each other on one topic from different
-  hosts are both delivered, with a warning in both receipts. Local `agentctl send --topic` uses
-  the topic namespace `local:<sender>`, so a local send never supersedes a team's message.
-- **Explicit supersede.** `--supersedes KEY` cancels a specific earlier message (any topic) if
-  it has not been typed. Too late is reported, not hidden: the receipt says the earlier one was
-  already delivered.
-- **Retract.** `agentctl team retract ID` cancels the message if it has not been typed.
-- **Visible backlog.** `team accept` reports the target's queue depth and the age of its oldest
-  pending item, and `team send` prints it ("3 messages already waiting, oldest 2 h; target is
-  idle-only"). That is the signal I3 lacked.
+Strictly, no system over unreliable links can promise that a message is delivered exactly once
+*and* always delivered. This design promises:
 
-### 7.2 Cancellation without the delivery lock
+- **At most one enqueue per ID per team**, across all routes, retries, restarts and hosts of
+  that team, and **at most one paste per ID** into any pane;
+- **at least once while things work**: if some route to a verified contact stays up long enough
+  before `not_after`, the message is delivered;
+- **never silently in between**: when neither can be shown (a crash between hand-over and
+  typing), the message ends `possibly_submitted` or `lost`, visible to the sender and the owner,
+  and is never retried automatically. That is agentctl's existing rule, kept.
 
-A drain holds the queue's delivery lock while it waits for a busy pane (2.1), which is exactly
-the I3 window. If superseding needed that lock, a `resume` could not cancel a `hold` until the
-drainer had already typed it. So cancellation is a **tombstone**: `queue/cancel/<id>.json`,
-written by atomic rename with no queue lock (only the ledger's own short lock). The drain, for
-each item that carries team fields, re-reads the item's tombstone and `not_after` **after**
-readiness and immediately before the paste, under the target lock, and moves a cancelled or
-expired item to a new terminal directory (`queue/cancelled/`, with the reason) instead of typing
-it. A tombstone that arrives after the paste is too late, and the receipt says so. A new
-message on a topic writes the tombstones for the older ones before it is itself enqueued; the
-enqueue may then wait for the delivery lock (the drainer is busy), but the cancellation has
-already taken effect.
+### 9.2 One ID end to end, and a durable seen-set at the receiver
 
-### 7.3 Who drains, and never `team accept`
+- **One ID, assigned at send.** The ID is fixed when the outbox entry is written (8.1) and is
+  carried in the envelope on every route. Where a route has a native idempotency key, the route
+  passes a key derived from the ID (the ID itself, or `<id>/<route>` where a provider scopes keys
+  per sender): `--idempotency-key` for a runtime CLI, the operation UUID for a chat outbound
+  helper (2.5). Native keys are a second line of defence; the receiver's ledger is the first,
+  because several routes have none (ssh, a node-exec command) and native keys do not span routes.
+- **The seen-set is the team's ledger** on the receiving host, one file per ID. `accept`
+  **claims** an ID by creating `ledger/<id>.json` with exclusive create (`O_EXCL`, under the
+  ledger's own short lock, never the queue's delivery lock), recording `claimed` with its own
+  process identity, *before* it hands anything to the deliverer. Only the claimer hands over. A
+  second arrival of the same ID, by any route, at any time, reads the existing entry and returns
+  its state: same body, the current state; different body, `conflict`. Two arrivals racing (one
+  over ssh, one relayed by the bridge) cannot both claim.
+- **Crash between claim and hand-over.** The hand-over itself is idempotent: the agentctl queue
+  refuses an existing ID in any phase (`cli.rs:645`), the new lane and the cancellation
+  directories included (12.4), and the hook inbox is keyed by ID. Recovery (at the next accept,
+  receipt, or `drain` of that team) sees `claimed` with a dead claimer, re-runs the hand-over,
+  and records `accepted` either way. `withdraw` refuses `tm-*` IDs, so an item cannot leave the
+  queue except by delivery, cancellation or quarantine.
+- **Durable, not in memory.** The fix for I5 remembers keys for 24 h in a server's memory, which
+  suits a page retrying within seconds. Here restarts of either side are among the failures, and
+  retries come from timers hours later, so the seen-set is on disk and survives restarts,
+  `agentctl stop`, archive, rename, and a change of the coordinator's registry.
+- **Retention longer than any retry window, by construction.** Every message has a `not_after`
+  no later than `created_at + max_ttl_seconds` (default 7 days); `accept` refuses an expired
+  envelope and one whose `created_at` is older than the retention horizon; ledger entries are
+  kept at least `max_ttl_seconds + 30 days` past `created_at`. So by the time an entry may be
+  pruned, every copy of that envelope still in flight anywhere would be refused as expired:
+  pruning can never reopen an ID. `--ttl none` is therefore not offered (question 4).
+- **One team, several hosts.** A team with entries on two hosts has two ledgers. The ID is
+  addressed to one entry (`to.host`); moving it to another entry is a change of contact and
+  follows 9.4, so two ledgers never both accept one ID.
 
-`team accept` enqueues and returns; it never types. Typing from `accept` would hold the delivery
-and target locks across a readiness wait inside an ssh session that can drop (leaving a
-`possibly_submitted` item), and would type any chat prompt ahead of it without the bridge's
-read-before-typing check, which is the hazard the helper in 2.3 defers on.
+### 9.3 Retrying on the same contact: any route, after asking
 
-Team items are typed by the drainers that already serve the queue (a bridge, `watch-agents`, a
-human `send`), once those binaries understand them (7.4), or by a receiver-side `agentctl team
-drain` run from a timer on hosts with no such drainer. `team drain` is bounded (`--deadline`,
-`--lock-timeout`, `--max-items`: the flags the helper already asks agentctl for, which phase 3
-adds as a prerequisite) and types only `tm-*` items, and only while the head of the queue is one:
-if a chat prompt is ahead, it leaves the queue to the bridge and reports `waiting-behind-chat`.
-`send_once` reminders (2.1) count queued team items like any other untyped prompt.
+All `host` routes to one entry converge on that entry's ledger, so a resend of the same ID to
+the same contact, over the same route or another one, cannot enqueue twice. The rule for an
+ambiguous outcome is still **ask before resending**:
 
-### 7.4 Older drainers must not see what they cannot honour
+1. An attempt ends **definite** (a refusal or `accepted` answered by `accept`, or a failure the
+   route proves happened before the envelope could reach the host; 10.2) or **ambiguous**
+   (anything else: a timeout, a connection dropped after the remote command started, a chat
+   post with no receipt yet, an unreadable answer).
+2. After an ambiguous attempt the sender records `ambiguous` and asks the receiver: `receipt ID`
+   over the first route in order that answers. A known state ends the matter.
+3. Only when the receipt says the ID is **unknown** does the sender resend, still with the same
+   ID, to the same contact (over any route). Even if the earlier attempt lands later, the ledger
+   absorbs it.
+4. If no route can answer, the message stays `ambiguous` and `pump` asks again later. It is
+   never resent blind.
 
-Old binaries ignore unknown JSON fields, so a marker field inside an item refuses nothing: any
-pinned bridge, watcher, helper or rollback binary that drains the queue would type an expired
-`hold`. So items with team fields are not written to `inbox/` at all, but to a new lane,
-`queue/inbox.v2/`, which binaries before phase 2 never list. Phase-2 drainers merge `inbox/` and
-`inbox.v2/` in enqueue order. Until a queue's drainers are new, team items in `inbox.v2/` are
-typed only by `team drain`, and `team accept` says so in the receipt when it finds a running
-drainer whose binary predates phase 2 (`agentctl capabilities` on that path).
+The ask costs one round trip and keeps logs honest ("resent after the receiver reported the ID
+unknown at 13:04:10Z" rather than "retried"). It also covers the rare case where the ledger is
+unreachable but the queue is not.
 
-Every consumer that hardcodes the four phases has to learn the new ones, or an expired or
-cancelled ID looks absent:
+### 9.4 Trying a second contact: only after proof, never after ambiguity
 
-- agentctl's enqueue duplicate check and `message_state` (`agent.rs:1422`, `1839`): both
-  editions must list `inbox.v2/`, `cancel/` and `cancelled/`.
-- The Python edition's chat runtime re-enqueues a `received` item it cannot find
-  (`py/agentctl/chat_runtime.py:784-797`); it never owns `tm-*` IDs, but the listing must not
-  treat the new directories as unknown.
-- The helper in 2.3 classifies an item it cannot find as `lost`; it never owns `tm-*` IDs
-  either, until it becomes the wrapper of section 10, which reads team receipts instead.
+A different contact has a different dedupe authority (another host's ledger, or a runtime's
+journal), so trying it after an ambiguous attempt could deliver twice: the I2 pattern by another
+road. The rule:
 
-Local `agentctl send --expires/--topic/--supersedes` on ordinary (non-team) IDs is enabled only
-after the same inventory covers every writer of that queue.
+- **A contact is released** (the walk may move on) only when every attempt to it is definitely
+  undelivered: every attempt was refused by `accept`, or failed in a way the route proves
+  preceded hand-over, **or** the receiver has **fenced** the ID.
+- **A fence** is `agent-teams fence ID` on the receiving host: under the ledger lock, if the ID
+  is unknown it writes a `fenced` entry, so any later arrival of that ID, by any route, is
+  refused; if the ID is known it returns its state instead. A fence is how "the receipt says
+  unknown" becomes proof that it will stay unknown: without it, an attempt still in flight (a
+  slow ssh command, a chat post the receiving bridge has not read yet, a pull not yet taken)
+  could land after the sender moved on.
+- **A contact is pinned** once any attempt to it was ambiguous and it cannot be fenced (no route
+  to its host answers), or once it answered `accepted`. A pinned message is never tried on
+  another contact; `pump` keeps asking the pinned contact until it answers or `not_after`
+  passes, and then reports `ambiguous-expired` for a human. This keeps revision 1's rule ("pin
+  once handed over", as `inbox deliver` does) and refines it: a fence can unpin.
+- **Session contacts** have no fence. A session-mode route may declare a `status` operation
+  that reports whether the runtime journaled a key (10.5); with one, an unknown key after the
+  route's declared idempotency window is proof enough to move on; without one, a session contact
+  is pinned by any ambiguous attempt.
 
-### 7.5 agentcloud contacts
+### 9.5 Never two pastes for one ID
 
-No `team accept` runs for an agentcloud contact, so none of 7.1-7.3 applies there: agentcloud's
-journal has no expiry or cancellation. The sender checks `not_after` and the ledger-free topic
-rule from its own outbox immediately before the send, and refuses `--kind hold|resume` to an
-agentcloud contact unless `--allow-unexpiring` is given. A `notify` arrives mid-turn as a system
-reminder, so the I3 delay is shorter there, but it is not zero.
+The drain (agentctl, through the shared library) already moves an item to `inflight/` by atomic
+rename before typing, so two drainers cannot take one item, and an uncertain paste becomes
+`possibly_submitted`, never retyped. For `tm-*` items the drain also checks, just before the
+paste and together with the tombstone and expiry re-check (12.2), that the team ledger does not
+already record the ID as `delivered` from another queue (possible only if a team's coordinator
+moved registries between a crash and its recovery); such an item is moved to `cancelled/` with
+reason `duplicate` and is not typed. The hook deliverer claims an item by rename before printing
+it and records `delivered` before returning the hook's output.
 
-## 8. Safety
+### 9.6 What the coordinator sees if a duplicate slips through
 
-- **Single typist.** Team messaging adds no typing path. Its only effects are a queue item
-  (typed later by agentctl's drain under the host-wide target lock) or an agentcloud journal
-  entry. `team accept` never types (7.3). There is no `herdr` contact kind and no fallback to
-  typing, matching the helper in 2.3.
-- **No impersonation.** Sender identity is proved at outbox write (6.2), re-derived by the
-  receiver for local reach, labelled as asserted by the sending host for remote reach, and
-  rendered by the receiver. The owner is never a sender. Services are registered, verified by
-  cgroup, and labelled as services. agentcloud deliveries never use operator-mode
-  notifications. Body text cannot forge a header or a chat reply marker (6.1).
-- **Scoping.** The receiving team's declaration is authoritative: `accepts_from` lists senders
-  (`team`, `team/agent` or `service:NAME`) with the kinds each may send; the default is nobody,
-  so a team opts in. `limits` cap message size (default 8 KiB; agentcloud allows more, a
-  coordinator's attention does not) and rate per sender per hour. A team's own `may_send_to`,
-  checked by the sender and again by the receiver, keeps a confused coordinator from messaging
-  arbitrary teams.
-- **Threat model.** Every host runs as the same owner, and anything that can run `team accept`
-  on a host could also write that host's queue files directly. The checks protect against
-  confused and stale agents and scripts, not against a hostile process under the owner's
-  account. That is why they are about provenance and freshness, not cryptography, and why a
-  remote proof asserted by the sending host's agentctl is acceptable, provided it is labelled.
-- **Logging.** The sender's and receiver's `team-log.jsonl` record ID, key, sender and its
-  proof, target, contact, each check with its result, outcome, body SHA-256 and byte count. The
-  body itself stays in the outbox and in the queue item, which are already private (0700
-  registry), not in the log.
+Duplicates should not reach a coordinator, but two paths remain where a second sighting is
+possible: a message delivered through a `session` contact and later through a host contact
+after a human resolved an `ambiguous-expired` message, and a body a human pasted by hand. For
+those:
 
-## 9. Chat bridges
+- The header always shows the ID, and a host-side delivery of an ID the ledger already records
+  as delivered (it can only come from a human's explicit `agent-teams redeliver ID`) is rendered
+  `[team message tm-… — ALREADY DELIVERED 13:02Z via link-b; shown again at the owner's request]`.
+- The footer tells the coordinator that an ID it has already handled needs no action, and
+  `agent-teams seen ID` answers "delivered at 13:02Z" from the local ledger.
+- A reply defaults to key `reply:<ID>`, so answering both sightings sends one reply, deduped by
+  the sender's ledger.
+- No footer ever asks the agent to resend anything: the lesson of I2 is that "not sent" said to
+  an agent produces a second send.
 
-- **Bridges beside an `agentctl` contact.** Most coordinators that have a chat bridge share its
-  queue: the bridge delivers owner messages into the same registry queue a team message uses.
-  The `bridges` list on an `agentctl` contact in `teams.yaml` records which bridges the owner
-  expects; the receiver checks them against what is actually running (6.3). A team message is
-  not a chat request: the bridge has no reply route for it, and the typed footer tells the
-  coordinator to answer with `team reply`, not a fenced chat reply.
-- **A `chat` contact.** Posting into a team's channel as the sending team's app identity. Today
-  the Slack provider ignores bot-message subtypes (2.5), so this reaches the people in the
-  channel, not the coordinator. That is still useful: as a last-resort contact ("no agent contact
-  verified for team tools; owner, please look") and as an optional audit mirror
-  (`--mirror-to-chat`). Making it a delivery path would need the bridge to admit specific app
-  senders as team senders with distinct attribution, never folded into `allowed_senders`, which
-  means the owner. It is never posted as the owner.
-- **Bridges sharing a pane (I2).** The rule: every running bridge whose agent resolves to the
-  same pane has its own `reply_alias_range`, and no two overlap. `discover` and `check` report
-  violations; `team accept` reports one in the receipt. Separately (phase 5), `chat run` should
-  refuse to start when another running bridge resolves to the same pane and either has no range
-  or the ranges overlap. The deeper lesson of I2 is that a bridge reporting "not sent" makes an
-  agent resend; a team message footer therefore never asks the agent to resend anything, and a
-  team reply is idempotent by its default key (6.6).
+### 9.7 Tests the implementation must have
 
-## 10. Migration from a per-host coordinators file
+Exactly-once is a property of every interleaving, so example tests are not enough. Phase 3 must
+include a **model-based harness** (a deterministic simulation with a seeded schedule, replayable
+from the seed of any failure, in the style of property-based stateful testing):
 
-The file in 2.3 maps onto `teams.yaml` as one team with one entry per host:
+- **Model:** two to four hosts, teams with one or two entries, contacts of both kinds, two to
+  four routes per host (local, ssh-like, command-like, relay-like), real ledger and queue code
+  on a temporary filesystem, a fake pane that counts pastes per ID, and a fake runtime journal
+  with declared idempotency semantics.
+- **Faults, chosen at random per step:** a route failing before the remote command starts;
+  after it starts but before the answer; with the answer lost; with the command still running
+  after the sender gave up; delayed delivery (a relay post read minutes later, a pull taken
+  late); duplicate delivery by the route itself (a chat helper's repost, a stream replay);
+  partitions that cut one host from some or all routes for a while; receiver crashes (kill at
+  every step of accept: before claim, after claim, after hand-over, before recording `accepted`);
+  drainer crashes before and after the paste; sender crashes between the attempt record and the
+  route call; clock skew between hosts; ledger pruning at the retention horizon; a coordinator
+  rename or registry move mid-flight.
+- **Invariants checked after every step:** at most one enqueue per ID per team across all
+  ledgers and queues; at most one paste per ID in all fake panes; no paste after `not_after`;
+  no attempt on a second contact while the first is pinned; no resend without a preceding
+  receipt that said unknown; every message eventually terminal, `ambiguous-expired`,
+  `possibly_submitted` or `lost`, each visible in a receipt; and, when routes are healthy for
+  long enough before `not_after`, `delivered`.
+- **Real-process cases** for the same faults at the seams a simulation cannot see: `kill -9`
+  of `accept` and `drain` at named failpoints, an ssh connection cut with the remote command
+  running, and an old drainer binary beside a new one (12.4), in both editions where the queue
+  is concerned.
+- **Regression cases named for the incidents:** a slow multi-part relay post retried by the
+  sender (I5), and two bridges sharing a pane with the coordinator replying (I2).
 
-| coordinators/v1 | teams.yaml |
+## 10. Routes: a pluggable layer described in data
+
+### 10.1 Drivers in code, routes in data
+
+The code ships a small fixed set of **drivers**; every **route** is a named instance in
+`routes.d/*.json` (6.3) that picks a driver and fills in everything else. Nothing about a
+particular host, key, runtime or chat workspace is compiled in.
+
+| Driver | Reaches | Envelope travels | Built-in route |
+|---|---|---|---|
+| `local` | `agent-teams accept` on this host, as a child process | stdin | `local` |
+| `ssh` | `agent-teams serve` on a remote host, through OpenSSH, optionally over a managed link | stdin, after a ready banner | none |
+| `command` | anything an argv template can run: in `host` mode, `agent-teams serve` on a remote host (a node-exec command); in `session` mode, an agent-runtime session; in `relay` mode, a post to a chat channel | stdin or one argument, as declared | none |
+
+A route file:
+
+```json
+{
+  "schema": "agent-teams-routes/v1",
+  "comment": "Routes from this host. Private routes go in a separate file that is not published.",
+  "routes": {
+    "link-b": {"driver": "ssh", "target": "host-b.example.net", "...": "section 10.3"},
+    "node-exec-c": {"driver": "command", "mode": "host", "...": "section 10.4"},
+    "cloud-session": {"driver": "command", "mode": "session", "...": "section 10.5"},
+    "relay-coord": {"driver": "command", "mode": "relay", "...": "section 10.6"}
+  }
+}
+```
+
+### 10.2 The contract every host route meets
+
+A `host` route is only a way to run `agent-teams serve VERB` on the target host with an input
+and read its output. The verbs are fixed: `accept`, `receipt`, `fence`, `probe`, `ping`, `pull`,
+`ack`. Every attempt is classified by the driver into one of:
+
+- `answered` (the remote agent-teams spoke the protocol; the JSON answer decides: `accepted`,
+  a known state, `refused`, `fenced`);
+- `not-delivered` (**definite**: the route proves the envelope cannot have reached the remote
+  `accept`);
+- `ambiguous` (everything else).
+
+How a driver proves `not-delivered`:
+
+- **Interactive stdin** (`local`, `ssh`): `serve` prints a ready banner (`agent-teams-serve/1
+  ready <host> <boot_id>`) before it reads anything, and the driver writes the envelope only
+  after it has read the banner. No banner means the envelope was never sent: definite. Once the
+  envelope has been written, a failure is ambiguous. `serve` acts only on a complete,
+  length-prefixed envelope whose SHA-256 matches, so a cut-off write does nothing.
+- **Argument or non-interactive stdin** (`command` routes that cannot hold a conversation): the
+  envelope is in the argv or the first write, so any execution may accept it. Only failures the
+  route's data declares as happening before the command runs (10.4's `pre_exec_failure`) are
+  definite; everything else is ambiguous.
+
+Each attempt record keeps: route, contact, verb, phase reached (`connect`, `banner`, `sent`,
+`answered`), classification, the remote's `boot_id` if seen, duration, exit status, and a
+bounded, redacted stderr excerpt.
+
+### 10.3 ssh, without assuming ambient keys
+
+The owner is "concerned about passwordless ssh and the ability to access the other servers".
+Revision 1, like the helper in 2.3, used whatever ssh access the account happened to have, which
+grants a full shell on the other host to anything that can run ssh. The ssh driver assumes
+nothing ambient:
+
+- **A dedicated key per host pair, restricted to the protocol.** `agent-teams ssh enroll --peer
+  host-b` creates a key under `~/.config/agent-teams/ssh/` (mode 0600) and prints the line for
+  host-b's `authorized_keys`:
+
+  ```
+  command="/home/u/.local/bin/agent-teams serve --stdio --peer host-a",restrict ssh-ed25519 AAAA… agent-teams host-a->host-b
+  ```
+
+  `restrict` disables port, agent and X11 forwarding, the pty and `~/.ssh/rc`; the forced command
+  means the key can run only `serve`, which reads the verb from `SSH_ORIGINAL_COMMAND`, accepts
+  only the fixed verbs, and records `--peer host-a` as the authenticated origin of everything it
+  receives. A `from="..."` option may be added. agent-teams never edits `authorized_keys`; the
+  owner installs the line.
+- **No user ssh configuration by default.** The driver runs OpenSSH with `-F none` and explicit
+  options: `BatchMode=yes` (never prompt), `IdentitiesOnly=yes` with the route's key,
+  `IdentityAgent=none`, `StrictHostKeyChecking=yes` with a known-hosts file of its own (filled at
+  enrollment from a fingerprint the owner confirms), `ForwardAgent=no`, `ClearAllForwardings=yes`,
+  `ConnectTimeout`, `ServerAliveInterval` and `ServerAliveCountMax`. A route may opt into the
+  user's own configuration and agent (`"use_user_ssh_config": true`, for example to inherit a jump
+  host), which is labelled in `teams show`.
+- **Attribution gets better, not worse.** Because the key is bound to a peer, the receiver knows
+  which host's agent-teams handed it the envelope: "proved on host-b, via the host-b key".
+- **A host key mismatch** disables that route (never `accept-new` after enrollment) and is
+  reported as a finding on every send until the owner re-enrolls; other routes to the host may
+  still be used, since each authenticates independently.
+
+**The managed link (optional).** A persistent connection avoids paying ssh setup on every
+receipt query and gives a health signal:
+
+```json
+"link-b": {
+  "driver": "ssh",
+  "target": "host-b.example.net",
+  "user": "u",
+  "identity": "~/.config/agent-teams/ssh/host-a-to-host-b",
+  "known_hosts": "~/.config/agent-teams/ssh/known_hosts",
+  "link": {"mode": "persistent", "ping_seconds": 30, "down_after_failures": 3,
+           "backoff_seconds": [5, 30, 120, 600]},
+  "direction": "push",
+  "capabilities": {"max_envelope_bytes": 65536}
+}
+```
+
+- `link.mode`: `none` (a fresh connection per operation), `on-demand` (an OpenSSH ControlMaster
+  opened on first use with `ControlPersist` for an idle period, so nothing lingers), or
+  `persistent` (kept up by `agent-teams link run ROUTE`, an autossh-style supervisor: it runs the
+  ControlMaster in the foreground, pings with `serve ping` through it, and reconnects with
+  backoff). The control socket is `$XDG_RUNTIME_DIR/agent-teams/links/<route>.sock`; every
+  operation is a new session channel on it, each still subject to the forced command.
+- **Lifecycle.** `persistent` links are run by a user unit the owner installs; agent-teams
+  prints a unit file or `systemd-run` line and never runs `systemctl` itself. `link up`, `link
+  down` and `link status` act on the socket; stopping the supervisor closes the master.
+- **Health.** The supervisor writes `$XDG_STATE_HOME/agent-teams/links/<route>.json`: `state`
+  (`up`, `degraded`, `down`), `since`, `last_ok`, round-trip time, consecutive failures, last
+  error, and the peer's `boot_id` (a change means host-b rebooted). `teams check` and `send`
+  read it.
+- **When the link is down.** A link known down (state fresher than twice the ping interval) is
+  skipped without an attempt, which is definite; the walk goes on to the next route. With no
+  usable route the message is `deferred` and `pump` retries. A link that drops mid-attempt
+  makes that attempt ambiguous, resolved as in 9.3.
+
+**One-way reachability: pull, not a reverse tunnel.** Where host-b can reach host-a but not the
+reverse, host-b runs the link to host-a with `"direction": "pull"`. host-b's supervisor keeps a
+long poll open, `serve pull --for <host-b's teams> --wait 300`, which returns as soon as host-a's
+outbox holds a message for one of them. host-b runs `accept` locally and returns the result with
+`serve ack ID STATE`. host-a records each offer; an offer without an ack is ambiguous, and
+host-a offers the same ID again (host-b's ledger absorbs it). Since host-a cannot reach host-b
+to fence, a message offered to host-b is pinned to it (9.4). This needs only an outbound
+connection from host-b and the same restricted key. A reverse port forward (`ssh -R` of a
+socket, with a listener on host-b) would also work, but adds a listening service and a
+`permitlisten` grant for no gain; it is not proposed.
+
+**Hosts where ssh is refused** get no ssh route: a `command` route (10.4), a chat relay (10.6),
+pull from the other side if that host can ssh out, or a session contact. With none, `teams
+check` reports `no-route` for the entry.
+
+### 10.4 The command transport, and company-internal channels as data
+
+The owner: "Agentcloud is another interesting route between servers, but it's internal to one
+company, so we would need a very flexible description of it in a data file to keep it outside
+the code." The `command` driver is that description's interpreter. It knows argv templates,
+exit-code tables, JSON pointers and capability flags; it knows nothing about any runtime. Every
+company-internal channel (a node-exec command, a runtime's session messaging) is a `command`
+route in a private route file.
+
+**Host mode** (runs `agent-teams serve` on the target host):
+
+```json
+"node-exec-c": {
+  "driver": "command",
+  "mode": "host",
+  "comment": "The runtime's node-exec command; ssh is refused on host-c.",
+  "argv": ["{vars.tool}", "node", "exec", "--node", "{host.address}", "--", "{remote...}"],
+  "vars": {"tool": "/usr/local/bin/example-runtimectl"},
+  "host_address": {"host-c": "host-c.example.net"},
+  "remote": "argv",
+  "envelope": "probe",
+  "interactive": false,
+  "timeout_seconds": 60,
+  "environment": {"pass": ["EXAMPLE_TLS_CERT", "EXAMPLE_TLS_KEY"], "set": {}},
+  "outcome": {
+    "pre_exec_failure": [
+      {"exit": 2, "stderr_regex": "^error: node .* not found", "comment": "documented: checked before dispatch"},
+      {"exit": 3, "stderr_regex": "^error: not authorized", "comment": "documented: checked before dispatch"}
+    ]
+  },
+  "capabilities": {"max_argument_bytes": 131072}
+}
+```
+
+**Templates.** Placeholders are drawn from a fixed set: `host.name`, `host.address`, `vars.*`,
+`contact.*`, `message.id`, `message.key`, `message.bytes`, `sender.team`, `sender.session`,
+`idempotency_key`, `envelope_base64`, `body_file`, and the splice `{remote...}`. An unknown
+placeholder is a load error. A placeholder fills part or all of one argv element and never
+causes word splitting; there are no conditionals and no expressions. `remote` says how the
+remote command reaches the transport: `argv` (spliced as separate elements) or `shell` (the
+transport takes one shell string, such as `sh -c "{remote}"`; agent-teams quotes it itself).
+`environment` passes only the named variables (paths, never secrets), the way the chat bridge
+scrubs its helpers' environment.
+
+**Outcome.** Exit status 0 with a protocol answer on stdout is `answered`. Only the declared
+`pre_exec_failure` entries are `not-delivered`; anything else is `ambiguous`. A route with no
+such entries can never prove non-delivery, which is safe: it is pinned on ambiguity and resolved
+by a receipt over any route.
+
+**Envelope.** `stdin`, `argument` (`envelope_base64`), or `probe`: `teams discover` sends a
+known string and records whether stdin arrived (2.4 left this unverified), and the route uses
+stdin only when it did.
+
+**Session mode** (an agent-runtime session as the destination, 10.5) and **relay mode** (a chat
+post, 10.6) use the same machinery with named operations instead of one argv.
+
+### 10.5 Session routes: agent-runtime sessions such as agentcloud
+
+A session contact is used when the coordinator is a runtime session that no host-side
+agent-teams serves (I1's coordinator, before anyone registered it). When the session is
+registered (`agentctl attach-self`, or `agent-teams init --coordinator-self` inside it), the
+host contact is preferred: that host's agent-teams verifies it and its deliverer sends through
+the runtime locally.
+
+```json
+"cloud-session": {
+  "driver": "command",
+  "mode": "session",
+  "comment": "Session-to-session messaging of the company's agent runtime.",
+  "operations": {
+    "deliver": {
+      "argv": ["{vars.tool}", "send-message", "--session", "{sender.session}",
+               "--to", "{contact.session}", "--idempotency-key", "{idempotency_key}", "--body-file", "{body_file}"],
+      "outcome": {"pre_exec_failure": [{"exit": 2, "stderr_regex": "^usage:"}]}
+    },
+    "inspect": {
+      "argv": ["{vars.tool}", "inspect", "--session", "{contact.session}", "--json"],
+      "fields": {"exists": "/exists", "owned": "/owned_by_caller", "halted": "/halted",
+                 "archived": "/archived", "title": "/title"}
+    },
+    "status": {
+      "argv": ["{vars.tool}", "message-status", "--session", "{contact.session}", "--idempotency-key", "{idempotency_key}", "--json"],
+      "fields": {"known": "/found", "state": "/state"},
+      "comment": "Omit if the runtime has no such query; the contact is then pinned on ambiguity."
+    }
+  },
+  "vars": {"tool": "/usr/local/bin/example-runtimectl"},
+  "identity": {
+    "sender": {"requires": "session", "session_from_env": "EXAMPLE_SESSION_ID"},
+    "target_check": {"field": "title", "equals": "{contact.expect_title}"}
+  },
+  "attribution": "transport",
+  "authority": "peer",
+  "idempotency": {"native": true, "scope": "target-session", "same_key_other_body": "first-wins",
+                  "window_seconds": 86400, "keyless_retry_may_duplicate": true},
+  "capabilities": {"stdin": false, "max_body_bytes": 65536, "arrives_mid_turn": true,
+                   "expiry": false, "cancel": false, "halted_detection": true}
+}
+```
+
+What the code does with each field, without knowing what runtime it is:
+
+- **`identity` and `attribution`.** `transport` means the runtime itself names the sending session
+  to the receiver, so the sender is proved by the runtime (8.2); `header` means the runtime
+  attributes the message to the owner or a generic tool, so the only attribution is the rendered
+  header, labelled "asserted". `target_check` is the identity check of the destination, from the
+  `inspect` fields (question 7).
+- **`authority`.** `peer` (an ordinary message) or `operator` (a directive, such as a runtime's
+  system-notification mode). The code refuses an `operator` route unless the sender is a
+  registered service *and* the receiving team's declaration grants that service `authority:
+  operator` (question 6). Coordinators never send with operator authority.
+- **`idempotency`.** Whether the runtime takes a key, its scope and window, and what it does with
+  a reused key and a different body. With `same_key_other_body: first-wins` the code refuses to
+  reuse a key with a new body (8.1 already does). `keyless_retry_may_duplicate` forbids any retry
+  without the key.
+- **`capabilities`.** `expiry: false` and `cancel: false` mean no tombstone can stop a message
+  once delivered to the runtime, so the sender checks `not_after` and the topic rule from its own
+  outbox immediately before `deliver`, and refuses `--kind hold|resume` unless
+  `--allow-unexpiring` is given. `halted_detection` makes the sender run `inspect` after
+  `deliver` and report `journaled-halted`. `max_body_bytes` bounds the body; `stdin: false` means
+  the body goes by `body_file`.
+- **Verification at delivery time.** `inspect` before `deliver` (exists, owned, not halted or
+  archived, title matches) and after it. This is the runtime's own record of its session, the
+  analogue of the receiving host's agentctl (principle 1); it is not a remote reading of panes.
+
+### 10.6 The chat relay: an opportunistic route between coordinators
+
+The owner: "explore whether any chat bridge could be used as another route between coordinators,
+but it would have to be opportunistic, because we need to make sure our components can be used
+individually."
+
+**Shape.** Both teams' coordinators already have chat bridges. The owner creates a shared
+channel (say `#coord-relay`) and marks it as a **relay channel** in each bridge's configuration.
+A message travels:
+
+1. On host-b, `agent-teams send tools` (or `pump`) picks route `relay-coord`. Its `post`
+   operation runs host-b's chat outbound helper (the same helper the bridge uses, named in the
+   route's data) to post into the channel, as host-b's bridge app, one post containing a short
+   human-readable line and the envelope as compact JSON in a code block. The helper's operation
+   UUID is derived from the message ID, so the helper's own idempotency applies.
+2. On host-a, the bridge sees the post in a relay channel from an admitted **peer sender**
+   (below). It does not type it. It pipes the post's text to the relay channel's configured
+   command, `agent-teams accept --via relay:relay-coord --peer-sender <user id>`, and that
+   host's agent-teams does everything a host route would: verify, claim in the ledger, hand to
+   the deliverer.
+3. host-a's bridge reacts to the post (accepted or refused) and posts the receipt JSON in the
+   post's thread; host-b's bridge, which admits host-a's bridge the same way, pipes it to
+   `agent-teams relay-receipt`, which updates the outbox.
+
+**What has to change in the bridge, and why.** Today the relay cannot work: the Slack provider
+drops `bot_message` subtypes and every sender outside `allowed_senders`, and a bridge's posts
+come from its app's bot user (2.5). Adding the peer bot to `allowed_senders` is not an option:
+that list means "the owner", and the peer's posts would become owner-authority prompts typed into
+the coordinator. So a relay channel needs a separate, narrower admission class, generic enough to
+belong to the bridge rather than to teams:
+
+- a `relay_channels` entry in the bridge configuration: `{channel, peer_senders: {<user id>:
+  <label>}, command: [argv]}`;
+- in a relay channel, only posts from listed peer sender IDs are admitted (and, if the
+  provider delivers the peer's posts with the `bot_message` subtype, that subtype is admitted
+  there only; which form arrives is unverified and the enrollment probe records it);
+- admitted relay posts are never typed and never prompts; they go only to the command, on stdin;
+- owner messages in a relay channel are not requests (a relay channel is not also an owner
+  channel); the bridge reacts to them as refused.
+
+A provider that cannot deliver posts from other apps cannot carry a relay, and the route is
+simply not offered there.
+
+**Attribution.** The receiver labels the sender "asserted by sim's bridge (app user U) in
+#coord-relay". The chat provider vouches that the post came from that bot user, which a person in
+the channel cannot forge; the agent-level claim inside the envelope is the sending host's
+assertion, as on other remote routes. If two teams' bridges post as the same app, the poster
+identifies only "one of the owner's bridges"; one app (or bot user) per team is recommended
+(question 15).
+
+**Dedupe.** Relay posts can appear more than once: the sender's helper may repost after an
+uncertain outcome (2.5), and a bridge's rescan or a replayed stream can present one post twice.
+None of that matters for delivery, because every copy carries the same ID and ends at the same
+ledger (9.2); the channel may show a duplicate post, the coordinator never sees one. The relay
+route still asks the helper not to repost on its own: an uncertain post is resolved by the
+receipt in the thread, or by a receipt over a host route, never by a new post.
+
+**Limits.** One post per envelope: an envelope larger than the route's `max_envelope_bytes`
+(below the helper's 11,000-byte chunk size) is a definite `not-delivered` at the sender, nothing
+is posted, and the walk moves on. Multi-part posts are where I5 went wrong, and a relay envelope
+is never split. Bodies are visible to every channel member, so `--private` messages never take a
+relay route (question 16). Latency is that of two bridges; if host-a's bridge is down, the post
+waits in the channel and may be read after `not_after`, in which case `accept` records it
+`expired`.
+
+**Why it stays optional.**
+
+- Each bridge works exactly as today without a `relay_channels` entry, and agent-teams works
+  without any chat bridge; neither binary links the other (4.3).
+- A relay route is offered only when the sender's route data names it, the receiving host's
+  declaration lists it in `relay_channels`, and the last probe saw both bridges running with
+  that channel. Otherwise it is skipped, which is definite.
+- It ends at the same `accept` and ledger as every other route, so it can be used as a fallback,
+  or with a host route for receipts and fences: a fence written over ssh also bars a relay post
+  the bridge has not read yet (9.4).
+
+## 11. Route selection, fallback and failure reporting
+
+### 11.1 The walk
+
+For a message to `TEAM[@HOST]` (entry chosen as in question 2):
+
+1. **Contacts in declaration order.** For each contact not yet released or pinned elsewhere:
+2. **Candidate routes.** For a `host` contact, the entry host's `routes` list in order; for a
+   `session` contact, its one route. Drop, without an attempt (each a definite skip, recorded):
+   routes whose driver is unavailable here, whose link is known down, whose capabilities do not
+   fit (envelope too large, stdin required but absent), which expose the body when the message
+   is `--private`, and relay routes the receiver has not advertised.
+3. **Attempt** `accept` (or `deliver`) over the first candidate.
+   - `answered: accepted` or a known state: pinned to this contact; done for now.
+   - `answered: refused`: definite; the contact is released only if the refusal is about the
+     contact (verification, `remote-too-old`); a policy or conflict refusal ends the message as
+     `refused`, since another contact of the same team would apply the same policy.
+   - `not-delivered`: try the next candidate route for the same contact.
+   - `ambiguous`: stop the walk. Resolve by `receipt` over the candidates in order (9.3); unknown
+     leads to a resend to the same contact; no answer leaves the message `ambiguous` for `pump`.
+4. **Next contact** only when the current one is released: every attempt definite and
+   undelivered, or fenced (9.4).
+5. With no contact left, the message is `deferred` (some route might come back) or `refused`
+   (every contact refused); `pump` retries `deferred` until `not_after`.
+
+Two `pump` processes never work one message at once: each outbox entry has its own lock, and the
+attempt record is written before the route runs (the helper's rule in 2.3).
+
+### 11.2 Default order
+
+The owner's file orders routes per host; the recommended default puts the cheapest verified route
+first: `local`, then a persistent ssh link, then plain ssh, then a host-mode command route, then
+a relay. Session contacts come after host contacts. A relay is never first unless it is the only
+route, because its latency is two bridges and its receipts are slower.
+
+### 11.3 Failure reporting
+
+- `send` prints the walk as a table: contact, route, verb, phase reached, classification, reason,
+  and age of the route's health state. For example: `host@host-b link-b skipped (link down since
+  12:40Z, 3 failures)`, `host@host-b relay-coord posted; accepted 13:00:12Z`.
+- Receipts carry the receiver's findings (stale-bridge, shared-pane-bridge, `queued-no-drainer`,
+  `hook-only`, backlog depth and age of the oldest pending item).
+- `teams check` shows per-route health: link state, last success, last definite failure, last
+  ambiguous attempt.
+- `team-log.jsonl` on each side records every attempt and check (13).
+- Exit status follows 16's table; the JSON `state` is the full answer.
+
+### 11.4 What each route verifies, and by whom
+
+| Route | Coordinator verified by | Sender proof as rendered | Ambiguity resolved by | Cancellation after hand-over |
+|---|---|---|---|---|
+| `local` | this host's agent-teams and agentctl (8.3) | re-derived by the receiver | not needed (child process) | tombstone (12.2) |
+| `ssh` (with or without link) | the receiving host's agent-teams and agentctl | "proved on host-b, via the host-b key" | `receipt` over any route; `fence` | tombstone |
+| `ssh` pull | the puller's own agent-teams and agentctl | "pulled from host-a's outbox over link-a" | re-offer of the same ID; ack | tombstone |
+| `command`, host mode | the receiving host's agent-teams and agentctl | "proved on host-c, via node-exec-c" | `receipt` over any route; `fence` | tombstone |
+| `command`, relay mode | the receiving host's agent-teams and agentctl, invoked by its bridge | "asserted by sim's bridge in #coord-relay" | receipt in thread, or over a host route; `fence` over a host route | tombstone |
+| `command`, session mode | the runtime's own `inspect`, before and after | the runtime's attribution, or "asserted" | the route's `status` operation if declared; else pinned | none (runtime has no expiry or cancel) |
+
+## 12. Agents that only take input when idle
+
+I3 is not a transport failure; the message was delivered exactly as designed, hours after it meant
+anything. The fix belongs in the queue, and it helps local sends too. These are generic queue
+features of the shared library and agentctl's drain (4.3); they know nothing about teams except
+that some items carry the fields.
+
+### 12.1 Expiry, topics, supersede, retract
+
+- **Expiry.** A queue item may carry `not_after` (Unix ms). Every team message has one: `--ttl` or
+  `--expires`, else the receiving team's `default_ttl_seconds`, else 2 h, never beyond
+  `max_ttl_seconds` (9.2).
+- **Topics, by the sender's order.** `--topic SLUG` makes the newest message in a topic from one
+  sender team supersede older ones from that team not yet typed. "Newest" is the sender's
+  `(created_at, host, seq)`, not arrival order. A message older than the newest the ledger has
+  seen on its topic, **in any state, delivered included**, starts `superseded` and is never
+  queued, so a `hold` deferred at 13:00 and delivered at 13:10, after a `resume` created at 13:05
+  was typed, is dropped. Across hosts, two messages within the skew tolerance (default 2 s) are
+  both delivered, with a warning. Local `agentctl send --topic` uses the namespace
+  `local:<sender>`.
+- **Explicit supersede.** `--supersedes KEY` cancels a specific earlier message if not yet typed;
+  too late is reported.
+- **Retract.** `agent-teams retract ID` cancels the message if not yet typed.
+- **Visible backlog.** `accept` reports queue depth and the oldest pending item's age, and `send`
+  prints it ("3 messages already waiting, oldest 2 h; target is idle-only"), the signal I3
+  lacked.
+
+### 12.2 Cancellation without the delivery lock
+
+A drain holds the delivery lock while it waits for a busy pane (2.1), exactly the I3 window, so
+cancellation is a **tombstone**: `queue/cancel/<id>.json`, written by atomic rename with no queue
+lock. The drain re-reads an item's tombstone, `not_after` and (for `tm-*`) ledger state **after**
+readiness and immediately before the paste, under the target lock, and moves a cancelled,
+expired or duplicate item to `queue/cancelled/` with the reason instead of typing it. A tombstone
+that arrives after the paste is too late, and the receipt says so. A new message on a topic
+writes the tombstones for older ones before it is itself enqueued.
+
+### 12.3 Who drains, and never `accept`
+
+`accept` claims, hands over and returns; it never types. Typing from `accept` would hold the
+delivery and target locks across a readiness wait inside an ssh session that can drop, and would
+type any chat prompt ahead of it without the bridge's read-before-typing check. Team items in an
+agentctl queue are typed by the drainers that already serve it (a bridge, `watch-agents`, a human
+`agentctl send`) once their binaries understand the lane (12.4), or by `agent-teams drain` from a
+timer on hosts with no such drainer. `agent-teams drain` calls the shared library's drain with
+bounds (`--deadline`, `--lock-timeout`, `--max-items`, the flags the helper in 2.3 asks for, added
+to agentctl as a prerequisite), types only `tm-*` items, and only while the head of the queue is
+one; with a chat prompt ahead, it leaves the queue to the bridge and reports
+`waiting-behind-chat`. Whether this local typing should live in `agent-teams drain` or only in
+`agentctl drain --only-prefix tm-` is question 13's second half; either way it is the receiving
+host's own process (principle 1).
+
+### 12.4 Older drainers must not see what they cannot honour
+
+Old binaries ignore unknown JSON fields, so a marker inside an item refuses nothing: a pinned
+bridge, watcher, helper or rollback binary would type an expired `hold`. Items with team fields
+therefore go to a new lane, `queue/inbox.v2/`, which binaries before phase 2 never list. New
+drainers merge `inbox/` and `inbox.v2/` in enqueue order. Until a queue's drainers are new, its
+`inbox.v2/` items are typed only by the bounded team drain, and `accept` says so in the receipt
+when it finds a running drainer whose binary predates the lane (`agentctl capabilities` on that
+path). Every consumer that hardcodes the four phases must learn `inbox.v2/`, `cancel/` and
+`cancelled/`: agentctl's enqueue duplicate check and `message_state` (`agent.rs:1422`, `1839`) in
+both editions; the Python chat runtime's re-enqueue of a `received` item it cannot find
+(`py/agentctl/chat_runtime.py:784-797`); and the helper in 2.3. Local `agentctl send
+--expires/--topic/--supersedes` is enabled only after that inventory covers every writer.
+
+## 13. Safety
+
+- **Single typist, local only.** Team messaging adds no typing path and no remote one. Its only
+  effects are a ledger entry and a hand-over to a local deliverer (typed later by the receiving
+  host's drain under the host-wide target lock, or read by a hook), or a runtime journal entry.
+  No route reaches a remote Herdr (principle 1).
+- **No duplicates by construction** (9): one ID, a durable claim before hand-over, no second
+  contact without proof, no resend without asking, no second paste.
+- **No impersonation.** Senders are coordinators proved by ancestry or registered services proved
+  by cgroup (8.2); remote proofs are labelled with what the route authenticated; the owner is
+  never a sender; operator authority needs an explicit grant to a service; body text cannot
+  forge a header or a chat reply marker.
+- **Least access between hosts.** No ambient ssh: a dedicated key per host pair, restricted by a
+  forced command to the protocol's verbs, with its own known-hosts file (10.3). Command routes
+  pass only named environment variables.
+- **Scoping.** The receiving declaration's `accepts_from` (default nobody), `may_send_to`, size
+  and rate limits.
+- **Threat model.** Every host runs as the same owner, and anything that can run `accept` on a
+  host could write its queue files directly. The checks protect against confused and stale agents
+  and scripts, and the restricted keys limit what a leaked key can do; neither protects against
+  a hostile process under the owner's account on the receiving host.
+- **Logging.** Both sides' `team-log.jsonl` record ID, key, sender and proof, target, contact,
+  route, each check and attempt with its classification, outcome, body SHA-256 and byte count.
+  The body stays in the outbox, ledger-adjacent queue item or inbox, all private (0700), not in
+  the log.
+
+## 14. Chat bridges beside a coordinator
+
+- **Bridges sharing the coordinator's queue.** Most coordinators with a bridge share its queue.
+  The receiver checks the running bridges against what it expects (7, 8.3). A team message is not
+  a chat request: the bridge has no reply route for it, and the footer tells the coordinator to
+  answer with `agent-teams reply`, not a fenced chat reply.
+- **Visibility.** A sender may mirror a message to a channel for people (`--mirror-to-chat`,
+  through a relay-mode route's `post` operation, marked as a mirror so no bridge relays it). That
+  is for people only, never a delivery, and never posted as the owner.
+- **Bridges sharing a pane (I2).** Every running bridge whose agent resolves to the same pane must
+  have its own `reply_alias_range`, with no two overlapping. `discover`, `check` and receipts
+  report violations; separately, `chat run` should refuse to start when another running bridge
+  resolves to the same pane and either has no range or the ranges overlap. This belongs to the
+  bridge, whichever binary it ends up in.
+
+## 15. Migration
+
+### 15.1 From a per-host coordinators file
+
+The file in 2.3 maps onto `teams.json` as one team with one entry per host:
+
+| coordinators/v1 | teams.json |
 |---|---|
 | `hosts.<short>` | `hosts.<short>` and an entry `{host: <short>}` in the project's team |
-| `fqdn`, `ssh` | `reach: ssh`, `ssh: <ssh or fqdn>`; `reach: exec` added by hand where ssh is refused |
-| `herdr` | `hosts.<short>.herdr` |
-| `coordinator.name` | the entry's `coordinator` (informational; the declaration is authoritative) |
-| `coordinator.harness` | dropped; the record says which harness runs |
-| contact `agentcloud` `session`, `url` | contact `agentcloud` `session`; URL dropped |
-| contact `agentctl` `agent`, `registry` | contact `agentctl` `agent`, `registry` |
-| `bin`, `herdr_bin` | `hosts.<short>.agentctl`, `herdr` (per host, not per contact) |
-| `bridge_unit` | `bridges: [{unit: ...}]` on the contact |
-| `workspace`, `tab` | dropped; `discover` reports them live |
+| `fqdn`, `ssh` | an `ssh` route in `routes.d` (with `use_user_ssh_config: true` until `ssh enroll` has run); a `command` route by hand where ssh is refused |
+| `herdr` | dropped: agent-teams never calls Herdr; the receiving host's agentctl knows its own |
+| `coordinator.name` | the entry's `coordinator` (informational) |
+| `coordinator.harness` | dropped; the declaration designates the coordinator |
+| contact `agentcloud` `session`, `url` | a `session` contact with a session-mode route; URL dropped |
+| contact `agentctl` `agent`, `registry` | a `host` contact; `registry` goes into that host's declaration (`deliverer.registry`) |
+| `bin`, `herdr_bin` | `hosts.<short>.agent_teams` |
+| `bridge_unit` | dropped from the sender's data; the receiving host's probe finds bridges |
+| `workspace`, `tab` | dropped; the receiving host reports them |
 | contact `herdr` | not mapped; reported and dropped |
 
-`agentctl teams import --coordinators-file FILE --team NAME` prints the converted entries for
+`agent-teams import --coordinators-file FILE --team NAME` prints the converted files for
 review; it does not write.
 
-The helper then becomes a thin wrapper: it keeps its command line, its dedupe and
-`--repeat-after` memory, tick-report digests and `resolve`, and replaces its transport (contact
-walk, bridge path resolution, ssh, queue settling) with
+The helper becomes a thin wrapper: it keeps its command line, dedupe and `--repeat-after` memory,
+digests and `resolve`, and replaces its transport with
 
 ```
-agentctl team send <team>@<host> --from-service tick-hub --key <key> --ttl <t> --kind info \
+agent-teams send <team>@<host> --from-service tick-hub --key <key> --ttl <t> --kind info \
     --allow-undeclared --file - --json
 ```
 
-mapping receipt states onto its outcomes: `delivered` → delivered, `accepted` → queued,
-`deferred` → deferred, `possibly_submitted` → possibly_submitted, `lost` → lost, `refused` →
-not-enqueued, `expired`/`superseded` → expired. `--allow-undeclared` lets it work on hosts that
-have no declaration yet. Its 50 s bounded run fits, because `team accept` only enqueues.
+mapping states onto its outcomes (`delivered`, `accepted` → queued, `deferred` and `ambiguous` →
+deferred, `possibly_submitted`, `lost`, `refused` → not-enqueued, `expired`/`superseded` →
+expired). `--allow-undeclared` lets it work on hosts with no declaration yet: an explicit
+registry from the import is used, the receipt and both logs carry `unverified-team`, and the
+option is removed one release after phase 5. Its alerts to agentcloud sessions arrive today as
+`[operator]` directives and would become peer-level unless the receiving team grants it operator
+authority (question 6).
 
-One behaviour changes and needs the owner's decision (question 6): its agentcloud alerts arrive
-today as `[operator]` directives, and through `team send` they would arrive as peer-level
-`cli-script` messages.
+### 15.2 From revision 1
 
-## 11. CLI summary
+Nothing was implemented, so only the documents change: `teams.yaml` becomes `teams.json` plus
+`routes.d`; `REGISTRY/team.json` becomes `teams.d/<team>/declaration.json` plus the registry's
+own coordinator designation; `reach: local|ssh|exec` becomes named routes; the `agentcloud`
+contact kind becomes a `session` contact on a data-described route; the `chat` contact becomes a
+relay route; `agentctl team(s) ...` becomes `agent-teams ...`.
+
+## 16. CLI summary
 
 ```
-agentctl teams show [TEAM] [--json]                        # parsed file + freshness
-agentctl teams check [TEAM[@HOST]]... [--json]             # verify every contact; exit 1 if an entry has none
-agentctl teams discover [--host H]... [--apply] [--json]   # probe hosts, propose a diff, findings
-agentctl teams import --coordinators-file FILE --team NAME # convert, print only
-agentctl teams probe --json                                # (runs on the target) read-only facts for discover
+agent-teams show [TEAM] [--json]                        # parsed files + freshness
+agent-teams check [TEAM[@HOST]]... [--strict] [--json]  # verify contacts and routes
+agent-teams discover [--host H]... [--apply] [--json]   # probe hosts, propose a diff, findings
+agent-teams import --coordinators-file FILE --team NAME # convert, print only
 
-agentctl team init TEAM [--coordinator NAME]               # write REGISTRY/team.json and teams.d/TEAM
-agentctl team send TEAM[@HOST] --file F [--key K] [--topic T] [--supersedes K]... [--ttl D] [--kind K] [--wait S] [--json]
-agentctl team reply ID --file F [--key K]
-agentctl team retract ID
-agentctl team status ID | outbox | pump | pull --for TEAM
-agentctl team accept --protocol 1 [--team T] (--envelope - | --envelope-base64 B)   # (target) enqueue only
-agentctl team receipt ID                                   # (target) lock-free read of the ledger and queue
-agentctl team drain [--deadline S] [--lock-timeout S] [--max-items N]               # (target) types tm-* only
+agent-teams init TEAM (--registry R | --coordinator-self) [--deliver agentctl-queue|hook-inbox|command]
+agent-teams send TEAM[@HOST] --file F [--key K] [--topic T] [--supersedes K]... [--ttl D] [--kind K] [--private] [--wait S] [--json]
+agent-teams reply ID --file F [--key K]
+agent-teams retract ID
+agent-teams status ID | outbox | pump | pull --for TEAM
+agent-teams seen ID                                           # local ledger: has this ID been delivered here?
+agent-teams redeliver ID                                      # human only: show a delivered message again, marked as such
+agent-teams hook                                              # harness hook for the hook-inbox deliverer
+agent-teams drain [--deadline S] [--lock-timeout S] [--max-items N]   # (target) types tm-* only
 
-agentctl send NAME --file F [--expires TIME] [--topic T] [--supersedes ID]   # after 7.4's inventory
+agent-teams ssh enroll --peer HOST                            # make a key; print the authorized_keys line
+agent-teams link run ROUTE | up ROUTE | down ROUTE | status [ROUTE]
+
+agent-teams serve --stdio --peer HOST                         # (target) forced command: accept, receipt, fence, probe, ping, pull, ack
+agent-teams accept --protocol 1 [--team T] [--via relay:ROUTE --peer-sender ID] (--envelope - | --envelope-base64 B)
+agent-teams receipt ID | fence ID | probe --json              # (target) lock-free reads; fence under the ledger lock
+
+agentctl send NAME --file F [--expires TIME] [--topic T] [--supersedes ID]   # generic queue features, after 12.4
 ```
 
-Global: `--teams FILE` (default `$AGENTCTL_TEAMS`, then `$XDG_CONFIG_HOME/agentctl/teams.yaml`).
+Global: `--teams FILE` (default `$AGENT_TEAMS_FILE`, then
+`$XDG_CONFIG_HOME/agent-teams/teams.json`) and `--routes DIR`.
 
-Exit status follows `agentctl send`; the JSON `state` field is the full answer:
+Exit status follows `agentctl send`:
 
 | Exit | Meaning | Safe to re-run the same command? |
 |---|---|---|
 | 0 | `delivered` | yes; it reports the same state |
-| 75 | not settled: `accepted`, `deferred`, `awaiting-pull`, or `--wait` ended first | yes; the key makes it a retry |
-| 76 | uncertain: `possibly_submitted`, `lost`, or a handover whose outcome is unknown | yes, it never resends; a human resolves |
-| 65 | terminal and undelivered: `expired`, `superseded`, `retracted`, `refused`, `journaled-halted`, retract too late, or every contact refused (including `remote-too-old`) | yes; nothing new is sent |
-| 2 | usage or configuration, including a team command run in an edition that lacks it | n/a |
+| 75 | not settled: `accepted`, `deferred`, `awaiting-pull`, or `--wait` ended first | yes; the ID makes it a retry |
+| 76 | uncertain: `ambiguous`, `ambiguous-expired`, `possibly_submitted`, `lost` | yes; it asks, it never resends blind |
+| 65 | terminal and undelivered: `expired`, `superseded`, `retracted`, `refused`, `fenced`, `journaled-halted`, retract too late, every contact refused | yes; nothing new is sent |
+| 2 | usage or configuration | n/a |
 
-## 12. Phased plan
+## 17. Phased plan
 
-1. **Read-only model (P1).** `teams.yaml` parser, `teams show`, `teams probe`, `teams check`,
-   `teams discover` (proposal only), `teams import`. Addresses I1 (unregistered coordinator
-   panes surface), I2 and I4 (shared-pane and stale bridges surface) with no change to delivery.
-2. **Queue lanes and cancellation (P2).** `inbox.v2/`, `cancel/` tombstones, `cancelled/`,
-   `not_after`, the merge in both editions, the pre-paste re-check, and the consumer inventory of
-   7.4, with cross-edition differential cases (including an old drainer that must not see
-   `inbox.v2/`, and a tombstone written while a drainer waits).
-3. **Team delivery (P3).** Bounded drain flags (`--deadline`, `--lock-timeout`, `--max-items`) as
-   a prerequisite; `team init` and the declaration (plus `rename`/`restore` updating it); the
-   ledger; `team accept`, `team receipt`, `team drain`; `team send` over local, ssh and exec;
-   outbox, pinned contact walk, `status`/`outbox`/`pump`/`retract`; sender proof for unboxed and
-   coordinator-boxed senders, with a test per mode.
-4. **Replies and policy (P4).** `team reply`, `pull`, `accepts_from` with kinds, `may_send_to`,
-   size and rate limits, service registration, both logs, retention.
-5. **Migration and bridges (P5).** The helper in 2.3 as a wrapper; `chat` contact (visibility and
-   last resort); the shared-pane range check in `chat run`.
+1. **P0: extract the shared library.** Queue format, enqueue duplicate check, harness identity
+   and ancestry into `agent-queue`, with agentctl switched to it and no behaviour change; the
+   Python edition documented against the same format. (Coordinated with the suite-factoring
+   lane's audit.)
+2. **P1: read-only model.** `teams.json` and `routes.d` parsers with schema and comment handling,
+   `teams show`, `probe`, `check`, `discover` (proposal only), `import`. Surfaces I1, I2 and I4
+   with no change to delivery.
+3. **P2: queue lanes and cancellation** in the library and both agentctl editions: `inbox.v2/`,
+   `cancel/`, `cancelled/`, `not_after`, the pre-paste re-check, bounded drain flags, the 12.4
+   inventory, with cross-edition differential cases.
+4. **P3: exactly-once core and local delivery.** Declarations, ledger with claim, fence and
+   recovery; `accept`, `receipt`, `fence`, `serve`; deliverers `agentctl-queue` and
+   `hook-inbox`; `send`, outbox, the walk, `status`, `pump`, `retract`; sender proof
+   (coordinator, service) with a test per mode; the `local` route. **The model-based harness of
+   9.7 lands in this phase, before any network route.**
+5. **P4: network routes.** The `ssh` driver with `enroll`, the restricted forced command and its
+   own known-hosts; links (`on-demand`, `persistent`) and pull; the `command` driver in host and
+   session modes; route health; the harness extended with each driver's fault model.
+6. **P5: replies, policy, migration, relay.** `reply`, `pull`, `accepts_from` with kinds,
+   operator grants, limits, retention; the helper in 2.3 as a wrapper; the bridge's generic
+   relay-channel admission and the relay route; the shared-pane range check in `chat run`.
 
-Phases 1 and 2 are independent and can proceed in parallel. Addressing I3 for ordinary local
-sends waits for phase 2 plus the inventory.
+P1 and P2 are independent of each other once P0 is done. Fixing I3 for ordinary local sends waits
+for P2 and its inventory.
 
-## 13. Questions for the owner
+## 18. Questions for the owner
 
-1. **Where does `teams.yaml` live across hosts?** One file on a primary host that other hosts
-   never read (replies then depend on `reply_to` and pull), or a copy on every host kept in sync
-   (by a dotfiles repository, or by `teams discover --apply` pushing it)? Recommendation: a copy
-   on every host from a dotfiles repository; senders work from their local copy, and staleness is
-   handled by the checks anyway.
-2. **Default entry for `team send proj` when a team has entries on several hosts:** the file's
-   `primary`, the sender's own host if the team has an entry there, or refuse without `@host`?
-   Recommendation: the sender's own host, then `primary`, then refuse.
-3. **May `team accept` ever type?** The design says never (7.3), at the cost of needing a drainer
-   on each receiving host: a bridge, a new enough watcher, or a `team drain` timer. The
-   alternative is a bounded type-on-accept for hosts with none.
-4. **Expiry and delivery while working.** Is 2 h right for messages without `--ttl`? Should
-   idle-only targets (Muse) get a shorter default, and should `--ttl none` be allowed at all?
-   For Claude Code targets, should a `hold` use `--deliver-while-working`, so it arrives behind
-   the current turn instead of waiting for idle?
-5. **Default scoping.** Should `accepts_from` default to nobody (each team opts in), or to every
-   team in the owner's file? Recommendation: nobody, plus `service:` senders listed explicitly.
-6. **Operator or peer for services.** Should a registered service's message to an agentcloud
-   coordinator arrive as an `[operator]` directive, as the consuming project's alerts do today,
-   or as a peer-level message like every other team message? Recommendation: peer-level, with
-   an explicit per-service opt-in in the receiving team's declaration if you want operator mode.
-7. **agentcloud identity.** For an agentcloud coordinator, is session title (`expect_title`) an
-   acceptable identity check, or should `attach-self` registration (and so a declaration) be
-   required before a session can be a team entry?
-8. **Workers as senders.** May a worker send to another team as its team, or only coordinators
-   and registered services? Recommendation: only coordinators and services; workers in slot
-   boxes cannot be proved or write an outbox in phase 3 anyway (6.2).
-9. **Retention.** 30 days for terminal outbox and ledger entries? And should this work also
-   prune the queue's `processed/` directory, which nothing prunes today?
-10. **Clock skew.** Is a 2 s cross-host tolerance for topic order acceptable, or should cross-host
-    senders of one team be required to share one sending host for topics?
-11. **Editions.** Team commands in the Rust edition only (the deployed bridges are Rust), with
-    the Python edition exiting 2 with a pointer? The queue changes of phase 2 must land in both,
-    since either edition may drain a queue.
+Numbers 1-11 keep revision 1's numbering; 12 onward are new.
 
-## 14. Related designs
+**Resolved**
 
-Store-and-forward mail (an outbox, per-hop receipts, delivery status notifications) is the
-closest analogy for the outbox and receipt states; message expiry here plays the role of a
-message's delivery deadline. Matrix and XMPP federation route on a sparse address
-(`user@server`) and leave authoritative state with the server that owns it, as `teams.yaml`
-leaves it with the host's declaration. Message brokers with per-message TTL and "last value"
-topics (for example NATS JetStream's per-subject limits, or Kafka log compaction by key) are the
-precedent for topic superseding. None of them has the constraint that shapes this design: the
-final hop is a terminal composer that only one program may type into, and only when the agent
-behind it is idle.
+- **Format** (new): JSON, with explicit `comment` and `notes` fields and a versioned `schema`
+  (6.1). Owner, 2026-10-24.
+- **8. Workers as senders:** only coordinators, plus registered services, which this design keeps
+  explicitly for operational alerts (8.2). Workers neither send nor receive. Owner, 2026-10-24.
 
-## 15. Review record
+**Open**
 
-One adversarial review (2026-10-24) of the first draft. Every cited line was re-checked; the
-changes it caused:
+1. **Where do `teams.json` and `routes.d` live across hosts?** Recommendation: a copy of
+   `teams.json` and the public routes on every host from a dotfiles repository; private route
+   files (17) from a private one. Senders work from their local copy; staleness is handled by
+   the checks.
+2. **Default entry** for `send proj` when a team has entries on several hosts. Recommendation:
+   the sender's own host, then `primary`, then refuse.
+3. **May `accept` ever type?** Principle 1 would allow it (it runs on the receiving host), but
+   the design says never (12.3), at the cost of a drainer on each receiving host.
+4. **Expiry.** 2 h default without `--ttl`? Shorter for idle-only targets (Muse)? A maximum TTL of
+   7 days, with no `--ttl none` (9.2 needs a bound)? Should a `hold` to Claude Code use
+   `--deliver-while-working`?
+5. **Default scoping.** `accepts_from` defaults to nobody, with `service:` senders listed
+   explicitly. Recommendation: yes.
+6. **Operator or peer for services.** Recommendation: peer, with an explicit per-service
+   `authority: operator` grant in the receiving declaration for alerts that must stay directives.
+7. **Session identity.** Is a session title match (`target_check`) acceptable, or must a session
+   coordinator register (`attach-self` or `init --coordinator-self`) before it can be a contact?
+9. **Retention.** Terminal ledger entries kept `max_ttl + 30 days` past creation (so pruning can
+   never reopen an ID)? And should this work also prune agentctl's `processed/`?
+10. **Clock skew.** A 2 s cross-host tolerance for topic order, or require one sending host per
+    topic?
+11. **Editions.** `agent-teams` in Rust only; the queue changes of P2 in both agentctl editions.
+12. **ssh access.** A dedicated key per host pair, restricted by a forced command to the
+    protocol, installed by you by hand (recommended)? May routes opt into your own ssh
+    configuration and agent during migration (`use_user_ssh_config`), and should that opt-in
+    expire?
+13. **Where it lives.** A separate `agent-teams` binary sharing an extracted `agent-queue` crate
+    (recommended, section 4), or subcommands of agentctl? Which name? And should the bounded
+    local typing of team items be `agent-teams drain` or `agentctl drain --only-prefix tm-`?
+14. **Links.** Which host pairs get a persistent link (a user unit you install) versus on-demand
+    connections? For pairs reachable in one direction only, is the pull link (10.3) acceptable?
+15. **Chat relay.** Do you want a shared coordinator channel at all? If so: one bridge app (or
+    bot user) per team, so the poster identifies the team; and the bridge change of 10.6 (a
+    relay-channel admission class, separate from `allowed_senders`, whose posts are never typed).
+16. **Bodies in a channel.** May non-private message bodies appear in a relay channel, or should
+    the relay carry only the ID, with the body fetched over a host route?
+17. **Private route files.** Where should company-internal route definitions live, and should the
+    public repository ship only placeholder examples (recommended)?
+18. **Hook-only teams.** Is the `hook-inbox` deliverer acceptable for teams without agentctl,
+    given that it never wakes an idle agent (4.4)?
+19. **Unresolvable ambiguity.** A message pinned to a contact that never answers ends
+    `ambiguous-expired`. Should a human-only `agent-teams resolve ID (--fence | --mark-delivered)`
+    exist, run on the receiving host when it is reachable again?
+20. **Test budget.** How many seeds of the model-based harness per gate run (a bounded run,
+    under a minute), with a longer soak where?
 
-- `team accept` no longer drains (it held the delivery and target locks across a readiness wait
-  in an ssh session, and would type chat prompts without the bridge's check); 7.3.
-- Cancellation became a lock-free tombstone re-checked before the paste, because the delivery
-  lock is held through the very wait I3 is about; 7.2.
-- Team items moved to a lane old drainers never list, and the consumers that hardcode queue
-  phases are inventoried; 7.4. The first draft only checked running bridges.
-- Topic order follows the sender's clock, and a late older message starts superseded; 7.1.
-- A per-team receiver ledger replaced the queue as the dedupe record, adding `lost`; 6.5.
-- `--from-service` requires a registered unit and cgroup membership, `$AGENTCLOUD_SESSION_ID`
-  is an assertion, proof is taken at outbox write, and remote proofs are labelled; 6.2.
-- The contact walk advances only on a definite answer and pins once handed over; 6.4.
-- Keyless keys are derived from content, same-key-same-body returns the current state, replies
-  default to `reply:<ID>`; 6.1, 6.6.
-- agentcloud contacts got their own states and limits; 6.5, 7.5.
-- The bridge check reads the main process and the bridge state, and reuses `restore.json`;
-  2.5, 5.
-- The local "anchor" was renamed "declaration" (agentctl already uses "anchor"); two registries
-  claiming a team are refused; undeclared targets are labelled and time-limited; 3, 6.3.
-- Remote binaries must be absolute paths, the envelope falls back to an argument where stdin
-  does not pass, the generic `exec` reach replaces a named node-exec command, exit codes were
-  realigned with `agentctl send`, and owner questions 3, 4 (second half), 6, 9 and 10 were added.
+## 19. Related designs
+
+Store-and-forward mail (an outbox, per-hop receipts, delivery status notifications) is the closest
+analogy for the outbox and receipt states; message expiry plays the role of a delivery deadline.
+Matrix and XMPP federation route on a sparse address (`user@server`) and leave authoritative state
+with the server that owns it, as `teams.json` leaves it with the host's declaration. The
+exactly-once design is the familiar idempotent-receiver pattern (a durable deduplication table
+keyed by message ID, as transactional outboxes and inboxes use, and as message brokers do with
+per-producer sequence numbers); the fence is a write-once tombstone in the same table. Brokers
+with per-message TTL and "last value" topics (NATS JetStream per-subject limits, Kafka log
+compaction) are the precedent for topic superseding. autossh and OpenSSH's ControlMaster are the
+precedent for the managed link, and forced commands in `authorized_keys` (as Git hosting and
+rsync-only backups use) for the restricted key. Gas Town's `gt nudge` falls back to a file queue a
+hook drains at the next turn boundary, the model for the hook deliverer; CLI Agent Orchestrator
+marks a message delivered before the paste so a crash cannot deliver twice, the same choice as
+agentctl's `inflight/` rename (`common/docs/agentctl/RELATED_WORK.md:123-140`). None of them has
+the constraint that shapes this design: the final hop is a terminal composer that only one local
+program may type into, and only when the agent behind it is idle. A `RELATED_WORK.md` for
+`agent-teams` is required when the tool is created.
+
+## 20. Review record
+
+**Revision 1** (2026-10-24, after one adversarial review of the first draft): `accept` stopped
+draining (it held locks across a readiness wait inside ssh and would type chat prompts without the
+bridge's check); cancellation became a lock-free tombstone re-checked before the paste; team items
+moved to a lane old drainers never list, with the phase-hardcoding consumers inventoried; topic
+order follows the sender's clock; a per-team receiver ledger replaced the queue as the dedupe
+record, adding `lost`; `--from-service` requires a registered unit and cgroup membership and proof
+is taken at outbox write; the contact walk advances only on a definite answer and pins once handed
+over; keyless keys derive from content and replies default to `reply:<ID>`; agentcloud contacts got
+their own states; the bridge check reads the main process and bridge state; "anchor" was renamed
+"declaration"; remote binaries must be absolute paths, the envelope falls back to an argument, and
+exit codes were aligned with `agentctl send`.
+
+**Revision 2** (2026-10-24, owner feedback):
+
+- `teams.yaml` became `teams.json` plus `routes.d/*.json`, with explicit `comment`/`notes` fields
+  preserved by machine rewrites and versioned schemas; the declaration moved to
+  `teams.d/<team>/declaration.json` (6).
+- Only coordinators and registered services send; workers neither send nor receive; `accepts_from`
+  lost the `team/agent` form; replies go to the coordinator; old question 8 resolved (8.2).
+- Exactly-once became its own section: one ID end to end, a durable claim before hand-over with
+  retention tied to the maximum TTL, ask before resend, a fence before any second contact, no
+  second paste, what a coordinator sees on a second sighting, and a required model-based fault
+  harness; incidents I2 and I5 named (9).
+- The principle that only the receiving host's agentctl does TUI work and verification is stated,
+  and the probe no longer reads remote panes (3, 7).
+- Routes became a pluggable layer: drivers `local`, `ssh`, `command`; ssh without ambient keys
+  (dedicated restricted keys, its own known-hosts, an optional managed link, pull for one-way
+  pairs); the `command` transport in host, session and relay modes, with agentcloud-like channels
+  described entirely in data; an opportunistic chat relay, including why the Slack provider's
+  admission rules block it today and the generic bridge change it needs (10); route selection,
+  fallback, failure reporting and per-route verification (11).
+- Team messaging moved out of agentctl into a separate tool sharing an extracted library, with
+  deliverers for users without agentctl (4); revision 1's `agentcloud` and `chat` contact kinds
+  became a `session` contact and a relay route; owner questions 12-20 were added (18).
