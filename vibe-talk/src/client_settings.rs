@@ -36,7 +36,8 @@
 //! kept for Undo, the saved message cache (a replica of the server, not a choice), the
 //! per-window column layout (`columns`, one window's own by `#281 view-keys`), the
 //! read strip's dragged position (`read-steer-offset`, a place on one desk's screen),
-//! the active channel and other UI state, identity caches, and the token. Settings that
+//! the active channel and other UI state, the census of who has spoken where (a cache of
+//! what was read; the owner's choices about those accounts sync, `#488`), and the token. Settings that
 //! were already server-side keep their own homes — voice send approval, the voice
 //! prompt and post prefix, noise rules, channel aliases and upstream-clear — and are not
 //! duplicated here.
@@ -81,6 +82,9 @@ pub const SYNCED_KEYS: &[&str] = &[
     "vibe-talk.voice.threads-main",
     "vibe-talk.voice.thread-order",
     "vibe-talk.voice.thread-card-folded",
+    // Channels: who is who, the owner's choice of which account is him, the coding agent,
+    // a person or another bot. `#488 slack-app-agents`.
+    "vibe-talk.voice.identities",
 ];
 
 /// The largest value one synced setting may hold, in bytes.

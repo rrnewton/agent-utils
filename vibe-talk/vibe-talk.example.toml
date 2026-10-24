@@ -169,7 +169,8 @@ live_poll_seconds = 0
 # api_base = "https://slack.com/api"
 # token = "xoxb-REPLACE-ME"
 # owner_user_id = "U0123ABCDEF"
-# coding_agent_user_ids = ["U0AGENT0001"]   # the bots your coding agents post as; see above
+# coding_agent_user_ids = ["U0AGENT0001"]   # the bots your coding agents post as; see above. A
+#                                           # Slack app's posts: the id Settings' Who is who shows
 # live_poll_seconds = 30
 # channel_registration = true    # accept pasted Slack links in the app
 # registered_channels_writable = false
