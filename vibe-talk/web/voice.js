@@ -34113,10 +34113,12 @@ function streamingPlayer(url, context, clock = readClock()) {
     sounding.clear();
     waiting.length = 0;
   };
-  const fail = () => {
+  // `#487 read-aloud-recovery`. Why, for the read to tell a part that was cut off or whose ticket is
+  // gone ("lost": worth starting again) from one refused or malformed (which would only fail again).
+  const fail = (why = "refused") => {
     if (over) return;
     silence();
-    emit("error");
+    emit("error", why);
   };
   const endIfDone = () => {
     if (over || !finished || !wanted || waiting.length > 0 || sounding.size > 0) return;
@@ -34230,12 +34232,13 @@ function streamingPlayer(url, context, clock = readClock()) {
     try {
       response = await fetch(url, { signal: abort.signal, cache: "no-store" });
     } catch (_error) {
-      fail();
+      fail("lost");
       return;
     }
     if (over) return;
     if (!response.ok || !response.body || typeof response.body.getReader !== "function") {
-      fail();
+      // A ticket the server does not know: it ended, or the server restarted and forgot it.
+      fail(response.status === 404 || response.status === 410 ? "lost" : "refused");
       return;
     }
     const reader = response.body.getReader();
@@ -34271,15 +34274,15 @@ function streamingPlayer(url, context, clock = readClock()) {
         if (wanted) schedule(buffer);
         else waiting.push(buffer);
       }
-    } catch (_error) {
+    } catch (error) {
       // Includes a response cut off part-way: a read that did not arrive whole did not END, and
-      // must not be archived as heard.
-      fail();
+      // must not be archived as heard. Cut off is "lost"; audio this page cannot read is not.
+      fail(error && error.name === "TypeError" ? "lost" : "malformed");
       return;
     }
     // A body that stops inside a frame was cut short, or disagrees with its own format.
     if (!loaded || carry.length > 0) {
-      fail();
+      fail("malformed");
       return;
     }
     finished = true;
@@ -35182,6 +35185,67 @@ function restartHeldBlock(playing) {
   }
 }
 
+// --- a read cut off on the way: `#487 read-aloud-recovery` -----------------------------------------
+//
+// The owner, 2026-10-23: a read "just died spontaneously before finishing the message and clicking it
+// again. Got no response." The server had restarted under it (a deploy), and a restarted server has
+// forgotten every ticket it minted: the read's next request was a 404, the read ended, and every later
+// tap played another URL prepared before the restart, failing the same way. Now a streamed part that
+// fails forgets what was prepared and starts the read again from that part, after a short wait for a
+// server that is coming back, a few times before it says the message could not be played.
+
+/** How long to wait before each try at starting a cut-off read again: about as long as a restart. */
+const READ_RECOVERY_WAITS_MS = [1000, 3000, 8000];
+
+/** The try waiting to start, or null. */
+let readRecoveryTimer = null;
+
+/**
+ * Start read `parts` again from `from` (`{part, block, recovery}`) after `wait` ms, on fresh tickets.
+ * Until then the row shows the read as asked for, and a tap on it, or on any other, is the reader's
+ * own choice, which the try then leaves alone.
+ *
+ * @param {Array<string>} parts
+ * @param {{part: number, block: number | null, recovery: number}} from
+ * @param {number} wait
+ */
+function recoverRead(parts, from, wait) {
+  // Every ticket minted before this may be as dead as the one that failed.
+  forgetPreparedSpeech();
+  // Stopped as a jump stops it: the media keys and the audio output stay with the read.
+  readJumping = true;
+  try {
+    stopReading();
+  } finally {
+    readJumping = false;
+  }
+  const ticket = readingTicket;
+  const id = parts[0];
+  pendingRead = id;
+  setReadState("working");
+  eachColumn(renderChannelRows);
+  setStatus("Reading aloud was cut off; trying again…");
+  if (readRecoveryTimer !== null) clearTimeout(readRecoveryTimer);
+  readRecoveryTimer = setTimeout(() => {
+    readRecoveryTimer = null;
+    if (ticket !== readingTicket || pendingRead !== id) return;
+    readJumping = true;
+    readJumpPending = true;
+    let attempt;
+    try {
+      attempt = readAloud(parts, from);
+    } finally {
+      readJumping = false;
+    }
+    Promise.resolve(attempt).catch(() => {
+      // Not even prepared or fetched (the server still away): another try, while there are tries.
+      if (from.recovery < READ_RECOVERY_WAITS_MS.length && pendingRead === null && nowPlaying === null) {
+        recoverRead(parts, { ...from, recovery: from.recovery + 1 }, READ_RECOVERY_WAITS_MS[from.recovery]);
+      }
+    });
+  }, wait);
+}
+
 function resumeReading() {
   const playing = nowPlaying;
   if (playing === null || !playing.paused) return;
@@ -35465,6 +35529,9 @@ async function readAloud(ids, from = null) {
   const first = from === null ? 0 : Math.max(0, segments.findIndex((segment) =>
     segment.part === from.part && (from.block === null || segment.block === null || segment.block >= from.block)));
   const clock = readClock();
+  // `#487 read-aloud-recovery`. How many times this read has been started again after a part failed
+  // on the way, since a part last played to its end.
+  let recovery = from !== null && Number.isInteger(from.recovery) ? from.recovery : 0;
   // The blocks the read was prepared in travel with it, so a pace change that forgets what was
   // prepared does not take the light off the read in progress.
   const blocks = ready.map((entry) => (entry && entry.blocks) || null);
@@ -35571,6 +35638,8 @@ async function readAloud(ids, from = null) {
       if (ticket !== readingTicket || nowPlaying === null || nowPlaying.id !== id) {
         return;
       }
+      // A part heard to its end: the read is going again, and a later failure has every try.
+      recovery = 0;
       if (at + 1 < sources.length) {
         // A part that was not started when this one drained (an `<audio>` element says no such
         // thing) starts now.
@@ -35582,10 +35651,13 @@ async function readAloud(ids, from = null) {
       // archiving only the first would leave its own tail in the queue.
       guardQuietly(() => dismissMessages({ messages: parts }))();
     });
-    audio.addEventListener("error", () => {
+    audio.addEventListener("error", (why) => {
       if (ticket !== readingTicket) {
         return;
       }
+      // `#487 read-aloud-recovery`: the streamed player says why it failed; an `<audio>` element
+      // hands an event, which says nothing this can act on.
+      const lost = /** @type {unknown} */ (why) === "lost";
       // `#434 read-aloud-pause`: a part that fails while the read is HELD (its stream timed out
       // under the pause, its ticket went) does not end the read the reader only paused. It is
       // marked stale, and the resume reads the held block again on a fresh ticket.
@@ -35600,7 +35672,22 @@ async function readAloud(ids, from = null) {
         restartHeldBlock(nowPlaying);
         return;
       }
+      // `#487 read-aloud-recovery`. A streamed part that fails was most often cut off by the server
+      // going away (a restart forgets every ticket it minted) or by its connection dropping: the read
+      // is started again from that part on fresh tickets, a few times, before it is given up. A part
+      // fetched ahead that fails while the one before it is still heard starts the read again from
+      // the one being heard, so nothing is skipped.
+      if (streamed && lost && recovery < READ_RECOVERY_WAITS_MS.length) {
+        const heard = nowPlaying !== null && nowPlaying.id === id && !started[at] ? nowPlaying.segment : at;
+        const segment = segments[heard] || segments[at];
+        recoverRead(parts, { part: segment.part, block: segment.block, recovery: recovery + 1 },
+          READ_RECOVERY_WAITS_MS[recovery]);
+        return;
+      }
       stopReading();
+      // `#487`: and what was prepared before a lost part with it, so the next tap prepares again
+      // rather than playing another URL as dead as this one.
+      if (streamed && lost) forgetPreparedSpeech();
       setStatus("that message could not be played.");
     });
     return audio;

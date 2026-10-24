@@ -33301,19 +33301,105 @@ test("a streamed read CUT OFF part-way, or refused, says so and archives nothing
   await page.settle();
   page.audioStreams[0].controller.bytes(joined(wavHeader(24000, 1), pcm(1, 2, 3)));
   await page.settle();
-  // A body that ends without its terminating chunk did not END, whatever was heard of it.
+  // A body that ends without its terminating chunk did not END, whatever was heard of it. Cut off,
+  // it is tried again (`#487 read-aloud-recovery`), and given up when every try is cut off too.
   page.audioStreams[0].controller.fail();
   await page.settle();
   assert.equal(page.audio.sources[0].halted, true);
+  for (const wait of page.pure("READ_RECOVERY_WAITS_MS")) {
+    assert.match(page.el("status").textContent, /cut off; trying again/);
+    assert.equal(page.expireTimers(wait), 1, `nothing waited ${wait} ms to try again`);
+    await page.settle();
+    page.audioStreams.at(-1).controller.fail();
+    await page.settle();
+  }
   assert.match(page.el("status").textContent, /could not be played/);
   assert.equal(rowState(page, 0).reading, "false", "the row is stuck looking like it is speaking");
 
-  page.ticketStatus = 410;
+  // Refused outright, not lost: said at once, and not tried again.
+  page.ticketStatus = 500;
+  const asked = page.audioStreams.length;
   await rows[1].dispatch("click", {});
   await page.settle();
   assert.equal(page.audio.sources.length, 1, "a refused read played something");
   assert.match(page.el("status").textContent, /could not be played/);
+  assert.equal(page.audioStreams.length, asked + 1, "a refused read was asked for again");
   assert.deepEqual(page.dismissCalls, [], "a read nobody heard to the end was archived");
+});
+
+// --- `#487 read-aloud-recovery`: a read whose server went away ---------------------------------------
+
+test("A READ CUT OFF BY A RESTART prepares again and carries on from the block it was on", async () => {
+  // The owner, 2026-10-23: a read died part-way when the server restarted under it, and tapping again
+  // did nothing. A restarted server has forgotten every ticket: the page prepares again and goes on.
+  const { page, rows } = await blockedRead();
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  await page.el("read-next").click();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "2 of 3", "the premise: the read is not on its second block");
+  const before = page.prepareCalls.length;
+  page.audioStreams.at(-1).controller.bytes(joined(wavHeader(1000, 1), pcm(0x2000, 0x2000)));
+  await page.settle();
+  // The server goes away: the block being heard is cut off, and its ticket is gone with it.
+  page.speechTicketSuffix = "-after-restart";
+  page.audioStreams.at(-2).controller.fail();
+  await page.settle();
+  assert.match(page.el("status").textContent, /cut off; trying again/);
+  assert.equal(rowState(page, 0).pending, "true", "the row does not say its read is coming back");
+  assert.equal(page.expireTimers(page.pure("READ_RECOVERY_WAITS_MS")[0]), 1, "nothing waited to try again");
+  await page.settle();
+  assert.ok(page.prepareCalls.slice(before).some((call) => (call.ids || []).includes(BLOCKED_ID)),
+    "the read went on without preparing again");
+  const resumed = page.audioStreams.at(-1);
+  assert.match(resumed.url, /-after-restart\?/, `the read went on from a ticket minted before the restart: ${resumed.url}`);
+  assert.equal(blockOf(resumed.url), "1", "the read did not go on from the block it was cut off in");
+  assert.equal(page.el("read-steer-count").text(), "2 of 3");
+});
+
+test("a tap after a read that could not be played prepares again, rather than playing another dead URL", async () => {
+  const page = newPage();
+  page.enableStreamedAudio();
+  await signIn(page);
+  const rows = await inReadingMode(page, [
+    message({ id: "1000000000000000001", author_id: "1000000000000000011", content: "first" }),
+    message({ id: "1000000000000000002", author_id: "1000000000000000012", content: "second" }),
+  ]);
+  // Both rows prepared before the server restarts; every try at the first then finds it gone.
+  page.ticketStatus = 404;
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  for (const wait of page.pure("READ_RECOVERY_WAITS_MS")) {
+    assert.equal(page.expireTimers(wait), 1);
+    await page.settle();
+  }
+  assert.match(page.el("status").textContent, /could not be played/);
+  // The server is back. A tap on the other row asks for a fresh ticket first.
+  page.ticketStatus = 200;
+  page.speechTicketSuffix = "-fresh";
+  const before = page.prepareCalls.length;
+  await rows[1].dispatch("click", {});
+  await page.settle();
+  assert.ok(page.prepareCalls.slice(before).some((call) => (call.ids || []).includes("1000000000000000002")),
+    "the tap played the ticket prepared before the server restarted");
+  assert.match(page.audioStreams.at(-1).url, /-fresh\?/);
+});
+
+test("a tap during the wait to try again is the reader's own: the try leaves it alone", async () => {
+  const { page, rows } = await blockedRead();
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  page.audioStreams[0].controller.fail();
+  await page.settle();
+  assert.match(page.el("status").textContent, /cut off; trying again/);
+  // A tap on the row whose read is coming back stops it, as a tap on a row being read does.
+  await page.el("discord-log").children[0].dispatch("click", {});
+  await page.settle();
+  const asked = page.audioStreams.length;
+  page.expireTimers(10_000);
+  await page.settle();
+  assert.equal(page.audioStreams.length, asked, "the try started a read the reader had stopped");
+  assert.equal(rowState(page, 0).pending, "false");
 });
 
 test("a streamed read that ENDS PART-WAY through a sample did not arrive whole, and archives nothing", async () => {
