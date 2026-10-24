@@ -6,9 +6,12 @@
 //! [`crate::threads::ThreadSummary`] carries `display_name` (for example `runner-wedged`) and
 //! `summary` (one sentence). The NAME is chosen at the first summary and then kept, even when the
 //! thread drifts, so the reader always finds a thread under the name they first learned it by. The
-//! SENTENCE is refreshed on [`crate::threads::thread_summary_due`]'s schedule — at 1, 2, 4 and 8
-//! messages, then every 10 — because early on each message changes what a thread is about and
-//! later one more rarely does.
+//! SENTENCE is refreshed on [`crate::threads::thread_summary_due`]'s schedule — nothing before
+//! a thread's third message ([`crate::threads::THREAD_SUMMARY_MIN_MESSAGES`], `#484
+//! summary-card-threshold`), then at 3, 4 and 8 messages and every 10 after — because early on
+//! each message changes what a thread is about and later one more rarely does. Below the
+//! threshold no model call is spent and nothing filed is served: the card says the thread's
+//! real words.
 //!
 //! # Where it happens
 //!
@@ -106,7 +109,8 @@ use crate::chat::ChatClient;
 use crate::model::{ChannelId, Message, MessageId};
 use crate::store::{StateStore, StoreError, SummaryKey};
 use crate::threads::{
-    thread_summary_due, ThreadSummary, TimelinePage, TimelineRequest, TimelineView,
+    thread_summary_due, thread_summary_shown, ThreadSummary, TimelinePage, TimelineRequest,
+    TimelineView, THREAD_SUMMARY_MIN_MESSAGES,
 };
 
 /// The instruction a thread is named under.
@@ -934,7 +938,13 @@ impl ThreadNames {
             answered.insert(summary.id.clone());
             match self.lookup(deps, channel, &summary.id).await {
                 Lookup::Known(record) => {
-                    if let Some(record) = &record {
+                    // `#484 summary-card-threshold`: while a thread is known to be under the
+                    // threshold its page is served neither half, whoever filed them; the record
+                    // itself is kept and shows again from the third message.
+                    if !thread_summary_shown(summary.reply_count) {
+                        summary.display_name = None;
+                        summary.summary = None;
+                    } else if let Some(record) = &record {
                         summary.display_name = Some(record.name.clone());
                         summary.summary = record.sentence.as_ref().map(|sentence| {
                             super::cut_for_serving(&sentence.summary, deps.sentence_chars)
@@ -953,7 +963,13 @@ impl ThreadNames {
                     }
                 }
                 Lookup::Unknown(name) => {
-                    summary.display_name = name;
+                    // The same threshold as the known record above (`#484 summary-card-threshold`).
+                    if thread_summary_shown(summary.reply_count) {
+                        summary.display_name = name;
+                    } else {
+                        summary.display_name = None;
+                        summary.summary = None;
+                    }
                     self.refresh_copies(channel, summary);
                 }
             }
@@ -1412,6 +1428,28 @@ impl ThreadNames {
                 "the thread has no text to name it by".to_owned(),
             )));
         }
+        // `#484 summary-card-threshold`: no model call while every count in hand — what this read
+        // brought back, what it reported, and the most replies a page showed while the thread
+        // waited — is under the threshold. (Going by the read's messages alone would unname a
+        // thread whose list has reached the threshold while its thread view lags a reply behind.)
+        // Too few is no failure: nothing is asked or filed, and the thread falls due as it grows.
+        let known = [
+            read_copy.as_ref().and_then(|thread| thread.reply_count),
+            waiting.most_replies,
+        ]
+        .into_iter()
+        .flatten()
+        .map(|replies| replies.saturating_add(1))
+        .chain(std::iter::once(messages.len() as u64))
+        .max()
+        .unwrap_or(0);
+        if known < THREAD_SUMMARY_MIN_MESSAGES {
+            tracing::info!(
+                messages = known,
+                "a thread under the summary threshold was not named; no model call was spent"
+            );
+            return Ok(None);
+        }
         let request = ThreadRequest::new(&messages, deps.sentence_chars);
         let began = std::time::Instant::now();
         let naming = deps
@@ -1529,6 +1567,13 @@ fn not_older(arriving: &ThreadSummary, held: &ThreadSummary) -> bool {
 /// Whether a thread needs a name, or a fresh sentence.
 fn due(summary: &ThreadSummary, record: Option<&ThreadRecord>) -> bool {
     let messages = summary.reply_count.map(|replies| replies.saturating_add(1));
+    // `#484 summary-card-threshold`: a thread known to hold fewer than
+    // `THREAD_SUMMARY_MIN_MESSAGES` is never due, named or not. With no count reported the
+    // thread is still queued, and the worker counts the messages its own read brings back
+    // before any model call (`name_turn`).
+    if matches!(messages, Some(count) if count < THREAD_SUMMARY_MIN_MESSAGES) {
+        return false;
+    }
     let Some(record) = record else {
         return true;
     };
@@ -1817,12 +1862,23 @@ mod tests {
             }),
             sentence_below_cap: false,
         };
-        assert!(due(&thread(Some(0)), None), "an unnamed thread is due");
+        // `#484 summary-card-threshold`: under three messages nothing is due, named or not;
+        // with no count reported the worker's own read decides (`name_turn`).
+        assert!(!due(&thread(Some(0)), None), "a lone root is not due");
+        assert!(
+            !due(&thread(Some(1)), None),
+            "one question and one response is not due"
+        );
+        assert!(due(&thread(Some(2)), None), "the third message is due");
         assert!(due(&thread(None), None), "even with no count");
         assert!(!due(&thread(Some(0)), Some(&record(1))));
         assert!(
-            due(&thread(Some(1)), Some(&record(1))),
-            "2 messages after 1"
+            !due(&thread(Some(1)), Some(&record(1))),
+            "2 messages stay under the threshold whatever was filed at 1"
+        );
+        assert!(
+            due(&thread(Some(3)), Some(&record(1))),
+            "4 messages after a sentence filed at 1"
         );
         assert!(
             !due(&thread(Some(2)), Some(&record(2))),

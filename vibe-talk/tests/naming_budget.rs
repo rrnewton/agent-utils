@@ -1582,10 +1582,11 @@ async fn a_named_thread_whose_fresh_read_says_it_is_behind_is_read_once() {
 async fn a_provider_whose_thread_view_counts_a_reply_fewer_than_its_list_names_each_thread_once() {
     // No `as_of` here: the thread view simply lags the list by one reply, every time. Each thread
     // is named once in half an hour of write-scope polls every three seconds. Filed at the read's
-    // count, a thread with 1, 3 or 7 replies on the list was due again at the next poll, for ever.
+    // count, a thread whose list count lands on a schedule step (2, 3, 7 or 17 replies: 3, 4, 8
+    // and 18 messages) was due again at the next poll, for ever.
     let h = harness();
     let ids = h.upstream.add(WRITE_CHANNEL, 5);
-    for (thread, replies) in ids.iter().zip([1, 3, 7, 2, 10]) {
+    for (thread, replies) in ids.iter().zip([2, 3, 7, 17, 10]) {
         h.upstream.change(thread, |thread| {
             thread.replies = (0..replies).map(|n| format!("reply {n}")).collect();
         });
@@ -1671,7 +1672,9 @@ async fn deleted_while_behind_then_a_reply(named_at: Option<usize>) -> (usize, S
     let h = harness();
     let thread = h.upstream.add(WRITE_CHANNEL, 1).remove(0);
     let replies = match named_at {
-        None => 1,
+        // Three replies in the behind copy, two on the list: three messages, the first count a
+        // thread is named at (`#484 summary-card-threshold`).
+        None => 3,
         Some(replies) => {
             h.poll(WRITE_CHANNEL, true).await;
             h.at(5).await;
@@ -1728,11 +1731,12 @@ async fn deleted_while_behind_then_a_reply(named_at: Option<usize>) -> (usize, S
 #[tokio::test(start_paused = true)]
 async fn a_reply_deleted_while_the_read_at_the_turn_was_behind_leaves_the_sentence_at_the_next_reply(
 ) {
-    // An unnamed thread whose only reply was deleted: the list shows none, and the read at its
-    // turn still holds it. Filed at that read's count, two messages, the sentence was not due again
-    // when the next reply brought the thread to two, and the deleted reply's text was served for as
-    // long as the thread stayed there. Before W5, and now, it is filed at the one message the list
-    // showed, and the next reply makes it due.
+    // An unnamed thread whose third reply was deleted: the list shows two replies (three
+    // messages, the first count a thread is named at), and the read at its turn still holds the
+    // deleted one. Filed at that read's count, four messages, the sentence was not due again
+    // when the next reply brought the thread to four, and the deleted reply's text was served
+    // until eight. Before W5, and now, it is filed at the three messages the list showed, and
+    // the next reply makes it due.
     let (reads, last) = deleted_while_behind_then_a_reply(None).await;
     assert_eq!(
         reads, 2,

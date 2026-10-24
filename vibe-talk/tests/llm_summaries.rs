@@ -239,13 +239,23 @@ async fn a_host_overlay_moving_to_vertex_sends_none_of_the_shared_files_key() {
 
 // --- thread names -------------------------------------------------------------------------------
 
-/// A provider with two threads whose reply counts a test can move.
-#[derive(Default)]
+/// A provider with two threads whose reply counts a test can move. Each starts at two replies:
+/// three messages, the fewest a thread is named at (`#484 summary-card-threshold`).
 struct Threads {
     replies: Mutex<[u64; 2]>,
     thread_reads: Mutex<Vec<String>>,
     /// When set, every thread's `updated_at`.
     updated: Mutex<Option<String>>,
+}
+
+impl Default for Threads {
+    fn default() -> Self {
+        Self {
+            replies: Mutex::new([2, 2]),
+            thread_reads: Mutex::default(),
+            updated: Mutex::default(),
+        }
+    }
 }
 
 const THREADS: [&str; 2] = ["spaces/A/threads/runner", "spaces/A/threads/cache"];
@@ -526,7 +536,7 @@ async fn a_thread_list_read_by_the_owner_names_its_threads_in_the_background() {
         .expect("readable")
         .expect("filed");
     let sentence: FiledSentence = serde_json::from_str(&sentence.text).expect("a sentence row");
-    assert_eq!(sentence.at, 1, "named at one message: the root");
+    assert_eq!(sentence.at, 3, "named at three messages: the root and two replies");
 
     // A read with nothing due asks nothing.
     let (_, _) = call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
@@ -545,8 +555,8 @@ async fn the_name_is_kept_as_the_thread_grows_and_only_the_sentence_follows_the_
         .find(|(id, _, _)| id == THREADS[0])
         .unwrap();
 
-    // One reply: two messages, which is due (1, 2, 4, 8, then every 10).
-    h.threads.grow(0, 1);
+    // Three replies: four messages, which is due (3, 4, 8, then every 10; `#484`).
+    h.threads.grow(0, 3);
     call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
     until_named(&h.names, 3).await;
     let (_, after) = call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
@@ -560,11 +570,40 @@ async fn the_name_is_kept_as_the_thread_grows_and_only_the_sentence_follows_the_
     );
     assert_ne!(sentence_after, sentence_before, "the sentence is refreshed");
 
-    // Two replies is three messages: not due until four.
-    h.threads.grow(0, 2);
+    // Four replies is five messages: not due until eight.
+    h.threads.grow(0, 4);
     call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(h.names.named(), 3, "three messages is not on the schedule");
+    assert_eq!(h.names.named(), 3, "five messages is not on the schedule");
+}
+
+#[tokio::test]
+async fn a_thread_is_not_named_or_shown_named_before_its_third_message() {
+    // `#484 summary-card-threshold`: one question and one response is never queued, never read
+    // for naming and never served a name; the third message names it as any thread is named.
+    let h = harness();
+    h.threads.grow(0, 1);
+    h.threads.grow(1, 1);
+    let (status, first) = call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.names.pending() + h.names.named(), 0, "a small thread was queued");
+    assert!(h.threads.thread_reads.lock().unwrap().is_empty(), "a small thread was read");
+    assert!(h.summarizer.thread_prompts().is_empty(), "the model was asked");
+    for (_, name, sentence) in names_of(&first) {
+        assert_eq!((name, sentence), (None, None), "a small thread was served named: {first}");
+    }
+
+    h.threads.grow(0, 2);
+    call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
+    until_named(&h.names, 1).await;
+    let (_, second) = call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
+    let named: Vec<_> = names_of(&second)
+        .into_iter()
+        .filter(|(_, name, _)| name.is_some())
+        .map(|(id, _, _)| id)
+        .collect();
+    assert_eq!(named, [THREADS[0]], "only the grown thread is named: {second}");
 }
 
 #[tokio::test]
@@ -817,7 +856,7 @@ async fn an_active_thread_keeps_its_name_row_fresh_without_asking_the_model() {
                 &sentence_key(&h.state.summary_version, &channel(), thread),
                 &serde_json::to_string(&FiledSentence {
                     summary: "It is stuck.".to_owned(),
-                    at: 1,
+                    at: 3,
                 })
                 .unwrap(),
                 None,
@@ -894,7 +933,7 @@ async fn an_active_thread_keeps_its_sentence_row_alive_with_its_name() {
                 &sentence_key(&deps.version, &channel(), thread),
                 &serde_json::to_string(&FiledSentence {
                     summary: "It is stuck.".to_owned(),
-                    at: 1,
+                    at: 3,
                 })
                 .unwrap(),
                 None,
@@ -1061,7 +1100,7 @@ async fn a_thread_sentence_cut_below_the_cap_is_shown_as_it_is_and_asked_again_o
                 &sentence_key(&h.state.summary_version, &channel(), thread),
                 &serde_json::to_string(&FiledSentence {
                     summary: short.to_owned(),
-                    at: 1,
+                    at: 3,
                 })
                 .unwrap(),
                 (n == 0).then_some(40),
