@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import os
 import shlex
@@ -892,6 +893,52 @@ def test_the_app_page_suite_runs_once_beside_the_rust_suites() -> None:
     assert "vibe-talk.build.tests" in by_tag["vibe-talk.test.page"].deps
     assert "vibe-talk.build.tests" in by_tag["vibe-talk.test.unit"].deps
     assert "vibe-talk.test.page" not in by_tag["vibe-talk.test.unit"].deps
+
+
+def _declared_parts(script: Path) -> list[str] | None:
+    """The names in a browser check's module-level `PARTS` literal, or None if it has none."""
+    for node in ast.parse(script.read_text(encoding="utf-8")).body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            target, value = node.target, node.value
+        else:
+            continue
+        if isinstance(target, ast.Name) and target.id == "PARTS":
+            return list(ast.literal_eval(value))
+    return None
+
+
+def _parts_named(tokens: list[str]) -> list[str]:
+    named = [token.split("=", 1)[1] for token in tokens if token.startswith("--part=")]
+    return named + [tokens[at + 1] for at, token in enumerate(tokens[:-1]) if token == "--part"]
+
+
+def test_a_browser_check_split_into_parts_runs_every_part_once() -> None:
+    # `#474 browser-lane-critical-path`: a long browser check is split into parts the gate runs
+    # side by side. Together the parts are the whole check only if every part is some step's, once,
+    # and no step still runs the whole (which would pay for it twice). One part per step keeps each
+    # step's name, budget and failure about one part.
+    by_tag = dag_from_path(REPO_ROOT / "validation.dag.yaml").by_tag()
+    split: dict[str, list[str]] = {}
+    for script in sorted((REPO_ROOT / "vibe-talk/tests").glob("*.py")):
+        parts = _declared_parts(script)
+        if parts is not None:
+            split[script.name] = parts
+    assert "approval_card_browser.py" in split
+    for script, parts in split.items():
+        target = script.removesuffix(".py").replace("_", "-")
+        runs = [tokens for tokens in (shlex.split(step.cmd) for step in by_tag.values())
+                if any(Path(token).name == script for token in tokens)]
+        assert runs, f"no step runs {script}"
+        assert not [step.tag for step in by_tag.values() if target in shlex.split(step.cmd)], \
+            f"a step runs all of {script} through its make target"
+        stepped: list[str] = []
+        for tokens in runs:
+            named = _parts_named(tokens)
+            assert len(named) == 1, f"a step runs {script} with parts {named}, not exactly one"
+            stepped += named
+        assert sorted(stepped) == sorted(parts), f"{script}: steps run parts {stepped}, it declares {parts}"
 
 
 # ---- `#361 python-minimum-timeout` --------------------------------------------------------------
