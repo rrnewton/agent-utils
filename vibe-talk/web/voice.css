@@ -1236,6 +1236,25 @@ a.search-hit-link {
   align-items: center;
   gap: 0.3rem 0.6rem;
   border-inline-start: 3px solid hsl(var(--thread-hue, 210) 55% 50%);
+  /* `#483 thread-card-read-style`: a card recedes by the message rows' amounts (below). */
+  opacity: var(--row-opacity, 1);
+  filter: var(--row-filter, none);
+}
+
+/* `#483 thread-card-read-style`: read whole, a card of this list recedes as the Threads view's
+   cards and the read message rows do, and comes back where the reader is on it. */
+#thread-list .thread-card[data-thread-read] {
+  --row-opacity: 0.42;
+  --row-filter: grayscale(1);
+  --row-grey: 1;
+}
+
+#thread-list .thread-card[data-thread-read][data-selected="true"],
+#thread-list .thread-card[data-thread-read][data-highlighted],
+#thread-list .thread-card[data-thread-read]:focus-within {
+  --row-opacity: 1;
+  --row-filter: none;
+  --row-grey: 0;
 }
 
 #thread-list .thread-card > .thread-open {
@@ -8795,6 +8814,9 @@ li.discord-message[data-root-child] > .reply-bridge {
   cursor: pointer;
   touch-action: manipulation;
   -webkit-tap-highlight-color: transparent;
+  /* `#483 thread-card-read-style`: a card recedes by the message rows' amounts (below). */
+  opacity: var(--row-opacity, 1);
+  filter: var(--row-filter, none);
 }
 
 .side-card {
@@ -8833,6 +8855,10 @@ li.discord-message[data-root-child] > .reply-bridge {
   border-color: transparent;
   border-left-color: transparent;
   outline: none;
+  /* The run's line at full strength, as a message row heading a run keeps its line. */
+  --row-opacity: 1;
+  --row-filter: none;
+  --row-grey: 0;
 }
 
 #side-cards li.side-card-row[data-read-run="head"] > :not(.read-run) {
@@ -8863,13 +8889,39 @@ li.discord-message[data-root-child] > .reply-bridge {
   color: var(--muted);
 }
 
+/* `#483 thread-card-read-style`. A card whose thread is read whole (`data-thread-read`,
+   `threadIsRead`) recedes as a read message row does: the archived rows' own amounts, above
+   (`li.discord-message[data-archived="true"]`), in every read mode — Fold read folds such
+   cards into runs and Hide read leaves them out before this is seen; under Show read this is
+   what says the thread wants nothing. The grey edge above stays Unpack unread's alone.
+   The card heading an open thread is never marked read, so it never recedes. */
+.side-card-row[data-thread-read] {
+  --row-opacity: 0.42;
+  --row-filter: grayscale(1);
+  --row-grey: 1;
+}
+
+/* Back at full strength where the reader is on it, as a read row is: selected, highlighted,
+   or holding the focus, its buttons have to read as buttons. */
+.side-card-row[data-thread-read][data-selected="true"],
+.side-card-row[data-thread-read][data-highlighted],
+.side-card-row[data-thread-read]:focus-within {
+  --row-opacity: 1;
+  --row-filter: none;
+  --row-grey: 0;
+}
+
 /*
  * `#425 collapsed-lines`. A card's text follows the reader's collapsed-lines count as a message's
  * does, but never under ONE line: this text is the card's name — what a screen reader calls it
  * and what tells one thread from another — and a list of nameless cards at 0 would be the count
  * breaking the view it was only meant to tighten. The plain `var()` is stated first for a browser
- * that takes no arithmetic in a clamp; at 0 such a browser unclamps, and the fixed height below,
+ * that takes no arithmetic in a clamp; at 0 such a browser unclamps, and the most height below,
  * whose `max()` every browser takes, still holds the card to its one line.
+ *
+ * `#482 thread-card-fit`: the count is a MAXIMUM, as it is on a message's clamped body. A card
+ * whose words take fewer lines is that much shorter — no fixed height reserving lines its text
+ * never fills between the words and the facts under them.
  */
 .side-card-text {
   display: -webkit-box;
@@ -8879,7 +8931,7 @@ li.discord-message[data-root-child] > .reply-bridge {
   line-clamp: var(--collapsed-lines);
   line-clamp: max(1, var(--collapsed-lines));
   overflow: hidden;
-  height: calc(max(1, var(--collapsed-lines)) * 1.35em);
+  max-height: calc(max(1, var(--collapsed-lines)) * 1.35em);
   line-height: 1.35;
   overflow-wrap: anywhere;
 }
@@ -8889,18 +8941,19 @@ li.discord-message[data-root-child] > .reply-bridge {
    no way to read the rest short of opening the thread, whose heading gives only the name. The card
    the reader was on showed its whole text, and under a moving mouse that was a card growing and
    shrinking at every move; the owner: "I also don't like the cards expanding." So the card
-   HIGHLIGHTED, by a press, shows it, and no other. Still the clamped height at least, so a short
-   card does not shrink as it is highlighted. */
+   HIGHLIGHTED, by a press, shows it, and no other. */
 /*
  * `#428 summary-cards-full`. A card saying a SUMMARY (`data-summarised-card`, from
  * `cardIsSummarized` in web/voice.js) in the same rule, and for keeps: a summary is already the
  * shortening, its length roughly chosen where it was made, so there is nothing left for a clamp
  * to protect the reader from — only meaning for an ellipsis to cut. Summarised cards are drawn
  * whole at every collapsed-lines count, 0 included; the count is for raw text, which is
- * unbounded. Still the clamped height at least, as a highlighted card, so a short summary's card
- * is the size of its neighbours. The card at the top of a thread is stated by id further down,
+ * unbounded. The card at the top of a thread is stated by id further down,
  * where its phone rule has to be outranked. `#440 thread-card-pack-toggle`: and a card the Threads view's
  * pack toggle has opened, whole or unpacked (`data-card-state`).
+ *
+ * `#482 thread-card-fit`: no least height either — a short summary's card is its own size, not
+ * its neighbours', and a highlighted short card keeps the height it already had fitted.
  */
 .side-card-row[data-highlighted] > .side-card > .side-card-text,
 .side-card-row[data-summarised-card] > .side-card > .side-card-text,
@@ -8911,7 +8964,7 @@ li.discord-message[data-root-child] > .reply-bridge {
   line-clamp: none;
   overflow: visible;
   height: auto;
-  min-height: calc(max(1, var(--collapsed-lines)) * 1.35em);
+  max-height: none;
 }
 
 .side-card-facts {
@@ -8957,11 +9010,11 @@ li.discord-message[data-root-child] > .reply-bridge {
  * so the heading gives up its rule and its least height, the card having its own border, and lines the
  * card up with the cards of the list under it.
  *
- * A FIXED HEIGHT: the reader's collapsed lines of text, clamped as a list card's are (two at most
- * on a phone, below), then a facts line as tall as the
- * X, and never less than two lines of the count. So the card is the same height whatever it says, and
- * a summary or a count arriving after the thread opened moves nothing under the reader (`#280
- * scroll-stability`).
+ * FITTED, as a list card is (`#482 thread-card-fit`): its text is its own height up to the
+ * reader's collapsed lines, clamped as a list card's are (two at most on a phone, below), then a
+ * facts line as tall as the X. Until `#482` the height was fixed so a summary arriving moved
+ * nothing; the owner traded that for cards that waste no room, and a summary arriving after the
+ * thread opened now grows the heading once, to what the summary needs.
  *
  * LARGER TYPE ON A PHONE. The facts line holds the age, the count and the X, and at 150% type on a
  * 360px phone they no longer fit on one line. The age is never narrower than its own words, which
@@ -9032,27 +9085,26 @@ li.discord-message[data-root-child] > .reply-bridge {
   }
 }
 
-/* On a phone, over a thread across the window, two lines of it rather than the reader's full count:
-   the card is the screen's heading there, and another line of it is a line less of the thread. Fewer
-   than two where the reader's count is fewer (`#425 collapsed-lines`), never under the one line a
-   card keeps for its name. Still a fixed height. */
+/* On a phone, over a thread across the window, two lines of it at most rather than the reader's
+   full count: the card is the screen's heading there, and another line of it is a line less of
+   the thread. Fewer than two where the reader's count is fewer (`#425 collapsed-lines`), never
+   under the one line a card keeps for its name. Fitted below that most, as a list card is. */
 @media (max-width: 599.98px) {
   #thread-card:not([data-folded]) > .side-card > .side-card-text {
     -webkit-line-clamp: 2;
     -webkit-line-clamp: max(1, min(var(--collapsed-lines), 2));
     line-clamp: 2;
     line-clamp: max(1, min(var(--collapsed-lines), 2));
-    height: calc(max(1, min(var(--collapsed-lines), 2)) * 1.35em);
+    max-height: calc(max(1, min(var(--collapsed-lines), 2)) * 1.35em);
   }
 }
 
 /*
  * `#428 summary-cards-full`. The card at the top of a thread, summarised: whole at every width,
- * stated by id so the phone's two lines above do not cut a summary either, and never under its
- * clamped height, so a summary arriving where raw words stood grows the heading once, to what the
- * summary needs, and no further moving follows it. Folded to a bar (`data-folded`, `#388
- * thread-header-collapse`) it is the bar and nothing else, summary or not: that fold is the
- * reader's own press on the card, kept as asked.
+ * stated by id so the phone's two lines above do not cut a summary either. Fitted like the list
+ * cards (`#482 thread-card-fit`), so a one-line summary is a one-line heading. Folded to a bar
+ * (`data-folded`, `#388 thread-header-collapse`) it is the bar and nothing else, summary or not:
+ * that fold is the reader's own press on the card, kept as asked.
  */
 :is(#thread-card, #side-thread-card)[data-summarised-card]:not([data-folded]) > .side-card > .side-card-text {
   display: block;
@@ -9060,16 +9112,7 @@ li.discord-message[data-root-child] > .reply-bridge {
   line-clamp: none;
   overflow: visible;
   height: auto;
-  min-height: calc(max(1, var(--collapsed-lines)) * 1.35em);
-}
-
-/* On a phone the least height is the phone heading's own — two lines at most, as a raw heading's —
-   so a one-line summary at a high count is not a mostly-empty block eight lines tall. The summary
-   itself is whole at every width; only the room kept under a shorter one follows the heading. */
-@media (max-width: 599.98px) {
-  :is(#thread-card, #side-thread-card)[data-summarised-card]:not([data-folded]) > .side-card > .side-card-text {
-    min-height: calc(max(1, min(var(--collapsed-lines), 2)) * 1.35em);
-  }
+  max-height: none;
 }
 
 /*

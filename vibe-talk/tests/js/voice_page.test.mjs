@@ -52866,22 +52866,24 @@ test("`#229 desktop-two-column`: with no thread selected, a card per thread, new
   for (const id of cardIds(page)) {
     assert.ok(page.el("side-cards").children.find((li) => li.getAttribute("data-id") === id).hasAttribute("data-card"));
   }
-  // Fixed height, the reader's collapsed lines (`#425 collapsed-lines`, never under one on a card),
-  // cut with an ellipsis: the stylesheet's, since this fixture lays nothing out.
+  // At most the reader's collapsed lines (`#425 collapsed-lines`, never under one line of clamp on
+  // a card), cut with an ellipsis, and fitted below that most (`#482 thread-card-fit`): the
+  // stylesheet's, since this fixture lays nothing out.
   // Outside the two-column block since `#281 view-keys`: the thread list draws the same cards at any width.
   const text = cssBlockOutside(TWO_COLUMN_QUERY, ".side-card-text");
   assert.match(text, /-webkit-line-clamp:\s*max\(1, var\(--collapsed-lines\)\)/);
   assert.match(text, /overflow:\s*hidden/);
-  assert.match(text, /height:\s*calc\(max\(1, var\(--collapsed-lines\)\) \* 1\.35em\)/, "a card is not a fixed height in collapsed lines");
+  assert.match(text, /max-height:\s*calc\(max\(1, var\(--collapsed-lines\)\) \* 1\.35em\)/, "a card is not held to at most its collapsed lines");
+  assert.doesNotMatch(text, /(^|[^-])height:\s*calc/, "a short card still reserves its collapsed lines");
   // `#257 summary-truncation`, since `#277 thread-card-focus`: save the card highlighted, which shows its
-  // whole text, three lines tall at least, so nothing the clamp cuts is out of reach. The card under the
+  // whole text, so nothing the clamp cuts is out of reach. The card under the
   // mouse or the keys does not: see `#277`'s own tests below. Outside the two columns' block since `#281
   // view-keys`, the thread list's cards being the same cards.
   const whole = cssBlockOutside(TWO_COLUMN_QUERY, ".side-card-row[data-highlighted] > .side-card > .side-card-text");
   assert.match(whole, /-webkit-line-clamp:\s*none/, "the highlighted card is still clamped");
   assert.match(whole, /overflow:\s*visible/, "the highlighted card still hides what runs over");
   assert.match(whole, /(^|[^-])height:\s*auto/, "the highlighted card is still a fixed height");
-  assert.match(whole, /min-height:\s*calc\(max\(1, var\(--collapsed-lines\)\) \* 1\.35em\)/, "the highlighted card shrinks a short card as it is lit");
+  assert.doesNotMatch(whole, /min-height:/, "a highlighted short card still reserves its collapsed lines");
   // A long first message is given whole, its line breaks folded, for the clamp to cut.
   page.threads = [];
   const long = message({ id: "210", content: "a long first message\n\nthat runs over several lines " + "and on ".repeat(40),
@@ -54800,7 +54802,7 @@ test("`#277 thread-card-focus`: every card stays the reader's collapsed lines �
   assert.match(whole, /-webkit-line-clamp:\s*none/, "a highlighted card is still clamped");
   assert.match(whole, /overflow:\s*visible/, "a highlighted card still hides what runs over");
   assert.match(whole, /(^|[^-])height:\s*auto/, "a highlighted card is still a fixed height");
-  assert.match(whole, /min-height:\s*calc\(max\(1, var\(--collapsed-lines\)\) \* 1\.35em\)/, "a short card shrinks as it is highlighted");
+  assert.doesNotMatch(whole, /min-height:/, "a highlighted short card still reserves its collapsed lines (`#482 thread-card-fit`)");
   const { page, data } = await twoColumnServer();
   const [first, second] = data.threads;
   await mouseTo(page, cardRow(page, first.id), 900, 60);
@@ -55174,9 +55176,9 @@ test("`#298 thread-card-header`: the card at the top of a thread is in the right
   assert.match(cssBlockOutside(TWO_COLUMN_QUERY, '.side-card-row.thread-card-header[data-thread-state="start"]'),
     /border-color:\s*var\(--thread-grey\)/, "a thread nobody has answered spends a colour on its card");
   assert.deepStrictEqual(cssRules(CSS_CODE, ".thread-card-header[data-highlighted]"), []);
-  // A fixed height: the list card's text, the reader's clamped lines of a fixed height, and an X of
-  // a fixed size on the facts line, which the count beside it is shorter than.
-  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, ".side-card-text"), /(^|[^-])height:\s*calc\(max\(1, var\(--collapsed-lines\)\) \* 1\.35em\)/);
+  // Fitted as a list card is (`#482 thread-card-fit`): the list card's text, at most the reader's
+  // clamped lines, and an X of a fixed size on the facts line, which the count beside it is shorter than.
+  assert.match(cssBlockOutside(TWO_COLUMN_QUERY, ".side-card-text"), /max-height:\s*calc\(max\(1, var\(--collapsed-lines\)\) \* 1\.35em\)/);
   assert.match(cssBlockOutside(TWO_COLUMN_QUERY, ".thread-card-close"), /(^|[^-])height:\s*1\.75rem/);
   // From review, larger type on a phone: the facts line no longer fits on one line at 150% type on a
   // 360px phone, and the age, the only column that could give way, was squeezed under its own words
@@ -55750,10 +55752,11 @@ test("`#298 thread-card-header`: a thread across the window is headed by the sam
   assert.match(cssBlockOutside(TWO_COLUMN_QUERY, "#thread-heading"), /align-items:\s*flex-start/);
   assert.match(cssBlockOutside(TWO_COLUMN_QUERY, "#channel-navigation:has(> #thread-heading:not([hidden]))"), /border-bottom:\s*0/);
   // On a phone, two lines of it at most — the reader's count under that, one at least (`#425
-  // collapsed-lines`) — still a fixed height.
+  // collapsed-lines`) — and fitted below that most (`#482 thread-card-fit`).
   const phone = cssBlockIn("(max-width: 599.98px)", "#thread-card:not([data-folded]) > .side-card > .side-card-text");
   assert.match(phone, /-webkit-line-clamp:\s*max\(1, min\(var\(--collapsed-lines\), 2\)\)/);
-  assert.match(phone, /(^|[^-])height:\s*calc\(max\(1, min\(var\(--collapsed-lines\), 2\)\) \* 1\.35em\)/, "the phone's card is not a fixed height");
+  assert.match(phone, /max-height:\s*calc\(max\(1, min\(var\(--collapsed-lines\), 2\)\) \* 1\.35em\)/, "the phone's card is not held to two lines at most");
+  assert.doesNotMatch(phone, /(^|[^-])height:\s*calc/, "the phone's card still reserves its two lines");
   // The move up: a transform from where the card in the list was, for as long as the stylesheet says,
   // with the thread fading in under it — nothing laid out — and none of it for a reader who asked for
   // less motion. The script reads the length, and asks no media query.
@@ -79573,6 +79576,30 @@ test("`#440 thread-card-pack-toggle`: Unpack goes Pack all, Unpack unread, Unpac
   page.wideDesk = true;
   await press(page, page.el("side-scroll"), "4", { ctrlKey: true });
   assert.equal(list.getAttribute("data-unpack"), "", "two columns' cards say Unpack's state");
+});
+
+test("`#483 thread-card-read-style`: a fully read thread's card recedes by the read rows' amounts, an unread one does not, and being on the card brings it back", async () => {
+  // The summarized thread read whole (703 too), the raw one with an unread reply, as above.
+  const { page } = await unpackPage(null, ["703"]);
+  assert.equal(cardRow(page, SUM).hasAttribute("data-thread-read"), true, "the premise: the summarized thread read whole");
+  assert.equal(cardRow(page, RAW).hasAttribute("data-thread-read"), false, "the premise: the raw thread unread");
+  // The stylesheet's part: the card spends the rows' amounts, a read message row's own numbers.
+  const rows = cssBlock('#discord-log li.discord-message[data-archived="true"]');
+  const amount = (block, name) => new RegExp(`${name}:\\s*([^;]+);`).exec(block)[1];
+  for (const selector of [".side-card-row[data-thread-read]", "#thread-list .thread-card[data-thread-read]"]) {
+    const dim = cssBlock(selector);
+    assert.equal(amount(dim, "--row-opacity"), amount(rows, "--row-opacity"), `${selector} does not recede as far as a read row`);
+    assert.equal(amount(dim, "--row-filter"), amount(rows, "--row-filter"), `${selector} keeps its colour where a read row loses it`);
+  }
+  assert.match(cssBlock(".side-card-row"), /opacity:\s*var\(--row-opacity/, "nothing draws a card's amounts");
+  assert.match(cssBlock("#thread-list .thread-card"), /opacity:\s*var\(--row-opacity/, "nothing draws a Threads list card's amounts");
+  for (const back of ['.side-card-row[data-thread-read][data-selected="true"]', ".side-card-row[data-thread-read][data-highlighted]",
+    ".side-card-row[data-thread-read]:focus-within", '#thread-list .thread-card[data-thread-read][data-highlighted]']) {
+    assert.match(cssRules(CSS_CODE, back).join("\n"), /--row-opacity:\s*1;/, `${back} does not bring the card back`);
+  }
+  // The run's line stays at full strength under Fold read, as a message run's line does.
+  assert.match(cssBlock('#side-cards li.side-card-row[data-read-run="head"]'), /--row-opacity:\s*1;/,
+    "a read run's line over the cards recedes with its card");
 });
 
 test("`#440 thread-card-pack-toggle`: a thread's own choice outranks Unpack until Unpack is pressed again; choices and Unpack are kept on the device, and an old on means Unpack all", async () => {
