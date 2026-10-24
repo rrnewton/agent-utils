@@ -52557,6 +52557,9 @@ const SYNCED_SETTING_KEYS = [
   "vibe-talk.voice.threads-main",
   "vibe-talk.voice.thread-order",
   "vibe-talk.voice.thread-card-folded",
+  // `#488 slack-app-agents`. Who is who: which account is the owner, the coding agent, a person or
+  // another bot, chosen once for every device. The census of who spoke where stays local: a cache.
+  "vibe-talk.voice.identities",
 ];
 
 /** How often the replica is compared with the archive. A settings write is a human act; a second
@@ -52703,6 +52706,21 @@ function applySyncedSetting(key) {
       case THREADS_MAIN_KEY: setMainRowsShown(storedMainRows()); break;
       case THREAD_ORDER_KEY: setThreadOrder(storedThreadOrder()); break;
       case THREAD_CARD_FOLD_KEY: setThreadCardFolded(storedThreadCardFolded()); break;
+      case IDENTITY_KEY: {
+        // `#488 slack-app-agents`. Another device said who an account is: every row it wrote is
+        // drawn that way here too, and the list in Settings says so.
+        let held = {};
+        try {
+          const parsed = JSON.parse(localSettingValue(key) || "null");
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) held = parsed;
+        } catch (_error) {
+          // A value this page cannot read is no choice at all.
+        }
+        identities = held;
+        eachColumn(renderChannelRows);
+        renderIdentityRows();
+        break;
+      }
       default: break;
     }
   } catch (_error) {

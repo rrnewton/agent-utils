@@ -20679,6 +20679,30 @@ function crowd() {
   ];
 }
 
+test("`#488 slack-app-agents`: who is who is chosen once for every device: another device's choice redraws the rows here", async () => {
+  // The owner, 2026-10-21, on Slack: his coding agent's messages, posted through a chat bridge's app,
+  // were drawn as another bot. The choice in Settings fixes that, and now syncs as his other settings do.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [
+    ...crowd(),
+    message({ id: "1000000000000000004", author: "chat-bridge", author_id: "30", author_is_bot: true }),
+  ]);
+  assert.equal(whoOf(page, 3), "bot", "the premise: with two bots, neither is guessed");
+  assert.ok(page.pure("SYNCED_SETTING_KEYS").includes("vibe-talk.voice.identities"), "who is who is not synced");
+  // What the sync does with a choice another device made: keep it, then apply it.
+  page.pure("keepLocalSetting")("vibe-talk.voice.identities", JSON.stringify({ 30: "coder" }));
+  page.pure("applySyncedSetting")("vibe-talk.voice.identities");
+  await page.settle();
+  assert.equal(whoOf(page, 3), "coder", "another device's choice did not redraw the row");
+  assert.equal(whoOf(page, 1), "bot", "a choice about one account moved another");
+  // A value this page cannot read is no choice: every account back to its guess.
+  page.pure("keepLocalSetting")("vibe-talk.voice.identities", "{not json");
+  page.pure("applySyncedSetting")("vibe-talk.voice.identities");
+  await page.settle();
+  assert.equal(whoOf(page, 3), "bot");
+});
+
 test("A LONE BOT IS GUESSED TO BE THE CODING AGENT, AND PEOPLE ARE GUESSED TO BE PEOPLE", async () => {
   const page = newPage();
   await signIn(page);

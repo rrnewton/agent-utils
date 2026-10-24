@@ -10164,6 +10164,12 @@ welcome bot as the coding agent, nameless and in its colours. In a Slack channel
 is drawn as another bot, with its own name and `(bot)`, until the configuration or Settings names the
 coding agent. Slackbot is drawn as a bot although Slack's `users.info` says otherwise.
 
+A coding agent that posts to Slack through a Slack app (a chat bridge, say) posts as that app's one
+account, whatever display name each message carries. Name it once: in Settings, Channels, Who is who,
+choose **coding agent** on its row, or put the id that row shows beside it into the Slack provider's
+`coding_agent_user_ids`. `#488 slack-app-agents`: a choice in Settings is kept on the server with the
+owner's other settings, so every device draws the account the same way.
+
 ## Running the tests
 
 ```bash
