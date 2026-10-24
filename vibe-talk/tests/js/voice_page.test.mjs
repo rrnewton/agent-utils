@@ -80639,6 +80639,25 @@ test("`#491 threads-view-sent-receipt`: a reply sent from among the cards, once 
     "the reply is drawn among the cards and again as a receipt at the foot");
 });
 
+test("`#492 threads-row-widths`: an unpacked thread's rows reach the card's right edge, the owner's half an inset narrower, the reply as wide", () => {
+  // The owner, 2026-10-22: the thread's rows came in on the right, his own were the wider ones, and the
+  // reply box was wider than the rows it posts among. Chromium measures it; this pins the rules.
+  const rows = cssBlock("#side-cards > li.discord-message.unpack-row[data-who]");
+  assert.match(rows, /margin-right:\s*0;/, "an unpacked row keeps a right inset");
+  assert.match(rows, /--row-inset-right:\s*0px/, "a line on an unpacked row stops short of the list's right edge");
+  const own = cssBlock('#side-cards > li.discord-message.unpack-row[data-who="me"]:not([data-read-run="head"])');
+  assert.match(own, /margin-left:\s*calc\(var\(--unpack-row-left\) \+ min\(15%, 6rem\) \/ 2\)/,
+    "the owner's unpacked rows are not half the old inset narrower");
+  assert.match(cssBlock("#side-list"), /--unpack-row-left:\s*calc\(var\(--speaker-inset\) \/ 2 \+ var\(--reply-gutter\)\)/,
+    "the thread's indent is not the stack's own");
+  assert.match(cssBlock("#side-list:has(> #side-cards > li.unpack-row[data-inline-reply]) > #side-reply[data-anchored]"),
+    /left:\s*calc\(anchor\(--inline-reply-list left\) \+ var\(--unpack-row-left\)\)/,
+    "a reply under an unpacked row is not as wide as the thread's rows");
+  // The spine stays one line past the owner's narrower rows.
+  assert.match(cssBlock('#side-cards > li.discord-message.unpack-row[data-who="me"]:not([data-read-run="head"]) > .reply-bridge'),
+    /width:\s*calc\(0\.9rem \+ var\(--reply-stroke\) \/ 2 \+ min\(15cqw, 6rem\) \/ 2\)/);
+});
+
 test("`#407 unpack-row-parity`: n goes to the next unread message over unpacked cards, a card standing for its unread replies", async () => {
   const { page } = await parityPage({ long: false });
   const area = page.el("side-scroll");
