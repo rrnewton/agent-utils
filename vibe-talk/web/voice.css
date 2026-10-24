@@ -9561,11 +9561,15 @@ li.discord-message[data-root-child] > .reply-bridge {
  */
 #side-list {
   --unpack-row-left: calc(var(--speaker-inset) / 2 + var(--reply-gutter));
+  --unpack-row-left-cqw: var(--unpack-row-left);
 }
 
+/* The `cqw` twin is for what is placed inside a row (its bookmark line, `--row-inset-left`), where a
+   percentage would be of the row and not of the list, as the stack's own inset rules say. */
 @media (min-width: 900px) and (pointer: fine) {
   #side-list {
     --unpack-row-left: calc(var(--desk-third-inset, min(7%, 3rem)) + var(--reply-gutter));
+    --unpack-row-left-cqw: calc(var(--desk-third-inset, min(7cqw, 3rem)) + var(--reply-gutter));
   }
 }
 
@@ -9578,7 +9582,7 @@ li.discord-message[data-root-child] > .reply-bridge {
    speaker. */
 #side-cards > li.discord-message.unpack-row[data-who="me"]:not([data-read-run="head"]) {
   margin-left: calc(var(--unpack-row-left) + min(15%, 6rem) / 2);
-  --row-inset-left: calc(var(--unpack-row-left) + min(15cqw, 6rem) / 2);
+  --row-inset-left: calc(var(--unpack-row-left-cqw) + min(15cqw, 6rem) / 2);
 }
 
 /* Its part of the bridge reaches back across the extra inset, so the spine stays one line down the

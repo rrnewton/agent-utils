@@ -33802,6 +33802,9 @@ let nowPlaying = null;
  */
 let readingTicket = 0;
 
+/** `#487 read-aloud-recovery`. The try at starting a cut-off read again that is waiting, or null. */
+let readRecoveryTimer = null;
+
 /**
  * The message a tap has ASKED for, before any audio exists.
  *
@@ -33841,6 +33844,14 @@ function stopReading() {
   readingTicket += 1;
   const wasPending = pendingRead !== null;
   pendingRead = null;
+  // `#487 read-aloud-recovery`. A read waiting to start again after it was cut off held the media
+  // keys and the audio output through the wait, as a jump does; stopped now, it gives them back.
+  if (readRecoveryTimer !== null && !readJumping) {
+    clearTimeout(readRecoveryTimer);
+    readRecoveryTimer = null;
+    releaseMediaSession();
+    quietReadAloudContext();
+  }
   if (nowPlaying === null) {
     // ABORTING A READ THAT NEVER STARTED still has to take the highlight off. This returned early,
     // so a message aborted while its audio was still being fetched stayed lit with nothing coming
@@ -35206,9 +35217,6 @@ function restartHeldBlock(playing) {
 /** How long to wait before each try at starting a cut-off read again: about as long as a restart. */
 const READ_RECOVERY_WAITS_MS = [1000, 3000, 8000];
 
-/** The try waiting to start, or null. */
-let readRecoveryTimer = null;
-
 /**
  * Start read `parts` again from `from` (`{part, block, recovery}`) after `wait` ms, on fresh tickets.
  * Until then the row shows the read as asked for, and a tap on it, or on any other, is the reader's
@@ -35247,9 +35255,14 @@ function recoverRead(parts, from, wait) {
       readJumping = false;
     }
     Promise.resolve(attempt).catch(() => {
-      // Not even prepared or fetched (the server still away): another try, while there are tries.
-      if (from.recovery < READ_RECOVERY_WAITS_MS.length && pendingRead === null && nowPlaying === null) {
+      if (pendingRead !== null || nowPlaying !== null) return;
+      // Not even prepared or fetched (the server still away): another try, while there are tries;
+      // after the last, the media keys and the audio output it held go back.
+      if (from.recovery < READ_RECOVERY_WAITS_MS.length) {
         recoverRead(parts, { ...from, recovery: from.recovery + 1 }, READ_RECOVERY_WAITS_MS[from.recovery]);
+      } else {
+        releaseMediaSession();
+        quietReadAloudContext();
       }
     });
   }, wait);
@@ -44986,6 +44999,11 @@ function renderSideCards() {
   const loading = threadPages.loading && threadPages.channel === String(el("discord-channel").value);
   setTextIfChanged(button, loading ? "Loading older threads…" : "Older threads…");
   if (button.disabled !== loading) button.disabled = loading;
+  // `#491 threads-view-sent-receipt`. A sent reply these cards now draw takes its receipt away: the
+  // outbox was drawn before them on a pass over the rows, and an unpack read draws them on its own.
+  if (sideCardsShown() && [...outgoingMessages.values()].some((entry) => entry.state === "sent")) {
+    eachColumn(renderOutgoingMessages);
+  }
   // `#410 inline-reply-editor`. A reply open under a row unpacked here, under it as the rows now stand;
   // one waiting for its message, opened again once the message is drawn here.
   if (replyDocked) placeInlineReply();
@@ -52777,6 +52795,17 @@ function takeServerSettings(entries, whole) {
       : settingsAtStart.has(entry.key) && local !== settingsAtStart.get(entry.key);
     syncedArchive.set(entry.key, { value: entry.value, updatedMs: entry.updated_ms });
     if (pendingLocal || local === entry.value) continue;
+    // `#488 slack-app-agents`. Who is who was kept per device until it synced, so the first read
+    // finds each device with choices of its own: merged, the server's winning an account both name,
+    // and the merge pushed by the next pass (the archive keeps the server's value, which differs).
+    if (!agreed && entry.key === IDENTITY_KEY && local !== null && entry.value !== null) {
+      const merged = mergedIdentities(local, entry.value);
+      if (merged !== null && merged !== entry.value) {
+        keepLocalSetting(entry.key, merged);
+        applySyncedSetting(entry.key);
+        continue;
+      }
+    }
     keepLocalSetting(entry.key, entry.value);
     applySyncedSetting(entry.key);
     adoptAppliedSetting(entry.key, entry.value, entry.updated_ms);
@@ -52803,6 +52832,25 @@ function takeServerSettings(entries, whole) {
       applySyncedSetting(key);
       adoptAppliedSetting(key, null, agreed.updatedMs);
     }
+  }
+}
+
+/**
+ * `#488 slack-app-agents`. Two devices' who-is-who choices as one, the server's winning an account
+ * both name, as the stored JSON; null when either is not a map this page can read.
+ *
+ * @param {string} local
+ * @param {string} server
+ */
+function mergedIdentities(local, server) {
+  try {
+    const mine = JSON.parse(local);
+    const theirs = JSON.parse(server);
+    const map = (value) => value && typeof value === "object" && !Array.isArray(value);
+    if (!map(mine) || !map(theirs)) return null;
+    return JSON.stringify({ ...mine, ...theirs });
+  } catch (_error) {
+    return null;
   }
 }
 
