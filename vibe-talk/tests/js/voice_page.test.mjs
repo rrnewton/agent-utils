@@ -5238,6 +5238,12 @@ const TUNING_BANDS = {
     "how many automatic reconnects one call may make: one ends a long call at the bridge's second " +
     "lost turn however far apart; past five a bridge that loses a turn every minute keeps the call " +
     "limping on new sessions for as long as the reader stays"],
+  // `#486 read-aloud-pieces`.
+  READ_PIECE_WORDS: [40, 90,
+    "the most words one piece of a block says aloud, unless one sentence is longer: fewer cuts a " +
+    "paragraph of short sentences into pieces of one or two, each a pause at the voice's first audio; " +
+    "more leaves a long paragraph one stretch the controller cannot step through. src/render.rs " +
+    "READ_PIECE_WORDS must say the same"],
   SENTENCE_STEP_MS: [50, 400,
     "how often the sentence being read aloud is looked for again (`#379 read-aloud-sentences`): " +
     "slower lights a sentence a word or more after the voice reaches it; faster redraws for nothing"],
@@ -12303,6 +12309,110 @@ test("a stall in the middle of a block holds the sentence light through the sile
   assert.equal(await look(2.9), "One two three.", "the block's arrival moved the light");
   assert.equal(await look(4.1), "Four five six!", "1.8 s of 2.72 s said is the second sentence");
   assert.equal(await look(4.5), "Seven eight?", "2.2 s of 2.72 s said is the third sentence");
+});
+
+// --- `#486 read-aloud-pieces`: a block read in pieces --------------------------------------------
+
+/** The cases src/render.rs `read_pieces` is held to: the page cuts each the same way. */
+const PIECES_FIXTURE = JSON.parse(readFileSync(join(WEB, "..", "tests", "fixtures", "read_aloud_pieces.json"), "utf8"));
+
+test("THE PAGE CUTS A BLOCK INTO THE PIECES THE SERVER READS IT IN, case by case", () => {
+  const page = newPage();
+  const readPieces = page.pure("readPieces");
+  for (const { name, text, pieces } of PIECES_FIXTURE.cases) {
+    // Through JSON: the page's arrays are of its own realm.
+    assert.deepEqual(JSON.parse(JSON.stringify(readPieces(text).map(({ start, end }) => text.slice(start, end)))), pieces, name);
+  }
+  // The control: a bullet typed as a dash is a sentence, not a piece, and a short block is whole.
+  assert.equal(readPieces("Intro.\n- a\n- b").length, 1);
+  assert.equal(readPieces("").length, 0);
+});
+
+/** A page reading a paragraph of typed bullets as three pieces, and a list item after it as a fourth. */
+async function piecedRead() {
+  const page = newPage();
+  page.enableStreamedAudio();
+  page.enableAbort();
+  const highlights = page.enableHighlights();
+  const piece = (at, chars) => ({ kind: "paragraph", spoken: true, chars, element: 0, piece: at, pieces: 3 });
+  page.speechBlocks[BLOCKED_ID] = [piece(0, 6), piece(1, 8), piece(2, 11),
+    { kind: "item", spoken: true, chars: 4, element: 1, piece: 0, pieces: 1 }];
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: BLOCKED_ID,
+    content: "Intro:\n• one two.\n• three four.\n\n- tail",
+    content_html: "<p>Intro:<br>\n• one two.<br>\n• three four.</p>\n<ul>\n<li>tail</li>\n</ul>\n" })]);
+  return { page, rows, highlights };
+}
+
+test("A PARAGRAPH OF TYPED BULLETS IS READ IN PIECES: counted and stepped one by one, its block lit throughout", async () => {
+  // The owner, 2026-10-23: a message whose bullets were "•" lines was one stretch on the controller.
+  const { page, rows, highlights } = await piecedRead();
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  const row = () => page.el("discord-log").children[0];
+  assert.equal(page.el("read-steer-count").text(), "1 of 4");
+  assert.equal(blockOf(page.audioStreams[0].url), "0");
+  assert.match(litBlock(row()), /^p:Intro:/);
+  await page.el("read-next").click();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "2 of 4");
+  assert.equal(blockOf(page.audioStreams.at(-1).url), "1");
+  assert.match(litBlock(row()), /^p:Intro:/, "the paragraph went dark while its second piece was read");
+  // The light inside the block is the piece being read, whole, when it is one sentence.
+  const stream = page.audioStreams.at(-1);
+  stream.controller.bytes(joined(wavHeader(1000, 1), pcm(...new Array(300).fill(0x2000))));
+  await page.settle();
+  page.audio.currentTime = page.audio.sources.at(-1).startedAt + 0.1;
+  page.expireTimers(150);
+  await page.settle();
+  assert.equal(litSentence(highlights), "• one two.");
+  await page.el("read-next").click();
+  await page.settle();
+  await page.el("read-next").click();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "4 of 4");
+  assert.equal(litBlock(row()), "li:tail");
+});
+
+test("a tap on a block read in pieces jumps to its FIRST piece", async () => {
+  const { page, rows } = await piecedRead();
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  const row = page.el("discord-log").children[0];
+  const tail = everyElement(row).find((node) => String(node.tagName).toLowerCase() === "li");
+  await row.dispatch("click", { target: tail });
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "4 of 4");
+  const paragraph = everyElement(page.el("discord-log").children[0]).find((node) => String(node.tagName).toLowerCase() === "p");
+  await page.el("discord-log").children[0].dispatch("click", { target: paragraph });
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "1 of 4", "a tap on the paragraph went to its last piece");
+});
+
+test("pieces the page cuts otherwise than the server still read in order, the block lit and no piece lit", async () => {
+  // A mismatch costs the light its precision, never the read: here the server says the paragraph is two pieces.
+  const page = newPage();
+  page.enableStreamedAudio();
+  page.enableAbort();
+  const highlights = page.enableHighlights();
+  page.speechBlocks[BLOCKED_ID] = [{ kind: "paragraph", spoken: true, chars: 6, element: 0, piece: 0, pieces: 2 },
+    { kind: "paragraph", spoken: true, chars: 20, element: 0, piece: 1, pieces: 2 }];
+  await signIn(page);
+  const rows = await inReadingMode(page, [message({ id: BLOCKED_ID, content: "Intro:\n• one two.\n• three four.",
+    content_html: "<p>Intro:<br>\n• one two.<br>\n• three four.</p>\n" })]);
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "1 of 2");
+  assert.match(litBlock(page.el("discord-log").children[0]), /^p:Intro:/);
+  page.audioStreams[0].controller.bytes(joined(wavHeader(1000, 1), pcm(...new Array(300).fill(0x2000))));
+  await page.settle();
+  page.audio.currentTime = page.audio.sources.at(-1).startedAt + 0.1;
+  page.expireTimers(150);
+  await page.settle();
+  // The block's own sentences, the first of which runs from its first words across the line break.
+  const lit = highlights.get("read-aloud-sentence");
+  assert.ok(lit, "nothing was lit inside the block");
+  assert.equal(lit.ranges[0].start[0].textContent, "Intro:", "a piece the page could not find was lit");
 });
 
 test("a block of one sentence lights no sentence, and a browser without the highlight API looks for none", async () => {

@@ -843,6 +843,161 @@ fn item_source(text: &str) -> String {
     }
 }
 
+// --- read-aloud pieces: `#486 read-aloud-pieces` ------------------------------------------------
+//
+// The owner, 2026-10-23, of a message whose bullets were "•" lines inside one paragraph: "why is it
+// not split up into chunks with the floating controller for me to navigate within it? Shouldn't we
+// have a Max chunk size in words? ... splitting along paragraph or list structures is much
+// preferable to picking arbitrary breaks inside a paragraph. Having some heuristic to at least
+// identify sentence boundaries would be nice."
+//
+// So a block is read in PIECES, each its own request and its own stop on the controller, by one
+// rule the page applies to the text it drew and the server to the text the block was drawn from
+// (`readPieces` in web/voice.js; both are held to tests/fixtures/read_aloud_pieces.json):
+//
+// - a line that begins with a bullet glyph (`READ_BULLETS`) is a piece of its own, and the lines
+//   between such lines are one piece together, so a "•" list typed as text reads as a list;
+// - a piece of more than `READ_PIECE_WORDS` words is cut at sentence ends (the page's sentence rule,
+//   `sentencesOf`), as many whole sentences to a piece as fit;
+// - only a single sentence longer than that is cut inside, into equal runs of words.
+//
+// A code block and a table are said as a short description and are never cut.
+
+/// The most words one piece of a block says, unless one sentence is longer. About twenty seconds of
+/// speech: short enough to step through, long enough that a paragraph of three sentences is one.
+pub const READ_PIECE_WORDS: usize = 60;
+
+/// The glyphs a line typed as a bullet begins with. Not `-`, `*` or `+`, which Markdown already makes
+/// a list of, and not a dash, which begins sentences as often as items.
+pub const READ_BULLETS: &[char] = &[
+    '•', '◦', '▪', '▫', '‣', '⁃', '●', '○', '■', '□', '▸', '▹', '►',
+];
+
+/// The pieces `text` is read in, in order, each a trimmed slice of it. See the section note.
+#[must_use]
+pub fn read_pieces(text: &str) -> Vec<&str> {
+    let mut groups: Vec<(usize, usize)> = Vec::new();
+    let mut run: Option<(usize, usize)> = None;
+    let mut at = 0;
+    for line in text.split('\n') {
+        let (from, to) = (at, at + line.len());
+        at = to + 1;
+        if line.trim_start().starts_with(READ_BULLETS) {
+            groups.extend(run.take());
+            groups.push((from, to));
+        } else {
+            run = Some(run.map_or((from, to), |(start, _)| (start, to)));
+        }
+    }
+    groups.extend(run);
+    let mut pieces = Vec::new();
+    for (from, to) in groups {
+        pack_sentences(text, from, to, &mut pieces);
+    }
+    pieces
+        .into_iter()
+        .map(|(from, to)| text[from..to].trim())
+        .filter(|piece| piece.split_whitespace().next().is_some())
+        .collect()
+}
+
+/// What a piece says aloud: its words, less the bullet glyph it was typed with.
+#[must_use]
+pub fn piece_source(piece: &str) -> &str {
+    piece
+        .trim_start()
+        .trim_start_matches(READ_BULLETS)
+        .trim_start()
+}
+
+/// Cut `text[from..to]` into pieces of whole sentences of at most [`READ_PIECE_WORDS`] words, a
+/// longer sentence into equal runs of words, and push their ranges.
+fn pack_sentences(text: &str, from: usize, to: usize, pieces: &mut Vec<(usize, usize)>) {
+    let words = |a: usize, b: usize| text[a..b].split_whitespace().count();
+    if words(from, to) <= READ_PIECE_WORDS {
+        pieces.push((from, to));
+        return;
+    }
+    let mut current: Option<(usize, usize, usize)> = None;
+    for (start, end) in sentence_ranges(text, from, to) {
+        let count = words(start, end);
+        if count > READ_PIECE_WORDS {
+            pieces.extend(current.take().map(|(a, b, _)| (a, b)));
+            even_runs(text, start, end, count, pieces);
+            continue;
+        }
+        current = match current {
+            Some((a, _, held)) if held + count <= READ_PIECE_WORDS => Some((a, end, held + count)),
+            held => {
+                pieces.extend(held.map(|(a, b, _)| (a, b)));
+                Some((start, end, count))
+            }
+        };
+    }
+    pieces.extend(current.map(|(a, b, _)| (a, b)));
+}
+
+/// The sentences of `text[from..to]`: each ends at `.`, `!`, `?` or `…`, with any closing quote or
+/// bracket after it, followed by white space or the end. The page's `sentencesOf` rule.
+fn sentence_ranges(text: &str, from: usize, to: usize) -> Vec<(usize, usize)> {
+    let span = &text[from..to];
+    let mut found = Vec::new();
+    let mut start = 0;
+    let mut chars = span.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        if !matches!(c, '.' | '!' | '?' | '…') {
+            continue;
+        }
+        let mut end = at + c.len_utf8();
+        while let Some(&(next_at, next)) = chars.peek() {
+            if !matches!(
+                next,
+                '.' | '!' | '?' | '…' | '"' | '\'' | '”' | '’' | ')' | ']'
+            ) {
+                break;
+            }
+            end = next_at + next.len_utf8();
+            chars.next();
+        }
+        if span[end..].chars().next().is_none_or(char::is_whitespace) {
+            found.push((from + start, from + end));
+            start = end;
+        }
+    }
+    if start < span.len() {
+        found.push((from + start, to));
+    }
+    found
+}
+
+/// `text[from..to]`, of `count` words, cut into the fewest runs of at most [`READ_PIECE_WORDS`]
+/// words, as equal as words allow, the longer runs first.
+fn even_runs(text: &str, from: usize, to: usize, count: usize, pieces: &mut Vec<(usize, usize)>) {
+    let runs = count.div_ceil(READ_PIECE_WORDS);
+    let (size, longer) = (count / runs, count % runs);
+    let mut bounds = Vec::new();
+    let mut in_word = false;
+    let mut seen = 0;
+    let mut wanted = size + usize::from(longer > 0);
+    for (at, c) in text[from..to].char_indices() {
+        let space = c.is_whitespace();
+        if !space && !in_word {
+            if seen == wanted {
+                bounds.push(from + at);
+                wanted += size + usize::from(bounds.len() < longer);
+            }
+            seen += 1;
+        }
+        in_word = !space;
+    }
+    let mut start = from;
+    for bound in bounds {
+        pieces.push((start, bound));
+        start = bound;
+    }
+    pieces.push((start, to));
+}
+
 /// `source[from..to]`, each end moved back onto a character boundary and kept inside the text.
 fn slice_chars(source: &str, from: usize, to: usize) -> &str {
     let boundary = |mut at: usize| {
@@ -3816,6 +3971,49 @@ mod read_aloud_blocks {
         let blocks = source_blocks(&text, Markup::Discord, &[]);
         assert_eq!(kinds(&blocks), [BlockKind::Paragraph, BlockKind::Paragraph]);
         assert_eq!(blocks[1].source, "- x");
+    }
+
+    /// `#486 read-aloud-pieces`: the cases web/voice.js `readPieces` is held to as well.
+    #[test]
+    fn a_block_is_read_in_the_pieces_the_page_cuts_it_into() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/read_aloud_pieces.json"))
+                .expect("the fixture is JSON");
+        for case in fixture["cases"].as_array().expect("cases") {
+            let text = case["text"].as_str().expect("text");
+            let wanted: Vec<&str> = case["pieces"]
+                .as_array()
+                .expect("pieces")
+                .iter()
+                .map(|piece| piece.as_str().expect("a piece"))
+                .collect();
+            assert_eq!(read_pieces(text), wanted, "{}", case["name"]);
+        }
+    }
+
+    #[test]
+    fn no_piece_is_longer_than_the_most_words_unless_it_is_one_sentence_cut_evenly() {
+        let sentence = |words: usize| format!("{}.", vec!["w"; words].join(" "));
+        let text = [sentence(30), sentence(31), sentence(59), sentence(1)].join(" ");
+        let pieces = read_pieces(&text);
+        let counts: Vec<usize> = pieces
+            .iter()
+            .map(|p| p.split_whitespace().count())
+            .collect();
+        assert_eq!(counts, [30, 31, 60], "{pieces:?}");
+        let counts: Vec<usize> = read_pieces(&vec!["w"; 121].join(" "))
+            .iter()
+            .map(|p| p.split_whitespace().count())
+            .collect();
+        assert_eq!(counts, [41, 40, 40]);
+        assert!(read_pieces("  \n \n").is_empty());
+    }
+
+    #[test]
+    fn a_piece_says_its_words_without_the_bullet_it_was_typed_with() {
+        assert_eq!(piece_source("  • First load"), "First load");
+        assert_eq!(piece_source("▸ x"), "x");
+        assert_eq!(piece_source("No bullet"), "No bullet");
     }
 
     #[test]
