@@ -5120,8 +5120,13 @@ fn spoken_blocks(
     let cut: Vec<(BlockKind, Vec<&str>)> = blocks
         .iter()
         .map(|block| {
+            // A code block or a table is said as a description of it, and a block whose source still
+            // holds a fence (the whole text, when the tree and the HTML disagree) is never cut
+            // through its code: each whole.
+            let fenced = block.source.contains("```") || block.source.contains("~~~");
             let pieces = match block.kind {
                 BlockKind::Code | BlockKind::Table => vec![block.source.as_str()],
+                _ if fenced => vec![block.source.as_str()],
                 _ => crate::render::read_pieces(&block.source),
             };
             // A block of nothing a piece can hold is still a block the page draws: kept whole.

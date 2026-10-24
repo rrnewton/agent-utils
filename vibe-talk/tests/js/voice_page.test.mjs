@@ -20703,6 +20703,21 @@ test("`#488 slack-app-agents`: who is who is chosen once for every device: anoth
   assert.equal(whoOf(page, 3), "bot");
 });
 
+test("`#488 slack-app-agents`: the first sync merges who is who with the server's, the server's winning an account both name", async () => {
+  // From review: each device had choices of its own before they synced; taking the server's whole
+  // would lose this device's.
+  const page = newPage(new Map([["vibe-talk.voice.identities", JSON.stringify({ 30: "bot", 40: "me" })]]));
+  await signIn(page);
+  page.pure("takeServerSettings")([{ key: "vibe-talk.voice.identities", value: JSON.stringify({ 30: "coder", 50: "human" }),
+    updated_ms: 5 }], true);
+  await page.settle();
+  const kept = JSON.parse(page.pure("localSettingValue")("vibe-talk.voice.identities"));
+  assert.deepEqual({ ...kept }, { 30: "coder", 40: "me", 50: "human" });
+  // And what is agreed is still the server's value, so the merge goes back to it on the next pass.
+  assert.equal(page.pure("syncedArchive").get("vibe-talk.voice.identities").value, JSON.stringify({ 30: "coder", 50: "human" }));
+  assert.equal(page.pure("mergedIdentities")("[1]", "{}"), null, "a value that is not a map was merged");
+});
+
 test("A LONE BOT IS GUESSED TO BE THE CODING AGENT, AND PEOPLE ARE GUESSED TO BE PEOPLE", async () => {
   const page = newPage();
   await signIn(page);
@@ -33430,6 +33445,22 @@ test("a tap after a read that could not be played prepares again, rather than pl
   assert.ok(page.prepareCalls.slice(before).some((call) => (call.ids || []).includes("1000000000000000002")),
     "the tap played the ticket prepared before the server restarted");
   assert.match(page.audioStreams.at(-1).url, /-fresh\?/);
+});
+
+test("a read stopped while it waits to start again gives back the media keys it held", async () => {
+  // From review: the wait keeps the media session as a jump does; a stop then found nothing playing and
+  // left the lock screen's controls claimed.
+  const { page, rows } = await blockedRead({ mediaSession: true });
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  assert.equal(page.mediaSession.playbackState, "playing", "the premise: the read holds the media session");
+  page.audioStreams[0].controller.fail();
+  await page.settle();
+  assert.match(page.el("status").textContent, /cut off; trying again/);
+  await page.el("discord-log").children[0].dispatch("click", {});
+  await page.settle();
+  assert.equal(page.mediaSession.playbackState, "none", "the stopped read kept the media session");
+  assert.equal(page.mediaSession.handlers.pause, null, "the stopped read left its media keys bound");
 });
 
 test("a tap during the wait to try again is the reader's own: the try leaves it alone", async () => {

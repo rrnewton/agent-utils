@@ -882,7 +882,9 @@ pub fn read_pieces(text: &str) -> Vec<&str> {
     for line in text.split('\n') {
         let (from, to) = (at, at + line.len());
         at = to + 1;
-        if line.trim_start().starts_with(READ_BULLETS) {
+        // A quote's `>` markers are not drawn: its typed bullets begin lines as the page sees them.
+        let drawn = line.trim_start().trim_start_matches('>').trim_start();
+        if drawn.starts_with(READ_BULLETS) {
             groups.extend(run.take());
             groups.push((from, to));
         } else {
@@ -938,14 +940,17 @@ fn pack_sentences(text: &str, from: usize, to: usize, pieces: &mut Vec<(usize, u
 }
 
 /// The sentences of `text[from..to]`: each ends at `.`, `!`, `?` or `…`, with any closing quote or
-/// bracket after it, followed by white space or the end. The page's `sentencesOf` rule.
+/// bracket after it, followed by white space or the end. The page's `sentencesOf` rule, on the drawn
+/// text; here, on the source, never inside markup the page does not draw as text (see
+/// [`inside_markup`]), so no piece holds half a code span or half a link.
 fn sentence_ranges(text: &str, from: usize, to: usize) -> Vec<(usize, usize)> {
     let span = &text[from..to];
+    let inside = inside_markup(span);
     let mut found = Vec::new();
     let mut start = 0;
     let mut chars = span.char_indices().peekable();
     while let Some((at, c)) = chars.next() {
-        if !matches!(c, '.' | '!' | '?' | '…') {
+        if !matches!(c, '.' | '!' | '?' | '…') || inside[at] {
             continue;
         }
         let mut end = at + c.len_utf8();
@@ -968,6 +973,35 @@ fn sentence_ranges(text: &str, from: usize, to: usize) -> Vec<(usize, usize)> {
         found.push((from + start, to));
     }
     found
+}
+
+/// For each byte of `span`, whether it is inside an inline code span, a link's text in `[...]`, or a
+/// link's target in the `(...)` after it, as Markdown writes them.
+fn inside_markup(span: &str) -> Vec<bool> {
+    let mut inside = vec![false; span.len() + 1];
+    let (mut code, mut square, mut target, mut opening) = (false, 0usize, 0usize, false);
+    let mut chars = span.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        let here = code || square > 0 || target > 0;
+        inside[at..at + c.len_utf8()].fill(here);
+        match c {
+            '`' => code = !code,
+            _ if code => {}
+            '[' => square += 1,
+            ']' if square > 0 => {
+                square -= 1;
+                opening = chars.peek().is_some_and(|&(_, next)| next == '(');
+            }
+            '(' if opening => {
+                opening = false;
+                target = 1;
+            }
+            '(' if target > 0 => target += 1,
+            ')' if target > 0 => target -= 1,
+            _ => {}
+        }
+    }
+    inside
 }
 
 /// `text[from..to]`, of `count` words, cut into the fewest runs of at most [`READ_PIECE_WORDS`]
@@ -4007,6 +4041,22 @@ mod read_aloud_blocks {
             .collect();
         assert_eq!(counts, [41, 40, 40]);
         assert!(read_pieces("  \n \n").is_empty());
+    }
+
+    /// From review: the source holds markup the page draws as something else, and a piece never
+    /// ends inside it; a quote's typed bullets are pieces, as the page sees them.
+    #[test]
+    fn a_piece_never_ends_inside_a_code_span_or_a_link() {
+        let long = |w: &str| vec![w; 35].join(" ");
+        let text = format!(
+            "{} see [Mr. Smith](https://example.com/a. b) and `x. y` then. {}.",
+            long("a"),
+            long("b")
+        );
+        let pieces = read_pieces(&text);
+        assert_eq!(pieces.len(), 2, "{pieces:?}");
+        assert!(pieces[0].ends_with("then."), "{pieces:?}");
+        assert_eq!(read_pieces("> • a\n> • b").len(), 2);
     }
 
     #[test]
