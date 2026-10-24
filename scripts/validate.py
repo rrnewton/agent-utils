@@ -209,6 +209,8 @@ PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
     ("scripts/embed_userguides.py", frozenset({DOCS, PACKAGES})),
     ("scripts/check_python_packages.py", frozenset({PYTHON_PACKAGES})),
     ("scripts/check_rust_packages.py", frozenset({RUST_PACKAGES})),
+    # Its subsets install Python distributions and run beside the package smoke checks.
+    ("scripts/check_standalone.py", frozenset({PYTHON_PACKAGES})),
     ("scripts/with-node22", frozenset({TIMELINE_BROWSER})),
     ("scripts/provision-node-packages", frozenset({TIMELINE_BROWSER, VIBE_TALK})),
     ("scripts/provision-node22", frozenset({TIMELINE_BROWSER})),
@@ -1040,6 +1042,12 @@ def self_test() -> int:
         ["scripts/check_rust_packages.py"],
         {PYTHON, RUST_PACKAGES},
         "the Rust package checker selects no Python package gates",
+        {"repository-infrastructure"},
+    )
+    expect(
+        ["scripts/check_standalone.py"],
+        {PYTHON, PYTHON_PACKAGES},
+        "the standalone-subset checker selects no Rust package gates",
         {"repository-infrastructure"},
     )
     expect(

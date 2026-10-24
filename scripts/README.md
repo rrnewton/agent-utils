@@ -14,6 +14,7 @@ through the top-level `bin/` command surface while that family is still evolving
 | `check_no_any.py` | Reject explicit `typing.Any` use at typed boundaries. |
 | `check_python_packages.py` | Build each wheel and sdist, rebuild from the sdist, then inspect, install, and smoke every Python distribution in isolation. |
 | `check_rust_packages.py` | Package and inspect each Rust crate in isolation. |
+| `check_standalone.py` | Install one subset of the suite alone, with no other suite command, sibling package, or Herdr visible, and run its quickstart workflow end to end (`--list` names the subsets). |
 | `check_site.py` | Check the public website under `site/`: pages parse, every relative and repository link resolves (including `#fragments` into Markdown headings), nothing loads from another origin, every published file is tracked by git, and asset sizes stay within their caps. `--stage DIR` copies the published files (all but `site/demos/` and `site/README.md`) for the Pages workflow. |
 | `dagrun_profile_chart.py` | Render deterministic, dependency-free SVG speedup and within-step parallelism charts from dagrun model/trace data. |
 | `agent-log-archive/fetch_agent_logs.py` | Strict-typed, non-deleting local/SSH archive fetcher with manifests, metrics, and immutable receipts (`.sh` is its compatibility launcher). |

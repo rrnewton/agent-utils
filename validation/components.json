@@ -231,6 +231,7 @@
         "scripts/check_python_packages.py",
         "scripts/check_rust_packages.py",
         "scripts/check_site.py",
+        "scripts/check_standalone.py",
         "scripts/embed_userguides.py",
         "scripts/pid_namespace_init.py",
         "scripts/rebase-delta-guard",
