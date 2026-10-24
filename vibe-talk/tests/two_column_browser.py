@@ -427,13 +427,17 @@ def columns_walk(desk: Desk) -> None:
     desk.check(regions == [["side-scroll", "Thread list"]], f"the right column is not one region named for its cards: {regions}")
     desk.notes.append("one region on the right")
 
-    # The cards: newest activity at the foot (`#261 two-column-connectors`), one height, the summarised
-    # one by its name and summary, and the long question cut to three lines.
+    # The cards: newest activity at the foot (`#261 two-column-connectors`), each fitted to its
+    # lines (`#482 thread-card-fit`), the summarised one by its name and summary, and the long
+    # question cut to three lines.
     cards = desk.cards()
     ids = [str(card["id"]) for card in cards]
     desk.check(ids == [REPLICA, CANARY, RUNNER], f"the cards are not newest activity at the foot: {ids}")
-    heights = {round(float(str(card["height"]))) for card in cards}
-    desk.check(len(heights) == 1, f"the cards are not one height: {heights}")
+    by_lines = sorted(cards, key=lambda card: int(str(card["lines"])))
+    heights = [round(float(str(card["height"]))) for card in by_lines]
+    desk.check(all(int(str(card["lines"])) <= 3 for card in by_lines) and heights == sorted(heights),
+               f"a card's height does not follow its lines: "
+               f"{[(str(c['id']), str(c['lines']), round(float(str(c['height'])))) for c in by_lines]}")
     text = {str(card["id"]): str(card["text"]) for card in cards}
     desk.check(text[RUNNER] == "runner-wedged: The overnight runner hung twice and was restarted by hand.",
                f"the summarised thread's card says {text[RUNNER]!r}")
@@ -443,7 +447,7 @@ def columns_walk(desk: Desk) -> None:
     desk.check(bool(replica["clamped"]) and int(str(replica["lines"])) == 3,
                f"the long question is not cut to three lines: {replica}")
     desk.shot("1-list")
-    desk.notes.append(f"three cards {heights.pop()}px each, newest at the foot, the long one cut to three lines")
+    desk.notes.append(f"three cards fitted at {heights}px by their lines, newest at the foot, the long one cut to three lines")
 
     # `#257 summary-truncation`, as `#277 thread-card-focus` has it: what the clamp cuts is not out of
     # reach, and no card grows under the mouse. The card under the mouse is the selected one and keeps
