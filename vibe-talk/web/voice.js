@@ -3442,9 +3442,40 @@ function timeNode(className, at, shown) {
   node.textContent = shown;
   if (at !== null) {
     node.setAttribute("datetime", at.toISOString());
-    node.setAttribute("title", dayTitle(at, shown));
+    const title = dayTitle(at, shown);
+    node.setAttribute("title", title);
+    // `#479 message-time-full-date`. The same words as its name, so a reader who cannot hover
+    // hears the day a hover would have shown; and focusable without a Tab stop of its own —
+    // the selected row's time takes the stop with the row (`rowTimeTabStop`), so the keys
+    // reach one time at a time, the one on the row they are on.
+    node.setAttribute("aria-label", title);
+    node.setAttribute("tabindex", "-1");
   }
   return node;
+}
+
+/** A row's time element, when it has one that knows its instant. `#479 message-time-full-date`. */
+function rowTime(row) {
+  if (!row) return null;
+  const node = childByClass(row, "msg-time");
+  return node && node.getAttribute("datetime") ? node : null;
+}
+
+/**
+ * The selected row's time shares its Tab stop: Tab from the row reaches its time, whose tooltip
+ * and name say the full date, and Enter there says it on the status line (`sayTimeDay`). Every
+ * other row's time stays out of the Tab order, as every other row does (`#239 single-selection`).
+ */
+function rowTimeTabStop(row, on) {
+  const node = rowTime(row);
+  if (node) node.setAttribute("tabindex", on ? "0" : "-1");
+}
+
+/** Say a time element's full day on the status line: a tap on a phone, Enter on the keys. */
+function sayTimeDay(node) {
+  const at = new Date(String(node.getAttribute("datetime") || ""));
+  if (Number.isNaN(at.getTime())) return;
+  setStatus(fullLocalAt(at));
 }
 
 /**
@@ -3468,6 +3499,42 @@ function freshenDayTitle(event) {
   if (Number.isNaN(at.getTime())) return;
   const title = kind === EDITED_MARK ? editedTitle(at) : dayTitle(at, String(node.textContent));
   if (node.getAttribute("title") !== title) node.setAttribute("title", title);
+  // `#479 message-time-full-date`. Its name is the same words, freshened with them.
+  if (kind !== EDITED_MARK && node.getAttribute("aria-label") !== title) node.setAttribute("aria-label", title);
+}
+
+/**
+ * A tap (or click) on a message's time says its full day on the status line: the one press on
+ * a phone that says when a message was from, without the details sheet a press-and-hold on
+ * the row opens. The press itself is the row's as it always was — at zero collapsed lines the
+ * header is all of a row there is to press, and a press there must still open it.
+ * `#479 message-time-full-date`.
+ *
+ * @param {Event} event
+ */
+function onTimeTap(event) {
+  const node = /** @type {Element | null} */ (event ? event.target : null);
+  if (!node || typeof node.getAttribute !== "function" || String(node.tagName).toLowerCase() !== "time") return;
+  if (!DAY_TITLED.has(String(node.className))) return;
+  freshenDayTitle(event);
+  sayTimeDay(/** @type {Element} */ (node));
+}
+
+/**
+ * Enter or Space on a focused time says its day, as a tap does; every other key is the row's.
+ * `#479 message-time-full-date`.
+ *
+ * @param {KeyboardEvent} event
+ */
+function onTimeKey(event) {
+  if (!event || (event.key !== "Enter" && event.key !== " ")) return;
+  const node = /** @type {Element | null} */ (event.target);
+  if (!node || typeof node.getAttribute !== "function" || String(node.tagName).toLowerCase() !== "time") return;
+  if (!DAY_TITLED.has(String(node.className))) return;
+  event.stopPropagation();
+  event.preventDefault();
+  freshenDayTitle(event);
+  sayTimeDay(/** @type {Element} */ (node));
 }
 
 // --- long messages, folded -----------------------------------------------------------------------
@@ -6796,6 +6863,7 @@ function carrySelection(anchor, row, substituted) {
   if (anchor.drawn) {
     releaseRow(pane, row);
     row.setAttribute("tabindex", "0");
+    rowTimeTabStop(row, true);
     // The focus too, when it was on the row: a change that took the row away dropped it to the page,
     // as a redraw does (`keepSelection`). A control the reader clicked keeps it, as #239 has it.
     if (anchor.focused) row.focus({ preventScroll: true });
@@ -10185,6 +10253,7 @@ function markRow(pane, row, drawn) {
 /** Take the `tabindex` back from the row selected last, when `row` is not that row. */
 function releaseRow(pane, row = null) {
   if (pane.row && pane.row !== row && pane.row.getAttribute("tabindex") === "0") pane.row.removeAttribute("tabindex");
+  if (pane.row && pane.row !== row) rowTimeTabStop(pane.row, false);
   pane.row = row;
 }
 
@@ -10233,6 +10302,7 @@ function takeRow(pane, row, focus) {
   releaseRow(pane, row);
   markRow(pane, row, true);
   row.setAttribute("tabindex", "0");
+  rowTimeTabStop(row, true);
   if (focus) row.focus({ preventScroll: true });
 }
 
@@ -10341,6 +10411,7 @@ function keepSelection() {
     // Not `markRow`: a redraw of both columns must not make whichever came last the one in use.
     setMark(pane, row, true);
     row.setAttribute("tabindex", "0");
+    rowTimeTabStop(row, true);
     if (had || (lost && pane === active)) row.focus({ preventScroll: true });
   }
   // The new row of the selected message is lit, the old one having gone with the redraw. A selection
@@ -10602,6 +10673,7 @@ function focusList(pane) {
   if (row && pane) {
     releaseRow(pane, row);
     row.setAttribute("tabindex", "0");
+    rowTimeTabStop(row, true);
   }
   // The pane handed the keys is the one in use, and its selection the one lit.
   if (pane && pane.list() !== null && lastPane !== pane) {
@@ -45813,6 +45885,9 @@ function sideCard({ choice, text, summarized, root, age, replies, unread, read, 
   const facts = document.createElement("span");
   facts.className = "side-card-facts";
   facts.textContent = age;
+  // `#479 message-time-full-date`. Hovering a card's age says the day it last moved, whole.
+  const lastMoved = Number.isFinite(choice.at) ? choice.at : choice.started;
+  if (Number.isFinite(lastMoved)) facts.setAttribute("title", fullLocalAt(new Date(lastMoved)));
   // `#259 thread-list-unread-filter`: the card's "N unread" or "N new".
   if (unread) row.setAttribute("data-unread", "");
   // `#432 read-mode-unify`. Read: every message of its thread, root and replies, as the read modes see it.
@@ -46189,6 +46264,11 @@ function paintThreadCard(card, choice, tally) {
   setTextIfChanged(words, text);
   if (button.getAttribute("title") !== text) button.setAttribute("title", text);
   setTextIfChanged(leftEl(`${card.id}-age`), age);
+  // `#479 message-time-full-date`. Hovering the open thread's age says the day it last moved, whole.
+  const cardLastMoved = Number.isFinite(choice.at) ? choice.at : choice.started;
+  const ageNode = leftEl(`${card.id}-age`);
+  const ageTitle = Number.isFinite(cardLastMoved) ? fullLocalAt(new Date(cardLastMoved)) : null;
+  if (ageTitle && ageNode.getAttribute("title") !== ageTitle) ageNode.setAttribute("title", ageTitle);
   // A span, not the list card's button: the thread is open already. Never "Open thread".
   const count = leftEl(`${card.id}-count`);
   count.replaceChildren(...cardCountParts("side-card", replies, unread));
@@ -52562,6 +52642,11 @@ document.documentElement.addEventListener("pointerleave", onPointerLeavePage);
 document.addEventListener("selectionchange", noteQuoteSelection);
 // `#260 timestamp-hover`. A message's time says its day on hover, worded as the pointer arrives.
 document.addEventListener("pointerover", freshenDayTitle);
+// `#479 message-time-full-date`. The same wording as the focus reaches a time, and its day said
+// on a tap on it or Enter on the keys, captured ahead of the row's own press.
+document.addEventListener("focusin", freshenDayTitle);
+document.addEventListener("click", onTimeTap, true);
+document.addEventListener("keydown", onTimeKey, true);
 // `#189 restore-ui-state`. The last moments a phone promises this page before it may reclaim it —
 // hidden, or being unloaded — are when the reader's place is written down. Hidden comes first on
 // a phone, and is the one an installed app reliably gets before it is killed.

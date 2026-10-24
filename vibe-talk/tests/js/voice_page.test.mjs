@@ -45738,6 +45738,47 @@ test("a restored transcript line says its day on hover too, beside the time it s
   });
 });
 
+test("`#479 message-time-full-date`: a time's day is its name, a tap or Enter on it says it, and the selected row's time is a Tab stop", async () => {
+  await inZone("America/New_York", async () => {
+    const page = newPage();
+    await signIn(page);
+    const before = localAt(2026, 8, 18, 23, 9);
+    const older = localAt(2025, 10, 3, 23, 9);
+    await showDiscord(page, [
+      message({ id: "701", content: "late yesterday", timestamp: before.toISOString() }),
+      message({ id: "702", content: "last year", timestamp: older.toISOString() }),
+    ]);
+    const time = (id) => rowWithId(page, id).descendants().find((node) => node.className === "msg-time");
+    const zoned = before.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", timeZoneName: "short" });
+    // Hover's words are its name too, year only when it is not this year; no Tab stop of its own.
+    assert.equal(time("701").getAttribute("aria-label"), `Yesterday, Aug 18, Tue, ${shownTime(before)}`);
+    assert.equal(time("701").getAttribute("title"), time("701").getAttribute("aria-label"));
+    assert.match(time("702").getAttribute("aria-label"), /^Oct 3, 2025, Fri, /);
+    assert.equal(time("701").getAttribute("tabindex"), "-1", "an unselected row's time is a Tab stop");
+    // The selected row's time shares the row's stop, and only that row's.
+    page.el("scroll-area").scrollTop = 0;
+    await press(page, page.el("scroll-area"), "ArrowDown");
+    const selected = selectedId(page);
+    const other = selected === "701" ? "702" : "701";
+    assert.equal(time(selected).getAttribute("tabindex"), "0",
+      `the selected row's time cannot be reached by Tab (selected=${selected}, row tabindex=${rowWithId(page, selected).getAttribute("tabindex")})`);
+    assert.equal(time(other).getAttribute("tabindex"), "-1", "another row's time took a Tab stop too");
+    // A tap on the time says the whole day on the status line; the press is still the row's.
+    await page.documentEvent("click", { target: time("701") });
+    assert.equal(statusText(page), `Yesterday, Aug 18, Tue, ${zoned}`);
+    // Enter on the focused time says it the same way; another year says its year.
+    const enter = { key: "Enter", target: time("702"), stopped: false, stopPropagation() { this.stopped = true; }, preventDefault() {} };
+    await page.documentEvent("keydown", enter);
+    assert.equal(enter.stopped, true, "Enter on a time fell through to the row's keys");
+    assert.match(statusText(page), /^Oct 3, 2025, Fri, /);
+    // The words follow the clock on focus as on hover, name with title.
+    page.setClock(localAt(2026, 8, 20, 0, 5).getTime());
+    await page.documentEvent("focusin", { target: time("701") });
+    assert.equal(time("701").getAttribute("aria-label"), `Aug 18, Tue, ${shownTime(before)}`,
+      "a page left open past midnight still named the time Yesterday");
+  });
+});
+
 test("the details sheet says the day in the same words, with the time and the zone", async () => {
   await inZone("America/New_York", async () => {
     const page = newPage();
