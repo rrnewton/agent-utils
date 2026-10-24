@@ -159,6 +159,10 @@ It serves the checked-out assets and a small fake API from one loopback origin a
 WebSocket to a Playwright mock playing the deployed `vibe-talk-v1` protocol (and, for point 9, the
 hosted one). Pass --web-root DIR to
 run it against another copy of the page, and --screenshots DIR to keep a PNG of each placement.
+
+The runs fall into five independent parts, each in its own browser profiles against its own fake API
+(`PARTS`). The gate runs them as five steps side by side; --part NAME runs one of them, and with no
+--part every part runs, one after another.
 """
 
 from __future__ import annotations
@@ -212,6 +216,21 @@ CARD_GONE_MS = 30_000
 # Point 8's desk, and its channel's one thread: Main's message 3 opened it, and 13 and 14 answer in it.
 DESK = (1280, 800)
 THREAD_ID = "1110000000000000300"
+# A phone's walk in three stretches: the card's place, reach, hold, frozen card and recap and the channel
+# and thread list kept still (points 1 to 7, 9 to 13, 15, 16 and 23); a reader who saw only the card and
+# the trips to Settings (18, 19); and the trips to Help by its key, the chips' room and the jump (20 to 22).
+STRETCHES = ("place", "alone", "help")
+# The check's parts. Each runs in its own browser profiles against its own fake API and server, so the
+# gate runs each as a step of its own beside the others (tests.dag.yaml), and all of them together are
+# the whole check: the walk at 393x852 split at its stretches, the two smaller phones and the short
+# screens, and the desk. With no --part they run one after another, in this order.
+PARTS = {
+    "phone-place": "393x852, the card's place, reach, hold, frozen card and recap, and the lists kept still",
+    "phone-alone": "393x852, a reader who saw only the card, and the trips to Settings",
+    "phone-help": "393x852, the trips to Help by its key, the chips' room and the jump back from Settings",
+    "small-screens": "360x780 and 375x667 whole, and the docked card alone at 667x375 and 375x330",
+    "desk": "1280x800 with a mouse: two columns, the thread list and the reader kept across both",
+}
 Json = dict[str, object]
 
 
@@ -613,6 +632,14 @@ def arguments() -> argparse.Namespace:
         type=Path,
         help="keep a PNG of the card on the call's view, the channel and Settings at each size here "
              "(default: none kept)",
+    )
+    parser.add_argument(
+        "--part",
+        action="append",
+        choices=tuple(PARTS),
+        help="run only this part of the check, repeatable; the parts are independent and together are the "
+             "whole check: " + "; ".join(f"{name}: {what}" for name, what in PARTS.items())
+             + " (default: every part, one after another)",
     )
     return parser.parse_args()
 
@@ -1222,7 +1249,8 @@ def channel_still_case(page: Page, url: str, voice: FakeVoice, api: FakeApi, siz
 
 
 def walk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi,
-         size: tuple[int, int]) -> str:
+         size: tuple[int, int], stretches: tuple[str, ...] = STRETCHES) -> str:
+    """One phone, in one browser profile, through the named stretches of its walk, in the walk's order."""
     width, height = size
     voice = FakeVoice()
     hosted = FakeHosted()
@@ -1246,40 +1274,45 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi
             page = context.pages[0]
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
-            lowest = 1.0
-            for rows in (1, 30):
-                for banner in (False, True):
-                    for draft in (SHORT_DRAFT, LONG_DRAFT):
-                        lowest = min(lowest, reach_case(page, url, voice, api, size, rows, banner, draft))
-            placement_case(page, url, voice, api, size, args.screenshots)
-            channel_still_case(page, url, voice, api, size)
-            dock_case(page, url, voice, api, size, args.screenshots)
-            frozen_case(page, url, voice, api, size, args.screenshots)
-            recap_case(page, url, hosted, api, size, args.screenshots)
-            listed = ""
-            if size == PHONES[0]:
-                listed = "; " + thread_list_case(page, url, voice, api, size, True, args.screenshots)
-                listed += "; " + thread_list_place_case(page, url, voice, api, size, True)
-                listed += "; " + thread_list_arrival_case(page, url, voice, api, size, True)
-                listed += "; " + thread_list_away_case(page, url, voice, api, size, True)
-                listed += "; " + room_back_case(page, url, voice, api, size, True)
-                listed += "; " + opened_card_case(page, url, voice, api, size)
-            listed += "; " + card_alone_case(page, url, voice, api, size,
-                                             CARD_ALONE_CASES if size == PHONES[0] else CARD_ALONE_FEW)
-            if size in (PHONES[0], PHONES[2]):
-                listed += "; " + settings_trip_case(page, url, voice, api, size,
-                                                    SETTINGS_TRIPS if size == PHONES[0] else SETTINGS_TRIPS_FEW)
-                listed += "; " + help_key_trip_case(page, url, voice, api, size,
-                                                    HELP_KEY_TRIPS if size == PHONES[0] else HELP_KEY_TRIPS_FEW)
-            if size == PHONES[0]:
-                listed += "; " + chips_room_case(page, url, voice, api, size)
-                listed += "; " + jump_after_settings_case(page, url, voice, api, size, True, JUMP_TRIPS_PHONE)
+            said: list[str] = []
+            if "place" in stretches:
+                lowest = 1.0
+                for rows in (1, 30):
+                    for banner in (False, True):
+                        for draft in (SHORT_DRAFT, LONG_DRAFT):
+                            lowest = min(lowest, reach_case(page, url, voice, api, size, rows, banner, draft))
+                placement_case(page, url, voice, api, size, args.screenshots)
+                channel_still_case(page, url, voice, api, size)
+                dock_case(page, url, voice, api, size, args.screenshots)
+                frozen_case(page, url, voice, api, size, args.screenshots)
+                recap_case(page, url, hosted, api, size, args.screenshots)
+                said.append(f"Send's centre at >= {lowest:.3f} of the screen in every run; on the channel the card"
+                            " coming and going left a reader up the list on their row and one at the foot there;"
+                            " the next call's line says '412-word recap sent'")
+                if size == PHONES[0]:
+                    said.append(thread_list_case(page, url, voice, api, size, True, args.screenshots))
+                    said.append(thread_list_place_case(page, url, voice, api, size, True))
+                    said.append(thread_list_arrival_case(page, url, voice, api, size, True))
+                    said.append(thread_list_away_case(page, url, voice, api, size, True))
+                    said.append(room_back_case(page, url, voice, api, size, True))
+                    said.append(opened_card_case(page, url, voice, api, size))
+            if "alone" in stretches:
+                said.append(card_alone_case(page, url, voice, api, size,
+                                            CARD_ALONE_CASES if size == PHONES[0] else CARD_ALONE_FEW))
+                if size in (PHONES[0], PHONES[2]):
+                    said.append(settings_trip_case(page, url, voice, api, size,
+                                                   SETTINGS_TRIPS if size == PHONES[0] else SETTINGS_TRIPS_FEW))
+            if "help" in stretches:
+                if size in (PHONES[0], PHONES[2]):
+                    said.append(help_key_trip_case(page, url, voice, api, size,
+                                                   HELP_KEY_TRIPS if size == PHONES[0] else HELP_KEY_TRIPS_FEW))
+                if size == PHONES[0]:
+                    said.append(chips_room_case(page, url, voice, api, size))
+                    said.append(jump_after_settings_case(page, url, voice, api, size, True, JUMP_TRIPS_PHONE))
             check(not errors, f"{width}x{height}: the page threw: {errors}")
         finally:
             context.close()
-    return (f"{width}x{height}: Send's centre at >= {lowest:.3f} of the screen in every run; on the channel"
-            " the card coming and going left a reader up the list on their row and one at the foot there;"
-            f" the next call's line says '412-word recap sent'{listed}")
+    return f"{width}x{height}: " + "; ".join(said)
 
 
 def walk_short(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi,
@@ -2881,9 +2914,22 @@ def main() -> int:
     url = f"http://127.0.0.1:{server.server_port}/"
     try:
         with sync_playwright() as playwright:
-            lines = [walk(playwright.chromium, args, url, api, size) for size in PHONES]
-            lines += [walk_short(playwright.chromium, args, url, api, size) for size in SHORT_SCREENS]
-            lines.append(walk_desk(playwright.chromium, args, url, api))
+            chromium = playwright.chromium
+            lines: list[str] = []
+            for part in (part for part in PARTS if part in (args.part or PARTS)):
+                if part == "phone-place":
+                    lines.append(walk(chromium, args, url, api, PHONES[0], ("place",)))
+                elif part == "phone-alone":
+                    lines.append(walk(chromium, args, url, api, PHONES[0], ("alone",)))
+                elif part == "phone-help":
+                    lines.append(walk(chromium, args, url, api, PHONES[0], ("help",)))
+                elif part == "small-screens":
+                    lines += [walk(chromium, args, url, api, size) for size in PHONES[1:]]
+                    lines += [walk_short(chromium, args, url, api, size) for size in SHORT_SCREENS]
+                elif part == "desk":
+                    lines.append(walk_desk(chromium, args, url, api))
+                else:
+                    raise AssertionError(f"part {part!r} is named in PARTS but runs nothing")
         for line in lines:
             print(line)
         return 0

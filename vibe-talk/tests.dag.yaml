@@ -545,17 +545,82 @@ steps:
   # headroom, and its CPU limit stays 200s. The trips from the thread list to Settings and Help and back with a
   # draft arriving there add about 36s alone at 393x852 and 1280x800 (2026-10-19), so its wall limit goes from
   # 900s to 960s for that headroom, and its CPU limit stays 200s.
+  #
+  # `#474 browser-lane-critical-path`: the whole check ran about 690s wall on 2026-10-23 for about 85s of CPU,
+  # waiting on the page's own holds and settles, and as one step it was the longest in the gate. Its runs fall
+  # into five independent parts (`PARTS` in the script), each in its own browser profiles against its own fake
+  # API and server, so they are five steps here that the browser cap lets run side by side. The graph contract
+  # (py/tests/test_validation_graph_contract.py) holds these steps to exactly the script's parts, one each.
+  # Measured alone on a quiet host: the 393x852 walk's three stretches about 150s, 110s and 95s, the smaller
+  # phones and short screens about 170s, and the desk about 160s. Each wall limit is about three times that.
+  # Each CPU limit is half the whole check's 200s, as a backstop: no part used a quarter of the whole's 85s.
   - group: check
-    job: approval-card-browser
-    desc: the send card's place, thumb reach, hold, docked layout and frozen card, the recap line of a new call, and the channel's list held still as the card comes and goes, in current Chromium at 393x852, 360x780, 375x667, 667x375 and 375x330, beside a reply open in a column at 1280x800, and docked under the thread list through the view keys, arriving there, and back from it with the channel's reader where they were, at 393x852 and 1280x800, the cards' reader kept across two columns and back at 1280x800, the channel's reader kept at its foot as the box takes back its room after Send at 393x852 and 1280x800, a reader of a draft opened by More kept on it at 393x852 and through two columns and back at 1280x800, and a reader who saw only that card at the foot once it goes, there or from under the thread list, at 393x852, 360x780 and 375x667, and back from Settings where they were at 393x852 and 375x667, the chips' room kept for them at 393x852, the jump decided on the list as it is laid out at 393x852 and 1280x800, and back from Help opened by its key on the newest line once the draft went or changed while Help was up at 393x852 and 375x667, and the thread list's reader back at the foot of its cards when a draft came while Settings or Help was up at 393x852 and 1280x800
+    job: approval-card-phone-place-browser
+    desc: the send card's place, thumb reach, hold, docked layout and frozen card, the recap line of a new call, and the channel's list held still as the card comes and goes, at 393x852; docked under the thread list through the view keys, arriving there and back from it with the channel's reader where they were, a draft arriving while Settings or Help was up, the reader kept at the foot as the box takes back its room after Send, and a reader of a draft opened by More kept on it, at 393x852, in current Chromium
     labels: [validation-vibe-talk]
-    cmd: cd vibe-talk && python3 tests/approval_card_browser.py
+    cmd: cd vibe-talk && python3 tests/approval_card_browser.py --part phone-place
     jobs_flag: ""
-    timeout: 960
-    cpu_timeout: 200
+    timeout: 480
+    cpu_timeout: 100
     hint:
       resources: {browser: 1}
-      est_duration_s: 300
+      est_duration_s: 150
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  - group: check
+    job: approval-card-phone-alone-browser
+    desc: a reader who saw only a long draft's card at the foot once it goes, there or from under the thread list, and back from Settings where they were, at 393x852, in current Chromium
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/approval_card_browser.py --part phone-alone
+    jobs_flag: ""
+    timeout: 360
+    cpu_timeout: 100
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 110
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  - group: check
+    job: approval-card-phone-help-browser
+    desc: back from Help opened by its key on the newest line once the draft went or changed while Help was up, the chips' room kept for a reader, and the jump decided on the list as it is laid out, at 393x852, in current Chromium
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/approval_card_browser.py --part phone-help
+    jobs_flag: ""
+    timeout: 300
+    cpu_timeout: 100
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 95
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  - group: check
+    job: approval-card-small-screens-browser
+    desc: the send card's place, reach, hold, docked layout, frozen card and recap line, the channel's list held still and a reader who saw only the card, at 360x780 and 375x667, the trips to Settings and Help at 375x667, and the docked card whole at 667x375 and 375x330, in current Chromium
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/approval_card_browser.py --part small-screens
+    jobs_flag: ""
+    timeout: 480
+    cpu_timeout: 100
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 170
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
+  - group: check
+    job: approval-card-desk-browser
+    desc: beside a reply open in a column, docked under the thread list and back, the cards' reader kept across two columns, the reader kept at the foot after Send, a draft opened by More through two columns and back, the jump back from Settings and a draft arriving while Settings or Help was up, at 1280x800 with a mouse, in current Chromium
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/approval_card_browser.py --part desk
+    jobs_flag: ""
+    timeout: 480
+    cpu_timeout: 100
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 160
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 

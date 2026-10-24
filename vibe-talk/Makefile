@@ -248,9 +248,9 @@ send-order-browser:
 # (`#280`); and at 393x852 and 1280x800 a reader of the thread list to whom a draft came while Settings
 # or Help was up, back at the foot of its cards over the docked card if they left from it (`#336
 # draft-return-thread-list`). Pass WEB_ROOT=dir for another copy of the page, SCREENSHOTS=dir to keep a
-# PNG of each placement.
+# PNG of each placement, PART=name to run one of its five parts (the gate runs each as its own step).
 approval-card-browser:
-	python3 tests/approval_card_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
+	python3 tests/approval_card_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS)) $(if $(PART),--part $(PART))
 
 # `#241 voice-composer` in a real Chromium at 412x915 and 1280x800: the call's message box and the
 # view switch on screen and uncovered while the box has the focus -- at idle, in a typed
