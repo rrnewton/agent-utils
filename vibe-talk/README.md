@@ -7687,6 +7687,8 @@ from, so it cannot name a key the page does not answer.
 | ↓ or `j`, ↑ or `k` | The next or previous message. A message taller than the screen is scrolled through first |
 | `n` | The next unread message below |
 | Enter or `o` | Open or close the selected message, as a tap does (in Read, read it aloud) |
+| Shift+O | Fold the selected message away into a "… read messages …" line and step to the message above, marking it read; pressed again and again it closes up a thread from the bottom, and does nothing on its first message. Enter on the line opens it again (`#480 fold-one-message-key`) |
+| Ctrl+O (Cmd+O) | Open the selected message in its chat service, as the ⋯ menu's "Open in …" link does. It was Shift+O until `#480 fold-one-message-key` |
 | → | Into the thread of the selected message; in two columns it opens on the right, and the keys go with it |
 | ← | Out of a thread, back to the message it was opened from; in two columns, back to Main on the left |
 | `[`, `]` | In two columns, the keys to the left column (Main) or the right one (the thread, or its list) |

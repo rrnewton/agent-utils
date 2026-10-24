@@ -30,8 +30,8 @@ At 1280x800 and at 393x852, the same walk:
   the clipboard holds the address -> the link followed: a new page at the address whose `opener` is null,
   this page where it was, the menu shut, nothing copied -> the question highlighted by the keys and a
   real `l` pressed through CDP: the clipboard holds the address whole and the status pill says so ->
-  a real Shift+O: the same new page -> a message with no address: its ⋯ menu offers neither item, `l`
-  on it highlighted copies nothing and Shift+O opens nothing.
+  a real Ctrl+O: the same new page -> a message with no address: its ⋯ menu offers neither item, `l`
+  on it highlighted copies nothing and Ctrl+O opens nothing.
 
 No page error at any step. Pass --screenshots DIR to keep a PNG of the open menu at each size.
 """
@@ -206,10 +206,10 @@ class Reader:
     def page(self) -> Page:
         return self.desk.page
 
-    def key(self, name: str, shift: bool = False) -> None:
-        """Press one key (`l`, `j`, `Home`, `Escape`, Shift+`O`) through CDP, as a keyboard sends it."""
+    def key(self, name: str, shift: bool = False, ctrl: bool = False) -> None:
+        """Press one key (`l`, `j`, `Home`, `Escape`, Ctrl+`O`) through CDP, as a keyboard sends it."""
         named = {"Home": ("Home", 36), "Escape": ("Escape", 27)}
-        modifiers = 8 if shift else 0  # CDP's modifier bits: 8 is Shift.
+        modifiers = (8 if shift else 0) | (2 if ctrl else 0)  # CDP's modifier bits: 8 Shift, 2 Ctrl.
         if name in named:
             code, vk = named[name]
             text = ""
@@ -217,6 +217,8 @@ class Reader:
         else:
             code, vk = f"Key{name.upper()}", ord(name.upper())
             text = key_name = name.upper() if shift else name
+            if ctrl:
+                text = ""
         down: Json = {"type": "keyDown" if text else "rawKeyDown", "modifiers": modifiers,
                       "key": key_name, "code": code, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk}
         if text:
@@ -271,7 +273,7 @@ class Reader:
             if act == "item":
                 self.page.locator(f"#discord-log > li[data-id='{QUESTION_ID}'] .row-open-link-button").click()
             else:
-                self.key("o", shift=True)
+                self.key("o", ctrl=True)
         opened_page = tab.value
         opened_page.wait_for_load_state()
         self.check(opened_page.url == ADDRESS, f"{act} opened {opened_page.url}, not the address")
@@ -360,13 +362,13 @@ class Reader:
                                "is null, this page unmoved")
 
         # The keys: highlight the question, press l (the copy a pointer takes from the link),
-        # then Shift+O (the opening itself).
+        # then Ctrl+O (the opening itself).
         self.highlight(QUESTION_ID)
         self.check(self.copied_after("l") == ADDRESS, "l on the highlighted question did not copy its link")
         self.check(self.menu(QUESTION_ID)["status"] == "Copied the link in Slack.", "l did not say it copied")
         self.desk.notes.append("l on the highlighted question copied the same address")
         self.opened_at_the_address("key").close()
-        self.desk.notes.append("Shift+O on the highlighted question opened the same address")
+        self.desk.notes.append("Ctrl+O on the highlighted question opened the same address")
 
         # A message the server formed no address for: no item, and both keys are nothing.
         plain_button = f"#discord-log > li[data-id='{PLAIN_ID}'] .row-more-button"
@@ -384,13 +386,13 @@ class Reader:
         self.highlight(PLAIN_ID)
         self.check(self.copied_after("l") == SENTINEL, "l on a message with no address changed the clipboard")
         pages_before = len(page.context.pages)
-        self.key("o", shift=True)
+        self.key("o", ctrl=True)
         page.wait_for_timeout(500)
-        self.check(len(page.context.pages) == pages_before, "Shift+O on a message with no address opened a page")
+        self.check(len(page.context.pages) == pages_before, "Ctrl+O on a message with no address opened a page")
         self.check(float(str(self.menu(PLAIN_ID)["overflow"])) <= 0, "the page scrolls sideways")
         self.desk.shot("2-no-link")
         self.desk.notes.append("a message with no address offered no upstream item (its vibe-talk link "
-                               "still stood), l on it copied nothing and Shift+O opened nothing")
+                               "still stood), l on it copied nothing and Ctrl+O opened nothing")
 
 
 

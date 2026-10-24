@@ -11146,6 +11146,66 @@ function foldForRead(pane, row) {
 }
 
 /**
+ * Shift+O: fold the selected message away into a "… read messages …" line, and step to the
+ * message above (`#480 fold-one-message-key`). The owner's way through one thread at a time:
+ * press, press, press, closing up what is dealt with, until the thread's first message — which
+ * stays, and the key does nothing there. Adjacent folded messages are one line with a count, by
+ * the same plan as Fold read's runs (`readRunPlan`), in any read mode; Enter or a tap on the
+ * line opens it again (`openReadRun` takes its ids back out of `foldedOnes`).
+ *
+ * Folding a message away marks it Done when it was not already, as `e` marks it: the line says
+ * "read messages", and a message the reader has closed up as dealt with is read. A message
+ * already Done is not marked again. On a run's own line the key steps above it and folds that
+ * message, so spamming it keeps going up. A card is packed by its own control, not folded here.
+ */
+function foldOneFromKeyboard(target) {
+  const { pane, row, took } = rowForAct(target);
+  if (!pane || !row) return took;
+  if (row.hasAttribute("data-card")) return false;
+  let at = row;
+  // On a folded line already: the message to fold is the one above it.
+  while (at && at.getAttribute("data-read-run")) {
+    const rows = paneRows(pane);
+    at = rows[rows.indexOf(at) - 1] || null;
+    if (at && at.getAttribute("data-read-run") === "member") at = shownRowFor(at);
+  }
+  if (!at || at.hasAttribute("data-card")) return true;
+  const unpack = at.getAttribute("data-unpack-thread");
+  const root = unpack !== null
+    ? rowMessages(at).some((message) => Boolean(message.thread && message.thread.is_root))
+    : isOpenThreadRoot(at, openThreadRootId());
+  if (root) {
+    setStatus("The thread's first message stays.");
+    return true;
+  }
+  const ids = idsOf(at);
+  if (ids.length === 0) return false;
+  const key = unpack !== null ? viewKey("thread", unpack) : inColumn(pane === sidePane ? columns.side : columns.main, () => viewKey());
+  const folded = foldedOnes.get(key) || new Set();
+  for (const id of ids) folded.add(id);
+  foldedOnes.set(key, folded);
+  const opened = openedReadRuns.get(key);
+  if (opened) for (const id of ids) opened.delete(id);
+  if (!ids.every((id) => archivedIds.has(id))) guardQuietly(() => markRowDone(ids, at))();
+  if (unpack !== null) {
+    sideCardsDrawn = "";
+    renderSideColumn();
+  } else {
+    inColumn(pane === sidePane ? columns.side : columns.main, () => {
+      applyReadRuns();
+      renderScrollTools();
+    });
+  }
+  // Above the line it folded into, or on the line itself when there is nothing above.
+  const landed = paneRowFor(pane, ids[0], false);
+  const rows = paneRows(pane);
+  const above = landed ? rows[rows.indexOf(landed) - 1] : null;
+  selectRow(pane, above || landed || at);
+  setStatus("Folded away.");
+  return true;
+}
+
+/**
  * Enter and o: what a tap on the selected message does (fold or unfold it, or in Read read it aloud:
  * `actOnRow`) and, on the line of a collapsed run of read messages, open the run. Enter on a button
  * or a link inside a row is that control's own press, and is left to it.
@@ -12365,11 +12425,19 @@ const KEYMAP = [
     run: (event, target) => copyLinkFromKeyboard(target),
   },
   {
-    // `#409 open-upstream-link`. Shift+O: bare o opens or closes the message here, its shifted
-    // form opens it in its service — the ⋯ menu's "Open in …" link, pressed, so the opening is
-    // the link's own, in a new tab, exactly as a tap on it. On a row with no address the link
-    // is not there to press and the key is left alone, as l is.
+    // `#480 fold-one-message-key`. Shift+O: bare o shrinks or expands the message here, its
+    // shifted form folds it away altogether into a "… read messages …" line and steps above
+    // it, for closing up one thread at a time. Marks it read, as dealt with.
     group: KEYS_MESSAGE, chords: [{ key: "o", shift: true }],
+    does: () => `Fold it away into a "… read messages …" line and step to the message above, marking it read: press again and again to close up a thread from the bottom; Enter on the line opens it again`,
+    run: (event, target) => foldOneFromKeyboard(target),
+  },
+  {
+    // `#409 open-upstream-link`, moved from Shift+O by `#480 fold-one-message-key`. Cmd+O (or
+    // Ctrl+O): the ⋯ menu's "Open in …" link, pressed, so the opening is the link's own,
+    // exactly as a tap on it — and the browser's own Open File does not come up over it. On a
+    // row with no address the link is not there to press and the key is left alone, as l is.
+    group: KEYS_MESSAGE, chords: [{ key: "o", mod: true }],
     does: () => `Open it in ${providerDescriptions.size > 1 ? "its chat service" : chatServiceName()}, in a new tab: the same address Copy its link copies, where the server could form one`,
     rowControls: ["row-open-link-button"],
     // `pressRowButton` answers "took" where it took the row's selection but found no link:
@@ -38605,6 +38673,20 @@ const READ_MODE_KEY = "vibe-talk.voice.read-mode";
 const openedReadRuns = new Map();
 
 /**
+ * The messages the reader folded away one by one (Shift+O, `#480 fold-one-message-key`), per view
+ * as `openedReadRuns` is kept: ids, so a redraw draws them folded again, in any read mode — a
+ * thread being worked through keeps the parts closed up until their line is opened, which takes
+ * them out of this set (`openReadRun`). In memory only, as an opened run is: a reload lays the
+ * thread out afresh.
+ */
+const foldedOnes = new Map();
+
+/** The folded-away ids of the view `key` names, or an empty set. */
+function foldedOneIds(key) {
+  return foldedOnes.get(key) || new Set();
+}
+
+/**
  * How many rows the last pass left in collapsed runs. At zero, outside Fold read, there is
  * nothing to undo, and a pass — which runs with every redraw and every filter change — is free.
  */
@@ -38790,7 +38872,10 @@ function placeInReadRun(row, role, count) {
  * looking at that has just joined a run is held where it was by the line it joined.
  */
 function applyReadRuns() {
-  const collapsing = readMode === "fold" && !readRunsSuspended();
+  const key = viewKey();
+  const forced = foldedOneIds(key);
+  // `#480 fold-one-message-key`: messages folded away one by one collapse in any read mode.
+  const collapsing = (readMode === "fold" || forced.size > 0) && !readRunsSuspended();
   if (!collapsing && collapsedRunRows === 0) return;
   const list = el("discord-log");
   const rows = [...list.children];
@@ -38799,8 +38884,10 @@ function applyReadRuns() {
   // gathered to be read together, and a line in the stack would break the bridge. Nor a root on Main
   // whose thread holds an unread reply (`#222 unread-replies`): Hide read keeps it, so Fold read
   // does, by the attribute the pass has just set from the same rule.
-  const placed = collapsing ? readRunPlan(rows, viewKey(), (row) => rowIsRead(row) && !isOpenThreadRoot(row, rootId) &&
-    !row.hasAttribute("data-coalesce") && !row.hasAttribute("data-unread-replies")) : new Map();
+  const placed = collapsing ? readRunPlan(rows, key, (row) => !isOpenThreadRoot(row, rootId) &&
+    !row.hasAttribute("data-coalesce") && !row.hasAttribute("data-unread-replies") &&
+    ((readMode === "fold" && rowIsRead(row)) || idsOf(row).some((id) => forced.has(id))),
+    idsOf, forced) : new Map();
   collapsedRunRows = placed.size;
   const want = (row) => placed.get(row) || { role: null, count: 0 };
   const changed = rows.some((row) => {
@@ -38838,25 +38925,49 @@ function applyReadRuns() {
  * @param {string} key
  * @param {(row: Element) => boolean} joins
  * @param {(row: Element) => string[]} [idsFor]
+ * @param {Set<string>} [forcedIds] Messages folded away one by one (`#480 fold-one-message-key`):
+ *   a run holding one collapses however short it is — one message is a run when the reader folded
+ *   it themselves — and the last row may join for one, where a read run never takes it.
  * @returns {Map<Element, {role: string, count: number}>}
  */
-function readRunPlan(rows, key, joins, idsFor = idsOf) {
+function readRunPlan(rows, key, joins, idsFor = idsOf, forcedIds = new Set()) {
   const opened = openedReadRuns.get(key) || new Set();
   /** @type {Map<Element, {role: string, count: number}>} */
   const placed = new Map();
   let run = [];
+  const place = (part) => {
+    const ids = part.flatMap(idsFor);
+    part.forEach((row, index) => placed.set(row, { role: index === 0 ? "head" : "member", count: ids.length }));
+  };
   const close = () => {
     const ids = run.flatMap(idsFor);
-    if (run.length >= READ_RUN_MIN_ROWS && ids.some((id) => opened.has(id))) {
+    const forced = ids.some((id) => forcedIds.has(id));
+    if (run.length >= READ_RUN_MIN_ROWS && ids.some((id) => opened.has(id)) && !forced) {
       // Opened: it stays open as it grows, so what joined it since is remembered with it.
       for (const id of ids) opened.add(id);
-    } else if (run.length >= READ_RUN_MIN_ROWS) {
-      run.forEach((row, index) => placed.set(row, { role: index === 0 ? "head" : "member", count: ids.length }));
+    } else if (run.length >= READ_RUN_MIN_ROWS || forced) {
+      if (forced && ids.some((id) => opened.has(id))) {
+        // One folded away inside a run the reader opened: only its own stretch collapses, and
+        // the rest of the run stays open as it was left.
+        let part = [];
+        for (const row of run) {
+          if (idsFor(row).some((id) => forcedIds.has(id))) part.push(row);
+          else if (part.length > 0) {
+            place(part);
+            part = [];
+          }
+        }
+        if (part.length > 0) place(part);
+        for (const id of ids) if (!forcedIds.has(id)) opened.add(id);
+      } else {
+        place(run);
+      }
     }
     run = [];
   };
   rows.forEach((row, index) => {
-    if (index < rows.length - 1 && joins(row)) run.push(row);
+    const forced = idsFor(row).some((id) => forcedIds.has(id));
+    if ((index < rows.length - 1 || forced) && joins(row)) run.push(row);
     else close();
   });
   close();
@@ -38903,10 +39014,16 @@ function openReadRun(row) {
   }
   const key = thread === null ? viewKey() : viewKey("thread", thread);
   const opened = openedReadRuns.get(key) || new Set();
+  // Opening a run is also un-folding what was folded into it one by one (`#480 fold-one-message-key`).
+  const folded = foldedOnes.get(key);
   for (const one of readRunRows(row)) {
-    for (const id of idsOf(one)) opened.add(id);
+    for (const id of idsOf(one)) {
+      opened.add(id);
+      if (folded) folded.delete(id);
+    }
   }
   openedReadRuns.set(key, opened);
+  if (folded && folded.size === 0) foldedOnes.delete(key);
   if (thread !== null) {
     sideCardsDrawn = "";
     renderSideColumn();
@@ -45371,8 +45488,10 @@ function unpackBlock(choice, tally) {
     // where All's bridge holds its X.
     row.replaceChildren(...(at === 0 ? [packButton(choice.id)] : []), bridgePiece(), ...row.children);
   });
-  const placed = readMode === "fold" && !readRunsSuspended()
-    ? readRunPlan(rows, viewKey("thread", choice.id), (row) => rowIsRead(row) && !row.hasAttribute("data-root-child"))
+  const unpackForced = foldedOneIds(viewKey("thread", choice.id));
+  const placed = (readMode === "fold" || unpackForced.size > 0) && !readRunsSuspended()
+    ? readRunPlan(rows, viewKey("thread", choice.id), (row) => !row.hasAttribute("data-root-child") &&
+      ((readMode === "fold" && rowIsRead(row)) || idsOf(row).some((id) => unpackForced.has(id))), idsOf, unpackForced)
     : new Map();
   for (const row of rows) {
     const { role, count } = placed.get(row) || { role: null, count: 0 };

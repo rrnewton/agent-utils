@@ -17299,7 +17299,8 @@ test("Open in the ⋯ menu links to the message's own address in its service, an
   // `#408 copy-upstream-link` as `#409 open-upstream-link` leaves it. The address is the
   // server's, carried on the message; the item is a real link to it, named for the message's
   // provider and sitting with the copy. A pointer copies the address from the link itself;
-  // l still copies it for a keyboard, and Shift+O opens it.
+  // l still copies it for a keyboard, and Cmd+O (Ctrl+O off a Mac) opens it — Shift+O folds
+  // a message away instead since `#480 fold-one-message-key`.
   const page = newPage();
   await signIn(page);
   const address = "https://discord.com/channels/900000000000000001/900000000000000002/8000000000000000300";
@@ -17326,7 +17327,7 @@ test("Open in the ⋯ menu links to the message's own address in its service, an
   assert.equal(link.getAttribute("href"), address, "the link does not hold the message's own address");
   assert.equal(link.getAttribute("target"), "_blank", "the link does not open in a new tab");
   assert.equal(link.getAttribute("rel"), "noopener noreferrer", "the opened page would hold this one");
-  assert.equal(link.getAttribute("aria-keyshortcuts"), "Shift+O", "a screen reader is not told the key");
+  assert.equal(link.getAttribute("aria-keyshortcuts"), "Control+O Meta+O", "a screen reader is not told the key");
   // `#461 upstream-link-native`: beside the link, its Copy as an item of its own, for the
   // contexts whose long-press or installed-app menu cannot be counted on to offer the
   // browser's copy-link-address. It says `l` to a screen reader, as the key makes the same copy.
@@ -17359,14 +17360,14 @@ test("Open in the ⋯ menu links to the message's own address in its service, an
   assert.equal(rowMoreMenu(rows[0]).hidden, true, "the ⋯ menu stayed open after the Copy item");
   page.clipboard = undefined;
 
-  // Shift+O presses the same link on the highlighted row: with the menu open, the press is
+  // Cmd+O presses the same link on the highlighted row: with the menu open, the press is
   // what shuts it. (The opening itself is the Chromium walk's to see.) The keys that follow act
   // on a row in sight, as they must: the reader is at the top of the list for them.
   page.el("scroll-area").scrollTop = 0;
   await rowMoreButton(rows[0]).click();
-  const opened = await press(page, rows[0], "O", { shiftKey: true });
-  assert.equal(opened.defaulted, false, "Shift+O was left to the browser on a row with a link");
-  assert.equal(rowMoreMenu(rows[0]).hidden, true, "Shift+O did not press the row's link");
+  const opened = await press(page, rows[0], "o", { ctrlKey: true });
+  assert.equal(opened.defaulted, false, "Cmd+O was left to the browser on a row with a link");
+  assert.equal(rowMoreMenu(rows[0]).hidden, true, "Cmd+O did not press the row's link");
 
   // l copies the same address on the highlighted row, and the ? list says both keys.
   page.clipboard = undefined;
@@ -17375,18 +17376,18 @@ test("Open in the ⋯ menu links to the message's own address in its service, an
   assert.equal(page.el("status").textContent, "Copied the link in Discord.");
   const listed = page.el("keyboard-keys").descendants().filter((node) => node.tagName === "kbd").map((node) => node.textContent);
   assert.ok(listed.includes("l"), `the list of keys does not name l: ${listed.join(" | ")}`);
-  assert.ok(listed.includes("Shift+O"), `the list of keys does not name Shift+O: ${listed.join(" | ")}`);
+  assert.ok(listed.includes("Ctrl+O"), `the list of keys does not name Ctrl+O: ${listed.join(" | ")}`);
   const copyEntry = page.el("keyboard-keys").descendants().find((node) => node.tagName === "kbd" && node.textContent === "l");
   assert.match(copyEntry.parentNode.text(), /Copy its link in Discord/);
-  const openEntry = page.el("keyboard-keys").descendants().find((node) => node.tagName === "kbd" && node.textContent === "Shift+O");
+  const openEntry = page.el("keyboard-keys").descendants().find((node) => node.tagName === "kbd" && node.textContent === "Ctrl+O");
   assert.match(openEntry.parentNode.text(), /Open it in Discord/);
   // On the row with no address, l is nothing.
   page.clipboard = undefined;
   const event = await press(page, rows[1], "l");
   assert.equal(event.defaulted, true, "l was taken on a row with no link");
   assert.equal(page.clipboard, undefined);
-  const dead = await press(page, rows[1], "O", { shiftKey: true });
-  assert.equal(dead.defaulted, true, "Shift+O was taken on a row with no link");
+  const dead = await press(page, rows[1], "o", { ctrlKey: true });
+  assert.equal(dead.defaulted, true, "Cmd+O was taken on a row with no link");
   const scripted = await press(page, rows[2], "l");
   assert.equal(scripted.defaulted, true, "l was taken on a row whose address is a script");
   assert.equal(page.clipboard, undefined, "l copied an address of no formable shape");
@@ -49130,6 +49131,51 @@ test("the Hide read button cycles Show read, Fold read and Hide read, names each
       "a desk's dock does not stand the name in two lines");
   }
   assert.doesNotMatch(CSS_CODE, /\.read-mode-noun\s*\{\s*display:\s*none/, "a desk's dock cuts the name to its first word");
+});
+
+test("`#480 fold-one-message-key`: Shift+O folds one message away, marks it read, and steps above it, to the root", async () => {
+  const page = newPage();
+  const messages = runThread(page, { read: 2, tail: [["agent", false], ["agent", false]] });
+  await enterRunThread(page, messages);
+  const row = (n) => rowWithId(page, runId(n));
+  const shiftO = async (target) => {
+    const event = await press(page, target, "O", { shiftKey: true });
+    await page.settle();
+    await page.settle();
+    return event;
+  };
+  // One unread reply folded away on its own, in Show read: a line of one, the selection above it.
+  await shiftO(row(501));
+  assert.equal(row(501).getAttribute("data-read-run"), "head", "one folded message drew no line");
+  assert.equal(readRunLineOf(row(501)).textContent, "… 1 read message …");
+  assert.equal(row(501).getAttribute("data-archived"), "true", "folding a message away did not mark it read");
+  assert.equal(selectedId(page), runId(500), "the selection did not step to the message above");
+  // Again and again from where the selection landed: adjacent folds merge into one counted line.
+  await shiftO(focused(page));
+  assert.equal(row(500).getAttribute("data-read-run"), "head");
+  assert.equal(row(501).getAttribute("data-read-run"), "member", "adjacent folded messages did not merge");
+  assert.equal(readRunLineOf(row(500)).textContent, "… 2 read messages …");
+  assert.equal(selectedId(page), runId(2));
+  await shiftO(focused(page));
+  await shiftO(focused(page));
+  assert.equal(readRunLineOf(row(1)).textContent, "… 4 read messages …", "the run did not grow to the root");
+  assert.equal(selectedId(page), runId(0), "the selection did not arrive on the root");
+  // The root stays, and the key says so rather than folding the thread's first message.
+  await shiftO(focused(page));
+  assert.equal(row(0).hasAttribute("data-read-run"), false, "the root was folded away");
+  assert.equal(selectedId(page), runId(0));
+  assert.equal(statusText(page), "The thread's first message stays.");
+  // Enter on the line opens the run again, and a redraw keeps it open (nothing is folded now).
+  await press(page, row(1), "Enter");
+  await page.settle();
+  assert.deepStrictEqual(collapsedRows(page), [], "Enter on the line did not open the run");
+  // Folded away again, it survives the redraw a poll brings.
+  await shiftO(row(501));
+  assert.equal(row(501).getAttribute("data-read-run"), "head");
+  await pollOnce(page);
+  await page.settle();
+  assert.equal(rowWithId(page, runId(501)).getAttribute("data-read-run"), "head",
+    "a redraw unfolded what was folded away");
 });
 
 test("Fold read: a thread opens on its root, one line for the read run, and the first unread unfolded", async () => {
