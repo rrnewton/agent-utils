@@ -1,13 +1,14 @@
 ---
 title: 'agentctl-team-messaging: message another team''s coordinator across hosts, checking stale state as it goes'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - agentctl
 - design
 created_at: 2026-10-24T13:05:22.511039550+00:00
-updated_at: 2026-10-24T13:05:22.511039550+00:00
+updated_at: 2026-10-24T13:24:06.161714708+00:00
+closed_at: 2026-10-24T13:24:06.161714578+00:00
 ---
 
 # Description
