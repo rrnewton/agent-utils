@@ -1,12 +1,13 @@
 ---
 title: 'message-time-full-date: a message''s time says its full date on hover, focus and touch, and its day inline when not today'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
 - vibe-talk
 created_at: 2026-10-24T02:22:19.277386836+00:00
-updated_at: 2026-10-24T02:22:19.277386836+00:00
+updated_at: 2026-10-24T02:51:02.330791825+00:00
+closed_at: 2026-10-24T02:51:02.330791694+00:00
 ---
 
 # Description
@@ -20,4 +21,3 @@ Wanted: hovering any message's time (channel rows, thread rows, cards where a ti
 # Acceptance Criteria
 
 Hover title, focus name and tap all say the full local date+time for the same message in the same words; inline day shown iff not today, freshened like the title so an overnight page does not lie; existing `#260` day words unchanged for the details sheet; page tests cover today/yesterday/week/older/other-year in a named zone.
-
