@@ -9546,3 +9546,53 @@ li.discord-message[data-root-child] > .reply-bridge {
   --row-filter: none;
   --row-grey: 0;
 }
+
+/*
+ * `#492 threads-row-widths`. A thread unpacked under its card in the Threads view. The owner, 2026-10-22:
+ * "The thread messages are less wide than the card above them ... I understand that they need to be
+ * indented on their left edge, good. But why does the right edge need to come in!!?" and "My messages
+ * should be the shorter ones. And I think the difference in their width could be HALF what it is now."
+ * So every row of the thread reaches the card's right edge; each begins at the thread's indent (the
+ * stack's, above), the owner's own half the old difference further in, `min(15%, 6rem) / 2`; and a reply
+ * opened under one of them is as wide as the thread's rows, where the reply will be drawn.
+ *
+ * `--unpack-row-left` is that indent, stated on the list holding the cards and the reply's box, so both
+ * read it; a phone's and a desk's, as the stack's own rules state it.
+ */
+#side-list {
+  --unpack-row-left: calc(var(--speaker-inset) / 2 + var(--reply-gutter));
+}
+
+@media (min-width: 900px) and (pointer: fine) {
+  #side-list {
+    --unpack-row-left: calc(var(--desk-third-inset, min(7%, 3rem)) + var(--reply-gutter));
+  }
+}
+
+#side-cards > li.discord-message.unpack-row[data-who] {
+  margin-right: 0;
+  --row-inset-right: 0px;
+}
+
+/* A run's line keeps the stack's indent (`#407 unpack-row-parity`, above): it stands for rows, not for one
+   speaker. */
+#side-cards > li.discord-message.unpack-row[data-who="me"]:not([data-read-run="head"]) {
+  margin-left: calc(var(--unpack-row-left) + min(15%, 6rem) / 2);
+  --row-inset-left: calc(var(--unpack-row-left) + min(15cqw, 6rem) / 2);
+}
+
+/* Its part of the bridge reaches back across the extra inset, so the spine stays one line down the
+   thread, and the Pack triangle stays in the thread's gutter where the first row is the owner's. */
+#side-cards > li.discord-message.unpack-row[data-who="me"]:not([data-read-run="head"]) > .reply-bridge {
+  width: calc(0.9rem + var(--reply-stroke) / 2 + min(15cqw, 6rem) / 2);
+}
+
+#side-cards > li.discord-message.unpack-row[data-who="me"]:not([data-read-run="head"]) > .reply-ungather {
+  right: calc(100% + min(15cqw, 6rem) / 2);
+}
+
+@supports (anchor-name: --a) {
+  #side-list:has(> #side-cards > li.unpack-row[data-inline-reply]) > #side-reply[data-anchored] {
+    left: calc(anchor(--inline-reply-list left) + var(--unpack-row-left));
+  }
+}
