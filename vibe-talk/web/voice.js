@@ -24632,10 +24632,11 @@ function threadCard(summary, tally) {
   // `#194 thread-picker-polish`: the name the selector and the heading use, given the card's room.
   title.textContent = threadName(choice, Infinity);
   const said = typeof summary.summary === "string" ? summary.summary.trim() : "";
-  const first = choice.root ? messageText(choice.root).replace(/\s+/g, " ").trim() : "";
+  // `#489 card-root-lines`: its lines, as a list card's are.
+  const first = choice.root ? cardLines(choice.root) : "";
   const about = document.createElement("span");
   about.className = "thread-card-text";
-  about.textContent = said || (first === title.textContent ? "" : first);
+  about.textContent = said || (first.replace(/\s+/g, " ") === title.textContent ? "" : first);
   button.append(title, about);
   button.addEventListener("click", () => toggleLitCard(id, row));
   const unread = sideCardUnread(choice, tally);
@@ -44794,8 +44795,19 @@ function sideCardText(choice) {
   const named = summary && typeof summary.display_name === "string" ? summary.display_name.trim() : "";
   const said = summary && typeof summary.summary === "string" ? summary.summary.trim() : "";
   if (named && said) return `${named}: ${said}`;
-  const first = choice.root ? messageText(choice.root).replace(/\s+/g, " ").trim() : "";
+  const first = choice.root ? cardLines(choice.root) : "";
   return first || threadName(choice, Infinity);
+}
+
+/**
+ * `#489 card-root-lines`. A message's words as a card shows them in place of a summary: line by line
+ * as its body is drawn (a line end at each line break and each block's edge, `messageText`), each
+ * line's white space closed up and blank lines dropped. The owner, 2026-10-22: a card showing his
+ * "header / ----- / body" as one squashed line should "render properly"; the stylesheet keeps these
+ * line ends (`white-space: pre-line` on the card's text).
+ */
+function cardLines(message) {
+  return messageText(message).split("\n").map((line) => line.replace(/\s+/g, " ").trim()).filter(Boolean).join("\n");
 }
 
 /**
@@ -44804,7 +44816,7 @@ function sideCardText(choice) {
  * found by what its first message says too, not only by the summary of it.
  */
 function sideCardRootText(choice) {
-  const first = choice.root ? messageText(choice.root).replace(/\s+/g, " ").trim() : "";
+  const first = choice.root ? cardLines(choice.root) : "";
   return first && first !== sideCardText(choice) ? first : "";
 }
 
