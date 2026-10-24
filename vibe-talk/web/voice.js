@@ -1218,6 +1218,15 @@ function onBackPop(event) {
   }
   if (!awaited || target !== awaited.target) closeBackLevelsTo(closeTo);
   syncBackStack();
+  // `#462 webapp-deep-links`. The entry landed on carries the address it was left with, which
+  // may name a place the reader has since left (entries are pushed as levels open, places move
+  // after): say where the reader stands now, on this entry. A further traversal the sync just
+  // started lands with its own pop, and that one says it then.
+  try {
+    if (!backTraversal) syncDeepLinkAddress();
+  } catch (_error) {
+    // An address that cannot be written leaves the entry's own standing.
+  }
 }
 
 /**

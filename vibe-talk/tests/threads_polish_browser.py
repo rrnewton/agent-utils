@@ -547,11 +547,20 @@ def read_mode_walk(desk: Desk, api: PolishApi) -> None:
     # would be drawn from the rows held, the replies' Done arriving with All's own read later.
     page.select_option("#thread-select", "flat")
     desk.wait_for("() => document.getElementById('thread-select').value === 'flat'", "the picker did not show All")
+    # The address names All before the reload stands on it (`#462 webapp-deep-links`): reloaded on the
+    # thread list's address instead, the page would rightly reopen there, and All's own read — the one
+    # carrying the replies' Done — would still be coming when `h` is pressed below.
+    desk.wait_for("() => location.search.includes('v=all')", "the address did not name All")
     page.reload(wait_until="load")
     desk.wait_for("() => document.querySelectorAll('#discord-log > li[data-id], #side-cards > li[data-card]').length > 0",
                   "the reload drew no list")
     page.select_option("#thread-select", "flat")
     desk.wait_for("() => document.getElementById('thread-select').value === 'flat'", "the picker did not show All")
+    # An unread reply (213) drawn as its own row says All's read landed: Main never draws it, and
+    # the read replies themselves may still be hidden by the read mode the walk left on.
+    desk.wait_for("() => [...document.querySelectorAll('#discord-log > li')].some((li) => "
+                  "((li.getAttribute('data-ids') || '') + ' ' + (li.getAttribute('data-id') || '')).includes('213'))",
+                  "All's own read, with its replies in it, did not land", seconds=30)
     desk.settled()
     while page.get_attribute("#todo-filter", "data-read-mode") != "show":
         page.click("#todo-filter")
