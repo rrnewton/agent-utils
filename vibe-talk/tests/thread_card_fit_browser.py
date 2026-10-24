@@ -335,11 +335,16 @@ def card_fit_walk(walk: Walk) -> None:
     # None of the reader's marks on it: a selected or focused read row is back at full strength.
     page.mouse.move(5, 5)
     walk.settled()
-    read_row = next((page.evaluate(ROW_STYLE_JS, ident) for ident in ("602", "600", "604")
-                     if (held := page.evaluate(ROW_STYLE_JS, ident)) and held["archived"] == "true"
-                     and held["selected"] != "true"), None)
-    walk.check(read_row is not None and read_row["opacity"] != "1",
-               f"the premise: no unselected read row to measure against: {read_row}")
+    held_row: Json | None = None
+    for ident in ("602", "600", "604"):
+        held: Json = page.evaluate(ROW_STYLE_JS, ident)
+        if held["archived"] == "true" and held["selected"] != "true":
+            held_row = held
+            break
+    walk.check(held_row is not None and held_row["opacity"] != "1",
+               f"the premise: no unselected read row to measure against: {held_row}")
+    assert held_row is not None
+    read_row: Json = held_row
     page.select_option("#thread-select", "threads")
     walk.wait_for(f"() => !!document.querySelector('#side-cards > li[data-id=\"{READ_ONE}\"]')",
                   "the Threads view did not come back")
