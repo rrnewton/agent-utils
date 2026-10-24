@@ -1,7 +1,12 @@
 description: Browser-functional and interaction-budget checks for the timeline viewer
 
 resource_caps:
-  browser: 1
+  # Real browsers, as many at once as vibe-talk/tests.dag.yaml allows its own: the composed graph
+  # refuses two fragments that disagree on a cap.
+  browser: 4
+  # The three steps below share py/tests/js/browser's output directory, and the functional suite
+  # serves its fixture on a fixed port, so they take turns with each other whatever the browser cap.
+  timeline-fixture: 1
 
 steps:
   # The browser checks run Playwright from py/tests/js/browser/node_modules and drive the Chromium
@@ -58,7 +63,7 @@ steps:
     timeout: 600
     cpu_timeout: 900
     hint:
-      resources: {browser: 1}
+      resources: {browser: 1, timeline-fixture: 1}
       est_duration_s: 45
       classification: latency-bound
       preferred_inner_jobs: 2
@@ -81,7 +86,7 @@ steps:
     timeout: 600
     cpu_timeout: 900
     hint:
-      resources: {browser: 1}
+      resources: {browser: 1, timeline-fixture: 1}
       est_duration_s: 15
       classification: latency-bound
       preferred_inner_jobs: 2
@@ -103,7 +108,9 @@ steps:
     timeout: 600
     cpu_timeout: 900
     hint:
-      resources: {browser: 1}
+      # A redraw budget is a timing: it holds every browser slot, so it is still measured with no
+      # other browser running, as it was when the cap was 1.
+      resources: {browser: 4, timeline-fixture: 1}
       est_duration_s: 15
       classification: latency-bound
       preferred_inner_jobs: 2

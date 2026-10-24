@@ -21,9 +21,20 @@
 # `build.release`, which is stated once rather than paid for per step.
 #
 # THE BROWSER CAP IS THE POINT OF THE `resource_caps` BLOCK. Playwright is the only genuinely
-# expensive thing here — a real Chromium per run — and two of them at once on a laptop is how a
-# test suite becomes the reason the laptop is unusable. `browser: 1` is a semaphore: any number of
-# steps may DECLARE the resource, and at most one holds it at a time.
+# expensive thing here — a real Chromium per run — and a pile of them at once on a laptop is how a
+# test suite becomes the reason the laptop is unusable. `browser: 4` is a semaphore: any number of
+# steps may DECLARE the resource, and at most four hold it at a time.
+#
+# It was 1 until `#474 browser-lane-critical-path` (2026-10-23). The browser steps then ran one after
+# another, and their sum was nearly all of a 2470s gate. They are latency-bound, not
+# CPU-bound — together about 890s of CPU in those 2470s, most boxed to one core — so four side by side
+# take about a quarter of the time on any machine with four cores to spare. What makes that safe:
+# each check serves the page and its fake API on a port the kernel picks (bound to port 0, or for
+# the two that start the real server, send-order and pwa-installability, probed free just before),
+# launches Chromium in a fresh temporary profile, and keeps its state in temporary directories. The
+# fixed ports are the screenshot harness's (VIBE_TALK_SHOTS_PORT and the two above it), and it is
+# the only step that uses them; it also writes its PNGs under vibe-talk/debug/screenshots/, a new
+# stamped directory each run. The lane at 1 and at 4 was compared check by check.
 #
 # HOW TO RUN IT
 #
@@ -35,8 +46,9 @@
 description: vibe-talk fmt, lint, unit, PWA, offline-cache, page and screenshot suites, boxed
 
 resource_caps:
-  # A real browser. One at a time, however many steps ask for it.
-  browser: 1
+  # A real browser. Four at a time, however many steps ask for it. validation/timeline.dag.yaml
+  # states the same number: the composed graph refuses two fragments that disagree.
+  browser: 4
 
 steps:
   # ---- the cheap gates, which need nothing built ------------------------------------------------
