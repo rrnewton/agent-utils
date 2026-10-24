@@ -941,6 +941,14 @@ def test_a_browser_check_split_into_parts_runs_every_part_once() -> None:
         assert sorted(stepped) == sorted(parts), f"{name}: steps run parts {stepped}, it declares {parts}"
 
 
+def test_the_timeline_redraw_budget_holds_every_browser_slot() -> None:
+    # `#474 browser-lane-critical-path`: the browser cap went from 1 to 4. The redraw budget is a
+    # timing, so it still runs with no other browser step beside it, whatever the cap is.
+    cfg = dag_from_path(REPO_ROOT / "validation.dag.yaml")
+    benchmark = cfg.by_tag()["timeline.browser.benchmark"]
+    assert benchmark.hint.resources["browser"] == cfg.resource_caps["browser"]
+
+
 # ---- `#361 python-minimum-timeout` --------------------------------------------------------------
 
 PY310_SHARDS = 6
