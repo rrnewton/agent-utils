@@ -1706,10 +1706,11 @@ steps:
 
   # ---- suites that need it ----------------------------------------------------------------------
   #
-  # The test binaries, built once for the two steps that run them (`test.unit`, `test.page`), so that
-  # neither builds them inside its own box and budget while the other waits on cargo's build lock.
-  # `cargo test --release` builds the dependencies again with the dev-dependencies' features, so this
-  # is most of what `test.unit` used to spend before its first test ran.
+  # The test binaries, built for `test.unit` in a step of their own, a habit from when a second step
+  # ran them too and neither was to build them in its own box while the other waited on cargo's build
+  # lock (the page suite's slices below now need none). `cargo test --release` builds the
+  # dependencies again with the dev-dependencies' features, so this is most of what `test.unit` used
+  # to spend before its first test ran.
   - group: build
     job: tests
     desc: the release test binaries the Rust and page suites run
@@ -1732,12 +1733,12 @@ steps:
   # default cargo stops at the first failing test binary, so one red binary hid every later one.
   #
   # The app page's suite (tests/voice_page.rs, which runs node tests/js/voice_page.test.mjs) is the
-  # one exception: it is skipped here, by its exact name, and run by `test.page` below, still through
-  # its harness (`#472 gate-flake-hardening`). It alone is single-threaded node work of 450 to 740 s
-  # CPU on the loaded validation host, and run-cargo runs the test binaries one after another, so
-  # inside this step it was most of the wall time and a third of the CPU budget, and runs were
-  # killed at the budget while it was still going. Apart, the two run side by side and each budget
-  # is its own. Run alone, `cargo test` (and `make test`) still runs every suite.
+  # one exception: it is skipped here, by its exact name, and run by the `test.page-*` slices below,
+  # straight through node (`#472 gate-flake-hardening`, `test-time-vibe-talk`). It was single-threaded
+  # node work of 450 to 740 s CPU on the loaded validation host, and run-cargo runs the test binaries
+  # one after another, so inside this step it was most of the wall time and a third of the CPU
+  # budget, and runs were killed at the budget while it was still going. Run alone, `cargo test`
+  # (and `make test`) still runs every suite.
   - group: test
     job: unit
     desc: the Rust suites, and the contract's page suite through its harness
@@ -1758,26 +1759,98 @@ steps:
       preferred_inner_jobs: 8
       rss_baseline_bytes: 1073741824
 
-  # The app page's suite, through its harness: `the_voice_page_suite_passes` in tests/voice_page.rs
-  # runs node tests/js/voice_page.test.mjs and holds it to a floor of collected tests.
+  # The app page's suite, straight through node: tests/js/voice_page.test.mjs over web/voice.js, as
+  # four interleaved slices (`VOICE_PAGE_SHARD`, `test-time-vibe-talk`) that run side by side.
+  #
+  # Not through its cargo-test harness (`the_voice_page_suite_passes` in tests/voice_page.rs, which
+  # `test.unit` skips by name and `cargo test` alone still runs, the same slices at once): that
+  # harness only starts node and reads its counts, and the counts it held the run to are in the file
+  # now, which fails a slice that selected nothing or a file that collected less than its floor. So
+  # these need no test binary, hang off nothing, and run while the builds do instead of after them.
+  #
+  # Measured 2026-10-24 on the loaded validation host: the whole suite in one node, 605 s wall and
+  # 615 s of CPU with a 3.7 GiB peak, before the fixture stopped re-reading web/voice.html for every
+  # page; 168 s and 206 s after. Four slices side by side, 49 s wall. A slice's CPU budget is the
+  # whole suite's, as a backstop for a slice that spins.
   - group: test
-    job: page
-    desc: the app page's suite, node over web/voice.js through its cargo-test harness
+    job: page-0
+    desc: the app page's suite, slice 0 of four, node over web/voice.js
     labels: [validation-vibe-talk]
-    cmd: cd vibe-talk && python3 ../scripts/case_timings.py run-cargo -- cargo test --release --locked --no-fail-fast --test voice_page
+    cmd: >-
+      cd vibe-talk && mkdir -p "${AGENT_UTILS_CASE_TIMING_DIR:-target/case-timings}" &&
+      VOICE_PAGE_SHARD=0/4 node --test-reporter=spec --test-reporter-destination=stdout
+      --test-reporter=tap
+      --test-reporter-destination="${AGENT_UTILS_CASE_TIMING_DIR:-target/case-timings}/node-${DAGRUN_OUTER_RUN:-vibe-talk.test.page-0}.tap"
+      tests/js/voice_page.test.mjs
     jobs_flag: ""
-    jobs_env: CARGO_BUILD_JOBS
-    deps: [build.tests]
-    # Measured 2026-10-23 on the loaded validation host: node alone, 552 s of CPU over 546 s wall
-    # and a 4.0 GiB peak; this step, 641 s wall and 742 s of CPU (the collector's threads too) and
-    # 2.9 GiB in its box. About twice the CPU, and a baseline over the peak.
-    cpu_timeout: 1500
+    timeout: 600
+    cpu_timeout: 600
     hint:
-      est_duration_s: 640
+      est_duration_s: 60
       classification: cpu-bound
       # node is one thread of JavaScript plus its collector's.
       preferred_inner_jobs: 2
-      rss_baseline_bytes: 5368709120
+      rss_baseline_bytes: 2147483648
+
+  - group: test
+    job: page-1
+    desc: the app page's suite, slice 1 of four, node over web/voice.js
+    labels: [validation-vibe-talk]
+    cmd: >-
+      cd vibe-talk && mkdir -p "${AGENT_UTILS_CASE_TIMING_DIR:-target/case-timings}" &&
+      VOICE_PAGE_SHARD=1/4 node --test-reporter=spec --test-reporter-destination=stdout
+      --test-reporter=tap
+      --test-reporter-destination="${AGENT_UTILS_CASE_TIMING_DIR:-target/case-timings}/node-${DAGRUN_OUTER_RUN:-vibe-talk.test.page-1}.tap"
+      tests/js/voice_page.test.mjs
+    jobs_flag: ""
+    timeout: 600
+    cpu_timeout: 600
+    hint:
+      est_duration_s: 60
+      classification: cpu-bound
+      # node is one thread of JavaScript plus its collector's.
+      preferred_inner_jobs: 2
+      rss_baseline_bytes: 2147483648
+
+  - group: test
+    job: page-2
+    desc: the app page's suite, slice 2 of four, node over web/voice.js
+    labels: [validation-vibe-talk]
+    cmd: >-
+      cd vibe-talk && mkdir -p "${AGENT_UTILS_CASE_TIMING_DIR:-target/case-timings}" &&
+      VOICE_PAGE_SHARD=2/4 node --test-reporter=spec --test-reporter-destination=stdout
+      --test-reporter=tap
+      --test-reporter-destination="${AGENT_UTILS_CASE_TIMING_DIR:-target/case-timings}/node-${DAGRUN_OUTER_RUN:-vibe-talk.test.page-2}.tap"
+      tests/js/voice_page.test.mjs
+    jobs_flag: ""
+    timeout: 600
+    cpu_timeout: 600
+    hint:
+      est_duration_s: 60
+      classification: cpu-bound
+      # node is one thread of JavaScript plus its collector's.
+      preferred_inner_jobs: 2
+      rss_baseline_bytes: 2147483648
+
+  - group: test
+    job: page-3
+    desc: the app page's suite, slice 3 of four, node over web/voice.js
+    labels: [validation-vibe-talk]
+    cmd: >-
+      cd vibe-talk && mkdir -p "${AGENT_UTILS_CASE_TIMING_DIR:-target/case-timings}" &&
+      VOICE_PAGE_SHARD=3/4 node --test-reporter=spec --test-reporter-destination=stdout
+      --test-reporter=tap
+      --test-reporter-destination="${AGENT_UTILS_CASE_TIMING_DIR:-target/case-timings}/node-${DAGRUN_OUTER_RUN:-vibe-talk.test.page-3}.tap"
+      tests/js/voice_page.test.mjs
+    jobs_flag: ""
+    timeout: 600
+    cpu_timeout: 600
+    hint:
+      est_duration_s: 60
+      classification: cpu-bound
+      # node is one thread of JavaScript plus its collector's.
+      preferred_inner_jobs: 2
+      rss_baseline_bytes: 2147483648
 
   # `#277 send-order` in the browser engine, against the real server binary and its real provider
   # client: a mock Google Chat bridge on loopback fails A at once; B waits behind A, saying so, and

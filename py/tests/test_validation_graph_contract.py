@@ -119,7 +119,9 @@ def test_javascript_validation_entrypoints_are_owned_once() -> None:
         assert commands.count(suite) == 1
 
     # The vibe page suites are owned by their Rust cargo-test harnesses. Running them directly in
-    # the graph as well would double their several-hundred-case cost.
+    # the graph as well would double their several-hundred-case cost. The app page's suite is the one
+    # the graph runs straight through node, in slices, with its harness skipped by the unit step
+    # (`test_the_app_page_suite_runs_once_beside_the_rust_suites`, `test-time-vibe-talk`).
     harnesses = [
         path.read_text(encoding="utf-8")
         for path in sorted((REPO_ROOT / "vibe-talk/tests").glob("*.rs"))
@@ -128,8 +130,9 @@ def test_javascript_validation_entrypoints_are_owned_once() -> None:
     assert vibe_suites
     for path in vibe_suites:
         suite = path.name
-        assert suite not in commands
         assert sum(suite in harness for harness in harnesses) == 1
+        if suite != "voice_page.test.mjs":
+            assert suite not in commands
 
 
 def test_rust_and_cross_nodes_cover_their_registries_once() -> None:
@@ -878,21 +881,32 @@ def test_the_rust_suites_run_past_a_failing_test_binary() -> None:
 
 
 def test_the_app_page_suite_runs_once_beside_the_rust_suites() -> None:
-    # `#472 gate-flake-hardening`: the page suite's harness is skipped by the unit step and run by
-    # its own, so neither step pays for it twice and neither loses it.
+    # `#472 gate-flake-hardening`: the page suite's harness is skipped by the unit step, and the suite
+    # is run by steps of its own, so neither pays for it twice and neither loses it.
+    # `test-time-vibe-talk`: those steps are interleaved slices, straight through node; together they
+    # are the whole suite only if every slice of one count is some step's, once.
     by_tag = dag_from_path(REPO_ROOT / "validation.dag.yaml").by_tag()
     unit = shlex.split(by_tag["vibe-talk.test.unit"].cmd)
-    page = shlex.split(by_tag["vibe-talk.test.page"].cmd)
     harness = (REPO_ROOT / "vibe-talk/tests/voice_page.rs").read_text(encoding="utf-8")
     assert "fn the_voice_page_suite_passes()" in harness
     # Skipped by its exact name: libtest's --skip is otherwise a substring, and would skip any test
     # whose name contained it in every binary, run by no step at all.
     assert unit[unit.index("--skip") + 1] == "the_voice_page_suite_passes" and "--exact" in unit
-    assert page[page.index("--test") + 1] == "voice_page" and "--skip" not in page
-    assert "--no-fail-fast" in page
-    assert "vibe-talk.build.tests" in by_tag["vibe-talk.test.page"].deps
     assert "vibe-talk.build.tests" in by_tag["vibe-talk.test.unit"].deps
-    assert "vibe-talk.test.page" not in by_tag["vibe-talk.test.unit"].deps
+    slices: list[str] = []
+    for tag, step in by_tag.items():
+        tokens = shlex.split(step.cmd)
+        if not any(token.endswith("tests/js/voice_page.test.mjs") for token in tokens):
+            continue
+        shard = [token.split("=", 1)[1] for token in tokens if token.startswith("VOICE_PAGE_SHARD=")]
+        assert len(shard) == 1, f"{tag} runs the page suite without naming exactly one slice"
+        slices.append(shard[0])
+        # Nothing built: the slices are node over the checked-out page, beside the builds.
+        assert not step.deps, f"{tag} waits on {step.deps}"
+        assert tag not in by_tag["vibe-talk.test.unit"].deps
+    assert slices, "no step runs the page suite"
+    count = len(slices)
+    assert sorted(slices) == sorted(f"{index}/{count}" for index in range(count)), slices
 
 
 def _declared_parts(script: Path) -> list[str] | None:

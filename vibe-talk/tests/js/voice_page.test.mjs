@@ -29,12 +29,60 @@
 //
 // No dependencies, no build step, no framework — same rule the page itself follows.
 
-import { afterEach, beforeEach, test } from "node:test";
+import { afterEach, beforeEach, test as nodeTest } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
+
+/**
+ * One slice of the suite, or all of it. `VOICE_PAGE_SHARD=i/n` runs the tests at positions i, i+n,
+ * i+2n... in the order this file defines them, so n processes side by side run every test exactly
+ * once; unset, this process runs every test. node:test runs one file's tests one after another, and
+ * this file is thousands of them: whole, it is one core for minutes, and the longest single step of
+ * the gate (`test-time-vibe-talk`). Interleaved rather than cut into runs so that the slow families,
+ * which sit together in the file, are spread over every slice.
+ *
+ * Strict: a value that is not `i/n` with 0 <= i < n throws, and a slice that ran nothing fails the
+ * process at exit, so a mistyped slice cannot pass by running no tests at all. So does a file that
+ * defines fewer than `COLLECTED_FLOOR` tests, whichever slice it is: the floor tests/voice_page.rs
+ * held the whole run to, here so that a slice run straight through node is held to it too.
+ */
+const SHARD = (() => {
+  const raw = process.env.VOICE_PAGE_SHARD;
+  if (raw === undefined || raw === "") return null;
+  const parts = /^(\d+)\/(\d+)$/.exec(raw);
+  if (!parts || Number(parts[2]) < 1 || Number(parts[1]) >= Number(parts[2])) {
+    throw new Error(`VOICE_PAGE_SHARD must be i/n with 0 <= i < n, not ${JSON.stringify(raw)}`);
+  }
+  return { index: Number(parts[1]), count: Number(parts[2]) };
+})();
+// Raise this with the suite. It is a floor against a suite that stopped COLLECTING, so it has to
+// track the real count; left behind, it would keep passing while half the file went missing.
+const COLLECTED_FLOOR = 294;
+let testsDefined = 0;
+let testsSelected = 0;
+const test = (...args) => {
+  const position = testsDefined;
+  testsDefined += 1;
+  if (SHARD && position % SHARD.count !== SHARD.index) return undefined;
+  testsSelected += 1;
+  return nodeTest(...args);
+};
+process.on("exit", () => {
+  if (SHARD) {
+    console.log(`# voice_page shard ${SHARD.index}/${SHARD.count}: ${testsSelected} of ${testsDefined} tests`);
+  }
+  if (testsSelected === 0) {
+    console.error(`voice_page: this process selected none of the ${testsDefined} tests the file defines`);
+    process.exitCode = 1;
+  }
+  if (testsDefined < COLLECTED_FLOOR) {
+    console.error(`voice_page: the file defines only ${testsDefined} tests, so something stopped collecting them`);
+    process.exitCode = 1;
+  }
+});
 
 /**
  * How many messages `message()` has built in the test now running, which is its clock: see
@@ -590,11 +638,24 @@ function helpEntry(slug) {
   return HTML.slice(at, HTML.indexOf("</details>", at));
 }
 
+/**
+ * web/voice.html's lines, and where each id asked for is defined, worked out once. `newPage` checks
+ * every pair in FIXTURE_TREE against the markup, so these were asked thousands of times over a file
+ * that never changes while the suite runs, and splitting it afresh each time was half of the suite's
+ * CPU (`test-time-vibe-talk`).
+ */
+const HTML_LINES = HTML.split("\n");
+const markupPlaces = new Map();
+
 function markupPlace(id) {
-  const lines = HTML.split("\n");
+  const known = markupPlaces.get(id);
+  if (known) return known;
+  const lines = HTML_LINES;
   const at = lines.findIndex((line) => line.includes(`id="${id}"`));
   assert.ok(at >= 0, `web/voice.html defines no #${id}`);
-  return { at, indent: lines[at].length - lines[at].trimStart().length, lines };
+  const place = Object.freeze({ at, indent: lines[at].length - lines[at].trimStart().length, lines });
+  markupPlaces.set(id, place);
+  return place;
 }
 
 /**
@@ -606,6 +667,14 @@ function markupPlace(id) {
 function markupHolds(parent, child) {
   const outer = markupPlace(parent);
   const inner = markupPlace(child);
+  return inner.at > outer.at && inner.at < markupCloses(outer);
+}
+
+/** The line where the element at `outer` (a `markupPlace`) ends, worked out once per element, as its place is. */
+const markupEnds = new Map();
+function markupCloses(outer) {
+  const known = markupEnds.get(outer);
+  if (known !== undefined) return known;
   let closesAt = outer.lines.length;
   for (let i = outer.at + 1; i < outer.lines.length; i += 1) {
     const line = outer.lines[i];
@@ -617,7 +686,8 @@ function markupHolds(parent, child) {
       break;
     }
   }
-  return inner.at > outer.at && inner.at < closesAt;
+  markupEnds.set(outer, closesAt);
+  return closesAt;
 }
 
 /**
@@ -639,6 +709,23 @@ function assertMarkupContains(parent, child) {
 function inlinePx(value) {
   const match = /^(-?\d+(?:\.\d+)?)px$/.exec(String(value || ""));
   return match ? Number(match[1]) : null;
+}
+
+/**
+ * The words of a class list, split once per distinct list. The layout model below asks every row's
+ * classes on every measurement, and the same few lists come round thousands of times, so splitting
+ * each afresh was a tenth of the suite (`test-time-vibe-talk`). Bounded, though nothing near the
+ * bound has been seen: a page that wrote a new list every time would otherwise grow it forever.
+ */
+const CLASS_WORDS = new Map();
+function classWords(className) {
+  let words = CLASS_WORDS.get(className);
+  if (words === undefined) {
+    if (CLASS_WORDS.size >= 4096) CLASS_WORDS.clear();
+    words = className.split(/\s+/);
+    CLASS_WORDS.set(className, words);
+  }
+  return words;
 }
 
 class FakeElement {
@@ -738,7 +825,7 @@ class FakeElement {
 
   /** Whether this element's class list contains a word — `className` here is a plain string. */
   hasClass(name) {
-    return this.className.split(/\s+/).includes(name);
+    return classWords(this.className).includes(name);
   }
 
   /**
@@ -1675,6 +1762,14 @@ function replyDismissals(messages, dealtWith) {
   return { from: String(from), messages: marks };
 }
 
+/**
+ * The page's scripts, compiled once and run in each new page's own context, as a browser runs one
+ * cached script in every tab that loads it: compiling web/voice.js afresh for every page was a
+ * twentieth of the suite (`test-time-vibe-talk`). A negative control's copy is compiled on its own.
+ */
+const CONTRACT_COMPILED = new vm.Script(CONTRACT, { filename: "contract.js" });
+const SCRIPT_COMPILED = new vm.Script(SCRIPT, { filename: "voice.js" });
+
 function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   const elements = new Map();
   for (const [id, markup] of PAGE_ELEMENTS) {
@@ -1779,8 +1874,13 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     tab() {
       return page.el("pane-discord").hidden ? "voice" : "discord";
     },
-    /** Let the page's own floating promises (sign-in on load) run to completion. */
-    settle: () => new Promise((resolve) => setTimeout(resolve, 0)),
+    /**
+     * Let the page's own floating promises (sign-in on load) run to completion. Everything the page
+     * waits on here is a promise (its timers are the test's, below), so the next turn of the event
+     * loop is enough; `setImmediate` is that turn, where `setTimeout(…, 0)` also waits out a
+     * millisecond of real time, thousands of times over (`test-time-vibe-talk`).
+     */
+    settle: () => new Promise((resolve) => setImmediate(resolve)),
     /** The mint handler. `setFetch` replaces it; the other routes keep working. */
     mint: async () => {
       throw new Error("this test did not set a mint response");
@@ -4278,8 +4378,8 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   // here, before a line of the page has run.
   if (arrange) arrange(page);
   vm.createContext(context);
-  vm.runInContext(CONTRACT, context, { filename: "contract.js" });
-  vm.runInContext(script, context, { filename: "voice.js" });
+  CONTRACT_COMPILED.runInContext(context);
+  (script === SCRIPT ? SCRIPT_COMPILED : new vm.Script(script, { filename: "voice.js" })).runInContext(context);
   // `#212 link-filter`. One of the page's own functions, by name, for the few that are PURE — an
   // address in, a kind out — and so are pinned down as values, a table of them at a time. Only for
   // those: everything the reader sees is asserted through the page as it draws it.
