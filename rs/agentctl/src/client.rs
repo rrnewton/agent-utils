@@ -4914,6 +4914,12 @@ mod tests {
             .client()
             .verify_custom_harness("pane", "muse", Some(&identity))
             .is_err());
+        // A second live process of the same image in the same group, so the refusal is the
+        // ambiguity itself. A guessed PID (the original's plus one) was refused only while
+        // nothing lived there, and under parallel tests another test's process often did.
+        let mut sibling = Command::new(&harness);
+        sibling.arg("30").process_group(original_pid as i32);
+        let sibling = ChildGuard(sibling.spawn().expect("start second harness process"));
         let duplicate = serde_json::json!({
             "result": {
                 "process_info": {
@@ -4921,17 +4927,24 @@ mod tests {
                     "foreground_process_group_id": original_pid,
                     "foreground_processes": [
                         {"pid": original_pid, "argv": [harness.display().to_string(), "30"]},
-                        {"pid": u64::from(original_pid) + 1, "argv": [harness.display().to_string(), "30"]}
+                        {"pid": sibling.0.id(), "argv": [harness.display().to_string(), "30"]}
                     ]
                 }
             }
         })
         .to_string();
         herdr.set_response(&duplicate);
-        assert!(herdr
+        let refused = herdr
             .client()
             .custom_harness_observed("pane", &pinned, &|| false)
-            .is_err());
+            .expect_err("two matching processes are ambiguous");
+        assert!(
+            refused
+                .to_string()
+                .contains("multiple matching custom harness processes"),
+            "{refused}"
+        );
+        drop(sibling);
 
         let duplicate_identity = serde_json::json!({
             "result": {

@@ -8,6 +8,16 @@ description: Tool-owned Rust regression suites
 #
 # --no-fail-fast: a package has several test binaries, and by default cargo stops at the first
 # failing one, so a failure there hid the rest of that package's tests.
+#
+# RUST_TEST_THREADS: one test at a time, except in the three packages whose serial runs were long
+# enough to matter and that are safe to share (2026-10-24, sums of case times: agentctl 357 s,
+# wrkslotsd 229 s, gh-paced 179 s), which run four. Each passed three consecutive four-thread
+# runs here, in 125-166 s, 78-96 s and 49-50 s, and a gate. dagrun (201 s) stays serial: its
+# suite passed three four-thread runs by hand, but inside a gate, where it runs in a delegated
+# cgroup, cli::tests::delegated_parent_clamps_explicit_run_budgets_and_rejects_wide_cpuset saw a
+# default CPU budget of 1 instead of 2 while its neighbours ran. The other packages' tests sum
+# to seconds, and the chat-subscription conformance tests keep fixed sub-second deadlines that
+# contention can miss.
 
 resource_caps:
   cargo-target: 4
@@ -18,7 +28,7 @@ steps:
     desc: agentctl Rust tests
     cmd: >-
       host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
-      RUST_TEST_THREADS=1 python3 scripts/case_timings.py run-cargo -- cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
+      RUST_TEST_THREADS=4 python3 scripts/case_timings.py run-cargo -- cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
       --target "$host_target" --target-dir rs/target/validation-tests -p agentctl ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-agentctl]
@@ -128,7 +138,7 @@ steps:
     desc: gh-paced Rust tests
     cmd: >-
       host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
-      RUST_TEST_THREADS=1 python3 scripts/case_timings.py run-cargo -- cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
+      RUST_TEST_THREADS=4 python3 scripts/case_timings.py run-cargo -- cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
       --target "$host_target" --target-dir rs/target/validation-tests -p gh-paced ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests]
@@ -167,7 +177,7 @@ steps:
     desc: wrkslots daemon Rust tests
     cmd: >-
       host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
-      RUST_TEST_THREADS=1 python3 scripts/case_timings.py run-cargo -- cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
+      RUST_TEST_THREADS=4 python3 scripts/case_timings.py run-cargo -- cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
       --target "$host_target" --target-dir rs/target/validation-tests -p wrkslotsd ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-wrkslots]
