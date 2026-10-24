@@ -165,18 +165,39 @@ pub struct ThreadSummary {
     pub hue: Option<u16>,
 }
 
+/// The fewest messages a thread holds before it is named or summarised at all: the root and
+/// two replies. `#484 summary-card-threshold`.
+///
+/// One question and one response needs no summary card: its real words are shorter than any
+/// sentence about them, and a model call spent naming it buys nothing. This constant is the
+/// one place the threshold is stated: [`thread_summary_due`] never falls due below it, the
+/// naming worker spends no model call on a thread its own read finds below it, and
+/// [`thread_summary_shown`] keeps a name or sentence filed earlier off a page while its
+/// thread is known to be below it.
+pub const THREAD_SUMMARY_MIN_MESSAGES: u64 = 3;
+
+/// Whether a thread's filed name and sentence may be shown on a page, by its reported size:
+/// `reply_count` replies, the root counted on top. Below [`THREAD_SUMMARY_MIN_MESSAGES`] the
+/// card says the thread's real words instead. An unreported count proves nothing about the
+/// thread's size, so what is filed still shows.
+#[must_use]
+pub fn thread_summary_shown(reply_count: Option<u64>) -> bool {
+    reply_count.is_none_or(|replies| replies.saturating_add(1) >= THREAD_SUMMARY_MIN_MESSAGES)
+}
+
 /// Whether a thread with `messages` messages, last summarised at `last` messages, is due again.
 ///
-/// Backed off exponentially, then linearly: summarise at 1, 2, 4 and 8 messages, then every 10
-/// after that (18, 28, ...). Early on a thread's subject is still settling and each message
-/// changes it a lot; later one more message rarely does, and each summary costs a model call.
+/// Nothing below [`THREAD_SUMMARY_MIN_MESSAGES`]; from there, backed off exponentially, then
+/// linearly: summarise at 3, 4 and 8 messages, then every 10 after that (18, 28, ...). Early
+/// on a thread's subject is still settling and each message changes it a lot; later one more
+/// message rarely does, and each summary costs a model call.
 /// `last` is `None` for a thread never summarised. The display name is chosen at the first
 /// summary and never changes; only the sentence follows this schedule.
 #[must_use]
 pub fn thread_summary_due(messages: u64, last: Option<u64>) -> bool {
     const LINEAR_AFTER: u64 = 8;
     const LINEAR_STEP: u64 = 10;
-    if messages == 0 {
+    if messages < THREAD_SUMMARY_MIN_MESSAGES {
         return false;
     }
     let Some(last) = last else {
@@ -308,8 +329,16 @@ mod summary_schedule_tests {
     }
 
     #[test]
-    fn a_growing_thread_is_summarised_at_1_2_4_8_then_every_10() {
-        assert_eq!(schedule(40), [1, 2, 4, 8, 18, 28, 38]);
+    fn a_growing_thread_is_summarised_from_its_third_message_then_on_the_backoff() {
+        // `#484 summary-card-threshold`: nothing at 1 or 2 messages; the first summary is at 3,
+        // and the old powers-of-two backoff runs from there (4, 8, then every 10).
+        assert_eq!(schedule(40), [3, 4, 8, 18, 28, 38]);
+        assert!(!thread_summary_due(1, None), "a lone root is not summarised");
+        assert!(
+            !thread_summary_due(2, None),
+            "one question and one response is not summarised"
+        );
+        assert!(thread_summary_due(3, None), "the third message is");
     }
 
     #[test]
