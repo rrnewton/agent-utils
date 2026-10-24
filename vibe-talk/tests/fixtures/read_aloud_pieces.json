@@ -1,0 +1,49 @@
+{
+ "about": "#486 read-aloud-pieces: the pieces a block's text is read in. src/render.rs read_pieces and web/voice.js readPieces are both held to every case here.",
+ "cases": [
+  {
+   "name": "typed bullets",
+   "pieces": [
+    "Settings sync is live on both servers (build bac092ae), #457 settings-server-side:",
+    "• Every setting outside \"Screen and keys\" is now stored on the server and shared by all your devices: read mode, collapsed lines, pack/unpack and card states, sort order, read-aloud prefs, and so on. A change on one device reaches your other open devices live, without a reload.",
+    "• \"Screen and keys\" (text size, width, bar placement, Enter-sends, single-key shortcuts) stays per-device, and its heading now says \"(client side)\" in small, faint text.",
+    "• First load on each device seeds the server with that device's values only where the server has none, so nothing newer is overwritten. Load your phone and your desktop once each and they'll converge.",
+    "Known limits: a setting holding several entries (e.g. per-thread card states) merges as a whole, so two devices editing different entries at the same moment can lose one side's edit. Migration against your real devices hasn't been exercised outside tests, so tell me if anything looks reset."
+   ],
+   "text": "Settings sync is live on both servers (build bac092ae), #457 settings-server-side:\n• Every setting outside \"Screen and keys\" is now stored on the server and shared by all your devices: read mode, collapsed lines, pack/unpack and card states, sort order, read-aloud prefs, and so on. A change on one device reaches your other open devices live, without a reload.\n• \"Screen and keys\" (text size, width, bar placement, Enter-sends, single-key shortcuts) stays per-device, and its heading now says \"(client side)\" in small, faint text.\n• First load on each device seeds the server with that device's values only where the server has none, so nothing newer is overwritten. Load your phone and your desktop once each and they'll converge.\nKnown limits: a setting holding several entries (e.g. per-thread card states) merges as a whole, so two devices editing different entries at the same moment can lose one side's edit. Migration against your real devices hasn't been exercised outside tests, so tell me if anything looks reset."
+  },
+  {
+   "name": "long paragraph",
+   "pieces": [
+    "The cache follows the same rules as the store does. Newer content replaces older content whenever a read brings it, and a deletion leaves a contentless tombstone behind it. A pushed event can never resurrect a deleted message, and only a read that started after the deletion can bring it back. That keeps the two copies honest with each other.",
+    "Slack's forward feed is additions-only: what is new since a point never reports edits or deletes. An edit or delete of an older message is therefore noticed only when someone loads that range again, which can be hours later on a quiet channel.",
+    "The cheap improvement is to subscribe the hint to updates and deletions too, and re-read just the affected message."
+   ],
+   "text": "The cache follows the same rules as the store does. Newer content replaces older content whenever a read brings it, and a deletion leaves a contentless tombstone behind it. A pushed event can never resurrect a deleted message, and only a read that started after the deletion can bring it back. That keeps the two copies honest with each other. Slack's forward feed is additions-only: what is new since a point never reports edits or deletes. An edit or delete of an older message is therefore noticed only when someone loads that range again, which can be hours later on a quiet channel. The cheap improvement is to subscribe the hint to updates and deletions too, and re-read just the affected message."
+  },
+  {
+   "name": "one long sentence",
+   "pieces": [
+    "word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25 word26 word27 word28 word29 word30 word31 word32 word33 word34 word35 word36 word37 word38 word39 word40 word41 word42 word43 word44",
+    "word45 word46 word47 word48 word49 word50 word51 word52 word53 word54 word55 word56 word57 word58 word59 word60 word61 word62 word63 word64 word65 word66 word67 word68 word69 word70 word71 word72 word73 word74 word75 word76 word77 word78 word79 word80 word81 word82 word83 word84 word85 word86 word87",
+    "word88 word89 word90 word91 word92 word93 word94 word95 word96 word97 word98 word99 word100 word101 word102 word103 word104 word105 word106 word107 word108 word109 word110 word111 word112 word113 word114 word115 word116 word117 word118 word119 word120 word121 word122 word123 word124 word125 word126 word127 word128 word129 word130"
+   ],
+   "text": "word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12 word13 word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25 word26 word27 word28 word29 word30 word31 word32 word33 word34 word35 word36 word37 word38 word39 word40 word41 word42 word43 word44 word45 word46 word47 word48 word49 word50 word51 word52 word53 word54 word55 word56 word57 word58 word59 word60 word61 word62 word63 word64 word65 word66 word67 word68 word69 word70 word71 word72 word73 word74 word75 word76 word77 word78 word79 word80 word81 word82 word83 word84 word85 word86 word87 word88 word89 word90 word91 word92 word93 word94 word95 word96 word97 word98 word99 word100 word101 word102 word103 word104 word105 word106 word107 word108 word109 word110 word111 word112 word113 word114 word115 word116 word117 word118 word119 word120 word121 word122 word123 word124 word125 word126 word127 word128 word129 word130"
+  },
+  {
+   "name": "short",
+   "pieces": [
+    "Done and deployed.\nReload the page to get it."
+   ],
+   "text": "Done and deployed.\nReload the page to get it."
+  },
+  {
+   "name": "quoted sentence ends",
+   "pieces": [
+    "alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha said \"stop.\"",
+    "beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta! gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma?"
+   ],
+   "text": "alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha said \"stop.\" beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta! gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma?"
+  }
+ ]
+}

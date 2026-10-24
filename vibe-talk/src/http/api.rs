@@ -4935,6 +4935,14 @@ pub struct PreparedBlock {
     /// How many characters it says. `#379 read-aloud-sentences`: the page times the sentence it
     /// lights against the block's audio by this, until the block's audio has all arrived.
     pub chars: usize,
+    /// `#486 read-aloud-pieces`. Which drawn block this is a piece of, counting from 0 in drawing
+    /// order: a block too long or too bulleted to read in one go is read as several pieces, each
+    /// listed here in order with the same `element`.
+    pub element: usize,
+    /// Which piece of that drawn block this is, from 0.
+    pub piece: usize,
+    /// How many pieces that drawn block is read in, so the page can check it cuts it the same way.
+    pub pieces: usize,
 }
 
 /// Everything the page needs to make a tap instant.
@@ -5052,17 +5060,20 @@ pub async fn prepare_speech(
     for (message_id, said, blocks) in resolved {
         let described = blocks
             .iter()
-            .map(|(kind, said)| PreparedBlock {
-                kind: *kind,
-                spoken: !said.trim().is_empty(),
-                chars: said.trim().chars().count(),
+            .map(|block| PreparedBlock {
+                kind: block.kind,
+                spoken: !block.said.trim().is_empty(),
+                chars: block.said.trim().chars().count(),
+                element: block.element,
+                piece: block.piece,
+                pieces: block.pieces,
             })
             .collect();
         let ticket = state.speech_tickets.mint(crate::speech_tickets::Prepared {
             channel: channel.id.0.clone(),
             message: message_id.clone(),
             said,
-            blocks: blocks.into_iter().map(|(_, said)| said).collect(),
+            blocks: blocks.into_iter().map(|block| block.said).collect(),
             speed: crate::speech::clamp_speed(request.speed),
             observation: crate::speech_tickets::fresh_observation(),
             preparation_ms,
@@ -5079,8 +5090,22 @@ pub async fn prepare_speech(
     }))
 }
 
+/// One piece of a drawn block, as [`spoken_blocks`] lists it.
+struct SpokenBlock {
+    kind: crate::render::BlockKind,
+    /// The drawn block, its piece, and how many pieces it is read in (`#486 read-aloud-pieces`).
+    element: usize,
+    piece: usize,
+    pieces: usize,
+    said: String,
+}
+
 /// `#376 read-aloud-blocks`. What each block of `message` says, in the order the page draws its
 /// blocks (see [`crate::render::source_blocks`]); empty when it is one block.
+///
+/// `#486 read-aloud-pieces`. Each drawn block in the pieces [`crate::render::read_pieces`] cuts it
+/// into, but a code block or a table, which is said as a short description of it, whole. Empty when
+/// the whole message is one piece.
 ///
 /// Every block through the same speech rules as the whole message, sharing one set of short names
 /// so a hash is "hash code A" in whichever block it is said.
@@ -5089,24 +5114,52 @@ fn spoken_blocks(
     markup: crate::render::Markup,
     now: i64,
     zone: &crate::clock::Zone,
-) -> Vec<(crate::render::BlockKind, String)> {
+) -> Vec<SpokenBlock> {
+    use crate::render::BlockKind;
     let blocks = crate::render::source_blocks(&message.content, markup, &message.mentions);
-    if blocks.len() < 2 {
+    let cut: Vec<(BlockKind, Vec<&str>)> = blocks
+        .iter()
+        .map(|block| {
+            let pieces = match block.kind {
+                BlockKind::Code | BlockKind::Table => vec![block.source.as_str()],
+                _ => crate::render::read_pieces(&block.source),
+            };
+            // A block of nothing a piece can hold is still a block the page draws: kept whole.
+            let pieces = if pieces.is_empty() {
+                vec![block.source.as_str()]
+            } else {
+                pieces
+            };
+            (block.kind, pieces)
+        })
+        .collect();
+    if cut.iter().map(|(_, pieces)| pieces.len()).sum::<usize>() < 2 {
         return Vec::new();
     }
     let mut names = crate::speakable::Names::default();
-    blocks
-        .into_iter()
-        .map(|block| {
+    let mut spoken = Vec::new();
+    for (element, (kind, pieces)) in cut.into_iter().enumerate() {
+        let count = pieces.len();
+        for (piece, source) in pieces.into_iter().enumerate() {
             let said = crate::speakable::for_speech_with(
-                &crate::speakable::with_mention_names(&block.source, &message.mentions),
+                &crate::speakable::with_mention_names(
+                    crate::render::piece_source(source),
+                    &message.mentions,
+                ),
                 now,
                 zone,
                 &mut names,
             );
-            (block.kind, said)
-        })
-        .collect()
+            spoken.push(SpokenBlock {
+                kind,
+                element,
+                piece,
+                pieces: count,
+                said,
+            });
+        }
+    }
+    spoken
 }
 
 /// Query parameters for playing a prepared message.

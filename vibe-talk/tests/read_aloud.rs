@@ -1192,3 +1192,57 @@ async fn a_message_of_several_blocks_is_prepared_and_played_block_by_block() {
     let (status, _bytes) = call(&app, "GET", &format!("{short_url}?block=1"), None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+/// `#486 read-aloud-pieces`. A paragraph of typed "•" bullets is prepared as one piece per bullet
+/// line, each naming the drawn block it is a piece of, and plays without its bullet; a block that
+/// fits in one piece is listed as one piece of one.
+#[tokio::test]
+async fn a_paragraph_of_typed_bullets_is_prepared_and_played_piece_by_piece() {
+    let (mut state, chat, _elevenlabs) =
+        testing::state_from_toml(&testing::config_toml_without_elevenlabs());
+    state.speech = Arc::new(IndependentSpeech);
+    let channel = ChannelId(READ_CHANNEL.to_owned());
+    let bulleted = chat.seed(
+        &channel,
+        "Reader",
+        "Settings sync is live:\n• Every setting is stored.\n• Screen and keys stays per-device.\nKnown limits: none yet.\n\nThat is all.",
+    );
+    let app = router(state);
+    let (status, bytes) = call(
+        &app,
+        "POST",
+        &format!("/api/v1/channels/{READ_CHANNEL}/speech/prepare"),
+        Some(json!({"ids": [bulleted.0]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let prepared: Value = serde_json::from_slice(&bytes).expect("prepared");
+    let pieces: Vec<Value> = prepared["prepared"][0]["blocks"]
+        .as_array()
+        .expect("blocks")
+        .iter()
+        .map(|block| json!([block["element"], block["piece"], block["pieces"]]))
+        .collect();
+    assert_eq!(
+        Value::Array(pieces),
+        json!([[0, 0, 4], [0, 1, 4], [0, 2, 4], [0, 3, 4], [1, 0, 1]]),
+        "{prepared}"
+    );
+    let url = prepared["prepared"][0]["url"].as_str().expect("ticket");
+    let mut heard = Vec::new();
+    for block in 0..5 {
+        let (status, bytes) = call(&app, "GET", &format!("{url}?block={block}"), None).await;
+        assert_eq!(status, StatusCode::OK, "block {block}");
+        heard.push(String::from_utf8(bytes).expect("test audio"));
+    }
+    assert_eq!(
+        heard,
+        [
+            "Settings sync is live:",
+            "Every setting is stored.",
+            "Screen and keys stays per-device.",
+            "Known limits: none yet.",
+            "That is all.",
+        ]
+    );
+}

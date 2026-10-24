@@ -34407,8 +34407,12 @@ function readingBlocks(box) {
 const READING_BLOCK_ATTRIBUTE = "data-reading-block";
 
 /**
- * The drawn blocks of message `part` of `row`, when they are the blocks the server prepared it as;
- * null when it was not prepared in blocks or the two disagree.
+ * The drawn blocks of message `part` of `row`, one per block the server prepared it as, when they
+ * are the blocks it was prepared in; null when it was not prepared in blocks or the two disagree.
+ *
+ * `#486 read-aloud-pieces`. A prepared block is a PIECE of a drawn one (`element`, `piece` of
+ * `pieces`); a server from before pieces lists one per drawn block, each its own element. Each entry
+ * here is `{element, kind, piece, pieces}`: the drawn element it is lit as, and which of its pieces.
  */
 function preparedBlocksOf(row, part) {
   const body = childByClass(row, "body");
@@ -34420,9 +34424,22 @@ function preparedBlocksOf(row, part) {
   const listed = playing ? nowPlaying.blocks[part] : entry && entry.blocks;
   if (!box || !listed) return null;
   const drawn = readingBlocks(box);
-  const same = drawn.length === listed.length &&
-    drawn.every((block, index) => block.kind === listed[index].kind);
-  return same ? drawn : null;
+  const elementOf = (block, index) => (Number.isInteger(block.element) ? block.element : index);
+  // Every drawn block in order, each listed at least once and only with its own kind.
+  let next = 0;
+  for (const [index, block] of listed.entries()) {
+    const at = elementOf(block, index);
+    if (at !== next && at !== next - 1) return null;
+    if (!drawn[at] || drawn[at].kind !== block.kind) return null;
+    next = at + 1;
+  }
+  if (next !== drawn.length) return null;
+  return listed.map((block, index) => ({
+    element: drawn[elementOf(block, index)].element,
+    kind: block.kind,
+    piece: Number.isInteger(block.piece) ? block.piece : 0,
+    pieces: Number.isInteger(block.pieces) ? block.pieces : 1,
+  }));
 }
 
 /** Light the block being read in `row`, and only that one. The row is marked while one is lit. */
@@ -34507,55 +34524,206 @@ function silentBefore(timeline, at) {
 }
 
 /**
- * The sentences `element` shows, in order, each as `{from, to, length}`: where it begins and ends
- * as `[text node, offset]`, and how many characters it is. The text of a nested list is not the
- * element's own. A sentence ends at `.`, `!`, `?` or `…` (and any closing quote or bracket) that is
- * followed by a space or the end.
+ * The text `element` shows, as `{text, place}`: its text nodes in order, a line break as a line end,
+ * and `place(offset)`, where an offset into that text is as `[text node, offset]`. The text of a
+ * nested list is not the element's own.
  */
-function sentencesOf(element) {
-  const pieces = [];
+function shownTextOf(element) {
+  const nodes = [];
   let text = "";
   const walk = (node) => {
     for (const kid of node.childNodes || []) {
       if (kid.nodeType === 3) {
-        pieces.push({ node: kid, at: text.length });
+        nodes.push({ node: kid, at: text.length });
         text += kid.textContent;
         continue;
       }
       const tag = String(kid.tagName || "").toLowerCase();
       if (tag === "ul" || tag === "ol") continue;
+      // `#486 read-aloud-pieces`: a typed bullet begins a line, and a drawn line break ends one.
+      if (tag === "br") {
+        text += "\n";
+        continue;
+      }
       walk(kid);
     }
   };
   walk(element);
   const place = (offset) => {
-    let piece = pieces[0];
-    for (const candidate of pieces) {
+    let piece = nodes[0];
+    for (const candidate of nodes) {
       if (candidate.at > offset) break;
       piece = candidate;
     }
-    return [piece.node, Math.min(offset - piece.at, piece.node.textContent.length)];
+    return [piece.node, Math.max(0, Math.min(offset - piece.at, piece.node.textContent.length))];
   };
+  return { text, place };
+}
+
+/**
+ * Where the sentences of `text[from, to)` end, as offsets into `text`, the last at `to`. A sentence
+ * ends at `.`, `!`, `?` or `…` (and any closing quote or bracket) that is followed by white space or
+ * the end. src/render.rs `sentence_ranges` is the same rule.
+ */
+function sentenceEnds(text, from = 0, to = text.length) {
+  const ends = [];
+  for (let at = from; at < to; at += 1) {
+    if (!/[.!?…]/.test(text[at])) continue;
+    let end = at + 1;
+    while (end < to && /[.!?…"'”’)\]]/.test(text[end])) end += 1;
+    if (end === to || /\s/.test(text[end])) {
+      ends.push(end);
+      at = end - 1;
+    }
+  }
+  if (ends[ends.length - 1] !== to) ends.push(to);
+  return ends;
+}
+
+/**
+ * The sentences `element` shows, in order, each as `{from, to, length}`: where it begins and ends as
+ * `[text node, offset]`, and how many characters it is. `#486 read-aloud-pieces`: with `within`, only
+ * the sentences of that stretch of its text (`shownTextOf`), as `{start, end}`, cut at its edges.
+ *
+ * @param {Element} element
+ * @param {{start: number, end: number} | null} [within]
+ */
+function sentencesOf(element, within = null) {
+  const { text, place } = shownTextOf(element);
+  if (text === "") return [];
   const found = [];
-  let start = 0;
-  const close = (end) => {
+  let start = within ? within.start : 0;
+  for (const end of sentenceEnds(text, start, within ? within.end : text.length)) {
     while (start < end && /\s/.test(text[start])) start += 1;
     let last = end;
     while (last > start && /\s/.test(text[last - 1])) last -= 1;
     if (last > start) found.push({ from: place(start), to: place(last), length: last - start });
     start = end;
-  };
-  for (let at = 0; at < text.length; at += 1) {
-    if (!/[.!?…]/.test(text[at])) continue;
-    let end = at + 1;
-    while (end < text.length && /[.!?…"'”’)\]]/.test(text[end])) end += 1;
-    if (end === text.length || /\s/.test(text[end])) {
-      close(end);
-      at = end - 1;
+  }
+  return found;
+}
+
+// --- reading a block in pieces: `#486 read-aloud-pieces` ------------------------------------------
+//
+// The owner, 2026-10-23, of a message whose bullets were typed "•" lines in one paragraph: why was it
+// not cut into pieces the controller can step through, with a most size in words, cut at paragraphs
+// and list items first, at sentences next, and evenly by words only as a last resort? So a drawn
+// block is read in pieces, by the rule src/render.rs `read_pieces` cuts the text it was drawn from
+// with (both held to tests/fixtures/read_aloud_pieces.json): a line beginning with a bullet glyph is
+// a piece of its own and the lines between are one; a piece of more than `READ_PIECE_WORDS` words is
+// cut at sentence ends; only one sentence longer than that is cut into equal runs of words. The block
+// stays lit while its pieces are read, and the sentence light keeps inside the piece being read.
+
+/** The most words one piece says, unless one sentence is longer. src/render.rs `READ_PIECE_WORDS`. */
+const READ_PIECE_WORDS = 60;
+/** The glyphs a typed bullet begins with. src/render.rs `READ_BULLETS`. */
+const READ_BULLETS = "•◦▪▫‣⁃●○■□▸▹►";
+
+/** How many words `text` holds: runs of anything but white space. */
+function wordCount(text) {
+  return (String(text).match(/\S+/g) || []).length;
+}
+
+/**
+ * The pieces `text` is read in, in order, each as `{start, end}`, offsets into `text` with the white
+ * space at either end left out. See the section note.
+ *
+ * @param {string} text
+ * @returns {Array<{start: number, end: number}>}
+ */
+function readPieces(text) {
+  const groups = [];
+  let run = null;
+  let at = 0;
+  for (const line of String(text).split("\n")) {
+    const from = at;
+    const to = at + line.length;
+    at = to + 1;
+    if (READ_BULLETS.includes(line.trimStart().charAt(0)) && line.trimStart() !== "") {
+      if (run) groups.push(run);
+      run = null;
+      groups.push([from, to]);
+    } else {
+      run = run ? [run[0], to] : [from, to];
     }
   }
-  close(text.length);
+  if (run) groups.push(run);
+  const ranges = [];
+  for (const [from, to] of groups) {
+    if (wordCount(text.slice(from, to)) <= READ_PIECE_WORDS) {
+      ranges.push([from, to]);
+      continue;
+    }
+    let current = null;
+    let start = from;
+    for (const end of sentenceEnds(text, from, to)) {
+      const count = wordCount(text.slice(start, end));
+      if (count > READ_PIECE_WORDS) {
+        if (current) ranges.push([current[0], current[1]]);
+        current = null;
+        ranges.push(...evenRuns(text, start, end, count));
+      } else if (current && current[2] + count <= READ_PIECE_WORDS) {
+        current = [current[0], end, current[2] + count];
+      } else {
+        if (current) ranges.push([current[0], current[1]]);
+        current = [start, end, count];
+      }
+      start = end;
+    }
+    if (current) ranges.push([current[0], current[1]]);
+  }
+  const pieces = [];
+  for (let [start, end] of ranges) {
+    while (start < end && /\s/.test(text[start])) start += 1;
+    while (end > start && /\s/.test(text[end - 1])) end -= 1;
+    if (end > start) pieces.push({ start, end });
+  }
+  return pieces;
+}
+
+/**
+ * `text[from, to)`, of `count` words, cut into the fewest runs of at most `READ_PIECE_WORDS` words,
+ * as equal as words allow, the longer runs first. src/render.rs `even_runs`.
+ */
+function evenRuns(text, from, to, count) {
+  const runs = Math.ceil(count / READ_PIECE_WORDS);
+  const size = Math.floor(count / runs);
+  const longer = count % runs;
+  const bounds = [];
+  let inWord = false;
+  let seen = 0;
+  let wanted = size + (longer > 0 ? 1 : 0);
+  for (let at = from; at < to; at += 1) {
+    const space = /\s/.test(text[at]);
+    if (!space && !inWord) {
+      if (seen === wanted) {
+        bounds.push(at);
+        wanted += size + (bounds.length < longer ? 1 : 0);
+      }
+      seen += 1;
+    }
+    inWord = !space;
+  }
+  const found = [];
+  let start = from;
+  for (const bound of bounds) {
+    found.push([start, bound]);
+    start = bound;
+  }
+  found.push([start, to]);
   return found;
+}
+
+/**
+ * Piece `block.piece` of the drawn block `block` as `{start, end}` in its shown text, when the page
+ * cuts that block into as many pieces as the server read it in; else null.
+ *
+ * @param {{element: Element, piece: number, pieces: number}} block
+ */
+function readPieceOf(block) {
+  if (block.pieces < 2) return null;
+  const pieces = readPieces(shownTextOf(block.element).text);
+  return pieces.length === block.pieces ? pieces[block.piece] || null : null;
 }
 
 /** Take the sentence light off, and stop looking for the next one. */
@@ -34583,8 +34751,12 @@ function showReadingSentence() {
   const drawn = row && segment && segment.block !== null ? preparedBlocksOf(row, segment.part) : null;
   const block = drawn ? drawn[segment.block] : null;
   const timeline = player && typeof player.timeline === "function" ? player.timeline() : null;
-  const sentences = block ? sentencesOf(block.element) : [];
-  if (sentences.length < 2 || !timeline || timeline.startsAt === null || readAloudContext === null) {
+  // `#486 read-aloud-pieces`. A piece of the block lights its own sentences, or itself whole when it
+  // is one; where the page cuts the block otherwise, every sentence of the block.
+  const piece = block ? readPieceOf(block) : null;
+  const sentences = block ? sentencesOf(block.element, piece) : [];
+  if ((sentences.length < 2 && !piece) || sentences.length < 1 || !timeline || timeline.startsAt === null ||
+      readAloudContext === null) {
     if (litSentence !== "") CSS.highlights.delete(SENTENCE_HIGHLIGHT);
     litSentence = "";
     return;
@@ -35522,9 +35694,10 @@ function blockTapped(li, target) {
   if (part < 0) return null;
   const drawn = preparedBlocksOf(li, part);
   let block = null;
-  // The innermost: an item nested in another comes after it.
+  // The innermost: an item nested in another comes after it. `#486 read-aloud-pieces`: and a block
+  // read in pieces from its first piece.
   (drawn || []).forEach((found, index) => {
-    if (nodeWithin(found.element, target)) block = index;
+    if (nodeWithin(found.element, target) && (block === null || drawn[block].element !== found.element)) block = index;
   });
   return { part, block };
 }
