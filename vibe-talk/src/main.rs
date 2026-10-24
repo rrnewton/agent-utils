@@ -308,6 +308,13 @@ async fn keep_summaries_across_the_policy_change(
     }
 }
 
+/// Whether the log is coloured: only for a person at a terminal, and never under `NO_COLOR`.
+/// Appended to a file or a journal, the escape codes were two fifths of its bytes and made it
+/// harder to search. `#490 storage-io-audit`.
+fn log_in_colour(stream: &impl std::io::IsTerminal) -> bool {
+    stream.is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut argv = std::env::args().skip(1);
@@ -315,6 +322,7 @@ async fn main() -> anyhow::Result<()> {
         return pair_link(argv).await;
     }
     tracing_subscriber::fmt()
+        .with_ansi(log_in_colour(&std::io::stdout()))
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -900,6 +908,7 @@ async fn main() -> anyhow::Result<()> {
 async fn pair_link(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        .with_ansi(log_in_colour(&std::io::stderr()))
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),

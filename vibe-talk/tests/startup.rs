@@ -408,7 +408,8 @@ async fn starting_the_server_sweeps_summaries_from_a_policy_that_no_longer_appli
 
 /// The child's output with ANSI escapes removed.
 ///
-/// `tracing_subscriber` colours its output even when stdout is a pipe, and the colouring lands
+/// The server colours its log only when it writes to a terminal (`#490 storage-io-audit`), so a
+/// pipe gets none. This stays for a run under a pseudo-terminal, where the colouring lands
 /// BETWEEN a structured field's name and its value: `summaries_available` `ESC[0m` `ESC[2m` `=`
 /// `ESC[0m` `false`. So a naive `contains("name=value")` reads as absent when the field is
 /// present — and, far worse, passes on any PROSE in the same log that happens to spell the pair
