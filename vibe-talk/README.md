@@ -4418,11 +4418,27 @@ either. Counts are kept per consumer, in memory, from the moment the process sta
 * `late`: an evaluation that read what a newer read had already written, so it gives no verdict;
 * when the cache would have answered and upstream did too:
   * `compared` and `agreed`;
-  * `missing_rows`, messages upstream listed that the cache lacked;
+  * `missing_rows`, messages upstream listed that the cache lacked, written before the end of what
+    the cache's answer claims: past the head the latest read of that scope's newest end listed,
+    and past when that read began (plus a second for the two clocks). Rows the answer claimed to
+    hold, each a wrong answer had it been served;
+  * `stale_rows`, messages upstream listed that the cache lacked, written past the end of that
+    claim but before the reader asked: what the rule's freshness lets a served answer leave out
+    until the next read brings it. No difference, so `agreed` does not count them, but worth
+    watching before serving is turned on;
+  * `newer_rows`, the same, written after the reader asked, while upstream was being read: no
+    difference at all;
   * `extra_rows`, messages the cache would have shown that the provider no longer lists. Each one
-    would have brought a deleted message back, so any is logged as a warning, with counts and
-    nothing else;
+    would have brought a deleted message back;
   * `content_differs`.
+
+  A comparison that finds any of these writes one log line: a warning for a difference, an `info`
+  line when it found only stale or newer messages, at most thirty of each an hour (the next says
+  how many were held back). It names the channel, the scope, the read reason, the window and the
+  read it rests on, and each message by id, with its times as offsets from the ask, where the
+  scope's coverage puts it, what offered it to the cache (`caller`, `stream`, `poller`,
+  `refresher`, `backfill`, `own-post`, or `never`) and what the file holds of it. Never a word of
+  text.
 
 With a table but no file open, an ask counts as `off`. With no table, nothing is counted. An ask
 the cache would never answer, such as Slack's Flat view, is not counted at all. An answer that
@@ -4501,8 +4517,8 @@ path:
     { "consumer": "messages", "asked": 410, "would_serve": 120, "served": 0, "needs_existence_check": 0,
       "misses": { "off": 0, "blocked": 0, "suspect": 0, "gap": 30, "incomplete": 0,
                   "stale_head": 260, "barrier": 0 },
-      "late": 0, "compared": 120, "agreed": 118, "missing_rows": 2, "extra_rows": 0,
-      "content_differs": 0 }
+      "late": 0, "compared": 120, "agreed": 118, "missing_rows": 2, "stale_rows": 1,
+      "newer_rows": 1, "extra_rows": 0, "content_differs": 0 }
   ]
 }
 ```
@@ -4528,7 +4544,11 @@ INFO vibe_talk::cache::sink: message cache figures since this process started av
 ```
 
 **What is never logged.** No log line about the cache, at any level, carries message text, a
-message or channel id, a content hash or a summary key. A line names a provider by its
+content hash or a summary key. None carries a message or channel id either, with one exception:
+the shadow's line about a comparison that found anything (above, `#497 cache-shadow-missing-row`:
+the warning for a difference and the `info` line for stale or newer messages) names the channel,
+its thread and the messages concerned by id, because a disagreement that cannot be traced to a
+message cannot be explained; it carries ids and times, never text. A line names a provider by its
 configuration key, a doubtful scope by its kind (`channel` or `thread`), and the cache's own files
 by their paths. The cache's SQLite failures are logged as result codes, never as SQLite's message,
 which can quote what it was given. Neither the diagnostics section nor the hourly line is written

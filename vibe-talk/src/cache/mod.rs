@@ -119,6 +119,7 @@
 //! writer's commits never checkpoint), and two readers, each with its own connection.
 
 pub mod access;
+pub mod arrivals;
 mod checkpoint;
 pub mod coverage;
 pub mod file;

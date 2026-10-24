@@ -795,3 +795,147 @@ async fn a_band_row_the_latest_read_did_not_list_is_never_served_in_a_window_nor
     );
     assert_eq!(count.misses.gap, 1, "{count:?}");
 }
+
+/// Capture this thread's log at INFO, as [`testing::LogCapture::info_only`] does, once a global
+/// subscriber that takes INFO and writes nothing is in place. Without one, another test's capture
+/// dropped on another thread rebuilds each callsite's interest from the captures alive at that
+/// moment, and may leave the diagnostics' callsites cached as of interest to no one just as this
+/// thread's capture begins: its line would then never reach it.
+fn capture_info() -> testing::LogCapture {
+    static GLOBAL: std::sync::Once = std::sync::Once::new();
+    GLOBAL.call_once(|| {
+        let quiet = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(std::io::sink)
+            .finish();
+        let _ = tracing::subscriber::set_global_default(quiet);
+    });
+    testing::LogCapture::info_only()
+}
+
+/// `#497 cache-shadow-missing-row`: the race behind the shadow's one missing row a window. The
+/// cache's answer claims what the latest read of the scope's newest end listed and the claims
+/// below it; upstream is read after the ask, and its read takes seconds. A message written past
+/// the end of that claim is listed upstream and not held, and was never claimed: written before
+/// the ask (inside the freshness the rule allows) it is counted `stale`, after it (while upstream
+/// was being read) `newer`, and neither is `missing`; the comparison agrees. One info line names
+/// them, ids and times only.
+#[tokio::test]
+async fn a_message_written_past_the_end_of_the_answers_claim_is_stale_or_newer_not_missing() {
+    let d = deployment("cache-shadow-newer", &testing::config_toml()).await;
+    d.fill().await;
+    let read_began = T0 + HOUR;
+    d.clock.advance(5 * SECOND);
+    let read = ChannelId(READ_CHANNEL.to_owned());
+    // Between the read the answer rests on and the ask; and after the ask, during upstream's read.
+    let before_ask = d.fake.seed_at(
+        &read,
+        "Ada",
+        "a secret before the ask",
+        read_began + 2 * SECOND,
+    );
+    let during = d.fake.seed_at(
+        &read,
+        "Ada",
+        "a secret during the read",
+        read_began + 7 * SECOND,
+    );
+    let capture = capture_info();
+    d.read_window(5).await;
+    let after = d.messages();
+    assert_eq!(after.would_serve, 1, "{after:?}");
+    assert_eq!(
+        (
+            after.compared,
+            after.agreed,
+            after.missing_rows,
+            after.stale_rows,
+            after.newer_rows,
+            after.extra_rows
+        ),
+        (1, 1, 0, 1, 1, 0),
+        "{after:?}"
+    );
+    let log = capture.text();
+    let line = log
+        .lines()
+        .find(|line| line.contains("lacked only messages written past the end"))
+        .unwrap_or_else(|| panic!("no info line:\n{log}"));
+    assert!(line.contains(" INFO "), "{line}");
+    assert!(
+        line.contains(&format!("stale={} created=-3000ms", before_ask.0)),
+        "{line}"
+    );
+    assert!(
+        line.contains(&format!("newer={} created=+2000ms", during.0)),
+        "{line}"
+    );
+    for field in [
+        "stale_rows=1",
+        "newer_rows=1",
+        "missing_rows=0",
+        "version=-5000ms",
+        "claim_end=-4000ms",
+        "arrived=never",
+    ] {
+        assert!(line.contains(field), "{field} in {line}");
+    }
+    assert!(!log.contains("secret"), "no text is logged:\n{log}");
+}
+
+/// `#497 cache-shadow-missing-row`: and a message written BEFORE the read the answer rests on,
+/// which that read did not list (a provider that lists a message late), is a row the answer
+/// claimed to hold. Still `missing`, still a difference, and warned about with what the cache
+/// knows of it.
+#[tokio::test]
+async fn a_message_written_before_the_read_the_answer_rests_on_is_missing_and_warned() {
+    let d = deployment("cache-shadow-missing", &testing::config_toml()).await;
+    d.fill().await;
+    d.clock.advance(5 * SECOND);
+    let read = ChannelId(READ_CHANNEL.to_owned());
+    // Between message 10 and the head, message 11: in the unsettled band, listed late.
+    let late = d.fake.seed_at(
+        &read,
+        "Ada",
+        "a secret listed late",
+        T0 + 10 * MINUTE + 30 * SECOND,
+    );
+    let capture = capture_info();
+    d.read_window(5).await;
+    let after = d.messages();
+    assert_eq!(
+        (
+            after.would_serve,
+            after.compared,
+            after.agreed,
+            after.missing_rows,
+            after.newer_rows
+        ),
+        (1, 1, 0, 1, 0),
+        "{after:?}"
+    );
+    let log = capture.text();
+    let line = log
+        .lines()
+        .find(|line| line.contains("differed from its provider's"))
+        .unwrap_or_else(|| panic!("no warning:\n{log}"));
+    assert!(line.contains(" WARN "), "{line}");
+    assert!(
+        line.contains(&format!("missing={} created=", late.0)),
+        "{line}"
+    );
+    for field in [
+        "consumer=\"messages\"",
+        "channel=",
+        "scope=main",
+        "read_reason=",
+        "missing_rows=1",
+        "claim=band",
+        "arrived=never",
+        "file=absent",
+        "held_back=0",
+    ] {
+        assert!(line.contains(field), "{field} in {line}");
+    }
+    assert!(!log.contains("secret"), "no text is logged:\n{log}");
+}

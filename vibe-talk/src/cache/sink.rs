@@ -124,6 +124,13 @@
 //! on one `info` line an hour. Both say nothing on a server whose configuration has no
 //! `[message_cache]` table, and neither ever carries a channel id, a message id or a word of text.
 //!
+//! A comparison that finds anything writes one line of its own (`#497 cache-shadow-missing-row`),
+//! a warning for a difference and an `info` line for messages past the end of the answer's claim:
+//! the channel, the scope, the read it rests on, and each message it found different by id and
+//! times, with what offered it to the cache ([`Arrivals`]) and what the file holds of it. The one
+//! cache log line that names a channel or a message; never a word of text, and at most
+//! [`NOTES_PER_HOUR`] of each kind an hour.
+//!
 //! # Who puts a cache behind it
 //!
 //! The server does, at startup, when the configuration enables the cache and the owner has not
@@ -139,19 +146,20 @@ use async_trait::async_trait;
 use serde::Serialize;
 
 use super::access::{AccessListener, Suspect};
+use super::arrivals::Arrivals;
 use super::grant::{FillGrant, ServerFill};
 use super::lifecycle::Lifecycle;
 use super::observe::{self, PageRead, Shape, TimelineRead};
 use super::orphans::{self, Summaries};
-use super::shadow::{self, Ask, Decision, Miss, Upstream, View};
+use super::shadow::{self, Ask, Decision, Differing, Miss, Upstream, View};
 use super::{
-    lock, Account, CacheStats, ChanKey, Counts, MessageCache, Observation, Read, RouteSnapshot,
-    Scope, Stamp,
+    lock, Account, CacheStats, ChanKey, Counts, MessageCache, Observation, Offered, Read,
+    RouteSnapshot, Scope, Stamp,
 };
 use crate::chat::{ChatClient, ChatError, RecentRead};
 use crate::config::{Config, ProviderKind, RecentView};
 use crate::live::LiveMessage;
-use crate::model::{ChannelId, ChannelInfo, Message};
+use crate::model::{ChannelId, ChannelInfo, Message, MessageId};
 use crate::providers::ChatRouter;
 use crate::threads::{TimelinePage, TimelineRequest, TimelineView};
 
@@ -227,6 +235,10 @@ struct State {
     /// back on. Without this, every later load would serve again and older history would stay
     /// unreachable on a serving channel forever. `#384 cache-serve`.
     cursor_owed: Mutex<HashSet<(ChannelId, String)>>,
+    /// How each recent message reached the cache, by whom it was offered: what the shadow's
+    /// diagnostics name beside a message its comparison found different. Memory only. `#497
+    /// cache-shadow-missing-row`.
+    arrivals: Arc<Arrivals>,
 }
 
 /// What the shadow has counted since the process started, and how many of its evaluations have
@@ -237,6 +249,54 @@ struct ShadowProgress {
     begun: AtomicU64,
     read: AtomicU64,
     counted: AtomicU64,
+    /// How many diagnostic lines the shadow has written this hour. `#497 cache-shadow-missing-row`.
+    notes: Mutex<Notes>,
+}
+
+/// The most lines the shadow's diagnostics write an hour of each kind: comparisons that found a
+/// difference, and comparisons that found only messages written past the end of their answer's
+/// claim. `#497 cache-shadow-missing-row`.
+pub const NOTES_PER_HOUR: u32 = 30;
+
+/// The most messages of each kind one diagnostic line names; it counts the rest.
+const NOTED_ROWS: usize = 8;
+
+/// The kinds of diagnostic line, each with its own hourly allowance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NoteKind {
+    /// A comparison found a difference: a `warn` line.
+    Differs,
+    /// A comparison found only messages written past the end of its answer's claim: `info`.
+    Past,
+}
+
+/// The diagnostics' hourly allowance: see [`NOTES_PER_HOUR`].
+#[derive(Debug, Default)]
+struct Notes {
+    since: Option<Instant>,
+    written: [u32; 2],
+    held_back: [u64; 2],
+}
+
+impl Notes {
+    /// Whether a line of `kind` may be written at `now`: then how many of its kind were held back
+    /// since the last one written, which it says.
+    fn take(&mut self, kind: NoteKind, now: Instant) -> Option<u64> {
+        if self
+            .since
+            .is_none_or(|since| now.duration_since(since) >= Duration::from_secs(60 * 60))
+        {
+            self.since = Some(now);
+            self.written = [0; 2];
+        }
+        let kind = kind as usize;
+        if self.written[kind] >= NOTES_PER_HOUR {
+            self.held_back[kind] += 1;
+            return None;
+        }
+        self.written[kind] += 1;
+        Some(std::mem::take(&mut self.held_back[kind]))
+    }
 }
 
 /// Each provider's standing against the cache behind the sink.
@@ -475,6 +535,7 @@ pub struct Fill {
     shape: Shape,
     recent_via_flat: bool,
     rows: bool,
+    arrivals: Weak<Arrivals>,
 }
 
 impl Fill {
@@ -658,13 +719,30 @@ impl Fill {
     ///
     /// A fill that writes no rows offers deletions alone. Anything else it leaves out marks the
     /// channel suspect, as a full queue's drop does: it may have been an edit the file now lacks.
+    ///
+    /// What is offered is noted by id, with who offered it, for the shadow's diagnostics: one
+    /// brief lock, never a wait ([`Arrivals::note`]).
     fn offer(self, observations: Vec<Observation>) {
         let Some(cache) = self.cache.upgrade() else {
             return;
         };
+        let arrivals = self.arrivals.upgrade();
+        let offered_ms = cache.now_ms();
         for observation in observations {
             if self.rows || observation.removes_only() {
-                cache.offer(self.chan.clone(), self.stamp, observation);
+                // Noted only once queued: an offer dropped never reached the file.
+                let noted = arrivals.as_ref().map(|arrivals| {
+                    (
+                        arrivals,
+                        Arrivals::noted(&observation, self.grant.label(), offered_ms),
+                    )
+                });
+                if let Offered::Queued(_) = cache.offer(self.chan.clone(), self.stamp, observation)
+                {
+                    if let Some((arrivals, noted)) = noted {
+                        arrivals.record(&self.chan, noted);
+                    }
+                }
             } else {
                 cache.mark_suspect(&self.chan);
             }
@@ -683,6 +761,15 @@ pub struct Shadowed {
 #[derive(Debug)]
 struct ShadowTask {
     ask: Ask,
+    /// The channel, as the cache names it, and the scope the evaluation read (a message's is
+    /// found by the read): for the diagnostics.
+    chan: ChanKey,
+    scope: Option<Scope>,
+    /// Why the request read, for the diagnostics.
+    reason: crate::read_reason::ReadReason,
+    /// Whether the answer was handed back from the cache ([`Sink::try_serve`]).
+    served: bool,
+    arrivals: Weak<Arrivals>,
     feed: shadow::Feed,
     live_fed: bool,
     /// [`MessageCache::fed_since_ms`] when the ask was made.
@@ -905,12 +992,18 @@ impl ShadowTask {
         self.evaluate().await;
         let Self {
             ask,
+            chan,
+            scope,
+            reason,
+            served,
+            arrivals,
             feed,
             live_fed,
             fed_since_ms,
             asked_ms,
             evaluated,
             progress,
+            cache,
             ..
         } = self;
         let consumer = ask.consumer();
@@ -949,22 +1042,274 @@ impl ShadowTask {
             progress.tallies.decided(consumer, decision);
             if let (Decision::Serve, Some(view), Some((upstream, _))) = (decision, &view, &upstream)
             {
-                if let Some(comparison) = shadow::compare(&ask, view, upstream) {
+                if let Some((comparison, detail)) =
+                    shadow::compare_detail(&ask, view, upstream, asked_ms)
+                {
                     progress.tallies.compared(consumer, &comparison);
-                    if comparison.extra > 0 {
-                        tracing::warn!(
-                            consumer = consumer.label(),
-                            extra_rows = comparison.extra,
-                            missing_rows = comparison.missing,
-                            content_differs = comparison.differs,
-                            "the message cache's answer held messages its provider no \
-                             longer lists"
-                        );
+                    if comparison != shadow::Comparison::default() {
+                        let context = NoteContext {
+                            consumer,
+                            chan: &chan,
+                            scope: scope.as_ref().or(view.home.as_ref()),
+                            reason,
+                            served,
+                            asked_ms,
+                            live_fed,
+                            view,
+                        };
+                        note(&progress, &context, &comparison, &detail, &arrivals, &cache).await;
                     }
                 }
             }
         }
         progress.counted.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// What one diagnostic line says beside a comparison's counts. `#497 cache-shadow-missing-row`.
+struct NoteContext<'a> {
+    consumer: shadow::Consumer,
+    chan: &'a ChanKey,
+    scope: Option<&'a Scope>,
+    reason: crate::read_reason::ReadReason,
+    served: bool,
+    asked_ms: i64,
+    live_fed: bool,
+    view: &'a View,
+}
+
+/// A time as an offset from the ask, `+1200ms` or `-35000ms`, or `none`: short, and read at a
+/// glance against the read the answer rests on. Provider times and local ones alike, both wall
+/// clocks.
+fn since_ask(at: Option<i64>, asked_ms: i64) -> String {
+    at.map_or_else(
+        || "none".to_owned(),
+        |at| format!("{:+}ms", at.saturating_sub(asked_ms)),
+    )
+}
+
+/// What the read scope's coverage says of instant `at`: above the head, in its unsettled band
+/// (held by the latest read of the newest end alone), inside a claim (its source and when it was
+/// listed), or nowhere.
+fn claim_at(view: &View, at: i64, asked_ms: i64) -> String {
+    if let Some(head) = view.head {
+        if at > head.head_ms {
+            return "above-head".to_owned();
+        }
+        if at >= head.settled_top() {
+            return "band".to_owned();
+        }
+    }
+    view.coverage
+        .iter()
+        .find(|interval| interval.t0_ms <= at && at < interval.t1_ms)
+        .map_or_else(
+            || "uncovered".to_owned(),
+            |interval| {
+                format!(
+                    "{}@{}",
+                    interval.source.as_str(),
+                    since_ask(Some(interval.listed_ms), asked_ms)
+                )
+            },
+        )
+}
+
+/// What the file holds of a message the answer lacked, read after the comparison: held (when last
+/// seen, and in which scopes), tombstoned, absent, or not read.
+fn file_row(cache: &MessageCache, chan: &ChanKey, id: &MessageId, asked_ms: i64) -> String {
+    match cache.message(chan, id).served() {
+        Some(Some(row)) => {
+            let scopes = cache
+                .memberships(chan, id)
+                .served()
+                .unwrap_or_default()
+                .iter()
+                .map(Scope::key)
+                .collect::<Vec<_>>()
+                .join("+");
+            format!(
+                "held(observed={},scopes={scopes})",
+                since_ask(Some(row.observed_ms), asked_ms)
+            )
+        }
+        Some(None) => match cache.tombstoned(chan, id).served() {
+            Some(true) => "tombstoned".to_owned(),
+            Some(false) => "absent".to_owned(),
+            None => "unread".to_owned(),
+        },
+        None => "unread".to_owned(),
+    }
+}
+
+/// One message of a diagnostic line: its id, its times as offsets from the ask, where the read
+/// scope's coverage puts it, how it reached the cache, and what the file holds of it.
+fn describe(
+    row: &Differing,
+    context: &NoteContext<'_>,
+    arrivals: Option<&Arrivals>,
+    files: &HashMap<String, String>,
+) -> String {
+    let asked = context.asked_ms;
+    let mut out = format!("{} created={}", row.id, since_ask(row.created_ms, asked));
+    if let Some(created) = row.created_ms {
+        out.push_str(&format!(
+            " claim={}",
+            claim_at(context.view, created, asked)
+        ));
+    }
+    if let Some(held) = row.held {
+        out.push_str(&format!(
+            " observed={} vouched={}{}",
+            since_ask(Some(held.observed_ms), asked),
+            since_ask(held.vouched_ms, asked),
+            if held.partial { " partial" } else { "" }
+        ));
+    }
+    match arrivals.and_then(|arrivals| arrivals.of(context.chan, &row.id)) {
+        Some(arrived) => {
+            let one = |at: super::arrivals::Arrival| {
+                format!(
+                    "{}/{}@{}",
+                    at.by,
+                    at.kind,
+                    since_ask(Some(at.offered_ms), asked)
+                )
+            };
+            out.push_str(&format!(" arrived={}", one(arrived.first)));
+            if arrived.latest != arrived.first {
+                out.push_str(&format!(",latest={}", one(arrived.latest)));
+            }
+        }
+        None => out.push_str(" arrived=never"),
+    }
+    if let Some(file) = files.get(&row.id) {
+        out.push_str(&format!(" file={file}"));
+    }
+    out
+}
+
+/// At most [`NOTED_ROWS`] messages, described, and a count of the rest.
+fn describe_all(
+    rows: &[Differing],
+    context: &NoteContext<'_>,
+    arrivals: Option<&Arrivals>,
+    files: &HashMap<String, String>,
+) -> String {
+    let mut parts: Vec<String> = rows
+        .iter()
+        .take(NOTED_ROWS)
+        .map(|row| describe(row, context, arrivals, files))
+        .collect();
+    if rows.len() > NOTED_ROWS {
+        parts.push(format!("+{} more", rows.len() - NOTED_ROWS));
+    }
+    parts.join("; ")
+}
+
+/// Write one line about a comparison that found anything: a `warn` for a difference, an `info`
+/// for messages written only past the end of the answer's claim ([`shadow::claim_end`]). Content-free: ids, times,
+/// counts and words this server chooses, never a word of text. At most [`NOTES_PER_HOUR`] of
+/// each, the rest counted and said by the next. `#497 cache-shadow-missing-row`.
+async fn note(
+    progress: &ShadowProgress,
+    context: &NoteContext<'_>,
+    comparison: &shadow::Comparison,
+    detail: &shadow::Detail,
+    arrivals: &Weak<Arrivals>,
+    cache: &Weak<MessageCache>,
+) {
+    let kind = if comparison.agreed() {
+        NoteKind::Past
+    } else {
+        NoteKind::Differs
+    };
+    let Some(held_back) = lock(&progress.notes).take(kind, Instant::now()) else {
+        return;
+    };
+    // What the file holds of what the answer lacked, read now: a later write (the request's own,
+    // even) may show in it, and its times say so.
+    let lacked: Vec<MessageId> = detail
+        .missing
+        .iter()
+        .chain(&detail.stale)
+        .chain(&detail.newer)
+        .take(3 * NOTED_ROWS)
+        .map(|row| MessageId(row.id.clone()))
+        .collect();
+    let files = match cache.upgrade() {
+        Some(cache) if !lacked.is_empty() => {
+            let chan = context.chan.clone();
+            let asked_ms = context.asked_ms;
+            tokio::task::spawn_blocking(move || {
+                lacked
+                    .iter()
+                    .map(|id| (id.0.clone(), file_row(&cache, &chan, id, asked_ms)))
+                    .collect::<HashMap<_, _>>()
+            })
+            .await
+            .unwrap_or_default()
+        }
+        _ => HashMap::new(),
+    };
+    let arrivals = arrivals.upgrade();
+    let arrivals = arrivals.as_deref();
+    let asked = context.asked_ms;
+    let view = context.view;
+    let head = view.head;
+    let rows = |list: &[Differing]| describe_all(list, context, arrivals, &files);
+    macro_rules! line {
+        ($level:ident, $message:literal) => {
+            tracing::$level!(
+                consumer = context.consumer.label(),
+                served = context.served,
+                provider = %context.chan.provider_key,
+                channel = %context.chan.channel_id,
+                scope = %context.scope.map_or_else(|| "none".to_owned(), Scope::key),
+                read_reason = context.reason.as_str(),
+                live_fed = context.live_fed,
+                asked_ms = asked,
+                version = %since_ask(detail.version_ms, asked),
+                claim_end = %since_ask(detail.claim_end_ms, asked),
+                head = %since_ask(head.map(|head| head.head_ms), asked),
+                settled_top = %since_ask(head.map(|head| head.settled_top()), asked),
+                checked_from = %since_ask(view.head_checked_from_ms, asked),
+                window_rows = view.rows.len(),
+                window_oldest = %since_ask(view.rows.first().map(|row| row.created_ms), asked),
+                window_newest = %since_ask(view.rows.last().map(|row| row.created_ms), asked),
+                compared_from = %since_ask(detail.from_ms, asked),
+                compared_until = %since_ask(detail.until_ms, asked),
+                upstream_rows = detail.upstream_rows,
+                upstream_oldest = %since_ask(detail.upstream_oldest_ms, asked),
+                upstream_newest = %since_ask(detail.upstream_newest_ms, asked),
+                upstream_bounded = detail.upstream_bounded,
+                missing_rows = comparison.missing,
+                stale_rows = comparison.stale,
+                newer_rows = comparison.newer,
+                extra_rows = comparison.extra,
+                content_differs = comparison.differs,
+                missing = %rows(&detail.missing),
+                stale = %rows(&detail.stale),
+                newer = %rows(&detail.newer),
+                extra = %rows(&detail.extra),
+                differs = %rows(&detail.differs),
+                held_back,
+                $message
+            )
+        };
+    }
+    match kind {
+        NoteKind::Differs => line!(
+            warn,
+            "the message cache's would-be answer differed from its provider's; times are \
+             offsets from the ask"
+        ),
+        NoteKind::Past => line!(
+            info,
+            "the message cache's would-be answer lacked only messages written past the end of \
+             what it claims (stale: before the ask; newer: after it); times are offsets from the \
+             ask"
+        ),
     }
 }
 
@@ -1238,6 +1583,7 @@ impl Sink {
             shape: route.shape,
             recent_via_flat: route.recent_via_flat,
             rows,
+            arrivals: Arc::downgrade(&self.state.arrivals),
         })
     }
 
@@ -1347,6 +1693,7 @@ impl Sink {
         // Any other channel's vouches only while an adapter is pushing for its provider.
         let fed_since_ms = self.fed_since_for(&route, &cache);
         let chan = ChanKey::new(route.key, channel.as_str());
+        let noted = (chan.clone(), query.scope().cloned());
         let target = cache.enqueued_seq();
         let weak = Arc::downgrade(&cache);
         drop(cache);
@@ -1371,6 +1718,11 @@ impl Sink {
         Some(Shadowed {
             task: Some(Box::new(ShadowTask {
                 ask,
+                chan: noted.0,
+                scope: noted.1,
+                reason: crate::read_reason::ReadReason::current(),
+                served: false,
+                arrivals: Arc::downgrade(&self.state.arrivals),
                 feed: shadow::Feed::of(route.shape),
                 live_fed,
                 fed_since_ms,
@@ -1460,13 +1812,14 @@ impl Sink {
         if decision != Decision::Serve || !gated(self) {
             return ServeOutcome::NotServed(Some(shadowed));
         }
-        let task = shadowed.task.take().expect("a task was evaluated");
+        let mut task = shadowed.task.take().expect("a task was evaluated");
         let view = match task.evaluated.as_ref().map(|evaluated| &evaluated.read) {
             Some(Read::Served(view)) => view.clone(),
             _ => {
                 return ServeOutcome::NotServed(Some(Shadowed { task: Some(task) }));
             }
         };
+        task.served = true;
         if let Ask::Timeline { view, thread, .. } = &ask {
             lock(&self.state.cursor_owed)
                 .insert((channel.clone(), cursor_owed_words(*view, thread.as_deref())));
@@ -1646,6 +1999,8 @@ impl Sink {
             shadow_compared = shadow.compared,
             shadow_agreed = shadow.agreed,
             shadow_missing_rows = shadow.missing_rows,
+            shadow_stale_rows = shadow.stale_rows,
+            shadow_newer_rows = shadow.newer_rows,
             shadow_extra_rows = shadow.extra_rows,
             shadow_content_differs = shadow.content_differs,
             "message cache figures since this process started"
@@ -2501,6 +2856,62 @@ mod tests {
         assert!(writes(&sink));
     }
 
+    /// `#497 cache-shadow-missing-row`: the diagnostics write at most [`NOTES_PER_HOUR`] lines of
+    /// each kind an hour, each kind on its own allowance, and the first line written after some
+    /// were held back says how many.
+    #[test]
+    fn the_diagnostics_write_a_bounded_number_of_lines_an_hour_and_count_the_rest() {
+        let mut notes = Notes::default();
+        let start = Instant::now();
+        for _ in 0..NOTES_PER_HOUR {
+            assert_eq!(notes.take(NoteKind::Differs, start), Some(0));
+        }
+        assert_eq!(notes.take(NoteKind::Differs, start), None);
+        assert_eq!(notes.take(NoteKind::Differs, start), None);
+        assert_eq!(
+            notes.take(NoteKind::Past, start),
+            Some(0),
+            "each kind has its own allowance"
+        );
+        let hour = start + Duration::from_secs(60 * 60);
+        assert_eq!(
+            notes.take(NoteKind::Differs, hour),
+            Some(2),
+            "an hour on, the next line says two were held back"
+        );
+        assert_eq!(notes.take(NoteKind::Differs, hour), Some(0));
+    }
+
+    /// A time is written as an offset from the ask, and a row's place in the read scope's
+    /// coverage by where its instant falls: above the head, in the band, in a claim, or nowhere.
+    #[test]
+    fn a_diagnostic_line_places_a_message_against_the_head_and_the_claims() {
+        use super::super::coverage::{Head, Interval, Source};
+        assert_eq!(since_ask(Some(1_500), 1_000), "+500ms");
+        assert_eq!(since_ask(Some(400), 1_000), "-600ms");
+        assert_eq!(since_ask(None, 1_000), "none");
+        let view = View {
+            head: Some(Head {
+                head_ms: 10_000,
+                unsettled_from_ms: 8_000,
+                head_listed_ms: 20_000,
+            }),
+            coverage: vec![Interval {
+                t0_ms: 1_000,
+                t1_ms: 8_000,
+                listed_ms: 19_000,
+                full_ms: Some(19_000),
+                complete: false,
+                source: Source::Read,
+            }],
+            ..View::default()
+        };
+        assert_eq!(claim_at(&view, 10_001, 21_000), "above-head");
+        assert_eq!(claim_at(&view, 9_000, 21_000), "band");
+        assert_eq!(claim_at(&view, 5_000, 21_000), "read@-2000ms");
+        assert_eq!(claim_at(&view, 500, 21_000), "uncovered");
+    }
+
     /// `#384 cache-serve`: a serve that stops waiting for its evaluation does not lose the
     /// count. The evaluation's handle survives the timeout, and counting still decides it
     /// off the path, asked and missed included.
@@ -2516,6 +2927,11 @@ mod tests {
                 consumer: shadow::Consumer::Messages,
                 limit: 1,
             },
+            chan: ChanKey::new("legacy", "c1"),
+            scope: Some(Scope::Main),
+            reason: crate::read_reason::ReadReason::Untagged,
+            served: false,
+            arrivals: Weak::new(),
             feed: shadow::Feed::AdditionsOnly,
             live_fed: false,
             fed_since_ms: None,

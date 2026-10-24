@@ -66,14 +66,32 @@
 //! cut short. Messages are matched by id, and their text by the same content hash the summary
 //! cache keys on; no text is kept.
 //!
+//! An answer resting on a scope's head claims every message written before the end of its claim
+//! ([`claim_end`]): the later of the head itself (the newest message the latest read of the newest
+//! end listed: that read began at the answer's version, [`version`], which a served page reports,
+//! `#473 replication-c7-server-versions`, and may have listed messages written while it ran) and
+//! that version, plus [`CLOCK_MARGIN_MS`] for the provider's clock against the cache's. Upstream
+//! is read after the ask, and its read takes seconds, so it may list messages written past that
+//! end: ones the rule's freshness allowed the answer not to hold, and ones written after the ask,
+//! while upstream was being read. Neither is a row the answer claimed, and each is counted apart
+//! (`#497 cache-shadow-missing-row`).
+//!
 //! - `compared` and `agreed`: comparisons made, and those that found no difference;
-//! - `missing_rows`: messages upstream listed that the cache's answer lacked;
+//! - `missing_rows`: messages upstream listed that the cache's answer lacked, written before the
+//!   end of its claim (or with no time to tell): rows the answer claimed to hold, each a wrong
+//!   answer had it been served;
+//! - `stale_rows`: messages upstream listed that the cache's answer lacked, written past the end
+//!   of its claim but before the ask. The answer never claimed them, so they are no difference,
+//!   but they existed when the reader asked: what the rule's freshness let a served answer leave
+//!   out until the next read brings them;
+//! - `newer_rows`: messages upstream listed that the cache's answer lacked, written past the end
+//!   of its claim and after the ask: no difference at all;
 //! - `extra_rows`: messages the cache's answer held that upstream no longer lists. Served, each
-//!   would have brought a deleted message back; a comparison that finds any is warned about, with
-//!   its counts and nothing else;
+//!   would have brought a deleted message back;
 //! - `content_differs`: messages both listed whose text differs.
 //!
-//! The three row counts are summed over comparisons.
+//! The row counts are summed over comparisons. A comparison that finds any of them is written to
+//! the log, ids and times only ([`super::sink`]).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -595,11 +613,41 @@ fn reuse_ms(facts: &Facts) -> i64 {
 /// read that opened the band, which is what the band's ten minutes are counted from, and a quiet
 /// channel read every few seconds would otherwise look stale for those ten minutes.
 fn fresh(view: &View, head: &Head, facts: &Facts) -> bool {
-    let checked = view
-        .head_checked_ms
+    facts.asked_ms.saturating_sub(checked(view, head)) <= reuse_ms(facts)
+}
+
+/// When the latest read of the scope's newest end the file records began, local time.
+fn checked(view: &View, head: &Head) -> i64 {
+    view.head_checked_ms
         .unwrap_or(head.head_listed_ms)
-        .max(head.head_listed_ms);
-    facts.asked_ms.saturating_sub(checked) <= reuse_ms(facts)
+        .max(head.head_listed_ms)
+}
+
+/// What an answer from `view` stands as of, local time: when the latest read of the scope's newest
+/// end began, which listed every message it could see from where its listing began up, and below
+/// which claims hold the rest. `None` for an answer resting on no head: a message by id. `#497
+/// cache-shadow-missing-row`.
+#[must_use]
+pub fn version(view: &View) -> Option<i64> {
+    view.head.map(|head| checked(view, &head))
+}
+
+/// How far the provider's clock may run ahead of the cache's, for [`claim_end`]: a message written
+/// this much after the answer's version, by the provider's clock, may have been written before it.
+pub const CLOCK_MARGIN_MS: i64 = 1_000;
+
+/// Where what an answer from `view` claims to hold ends, provider time, exclusive: past its head,
+/// the newest message the latest read of the newest end listed, which that read may have listed
+/// while it ran, after it began; and past its version, by [`CLOCK_MARGIN_MS`] more. Every message
+/// written before it that the answer lacks is one it claimed to hold. `None` with no head.
+#[must_use]
+pub fn claim_end(view: &View) -> Option<i64> {
+    let head = view.head?;
+    Some(
+        checked(view, &head)
+            .saturating_add(CLOCK_MARGIN_MS)
+            .max(head.head_ms.saturating_add(1)),
+    )
 }
 
 /// Whether the claims a window or a count rests on still stand: their edits and deletions were
@@ -853,8 +901,16 @@ impl Upstream {
 /// How the cache's answer differed from upstream's.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Comparison {
-    /// Messages upstream listed that the cache's answer lacked.
+    /// Messages upstream listed that the cache's answer lacked, written before the end of its claim
+    /// ([`claim_end`]), or with no time to tell: rows it claimed to hold.
     pub missing: usize,
+    /// Messages upstream listed that the cache's answer lacked, written past the end of its claim
+    /// but before the ask: rows it never claimed, which existed when the reader asked. `#497
+    /// cache-shadow-missing-row`.
+    pub stale: usize,
+    /// Messages upstream listed that the cache's answer lacked, written past the end of its claim
+    /// and after the ask: rows it never claimed.
+    pub newer: usize,
     /// Messages the cache's answer held that upstream no longer lists.
     pub extra: usize,
     /// Messages both listed whose text differs.
@@ -862,19 +918,96 @@ pub struct Comparison {
 }
 
 impl Comparison {
-    /// Whether the two answers agreed.
+    /// Whether the two answers agreed: nothing missing, extra or different. A message written
+    /// past the end of the answer's claim is no difference.
     #[must_use]
     pub fn agreed(&self) -> bool {
         self.missing == 0 && self.extra == 0 && self.differs == 0
     }
 }
 
-/// Compare what the cache would have answered `ask` with, from `view`, against what upstream
-/// answered, over the stretch both speak for. `None` when they share none: a message by id that
-/// upstream's window does not reach, or a count either side stopped at its cap.
+/// One message a comparison found the two answers differ on: its id and times, never its text.
+/// `#497 cache-shadow-missing-row`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Differing {
+    /// The message's id.
+    pub id: String,
+    /// When it was written, provider time, when known.
+    pub created_ms: Option<i64>,
+    /// What the cache's answer held of it: `None` for a message the answer lacked.
+    pub held: Option<HeldRow>,
+}
+
+/// What the cache's answer held of a message, times and flags only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeldRow {
+    /// When a read last saw it, local time.
+    pub observed_ms: i64,
+    /// When the latest read of the scope's newest end to list it began, when one did.
+    pub vouched_ms: Option<i64>,
+    /// Whether its text is held only as a push brought it.
+    pub partial: bool,
+}
+
+/// What a comparison found, message by message, and the stretch it compared: what the shadow's
+/// diagnostics write beside the counts. `#497 cache-shadow-missing-row`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Detail {
+    /// Upstream listed them, the answer lacked them, and they were written before the end of its
+    /// claim.
+    pub missing: Vec<Differing>,
+    /// Upstream listed them, the answer lacked them, and they were written past the end of its
+    /// claim, before the ask.
+    pub stale: Vec<Differing>,
+    /// Upstream listed them, the answer lacked them, and they were written past the end of its
+    /// claim, after the ask.
+    pub newer: Vec<Differing>,
+    /// The answer held them, and upstream no longer lists them.
+    pub extra: Vec<Differing>,
+    /// Both listed them, with different text.
+    pub differs: Vec<Differing>,
+    /// The oldest instant compared, provider time; `None` from the scope's start.
+    pub from_ms: Option<i64>,
+    /// The newest instant compared, provider time, inclusive; `None` to the newest end.
+    pub until_ms: Option<i64>,
+    /// What the answer stands as of ([`version`]), local time.
+    pub version_ms: Option<i64>,
+    /// Where what it claims ends ([`claim_end`]), provider time.
+    pub claim_end_ms: Option<i64>,
+    /// How many messages upstream answered with, its oldest and newest times, and whether its
+    /// answer stopped short of the scope's far end.
+    pub upstream_rows: usize,
+    /// The oldest of them, provider time.
+    pub upstream_oldest_ms: Option<i64>,
+    /// The newest of them, provider time.
+    pub upstream_newest_ms: Option<i64>,
+    /// Whether upstream's answer stopped short of its scope's far end.
+    pub upstream_bounded: bool,
+}
+
+/// Compare what the cache would have answered `ask`, asked at local time `asked_ms`, with, from
+/// `view`, against what upstream answered, over the stretch both speak for. `None` when they share
+/// none: a message by id that upstream's window does not reach, or a count either side stopped at
+/// its cap.
 #[must_use]
-pub fn compare(ask: &Ask, view: &View, upstream: &Upstream) -> Option<Comparison> {
-    match ask {
+pub fn compare(ask: &Ask, view: &View, upstream: &Upstream, asked_ms: i64) -> Option<Comparison> {
+    compare_detail(ask, view, upstream, asked_ms).map(|(comparison, _)| comparison)
+}
+
+/// [`compare`], and what it found message by message. `#497 cache-shadow-missing-row`.
+#[must_use]
+pub fn compare_detail(
+    ask: &Ask,
+    view: &View,
+    upstream: &Upstream,
+    asked_ms: i64,
+) -> Option<(Comparison, Detail)> {
+    let version_ms = version(view);
+    let past = Past {
+        claim_end_ms: claim_end(view),
+        asked_ms,
+    };
+    let (comparison, mut detail) = match ask {
         Ask::Window { limit, .. } | Ask::Timeline { limit, .. } => {
             // From the newer of the two oldest rows, for each answer whose older end was cut: a
             // row the cache misses at the top pushes an older one into its window that upstream's
@@ -883,36 +1016,40 @@ pub fn compare(ask: &Ask, view: &View, upstream: &Upstream) -> Option<Comparison
                 .then(|| view.rows.first().map(|row| row.created_ms))
                 .flatten();
             let upstream_cut = upstream.bounded.then(|| upstream.oldest()).flatten();
-            let lower = cache_cut.max(upstream_cut).unwrap_or(i64::MIN);
-            Some(differences(
-                view.rows.iter().filter(|row| row.created_ms >= lower),
+            let lower = cache_cut.max(upstream_cut);
+            let from = lower.unwrap_or(i64::MIN);
+            let mut detail = differences(
+                view.rows.iter().filter(|row| row.created_ms >= from),
                 upstream
                     .rows
                     .iter()
-                    .filter(|seen| seen.created_ms.is_none_or(|ms| ms >= lower)),
-            ))
+                    .filter(|seen| seen.created_ms.is_none_or(|ms| ms >= from)),
+                past,
+            );
+            detail.from_ms = lower;
+            (detail.counts(), detail)
         }
         Ask::Message { .. } => {
             let row = view.rows.first()?;
-            match upstream
+            let found = upstream
                 .rows
                 .iter()
-                .find(|seen| seen.id == row.message.id.as_str())
-            {
-                Some(seen) => Some(Comparison {
-                    differs: usize::from(seen.hash != hash(row)),
-                    ..Comparison::default()
-                }),
+                .find(|seen| seen.id == row.message.id.as_str());
+            let mut detail = Detail::default();
+            match found {
+                Some(seen) if seen.hash != hash(row) => detail.differs.push(held(row)),
+                Some(_) => {}
                 // Not listed: deleted, if upstream's answer reaches back to when it was written.
-                None => (!upstream.bounded
+                None if !upstream.bounded
                     || upstream
                         .oldest()
-                        .is_some_and(|oldest| row.created_ms >= oldest))
-                .then_some(Comparison {
-                    extra: 1,
-                    ..Comparison::default()
-                }),
+                        .is_some_and(|oldest| row.created_ms >= oldest) =>
+                {
+                    detail.extra.push(held(row));
+                }
+                None => return None,
             }
+            (detail.counts(), detail)
         }
         Ask::Page { limit, .. } => {
             // Up to the older of the two last rows, for each answer that was cut at its newer end.
@@ -921,30 +1058,56 @@ pub fn compare(ask: &Ask, view: &View, upstream: &Upstream) -> Option<Comparison
                 .flatten();
             let upstream_cut = upstream.bounded.then(|| upstream.newest()).flatten();
             let upper = match (cache_cut, upstream_cut) {
-                (Some(a), Some(b)) => a.min(b),
-                (Some(a), None) | (None, Some(a)) => a,
-                (None, None) => i64::MAX,
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
             };
-            Some(differences(
-                view.rows.iter().filter(|row| row.created_ms <= upper),
+            let until = upper.unwrap_or(i64::MAX);
+            let mut detail = differences(
+                view.rows.iter().filter(|row| row.created_ms <= until),
                 upstream
                     .rows
                     .iter()
-                    .filter(|seen| seen.created_ms.is_none_or(|ms| ms <= upper)),
-            ))
+                    .filter(|seen| seen.created_ms.is_none_or(|ms| ms <= until)),
+                past,
+            );
+            detail.until_ms = upper;
+            (detail.counts(), detail)
         }
         Ask::Count { since_ms, cap } => {
             if upstream.bounded || view.rows.len() > *cap {
                 return None;
             }
             let since = since_ms.unwrap_or(i64::MIN);
-            Some(differences(
+            let mut detail = differences(
                 view.rows.iter(),
                 upstream
                     .rows
                     .iter()
                     .filter(|seen| seen.created_ms.is_none_or(|ms| ms >= since)),
-            ))
+                past,
+            );
+            detail.from_ms = *since_ms;
+            (detail.counts(), detail)
+        }
+    };
+    detail.version_ms = version_ms;
+    detail.claim_end_ms = past.claim_end_ms;
+    detail.upstream_rows = upstream.rows.len();
+    detail.upstream_oldest_ms = upstream.oldest();
+    detail.upstream_newest_ms = upstream.newest();
+    detail.upstream_bounded = upstream.bounded;
+    Some((comparison, detail))
+}
+
+impl Detail {
+    fn counts(&self) -> Comparison {
+        Comparison {
+            missing: self.missing.len(),
+            stale: self.stale.len(),
+            newer: self.newer.len(),
+            extra: self.extra.len(),
+            differs: self.differs.len(),
         }
     }
 }
@@ -953,24 +1116,78 @@ fn hash(row: &CachedMessage) -> u64 {
     crate::summarize::content_hash(&row.message.content)
 }
 
+fn held(row: &CachedMessage) -> Differing {
+    Differing {
+        id: row.message.id.as_str().to_owned(),
+        created_ms: Some(row.created_ms),
+        held: Some(HeldRow {
+            observed_ms: row.observed_ms,
+            vouched_ms: row.vouched_ms,
+            partial: row.content_partial,
+        }),
+    }
+}
+
+/// Where a message the answer lacked falls: before the end of its claim, or past it and before or
+/// after the ask.
+#[derive(Clone, Copy, Debug)]
+struct Past {
+    claim_end_ms: Option<i64>,
+    asked_ms: i64,
+}
+
+/// The differences between what the cache held and what upstream listed, over the same stretch.
+/// A message upstream listed and the cache lacked is `missing` when it was written before the end
+/// of the answer's claim (or has no time, or the answer no head); past it, `stale` when written
+/// before the ask, and `newer` from then on.
 fn differences<'a>(
-    held: impl Iterator<Item = &'a CachedMessage>,
+    held_rows: impl Iterator<Item = &'a CachedMessage>,
     listed: impl Iterator<Item = &'a Seen>,
-) -> Comparison {
-    let held: HashMap<&str, u64> = held
-        .map(|row| (row.message.id.as_str(), hash(row)))
+    past: Past,
+) -> Detail {
+    let held_rows: HashMap<&str, &CachedMessage> = held_rows
+        .map(|row| (row.message.id.as_str(), row))
         .collect();
-    let listed: HashMap<&str, u64> = listed.map(|seen| (seen.id.as_str(), seen.hash)).collect();
-    let mut comparison = Comparison::default();
-    for (id, listed_hash) in &listed {
-        match held.get(id) {
-            None => comparison.missing += 1,
-            Some(held_hash) if held_hash != listed_hash => comparison.differs += 1,
+    let listed: HashMap<&str, &Seen> = listed.map(|seen| (seen.id.as_str(), seen)).collect();
+    let mut detail = Detail::default();
+    for (id, seen) in &listed {
+        match held_rows.get(id) {
+            None => {
+                let lacked = Differing {
+                    id: (*id).to_owned(),
+                    created_ms: seen.created_ms,
+                    held: None,
+                };
+                match seen.created_ms.zip(past.claim_end_ms) {
+                    Some((created, end)) if created >= end => {
+                        if created < past.asked_ms {
+                            detail.stale.push(lacked);
+                        } else {
+                            detail.newer.push(lacked);
+                        }
+                    }
+                    _ => detail.missing.push(lacked),
+                }
+            }
+            Some(row) if hash(row) != seen.hash => detail.differs.push(held(row)),
             Some(_) => {}
         }
     }
-    comparison.extra = held.keys().filter(|id| !listed.contains_key(*id)).count();
-    comparison
+    detail.extra = held_rows
+        .iter()
+        .filter(|(id, _)| !listed.contains_key(*id))
+        .map(|(_, row)| held(row))
+        .collect();
+    for list in [
+        &mut detail.missing,
+        &mut detail.stale,
+        &mut detail.newer,
+        &mut detail.extra,
+        &mut detail.differs,
+    ] {
+        list.sort_by(|a, b| (a.created_ms, &a.id).cmp(&(b.created_ms, &b.id)));
+    }
+    detail
 }
 
 /// One consumer's counters.
@@ -985,6 +1202,8 @@ struct Tally {
     compared: AtomicU64,
     agreed: AtomicU64,
     missing_rows: AtomicU64,
+    stale_rows: AtomicU64,
+    newer_rows: AtomicU64,
     extra_rows: AtomicU64,
     content_differs: AtomicU64,
 }
@@ -1040,6 +1259,8 @@ impl Tallies {
             bump(&tally.agreed, 1);
         }
         bump(&tally.missing_rows, widen(comparison.missing));
+        bump(&tally.stale_rows, widen(comparison.stale));
+        bump(&tally.newer_rows, widen(comparison.newer));
         bump(&tally.extra_rows, widen(comparison.extra));
         bump(&tally.content_differs, widen(comparison.differs));
     }
@@ -1071,6 +1292,8 @@ impl Tallies {
                     compared: read(&tally.compared),
                     agreed: read(&tally.agreed),
                     missing_rows: read(&tally.missing_rows),
+                    stale_rows: read(&tally.stale_rows),
+                    newer_rows: read(&tally.newer_rows),
                     extra_rows: read(&tally.extra_rows),
                     content_differs: read(&tally.content_differs),
                 }
@@ -1101,8 +1324,16 @@ pub struct ConsumerCounts {
     pub compared: u64,
     /// Comparisons that found no difference.
     pub agreed: u64,
-    /// Messages upstream listed that the cache's answers lacked.
+    /// Messages upstream listed that the cache's answers lacked, written before the end of each
+    /// answer's claim: rows those answers claimed to hold.
     pub missing_rows: u64,
+    /// Messages upstream listed that the cache's answers lacked, written past the end of each
+    /// answer's claim and before its ask: no difference, but what a served answer would have left
+    /// out. `#497 cache-shadow-missing-row`.
+    pub stale_rows: u64,
+    /// Messages upstream listed that the cache's answers lacked, written past the end of each
+    /// answer's claim and after its ask: no difference.
+    pub newer_rows: u64,
     /// Messages the cache's answers held that upstream no longer lists.
     pub extra_rows: u64,
     /// Messages both listed whose text differed.
@@ -1132,6 +1363,8 @@ impl ConsumerCounts {
             compared: self.compared + other.compared,
             agreed: self.agreed + other.agreed,
             missing_rows: self.missing_rows + other.missing_rows,
+            stale_rows: self.stale_rows + other.stale_rows,
+            newer_rows: self.newer_rows + other.newer_rows,
             extra_rows: self.extra_rows + other.extra_rows,
             content_differs: self.content_differs + other.content_differs,
         }
@@ -1169,6 +1402,8 @@ mod tests {
     const HOUR: i64 = 60 * MINUTE;
     /// When the read that listed everything below started, local time.
     const LISTED: i64 = T + HOUR;
+    /// When a comparison's request asked, local time.
+    const ASKED: i64 = LISTED + 5_000;
 
     fn row(n: i64) -> CachedMessage {
         CachedMessage {
@@ -1995,7 +2230,7 @@ mod tests {
     }
 
     fn compared(ask: &Ask, view: &View, (messages, bounded): (Vec<Message>, bool)) -> Comparison {
-        compare(ask, view, &Upstream::of(&messages, bounded)).expect("compared")
+        compare(ask, view, &Upstream::of(&messages, bounded), ASKED).expect("compared")
     }
 
     #[test]
@@ -2038,6 +2273,153 @@ mod tests {
         );
     }
 
+    /// `#497 cache-shadow-missing-row`. An answer claims every message written before the end of
+    /// its claim: past its version (when the latest read of the newest end began) by the clock
+    /// margin, and past its head. A message upstream lists that the answer lacks is `missing`
+    /// before that end; past it, `stale` when written before the ask (the freshness the rule
+    /// allows) and `newer` after it (written while upstream was being read): neither a difference.
+    #[test]
+    fn a_lacked_message_is_missing_up_to_the_end_of_the_claim_then_stale_then_newer() {
+        let ask = window(5);
+        let later = LISTED + 20_000;
+        let asked = later + 10_000;
+        let view = View {
+            head_checked_ms: Some(later),
+            ..newest(&listed(12, false), 5)
+        };
+        assert_eq!(version(&view), Some(later));
+        let end = later + CLOCK_MARGIN_MS;
+        assert_eq!(
+            claim_end(&view),
+            Some(end),
+            "the head lies long before the read"
+        );
+        let lacking = |view: &View, created_ms: Option<i64>| {
+            let mut new = row(12).message;
+            new.timestamp = created_ms.map_or_else(String::new, crate::clock::iso_from_ms);
+            let mut messages = upstream(8..12, true).0;
+            messages.push(new);
+            compare_detail(&ask, view, &Upstream::of(&messages, true), asked).expect("compared")
+        };
+        let (stale, detail) = lacking(&view, Some(end));
+        assert_eq!(
+            stale,
+            Comparison {
+                stale: 1,
+                ..Comparison::default()
+            },
+            "written past the claim, before the ask"
+        );
+        assert!(stale.agreed());
+        assert_eq!(detail.stale[0].id, "m12");
+        assert_eq!(
+            (detail.version_ms, detail.claim_end_ms),
+            (Some(later), Some(end))
+        );
+        assert_eq!(
+            detail.from_ms,
+            Some(row(8).created_ms),
+            "upstream's window was cut there"
+        );
+        assert_eq!(
+            lacking(&view, Some(asked)).0,
+            Comparison {
+                newer: 1,
+                ..Comparison::default()
+            },
+            "written after the ask, while upstream was read"
+        );
+        let (inside, detail) = lacking(&view, Some(end - 1));
+        assert_eq!(
+            inside,
+            Comparison {
+                missing: 1,
+                ..Comparison::default()
+            },
+            "inside the clock margin: the provider's clock may run ahead"
+        );
+        assert!(!inside.agreed());
+        assert_eq!(
+            detail.missing[0].held, None,
+            "the answer held nothing of it"
+        );
+        assert_eq!(
+            lacking(&view, None).0.missing,
+            1,
+            "no time to tell: a row the answer may have claimed"
+        );
+        // The read began before messages it then listed were written: the head lies past the
+        // version, and a message written between the two that it did not list (listed late) is
+        // one the answer claimed, the head being newer.
+        let mut ran_long = view.clone();
+        ran_long.head = ran_long.head.map(|head| Head {
+            head_ms: later + 5_000,
+            unsettled_from_ms: later + 5_000 - SETTLE_MS,
+            ..head
+        });
+        assert_eq!(claim_end(&ran_long), Some(later + 5_001));
+        assert_eq!(
+            lacking(&ran_long, Some(later + 3_000)).0.missing,
+            1,
+            "older than the head the answer ends with"
+        );
+        assert_eq!(lacking(&ran_long, Some(later + 5_001)).0.stale, 1);
+        // With no head there is no claim to end: every lacked message is missing.
+        let headless = View {
+            head: None,
+            ..view.clone()
+        };
+        let mut messages = upstream(8..12, true).0;
+        messages.push(row(40).message);
+        let (comparison, detail) =
+            compare_detail(&ask, &headless, &Upstream::of(&messages, true), asked)
+                .expect("compared");
+        assert_eq!(
+            (comparison.missing, comparison.stale, comparison.newer),
+            (1, 0, 0)
+        );
+        assert_eq!(detail.claim_end_ms, None);
+    }
+
+    /// What a comparison found, message by message: ids and times, and for what the answer held,
+    /// when it was seen, vouched for, and whether a push brought its text. Never the text.
+    #[test]
+    fn a_comparisons_detail_names_each_message_by_id_and_times() {
+        let ask = window(5);
+        let mut view = newest(&listed(12, false), 5);
+        view.rows[1].content_partial = true;
+        let mut messages = upstream(7..12, true).0;
+        messages.retain(|m| m.id.as_str() != "m9");
+        messages[0].content = "edited".to_owned();
+        let (comparison, detail) =
+            compare_detail(&ask, &view, &Upstream::of(&messages, true), ASKED).expect("compared");
+        assert_eq!((comparison.extra, comparison.differs), (1, 1));
+        assert_eq!(detail.extra[0].id, "m9");
+        assert_eq!(
+            detail.extra[0].held,
+            Some(HeldRow {
+                observed_ms: LISTED,
+                vouched_ms: Some(LISTED),
+                partial: false,
+            })
+        );
+        assert_eq!(detail.differs[0].id, "m7");
+        assert_eq!((detail.upstream_rows, detail.upstream_bounded), (4, true));
+        assert_eq!(detail.upstream_newest_ms, Some(row(11).created_ms));
+        let by_id = Ask::Message {
+            consumer: Consumer::MessageById,
+            id: MessageId("m8".to_owned()),
+        };
+        let one = View {
+            rows: vec![view.rows[1].clone()],
+            ..View::default()
+        };
+        let (_, detail) =
+            compare_detail(&by_id, &one, &Upstream::of(&[], false), ASKED).expect("compared");
+        assert_eq!(detail.extra[0].id, "m8");
+        assert!(detail.extra[0].held.is_some_and(|held| held.partial));
+    }
+
     #[test]
     fn a_message_by_id_is_extra_only_where_upstreams_window_reaches() {
         let ask = Ask::Message {
@@ -2055,7 +2437,7 @@ mod tests {
         assert_eq!(compared(&ask, &view, (reached, true)).extra, 1);
         let (messages, bounded) = upstream(4..10, true);
         assert_eq!(
-            compare(&ask, &view, &Upstream::of(&messages, bounded)),
+            compare(&ask, &view, &Upstream::of(&messages, bounded), ASKED),
             None,
             "older than the window upstream read: nothing to say"
         );
@@ -2097,7 +2479,10 @@ mod tests {
         };
         assert!(compared(&ask, &view, upstream(0..6, false)).agreed());
         let (messages, _) = upstream(0..6, true);
-        assert_eq!(compare(&ask, &view, &Upstream::of(&messages, true)), None);
+        assert_eq!(
+            compare(&ask, &view, &Upstream::of(&messages, true), ASKED),
+            None
+        );
     }
 
     #[test]
@@ -2112,6 +2497,8 @@ mod tests {
             &Comparison {
                 extra: 2,
                 missing: 1,
+                stale: 4,
+                newer: 3,
                 differs: 0,
             },
         );
@@ -2125,9 +2512,12 @@ mod tests {
                 page.compared,
                 page.agreed,
                 page.extra_rows,
-                page.missing_rows
+                page.missing_rows,
+                page.stale_rows,
+                page.newer_rows
             ),
-            (2, 1, 2, 1)
+            (2, 1, 2, 1, 4, 3),
+            "messages past the end of the answer's claim are counted apart, and are no difference"
         );
         let summary = report
             .iter()
