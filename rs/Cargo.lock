@@ -16,6 +16,7 @@ dependencies = [
 name = "agent-teams"
 version = "0.1.0"
 dependencies = [
+ "agent-queue",
  "fs2",
  "libc",
  "serde",

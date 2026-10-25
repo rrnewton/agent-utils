@@ -637,14 +637,14 @@ fn cmd_init(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
             json!({"kind": deliver, "registry": crate::jsonfile::expand_home(registry).to_string_lossy()}),
         )
     } else if has_flag(args, "--coordinator-self") {
-        let pid: i64 = match flag_value(args, "--coordinator-pid") {
+        let pid: u64 = match flag_value(args, "--coordinator-pid") {
             Some(text) => text
                 .parse()
                 .map_err(|_| err("usage", "--coordinator-pid must be a process ID"))?,
             None => crate::proof::ancestry()
                 .get(1)
                 .copied()
-                .unwrap_or(std::process::id() as i64),
+                .unwrap_or_else(|| u64::from(std::process::id())),
         };
         let identity =
             identity_of(pid).ok_or_else(|| err("usage", format!("process {pid} is not live")))?;
@@ -661,10 +661,7 @@ fn cmd_init(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         (
             json!({
                 "designation": "pinned",
-                "harness_identity": {
-                    "boot_id": identity.boot_id, "pid": identity.pid,
-                    "starttime_ticks": identity.starttime_ticks,
-                },
+                "harness_identity": serde_json::to_value(&identity)?,
                 "comment": "refresh by re-running init --coordinator-self from the new session",
             }),
             deliverer,

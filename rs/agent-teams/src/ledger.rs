@@ -202,13 +202,13 @@ pub fn accept(
         if recorded_state == "claimed" {
             let claimer_alive = existing
                 .get("claimer_pid")
-                .and_then(Value::as_i64)
+                .and_then(Value::as_u64)
                 .is_some_and(|pid| {
-                    pid != std::process::id() as i64
+                    pid != u64::from(std::process::id())
                         && crate::proof::identity_of(pid).is_some_and(|live| {
                             existing
                                 .get("claimer_ticks")
-                                .and_then(Value::as_i64)
+                                .and_then(Value::as_u64)
                                 .is_none_or(|ticks| ticks == live.starttime_ticks)
                         })
                 });
@@ -335,7 +335,7 @@ pub fn accept(
         "not_after": envelope.get("not_after"),
         "via": ctx.via,
         "claimer_pid": std::process::id(),
-        "claimer_ticks": crate::proof::identity_of(std::process::id() as i64).map(|i| i.starttime_ticks),
+        "claimer_ticks": crate::proof::identity_of(u64::from(std::process::id())).map(|i| i.starttime_ticks),
         "claimer_boot_id": crate::timeutil::boot_id(),
         "target": {
             "kind": target.kind,

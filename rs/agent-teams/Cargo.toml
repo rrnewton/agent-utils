@@ -13,6 +13,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+agent-queue = { version = "0.1.0", path = "../agent-queue" }
 fs2 = "0.4"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
@@ -29,3 +30,6 @@ path = "src/lib.rs"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+agent-queue = { version = "0.1.0", path = "../agent-queue" }

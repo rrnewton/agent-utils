@@ -2,11 +2,10 @@
 //! (design section 4.4). `accept` never types; the local deliverer does.
 //!
 //! Delivery is behind the [`Deliverer`] trait so agent-teams stays
-//! independent of Herdr and agentctl. The `agentctl-queue` deliverer writes
-//! the `inbox.v2/` lane of the coordinator's queue; until the shared
-//! `agent-queue` crate is on main it writes that lane directly (temp file
-//! plus `link()`, which fails when the ID is already there), and tests use
-//! the [`FakeDeliverer`].
+//! independent of Herdr and agentctl. The `agentctl-queue` deliverer
+//! enqueues through the shared `agent-queue` crate (the same queue format
+//! and duplicate check agentctl's drainers use), and tests use the
+//! [`FakeDeliverer`].
 
 use crate::jsonfile::DataResult;
 use serde_json::{json, Value};
@@ -133,7 +132,15 @@ impl Deliverer for HookInboxDeliverer {
 }
 
 /// The `agentctl-queue` deliverer: enqueues into the designated
-/// coordinator's `inbox.v2/` lane; that host's drainers type it.
+/// coordinator's queue through the shared `agent-queue` crate; that host's
+/// drainers type it. The enqueue is unserialized (`serialize: false`):
+/// `accept` must never block on the queue's delivery lock (design 9.2),
+/// and the ledger claim that precedes every hand-over is what makes this
+/// ID single-writer, so the crate's no-replace create is the exact
+/// duplicate guard. Team items join the crate's `inbox.v2/` lane, with
+/// drain-side `not_after`/tombstone re-checks, when phase P2 lands them
+/// in `agent-queue`; until then expiry and supersede are enforced at
+/// `accept` and in the ledger.
 pub struct AgentctlQueueDeliverer {
     /// The coordinator's queue directory (`REGISTRY/<agent>/queue`).
     pub queue_dir: PathBuf,
@@ -142,13 +149,45 @@ pub struct AgentctlQueueDeliverer {
 }
 
 impl AgentctlQueueDeliverer {
-    /// Live phases: an ID here was (or will be) typed. Presence only in
-    /// `failed`, `cancel` or `cancelled` never proves delivery.
-    pub fn phases(&self) -> Vec<PathBuf> {
-        ["inbox.v2", "inbox", "inflight", "processed"]
-            .iter()
-            .map(|phase| self.queue_dir.join(phase))
-            .collect()
+    /// The queue item: the crate's plain item plus the team fields a
+    /// reader may ignore until P2 teaches drainers to honour them.
+    fn document(&self, id: &str, envelope: &Value, rendered: &str) -> Value {
+        let mut item = agent_queue::queue::plain_item(id, rendered);
+        if let Some(obj) = item.as_object_mut() {
+            if let Some(ms) = envelope
+                .get("not_after")
+                .and_then(Value::as_str)
+                .and_then(crate::timeutil::parse_rfc3339_ms)
+            {
+                obj.insert("not_after".to_string(), json!(ms));
+            }
+            obj.insert(
+                "topic".to_string(),
+                envelope.get("topic").cloned().unwrap_or(Value::Null),
+            );
+            obj.insert(
+                "external_delivery_record".to_string(),
+                json!(self.ledger_path.to_string_lossy()),
+            );
+            obj.insert("envelope".to_string(), envelope.clone());
+        }
+        item
+    }
+
+    /// Whether the item already in the queue under `id` is this envelope.
+    fn existing_is_ours(&self, id: &str, envelope: &Value) -> Option<bool> {
+        let directories = agent_queue::queue::QueueDirectories::new(&self.queue_dir);
+        for (dir, _state) in directories.states() {
+            let path = dir.join(format!("{id}.json"));
+            if path.exists() {
+                let doc = agent_queue::queue::load_message(&path).ok()?;
+                return Some(
+                    doc.get("envelope").and_then(|e| e.get("body_sha256"))
+                        == envelope.get("body_sha256"),
+                );
+            }
+        }
+        Some(false)
     }
 }
 
@@ -164,29 +203,48 @@ impl Deliverer for AgentctlQueueDeliverer {
         }
     }
     fn handover(&self, id: &str, envelope: &Value, rendered: &str) -> Handover {
-        // Refuse a duplicate in any phase, as the queue's enqueue does.
-        if self.contains(id) == Some(true) {
-            return Handover::Accepted;
-        }
-        let item = queue_item(envelope, rendered, &self.ledger_path);
-        match link_into(
-            &self.queue_dir.join("inbox.v2"),
-            id,
-            item.to_string().as_bytes(),
-        ) {
+        let result = agent_queue::queue::enqueue(
+            &self.queue_dir,
+            Some(id),
+            false,
+            &agent_queue::fsio::Blocking,
+            |identifier| self.document(identifier, envelope, rendered),
+        );
+        match result {
             Ok(_) => Handover::Accepted,
-            Err(e) => Handover::Refused(format!("queue enqueue failed: {e}")),
+            Err(e) if e.kind() == agent_queue::ErrorKind::Duplicate => {
+                match self.existing_is_ours(id, envelope) {
+                    Some(true) => Handover::Accepted,
+                    Some(false) => Handover::PossiblySubmitted(
+                        "queue already holds a different item under this ID".to_string(),
+                    ),
+                    None => Handover::PossiblySubmitted(
+                        "queue holds this ID but its item could not be read".to_string(),
+                    ),
+                }
+            }
+            Err(e) => match self.contains(id) {
+                Some(true) => Handover::Accepted,
+                Some(false) => Handover::Refused(format!("queue enqueue failed: {}", e.message())),
+                None => Handover::PossiblySubmitted(format!(
+                    "queue enqueue failed and presence is unprovable: {}",
+                    e.message()
+                )),
+            },
         }
     }
     fn contains(&self, id: &str) -> Option<bool> {
-        if !self.queue_dir.exists() {
-            return None;
+        use agent_queue::queue::MessageState;
+        match agent_queue::queue::message_state(&self.queue_dir, id) {
+            Ok(Some(MessageState::Pending | MessageState::Inflight | MessageState::Processed)) => {
+                Some(true)
+            }
+            // Quarantined: the hand-over happened but delivery is unsettled,
+            // so recovery must settle it as possibly_submitted, not accepted.
+            Ok(Some(MessageState::Failed)) => None,
+            Ok(None) => Some(false),
+            Err(_) => None,
         }
-        Some(
-            self.phases()
-                .iter()
-                .any(|dir| dir.join(format!("{id}.json")).exists()),
-        )
     }
 }
 

@@ -10,71 +10,67 @@
 
 use crate::jsonfile::DataResult;
 use crate::model::Designation;
+use agent_queue::identity::{liveness, observe, Ancestry, ProcessLiveness};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-/// One process identity: `(boot_id, pid, starttime_ticks)`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProcessIdentity {
-    /// Host boot ID.
-    pub boot_id: String,
-    /// Process ID.
-    pub pid: i64,
-    /// Start ticks from `/proc/<pid>/stat` field 22.
-    pub starttime_ticks: i64,
+/// One process identity, as recorded in agentctl's `harness_identity`:
+/// the shared `agent-queue` type, so sender proof here and agentctl's own
+/// pinning can never disagree about what names a process generation.
+pub use agent_queue::identity::ProcessIdentity;
+
+/// Identity of a live process, observed coherently (pidfd-backed), if it exists.
+pub fn identity_of(pid: u64) -> Option<ProcessIdentity> {
+    observe(pid).ok().map(|live| live.identity)
 }
 
-/// Read a process's start ticks and parent PID from `/proc/<pid>/stat`.
-pub fn stat_of(pid: i64) -> Option<(i64, i64)> {
-    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // Field 2 (comm) may contain spaces and parentheses; split after the last ')'.
-    let close = text.rfind(')')?;
-    let rest: Vec<&str> = text[close + 2..].split_whitespace().collect();
-    // rest[0] is field 3 (state); ppid is field 4, starttime is field 22.
-    let ppid: i64 = rest.get(1)?.parse().ok()?;
-    let starttime: i64 = rest.get(19)?.parse().ok()?;
-    Some((ppid, starttime))
-}
-
-/// Identity of a live process, if it exists.
-pub fn identity_of(pid: i64) -> Option<ProcessIdentity> {
-    let (_, starttime) = stat_of(pid)?;
-    Some(ProcessIdentity {
-        boot_id: crate::timeutil::boot_id(),
-        pid,
-        starttime_ticks: starttime,
+/// Whether a recorded identity still names the same live process. A full
+/// identity uses the crate's liveness probe; a partial one recorded before
+/// executable fields were stored falls back to boot + start-ticks equality
+/// against a fresh observation, which is the weaker proof it was pinned with.
+pub fn identity_alive(identity: &ProcessIdentity) -> bool {
+    if identity.valid() {
+        return liveness(identity) == ProcessLiveness::Alive;
+    }
+    identity_of(identity.pid).is_some_and(|live| {
+        live.boot_id == identity.boot_id && live.starttime_ticks == identity.starttime_ticks
     })
 }
 
-/// Whether a recorded identity still names the same live process.
-pub fn identity_alive(identity: &ProcessIdentity) -> bool {
-    identity.boot_id == crate::timeutil::boot_id()
-        && identity_of(identity.pid)
-            .is_some_and(|live| live.starttime_ticks == identity.starttime_ticks)
-}
-
 /// The ancestor PIDs of this process, nearest first (including self).
-pub fn ancestry() -> Vec<i64> {
-    let mut chain = Vec::new();
-    let mut pid = std::process::id() as i64;
-    for _ in 0..128 {
-        chain.push(pid);
-        match stat_of(pid) {
-            Some((ppid, _)) if ppid > 0 && ppid != pid => pid = ppid,
-            _ => break,
-        }
-    }
-    chain
+pub fn ancestry() -> Vec<u64> {
+    Ancestry::of_self()
+        .map(|ancestry| ancestry.links.iter().map(|link| link.pid).collect())
+        .unwrap_or_else(|_| vec![u64::from(std::process::id())])
 }
 
-/// Whether any ancestor (or self) has exactly this identity.
+/// Whether any ancestor (or self) has exactly this identity: the crate's
+/// double-walked ancestry, compared on boot, PID and start ticks.
 pub fn ancestry_contains(identity: &ProcessIdentity) -> bool {
-    ancestry().iter().any(|pid| {
-        identity_of(*pid).is_some_and(|live| {
-            live.pid == identity.pid
-                && live.starttime_ticks == identity.starttime_ticks
-                && live.boot_id == identity.boot_id
-        })
+    Ancestry::of_self()
+        .map(|ancestry| ancestry.contains(identity))
+        .unwrap_or(false)
+}
+
+/// Parse a recorded harness identity: the full `agent-queue` shape when
+/// present, else the older boot/PID/ticks subset (executable fields zero).
+fn parse_identity(value: &Value) -> Option<ProcessIdentity> {
+    if let Ok(full) = serde_json::from_value::<ProcessIdentity>(value.clone()) {
+        return Some(full);
+    }
+    Some(ProcessIdentity {
+        version: 1,
+        boot_id: value.get("boot_id")?.as_str()?.to_string(),
+        pid: value.get("pid")?.as_u64()?,
+        starttime_ticks: value.get("starttime_ticks")?.as_u64()?,
+        executable_device: value
+            .get("executable_device")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        executable_inode: value
+            .get("executable_inode")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
     })
 }
 
@@ -93,11 +89,7 @@ pub fn agent_record(registry: &Path, agent: &str) -> Option<(ProcessIdentity, Op
     let text = std::fs::read_to_string(registry.join(agent).join("agent.json")).ok()?;
     let value: Value = serde_json::from_str(&text).ok()?;
     let identity = value.get("harness_identity")?;
-    let parsed = ProcessIdentity {
-        boot_id: identity.get("boot_id")?.as_str()?.to_string(),
-        pid: identity.get("pid")?.as_i64()?,
-        starttime_ticks: identity.get("starttime_ticks")?.as_i64()?,
-    };
+    let parsed = parse_identity(identity)?;
     let managed_by = value
         .get("managed_by")
         .and_then(|m| m.get("agent"))
@@ -116,10 +108,15 @@ pub fn coordinator_identity(
             boot_id,
             pid,
             starttime_ticks,
+            executable_device,
+            executable_inode,
         } => Some(ProcessIdentity {
+            version: 1,
             boot_id: boot_id.clone(),
-            pid: *pid,
-            starttime_ticks: *starttime_ticks,
+            pid: u64::try_from(*pid).ok()?,
+            starttime_ticks: u64::try_from(*starttime_ticks).ok()?,
+            executable_device: *executable_device,
+            executable_inode: *executable_inode,
         }),
         Designation::Registry => {
             let registry = registry?;
@@ -286,7 +283,8 @@ mod tests {
 
     #[test]
     fn own_identity_is_alive_and_in_ancestry() {
-        let me = identity_of(std::process::id() as i64).expect("self identity");
+        let me = identity_of(u64::from(std::process::id())).expect("self identity");
+        assert!(me.valid());
         assert!(identity_alive(&me));
         assert!(ancestry_contains(&me));
         let stale = ProcessIdentity {
@@ -294,11 +292,18 @@ mod tests {
             ..me.clone()
         };
         assert!(!identity_alive(&stale));
+        assert!(!ancestry_contains(&stale));
     }
 
     #[test]
-    fn stat_parses_parent() {
-        let (ppid, _) = stat_of(std::process::id() as i64).expect("stat");
-        assert!(ppid >= 0);
+    fn partial_identity_parses_and_matches_ancestry() {
+        let me = identity_of(u64::from(std::process::id())).expect("self identity");
+        let partial = parse_identity(&serde_json::json!({
+            "boot_id": me.boot_id, "pid": me.pid, "starttime_ticks": me.starttime_ticks,
+        }))
+        .expect("partial identity");
+        assert!(!partial.valid());
+        assert!(identity_alive(&partial));
+        assert!(ancestry_contains(&partial));
     }
 }

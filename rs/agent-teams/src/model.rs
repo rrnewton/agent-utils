@@ -474,6 +474,10 @@ pub enum Designation {
         pid: i64,
         /// `/proc/<pid>/stat` start ticks.
         starttime_ticks: i64,
+        /// Executable device (0 when the declaration predates recording it).
+        executable_device: u64,
+        /// Executable inode (0 when the declaration predates recording it).
+        executable_inode: u64,
     },
 }
 
@@ -556,6 +560,14 @@ pub fn parse_declaration(raw: Value) -> DataResult<Declaration> {
                 starttime_ticks: identity
                     .get("starttime_ticks")
                     .and_then(Value::as_i64)
+                    .unwrap_or(0),
+                executable_device: identity
+                    .get("executable_device")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                executable_inode: identity
+                    .get("executable_inode")
+                    .and_then(Value::as_u64)
                     .unwrap_or(0),
             }
         }

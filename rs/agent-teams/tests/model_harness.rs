@@ -575,3 +575,65 @@ fn peer_host_mismatch_is_route_refused() {
     assert_eq!(paste_count(&state, "tools", id), 0);
     let _ = std::fs::remove_dir_all(&state);
 }
+
+/// The agentctl-queue deliverer really enqueues through `agent-queue`:
+/// the item lands in the classic lane in the crate's format, a second
+/// hand-over of the same envelope is idempotent, and `contains` reads the
+/// crate's message state.
+#[test]
+fn agentctl_queue_deliverer_uses_agent_queue() {
+    use agent_teams::deliver::{AgentctlQueueDeliverer, Deliverer, Handover};
+    let state = temp_state("queue-deliverer");
+    let queue_dir = state.join("queue");
+    let deliverer = AgentctlQueueDeliverer {
+        queue_dir: queue_dir.clone(),
+        ledger_path: state.join("ledger.json"),
+    };
+    let now_ms = agent_teams::timeutil::now_unix_ms();
+    let id = "tm-sim-dddddddddddddddd";
+    let envelope = build_envelope(
+        id,
+        "k",
+        "sim",
+        "host-a",
+        1,
+        "harness-ancestry",
+        "tools",
+        "host-a",
+        "info",
+        None,
+        &[],
+        false,
+        now_ms,
+        now_ms + 7_200_000,
+        None,
+        "queued body",
+    );
+    assert_eq!(deliverer.contains(id), Some(false));
+    assert_eq!(
+        deliverer.handover(id, &envelope, "rendered text"),
+        Handover::Accepted
+    );
+    assert_eq!(
+        agent_queue::queue::message_state(&queue_dir, id).expect("state"),
+        Some(agent_queue::queue::MessageState::Pending)
+    );
+    let doc = agent_queue::queue::load_message(&queue_dir.join("inbox").join(format!("{id}.json")))
+        .expect("item");
+    assert_eq!(
+        doc.get("text").and_then(|t| t.as_str()),
+        Some("rendered text")
+    );
+    assert!(doc.get("external_delivery_record").is_some());
+    // Idempotent: the crate refuses the duplicate, we recognise our own item.
+    assert_eq!(
+        deliverer.handover(id, &envelope, "rendered text"),
+        Handover::Accepted
+    );
+    assert_eq!(deliverer.contains(id), Some(true));
+    assert_eq!(
+        agent_queue::queue::pending_identifiers(&queue_dir).expect("pending"),
+        vec![id.to_string()]
+    );
+    let _ = std::fs::remove_dir_all(&state);
+}
