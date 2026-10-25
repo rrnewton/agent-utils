@@ -1,13 +1,14 @@
 ---
 title: 'cache-serve-every-read: a served timeline page blocks the next serve of its view, so only half of servable reads are served'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 - message-cache
 created_at: 2026-10-25T15:07:48.839759861+00:00
-updated_at: 2026-10-25T15:07:48.839759861+00:00
+updated_at: 2026-10-25T15:55:55.062215298+00:00
+closed_at: 2026-10-25T15:55:55.062215037+00:00
 ---
 
 # Description
