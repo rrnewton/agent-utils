@@ -138,8 +138,10 @@ Drivers are built in (`local`, `ssh`, `command`); routes are data.
 - `local` — built in; `serve` as a child process on this host.
 - `ssh` — fields: `target`, `user`, `identity`, `known_hosts`,
   `connect_timeout_seconds` (default 10), `use_user_ssh_config`,
-  `link.mode` (`none` default, `on-demand`, `persistent`), `capabilities.
-  max_envelope_bytes`. Without `use_user_ssh_config` the driver uses
+  `link.mode` (`none` default, `on-demand`, `persistent`; with
+  `use_user_ssh_config` the owner's own master and `Control*` settings
+  apply and are never overridden — agent-teams' managed socket is only for
+  dedicated-key routes), `capabilities.max_envelope_bytes`. Without `use_user_ssh_config` the driver uses
   `-F none`, `BatchMode`, `IdentitiesOnly`, `StrictHostKeyChecking` with its
   own known-hosts file, and no forwarding. With `use_user_ssh_config: true`
   (allowed permanently) it uses the owner's configuration and agent; the

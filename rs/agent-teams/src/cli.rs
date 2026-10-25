@@ -1627,8 +1627,10 @@ fn link_run(
     route: &crate::route::SshRoute,
     once: bool,
 ) -> Result<i32, DataError> {
-    // Open the ControlMaster in the background, then ping through it.
-    let Some(control) = &route.control_path else {
+    // Ping through the route's master: our own socket for dedicated-key
+    // routes, the owner's live master for use_user_ssh_config routes (no
+    // control_path there, by design).
+    if route.link_mode == "none" {
         return Err(err(
             "usage",
             format!(
@@ -1636,8 +1638,8 @@ fn link_run(
                 route.name
             ),
         ));
-    };
-    if let Some(parent) = control.parent() {
+    }
+    if let Some(parent) = route.control_path.as_ref().and_then(|c| c.parent()) {
         std::fs::create_dir_all(parent)?;
     }
     let mut failures: u32 = 0;

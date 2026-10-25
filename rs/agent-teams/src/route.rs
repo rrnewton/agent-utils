@@ -200,7 +200,16 @@ impl SshRoute {
             .and_then(Value::as_str)
             .unwrap_or("none")
             .to_string();
-        let control_path = if link_mode == "none" {
+        let use_user_ssh_config = raw
+            .get("use_user_ssh_config")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        // With the owner's ssh configuration, never override Control*: the
+        // owner's live master (already past publickey/2FA) is the link.
+        // Forcing our own socket would start a fresh master that BatchMode
+        // cannot authenticate (live-trial finding, 2026-10-25). Our own
+        // on-demand master is only for dedicated-key routes.
+        let control_path = if link_mode == "none" || use_user_ssh_config {
             None
         } else {
             Some(control_socket(name))
@@ -215,10 +224,7 @@ impl SshRoute {
             user: raw.get("user").and_then(Value::as_str).map(str::to_string),
             identity: expand("identity"),
             known_hosts: expand("known_hosts"),
-            use_user_ssh_config: raw
-                .get("use_user_ssh_config")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
+            use_user_ssh_config,
             remote_binary: remote_binary.to_string(),
             peer: peer.to_string(),
             connect_timeout: raw
@@ -564,5 +570,48 @@ mod tests {
         assert!(argv.windows(2).any(|w| w == ["-F", "none"]));
         assert!(argv.iter().any(|a| a == "BatchMode=yes"));
         assert!(argv.iter().any(|a| a == "host-b.example.net"));
+    }
+
+    #[test]
+    fn ssh_user_config_never_overrides_control() {
+        // Live-trial regression (2026-10-25): overriding ControlPath with
+        // use_user_ssh_config forced a fresh master that BatchMode could
+        // not authenticate, while the owner's live master worked.
+        let raw = json!({
+            "driver": "ssh",
+            "target": "host-b.example.net",
+            "use_user_ssh_config": true,
+            "link": {"mode": "on-demand"}
+        });
+        let route = SshRoute::from_def(
+            "ssh-b",
+            &raw,
+            "host-a",
+            "~/bin/agent-teams",
+            PathBuf::from("/tmp").as_path(),
+        );
+        assert!(route.control_path.is_none());
+        let argv = route.ssh_argv();
+        assert!(
+            !argv.iter().any(|a| a.starts_with("Control")),
+            "user-config argv carries a Control override: {argv:?}"
+        );
+        // The dedicated-key form keeps its own on-demand master.
+        let raw = json!({
+            "driver": "ssh",
+            "target": "host-b.example.net",
+            "link": {"mode": "on-demand"}
+        });
+        let route = SshRoute::from_def(
+            "ssh-b",
+            &raw,
+            "host-a",
+            "~/bin/agent-teams",
+            PathBuf::from("/tmp").as_path(),
+        );
+        assert!(route.control_path.is_some());
+        let argv = route.ssh_argv();
+        assert!(argv.iter().any(|a| a.starts_with("ControlPath=")));
+        assert!(argv.iter().any(|a| a == "ControlMaster=auto"));
     }
 }
