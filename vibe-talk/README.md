@@ -4365,12 +4365,23 @@ cache at once instead of waiting for the provider (`#384 cache-serve`):
 * **The page's newest timeline page** (the Main view, and the Flat view on a bridge; never a step
   back, a delta, the thread list, or one thread's page). The reader sees the newest messages the
   cache holds, stamped and marked as upstream ones, with `as_of` set to the newest of them, a
-  generic forward cursor for what changes next, and no backward cursor, which the page reads as
-  "more above: unknown". However old the copy is, it is provisional only until its refresh lands.
-  A view answered that way is not answered from the cache again until the reader has been given
-  the provider's own page, whose backward cursor a walk back takes: the first step back fetches
-  that page behind the rows, and any later full read fetches it too, so older history is never
-  stranded behind a page with no way back.
+  generic forward cursor for what changes next, and a backward cursor of the server's own, which
+  says only "older than the oldest message shown" (`#510 cache-serve-every-read`). However old the
+  copy is, it is provisional only until its refresh lands. A step back with that cursor reads the
+  provider's own newest page, offered to the cache as any newest read is, and walks back on the
+  provider's cursors from there, at most four pages, until it reaches a message older than the
+  oldest one shown; it answers with only those older messages and the provider's own backward
+  cursor, so every later step is the provider's and older history is never stranded behind a
+  served page. A walk that reads its four pages without reaching one (more has arrived since the
+  serve than they hold) answers nothing yet, with a cursor of the same kind that goes on from where
+  it stopped: a step back never hands the page a message newer than the ones it shows. The cursor
+  is bound to its channel, view and thread, and the server keeps nothing for it. Each reload the
+  rule allows is served, however many come in a row, except one made while the refresh of an
+  earlier serve of the same page is still reading the provider: every served page has a refresh of
+  its own to compare and correct it, so that reload goes upstream. (Until `#510`, a served page carried no backward cursor, and its
+  view was not served again until a reader had been given the provider's own page, so reloads
+  alternated between the cache and the provider: on a deployment, 51 of 100 servable reads in an
+  hour were served.)
 * **A channel's newest window** (`/messages` and its callers: the digest, the to-do list,
   bankruptcy, read-aloud's window), only while what it holds is as fresh as the window re-use
   the server already practises, and never on Slack, whose windows carry thread replies the cache
@@ -4421,6 +4432,16 @@ either. Counts are kept per consumer, in memory, from the moment the process sta
   still exists, as for Slack messages not re-checked within two hours;
 * `misses` by reason: `off`, `blocked`, `suspect`, `gap`, `incomplete`, `stale_head` and
   `barrier`;
+* `gaps`, a newest window's or page's `gap` misses by cause (`#510 cache-serve-every-read`), each
+  counting the misses that had it, so one miss may count under several and they need not add up
+  to `gap`: `no_head` (no read of the scope's newest end recorded), `partial` (a row held only as
+  a push brought it), `above_head` (a row above the head that read listed: pushed, or posted by
+  this server, since), `unlisted` (a row in the unsettled band that read did not list), `listing`
+  (that read began listing above the part of the band the answer holds, having read fewer rows
+  than the band spans) and `hole` (a hole in the coverage below the band). Measured on the
+  loopback Slack fake (`measure_the_servable_rate_of_the_newest_timeline_page`), a message pushed
+  and then asked for before any read of the channel is `partial` and `above_head` every time, 10
+  of 10; with the relist reading the channel in between, the page is servable 10 of 10;
 * `late`: an evaluation that read what a newer read had already written, so it gives no verdict;
 * when the cache would have answered and upstream did too:
   * `compared` and `agreed`;
@@ -4446,7 +4467,7 @@ either. Counts are kept per consumer, in memory, from the moment the process sta
   * `would`: answered by the provider though the rule would have served it, timed from the ask to
     the cache's answer being ready: what answering from the cache would have taken, where serving
     is off, the read is one this build only measures, or a serve did not go ahead (its evaluation
-    took longer than 300 ms, or the view still owed the provider's own page).
+    took longer than 300 ms, or a refresh of the same page was still running).
 
   A read that failed is not timed, nor one counted `off` or `blocked` before the cache was read, so
   `n` may be less than `asked`.
@@ -4543,6 +4564,8 @@ path:
     { "consumer": "messages", "asked": 410, "would_serve": 120, "served": 0, "needs_existence_check": 0,
       "misses": { "off": 0, "blocked": 0, "suspect": 0, "gap": 30, "incomplete": 0,
                   "stale_head": 260, "barrier": 0 },
+      "gaps": { "no_head": 0, "partial": 24, "above_head": 26, "unlisted": 2, "listing": 1,
+                "hole": 0 },
       "late": 0, "compared": 120, "agreed": 118, "missing_rows": 2, "stale_rows": 1,
       "newer_rows": 1, "extra_rows": 0, "content_differs": 0,
       "latency": { "cache":    { "n": 0,   "p50_us": 0,       "p90_us": 0,       "p99_us": 0 },
@@ -4568,10 +4591,11 @@ What the fields mean:
 **Every hour, one `info` line** gives the same figures, as totals since the process started, with
 the shadow's counts and misses summed over consumers, and its latencies per consumer in
 `read_timings`, one entry for each consumer and way of answering that timed a read (`none` when
-none did), in milliseconds:
+none did), in milliseconds, and its `gap` misses by cause per consumer in `gap_causes`, one entry
+for each consumer that had any (`none` when none had):
 
 ```text
-INFO vibe_talk::cache::sink: message cache figures since this process started available=true enabled=true bytes=18874368 messages=6120 channels=9 covered_days=31.5 ops_applied=15210 ops_dropped=0 … batch_p99_us=24000 orphans_dropped=0 providers_verified=1 providers_suspended=0 blocked=0 shadow_asked=410 shadow_would_serve=120 … shadow_extra_rows=0 shadow_content_differs=0 shadow_miss_off=0 shadow_miss_blocked=0 shadow_miss_suspect=0 shadow_miss_gap=30 shadow_miss_incomplete=0 shadow_miss_stale_head=260 shadow_miss_barrier=0 read_timings="timeline_fallback cache n=81 p50_ms=0.6 p90_ms=1.4 p99_ms=3.2; timeline_fallback upstream n=182 p50_ms=2650.1 p90_ms=4352 p99_ms=9216; messages upstream n=410 p50_ms=1601 p90_ms=2205 p99_ms=5480; messages would n=120 p50_ms=0.4 p90_ms=0.9 p99_ms=2.1"
+INFO vibe_talk::cache::sink: message cache figures since this process started available=true enabled=true bytes=18874368 messages=6120 channels=9 covered_days=31.5 ops_applied=15210 ops_dropped=0 … batch_p99_us=24000 orphans_dropped=0 providers_verified=1 providers_suspended=0 blocked=0 shadow_asked=410 shadow_would_serve=120 … shadow_extra_rows=0 shadow_content_differs=0 shadow_miss_off=0 shadow_miss_blocked=0 shadow_miss_suspect=0 shadow_miss_gap=30 shadow_miss_incomplete=0 shadow_miss_stale_head=260 shadow_miss_barrier=0 read_timings="timeline_fallback cache n=81 p50_ms=0.6 p90_ms=1.4 p99_ms=3.2; timeline_fallback upstream n=182 p50_ms=2650.1 p90_ms=4352 p99_ms=9216; messages upstream n=410 p50_ms=1601 p90_ms=2205 p99_ms=5480; messages would n=120 p50_ms=0.4 p90_ms=0.9 p99_ms=2.1" gap_causes="messages no_head=0 partial=24 above_head=26 unlisted=2 listing=1 hole=0"
 ```
 
 So how answering from the cache changes a read's latency is read off one consumer's entries: its

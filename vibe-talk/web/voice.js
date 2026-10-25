@@ -21697,8 +21697,8 @@ function walkCursorOwed() {
   if (discordOlderCursor || channelCanon.channel !== String(el("discord-channel").value)) {
     return false;
   }
-  // A page answered from the server's message cache (`#384 cache-serve`): it said more
-  // exists and could not carry the provider's cursor, whatever the view's cover.
+  // A page that said more exists and carried no cursor, whatever the view's cover: one a
+  // server before `#510 cache-serve-every-read` answered from its message cache.
   if (discordWalkCursorOwed) return true;
   if (!threadingSupported) return false;
   const cover = channelCanon.views.get(viewKey());
@@ -37429,10 +37429,10 @@ const OLDER_TRIGGER_PX = 80;
  */
 let discordMoreAbove = false;
 let discordOlderCursor = null;
-// The last live page said more exists above but carried no cursor to walk back on — a page
-// the server answered from its message cache (`#384 cache-serve`), which cannot mint the
-// provider's backward cursor. The first step back then owes the view a read of its own
-// newest page first (`readWalkCursor`), which the server answers from the provider.
+// The last live page said more exists above but carried no cursor to walk back on — a page a
+// server before `#510 cache-serve-every-read` answered from its message cache (`#384
+// cache-serve`); a server now mints a cursor of its own for such a page. The first step back
+// then owes the view a read of its own newest page first (`readWalkCursor`).
 let discordWalkCursorOwed = false;
 let olderFetchInFlight = false;
 

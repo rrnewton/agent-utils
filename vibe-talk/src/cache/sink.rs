@@ -229,12 +229,6 @@ struct State {
     /// The background refreshes of served answers now running, one per read: a second serve of
     /// the same read starts no second upstream read. `#384 cache-serve`.
     refreshing: Mutex<HashSet<RefreshKey>>,
-    /// Newest timeline views a served page left without a backward cursor, by channel and
-    /// view-and-thread words ([`Sink::note_real_page`]): such a view is not served again until
-    /// a caller has been handed the provider's own page, whose `next_before` the reader walks
-    /// back on. Without this, every later load would serve again and older history would stay
-    /// unreachable on a serving channel forever. `#384 cache-serve`.
-    cursor_owed: Mutex<HashSet<(ChannelId, String)>>,
     /// How each recent message reached the cache, by whom it was offered: what the shadow's
     /// diagnostics name beside a message its comparison found different. Memory only. `#497
     /// cache-shadow-missing-row`.
@@ -467,13 +461,6 @@ impl RefreshKey {
             read: format!("timeline:{view:?}:{}:{limit}", thread.unwrap_or_default()),
         }
     }
-}
-
-/// The words a channel's newest timeline view is owed a provider page under
-/// ([`Sink::note_real_page`]): the view and its thread, no size, since any size's real page
-/// carries the cursor a walk back takes. Never logged.
-fn cursor_owed_words(view: TimelineView, thread: Option<&str>) -> String {
-    format!("{view:?}:{}", thread.unwrap_or_default())
 }
 
 /// A running background refresh's claim ([`Sink::claim_refresh`]): dropped, the read may be
@@ -1063,6 +1050,11 @@ impl ShadowTask {
                 }
             };
             progress.tallies.decided(consumer, decision);
+            if let (Decision::Miss(Miss::Gap), Some(view)) = (decision, &view) {
+                if let Some(causes) = shadow::gap_causes(&ask, view) {
+                    progress.tallies.gapped(consumer, &causes);
+                }
+            }
             // Timed only beside an upstream answer, as the reads it is set against are.
             if decision == Decision::Serve && !served && upstream.is_some() {
                 progress
@@ -1367,6 +1359,29 @@ pub fn read_timings(consumers: &[shadow::ConsumerCounts]) -> String {
                     )
                 })
             })
+        })
+        .collect();
+    if entries.is_empty() {
+        "none".to_owned()
+    } else {
+        entries.join("; ")
+    }
+}
+
+/// The hourly line's `gap` misses by cause (`#510 cache-serve-every-read`): one entry per
+/// consumer that had any, `<consumer> <cause>=<count> ...`, joined by `; `; `none` when none had.
+#[must_use]
+pub fn gap_causes(consumers: &[shadow::ConsumerCounts]) -> String {
+    let entries: Vec<String> = consumers
+        .iter()
+        .filter(|counts| counts.gaps != shadow::GapCounts::default())
+        .map(|counts| {
+            let causes: Vec<String> = shadow::GapCounts::LABELS
+                .iter()
+                .zip(counts.gaps.each())
+                .map(|(label, n)| format!("{label}={n}"))
+                .collect();
+            format!("{} {}", counts.consumer, causes.join(" "))
         })
         .collect();
     if entries.is_empty() {
@@ -1813,9 +1828,10 @@ impl Sink {
     /// never handed back as another's, verified again after the snapshot read, in case either
     /// changed under it), the snapshot holds nothing a read begun at or after the ask wrote
     /// (counting would call such an evaluation `late` and compare nothing: a serve escapes no
-    /// comparison), and the rule decides [`Decision::Serve`] on the snapshot read. A timeline
-    /// serve also owes the view a provider page ([`Sink::note_real_page`]) and is not repeated
-    /// until one is handed out. The serve is counted as it is handed back; the caller starts
+    /// comparison), and the rule decides [`Decision::Serve`] on the snapshot read. Nothing a
+    /// serve hands out holds back the next: a served timeline page carries a backward cursor of
+    /// the server's own ([`crate::timeline_served`], `#510 cache-serve-every-read`), so older
+    /// history is reachable from it. The serve is counted as it is handed back; the caller starts
     /// the read's refresh upstream and hands its answer to the returned [`PendingServe`], so
     /// the comparison runs as for any shadow. Anything else is [`ServeOutcome::NotServed`]
     /// with the ask's shadow to carry on with, and the request goes upstream exactly as it did
@@ -1839,14 +1855,6 @@ impl Sink {
             })
         };
         if !gated(self) {
-            return ServeOutcome::NotServed(self.shadow(channel, ask, live_fed));
-        }
-        let owed = match &ask {
-            Ask::Timeline { view, thread, .. } => lock(&self.state.cursor_owed)
-                .contains(&(channel.clone(), cursor_owed_words(*view, thread.as_deref()))),
-            _ => false,
-        };
-        if owed {
             return ServeOutcome::NotServed(self.shadow(channel, ask, live_fed));
         }
         let Some(mut shadowed) = self.shadow(channel, ask.clone(), live_fed) else {
@@ -1888,24 +1896,11 @@ impl Sink {
         };
         task.served = true;
         task.answered_by(shadow::Answered::Cache);
-        if let Ask::Timeline { view, thread, .. } = &ask {
-            lock(&self.state.cursor_owed)
-                .insert((channel.clone(), cursor_owed_words(*view, thread.as_deref())));
-        }
         self.state.shadow.tallies.served(ask.consumer());
         ServeOutcome::Served(Box::new(ServedAnswer {
             view,
             pending: PendingServe { task: Some(task) },
         }))
-    }
-
-    /// Note that a caller has been handed the provider's own newest page of `view` of
-    /// `channel` — with the `next_before` cursor a walk back takes, which no served page can
-    /// mint — so the view may be served from the cache again. Call it once such a page is
-    /// answered upstream, never for a background refresh's page, which no reader holds.
-    /// `#384 cache-serve`.
-    pub fn note_real_page(&self, channel: &ChannelId, view: TimelineView, thread: Option<&str>) {
-        lock(&self.state.cursor_owed).remove(&(channel.clone(), cursor_owed_words(view, thread)));
     }
 
     /// `channel` as the cache names it, under the provider the latest routes give it: for a
@@ -2079,6 +2074,7 @@ impl Sink {
             shadow_miss_stale_head = shadow.misses.stale_head,
             shadow_miss_barrier = shadow.misses.barrier,
             read_timings = read_timings(&report.shadow).as_str(),
+            gap_causes = gap_causes(&report.shadow).as_str(),
             "message cache figures since this process started"
         );
     }

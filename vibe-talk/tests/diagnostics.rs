@@ -904,6 +904,10 @@ async fn the_message_cache_section_is_numbers_and_never_an_id_or_a_word() {
     assert_eq!(messages["asked"], 2, "{messages:#}");
     assert_eq!(messages["would_serve"], 1, "{messages:#}");
     assert!(messages["misses"]["stale_head"].is_u64());
+    // `#510 cache-serve-every-read`: the gaps by cause, numbers only.
+    for cause in vibe_talk::cache::shadow::GapCounts::LABELS {
+        assert!(messages["gaps"][cause].is_u64(), "{cause}: {messages:#}");
+    }
 
     let text = section.to_string();
     for private in [vibe_talk::testing::READ_CHANNEL, words, author]

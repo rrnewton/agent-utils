@@ -1571,8 +1571,8 @@ mod measure {
         ] {
             let counts = servable(&format!("measure-{name}"), backfill, relist, rounds).await;
             println!(
-                "timeline_fallback {name:>16}: {}/{} servable, {} agreed; misses {:?}",
-                counts.would_serve, counts.asked, counts.agreed, counts.misses
+                "timeline_fallback {name:>16}: {}/{} servable, {} agreed; misses {:?}; gaps {:?}",
+                counts.would_serve, counts.asked, counts.agreed, counts.misses, counts.gaps
             );
             rates.push(counts.would_serve);
         }
