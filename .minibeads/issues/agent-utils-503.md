@@ -1,10 +1,11 @@
 ---
 title: 'engine-rust-default: make Rust the default engine for paired tools'
-status: open
+status: closed
 priority: 2
 issue_type: task
 created_at: 2026-10-25T12:23:34.017596650+00:00
-updated_at: 2026-10-25T12:23:34.017596650+00:00
+updated_at: 2026-10-25T14:57:12.735126787+00:00
+closed_at: 2026-10-25T14:57:12.735126536+00:00
 ---
 
 # Description
