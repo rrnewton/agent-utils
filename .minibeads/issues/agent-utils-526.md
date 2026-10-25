@@ -1,12 +1,13 @@
 ---
 title: 'pack-triangle-dim: the pack triangle dimmed, up and left, centred in its hover rectangle'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-25T21:41:50.416798579+00:00
-updated_at: 2026-10-25T21:41:50.416798579+00:00
+updated_at: 2026-10-25T23:26:35.890389218+00:00
+closed_at: 2026-10-25T23:26:35.890388948+00:00
 ---
 
 # Description

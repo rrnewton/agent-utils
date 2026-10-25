@@ -1,12 +1,13 @@
 ---
 title: 'thread-bridge-even-connectors: own unpacked rows left-justified so every bridge connector is the same length'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-25T21:41:30.794614797+00:00
-updated_at: 2026-10-25T21:41:30.794614797+00:00
+updated_at: 2026-10-25T23:26:35.884162907+00:00
+closed_at: 2026-10-25T23:26:35.884162777+00:00
 ---
 
 # Description

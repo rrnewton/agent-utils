@@ -1,12 +1,13 @@
 ---
 title: 'cmd-0-voice-view: Ctrl/Cmd+0 goes to the voice (call) view, as Ctrl/Cmd+1 to 4 go to theirs'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-10-25T21:41:48.041719809+00:00
-updated_at: 2026-10-25T21:41:48.041719809+00:00
+updated_at: 2026-10-25T23:26:35.887370260+00:00
+closed_at: 2026-10-25T23:26:35.887370030+00:00
 ---
 
 # Description
