@@ -79989,22 +79989,26 @@ test("`#501 thread-bridge-gutter`: on a phone the bridge hugs the left edge, and
   const PHONE = "(max-width: 599.98px)";
   const tail = CSS_CODE.slice(CSS_CODE.lastIndexOf(`@media ${PHONE}`));
   const phone = (selector) => cssRules(mediaBodyOf(tail, PHONE), selector).join("\n");
-  for (const list of ["#side-cards", "#discord-log", "#side-log"]) {
+  // Under a card the triangle's slim target lets the stack hang 0.85rem in; in a channel list
+  // the X keeps its whole gutter square on the screen, so there it is 1.25rem, and under the
+  // agent's edge-to-edge tile the inset it always had (no phone rule at all).
+  for (const [list, inset] of [["#side-cards", "0\\.85rem"], ["#discord-log", "1\\.25rem"], ["#side-log", "1\\.25rem"]]) {
     assert.match(phone(`${list} li.discord-message[data-stack-under="third"][data-who]`),
-      /margin-left:\s*calc\(var\(--speaker-inset\) \/ 2 \+ 0\.85rem\)/, `${list}: a phone's stack still hangs a full gutter in`);
+      new RegExp(`margin-left:\\s*calc\\(var\\(--speaker-inset\\) \\/ 2 \\+ ${inset}\\)`), `${list}: a phone's stack still hangs a full gutter in`);
     assert.match(phone(`${list} li.discord-message[data-stack-under="me"][data-who]`),
-      /margin-left:\s*calc\(var\(--speaker-inset\) \+ 0\.85rem\)/, `${list}: a phone's stack under the owner's row still hangs a full gutter in`);
+      new RegExp(`margin-left:\\s*calc\\(var\\(--speaker-inset\\) \\+ ${inset}\\)`), `${list}: a phone's stack under the owner's row still hangs a full gutter in`);
     assert.match(phone(`${list} li.discord-message[data-stack-under="reply"][data-who]`),
-      /margin-left:\s*calc\(var\(--reply-gutter\) \+ 0\.85rem\)/, `${list}: a phone's stack under a reply still hangs a second full gutter in`);
+      new RegExp(`margin-left:\\s*calc\\(var\\(--reply-gutter\\) \\+ ${inset}\\)`), `${list}: a phone's stack under a reply still hangs a second full gutter in`);
     assert.match(phone(`${list} .reply-bridge`), /width:\s*calc\(0\.55rem \+ var\(--reply-stroke\) \/ 2\)/,
       `${list}: a phone's bridge still reaches 0.9rem into its row`);
+    assert.equal(phone(`${list} li.discord-message[data-stack-under="coder"][data-who]`), "",
+      `${list}: a stack under the agent's edge-to-edge tile moved, though its square fits nowhere else`);
   }
-  assert.match(phone("#discord-log li.discord-message[data-stack-under=\"coder\"][data-who]"),
-    /margin-left:\s*calc\(1\.6875rem - env\(safe-area-inset-left\)\)/,
-    "a stack under the agent's edge-to-edge tile does not keep just the room its disc fits in");
+  assert.equal(phone("#discord-log .reply-ungather"), "", "the X's square shrank with the triangle's");
+  assert.match(cssBlock("#discord-log .reply-ungather"), /width:\s*var\(--reply-gutter\)/, "the X is not its whole gutter square");
   assert.match(phone("#discord-log .reply-ungather-mark"),
-    /left:\s*calc\(2\.25rem - 0\.55rem - 0\.09375rem - 0\.25rem - 1\.2rem\)/,
-    "the X's disc is not set in its slim button by the branch, the gap and its own width");
+    /left:\s*calc\(var\(--reply-gutter\) - 0\.55rem - 0\.09375rem - 0\.25rem - 1\.2rem\)/,
+    "the X's disc is not set in its whole square by the branch, the gap and its own width");
   assert.match(phone("#side-cards .unpack-pack-mark"), /left:\s*0\.05625rem/,
     "the triangle is not centred where the disc's centre was, in its slim button");
   assert.match(phone('#side-cards > li.discord-message.unpack-row[data-who="me"]:not([data-read-run="head"]) > .reply-bridge'),

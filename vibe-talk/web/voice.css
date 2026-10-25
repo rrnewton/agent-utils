@@ -9630,44 +9630,49 @@ li.discord-message[data-root-child] > .reply-bridge {
  * branch were laid out across that gutter; on a 393px phone an unpacked thread's rows began
  * 68px from the edge and the triangle's ink 29px.
  *
- * Here a stack hangs 0.85rem in instead, on a 0.55rem branch: the spine still comes out of the
- * foot of what the replies hang from and each row still begins visibly inside its parent — an
- * unpacked thread's rows 1.6rem in from their card's face, the third speaker's half inset and
- * the 0.85rem together — while the mark left of the spine takes the room
- * the parent itself does not use, out to a few pixels from the screen's edge, notch room
- * included where the list keeps it. The agent's tile is the one parent with no such room: it
- * runs edge to edge, so a stack under it keeps the least room the disc, its gap, the spine and
- * the branch fit in, which is what it nearly had. The mark's button is 2.25rem wide here —
- * still a thumb's target, and never under the 2rem floor the triangle states for itself; its
- * height is the gutter it always was.
+ * Here a stack hangs less far in instead, on a 0.55rem branch: the spine still comes out of the
+ * flat of the foot of what the replies hang from and each row still begins visibly inside its
+ * parent, while the mark left of the spine takes the room the parent itself does not use, out
+ * to a few pixels from the screen's edge, notch room included where the list keeps it. How far
+ * in is set by what stands at the first row's gutter. Under a card that is the pack triangle,
+ * whose target may go to 2.25rem here — still a thumb's, and never under the 2rem floor it
+ * states for itself — so an unpacked thread's rows hang 0.85rem in past the third speaker's
+ * half inset, 1.6rem in from their card's face altogether. In a channel list it is the X, which
+ * keeps its whole gutter square (its target has always been the full 2.75rem, every point of
+ * it on the screen), so there a stack hangs 1.25rem in: the least that keeps that square on
+ * the screen and the spine on its parent's flat, past the parent's corner. The agent's tile is
+ * the one parent with no room to give: it runs edge to edge, and a stack under it keeps the
+ * inset it always had, which is that least room already; only its branch shortens with the
+ * rest, and its disc follows the spine.
  *
  * Every list the bridge is drawn in, restated from the stack's own rules above as a desk
  * restates them in its block; a desk keeps the room it has, and a reply's arrow keeps its whole
  * gutter everywhere — only what hangs on a bridge moves.
  */
 @media (max-width: 599.98px) {
-  #side-log li.discord-message[data-stack-under="coder"][data-who],
-  #side-cards li.discord-message[data-stack-under="coder"][data-who],
-  #discord-log li.discord-message[data-stack-under="coder"][data-who] {
-    margin-left: calc(1.6875rem - env(safe-area-inset-left));
-  }
-  #side-log li.discord-message[data-stack-under="me"][data-who],
-  #side-cards li.discord-message[data-stack-under="me"][data-who],
-  #discord-log li.discord-message[data-stack-under="me"][data-who] {
+  #side-cards li.discord-message[data-stack-under="me"][data-who] {
     margin-left: calc(var(--speaker-inset) + 0.85rem);
   }
-  #side-log li.discord-message[data-stack-under="third"][data-who],
-  #side-cards li.discord-message[data-stack-under="third"][data-who],
-  #discord-log li.discord-message[data-stack-under="third"][data-who] {
+  #side-cards li.discord-message[data-stack-under="third"][data-who] {
     margin-left: calc(var(--speaker-inset) / 2 + 0.85rem);
   }
-  #side-log li.discord-message[data-stack-under="reply"][data-who],
   #side-cards li.discord-message[data-stack-under="reply"][data-who],
+  #side-cards li.discord-message[data-stack-under="me-reply"][data-who] {
+    margin-left: calc(var(--reply-gutter) + 0.85rem);
+  }
+  #side-log li.discord-message[data-stack-under="me"][data-who],
+  #discord-log li.discord-message[data-stack-under="me"][data-who] {
+    margin-left: calc(var(--speaker-inset) + 1.25rem);
+  }
+  #side-log li.discord-message[data-stack-under="third"][data-who],
+  #discord-log li.discord-message[data-stack-under="third"][data-who] {
+    margin-left: calc(var(--speaker-inset) / 2 + 1.25rem);
+  }
+  #side-log li.discord-message[data-stack-under="reply"][data-who],
   #discord-log li.discord-message[data-stack-under="reply"][data-who],
   #side-log li.discord-message[data-stack-under="me-reply"][data-who],
-  #side-cards li.discord-message[data-stack-under="me-reply"][data-who],
   #discord-log li.discord-message[data-stack-under="me-reply"][data-who] {
-    margin-left: calc(var(--reply-gutter) + 0.85rem);
+    margin-left: calc(var(--reply-gutter) + 1.25rem);
   }
 
   #side-log .reply-bridge,
@@ -9676,22 +9681,17 @@ li.discord-message[data-root-child] > .reply-bridge {
     width: calc(0.55rem + var(--reply-stroke) / 2);
   }
 
-  #side-log .reply-ungather,
-  #side-cards .reply-ungather,
-  #discord-log .reply-ungather {
-    width: 2.25rem;
-  }
-
   #side-cards .reply-ungather.unpack-pack {
     width: 2.25rem;
   }
 
-  /* The disc and the triangle in their slim button, by the arithmetic their own rules state: the
-     button's width, less the branch, half the spine, the gap to it, and the mark itself. */
+  /* The disc in its whole square, and the triangle in its slim one, by the arithmetic their own
+     rules state: the button's width, less the branch, half the spine, the gap to it, and the
+     mark itself. */
   #side-log .reply-ungather-mark,
   #side-cards .reply-ungather-mark,
   #discord-log .reply-ungather-mark {
-    left: calc(2.25rem - 0.55rem - 0.09375rem - 0.25rem - 1.2rem);
+    left: calc(var(--reply-gutter) - 0.55rem - 0.09375rem - 0.25rem - 1.2rem);
   }
 
   #side-cards .unpack-pack-mark {
