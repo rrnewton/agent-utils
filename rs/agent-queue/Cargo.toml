@@ -1,0 +1,25 @@
+[package]
+name = "agent-queue"
+version = "0.1.0"
+description = "Durable on-disk prompt queues and process identity for interactive coding agents"
+readme = "README.md"
+keywords = ["agents", "queue", "durable", "terminal"]
+categories = ["filesystem", "command-line-utilities"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+# Lets a dependent's own tests observe or fail each directory sync. Never enabled by a release build.
+test-hooks = []
+
+[dependencies]
+fs2 = "0.4"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+
+[lints]
+workspace = true

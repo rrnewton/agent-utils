@@ -3,6 +3,7 @@
   "components": {
     "agentctl": {
       "source_prefixes": [
+        "common/docs/agent-queue/",
         "common/docs/agentctl/",
         "common/docs/chat-subscription-plugin/",
         "common/docs/chat-subscription/",
@@ -11,6 +12,7 @@
         "py/bin/herdr-agent",
         "py/bin/herdr-chat",
         "py/bin/herdr-subagents",
+        "rs/agent-queue/",
         "rs/agentctl/",
         "rs/bin/agentctl",
         "rs/bin/herdr-agent",

@@ -5,6 +5,7 @@ members = [
     "tick-hub",
     "pr-landing-planner",
     "herdr-run",
+    "agent-queue",
     "agentctl",
     "chat-subscription",
     "chat-subscription-plugin",

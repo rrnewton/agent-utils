@@ -6,9 +6,10 @@ resource_caps:
 steps:
   - group: rust
     job: agentctl
-    desc: package and smoke the agentctl and chat-subscription Rust crates once
+    desc: package and smoke the agentctl, agent-queue and chat-subscription Rust crates once
     cmd: >-
       python3 scripts/check_rust_packages.py
+      --crate agent-queue
       --crate chat-subscription
       --crate chat-subscription-plugin
       --crate agentctl

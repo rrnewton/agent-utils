@@ -4,18 +4,27 @@
 //! submission, working-state confirmation, and at-most-once quarantine after an ambiguous pane
 //! injection. Queue and target locks use the command's stable, package-independent disk format.
 
-use std::ffi::{CString, OsStr};
+use std::ffi::CString;
 use std::fmt;
-use std::fs::{self, DirBuilder, File, OpenOptions};
-use std::io::{self, BufWriter, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::fs::{self, File, OpenOptions};
+use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
+#[cfg(test)]
+pub(crate) use agent_queue::fsio::DIRECTORY_SYNC_HOOK;
+use agent_queue::fsio::{transition, Waiter};
+#[cfg(test)]
+use agent_queue::queue::json_paths;
+pub use agent_queue::queue::MessageState as QueueMessageState;
+use agent_queue::queue::{
+    delivery_attempts, failed_metadata, identifiers, identifiers_if_directory,
+    inbox_in_queue_order, load_message, message_id_from_path, quarantine_raw, recover_inflight,
+    unix_seconds, DirectoryIdentity as QueueDirectoryIdentity, QueueDirectories,
+};
 use fs2::FileExt;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -25,9 +34,6 @@ use crate::client::{AgentPaneInfo, HerdrClient, Pane};
 use crate::error::{AdapterError, AdapterErrorKind, EXIT_BUSY, EXIT_TIMEOUT};
 use crate::submission::{PromptTerminal, Submission, SubmitTimeouts};
 
-static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-const MESSAGE_ID_MAX: usize = 255;
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Identity assertions for one already-running interactive Herdr agent.
@@ -57,20 +63,6 @@ pub enum QueueOutcome {
     Pending,
     /// At least one prompt may have been injected and was quarantined rather than retried.
     PossiblySubmitted,
-}
-
-/// Exact durable location of one caller-selected queue message identifier.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum QueueMessageState {
-    /// The message is known not to have crossed the injection barrier.
-    Pending,
-    /// The message crossed the barrier and its outcome remains unsettled.
-    Inflight,
-    /// The native working transition confirmed delivery.
-    Processed,
-    /// Delivery may have occurred and automatic replay is unsafe.
-    Failed,
 }
 
 impl QueueOutcome {
@@ -804,63 +796,29 @@ fn enqueue_internal(
     if text.is_empty() {
         return Err(AgentError::delivery("message must not be empty"));
     }
-    let directories = prepare(root)?;
-    let identifier = message_id.map_or_else(generated_message_id, str::to_owned);
-    validate_message_id(&identifier)?;
-    let filename = format!("{identifier}.json");
-    let path = directories.inbox.join(&filename);
-    let _lock = if serialize {
-        let directory_identity = queue_directory_identity(root)?;
-        let lock_path = root.join(".delivery.lock");
-        let lock = open_private_lock(&lock_path, "queue delivery lock")?;
-        lock_exclusive_with_runtime(&lock, &lock_path, "queue delivery", runtime)?;
-        verify_queue_lock(
-            root,
-            directory_identity,
-            &lock_path,
-            &lock,
-            "queue delivery lock",
-        )?;
-        Some(lock)
-    } else {
-        None
-    };
-    if directories
-        .all()
-        .iter()
-        .any(|directory| fs::symlink_metadata(directory.join(&filename)).is_ok())
-    {
-        return Err(AgentError::delivery(format!(
-            "message id already exists: {identifier}"
-        )));
-    }
-    // A chat request prompt names its message's create time, so the drain can open its first
-    // line with the delay as of typing; the stored text stays printable. See `prompt_time`.
-    let document = match crate::prompt_time::queue_deferred(text, crate::prompt_time::now_millis())
-    {
-        Some(queued) => json!({
-            "id": identifier,
-            "text": queued.text,
-            "sent_at": queued.sent_at,
-            "opening": queued.opening,
-            "queued_at": unix_seconds(),
-            "delivery_attempts": 0,
-        }),
-        None => json!({
-            "id": identifier,
-            "text": text,
-            "queued_at": unix_seconds(),
-            "delivery_attempts": 0,
-        }),
-    };
-    atomic_json_create(&path, &document).map_err(|error| {
-        if error.kind() == io::ErrorKind::AlreadyExists {
-            AgentError::delivery(format!("message id already exists: {identifier}"))
-        } else {
-            io_error("persist queued message", &path, error)
-        }
-    })?;
-    Ok(identifier)
+    let waiter = RuntimeWaiter(runtime);
+    Ok(agent_queue::queue::enqueue(
+        root,
+        message_id,
+        serialize,
+        &waiter,
+        |identifier| {
+            // A chat request prompt names its message's create time, so the drain can open its
+            // first line with the delay as of typing; the stored text stays printable. See
+            // `prompt_time`.
+            match crate::prompt_time::queue_deferred(text, crate::prompt_time::now_millis()) {
+                Some(queued) => json!({
+                    "id": identifier,
+                    "text": queued.text,
+                    "sent_at": queued.sent_at,
+                    "opening": queued.opening,
+                    "queued_at": unix_seconds(),
+                    "delivery_attempts": 0,
+                }),
+                None => agent_queue::queue::plain_item(identifier, text),
+            }
+        },
+    )?)
 }
 
 /// Serialize and drain a FIFO with production timing.
@@ -1420,42 +1378,7 @@ fn status_with_binding_mode<A: AgentApi + ?Sized>(
 /// [`send_identified`]. `None` proves that no artifact with this identifier exists in any queue
 /// phase while the caller holds the surrounding agent lifecycle lock.
 pub fn message_state(root: &Path, message_id: &str) -> AgentResult<Option<QueueMessageState>> {
-    validate_message_id(message_id)?;
-    if fs::symlink_metadata(root).is_err() {
-        return Ok(None);
-    }
-    validate_existing_queue(root)?;
-    let filename = format!("{message_id}.json");
-    let directories = QueueDirectories::new(root);
-    let candidates = [
-        (&directories.inbox, QueueMessageState::Pending),
-        (&directories.inflight, QueueMessageState::Inflight),
-        (&directories.processed, QueueMessageState::Processed),
-        (&directories.failed, QueueMessageState::Failed),
-    ];
-    let mut observed = None;
-    for (directory, state) in candidates {
-        let path = directory.join(&filename);
-        match fs::symlink_metadata(&path) {
-            Ok(_) => {
-                let document = load_message(&path)?;
-                if document.get("id").and_then(Value::as_str) != Some(message_id) {
-                    return Err(AgentError::delivery(format!(
-                        "queue artifact {} contains a different message id",
-                        path.display()
-                    )));
-                }
-                if observed.replace(state).is_some() {
-                    return Err(AgentError::delivery(format!(
-                        "message id {message_id:?} exists in multiple queue phases"
-                    )));
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(io_error("inspect queue message", &path, error)),
-        }
-    }
-    Ok(observed)
+    Ok(agent_queue::queue::message_state(root, message_id)?)
 }
 
 /// The identifiers of the prompts in the queue's inbox: those the next drain types, in queue
@@ -1463,11 +1386,7 @@ pub fn message_state(root: &Path, message_id: &str) -> AgentResult<Option<QueueM
 /// in flight, processed or failed is not one: a drain never types it, and files one a crash left
 /// in flight as failed.
 pub(crate) fn queued_prompts(root: &Path) -> AgentResult<Vec<String>> {
-    if fs::symlink_metadata(root).is_err() {
-        return Ok(Vec::new());
-    }
-    validate_existing_queue(root)?;
-    identifiers_if_directory(&QueueDirectories::new(root).inbox)
+    Ok(agent_queue::queue::pending_identifiers(root)?)
 }
 
 /// Take the prompt `message_id` back out of the queue's inbox, untyped, and say whether it was
@@ -1480,39 +1399,11 @@ pub(crate) fn withdraw(
     message_id: &str,
     runtime: &dyn AgentRuntime,
 ) -> AgentResult<bool> {
-    validate_message_id(message_id)?;
-    if fs::symlink_metadata(root).is_err() {
-        return Ok(false);
-    }
-    validate_existing_queue(root)?;
-    let directory_identity = queue_directory_identity(root)?;
-    let lock_path = root.join(".delivery.lock");
-    let lock = open_private_lock(&lock_path, "queue delivery lock")?;
-    lock_exclusive_with_runtime(&lock, &lock_path, "queue delivery", runtime)?;
-    verify_queue_lock(
+    Ok(agent_queue::queue::withdraw(
         root,
-        directory_identity,
-        &lock_path,
-        &lock,
-        "queue delivery lock",
-    )?;
-    let inbox = QueueDirectories::new(root).inbox;
-    let path = inbox.join(format!("{message_id}.json"));
-    match fs::symlink_metadata(&path) {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(io_error("inspect queue message", &path, error)),
-    }
-    let document = load_message(&path)?;
-    if document.get("id").and_then(Value::as_str) != Some(message_id) {
-        return Err(AgentError::delivery(format!(
-            "queue artifact {} contains a different message id",
-            path.display()
-        )));
-    }
-    fs::remove_file(&path).map_err(|error| io_error("withdraw queued message", &path, error))?;
-    sync_directory(&inbox)?;
-    Ok(true)
+        message_id,
+        &RuntimeWaiter(runtime),
+    )?)
 }
 
 /// Read recent terminal output from a validated interactive-agent target.
@@ -1818,181 +1709,6 @@ fn deliver_one<A: AgentApi + ?Sized>(
     }
 }
 
-#[derive(Clone, Debug)]
-struct QueueDirectories {
-    inbox: PathBuf,
-    inflight: PathBuf,
-    processed: PathBuf,
-    failed: PathBuf,
-}
-
-impl QueueDirectories {
-    fn new(root: &Path) -> Self {
-        Self {
-            inbox: root.join("inbox"),
-            inflight: root.join("inflight"),
-            processed: root.join("processed"),
-            failed: root.join("failed"),
-        }
-    }
-
-    fn all(&self) -> [&Path; 4] {
-        [&self.inbox, &self.inflight, &self.processed, &self.failed]
-    }
-}
-
-fn prepare(root: &Path) -> AgentResult<QueueDirectories> {
-    let root_existed = fs::symlink_metadata(root).is_ok();
-    create_private_directory(root, "queue directory", true, true)?;
-    if !root_existed {
-        if let Some(parent) = root.parent().filter(|path| !path.as_os_str().is_empty()) {
-            sync_directory(parent)?;
-        }
-    }
-    let directories = QueueDirectories::new(root);
-    for path in directories.all() {
-        create_private_directory(path, "queue state directory", true, true)?;
-    }
-    sync_directory(root)?;
-    Ok(directories)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct QueueDirectoryIdentity {
-    device: u64,
-    inode: u64,
-}
-
-fn queue_directory_identity(root: &Path) -> AgentResult<QueueDirectoryIdentity> {
-    let metadata = fs::symlink_metadata(root)
-        .map_err(|error| io_error("inspect queue directory", root, error))?;
-    let uid = unsafe { libc::getuid() };
-    if !metadata.file_type().is_dir() || metadata.uid() != uid {
-        return Err(AgentError::delivery(format!(
-            "unsafe queue directory: {}",
-            root.display()
-        )));
-    }
-    if metadata.permissions().mode() & 0o077 != 0 {
-        return Err(AgentError::delivery(format!(
-            "queue directory is not private: {}",
-            root.display()
-        )));
-    }
-    Ok(QueueDirectoryIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
-}
-
-fn verify_queue_lock(
-    root: &Path,
-    directory_identity: QueueDirectoryIdentity,
-    path: &Path,
-    lock: &File,
-    purpose: &str,
-) -> AgentResult<()> {
-    if queue_directory_identity(root)? != directory_identity {
-        return Err(AgentError::delivery(format!(
-            "queue directory changed while waiting for {purpose}: {}",
-            root.display()
-        )));
-    }
-    let current = fs::symlink_metadata(path)
-        .map_err(|error| io_error(&format!("inspect {purpose} after locking"), path, error))?;
-    let opened = lock
-        .metadata()
-        .map_err(|error| io_error(&format!("inspect {purpose} after locking"), path, error))?;
-    let uid = unsafe { libc::getuid() };
-    for metadata in [&current, &opened] {
-        if !metadata.file_type().is_file()
-            || metadata.uid() != uid
-            || metadata.permissions().mode() & 0o077 != 0
-        {
-            return Err(AgentError::delivery(format!(
-                "unsafe {purpose}: {}",
-                path.display()
-            )));
-        }
-    }
-    if (current.dev(), current.ino()) != (opened.dev(), opened.ino()) {
-        return Err(AgentError::delivery(format!(
-            "{purpose} changed while waiting: {}",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
-pub(crate) fn create_private_directory(
-    path: &Path,
-    purpose: &str,
-    recursive: bool,
-    tighten: bool,
-) -> AgentResult<()> {
-    let mut builder = DirBuilder::new();
-    builder.recursive(recursive).mode(0o700);
-    if let Err(error) = builder.create(path) {
-        if error.kind() != io::ErrorKind::AlreadyExists {
-            return Err(io_error(&format!("prepare {purpose}"), path, error));
-        }
-    }
-    validate_private_directory(path, purpose, tighten)
-}
-
-pub(crate) fn validate_private_directory(
-    path: &Path,
-    purpose: &str,
-    tighten: bool,
-) -> AgentResult<()> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| io_error(&format!("inspect {purpose}"), path, error))?;
-    let uid = unsafe { libc::getuid() };
-    if !metadata.file_type().is_dir() || metadata.uid() != uid {
-        return Err(AgentError::delivery(format!(
-            "unsafe {purpose}: {}",
-            path.display()
-        )));
-    }
-    if metadata.permissions().mode() & 0o077 != 0 {
-        if !tighten {
-            return Err(AgentError::delivery(format!(
-                "{purpose} is not private: {}",
-                path.display()
-            )));
-        }
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .map_err(|error| io_error(&format!("make {purpose} private"), path, error))?;
-    }
-    Ok(())
-}
-
-pub(crate) fn open_private_lock(path: &Path, purpose: &str) -> AgentResult<File> {
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|error| io_error(&format!("open {purpose}"), path, error))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| io_error(&format!("inspect {purpose}"), path, error))?;
-    let uid = unsafe { libc::getuid() };
-    if !metadata.file_type().is_file()
-        || metadata.uid() != uid
-        || metadata.permissions().mode() & 0o077 != 0
-    {
-        return Err(AgentError::delivery(format!(
-            "unsafe {purpose}: {}",
-            path.display()
-        )));
-    }
-    Ok(file)
-}
-
 fn binding(target: &Target) -> AgentResult<Value> {
     let expected_cwd = target
         .expected_cwd
@@ -2270,22 +1986,6 @@ fn validate_existing_binding(
     Ok(())
 }
 
-fn validate_existing_queue(root: &Path) -> AgentResult<()> {
-    match fs::symlink_metadata(root) {
-        Ok(_) => validate_private_directory(root, "queue directory", false)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(io_error("inspect queue directory", root, error)),
-    }
-    for directory in QueueDirectories::new(root).all() {
-        match fs::symlink_metadata(directory) {
-            Ok(_) => validate_private_directory(directory, "queue state directory", false)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(io_error("inspect queue state directory", directory, error)),
-        }
-    }
-    Ok(())
-}
-
 pub(crate) fn validate_target_authority(target: &Target) -> AgentResult<()> {
     let pane = target
         .pane_id
@@ -2542,7 +2242,7 @@ fn test_target_lock_root() -> PathBuf {
     }
     ROOT.get_or_init(|| {
         let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+            .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_nanos());
         let root = std::env::temp_dir().join(format!(
             "agentctl-test-target-locks-{}-{}-{nanos}",
@@ -2581,348 +2281,6 @@ pub(crate) fn lock_resolved_target_with_runtime<A: AgentApi + ?Sized>(
     Ok((lock, confirmed))
 }
 
-pub(crate) fn lock_exclusive_with_runtime(
-    lock: &File,
-    path: &Path,
-    purpose: &str,
-    runtime: &dyn AgentRuntime,
-) -> AgentResult<()> {
-    loop {
-        match FileExt::try_lock_exclusive(lock) {
-            Ok(()) => return Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if runtime.cancelled() {
-                    return Err(AgentError::delivery(format!(
-                        "cancelled while waiting to lock {purpose}: {}",
-                        path.display()
-                    )));
-                }
-                runtime.sleep(Duration::from_millis(10));
-            }
-            Err(error) => return Err(io_error(&format!("lock {purpose}"), path, error)),
-        }
-    }
-}
-
-pub(crate) fn atomic_json(path: &Path, value: &Value) -> AgentResult<()> {
-    let parent = path.parent().ok_or_else(|| {
-        AgentError::delivery(format!("JSON path has no parent: {}", path.display()))
-    })?;
-    let (temporary, mut file) = temporary_file(parent)?;
-    let write_result = (|| -> io::Result<()> {
-        {
-            let mut writer = BufWriter::new(&mut file);
-            serde_json::to_writer_pretty(&mut writer, value).map_err(io::Error::other)?;
-            writer.write_all(b"\n")?;
-            writer.flush()?;
-        }
-        file.sync_all()?;
-        fs::rename(&temporary, path)?;
-        sync_directory_io(parent)
-    })();
-    if write_result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    write_result.map_err(|error| io_error("write durable JSON", path, error))
-}
-
-pub(crate) fn atomic_temporary_name(name: &OsStr) -> bool {
-    let Some(name) = name.to_str() else {
-        return false;
-    };
-    let Some(suffix) = name.strip_prefix(".message.") else {
-        return false;
-    };
-    let Some((process, sequence)) = suffix.split_once('.') else {
-        return false;
-    };
-    !process.is_empty()
-        && !sequence.is_empty()
-        && process.bytes().all(|byte| byte.is_ascii_digit())
-        && sequence.bytes().all(|byte| byte.is_ascii_digit())
-}
-
-fn open_atomic_temporary_at(directory: &File, name: &OsStr) -> AgentResult<Option<File>> {
-    let name = CString::new(name.as_bytes())
-        .map_err(|_| AgentError::delivery("durable JSON temporary name contains NUL".to_owned()))?;
-    let descriptor = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-        )
-    };
-    if descriptor < 0 {
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::NotFound {
-            return Ok(None);
-        }
-        return Err(io_error(
-            "open durable JSON temporary without following links",
-            Path::new(name.to_str().unwrap_or("<non-UTF8>")),
-            error,
-        ));
-    }
-    Ok(Some(unsafe { File::from_raw_fd(descriptor) }))
-}
-
-fn validate_atomic_temporary(file: &File, path: &Path) -> AgentResult<()> {
-    let metadata = file
-        .metadata()
-        .map_err(|error| io_error("inspect durable JSON temporary", path, error))?;
-    let uid = unsafe { libc::geteuid() };
-    if !metadata.file_type().is_file()
-        || metadata.uid() != uid
-        || metadata.nlink() != 1
-        || metadata.permissions().mode() & 0o777 != 0o600
-    {
-        return Err(AgentError::delivery(format!(
-            "unsafe durable JSON temporary: {}",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
-/// Recognize one securely owned named temporary created by [`atomic_json`].
-pub(crate) fn is_atomic_json_temporary(path: &Path) -> AgentResult<bool> {
-    let Some(name) = path.file_name().filter(|name| atomic_temporary_name(name)) else {
-        return Ok(false);
-    };
-    let parent = path.parent().ok_or_else(|| {
-        AgentError::delivery(format!(
-            "durable JSON temporary has no parent: {}",
-            path.display()
-        ))
-    })?;
-    let directory = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(parent)
-        .map_err(|error| io_error("open durable JSON temporary directory", parent, error))?;
-    let Some(file) = open_atomic_temporary_at(&directory, name)? else {
-        return Ok(false);
-    };
-    validate_atomic_temporary(&file, path)?;
-    Ok(true)
-}
-
-/// Remove only securely recognized atomic-write residue and fsync the containing directory.
-///
-/// The containing state directory is private mode 0700 and the same UID is trusted. Linux has no
-/// inode-conditional unlink, so the held descriptor plus immediate `fstatat` identity comparison
-/// prevents traversal and accidental foreign-artifact removal but cannot defeat a malicious
-/// same-UID process that swaps the pathname after that comparison.
-pub(crate) fn cleanup_atomic_json_temporaries(directory: &Path) -> AgentResult<()> {
-    let directory_file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(directory)
-        .map_err(|error| io_error("open durable JSON temporary directory", directory, error))?;
-    let mut removed = false;
-    for entry in fs::read_dir(directory)
-        .map_err(|error| io_error("scan durable JSON temporaries", directory, error))?
-    {
-        let entry = entry
-            .map_err(|error| io_error("read durable JSON temporary entry", directory, error))?;
-        let name = entry.file_name();
-        if !atomic_temporary_name(&name) {
-            continue;
-        }
-        let Some(file) = open_atomic_temporary_at(&directory_file, &name)? else {
-            continue;
-        };
-        validate_atomic_temporary(&file, &entry.path())?;
-        let metadata = file
-            .metadata()
-            .map_err(|error| io_error("inspect durable JSON temporary", &entry.path(), error))?;
-        let name_c = CString::new(name.as_bytes()).map_err(|_| {
-            AgentError::delivery("durable JSON temporary name contains NUL".to_owned())
-        })?;
-        let mut current = std::mem::MaybeUninit::<libc::stat>::uninit();
-        let status = unsafe {
-            libc::fstatat(
-                directory_file.as_raw_fd(),
-                name_c.as_ptr(),
-                current.as_mut_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        };
-        if status < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::NotFound {
-                continue;
-            }
-            return Err(io_error(
-                "revalidate durable JSON temporary",
-                &entry.path(),
-                error,
-            ));
-        }
-        let current = unsafe { current.assume_init() };
-        if current.st_dev != metadata.dev() || current.st_ino != metadata.ino() {
-            return Err(AgentError::delivery(format!(
-                "durable JSON temporary changed before cleanup: {}",
-                entry.path().display()
-            )));
-        }
-        let status = unsafe { libc::unlinkat(directory_file.as_raw_fd(), name_c.as_ptr(), 0) };
-        if status < 0 {
-            return Err(io_error(
-                "remove durable JSON temporary",
-                &entry.path(),
-                io::Error::last_os_error(),
-            ));
-        }
-        removed = true;
-    }
-    if removed {
-        directory_file
-            .sync_all()
-            .map_err(|error| io_error("sync durable JSON temporary directory", directory, error))?;
-    }
-    Ok(())
-}
-
-fn atomic_json_create(path: &Path, value: &Value) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::other("JSON path has no parent"))?;
-    let (temporary, mut file) = temporary_file_io(parent)?;
-    let result = (|| {
-        {
-            let mut writer = BufWriter::new(&mut file);
-            serde_json::to_writer_pretty(&mut writer, value).map_err(io::Error::other)?;
-            writer.write_all(b"\n")?;
-            writer.flush()?;
-        }
-        file.sync_all()?;
-        fs::hard_link(&temporary, path)?;
-        fs::remove_file(&temporary)?;
-        sync_directory_io(parent)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
-}
-
-fn temporary_file(parent: &Path) -> AgentResult<(PathBuf, File)> {
-    temporary_file_io(parent)
-        .map_err(|error| io_error("create durable JSON temporary", parent, error))
-}
-
-fn temporary_file_io(parent: &Path) -> io::Result<(PathBuf, File)> {
-    for _ in 0..100 {
-        let path = parent.join(format!(
-            ".message.{}.{}",
-            std::process::id(),
-            TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        match OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(&path)
-        {
-            Ok(file) => return Ok((path, file)),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "could not allocate a unique JSON temporary file",
-    ))
-}
-
-fn read_json(path: &Path) -> AgentResult<Value> {
-    read_json_with_policy(path, false)
-}
-
-pub(crate) fn read_private_json(path: &Path) -> AgentResult<Value> {
-    read_json_with_policy(path, true)
-}
-
-fn read_json_with_policy(path: &Path, require_private: bool) -> AgentResult<Value> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|error| io_error("read JSON", path, error))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| io_error("inspect JSON", path, error))?;
-    if !metadata.file_type().is_file()
-        || metadata.uid() != unsafe { libc::getuid() }
-        || require_private && metadata.permissions().mode() & 0o077 != 0
-    {
-        return Err(AgentError::delivery(format!(
-            "unsafe JSON artifact: {}",
-            path.display()
-        )));
-    }
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)
-        .map_err(|error| io_error("read JSON", path, error))?;
-    serde_json::from_str(&contents).map_err(|error| {
-        AgentError::delivery(format!("cannot read JSON {}: {error}", path.display()))
-    })
-}
-
-fn load_message(path: &Path) -> AgentResult<Map<String, Value>> {
-    let value = read_json(path).map_err(|error| {
-        AgentError::delivery(format!(
-            "cannot read queued message {}: {error}",
-            path.display()
-        ))
-    })?;
-    let document = value.as_object().cloned().ok_or_else(|| {
-        AgentError::delivery(format!(
-            "queued message {} has no string text field",
-            path.display()
-        ))
-    })?;
-    if document
-        .get("text")
-        .and_then(Value::as_str)
-        .is_none_or(str::is_empty)
-    {
-        return Err(AgentError::delivery(format!(
-            "queued message {} must have a nonempty string text field",
-            path.display()
-        )));
-    }
-    if document.get("id").is_some_and(|value| !value.is_string()) {
-        return Err(AgentError::delivery(format!(
-            "queued message {} has a non-string id field",
-            path.display()
-        )));
-    }
-    Ok(document)
-}
-
-fn delivery_attempts(document: &Map<String, Value>, path: &Path) -> AgentResult<u64> {
-    let (key, value) = if let Some(value) = document.get("delivery_attempts") {
-        ("delivery_attempts", Some(value))
-    } else {
-        (
-            "tui_delivery_attempts",
-            document.get("tui_delivery_attempts"),
-        )
-    };
-    match value {
-        None => Ok(0),
-        Some(value) => value.as_u64().ok_or_else(|| {
-            AgentError::delivery(format!(
-                "queued message {} has an invalid nonnegative integer {key} field",
-                path.display()
-            ))
-        }),
-    }
-}
-
 /// The text a drain types for a queued message: its stored text, except that a chat request prompt
 /// that recorded its message's create time gets its opening decided now. See `prompt_time`.
 fn typed_text(document: &Map<String, Value>) -> AgentResult<String> {
@@ -2945,212 +2303,122 @@ fn message_text(document: &Map<String, Value>) -> AgentResult<String> {
         .ok_or_else(|| AgentError::delivery("queued message has no string text field"))
 }
 
-fn transition(source: &Path, destination: &Path) -> AgentResult<()> {
-    match fs::symlink_metadata(destination) {
-        Ok(_) => {
-            return Err(AgentError::delivery(format!(
-                "refusing to replace durable queue artifact {}",
-                destination.display()
-            )))
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(io_error(
-                "inspect durable queue destination",
-                destination,
-                error,
-            ))
-        }
-    }
-    fs::rename(source, destination)
-        .map_err(|error| io_error("transition durable queue artifact", source, error))?;
-    let destination_parent = destination.parent().expect("queue destination has parent");
-    sync_directory(destination_parent)?;
-    let source_parent = source.parent().expect("queue source has parent");
-    if source_parent != destination_parent {
-        sync_directory(source_parent)?;
-    }
-    Ok(())
-}
+// The queue format, its file primitives and the queue reads and moves every drainer shares live in
+// the agent-queue crate; these keep this module's error type and runtime for its callers.
 
-fn failed_metadata(failed_path: &Path, outcome: &str, error: &str) -> AgentResult<()> {
-    let filename = failed_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| AgentError::delivery("failed artifact name is not valid UTF-8"))?;
-    atomic_json(
-        &failed_path.with_file_name(format!("{filename}.error")),
-        &json!({
-            "artifact": filename,
-            "outcome": outcome,
-            "error": error,
-            "failed_at": unix_seconds(),
-        }),
-    )
-}
-
-fn quarantine_raw(path: &Path, failed: &Path, outcome: &str, error: &str) -> AgentResult<String> {
-    let filename = path.file_name().ok_or_else(|| {
-        AgentError::delivery(format!(
-            "queued message has no filename: {}",
-            path.display()
-        ))
-    })?;
-    let destination = failed.join(filename);
-    transition(path, &destination)?;
-    failed_metadata(&destination, outcome, error)?;
-    message_id_from_path(path)
-}
-
-fn recover_inflight(directories: &QueueDirectories) -> AgentResult<Vec<String>> {
-    let mut recovered = Vec::new();
-    for path in json_paths(&directories.inflight)? {
-        let filename = path.file_name().expect("listed path has filename");
-        let destination = directories.failed.join(filename);
-        transition(&path, &destination)?;
-        failed_metadata(
-            &destination,
-            "possibly_submitted",
-            "recovered an inflight prompt after process restart; refusing automatic resubmission",
-        )?;
-        recovered.push(message_id_from_path(&path)?);
-    }
-    Ok(recovered)
-}
-
-fn json_paths(directory: &Path) -> AgentResult<Vec<PathBuf>> {
-    let entries = fs::read_dir(directory)
-        .map_err(|error| io_error("list durable queue directory", directory, error))?;
-    let mut paths = Vec::new();
-    for entry in entries {
-        let entry = entry
-            .map_err(|error| io_error("read durable queue directory entry", directory, error))?;
-        if entry
-            .file_name()
-            .to_str()
-            .is_some_and(|name| name.ends_with(".json"))
-        {
-            paths.push(entry.path());
-        }
-    }
-    paths.sort();
-    Ok(paths)
-}
-
-/// The inbox's prompts in the order they were queued: by `queued_at`, then by file name.
-///
-/// A chat request's file is named for its key, a hash, so name order alone is not the order of
-/// arrival. An entry without a numeric `queued_at` comes first, by name: one in the subagent
-/// message shape, which numbers its file names in sequence and records `queued_at` as text, if
-/// at all, or one that cannot be read, which the drain loop then quarantines.
-fn inbox_in_queue_order(inbox: &Path) -> AgentResult<Vec<PathBuf>> {
-    let mut entries: Vec<(Option<f64>, PathBuf)> = json_paths(inbox)?
-        .into_iter()
-        .map(|path| {
-            let queued_at = read_json(&path)
-                .ok()
-                .and_then(|document| document.get("queued_at").and_then(Value::as_f64))
-                // `total_cmp` puts -0.0 before 0.0; make them one time, as Python does.
-                .map(|seconds| if seconds == 0.0 { 0.0 } else { seconds });
-            (queued_at, path)
-        })
-        .collect();
-    entries.sort_by(|(left_at, left), (right_at, right)| {
-        match (left_at, right_at) {
-            (Some(left_time), Some(right_time)) => left_time.total_cmp(right_time),
-            _ => left_at.is_some().cmp(&right_at.is_some()),
-        }
-        .then_with(|| left.cmp(right))
-    });
-    Ok(entries.into_iter().map(|(_, path)| path).collect())
-}
-
-fn identifiers(directory: &Path) -> AgentResult<Vec<String>> {
-    json_paths(directory)?
-        .iter()
-        .map(|path| message_id_from_path(path))
-        .collect()
-}
-
-fn identifiers_if_directory(directory: &Path) -> AgentResult<Vec<String>> {
-    match fs::symlink_metadata(directory) {
-        Ok(metadata) if metadata.file_type().is_dir() => identifiers(directory),
-        Ok(_) => Err(AgentError::delivery(format!(
-            "unsafe queue state directory: {}",
-            directory.display()
-        ))),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(error) => Err(io_error("inspect queue state directory", directory, error)),
+impl From<agent_queue::Error> for AgentError {
+    fn from(error: agent_queue::Error) -> Self {
+        Self::Delivery(error.to_string())
     }
 }
 
-fn message_id_from_path(path: &Path) -> AgentResult<String> {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .and_then(|name| name.strip_suffix(".json"))
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            AgentError::delivery(format!(
-                "queued message name is not valid UTF-8 JSON: {}",
-                path.display()
-            ))
-        })
+/// Waits for a queue lock through an agent runtime's clock and cancellation.
+struct RuntimeWaiter<'a>(&'a dyn AgentRuntime);
+
+impl Waiter for RuntimeWaiter<'_> {
+    fn cancelled(&self) -> bool {
+        self.0.cancelled()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        self.0.sleep(duration);
+    }
+}
+
+fn prepare(root: &Path) -> AgentResult<QueueDirectories> {
+    Ok(agent_queue::queue::prepare(root)?)
+}
+
+fn queue_directory_identity(root: &Path) -> AgentResult<QueueDirectoryIdentity> {
+    Ok(agent_queue::queue::directory_identity(root)?)
+}
+
+fn verify_queue_lock(
+    root: &Path,
+    directory_identity: QueueDirectoryIdentity,
+    path: &Path,
+    lock: &File,
+    purpose: &str,
+) -> AgentResult<()> {
+    Ok(agent_queue::queue::verify_queue_lock(
+        root,
+        directory_identity,
+        path,
+        lock,
+        purpose,
+    )?)
+}
+
+fn validate_existing_queue(root: &Path) -> AgentResult<()> {
+    Ok(agent_queue::queue::validate_existing_queue(root)?)
+}
+
+pub(crate) fn create_private_directory(
+    path: &Path,
+    purpose: &str,
+    recursive: bool,
+    tighten: bool,
+) -> AgentResult<()> {
+    Ok(agent_queue::fsio::create_private_directory(
+        path, purpose, recursive, tighten,
+    )?)
+}
+
+pub(crate) fn validate_private_directory(
+    path: &Path,
+    purpose: &str,
+    tighten: bool,
+) -> AgentResult<()> {
+    Ok(agent_queue::fsio::validate_private_directory(
+        path, purpose, tighten,
+    )?)
+}
+
+pub(crate) fn open_private_lock(path: &Path, purpose: &str) -> AgentResult<File> {
+    Ok(agent_queue::fsio::open_private_lock(path, purpose)?)
+}
+
+pub(crate) fn lock_exclusive_with_runtime(
+    lock: &File,
+    path: &Path,
+    purpose: &str,
+    runtime: &dyn AgentRuntime,
+) -> AgentResult<()> {
+    Ok(agent_queue::fsio::lock_exclusive(
+        lock,
+        path,
+        purpose,
+        &RuntimeWaiter(runtime),
+    )?)
+}
+
+pub(crate) fn atomic_json(path: &Path, value: &Value) -> AgentResult<()> {
+    Ok(agent_queue::fsio::atomic_json(path, value)?)
+}
+
+/// Recognize one securely owned named temporary created by [`atomic_json`].
+pub(crate) fn is_atomic_json_temporary(path: &Path) -> AgentResult<bool> {
+    Ok(agent_queue::fsio::is_atomic_json_temporary(path)?)
+}
+
+/// Remove only securely recognized atomic-write residue and fsync the containing directory.
+pub(crate) fn cleanup_atomic_json_temporaries(directory: &Path) -> AgentResult<()> {
+    Ok(agent_queue::fsio::cleanup_atomic_json_temporaries(
+        directory,
+    )?)
+}
+
+#[cfg(test)]
+fn read_json(path: &Path) -> AgentResult<Value> {
+    Ok(agent_queue::fsio::read_json(path)?)
+}
+
+pub(crate) fn read_private_json(path: &Path) -> AgentResult<Value> {
+    Ok(agent_queue::fsio::read_private_json(path)?)
 }
 
 pub(crate) fn sync_directory(path: &Path) -> AgentResult<()> {
-    sync_directory_io(path).map_err(|error| io_error("sync durable queue directory", path, error))
-}
-
-/// A test's hook for [`DIRECTORY_SYNC_HOOK`].
-#[cfg(test)]
-pub(crate) type DirectorySyncHook = Box<dyn FnMut(&Path) -> io::Result<()>>;
-
-#[cfg(test)]
-thread_local! {
-    /// Called on this thread with each directory just before it is synced, so a test can record
-    /// the syncs or make one fail.
-    pub(crate) static DIRECTORY_SYNC_HOOK: std::cell::RefCell<Option<DirectorySyncHook>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-fn sync_directory_io(path: &Path) -> io::Result<()> {
-    #[cfg(test)]
-    DIRECTORY_SYNC_HOOK
-        .with(|hook| hook.borrow_mut().as_mut().map_or(Ok(()), |hook| hook(path)))?;
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)?
-        .sync_all()
-}
-
-fn validate_message_id(identifier: &str) -> AgentResult<()> {
-    let bytes = identifier.as_bytes();
-    let first_ok = bytes.first().is_some_and(u8::is_ascii_alphanumeric);
-    let rest_ok = bytes
-        .iter()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
-    if !first_ok || !rest_ok || bytes.len() > MESSAGE_ID_MAX {
-        return Err(AgentError::delivery(
-            "message id must be 1-255 ASCII letters, digits, dots, underscores, or hyphens and must start with a letter or digit",
-        ));
-    }
-    Ok(())
-}
-
-fn generated_message_id() -> String {
-    let nanoseconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{nanoseconds:020}-{}", std::process::id())
-}
-
-fn unix_seconds() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
+    Ok(agent_queue::fsio::sync_directory(path)?)
 }
 
 fn real_path(path: &Path) -> AgentResult<PathBuf> {

@@ -3,8 +3,10 @@
 //! Herdr owns protocol negotiation and terminal processes. This adapter starts no
 //! server and has no shell executor, broker, or allowlist dependency.
 use crate::error::{AdapterError, Result};
+use agent_queue::identity::{LiveProcess as LiveCustomProcess, ProcessStat as LinuxProcessStat};
+pub use agent_queue::identity::{ProcessIdentity as CustomProcessIdentity, ProcessLiveness};
 use chat_subscription_plugin::process::ProcessPluginChild;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{CStr, OsString};
@@ -27,7 +29,6 @@ const CONTROL_STDERR_BYTES: usize = 64 * 1024;
 const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CAPTURE_READ_BURST: usize = 256 * 1024;
 const PROC_STAT_BYTES: usize = 8 * 1024;
-const BOOT_ID_BYTES: usize = 128;
 const SUPPORTED_PANE_SHELLS: [&str; 6] = ["bash", "zsh", "sh", "dash", "fish", "ksh"];
 const MAX_SHELL_TASKS: usize = 4096;
 const MAX_CHILDREN_BYTES: usize = 64 * 1024;
@@ -35,46 +36,6 @@ const MAX_PROC_ENTRIES: usize = 1024 * 1024;
 #[cfg(all(test, target_os = "linux"))]
 static POLL_CAPTURE_INTERRUPTS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
-
-/// Durable identity of one pane-owned process generation.
-///
-/// A pathname is deliberately absent: package upgrades may atomically replace the
-/// installed image while the old process remains alive. The boot/start tuple binds
-/// the PID, while device/inode binds the executable image that Linux actually ran.
-/// Each observation holds a pidfd so PID reuse cannot interleave its `/proc` reads.
-/// Across separate invocations, Linux exposes no persistent handle in this schema;
-/// reuse of the same PID by the same executable within one scheduler tick remains a
-/// theoretical ambiguity. The identity is used only alongside pane and terminal-state
-/// checks; it never independently authorizes a signal to the PID.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CustomProcessIdentity {
-    /// Identity schema version.
-    pub version: u32,
-    /// Canonical Linux boot UUID.
-    pub boot_id: String,
-    /// Positive Linux process identifier.
-    pub pid: u64,
-    /// Field 22 from `/proc/PID/stat`.
-    pub starttime_ticks: u64,
-    /// Device number of the opened executable image.
-    pub executable_device: u64,
-    /// Inode number of the opened executable image.
-    pub executable_inode: u64,
-}
-
-/// Whether a recorded local process can still be the same kernel generation.
-///
-/// This classification never independently authorizes input or a signal.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProcessLiveness {
-    /// A coherent process generation and executable image match the record.
-    Alive,
-    /// The kernel positively establishes that the recorded generation is gone.
-    Dead,
-    /// The probe failed, changed during observation, or found a different live image.
-    Unknown,
-}
 
 /// Exact supported idle-shell process generation and kernel executable path.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -85,30 +46,12 @@ pub struct PaneShellProof {
     pub executable_path: PathBuf,
 }
 
-impl CustomProcessIdentity {
-    pub(crate) fn valid(&self) -> bool {
-        self.version == 1
-            && canonical_boot_uuid(&self.boot_id)
-            && (1..=i32::MAX as u64).contains(&self.pid)
-            && self.starttime_ticks > 0
-            && self.executable_device > 0
-            && self.executable_inode > 0
-    }
-}
-
 #[derive(Debug)]
 struct PinnedHarnessExecutable {
     path: PathBuf,
     _image: File,
     device: u64,
     inode: u64,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-struct LiveCustomProcess {
-    identity: CustomProcessIdentity,
-    process_group_id: u64,
-    executable_path: PathBuf,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -216,17 +159,6 @@ fn slot_boxed_shell(state: &PaneProcessState) -> bool {
             .is_ok_and(|cgroup| cgroup.contains("wrkslots"))
 }
 
-fn canonical_boot_uuid(value: &str) -> bool {
-    value.len() == 36
-        && value.bytes().enumerate().all(|(index, byte)| {
-            if matches!(index, 8 | 13 | 18 | 23) {
-                byte == b'-'
-            } else {
-                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
-            }
-        })
-}
-
 fn bounded_file(path: &Path, limit: usize, label: &str) -> Result<Vec<u8>> {
     let value = fs::read(path).map_err(|error| {
         AdapterError::unavailable(format!("cannot read {label} {}: {error}", path.display()))
@@ -240,423 +172,19 @@ fn bounded_file(path: &Path, limit: usize, label: &str) -> Result<Vec<u8>> {
     Ok(value)
 }
 
-fn current_boot_uuid() -> Result<String> {
-    let path = Path::new("/proc/sys/kernel/random/boot_id");
-    let value = bounded_file(path, BOOT_ID_BYTES, "boot identity")?;
-    let value = std::str::from_utf8(&value)
-        .map_err(|_| AdapterError::unavailable("Linux boot identity is not UTF-8"))?
-        .trim();
-    if !canonical_boot_uuid(value) {
-        return Err(AdapterError::unavailable(
-            "Linux boot identity is not a canonical UUID",
-        ));
-    }
-    Ok(value.to_owned())
-}
+// Process identity, liveness and `/proc/PID/stat` parsing live in the agent-queue crate, shared
+// with programs that never talk to Herdr; these keep this module's error type.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct LinuxProcessStat {
-    state: u8,
-    parent_pid: u64,
-    process_group_id: u64,
-    starttime_ticks: u64,
-}
-
-fn linux_process_state(state: u8) -> bool {
-    matches!(
-        state,
-        b'R' | b'S' | b'D' | b'Z' | b'T' | b't' | b'X' | b'x' | b'K' | b'W' | b'P' | b'I'
-    )
+fn identity_error(error: agent_queue::Error) -> AdapterError {
+    AdapterError::unavailable(error.to_string())
 }
 
 fn parse_process_stat(value: &[u8], expected_pid: u64) -> Result<LinuxProcessStat> {
-    let bad =
-        || AdapterError::unavailable(format!("cannot parse process stat for pid {expected_pid}"));
-    let opening = value
-        .windows(2)
-        .position(|window| window == b" (")
-        .ok_or_else(bad)?;
-    let close = value
-        .iter()
-        .rposition(|byte| *byte == b')')
-        .filter(|close| *close > opening + 1)
-        .ok_or_else(bad)?;
-    let state = match value.get(close + 1..close + 4) {
-        Some([b' ', state, b' ']) if linux_process_state(*state) => *state,
-        _ => return Err(bad()),
-    };
-    let recorded_pid = std::str::from_utf8(&value[..opening])
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value == expected_pid)
-        .ok_or_else(|| {
-            AdapterError::unavailable(format!(
-                "process stat identity changed for pid {expected_pid}"
-            ))
-        })?;
-    debug_assert_eq!(recorded_pid, expected_pid);
-    let fields = value[close + 2..]
-        .split(|byte| byte.is_ascii_whitespace())
-        .filter(|field| !field.is_empty())
-        .collect::<Vec<_>>();
-    if fields.len() <= 19 {
-        return Err(bad());
-    }
-    let number = |field: &[u8]| {
-        std::str::from_utf8(field)
-            .ok()
-            .and_then(|field| field.parse::<u64>().ok())
-            .ok_or_else(bad)
-    };
-    Ok(LinuxProcessStat {
-        state,
-        parent_pid: number(fields[1])?,
-        process_group_id: number(fields[2])?,
-        starttime_ticks: number(fields[19])?,
-    })
+    agent_queue::identity::parse_process_stat(value, expected_pid).map_err(identity_error)
 }
 
-fn process_stat(pid: u64) -> Result<(u64, u64)> {
-    let path = PathBuf::from(format!("/proc/{pid}/stat"));
-    let value = bounded_file(&path, PROC_STAT_BYTES, "process stat")?;
-    let stat = parse_process_stat(&value, pid)?;
-    if stat.state == b'Z' {
-        return Err(AdapterError::unavailable(format!(
-            "process stat for pid {pid} is incomplete or exited"
-        )));
-    }
-    let process_group_id = Some(stat.process_group_id)
-        .filter(|value| *value > 0 && *value <= i32::MAX as u64)
-        .ok_or_else(|| {
-            AdapterError::unavailable(format!("process group is invalid for pid {pid}"))
-        })?;
-    let starttime_ticks = Some(stat.starttime_ticks)
-        .filter(|value| *value > 0)
-        .ok_or_else(|| {
-            AdapterError::unavailable(format!("process start time is invalid for pid {pid}"))
-        })?;
-    Ok((process_group_id, starttime_ticks))
-}
-
-#[cfg(target_os = "linux")]
-fn open_pidfd_raw(pid: u64) -> io::Result<OwnedFd> {
-    let pid = libc::pid_t::try_from(pid)
-        .ok()
-        .filter(|value| *value > 0)
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "custom process id is invalid")
-        })?;
-    for _attempt in 0..4 {
-        // SAFETY: pidfd_open receives a checked positive pid and no pointer arguments.
-        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-        if descriptor >= 0 {
-            // SAFETY: pidfd_open returned a new descriptor owned by this call.
-            return Ok(unsafe { OwnedFd::from_raw_fd(descriptor as i32) });
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::Interrupted,
-        "pidfd_open interrupted repeatedly",
-    ))
-}
-
-#[cfg(target_os = "linux")]
-fn open_pidfd(pid: u64) -> Result<OwnedFd> {
-    open_pidfd_raw(pid).map_err(|error| {
-        AdapterError::unavailable(format!("cannot pin custom process {pid}: {error}"))
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn pidfd_exited(pidfd: &OwnedFd) -> Result<bool> {
-    for _attempt in 0..4 {
-        let mut descriptor = libc::pollfd {
-            fd: pidfd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: descriptor points to one initialized pollfd for this call.
-        let status = unsafe { libc::poll(&mut descriptor, 1, 0) };
-        if status == 0 && descriptor.revents == 0 {
-            return Ok(false);
-        }
-        if status < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-            continue;
-        }
-        if status == 1
-            && descriptor.revents & libc::POLLIN != 0
-            && descriptor.revents & !(libc::POLLIN | libc::POLLHUP) == 0
-        {
-            return Ok(true);
-        }
-        return Err(AdapterError::unavailable(
-            "cannot establish a valid pidfd exit indication",
-        ));
-    }
-    Err(AdapterError::unavailable(
-        "pidfd inspection interrupted repeatedly",
-    ))
-}
-
-#[cfg(target_os = "linux")]
-trait ProcessLivenessProbe {
-    type Handle;
-
-    fn boot_identity(&mut self) -> Result<String>;
-    fn pin(&mut self, pid: u64) -> io::Result<Self::Handle>;
-    fn exited(&mut self, handle: &Self::Handle) -> Result<bool>;
-    fn process_stat(&mut self, pid: u64) -> Result<LinuxProcessStat>;
-    fn executable_identity(&mut self, pid: u64) -> Result<(u64, u64)>;
-}
-
-#[cfg(target_os = "linux")]
-struct KernelProcessLivenessProbe;
-
-#[cfg(target_os = "linux")]
-impl ProcessLivenessProbe for KernelProcessLivenessProbe {
-    type Handle = OwnedFd;
-
-    fn boot_identity(&mut self) -> Result<String> {
-        current_boot_uuid()
-    }
-
-    fn pin(&mut self, pid: u64) -> io::Result<OwnedFd> {
-        open_pidfd_raw(pid)
-    }
-
-    fn exited(&mut self, handle: &OwnedFd) -> Result<bool> {
-        pidfd_exited(handle)
-    }
-
-    fn process_stat(&mut self, pid: u64) -> Result<LinuxProcessStat> {
-        let path = PathBuf::from(format!("/proc/{pid}/stat"));
-        let value = bounded_file(&path, PROC_STAT_BYTES, "process stat")?;
-        let stat = parse_process_stat(&value, pid)?;
-        if stat.starttime_ticks == 0
-            || stat.parent_pid > i32::MAX as u64
-            || stat.process_group_id > i32::MAX as u64
-        {
-            return Err(AdapterError::unavailable(
-                "invalid Linux process generation",
-            ));
-        }
-        Ok(stat)
-    }
-
-    fn executable_identity(&mut self, pid: u64) -> Result<(u64, u64)> {
-        executable_identity(pid)
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn process_liveness_with_probe<P: ProcessLivenessProbe>(
-    expected: &CustomProcessIdentity,
-    probe: &mut P,
-) -> ProcessLiveness {
-    fn inspect<P: ProcessLivenessProbe>(
-        expected: &CustomProcessIdentity,
-        probe: &mut P,
-    ) -> Result<ProcessLiveness> {
-        let boot = probe.boot_identity()?;
-        if !canonical_boot_uuid(&boot) {
-            return Ok(ProcessLiveness::Unknown);
-        }
-        let stable_boot = |probe: &mut P| {
-            probe
-                .boot_identity()
-                .map(|after| canonical_boot_uuid(&after) && after == boot)
-        };
-        if boot != expected.boot_id {
-            return Ok(if stable_boot(probe)? {
-                ProcessLiveness::Dead
-            } else {
-                ProcessLiveness::Unknown
-            });
-        }
-        let handle = match probe.pin(expected.pid) {
-            Ok(handle) => handle,
-            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
-                return Ok(if stable_boot(probe)? {
-                    ProcessLiveness::Dead
-                } else {
-                    ProcessLiveness::Unknown
-                });
-            }
-            Err(_) => return Ok(ProcessLiveness::Unknown),
-        };
-        if probe.exited(&handle)? {
-            return Ok(if stable_boot(probe)? {
-                ProcessLiveness::Dead
-            } else {
-                ProcessLiveness::Unknown
-            });
-        }
-        let first = probe.process_stat(expected.pid)?;
-        if first.starttime_ticks == 0 || !linux_process_state(first.state) {
-            return Ok(ProcessLiveness::Unknown);
-        }
-        let dead_state = |state| matches!(state, b'Z' | b'X' | b'x');
-        if first.starttime_ticks != expected.starttime_ticks || dead_state(first.state) {
-            let second = probe.process_stat(expected.pid)?;
-            if second.starttime_ticks == 0 || !linux_process_state(second.state) {
-                return Ok(ProcessLiveness::Unknown);
-            }
-            let stable_boot = stable_boot(probe)?;
-            probe.exited(&handle)?;
-            return Ok(
-                if stable_boot
-                    && first.starttime_ticks == second.starttime_ticks
-                    && (first.starttime_ticks != expected.starttime_ticks
-                        || dead_state(second.state))
-                {
-                    ProcessLiveness::Dead
-                } else {
-                    ProcessLiveness::Unknown
-                },
-            );
-        }
-        let image_before = probe.executable_identity(expected.pid)?;
-        let second = probe.process_stat(expected.pid)?;
-        if second.starttime_ticks == 0 || !linux_process_state(second.state) {
-            return Ok(ProcessLiveness::Unknown);
-        }
-        let image_after = probe.executable_identity(expected.pid)?;
-        let stable_boot = stable_boot(probe)?;
-        let exited = probe.exited(&handle)?;
-        if !stable_boot
-            || first.starttime_ticks != second.starttime_ticks
-            || image_before != image_after
-        {
-            return Ok(ProcessLiveness::Unknown);
-        }
-        if exited {
-            return Ok(ProcessLiveness::Dead);
-        }
-        Ok(
-            if !dead_state(second.state)
-                && image_before == (expected.executable_device, expected.executable_inode)
-            {
-                ProcessLiveness::Alive
-            } else {
-                ProcessLiveness::Unknown
-            },
-        )
-    }
-
-    if !expected.valid() {
-        return ProcessLiveness::Unknown;
-    }
-    inspect(expected, probe).unwrap_or(ProcessLiveness::Unknown)
-}
-
-#[cfg(target_os = "linux")]
-fn require_live_pidfd(pidfd: &OwnedFd, pid: u64) -> Result<()> {
-    let mut descriptor = libc::pollfd {
-        fd: pidfd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    loop {
-        // SAFETY: descriptor points to one initialized pollfd for the duration of this call.
-        let status = unsafe { libc::poll(&mut descriptor, 1, 0) };
-        if status == 0 && descriptor.revents == 0 {
-            return Ok(());
-        }
-        if status < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-            continue;
-        }
-        if status < 0 {
-            return Err(AdapterError::unavailable(format!(
-                "cannot inspect pinned custom process {pid}: {}",
-                io::Error::last_os_error()
-            )));
-        }
-        return Err(AdapterError::unavailable(format!(
-            "custom process {pid} exited while its identity was inspected"
-        )));
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn executable_identity(pid: u64) -> Result<(u64, u64)> {
-    let path = PathBuf::from(format!("/proc/{pid}/exe"));
-    let image = File::open(&path).map_err(|error| {
-        AdapterError::unavailable(format!(
-            "cannot open executable image for custom process {pid}: {error}"
-        ))
-    })?;
-    let metadata = image.metadata().map_err(|error| {
-        AdapterError::unavailable(format!(
-            "cannot inspect executable image for custom process {pid}: {error}"
-        ))
-    })?;
-    if !metadata.is_file() || metadata.dev() == 0 || metadata.ino() == 0 {
-        return Err(AdapterError::unavailable(format!(
-            "custom process {pid} has an invalid executable image"
-        )));
-    }
-    Ok((metadata.dev(), metadata.ino()))
-}
-
-#[cfg(target_os = "linux")]
 fn live_custom_process(pid: u64) -> Result<LiveCustomProcess> {
-    if !(1..=i32::MAX as u64).contains(&pid) {
-        return Err(AdapterError::unavailable(
-            "custom process id is not a positive Linux process id",
-        ));
-    }
-    let pidfd = open_pidfd(pid)?;
-    require_live_pidfd(&pidfd, pid)?;
-    let boot_before = current_boot_uuid()?;
-    let stat_before = process_stat(pid)?;
-    let executable_path = PathBuf::from(format!("/proc/{pid}/exe"));
-    let executable_path_before = fs::read_link(&executable_path).map_err(|error| {
-        AdapterError::unavailable(format!(
-            "cannot read executable path for custom process {pid}: {error}"
-        ))
-    })?;
-    let executable_before = executable_identity(pid)?;
-    let stat_after = process_stat(pid)?;
-    let executable_after = executable_identity(pid)?;
-    let executable_path_after = fs::read_link(&executable_path).map_err(|error| {
-        AdapterError::unavailable(format!(
-            "cannot reread executable path for custom process {pid}: {error}"
-        ))
-    })?;
-    let boot_after = current_boot_uuid()?;
-    require_live_pidfd(&pidfd, pid)?;
-    if boot_before != boot_after
-        || stat_before != stat_after
-        || executable_before != executable_after
-        || executable_path_before != executable_path_after
-    {
-        return Err(AdapterError::unavailable(format!(
-            "custom process {pid} identity changed while it was inspected"
-        )));
-    }
-    Ok(LiveCustomProcess {
-        identity: CustomProcessIdentity {
-            version: 1,
-            boot_id: boot_before,
-            pid,
-            starttime_ticks: stat_before.1,
-            executable_device: executable_before.0,
-            executable_inode: executable_before.1,
-        },
-        process_group_id: stat_before.0,
-        executable_path: executable_path_before,
-    })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn live_custom_process(_pid: u64) -> Result<LiveCustomProcess> {
-    Err(AdapterError::unavailable(
-        "custom process identity requires Linux pidfds and procfs",
-    ))
+    agent_queue::identity::observe(pid).map_err(identity_error)
 }
 
 fn supported_shell_name(path: &Path) -> bool {
@@ -2776,15 +2304,7 @@ impl HerdrClient {
     /// establishes death. A different live executable image remains unknown. This
     /// proof does not authorize input or a signal without separate pane ownership.
     pub fn process_liveness(&self, expected: &CustomProcessIdentity) -> ProcessLiveness {
-        #[cfg(target_os = "linux")]
-        {
-            process_liveness_with_probe(expected, &mut KernelProcessLivenessProbe)
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = expected;
-            ProcessLiveness::Unknown
-        }
+        agent_queue::identity::liveness(expected)
     }
 
     /// Pin the pane's foreground process-group leader, the harness Herdr detected.
@@ -3471,119 +2991,6 @@ mod tests {
     static SIGNAL_FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[cfg(target_os = "linux")]
-    #[derive(Debug)]
-    enum LivenessReply {
-        Boot(Result<String>),
-        Pin(io::Result<()>),
-        Exited(Result<bool>),
-        Stat(Result<LinuxProcessStat>),
-        Image(Result<(u64, u64)>),
-    }
-
-    #[cfg(target_os = "linux")]
-    struct ScriptedLivenessProbe(std::collections::VecDeque<LivenessReply>);
-
-    #[cfg(target_os = "linux")]
-    impl ScriptedLivenessProbe {
-        fn next(&mut self) -> LivenessReply {
-            self.0.pop_front().expect("unexpected liveness probe call")
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    impl ProcessLivenessProbe for ScriptedLivenessProbe {
-        type Handle = ();
-
-        fn boot_identity(&mut self) -> Result<String> {
-            match self.next() {
-                LivenessReply::Boot(value) => value,
-                reply => panic!("expected boot probe, got {reply:?}"),
-            }
-        }
-
-        fn pin(&mut self, pid: u64) -> io::Result<()> {
-            assert_eq!(pid, 4242);
-            match self.next() {
-                LivenessReply::Pin(value) => value,
-                reply => panic!("expected pidfd_open, got {reply:?}"),
-            }
-        }
-
-        fn exited(&mut self, _: &()) -> Result<bool> {
-            match self.next() {
-                LivenessReply::Exited(value) => value,
-                reply => panic!("expected pidfd poll, got {reply:?}"),
-            }
-        }
-
-        fn process_stat(&mut self, pid: u64) -> Result<LinuxProcessStat> {
-            assert_eq!(pid, 4242);
-            match self.next() {
-                LivenessReply::Stat(value) => value,
-                reply => panic!("expected stat probe, got {reply:?}"),
-            }
-        }
-
-        fn executable_identity(&mut self, pid: u64) -> Result<(u64, u64)> {
-            assert_eq!(pid, 4242);
-            match self.next() {
-                LivenessReply::Image(value) => value,
-                reply => panic!("expected image probe, got {reply:?}"),
-            }
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn liveness_record() -> CustomProcessIdentity {
-        CustomProcessIdentity {
-            version: 1,
-            boot_id: "00000000-0000-0000-0000-000000000000".to_owned(),
-            pid: 4242,
-            starttime_ticks: 99,
-            executable_device: 10,
-            executable_inode: 11,
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn liveness_stat(state: u8, starttime_ticks: u64) -> LinuxProcessStat {
-        LinuxProcessStat {
-            state,
-            parent_pid: 1,
-            process_group_id: 4242,
-            starttime_ticks,
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn boot_reply() -> LivenessReply {
-        LivenessReply::Boot(Ok(liveness_record().boot_id))
-    }
-
-    #[cfg(target_os = "linux")]
-    fn alive_replies() -> Vec<LivenessReply> {
-        vec![
-            boot_reply(),
-            LivenessReply::Pin(Ok(())),
-            LivenessReply::Exited(Ok(false)),
-            LivenessReply::Stat(Ok(liveness_stat(b'S', 99))),
-            LivenessReply::Image(Ok((10, 11))),
-            LivenessReply::Stat(Ok(liveness_stat(b'R', 99))),
-            LivenessReply::Image(Ok((10, 11))),
-            boot_reply(),
-            LivenessReply::Exited(Ok(false)),
-        ]
-    }
-
-    #[cfg(target_os = "linux")]
-    fn inspect_script(
-        expected: &CustomProcessIdentity,
-        replies: Vec<LivenessReply>,
-    ) -> ProcessLiveness {
-        process_liveness_with_probe(expected, &mut ScriptedLivenessProbe(replies.into()))
-    }
-
-    #[cfg(target_os = "linux")]
     #[test]
     fn process_liveness_tracks_a_real_child_before_and_after_kill() {
         let mut process = spawn_test_process(Path::new("/usr/bin/sleep"));
@@ -3594,7 +3001,7 @@ mod tests {
             herdr.client().process_liveness(&identity),
             ProcessLiveness::Alive
         );
-        let pinned = open_pidfd(pid).unwrap();
+        let pinned = agent_queue::identity::open_pidfd(pid).unwrap();
         process.0.kill().unwrap();
         let mut descriptor = libc::pollfd {
             fd: pinned.as_raw_fd(),
@@ -3617,211 +3024,6 @@ mod tests {
             !herdr.root.join("args").exists(),
             "liveness must not invoke Herdr"
         );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn process_liveness_requires_positive_generation_or_exit_evidence() {
-        let expected = liveness_record();
-        assert_eq!(
-            inspect_script(&expected, alive_replies()),
-            ProcessLiveness::Alive
-        );
-        assert_eq!(
-            inspect_script(
-                &expected,
-                vec![
-                    boot_reply(),
-                    LivenessReply::Pin(Err(io::Error::from_raw_os_error(libc::ESRCH))),
-                    boot_reply(),
-                ]
-            ),
-            ProcessLiveness::Dead
-        );
-        assert_eq!(
-            inspect_script(
-                &expected,
-                vec![
-                    boot_reply(),
-                    LivenessReply::Pin(Ok(())),
-                    LivenessReply::Exited(Ok(true)),
-                    boot_reply(),
-                ]
-            ),
-            ProcessLiveness::Dead
-        );
-        let mut old_boot = expected.clone();
-        old_boot.boot_id = "ffffffff-ffff-ffff-ffff-ffffffffffff".to_owned();
-        assert_eq!(
-            inspect_script(&old_boot, vec![boot_reply(), boot_reply()]),
-            ProcessLiveness::Dead
-        );
-        for (state, ticks) in [(b'S', 100), (b'Z', 99), (b'X', 99), (b'x', 99)] {
-            assert_eq!(
-                inspect_script(
-                    &expected,
-                    vec![
-                        boot_reply(),
-                        LivenessReply::Pin(Ok(())),
-                        LivenessReply::Exited(Ok(false)),
-                        LivenessReply::Stat(Ok(liveness_stat(state, ticks))),
-                        LivenessReply::Stat(Ok(liveness_stat(state, ticks))),
-                        boot_reply(),
-                        LivenessReply::Exited(Ok(false)),
-                    ]
-                ),
-                ProcessLiveness::Dead
-            );
-        }
-        for field in ["device", "inode"] {
-            let mut different_image = expected.clone();
-            if field == "device" {
-                different_image.executable_device += 1;
-            } else {
-                different_image.executable_inode += 1;
-            }
-            assert_eq!(
-                inspect_script(&different_image, alive_replies()),
-                ProcessLiveness::Unknown
-            );
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn process_liveness_keeps_failed_and_malformed_probes_unknown() {
-        let expected = liveness_record();
-        for errno in [
-            libc::EPERM,
-            libc::EACCES,
-            libc::ENOSYS,
-            libc::EINVAL,
-            libc::EIO,
-            libc::EINTR,
-        ] {
-            let mut replies = alive_replies();
-            replies[1] = LivenessReply::Pin(Err(io::Error::from_raw_os_error(errno)));
-            assert_eq!(inspect_script(&expected, replies), ProcessLiveness::Unknown);
-        }
-        for detail in [
-            "permission denied",
-            "I/O failure",
-            "missing proc file",
-            "malformed or oversized read",
-        ] {
-            for index in [0, 2, 3, 4, 5, 6, 7, 8] {
-                let mut replies = alive_replies();
-                let error = Err(AdapterError::unavailable(detail));
-                replies[index] = match index {
-                    0 | 7 => LivenessReply::Boot(error),
-                    2 | 8 => LivenessReply::Exited(Err(AdapterError::unavailable(detail))),
-                    3 | 5 => LivenessReply::Stat(Err(AdapterError::unavailable(detail))),
-                    4 | 6 => LivenessReply::Image(Err(AdapterError::unavailable(detail))),
-                    _ => unreachable!(),
-                };
-                assert_eq!(inspect_script(&expected, replies), ProcessLiveness::Unknown);
-            }
-        }
-        for boot in [String::new(), "invalid".to_owned(), "x".repeat(129)] {
-            assert_eq!(
-                inspect_script(&expected, vec![LivenessReply::Boot(Ok(boot))]),
-                ProcessLiveness::Unknown
-            );
-        }
-        for stat in [liveness_stat(b'S', 0), liveness_stat(b'?', 99)] {
-            let mut replies = alive_replies();
-            replies[3] = LivenessReply::Stat(Ok(stat));
-            assert_eq!(inspect_script(&expected, replies), ProcessLiveness::Unknown);
-        }
-        let mut invalid = expected.clone();
-        invalid.version = 0;
-        assert_eq!(inspect_script(&invalid, vec![]), ProcessLiveness::Unknown);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn process_liveness_refuses_changing_boot_stat_or_image_reads() {
-        let expected = liveness_record();
-        for (index, replacement) in [
-            (
-                7,
-                LivenessReply::Boot(Ok("ffffffff-ffff-ffff-ffff-ffffffffffff".to_owned())),
-            ),
-            (5, LivenessReply::Stat(Ok(liveness_stat(b'S', 100)))),
-            (6, LivenessReply::Image(Ok((10, 12)))),
-        ] {
-            let mut replies = alive_replies();
-            replies[index] = replacement;
-            assert_eq!(inspect_script(&expected, replies), ProcessLiveness::Unknown);
-        }
-        for (first, second) in [
-            (liveness_stat(b'S', 100), liveness_stat(b'S', 101)),
-            (liveness_stat(b'Z', 99), liveness_stat(b'S', 99)),
-        ] {
-            assert_eq!(
-                inspect_script(
-                    &expected,
-                    vec![
-                        boot_reply(),
-                        LivenessReply::Pin(Ok(())),
-                        LivenessReply::Exited(Ok(false)),
-                        LivenessReply::Stat(Ok(first)),
-                        LivenessReply::Stat(Ok(second)),
-                        boot_reply(),
-                        LivenessReply::Exited(Ok(false)),
-                    ]
-                ),
-                ProcessLiveness::Unknown
-            );
-        }
-        // Positive absence still needs a stable readable boot identity.
-        assert_eq!(
-            inspect_script(
-                &expected,
-                vec![
-                    boot_reply(),
-                    LivenessReply::Pin(Err(io::Error::from_raw_os_error(libc::ESRCH))),
-                    LivenessReply::Boot(Err(AdapterError::unavailable("boot unreadable"))),
-                ]
-            ),
-            ProcessLiveness::Unknown
-        );
-    }
-
-    #[test]
-    fn process_stat_parser_treats_the_command_as_opaque_bytes() {
-        let mut record = b"4242 (name\xff) Z 999 888\nPPid:\t123 (more)".to_vec();
-        record.extend_from_slice(b") S 7 9 11 0 -1 4194304 1 2 3 4 13 14 15 16 20 0 1 0 22 0 0\n");
-        let parsed = parse_process_stat(&record, 4242).unwrap();
-        assert_eq!(parsed.state, b'S');
-        assert_eq!(parsed.parent_pid, 7);
-        assert_eq!(parsed.process_group_id, 9);
-        assert_eq!(parsed.starttime_ticks, 22);
-        assert!(parse_process_stat(&record, 4241).is_err());
-
-        let mut malformed = record;
-        malformed.push(b')');
-        assert!(parse_process_stat(&malformed, 4242).is_err());
-
-        let mut shifted =
-            b"4242 (worker) S 7 9 11 0 -1 4194304 1 2 3 4 13 14 15 16 20 0 1 0 22 0 0".to_vec();
-        shifted.extend_from_slice(b") 7 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22");
-        assert!(parse_process_stat(&shifted, 4242).is_err());
-
-        for state in b"RSDZTtXxKWPI" {
-            let mut value =
-                b"4242 (worker) S 7 9 11 0 -1 4194304 1 2 3 4 13 14 15 16 20 0 1 0 22 0 0".to_vec();
-            let closing = value.iter().rposition(|byte| *byte == b')').unwrap();
-            value[closing + 2] = *state;
-            assert_eq!(parse_process_stat(&value, 4242).unwrap().state, *state);
-        }
-        for state in b"Q0)\x7f" {
-            let mut value =
-                b"4242 (worker) S 7 9 11 0 -1 4194304 1 2 3 4 13 14 15 16 20 0 1 0 22 0 0".to_vec();
-            let closing = value.iter().rposition(|byte| *byte == b')').unwrap();
-            value[closing + 2] = *state;
-            assert!(parse_process_stat(&value, 4242).is_err());
-        }
     }
 
     #[test]
