@@ -809,6 +809,50 @@ fn post_request_with_nonce(
     })
 }
 
+/// Adapt Discord attachments and embeds to the existing bounded, escaped file-line formatter.
+/// The links are only rendered; no attachment or preview is fetched.
+fn discord_body(value: &serde_json::Value) -> String {
+    use serde_json::{json, Value};
+    let text = value
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let attachments = value
+        .get("attachments")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|file| file.is_object())
+        .map(|file| {
+            json!({
+                "name": file.get("filename"), "mimetype": file.get("content_type"),
+                "permalink": file.get("url"),
+            })
+        });
+    let embeds = value
+        .get("embeds")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|embed| embed.is_object())
+        .map(|embed| {
+            let url = embed
+                .get("url")
+                .and_then(Value::as_str)
+                .or_else(|| embed.get("image")?.get("url")?.as_str());
+            let name = embed
+                .get("title")
+                .and_then(Value::as_str)
+                .filter(|name| !name.trim().is_empty())
+                .or(url)
+                .or_else(|| embed.get("description")?.as_str())
+                .unwrap_or("an embed");
+            json!({"name": name, "pretty_type": "embed", "permalink": url})
+        });
+    let files = Value::Array(attachments.chain(embeds).collect());
+    crate::slack::files::body(text.to_owned(), Some(&files))
+}
+
 /// Convert one Discord message object into this server's [`Message`].
 ///
 /// # Errors
@@ -893,13 +937,8 @@ pub fn parse_message(value: &serde_json::Value) -> Result<Message, ChatError> {
             .and_then(|reference| reference.get("message_id"))
             .and_then(serde_json::Value::as_str)
             .map(|id| MessageId(id.to_owned())),
-        // A message can legitimately have empty content (an embed or an attachment only), so this
-        // one is defaulted rather than required.
-        content: value
-            .get("content")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
+        // Attachment/embed-only posts must remain visible under the empty-message filter.
+        content: discord_body(value),
         // Empty for the same reason as `spoken_time` above, and one more: how this server's voice
         // reads a message is an application decision, not something a chat adapter gets a say in.
         // See `crate::model::Message::spoken_content`.
@@ -3322,6 +3361,45 @@ mod tests {
             "author": { "username": "u" }
         });
         assert!(matches!(parse_message(&value), Err(DiscordError::Shape(_))));
+    }
+
+    #[test]
+    fn discord_file_posts_keep_attachment_and_embed_only_bodies_visible() {
+        let base = serde_json::json!({"id":"5", "channel_id":"123", "timestamp":"t",
+            "author":{"id":"7", "username":"u"}});
+        for (extra, expected) in [
+            (
+                serde_json::json!({"attachments":[{"filename":"photo.png", "content_type":"image/png", "url":"https://cdn.discordapp.com/photo.png"}]}),
+                "📎 [photo.png](<https://cdn.discordapp.com/photo.png>) · image/png",
+            ),
+            (
+                serde_json::json!({"embeds":[{"title":"A preview", "url":"https://example.org/article"}]}),
+                "📎 [A preview](<https://example.org/article>) · embed",
+            ),
+            (
+                serde_json::json!({"content":"words", "attachments":[{"filename":"log.txt"}, {"filename":"other.txt"}]}),
+                "words\n\n📎 log.txt\n📎 other.txt",
+            ),
+            (
+                serde_json::json!({"embeds":[{"url":"https://example.org/only"}]}),
+                "📎 [https://example.org/only](<https://example.org/only>) · embed",
+            ),
+            (
+                serde_json::json!({"attachments":[{"filename":"evil*[name]\n.txt", "url":"javascript:alert(1)"}]}),
+                "📎 evil\\*\\[name\\] .txt",
+            ),
+        ] {
+            let mut wire = base.clone();
+            wire.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert_eq!(parse_message(&wire).unwrap().content, expected);
+        }
+        assert_eq!(
+            parse_message(&base).unwrap().content,
+            "",
+            "truly empty posts stay empty"
+        );
     }
 
     #[test]

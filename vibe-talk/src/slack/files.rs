@@ -88,7 +88,7 @@ struct SharedFile {
 /// The body of a message: `text`, Slack's text already read as Markdown, then one line for each
 /// file in `files`, Slack's `files` array. `text` alone when the message shares no file.
 #[must_use]
-pub(super) fn body(text: String, files: Option<&Value>) -> String {
+pub(crate) fn body(text: String, files: Option<&Value>) -> String {
     let shared = shared(files, &text);
     if shared.is_empty() {
         return text;

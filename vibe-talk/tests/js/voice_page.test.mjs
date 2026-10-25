@@ -82318,3 +82318,18 @@ test("pin-badge-lag: main rows among thread cards update before PUT and roll bac
   assert.equal(pinChip(row()).hidden, true);
   assert.match(page.el("status").textContent, /pin refused/);
 });
+
+
+test("discord-file-posts: attachment and embed lines remain visible with Empty messages on", async () => {
+  const page = newPage();
+  await signIn(page);
+  assert.equal(page.el("hide-empty-messages").checked, true);
+  await showDiscord(page, [
+    message({ id: "901", content: "📎 [photo.png](<https://cdn.discordapp.com/photo.png>) · image/png", author_id: "11" }),
+    message({ id: "902", content: "📎 [A preview](<https://example.org/article>) · embed", author_id: "12" }),
+    message({ id: "903", content: "", author_id: "13" }),
+  ]);
+  assert.ok(shownIds(page).includes("901"), "attachment-only post hidden");
+  assert.ok(shownIds(page).includes("902"), "embed-only post hidden");
+  assert.ok(!shownIds(page).includes("903"), "the empty-post control is not hidden");
+});

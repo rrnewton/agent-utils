@@ -1,17 +1,18 @@
 ---
 title: 'discord-file-posts: a Discord post that is only a file or an embed reaches the page as a line naming it'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-10-19T22:18:47.668393132+00:00
-updated_at: 2026-10-19T22:18:47.668393132+00:00
+updated_at: 2026-10-25T21:47:59.469412276+00:00
+closed_at: 2026-10-25T21:47:59.469412225+00:00
 ---
 
 # Description
 
-[opus 5.5] Found while building #386 hide-empty-messages. The Discord adapter (src/discord/http.rs parse_message) reads a message's content and nothing of its attachments or embeds, so a Discord post that is only an image, a file or an embed reaches the page with empty text: it was drawn as a blank row, and with the Empty messages switch on (its default) it is now left out entirely. Slack files already arrive as a line naming the file (#313 slack-file-posts); Discord's do not.
+[GPT-6 Codex codex-vibe-discord] Discord attachment/image/embed-only posts had empty content and were hidden by hide-empty-messages (agent-utils-386). Confirmed the fix was absent from origin/main at 9fa6d01a. Adapt attachments and embeds into the existing bounded, escaped Slack file-line formatter; retain names, kinds and safe links without fetching files. Add Discord-shaped JSON tests, malformed-link/name escaping control, a truly-empty control, and a client test with the default empty-message filter enabled. Focused server/client tests pass. Mutation removing attachments and embeds fails the new server regression. Full selected repository validation running before publication.
 
 # Acceptance Criteria
 

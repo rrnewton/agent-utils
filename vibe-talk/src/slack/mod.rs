@@ -79,7 +79,7 @@
 mod clear;
 mod client;
 mod emoji;
-mod files;
+pub(crate) mod files;
 mod groups;
 mod history;
 pub mod ids;
