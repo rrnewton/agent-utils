@@ -143,6 +143,12 @@ def rows_of(found: dict[str, object]) -> list[dict[str, object]]:
     return [row for row in rows if isinstance(row, dict)]
 
 
+def box_of(row: dict[str, object], name: str) -> dict[str, float]:
+    piece = row[name]
+    assert isinstance(piece, dict)
+    return {str(key): float(value) for key, value in piece.items() if isinstance(value, (int, float))}
+
+
 def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int,
          touch: bool, scheme: str) -> str:
     api = EvenApi()
@@ -154,7 +160,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
         with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-bridge-even-") as profile:
             context = chromium.launch_persistent_context(
                 profile, headless=True, executable_path=args.browser_executable,
-                viewport={"width": width, "height": height}, color_scheme=scheme,
+                viewport={"width": width, "height": height}, color_scheme=scheme,  # type: ignore[arg-type]
                 has_touch=touch, is_mobile=touch)
             version = context.browser.version if context.browser else "Chromium"
             page = context.pages[0]
@@ -175,8 +181,9 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             own = [row for row in stack if isinstance(row, dict) and row.get("who") == "me"]
             desk.check(len(own) >= 1, f"All: no owner reply gathered: {stack}")
             if stack and own:
-                lefts = [float(row["box"]["left"]) for row in stack if isinstance(row, dict)]
-                spans = [float(row["box"]["left"]) - float(row["bridge"]["left"]) for row in stack if isinstance(row, dict)]
+                lefts = [box_of(row, "box")["left"] for row in stack if isinstance(row, dict)]
+                spans = [box_of(row, "box")["left"] - box_of(row, "bridge")["left"]
+                         for row in stack if isinstance(row, dict)]
                 desk.check(max(lefts) - min(lefts) <= 1.5, f"All: gathered rows start at {lefts}")
                 desk.check(max(spans) - min(spans) <= 1.5, f"All: gathered connectors reach {spans}")
             desk.shot("1-all-gathered")
@@ -199,16 +206,16 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             desk.check(float(str(found["overflow"])) <= 0, f"the page scrolls sideways: {found['overflow']}")
             desk.check(len(mine) >= 1 and len(others) >= 2, f"the unpacked thread holds no mix: {rows}")
             if rows and mine and others:
-                lefts = [float(row["box"]["left"]) for row in rows]  # type: ignore[index]
-                spans = [float(row["box"]["left"]) - float(row["bridge"]["left"]) for row in rows]  # type: ignore[index]
+                lefts = [box_of(row, "box")["left"] for row in rows]
+                spans = [box_of(row, "box")["left"] - box_of(row, "bridge")["left"] for row in rows]
                 desk.check(max(lefts) - min(lefts) <= 1.5, f"unpacked rows start at {lefts}")
                 desk.check(max(spans) - min(spans) <= 1.5, f"bridge connectors reach {spans}")
-                other_width = float(others[0]["box"]["width"])  # type: ignore[index]
+                other_width = box_of(others[0], "box")["width"]
                 for row in mine:
-                    box = row["box"]  # type: ignore[index]
-                    desk.check(float(box["width"]) < other_width - 8,
+                    box = box_of(row, "box")
+                    desk.check(box["width"] < other_width - 8,
                                f"the owner's row is not the narrower one: {box['width']} against {other_width}")
-                    desk.check(float(box["right"]) < float(others[0]["box"]["right"]) - 8,  # type: ignore[index]
+                    desk.check(box["right"] < box_of(others[0], "box")["right"] - 8,
                                "the owner's row reaches the others' right edge")
                     desk.check(row.get("bg") != others[0].get("bg"), "the owner's row lost its colour")
             button, card = part(found, "button"), part(found, "card")
