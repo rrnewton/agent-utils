@@ -1621,6 +1621,39 @@ pub async fn voice_health(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// What `POST /api/v1/voice-heard` takes. `#511 voice-explicit-send-only`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeardRequest {
+    /// The page's name for the user turn, stable while the turn grows.
+    pub key: String,
+    /// Everything the user has said in that turn so far.
+    pub text: String,
+}
+
+/// `POST /api/v1/voice-heard` — the user's words in one turn of a call, as the voice page heard
+/// them so far. `#511 voice-explicit-send-only`.
+///
+/// The server never sees a call's frames, and the voice agent's `post_reply` must quote an ask the
+/// user really made, so the page says what it heard: each user turn's whole text as it grows,
+/// never its own prompts' echoes. Held in memory for [`crate::send_intent::HEARD_WINDOW`] and
+/// bounded; not stored, and not logged.
+pub async fn voice_heard(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Json(request): Json<HeardRequest>,
+) -> Result<Response, ApiError> {
+    if request.key.trim().is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_heard",
+            "a heard turn needs a key",
+        ));
+    }
+    state.send_intent.hear(&request.key, &request.text);
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
 /// `POST /api/v1/voice-end` — how a call that opened ended, as the page saw it. `#268
 /// voice-call-drops`.
 ///
@@ -2610,6 +2643,10 @@ pub struct ProposeRequest {
     pub text: String,
     /// The message it answers, when any.
     pub reply_to: Option<String>,
+    /// The user's own words asking for the send. Required while `[conversation]
+    /// explicit_send_only` is on. `#511 voice-explicit-send-only`.
+    #[serde(default)]
+    pub user_request: Option<String>,
 }
 
 /// What `POST /api/v1/post-proposals` answers. It carries no handle: the proposing caller may be
@@ -2718,10 +2755,17 @@ pub async fn propose_post(
         &request.channel_id,
         &request.text,
         request.reply_to.as_deref(),
+        request.user_request.as_deref(),
         crate::store::SendOrigin::Rest,
     )
     .await;
     match outcome {
+        // `#511 voice-explicit-send-only`. Nothing proposed or posted: the user did not ask.
+        Ok(crate::send_approval::VoicePost::Refused { refusal }) => Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "send_not_requested",
+            refusal.sentence(),
+        )),
         Ok(crate::send_approval::VoicePost::Proposed { channel, proposal }) => {
             Ok(Json(ProposedResponse {
                 sent: false,
@@ -3704,6 +3748,8 @@ pub async fn forget_conversations(
 ) -> Result<Response, ApiError> {
     let forgotten = state.store.forget_all_conversations().await?;
     state.post_gate.forget_sends();
+    // `#511 voice-explicit-send-only`. What the user said lately is part of that record too.
+    state.send_intent.forget();
     Ok(no_store(Json(
         serde_json::json!({ "forgotten": forgotten }),
     )))
@@ -3813,6 +3859,8 @@ pub async fn purge_storage(
         }
     }
     state.post_gate.forget_sends();
+    // `#511 voice-explicit-send-only`. What the user said lately is part of that record too.
+    state.send_intent.forget();
     if forgotten > 0 {
         tracing::info!(
             channels = forgotten,

@@ -253,6 +253,7 @@ mod tests {
             websocket_url: Some(url.to_owned()),
             label: "voice".to_owned(),
             ask_before_send: true,
+            explicit_send_only: true,
         }
     }
 

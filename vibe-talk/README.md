@@ -4702,6 +4702,7 @@ own adapter-only token; every other route uses the read/write tokens described a
 | GET | `/api/v1/voice-agent` | read | the versioned voice-agent prompt and which MCP tools this credential may call — see "Conversational voice providers" |
 | POST | `/api/v1/voice-timing` | **write** | one call's content-free startup phase offsets, logged as `voice_startup` |
 | POST | `/api/v1/voice-health` | **write** | a content-free "the voice service is not responding" record, logged as `voice_unresponsive` or `voice_recovered`, or that a turn was heard with no text, `voice_text_missing` — see "When the voice service stops answering" |
+| POST | `/api/v1/voice-heard` | **write** | `{key, text}` — the owner's words in one turn of a call, as the voice page heard them so far, held in memory for three minutes for checking the voice agent's ask to send; 204; never stored or logged — see "Only an explicit ask sends" |
 | POST | `/api/v1/voice-end` | **write** | how a call that opened ended, on either protocol — `hang_up`, `error_frame`, `server_closed`, `connection_lost`, `suspended`, `reconnect_limit` or `reconnect_failed`, or a socket the page replaced, `reconnected` — with the voice service's own capped reason, as one line, `voice_call_ended` — see "How a call ended" |
 | GET | `/api/v1/signed-url` | **write** | compatibility endpoint that mints an ElevenLabs signed URL |
 | GET | `/api/v1/channels/{id}/messages?limit=` | read | full scrollback, oldest first; an optional `as_of` when the provider served a copy it could not bring up to date (`#208 persistent-cache`) |
@@ -4716,7 +4717,7 @@ own adapter-only token; every other route uses the read/write tokens described a
 | POST | `/api/v1/channels/{id}/reply/outcome?wait=` | **write** | the reply's own body, `idempotency_key` required — what became of that post, posting nothing (`#448 send-dedupe`): `200` or `207` as the reply answered, `202 {state: "posting", posted, parts}` while it is still being posted after waiting up to `wait` seconds (at most 25, default 0), or `404 post_unknown` when this server has no record of it, which proves nothing either way. The page asks it after a send whose answer was lost and, every two seconds, while a send is slow, to say which part is going |
 | POST | `/api/v1/channels/{id}/ask` | **write** | slow path — answers 501 in v0 |
 | GET | `/api/v1/post-proposals?wait=&seen=&sent_after=` | **write** | the one post waiting for the owner's confirmation, or `null`; `wait` (seconds, at most 25) holds the request until it changes from serial `seen`. Its `text` is what would be posted, the owner's tag included, and `prefix`, when present, is the start of `text` the server put there (`#303 voice-post-prefix`) — see "Posting asks first, unless you turn that off". Every answer also says what became of the proposals the server remembers (`settled`), how far the send memory has numbered (`sends_through`) and the server's clock (`now_ms`); with `sent_after` it carries `sends`, every message the voice agent posted since that number, however it was approved, each with the text that went, tag and all, and the wait also ends when one settles (`#270 voice-transcript-markers`) |
-| POST | `/api/v1/post-proposals` | **write** | `{channel_id, text, reply_to?}` — what `post_reply` does, the owner's tag put in front of `text` first (`#303 voice-post-prefix`): propose a post, superseding any pending one, and answer `{sent: false, serial, result}`, where `result` is `post_reply`'s sentence, and no handle; or, with "Ask me before the voice agent sends" off, post it at once and answer `{sent: true, serial, result}` (207 with the unsent remainder, and the thread it belongs in, as the reply route answers, when only part went; the same words again within a minute post nothing, answering the first send's `{sent: true}` when it posted and `409 post_repeated` when it may have) — see "Posting asks first, unless you turn that off" |
+| POST | `/api/v1/post-proposals` | **write** | `{channel_id, text, reply_to?, user_request?}` — what `post_reply` does; with `[conversation] explicit_send_only` on (the default) `user_request` must name an explicit ask the owner made lately, or the answer is `403 send_not_requested` and nothing is proposed or posted (see "Only an explicit ask sends"); the owner's tag put in front of `text` first (`#303 voice-post-prefix`): propose a post, superseding any pending one, and answer `{sent: false, serial, result}`, where `result` is `post_reply`'s sentence, and no handle; or, with "Ask me before the voice agent sends" off, post it at once and answer `{sent: true, serial, result}` (207 with the unsent remainder, and the thread it belongs in, as the reply route answers, when only part went; the same words again within a minute post nothing, answering the first send's `{sent: true}` when it posted and `409 post_repeated` when it may have) — see "Posting asks first, unless you turn that off" |
 | POST | `/api/v1/post-proposals/commit` | **write** | `{handle, channel_id, text, reply_to, confirmed_by}` — confirm and post it, once; posted whole, its `reply_to` is then marked Done, and read at the provider where it can be (`#300 reply-marks-read`). The answer names the send memory's `send_seq` for it, and a 207 carries `serial`, `send_seq` when anything may have gone, and `uncertain` when the part that failed may have been posted anyway |
 | POST | `/api/v1/post-proposals/cancel` | **write** | `{handle}` — withdraw it; `204` |
 | GET | `/api/v1/channels/{id}/stream` | read | **Server-Sent Events**: messages as they arrive — see "Live push" |
@@ -9116,6 +9117,75 @@ shape.
 **A read credential is not shown `post_reply` at all,** and is refused with HTTP `403` plus
 JSON-RPC `-32001` if it calls it anyway. Hiding and enforcing are separate on purpose: hiding a
 tool is never the thing that keeps it from running.
+
+### Only an explicit ask sends
+
+`#511 voice-explicit-send-only`. The voice agent sends to the chat, or to a coding agent through it,
+only when the owner explicitly asks it to with a verb that sends — "send this to the coding agent",
+"tell the coding agent to rebase", "ask Claude whether the tests pass", "post that in the lead
+channel" — **whether or not it asks before it sends** (next section). Confirmation decides how a
+send goes out; it never decides whether the owner asked for one. The agent never passes on what
+the owner said as a message: a fragment of speech, a question meant for the agent, a request to find
+or read something, or words it is not sure it heard are answered or asked about, never sent.
+
+It was written after an owner, driving, asked the agent to find a message, and the speech runtime
+cut his long sentence into four turns, misheard two of them, and dropped them on the way to the
+page; the model, which had heard the audio itself, posted the fragment "afflicting guidance and
+remind on" to a coding agent's channel with confirmation off.
+
+**Two layers.** The prompt's sending section and `post_reply`'s description say all of the above,
+in both send modes. And the server checks, because a model told is not a model that listens:
+
+* `post_reply` takes `user_request`, **required**: the owner's own words that asked for the send.
+  The quote must itself be an ask (below), and say more than small words — a quote of "the" matches
+  every turn.
+* The server looks for those words in what the owner said in the last three minutes — at least half
+  of the quote's content words, each as heard or one slip of the ear from it — and the turn it finds
+  them in must hold an ask too. Two turns said within fifteen seconds of each other are read
+  together as well, so an ask a pause cut in two is still one ask.
+* An ask is positional, not a word list. A send verb counts only where an imperative or a request
+  stands: at the start of a sentence, after "please", "so", "and", "then", "yes", "no", after "can
+  you", "could you", "would you", "will you", or after "want you to" — and with no "don't", "not" or
+  "never" in the few words before it. So "did you send it", "the agent should post that", "should
+  I tell it", "I don't want you to send this" and "don't send that" are not asks. It must also reach
+  what the send is for: "tell", "ask", "remind", "ping", "message" or "have" a **named** addressee —
+  an agent noun ("the coding agent", "Claude", "the bot") or a channel this server lists, never
+  "it" or "them", which is where a misheard fragment slips through ("so tell it to afflicting
+  guidance"); "let" an addressee "know"; "have" not in a question ("have the agents finished?"
+  asks the voice agent); "send", "post", "forward", "relay", "pass", "share" a message ("this",
+  "that", "it", "a message") or to an addressee; "put" only to an addressee; "say", "write",
+  "reply" to an addressee. A word that turns the sentence away — "me", "you", "what", "about", the
+  end of a sentence — stops the search, so "tell me what the agent said" is not an ask. A bare
+  "yes" is not one either: the agent asks the owner to say "send it".
+* **One ask, one send.** A direct send spends the ask that licensed it in the same step as the
+  check, so one "tell the coding agent to rebase" licenses one post and two sends at once cannot
+  share it; a send that certainly posted nothing gives it back. The same call again — a transport's
+  retry — is still answered from the send memory as a repeat that posts nothing. The same words said
+  again later are a new ask. Proposing spends nothing: a proposal posts nothing.
+
+No match, no ask, or a spent one, and nothing is proposed or posted: the tool answers `NOT SENT.
+Nothing was posted or proposed:` and why, with what to do instead (answer, or ask the owner to say
+it again). `POST /api/v1/post-proposals` answers `403 send_not_requested` with the same sentence.
+The log gets one content-free `send_intent` line per check — `allowed` or `refused` with the reason
+(`missing_request`, `no_directive`, `not_heard`, `spent`), the request's length and how many turns
+were held — and never a word of either.
+
+**What the server hears.** The browser owns the call's socket, so the server hears the owner only
+from the voice page: `POST /api/v1/voice-heard` with each of his turns' whole text as it grows. A
+spoken turn is filed in the transcript only when it settles, which on the websocket backend is after
+the model's tool call, so the live report is what counts; the check waits up to two and a half
+seconds for a report that is a beat behind the call. Turns filed in the transcript are deliberately
+not heard: the page files turns it saved before it was closed minutes or hours later, and an ask in
+one must not come back to life. Never the page's echo of its own prompt (`#353
+relay-echo-as-owner`), and nothing at all while a turn the page sent — a relayed message, its word
+on a card — is in flight; never a chat message, never anything the agent said. Held in memory, at
+most 32 turns of 2,000 characters (a longer turn keeps its start and its end) for three minutes,
+never stored or logged, and forgotten by `DELETE /api/v1/conversations` and `DELETE /api/v1/storage`.
+**Reload the voice page after deploying this**: a page that predates the report reports nothing,
+so every send it asks for is refused until it reloads.
+
+**The setting.** `[conversation] explicit_send_only`, on unless the operator turns it off in the
+configuration file. Nothing else reaches it: no Settings switch, no route, no tool.
 
 ### Posting asks first, unless you turn that off
 

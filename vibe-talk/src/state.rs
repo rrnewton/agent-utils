@@ -126,6 +126,9 @@ pub struct AppState {
     /// [`crate::post_keys`]. A repeat of a post that landed, or that is landing now, is answered
     /// with that post's answer and posts nothing. In memory.
     pub post_keys: Arc<crate::post_keys::PostKeys>,
+    /// What the user said lately, as the voice page heard it, and which of their asks to send were
+    /// spent. `#511 voice-explicit-send-only`; see [`crate::send_intent`]. In memory.
+    pub send_intent: Arc<crate::send_intent::SendIntent>,
     /// Per channel, the newest message whose provider read marker this server has moved through,
     /// so that a reply to it, or to anything before it, does not ask the provider again. `#300
     /// reply-marks-read`; see [`crate::reply_read`]. In memory, ids only.

@@ -2283,6 +2283,10 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     timingPosts: [],
     /** Every voice health record the page has POSTed, parsed. */
     healthPosts: [],
+    /** `#511 voice-explicit-send-only`. Every report of the owner's words the page has POSTed, parsed. */
+    heardPosts: [],
+    /** How many of the next reports of the owner's words the server refuses. */
+    heardFailures: 0,
     /** `#268 voice-call-drops`. Every record of how a call ended the page has POSTed, parsed. */
     endPosts: [],
     /** Every constraint object the page has handed getUserMedia, in order. */
@@ -3123,6 +3127,14 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       }
       if (String(path) === "/api/v1/voice-health") {
         page.healthPosts.push(JSON.parse(options.body));
+        return json(204, null);
+      }
+      if (String(path) === "/api/v1/voice-heard") {
+        page.heardPosts.push(JSON.parse(options.body));
+        if (page.heardFailures > 0) {
+          page.heardFailures -= 1;
+          return json(503, { error: "unavailable", detail: "try again" });
+        }
         return json(204, null);
       }
       if (String(path) === "/api/v1/voice-end") {
@@ -5294,6 +5306,14 @@ const TUNING_BANDS = {
   THREAD_HUE_RECENT: [2, 4,
     "threads most recently given a colour whose colours a new one avoids. Under two, a view drawing " +
     "new threads in its own order can still put two alike side by side; past four the same crowding"],
+  // `#511 voice-explicit-send-only`.
+  HEARD_TEXT_MAX: [2000, 2000,
+    "the most of one owner turn the page tells the server it heard. It is the server's own limit " +
+    "(send_intent::HEARD_TEXT_MAX): more is a request the server cuts or refuses as too large, and " +
+    "less cuts off an ask to send at the end of a long turn the server would have kept"],
+  HEARD_HEAD: [500, 500,
+    "how much of the start of a turn longer than HEARD_TEXT_MAX is reported; the rest is its end. " +
+    "It is the server's own split (send_intent::HEARD_HEAD), so a turn cut by both reads the same"],
 };
 test("every number this page is tuned by stays inside a band that says what would be wrong", () => {
   for (const [name, [low, high, why]] of Object.entries(TUNING_BANDS)) {
@@ -81742,4 +81762,96 @@ test("`#469 replication-model-tests`: the page agrees with the service under ran
     }
   }
   assert.ok(caught !== null, "without the server's versions no seed broke a property, so this test cannot see them");
+});
+
+// --- #511 voice-explicit-send-only ---------------------------------------------------------------
+//
+// The voice agent sends to the chat only on the owner's explicit ask, and the server checks each
+// send against what the owner said. It never sees a call's frames, and a spoken turn is filed only
+// when it settles, after the agent's tool call, so the page reports the owner's words as they
+// arrive: his, never an echo of the page's own prompt and never the assistant's.
+
+/** What the page has told the server it heard, newest text per key. */
+const heardNow = (page) => {
+  const latest = new Map();
+  for (const post of page.heardPosts) latest.set(post.key, post.text);
+  return latest;
+};
+
+test("`#511 voice-explicit-send-only`: the owner's words are reported as they grow, before the turn settles, and the assistant's never", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  await page.settle();
+  speech(socket, "user", 3, "Tell the coding agent", false);
+  await page.settle();
+  assert.deepEqual([...heardNow(page).values()], ["Tell the coding agent"], "a partial was not reported while it was spoken");
+  speech(socket, "user", 3, "Tell the coding agent to rebase onto main.", true);
+  await page.settle();
+  const heard = heardNow(page);
+  assert.equal(heard.size, 1, "one turn was reported under more than one key");
+  assert.deepEqual([...heard.values()], ["Tell the coding agent to rebase onto main."]);
+  assert.ok(!storedTexts(page).some((t) => t.startsWith("you: ")), "the turn was filed before it settled, so this proves nothing");
+  speech(socket, "assistant", 3, "Sending that now.", true);
+  turnDone(socket, 3);
+  await page.settle();
+  assert.ok(!page.heardPosts.some((post) => post.text.includes("Sending that")), "the assistant's words were reported as the owner's");
+  // The same text again is not sent again.
+  const before = page.heardPosts.length;
+  speech(socket, "user", 3, "Tell the coding agent to rebase onto main.", true);
+  await page.settle();
+  assert.equal(page.heardPosts.length, before);
+});
+
+test("`#511 voice-explicit-send-only`: the bridge's echo of a relayed prompt is never reported as the owner's words", async () => {
+  const flatWords = (text) => text.split(/\s+/).join(" ").trim();
+  const page = newPage();
+  const { prompt } = await relayInFlight(page);
+  await page.settle();
+  assert.ok(!page.heardPosts.some((post) => flatWords(post.text) === flatWords(prompt)),
+    "the relayed prompt's echo was reported as the owner's words");
+  // The negative control: a page that reported every user transcript reports the echo.
+  const control = newPage(new Map(), brokenScriptEach(
+    ["      if (who === \"you\" && !spoken.entry.echo) reportHeard(spoken.key, spokenText(spoken.entry));",
+      "      if (who === \"you\") reportHeard(spoken.key, spokenText(spoken.entry));"],
+    ["  if (!whole || pageTurnInFlight()) return;", "  if (!whole) return;"]));
+  const relayed = await relayInFlight(control);
+  await control.settle();
+  assert.ok(control.heardPosts.some((post) => flatWords(post.text) === flatWords(relayed.prompt)),
+    "the control did not report the echo, so the test above proves nothing");
+});
+
+test("`#511 voice-explicit-send-only`: a typed message and the hosted agent's user transcript are reported too", async () => {
+  const typed = newPage();
+  await startNeutralCall(typed);
+  await typed.settle();
+  await compose(typed, "send this to the lead team: rebase");
+  await typed.el("send-text").click();
+  await typed.settle();
+  assert.ok([...heardNow(typed).values()].includes("send this to the lead team: rebase"));
+
+  const hosted = newPage();
+  await startTalking(hosted);
+  youSay(hosted, "Ask Claude whether the tests pass.");
+  await hosted.settle();
+  assert.ok([...heardNow(hosted).values()].includes("Ask Claude whether the tests pass."));
+});
+
+test("`#511 voice-explicit-send-only`: a report the server refused goes again with the next frame, and a long turn keeps its end", async () => {
+  const page = newPage();
+  const socket = await startNeutralCall(page);
+  await page.settle();
+  page.heardFailures = 1;
+  speech(socket, "user", 3, "Tell the coding agent to stop.", true);
+  await page.settle();
+  // The same words in the next frame (a partial: the page drops an identical frame before this).
+  speech(socket, "user", 3, "Tell the coding agent to stop.", false);
+  await page.settle();
+  assert.equal(page.heardPosts.filter((post) => post.text === "Tell the coding agent to stop.").length, 2,
+    "a refused report was taken for a delivered one");
+  const long = `${"blah ".repeat(800)}so send all that to the coding agent`;
+  speech(socket, "user", 5, long, true);
+  await page.settle();
+  const sent = page.heardPosts.at(-1).text;
+  assert.equal(sent.length, sourceConstant("HEARD_TEXT_MAX"));
+  assert.ok(sent.endsWith("send all that to the coding agent"), sent.slice(-80));
 });

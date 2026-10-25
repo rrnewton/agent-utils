@@ -259,6 +259,21 @@ pub fn post_gate(
     );
 }
 
+/// One line for one check of the voice agent's ask to send. `#511 voice-explicit-send-only`.
+///
+/// Content-free: whether it was allowed or refused and why, how long the quoted request was, and
+/// how many user turns the server held — never a word of the request or of what the user said.
+pub fn send_intent(event: &str, reason: Option<&str>, request_len: usize, heard: usize) {
+    tracing::info!(
+        target: "vibe_talk::access",
+        event,
+        reason = reason.unwrap_or("-"),
+        request_len,
+        heard,
+        "send_intent"
+    );
+}
+
 /// One line for one record the voice page filed in its transcript: a send it drew, a draft not
 /// sent, a conversation's start, or the tag on a spoken yes. `#270 voice-transcript-markers`.
 ///
