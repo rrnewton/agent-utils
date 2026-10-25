@@ -7,6 +7,7 @@ import json
 import os
 import sys
 from collections.abc import Sequence
+from datetime import datetime
 from importlib.resources import files
 from pathlib import Path
 
@@ -71,6 +72,7 @@ from wrkviz.query import (
     schema_3_completeness,
     schema_3_record_counts,
 )
+from wrkviz.responsiveness import Sources as ResponsivenessSources, run as run_responsiveness
 from wrkviz.server import serve
 from wrkviz.snapshot_store import (
     format_migration_report,
@@ -1011,7 +1013,87 @@ def _parser() -> argparse.ArgumentParser:
         help="rollup kind to count; repeat as needed",
     )
     query_stats.set_defaults(handler="query_stats")
+
+    responsiveness = sub.add_parser(
+        "responsiveness",
+        help="measure how promptly an agentctl coordinator answers its children; zero tokens",
+        description=(
+            "Rebuild a coordinator/child loop from an agentctl registry, the coordinator's Claude "
+            "Code transcript, and the children's own Claude Code or Muse logs, then report how long "
+            "children waited for the parent: when it was told that a child stopped, when it looked, "
+            "and when it acted. Reads only; calls no model. Definitions are in `wrkviz --userguide`."
+        ),
+        epilog=(
+            "example:\n"
+            "  wrkviz responsiveness --registry ~/project/.agentctl \\\n"
+            "    --coordinator-transcript ~/.claude/projects/-home-me-project/SESSION.jsonl \\\n"
+            "    --muse-sessions ~/.local/share/muse/sessions --sweep-marker '[coordinator sweep]' \\\n"
+            "    --format json --episodes /tmp/episodes.json"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    responsiveness.add_argument(
+        "--registry", required=True,
+        help="agentctl registry directory (the one holding agent records, archive/ and queues)",
+    )
+    responsiveness.add_argument(
+        "--coordinator-transcript", required=True,
+        help="the coordinator's Claude Code session JSONL",
+    )
+    responsiveness.add_argument(
+        "--coordinator", default="coordinator",
+        help="the coordinator's registered agentctl name (default: %(default)s)",
+    )
+    responsiveness.add_argument(
+        "--claude-projects", default="~/.claude/projects",
+        help="Claude Code projects directory searched for child transcripts by native session id "
+             "(default: %(default)s)",
+    )
+    responsiveness.add_argument(
+        "--muse-sessions", default=None,
+        help="Muse sessions directory searched for child logs by working directory "
+             "(default: none, Muse children are skipped)",
+    )
+    responsiveness.add_argument(
+        "--sweep-marker", default=None,
+        help="text that marks the coordinator's periodic sweep prompt; scheduled-task fires and "
+             "prompts containing it count as sweeps (default: every scheduled-task fire is a sweep)",
+    )
+    responsiveness.add_argument(
+        "--exclude", action="append", default=[], metavar="PATTERN",
+        help="leave out children whose name matches this shell-style pattern, such as a delivery "
+             "test agent; repeatable (default: none)",
+    )
+    responsiveness.add_argument(
+        "--since", default=None,
+        help="ignore child turn ends before this RFC 3339 instant (default: the transcript's first turn)",
+    )
+    responsiveness.add_argument(
+        "--until", default=None,
+        help="ignore child turn ends after this RFC 3339 instant (default: the transcript's last turn)",
+    )
+    responsiveness.add_argument(
+        "--format", choices=("markdown", "json"), default="markdown",
+        help="report format (default: %(default)s)",
+    )
+    responsiveness.add_argument(
+        "--episodes", default=None,
+        help="also write one JSON row per episode to this file (default: not written)",
+    )
+    responsiveness.set_defaults(handler="responsiveness")
     return parser
+
+
+def _instant(raw: object, label: str) -> float | None:
+    if raw is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError(f"{label} must be an RFC 3339 instant, not {raw!r}") from error
+    if parsed.tzinfo is None:
+        raise ValueError(f"{label} must carry a UTC offset, not {raw!r}")
+    return parsed.timestamp()
 
 
 def _summary_call(ns: argparse.Namespace) -> SummarizeReport:
@@ -1693,6 +1775,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     if handler == "serve":
         serve(_path(str(ns.output)), "127.0.0.1", int(ns.port), bool(ns.open_browser))
         return 0
+    if handler == "responsiveness":
+        try:
+            print(run_responsiveness(
+                ResponsivenessSources(
+                    registry=_path(str(ns.registry)),
+                    coordinator_transcript=_path(str(ns.coordinator_transcript)),
+                    coordinator=str(ns.coordinator),
+                    claude_projects=_path(str(ns.claude_projects)),
+                    muse_sessions=_path(str(ns.muse_sessions)) if ns.muse_sessions is not None else None,
+                    sweep_marker=str(ns.sweep_marker) if ns.sweep_marker is not None else None,
+                    exclude=tuple(str(pattern) for pattern in ns.exclude),
+                ),
+                _instant(ns.since, "--since"),
+                _instant(ns.until, "--until"),
+                str(ns.format),
+                _path(str(ns.episodes)) if ns.episodes is not None else None,
+            ), end="")
+            return 0
+        except (OSError, ValueError) as error:
+            print(f"{PROG}: {error}", file=sys.stderr)
+            return 2
     if handler == "inspect":
         try:
             return _inspect(_path(str(ns.output)))

@@ -1445,6 +1445,80 @@ the UI clearly says the exact body is unavailable and shows an inferred paragrap
 agent's subsequent work. Automatic final answers and each agent's own commentary/final response are
 plaintext; encrypted instruction bodies remain unavailable to the archive.
 
+## Measure parent-child responsiveness (agentctl teams)
+
+A coordinator keeps its subagents busy only if it learns promptly that one stopped and then acts.
+`wrkviz responsiveness` measures that loop for a team run with agentctl, from records the team
+already writes. It reads only, calls no model, and needs no archive:
+
+```bash
+wrkviz responsiveness \
+  --registry ~/project/.agentctl \
+  --coordinator-transcript ~/.claude/projects/-home-me-project/SESSION.jsonl \
+  --muse-sessions ~/.local/share/muse/sessions \
+  --sweep-marker '[coordinator sweep]' \
+  --format json --episodes /tmp/episodes.json
+```
+
+Sources:
+
+- **The agentctl registry**: every agent record, live or under `archive/`, and every queue message
+  with `queued_at` (when a sender queued it) and `confirmed_at` (when agentctl saw it accepted).
+  Messages a child sends the coordinator are attributed by the `NAME:` convention: the text starts
+  with the child's registered name. Queue IDs starting `agent-watch-` are `agentctl watch-agents`
+  notices and `chat-` are chat-bridge prompts. A message in a child's own queue is the parent
+  acting on that child, at its `queued_at`.
+- **The coordinator's Claude Code transcript**: a turn runs from the prompt or scheduled-task fire
+  that starts it to its `turn_duration` record; prompts absorbed mid-turn are counted as inputs but
+  start no turn; a turn the harness never closed (a killed process) ends at its last record. Only
+  Bash tool calls are read, and in them only a simple command that starts with `agentctl VERB NAME`
+  addresses that child: `stop`, `send`, `answer` and `start` count as acting, anything else as
+  looking. A name inside message text or a heredoc is not an action; `for VAR in NAMES; do
+  agentctl VERB $VAR` applies the verb to each name. `wrkslots read-handoff SLOT` and
+  `wrkslots remove SLOT` act on the slot's newest child. Scheduled-task fires are sweeps; with
+  `--sweep-marker` only prompts containing that text are. One transcript is read: a coordinator
+  restarted into a new session needs one run per transcript.
+- **Each child's log**: a Claude Code transcript found under `--claude-projects` by the agent's
+  native session ID, or a Muse session log under `--muse-sessions` whose `route_facts` record
+  names the agent's working directory; each Muse log goes to at most one child, the first registered
+  in that directory within ten minutes before the log started. A Claude turn started by a
+  `<task-notification>`, or a Muse
+  turn started with an empty prompt, was started by the child's own background work.
+
+Definitions:
+
+- A **turn end** is classified by the child's last reply: `DONE` or `BLOCKED` when a line starts
+  with that marker, `ask` for a question, `await` for an explicit wait on the parent ("holding for
+  your all-clear"), otherwise `progress`.
+- An **episode** is a turn end the parent had to answer: the child's next turn was not started by
+  its own background work.
+- **notify** is the first notice queued after the turn end: the child's own message (queued at
+  most 15 minutes before it), a watch notice, or a sweep. **observe** and **act** are the first
+  coordinator tool calls that look at, and act on, that child. Latencies are measured from the
+  turn end.
+- **path** is the notice delivered most recently before the parent first looked: `child-message`,
+  `watch-notice` (every agent a notice lists counts), `sweep`, `chat-turn` (a chat prompt arrived
+  first), `coordinator-own` (no notice; the coordinator looked on its own), or `pre-queued` (a
+  message queued for the child before its turn ended reached it within three minutes, and the
+  coordinator did nothing else in between). Any message in a child's queue counts as the parent's. `first_notice` is the earliest
+  notice delivered, whether or not it was what made the parent look.
+- **parent busy** is whether a coordinator turn was running at the turn end.
+- Each child's idle time from a turn end to its next turn, or to its stop, is split by what it
+  waited for: `self` (its own background work), `parent`, or `stop` (after its last turn), clipped
+  to the window.
+  `child_idle_waiting_on_parent_fraction` is (`parent` + `stop`) / all.
+- `next_turn_after_child_end_when_idle` is, for episodes where the coordinator was idle, the time
+  until its next turn started for any reason: how long an idle parent stays idle.
+
+Use `--exclude PATTERN` for agents that are not part of the work, such as delivery tests, and
+`--since`/`--until` (RFC 3339 with an offset) to bound the turn ends counted. The Markdown format
+prints the act latency split by path, first notice, harness, verdict and parent busy; JSON prints
+every figure, and `--episodes FILE` writes one row per episode for case studies.
+
+Limits: the coordinator must be a Claude Code session; children must be Claude Code or Muse; a
+child that never names itself in its messages is not credited with notifying; and screen-only
+signals (approval prompts) are visible only through watch notices.
+
 ## Inspect and troubleshoot
 
 Agents and shell scripts can navigate the same archive without starting the website. Every archive
