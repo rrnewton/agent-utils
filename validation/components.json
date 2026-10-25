@@ -248,6 +248,7 @@
       "test_files": [
         "py/tests/test_agent_log_archive_fetcher.py",
         "py/tests/test_case_timings.py",
+        "py/tests/test_engine_resolver_default.py",
         "py/tests/test_engine_resolver_source_pin.py",
         "py/tests/test_gh_resolve.py",
         "py/tests/test_gh_resolve_copies.py",
