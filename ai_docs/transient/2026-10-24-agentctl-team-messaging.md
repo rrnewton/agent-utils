@@ -155,7 +155,7 @@ answered by sending again.
 - **No caller identity variable.** agentctl sets no environment variable naming the agent a
   process belongs to; identity has to be proved (section 8.2).
 - **No coordinator designation of its own, and no parent edges** (revision 3, checked at
-  `e707ba70`). An agent record carries no `started_by`, parent or spawner field: nothing records
+  `e707ba70`). An agent record carries no creator, parent or controller field: nothing records
   which agent started which. "The coordinator" exists only in scattered, per-consumer places:
   the optional `coordinator` key of `REGISTRY/restore.json`, read by `restore` alone
   (`embedded_userguide.md:578, 611`); the `--coordinator NAME` argument each `watch-agents`
@@ -2137,7 +2137,7 @@ Exit status extends `agentctl send`'s 0, 75 and 76 with 65 for terminal non-deli
    and ancestry into `agent-queue`, with agentctl switched to it and no behaviour change; the
    queue format documented with the crate. (Coordinated with the suite-factoring lane's
    audit.)
-2. **P0b: the coordinator designation in agentctl** (revision 3; proposed, question 27). An
+2. **P0b: the coordinator designation in agentctl** (revision 3; decided, question 27). An
    agentctl feature in its own right, useful without team messaging, closing the gap in 2.1:
    - **One designation per registry**, `REGISTRY/coordinator.json` (`{"schema":
      "agentctl-coordinator/v1", "name", "token", "set_at", "set_by"}`), set with `agentctl
@@ -2150,11 +2150,21 @@ Exit status extends `agentctl send`'s 0, 75 and 76 with 65 for terminal non-deli
      `chat run` (its target agent, when `chat.json` names none, and a warning when it names
      another), and wrkslots, which can take the designated record's pinned harness process ID
      instead of a caller-supplied `--coordinator-pid`.
-   - **A `started_by` edge on every record**, written by `agentctl start` from the caller's
-     proved identity: the ancestry walk of 8.2 finds the harness of a registered record
-     (`{"agent", "registry", "token", "proof": "harness-ancestry"}`), or else the record says
-     `unproved` (a human at a shell, a timer). It is informational: `status` and `list --tree`
-     show who started whom, and nothing grants authority from it.
+   - **Edges, optional but recorded by default.** Every record gets two separate fields, written
+     unless the caller opts out (`agentctl start --no-edges`, or `"record_edges": false` in a
+     launch profile). Each names an agent by `{"agent", "registry", "token", "proof":
+     "harness-ancestry"}`, found by the ancestry walk of 8.2, and is absent when the caller
+     cannot be proved to be a registered agent (a human at a shell, a timer):
+     - `created_by`, **provenance**: who ran `agentctl start`. Set once, never changed, possibly
+       absent. `status` and `list --tree` show it.
+     - `managed_by`, **the current controller**: set at `start` to the same agent, **replaced**
+       when another coordinator runs `agentctl adopt` on the record (the normal hand-over: the
+       owner often tells a new coordinator to adopt agents in tabs), and clearable with
+       `agentctl manage --clear NAME`.
+     Decisions about control follow `managed_by` or the registry's coordinator designation,
+     never `created_by`: who may send a hold or other directive to an agent, which coordinator
+     wrkslots hints as a slot's owner, and whom `watch-agents` notifies about an agent (its
+     `managed_by`, else the designated coordinator). `created_by` is history only.
    - agent-teams reads the designation (6.4's `"designation": "registry"`) and never writes it.
 3. **P1: read-only model.** `teams.json` and `routes.d` parsers with schema and comment handling,
    `teams show`, `probe`, `check`, `discover` (proposal only), `import`. Surfaces I1, I2 and I4
@@ -2210,6 +2220,14 @@ Numbers 1-11 keep revision 1's numbering; 12 onward are new.
   the Rust edition; the cross-edition differential checks just that refusal (12.4, 17). Catching
   the Python edition up is later work. The repository-wide switch of the engine default to Rust
   is a separate lane (`engine-rust-default`), not part of this design.
+- **27. The coordinator as an agentctl concept.** On the proposal of a registry-level coordinator
+  designation plus edges between agents (P0b, 17), the owner: "I think we should keep it edges
+  optional but maybe default. I often tell a new coordinator to adopt agents in tabs. So while
+  it's good to know who created a subagent it doesn't determine who controls it in the future."
+  (2026-10-25). Edges are optional but recorded by default, in two fields: `created_by`
+  (provenance, set once) and `managed_by` (the current controller, replaced by `adopt`).
+  Control follows `managed_by` or the registry's designation, never `created_by`. The
+  registry-level designation stays as proposed.
 - **12, second half. The owner's own ssh configuration.** Asked "May routes use your own ssh
   config during migration, and should that expire?", the owner answered "Sure and no. But good
   to test any other mechanism we propose." (2026-10-25). `use_user_ssh_config` is allowed and
@@ -2312,13 +2330,6 @@ Numbers 1-11 keep revision 1's numbering; 12 onward are new.
     only through the bridge's rescan (up to about 90 s late). Ask that client's maintainers for an
     exception for listed peer IDs, or accept the rescan latency for a last-resort route
     (recommended to start)?
-27. **The coordinator as an agentctl concept** (P0b, 17). You asked whether, without agent-teams,
-    you still get to know which agent is the coordinator, or only pairs of panes. Today agentctl
-    has no parent edges and no single designation (2.1). Proposal: a registry-level coordinator
-    designation (`agentctl coordinator set|show|clear`) that `restore`, `watch-agents`, the chat
-    bridge and wrkslots read, plus an informational `started_by` edge on every record written by
-    `agentctl start` from the caller's proved identity; agent-teams only reads the designation.
-    Do you confirm, and should it land before team messaging starts?
 
 ## 19. Related work
 
@@ -2460,6 +2471,7 @@ exit codes were aligned with `agentctl send`.
   A2A, NATS, Mosquitto, Matrix, Tailscale DERP, OpenSSH, and SMTP, UUCP and netnews (the last
   three recalled, because every fetch of the RFCs was refused).
 - The coordinator designation as an agentctl feature independent of teams (P0b): the gap stated
-  in 2.1, a registry-level designation its own consumers read, and an informational
-  `started_by` edge (17, question 27).
-- Model-harness relay faults and invariants (9.7); new questions 21-27 (18).
+  in 2.1, a registry-level designation its own consumers read, and edges recorded by default
+  with an opt-out, split into `created_by` (provenance) and `managed_by` (control, replaced by
+  `adopt`), as the owner decided (17, question 27).
+- Model-harness relay faults and invariants (9.7); new questions 21-26 (18).
