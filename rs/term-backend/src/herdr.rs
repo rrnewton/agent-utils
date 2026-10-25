@@ -1,6 +1,9 @@
 //! The Herdr backend: the Herdr CLI driven with the argument shapes
-//! the existing Herdr clients have always used, so existing behaviour is
-//! unchanged byte-for-byte where tests pin it.
+//! existing Herdr clients already use. Argument shapes and JSON field
+//! validation match those clients where their tests pin them; this
+//! backend deliberately does not reproduce their per-call timeouts,
+//! cancellation, or process-identity proofs — consumers that need those
+//! keep driving their own client behind the same traits.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -226,7 +229,7 @@ impl Multiplexer for HerdrBackend {
             args.extend(strings(&["--workspace", workspace.as_str()]));
         }
         let result = self.call(&args, "pane list")?;
-        object_entries(result.get("panes"), "pane list entry")?
+        let panes: Vec<PaneInfo> = object_entries(result.get("panes"), "pane list entry")?
             .iter()
             .map(|entry| {
                 Ok(PaneInfo {
@@ -244,7 +247,19 @@ impl Multiplexer for HerdrBackend {
                     terminal_id: optional_string(entry, "terminal_id")?,
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(expected) = workspace {
+            if let Some(pane) = panes
+                .iter()
+                .find(|pane| pane.workspace_id.as_ref() != Some(expected))
+            {
+                return Err(TermError::failed(format!(
+                    "pane list: returned pane {:?} from a different workspace, expected {expected:?}",
+                    pane.id
+                )));
+            }
+        }
+        Ok(panes)
     }
 
     fn focus_pane(&self, pane: &PaneId) -> Result<()> {

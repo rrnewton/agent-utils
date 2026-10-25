@@ -278,7 +278,7 @@ fn run(args: Args) -> Result<i32, CliError> {
         deliver_while_working: false,
     };
     let lines = args.lines;
-    let backend = crate::term::select_backend(
+    let (backend, _explicit) = crate::term::select_backend(
         args.term_backend.as_deref(),
         &|name| std::env::var(name).ok(),
         &args.registry,
@@ -361,7 +361,14 @@ fn run_direct<A: agent::AgentApi>(
 }
 
 fn run_managed(args: Args) -> Result<i32, CliError> {
-    if args.term_backend.as_deref() == Some("tmux") {
+    let (backend, backend_explicit) = crate::term::select_backend(
+        args.term_backend.as_deref(),
+        &|name| std::env::var(name).ok(),
+        &args.registry,
+        &args.herdr_bin,
+        &args.tmux_bin,
+    )?;
+    if backend_explicit && backend == term_backend::BackendKind::Tmux {
         return Err(CliError::Usage(
             "the tmux terminal backend drives only direct-pane commands (send/drain/status/read \
              --pane PANE); managed commands require Herdr"

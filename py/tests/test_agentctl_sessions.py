@@ -265,6 +265,23 @@ def test_project_configuration_exposes_a_bounded_workspace_policy(tmp_path: Path
     assert workspace_for_registry(tmp_path / "unrelated-registry") is None
 
 
+def test_project_configuration_accepts_the_shared_term_backend_key(tmp_path: Path) -> None:
+    # The Rust edition selects its terminal backend from this key in the
+    # shared profiles file; this edition validates and ignores it.
+    _write_project_configuration(tmp_path, "project-agents")
+    path = tmp_path / ".agentctl/profiles.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["term_backend"] = "tmux"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    path.chmod(0o600)
+    load_configuration(tmp_path)
+    document["term_backend"] = "screen"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    path.chmod(0o600)
+    with pytest.raises(AgentDeliveryError, match="term_backend must be"):
+        load_configuration(tmp_path)
+
+
 @pytest.mark.parametrize(
     "workspace", ["", " leading", "trailing ", "line\nfeed", "tab\tlabel", "x" * 129],
 )

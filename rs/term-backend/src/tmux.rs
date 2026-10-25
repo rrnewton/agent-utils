@@ -23,8 +23,11 @@ pub struct TmuxBackend {
     executable: PathBuf,
     socket: Option<String>,
     runner: SharedRunner,
-    paste_counter: AtomicU64,
 }
+
+/// Process-wide paste-buffer counter: two backends in one process must
+/// never mint the same buffer name.
+static PASTE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl TmuxBackend {
     /// Drive `executable` against the default server, or the `-L` socket
@@ -34,7 +37,6 @@ impl TmuxBackend {
             executable,
             socket,
             runner: system_runner(),
-            paste_counter: AtomicU64::new(0),
         }
     }
 
@@ -48,7 +50,6 @@ impl TmuxBackend {
             executable,
             socket,
             runner,
-            paste_counter: AtomicU64::new(0),
         }
     }
 
@@ -107,22 +108,27 @@ impl TmuxBackend {
 }
 
 fn parse_pane_row(line: &str) -> Result<PaneInfo> {
+    // Parse from both ends: the title (field 5 of 7) is program-controlled
+    // and may itself contain the separator, so any surplus fields belong
+    // to it rather than failing the whole census.
     let fields: Vec<&str> = line.split(SEP).collect();
-    if fields.len() != 7 {
+    if fields.len() < 7 {
         return Err(TermError::failed(format!(
             "tmux list-panes: malformed row {line:?}"
         )));
     }
-    let command = fields[6];
+    let tail = fields.len() - 2;
+    let command = fields[fields.len() - 1];
+    let title = fields[4..tail].join(&SEP.to_string());
     Ok(PaneInfo {
         id: fields[0].to_owned().into(),
         tab_id: Some(fields[1].to_owned().into()),
         workspace_id: Some(fields[2].to_owned().into()),
         cwd: (!fields[3].is_empty()).then(|| PathBuf::from(fields[3])),
-        title: (!fields[4].is_empty()).then(|| fields[4].to_owned()),
+        title: (!title.is_empty()).then_some(title),
         agent: known_harness(command).map(str::to_owned),
         agent_status: None,
-        pid: fields[5].parse::<u32>().ok(),
+        pid: fields[tail].parse::<u32>().ok(),
         terminal_id: None,
     })
 }
@@ -340,10 +346,21 @@ impl PaneTerminal for TmuxBackend {
     }
 
     fn paste_text(&self, pane: &PaneId, text: &str) -> Result<()> {
+        // Text that already carries escape framing (a verified-submission
+        // layer wraps prompts in bracketed-paste markers itself) must reach
+        // the pane byte-for-byte: paste-buffer sanitises ESC bytes into
+        // literal `^[` text, while `send-keys -l` delivers them raw.
+        if text.contains('\u{1b}') {
+            let args = self.args(&["send-keys", "-t", pane.as_str(), "-l", "--", text]);
+            return expect_ok(
+                &self.runner.run(&self.executable, &args, None)?,
+                "tmux send-keys",
+            );
+        }
         let buffer = format!(
             "term-backend-{}-{}",
             std::process::id(),
-            self.paste_counter.fetch_add(1, Ordering::Relaxed)
+            PASTE_COUNTER.fetch_add(1, Ordering::Relaxed)
         );
         let load = self.args(&["load-buffer", "-b", &buffer, "-"]);
         expect_ok(
@@ -351,8 +368,9 @@ impl PaneTerminal for TmuxBackend {
             "tmux load-buffer",
         )?;
         // -p uses bracketed paste where the pane's program enabled it; -d
-        // deletes the buffer once pasted.
-        self.run(
+        // deletes the buffer once pasted. On failure, delete it explicitly
+        // so prompt text never lingers in a server-side buffer.
+        let paste = self.run(
             &[
                 "paste-buffer",
                 "-p",
@@ -363,8 +381,15 @@ impl PaneTerminal for TmuxBackend {
                 pane.as_str(),
             ],
             "tmux paste-buffer",
-        )?;
-        Ok(())
+        );
+        if paste.is_err() {
+            let _ = self.runner.run(
+                &self.executable,
+                &self.args(&["delete-buffer", "-b", &buffer]),
+                None,
+            );
+        }
+        paste.map(|_| ())
     }
 
     fn send_keys(&self, pane: &PaneId, keys: &str) -> Result<()> {
@@ -484,6 +509,31 @@ mod tests {
         assert_eq!(calls[1].1.as_deref(), Some("typed text"));
         assert!(calls[2].0.contains(&"paste-buffer".to_owned()));
         assert!(calls[2].0.contains(&"-p".to_owned()));
+    }
+
+    #[test]
+    fn escape_framed_text_goes_as_raw_literal_keys_never_a_paste_buffer() {
+        let (backend, scripted) = backend(vec![""]);
+        backend
+            .paste_text(&PaneId::from("%1"), "\u{1b}[200~framed\u{1b}[201~")
+            .unwrap();
+        let calls = scripted.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].0.contains(&"send-keys".to_owned()));
+        assert!(calls[0].0.contains(&"-l".to_owned()));
+        assert_eq!(
+            calls[0].0.last().map(String::as_str),
+            Some("\u{1b}[200~framed\u{1b}[201~")
+        );
+    }
+
+    #[test]
+    fn a_tab_inside_a_pane_title_does_not_fail_the_census() {
+        let (backend, _scripted) =
+            backend(vec!["%1\t@1\t$1\t/work\ttitle\twith\ttabs\t99\tbash\n"]);
+        let panes = backend.list_panes(None).unwrap();
+        assert_eq!(panes[0].title.as_deref(), Some("title\twith\ttabs"));
+        assert_eq!(panes[0].pid, Some(99));
     }
 
     #[test]
