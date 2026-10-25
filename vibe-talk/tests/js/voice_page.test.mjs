@@ -79982,6 +79982,86 @@ test("`#440 thread-card-pack-toggle`: the triangle in the first unpacked row's g
   assert.equal(card.hasAttribute("data-thread-read"), true, "the read thread's card does not say so, so it is not greyed");
 });
 
+test("`#501 thread-bridge-gutter`: on a phone the bridge hugs the left edge, and a tap on the bridge glides back to the thread's card, still unpacked; reduced motion is at once, and in All the bridge goes back to the message the replies hang from", async () => {
+  // The stylesheet's half, measured drawn in tests/bridge_gutter_browser.py: narrow widths only,
+  // every list the bridge is drawn in, a slimmer stack and a shorter branch, on a hit target a
+  // thumb can still hit; the desk's insets are the ones it always had (asserted there too).
+  const PHONE = "(max-width: 599.98px)";
+  const tail = CSS_CODE.slice(CSS_CODE.lastIndexOf(`@media ${PHONE}`));
+  const phone = (selector) => cssRules(mediaBodyOf(tail, PHONE), selector).join("\n");
+  for (const list of ["#side-cards", "#discord-log", "#side-log"]) {
+    assert.match(phone(`${list} li.discord-message[data-stack-under="third"][data-who]`),
+      /margin-left:\s*calc\(var\(--speaker-inset\) \/ 2 \+ 0\.85rem\)/, `${list}: a phone's stack still hangs a full gutter in`);
+    assert.match(phone(`${list} li.discord-message[data-stack-under="me"][data-who]`),
+      /margin-left:\s*calc\(var\(--speaker-inset\) \+ 0\.85rem\)/, `${list}: a phone's stack under the owner's row still hangs a full gutter in`);
+    assert.match(phone(`${list} li.discord-message[data-stack-under="reply"][data-who]`),
+      /margin-left:\s*calc\(var\(--reply-gutter\) \+ 0\.85rem\)/, `${list}: a phone's stack under a reply still hangs a second full gutter in`);
+    assert.match(phone(`${list} .reply-bridge`), /width:\s*calc\(0\.55rem \+ var\(--reply-stroke\) \/ 2\)/,
+      `${list}: a phone's bridge still reaches 0.9rem into its row`);
+  }
+  const target = phone("#side-cards .reply-ungather.unpack-pack");
+  assert.match(target, /width:\s*2\.25rem/, "the triangle's target is not the slim phone width");
+  assert.match(cssBlock("#side-cards .reply-ungather.unpack-pack"), /min-width:\s*2rem/, "the triangle's target lost its 32px floor");
+  assert.match(phone("#side-list"), /--unpack-row-left:\s*calc\(var\(--speaker-inset\) \/ 2 \+ 0\.85rem\)/,
+    "the owner's unpacked rows and the reply opened under them keep the wide indent");
+  // The line itself takes the tap, over a thumb's width along it, and the triangle stands over it.
+  const bridgeRule = cssBlock("#side-cards .reply-bridge");
+  assert.doesNotMatch(bridgeRule, /pointer-events:\s*none/, "the bridge still refuses taps");
+  assert.match(cssBlock("#side-cards .reply-bridge::before"), /left:\s*-1\.1rem/, "the bridge's tap room does not reach left of the line");
+  assert.match(cssBlock("#side-cards .reply-ungather"), /z-index:\s*1/, "the triangle does not stand over the bridge's tap room");
+
+  const { page } = await stillPage();
+  const id = stillCardIds(page)[2];
+  const area = page.el("side-scroll");
+  const cardTop = () => cardRow(page, id).getBoundingClientRect().top;
+  assert.ok(unpackRows(page, id).length >= 1, "the premise: the thread stands unpacked");
+  // Scrolled way down the thread, a tap on the last row's part of the bridge goes back to the card.
+  area.scrollTop = area.scrollHeight;
+  await area.dispatch("scroll");
+  assert.ok(cardTop() < 0, "the premise: the card has been scrolled away");
+  const last = unpackRows(page, id).at(-1);
+  const bridge = last.children.find((node) => String(node.className).split(/\s+/).includes("reply-bridge"));
+  assert.ok(bridge, "the last unpacked row holds no part of the bridge");
+  await bridge.click();
+  await page.settle();
+  assert.deepStrictEqual((area.glides || []).map((glide) => glide.behavior), ["smooth"], "the bridge did not glide smoothly");
+  assert.ok(Math.abs(cardTop() - 8) <= 1, `the card stands at ${cardTop()}, not at the head of the list`);
+  const cardBox = cardRow(page, id).getBoundingClientRect();
+  assert.ok(cardBox.bottom <= area.clientHeight, "the card is not wholly on screen at the head of the list");
+  assert.deepStrictEqual(cardSays(page, id), ["unpacked", true], "the bridge packed the thread, as its triangle would");
+
+  // Reduced motion: the same tap, at once.
+  const slower = await stillPage();
+  slower.page.preferReducedMotion();
+  const still = slower.page.el("side-scroll");
+  still.scrollTop = still.scrollHeight;
+  await still.dispatch("scroll");
+  const calm = unpackRows(slower.page, id).at(-1)
+    .children.find((node) => String(node.className).split(/\s+/).includes("reply-bridge"));
+  await calm.click();
+  await slower.page.settle();
+  assert.deepStrictEqual((still.glides || []).map((glide) => glide.behavior), ["auto"],
+    "a reader who asks for reduced motion was given a smooth glide from the bridge");
+  assert.ok(Math.abs(cardRow(slower.page, id).getBoundingClientRect().top - 8) <= 1, "reduced motion landed elsewhere");
+
+  // In All, the bridge of a gathered stack goes back to the message the replies hang from, and
+  // leaves the gathering gathered: the X, not the line, puts them back.
+  const gathered = await scatteredPage();
+  await gatherChip(gathered, "601").click();
+  await gathered.settle();
+  const listArea = gathered.el("scroll-area");
+  listArea.scrollTop = listArea.scrollHeight;
+  await listArea.dispatch("scroll");
+  await gutterChild(rowWithId(gathered, "607"), "reply-bridge").click();
+  await gathered.settle();
+  assert.ok((listArea.glides || []).length === 1, "a gathered bridge did not glide");
+  const parentTop = rowWithId(gathered, "601").getBoundingClientRect().top;
+  // At the head of the channel list, which is under its floating line, not at its very top.
+  assert.ok(parentTop >= 0 && parentTop <= 40, `the parent stands at ${parentTop}, not at the head of the list`);
+  assert.deepStrictEqual(stackPlaces(gathered), [["601", "parent"], ["602", "first"], ["603", "middle"],
+    ["604", "middle"], ["606", "middle"], ["607", "last"]], "the bridge put the replies back, as the X would");
+});
+
 // --- a card packed or unpacked where it stands stays still (#459 pack-keeps-card-still) ---------------------
 //
 // The owner, 2026-10-23: packing a thread card a few threads from the foot of the Threads view made it jump

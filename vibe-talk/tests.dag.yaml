@@ -1485,6 +1485,24 @@ steps:
       resources: {browser: 1}
       est_duration_s: 9
 
+  # `#501 thread-bridge-gutter` in the browser engine, at 393x852 and 412x915 by touch and 1280x800
+  # with a mouse: on each phone the pack triangle's ink a few pixels from the left screen edge on
+  # a target of 32px at least, the unpacked rows a slim indent in from their card on a short
+  # branch; on the desk the wider indent it always had; scrolled to a thread's foot, a tap on
+  # the bridge's spine gliding back to its card, wholly at the head of the list, the thread
+  # still unpacked, and under reduced motion still landing there; the triangle packing as ever.
+  - group: check
+    job: bridge-gutter-browser
+    desc: on a phone the bridge hugging the left edge with the rows wider for it, a tap on the spine gliding back to the thread's card, and the triangle still packing in place, in current Chromium at 393x852, 412x915 and 1280x800
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/bridge_gutter_browser.py
+    jobs_flag: ""
+    timeout: 180
+    cpu_timeout: 90
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 20
+
   # `#459 pack-keeps-card-still` and `#460 pack-gap-slide` in the browser engine, at 1280x800 with a mouse and
   # 393x852 by touch: a card packed at the foot of the Threads view by a click, its top the same in every
   # frame, held past the foot in room that a live reply fills and that scrolling up takes away for good; the
