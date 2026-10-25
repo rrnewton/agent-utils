@@ -133,6 +133,28 @@ pub(crate) fn agentctl_command() -> std::process::Command {
     command
 }
 
+/// Whether an `agentctl capabilities` document lists the `inbox.v2` queue
+/// lane (phase P2). Team items land in that lane, so an agentctl without
+/// it queues them where no drainer ever types them.
+fn lanes_supported(capabilities: &Value) -> bool {
+    capabilities
+        .get("queue")
+        .and_then(|queue| queue.get("lanes"))
+        .and_then(Value::as_array)
+        .is_some_and(|lanes| lanes.iter().any(|lane| lane.as_str() == Some("inbox.v2")))
+}
+
+/// Ask the configured agentctl whether it supports queue lanes: `Some`
+/// when it answered, `None` when it could not be run or parsed.
+pub(crate) fn agentctl_supports_lanes() -> Option<bool> {
+    let output = agentctl_command().arg("capabilities").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let document: Value = serde_json::from_slice(&output.stdout).ok()?;
+    Some(lanes_supported(&document))
+}
+
 /// `agentctl coordinator show` as JSON: the designation as agentctl itself
 /// resolves it (following the designated generation through rename/revive),
 /// rather than the raw file. `None` when the binary is unavailable, predates
@@ -495,5 +517,15 @@ mod record_tests {
         assert_eq!(dirs[1], PathBuf::from("/home/someone/bin"));
         assert_eq!(dirs[2], PathBuf::from("/usr/bin"));
         assert!(augmented_path(None, None).is_none());
+    }
+
+    #[test]
+    fn lanes_supported_reads_the_queue_lanes() {
+        let with = serde_json::json!({"queue": {"lanes": ["inbox.v2", "cancel"]}});
+        let without = serde_json::json!({"queue": {"lanes": []}});
+        let older = serde_json::json!({"interactive": {}});
+        assert!(lanes_supported(&with));
+        assert!(!lanes_supported(&without));
+        assert!(!lanes_supported(&older));
     }
 }

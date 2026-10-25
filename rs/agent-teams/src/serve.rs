@@ -31,6 +31,9 @@ pub fn handle_verb(
             if !crate::model::valid_team_name(team) || !crate::envelope::valid_message_id(id) {
                 return json!({"known": false, "id": id, "state": "unknown"});
             }
+            // A receipt answer should reflect typing that finished after
+            // accept, whichever drainer did it; the read itself stays pure.
+            let _ = crate::ledger::reconcile_queue_delivery(state, team, id);
             receipt(state, team, id)
         }
         "fence" => {

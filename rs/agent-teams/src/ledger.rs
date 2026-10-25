@@ -634,6 +634,80 @@ pub fn fence(
     }
 }
 
+/// Fold the agentctl queue's terminal state for an accepted entry back
+/// into the ledger: `processed` becomes `delivered`, `cancelled` becomes
+/// the set-aside reason's terminal state, and `failed` becomes
+/// `possibly_submitted`. This is how a sender's receipt ever leaves
+/// `accepted` (gap 2): `accept` ends at hand-over, but typing finishes
+/// later and usually in a different process - our `drain-one`, the
+/// coordinator's bridge, or any `agentctl send` that drains the queue on
+/// its way. Returns the new state when it changed one. Only entries
+/// still `accepted` with an `agentctl-queue` target are touched.
+pub fn reconcile_queue_delivery(state: &Path, team: &str, id: &str) -> Option<String> {
+    use agent_queue::queue::MessageState;
+    let lock = lock_ledger(&ledger_dir(state, team)).ok()?;
+    let mut entry = read_entry(state, team, id)?;
+    if entry_state(&entry) != "accepted" {
+        unlock(lock);
+        return None;
+    }
+    let target = entry.get("target")?;
+    if target.get("kind").and_then(Value::as_str) != Some("agentctl-queue") {
+        unlock(lock);
+        return None;
+    }
+    let queue_dir = PathBuf::from(target.get("queue_dir").and_then(Value::as_str)?);
+    let queue_state = agent_queue::queue::message_state(&queue_dir, id)
+        .ok()
+        .flatten();
+    let (new_state, detail): (&str, String) = match queue_state {
+        Some(MessageState::Processed) => (
+            "delivered",
+            "typed into the coordinator's pane (queue item processed)".to_string(),
+        ),
+        Some(MessageState::Cancelled) => {
+            let item = fs::read_to_string(queue_dir.join("cancelled").join(format!("{id}.json")))
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+            let reason = item
+                .as_ref()
+                .and_then(|item| item.get("cancel_reason"))
+                .and_then(Value::as_str)
+                .unwrap_or("cancelled");
+            if reason == "expired" {
+                (
+                    "expired",
+                    "set aside untyped at drain: past not_after".to_string(),
+                )
+            } else {
+                (
+                    "retracted",
+                    "set aside untyped at drain: tombstoned".to_string(),
+                )
+            }
+        }
+        Some(MessageState::Failed) => (
+            "possibly_submitted",
+            "queue quarantined the item as possibly submitted; settle with resolve".to_string(),
+        ),
+        _ => {
+            unlock(lock);
+            return None;
+        }
+    };
+    entry["state"] = json!(new_state);
+    entry["detail"] = json!(detail);
+    entry["delivered_at"] = if new_state == "delivered" {
+        json!(format_rfc3339_ms(now_unix_ms()))
+    } else {
+        Value::Null
+    };
+    let written = write_json_atomic(&entry_path(state, team, id), &entry);
+    unlock(lock);
+    written.ok()?;
+    Some(new_state.to_string())
+}
+
 /// `receipt`: a pure read of the ledger (never recovers).
 pub fn receipt(state: &Path, team: &str, id: &str) -> Value {
     match read_entry(state, team, id) {

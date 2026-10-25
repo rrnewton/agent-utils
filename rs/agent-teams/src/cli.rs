@@ -69,7 +69,7 @@ RECEIVING HOST (run by routes, not by hand)
   accept --protocol 1 [--team T] (--envelope - | --envelope-base64 B)
   receipt ID [--team T]                Pure read of the ledger.
   fence ID --team T --not-after TIME   Bar an ID before it arrives.
-  drain-one --queue-dir D --registry R --agent A --id ID --ready-timeout S
+  drain-one --queue-dir D --registry R --agent A --id ID --ready-timeout S [--team T]
                                        Bounded delivery-on-arrival helper.
 
 SSH AND LINKS
@@ -505,6 +505,21 @@ fn cmd_check(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
                     _ => problems.push(format!("team {name}@{}: no-route", entry.host)),
                 }
             }
+        }
+    }
+    // Team items land in the inbox.v2 lane; an agentctl predating lanes
+    // would leave them untyped forever, so that is a hard problem here.
+    let needs_lanes = declarations
+        .iter()
+        .any(|(_, _, declaration)| declaration.deliverer_kind == "agentctl-queue");
+    if needs_lanes {
+        match crate::proof::agentctl_supports_lanes() {
+            Some(true) => lines.push(json!({"kind": "ok", "detail": format!("agentctl {} supports queue lanes (inbox.v2)", crate::proof::agentctl_binary().display())})),
+            Some(false) => problems.push(format!(
+                "agentctl {} predates queue lanes (inbox.v2); agentctl-queue items would never be typed; upgrade agentctl",
+                crate::proof::agentctl_binary().display()
+            )),
+            None => lines.push(json!({"kind": "warning", "detail": format!("could not ask agentctl {} for its capabilities; lane support unverified", crate::proof::agentctl_binary().display())})),
         }
     }
     if globals.json || has_flag(args, "--json") {
@@ -1289,6 +1304,10 @@ fn cmd_seen(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         .into_iter()
         .next()
         .ok_or_else(|| err("usage", "seen needs an ID"))?;
+    // Fold any finished typing into the ledger before answering.
+    if let Some((team, _)) = find_ledger_entry_any_team(globals, &id) {
+        let _ = crate::ledger::reconcile_queue_delivery(&globals.state, &team, &id);
+    }
     match find_ledger_entry_any_team(globals, &id) {
         Some((team, entry)) => {
             println!(
@@ -1444,7 +1463,16 @@ fn cmd_drain_one(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
     let state = flag_value(args, "--state-dir")
         .map(PathBuf::from)
         .unwrap_or_else(|| globals.state.clone());
-    crate::deliver::run_auto_drain(&state, &queue_dir, &registry, &agent, &id, ready_timeout);
+    let team = flag_value(args, "--team");
+    crate::deliver::run_auto_drain(
+        &state,
+        &queue_dir,
+        &registry,
+        &agent,
+        &id,
+        ready_timeout,
+        team.as_deref(),
+    );
     Ok(0)
 }
 

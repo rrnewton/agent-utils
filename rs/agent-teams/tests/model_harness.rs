@@ -586,6 +586,7 @@ fn agentctl_queue_deliverer_uses_agent_queue() {
     let state = temp_state("queue-deliverer");
     let queue_dir = state.join("queue");
     let deliverer = AgentctlQueueDeliverer {
+        team: "sim".into(),
         queue_dir: queue_dir.clone(),
         ledger_path: state.join("ledger.json"),
         registry: state.clone(),
@@ -906,6 +907,7 @@ fn auto_drain_spawns_bounded_helper() {
         )
     };
     let base = |enabled: bool| AgentctlQueueDeliverer {
+        team: "sim".into(),
         queue_dir: queue_dir.clone(),
         ledger_path: state.join("ledger.json"),
         registry: state.clone(),
@@ -938,7 +940,7 @@ fn auto_drain_spawns_bounded_helper() {
     assert!(!log.contains("rendered"), "log must be content-free: {log}");
 
     // The helper itself: one bounded agentctl drain for the queued item.
-    run_auto_drain(&state, &queue_dir, &state, "coordinator", id1, 5);
+    run_auto_drain(&state, &queue_dir, &state, "coordinator", id1, 5, None);
     let drained = std::fs::read_to_string(&drain_record).expect("drain argv");
     assert!(
         drained.contains("drain coordinator") && drained.contains("--deliver-while-working"),
@@ -958,5 +960,96 @@ fn auto_drain_spawns_bounded_helper() {
         std::env::remove_var("AGENT_TEAMS_SELF_BIN");
         std::env::remove_var("AGENT_TEAMS_AGENTCTL");
     }
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+/// Gap 2: an accepted ledger entry follows its queue item's terminal
+/// state - processed becomes delivered (so receipts leave `accepted`),
+/// failed becomes possibly_submitted, and a still-pending item changes
+/// nothing.
+#[test]
+fn reconcile_folds_queue_terminal_state_into_the_ledger() {
+    use agent_teams::deliver::AgentctlQueueDeliverer;
+    use agent_teams::ledger::{receipt, reconcile_queue_delivery};
+    let state = temp_state("reconcile");
+    declaration_for(&state, "tools", "sim");
+    let declarations = agent_teams::proof::load_declarations(&state).expect("decls");
+    let (_, _, declaration) = &declarations[0];
+    let queue_dir = state.join("queue");
+    let deliverer = AgentctlQueueDeliverer {
+        team: "tools".into(),
+        queue_dir: queue_dir.clone(),
+        ledger_path: state.join("ledger.json"),
+        registry: state.clone(),
+        agent: "coordinator".into(),
+        auto_drain: agent_teams::deliver::AutoDrain {
+            enabled: false,
+            ..Default::default()
+        },
+        drain_state_dir: None,
+    };
+    let ctx = AcceptContext {
+        state: &state,
+        this_host: "host-a",
+        declaration,
+        via: "test",
+        proof_note: "proved",
+        relayed_by: None,
+        peer_host: "host-a",
+    };
+    let now_ms = agent_teams::timeutil::now_unix_ms();
+    let deliver = |id: &str, seq: i64| {
+        let envelope = build_envelope(
+            id,
+            "k",
+            "sim",
+            "host-a",
+            seq,
+            "harness-ancestry",
+            "tools",
+            "host-a",
+            "info",
+            None,
+            &[],
+            false,
+            now_ms,
+            now_ms + 7_200_000,
+            None,
+            "body",
+        );
+        let answer = accept(&ctx, &envelope, &deliverer).expect("accept");
+        assert_eq!(answer.state.as_deref(), Some("accepted"), "{answer:?}");
+    };
+    let move_item = |id: &str, to: &str| {
+        let directories = agent_queue::queue::QueueDirectories::new(&queue_dir);
+        let from = [&directories.inbox_v2, &directories.inbox]
+            .into_iter()
+            .map(|dir| dir.join(format!("{id}.json")))
+            .find(|path| path.exists())
+            .expect("queued");
+        std::fs::rename(from, queue_dir.join(to).join(format!("{id}.json"))).expect("move");
+    };
+
+    let done = "tm-sim-3333333333333333";
+    deliver(done, 1);
+    assert_eq!(reconcile_queue_delivery(&state, "tools", done), None);
+    assert_eq!(receipt(&state, "tools", done)["state"], "accepted");
+    move_item(done, "processed");
+    assert_eq!(
+        reconcile_queue_delivery(&state, "tools", done).as_deref(),
+        Some("delivered")
+    );
+    let answer = receipt(&state, "tools", done);
+    assert_eq!(answer["state"], "delivered", "{answer}");
+    // Terminal entries are not rewritten again.
+    assert_eq!(reconcile_queue_delivery(&state, "tools", done), None);
+
+    let stuck = "tm-sim-4444444444444444";
+    deliver(stuck, 2);
+    move_item(stuck, "failed");
+    assert_eq!(
+        reconcile_queue_delivery(&state, "tools", stuck).as_deref(),
+        Some("possibly_submitted")
+    );
     let _ = std::fs::remove_dir_all(&state);
 }

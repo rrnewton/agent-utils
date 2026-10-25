@@ -175,6 +175,8 @@ impl Default for AutoDrain {
 /// drainers that re-check `not_after` and tombstones just before typing
 /// read; older drainers never see them.
 pub struct AgentctlQueueDeliverer {
+    /// The team this deliverer serves (for ledger reconcile after a drain).
+    pub team: String,
     /// The coordinator's queue directory (`REGISTRY/<agent>/queue`).
     pub queue_dir: PathBuf,
     /// Ledger entry path recorded in each item.
@@ -247,6 +249,8 @@ impl AgentctlQueueDeliverer {
                 &self.auto_drain.ready_timeout_seconds.to_string(),
                 "--state-dir",
                 &state.to_string_lossy(),
+                "--team",
+                &self.team,
             ])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -322,6 +326,7 @@ pub fn run_auto_drain(
     agent: &str,
     id: &str,
     ready_timeout_seconds: u64,
+    team: Option<&str>,
 ) {
     use fs2::FileExt;
     let log = |outcome: &str| {
@@ -355,12 +360,19 @@ pub fn run_auto_drain(
     let spawned = crate::proof::agentctl_command()
         .arg("--registry")
         .arg(registry)
+        // Bound the drain inside agentctl: its deadline stops it starting
+        // further prompts but never interrupts one being typed, unlike
+        // the helper's last-resort kill below.
         .args([
             "drain",
             agent,
             "--deliver-while-working",
             "--ready-timeout",
             &ready_timeout_seconds.to_string(),
+            "--deadline",
+            &(ready_timeout_seconds + 120).to_string(),
+            "--lock-timeout",
+            "60",
         ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -378,10 +390,15 @@ pub fn run_auto_drain(
         }
     };
     let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(ready_timeout_seconds + 180);
+        std::time::Instant::now() + std::time::Duration::from_secs(ready_timeout_seconds + 420);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                // Fold the queue's terminal state into the team ledger so
+                // senders' receipts can leave `accepted` (gap 2).
+                if let Some(team) = team.filter(|team| !team.is_empty()) {
+                    let _ = crate::ledger::reconcile_queue_delivery(state, team, id);
+                }
                 if status.success() {
                     log("done");
                 } else {
@@ -618,6 +635,10 @@ pub fn deliverer_for(
                 .and_then(|teams_d| teams_d.parent())
                 .map(|state| state.to_path_buf());
             Ok(Box::new(AgentctlQueueDeliverer {
+                team: team_state_dir
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
                 queue_dir: registry.join(&coordinator).join("queue"),
                 ledger_path: ledger_path.to_path_buf(),
                 registry,
