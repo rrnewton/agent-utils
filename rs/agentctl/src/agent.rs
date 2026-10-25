@@ -740,8 +740,8 @@ impl AgentRuntime for PasteTrackingRuntime<'_> {
 
 /// Remove the paste-tracking stamps before an item reaches a terminal
 /// phase: they are recovery evidence for `inflight/` only, and terminal
-/// queue documents must stay identical across editions (the Python
-/// edition writes no such fields).
+/// queue documents must stay in the shared format (no other writer of
+/// the format adds such fields).
 fn strip_paste_stamps(document: &mut Map<String, Value>) {
     document.remove("paste_tracking");
     document.remove("inflight_from");
