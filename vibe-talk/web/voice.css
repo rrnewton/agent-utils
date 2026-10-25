@@ -5132,15 +5132,7 @@ a.search-hit-link {
   }
 }
 
-/* On a narrow phone the button hangs at the bar's left end, where a centred chip would run off the
-   screen: there it starts at the button's own left edge instead. */
-@media (max-width: 400px) {
-  #author-filter .author-chip,
-  #author-filter .author-tip {
-    left: 0;
-    transform: none;
-  }
-}
+
 
 /* `#211 link-filter`. Links ON in the accent, the colour every other pressed toggle here wears and
    the colour its links are drawn in; gold is the pin's alone. */
@@ -5333,6 +5325,14 @@ a.search-hit-link {
     position: absolute;
     top: calc(100% + 1px + var(--kinds-gap));
     left: 3px;
+  }
+
+  /* `#520 search-whose-toggle-hint`. At the bar's left end a centred chip or tooltip would run off
+     the screen: there each starts at the button's own left edge instead. */
+  #author-filter .author-chip,
+  #author-filter .author-tip {
+    left: 0;
+    transform: none;
   }
 
   #screen-main[data-searching][data-link-kinds] #author-filter {

@@ -5421,6 +5421,11 @@ const TUNING_BANDS = {
   HEARD_HEAD: [500, 500,
     "how much of the start of a turn longer than HEARD_TEXT_MAX is reported; the rest is its end. " +
     "It is the server's own split (send_intent::HEARD_HEAD), so a turn cut by both reads the same"],
+  // `#520 search-whose-toggle-hint`.
+  AUTHOR_CHIP_MS: [800, 4000,
+    "how long the chip naming the author filter's new state stays up before it fades. Under most " +
+    "of a second it is gone before it is read; past a few seconds it outstays a press's news and " +
+    "stands over the messages it names"],
 };
 test("every number this page is tuned by stays inside a band that says what would be wrong", () => {
   for (const [name, [low, high, why]] of Object.entries(TUNING_BANDS)) {
