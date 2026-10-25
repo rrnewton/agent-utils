@@ -14361,6 +14361,7 @@ printf '{"version":1,"id":"%s","action":"send","ok":true,"receipt":{"message_id"
             working_timeout: Duration::from_secs(5),
             max_attempts: 1,
             deliver_while_working: false,
+            ..DrainOptions::default()
         }
     }
 

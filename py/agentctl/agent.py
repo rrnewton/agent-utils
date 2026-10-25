@@ -1197,6 +1197,7 @@ def _enqueue(
     max_artifact_bytes = _effective_artifact_limit(max_artifact_bytes)
     if not text:
         raise AgentDeliveryError("message must not be empty")
+    _refuse_queue_lanes(root)
     inbox, inflight, processed, failed = _prepare(root)
     identifier = f"{time.time_ns():020d}-{os.getpid()}" if message_id is None else message_id
     if _MESSAGE_ID.fullmatch(identifier) is None:
@@ -1214,7 +1215,11 @@ def _enqueue(
             descriptor = _open_private_lock(lock_path, "queue delivery lock")
             fcntl.flock(descriptor, fcntl.LOCK_EX)
             _verify_queue_lock(root, directory_identity, lock_path, descriptor, "queue delivery lock")
-        if any(os.path.lexists(os.path.join(directory, filename)) for directory in (inbox, inflight, processed, failed)):
+        # A prompt the Rust edition set aside (or still holds in its second inbox) keeps its
+        # identifier, so re-queueing it here can never type it a second time.
+        lanes = tuple(os.path.join(root, lane) for lane in ("inbox.v2", "cancelled"))
+        if any(os.path.lexists(os.path.join(directory, filename))
+               for directory in (inbox, inflight, processed, failed, *lanes)):
             raise AgentDeliveryError(f"message id already exists: {identifier}")
         try:
             _atomic_json_create(
@@ -1677,6 +1682,61 @@ def _validate_existing_binding(
         )
 
 
+#: Queue directories only the Rust edition understands: a second inbox whose prompts may expire,
+#: tombstones, and prompts set aside untyped.
+QUEUE_LANES = ("inbox.v2", "cancel", "cancelled")
+
+
+def queue_lane_refusal(root: str) -> str | None:
+    """Why this edition must not drain, deliver, or enqueue in ``root``, or None.
+
+    A queue with prompts in ``inbox.v2/``, a waiting tombstone in ``cancel/``, or an inbox prompt
+    that carries ``not_after`` holds prompts this edition would type without honouring their
+    expiry or tombstone. Prompts already set aside in ``cancelled/`` need nothing from this
+    edition, so they alone do not block it; ``_enqueue`` still refuses their identifiers.
+    """
+    for lane in ("inbox.v2", "cancel"):
+        try:
+            waiting = [name for name in os.listdir(os.path.join(root, lane)) if name.endswith(".json")]
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            return f"queue {root} has a {lane}/ this edition cannot read ({error})"
+        if waiting:
+            return f"queue {root} has {len(waiting)} item(s) in {lane}/"
+    inbox = os.path.join(root, "inbox")
+    try:
+        names = sorted(os.listdir(inbox))
+    except OSError:
+        return None
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(inbox, name)
+        try:
+            # Only a regular file is read: a FIFO or device planted under a .json name would
+            # block or misbehave, and the drain quarantines such entries itself.
+            if not stat.S_ISREG(os.lstat(path).st_mode):
+                continue
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+            with os.fdopen(descriptor, encoding="utf-8") as handle:
+                document = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if isinstance(document, dict) and "not_after" in document:
+            return f"queue {root} holds {name}, which carries not_after"
+    return None
+
+
+def _refuse_queue_lanes(root: str) -> None:
+    reason = queue_lane_refusal(root)
+    if reason is not None:
+        raise AgentDeliveryError(
+            f"{reason}: prompts there may expire or be cancelled, which only the Rust edition of "
+            "agentctl honours; drain and send with the Rust agentctl (for example DAGRUN_ENGINE=rust)"
+        )
+
+
 def _validate_existing_queue(root: str) -> None:
     """Validate every existing queue directory without creating or tightening it."""
 
@@ -1969,6 +2029,7 @@ def _drain(
     intact; a failed post-submission update retains the durable inflight barrier.
     """
     max_artifact_bytes = _effective_artifact_limit(max_artifact_bytes)
+    _refuse_queue_lanes(root)
     directory_identity = _bind_queue(
         root, target, max_artifact_bytes=max_artifact_bytes,
         allow_legacy_workspace_binding=allow_legacy_workspace_binding,

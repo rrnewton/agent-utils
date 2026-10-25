@@ -8601,10 +8601,12 @@ and the replies captured for them. The provider's own thread is the complete rec
                 Ok(None | Some(QueueMessageState::Pending)) => {
                     gate.unprompted.insert(record.key);
                 }
+                // Set aside untyped prompts are never typed, so nothing waits on their blocks.
                 Ok(Some(
                     QueueMessageState::Inflight
                     | QueueMessageState::Processed
-                    | QueueMessageState::Failed,
+                    | QueueMessageState::Failed
+                    | QueueMessageState::Cancelled,
                 )) => {}
                 Err(_) => {
                     gate.unconfirmed.insert(record.key);
@@ -8718,7 +8720,8 @@ and the replies captured for them. The provider's own thread is the complete rec
                     match delivery
                         .message_state(&self.config.agent_name, &record.delivery_message_id)
                     {
-                        Ok(None) => None,
+                        // A prompt set aside untyped never reaches the coordinator.
+                        Ok(None | Some(QueueMessageState::Cancelled)) => None,
                         Ok(Some(QueueMessageState::Pending)) => Some(PromptReach::Queued),
                         Ok(Some(
                             QueueMessageState::Inflight
@@ -11773,6 +11776,12 @@ fn drive_fence_feedback(
                 "fence feedback may already have reached the coordinator".to_owned(),
             ));
         }
+        // Set aside by a tombstone or expiry: it is not queued again under the same ID.
+        Some(QueueMessageState::Cancelled) => {
+            return Ok(CoordinatorDeliveryResult::Uncertain(
+                "the coordinator queue set fence feedback aside untyped".to_owned(),
+            ));
+        }
         // Either one drains the queue, which types the prompts in its inbox in the order they
         // were queued until it reaches one it cannot type.
         Some(QueueMessageState::Pending) => {
@@ -11793,6 +11802,11 @@ fn drive_fence_feedback(
         Some(QueueMessageState::Inflight | QueueMessageState::Failed) => {
             Ok(CoordinatorDeliveryResult::Uncertain(detail.unwrap_or_else(
                 || "fence feedback may already have reached the coordinator".to_owned(),
+            )))
+        }
+        Some(QueueMessageState::Cancelled) => {
+            Ok(CoordinatorDeliveryResult::Uncertain(detail.unwrap_or_else(
+                || "the coordinator queue set fence feedback aside untyped".to_owned(),
             )))
         }
         Some(QueueMessageState::Pending) | None => Ok(CoordinatorDeliveryResult::Pending(
@@ -12139,6 +12153,13 @@ pub(crate) fn deliver_request_with(
             state.set_delivery_phase(key, RequestPhase::DeliveryUncertain, Some(detail))?;
             return Ok(CoordinatorDeliveryResult::Uncertain(detail.to_owned()));
         }
+        // A request set aside untyped (cancelled or expired) is never queued again by itself;
+        // an operator settles it.
+        Some(QueueMessageState::Cancelled) => {
+            let detail = "coordinator queue set the request aside untyped (cancelled or expired)";
+            state.set_delivery_phase(key, RequestPhase::DeliveryUncertain, Some(detail))?;
+            return Ok(CoordinatorDeliveryResult::Uncertain(detail.to_owned()));
+        }
         // Either one drains the queue, which types the prompts in its inbox in the order they
         // were queued until it reaches one it cannot type.
         Some(QueueMessageState::Pending) => match guard_typing(state, delivery, None) {
@@ -12176,6 +12197,13 @@ pub(crate) fn deliver_request_with(
         Ok(Some(QueueMessageState::Processed)) => {
             state.set_delivery_phase(key, RequestPhase::Delivered, None)?;
             Ok(CoordinatorDeliveryResult::Delivered)
+        }
+        Ok(Some(QueueMessageState::Cancelled)) => {
+            let detail = operation_error.unwrap_or_else(|| {
+                "coordinator queue set the request aside untyped (cancelled or expired)".to_owned()
+            });
+            state.set_delivery_phase(key, RequestPhase::DeliveryUncertain, Some(&detail))?;
+            Ok(CoordinatorDeliveryResult::Uncertain(detail))
         }
         Ok(Some(QueueMessageState::Inflight | QueueMessageState::Failed)) => {
             let detail = operation_error.unwrap_or_else(|| {

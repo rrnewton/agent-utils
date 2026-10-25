@@ -28,12 +28,20 @@ pub const INFLIGHT: &str = "inflight";
 pub const PROCESSED: &str = "processed";
 /// Quarantined items: malformed, or possibly typed and never to be replayed.
 pub const FAILED: &str = "failed";
+/// Pending items that only a drainer which honours tombstones and `not_after` may type.
+pub const INBOX_V2: &str = "inbox.v2";
+/// Tombstones: `cancel/<id>.json` asks every drainer not to type item `<id>`.
+pub const CANCEL: &str = "cancel";
+/// Items a drainer set aside untyped: cancelled by a tombstone, or expired.
+pub const CANCELLED: &str = "cancelled";
 /// The lock that serializes drains, explicit-identifier enqueues and withdrawals.
 pub const DELIVERY_LOCK: &str = ".delivery.lock";
 /// The lock that serializes changes to the target binding.
 pub const BINDING_LOCK: &str = ".binding.lock";
 /// The target binding, written by the first send.
 pub const TARGET_BINDING: &str = "target.json";
+/// Item field: Unix time in milliseconds after which no drainer types the item.
+pub const NOT_AFTER: &str = "not_after";
 
 /// Exact durable location of one caller-selected queue message identifier.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -47,6 +55,8 @@ pub enum MessageState {
     Processed,
     /// Delivery may have occurred and automatic replay is unsafe.
     Failed,
+    /// Set aside untyped: cancelled by a tombstone, or expired.
+    Cancelled,
 }
 
 /// The phase directories of one queue.
@@ -60,6 +70,12 @@ pub struct QueueDirectories {
     pub processed: PathBuf,
     /// `failed/`.
     pub failed: PathBuf,
+    /// `inbox.v2/`, created by the first item that needs it.
+    pub inbox_v2: PathBuf,
+    /// `cancel/`, created by the first tombstone.
+    pub cancel: PathBuf,
+    /// `cancelled/`, created by the first item set aside.
+    pub cancelled: PathBuf,
 }
 
 impl QueueDirectories {
@@ -71,25 +87,66 @@ impl QueueDirectories {
             inflight: root.join(INFLIGHT),
             processed: root.join(PROCESSED),
             failed: root.join(FAILED),
+            inbox_v2: root.join(INBOX_V2),
+            cancel: root.join(CANCEL),
+            cancelled: root.join(CANCELLED),
         }
     }
 
-    /// Every phase directory, in lifecycle order.
+    /// The four phase directories every queue has, in lifecycle order. The lanes
+    /// ([`Self::lanes`]) exist only once something needed them, so a queue that never used one
+    /// stays readable by drainers that know only these four.
     #[must_use]
     pub fn all(&self) -> [&Path; 4] {
         [&self.inbox, &self.inflight, &self.processed, &self.failed]
     }
 
-    /// Every phase directory with the state an item in it has.
+    /// The directories a drainer must understand before it may touch the queue at all:
+    /// `inbox.v2/`, `cancel/` and `cancelled/`.
     #[must_use]
-    pub fn states(&self) -> [(&Path, MessageState); 4] {
+    pub fn lanes(&self) -> [&Path; 3] {
+        [&self.inbox_v2, &self.cancel, &self.cancelled]
+    }
+
+    /// Every directory that can hold an item, with the state an item in it has.
+    #[must_use]
+    pub fn states(&self) -> [(&Path, MessageState); 6] {
         [
             (&self.inbox, MessageState::Pending),
+            (&self.inbox_v2, MessageState::Pending),
             (&self.inflight, MessageState::Inflight),
             (&self.processed, MessageState::Processed),
             (&self.failed, MessageState::Failed),
+            (&self.cancelled, MessageState::Cancelled),
         ]
     }
+
+    /// Whether any lane directory exists.
+    #[must_use]
+    pub fn uses_lanes(&self) -> bool {
+        self.lanes()
+            .iter()
+            .any(|lane| fs::symlink_metadata(lane).is_ok())
+    }
+}
+
+/// Which pending directory an enqueue writes to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Lane {
+    /// `inbox/`: every drainer types it.
+    Inbox,
+    /// `inbox.v2/`: only drainers that honour tombstones and `not_after` see it.
+    InboxV2,
+}
+
+/// Create the lane directory `path` of the queue `root` if it is absent.
+pub fn prepare_lane(root: &Path, path: &Path) -> Result<()> {
+    let existed = fs::symlink_metadata(path).is_ok();
+    create_private_directory(path, "queue lane directory", false, true)?;
+    if !existed {
+        sync_directory(root)?;
+    }
+    Ok(())
 }
 
 /// Create the queue `root` and its phase directories, private to the caller, and sync them.
@@ -117,7 +174,8 @@ pub fn validate_existing_queue(root: &Path) -> Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(io_error("inspect queue directory", root, error)),
     }
-    for directory in QueueDirectories::new(root).all() {
+    let directories = QueueDirectories::new(root);
+    for directory in directories.all().into_iter().chain(directories.lanes()) {
         match fs::symlink_metadata(directory) {
             Ok(_) => validate_private_directory(directory, "queue state directory", false)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -268,24 +326,55 @@ pub fn enqueue(
     waiter: &dyn Waiter,
     document: impl FnOnce(&str) -> Value,
 ) -> Result<String> {
+    enqueue_into(root, Lane::Inbox, message_id, serialize, waiter, document)
+}
+
+/// [`enqueue`] into `lane`. An item for [`Lane::InboxV2`] may also carry `not_after`, a Unix time
+/// in milliseconds after which no drainer types it; that lane is created when first used.
+pub fn enqueue_into(
+    root: &Path,
+    lane: Lane,
+    message_id: Option<&str>,
+    serialize: bool,
+    waiter: &dyn Waiter,
+    document: impl FnOnce(&str) -> Value,
+) -> Result<String> {
     let directories = prepare(root)?;
     let identifier = message_id.map_or_else(generated_message_id, str::to_owned);
     validate_message_id(&identifier)?;
     let filename = format!("{identifier}.json");
-    let path = directories.inbox.join(&filename);
+    let directory = match lane {
+        Lane::Inbox => &directories.inbox,
+        Lane::InboxV2 => {
+            prepare_lane(root, &directories.inbox_v2)?;
+            &directories.inbox_v2
+        }
+    };
+    let path = directory.join(&filename);
     let _lock = if serialize {
         Some(lock_delivery(root, directory_identity(root)?, waiter)?)
     } else {
         None
     };
     if directories
-        .all()
+        .states()
         .iter()
-        .any(|directory| fs::symlink_metadata(directory.join(&filename)).is_ok())
+        .any(|(directory, _)| fs::symlink_metadata(directory.join(&filename)).is_ok())
     {
         return Err(duplicate(&identifier));
     }
     let document = document(&identifier);
+    let lane_fields_ok = match lane {
+        Lane::Inbox => document.get(NOT_AFTER).is_none_or(Value::is_null),
+        Lane::InboxV2 => document
+            .get(NOT_AFTER)
+            .is_none_or(|value| value.is_null() || value.as_u64().is_some()),
+    };
+    if !lane_fields_ok {
+        return Err(Error::invalid(format!(
+            "queued message {identifier}: not_after must be a Unix time in milliseconds, and only an inbox.v2 item may carry one"
+        )));
+    }
     if document
         .get("text")
         .and_then(Value::as_str)
@@ -364,13 +453,18 @@ pub fn message_state(root: &Path, message_id: &str) -> Result<Option<MessageStat
     Ok(observed)
 }
 
-/// The identifiers in the queue's inbox, sorted by name; empty when the queue does not exist.
+/// The identifiers waiting in the queue's inbox and `inbox.v2/`, sorted by name; empty when the
+/// queue does not exist.
 pub fn pending_identifiers(root: &Path) -> Result<Vec<String>> {
     if fs::symlink_metadata(root).is_err() {
         return Ok(Vec::new());
     }
     validate_existing_queue(root)?;
-    identifiers_if_directory(&QueueDirectories::new(root).inbox)
+    let directories = QueueDirectories::new(root);
+    let mut identifiers = identifiers_if_directory(&directories.inbox)?;
+    identifiers.extend(identifiers_if_directory(&directories.inbox_v2)?);
+    identifiers.sort();
+    Ok(identifiers)
 }
 
 /// Take the item `message_id` back out of the inbox, untyped, and say whether it was there.
@@ -384,13 +478,22 @@ pub fn withdraw(root: &Path, message_id: &str, waiter: &dyn Waiter) -> Result<bo
     }
     validate_existing_queue(root)?;
     let _lock = lock_delivery(root, directory_identity(root)?, waiter)?;
-    let inbox = QueueDirectories::new(root).inbox;
-    let path = inbox.join(format!("{message_id}.json"));
-    match fs::symlink_metadata(&path) {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(io_error("inspect queue message", &path, error)),
+    let directories = QueueDirectories::new(root);
+    let mut found = None;
+    for inbox in [&directories.inbox, &directories.inbox_v2] {
+        let path = inbox.join(format!("{message_id}.json"));
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                found = Some((inbox.clone(), path));
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error("inspect queue message", &path, error)),
+        }
     }
+    let Some((inbox, path)) = found else {
+        return Ok(false);
+    };
     let document = load_message(&path)?;
     if document.get("id").and_then(Value::as_str) != Some(message_id) {
         return Err(Error::invalid(format!(
@@ -535,25 +638,216 @@ pub fn json_paths(directory: &Path) -> Result<Vec<PathBuf>> {
 /// numbers its file names in sequence and records `queued_at` as text, if at all, or one that
 /// cannot be read, which a drain then quarantines.
 pub fn inbox_in_queue_order(inbox: &Path) -> Result<Vec<PathBuf>> {
-    let mut entries: Vec<(Option<f64>, PathBuf)> = json_paths(inbox)?
-        .into_iter()
-        .map(|path| {
+    in_queue_order(&[inbox])
+}
+
+/// Every pending item of the queue, `inbox/` and `inbox.v2/` merged, in the order of
+/// [`inbox_in_queue_order`]; for one `queued_at` and file name, the `inbox/` item first.
+pub fn pending_in_queue_order(directories: &QueueDirectories) -> Result<Vec<PathBuf>> {
+    if fs::symlink_metadata(&directories.inbox_v2).is_ok() {
+        // A second inbox another writer created with a wider mode is made private here, as
+        // `prepare` does for the four phases.
+        validate_private_directory(&directories.inbox_v2, "queue lane directory", true)?;
+        in_queue_order(&[&directories.inbox, &directories.inbox_v2])
+    } else {
+        in_queue_order(&[&directories.inbox])
+    }
+}
+
+fn in_queue_order(directories: &[&Path]) -> Result<Vec<PathBuf>> {
+    let mut entries: Vec<(Option<f64>, std::ffi::OsString, usize, PathBuf)> = Vec::new();
+    for (lane, directory) in directories.iter().enumerate() {
+        for path in json_paths(directory)? {
             let queued_at = read_json(&path)
                 .ok()
                 .and_then(|document| document.get("queued_at").and_then(Value::as_f64))
                 // `total_cmp` puts -0.0 before 0.0; make them one time.
                 .map(|seconds| if seconds == 0.0 { 0.0 } else { seconds });
-            (queued_at, path)
-        })
-        .collect();
-    entries.sort_by(|(left_at, left), (right_at, right)| {
-        match (left_at, right_at) {
-            (Some(left_time), Some(right_time)) => left_time.total_cmp(right_time),
-            _ => left_at.is_some().cmp(&right_at.is_some()),
+            let name = path.file_name().unwrap_or_default().to_owned();
+            entries.push((queued_at, name, lane, path));
         }
-        .then_with(|| left.cmp(right))
-    });
-    Ok(entries.into_iter().map(|(_, path)| path).collect())
+    }
+    entries.sort_by(
+        |(left_at, left, left_lane, _), (right_at, right, right_lane, _)| {
+            match (left_at, right_at) {
+                (Some(left_time), Some(right_time)) => left_time.total_cmp(right_time),
+                _ => left_at.is_some().cmp(&right_at.is_some()),
+            }
+            .then_with(|| left.cmp(right))
+            .then_with(|| left_lane.cmp(right_lane))
+        },
+    );
+    Ok(entries.into_iter().map(|(_, _, _, path)| path).collect())
+}
+
+/// The current time as a Unix time in milliseconds, the unit of `not_after`.
+#[must_use]
+pub fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+/// What [`cancel`] found.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancelOutcome {
+    /// The item was waiting and is now in `cancelled/`: no drainer, of any version, can type it.
+    SetAside,
+    /// The item waits untyped while a drain holds the queue; that drain, if it honours
+    /// tombstones, sets it aside instead of typing it. A drainer that knows only the four phases
+    /// does not read tombstones.
+    Pending,
+    /// No item has the identifier yet; the tombstone stays, so one that arrives later is set
+    /// aside too.
+    Unknown,
+    /// A drain has taken the item and may already be typing it: the tombstone stops it only if
+    /// the drain is still before its last check.
+    Inflight,
+    /// Too late: the item was typed, or quarantined after typing may have begun.
+    TooLate,
+    /// The item was already set aside.
+    AlreadyCancelled,
+}
+
+/// A [`Waiter`] that never waits: a contended lock is given up at once.
+struct NoWait;
+
+impl Waiter for NoWait {
+    fn cancelled(&self) -> bool {
+        true
+    }
+    fn sleep(&self, _duration: std::time::Duration) {}
+}
+
+/// [`message_state`], retried a few times when a drain moving the item between directories makes
+/// one look see it twice or lose it between listing and reading.
+fn settled_state(root: &Path, message_id: &str) -> Result<Option<MessageState>> {
+    let mut attempt = 0;
+    loop {
+        match message_state(root, message_id) {
+            Ok(state) => return Ok(state),
+            Err(error) if attempt < 5 && error.kind() == ErrorKind::Invalid => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Ask every drainer not to type item `message_id`, never waiting for a lock: write the tombstone
+/// `cancel/<id>.json` (`id`, `reason`, `cancelled_at`), then, if no drain holds the queue, set a
+/// waiting item aside at once ([`CancelOutcome::SetAside`]). Otherwise report where the item is:
+/// a drain checks for the tombstone after it moves an item to `inflight/` and before it types, so
+/// an item reported [`CancelOutcome::Pending`] is never typed by a drainer that honours
+/// tombstones.
+pub fn cancel(root: &Path, message_id: &str, reason: &str) -> Result<CancelOutcome> {
+    validate_message_id(message_id)?;
+    let directories = prepare(root)?;
+    match settled_state(root, message_id)? {
+        Some(MessageState::Cancelled) => return Ok(CancelOutcome::AlreadyCancelled),
+        Some(MessageState::Processed | MessageState::Failed) => return Ok(CancelOutcome::TooLate),
+        _ => {}
+    }
+    prepare_lane(root, &directories.cancel)?;
+    let path = directories.cancel.join(format!("{message_id}.json"));
+    let tombstone = json!({"id": message_id, "reason": reason, "cancelled_at": unix_seconds()});
+    match atomic_json_create(&path, &tombstone) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(io_error("write queue tombstone", &path, error)),
+    }
+    // With the delivery lock free, no drain is between its last check and its paste, so the item
+    // can be set aside now, out of reach of every drainer.
+    if let Ok(_lock) = lock_delivery(root, directory_identity(root)?, &NoWait) {
+        for inbox in [&directories.inbox, &directories.inbox_v2] {
+            let item = inbox.join(format!("{message_id}.json"));
+            if fs::symlink_metadata(&item).is_ok() {
+                let document = load_message(&item)?;
+                set_aside(root, &directories, &item, document, "cancelled", reason)?;
+                return Ok(CancelOutcome::SetAside);
+            }
+        }
+    }
+    Ok(match settled_state(root, message_id)? {
+        Some(MessageState::Pending) => CancelOutcome::Pending,
+        Some(MessageState::Inflight) => CancelOutcome::Inflight,
+        Some(MessageState::Processed | MessageState::Failed) => CancelOutcome::TooLate,
+        Some(MessageState::Cancelled) => CancelOutcome::AlreadyCancelled,
+        None => CancelOutcome::Unknown,
+    })
+}
+
+/// Why the item `message_id`, whose document is `document`, must not be typed at `now_millis`:
+/// `("cancelled", reason)` when a tombstone names it, `("expired", detail)` when its `not_after`
+/// has passed, or `None`. Drainers ask this just before typing.
+pub fn set_aside_reason(
+    directories: &QueueDirectories,
+    message_id: &str,
+    document: &Map<String, Value>,
+    now_millis: u64,
+) -> Option<(&'static str, String)> {
+    let tombstone = directories.cancel.join(format!("{message_id}.json"));
+    if fs::symlink_metadata(&tombstone).is_ok() {
+        let reason = read_json(&tombstone)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default();
+        return Some(("cancelled", reason));
+    }
+    // A `null` not_after is no deadline, as an absent one is.
+    let not_after = document.get(NOT_AFTER).filter(|value| !value.is_null())?;
+    match not_after.as_u64() {
+        Some(deadline) if deadline > now_millis => None,
+        Some(deadline) => Some((
+            "expired",
+            format!("not_after {deadline} passed at {now_millis}"),
+        )),
+        None => Some(("expired", format!("invalid not_after {not_after}"))),
+    }
+}
+
+/// Move the untyped item at `path` to `cancelled/` with `delivery_state: cancelled`,
+/// `cancel_reason`, `cancel_detail` and `cancelled_at` added, and return its identifier.
+pub fn set_aside(
+    root: &Path,
+    directories: &QueueDirectories,
+    path: &Path,
+    mut document: Map<String, Value>,
+    reason: &str,
+    detail: &str,
+) -> Result<String> {
+    prepare_lane(root, &directories.cancelled)?;
+    let filename = path.file_name().ok_or_else(|| {
+        Error::invalid(format!(
+            "queued message has no filename: {}",
+            path.display()
+        ))
+    })?;
+    document.remove("possibly_submitted");
+    document.remove("inflight_at");
+    document.insert("delivery_state".to_owned(), json!("cancelled"));
+    document.insert("cancel_reason".to_owned(), json!(reason));
+    document.insert("cancel_detail".to_owned(), json!(detail));
+    document.insert("cancelled_at".to_owned(), json!(unix_seconds()));
+    atomic_json(path, &Value::Object(document))?;
+    transition(path, &directories.cancelled.join(filename))?;
+    let identifier = message_id_from_path(path)?;
+    // The tombstone has done its work: the item it named can never be typed now.
+    let tombstone = directories.cancel.join(format!("{identifier}.json"));
+    if reason == "cancelled" && fs::remove_file(&tombstone).is_ok() {
+        sync_directory(&directories.cancel)?;
+    }
+    Ok(identifier)
 }
 
 /// The identifiers of the items in `directory`, sorted by name.
@@ -759,6 +1053,201 @@ mod tests {
             .map(|path| message_id_from_path(path).unwrap())
             .collect();
         assert_eq!(order, ["y", "z", "m", "n", "b", "c", "a"]);
+    }
+
+    #[test]
+    fn the_second_lane_is_created_on_first_use_and_shares_the_identifier_space() {
+        let queue = TestQueue::new();
+        let root = &queue.0;
+        put(root, "old", true).unwrap();
+        let directories = QueueDirectories::new(root);
+        assert!(
+            !directories.uses_lanes(),
+            "a v1 queue grows no lane directories"
+        );
+        let error = enqueue_into(
+            root,
+            Lane::Inbox,
+            Some("x"),
+            true,
+            &Blocking,
+            |id| json!({"id": id, "text": "t", "not_after": 5}),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Invalid, "{error}");
+        let error = enqueue_into(
+            root,
+            Lane::InboxV2,
+            Some("x"),
+            true,
+            &Blocking,
+            |id| json!({"id": id, "text": "t", "not_after": "soon"}),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Invalid, "{error}");
+        enqueue_into(
+            root,
+            Lane::InboxV2,
+            Some("new"),
+            false,
+            &Blocking,
+            |id| json!({"id": id, "text": "t", "queued_at": 0.5, "not_after": 9}),
+        )
+        .unwrap();
+        assert!(directories.uses_lanes());
+        let mode = fs::metadata(&directories.inbox_v2)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+        assert_eq!(
+            message_state(root, "new").unwrap(),
+            Some(MessageState::Pending)
+        );
+        for (lane, id) in [(Lane::Inbox, "new"), (Lane::InboxV2, "old")] {
+            let error = enqueue_into(root, lane, Some(id), false, &Blocking, |id| {
+                plain_item(id, "t")
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Duplicate);
+        }
+        assert_eq!(pending_identifiers(root).unwrap(), ["new", "old"]);
+        let order: Vec<String> = pending_in_queue_order(&directories)
+            .unwrap()
+            .iter()
+            .map(|path| message_id_from_path(path).unwrap())
+            .collect();
+        assert_eq!(order, ["new", "old"], "merged by queued_at across lanes");
+        assert!(withdraw(root, "new", &Blocking).unwrap());
+        assert_eq!(message_state(root, "new").unwrap(), None);
+    }
+
+    #[test]
+    fn a_tombstone_or_a_passed_deadline_sets_an_item_aside_untyped() {
+        let queue = TestQueue::new();
+        let root = &queue.0;
+        let directories = prepare(root).unwrap();
+        enqueue_into(
+            root,
+            Lane::InboxV2,
+            Some("late"),
+            true,
+            &Blocking,
+            |id| json!({"id": id, "text": "t", "not_after": 1_000}),
+        )
+        .unwrap();
+        put(root, "kept", true).unwrap();
+        let item = |id: &str, lane: &Path| load_message(&lane.join(format!("{id}.json"))).unwrap();
+        assert_eq!(
+            set_aside_reason(
+                &directories,
+                "late",
+                &item("late", &directories.inbox_v2),
+                999
+            ),
+            None
+        );
+        enqueue_into(
+            root,
+            Lane::InboxV2,
+            Some("open"),
+            false,
+            &Blocking,
+            |id| json!({"id": id, "text": "t", "not_after": null}),
+        )
+        .unwrap();
+        assert_eq!(
+            set_aside_reason(
+                &directories,
+                "open",
+                &item("open", &directories.inbox_v2),
+                u64::MAX
+            ),
+            None,
+            "a null not_after is no deadline"
+        );
+        let (reason, detail) = set_aside_reason(
+            &directories,
+            "late",
+            &item("late", &directories.inbox_v2),
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(reason, "expired");
+        assert!(detail.contains("1000"), "{detail}");
+
+        // While a drain holds the queue the tombstone is all cancel can write.
+        let held = lock_delivery(root, directory_identity(root).unwrap(), &Blocking).unwrap();
+        assert_eq!(
+            cancel(root, "kept", "superseded").unwrap(),
+            CancelOutcome::Pending
+        );
+        assert_eq!(
+            cancel(root, "kept", "again").unwrap(),
+            CancelOutcome::Pending
+        );
+        drop(held);
+        assert_eq!(
+            set_aside_reason(&directories, "kept", &item("kept", &directories.inbox), 0),
+            Some(("cancelled", "superseded".to_owned()))
+        );
+        let path = directories.inbox.join("kept.json");
+        let document = item("kept", &directories.inbox);
+        assert_eq!(
+            set_aside(
+                root,
+                &directories,
+                &path,
+                document,
+                "cancelled",
+                "superseded"
+            )
+            .unwrap(),
+            "kept"
+        );
+        assert_eq!(
+            message_state(root, "kept").unwrap(),
+            Some(MessageState::Cancelled)
+        );
+        let moved = load_message(&directories.cancelled.join("kept.json")).unwrap();
+        assert_eq!(moved["delivery_state"], "cancelled");
+        assert_eq!(moved["cancel_reason"], "cancelled");
+        assert_eq!(
+            cancel(root, "kept", "x").unwrap(),
+            CancelOutcome::AlreadyCancelled
+        );
+        assert_eq!(
+            put(root, "kept", true).unwrap_err().kind(),
+            ErrorKind::Duplicate
+        );
+
+        assert_eq!(
+            cancel(root, "future", "retract").unwrap(),
+            CancelOutcome::Unknown
+        );
+        // A later item under that identifier is set aside by the waiting tombstone.
+        assert!(directories.cancel.join("future.json").exists());
+        // With no drain holding the queue, a waiting item is set aside at once and its
+        // tombstone is consumed.
+        put(root, "now", true).unwrap();
+        assert_eq!(
+            cancel(root, "now", "lifted").unwrap(),
+            CancelOutcome::SetAside
+        );
+        assert_eq!(
+            message_state(root, "now").unwrap(),
+            Some(MessageState::Cancelled)
+        );
+        assert!(!directories.cancel.join("now.json").exists());
+        put(root, "done", true).unwrap();
+        transition(
+            &directories.inbox.join("done.json"),
+            &directories.processed.join("done.json"),
+        )
+        .unwrap();
+        assert_eq!(cancel(root, "done", "x").unwrap(), CancelOutcome::TooLate);
+        assert!(!directories.cancel.join("done.json").exists());
     }
 
     #[test]

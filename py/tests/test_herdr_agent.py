@@ -868,6 +868,45 @@ def test_session_resolution_cannot_silently_override_asserted_pane(tmp_path: obj
     assert fake.runs == []
 
 
+@pytest.mark.parametrize("lane", ["inbox.v2", "cancel", "not_after"])
+def test_queues_using_rust_only_lanes_are_refused_before_anything_is_typed(
+    tmp_path: Path, lane: str,
+) -> None:
+    root = tmp_path / "queue"
+    enqueue(str(root), "an ordinary prompt", message_id="first")
+    if lane == "not_after":
+        item = root / "inbox" / "first.json"
+        document = json.loads(item.read_text(encoding="utf-8"))
+        document["not_after"] = 1
+        item.write_text(json.dumps(document), encoding="utf-8")
+    else:
+        (root / lane).mkdir(mode=0o700)
+        (root / lane / "waiting.json").write_text('{"id": "waiting", "text": "t"}', encoding="utf-8")
+    fake = FakeAgentHerdr(["idle"])
+    for operation in (
+        lambda: drain(client(fake), target(), str(root)),
+        lambda: send(client(fake), target(), str(root), "another prompt"),
+        lambda: enqueue(str(root), "another prompt"),
+    ):
+        with pytest.raises(AgentDeliveryError, match="only the Rust edition of agentctl honours"):
+            operation()
+    assert fake.runs == []
+    assert sorted(path.name for path in (root / "inbox").iterdir()) == ["first.json"]
+
+
+def test_prompts_set_aside_by_the_rust_edition_neither_block_nor_return(tmp_path: Path) -> None:
+    root = tmp_path / "queue"
+    enqueue(str(root), "an ordinary prompt", message_id="first")
+    (root / "cancelled").mkdir(mode=0o700)
+    (root / "cancelled" / "gone.json").write_text('{"id": "gone", "text": "t"}', encoding="utf-8")
+    (root / "cancel").mkdir(mode=0o700)
+    with pytest.raises(AgentDeliveryError, match="message id already exists"):
+        enqueue(str(root), "re-queued after it was set aside", message_id="gone")
+    fake = FakeAgentHerdr(["idle"])
+    drain(client(fake), target(), str(root))
+    assert fake.runs == ["an ordinary prompt"]
+
+
 @pytest.mark.parametrize("identifier", ["../escape", "/absolute", ".hidden", "bad/name", ""])
 def test_enqueue_rejects_unsafe_message_ids(tmp_path: object, identifier: str) -> None:
     with pytest.raises(AgentDeliveryError, match="message id"):

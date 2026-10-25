@@ -276,6 +276,7 @@ fn run(args: Args) -> Result<i32, CliError> {
         working_timeout: Duration::from_secs_f64(args.working_timeout),
         max_attempts: args.max_attempts,
         deliver_while_working: false,
+        ..DrainOptions::default()
     };
     let lines = args.lines;
     let (backend, _explicit) = crate::term::select_backend(
@@ -461,6 +462,7 @@ fn run_managed(args: Args) -> Result<i32, CliError> {
         working_timeout: Duration::from_secs_f64(args.working_timeout),
         max_attempts: args.max_attempts,
         deliver_while_working: false,
+        ..DrainOptions::default()
     };
     let name = name.unwrap_or_default();
     match command {

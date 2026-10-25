@@ -19,11 +19,13 @@ pub(crate) use agent_queue::fsio::DIRECTORY_SYNC_HOOK;
 use agent_queue::fsio::{transition, Waiter};
 #[cfg(test)]
 use agent_queue::queue::json_paths;
+pub use agent_queue::queue::CancelOutcome;
 pub use agent_queue::queue::MessageState as QueueMessageState;
 use agent_queue::queue::{
-    delivery_attempts, failed_metadata, identifiers, identifiers_if_directory,
-    inbox_in_queue_order, load_message, message_id_from_path, quarantine_raw, recover_inflight,
-    unix_seconds, DirectoryIdentity as QueueDirectoryIdentity, QueueDirectories,
+    delivery_attempts, failed_metadata, identifiers, identifiers_if_directory, load_message,
+    message_id_from_path, pending_in_queue_order, quarantine_raw, recover_inflight, set_aside,
+    set_aside_reason, unix_seconds, DirectoryIdentity as QueueDirectoryIdentity, Lane,
+    QueueDirectories,
 };
 use fs2::FileExt;
 use serde::Serialize;
@@ -88,6 +90,10 @@ pub struct QueueResult {
     pub quarantined: Vec<String>,
     /// Prompt identifiers that remain safe in `inbox`.
     pub pending: Vec<String>,
+    /// Prompt identifiers set aside untyped in `cancelled/`: a tombstone named them, or their
+    /// `not_after` passed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cancelled: Vec<String>,
     /// Readiness or identity failure that stopped FIFO progress.
     pub blocked: Option<String>,
     /// Machine-readable aggregate state.
@@ -478,6 +484,18 @@ pub struct DrainOptions {
     /// accepted while working by default (Muse steers its running turn with them). Slash commands
     /// and unsupported harnesses still wait for `idle` or `done`. Off by default for Claude.
     pub deliver_while_working: bool,
+    /// Longest wait for the queue's delivery lock and the host-wide target lock; `None` waits
+    /// until they are free.
+    pub lock_timeout: Option<Duration>,
+    /// Time after which the drain starts no further prompt, counted from its start; a prompt
+    /// being typed is never interrupted, and readiness waits end by then. `None` is no limit.
+    pub deadline: Option<Duration>,
+    /// Most prompts the drain types; `None` is no limit.
+    pub max_items: Option<usize>,
+    /// For a send: the prompt's `not_after`, a Unix time in milliseconds after which no drain
+    /// types it. Such a prompt goes to `inbox.v2/`, which only drainers that honour expiry and
+    /// tombstones read.
+    pub not_after: Option<u64>,
 }
 
 impl Default for DrainOptions {
@@ -487,7 +505,32 @@ impl Default for DrainOptions {
             working_timeout: Duration::from_secs(30),
             max_attempts: 3,
             deliver_while_working: false,
+            lock_timeout: None,
+            deadline: None,
+            max_items: None,
+            not_after: None,
         }
+    }
+}
+
+/// A runtime that behaves as `inner` and also counts as cancelled from `until` on (by `inner`'s
+/// clock): how a bounded drain stops waiting for a lock.
+struct UntilRuntime<'a> {
+    inner: &'a dyn AgentRuntime,
+    until: Duration,
+}
+
+impl AgentRuntime for UntilRuntime<'_> {
+    fn monotonic(&self) -> Duration {
+        self.inner.monotonic()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        self.inner.sleep(duration);
+    }
+
+    fn cancelled(&self) -> bool {
+        self.inner.cancelled() || self.inner.monotonic() >= self.until
     }
 }
 
@@ -790,42 +833,66 @@ fn validate_target_with_runtime<A: AgentApi + ?Sized>(
 
 /// Persist one prompt before any readiness or transport operation.
 pub fn enqueue(root: &Path, text: &str, message_id: Option<&str>) -> AgentResult<String> {
-    enqueue_internal(root, text, message_id, true, &SystemRuntime::default())
+    enqueue_internal(
+        root,
+        text,
+        message_id,
+        true,
+        None,
+        &SystemRuntime::default(),
+    )
 }
 
+/// Persist one prompt; one with a `not_after` goes to `inbox.v2/`, which drainers that do not
+/// honour expiry never read.
 fn enqueue_internal(
     root: &Path,
     text: &str,
     message_id: Option<&str>,
     serialize: bool,
+    not_after: Option<u64>,
     runtime: &dyn AgentRuntime,
 ) -> AgentResult<String> {
     if text.is_empty() {
         return Err(AgentError::delivery("message must not be empty"));
     }
     let waiter = RuntimeWaiter(runtime);
-    Ok(agent_queue::queue::enqueue(
+    let lane = if not_after.is_some() {
+        Lane::InboxV2
+    } else {
+        Lane::Inbox
+    };
+    Ok(agent_queue::queue::enqueue_into(
         root,
+        lane,
         message_id,
         serialize,
         &waiter,
         |identifier| {
-            // A chat request prompt names its message's create time, so the drain can open its
-            // first line with the delay as of typing; the stored text stays printable. See
-            // `prompt_time`.
-            match crate::prompt_time::queue_deferred(text, crate::prompt_time::now_millis()) {
-                Some(queued) => json!({
-                    "id": identifier,
-                    "text": queued.text,
-                    "sent_at": queued.sent_at,
-                    "opening": queued.opening,
-                    "queued_at": unix_seconds(),
-                    "delivery_attempts": 0,
-                }),
-                None => agent_queue::queue::plain_item(identifier, text),
+            let mut item = enqueued_item(identifier, text);
+            if let Some(not_after) = not_after {
+                item[agent_queue::queue::NOT_AFTER] = json!(not_after);
             }
+            item
         },
     )?)
+}
+
+/// The document `enqueue` writes for `text`.
+fn enqueued_item(identifier: &str, text: &str) -> Value {
+    // A chat request prompt names its message's create time, so the drain can open its first
+    // line with the delay as of typing; the stored text stays printable. See `prompt_time`.
+    match crate::prompt_time::queue_deferred(text, crate::prompt_time::now_millis()) {
+        Some(queued) => json!({
+            "id": identifier,
+            "text": queued.text,
+            "sent_at": queued.sent_at,
+            "opening": queued.opening,
+            "queued_at": unix_seconds(),
+            "delivery_attempts": 0,
+        }),
+        None => agent_queue::queue::plain_item(identifier, text),
+    }
 }
 
 /// Serialize and drain a FIFO with production timing.
@@ -883,12 +950,49 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
     runtime: &dyn AgentRuntime,
     allow_legacy_workspace_binding: bool,
 ) -> AgentResult<QueueResult> {
+    let started = runtime.monotonic();
+    // Lock waits end at the lock timeout, and never later than the drain's deadline.
+    let lock_bound = match (options.lock_timeout, options.deadline) {
+        (Some(limit), Some(deadline)) => Some(limit.min(deadline)),
+        (limit, deadline) => limit.or(deadline),
+    };
+    let bounded = lock_bound.map(|limit| UntilRuntime {
+        inner: runtime,
+        until: started.saturating_add(limit),
+    });
+    let lock_runtime: &dyn AgentRuntime = match &bounded {
+        Some(bounded) => bounded,
+        None => runtime,
+    };
+    let lock_limit = |error: AgentError| {
+        match lock_bound {
+        Some(limit) if lock_runtime.cancelled() && !runtime.cancelled() => {
+            AgentError::Pending(UndeliveredMessage {
+                message: format!(
+                    "a lock of queue {} stayed held for the drain's {}s lock bound; nothing was typed: {error}",
+                    root.display(),
+                    limit.as_secs_f64()
+                ),
+                message_id: String::new(),
+                artifact: root.to_path_buf(),
+            })
+        }
+        _ => error,
+    }
+    };
     let directory_identity =
-        bind_queue_with_runtime(root, target, runtime, allow_legacy_workspace_binding)?;
+        bind_queue_with_runtime(root, target, lock_runtime, allow_legacy_workspace_binding)
+            .map_err(lock_limit)?;
     let directories = QueueDirectories::new(root);
     let queue_lock_path = root.join(".delivery.lock");
     let queue_lock = open_private_lock(&queue_lock_path, "queue delivery lock")?;
-    lock_exclusive_with_runtime(&queue_lock, &queue_lock_path, "queue delivery", runtime)?;
+    lock_exclusive_with_runtime(
+        &queue_lock,
+        &queue_lock_path,
+        "queue delivery",
+        lock_runtime,
+    )
+    .map_err(lock_limit)?;
     verify_queue_lock(
         root,
         directory_identity,
@@ -898,12 +1002,41 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
     )?;
     let mut delivered = Vec::new();
     let mut quarantined = recover_inflight(&directories)?;
+    let mut cancelled = Vec::new();
+    let mut typed = 0_usize;
     let mut blocked = None;
     let mut target_lock: Option<TargetLock> = None;
     let mut locked_pane_id: Option<String> = None;
     let mut initial_info: Option<AgentPaneInfo> = None;
-    'message: for path in inbox_in_queue_order(&directories.inbox)? {
+    let deadline = options.deadline.map(|limit| started.saturating_add(limit));
+    'message: for path in pending_in_queue_order(&directories)? {
+        if options.max_items.is_some_and(|limit| typed >= limit) {
+            blocked = Some(format!(
+                "the drain typed its limit of {typed} prompt(s); the rest stay pending"
+            ));
+            break 'message;
+        }
+        if deadline.is_some_and(|deadline| runtime.monotonic() >= deadline) {
+            blocked = Some(format!(
+                "the drain's {}s deadline passed; the rest stay pending",
+                options.deadline.unwrap_or_default().as_secs_f64()
+            ));
+            break 'message;
+        }
+        // One prompt counts once against --max-items, however many times it is retried.
+        let mut counted = false;
+        let mut first_try = true;
         'retry: loop {
+            // A retry starts no new attempt once the deadline has passed.
+            if !std::mem::take(&mut first_try)
+                && deadline.is_some_and(|deadline| runtime.monotonic() >= deadline)
+            {
+                blocked = Some(format!(
+                    "the drain's {}s deadline passed; the rest stay pending",
+                    options.deadline.unwrap_or_default().as_secs_f64()
+                ));
+                break 'message;
+            }
             let (mut document, attempts) = match load_message(&path).and_then(|document| {
                 let attempts = delivery_attempts(&document, &path)?;
                 Ok((document, attempts))
@@ -925,6 +1058,20 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                 .get("id")
                 .and_then(Value::as_str)
                 .map_or(filename_id.clone(), str::to_owned);
+            // A cancelled or expired prompt is set aside before any wait for readiness.
+            if let Some((reason, detail)) =
+                set_aside_reason(&directories, &filename_id, &document, now_millis())
+            {
+                cancelled.push(set_aside(
+                    root,
+                    &directories,
+                    &path,
+                    document,
+                    reason,
+                    &detail,
+                )?);
+                continue 'message;
+            }
             if attempts >= options.max_attempts {
                 let detail = format!(
                 "message {identifier} reached the maximum delivery-attempt count ({attempts} >= {}); retained pending",
@@ -942,15 +1089,22 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
             // never typed into a working pane.
             let readiness = (|| -> AgentResult<AgentPaneInfo> {
                 if target_lock.is_none() {
-                    let (lock, info) = lock_resolved_target_with_runtime(client, target, runtime)?;
+                    let (lock, info) =
+                        lock_resolved_target_with_runtime(client, target, lock_runtime)
+                            .map_err(lock_limit)?;
                     target_lock = Some(lock);
                     locked_pane_id = Some(info.pane_id.clone());
                     initial_info = Some(info);
                 }
+                let ready_timeout = deadline.map_or(options.ready_timeout, |deadline| {
+                    options
+                        .ready_timeout
+                        .min(deadline.saturating_sub(runtime.monotonic()))
+                });
                 wait_ready(
                     client,
                     target,
-                    options.ready_timeout,
+                    ready_timeout,
                     runtime,
                     locked_pane_id
                         .as_deref()
@@ -983,6 +1137,24 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                 ))
             })?);
             transition(&path, &inflight_path)?;
+            // The last look before typing comes after the move, so a tombstone written while
+            // the prompt was still pending is always seen.
+            if let Some((reason, detail)) =
+                set_aside_reason(&directories, &filename_id, &document, now_millis())
+            {
+                cancelled.push(set_aside(
+                    root,
+                    &directories,
+                    &inflight_path,
+                    document,
+                    reason,
+                    &detail,
+                )?);
+                continue 'message;
+            }
+            if !std::mem::replace(&mut counted, true) {
+                typed += 1;
+            }
             document.insert("possibly_submitted".to_owned(), Value::Bool(true));
             document.insert("delivery_state".to_owned(), json!("inflight"));
             document.insert("inflight_at".to_owned(), json!(unix_seconds()));
@@ -1105,7 +1277,8 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
         }
     }
 
-    let pending = identifiers(&directories.inbox)?;
+    let mut pending = identifiers(&directories.inbox)?;
+    pending.extend(identifiers_if_directory(&directories.inbox_v2)?);
     let outcome = if blocked.is_some() {
         QueueOutcome::Pending
     } else if quarantined.is_empty() {
@@ -1118,6 +1291,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
         delivered,
         quarantined,
         pending,
+        cancelled,
         blocked,
         outcome,
     })
@@ -1264,7 +1438,14 @@ fn send_identified_with_runtime_binding<A: AgentApi + ?Sized>(
     // Explicit IDs serialize their cross-directory check against delivery transitions. Generated
     // identifiers plus no-replace creation need not wait behind a long-running drain. The drain and terminal-artifact inspection below resolve any message
     // consumed by another sender between these phases.
-    let identifier = enqueue_internal(root, text, message_id, message_id.is_some(), runtime)?;
+    let identifier = enqueue_internal(
+        root,
+        text,
+        message_id,
+        message_id.is_some(),
+        options.not_after,
+        runtime,
+    )?;
     let result = drain_with_runtime_binding(
         client,
         target,
@@ -1274,6 +1455,29 @@ fn send_identified_with_runtime_binding<A: AgentApi + ?Sized>(
         allow_legacy_workspace_binding,
     )?;
     let filename = format!("{identifier}.json");
+    let cancelled_path = root.join(agent_queue::queue::CANCELLED).join(&filename);
+    if result.cancelled.contains(&identifier) || fs::symlink_metadata(&cancelled_path).is_ok() {
+        let reason = load_message(&cancelled_path)
+            .ok()
+            .map(|document| {
+                format!(
+                    "{}: {}",
+                    document
+                        .get("cancel_reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("cancelled"),
+                    document
+                        .get("cancel_detail")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                )
+            })
+            .unwrap_or_else(|| "cancelled".to_owned());
+        return Err(AgentError::delivery(format!(
+            "message {identifier} was set aside untyped ({reason}); it is retained under {}/cancelled",
+            root.display()
+        )));
+    }
     let failed_path = root.join("failed").join(&filename);
     if result.quarantined.contains(&identifier) || fs::symlink_metadata(&failed_path).is_ok() {
         let detail = load_message(&failed_path)
@@ -1304,7 +1508,11 @@ fn send_identified_with_runtime_binding<A: AgentApi + ?Sized>(
             artifact: inflight_path,
         }));
     }
-    let inbox_path = root.join("inbox").join(&filename);
+    let inbox_path = [root.join("inbox"), root.join(agent_queue::queue::INBOX_V2)]
+        .into_iter()
+        .map(|inbox| inbox.join(&filename))
+        .find(|path| fs::symlink_metadata(path).is_ok())
+        .unwrap_or_else(|| root.join("inbox").join(&filename));
     if result.pending.contains(&identifier) || fs::symlink_metadata(&inbox_path).is_ok() {
         return Err(AgentError::Pending(UndeliveredMessage {
             message: format!(
@@ -1333,6 +1541,7 @@ fn send_identified_with_runtime_binding<A: AgentApi + ?Sized>(
         delivered,
         quarantined: result.quarantined,
         pending: result.pending,
+        cancelled: result.cancelled,
         blocked: result.blocked,
         outcome: QueueOutcome::Delivered,
     })
@@ -1412,6 +1621,15 @@ pub(crate) fn withdraw(
         &RuntimeWaiter(runtime),
     )?)
 }
+
+/// Write the tombstone that keeps every drain from typing queue message `message_id`, without
+/// waiting for any lock, and report where the message is. A drain checks the tombstone after it
+/// moves a prompt to `inflight/` and before it types, so a prompt reported pending is never typed.
+pub fn cancel(root: &Path, message_id: &str, reason: &str) -> AgentResult<CancelOutcome> {
+    Ok(agent_queue::queue::cancel(root, message_id, reason)?)
+}
+
+pub use agent_queue::queue::now_millis;
 
 /// Read recent terminal output from a validated interactive-agent target.
 pub fn read<A: AgentApi + ?Sized>(
@@ -3948,6 +4166,240 @@ mod tests {
         }
     }
 
+    /// A runtime that waits in fake time and runs `on_sleep` at its first sleep, as another
+    /// process acting while a drain waits for readiness would.
+    struct ActOnSleep {
+        clock: FakeRuntime,
+        on_sleep: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    impl AgentRuntime for ActOnSleep {
+        fn monotonic(&self) -> Duration {
+            self.clock.monotonic()
+        }
+
+        fn sleep(&self, duration: Duration) {
+            if let Some(action) = self.on_sleep.lock().unwrap().take() {
+                action();
+            }
+            self.clock.sleep(duration);
+        }
+    }
+
+    #[test]
+    fn an_expiring_prompt_goes_to_the_second_inbox_and_is_typed_in_queue_order() {
+        let directory = TestDirectory::new("lanes-order");
+        let root = directory.path();
+        enqueue(root, "first, plain", Some("a-first")).unwrap();
+        enqueue_internal(
+            root,
+            "second, expiring",
+            Some("b-second"),
+            true,
+            Some(now_millis() + 3_600_000),
+            &SystemRuntime::default(),
+        )
+        .unwrap();
+        assert!(root.join("inbox.v2/b-second.json").exists());
+        assert_eq!(queued_prompts(root).unwrap(), ["a-first", "b-second"]);
+        let fake = FakeAgent::new(&["idle"]);
+        let result = drain_with_runtime(
+            &fake,
+            &target(),
+            root,
+            DrainOptions::default(),
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(fake.runs(), ["first, plain", "second, expiring"]);
+        assert_eq!(result.delivered, ["a-first", "b-second"]);
+        assert!(result.cancelled.is_empty());
+        assert_eq!(
+            message_state(root, "b-second").unwrap(),
+            Some(QueueMessageState::Processed)
+        );
+        let serialized = serde_json::to_value(&result).unwrap();
+        assert!(serialized.get("cancelled").is_none(), "{serialized}");
+    }
+
+    #[test]
+    fn expired_and_cancelled_prompts_are_set_aside_without_typing() {
+        let directory = TestDirectory::new("lanes-set-aside");
+        let root = directory.path();
+        enqueue_internal(
+            root,
+            "stale hold",
+            Some("hold"),
+            true,
+            Some(1),
+            &SystemRuntime::default(),
+        )
+        .unwrap();
+        enqueue(root, "withdrawn by a tombstone", Some("gone")).unwrap();
+        enqueue(root, "still wanted", Some("kept")).unwrap();
+        // A drain holds the queue while the tombstone is written, so the drain sets it aside.
+        let held = open_private_lock(&root.join(".delivery.lock"), "held test lock").unwrap();
+        held.lock_exclusive().unwrap();
+        assert_eq!(
+            cancel(root, "gone", "lifted").unwrap(),
+            CancelOutcome::Pending
+        );
+        drop(held);
+        let fake = FakeAgent::new(&["idle"]);
+        let result = drain_with_runtime(
+            &fake,
+            &target(),
+            root,
+            DrainOptions::default(),
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(fake.runs(), ["still wanted"]);
+        assert_eq!(result.outcome, QueueOutcome::Delivered);
+        let mut cancelled = result.cancelled.clone();
+        cancelled.sort();
+        assert_eq!(cancelled, ["gone", "hold"]);
+        let hold = read_json(&root.join("cancelled/hold.json")).unwrap();
+        assert_eq!(hold["cancel_reason"], "expired");
+        let gone = read_json(&root.join("cancelled/gone.json")).unwrap();
+        assert_eq!(gone["cancel_reason"], "cancelled");
+        assert_eq!(gone["cancel_detail"], "lifted");
+        assert!(gone.get("possibly_submitted").is_none());
+
+        // A send whose own prompt is set aside fails with the reason, and nothing is typed.
+        let error = send_identified_with_runtime(
+            &fake,
+            &target(),
+            root,
+            "late",
+            DrainOptions {
+                not_after: Some(1),
+                ..DrainOptions::default()
+            },
+            &FakeRuntime::default(),
+            Some("late"),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("set aside untyped (expired"),
+            "{error}"
+        );
+        assert_eq!(fake.runs(), ["still wanted"]);
+    }
+
+    #[test]
+    fn a_tombstone_written_while_the_drain_waits_for_readiness_is_honoured() {
+        let directory = TestDirectory::new("lanes-late-tombstone");
+        let root = directory.path().to_path_buf();
+        enqueue(&root, "cancelled while waiting", Some("waiting")).unwrap();
+        // Codex takes follow-ups while working, so an unknown status is what makes it wait.
+        let fake = FakeAgent::new(
+            &["unknown"; 8]
+                .into_iter()
+                .chain(["idle"])
+                .collect::<Vec<_>>(),
+        );
+        let tombstone_root = root.clone();
+        let runtime = ActOnSleep {
+            clock: FakeRuntime::default(),
+            on_sleep: Mutex::new(Some(Box::new(move || {
+                assert_eq!(
+                    cancel(&tombstone_root, "waiting", "superseded").unwrap(),
+                    CancelOutcome::Pending
+                );
+            }))),
+        };
+        let result = drain_with_runtime(
+            &fake,
+            &target(),
+            &root,
+            DrainOptions {
+                ready_timeout: Duration::from_secs(5),
+                ..DrainOptions::default()
+            },
+            &runtime,
+        )
+        .unwrap();
+        assert!(
+            fake.runs().is_empty(),
+            "the prompt was typed: {:?}; tombstone {}; sleeps left {}",
+            fake.runs(),
+            root.join("cancel/waiting.json").exists(),
+            runtime.on_sleep.lock().unwrap().is_some()
+        );
+        assert_eq!(result.cancelled, ["waiting"]);
+        assert_eq!(
+            message_state(&root, "waiting").unwrap(),
+            Some(QueueMessageState::Cancelled)
+        );
+    }
+
+    #[test]
+    fn a_bounded_drain_stops_at_its_item_limit_deadline_or_lock_timeout() {
+        let directory = TestDirectory::new("bounded-drain");
+        let root = directory.path();
+        for (id, text) in [("one", "first"), ("two", "second"), ("three", "third")] {
+            enqueue(root, text, Some(id)).unwrap();
+        }
+        let fake = FakeAgent::new(&["idle"]);
+        let result = drain_with_runtime(
+            &fake,
+            &target(),
+            root,
+            DrainOptions {
+                max_items: Some(1),
+                ..DrainOptions::default()
+            },
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(fake.runs(), ["first"]);
+        assert_eq!(result.outcome, QueueOutcome::Pending);
+        assert!(result.blocked.as_deref().unwrap().contains("limit"));
+        assert_eq!(result.pending, ["three", "two"]);
+
+        let result = drain_with_runtime(
+            &fake,
+            &target(),
+            root,
+            DrainOptions {
+                deadline: Some(Duration::ZERO),
+                ..DrainOptions::default()
+            },
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(fake.runs(), ["first"], "nothing starts past the deadline");
+        assert!(result.blocked.as_deref().unwrap().contains("deadline"));
+
+        let holder = open_private_lock(&root.join(".delivery.lock"), "held test lock").unwrap();
+        holder.lock_exclusive().unwrap();
+        let error = drain_with_runtime(
+            &fake,
+            &target(),
+            root,
+            DrainOptions {
+                lock_timeout: Some(Duration::from_millis(50)),
+                ..DrainOptions::default()
+            },
+            &FakeRuntime::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.exit_code(), 75, "{error}");
+        assert!(error.to_string().contains("lock bound"), "{error}");
+        drop(holder);
+        let result = drain_with_runtime(
+            &fake,
+            &target(),
+            root,
+            DrainOptions::default(),
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(fake.runs(), ["first", "second", "third"]);
+        assert_eq!(result.outcome, QueueOutcome::Delivered);
+    }
+
     #[test]
     fn blocked_agent_is_pending_without_injection() {
         let directory = TestDirectory::new("blocked");
@@ -4648,8 +5100,15 @@ mod tests {
                 };
                 let fake = FakeAgent::new(&["idle", "working", "idle"]);
                 let result = if operation == "enqueue" {
-                    enqueue_internal(&queue, "stale writer prompt", Some("stale"), true, &runtime)
-                        .map(|_| ())
+                    enqueue_internal(
+                        &queue,
+                        "stale writer prompt",
+                        Some("stale"),
+                        true,
+                        None,
+                        &runtime,
+                    )
+                    .map(|_| ())
                 } else {
                     drain_with_runtime(&fake, &target(), &queue, DrainOptions::default(), &runtime)
                         .map(|_| ())

@@ -171,10 +171,9 @@ impl Default for AutoDrain {
 /// `accept` must never block on the queue's delivery lock (design 9.2),
 /// and the ledger claim that precedes every hand-over is what makes this
 /// ID single-writer, so the crate's no-replace create is the exact
-/// duplicate guard. Team items join the crate's `inbox.v2/` lane, with
-/// drain-side `not_after`/tombstone re-checks, when phase P2 lands them
-/// in `agent-queue`; until then expiry and supersede are enforced at
-/// `accept` and in the ledger.
+/// duplicate guard. Team items join the crate's `inbox.v2/` lane, which only
+/// drainers that re-check `not_after` and tombstones just before typing
+/// read; older drainers never see them.
 pub struct AgentctlQueueDeliverer {
     /// The coordinator's queue directory (`REGISTRY/<agent>/queue`).
     pub queue_dir: PathBuf,
@@ -401,8 +400,9 @@ pub fn run_auto_drain(
 
 impl AgentctlQueueDeliverer {
     fn enqueue(&self, id: &str, envelope: &Value, rendered: &str) -> Handover {
-        let result = agent_queue::queue::enqueue(
+        let result = agent_queue::queue::enqueue_into(
             &self.queue_dir,
+            agent_queue::queue::Lane::InboxV2,
             Some(id),
             false,
             &agent_queue::fsio::Blocking,
@@ -434,9 +434,14 @@ impl AgentctlQueueDeliverer {
     fn queue_contains(&self, id: &str) -> Option<bool> {
         use agent_queue::queue::MessageState;
         match agent_queue::queue::message_state(&self.queue_dir, id) {
-            Ok(Some(MessageState::Pending | MessageState::Inflight | MessageState::Processed)) => {
-                Some(true)
-            }
+            // Set aside untyped (a tombstone or expiry) still means the hand-over happened, so
+            // recovery never hands the ID over again.
+            Ok(Some(
+                MessageState::Pending
+                | MessageState::Inflight
+                | MessageState::Processed
+                | MessageState::Cancelled,
+            )) => Some(true),
             // Quarantined: the hand-over happened but delivery is unsettled,
             // so recovery must settle it as possibly_submitted, not accepted.
             Ok(Some(MessageState::Failed)) => None,

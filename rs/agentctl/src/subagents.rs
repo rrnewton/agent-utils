@@ -8287,6 +8287,31 @@ its drain would type first, so it was not queued",
         agent::withdraw(&self.queue(agent_name)?, message_id, runtime)
     }
 
+    /// Write the tombstone that keeps every drain from typing `message_id` in the agent's queue.
+    /// Unlike a send, this takes no lifecycle or queue lock, so it never waits behind a drain
+    /// that holds them while the agent is busy.
+    pub fn cancel_message(
+        &self,
+        agent_name: &str,
+        message_id: &str,
+        reason: &str,
+    ) -> Result<Value> {
+        let record = self.load(agent_name)?;
+        record.supported()?;
+        if record.is_cloud() {
+            return Err(fail(
+                "agentcloud agents journal prompts at once; there is no queue to cancel in",
+            ));
+        }
+        let outcome = agent::cancel(&self.queue(agent_name)?, message_id, reason)?;
+        Ok(json!({
+            "name": record.name,
+            "message_id": message_id,
+            "reason": reason,
+            "outcome": outcome,
+        }))
+    }
+
     /// Reconcile one caller-selected durable delivery identifier by exact path lookup.
     pub fn message_state(
         &self,

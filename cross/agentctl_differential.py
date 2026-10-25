@@ -1824,6 +1824,59 @@ def _handoff_and_pending(harness: Harness, report: Report) -> None:
         for root in (case.python_root, case.rust_root)), "uncertain work was replayed or discarded")
 
 
+def _queue_lanes(harness: Harness, report: Report) -> None:
+    """The Rust edition's expiring and cancellable prompts, and the other edition's refusal.
+
+    A prompt sent with --ttl goes to inbox.v2/, which the Python edition must refuse to drain or
+    add to rather than type without honouring the expiry; the Rust edition types it, and sets a
+    cancelled one aside untyped. Both projects run the same edition at each step, so the paired
+    outcomes must agree.
+    """
+    case = harness.case("primary-queue-lanes")
+    if not _start(harness, report, case, "primary/lanes/start"):
+        return
+    rust, python = harness.rust, harness.python
+    roots = (case.python_root, case.rust_root)
+
+    def both(command: Sequence[str], label: str, arguments: Sequence[str], expected: int) -> tuple[Outcome, Outcome]:
+        # The same edition in both projects, so the two outcomes must agree with each other.
+        first = harness._invoke_one(command, case.python_root, arguments)
+        second = harness._invoke_one(command, case.rust_root, arguments)
+        report.require(label, first.returncode == second.returncode == expected,
+                       f"expected rc {expected}; first={first!r} second={second!r}")
+        return first, second
+
+    _change(case, {"status": "working", "screen": "unrecognized terminal layout\n"})
+    both(rust, "primary/lanes/send-ttl", ("send", "worker", "expiring prompt", "--ttl", "3600",
+                                           "--message-id", "lane", "--ready-timeout", "0", *_COMMON), 75)
+    both(rust, "primary/lanes/send-cancelled", ("send", "worker", "cancelled prompt", "--ttl", "3600",
+                                                 "--message-id", "gone", "--ready-timeout", "0", *_COMMON), 75)
+    report.require("primary/lanes/second-inbox", all(
+        (root / "registry/worker/queue/inbox.v2/lane.json").is_file()
+        and not (root / "registry/worker/queue/inbox/lane.json").exists() for root in roots),
+        "a prompt with --ttl did not go to inbox.v2/")
+    outcomes = both(rust, "primary/lanes/cancel", ("cancel", "worker", "gone", "--reason", "superseded", *_COMMON), 0)
+    report.require("primary/lanes/cancel-set-aside", all(
+        isinstance(record := _json(outcome), dict) and record.get("outcome") == "set_aside" for outcome in outcomes),
+        f"cancel of a waiting prompt in an idle queue did not set it aside: {outcomes!r}")
+    _change(case, {"status": "idle", "screen": ""})
+    for label, arguments in (("drain", ("drain", "worker", *_COMMON)),
+                             ("send", ("send", "worker", "python prompt", *_COMMON))):
+        refused = both(python, f"primary/lanes/python-refuses-{label}", arguments, 75)
+        report.require(f"primary/lanes/python-refusal-reason-{label}", all(
+            "only the Rust edition of agentctl honours" in outcome.stderr for outcome in refused),
+            f"the other edition did not name the Rust edition: {refused!r}")
+    report.require("primary/lanes/python-typed-nothing", all(
+        _state(root).get("submitted") == [] for root in roots),
+        "the other edition typed into a queue with Rust-only lanes")
+    both(rust, "primary/lanes/rust-drain", ("drain", "worker", *_COMMON), 0)
+    report.require("primary/lanes/rust-typed-once", all(
+        _state(root).get("submitted") == ["expiring prompt"]
+        and (root / "registry/worker/queue/processed/lane.json").is_file()
+        and (root / "registry/worker/queue/cancelled/gone.json").is_file() for root in roots),
+        "the Rust drain did not type the expiring prompt once, or the cancelled one left cancelled/")
+
+
 def _registry_and_interop(harness: Harness, report: Report) -> None:
     defaults = harness.case("primary-default-registry")
     _pair(harness, report, defaults, "primary/default-registry/start", ("start", "worker", "--herdr-bin", "<HERDR>"))
@@ -2957,6 +3010,7 @@ def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> 
             _muse14_status(harness, report)
             _muse_busy_followup(harness, report)
             _handoff_and_pending(harness, report)
+            _queue_lanes(harness, report)
             _registry_and_interop(harness, report)
             _legacy_adopted_registry_and_queue(harness, report)
             _ownership(harness, report)

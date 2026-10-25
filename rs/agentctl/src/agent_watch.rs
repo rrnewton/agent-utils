@@ -1453,6 +1453,8 @@ impl<A: ManagedApi + ?Sized> Notifier for ManagedNotifier<'_, A> {
                 // fall through to the next re-queue ID rather than dropping the
                 // notice. A repeated notice is a lesser harm than a lost one.
                 Ok(Some(QueueMessageState::Failed)) => continue,
+                // Someone cancelled the notice, or it expired: it is not sent again.
+                Ok(Some(QueueMessageState::Cancelled)) => return Ok("cancelled".to_owned()),
                 Ok(None) => {
                     let result = manager.send_identified(
                         coordinator,

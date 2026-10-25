@@ -1165,6 +1165,54 @@ request ID and artifact path. Preserve that ID and use `drain` for pending
 work. Sending the same task under a new ID creates a second request and can
 duplicate work; it is not a recovery operation.
 
+### Expiring and cancelled prompts (Rust edition)
+
+A prompt can lose its meaning before an agent that takes input only when idle
+gets to it, such as a "hold" that a later message already lifted. The Rust
+edition adds three more directories, each created only when first used:
+
+| Directory | Meaning |
+| --- | --- |
+| `inbox.v2/` | Pending prompts that may expire; drained together with `inbox/`, oldest first |
+| `cancel/` | Tombstones: `cancel/ID.json` asks every drain not to type prompt `ID` |
+| `cancelled/` | Prompts set aside untyped, with `cancel_reason` `cancelled` or `expired` |
+
+```sh
+agentctl send worker 'Hold the release' --message-id hold-1 --ttl 3600
+agentctl cancel worker hold-1 --reason lifted
+agentctl drain worker --deadline 40 --lock-timeout 10 --max-items 1
+```
+
+`send --ttl SECONDS` records `not_after` (a Unix time in milliseconds) and puts
+the prompt in `inbox.v2/`. `cancel NAME ID` writes the tombstone without
+waiting for any lock, so it works while a drain is waiting for a busy agent; it
+reports `outcome` `set_aside` (no drain held the queue, so the prompt was moved
+to `cancelled/` at once), `pending` (a drain holds the queue; it sets the
+prompt aside instead of typing it),
+`unknown` (no such prompt yet; one that arrives later is set aside too),
+`inflight` (a drain has taken it and may be typing it), `too_late` (typed, or
+quarantined after typing may have begun), or `already_cancelled`. Just before
+it types each prompt, after moving it to `inflight/`, a drain checks for a
+tombstone and for a passed `not_after`, and moves such a prompt to `cancelled/`
+instead; a `send` whose prompt was set aside fails with that reason. Drained
+results list set-aside prompts under `cancelled`.
+
+`drain --deadline SECONDS` starts no prompt after that many seconds (a prompt
+being typed is never interrupted, and readiness waits end by then); `--max-items
+N` types at most N prompts; `--lock-timeout SECONDS` gives up with exit 75 and
+nothing typed when the queue's delivery lock or the host-wide target lock stays
+held that long. Prompts left over stay pending.
+
+agentctl binaries older than these directories never read `inbox.v2/` and
+never honour tombstones: until every drainer of a queue (a pinned chat bridge or
+watcher included) is current, a `pending` cancel of an `inbox/` prompt may still
+be typed by an older drainer, and `inbox.v2/` prompts wait for a current one. The Python edition refuses to drain, send, or queue
+into a queue with prompts in `inbox.v2/`, a waiting tombstone in `cancel/`, or
+an `inbox/` prompt that carries `not_after`, and says to use the Rust edition;
+prompts already in `cancelled/` do not block it, and their identifiers are
+never queued again. `agentctl capabilities`
+lists the directories a binary understands under `queue.lanes`.
+
 ## Boxing an agent to a wrkslots slot
 
 ```sh

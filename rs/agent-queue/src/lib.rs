@@ -15,7 +15,7 @@
 //! Typing into a terminal, readiness checks and the target lock that serializes typists across
 //! queues belong to the drainer, not to this library.
 //!
-//! # On-disk format, version 1
+//! # On-disk format
 //!
 //! A queue is one directory, mode 0700 and owned by the user. Apart from the two empty lock
 //! files, every file in it is JSON written by [`fsio::atomic_json`] or
@@ -31,6 +31,9 @@
 //!   inflight/<id>.json   past the at-most-once barrier, outcome unsettled
 //!   processed/<id>.json  delivery confirmed
 //!   failed/<id>.json     quarantined, with failed/<id>.json.error beside it
+//!   inbox.v2/<id>.json   pending, for drainers that honour the lanes (below)
+//!   cancel/<id>.json     tombstone: do not type <id>
+//!   cancelled/<id>.json  set aside untyped: cancelled or expired
 //!   .message.<pid>.<n>   temporaries of an atomic write in progress, here or in a phase
 //! ```
 //!
@@ -79,7 +82,26 @@
 //! "expected_agent", "expected_workspace", "expected_cwd"}`, absent expectations being `null`.
 //! A drainer refuses a queue bound to a different target.
 //!
-//! **Timestamps** in items and sidecars are Unix seconds as JSON numbers.
+//! **Lanes.** `inbox.v2/`, `cancel/` and `cancelled/` exist only once something needed them, so
+//! a queue that never used them is the original four-phase format. A drainer that knows only
+//! that format never types an `inbox.v2/` item, but it does not read tombstones either: until
+//! every drainer of a queue honours the lanes, only an item [`queue::cancel`] reports set aside
+//! is certain never to be typed. An `inbox.v2/` item may carry
+//! `not_after`, a Unix time in milliseconds (`null` is no deadline); an `inbox/` item never
+//! does, because a drainer that knows only `inbox/` would type it whatever its age. Drainers
+//! that honour the lanes take
+//! `inbox/` and `inbox.v2/` together in queue order. A tombstone `cancel/<id>.json` (`id`,
+//! `reason`, `cancelled_at`) is written without any lock ([`queue::cancel`]) and applies to an
+//! item in either pending directory, including one that arrives later; when no drain holds the
+//! queue, `cancel` also sets a waiting item aside at once, under the delivery lock, which every
+//! drainer respects. Setting an item aside consumes its tombstone. After a drainer moves an
+//! item to `inflight/`, and before it types, it checks the tombstone and `not_after` once more
+//! ([`queue::set_aside_reason`]); an item that fails either check goes to `cancelled/` untyped,
+//! with `delivery_state: cancelled`, `cancel_reason` (`cancelled` or `expired`), `cancel_detail`
+//! and `cancelled_at` ([`queue::set_aside`]). Because the check follows the move, a tombstone
+//! written while the item was still pending is always seen.
+//!
+//! **Timestamps** in items and sidecars are Unix seconds as JSON numbers, except `not_after`.
 
 pub mod error;
 pub mod fsio;

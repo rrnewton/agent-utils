@@ -520,6 +520,8 @@ pub(crate) fn deliver_reminder(
             }
             Ok(Some(QueueMessageState::Pending)) => ReminderOutcome::Waiting(why),
             Ok(None) => ReminderOutcome::Withdrawn(why),
+            // A tombstone or expiry set it aside: it was never typed and never will be.
+            Ok(Some(QueueMessageState::Cancelled)) => ReminderOutcome::Withdrawn(why),
             Err(read) => ReminderOutcome::Waiting(format!(
                 "{why}; the coordinator queue could not be read afterwards: {read}"
             )),
@@ -546,6 +548,9 @@ pub(crate) fn settle_reminder(
         Ok(None) => ReminderOutcome::Uncertain(
             "the coordinator queue no longer holds it, so it may have been typed".to_owned(),
         ),
+        Ok(Some(QueueMessageState::Cancelled)) => {
+            ReminderOutcome::Withdrawn("the coordinator queue set it aside untyped".to_owned())
+        }
         Ok(Some(QueueMessageState::Pending)) => {
             match delivery.withdraw(agent_name, &reminder.message_id) {
                 Ok(true) => ReminderOutcome::Withdrawn(

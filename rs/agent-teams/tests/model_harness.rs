@@ -625,8 +625,9 @@ fn agentctl_queue_deliverer_uses_agent_queue() {
         agent_queue::queue::message_state(&queue_dir, id).expect("state"),
         Some(agent_queue::queue::MessageState::Pending)
     );
-    let doc = agent_queue::queue::load_message(&queue_dir.join("inbox").join(format!("{id}.json")))
-        .expect("item");
+    let doc =
+        agent_queue::queue::load_message(&queue_dir.join("inbox.v2").join(format!("{id}.json")))
+            .expect("item");
     assert_eq!(
         doc.get("text").and_then(|t| t.as_str()),
         Some("rendered text")

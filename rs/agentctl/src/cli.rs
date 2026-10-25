@@ -184,8 +184,15 @@ enum Commands {
     )]
     Send(Send),
     /// Deliver queued prompts that are known not to have been submitted
-    #[command(after_help = "Example: agentctl drain reviewer --ready-timeout 60")]
+    #[command(
+        after_help = "Examples:\n  agentctl drain reviewer --ready-timeout 60\n  agentctl drain reviewer --deadline 40 --lock-timeout 10 --max-items 1\n\nThe drain types inbox/ and inbox.v2/ together, oldest first. Just before typing each prompt it\nchecks for a tombstone (agentctl cancel) and for an expired --ttl, and sets such a prompt aside in\ncancelled/ instead. Exit 0 when every examined prompt was confirmed, 75 when prompts remain pending\n(not ready, a bound reached, or a lock timeout), 76 when one was quarantined as possibly submitted."
+    )]
     Drain(Drain),
+    /// Ask every drain not to type a queued prompt: write its tombstone without waiting for any lock, and report where the prompt is
+    #[command(
+        after_help = "Examples:\n  agentctl cancel reviewer review-1\n  agentctl cancel reviewer hold-3 --reason superseded\n\nThe tombstone is QUEUE/cancel/MESSAGE_ID.json. A drain checks it after taking the prompt and before\ntyping, so a prompt reported pending is never typed: the drain moves it to cancelled/. outcome is\npending, unknown (no such prompt yet; one that arrives later is set aside too), inflight (a drain\nhas taken it and may be typing it), too_late (typed or quarantined), or already_cancelled. Once a\nqueue has a tombstone, the other edition refuses to drain it."
+    )]
+    Cancel(Cancel),
     /// Inspect blocking questions; reveal collapsed forms without selecting or submitting
     #[command(after_help = "Example: agentctl prompts reviewer")]
     Prompts(Named),
@@ -514,6 +521,7 @@ impl Delivery {
             working_timeout: Duration::from_secs_f64(self.working_timeout),
             max_attempts: self.max_attempts,
             deliver_while_working: self.deliver_while_working,
+            ..DrainOptions::default()
         }
     }
 }
@@ -762,6 +770,9 @@ struct Send {
     /// Model override for a headless turn (requires an installation with the worker extension)
     #[arg(long, value_name = "MODEL")]
     model: Option<String>,
+    /// Seconds after which no drain types the prompt; an expired prompt is set aside in the queue's cancelled/ untyped. The prompt goes to the queue's inbox.v2/, which older agentctl binaries and the other edition never type (default: no expiry; interactive agents only)
+    #[arg(long, value_name = "SECONDS", value_parser = positive_seconds)]
+    ttl: Option<f64>,
     #[command(flatten)]
     delivery: Delivery,
 }
@@ -769,8 +780,28 @@ struct Send {
 struct Drain {
     #[command(flatten)]
     agent: Named,
+    /// Seconds after the drain starts after which it starts no further prompt; a prompt being typed is not interrupted, and readiness waits end by then (default: no limit)
+    #[arg(long, value_name = "SECONDS", value_parser = positive_seconds)]
+    deadline: Option<f64>,
+    /// Seconds to wait for the queue's delivery lock and the host-wide target lock before giving up with exit 75 and nothing typed (default: wait until free)
+    #[arg(long, value_name = "SECONDS", value_parser = positive_seconds)]
+    lock_timeout: Option<f64>,
+    /// Most prompts to type in this drain; the rest stay pending (default: no limit)
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+    max_items: Option<u64>,
     #[command(flatten)]
     delivery: Delivery,
+}
+#[derive(Args)]
+struct Cancel {
+    #[command(flatten)]
+    agent: Named,
+    /// Queue message ID to cancel
+    #[arg(value_name = "MESSAGE_ID")]
+    message_id: String,
+    /// Why, recorded in the tombstone and in the cancelled item (default: cancelled)
+    #[arg(long, default_value = "cancelled", value_name = "TEXT")]
+    reason: String,
 }
 #[derive(Args)]
 struct Read {
@@ -1177,6 +1208,7 @@ impl ChatOperate {
                 max_attempts: self.max_attempts,
                 // `chat run` sets this from its own flag.
                 deliver_while_working: false,
+                ..DrainOptions::default()
             },
             reconciliation_interval: Duration::from_secs_f64(self.reconcile_interval),
             timing: crate::chat_service::DeliveryTiming::default(),
@@ -2152,18 +2184,41 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 .map_err(Failure::Usage)?
                 .ok_or_else(|| Failure::Usage("send requires prompt text or --file".to_owned()))?;
             if manager.is_cloud(&value.agent.name)? {
+                if value.ttl.is_some() {
+                    return Err(Failure::Usage(
+                        "--ttl applies to interactive agents; agentcloud journals the prompt at once"
+                            .to_owned(),
+                    ));
+                }
                 manager.send_cloud(&value.agent.name, &text, value.message_id.as_deref())?
             } else {
+                let not_after = value.ttl.map(|ttl| {
+                    crate::agent::now_millis().saturating_add((ttl * 1000.0).ceil() as u64)
+                });
                 json!(manager.send_identified(
                     &value.agent.name,
                     &text,
-                    value.delivery.options(),
+                    DrainOptions {
+                        not_after,
+                        ..value.delivery.options()
+                    },
                     value.message_id.as_deref()
                 )?)
             }
         }
+        Commands::Cancel(value) => {
+            manager.cancel_message(&value.agent.name, &value.message_id, &value.reason)?
+        }
         Commands::Drain(value) => {
-            let result = manager.drain(&value.agent.name, value.delivery.options())?;
+            let options = DrainOptions {
+                deadline: value.deadline.map(Duration::from_secs_f64),
+                lock_timeout: value.lock_timeout.map(Duration::from_secs_f64),
+                max_items: value
+                    .max_items
+                    .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX)),
+                ..value.delivery.options()
+            };
+            let result = manager.drain(&value.agent.name, options)?;
             write_json(&result).map_err(Failure::Output)?;
             return Ok(if result.blocked.is_some() {
                 75
@@ -2524,6 +2579,14 @@ fn capabilities_document(
             "capabilities": CLOUD_CAPABILITIES
         },
         "headless": null,
+        "queue": {
+            "lanes": [
+                agent_queue::queue::INBOX_V2,
+                agent_queue::queue::CANCEL,
+                agent_queue::queue::CANCELLED,
+            ],
+            "drain_bounds": ["deadline", "lock_timeout", "max_items"],
+        },
         "build": crate::build_info::document(),
         "services": [{
             "name": "chat-bridge",

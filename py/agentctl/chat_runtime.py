@@ -780,8 +780,10 @@ class _Runtime:
             self._cache_record(path, record)
             self._refresh_reply_index(key, items)
         if record["phase"] == "received":
+            # A prompt in a Rust-only lane is queued too, never prompted again: this edition then
+            # refuses to drain that queue rather than type a second copy.
             if any((queue_root / phase / f"{queue_id}.json").exists()
-                   for phase in ("inbox", "inflight", "processed", "failed")):
+                   for phase in ("inbox", "inflight", "processed", "failed", "inbox.v2", "cancelled")):
                 record.update(phase="queued", queued_at=_utc())
                 changed = True
             else:

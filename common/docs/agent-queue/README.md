@@ -18,6 +18,14 @@ enqueues, a status reader) share one on-disk format:
 An item moves to `inflight/` before it is typed, so a crash can never cause a
 second paste: an item found there afterwards is quarantined, not replayed.
 
+Prompts can also expire or be cancelled. An item in the second pending
+directory, `inbox.v2/`, may carry `not_after`; a tombstone in `cancel/`, written
+without any lock, asks every drainer not to type an item. A drainer checks both
+after it moves an item to `inflight/` and before it types, and sets such an item
+aside in `cancelled/` untyped. These directories exist only once something used
+them, so a drainer that knows only the first four can tell a queue it must not
+touch.
+
 Typing into a terminal, readiness checks and cross-queue typist locks belong to
 the program that drains the queue. The crate documentation describes the
 on-disk format in full.
