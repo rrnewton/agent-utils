@@ -568,7 +568,16 @@ async fn publish_serve_corrections(state: &AppState, channel: &ChannelId, served
         served
             .into_iter()
             .filter_map(|was| match cache.message(&chan, &was.id).served() {
-                Some(Some(now)) if now.message != was => {
+                // Compared without its version, which the served copy carries and the held
+                // one keeps beside it, not in it: a copy merely seen again since is no change,
+                // where every served row used to be corrected to itself after each refresh
+                // (`#510 cache-serve-every-read`).
+                Some(Some(now))
+                    if Message {
+                        observed_ms: was.observed_ms,
+                        ..now.message.clone()
+                    } != was =>
+                {
                     Some((crate::live::LiveKind::Update, now.message, was))
                 }
                 Some(None) if cache.tombstoned(&chan, &was.id).served() == Some(true) => {
@@ -1392,6 +1401,15 @@ pub async fn timeline(
         .map(|raw| forward::decode(raw, &channel.id, request.view, thread))
         .transpose()
         .map_err(|_| OpError::CursorMismatch)?;
+    // `#510 cache-serve-every-read`: a step back from a page answered from the cache, whose
+    // cursor this server minted. A backend's own cursor is handed to it untouched.
+    let served_below = request
+        .before
+        .as_deref()
+        .map(|raw| crate::timeline_served::decode(raw, &channel.id, request.view, thread))
+        .transpose()
+        .map_err(|_| OpError::CursorMismatch)?
+        .flatten();
     let mut backend = request.clone();
     // Before the fetch, not after: see `ReadAhead::remember`.
     let fetch_began = std::time::Instant::now();
@@ -1412,8 +1430,9 @@ pub async fn timeline(
         });
     // `#384 cache-serve`: as in `read_window`, the newest page's evaluation is awaited where
     // its shadow was begun, and a page it serves is handed back at once — provisional, its
-    // `as_of` the head it was served from, no backward cursor a backend never issued — with
-    // the read it stands in for refreshing it upstream in the background.
+    // `as_of` the head it was served from, its backward cursor this server's own (`#510
+    // cache-serve-every-read`) — with the read it stands in for refreshing it upstream in the
+    // background.
     let mut shadow = None;
     if let Some(ask) = newest_ask {
         if may_serve(state, caller) {
@@ -1427,6 +1446,12 @@ pub async fn timeline(
                 ServeOutcome::Served(answer) => {
                     let ServedAnswer { view, pending } = *answer;
                     let (raw, as_of) = served_messages(&view);
+                    let next_before = crate::timeline_served::encode(
+                        &channel.id,
+                        request.view,
+                        thread,
+                        raw.first(),
+                    )?;
                     if let Some(claim) = state.message_cache.claim_refresh(RefreshKey::timeline(
                         channel.id.clone(),
                         request.view,
@@ -1455,9 +1480,9 @@ pub async fn timeline(
                         settled_below_ms: view.head.map(|head| head.unsettled_from_ms),
                         // Never a claim that the scope's start is here: the cache's coverage
                         // is clipped at its age limit, so older history upstream is unknown
-                        // to it. With no `next_before` the page reads this as "more above:
-                        // unknown", and steps back only after a read of the provider's own.
+                        // to it. The step back says, from the provider's own pages.
                         has_more: true,
+                        next_before: Some(next_before),
                         as_of,
                         ..crate::threads::TimelinePage::default()
                     };
@@ -1483,19 +1508,27 @@ pub async fn timeline(
             });
         }
     }
-    let fill = state.message_cache.begin_for(caller, &channel.id);
+    // A step back from a served page offers each provider page it reads as it reads it.
+    let fill = served_below
+        .is_none()
+        .then(|| state.message_cache.begin_for(caller, &channel.id))
+        .flatten();
     // When the read began, on this server's clock: the page's version. `#473
     // replication-c7-server-versions`.
     let began_ms = crate::store::now_ms();
-    let (mut page, position) = match resumed {
-        Some(Forward::Native(own)) => {
+    let (mut page, position) = match (served_below.as_ref(), resumed) {
+        (Some(below), _) => (
+            step_back_from_served(state, caller, &channel.id, request, below).await?,
+            None,
+        ),
+        (None, Some(Forward::Native(own))) => {
             backend.after = Some(own);
             (
                 state.chat.fetch_timeline(&channel.id, &backend).await?,
                 None,
             )
         }
-        Some(Forward::Generic(since)) => {
+        (None, Some(Forward::Generic(since))) => {
             backend.after = None;
             let read = state
                 .chat
@@ -1503,7 +1536,7 @@ pub async fn timeline(
                 .await?;
             (read.page, Some(read.position))
         }
-        None => (state.chat.fetch_timeline(&channel.id, request).await?, None),
+        (None, None) => (state.chat.fetch_timeline(&channel.id, request).await?, None),
     };
     if let Some(shadow) = shadow {
         shadow.compare(Upstream::of(&page.messages, page.has_more));
@@ -1551,15 +1584,48 @@ pub async fn timeline(
     for gone in page.delta.iter().flat_map(|delta| &delta.deleted) {
         state.read_ahead.forget(&channel.id, gone);
     }
-    // `#384 cache-serve`: a newest page read upstream and handed to its caller carries the
-    // provider's own backward cursor, so the view owes none and may be served again. A delta
-    // or a step back hands out no such page and notes nothing.
-    if timeline_read == crate::cache::observe::TimelineRead::Newest {
-        state
-            .message_cache
-            .note_real_page(&channel.id, request.view, thread);
-    }
     Ok((channel, page))
+}
+
+/// One step back from a timeline page answered from the cache (`#510 cache-serve-every-read`):
+/// the provider's own newest page of the view, then its older pages by the provider's own
+/// cursors, until one holds a message older than the served page's oldest, the provider says
+/// there is nothing older, or [`crate::timeline_served::WALK_PAGES`] pages have been read.
+/// Each page is offered to the cache as it is read, the first as the newest read it is. The
+/// answer is the last page read, holding only what lies below the served page, with the
+/// provider's own `next_before`: every later step is the provider's. A walk that found nothing
+/// below yet answers empty, with the cursor it reached.
+async fn step_back_from_served(
+    state: &AppState,
+    caller: crate::auth::Scope,
+    channel: &ChannelId,
+    request: &crate::threads::TimelineRequest,
+    below: &crate::timeline_served::Below,
+) -> Result<crate::threads::TimelinePage, OpError> {
+    use crate::cache::observe::TimelineRead;
+    let mut read = crate::threads::TimelineRequest {
+        before: None,
+        after: None,
+        ..request.clone()
+    };
+    let mut kind = TimelineRead::Newest;
+    let mut pages = 0;
+    loop {
+        pages += 1;
+        let fill = state.message_cache.begin_for(caller, channel);
+        let page = state.chat.fetch_timeline(channel, &read).await?;
+        if let Some(fill) = fill {
+            fill.offer_timeline(&read, kind, &page);
+        }
+        let found = page.messages.iter().any(|message| below.holds(message));
+        match page.next_before.clone().filter(|_| page.has_more) {
+            Some(next) if !found && pages < crate::timeline_served::WALK_PAGES => {
+                read.before = Some(next);
+                kind = TimelineRead::Before;
+            }
+            _ => return Ok(below.older(page)),
+        }
+    }
 }
 
 /// Give `page`, read upstream from `began_ms`, its version on this server's clock, and every copy on

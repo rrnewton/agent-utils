@@ -754,6 +754,52 @@ fn newest(view: &View, limit: usize, facts: &Facts, needs_fresh: bool) -> Result
     Ok(Decision::Serve)
 }
 
+/// What made a newest window or page a `gap` (`#510 cache-serve-every-read`): every cause
+/// [`newest`] would find in `view`, not only the first it stops at, so that a row a push brought
+/// above the head counts as both `partial` and `above_head`. `None` for any other ask, whose
+/// gaps are not broken down.
+#[must_use]
+pub fn gap_causes(ask: &Ask, view: &View) -> Option<GapCounts> {
+    let limit = match ask {
+        Ask::Window { limit, .. } | Ask::Timeline { limit, .. } => (*limit).max(1),
+        _ => return None,
+    };
+    let window = &view.rows[view.rows.len().saturating_sub(limit)..];
+    let mut causes = GapCounts {
+        partial: u64::from(!window.iter().all(whole)),
+        ..GapCounts::default()
+    };
+    let Some(head) = view.head else {
+        causes.no_head = 1;
+        return Some(causes);
+    };
+    let bottom = if view.rows.len() >= limit {
+        view.rows[view.rows.len() - limit].created_ms
+    } else {
+        0
+    };
+    let top = head.settled_top();
+    if bottom < top && coverage::covers(&view.coverage, bottom, top).is_none() {
+        causes.hole = 1;
+    }
+    let lower = bottom.max(top);
+    if lower <= head.head_ms
+        && view
+            .head_checked_from_ms
+            .is_none_or(|listed_from| listed_from > lower)
+    {
+        causes.listing = 1;
+    }
+    let checked = view.head_checked_ms.unwrap_or(head.head_listed_ms);
+    causes.above_head = u64::from(window.iter().any(|row| row.created_ms > head.head_ms));
+    causes.unlisted = u64::from(window.iter().any(|row| {
+        row.created_ms >= top
+            && row.created_ms <= head.head_ms
+            && row.vouched_ms.is_none_or(|vouched| vouched < checked)
+    }));
+    Some(causes)
+}
+
 /// One message: held whole, seen since the channel's latest drop, and its home scope revalidated
 /// recently enough for its provider's feed. A live feed that carries deletions vouches for a
 /// message only when nothing it offered since the message was seen was dropped, and only when it
@@ -1198,6 +1244,7 @@ struct Tally {
     served: AtomicU64,
     needs_existence_check: AtomicU64,
     misses: [AtomicU64; 7],
+    gaps: [AtomicU64; 6],
     late: AtomicU64,
     compared: AtomicU64,
     agreed: AtomicU64,
@@ -1322,6 +1369,15 @@ impl Tallies {
         bump(counter, 1);
     }
 
+    /// Count what made one of `consumer`'s `gap` misses ([`gap_causes`]). `#510
+    /// cache-serve-every-read`.
+    pub fn gapped(&self, consumer: Consumer, causes: &GapCounts) {
+        let tally = self.tally(consumer);
+        for (counter, by) in tally.gaps.iter().zip(causes.each()) {
+            bump(counter, by);
+        }
+    }
+
     /// Count one answer actually served from the cache for `consumer` (`#384 cache-serve`): a
     /// subset of `would_serve`, counted when the answer is handed back, so the two can be told
     /// apart on a server with serving on.
@@ -1372,6 +1428,7 @@ impl Tallies {
                         stale_head: miss(Miss::StaleHead),
                         barrier: miss(Miss::Barrier),
                     },
+                    gaps: GapCounts::from_each(tally.gaps.each_ref().map(read)),
                     late: read(&tally.late),
                     compared: read(&tally.compared),
                     agreed: read(&tally.agreed),
@@ -1403,6 +1460,8 @@ pub struct ConsumerCounts {
     pub needs_existence_check: u64,
     /// Those it would not have, by reason.
     pub misses: MissCounts,
+    /// Its `gap` misses by cause, for a newest window or page. `#510 cache-serve-every-read`.
+    pub gaps: GapCounts,
     /// Those that read what a later read wrote: no verdict.
     pub late: u64,
     /// Comparisons of a would-be answer with upstream's.
@@ -1487,6 +1546,9 @@ impl ConsumerCounts {
                 stale_head: self.misses.stale_head + other.misses.stale_head,
                 barrier: self.misses.barrier + other.misses.barrier,
             },
+            gaps: GapCounts::from_each(std::array::from_fn(|n| {
+                self.gaps.each()[n] + other.gaps.each()[n]
+            })),
             late: self.late + other.late,
             compared: self.compared + other.compared,
             agreed: self.agreed + other.agreed,
@@ -1518,6 +1580,65 @@ pub struct MissCounts {
     pub stale_head: u64,
     /// The barrier did not pass in time.
     pub barrier: u64,
+}
+
+/// A newest window's or page's `gap` misses by cause ([`gap_causes`]): how many had each. One
+/// miss may have several, so they need not add up to `gap`. `#510 cache-serve-every-read`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct GapCounts {
+    /// No head: no read of the scope's newest end is recorded.
+    pub no_head: u64,
+    /// A row held only as a push brought it, which may be a snippet.
+    pub partial: u64,
+    /// A row above the head the latest read of the newest end listed: pushed, or posted by this
+    /// server, since that read.
+    pub above_head: u64,
+    /// A row in the unsettled band that the latest read of the newest end did not list.
+    pub unlisted: u64,
+    /// That read's listing began above the part of the band the answer holds: it read fewer rows
+    /// than the band spans.
+    pub listing: u64,
+    /// A hole in the coverage below the band.
+    pub hole: u64,
+}
+
+impl GapCounts {
+    /// The names the hourly line uses, in [`GapCounts::each`]'s order.
+    pub const LABELS: [&'static str; 6] = [
+        "no_head",
+        "partial",
+        "above_head",
+        "unlisted",
+        "listing",
+        "hole",
+    ];
+
+    /// Every count, in [`GapCounts::LABELS`]' order.
+    #[must_use]
+    pub const fn each(&self) -> [u64; 6] {
+        [
+            self.no_head,
+            self.partial,
+            self.above_head,
+            self.unlisted,
+            self.listing,
+            self.hole,
+        ]
+    }
+
+    /// The counts [`GapCounts::each`] lists.
+    #[must_use]
+    pub const fn from_each(each: [u64; 6]) -> Self {
+        let [no_head, partial, above_head, unlisted, listing, hole] = each;
+        Self {
+            no_head,
+            partial,
+            above_head,
+            unlisted,
+            listing,
+            hole,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1665,6 +1786,104 @@ mod tests {
             thread: None,
             limit,
         }
+    }
+
+    /// `#510 cache-serve-every-read`: a gap is broken down by every cause it has. A row a push
+    /// brought above the head counts as held only as the push brought it and as above the head;
+    /// a band row the latest read did not list, and a listing that began inside the band, each
+    /// count apart; a view that serves has none.
+    #[test]
+    fn a_gap_is_counted_under_every_cause_it_has() {
+        let later = LISTED + MINUTE;
+        let at = facts(later + 1_000);
+        let all = relisted(&newest(&listed(12, false), 5), later, T - HOUR, "");
+        assert_eq!(decide(&fallback(5), &all, &at), Decision::Serve);
+        assert_eq!(
+            gap_causes(&fallback(5), &all),
+            Some(GapCounts::default()),
+            "a view that serves has no cause"
+        );
+
+        let mut pushed = all.clone();
+        let mut above = row(12);
+        above.content_partial = true;
+        above.vouched_ms = None;
+        pushed.rows.push(above);
+        pushed.rows.remove(0);
+        assert_eq!(
+            decide(&fallback(5), &pushed, &at),
+            Decision::Miss(Miss::Gap)
+        );
+        assert_eq!(
+            gap_causes(&fallback(5), &pushed),
+            Some(GapCounts {
+                partial: 1,
+                above_head: 1,
+                ..GapCounts::default()
+            })
+        );
+
+        let unlisted = relisted(&newest(&listed(12, false), 5), later, T - HOUR, "m10");
+        assert_eq!(
+            gap_causes(&fallback(5), &unlisted),
+            Some(GapCounts {
+                unlisted: 1,
+                ..GapCounts::default()
+            })
+        );
+        // A latest read that listed only the band's newest minute.
+        let short = relisted(&all, later, T + 11 * MINUTE, "");
+        assert_eq!(decide(&fallback(5), &short, &at), Decision::Miss(Miss::Gap));
+        assert_eq!(
+            gap_causes(&fallback(5), &short).map(|gaps| gaps.listing),
+            Some(1)
+        );
+
+        let headless = View {
+            head: None,
+            ..all.clone()
+        };
+        assert_eq!(
+            gap_causes(&fallback(5), &headless).map(|gaps| gaps.no_head),
+            Some(1)
+        );
+        let holed = View {
+            coverage: Vec::new(),
+            ..listed(12, false)
+        };
+        assert_eq!(decide(&fallback(5), &holed, &at), Decision::Miss(Miss::Gap));
+        assert_eq!(
+            gap_causes(&fallback(5), &holed).map(|gaps| gaps.hole),
+            Some(1)
+        );
+        assert_eq!(
+            gap_causes(
+                &Ask::Message {
+                    consumer: Consumer::MessageById,
+                    id: MessageId("m1".to_owned()),
+                },
+                &all
+            ),
+            None,
+            "only a newest window or page is broken down"
+        );
+
+        let tallies = Tallies::default();
+        tallies.gapped(
+            Consumer::TimelineFallback,
+            &GapCounts::from_each([0, 1, 1, 0, 0, 0]),
+        );
+        tallies.gapped(
+            Consumer::TimelineFallback,
+            &GapCounts::from_each([0, 0, 1, 0, 1, 0]),
+        );
+        let counted = tallies
+            .report()
+            .into_iter()
+            .find(|counts| counts.consumer == "timeline_fallback")
+            .expect("the consumer");
+        assert_eq!(counted.gaps.each(), [0, 1, 2, 0, 1, 0]);
+        assert_eq!(counted.plus(&counted).gaps.each(), [0, 2, 4, 0, 2, 0]);
     }
 
     /// A later read of the newest end listed every row of the band but m10: m10 was deleted since

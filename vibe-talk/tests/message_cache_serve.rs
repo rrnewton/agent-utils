@@ -20,7 +20,7 @@ use serde_json::Value;
 use tower::ServiceExt as _;
 use vibe_talk::cache::shadow::ConsumerCounts;
 use vibe_talk::cache::sink::Verification;
-use vibe_talk::cache::ChanKey;
+use vibe_talk::cache::{ChanKey, RefreshKey};
 use vibe_talk::chat::ChatError;
 use vibe_talk::discord::fake::FakeDiscord;
 use vibe_talk::live::LiveKind;
@@ -30,6 +30,7 @@ use vibe_talk::state::AppState;
 use vibe_talk::testing::{
     self, CountingChat, ManualClock, TempDir, TimelineChat, READ_CHANNEL, READ_TOKEN, WRITE_TOKEN,
 };
+use vibe_talk::threads::TimelineView;
 
 /// 2026-08-18T12:00:00Z: where the fixtures' messages are written, a minute apart.
 const T0: i64 = 1_787_054_400_000;
@@ -539,35 +540,133 @@ async fn a_read_token_reload_is_never_served() {
     assert_eq!(counts(&d.state, "timeline_fallback").served, 0);
 }
 
+impl Deployment {
+    /// One reload served from the cache while the provider is held, its refresh then released
+    /// and settled: the served body.
+    async fn served_reload(&self, limit: u16) -> Value {
+        let held = self.chat.hold_next_timeline();
+        let body = tokio::time::timeout(AT_ONCE, self.spawn_timeline(limit))
+            .await
+            .expect("the reload answered at once, from the cache")
+            .expect("the request ran");
+        held.entered
+            .await
+            .expect("the refresh reached the provider");
+        held.release.send(()).expect("the refresh is waiting");
+        settled(&self.state).await;
+        self.refreshed(limit).await;
+        body
+    }
+
+    /// [`refreshed`] for the read channel.
+    async fn refreshed(&self, limit: u16) {
+        refreshed(&self.state, READ_CHANNEL, limit).await;
+    }
+
+    /// A write-token step back in `main` from `cursor`.
+    async fn step_back(&self, limit: u16, cursor: &str) -> Value {
+        let body = ok(
+            &self.state,
+            &path(
+                READ_CHANNEL,
+                &format!(
+                    "/timeline?view=main&limit={limit}&before={}",
+                    url_encode(cursor)
+                ),
+            ),
+            WRITE_TOKEN,
+        )
+        .await;
+        settled(&self.state).await;
+        body
+    }
+}
+
+/// Wait until no refresh of `channel`'s newest `main` page of `limit` is running: its read
+/// offered, its corrections published and its claim given up, so the next serve starts a refresh
+/// of its own and reads what this one wrote.
+async fn refreshed(state: &AppState, channel: &str, limit: u16) {
+    let key = || {
+        RefreshKey::timeline(
+            ChannelId(channel.to_owned()),
+            TimelineView::Main,
+            None,
+            limit,
+        )
+    };
+    tokio::time::timeout(WAIT, async {
+        while state.message_cache.claim_refresh(key()).is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the refresh finished");
+    settled(state).await;
+}
+
+/// The backward cursor a served page carries, which only this server mints.
+fn served_cursor(body: &Value) -> String {
+    let cursor = body["next_before"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a served page carries a backward cursor: {body}"))
+        .to_owned();
+    assert!(
+        cursor.starts_with(vibe_talk::timeline_served::PREFIX),
+        "the server's own cursor, not a provider's: {body}"
+    );
+    cursor
+}
+
 #[tokio::test]
-async fn a_served_pages_next_full_read_fetches_the_walk_back_cursor() {
-    // A served page cannot mint the provider's backward cursor, so it says more exists
-    // without one — and the view is then not served again until a caller holds a real page.
-    // Otherwise every later load would serve afresh and older history would stay unreachable.
+async fn back_to_back_reloads_are_each_served_and_a_step_back_still_reaches_older_history() {
+    // `#510 cache-serve-every-read`: a served page used to leave its view owing the provider's
+    // own page, so every other reload went upstream. Now each reload the rule allows is served,
+    // and the served page's own cursor walks back into the provider's history.
     let d = deployment("cache-serve-cursor").await;
     d.fill_timeline().await;
     d.clock.advance(2 * HOUR);
     d.state.message_cache.set_serve(true);
 
+    let mut cursor = String::new();
+    for round in 1..=3_u64 {
+        // Time passes between reloads, as it would: a snapshot holding what the refresh just
+        // wrote, at the very instant of the ask, is counted late and never served on.
+        d.clock.advance(SECOND);
+        let body = d.served_reload(5).await;
+        assert_eq!(
+            texts(&body),
+            [
+                "message 7",
+                "message 8",
+                "message 9",
+                "message 10",
+                "message 11"
+            ],
+            "reload {round}"
+        );
+        assert_eq!(body["has_more"], true, "{body}");
+        assert_eq!(body["has_threads"], false, "{body}");
+        cursor = served_cursor(&body);
+        assert_eq!(
+            counts(&d.state, "timeline_fallback").served,
+            round,
+            "reload {round} was served"
+        );
+    }
+
+    // The forward cursor a served page hands out is one a delta can continue from.
+    d.clock.advance(SECOND);
     let held = d.chat.hold_next_timeline();
     let body = tokio::time::timeout(AT_ONCE, d.spawn_timeline(5))
         .await
-        .expect("the reload answered at once")
+        .expect("served")
         .expect("the request ran");
-    assert_eq!(body["has_more"], true, "{body}");
-    assert!(body["next_before"].is_null(), "no minted cursor: {body}");
-    assert_eq!(body["has_threads"], false, "{body}");
+    held.release.send(()).expect("the refresh is waiting");
+    d.refreshed(5).await;
     let after = body["next_after"]
         .as_str()
         .expect("a forward cursor")
         .to_owned();
-    held.entered
-        .await
-        .expect("the refresh reached the provider");
-    held.release.send(()).expect("the refresh is waiting");
-    settled(&d.state).await;
-
-    // The forward cursor a served page hands out is one a delta can continue from.
     let delta = ok(
         &d.state,
         &path(
@@ -580,35 +679,153 @@ async fn a_served_pages_next_full_read_fetches_the_walk_back_cursor() {
     assert!(delta["delta"].is_object(), "a delta answer: {delta}");
     settled(&d.state).await;
 
-    // The next full read of the view goes upstream, refresh or no: it fetches the page whose
-    // cursor the reader walks back on.
-    let held = d.chat.hold_next_timeline();
-    let mut request = d.spawn_timeline(5);
-    assert!(
-        tokio::time::timeout(AT_ONCE, &mut request).await.is_err(),
-        "the view owed a real page is not served again"
+    // After those serves, the first one's cursor still steps back: the provider's own newest
+    // page holds the served rows and nothing older, so the step goes on by its cursor and
+    // answers the five older messages, with the provider's own cursor for the next.
+    let older = d.step_back(5, &cursor).await;
+    assert_eq!(
+        texts(&older),
+        [
+            "message 2",
+            "message 3",
+            "message 4",
+            "message 5",
+            "message 6"
+        ],
+        "{older}"
     );
-    held.release.send(()).expect("the read is waiting");
-    let body = request.await.expect("the request ran");
+    assert_eq!(older["has_more"], true, "{older}");
     assert!(
-        body["next_before"].is_string(),
-        "the provider's own backward cursor: {body}"
+        older["next_after"].is_null(),
+        "a step back says nothing of the newest end"
     );
-    settled(&d.state).await;
-    assert_eq!(counts(&d.state, "timeline_fallback").served, 1);
+    let next = older["next_before"]
+        .as_str()
+        .expect("the provider's own backward cursor")
+        .to_owned();
+    assert!(
+        !next.starts_with(vibe_talk::timeline_served::PREFIX),
+        "every step after the first is the provider's: {older}"
+    );
+    let oldest = d.step_back(5, &next).await;
+    assert_eq!(texts(&oldest), ["message 0", "message 1"], "{oldest}");
+    assert_eq!(oldest["has_more"], false, "{oldest}");
 
-    // With a real page handed out, serving resumes. Time passes first, as it would: a
-    // snapshot holding what the direct read just wrote, at the very instant of the ask,
-    // is counted late and never served on.
+    // And the step back held nothing back either: the next reload is served too.
     d.clock.advance(SECOND);
-    let held = d.chat.hold_next_timeline();
-    let body = tokio::time::timeout(AT_ONCE, d.spawn_timeline(5))
+    let body = d.served_reload(5).await;
+    served_cursor(&body);
+    assert_eq!(counts(&d.state, "timeline_fallback").served, 5);
+}
+
+#[tokio::test]
+async fn a_step_back_from_a_served_page_walks_past_what_arrived_since() {
+    // More messages arrived after the serve than one page holds: the provider's newest page no
+    // longer reaches the served rows, and the step walks back on its cursors until it does,
+    // answering only what lies below the oldest message served.
+    let d = deployment("cache-serve-walk").await;
+    d.fill_timeline().await;
+    d.clock.advance(2 * HOUR);
+    d.state.message_cache.set_serve(true);
+    let body = d.served_reload(5).await;
+    let cursor = served_cursor(&body);
+
+    let read = ChannelId(READ_CHANNEL.to_owned());
+    for n in 12..19 {
+        d.fake
+            .seed_at(&read, "Ada", &format!("message {n}"), T0 + n * MINUTE);
+    }
+    let older = d.step_back(5, &cursor).await;
+    assert_eq!(
+        texts(&older),
+        ["message 4", "message 5", "message 6"],
+        "only what lies below the served page: {older}"
+    );
+    assert_eq!(older["has_more"], true, "{older}");
+    let next = older["next_before"]
+        .as_str()
+        .expect("the provider's own backward cursor")
+        .to_owned();
+    let below = d.step_back(5, &next).await;
+    assert_eq!(
+        texts(&below),
+        ["message 0", "message 1", "message 2", "message 3"],
+        "{below}"
+    );
+}
+
+#[tokio::test]
+async fn a_served_cursor_is_refused_for_any_other_view() {
+    let d = deployment("cache-serve-cursor-bound").await;
+    d.fill_timeline().await;
+    d.clock.advance(2 * HOUR);
+    d.state.message_cache.set_serve(true);
+    let body = d.served_reload(5).await;
+    let cursor = served_cursor(&body);
+    let (status, refused) = call(
+        &d.state,
+        &path(
+            READ_CHANNEL,
+            &format!("/timeline?view=flat&limit=5&before={}", url_encode(&cursor)),
+        ),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+}
+
+#[tokio::test]
+async fn a_second_serve_in_a_row_is_corrected_by_its_own_refresh() {
+    // Serving back to back keeps every correction: what changed upstream after the first
+    // serve's refresh is shown by the second, provisionally, and put right by its refresh.
+    let d = deployment("cache-serve-correct-again").await;
+    d.fill_timeline().await;
+    d.clock.advance(2 * HOUR);
+    d.state.message_cache.set_serve(true);
+    d.served_reload(5).await;
+
+    d.fake.edit(&d.ids[10], "message 10, corrected");
+    let channel = ChannelId(READ_CHANNEL.to_owned());
+    let mut subscription = d.state.live.subscribe(&channel, None);
+    while subscription.receiver.try_recv().is_ok() {}
+    d.clock.advance(SECOND);
+    let body = d.served_reload(5).await;
+    assert_eq!(
+        texts(&body)[3],
+        "message 10",
+        "the provisional page is the cache as it stood"
+    );
+    // Only the row that changed is corrected: a row merely seen again by a refresh is no
+    // change, though its served copy carries a version the held copy keeps beside it.
+    let corrected = async {
+        let mut seen = Vec::new();
+        loop {
+            let live = subscription
+                .receiver
+                .recv()
+                .await
+                .expect("a live correction");
+            seen.push((
+                live.kind,
+                live.message.id.clone(),
+                live.message.content.clone(),
+            ));
+            if live.kind == LiveKind::Update && live.message.id == d.ids[10] {
+                return seen;
+            }
+        }
+    };
+    let seen = tokio::time::timeout(Duration::from_secs(10), corrected)
         .await
-        .expect("answered from the cache again")
-        .expect("the request ran");
-    assert!(body["next_before"].is_null(), "{body}");
-    held.release.send(()).expect("the refresh is waiting");
-    settled(&d.state).await;
+        .expect("the second serve's refresh corrected it");
+    assert_eq!(
+        seen,
+        [(
+            LiveKind::Update,
+            d.ids[10].clone(),
+            "message 10, corrected".to_owned()
+        )]
+    );
     assert_eq!(counts(&d.state, "timeline_fallback").served, 2);
 }
 
@@ -804,8 +1021,7 @@ async fn a_slack_window_is_never_served_and_a_slack_main_page_is() {
     assert_eq!(counts(&state, "messages").served, 0);
 
     // The Main page, against an edit the cache has not heard of: provisional first, and the
-    // read behind it — here the next full read, which the served view owes a real page —
-    // shows the correction.
+    // refresh behind it brings the correction, which the next reload, served again, shows.
     clock.advance(HOUR);
     slack_edit(&fake, 240, "message 4, edited upstream");
     let body = ok(
@@ -819,8 +1035,9 @@ async fn a_slack_window_is_never_served_and_a_slack_main_page_is() {
         ["message 4", "message 5, edited upstream"],
         "the Main page as the cache holds it, before its refresh lands"
     );
-    settled(&state).await;
+    refreshed(&state, SLACK_CH, 2).await;
     assert_eq!(counts(&state, "timeline_fallback").served, 1);
+    clock.advance(SECOND);
     let body = ok(
         &state,
         &path(SLACK_CH, "/timeline?view=main&limit=2"),
@@ -830,5 +1047,31 @@ async fn a_slack_window_is_never_served_and_a_slack_main_page_is() {
     assert_eq!(
         texts(&body),
         ["message 4, edited upstream", "message 5, edited upstream"]
+    );
+    settled(&state).await;
+    assert_eq!(
+        counts(&state, "timeline_fallback").served,
+        2,
+        "`#510 cache-serve-every-read`: served again, back to back"
+    );
+
+    // Its own cursor steps back past the provider's newest page into Slack's history.
+    let cursor = served_cursor(&body);
+    let older = ok(
+        &state,
+        &path(
+            SLACK_CH,
+            &format!("/timeline?view=main&limit=2&before={}", url_encode(&cursor)),
+        ),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(texts(&older), ["message 2", "message 3"], "{older}");
+    assert_eq!(older["has_more"], true, "{older}");
+    assert!(
+        older["next_before"]
+            .as_str()
+            .is_some_and(|next| !next.starts_with(vibe_talk::timeline_served::PREFIX)),
+        "Slack's own cursor for the next step: {older}"
     );
 }
