@@ -5,9 +5,9 @@
       "source_prefixes": [
         "common/docs/agent-queue/",
         "common/docs/agentctl/",
-        "common/docs/term-backend/",
         "common/docs/chat-subscription-plugin/",
         "common/docs/chat-subscription/",
+        "common/docs/term-backend/",
         "py/agentctl/",
         "py/bin/agentctl",
         "py/bin/herdr-agent",
