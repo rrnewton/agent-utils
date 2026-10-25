@@ -1,11 +1,12 @@
 ---
 title: 'terminal-backend-traits: abstract Herdr behind clean Rust traits with a first-class tmux backend'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 assignee: mu-term
 created_at: 2026-10-25T12:48:01.186541330+00:00
-updated_at: 2026-10-25T12:48:01.186541330+00:00
+updated_at: 2026-10-25T16:48:34.845617574+00:00
+closed_at: 2026-10-25T16:48:34.845617424+00:00
 ---
 
 # Description
