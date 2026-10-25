@@ -362,7 +362,7 @@ fn run_direct<A: agent::AgentApi>(
 }
 
 fn run_managed(args: Args) -> Result<i32, CliError> {
-    let (backend, _backend_explicit) = crate::term::select_backend(
+    let (backend, backend_explicit) = crate::term::select_backend(
         args.term_backend.as_deref(),
         &|name| std::env::var(name).ok(),
         &args.registry,
@@ -445,15 +445,18 @@ fn run_managed(args: Args) -> Result<i32, CliError> {
             Ok(command)
         })
         .transpose()?;
-    let client: Box<dyn crate::subagents::ManagedApi> = match backend {
-        term_backend::BackendKind::Herdr => {
+    // As in agentctl's own dispatch, managed commands run on tmux only
+    // when an operator selected it; a merely detected tmux keeps Herdr's
+    // not-found error.
+    let client: Box<dyn crate::subagents::ManagedApi> =
+        if backend_explicit && backend == term_backend::BackendKind::Tmux {
+            Box::new(term_backend::TmuxBackend::new(
+                args.tmux_bin.clone(),
+                args.tmux_socket.clone(),
+            ))
+        } else {
             Box::new(HerdrClient::with_executable("direct", &args.herdr_bin)?)
-        }
-        term_backend::BackendKind::Tmux => Box::new(term_backend::TmuxBackend::new(
-            args.tmux_bin.clone(),
-            args.tmux_socket.clone(),
-        )),
-    };
+        };
     let manager = ManagedAgents::new(
         &*client,
         &absolute_lexical(&args.registry).map_err(CliError::Output)?,

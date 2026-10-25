@@ -1874,7 +1874,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         }
         _ => {}
     }
-    let (selected_backend, _backend_explicit) = crate::term::select_backend(
+    let (selected_backend, backend_explicit) = crate::term::select_backend(
         args.term_backend.as_deref(),
         environment,
         &args.registry,
@@ -1882,14 +1882,19 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         &args.tmux_bin,
     )
     .map_err(AgentError::from)?;
-    let client: Box<dyn crate::subagents::ManagedApi> = match selected_backend {
-        term_backend::BackendKind::Herdr => Box::new(
-            HerdrClient::with_executable("direct", &args.herdr_bin).map_err(AgentError::from)?,
-        ),
-        term_backend::BackendKind::Tmux => Box::new(term_backend::TmuxBackend::new(
+    // Lifecycle runs on tmux only when an operator selected it (flag,
+    // environment, or the registry's profile config). When detection
+    // merely found no Herdr, fall through so the Herdr client reports its
+    // usual not-found error, exactly as before backends were selectable.
+    let client: Box<dyn crate::subagents::ManagedApi> = if backend_explicit
+        && selected_backend == term_backend::BackendKind::Tmux
+    {
+        Box::new(term_backend::TmuxBackend::new(
             args.tmux_bin.clone(),
             args.tmux_socket.clone(),
-        )),
+        ))
+    } else {
+        Box::new(HerdrClient::with_executable("direct", &args.herdr_bin).map_err(AgentError::from)?)
     };
     let client: &dyn crate::subagents::ManagedApi = &*client;
     let from_environment = CloudTools::from_environment(environment);
