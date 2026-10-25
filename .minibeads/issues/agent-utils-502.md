@@ -1,13 +1,14 @@
 ---
 title: 'cache-serve-coverage: the cache stops proving the newest page after a restart, and read latency is not measured'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 - message-cache
 created_at: 2026-10-25T12:05:50.197592342+00:00
-updated_at: 2026-10-25T12:05:50.197592342+00:00
+updated_at: 2026-10-25T12:28:32.997086432+00:00
+closed_at: 2026-10-25T12:28:32.997086081+00:00
 ---
 
 # Description
