@@ -512,6 +512,8 @@ pub struct Declaration {
     pub may_send_to: Vec<String>,
     /// Maximum body bytes.
     pub max_bytes: usize,
+    /// Arrivals accepted from one sender per hour (`0` = no limit).
+    pub per_sender_per_hour: u64,
     /// Maximum TTL in seconds.
     pub max_ttl_seconds: i64,
     /// Default TTL in seconds.
@@ -605,6 +607,10 @@ pub fn parse_declaration(raw: Value) -> DataResult<Declaration> {
             .get("max_bytes")
             .and_then(Value::as_u64)
             .unwrap_or(8192) as usize,
+        per_sender_per_hour: limits
+            .get("per_sender_per_hour")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
         max_ttl_seconds: limits
             .get("max_ttl_seconds")
             .and_then(Value::as_i64)

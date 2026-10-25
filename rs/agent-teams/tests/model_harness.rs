@@ -1053,3 +1053,111 @@ fn reconcile_folds_queue_terminal_state_into_the_ledger() {
     );
     let _ = std::fs::remove_dir_all(&state);
 }
+
+/// Gap 3a: `per_sender_per_hour` is enforced at accept from durable
+/// `recorded_at`s; the third arrival in an hour is refused, and the
+/// refusal names the limit.
+#[test]
+fn per_sender_rate_limit_refuses_beyond_the_hour() {
+    let state = temp_state("rate-limit");
+    let team_dir = state.join("teams.d/tools");
+    std::fs::create_dir_all(&team_dir).expect("team dir");
+    let declaration = json!({
+        "schema": "agent-teams-declaration/v1",
+        "team": "tools",
+        "deliverer": {"kind": "hook-inbox"},
+        "coordinator": {"designation": "pinned", "harness_identity": {"boot_id": "x", "pid": 1, "starttime_ticks": 1}},
+        "accepts_from": [{"sender": "sim", "kinds": ["info"]}],
+        "limits": {"max_bytes": 8192, "per_sender_per_hour": 2, "max_ttl_seconds": 604800},
+        "default_ttl_seconds": 7200,
+    });
+    agent_teams::jsonfile::write_json_atomic(&team_dir.join("declaration.json"), &declaration)
+        .expect("declaration");
+    let declarations = agent_teams::proof::load_declarations(&state).expect("decls");
+    let (_, _, declaration) = &declarations[0];
+    assert_eq!(declaration.per_sender_per_hour, 2);
+    let ctx = AcceptContext {
+        state: &state,
+        this_host: "host-a",
+        declaration,
+        via: "test",
+        proof_note: "proved",
+        relayed_by: None,
+        peer_host: "host-a",
+    };
+    let fake = FakeDeliverer::default();
+    let now_ms = agent_teams::timeutil::now_unix_ms();
+    let send = |id: &str, seq: i64| {
+        let envelope = build_envelope(
+            id,
+            "k",
+            "sim",
+            "host-a",
+            seq,
+            "harness-ancestry",
+            "tools",
+            "host-a",
+            "info",
+            None,
+            &[],
+            false,
+            now_ms,
+            now_ms + 7_200_000,
+            None,
+            "body",
+        );
+        accept(&ctx, &envelope, &fake).expect("accept")
+    };
+    assert_eq!(
+        send("tm-sim-5555555555555555", 1).state.as_deref(),
+        Some("accepted")
+    );
+    assert_eq!(
+        send("tm-sim-6666666666666666", 2).state.as_deref(),
+        Some("accepted")
+    );
+    let third = send("tm-sim-7777777777777777", 3);
+    assert_eq!(third.state.as_deref(), Some("refused"), "{third:?}");
+    assert!(third.detail.contains("rate limit"), "{third:?}");
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+/// Gap 3b: pruning removes only terminal entries past 30 days beyond
+/// their own `not_after`; live and unsettled entries stay, and a pruned
+/// ID replayed later is still refused (its envelope is long expired).
+#[test]
+fn pruning_keeps_everything_but_old_terminal_entries() {
+    use agent_teams::ledger::{entry_path, prune_team};
+    use agent_teams::timeutil::format_rfc3339_ms;
+    let state = temp_state("pruning");
+    declaration_for(&state, "tools", "sim");
+    let now_ms = agent_teams::timeutil::now_unix_ms();
+    let old = now_ms - 40 * 86_400_000;
+    let write = |id: &str, state_name: &str, not_after_ms: i64| {
+        let entry = json!({
+            "id": id, "state": state_name, "sender": "sim",
+            "not_after": format_rfc3339_ms(not_after_ms),
+            "recorded_at": format_rfc3339_ms(not_after_ms - 1000),
+        });
+        std::fs::create_dir_all(state.join("teams.d/tools/ledger")).expect("dir");
+        std::fs::write(
+            entry_path(&state, "tools", id),
+            serde_json::to_string_pretty(&entry).unwrap(),
+        )
+        .expect("entry");
+    };
+    write("tm-sim-8888888888888888", "delivered", old);
+    write("tm-sim-9999999999999999", "accepted", old);
+    write("tm-sim-aaaaaaaaaaaaaaaa", "possibly_submitted", old);
+    write("tm-sim-bbbbbbbbbbbbbbbb", "delivered", now_ms);
+    assert_eq!(prune_team(&state, "tools", now_ms).expect("prune"), 1);
+    assert!(!entry_path(&state, "tools", "tm-sim-8888888888888888").exists());
+    for kept in [
+        "tm-sim-9999999999999999",
+        "tm-sim-aaaaaaaaaaaaaaaa",
+        "tm-sim-bbbbbbbbbbbbbbbb",
+    ] {
+        assert!(entry_path(&state, "tools", kept).exists(), "{kept} kept");
+    }
+    let _ = std::fs::remove_dir_all(&state);
+}

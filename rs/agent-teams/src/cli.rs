@@ -61,6 +61,7 @@ MESSAGING
   outbox [--json]                      List the outbox.
   pump [--retry-refused] [--json]      Retry deferred and ambiguous messages.
   seen ID                              Has this host's ledger delivered ID?
+  prune [TEAM]                         Drop terminal entries 30 days past not_after.
   resolve ID (--fence | --mark-delivered)   Human only, on the receiving host.
   hook [--team TEAM]                   Harness hook for the hook-inbox deliverer.
 
@@ -210,6 +211,7 @@ fn run_inner(args: &[String]) -> Result<i32, DataError> {
         "outbox" => cmd_outbox(&globals),
         "pump" => cmd_pump(&globals, cmd_args),
         "seen" => cmd_seen(&globals, cmd_args),
+        "prune" => cmd_prune(&globals, cmd_args),
         "resolve" => cmd_resolve(&globals, cmd_args),
         "hook" => cmd_hook(&globals, cmd_args),
         "serve" => cmd_serve(&globals, cmd_args),
@@ -1297,6 +1299,36 @@ fn cmd_pump(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
         println!("pump: nothing to do");
     }
     Ok(worst)
+}
+
+/// `prune`: remove terminal ledger/outbox entries 30 days past their own
+/// `not_after` (design 9.2). Prints one line per store that lost entries.
+fn cmd_prune(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
+    let now_ms = crate::timeutil::now_unix_ms();
+    let wanted = positional(args).into_iter().next();
+    let mut total = 0_usize;
+    let teams = match &wanted {
+        Some(team) => vec![(
+            team.clone(),
+            crate::ledger::prune_team(&globals.state, team, now_ms)?,
+        )],
+        None => crate::ledger::prune_all(&globals.state, now_ms)?,
+    };
+    for (team, removed) in &teams {
+        if *removed > 0 {
+            println!("pruned {removed} ledger entries in team {team}");
+            total += removed;
+        }
+    }
+    if wanted.is_none() {
+        let removed = crate::ledger::prune_outbox(&globals.state, now_ms)?;
+        if removed > 0 {
+            println!("pruned {removed} outbox entries");
+            total += removed;
+        }
+    }
+    println!("prune: {total} entries removed");
+    Ok(0)
 }
 
 fn cmd_seen(globals: &Globals, args: &[String]) -> Result<i32, DataError> {

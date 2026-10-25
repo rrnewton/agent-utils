@@ -147,6 +147,11 @@ pub fn accept(
     envelope: &Value,
     deliverer: &dyn Deliverer,
 ) -> DataResult<AcceptAnswer> {
+    // Opportunistic retention pruning (its own ledger lock, taken and
+    // released before accept's): entries past their horizon are exactly
+    // the ones no live envelope can need, since any replay of them is
+    // refused on not_after below.
+    let _ = prune_team(ctx.state, &ctx.declaration.team, now_unix_ms());
     let team = &ctx.declaration.team;
     // Route refusals first: no ledger entry, nothing fenced (section 9.4).
     if let Err(reason) = check_envelope(envelope) {
@@ -321,6 +326,33 @@ pub fn accept(
             "not_after beyond max_ttl_seconds".to_string(),
             lock,
         );
+    }
+    // Rate limit: arrivals from one sender in the trailing hour, counted
+    // on durable recorded_at (refusals count too, so a flood cannot wash
+    // its own record away; the window slides).
+    if ctx.declaration.per_sender_per_hour > 0 {
+        let window_start = now_ms - 3_600_000;
+        let recent = list_entries(ctx.state, team)
+            .iter()
+            .filter(|entry| {
+                entry.get("sender").and_then(Value::as_str) == Some(sender.as_str())
+                    && entry
+                        .get("recorded_at")
+                        .and_then(Value::as_str)
+                        .and_then(parse_rfc3339_ms)
+                        .is_some_and(|at| at >= window_start)
+            })
+            .count();
+        if recent as u64 >= ctx.declaration.per_sender_per_hour {
+            return refuse(
+                "refused",
+                format!(
+                    "rate limit: {recent} arrivals from {sender} in the last hour (limit {})",
+                    ctx.declaration.per_sender_per_hour
+                ),
+                lock,
+            );
+        }
     }
     // Topic rule: an older message than the newest taken for delivery on its
     // topic starts superseded and is never queued (section 12.1).
@@ -706,6 +738,128 @@ pub fn reconcile_queue_delivery(state: &Path, team: &str, id: &str) -> Option<St
     unlock(lock);
     written.ok()?;
     Some(new_state.to_string())
+}
+
+/// Sender/ledger states after which an entry can never move again and
+/// may be pruned at its retention horizon. `possibly_submitted` and
+/// `claimed`/`accepted` are never terminal here: the former needs a
+/// human, the latter may still be typed.
+const PRUNABLE_STATES: [&str; 7] = [
+    "delivered",
+    "expired",
+    "superseded",
+    "retracted",
+    "fenced",
+    "refused",
+    "lost",
+];
+
+/// The retention horizon of one entry in Unix ms: 30 days past its own
+/// stored `not_after` (design 9.2). Entries without a parseable
+/// `not_after` have no horizon and are never pruned.
+fn retention_horizon_ms(entry: &Value) -> Option<i64> {
+    let not_after = entry.get("not_after").and_then(Value::as_str).or_else(|| {
+        entry
+            .get("envelope")
+            .and_then(|envelope| envelope.get("not_after"))
+            .and_then(Value::as_str)
+    })?;
+    parse_rfc3339_ms(not_after).map(|ms| ms + 30 * 86_400_000)
+}
+
+/// Delete one entry file and any atomic-write backups (`<id>.json.<stamp>`)
+/// beside it.
+fn remove_entry_files(dir: &Path, id: &str) {
+    let base = format!("{id}.json");
+    let _ = fs::remove_file(dir.join(&base));
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&format!("{base}.")) && name.len() > base.len() + 1 {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+/// Prune one team's ledger: terminal entries whose retention horizon has
+/// passed. Returns how many entries were removed.
+pub fn prune_team(state: &Path, team: &str, now_ms: i64) -> DataResult<usize> {
+    let dir = ledger_dir(state, team);
+    let lock = lock_ledger(&dir)?;
+    let mut removed = 0;
+    for entry in list_entries(state, team) {
+        let Some(id) = entry.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if !PRUNABLE_STATES.contains(&entry_state(&entry)) {
+            continue;
+        }
+        if retention_horizon_ms(&entry).is_some_and(|horizon| horizon <= now_ms) {
+            remove_entry_files(&dir, id);
+            removed += 1;
+        }
+    }
+    unlock(lock);
+    Ok(removed)
+}
+
+/// Prune every team's ledger under `state`. Returns `(team, removed)`
+/// pairs for teams that lost entries.
+pub fn prune_all(state: &Path, now_ms: i64) -> DataResult<Vec<(String, usize)>> {
+    let mut out = Vec::new();
+    let teams_dir = state.join("teams.d");
+    if let Ok(entries) = fs::read_dir(&teams_dir) {
+        for entry in entries.flatten() {
+            let team = entry.file_name().to_string_lossy().into_owned();
+            if crate::model::valid_team_name(&team) {
+                let removed = prune_team(state, &team, now_ms)?;
+                if removed > 0 {
+                    out.push((team, removed));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Prune the sender-side outbox: terminal entries (per
+/// [`crate::sender::is_terminal`]) past the same retention horizon.
+/// Outbox entries carry their envelope's `not_after` (see
+/// [`retention_horizon_ms`]); entries without one are kept.
+pub fn prune_outbox(state: &Path, now_ms: i64) -> DataResult<usize> {
+    let dir = state.join("outbox");
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Ok(0);
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(id) = name.strip_suffix(".json") else {
+            continue;
+        };
+        if !crate::envelope::valid_message_id(id) {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(document) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        let state_name = document
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !crate::sender::is_terminal(state_name) {
+            continue;
+        }
+        if retention_horizon_ms(&document).is_some_and(|horizon| horizon <= now_ms) {
+            remove_entry_files(&dir, id);
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 /// `receipt`: a pure read of the ledger (never recovers).
