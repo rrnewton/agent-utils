@@ -637,3 +637,28 @@ fn agentctl_queue_deliverer_uses_agent_queue() {
     );
     let _ = std::fs::remove_dir_all(&state);
 }
+
+/// Until P0b lands a registry designation, a declaration may name the
+/// coordinator agent explicitly for the agentctl-queue deliverer.
+#[test]
+fn deliverer_accepts_explicit_agent_name() {
+    let declaration = agent_teams::model::parse_declaration(json!({
+        "schema": "agent-teams-declaration/v1",
+        "team": "tools",
+        "deliverer": {"kind": "agentctl-queue", "registry": "/nonexistent-registry", "agent": "coordinator"},
+        "coordinator": {"designation": "pinned", "harness_identity": {"boot_id": "x", "pid": 1, "starttime_ticks": 1}},
+        "accepts_from": [],
+    }))
+    .expect("declaration");
+    let deliverer = agent_teams::deliver::deliverer_for(
+        &declaration,
+        Path::new("/tmp"),
+        Path::new("/tmp/ledger.json"),
+    )
+    .expect("deliverer with explicit agent");
+    assert_eq!(deliverer.kind(), "agentctl-queue");
+    assert_eq!(
+        deliverer.target().queue_dir,
+        Some(PathBuf::from("/nonexistent-registry/coordinator/queue"))
+    );
+}

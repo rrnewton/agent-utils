@@ -370,8 +370,11 @@ pub fn deliverer_for(
                         "agentctl-queue deliverer needs a registry path",
                     )
                 })?;
-            let coordinator =
-                crate::proof::registry_coordinator_name(&registry).ok_or_else(|| {
+            // Until the registry carries its own coordinator designation
+            // (phase P0b), a declaration may name the agent explicitly.
+            let coordinator = match declaration.deliverer.get("agent").and_then(Value::as_str) {
+                Some(agent) => agent.to_string(),
+                None => crate::proof::registry_coordinator_name(&registry).ok_or_else(|| {
                     crate::jsonfile::DataError::new(
                         "no-coordinator",
                         format!(
@@ -379,7 +382,8 @@ pub fn deliverer_for(
                             registry.display()
                         ),
                     )
-                })?;
+                })?,
+            };
             Ok(Box::new(AgentctlQueueDeliverer {
                 queue_dir: registry.join(coordinator).join("queue"),
                 ledger_path: ledger_path.to_path_buf(),
