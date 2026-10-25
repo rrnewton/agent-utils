@@ -25,6 +25,12 @@ use vibe_talk::store::StateStore;
 /// Streaming responses can remain open forever, so graceful shutdown itself must have a bound.
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long the live poller and the relist wait, at start, for every provider's account to be
+/// checked against the message cache's file before their first read (`#502
+/// cache-serve-coverage`). A provider answers in a second or two; one that does not answer is
+/// asked again with a growing backoff, and its live feed should not wait for that.
+const FIRST_CHECKS_WAIT: Duration = Duration::from_secs(15);
+
 const USAGE: &str = "\
 vibe-talk — a chat bridge for a voice agent
 
@@ -799,15 +805,19 @@ async fn main() -> anyhow::Result<()> {
     if vibe_talk::voice_bridge::needed(&state.config) {
         state.voice_bridge.refresh_if_stale();
     }
+    // `#502 cache-serve-coverage`. The background readers begin once every provider's account
+    // has been checked against the message cache's file, or after FIRST_CHECKS_WAIT: a read begun
+    // before then writes nothing to the cache and leaves its channel in doubt.
     for entry in providers.entries() {
         if entry.live_poll_seconds > 0 {
-            tokio::spawn(vibe_talk::live::poll_forever(
-                state.clone(),
-                providers.is_multi().then(|| entry.key.clone()),
-                Arc::clone(&entry.client),
-                live_limit,
-                std::time::Duration::from_secs(entry.live_poll_seconds),
-            ));
+            let state = state.clone();
+            let key = providers.is_multi().then(|| entry.key.clone());
+            let client = Arc::clone(&entry.client);
+            let interval = std::time::Duration::from_secs(entry.live_poll_seconds);
+            tokio::spawn(async move {
+                state.message_cache.first_checks(FIRST_CHECKS_WAIT).await;
+                vibe_talk::live::poll_forever(state, key, client, live_limit, interval).await;
+            });
         }
     }
     // `#452 slack-live-ingest`. The relist reads each channel a provider's event stream feeds
@@ -818,12 +828,13 @@ async fn main() -> anyhow::Result<()> {
             threads = state.config.ingest.relist_threads,
             "the relist is ON: each channel of a provider that takes pushed messages has its newest              page and its recently active threads read again on this interval"
         );
-        tokio::spawn(vibe_talk::relist::relist_forever(
-            state.clone(),
-            std::time::Duration::from_secs(state.config.ingest.relist_seconds),
-            live_limit,
-            state.config.ingest.relist_threads,
-        ));
+        let state = state.clone();
+        tokio::spawn(async move {
+            state.message_cache.first_checks(FIRST_CHECKS_WAIT).await;
+            let interval = std::time::Duration::from_secs(state.config.ingest.relist_seconds);
+            let threads = state.config.ingest.relist_threads;
+            vibe_talk::relist::relist_forever(state, interval, live_limit, threads).await;
+        });
     }
     // `#453 cache-backfill`. Walks each cached channel's history into the message cache while
     // its provider is otherwise idle; returns at once with `backfill = "off"`.
