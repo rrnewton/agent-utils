@@ -115,6 +115,13 @@ directory sits under a config tree.
   rename, re-checks expiry and tombstones, prints what survives. Hook
   delivery never wakes an idle agent.
 
+With the `agentctl-queue` deliverer, delivery starts on arrival: after an
+item is enqueued, accept starts one bounded `agentctl drain
+--deliver-while-working --ready-timeout 120` in a detached thread (never
+more than one per queue, content-free entries in `team-log.jsonl`), so a
+message does not wait for some other drain. Turn it off per declaration
+with `"auto_drain": false` (and tune `"auto_drain_ready_timeout_seconds"`).
+
 ### Receiving host (run by routes)
 
 - `serve --stdio --peer HOST` — the forced-command protocol endpoint. It

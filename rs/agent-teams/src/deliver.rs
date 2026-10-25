@@ -131,6 +131,28 @@ impl Deliverer for HookInboxDeliverer {
     }
 }
 
+/// Delivery on arrival for the `agentctl-queue` deliverer: after a
+/// successful enqueue, start one bounded `agentctl drain` (in a detached
+/// thread, so `accept` never waits for typing) instead of leaving the item
+/// for some later drain. On by default; a declaration turns it off with
+/// `"auto_drain": false`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutoDrain {
+    /// Start a drain after each accepted hand-over.
+    pub enabled: bool,
+    /// `--ready-timeout` for the drain, in seconds.
+    pub ready_timeout_seconds: u64,
+}
+
+impl Default for AutoDrain {
+    fn default() -> Self {
+        AutoDrain {
+            enabled: true,
+            ready_timeout_seconds: 120,
+        }
+    }
+}
+
 /// The `agentctl-queue` deliverer: enqueues into the designated
 /// coordinator's queue through the shared `agent-queue` crate; that host's
 /// drainers type it. The enqueue is unserialized (`serialize: false`):
@@ -146,6 +168,15 @@ pub struct AgentctlQueueDeliverer {
     pub queue_dir: PathBuf,
     /// Ledger entry path recorded in each item.
     pub ledger_path: PathBuf,
+    /// Registry the queue belongs to (for the drain command).
+    pub registry: PathBuf,
+    /// Coordinator agent name in that registry.
+    pub agent: String,
+    /// Delivery-on-arrival settings.
+    pub auto_drain: AutoDrain,
+    /// State directory holding the drain lock and `team-log.jsonl`;
+    /// `None` disables auto-drain (tests, embedding).
+    pub drain_state_dir: Option<PathBuf>,
 }
 
 impl AgentctlQueueDeliverer {
@@ -172,6 +203,28 @@ impl AgentctlQueueDeliverer {
             obj.insert("envelope".to_string(), envelope.clone());
         }
         item
+    }
+
+    /// Start the bounded delivery-on-arrival drain for this item, if
+    /// enabled. Runs in a detached thread holding a per-agent lock, so
+    /// there is never more than one of our drains per queue; a drain that
+    /// finds the item already processed does nothing. Logs are
+    /// content-free (IDs and outcomes only).
+    fn start_drain(&self, id: &str) {
+        if !self.auto_drain.enabled {
+            return;
+        }
+        let Some(state) = self.drain_state_dir.clone() else {
+            return;
+        };
+        let queue_dir = self.queue_dir.clone();
+        let registry = self.registry.clone();
+        let agent = self.agent.clone();
+        let id = id.to_string();
+        let ready_timeout = self.auto_drain.ready_timeout_seconds;
+        std::thread::spawn(move || {
+            run_auto_drain(&state, &queue_dir, &registry, &agent, &id, ready_timeout);
+        });
     }
 
     /// Whether the item already in the queue under `id` is this envelope.
@@ -203,6 +256,106 @@ impl Deliverer for AgentctlQueueDeliverer {
         }
     }
     fn handover(&self, id: &str, envelope: &Value, rendered: &str) -> Handover {
+        let outcome = self.enqueue(id, envelope, rendered);
+        if outcome == Handover::Accepted {
+            self.start_drain(id);
+        }
+        outcome
+    }
+    fn contains(&self, id: &str) -> Option<bool> {
+        self.queue_contains(id)
+    }
+}
+
+/// One bounded delivery-on-arrival drain (runs in the detached thread
+/// `start_drain` spawned). Holds the per-agent drain lock for its whole
+/// run, so our drains never overlap on one queue; the queue's own delivery
+/// lock inside `agentctl drain` remains the typing serialization.
+fn run_auto_drain(
+    state: &Path,
+    queue_dir: &Path,
+    registry: &Path,
+    agent: &str,
+    id: &str,
+    ready_timeout_seconds: u64,
+) {
+    use fs2::FileExt;
+    let log = |outcome: &str| {
+        crate::sender::log_event(
+            state,
+            &json!({"event": "auto-drain", "id": id, "agent": agent, "outcome": outcome}),
+        );
+    };
+    let lock_path = state.join(format!("auto-drain-{agent}.lock"));
+    let Ok(lock_file) = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+    else {
+        log("lock-open-failed");
+        return;
+    };
+    if lock_file.lock_exclusive().is_err() {
+        log("lock-failed");
+        return;
+    }
+    // A drain we queued behind may already have typed this item.
+    if let Ok(Some(agent_queue::queue::MessageState::Processed)) =
+        agent_queue::queue::message_state(queue_dir, id)
+    {
+        log("already-processed");
+        return;
+    }
+    log("started");
+    let spawned = std::process::Command::new(crate::proof::agentctl_binary())
+        .arg("--registry")
+        .arg(registry)
+        .args([
+            "drain",
+            agent,
+            "--deliver-while-working",
+            "--ready-timeout",
+            &ready_timeout_seconds.to_string(),
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(_) => {
+            log("spawn-failed");
+            return;
+        }
+    };
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(ready_timeout_seconds + 180);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                log(if status.success() { "done" } else { "failed" });
+                return;
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                log("timed-out");
+                return;
+            }
+            Err(_) => {
+                log("wait-failed");
+                return;
+            }
+        }
+    }
+}
+
+impl AgentctlQueueDeliverer {
+    fn enqueue(&self, id: &str, envelope: &Value, rendered: &str) -> Handover {
         let result = agent_queue::queue::enqueue(
             &self.queue_dir,
             Some(id),
@@ -223,7 +376,7 @@ impl Deliverer for AgentctlQueueDeliverer {
                     ),
                 }
             }
-            Err(e) => match self.contains(id) {
+            Err(e) => match self.queue_contains(id) {
                 Some(true) => Handover::Accepted,
                 Some(false) => Handover::Refused(format!("queue enqueue failed: {}", e.message())),
                 None => Handover::PossiblySubmitted(format!(
@@ -233,7 +386,7 @@ impl Deliverer for AgentctlQueueDeliverer {
             },
         }
     }
-    fn contains(&self, id: &str) -> Option<bool> {
+    fn queue_contains(&self, id: &str) -> Option<bool> {
         use agent_queue::queue::MessageState;
         match agent_queue::queue::message_state(&self.queue_dir, id) {
             Ok(Some(MessageState::Pending | MessageState::Inflight | MessageState::Processed)) => {
@@ -384,9 +537,31 @@ pub fn deliverer_for(
                     )
                 })?,
             };
+            let auto_drain = AutoDrain {
+                enabled: declaration
+                    .deliverer
+                    .get("auto_drain")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+                ready_timeout_seconds: declaration
+                    .deliverer
+                    .get("auto_drain_ready_timeout_seconds")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(120),
+            };
+            // team_state_dir is <state>/teams.d/<team>; the drain lock and
+            // content-free log belong to the state root.
+            let drain_state_dir = team_state_dir
+                .parent()
+                .and_then(|teams_d| teams_d.parent())
+                .map(|state| state.to_path_buf());
             Ok(Box::new(AgentctlQueueDeliverer {
-                queue_dir: registry.join(coordinator).join("queue"),
+                queue_dir: registry.join(&coordinator).join("queue"),
                 ledger_path: ledger_path.to_path_buf(),
+                registry,
+                agent: coordinator,
+                auto_drain,
+                drain_state_dir,
             }))
         }
         "command" => {

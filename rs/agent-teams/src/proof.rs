@@ -76,7 +76,7 @@ fn parse_identity(value: &Value) -> Option<ProcessIdentity> {
 
 /// The agentctl binary used for designation reads: `$AGENT_TEAMS_AGENTCTL`,
 /// else `agentctl` on PATH.
-fn agentctl_binary() -> String {
+pub(crate) fn agentctl_binary() -> String {
     std::env::var("AGENT_TEAMS_AGENTCTL").unwrap_or_else(|_| "agentctl".to_string())
 }
 

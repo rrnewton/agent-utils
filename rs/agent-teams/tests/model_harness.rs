@@ -588,6 +588,13 @@ fn agentctl_queue_deliverer_uses_agent_queue() {
     let deliverer = AgentctlQueueDeliverer {
         queue_dir: queue_dir.clone(),
         ledger_path: state.join("ledger.json"),
+        registry: state.clone(),
+        agent: "coordinator".into(),
+        auto_drain: agent_teams::deliver::AutoDrain {
+            enabled: false,
+            ..Default::default()
+        },
+        drain_state_dir: None,
     };
     let now_ms = agent_teams::timeutil::now_unix_ms();
     let id = "tm-sim-dddddddddddddddd";
@@ -841,5 +848,101 @@ fn receipt_ask_never_consults_skipped_routes() {
         resends, 0,
         "no resend licensed by a skipped route: {attempts:?}"
     );
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+/// Delivery on arrival: a successful enqueue starts one bounded drain
+/// (fake agentctl records its argv); disabled in the declaration, it does
+/// not. The drain runs in a detached thread, so poll for its record.
+#[test]
+fn auto_drain_starts_one_bounded_drain() {
+    use agent_teams::deliver::{AgentctlQueueDeliverer, AutoDrain, Deliverer, Handover};
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let state = temp_state("auto-drain");
+    let record = state.join("drain-argv.txt");
+    let script = state.join("fake-agentctl");
+    {
+        let mut file = std::fs::File::create(&script).expect("script");
+        writeln!(file, "#!/bin/sh").expect("script");
+        writeln!(file, "echo \"$@\" >> {}", record.display()).expect("script");
+    }
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("mode");
+    // Only this test reads AGENT_TEAMS_AGENTCTL in this test binary.
+    unsafe { std::env::set_var("AGENT_TEAMS_AGENTCTL", &script) };
+
+    let queue_dir = state.join("queue");
+    let now_ms = agent_teams::timeutil::now_unix_ms();
+    let make = |id: &str| {
+        build_envelope(
+            id,
+            "k",
+            "sim",
+            "host-a",
+            1,
+            "harness-ancestry",
+            "tools",
+            "host-a",
+            "info",
+            None,
+            &[],
+            false,
+            now_ms,
+            now_ms + 7_200_000,
+            None,
+            "body",
+        )
+    };
+    let enabled = AgentctlQueueDeliverer {
+        queue_dir: queue_dir.clone(),
+        ledger_path: state.join("ledger.json"),
+        registry: state.clone(),
+        agent: "coordinator".into(),
+        auto_drain: AutoDrain::default(),
+        drain_state_dir: Some(state.clone()),
+    };
+    let id1 = "tm-sim-1111111111111111";
+    assert_eq!(
+        enabled.handover(id1, &make(id1), "rendered"),
+        Handover::Accepted
+    );
+    let mut seen = String::new();
+    for _ in 0..50 {
+        if let Ok(text) = std::fs::read_to_string(&record) {
+            seen = text;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        seen.contains("drain coordinator") && seen.contains("--deliver-while-working"),
+        "drain argv recorded: {seen}"
+    );
+    // Content-free log line, no body.
+    let log = std::fs::read_to_string(state.join("team-log.jsonl")).unwrap_or_default();
+    assert!(log.contains("auto-drain"), "log: {log}");
+    assert!(!log.contains("rendered"), "log must be content-free: {log}");
+
+    // Disabled: no drain is started for a second item.
+    let _ = std::fs::remove_file(&record);
+    let disabled = AgentctlQueueDeliverer {
+        queue_dir: queue_dir.clone(),
+        ledger_path: state.join("ledger.json"),
+        registry: state.clone(),
+        agent: "coordinator".into(),
+        auto_drain: AutoDrain {
+            enabled: false,
+            ..Default::default()
+        },
+        drain_state_dir: Some(state.clone()),
+    };
+    let id2 = "tm-sim-2222222222222222";
+    assert_eq!(
+        disabled.handover(id2, &make(id2), "rendered"),
+        Handover::Accepted
+    );
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    assert!(!record.exists(), "no drain when disabled");
+    unsafe { std::env::remove_var("AGENT_TEAMS_AGENTCTL") };
     let _ = std::fs::remove_dir_all(&state);
 }
