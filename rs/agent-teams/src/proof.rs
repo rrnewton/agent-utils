@@ -125,7 +125,13 @@ pub fn registry_coordinator_name(registry: &Path) -> Option<String> {
 pub fn agent_record(registry: &Path, agent: &str) -> Option<(ProcessIdentity, Option<String>)> {
     let text = std::fs::read_to_string(registry.join(agent).join("agent.json")).ok()?;
     let value: Value = serde_json::from_str(&text).ok()?;
-    let identity = value.get("harness_identity")?;
+    // Records name the acting process either way: Muse panes pin
+    // harness_identity, other harnesses custom_process_identity (the same
+    // fallback agentctl's acting_process uses).
+    let identity = value
+        .get("harness_identity")
+        .filter(|v| !v.is_null())
+        .or_else(|| value.get("custom_process_identity"))?;
     let parsed = parse_identity(identity)?;
     let managed_by = value
         .get("managed_by")
@@ -378,5 +384,38 @@ mod tests {
         assert!(!partial.valid());
         assert!(identity_alive(&partial));
         assert!(ancestry_contains(&partial));
+    }
+}
+
+#[cfg(test)]
+mod record_tests {
+    use super::*;
+
+    #[test]
+    fn record_identity_falls_back_to_custom_process() {
+        let dir =
+            std::env::temp_dir().join(format!("agent-teams-record-test-{}", std::process::id()));
+        let agent_dir = dir.join("coordinator");
+        std::fs::create_dir_all(&agent_dir).expect("registry");
+        let me = identity_of(u64::from(std::process::id())).expect("self identity");
+        let record = serde_json::json!({
+            "harness_identity": null,
+            "custom_process_identity": me,
+            "managed_by": {"agent": "root-1"},
+        });
+        std::fs::write(
+            agent_dir.join("agent.json"),
+            serde_json::to_string(&record).expect("record json"),
+        )
+        .expect("record file");
+        std::fs::write(dir.join("coordinator.json"), "{\"name\": \"coordinator\"}")
+            .expect("designation file");
+        let (identity, managed_by) = agent_record(&dir, "coordinator").expect("record");
+        assert_eq!(identity.pid, me.pid);
+        assert_eq!(managed_by.as_deref(), Some("root-1"));
+        let found =
+            coordinator_identity(&Designation::Registry, Some(&dir)).expect("coordinator identity");
+        assert_eq!(found.pid, me.pid);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
