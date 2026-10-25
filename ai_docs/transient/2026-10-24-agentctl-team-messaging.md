@@ -11,7 +11,7 @@ first-class section; only the receiving host's own agentctl touches its panes; a
 messaging is factored as its own tool. Section 20 records what each revision changed.
 
 **Revision 3** (2026-10-25) folds in the owner's answers to questions 12 (second half), 13, 14, 15
-and 17-20, and the coordinator's Rust-only proposal for question 11. It adds a topology: a star of
+and 17-20, and the owner's approval of Rust only for question 11. It adds a topology: a star of
 persistent links that spokes dial out to, instead of a link per host pair; a store-and-forward relay
 at the hub that keeps section 9's guarantees, limited to one relay; and the `jump` option for ssh
 routes (11.5-11.7). It adds a related-work comparison with Gas Town and other public systems (19,
@@ -1987,7 +1987,7 @@ when it finds a running drainer whose binary predates the lane (`agentctl capabi
 path). Every Rust consumer that hardcodes the four phases must learn `inbox.v2/`, `cancel/` and
 `cancelled/`: agentctl's enqueue duplicate check and `message_state` (`agent.rs:1422`, `1839`),
 and the helper in 2.3 (or it becomes the wrapper of 15.1). The Python edition of agentctl gets no
-port of these features (question 11, proposed): it gets a **guard** instead. When a queue has an
+port of these features (question 11, decided 2026-10-25): it gets a **guard** instead. When a queue has an
 `inbox.v2/`, `cancel/` or `cancelled/` directory, or an item carries `not_after`, the Python
 edition refuses to drain, deliver or re-enqueue in that queue, and says to use the Rust edition.
 The guard has to cover the Python chat runtime's re-enqueue of a `received` item it cannot find
@@ -2201,6 +2201,15 @@ Numbers 1-11 keep revision 1's numbering; 12 onward are new.
   (6.1). Owner, 2026-10-24.
 - **8. Workers as senders:** only coordinators, plus registered services, which this design keeps
   explicitly for operational alerts (8.2). Workers neither send nor receive. Owner, 2026-10-24.
+- **11. Editions.** Asked "Wait I thought we were staying. All rust or rust by default. Why do
+  we need to write python for this?", and shown the proposal below, the owner approved it: "Yes
+  flip repo default to rust. Put only a refusal in python as you said. We can catch python up
+  later when things stabilize." (2026-10-25). `agent-teams` is Rust only. The Python edition of
+  agentctl gets no port of the queue features, only a guard that refuses to drain, deliver or
+  re-enqueue in a queue using the new lanes (`inbox.v2/`, `cancel/`, `not_after`) and points to
+  the Rust edition; the cross-edition differential checks just that refusal (12.4, 17). Catching
+  the Python edition up is later work. The repository-wide switch of the engine default to Rust
+  is a separate lane (`engine-rust-default`), not part of this design.
 - **12, second half. The owner's own ssh configuration.** Asked "May routes use your own ssh
   config during migration, and should that expire?", the owner answered "Sure and no. But good
   to test any other mechanism we propose." (2026-10-25). `use_user_ssh_config` is allowed and
@@ -2260,13 +2269,6 @@ Numbers 1-11 keep revision 1's numbering; 12 onward are new.
    agentctl's `processed/`?
 10. **Clock skew.** A 2 s cross-host tolerance for topic order, or require one sending host per
     topic?
-11. **Editions** (proposed by the coordinator on 2026-10-25, awaiting your OK). You asked: "Wait
-    I thought we were staying. All rust or rust by default. Why do we need to write python for
-    this?" Proposal: `agent-teams` in Rust only, with no feature port to the Python edition of
-    agentctl. In P2 the Python edition gets only a guard: it refuses to drain, deliver or
-    re-enqueue in a queue that uses the new lanes (`inbox.v2/`, `cancel/`, `not_after`) and
-    points to the Rust edition; the cross-edition differential checks just that refusal (12.4).
-    Whether the repository as a whole goes Rust by default is out of scope here.
 12. **Dedicated keys** (first half). A dedicated key per host pair (per spoke, in the star),
     restricted by a forced command to the protocol, installed by you by hand? Recommendation:
     keep them **optional**. `use_user_ssh_config` is a permanent supported mode (resolved above),
@@ -2424,8 +2426,8 @@ exit codes were aligned with `agentctl send`.
   (`agent-teams`, a separate binary on `agent-queue`), 15 in part (no shared channel yet; a
   direct-message chat route; one tag; sparing use), 17 (git-ignored `*.private.json` route files
   on a search path, 6.3), 18 (`hook-inbox` accepted), 19 (`resolve` as recommended) and 20 (gate
-  pass plus nightly soak, 9.7). Question 11 rewritten as a Rust-only proposal awaiting the
-  owner: the Python edition only refuses queues that use the new lanes (12.4, 17).
+  pass plus nightly soak, 9.7) and 11 (Rust only; the Python edition only refuses queues that
+  use the new lanes, 12.4, 17).
 - Topology (11.5): a star of persistent links named in `teams.json`'s `topology`, dialled by the
   spokes, with pull for the reverse direction, on-demand direct routes where they pay, a standby
   hub, and no automatic failover of messages in custody.
