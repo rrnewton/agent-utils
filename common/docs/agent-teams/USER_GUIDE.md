@@ -41,6 +41,17 @@ by group or others are refused.
 
 Paths default under `0700` directories; create the state directory so.
 
+**Shared configuration, private state.** `teams.json` and public route
+definitions may be shared or even synced between hosts (a route list can
+name `local` first for every host; it is skipped for other hosts). Host
+state — declarations, ledger, outbox, link state, enrolment keys — must
+never be shared or synced: a synced ledger would break exactly-once.
+Some setups sync all of `~/.config` between a user's hosts; keep state
+under the default `~/.local/state/agent-teams` there, never point
+`$AGENT_TEAMS_STATE_DIR` into a synced tree, and install the binary
+per host outside synced directories. `check` warns when the state
+directory sits under a config tree.
+
 ## Commands
 
 ### Read-only model
@@ -122,7 +133,7 @@ Paths default under `0700` directories; create the state directory so.
 ### ssh and links
 
 - `ssh enroll --peer HOST [--from ADDR]` — creates a dedicated key under
-  `~/.config/agent-teams/ssh/` and prints the restricted `authorized_keys`
+  `~/.local/state/agent-teams/ssh/` (host state, never synced config) and prints the restricted `authorized_keys`
   line (`command="... serve --stdio --peer <this host>",restrict`).
   agent-teams never edits `authorized_keys`. Dedicated keys are optional.
 - `link run ROUTE | up ROUTE | down ROUTE | status [ROUTE]` — managed

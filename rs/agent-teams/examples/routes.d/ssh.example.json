@@ -16,8 +16,8 @@
       "target": "host-b.example.net",
       "user": "u",
       "comment": "Dedicated forced-command key from `agent-teams ssh enroll --peer host-b`; optional, stronger attribution.",
-      "identity": "~/.config/agent-teams/ssh/host-a-to-host-b",
-      "known_hosts": "~/.config/agent-teams/ssh/known_hosts",
+      "identity": "~/.local/state/agent-teams/ssh/host-a-to-host-b",
+      "known_hosts": "~/.local/state/agent-teams/ssh/known_hosts",
       "link": {"mode": "persistent", "ping_seconds": 30, "down_after_failures": 3}
     },
     "node-exec-c": {

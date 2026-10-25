@@ -393,6 +393,25 @@ fn cmd_show(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
     Ok(0)
 }
 
+/// Warn when host state sits under a config tree: some setups sync
+/// `~/.config` between hosts (live-trial finding, 2026-10-25), and a synced
+/// ledger, outbox or declaration would break exactly-once. The teams file
+/// and public routes may be shared; host state may not.
+fn synced_state_warning(state: &Path, config: &Path) -> Option<String> {
+    let under_config = state.starts_with(config)
+        || state
+            .components()
+            .any(|c| c.as_os_str() == std::ffi::OsStr::new(".config"));
+    if under_config {
+        Some(format!(
+            "state directory {} is under a config tree; if that tree syncs              between hosts, ledgers/outboxes/declarations would be shared              and exactly-once would break - move state under              $XDG_STATE_HOME/agent-teams (default ~/.local/state/agent-teams)",
+            state.display()
+        ))
+    } else {
+        None
+    }
+}
+
 fn cmd_check(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
     let teams = globals.load_teams()?;
     let routes = globals.load_routes()?;
@@ -402,6 +421,12 @@ fn cmd_check(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
     let mut problems: Vec<String> = Vec::new();
     let mut lines: Vec<Value> = Vec::new();
     for warning in teams.warnings.iter().chain(routes.warnings.iter()) {
+        if strict {
+            problems.push(warning.clone());
+        }
+        lines.push(json!({"kind": "warning", "detail": warning}));
+    }
+    if let Some(warning) = synced_state_warning(&globals.state, &globals.config) {
         if strict {
             problems.push(warning.clone());
         }
@@ -1503,8 +1528,15 @@ fn cmd_ssh(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
     }
     let peer =
         flag_value(args, "--peer").ok_or_else(|| err("usage", "ssh enroll needs --peer HOST"))?;
-    let dir = globals.config.join("ssh");
+    // Keys are per-host secrets: they live under the state directory, never
+    // under ~/.config, which some setups sync between hosts.
+    let dir = globals.state.join("ssh");
     std::fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
     let key = dir.join(format!("{}-to-{}", globals.host, peer));
     if !key.exists() {
         let status = std::process::Command::new("ssh-keygen")
@@ -1717,4 +1749,21 @@ fn base64_decode(text: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn synced_state_warning_flags_config_tree_only() {
+        let config = Path::new("/home/u/.config/agent-teams");
+        assert!(
+            synced_state_warning(Path::new("/home/u/.config/agent-teams/state"), config).is_some()
+        );
+        assert!(synced_state_warning(Path::new("/home/u/.config/other"), config).is_some());
+        assert!(
+            synced_state_warning(Path::new("/home/u/.local/state/agent-teams"), config).is_none()
+        );
+    }
 }

@@ -21,7 +21,9 @@ deliverer enqueues into the coordinator's queue and wakes idle agents.
 
 ```bash
 cargo build --release --manifest-path rs/Cargo.toml -p agent-teams
-install -m 0755 rs/target/release/agent-teams ~/.local/bin/agent-teams
+mkdir -p ~/.local/lib/agent-teams ~/.local/bin
+install -m 0755 rs/target/release/agent-teams ~/.local/lib/agent-teams/agent-teams
+ln -sf ~/.local/lib/agent-teams/agent-teams ~/.local/bin/agent-teams
 ```
 
 ## Set up two teams on one host
