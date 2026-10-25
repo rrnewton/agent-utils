@@ -106,12 +106,39 @@ pub(crate) fn agentctl_binary() -> PathBuf {
     PathBuf::from("agentctl")
 }
 
+/// PATH for a spawned agentctl: ours, with the per-user bin directories
+/// prepended when missing. agentctl in turn shells out by bare name (for
+/// example `herdr`), and a non-login ssh PATH lacks both directories -
+/// live trial 5c's first drain failed exactly there, after the same fix
+/// one level up found agentctl itself.
+fn augmented_path(
+    current: Option<&std::ffi::OsStr>,
+    home: Option<&Path>,
+) -> Option<std::ffi::OsString> {
+    let home = home?;
+    let mut dirs = vec![home.join(".local/bin"), home.join("bin")];
+    if let Some(current) = current {
+        dirs.extend(std::env::split_paths(current));
+    }
+    std::env::join_paths(dirs).ok()
+}
+
+/// A `Command` for agentctl with [`augmented_path`] applied.
+pub(crate) fn agentctl_command() -> std::process::Command {
+    let mut command = std::process::Command::new(agentctl_binary());
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if let Some(path) = augmented_path(std::env::var_os("PATH").as_deref(), home.as_deref()) {
+        command.env("PATH", path);
+    }
+    command
+}
+
 /// `agentctl coordinator show` as JSON: the designation as agentctl itself
 /// resolves it (following the designated generation through rename/revive),
 /// rather than the raw file. `None` when the binary is unavailable, predates
 /// the command, or no coordinator is designated (show exits 1 then).
 pub fn coordinator_show(registry: &Path) -> Option<Value> {
-    let output = std::process::Command::new(agentctl_binary())
+    let output = agentctl_command()
         .arg("--registry")
         .arg(registry)
         .args(["coordinator", "show"])
@@ -456,5 +483,17 @@ mod record_tests {
         assert_eq!(find_on_path("agentctl", &joined), Some(file));
         assert_eq!(find_on_path("nope", &joined), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn augmented_path_prepends_user_bins() {
+        let home = PathBuf::from("/home/someone");
+        let current = std::ffi::OsString::from("/usr/bin:/bin");
+        let joined = augmented_path(Some(&current), Some(&home)).expect("path");
+        let dirs: Vec<_> = std::env::split_paths(&joined).collect();
+        assert_eq!(dirs[0], PathBuf::from("/home/someone/.local/bin"));
+        assert_eq!(dirs[1], PathBuf::from("/home/someone/bin"));
+        assert_eq!(dirs[2], PathBuf::from("/usr/bin"));
+        assert!(augmented_path(None, None).is_none());
     }
 }

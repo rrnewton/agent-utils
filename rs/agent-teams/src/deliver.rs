@@ -352,7 +352,7 @@ pub fn run_auto_drain(
         return;
     }
     log("started");
-    let spawned = std::process::Command::new(crate::proof::agentctl_binary())
+    let spawned = crate::proof::agentctl_command()
         .arg("--registry")
         .arg(registry)
         .args([
@@ -382,7 +382,15 @@ pub fn run_auto_drain(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                log(if status.success() { "done" } else { "failed" });
+                if status.success() {
+                    log("done");
+                } else {
+                    crate::sender::log_event(
+                        state,
+                        &json!({"event": "auto-drain", "id": id, "agent": agent,
+                                "outcome": "failed", "exit_code": status.code()}),
+                    );
+                }
                 return;
             }
             Ok(None) if std::time::Instant::now() < deadline => {
