@@ -315,7 +315,9 @@ def test_promote_refuses_unless_the_launched_harness_is_provably_there(
     assert sessions.get("liteinst").lifecycle == "launch_failed"
 
 
-@pytest.mark.parametrize("command", ["restore", "install-units", "watch", "watch-agents", "hold"])
+@pytest.mark.parametrize(
+    "command",
+    ["restore", "install-units", "watch", "watch-agents", "hold", "coordinator", "manage", "tree"])
 def test_rust_only_restore_commands_are_refused_by_this_edition(
     command: str, capsys: pytest.CaptureFixture[str],
 ) -> None:

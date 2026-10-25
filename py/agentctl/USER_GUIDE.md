@@ -277,7 +277,10 @@ The label must be 1–128 UTF-8 bytes, have no surrounding whitespace, and conta
 no control characters.
 
 Within each profile, `harness` and `mode` are required. `model`,
-`reasoning_effort`, `argv`, and `env` are optional. Values are parsed as JSON strings and passed as literal
+`reasoning_effort`, `argv`, and `env` are optional, and so is `record_edges`:
+`false` makes `start` with this profile record no `created_by` or `managed_by`
+edge (see [The coordinator and the control tree](#the-coordinator-and-the-control-tree-rust-edition)).
+Values are parsed as JSON strings and passed as literal
 arguments or environment entries; they are never shell-expanded. A profile
 cannot specify the model or effort both structurally and in `argv`. When
 `--profile NAME` is present, explicit `--harness`, `--mode`, `--model`,
@@ -582,11 +585,15 @@ In order, it:
    waits for agentctl restore"` for the slot of every running agent, so no
    cleanup can retire it while the agent is down;
 4. waits for the Herdr server (`herdr_wait_seconds`, default 300);
-5. revives the coordinator from its launch spec, then makes every registry in
+5. revives the coordinator (`coordinator` in `restore.json`, else the registry's
+   designated coordinator; when the two disagree, or the designation cannot be
+   read, it keeps `restore.json`'s and records `designation_problem` in the
+   report) from its launch spec, then makes every registry in
    `also_registered` name its new pane: the same pane has its anchors replaced,
    and an adopted record left on the old pane is retired (bound to its exact
    token and bytes) and the live pane adopted under the same name;
-6. revives every other dead agent one at a time, waiting
+6. revives every other dead agent one at a time, managers before the agents
+   they manage at every depth of the control tree, waiting
    `startup_delay_seconds` (default 20) after each launch, promotes each live
    `launch_failed` record, and records every refusal with its reason; a live
    harness is left alone, which is what makes reruns safe. For each revived or
@@ -669,6 +676,59 @@ pass listing unrepaired findings it has not reported in the last hour.
 `--once` runs a single pass and exits 0 when every check passed, 1 otherwise;
 `--check-only` repairs, remounts, and sends nothing.
 
+### The coordinator and the control tree (Rust edition)
+
+One agent of a registry can be designated its coordinator, and every agent
+records who started it and who controls it now:
+
+```sh
+agentctl coordinator set coordinator
+agentctl coordinator show
+agentctl tree
+agentctl manage worker-1 --by lieutenant
+```
+
+The designation is `REGISTRY/coordinator.json` (schema
+`agentctl-coordinator/v1`: `name`, `token`, `set_at`, `set_by`). It names one
+agent generation by its token, so it follows the agent through `rename` and
+`revive`; once that agent is stopped, `coordinator show` reports
+`coordinator-stopped`, and it reports `replaced` when the name now belongs to
+another agent. `show` prints JSON and exits 1 when none is designated; its
+`harness_pid` is the coordinator's pinned harness process when it belongs to
+the current boot (else null), the process ID a slot manager such as wrkslots
+takes as the coordinator's. `adopt
+--as-coordinator` and `attach-self --as-coordinator` designate the agent in the
+same step, and `coordinator clear` removes the designation. `watch-agents` and
+`restore` use it when they are given no coordinator of their own.
+
+Each agent record can carry two edges, each `{"agent", "registry", "token",
+"proof"}`:
+
+- `created_by`, provenance: the agent that ran `agentctl start`, set once and
+  never changed.
+- `managed_by`, the agent that controls it now: set by `start` to the same
+  agent, set by `adopt` to the adopting agent, and changed by `agentctl manage
+  NAME` (the calling agent takes over), `manage NAME --by MANAGER`, or `manage
+  NAME --clear`. A manager that would make a cycle is refused.
+
+`start` and `adopt` record an edge only when the caller is proved to be a
+registered agent of this registry: agentctl walks its own process ancestry to
+the nearest pinned harness process of a registered agent (`proof:
+harness-ancestry`). A human at a shell, a timer, or a process whose ancestry
+stops at a box relay records nothing. `start --no-edges`, `adopt --no-edges`, or
+`"record_edges": false` in a launch profile turn the edges off. Edges name a
+token too, so a renamed agent keeps its workers and a revived one answers to its
+earlier tokens, which it lists in `former_tokens`.
+
+Control is a tree, not a star: the designated coordinator is the root, a
+lieutenant whose `managed_by` names the coordinator manages workers whose
+`managed_by` names the lieutenant, and so on to any depth. `agentctl tree`
+prints it, with `--json` for tokens, edges and each agent's `harness_pid`. An
+agent with no manager, a stopped manager, or a manager in another registry hangs
+under the coordinator. Every control decision follows `managed_by`, never
+`created_by`: whom `watch-agents` tells about an agent, and the order in which
+`restore` revives agents.
+
 ### Watch agents for finishes, prompts, stalls, and silence (Rust edition)
 
 `agentctl watch` keeps the coordinator's environment alive. `agentctl
@@ -681,8 +741,10 @@ agentctl watch-agents --coordinator coordinator --once --check-only
 agentctl watch-agents --coordinator coordinator
 ```
 
-Every `--interval` seconds (default 60) it lists the registry and reads each
-running or starting agent except the coordinator — paused, mid-move, and
+`--coordinator` defaults to the registry's designated coordinator, else the
+agent named `coordinator`. Every `--interval` seconds (default 60) it lists the
+registry and reads each running or starting agent except the coordinator —
+lieutenants are watched like any agent — paused, mid-move, and
 agentcloud agents are skipped, and a `launch_failed` record, which `start`
 already reported, is left alone; a record that cannot be read is watched as
 unreachable rather than skipped. One watcher runs per `--state-dir`; a second
@@ -749,8 +811,16 @@ prompts are still reported, since they are drawn at the bottom. When every watch
 server is the problem, and the pass says so instead of calling every harness
 dead; repairing that is `agentctl watch`'s job.
 
-The watcher never answers a prompt and never types into any agent except the
-coordinator. A condition past its threshold becomes **one notice per episode**,
+A notice about an agent goes to the nearest agent up its `managed_by` chain that
+can take one (registered here, running, not paused, and reachable), so a
+lieutenant hears about its own workers and the coordinator about the
+lieutenants and every agent with no reachable manager; "the coordinator" below
+means that recipient. Each recipient gets its own batches and its own
+`--min-notice-interval`, and a manager that cannot take a batch has its notices
+redirected to the coordinator.
+
+The watcher never answers a prompt and never types into any agent except
+those recipients. A condition past its threshold becomes **one notice per episode**,
 and every message goes through the same durable queue as `agentctl send`,
 delivered even while the coordinator works, so a coordinator that is busy
 simply keeps it queued. A `child-done` notice is a message of its own, sent in

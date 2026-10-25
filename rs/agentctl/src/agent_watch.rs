@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::agent::{AgentError, DrainOptions, QueueMessageState};
-use crate::subagents::{ManagedAgents, ManagedApi};
+use crate::subagents::{controller_of, ManagedAgents, ManagedApi};
 
 /// Schema of the persisted watcher state and of the per-pass report.
 pub const STATE_SCHEMA: &str = "agentctl-agent-watch/v1";
@@ -170,6 +170,9 @@ pub struct Observation {
     pub has_pending: bool,
     /// Probe detail carried into a notice, such as the error that made it `gone`.
     pub detail: String,
+    /// The agent to tell about this one, when it is not the coordinator: the nearest reachable
+    /// agent up its `managed_by` chain.
+    pub recipient: Option<String>,
 }
 
 /// Prompt phrases, lowercased, matched against the bottom of the screen. Each is a
@@ -435,6 +438,12 @@ struct PendingNotice {
     /// For `child-done`, the landing-queue holders this finish releases, as `NAME (NOTE)`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     next: Vec<String>,
+    /// Who is told, when not the coordinator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recipient: Option<String>,
+    /// A manager could not take this notice, so it goes to the coordinator from now on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    redirected: bool,
 }
 
 impl PendingNotice {
@@ -454,6 +463,9 @@ impl PendingNotice {
 struct InflightBatch {
     message_id: String,
     keys: Vec<String>,
+    /// Who the batch is for, when not the coordinator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recipient: Option<String>,
 }
 
 /// The persisted watcher state.
@@ -462,7 +474,11 @@ struct WatchState {
     agents: BTreeMap<String, AgentMemory>,
     pending: Vec<PendingNotice>,
     inflight: Option<InflightBatch>,
+    /// When the coordinator was last sent a batch.
     last_notice_at: Option<f64>,
+    /// When each other recipient was last sent a batch.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    last_notice_by: BTreeMap<String, f64>,
 }
 
 /// Where observations come from; the production source reads the registry through Herdr.
@@ -766,6 +782,11 @@ fn update_episode(
                 Vec::new()
             },
             detail: detail.clone(),
+            recipient: observation
+                .recipient
+                .clone()
+                .filter(|recipient| *recipient != options.coordinator),
+            redirected: false,
         };
         if !state
             .pending
@@ -798,8 +819,9 @@ fn update_episode(
     row
 }
 
-/// Send every pending notice as one message, when the rate limit allows. Returns the
-/// report row; on failure the batch stays in flight and is retried next pass.
+/// Send the pending notices, one message per recipient, as the rate limit allows. Returns the
+/// report row of the first batch, with any later batches of the same pass under `more`; on
+/// failure the batch stays in flight and is retried next pass.
 fn flush_notices(
     state: &mut WatchState,
     notifier: &mut dyn Notifier,
@@ -809,29 +831,77 @@ fn flush_notices(
     if options.check_only {
         return json!({"sent": false, "reason": "check only", "waiting": state.pending.len()});
     }
+    let mut first = flush_batch(state, notifier, now, options);
+    let mut more = Vec::new();
+    let mut last = first.clone();
+    while last["sent"] == true || last["redirected"] == true {
+        last = flush_batch(state, notifier, now, options);
+        if last["sent"] == true || last["reason"] != "nothing to report" {
+            more.push(last.clone());
+        }
+    }
+    if !more.is_empty() {
+        first["more"] = json!(more);
+    }
+    first
+}
+
+/// The rate limit for `recipient` (`None`, the coordinator) still holds at `now`.
+fn rate_limited(
+    state: &WatchState,
+    recipient: Option<&str>,
+    now: f64,
+    options: &WatchAgentsOptions,
+) -> bool {
+    let last = match recipient {
+        None => state.last_notice_at,
+        Some(recipient) => state.last_notice_by.get(recipient).copied(),
+    };
+    last.is_some_and(|last| now - last < options.min_notice_interval.as_secs_f64())
+}
+
+/// Send one batch: the one in flight, else every pending notice for the first recipient, in
+/// the order notices became due, whose rate limit allows a message.
+fn flush_batch(
+    state: &mut WatchState,
+    notifier: &mut dyn Notifier,
+    now: f64,
+    options: &WatchAgentsOptions,
+) -> Value {
     let batched = |notice: &PendingNotice| notice.kind != EpisodeKind::ChildDone;
     if state.inflight.is_none() {
         if !state.pending.iter().any(batched) {
             return json!({"sent": false, "reason": "nothing to report"});
         }
-        if state
-            .last_notice_at
-            .is_some_and(|last| now - last < options.min_notice_interval.as_secs_f64())
-        {
-            return json!({"sent": false, "reason": "rate limited", "waiting": state.pending.len()});
+        let mut recipients: Vec<Option<String>> = Vec::new();
+        for notice in state.pending.iter().filter(|notice| batched(notice)) {
+            if !recipients.contains(&notice.recipient) {
+                recipients.push(notice.recipient.clone());
+            }
         }
+        let Some(recipient) = recipients
+            .into_iter()
+            .find(|recipient| !rate_limited(state, recipient.as_deref(), now, options))
+        else {
+            return json!({"sent": false, "reason": "rate limited", "waiting": state.pending.len()});
+        };
         // The batch ID is derived from the notices themselves, so a watcher killed
         // between queueing a batch and persisting that fact re-derives the same ID
-        // after a restart and the coordinator's queue recognises it as sent.
+        // after a restart and the recipient's queue recognises it as sent.
         let keys: Vec<String> = state
             .pending
             .iter()
-            .filter(|notice| batched(notice))
+            .filter(|notice| batched(notice) && notice.recipient == recipient)
             .map(PendingNotice::key)
             .collect();
+        let digest = match recipient.as_deref() {
+            None => stable_hash(&keys.join("\n")),
+            Some(recipient) => stable_hash(&format!("{recipient}\n{}", keys.join("\n"))),
+        };
         state.inflight = Some(InflightBatch {
-            message_id: format!("agent-watch-{:016x}", stable_hash(&keys.join("\n"))),
+            message_id: format!("agent-watch-{digest:016x}"),
             keys,
+            recipient,
         });
     }
     let batch = state.inflight.clone().expect("batch prepared");
@@ -860,16 +930,47 @@ fn flush_notices(
         lines.len(),
         lines.join("\n")
     );
-    match notifier.notify(&options.coordinator, &text, &batch.message_id) {
+    let recipient = batch.recipient.as_deref().unwrap_or(&options.coordinator);
+    match notifier.notify(recipient, &text, &batch.message_id) {
         Ok(outcome) => {
             state
                 .pending
                 .retain(|notice| !batch.keys.contains(&notice.key()));
             state.inflight = None;
-            state.last_notice_at = Some(now);
-            json!({"sent": true, "message_id": batch.message_id, "outcome": outcome, "notices": lines.len()})
+            match batch.recipient.as_deref() {
+                None => state.last_notice_at = Some(now),
+                Some(other) => {
+                    state.last_notice_by.insert(other.to_owned(), now);
+                }
+            }
+            let mut row = json!({"sent": true, "message_id": batch.message_id, "outcome": outcome, "notices": lines.len()});
+            if let Some(other) = batch.recipient.as_deref() {
+                row["recipient"] = json!(other);
+            }
+            row
         }
         Err(error) => {
+            // A manager that could not take its batch (stopped, renamed, paused since) must not
+            // hold every later notice behind it: its notices go to the coordinator instead, in a
+            // batch of their own. One that did reach the manager's queue may then be read twice,
+            // which is a lesser harm than a notice nobody reads.
+            if let Some(manager) = batch.recipient.as_deref() {
+                for notice in &mut state.pending {
+                    if batch.keys.contains(&notice.key()) {
+                        notice.recipient = None;
+                        notice.redirected = true;
+                    }
+                }
+                state.inflight = None;
+                return json!({
+                    "sent": false,
+                    "message_id": batch.message_id,
+                    "recipient": manager,
+                    "reason": format!("{error}; its notices go to the coordinator instead"),
+                    "redirected": true,
+                    "waiting": state.pending.len(),
+                });
+            }
             json!({"sent": false, "message_id": batch.message_id, "reason": error.to_string(), "waiting": state.pending.len()})
         }
     }
@@ -916,8 +1017,21 @@ fn flush_child_done(
             "\nRead its reply with `agentctl read {}`, then give it its next task or stop it.",
             notice.agent
         ));
-        let target = notice_target(options, &notice.agent);
-        match notifier.notify(target, &text, &message_id) {
+        let mut sent = notifier.notify(notice_target(options, &notice), &text, &message_id);
+        // A manager that cannot take the finish (stopped, renamed, paused since) passes it to
+        // the coordinator, now and from then on.
+        if sent.is_err() && notice.recipient.is_some() {
+            if let Some(pending) = state
+                .pending
+                .iter_mut()
+                .find(|pending| pending.key() == key)
+            {
+                pending.recipient = None;
+                pending.redirected = true;
+            }
+            sent = notifier.notify(&options.coordinator, &text, &message_id);
+        }
+        match sent {
             Ok(outcome) => {
                 state.pending.retain(|pending| pending.key() != key);
                 // The holders this notice named have now been told about; a later finish of
@@ -941,10 +1055,10 @@ fn flush_child_done(
     rows
 }
 
-/// Who is told about `agent`. Every notice goes to the configured coordinator for now; this is
-/// the one place a manager tree would route a child's notice to its nearest manager instead.
-fn notice_target<'a>(options: &'a WatchAgentsOptions, _agent: &str) -> &'a str {
-    &options.coordinator
+/// Who is told about a notice: the agent's nearest reachable manager, as the pass decided it,
+/// else the configured coordinator.
+fn notice_target<'a>(options: &'a WatchAgentsOptions, notice: &'a PendingNotice) -> &'a str {
+    notice.recipient.as_deref().unwrap_or(&options.coordinator)
 }
 
 /// One pass: observe, update episodes, flush due notices, and build the report.
@@ -985,6 +1099,27 @@ fn watch_agents_once(
                 })
         });
     }
+    // Whom to tell is decided again each pass from the latest observation, so a notice still
+    // waiting does not go to a manager that has since stopped, paused or lost the agent.
+    let in_flight: Vec<String> = state
+        .inflight
+        .as_ref()
+        .map(|batch| batch.keys.clone())
+        .unwrap_or_default();
+    for notice in &mut state.pending {
+        if notice.redirected || in_flight.contains(&notice.key()) {
+            continue;
+        }
+        if let Some(observation) = observations.iter().find(|row| row.name == notice.agent) {
+            notice.recipient = observation
+                .recipient
+                .clone()
+                .filter(|recipient| *recipient != options.coordinator);
+        }
+    }
+    // A recipient's last send matters only while it can still rate-limit the next one.
+    let window = options.min_notice_interval.as_secs_f64();
+    state.last_notice_by.retain(|_, at| now - *at < window);
     let child_done = flush_child_done(state, notifier, now, options);
     let notice = flush_notices(state, notifier, now, options);
     // Agents whose view is scrolled up cannot be judged stalled or idle; say which, and do
@@ -1201,9 +1336,21 @@ impl<A: ManagedApi + ?Sized> Probe for ManagedProbe<'_, A> {
                 "no watched agent could be probed; the terminal server may be down",
             ));
         }
+        // Notices about an agent go to the nearest agent up its managed_by chain that can take
+        // one now; a manager that is paused, unreachable or gone passes them further up.
+        let (mut nodes, _, registry) = manager.control_view()?;
+        for node in &mut nodes {
+            if let Some(row) = rows.iter().find(|row| row["name"] == node.name.as_str()) {
+                node.reachable = node.reachable
+                    && row["paused"] != true
+                    && !(row["agent_status"] == "unknown" && !row["probe_error"].is_null());
+            }
+        }
         let mut observations = Vec::with_capacity(watched.len());
         for row in watched {
             let name = row["name"].as_str().unwrap_or_default().to_owned();
+            let recipient = controller_of(&nodes, &registry, Some(&self.coordinator), &name)
+                .filter(|recipient| *recipient != self.coordinator);
             let gone = row["agent_status"] == "unknown" && !row["probe_error"].is_null();
             let queue = row["queue"]
                 .as_str()
@@ -1243,6 +1390,7 @@ impl<A: ManagedApi + ?Sized> Probe for ManagedProbe<'_, A> {
                         .as_array()
                         .is_some_and(|values| !values.is_empty())
                 }),
+                recipient,
                 name,
             });
         }
@@ -1361,6 +1509,7 @@ mod tests {
             has_delivered: true,
             has_pending: false,
             detail: String::new(),
+            recipient: None,
         }
     }
 
@@ -1464,6 +1613,79 @@ mod tests {
             2,
             "a cleared episode can be reported again"
         );
+    }
+
+    #[test]
+    fn notices_go_to_each_agents_manager_in_one_batch_per_recipient() {
+        let mut options = options();
+        options.min_notice_interval = Duration::from_secs(600);
+        let managed = |name: &str, recipient: Option<&str>| Observation {
+            recipient: recipient.map(str::to_owned),
+            ..observation(name, "idle", Some(PROMPT_SCREEN))
+        };
+        let round = || {
+            vec![
+                managed("worker-a", Some("lieutenant")),
+                managed("worker-b", Some("lieutenant")),
+                managed("lieutenant", None),
+                // A recipient that names the coordinator is the coordinator's batch.
+                managed("loner", Some("coordinator")),
+            ]
+        };
+        let mut probe = ScriptedProbe(vec![round(), round(), round()]);
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
+        let due = pass(&mut probe, &mut notifier, &mut state, 300.0, &options);
+        assert_eq!(notifier.sent.len(), 2, "{due}");
+        let to: BTreeMap<&str, &str> = notifier
+            .sent
+            .iter()
+            .map(|(recipient, text, _)| (recipient.as_str(), text.as_str()))
+            .collect();
+        assert!(to["lieutenant"].contains("worker-a") && to["lieutenant"].contains("worker-b"));
+        assert!(!to["lieutenant"].contains("loner"));
+        assert!(to["coordinator"].contains("- lieutenant:") && to["coordinator"].contains("loner"));
+        assert_ne!(notifier.sent[0].2, notifier.sent[1].2, "distinct batch IDs");
+        assert_eq!(due["notice"]["more"][0]["sent"], true, "{due}");
+        assert_eq!(state.last_notice_by.get("lieutenant"), Some(&300.0));
+        assert_eq!(state.last_notice_at, Some(300.0));
+        // A batch for one recipient never carries another's notices, even after a restart.
+        let saved: WatchState =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        assert_eq!(saved.last_notice_by, state.last_notice_by);
+    }
+
+    #[test]
+    fn a_manager_that_cannot_take_its_batch_does_not_hold_the_notices() {
+        let options = options();
+        let managed = Observation {
+            recipient: Some("lieutenant".to_owned()),
+            ..observation("worker", "idle", Some(PROMPT_SCREEN))
+        };
+        let mut probe = ScriptedProbe(vec![
+            vec![managed.clone()],
+            vec![managed.clone()],
+            vec![managed],
+        ]);
+        let mut notifier = RecordingNotifier {
+            fail_attempts: 1,
+            ..RecordingNotifier::default()
+        };
+        let mut state = WatchState::default();
+        pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
+        let due = pass(&mut probe, &mut notifier, &mut state, 300.0, &options);
+        assert_eq!(notifier.attempts.len(), 2, "{due}");
+        assert_eq!(notifier.sent.len(), 1, "{due}");
+        assert_eq!(
+            notifier.sent[0].0, "coordinator",
+            "the coordinator heard instead"
+        );
+        assert!(state.inflight.is_none() && state.pending.is_empty());
+        assert_eq!(due["notice"]["redirected"], true, "{due}");
+        // The redirected notice stays with the coordinator; nothing is resent to anyone.
+        pass(&mut probe, &mut notifier, &mut state, 400.0, &options);
+        assert_eq!(notifier.sent.len(), 1);
     }
 
     #[test]
@@ -2335,6 +2557,29 @@ mod tests {
         assert_eq!(notifier.sent.len(), 3, "{:?}", notifier.sent);
         assert!(notifier.sent[2].1.contains("late-asker"));
         assert!(!notifier.sent[2].1.contains("finisher"));
+    }
+
+    #[test]
+    fn a_finish_goes_to_the_childs_manager_and_to_the_coordinator_if_it_cannot_take_it() {
+        let options = options();
+        let finished = |name: &str| Observation {
+            recipient: Some("lieutenant".to_owned()),
+            ..observation(name, "idle", Some(DONE_SCREEN))
+        };
+        let mut probe = ScriptedProbe(vec![vec![finished("worker")], vec![finished("other")]]);
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let done = pass(&mut probe, &mut notifier, &mut state, 0.0, &options);
+        assert_eq!(done["child_done"][0]["sent"], true, "{done}");
+        assert_eq!(
+            notifier.sent[0].0, "lieutenant",
+            "the manager hears of its own child"
+        );
+        notifier.fail_attempts = 1;
+        let redirected = pass(&mut probe, &mut notifier, &mut state, 10.0, &options);
+        assert_eq!(redirected["child_done"][0]["sent"], true, "{redirected}");
+        assert_eq!(notifier.sent[1].0, "coordinator");
+        assert!(state.pending.is_empty());
     }
 
     #[test]

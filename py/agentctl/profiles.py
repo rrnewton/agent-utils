@@ -374,10 +374,13 @@ def _profile(name: str, raw: object) -> LaunchProfile:
         raise AgentDeliveryError(f"invalid profile name {name!r}; use lowercase letters, digits, and hyphens")
     if not isinstance(raw, dict):
         raise AgentDeliveryError(f"profile {name!r} must be an object")
-    allowed = {"harness", "mode", "model", "reasoning_effort", "argv", "env", "agentcloud"}
+    allowed = {"harness", "mode", "model", "reasoning_effort", "argv", "env", "agentcloud", "record_edges"}
     unknown = sorted(set(raw) - allowed)
     if unknown:
         raise AgentDeliveryError(f"profile {name!r} has unknown fields: {', '.join(unknown)}")
+    # Only the Rust edition records control edges; this edition accepts the switch and records none.
+    if "record_edges" in raw and not isinstance(raw["record_edges"], bool):
+        raise AgentDeliveryError(f"profile {name!r} record_edges must be true or false")
     harness = _text(raw.get("harness"), f"{name}.harness")
     mode = _text(raw.get("mode"), f"{name}.mode")
     assert harness is not None and mode is not None

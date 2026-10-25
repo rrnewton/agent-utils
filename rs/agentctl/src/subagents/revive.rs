@@ -1776,6 +1776,8 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         candidate.adapter = revived_adapter(&record).to_owned();
         // The new generation is a flat schema-1 record whatever form the old one had.
         candidate.nested = None;
+        // Edges naming the old generation still reach the new one, and its own edges survive.
+        candidate.succeed(&record, self.token_referenced(&record.token));
         candidate.storage_directory = Some(StorageDirectory {
             path: new_path,
             device: new_directory.device,

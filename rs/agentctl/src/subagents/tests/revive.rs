@@ -99,6 +99,10 @@ fn revive_resumes_without_reports_using_independent_process_and_terminal_anchors
     assert!(new.terminal_id.is_some());
     assert_eq!(new.arguments, ["--resume", &native.value]);
     assert_eq!(new.extra["revived_from"], old.token);
+    assert!(
+        !new.extra.contains_key("former_tokens"),
+        "a registry with no edges or designation gets no new field"
+    );
     assert!(new.storage_directory.is_none());
     assert_eq!(fixture.client.environments.lock().unwrap().len(), 2);
     assert_eq!(
@@ -106,6 +110,34 @@ fn revive_resumes_without_reports_using_independent_process_and_terminal_anchors
         [old.pane_id.clone().unwrap()]
     );
     assert!(!journal_path(&fixture, &old).exists());
+}
+
+#[test]
+fn revive_keeps_the_control_edges_and_answers_to_its_former_token() {
+    let (fixture, old) = recoverable("claude", false);
+    let path = fixture.root.join("registry/worker/agent.json");
+    let mut document = agent::read_private_json(&path).unwrap();
+    let edge = json!({"agent": "lieutenant", "registry": "/r", "token": "t", "proof": "assigned"});
+    document["managed_by"] = edge.clone();
+    document["created_by"] = edge.clone();
+    agent::atomic_json(&path, &document).unwrap();
+    // Only a token something names is kept: here the designation names the old generation.
+    fixture.manager().coordinator_set("worker").unwrap();
+    fixture
+        .manager()
+        .revive("worker", false, Some(&old.token), TIMEOUT)
+        .unwrap();
+    let new = fixture.manager().load("worker").unwrap();
+    assert_ne!(new.token, old.token);
+    assert_eq!(
+        fixture.manager().coordinator_show().unwrap()["state"],
+        "running",
+        "the designation follows the revived agent"
+    );
+    assert_eq!(new.former_tokens(), std::slice::from_ref(&old.token));
+    assert!(new.answers_to(&old.token));
+    assert_eq!(json!(new.edge(crate::subagents::control::MANAGED_BY)), edge);
+    assert_eq!(json!(new.edge(crate::subagents::control::CREATED_BY)), edge);
 }
 
 #[test]

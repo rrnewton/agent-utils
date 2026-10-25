@@ -12,8 +12,8 @@ use serde_json::{json, Value};
 use crate::agent::{AgentError, DrainOptions, QueueOutcome};
 use crate::client::HerdrClient;
 use crate::subagents::{
-    environment_entries, stop_reason, AdoptOptions, CloudLaunch, CloudTools, ManagedAgents,
-    RecoveryAction, SlotLaunch, StartOptions, StopContext, StopFailure, StopOptions,
+    environment_entries, stop_reason, AdoptOptions, CloudLaunch, CloudTools, ManageAction,
+    ManagedAgents, RecoveryAction, SlotLaunch, StartOptions, StopContext, StopFailure, StopOptions,
 };
 
 const MAX_CHAT_PUBLISH_BYTES: usize = 30_000;
@@ -83,6 +83,21 @@ enum Commands {
         after_help = "Example: agentctl adopt reviewer --pane w1:p2 --workspace project --cwd /work/project --harness codex"
     )]
     Adopt(Adopt),
+    /// Show, set, or clear this registry's designated coordinator: the root of the control tree, the agent watch-agents and restore notify when no nearer manager is recorded
+    #[command(
+        after_help = "Examples:\n  agentctl coordinator set coordinator\n  agentctl coordinator show\n  agentctl coordinator clear\n\nThe designation is REGISTRY/coordinator.json (schema agentctl-coordinator/v1: name, token, set_at,\nset_by). It names one agent generation by its token, so it follows the agent through rename and revive;\nshow reports coordinator-stopped once that agent is stopped, and harness_pid, the pinned harness\nprocess a slot manager can take as the coordinator's process. adopt --as-coordinator and\nattach-self --as-coordinator set it in the same step. watch-agents and restore use it when no\nexplicit coordinator is given."
+    )]
+    Coordinator(Coordinator),
+    /// Change which agent controls a registered agent: the calling agent (proved by process ancestry), a named agent, or none
+    #[command(
+        after_help = "Examples:\n  agentctl manage worker-1\n  agentctl manage worker-1 --by lieutenant\n  agentctl manage worker-1 --clear\n\nmanaged_by decides who controls an agent: whom watch-agents tells about it, and where it sits in\n`agentctl tree`. start records the calling agent as both created_by (provenance, never changed) and\nmanaged_by; adopt records the adopting agent as managed_by. With neither --by nor --clear, the\ncalling agent takes over: it must be a registered agent of this registry whose pinned harness is an\nancestor of this process. A manager that would make a cycle is refused. An agent with no manager\nanswers to the designated coordinator."
+    )]
+    Manage(Manage),
+    /// Print the control tree: the designated coordinator at the root and every agent under the agent that manages it, at any depth
+    #[command(
+        after_help = "Examples:\n  agentctl tree\n  agentctl tree --json\n\nAn agent hangs under the registered agent its managed_by names; one with no manager, a stopped\nmanager, or a manager in another registry hangs under the designated coordinator. created_by is shown\nwhere it differs from managed_by. --json adds tokens, edges and each agent's pinned harness process."
+    )]
+    Tree(Tree),
     /// Move a running owned native Herdr agent into an existing configured workspace; adopted, custom-pane, and multi-pane tabs are refused
     #[command(after_help = "Example: agentctl move reviewer")]
     Move(Named),
@@ -95,9 +110,9 @@ enum Commands {
     /// Mark a launch_failed record running when its harness is in fact live: Herdr reports the launched harness in the recorded pane, tab, workspace and cwd, the Herdr agent name still points there, and the harness is the pane's only foreground process. Pins that process and terminal; never touches the tab, pane, or process. Use it when a readiness wait timed out on a harness that runs fine
     #[command(after_help = "Example: agentctl promote reviewer")]
     Promote(Promote),
-    /// Bring the coordinator team back after the host restarts: remount slot images, wait for Herdr, revive the coordinator and then every dead agent from its launch spec, register the coordinator's new pane in other registries, start the configured units, and queue one recovery notice. Idempotent; writes a JSON report for the boot
+    /// Bring the coordinator team back after the host restarts: remount slot images, wait for Herdr, revive the coordinator and then every dead agent from its launch spec, managers before the agents they manage, register the coordinator's new pane in other registries, start the configured units, and queue one recovery notice. Idempotent; writes a JSON report for the boot
     #[command(
-        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl restore --dry-run\n  agentctl --registry ~/project/.agentctl restore --boot\n\nConfiguration is REGISTRY/restore.json (schema agentctl-restore/v1): coordinator, also_registered\n([{registry, name}]), units, exclude (names to leave alone), startup_delay_seconds (default 20), herdr_wait_seconds (default 300),\nreport_dir (default $XDG_STATE_HOME/agentctl/restore), herdr_unit, and timers (used by watch).\nThe slot manager is AGENTCTL_WRKSLOTS_BIN, then profiles.json \"wrkslots\", then PATH; restore runs\n`wrkslots image status` once, before any agent starts, so image-backed slots are mounted.\nA completed restore for this boot makes a rerun exit 0 at once unless --force. Exit 0 when the\nrestore completed with no refusal, 75 otherwise; every step and refusal is in the report."
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl restore --dry-run\n  agentctl --registry ~/project/.agentctl restore --boot\n\nConfiguration is REGISTRY/restore.json (schema agentctl-restore/v1): coordinator (default: the\nregistry's designated coordinator; when both are set and disagree, restore.json wins and the report\nsays so under designation_problem), also_registered\n([{registry, name}]), units, exclude (names to leave alone), startup_delay_seconds (default 20), herdr_wait_seconds (default 300),\nreport_dir (default $XDG_STATE_HOME/agentctl/restore), herdr_unit, and timers (used by watch).\nThe slot manager is AGENTCTL_WRKSLOTS_BIN, then profiles.json \"wrkslots\", then PATH; restore runs\n`wrkslots image status` once, before any agent starts, so image-backed slots are mounted.\nA completed restore for this boot makes a rerun exit 0 at once unless --force. Exit 0 when the\nrestore completed with no refusal, 75 otherwise; every step and refusal is in the report."
     )]
     Restore(Restore),
     /// Write the user units that restore the team at boot: a persistent herdr-server.service, the agent-restore.service boot hook, agent-watch.service, and a drop-in that orders the chat bridge after Herdr and restarts it on failure (start limits stay with the bridge's own policy). Never enables, starts, or reloads anything
@@ -110,9 +125,9 @@ enum Commands {
         after_help = "Examples:\n  agentctl --registry ~/project/.agentctl watch --once\n  agentctl --registry ~/project/.agentctl watch --interval 60\n\nConfiguration is REGISTRY/restore.json (herdr_unit, units, timers [{unit, max_age_seconds}],\ncoordinator). health.json goes to --state-dir (default $XDG_STATE_HOME/agentctl/watch). With --once,\nexit 0 when every check passed and 1 otherwise. Without it the watch runs until stopped."
     )]
     Watch(Watch),
-    /// Watch every registered agent and tell the coordinator when one finished its turn with a verdict or needs a human: at a harness approval or permission prompt, idle without a verdict, stalled with no new output, or dead. One notice per episode, queued durably for the coordinator; never answers a prompt and never types into any other agent
+    /// Watch every registered agent and tell its manager, else the coordinator, when one finished its turn with a verdict or needs a human: at a harness approval or permission prompt, idle without a verdict, stalled with no new output, or dead. One notice per episode, queued durably for its recipient; never answers a prompt and never types into any other agent
     #[command(
-        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl watch-agents --coordinator coordinator --once --check-only\n  agentctl --registry ~/project/.agentctl watch-agents --coordinator coordinator --approval-minutes 5 --idle-minutes 5 --stall-minutes 30\n\nEach pass lists the registry, reads every running or starting agent except the coordinator (paused, mid-move, and agentcloud\nagents are skipped; an unreadable record is watched as unreachable), and classifies it. A condition that holds past its\nthreshold is reported once, as one message queued for the coordinator through the same durable path as `agentctl send`, so a\nbusy coordinator loses nothing. A verdict is a prose line (not tool output) of the agent's last reply (from its first block after the last user turn\non screen) that starts with one of --done-marker once any reply bullet is stripped (--done-marker replaces the DONE:/BLOCKED:\ndefaults). An idle agent with a verdict is reported as child-done after --child-done-seconds (default 0: the pass that sees it),\nin a message of its own that names the verdict line, once per turn, never held by --min-notice-interval; when the registry's\nlanding queue (`agentctl hold`) has agents waiting on it, the same message says who is next. An agent that was never sent\nwork, or still has prompts queued, is never reported idle, and a Claude Code view scrolled up (`N new messages (ctrl+End) ↓`\nabove the input box) is never judged stalled, idle, or finished until it is back at the bottom. Episode memory lives in\n--state-dir (default $XDG_STATE_HOME/agentctl/agent-watch); a message's queue ID is derived from its notices, so a restart\nrecognises a message that is already queued instead of sending it twice, and one watcher runs per state directory. With\n--once, exit 0 only when the team could be probed, no episode other than child-done is reported or due, and no view is\nscrolled up, 1 otherwise.\nWithout it the watch runs until stopped; see the sample user unit in `agentctl userguide`."
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl watch-agents --coordinator coordinator --once --check-only\n  agentctl --registry ~/project/.agentctl watch-agents --coordinator coordinator --approval-minutes 5 --idle-minutes 5 --stall-minutes 30\n\nEach pass lists the registry, reads every running or starting agent except the coordinator (paused, mid-move, and agentcloud\nagents are skipped; an unreadable record is watched as unreachable), and classifies it. A condition that holds past its\nthreshold is reported once, as one message queued through the same durable path as `agentctl send`, so a busy recipient\nloses nothing. The recipient is the nearest reachable agent up the agent's managed_by chain, else the coordinator\n(`agentctl tree` shows the chain). A verdict is a prose line (not tool output) of the agent's last reply (from its first block after the last user turn\non screen) that starts with one of --done-marker once any reply bullet is stripped (--done-marker replaces the DONE:/BLOCKED:\ndefaults). An idle agent with a verdict is reported as child-done after --child-done-seconds (default 0: the pass that sees it),\nin a message of its own that names the verdict line, once per turn, never held by --min-notice-interval; when the registry's\nlanding queue (`agentctl hold`) has agents waiting on it, the same message says who is next. An agent that was never sent\nwork, or still has prompts queued, is never reported idle, and a Claude Code view scrolled up (`N new messages (ctrl+End) ↓`\nabove the input box) is never judged stalled, idle, or finished until it is back at the bottom. Episode memory lives in\n--state-dir (default $XDG_STATE_HOME/agentctl/agent-watch); a message's queue ID is derived from its notices, so a restart\nrecognises a message that is already queued instead of sending it twice, and one watcher runs per state directory. With\n--once, exit 0 only when the team could be probed, no episode other than child-done is reported or due, and no view is\nscrolled up, 1 otherwise.\nWithout it the watch runs until stopped; see the sample user unit in `agentctl userguide`."
     )]
     WatchAgents(WatchAgents),
     /// Record that an agent lands after another (the landing queue), list the queue, or drop a hold. `watch-agents` reads it: when OTHER finishes its turn with a verdict that does not start with BLOCKED, OTHER's child-done notice to the coordinator says NAME is next, and once that notice is queued the hold is marked released. Nothing is ever sent to NAME
@@ -213,6 +228,42 @@ struct Named {
 }
 
 #[derive(Args)]
+struct Coordinator {
+    #[command(subcommand)]
+    command: CoordinatorCommand,
+}
+
+#[derive(Subcommand)]
+enum CoordinatorCommand {
+    /// Designate a registered agent as this registry's coordinator
+    Set(Named),
+    /// Print the designation and the state of the agent it names, as JSON; exit 1 when none is designated
+    Show,
+    /// Remove the designation
+    Clear,
+}
+
+#[derive(Args)]
+#[command(group(clap::ArgGroup::new("manager").args(["by", "clear"])))]
+struct Manage {
+    #[command(flatten)]
+    agent: Named,
+    /// Make this registered agent the manager (default: the calling agent)
+    #[arg(long, value_name = "MANAGER")]
+    by: Option<String>,
+    /// Remove the manager; the agent then answers to the designated coordinator
+    #[arg(long)]
+    clear: bool,
+}
+
+#[derive(Args)]
+struct Tree {
+    /// Print the tree as JSON instead of indented text
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
 #[command(group(clap::ArgGroup::new("selection").required(true).args(["option", "text"])))]
 struct Answer {
     #[command(flatten)]
@@ -278,9 +329,9 @@ struct Watch {
 
 #[derive(Args)]
 struct WatchAgents {
-    /// Registered name of the coordinator that receives notices (default: coordinator)
-    #[arg(long, default_value = "coordinator", value_name = "NAME")]
-    coordinator: String,
+    /// Registered name of the coordinator that receives notices about agents with no reachable manager, and is not itself watched (default: the registry's designated coordinator, else coordinator). A notice about an agent goes to the nearest reachable agent up its managed_by chain instead
+    #[arg(long, value_name = "NAME")]
+    coordinator: Option<String>,
     /// Seconds between passes, from 10 to 3600 (default: 60)
     #[arg(long, default_value = "60", value_parser = clap::value_parser!(u64).range(10..=3600), value_name = "SECONDS")]
     interval: u64,
@@ -456,6 +507,9 @@ struct AttachSelf {
     /// Seconds to wait for the viewer to become the tab's foreground process, greater than zero and at most 300
     #[arg(long, default_value = "30", value_parser = startup_seconds)]
     startup_timeout: f64,
+    /// Also designate the registered session as this registry's coordinator
+    #[arg(long)]
+    as_coordinator: bool,
 }
 
 #[derive(Args)]
@@ -550,6 +604,9 @@ struct Start {
     /// With --project-box: box name, which names its slice and its persistent private $HOME layer (default: the agent name)
     #[arg(long, value_name = "NAME", requires = "project_box")]
     box_name: Option<String>,
+    /// Record no created_by or managed_by edge naming the calling agent (default: record them when the caller is a registered agent of this registry; a profile's "record_edges": false does the same)
+    #[arg(long)]
+    no_edges: bool,
     /// Seconds to wait for harness startup, greater than zero and at most 300
     #[arg(long, default_value = "30", value_parser = startup_seconds)]
     startup_timeout: f64,
@@ -606,6 +663,12 @@ struct Adopt {
     /// Stable native conversation ID already reported by this exact pane
     #[arg(long, value_name = "ID")]
     session: Option<String>,
+    /// Record no managed_by edge naming the calling agent (default: the adopting agent manages the adopted one, when it is a registered agent of this registry)
+    #[arg(long)]
+    no_edges: bool,
+    /// Also designate the adopted agent as this registry's coordinator
+    #[arg(long)]
+    as_coordinator: bool,
 }
 
 #[derive(Args)]
@@ -1515,7 +1578,8 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         Commands::Restore(value) => {
             let client = HerdrClient::with_executable("direct", &args.herdr_bin)
                 .map_err(AgentError::from)?;
-            let config = crate::restore::RestoreConfig::load(&args.registry)?;
+            let mut config = crate::restore::RestoreConfig::load(&args.registry)?;
+            let designation_problem = designation_problem(&client, &args.registry, &mut config);
             let mut report = crate::restore::restore(
                 &client,
                 &args.registry,
@@ -1529,6 +1593,9 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 },
             )?;
             report["trigger"] = json!(if value.boot { "boot" } else { "manual" });
+            if let Some(problem) = designation_problem {
+                report["designation_problem"] = json!(problem);
+            }
             write_json(&report).map_err(Failure::Output)?;
             let done = report["action"] == "already-restored"
                 || (report["complete"] == true && report["refused"] == 0);
@@ -1537,7 +1604,10 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         Commands::Watch(value) => {
             let client = HerdrClient::with_executable("direct", &args.herdr_bin)
                 .map_err(AgentError::from)?;
-            let config = crate::restore::RestoreConfig::load(&args.registry)?;
+            let mut config = crate::restore::RestoreConfig::load(&args.registry)?;
+            if let Some(problem) = designation_problem(&client, &args.registry, &mut config) {
+                eprintln!("agentctl watch: {problem}");
+            }
             let health = crate::restore::watch(
                 &client,
                 &args.registry,
@@ -1562,8 +1632,14 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             } else {
                 value.done_markers
             };
+            let coordinator = match value.coordinator.clone() {
+                Some(coordinator) => coordinator,
+                None => ManagedAgents::new(&client, &args.registry)?
+                    .designated_coordinator()?
+                    .unwrap_or_else(|| "coordinator".to_owned()),
+            };
             let options = crate::agent_watch::WatchAgentsOptions {
-                coordinator: value.coordinator.clone(),
+                coordinator,
                 interval: Duration::from_secs(value.interval),
                 once: value.once,
                 check_only: value.check_only,
@@ -1725,6 +1801,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             .into_iter()
             .filter_map(|(present, flag)| present.then_some(flag))
             .collect::<Vec<_>>();
+            let mut record_edges = !value.no_edges;
             let (harness, mode, model, reasoning_effort, harness_args, environment, cloud) =
                 if let Some(profile_name) = value.profile.as_deref() {
                     let mut overlaps = Vec::new();
@@ -1762,6 +1839,9 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                             value.cwd.display()
                         ))
                     })?;
+                    if profile.record_edges == Some(false) {
+                        record_edges = false;
+                    }
                     (
                         profile.harness.clone(),
                         profile.mode.clone(),
@@ -1852,6 +1932,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 delivery: value.delivery.options(),
                 cloud,
                 slot,
+                record_edges,
             };
             if let Some(effort) = reasoning_effort.as_deref() {
                 manager.start_with_reasoning_effort(
@@ -1864,16 +1945,47 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 manager.start(&value.agent.name, &value.cwd, options)?
             }
         }
-        Commands::Adopt(value) => manager.adopt(
+        Commands::Adopt(value) => {
+            let mut result = manager.adopt(
+                &value.agent.name,
+                AdoptOptions {
+                    pane_id: value.pane,
+                    expected_workspace: value.workspace,
+                    cwd: value.cwd,
+                    harness: value.harness,
+                    session: value.session,
+                    record_edges: !value.no_edges,
+                },
+            )?;
+            manager.designate_after(&mut result, &value.agent.name, value.as_coordinator);
+            result
+        }
+        Commands::Coordinator(value) => match value.command {
+            CoordinatorCommand::Set(agent) => manager.coordinator_set(&agent.name)?,
+            CoordinatorCommand::Show => {
+                let shown = manager.coordinator_show()?;
+                write_json(&shown).map_err(Failure::Output)?;
+                return Ok(if shown["designated"] == true { 0 } else { 1 });
+            }
+            CoordinatorCommand::Clear => manager.coordinator_clear()?,
+        },
+        Commands::Manage(value) => manager.manage(
             &value.agent.name,
-            AdoptOptions {
-                pane_id: value.pane,
-                expected_workspace: value.workspace,
-                cwd: value.cwd,
-                harness: value.harness,
-                session: value.session,
+            match (value.by, value.clear) {
+                (Some(manager), _) => ManageAction::By(manager),
+                (None, true) => ManageAction::Clear,
+                (None, false) => ManageAction::Caller,
             },
         )?,
+        Commands::Tree(value) => {
+            let tree = manager.tree()?;
+            if value.json {
+                write_json(&tree).map_err(Failure::Output)?;
+            } else {
+                print!("{}", crate::subagents::render_tree(&tree));
+            }
+            return Ok(0);
+        }
         Commands::Move(value) => manager.move_to_project_workspace(&value.name)?,
         Commands::Rename(value) => manager.rename(&value.agent.name, &value.new_name)?,
         Commands::Promote(value) => {
@@ -2024,16 +2136,22 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 .map(|command| command.0.as_slice()),
         )?,
         Commands::Attach(value) => manager.attach(&value.name)?,
-        Commands::AttachSelf(value) => manager.attach_self(
-            &value.agent.name,
-            &value.cwd,
-            StartOptions {
-                workspace_id: value.workspace_id,
-                harness: "agentcloud".to_owned(),
-                startup_timeout: Duration::from_secs_f64(value.startup_timeout),
-                ..StartOptions::default()
-            },
-        )?,
+        Commands::AttachSelf(value) => {
+            let mut result = manager.attach_self(
+                &value.agent.name,
+                &value.cwd,
+                StartOptions {
+                    workspace_id: value.workspace_id,
+                    harness: "agentcloud".to_owned(),
+                    startup_timeout: Duration::from_secs_f64(value.startup_timeout),
+                    // The session registers itself; it is nobody's worker.
+                    record_edges: false,
+                    ..StartOptions::default()
+                },
+            )?;
+            manager.designate_after(&mut result, &value.agent.name, value.as_coordinator);
+            result
+        }
         Commands::Pause(value) => manager.pause(&value.name, true)?,
         Commands::Resume(value) => manager.pause(&value.name, false)?,
         Commands::Capabilities
@@ -2060,6 +2178,30 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             .any(|row| row.get("record_error").and_then(Value::as_bool) == Some(true))
     });
     Ok(i32::from(incomplete))
+}
+
+/// Make `config` follow the registry's coordinator designation, or say why it cannot. A
+/// designation that cannot be read, or that disagrees with `restore.json`, never stops `restore`
+/// or `watch`: they go on with `restore.json`'s own coordinator and report the problem.
+fn designation_problem(
+    client: &HerdrClient,
+    registry: &Path,
+    config: &mut crate::restore::RestoreConfig,
+) -> Option<String> {
+    let designated = match ManagedAgents::new(client, registry)
+        .and_then(|manager| manager.designated_coordinator())
+    {
+        Ok(designated) => designated,
+        Err(error) => {
+            return Some(format!(
+                "the coordinator designation is unreadable: {error}"
+            ))
+        }
+    };
+    config
+        .follow_designation(designated)
+        .err()
+        .map(|error| error.to_string())
 }
 
 /// The agentcloud session input is sent from: `--from-session`, else `$AGENTCLOUD_SESSION_ID`.

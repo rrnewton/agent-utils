@@ -130,6 +130,28 @@ impl RestoreConfig {
         Ok(config)
     }
 
+    /// Take the registry's designated coordinator (`agentctl coordinator set`) when
+    /// `restore.json` names none. A `restore.json` coordinator that disagrees with it, or a
+    /// designated coordinator that `exclude` lists, is an error, and the configuration keeps its
+    /// own coordinator (or none), so a caller can report the problem and carry on.
+    pub fn follow_designation(&mut self, designated: Option<String>) -> Result<()> {
+        match (&self.coordinator, designated) {
+            (None, Some(designated)) if self.exclude.contains(&designated) => Err(fail(format!(
+                "{CONFIG_FILE} excludes {designated:?}, the designated coordinator"
+            ))),
+            (None, designated) => {
+                self.coordinator = designated;
+                Ok(())
+            }
+            (Some(named), Some(designated)) if *named != designated => Err(fail(format!(
+                "{CONFIG_FILE} names coordinator {named:?} but the registry designates \
+                 {designated:?}; make them agree (agentctl coordinator set {named}), or drop the \
+                 coordinator key from {CONFIG_FILE}"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     fn empty() -> Self {
         Self {
             schema: CONFIG_SCHEMA.to_owned(),
@@ -750,6 +772,8 @@ fn register_elsewhere<A: ManagedApi + ?Sized>(
                     .unwrap_or_default()
                     .to_owned(),
                 session: None,
+                // A second registration of the coordinator is no worker of whoever runs restore.
+                record_edges: false,
             },
         )?;
         Ok(json!({"action": "adopted"}))
@@ -1166,7 +1190,18 @@ pub fn restore<A: ManagedApi + ?Sized>(
             }
         }
         let mut agents = Vec::new();
-        for name in names
+        // Managers come back before the agents they manage, at every depth of the control
+        // tree, so a lieutenant is live before its workers' notices are routed to it.
+        let ordered = match manager.control_view() {
+            Ok((nodes, _, tree_registry)) => crate::subagents::tree_order(
+                &nodes,
+                &tree_registry,
+                config.coordinator.as_deref(),
+                &names,
+            ),
+            Err(_) => names.clone(),
+        };
+        for name in ordered
             .iter()
             .filter(|name| config.coordinator.as_deref() != Some(name.as_str()))
         {

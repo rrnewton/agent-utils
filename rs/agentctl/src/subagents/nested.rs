@@ -428,6 +428,16 @@ fn sorted(value: Value) -> Value {
 }
 
 impl NestedRecord {
+    /// Keys the row carries beyond its schema, such as control edges.
+    pub(super) fn extensions(&self) -> &Map<String, Value> {
+        &self.extensions
+    }
+
+    /// [`Self::extensions`], for a write-back to change.
+    pub(super) fn extensions_mut(&mut self) -> &mut Map<String, Value> {
+        &mut self.extensions
+    }
+
     /// Update the mutable fields while retaining one canonical nested launch specification.
     fn document(&self, record: &AgentRecord) -> Result<Value> {
         let launch = &self.launch;

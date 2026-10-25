@@ -1002,7 +1002,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| fail(error.to_string()))?;
-        let record = AgentRecord {
+        let mut record = AgentRecord {
             storage_directory: None,
             nested: None,
             adapter: CLOUD_HARNESS.to_owned(),
@@ -1053,6 +1053,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             goal_messages: BTreeMap::new(),
             goal_message_id: None,
         };
+        self.creation_edges(&mut record, options.record_edges);
         self.save(&record)?;
         Ok((lock, record))
     }

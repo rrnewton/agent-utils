@@ -36,6 +36,8 @@ pub(crate) struct LaunchProfile {
     pub(crate) environment: Vec<String>,
     /// Agentcloud settings; present exactly when `harness` is `agentcloud`.
     pub(crate) cloud: Option<CloudLaunch>,
+    /// `false` turns off the `created_by` and `managed_by` edges `start` records.
+    pub(crate) record_edges: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -98,6 +100,8 @@ struct RawProfile {
     env: UniqueMap<String>,
     #[serde(default)]
     agentcloud: Option<CloudLaunch>,
+    #[serde(default)]
+    record_edges: Option<bool>,
 }
 
 #[derive(Debug, Default)]
@@ -602,6 +606,7 @@ fn validate(name: String, mut raw: RawProfile) -> Result<LaunchProfile, AgentErr
         argv: raw.argv,
         environment,
         cloud: raw.agentcloud,
+        record_edges: raw.record_edges,
     })
 }
 

@@ -260,6 +260,12 @@ def parser() -> argparse.ArgumentParser:
          "agentctl watch-agents --coordinator coordinator --once --check-only"),
         ("hold", "Record that an agent lands after another, for watch-agents to announce (Rust edition only; this "
          "edition refuses).", "agentctl hold cl-ingest --after cl-dedupe"),
+        ("coordinator", "Show, set, or clear this registry's designated coordinator (Rust edition only; this "
+         "edition refuses).", "agentctl coordinator show"),
+        ("manage", "Change which agent controls a registered agent (Rust edition only; this edition refuses).",
+         "agentctl manage worker-1 --by lieutenant"),
+        ("tree", "Print the control tree of coordinator, managers, and workers (Rust edition only; this "
+         "edition refuses).", "agentctl tree"),
     ):
         command(rust_only, purpose, example)
     for name, purpose in (
@@ -327,7 +333,7 @@ def _goal_command(args: argparse.Namespace) -> list[str] | None:
 
 
 #: Commands only the Rust edition implements; this edition refuses them with exit status 2.
-_RUST_ONLY = ("restore", "install-units", "watch", "watch-agents", "hold")
+_RUST_ONLY = ("restore", "install-units", "watch", "watch-agents", "hold", "coordinator", "manage", "tree")
 
 
 def main(argv: Sequence[str] | None = None) -> int:

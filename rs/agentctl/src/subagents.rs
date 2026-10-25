@@ -34,6 +34,7 @@ use crate::error::{AdapterError, AdapterErrorKind};
 use crate::submission::{GuardedInput, GuardedPrompt, Submission, SubmitTimeouts};
 
 mod cloud;
+mod control;
 mod launch_spec;
 mod nested;
 mod revive;
@@ -44,6 +45,8 @@ pub(crate) use cloud::{
     validate_create_arguments as validate_cloud_create_arguments, CLOUD_DRIVERS,
 };
 pub use cloud::{CloudLaunch, CloudTools};
+pub(crate) use control::{controller_of, tree_order};
+pub use control::{render_tree, ManageAction};
 pub(crate) use stop_advice::{stop_reason, StopContext};
 pub use stop_advice::{RecoveryAction, StopFailure};
 
@@ -4223,6 +4226,9 @@ pub struct StartOptions {
     pub cloud: Option<CloudLaunch>,
     /// Box the interactive agent to one wrkslots slot before the harness starts.
     pub slot: Option<SlotLaunch>,
+    /// Record `created_by` and `managed_by` edges naming the calling agent, when the caller can
+    /// be proved to be one (`agentctl start --no-edges` turns this off).
+    pub record_edges: bool,
 }
 
 /// The wrkslots slot an interactive agent is boxed to (`agentctl start --slot`).
@@ -4441,6 +4447,7 @@ impl Default for StartOptions {
             delivery: DrainOptions::default(),
             cloud: None,
             slot: None,
+            record_edges: true,
         }
     }
 }
@@ -4458,6 +4465,9 @@ pub struct AdoptOptions {
     pub harness: String,
     /// Optional native session ID already reported by the exact pane.
     pub session: Option<String>,
+    /// Record a `managed_by` edge naming the calling agent, when the caller can be proved to be
+    /// one.
+    pub record_edges: bool,
 }
 
 /// Explicit safety assertions for stop/recovery.
@@ -4489,6 +4499,10 @@ pub struct ManagedAgents<'a, A: ManagedApi + ?Sized> {
     cloud_tools: CloudTools,
     #[cfg(test)]
     revive_wrkslots_executable: Option<PathBuf>,
+    /// The caller's process ancestry as tests pretend it; `Some(None)` is a caller that is no
+    /// registered agent, the default, so fixtures that pin this test process record no edges.
+    #[cfg(test)]
+    caller_ancestry: Option<Option<agent_queue::identity::Ancestry>>,
 }
 
 impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
@@ -4512,6 +4526,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             cloud_tools: CloudTools::default(),
             #[cfg(test)]
             revive_wrkslots_executable: None,
+            #[cfg(test)]
+            caller_ancestry: Some(None),
         })
     }
 
@@ -5852,6 +5868,16 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
 
     /// Rename a live agent: registry entry, Herdr agent name and tab label together.
     pub fn rename(&self, old: &str, new: &str) -> Result<Value> {
+        let mut result = self.rename_record(old, new)?;
+        // The designation follows the agent by token whatever its name; this keeps the name it
+        // records readable.
+        if let Err(error) = self.follow_rename(new) {
+            result["designation_warning"] = json!(error.to_string());
+        }
+        Ok(result)
+    }
+
+    fn rename_record(&self, old: &str, new: &str) -> Result<Value> {
         self.refuse_pending_revive(&[old, new])?;
         name(old)?;
         name(new)?;
@@ -6786,6 +6812,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             goal_messages: BTreeMap::new(),
             goal_message_id: None,
         };
+        self.creation_edges(&mut record, options.record_edges);
         // The spec is durable before Herdr starts anything, so a launch that never reports
         // back can still be replayed exactly.
         record.launch_spec = Some(launch_spec::build(launch_spec::SpecFields {
@@ -7163,6 +7190,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             goal_messages: BTreeMap::new(),
             goal_message_id: None,
         };
+        // Whoever adopts an agent controls it from now on; who started it is unknown.
+        if options.record_edges {
+            record.set_edge(control::MANAGED_BY, self.caller_edge().as_ref());
+        }
         record.launch_spec = self.captured_launch_spec(
             &record,
             record.harness_identity.as_ref(),
@@ -8026,6 +8057,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         let agent_name = &record.name;
         let mut result = record.document()?;
+        for key in [control::CREATED_BY, control::MANAGED_BY] {
+            if let Some(edge) = record.edge(key) {
+                result[key] = json!(edge);
+            }
+        }
         result["queue"] = json!(self.queue(agent_name)?);
         result["output"] = json!(self.directory(agent_name)?.join("output.json"));
         result["goal_source"] = if record.goal.is_some() {
@@ -10567,6 +10603,7 @@ pub(crate) mod tests {
                 cwd: self.root.clone(),
                 harness: "codex".to_owned(),
                 session: None,
+                record_edges: true,
             }
         }
         fn adopt(&self) -> Value {
@@ -16742,6 +16779,8 @@ pub(crate) mod tests {
         assert!(fixture.client.closed.lock().unwrap().is_empty());
     }
 
+    /// The coordinator designation, created_by and managed_by edges, manage and the tree.
+    mod control;
     /// Offline retirement of an exact adopted generation with no runtime mutation.
     mod dead_adoption;
     /// Herdr readiness and adopted Muse process ownership compatibility.
