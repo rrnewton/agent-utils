@@ -13,11 +13,10 @@ message pass through an intermediary, and what stops a retry from delivering twi
 
 **How each claim was checked.** "Read" means the source or documentation was read at the commit
 given, from a shallow clone made on 2026-10-25 (Gas Town from a clone made 2026-10-24). "Recalled"
-means it is stated from general knowledge and was not re-read for this draft: every attempt to
-fetch the IETF texts failed (the session proxy answered `curl: (56) Received HTTP code 403 from
-proxy after CONNECT`; the terminal-pane route answered `herdr-run: REFUSED: program "curl" is not
-allowlisted. Allowed: gh, git`; the web fetcher could not reach the IETF sites), so the RFC
-sections below are marked recalled. Licenses were not re-checked.
+means it is stated from general knowledge and was not re-read for this draft; the IETF texts
+could not be fetched while it was written, so the RFC sections below are marked recalled and
+should be checked against the RFCs before this file moves to the tool. Licenses were not
+re-checked.
 
 ## Summary
 
@@ -214,8 +213,8 @@ general relay mesh turns into. The design forbids relaying a relayed envelope in
 
 **Implication.** Matrix pairs a per-hop idempotency key (the transaction) with an end-to-end ID
 (the event), and does not move on while a hop's outcome is unknown. Those are the design's
-custody receipt per hop, its end-to-end message ID, and its rule against a second route after
-ambiguity.
+custody receipt per hop, its end-to-end message ID, and its rule against moving to a second
+contact after ambiguity.
 
 ### Tailscale DERP
 
@@ -242,14 +241,15 @@ Local manual pages of OpenSSH 8.7p1, read 2026-10-25.
   for future client connections)" (`ssh_config(5)`).
 - In `authorized_keys`, `restrict` disables "port, agent and X11 forwarding, as well as disabling
   PTY allocation"; `port-forwarding` re-enables forwarding after `restrict`; `permitopen="host:port"`
-  limits `-L` forwarding to that destination (`sshd(8)`). A jump-only key is therefore possible:
-  `restrict,port-forwarding,permitopen="host-c:22",command="/bin/false"`. That forwarding
-  channels are not subject to the forced command, which only governs sessions, is recalled
-  OpenSSH behaviour, to be confirmed by the live trial of phase P4.
+  limits `-L` forwarding to that destination (`sshd(8)`). It does not limit `-R` listeners
+  (that is `permitlisten`), so a forwarding grant on a hub opens more than one destination; by
+  recalled behaviour unix-socket forwarding is not limited by `permitopen` either.
 
 **Implication.** Through a hub, ssh can relay without the hub reading or storing anything, if the
 destination accepts ssh from the hub and both are up at once. The design offers that as a route
-option (`jump`) and uses the store-and-forward relay only where it cannot work.
+option (`jump`), but carries it through the hub key's forced command (a `connect` verb used as
+`ProxyCommand`) rather than a forwarding grant, so the hub's key stays `restrict`ed; it uses the
+store-and-forward relay only where a jump cannot work.
 
 ### Store and forward: SMTP, UUCP and netnews
 
@@ -283,8 +283,9 @@ flooding and long hop counts.
   (`ProxyJump`, DERP) where it suffices.
 - **Exactly once:** an end-to-end ID with a durable seen-set at the final receiver only (netnews
   history, JetStream's `Nats-Msg-Id`), per-hop custody receipts (Matrix transactions, SMTP's
-  accepted responsibility), and no second route while a hop's outcome is unknown (Matrix's retry
-  rule). Unlike A2A, dedupe at the receiver is mandatory.
+  accepted responsibility), and no move to a second contact while a hop's outcome is unknown
+  (in the spirit of Matrix's retry rule; resends to the same receiver stay allowed, because its
+  seen-set absorbs them). Unlike A2A, dedupe at the receiver is mandatory.
 - **Authority:** only the final receiving host verifies the coordinator and applies policy; a hub
   forwards and never decides. Credentials name the peer, as Gas Town's proxy certificates do.
 - **What none of them has:** the final hop is a terminal composer that only one local program may
