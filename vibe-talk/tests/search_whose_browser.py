@@ -147,10 +147,12 @@ def walk(page: Page, label: str, touch: bool, shots: Path | None, width: int = 1
             if shots is not None:
                 page.screenshot(path=str(shots / f"{label}-search-whose-tooltip.png"))
             page.mouse.move(10, 10)
-        # ...and keyboard focus raises it too.
-        page.focus("#author-filter")
-        until(page, "() => getComputedStyle(document.getElementById('author-filter-tip')).display === 'block'",
-              f"{label}: focusing the author filter raised no tooltip")
+        # ...and reaching it with the keyboard raises it too (Tab from the field, as a reader's would).
+        page.focus("#search-field")
+        page.keyboard.press("Tab")
+        until(page, "() => document.activeElement && document.activeElement.id === 'author-filter'"
+                    " && getComputedStyle(document.getElementById('author-filter-tip')).display === 'block'",
+              f"{label}: tabbing to the author filter raised no tooltip")
     return "; ".join(landed)
 
 
