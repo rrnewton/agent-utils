@@ -261,6 +261,24 @@ def test_current_muse_yolo_footer_is_an_idle_composer() -> None:
     assert not client_module.muse_idle_composer(choice)
 
 
+def test_a_paste_muse_wraps_inside_a_word_or_a_path_is_still_the_exact_editor() -> None:
+    # Muse 1.4.14 wraps a long line at any character, inside a word or a path (#505
+    # agentctl-muse-followup; rs/agentctl/testdata/muse-busy/muse-wrapped-draft.txt), so a
+    # proof that joined rows only with a space never saw such a paste staged.
+    def frame(editor: str) -> str:
+        return ("────────────────\n" + editor + "\n────────────────\n"
+                "  watermelon-full-preview · xhigh · /work/project · Launch overrides\n")
+    token = "token-" + "abcdefghij" * 3 + " END"
+    assert muse_verified_process_paste_is_exact_composer(
+        frame("❯ token-abcdefghijabcde\n  fghijabcdefghij END"), token)
+    assert muse_verified_process_paste_is_exact_composer(
+        frame("❯ break/at/odd/\n  places"), "break/at/odd/places")
+    assert muse_verified_process_paste_is_exact_composer(
+        frame("❯ keep the self-\n  contained proof"), "keep the self-contained proof")
+    assert not muse_verified_process_paste_is_exact_composer(
+        frame("❯ break/at/odd/\n  places"), "break/at/odd/placez")
+
+
 def test_muse_launch_overrides_footer_is_an_idle_composer() -> None:
     # Captured 2026-10-19 from a live Muse launched with extra harness
     # arguments (--approval-mode never among them): the footer reports

@@ -1177,11 +1177,34 @@ pub fn clear_composer(
     harness: &str,
     runtime: &dyn AgentRuntime,
 ) -> std::result::Result<u32, String> {
-    let read = || -> std::result::Result<ComposerView, String> {
+    clear_editor(
+        terminal,
+        pane_id,
+        harness,
+        &|screen| {
+            composer_view(harness, screen)
+                .map(|view| (composer_content(&view), composer_is_empty(&view)))
+        },
+        runtime,
+    )
+}
+
+/// [`clear_composer`] for any editor `editor` can read: given a screen, it returns what the
+/// editor holds, compared between reads, and whether it is empty, or `None` when the screen
+/// shows no recognisable editor. `label` names the harness in messages.
+pub(crate) fn clear_editor(
+    terminal: &dyn PromptTerminal,
+    pane_id: &str,
+    label: &str,
+    editor: &dyn Fn(&str) -> Option<(String, bool)>,
+    runtime: &dyn AgentRuntime,
+) -> std::result::Result<u32, String> {
+    let harness = label;
+    let read = || -> std::result::Result<(String, bool), String> {
         let screen = terminal
             .read_screen(pane_id)
             .map_err(|error| format!("pane {pane_id}: composer read failed: {error}"))?;
-        composer_view(harness, &screen).ok_or_else(|| {
+        editor(&screen).ok_or_else(|| {
             format!("pane {pane_id} no longer shows a recognisable {harness} composer")
         })
     };
@@ -1193,28 +1216,28 @@ pub fn clear_composer(
             .send_keys(pane_id, key)
             .map_err(|error| format!("pane {pane_id}: key {key} failed: {error}"))
     };
-    let mut view = read()?;
+    let (mut content, mut empty) = read()?;
     let mut keys = 0_u32;
     for _ in 0..MAX_CLEAR_ROUNDS {
-        if composer_is_empty(&view) {
+        if empty {
             return Ok(keys);
         }
-        let before = composer_content(&view);
+        let before = content;
         for key in CLEAR_ROW_KEYS {
             send(key)?;
             keys += 1;
         }
         runtime.sleep(POLL);
-        view = read()?;
-        if composer_is_empty(&view) {
+        (content, empty) = read()?;
+        if empty {
             return Ok(keys);
         }
-        if composer_content(&view) == before {
+        if content == before {
             send(CLEAR_CHARACTER_KEY)?;
             keys += 1;
             runtime.sleep(POLL);
-            view = read()?;
-            if !composer_is_empty(&view) && composer_content(&view) == before {
+            (content, empty) = read()?;
+            if !empty && content == before {
                 return Err(format!(
                     "pane {pane_id}: the {harness} composer did not change after {keys} clearing \
                      key(s); it still holds text"
@@ -1222,7 +1245,7 @@ pub fn clear_composer(
             }
         }
     }
-    if composer_is_empty(&view) {
+    if empty {
         return Ok(keys);
     }
     Err(format!(

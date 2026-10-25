@@ -660,6 +660,8 @@ elif args[:2] == ["pane", "read"]:
         history = "".join("❯ " + text + "\n◆ accepted\n" for text in state.get("submitted", []))
         footer = "watermelon-preview · xhigh · project · " + state.get(
             "custom_permission", "Auto-review") + "\n"
+        # A Muse 1.4 turn in progress draws this row right above its editor (#505).
+        busy = "◇ Thinking (3s · esc to interrupt)\n" if state.get("custom_busy") else ""
         if state.get("custom_submitted"):
             if state.get("custom_post_error"):
                 sys.stdout.write(prefix + history + divider + "❯ " + state["custom_draft"] +
@@ -668,10 +670,10 @@ elif args[:2] == ["pane", "read"]:
                 sys.stdout.write(prefix + history + "Working...\n" + divider + "❯\n" +
                                  divider + footer)
         elif state.get("custom_draft"):
-            sys.stdout.write(prefix + history + divider + "❯ " + state["custom_draft"] +
+            sys.stdout.write(prefix + history + busy + divider + "❯ " + state["custom_draft"] +
                              "\n" + divider + footer)
         else:
-            sys.stdout.write(prefix + history + divider + "❯\n" + divider + footer)
+            sys.stdout.write(prefix + history + busy + divider + "❯\n" + divider + footer)
     elif source == "recent-unwrapped":
         if "read_unwrapped" in state:
             sys.stdout.write(state["read_unwrapped"])

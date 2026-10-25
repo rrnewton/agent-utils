@@ -318,9 +318,10 @@ def _muse_editor_matches(editor: str, text: str, *, exact: bool) -> bool:
     if not wanted or segments is None:
         return False
     prefixes = {""}
-    previous = ""
     for index, segment in enumerate(segments):
-        separators = ("",) if index == 0 else ((" ", "") if previous.endswith("-") else (" ",))
+        # Muse 1.4.14 wraps at any character, inside a word or a path as well as after a
+        # hyphen, so any row break may join with or without a space (#505).
+        separators = ("",) if index == 0 else (" ", "")
         next_prefixes: set[str] = set()
         for prefix in prefixes:
             for separator in separators:
@@ -334,7 +335,6 @@ def _muse_editor_matches(editor: str, text: str, *, exact: bool) -> bool:
         if not next_prefixes:
             return False
         prefixes = next_prefixes
-        previous = segment
     return wanted in prefixes
 
 

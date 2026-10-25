@@ -23,8 +23,9 @@ use sha2::{Digest, Sha256};
 
 use crate::agent::{self, AgentApi, AgentError, DrainOptions, QueueResult, Target};
 use crate::client::{
-    muse_auto_review_idle_composer, muse_startup_metadata, muse_trust_prompt,
-    muse_verified_pane_status, muse_verified_process_idle_composer,
+    muse_auto_review_idle_composer, muse_editor_rows_empty, muse_startup_metadata,
+    muse_trust_prompt, muse_verified_pane_status, muse_verified_process_editor_rows,
+    muse_verified_process_footer_mode, muse_verified_process_idle_composer,
     muse_verified_process_paste_in_composer, muse_verified_process_paste_is_exact_composer,
     muse_verified_process_prompt_transcript_count, AgentIdentity, AgentPaneInfo,
     CustomProcessIdentity, HerdrClient, Pane, PaneShellProof, ProcessLiveness,
@@ -2128,6 +2129,296 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         })
     }
 
+    /// Read the visible screen between two checks of the pinned Muse process.
+    fn verified_muse_screen(
+        &self,
+        pane_id: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<String> {
+        self.verify_muse_process_with_runtime(pane_id, runtime)?;
+        let screen = self
+            .client
+            .read_with_runtime(pane_id, "visible", Some(200), runtime)?;
+        self.verify_muse_process_with_runtime(pane_id, runtime)?;
+        Ok(screen)
+    }
+
+    /// Prove that a pinned Muse pane, idle or running a turn, may take a follow-up paste now,
+    /// and return the screen that the paste must change.
+    ///
+    /// As [`Self::muse_paste_baseline`], but the editor may sit below Muse's running-turn row:
+    /// the pane must show Muse's empty editor above exactly one status footer, read between two
+    /// checks of the pinned process. A draft in the editor, an approval form or a panel in its
+    /// place, or any other screen refuses. An adopted pane still needs its `Auto-review` footer.
+    /// Nothing has been typed when this returns, so every refusal is `NotStaged`.
+    fn muse_followup_baseline(
+        &self,
+        pane_id: &str,
+        text: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<String> {
+        let baseline = || {
+            if text.contains(['\0', '\u{1b}']) {
+                return Err(AdapterError::unavailable(
+                    "Muse pane prompts cannot contain NUL or terminal escape characters",
+                ));
+            }
+            let info = self.pane_info_with_runtime(pane_id, runtime)?;
+            if !matches!(info.status.as_str(), "idle" | "working") {
+                return Err(AdapterError::unavailable(format!(
+                    "Muse pane {pane_id} is {}, not idle or working",
+                    info.status
+                )));
+            }
+            let before = self.verified_muse_screen(pane_id, runtime)?;
+            if !crate::harness_tui::muse::MuseTui::editor_empty(&before) {
+                return Err(AdapterError::unavailable(format!(
+                    "pane {pane_id} does not show an empty Muse editor with one status footer \
+                     (a draft, an approval form or a panel may be there)"
+                )));
+            }
+            if self.record.adapter == "herdr-foreign"
+                && muse_verified_process_footer_mode(&crate::harness_tui::plain(&before))
+                    != Some("Auto-review")
+            {
+                return Err(AdapterError::unavailable(
+                    "an adopted Muse pane takes input only at its Auto-review editor",
+                ));
+            }
+            Ok(before)
+        };
+        baseline().map_err(|error| {
+            if error.kind() == AdapterErrorKind::NotStaged {
+                error
+            } else {
+                AdapterError::not_staged(format!("{error}; nothing was typed"))
+            }
+        })
+    }
+
+    /// Type an ordinary follow-up into a pinned Muse pane whose turn may be running, steer the
+    /// turn with Enter, and prove from the screen that Muse took it (#505
+    /// agentctl-muse-followup).
+    ///
+    /// Muse prints a steered prompt at once as a new user turn above its editor, so the proof is
+    /// the same as for an idle editor: one more exact copy of the prompt as a user turn than the
+    /// staged screen showed, and the prompt gone from the editor. Enter is pressed again, with a
+    /// doubling wait, only while the exact prompt is still staged. A prompt still staged when the
+    /// submission deadline passes is taken back out of the editor and reported as not typed, so
+    /// it stays pending; if that fails, or the prompt left the editor without the proof, the
+    /// outcome is unknown and the caller treats the prompt as possibly submitted.
+    fn muse_followup(
+        &self,
+        pane_id: &str,
+        text: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<Submission> {
+        use crate::submission::{FIRST_RETRY, MAX_RETRY, POLL, STAGE_TIMEOUT, SUBMIT_TIMEOUT};
+        *self
+            .goal_objective
+            .lock()
+            .expect("goal operation lock poisoned") = None;
+        let before = self.muse_followup_baseline(pane_id, text, runtime)?;
+        let guarded = self.guarded(runtime)?;
+        guarded.send_text(
+            pane_id,
+            &format!("{BRACKETED_PASTE_START}{text}{BRACKETED_PASTE_END}"),
+        )?;
+        let unknown = |detail: &str| {
+            Err(AdapterError::unavailable(format!(
+                "pane {pane_id}: {detail}; the outcome is unknown"
+            )))
+        };
+        let started = runtime.monotonic();
+        let staged = loop {
+            if runtime.cancelled() {
+                return unknown("delivery was cancelled after the prompt was pasted");
+            }
+            let screen = self.verified_muse_screen(pane_id, runtime)?;
+            if screen != before && muse_verified_process_paste_is_exact_composer(&screen, text) {
+                break screen;
+            }
+            if runtime.monotonic().saturating_sub(started) >= STAGE_TIMEOUT {
+                return Err(self.withdraw_unverified_muse_paste(
+                    &guarded,
+                    pane_id,
+                    &format!(
+                        "the pasted prompt was not observed as the whole Muse editor within {}s; \
+                         Enter was not sent",
+                        STAGE_TIMEOUT.as_secs()
+                    ),
+                    runtime,
+                ));
+            }
+            runtime.sleep(POLL);
+        };
+        let prior = muse_verified_process_prompt_transcript_count(&staged, text);
+        guarded.send_keys(pane_id, "Enter")?;
+        let pressed = runtime.monotonic();
+        let mut presses: u32 = 1;
+        let mut wait = FIRST_RETRY;
+        let mut next_press = pressed.saturating_add(wait);
+        loop {
+            runtime.sleep(POLL);
+            if runtime.cancelled() {
+                return unknown("delivery was cancelled after Enter");
+            }
+            let screen = self.verified_muse_screen(pane_id, runtime)?;
+            let now = runtime.monotonic();
+            if screen != staged
+                && muse_verified_process_prompt_transcript_count(&screen, text) > prior
+                && !muse_verified_process_paste_in_composer(&screen, text)
+            {
+                return Ok(Submission::Verified(crate::submission::SubmissionReceipt {
+                    key: "Enter",
+                    key_presses: presses,
+                    elapsed: now.saturating_sub(started),
+                    evidence: "prompt appeared above the Muse editor as a new user turn".to_owned(),
+                    printed: true,
+                    settled: true,
+                }));
+            }
+            let still_staged = muse_verified_process_paste_is_exact_composer(&screen, text);
+            if now.saturating_sub(pressed) >= SUBMIT_TIMEOUT {
+                if still_staged && runtime.withdraw_unaccepted_prompt() {
+                    return self.withdraw_muse_followup(
+                        &guarded,
+                        pane_id,
+                        text,
+                        prior,
+                        presses,
+                        now.saturating_sub(started),
+                        runtime,
+                    );
+                }
+                return unknown(&format!(
+                    "the prompt {} after {presses} Enter key press(es), without a new user turn \
+                     above the Muse editor",
+                    if still_staged {
+                        "is still staged in the Muse editor"
+                    } else {
+                        "left the Muse editor or the editor is not recognisable"
+                    }
+                ));
+            }
+            if still_staged && now >= next_press {
+                guarded.send_keys(pane_id, "Enter")?;
+                presses += 1;
+                wait = (wait * 2).min(MAX_RETRY);
+                next_press = now.saturating_add(wait);
+            }
+        }
+    }
+
+    /// After a paste that never showed as the whole Muse editor, and before any Enter, take what
+    /// it left in the editor back out, so the prompt is not stranded there unsubmitted (#505
+    /// agentctl-muse-followup). The editor was proved empty right before the paste, so whatever
+    /// it holds now is the paste, and no Enter was sent; a paste that drew late is looked for
+    /// once more a moment later. The prompt is still reported as possibly submitted, so the
+    /// queue quarantines it and never types it again: a paste Muse did not take as one paste
+    /// can submit a line at each newline, and a prompt that never matches would otherwise be
+    /// pasted and cleared again on every drain.
+    fn withdraw_unverified_muse_paste(
+        &self,
+        guarded: &dyn GuardedInput,
+        pane_id: &str,
+        detail: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> AdapterError {
+        let editor = |screen: &str| {
+            muse_verified_process_editor_rows(&crate::harness_tui::plain(screen))
+                .map(|rows| (rows.clone(), muse_editor_rows_empty(&rows)))
+        };
+        let mut cleared = Ok(0);
+        for _ in 0..2 {
+            cleared = crate::submission::clear_editor(
+                &GuardedPrompt(guarded),
+                pane_id,
+                "Muse",
+                &editor,
+                runtime,
+            );
+            if cleared.is_err() {
+                break;
+            }
+            runtime.sleep(MUSE_LATE_PASTE);
+        }
+        let empty = cleared.as_ref().is_ok()
+            && self
+                .verified_muse_screen(pane_id, runtime)
+                .is_ok_and(|screen| crate::harness_tui::muse::MuseTui::editor_empty(&screen));
+        AdapterError::unavailable(if empty {
+            format!(
+                "pane {pane_id}: {detail}; the paste was taken back out of the editor, which is \
+                 empty again; the prompt may still have been submitted in part, so it is not \
+                 typed again"
+            )
+        } else {
+            format!(
+                "pane {pane_id}: {detail}; taking the paste back out of the editor failed{}, so \
+                 it may be left there; the prompt may have been submitted",
+                cleared
+                    .err()
+                    .map_or(String::new(), |error| format!(" ({error})"))
+            )
+        })
+    }
+
+    /// Take a follow-up that Muse never accepted back out of its editor with the clearing keys,
+    /// which never submit or interrupt (Esc would interrupt the running turn). Nothing was
+    /// submitted when the editor is proved empty and shows no new user turn of the prompt.
+    #[allow(clippy::too_many_arguments)]
+    fn withdraw_muse_followup(
+        &self,
+        guarded: &dyn GuardedInput,
+        pane_id: &str,
+        text: &str,
+        prior: usize,
+        presses: u32,
+        elapsed: Duration,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> crate::error::Result<Submission> {
+        let elapsed = elapsed.as_secs_f64();
+        let left = |detail: String| {
+            Err(AdapterError::unavailable(format!(
+                "pane {pane_id}: the prompt is still staged in the Muse editor after {presses} \
+                 Enter key press(es) over {elapsed:.1}s; taking it back out failed, so it is \
+                 left there and treated as possibly submitted: {detail}"
+            )))
+        };
+        let editor = |screen: &str| {
+            muse_verified_process_editor_rows(&crate::harness_tui::plain(screen))
+                .map(|rows| (rows.clone(), muse_editor_rows_empty(&rows)))
+        };
+        if let Err(detail) = crate::submission::clear_editor(
+            &GuardedPrompt(guarded),
+            pane_id,
+            "Muse",
+            &editor,
+            runtime,
+        ) {
+            return left(detail);
+        }
+        let screen = match self.verified_muse_screen(pane_id, runtime) {
+            Ok(screen) => screen,
+            Err(error) => return left(format!("the screen read after the clear failed: {error}")),
+        };
+        if !crate::harness_tui::muse::MuseTui::editor_empty(&screen) {
+            return left("the Muse editor is not empty after the clear".to_owned());
+        }
+        if muse_verified_process_prompt_transcript_count(&screen, text) > prior {
+            return Err(AdapterError::unavailable(format!(
+                "pane {pane_id}: the prompt may have been accepted while it was taken back out of \
+                 the Muse editor (a new user turn of it appeared); the outcome is unknown"
+            )));
+        }
+        Ok(Submission::NotStaged(format!(
+            "pane {pane_id}: Muse did not accept the prompt after {presses} Enter key press(es) \
+             over {elapsed:.1}s; it was taken back out of the editor, which is empty again, so \
+             nothing was submitted"
+        )))
+    }
+
     fn verify_muse_process(&self, pane_id: &str) -> crate::error::Result<()> {
         self.verify_muse_process_with_runtime(pane_id, &agent::SystemRuntime::default())
     }
@@ -2626,6 +2917,8 @@ impl<A: ManagedApi + ?Sized> GuardedInput for GuardedTerminal<'_, '_, A> {
 
 /// Longest wait for a sent prompt to appear in the target pane's scrollback.
 const READBACK: Duration = Duration::from_secs(5);
+/// How long a withdrawn Muse paste is watched for drawing late before the editor counts as empty.
+const MUSE_LATE_PASTE: Duration = Duration::from_millis(500);
 
 #[cfg(test)]
 thread_local! {
@@ -3258,6 +3551,14 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         text: &str,
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<Submission> {
+        // A queue drain that found the pane working passes a follow-up key; a Muse pane then
+        // takes an ordinary prompt by steering its running turn (#505 agentctl-muse-followup).
+        if self.uses_muse_composer()
+            && !text.trim_start().starts_with('/')
+            && runtime.followup_key().is_some()
+        {
+            return self.muse_followup(pane_id, text, runtime);
+        }
         // Custom panes verify through their own composer model, and slash
         // commands (including goal replacement) need the native primitive.
         if self.uses_muse_composer() || text.trim_start().starts_with('/') {
@@ -3470,6 +3771,9 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
 }
 
 impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
+    fn verifies_muse_followups(&self) -> bool {
+        self.uses_muse_composer()
+    }
     fn codex_idle_ready_with_runtime(
         &self,
         info: &AgentPaneInfo,
@@ -3600,8 +3904,11 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 break screen;
             }
             if Instant::now() >= deadline {
-                return Err(crate::error::AdapterError::unavailable(
+                return Err(self.withdraw_unverified_muse_paste(
+                    &guarded,
+                    pane_id,
                     "literal text insertion did not produce exact visible Muse editor evidence; Enter was not sent",
+                    &runtime,
                 ));
             }
             std::thread::sleep(
@@ -3792,8 +4099,11 @@ impl<A: ManagedApi + ?Sized> AgentApi for WorkspaceClient<'_, A> {
                 break screen;
             }
             if Instant::now() >= deadline {
-                return Err(crate::error::AdapterError::unavailable(
+                return Err(self.withdraw_unverified_muse_paste(
+                    &guarded,
+                    pane_id,
                     "literal text insertion did not produce exact visible Muse editor evidence; Enter was not sent",
+                    runtime,
                 ));
             }
             std::thread::sleep(
@@ -11715,6 +12025,11 @@ pub(crate) mod tests {
                     .unwrap()
                     .insert(pane.to_owned(), 777);
             }
+            if key != "Enter" {
+                if let Some(editor) = self.muse_editor.lock().unwrap().as_mut() {
+                    editor.key(key);
+                }
+            }
             if key == "Enter" {
                 if let Some(prompt) = self
                     .muse_editor
@@ -16435,6 +16750,8 @@ pub(crate) mod tests {
     mod identity;
     /// Launch specs written at start, read at adopt and anchor, and replayed by revive.
     mod launch_spec;
+    /// Follow-ups typed into a running Muse turn: steered, proved, withdrawn or held.
+    mod muse_followup;
     /// Muse 1.4 paused, idle, staged and working status, and the input each one admits.
     mod muse_status;
     /// Nested agentctl-session/v2 and v3 rows: decode, write-back and anchor migration.

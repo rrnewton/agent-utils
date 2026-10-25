@@ -1740,6 +1740,57 @@ def _muse14_status(harness: Harness, report: Report) -> None:
     _retire_fixture_processes(case)
 
 
+def _muse_busy_followup(harness: Harness, report: Report) -> None:
+    """#505 agentctl-muse-followup: an EXPECTED divergence, checked per edition.
+
+    For a Muse that is running a turn, the Rust edition pastes an ordinary prompt into the empty
+    editor and steers the turn with Enter, proved by the new user turn. By the owner's 2026-10-25
+    decision this is not ported to Python, which keeps the prompt pending until the editor is
+    idle and then delivers it. Neither edition may type it twice.
+    """
+    case = harness.case("primary-muse-busy-followup", {
+        "harness": "muse", "custom_reported": True, "report_custom_session": True,
+        "foreground_argv_mode": "missing",
+    })
+    for root in (case.python_root, case.rust_root):
+        subprocess.run([
+            str(root / "fake-herdr"), "pane", "run", "w1:p1",
+            shlex.join([str(root / "fake-muse-runtime")]),
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    adopted, _ = _pair(harness, report, case, "primary/muse-busy/adopt", (
+        "adopt", "foreign", "--pane", "w1:p1", "--workspace", "project",
+        "--cwd", "<ROOT>", "--harness", "muse", "--session", "session-1", *_COMMON,
+    ))
+    if adopted.returncode != 0:
+        _retire_fixture_processes(case)
+        return
+    _change(case, {"status": "working", "custom_busy": True})
+    prompt = "hold: stop after the current step"
+    python, rust = harness.invoke(case, (
+        "send", "foreign", prompt, "--message-id", "busy", "--ready-timeout", "0", *_COMMON,
+    ))
+    report.require("primary/muse-busy/python-waits-for-idle",
+                   python.returncode == 75
+                   and _submission_count(case.python_root, prompt) == 0
+                   and (case.python_root / "registry/foreign/queue/inbox/busy.json").is_file(),
+                   f"Python typed into a busy Muse or lost the prompt: {python!r}")
+    report.require("primary/muse-busy/rust-steers-once",
+                   rust.returncode == 0
+                   and _submission_count(case.rust_root, prompt) == 1
+                   and _state(case.rust_root).get("paste_wrapped") is True
+                   and (case.rust_root / "registry/foreign/queue/processed/busy.json").is_file(),
+                   f"Rust did not steer the busy Muse exactly once: {rust!r}")
+    _change(case, {"status": "idle", "custom_busy": False, "custom_submitted": False,
+                   "custom_draft": ""})
+    harness.invoke(case, ("drain", "foreign", *_COMMON))
+    report.require("primary/muse-busy/delivered-once-each",
+                   all(_submission_count(root, prompt) == 1
+                       and (root / "registry/foreign/queue/processed/busy.json").is_file()
+                       for root in (case.python_root, case.rust_root)),
+                   "the idle drain lost or repeated the busy-time prompt")
+    _retire_fixture_processes(case)
+
+
 def _handoff_and_pending(harness: Harness, report: Report) -> None:
     case = harness.case("primary-handoff")
     if not _start(harness, report, case, "primary/handoff/start"):
@@ -2904,6 +2955,7 @@ def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> 
             _herdr_093_compatibility(harness, report)
             _muse_adoption(harness, report)
             _muse14_status(harness, report)
+            _muse_busy_followup(harness, report)
             _handoff_and_pending(harness, report)
             _registry_and_interop(harness, report)
             _legacy_adopted_registry_and_queue(harness, report)

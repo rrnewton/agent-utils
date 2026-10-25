@@ -418,12 +418,19 @@ the composer is not acceptance. Failure
 after either input boundary remains `possibly_submitted`; it is never replayed
 automatically. Every refusal before the paste (a draft or menu in the editor, a
 prompt containing NUL or an escape character, a changed process) leaves the
-message pending, exit 75.
+message pending, exit 75. A Muse pane that is running a turn takes ordinary
+follow-ups in the Rust edition, as described under `send`.
 Each screen is read between two checks of the pinned process, which is what
 identifies it as Muse's once Muse 1.4 has scrolled its `Muse Code X.Y.Z` header
 away. A long paste that Muse collapses to `[Pasted Content N chars]` counts as
 the draft only when N is the prompt's exact length in code points, with CRLF
-counted once. Of the text Muse prints at the end of its status footer after
+counted once. A paste Muse wraps over several rows counts when its text matches
+with or without a space at each row break, since Muse wraps inside words and
+paths as well as after hyphens. In the Rust edition, a paste that never shows as
+the whole editor is taken back out of it before any Enter instead of being left
+there; the message is still quarantined as possibly submitted, since a paste
+Muse did not take as one paste can submit a line at each newline. Of the text
+Muse prints at the end of its status footer after
 three or more spaces, only its two known notices, `Paste again to expand for
 editing` and `Hook · ...`, are ignored; anything else there, or Muse's progress
 line (`◇ Thinking (3s · esc to interrupt)`) as the last line above the editor,
@@ -873,6 +880,24 @@ paste plus Enter, so the active turn can receive the instruction. The existing
 empty-composer and at-most-once checks still apply. A blocking question is not a
 working composer, even when Herdr's status has not caught up with the screen.
 Slash commands still wait for idle or done.
+
+The Rust edition also delivers ordinary follow-ups to a working Muse pane by
+default. Muse keeps its editor typeable while a turn runs: Enter there steers the
+running turn, and Muse prints the prompt at once as a new user turn above the
+editor, while Tab would only queue it until the whole turn ends (and does
+nothing on an idle editor), and Esc interrupts the turn. So agentctl pastes into
+the empty editor and presses Enter, under the same pinned-process checks as an
+idle delivery, and counts the prompt delivered only when that new user turn
+shows and the editor no longer holds it. A prompt Muse never takes within the
+submission deadline is taken back out of the editor with `ctrl+e`, `ctrl+u` and
+`backspace` and stays pending. A draft in the editor, an approval form or panel
+in its place, or an adopted pane without its `Auto-review` footer keeps the
+prompt pending with nothing typed, and slash commands, which Muse runs at once
+even mid-turn, wait for idle. A steer reaches the model at its next step; Muse
+may move a long-running foreground command to the background to take it. Only
+agents agentctl manages (started or adopted) take Muse follow-ups; a raw pane
+target, as `herdr-agent` uses, has no verified Muse editor path and still waits
+for idle. The Python edition still waits for an idle Muse editor.
 
 To inspect a question without selecting or submitting an answer:
 
